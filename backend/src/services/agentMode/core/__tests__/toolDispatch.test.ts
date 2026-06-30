@@ -449,6 +449,102 @@ describe('executePreparedTools', () => {
     });
   });
 
+  describe('same-turn duplicate dedupe (ENG-108)', () => {
+    it('collapses two identical calls: executes once, answers BOTH tool_call_ids, no failure', async () => {
+      const ports = makePorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'create_lead', '{"email":"x@y.com"}'),
+          toolCall('b', 'create_lead', '{"email":"x@y.com"}'),
+        ],
+        ports,
+      );
+      const result = await executePreparedTools(input);
+
+      // The tool executed exactly once.
+      expect((ports as any).__execOrder).toEqual(['create_lead']);
+      // Every emitted tool_call_id is answered with a tool-role message.
+      const answeredIds = input.messages.map((m: any) => m.tool_call_id).sort();
+      expect(answeredIds).toEqual(['a', 'b']);
+      // The duplicate is neither a success counter nor a failed counter increment.
+      expect(result.pendingCounterUpdates).toEqual({ create_lead: 1 });
+      expect(result.failedCounterUpdates).toEqual({});
+      // The duplicate ledger entry references the call that IS handled and has no error.
+      const dupEntry = input.toolCallsLedger.find((t: any) => t.id === 'b');
+      expect(dupEntry.duplicateOf).toBe('a');
+      expect(dupEntry.error).toBeUndefined();
+    });
+
+    it('treats arg-order differences as the same call (stable key)', async () => {
+      const ports = makePorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'create_lead', '{"a":1,"b":2}'),
+          toolCall('b', 'create_lead', '{"b":2,"a":1}'),
+        ],
+        ports,
+      );
+      await executePreparedTools(input);
+      expect((ports as any).__execOrder).toEqual(['create_lead']);
+    });
+
+    it('does NOT collapse distinct args — both execute, both ids answered', async () => {
+      const ports = makePorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'create_lead', '{"email":"x@y.com"}'),
+          toolCall('b', 'create_lead', '{"email":"z@y.com"}'),
+        ],
+        ports,
+      );
+      const result = await executePreparedTools(input);
+
+      expect((ports as any).__execOrder).toEqual(['create_lead', 'create_lead']);
+      expect(input.messages.map((m: any) => m.tool_call_id).sort()).toEqual(['a', 'b']);
+      expect(result.pendingCounterUpdates).toEqual({ create_lead: 2 });
+    });
+
+    it('does NOT collapse identical calls for a non-dedupable tool (wait_seconds)', async () => {
+      const ports = makePorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'wait_seconds', '{"seconds":1}'),
+          toolCall('b', 'wait_seconds', '{"seconds":1}'),
+        ],
+        ports,
+      );
+      await executePreparedTools(input);
+      // Both identical wait_seconds calls execute (exempt set honored).
+      expect((ports as any).__execOrder).toEqual(['wait_seconds', 'wait_seconds']);
+    });
+
+    it('records suppression separately and keeps duplicates OUT of success/failure telemetry', async () => {
+      const recordDuplicateSuppression = jest.fn();
+      const recordToolTelemetry = jest.fn();
+      const ports = makePorts({ recordDuplicateSuppression, recordToolTelemetry });
+      const input = makeInput(
+        [
+          toolCall('a', 'create_lead', '{"email":"x@y.com"}'),
+          toolCall('b', 'create_lead', '{"email":"x@y.com"}'),
+        ],
+        ports,
+      );
+      await executePreparedTools(input);
+
+      // Suppression recorded once with the suppressed entry.
+      expect(recordDuplicateSuppression).toHaveBeenCalledTimes(1);
+      const suppressed = recordDuplicateSuppression.mock.calls[0][0];
+      expect(suppressed).toHaveLength(1);
+      expect(suppressed[0]).toMatchObject({ duplicateOfId: 'a', toolCall: expect.objectContaining({ id: 'b' }) });
+
+      // The suppressed duplicate must NOT appear in the success/failure telemetry.
+      const telemetered = recordToolTelemetry.mock.calls[0][0];
+      const telemeteredIds = telemetered.map((r: any) => r.toolCall?.id);
+      expect(telemeteredIds).not.toContain('b');
+      expect(telemeteredIds).toContain('a');
+    });
+  });
+
   // Counter-pollution fix (xCures incident, prod session 7c8ff5b2-…): a media-gen
   // tool can return success WITHOUT producing an asset — the generate_image
   // confirmation gate returns {success:true, awaitingUserConfirmation:true} to pause

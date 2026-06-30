@@ -274,6 +274,34 @@ function recordAgentModeRunFailed(
   void recorder.runFailed(runId, info);
 }
 
+/**
+ * Record same-turn duplicate tool-call suppression (ENG-108) as a structured,
+ * observability-only signal — SEPARATE from success/failure telemetry (a
+ * suppressed duplicate is neither). Best-effort: never throws into the chat hot
+ * path.
+ */
+function recordAgentModeDuplicateSuppression(
+  runId: string,
+  sessionId: string,
+  iteration: number,
+  entries: Array<{ toolCall: any; functionArgs: any; duplicateOfId: string }>,
+): void {
+  if (entries.length === 0) return;
+  try {
+    for (const entry of entries) {
+      console.warn('[agent-mode] duplicate tool call suppressed', {
+        runId,
+        sessionId,
+        iteration,
+        toolName: entry.toolCall?.function?.name ?? 'unknown',
+        duplicateOfId: entry.duplicateOfId,
+      });
+    }
+  } catch (err) {
+    console.error('[agent-mode] duplicate-suppression telemetry failed (swallowed):', err);
+  }
+}
+
 function countFailedToolCalls(toolCalls: any[]): number {
   return toolCalls.filter((toolCall) => toolCall && 'error' in toolCall).length;
 }
@@ -3073,6 +3101,8 @@ export class AgentModeService {
                 mediaAssetsProducedThisRun,
                 mediaGenerationDeadlineMs,
               }),
+            recordDuplicateSuppression: (entries) =>
+              recordAgentModeDuplicateSuppression(agentRuntimeRunId, sessionId, iteration, entries),
             extractMinimalToolResult: (result: any, toolName: string) => this.extractMinimalToolResult(result, toolName),
             extractToolContent,
             formatToolError: (toolName: string, errorMessage: string) => this.formatToolError(toolName, errorMessage),

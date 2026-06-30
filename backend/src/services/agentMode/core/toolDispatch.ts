@@ -42,6 +42,30 @@ export const MEDIA_GEN_TOOLS = new Set<string>([
 ]);
 
 /**
+ * Tools exempt from same-turn dedupe (ENG-108) — they have legitimate repeat
+ * semantics within a single assistant turn, so two identical calls are NOT a
+ * double-execution bug. `wait_seconds` is the canonical case (sleeping twice is
+ * meaningful and intended). Keep this set conservative: only add a tool here
+ * when an identical call back-to-back in one turn is genuinely valid.
+ */
+export const NON_DEDUPABLE_TOOLS = new Set<string>([
+  'wait_seconds',
+]);
+
+/**
+ * Deterministic, key-sorted stringify so two calls with the same fields in a
+ * different order ({a,b} vs {b,a}) produce the same dedupe key. Used only to
+ * build the same-turn dedupe signature — not for storage or model output.
+ */
+export function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(',')}}`;
+}
+
+/**
  * A media-gen tool can return `success: true` WITHOUT producing an asset: the
  * generate_image / generate_video human-in-the-loop confirmation gate returns
  * `{ success: true, awaitingUserConfirmation: true }` (no imageUrl/videoUrl) to
@@ -145,6 +169,14 @@ export interface ToolDispatchPorts {
   validateToolOutput?: (result: any) => any;
   /** record per-iteration tool telemetry (best-effort, observability-only) */
   recordToolTelemetry: (telemetryToolResults: Array<DispatchToolResult | PreflightToolResult>) => void;
+  /**
+   * Record same-turn duplicate tool-call suppression (ENG-108), SEPARATELY from
+   * success/failure telemetry (suppressed duplicates are deliberately NOT passed
+   * to recordToolTelemetry, which buckets non-success as a failure). Optional +
+   * observability-only. */
+  recordDuplicateSuppression?: (
+    entries: Array<{ toolCall: any; functionArgs: any; duplicateOfId: string }>,
+  ) => void;
   /** extract the minimal result stored on the toolCalls ledger entry */
   extractMinimalToolResult: (result: any, toolName: string) => any;
   /** extract the string content fed back to the model as the tool message */
@@ -278,6 +310,16 @@ export async function executePreparedTools(
   const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision }> = [];
   const preflightToolResults: PreflightToolResult[] = [];
 
+  // Same-turn dedupe (ENG-108): collapse identical (name + args) calls emitted in
+  // ONE assistant turn so they execute once and can't double-bill. We still MUST
+  // answer every emitted tool_call_id (or the next LLM turn rejects the orphaned
+  // call — same invariant the deferred-media path documents), so a suppressed
+  // duplicate gets its own tool-role message pointing at the call that IS being
+  // handled. Suppression is neither success nor failure: no counter, no telemetry
+  // through the success/failure path.
+  const seenToolCallKeys = new Map<string, string>(); // dedupe key -> first tool_call_id
+  const suppressedDuplicates: Array<{ toolCall: any; functionArgs: any; duplicateOfId: string }> = [];
+
   const appendPreflightToolFailure = (
     toolCall: any,
     functionArgs: any,
@@ -392,6 +434,35 @@ export async function executePreparedTools(
         appendPreflightToolFailure(toolCall, preparedFunctionArgs, errorMsg, JSON.stringify({ error: errorMsg, policy: policyDecision }), policyDecision);
         continue;
       }
+
+      // Same-turn dedupe (ENG-108): if an identical (name + canonical args) call
+      // was already accepted this turn and the tool isn't exempt, collapse this
+      // one — do NOT execute it. Still answer its tool_call_id with a tool-role
+      // message + a ledger entry so the next LLM turn isn't left with an orphan.
+      const dedupeKey = `${toolCall.function.name}:${stableStringify(preparedFunctionArgs)}`;
+      if (!NON_DEDUPABLE_TOOLS.has(toolCall.function.name) && seenToolCallKeys.has(dedupeKey)) {
+        const duplicateOfId = seenToolCallKeys.get(dedupeKey) as string;
+        const suppressMsg =
+          `This call was collapsed: an identical ${toolCall.function.name} call with the same arguments is already being handled this turn `
+          + `(tool_call_id ${duplicateOfId}). Use that call's result — do not repeat this call.`;
+        (messages as any[]).push({
+          tool_call_id: toolCall.id,
+          role: 'tool',
+          name: toolCall.function.name,
+          content: suppressMsg,
+          metadata: { timestamp: new Date().toISOString(), duplicateSuppressed: true, duplicateOfId },
+        });
+        toolCalls.push({
+          id: toolCall.id,
+          name: toolCall.function.name,
+          arguments: preparedFunctionArgs,
+          duplicateOf: duplicateOfId,
+          duration: 0,
+        });
+        suppressedDuplicates.push({ toolCall, functionArgs: preparedFunctionArgs, duplicateOfId });
+        continue;
+      }
+      seenToolCallKeys.set(dedupeKey, toolCall.id);
 
       preparedCalls.push({ toolCall, functionArgs: preparedFunctionArgs, policyDecision });
     } catch (error) {
@@ -533,6 +604,12 @@ export async function executePreparedTools(
 
   // Runtime-spine telemetry (best-effort, observability-only).
   ports.recordToolTelemetry(telemetryToolResults);
+
+  // Record same-turn duplicate suppression SEPARATELY (ENG-108) — never through
+  // recordToolTelemetry above, which would mislabel a suppression as a failure.
+  if (suppressedDuplicates.length > 0) {
+    ports.recordDuplicateSuppression?.(suppressedDuplicates);
+  }
 
   // Phase 3: Process results in original order — append to messages, toolCalls, counters
   for (const toolResult of toolResults) {
