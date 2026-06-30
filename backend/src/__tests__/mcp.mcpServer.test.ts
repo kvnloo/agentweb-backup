@@ -248,6 +248,64 @@ describe('MCP Server', () => {
       expect(response.body.error.code).toBe(-32001);
       expect(response.body.error.message).toContain('Session not found');
     });
+
+    it('recovers a stranded session end-to-end: bare emma_create_session → 404 reinit signal → initialize → retried tool call succeeds (ENG-97)', async () => {
+      // Proves the full ENG-97 recovery contract that the 400→404 conversion unlocks, as
+      // far as is provable with the SDK transport mocked. The reported failure (Linear
+      // ENG-97) was the literal `-32000 "Bad Request: No valid session ID provided"` —
+      // the string ONLY the bare-non-init branch produced — so the failing layer is the
+      // MCP session handshake, NOT auth/account state (auth failures return 401, and the
+      // initialize branch + createMcpServer have no org-specific logic). This test walks
+      // the three steps an SDK client takes after the fix:
+      //   1. A bare emma_create_session call (no mcp-session-id header) — the exact repro
+      //      — now returns 404 / -32001, which StreamableHTTPClientTransport treats as
+      //      "session expired → re-run initialize" (the old terminal 400 / -32000 made
+      //      the SDK give up here, permanently stranding the session).
+      //   2. The SDK reinitializes: an initialize request with no session id creates a
+      //      fresh session (transport constructed, onsessioninitialized registers the id).
+      //   3. The SDK retries the call WITH the new mcp-session-id header → the server finds
+      //      the live session, reuses its transport, and the call succeeds (200).
+      // Net: the previously-terminal failure self-heals for ANY account (incl. an org
+      // account) whose session was evicted/never-established. The client-side 404→reinit
+      // hop is the SDK's documented behavior, relied upon rather than re-implemented.
+
+      // Route initialize-vs-tool-call off the JSON-RPC method so the three sequential
+      // requests below are deterministic regardless of how many times the handler probes.
+      (isInitializeRequest as unknown as jest.Mock).mockImplementation(
+        (body: any) => body?.method === 'initialize'
+      );
+
+      // Step 1 — bare emma_create_session (no session header) → recoverable 404.
+      const stranded = await request(app)
+        .post('/mcp')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
+        .send({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'emma_create_session', arguments: {} }, id: 1 });
+
+      expect(stranded.status).toBe(404);
+      expect(stranded.body.error.code).toBe(-32001);
+      expect(stranded.body.error.message).toContain('Session not found');
+
+      // Step 2 — SDK re-runs initialize (no session id) → a fresh session is created.
+      await request(app)
+        .post('/mcp')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
+        .send({ jsonrpc: '2.0', method: 'initialize', params: { capabilities: {} }, id: 2 });
+
+      expect(StreamableHTTPServerTransport).toHaveBeenCalled();
+      // onsessioninitialized is scheduled via setTimeout(0) in the transport mock; let it
+      // run so the session id is registered in the in-memory Map before the retry.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // Step 3 — SDK retries the tool call WITH the new session id → transport reused, 200.
+      const retried = await request(app)
+        .post('/mcp')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
+        .set('mcp-session-id', 'test-session-id')
+        .send({ jsonrpc: '2.0', method: 'tools/call', params: { name: 'emma_create_session', arguments: {} }, id: 3 });
+
+      expect(retried.status).toBe(200);
+      expect(retried.body).toEqual({ result: 'ok' });
+    });
   });
 
   describe('GET /mcp endpoint (SSE)', () => {
