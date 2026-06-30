@@ -1,3 +1,5 @@
+import { toolResultError } from '../utils/toolResultError';
+
 export type AgentToolEffect =
   | 'read'
   | 'session_state'
@@ -570,6 +572,34 @@ export async function executeAgentToolThroughGateway(
 
   try {
     const result = await input.execute();
+    // A resolved result can still encode a failure ({ success: false } /
+    // { isError: true }). Tools like performDataAnalysis, getMetaAdsMetrics,
+    // fathom_get_meetings and coding_agent signal failure this way instead of
+    // throwing. Use the SAME canonical detector the dispatcher uses to downgrade
+    // these (toolResultError, see toolDispatch.ts) so gateway failure accounting
+    // and dispatcher classification stay in lockstep. Account a structured
+    // failure exactly like the catch path; do NOT clear prior failure counts.
+    const structuredFailure = toolResultError(result);
+    if (structuredFailure) {
+      if (input.runId) recordToolFailure(input.runId, policyDecision.toolName, structuredFailure);
+      if (
+        input.budgetScopeId
+        && input.budgetScopeId !== input.runId
+        && mediaFailureBudget(policyDecision.toolName) != null
+      ) {
+        recordToolFailure(input.budgetScopeId, policyDecision.toolName, structuredFailure);
+      }
+      // Keep returning status:'success' with the result so the dispatcher's
+      // downgrade (toolDispatch.ts) carries the structured payload to the model.
+      // Flipping to status:'error' here would strip `result`. The only observable
+      // change is internal accounting — counts increment instead of being cleared.
+      return {
+        status: 'success',
+        result,
+        policyDecision,
+        durationMs: Math.max(0, now() - startedAt),
+      };
+    }
     if (input.runId) clearToolFailures(input.runId, policyDecision.toolName);
     if (input.budgetScopeId && input.budgetScopeId !== input.runId) {
       clearToolFailures(input.budgetScopeId, policyDecision.toolName);

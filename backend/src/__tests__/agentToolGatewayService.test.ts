@@ -1141,6 +1141,136 @@ describe('agentToolGatewayService', () => {
       expect(execute).toHaveBeenCalledTimes(1);
     });
 
+    // ENG-101: structured failures ({ success:false } / { isError:true }) must
+    // trip the SAME breaker as thrown errors. Tools like performDataAnalysis,
+    // getMetaAdsMetrics, fathom_get_meetings, coding_agent resolve with a failure
+    // payload instead of throwing; before the fix the gateway treated those as
+    // success and even CLEARED prior thrown-error counts, so a tool returning
+    // success:false could retry-spiral forever.
+    it('trips the breaker when a tool repeatedly RESOLVES with success:false', async () => {
+      for (let i = 0; i < 3; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'performDataAnalysis',
+          args: { attempt: i },
+          runId: 'run-struct',
+          execute: () => Promise.resolve({ success: false, error: 'Query failed' }),
+        });
+        // Shape preserved: still status:'success' so the dispatcher can downgrade
+        // and carry the structured payload to the model.
+        expect(outcome.status).toBe('success');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ success: false, error: 'Query failed' });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'performDataAnalysis',
+        args: { attempt: 3 },
+        runId: 'run-struct',
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+        expect((outcome.error as Error).message).toContain('performDataAnalysis');
+        expect((outcome.error as Error).message).toContain('Query failed');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('does NOT clear prior thrown-error counts when a structured failure resolves', async () => {
+      // Two thrown failures with the same message...
+      await failNTimes('run-mixed', 'getMetaAdsMetrics', 'Invalid parameters', 2);
+      // ...then a resolved structured failure carrying the SAME reason. Before the
+      // fix this cleared the two thrown counts; now it adds a third on the same key.
+      const resolved = await executeAgentToolThroughGateway({
+        toolName: 'getMetaAdsMetrics',
+        args: {},
+        runId: 'run-mixed',
+        execute: () => Promise.resolve({ success: false, error: 'Invalid parameters' }),
+      });
+      expect(resolved.status).toBe('success');
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'getMetaAdsMetrics',
+        args: {},
+        runId: 'run-mixed',
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('trips the breaker on repeated isError:true structured failures', async () => {
+      for (let i = 0; i < 3; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'fathom_get_meetings',
+          args: { attempt: i },
+          runId: 'run-iserror',
+          execute: () => Promise.resolve({ isError: true, message: 'boom' }),
+        });
+        expect(outcome.status).toBe('success');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ isError: true, message: 'boom' });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'fathom_get_meetings',
+        args: { attempt: 3 },
+        runId: 'run-iserror',
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+        expect((outcome.error as Error).message).toContain('boom');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('still clears the count on a genuine success after structured failures', async () => {
+      // Two structured failures, then a genuine success (toolResultError -> null)
+      // clears the count; two more failures must not yet trip on the next call.
+      for (let i = 0; i < 2; i += 1) {
+        await executeAgentToolThroughGateway({
+          toolName: 'coding_agent',
+          args: { attempt: i },
+          runId: 'run-clear',
+          execute: () => Promise.resolve({ success: false, error: 'compile error' }),
+        });
+      }
+      const success = await executeAgentToolThroughGateway({
+        toolName: 'coding_agent',
+        args: {},
+        runId: 'run-clear',
+        execute: () => Promise.resolve({ success: true, ok: true }),
+      });
+      expect(success.status).toBe('success');
+
+      for (let i = 0; i < 2; i += 1) {
+        await executeAgentToolThroughGateway({
+          toolName: 'coding_agent',
+          args: { attempt: i },
+          runId: 'run-clear',
+          execute: () => Promise.resolve({ success: false, error: 'compile error' }),
+        });
+      }
+
+      const execute = jest.fn().mockResolvedValue({ success: true, ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'coding_agent',
+        args: {},
+        runId: 'run-clear',
+        execute,
+      });
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
     it('never blocks calls without a runId', async () => {
       for (let i = 0; i < 4; i += 1) {
         const outcome = await executeAgentToolThroughGateway({
