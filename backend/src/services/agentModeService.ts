@@ -523,19 +523,6 @@ function buildFindReason(filters: {
   return joined.length > 200 ? joined.slice(0, 197) + '...' : joined;
 }
 
-/**
- * Heuristic: did this update_brand_guidelines call look like a broad brand
- * "re-setup" (several identity fields changed at once) rather than a one-off
- * tweak (e.g. just the tagline or a single color)? Used to decide whether to
- * offer a matching market-strategy regeneration. Pure + exported for unit
- * testing. (ENG-44)
- */
-export function isBroadBrandResetup(brandData: any): boolean {
-  if (!brandData || typeof brandData !== 'object') return false;
-  const providedFields = Object.keys(brandData).filter((k) => brandData[k] !== undefined);
-  return providedFields.length >= 3;
-}
-
 
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
@@ -11163,12 +11150,6 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         updatedAssets: updatedAssets
       });
 
-      // After a broad brand re-setup, surface a non-destructive offer to bring the
-      // market strategy (competitors/ICPs) in line with the new brand. This call
-      // itself does NOT touch the market strategy — Emma relays the offer and only
-      // runs regenerate_market_strategy on explicit user confirmation. (ENG-44)
-      const marketStrategyRefresh = await this.buildMarketStrategyRefreshHint(user, brandData);
-
       return {
         success: true,
         message: 'Brand guidelines updated successfully',
@@ -11176,8 +11157,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         brandData: updatedBrandData,
         attachments: updatedAttachments,
         updatedAssets: updatedAssets, // Only the assets that were actually updated
-        formattedContent,
-        ...(marketStrategyRefresh ? { marketStrategyRefresh } : {})
+        formattedContent
       };
     } catch (error) {
       console.error('AgentMode: Error updating brand guidelines:', error);
@@ -11201,41 +11181,6 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
       if (org && org.marketStrategy) return org.marketStrategy;
     }
     return user?.marketStrategy;
-  }
-
-  /**
-   * Build the non-destructive "your market strategy was not changed — want me to
-   * regenerate it to match?" hint that rides on an update_brand_guidelines result
-   * after a broad brand re-setup. Returns null for small single-field edits so we
-   * don't nag the user on every tweak. (ENG-44)
-   */
-  private async buildMarketStrategyRefreshHint(
-    user: any,
-    brandData: any,
-  ): Promise<{
-    marketStrategyChanged: false;
-    existingCompetitors: number;
-    existingIcps: number;
-    suggestedAction: 'regenerate_market_strategy';
-    note: string;
-  } | null> {
-    if (!isBroadBrandResetup(brandData)) return null;
-    const existing = await this.getExistingMarketStrategy(user);
-    const existingCompetitors = Array.isArray(existing?.competitors) ? existing.competitors.length : 0;
-    const existingIcps = Array.isArray(existing?.icp) ? existing.icp.length : 0;
-    return {
-      marketStrategyChanged: false,
-      existingCompetitors,
-      existingIcps,
-      suggestedAction: 'regenerate_market_strategy',
-      note:
-        'Brand guidelines were updated, but the market strategy (business overview, competitors, ICPs) was NOT changed. ' +
-        'Tell the user this explicitly, then offer to regenerate the market strategy to match the new brand using regenerate_market_strategy. ' +
-        (existingCompetitors > 0 || existingIcps > 0
-          ? `Warn them this will replace their existing ${existingCompetitors} competitor(s) and ${existingIcps} ICP(s). `
-          : '') +
-        'Do NOT call regenerate_market_strategy without explicit user confirmation.',
-    };
   }
 
   /**
