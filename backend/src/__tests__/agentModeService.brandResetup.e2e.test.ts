@@ -1,21 +1,23 @@
 /**
- * ENG-44 end-to-end: drive the *real* Emma tools through emmaToolRegistry.execute
- * against a stateful in-memory DB, reproducing the exact user journey that used to
- * fail silently:
+ * ENG-44 end-to-end (Design 2 — ask scope up front, then act).
  *
- *   1. User asks Emma to "re-setup the brand"  -> update_brand_guidelines (broad).
- *      BEFORE: brand updated, market strategy left silently stale, no disclosure.
- *      AFTER:  brand updated, market strategy untouched, BUT the result now carries
- *              a marketStrategyRefresh disclosure + offer (no longer silent).
- *   2. User confirms                           -> regenerate_market_strategy.
- *      Competitors + ICPs are regenerated from the NEW brand and REPLACE the old
- *      ones (business overview preserved).
- *   3. User tweaks one field                   -> update_brand_guidelines (narrow).
- *      No offer (we don't nag on small edits).
+ * Per Fangfang's chosen design, when a user asks to "re-setup the brand" Emma
+ * FIRST asks what to update — (1) brand only, or (2) also re-do positioning
+ * (value prop / ICPs / competitors, which REPLACES the current ones) — then acts.
+ * The up-front question itself is conversational (driven by the tool-description
+ * instruction asserted below); it is not unit-testable. What IS asserted here, via
+ * the real emmaToolRegistry against a stateful in-memory DB, is the deterministic
+ * behaviour of the two branches:
  *
- * Only the LLM call itself is canned (generateIcpsForUser / generateCompetitorStrategyForUser);
- * the brand-context extraction, the result mappers, the persistence/merge/replace
- * logic, the tool registration, and the registry dispatch are all real.
+ *   Option 1 (brand only) -> update_brand_guidelines updates the brand and leaves
+ *     the market strategy untouched (and carries no auto "offer" — the offer is
+ *     front-loaded, so there is no back-loaded hint to double-ask).
+ *   Option 2 (also positioning) -> update_brand_guidelines THEN
+ *     regenerate_market_strategy regenerates ICPs+competitors from the NEW brand
+ *     and REPLACES the stale ones (business overview preserved).
+ *
+ * Only the LLM call is canned; brand-context extraction, mappers, persistence,
+ * tool registration and registry dispatch are all real.
  */
 
 // ── Stateful in-memory DB (jest factory may only reference `mock*` outer vars) ──
@@ -82,59 +84,57 @@ function seedUser() {
   };
 }
 
-describe('ENG-44 e2e: brand re-setup → offer → confirm → regenerate (real tools)', () => {
+describe('ENG-44 e2e (Design 2): ask scope up front, then act (real tools)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     seedUser();
   });
 
-  it('the new tools are registered on the Emma registry', () => {
+  it('registers the new tool and wires the up-front scope question into the brand tool', () => {
     expect(emmaToolRegistry.getTool('regenerate_market_strategy')).toBeDefined();
-    expect(emmaToolRegistry.getTool('update_brand_guidelines')).toBeDefined();
+    const brandTool = emmaToolRegistry.getTool('update_brand_guidelines');
+    expect(brandTool).toBeDefined();
+    // The front-loaded "ask first" instruction must be present (it is what drives
+    // Design 2 — Emma asking scope before editing). Conversational, so this guards
+    // that the instruction is wired even though the LLM behaviour itself isn't unit-testable.
+    const desc = brandTool!.definition.description as string;
+    expect(desc).toMatch(/FIRST ask/i);
+    expect(desc).toContain('regenerate_market_strategy');
+    expect(desc).toMatch(/single-field edit/i);
   });
 
-  it('runs the full journey: re-setup discloses + leaves MS stale, confirm regenerates + replaces', async () => {
-    // ── Step 1: "re-setup my brand" → broad update_brand_guidelines ───────────
-    const r1 = await emmaToolRegistry.execute(
+  it('OPTION 1 (brand only): updates the brand, leaves market strategy untouched, no back-loaded offer', async () => {
+    const r = await emmaToolRegistry.execute(
       'update_brand_guidelines',
       { brandData: { brandName: 'Acme', tagline: 'Widgets, reinvented', toneOfVoice: 'bold', valueProposition: 'Ship faster' } },
       ctx,
     );
-
-    // Brand guideline DID change...
-    expect(r1.success).toBe(true);
+    expect(r.success).toBe(true);
     expect(mockStore.user.brandGuidelines.brandData.tagline).toBe('Widgets, reinvented');
-
-    // ...the market strategy was NOT silently changed (the old bug)...
+    // Market strategy untouched...
     expect(mockStore.user.marketStrategy.competitors.map((c: any) => c.name)).toEqual(['StaleCo', 'OldRival']);
     expect(mockStore.user.marketStrategy.icp.map((i: any) => i.title)).toEqual(['Old ICP']);
+    // ...and NO auto/back-loaded offer rides on the result (the offer is front-loaded).
+    expect(r.marketStrategyRefresh).toBeUndefined();
+  });
 
-    // ...but the response now DISCLOSES that and OFFERS to fix it (no longer silent).
-    expect(r1.marketStrategyRefresh).toBeDefined();
-    expect(r1.marketStrategyRefresh.marketStrategyChanged).toBe(false);
-    expect(r1.marketStrategyRefresh.existingCompetitors).toBe(2);
-    expect(r1.marketStrategyRefresh.existingIcps).toBe(1);
-    expect(r1.marketStrategyRefresh.suggestedAction).toBe('regenerate_market_strategy');
-
-    // ── Step 2: user confirms → regenerate_market_strategy ────────────────────
+  it('OPTION 2 (also positioning): brand update + regenerate replaces ICPs/competitors from the new brand', async () => {
+    // User chose option 2 → Emma updates brand, then calls regenerate_market_strategy.
+    await emmaToolRegistry.execute(
+      'update_brand_guidelines',
+      { brandData: { brandName: 'Acme', tagline: 'Widgets, reinvented', toneOfVoice: 'bold', valueProposition: 'Ship faster' } },
+      ctx,
+    );
     const r2 = await emmaToolRegistry.execute('regenerate_market_strategy', {}, ctx);
 
     expect(r2.success).toBe(true);
     expect(r2.replaced).toEqual({ competitors: 2, icps: 1 });
     expect(r2.generated).toEqual({ competitors: 2, icps: 2 });
 
-    // The stale competitors/ICPs are GONE, replaced with ones derived from the new brand.
+    // Stale competitors/ICPs are GONE, replaced with ones derived from the new brand.
     expect(mockStore.user.marketStrategy.competitors.map((c: any) => c.name)).toEqual(['RivalAI', 'CompeteCo']);
     expect(mockStore.user.marketStrategy.icp.map((i: any) => i.title)).toEqual(['Series-A Founders', 'Growth Leads']);
     // Business overview is preserved (not regenerated).
     expect(mockStore.user.marketStrategy.businessOverview).toBe('Acme sells widgets.');
-  });
-
-  it('does NOT offer on a single-field brand tweak (no nagging)', async () => {
-    const r = await emmaToolRegistry.execute('update_brand_guidelines', { brandData: { tagline: 'just a tweak' } }, ctx);
-    expect(r.success).toBe(true);
-    expect(r.marketStrategyRefresh).toBeUndefined();
-    // Market strategy still untouched.
-    expect(mockStore.user.marketStrategy.competitors.map((c: any) => c.name)).toEqual(['StaleCo', 'OldRival']);
   });
 });

@@ -1,4 +1,4 @@
-import { AgentModeService, isBroadBrandResetup } from '../services/agentModeService';
+import { AgentModeService } from '../services/agentModeService';
 
 // ── Mocks ──────────────────────────────────────────────────────────────────
 jest.mock('../services/db', () => ({
@@ -42,27 +42,7 @@ jest.mock('../services/onboardingCompetitorService', () => ({
 
 const userDb = require('../services/db').userDb;
 
-// ── AC6: single-field edits stay quiet, broad re-setup triggers the offer ────
-describe('isBroadBrandResetup', () => {
-  it('returns false for a single-field tweak (just tagline)', () => {
-    expect(isBroadBrandResetup({ tagline: 'New tagline' })).toBe(false);
-  });
-  it('returns false for a two-field tweak', () => {
-    expect(isBroadBrandResetup({ tagline: 'x', primaryColor: '#fff' })).toBe(false);
-  });
-  it('returns true for a broad re-setup (>= 3 provided fields)', () => {
-    expect(isBroadBrandResetup({ brandName: 'Acme', tagline: 'x', toneOfVoice: 'bold' })).toBe(true);
-  });
-  it('ignores undefined fields when counting', () => {
-    expect(isBroadBrandResetup({ brandName: 'Acme', tagline: undefined, toneOfVoice: undefined })).toBe(false);
-  });
-  it('returns false for null/empty', () => {
-    expect(isBroadBrandResetup(null)).toBe(false);
-    expect(isBroadBrandResetup({})).toBe(false);
-  });
-});
-
-// ── AC3/AC5: regeneration REPLACES (non-destructive default preserved) ────────
+// ── replace option: regeneration REPLACES, default still MERGES ───────────────
 describe('AgentModeService.updateMarketStrategy replace option', () => {
   let svc: AgentModeService;
   beforeEach(() => {
@@ -113,7 +93,7 @@ describe('AgentModeService.updateMarketStrategy replace option', () => {
   });
 });
 
-// ── AC5: regenerate from brand context, replace, report counts ───────────────
+// ── regenerate from brand context, replace, report counts ────────────────────
 describe('AgentModeService.regenerateMarketStrategy', () => {
   let svc: AgentModeService;
   beforeEach(() => {
@@ -160,56 +140,5 @@ describe('AgentModeService.regenerateMarketStrategy', () => {
     const res = await svc.regenerateMarketStrategy('u1');
     expect(res.success).toBe(false);
     expect(userDb.updateUser).not.toHaveBeenCalled();
-  });
-});
-
-// ── AC1/AC2/AC6: brand re-setup discloses + offers, never silently touches MS ─
-describe('AgentModeService.updateBrandGuidelines — market-strategy refresh offer', () => {
-  let svc: AgentModeService;
-  beforeEach(() => {
-    svc = new AgentModeService();
-    jest.clearAllMocks();
-  });
-
-  const baseUser = {
-    userId: 'u1',
-    email: 'u@x.com',
-    brandGuidelines: { brandData: { brandName: 'Acme' }, attachments: [], createdAt: 'x', updatedAt: 'x' },
-    marketStrategy: {
-      businessOverview: 'o',
-      competitors: [
-        { name: 'C1', description: 'd' },
-        { name: 'C2', description: 'd' },
-      ],
-      icp: [{ title: 'I1', description: 'd', valueProposition: 'v', buyerPersonas: [] }],
-    },
-  };
-
-  it('attaches a non-destructive marketStrategyRefresh offer on a broad re-setup, and does NOT write market strategy', async () => {
-    userDb.getUserById.mockResolvedValue(baseUser);
-    userDb.updateUser.mockResolvedValue({});
-    const res = await svc.updateBrandGuidelines(
-      { brandData: { brandName: 'Acme 2', tagline: 'New', toneOfVoice: 'Bold' } },
-      'u1',
-    );
-    expect(res.success).toBe(true);
-    expect(res.marketStrategyRefresh).toBeDefined();
-    expect(res.marketStrategyRefresh.marketStrategyChanged).toBe(false);
-    expect(res.marketStrategyRefresh.existingCompetitors).toBe(2);
-    expect(res.marketStrategyRefresh.existingIcps).toBe(1);
-    expect(res.marketStrategyRefresh.suggestedAction).toBe('regenerate_market_strategy');
-    // Brand-only: this call must not write the marketStrategy field.
-    const wroteMarketStrategy = userDb.updateUser.mock.calls.some(
-      (c: any[]) => c[1] && Object.prototype.hasOwnProperty.call(c[1], 'marketStrategy'),
-    );
-    expect(wroteMarketStrategy).toBe(false);
-  });
-
-  it('stays quiet (no offer) on a single-field brand edit', async () => {
-    userDb.getUserById.mockResolvedValue(baseUser);
-    userDb.updateUser.mockResolvedValue({});
-    const res = await svc.updateBrandGuidelines({ brandData: { tagline: 'Just a tweak' } }, 'u1');
-    expect(res.success).toBe(true);
-    expect(res.marketStrategyRefresh).toBeUndefined();
   });
 });
