@@ -208,7 +208,15 @@ describe('MCP Server', () => {
       expect(StreamableHTTPServerTransport).toHaveBeenCalled();
     });
 
-    it('should return 400 for missing session ID on non-initialization request', async () => {
+    it('should return 404 for missing session ID on non-initialization request (so MCP client auto-reinitializes)', async () => {
+      // A bare non-initialize call (no mcp-session-id header) arrives when a client's
+      // session was evicted/lost and its transport dropped the cached id. The server must
+      // return 404 / -32001 — identical to the unknown-session branch — so the MCP SDK's
+      // StreamableHTTPClientTransport treats it as "session expired", re-runs initialize,
+      // and retries with a fresh session. The prior behavior returned 400 / -32000, which
+      // the SDK treats as terminal, permanently failing emma_create_session and every
+      // subsequent tool call until a manual reconnect (ENG-97). This is a lock-in test
+      // that previously pinned the wrong (terminal-400) contract; corrected here.
       (isInitializeRequest as unknown as jest.Mock).mockReturnValueOnce(false);
 
       const response = await request(app)
@@ -216,8 +224,9 @@ describe('MCP Server', () => {
         .set('Authorization', `Bearer ${TEST_TOKEN}`)
         .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
 
-      expect(response.status).toBe(400);
-      expect(response.body.error.message).toContain('No valid session ID');
+      expect(response.status).toBe(404);
+      expect(response.body.error.code).toBe(-32001);
+      expect(response.body.error.message).toContain('Session not found');
     });
 
     it('should return 404 for stale/unknown session ID (so MCP client auto-reinitializes)', async () => {
