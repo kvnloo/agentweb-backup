@@ -900,13 +900,20 @@ emmaToolRegistry.register({
           default: '7d'
         },
         campaign_ids: {
-          type: 'array',
+          // Union type so the static schema accepts exactly the shapes execute()
+          // normalizes (array preferred; legacy single string also accepted).
+          // minItems only fires for arrays, so a string id is not rejected.
+          type: ['array', 'string'],
           items: { type: 'string' },
           minItems: 1,
-          description: 'Required list of campaign IDs to filter metrics by. Use list_meta_ads_campaigns to get available campaign IDs (works even without a connected Meta account).'
+          description: 'List of campaign IDs to filter metrics by (array preferred; a single campaign id string is also accepted). Use list_meta_ads_campaigns to get available campaign IDs (works even without a connected Meta account).'
+        },
+        campaign_id: {
+          // Legacy single-id alias. execute() normalizes this into campaign_ids.
+          type: 'string',
+          description: 'Legacy alias for a single campaign id. Prefer campaign_ids. Provide at least one of campaign_ids or campaign_id.'
         }
-      },
-      required: ['campaign_ids']
+      }
     }
   },
   execute: async (args, context) => {
