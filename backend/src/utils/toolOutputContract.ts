@@ -54,16 +54,25 @@ export function validateToolOutputContract(
     return new ToolOutputContractError('Tool returned no output (null/undefined).');
   }
 
-  // MCP-shaped object: a content array with no usable text and no formattedContent
-  // is empty output regardless of what JSON.stringify would produce.
+  // MCP-shaped object: a content array with NO usable part and no formattedContent
+  // is empty output regardless of what JSON.stringify would produce. A "usable part"
+  // is a non-blank text part OR any non-text part (image/audio/file/resource/…) —
+  // those carry their own payload, so an image-only result
+  // (content:[{type:'image',...}]) must NOT be downgraded just because it has no
+  // .text. Only a genuinely empty array, or one whose every part is blank text,
+  // counts as empty output.
   if (typeof result === 'object') {
     const obj = result as Record<string, any>;
     const hasFormatted = typeof obj.formattedContent === 'string' && obj.formattedContent.trim() !== '';
     if (!hasFormatted && Array.isArray(obj.content)) {
-      const hasText = obj.content.some(
-        (part: any) => part && typeof part.text === 'string' && part.text.trim() !== '',
-      );
-      if (!hasText) {
+      const hasUsablePart = obj.content.some((part: any) => {
+        if (!part || typeof part !== 'object') return false;
+        // Non-text parts (image, audio, file, resource, …) are payload of their own.
+        if (typeof part.type === 'string' && part.type !== 'text') return true;
+        // Text parts (or untyped parts) are usable only with non-blank text.
+        return typeof part.text === 'string' && part.text.trim() !== '';
+      });
+      if (!hasUsablePart) {
         return new ToolOutputContractError('Tool returned an empty content array (no usable text).');
       }
     }

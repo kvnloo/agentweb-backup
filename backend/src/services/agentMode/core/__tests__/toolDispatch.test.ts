@@ -18,6 +18,16 @@ import {
   type ExecutePreparedToolsInput,
   type ToolDispatchPorts,
 } from '../toolDispatch';
+// ENG-105 wiring: the REAL output-contract validator + the REAL extractToolContent
+// (now a monolith-free util) + the REAL error classifier, so this suite proves the
+// production port — not a hand-copied mirror — downgrades empty output and tags it
+// invalid_output.
+import {
+  validateToolOutputContract,
+  ToolOutputContractError,
+} from '../../../../utils/toolOutputContract';
+import { extractToolContent } from '../../../../utils/extractToolContent';
+import { classifyToolErrorClass } from '../../../../utils/toolErrorClassifier';
 
 /** Build a model tool_call in the shape the loop emits. */
 function toolCall(id: string, name: string, args: string) {
@@ -604,6 +614,99 @@ describe('executePreparedTools', () => {
       // Two generate_image calls, but only one produced an asset.
       expect(result.pendingCounterUpdates).toEqual({ generate_image: 1 });
       expect(result.mediaAssetsProduced).toBe(1);
+    });
+  });
+
+  // ── ENG-105: the REAL validateToolOutput port, end-to-end through dispatch ──────
+  // The isolated toolOutputContract.test.ts proves the validator in a vacuum (with a
+  // mirror extractor). This wires the ACTUAL production port — the real
+  // validateToolOutputContract composed with the real extractToolContent — into
+  // executePreparedTools, the same composition agentModeService does, and proves a
+  // tool that returns WITHOUT throwing but yields no usable output is downgraded to a
+  // structured failure (failed-counter incremented, telemetry errorClass
+  // invalid_output via the real classifier) instead of a silent success.
+  describe('ENG-105: real validateToolOutput port wiring', () => {
+    /** makePorts + the production validateToolOutput composition, returning a tool result. */
+    function portsWithRealValidator(
+      toolReturns: unknown,
+      recordToolTelemetry = jest.fn(),
+    ) {
+      return makePorts({
+        // The real production wiring: validateToolOutputContract(result, extractToolContent).
+        validateToolOutput: (result: any) => validateToolOutputContract(result, extractToolContent),
+        // Real extractor on the content path so the wired composition is genuine.
+        extractToolContent,
+        executePreparedAgentTool: async () => toolReturns,
+        recordToolTelemetry,
+      });
+    }
+
+    // Every output that the contract must reject, with the value the tool "successfully" returns.
+    const invalidCases: Array<[string, unknown]> = [
+      ['undefined', undefined],
+      ['an empty string', ''],
+      ["the literal string 'undefined'", 'undefined'],
+      ['an empty content array', { content: [] }],
+    ];
+
+    it.each(invalidCases)(
+      'downgrades a success that extracts to %s -> failure + errorClass invalid_output',
+      async (_label, toolReturns) => {
+        const recordToolTelemetry = jest.fn();
+        const ports = portsWithRealValidator(toolReturns, recordToolTelemetry);
+        const input = makeInput([toolCall('a', 'fetch_thing', '{}')], ports);
+
+        const result = await executePreparedTools(input);
+
+        // Downgraded to a failure: failed counter incremented, no pending counter.
+        expect(result.failedCounterUpdates).toEqual({ fetch_thing: 1 });
+        expect(result.pendingCounterUpdates).toEqual({});
+
+        // The failure is the structured ToolOutputContractError, and the REAL classifier
+        // tags it invalid_output (distinct from execution failures).
+        const telemetered = recordToolTelemetry.mock.calls[0][0];
+        const entry = telemetered.find((r: any) => r.toolCall?.id === 'a');
+        expect(entry.status).toBe('error');
+        expect(entry.error).toBeInstanceOf(ToolOutputContractError);
+        expect(classifyToolErrorClass(entry.error)).toBe('invalid_output');
+
+        // The model sees a structured tool error, not the garbage output.
+        expect(input.toolCallsLedger[0].name).toBe('fetch_thing');
+        expect(input.messages[0]).toMatchObject({ role: 'tool', name: 'fetch_thing' });
+      },
+    );
+
+    it('passes a VALID string result through unchanged — success, no downgrade', async () => {
+      const recordToolTelemetry = jest.fn();
+      const ports = portsWithRealValidator('GTM Plan: step 1, step 2, step 3', recordToolTelemetry);
+      const input = makeInput([toolCall('a', 'fetch_thing', '{}')], ports);
+
+      const result = await executePreparedTools(input);
+
+      expect(result.pendingCounterUpdates).toEqual({ fetch_thing: 1 });
+      expect(result.failedCounterUpdates).toEqual({});
+      const telemetered = recordToolTelemetry.mock.calls[0][0];
+      const entry = telemetered.find((r: any) => r.toolCall?.id === 'a');
+      expect(entry.status).toBe('success');
+      expect(input.messages[0].content).toContain('GTM Plan: step 1');
+    });
+
+    it('passes an image-only content array through unchanged — non-text payload is NOT empty output', async () => {
+      // The false-positive the reviewer flagged: an image-only success must survive.
+      const recordToolTelemetry = jest.fn();
+      const imageResult = {
+        content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KG...' } }],
+      };
+      const ports = portsWithRealValidator(imageResult, recordToolTelemetry);
+      const input = makeInput([toolCall('a', 'generate_diagram', '{}')], ports);
+
+      const result = await executePreparedTools(input);
+
+      expect(result.pendingCounterUpdates).toEqual({ generate_diagram: 1 });
+      expect(result.failedCounterUpdates).toEqual({});
+      const telemetered = recordToolTelemetry.mock.calls[0][0];
+      const entry = telemetered.find((r: any) => r.toolCall?.id === 'a');
+      expect(entry.status).toBe('success');
     });
   });
 });

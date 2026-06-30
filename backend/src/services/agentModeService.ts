@@ -60,22 +60,12 @@ const MAX_TOOL_CONTENT_SIZE = 300_000;
 // get compressed to a 200-char preview. Storing them in S3 lets the LLM call search_tool_response
 // to retrieve specific fields from the original payload without needing the full text in context.
 
-/**
- * Extracts the string content from a tool result for LLM consumption and S3 storage.
- *
- * Tools registered via mcpToolRegistry use jsonResult() which wraps their output in the MCP
- * format: { content: [{ type: 'text', text: '<actual JSON>' }] }. If we store the entire
- * wrapper via JSON.stringify(), the inner JSON becomes double-escaped in S3: field names like
- * "sessionId" are stored as \"sessionId\", causing search_tool_response to return 0 matches.
- *
- * Priority: formattedContent > content[0].text (MCP inner text) > JSON.stringify fallback.
- */
-export function extractToolContent(result: any): string {
-  if (typeof result === 'string') return result;
-  if (result?.formattedContent) return result.formattedContent;
-  if (result?.content?.[0]?.text) return result.content[0].text;
-  return JSON.stringify(result);
-}
+// extractToolContent now lives in ../utils/extractToolContent (pure, monolith-free)
+// so the tool-output contract validator and the toolDispatch unit suite can wire
+// the REAL extractor without loading this 24k-line service. Re-exported here so
+// existing `from '../services/agentModeService'` importers are unaffected.
+export { extractToolContent } from '../utils/extractToolContent';
+import { extractToolContent } from '../utils/extractToolContent';
 
 /**
  * Normalize a video timecode to a numeric number of seconds.

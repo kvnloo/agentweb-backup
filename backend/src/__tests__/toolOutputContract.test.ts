@@ -65,5 +65,26 @@ describe('validateToolOutputContract (ENG-105)', () => {
     it('accepts a plain data object that relies on the JSON.stringify fallback', () => {
       expect(validateToolOutputContract({ leads: [{ id: 1 }] }, extract)).toBeNull();
     });
+
+    it('accepts an image-only content array — non-text parts are NOT empty output (ENG-105 false-positive fix)', () => {
+      // A tool that returns a generated image as the only content part has no
+      // `.text`, but the image IS the payload — it must NOT be downgraded.
+      expect(
+        validateToolOutputContract(
+          { content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KG...' } }] },
+          extract,
+        ),
+      ).toBeNull();
+    });
+
+    it('accepts a content array mixing a blank text part with a non-text part', () => {
+      // Even when one part has empty text, a sibling non-text part keeps the output usable.
+      expect(
+        validateToolOutputContract(
+          { content: [{ type: 'text', text: '' }, { type: 'image', source: { data: 'x' } }] },
+          extract,
+        ),
+      ).toBeNull();
+    });
   });
 });
