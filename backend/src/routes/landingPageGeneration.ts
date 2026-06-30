@@ -60,6 +60,20 @@ function validateBranchName(branch: string): boolean {
   return branch === "main" || branch === REUSABLE_PREVIEW_BRANCH;
 }
 
+function isGithubContentUpdateRace(error: any): boolean {
+  const status = error?.response?.status;
+  if (status === 409) return true;
+  if (status !== 422) return false;
+  const body = (() => {
+    try {
+      return JSON.stringify(error?.response?.data || "");
+    } catch {
+      return "";
+    }
+  })();
+  return /sha|reference|fast[ -]?forward|already exists|update/i.test(body);
+}
+
 /**
  * Fetch a landing page and authorize the caller for view or edit.
  * Owner always passes. Otherwise checks shareSettings.landingPages via
@@ -931,9 +945,10 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
       try {
         commitRes = await commitViaContentsApi(fileSha);
       } catch (err: any) {
-        if (err.response?.status === 409) {
-          // SHA mismatch — refetch SHA and retry once
-          console.log(`[LP GENERATION] SHA mismatch for ${file_path}, retrying with fresh SHA`);
+        if (isGithubContentUpdateRace(err)) {
+          // GitHub reports stale SHA / ref races as 409 or, in some Contents API
+          // cases, 422. Refetch before one retry so coding_agent does not loop.
+          console.log(`[LP GENERATION] GitHub content update race for ${file_path}, retrying with fresh SHA`);
           fileSha = await getFileSha();
           commitRes = await commitViaContentsApi(fileSha);
         } else {

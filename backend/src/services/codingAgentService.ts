@@ -13,7 +13,7 @@ import axios from 'axios';
 import { mcpFetch } from '../mcp/server/httpClient';
 import { agentModeService } from './agentModeService';
 import { getGitHubOrgToken, getSecret } from '../utils/secretsManager';
-import { getLandingPageById, getLandingPagesByOwner, canUserEditLandingPage, GeneratedLandingPage } from './v0Service';
+import { getLandingPageById, getLandingPagesByOwner, canUserEditLandingPage, GeneratedLandingPage, isRetryableGithubPushError } from './v0Service';
 import { AcceptanceCheck, AcceptanceStatus, AcceptanceVerificationResult, verifyAcceptanceChecks } from './codingAgentAcceptance';
 import {
   CodingAgentRecoveryState,
@@ -199,22 +199,60 @@ async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Pr
     throw new Error('Cannot prepare preview branch: main SHA not found');
   }
 
-  try {
-    await axios.patch(
-      `${repoBase}/git/refs/heads/${LANDING_PAGE_PREVIEW_BRANCH}`,
-      { sha: mainSha, force: true },
-      { headers, timeout: GITHUB_API_TIMEOUT_MS },
-    );
-    console.log(`[CODING AGENT] Reset ${LANDING_PAGE_PREVIEW_BRANCH} to main (${mainSha.substring(0, 7)})`);
-  } catch (error: any) {
-    if (error.response?.status !== 404) throw error;
+  const formatGitHubError = (error: any): string => {
+    const status = error?.response?.status;
+    const data = error?.response?.data;
+    const message = data?.message || error?.message || String(error);
+    const errors = Array.isArray(data?.errors)
+      ? ` (${data.errors.map((e: any) => e.message || e.code || JSON.stringify(e)).join('; ')})`
+      : '';
+    return `GitHub API error${status ? ` ${status}` : ''}: ${message}${errors}`;
+  };
 
-    await axios.post(
-      `${repoBase}/git/refs`,
-      { ref: `refs/heads/${LANDING_PAGE_PREVIEW_BRANCH}`, sha: mainSha },
-      { headers, timeout: GITHUB_API_TIMEOUT_MS },
-    );
-    console.log(`[CODING AGENT] Created ${LANDING_PAGE_PREVIEW_BRANCH} from main (${mainSha.substring(0, 7)})`);
+  let lastError: any;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await axios.patch(
+        `${repoBase}/git/refs/heads/${LANDING_PAGE_PREVIEW_BRANCH}`,
+        { sha: mainSha, force: true },
+        { headers, timeout: GITHUB_API_TIMEOUT_MS },
+      );
+      console.log(`[CODING AGENT] Reset ${LANDING_PAGE_PREVIEW_BRANCH} to main (${mainSha.substring(0, 7)})`);
+      return;
+    } catch (error: any) {
+      if (error.response?.status === 404) {
+        try {
+          await axios.post(
+            `${repoBase}/git/refs`,
+            { ref: `refs/heads/${LANDING_PAGE_PREVIEW_BRANCH}`, sha: mainSha },
+            { headers, timeout: GITHUB_API_TIMEOUT_MS },
+          );
+          console.log(`[CODING AGENT] Created ${LANDING_PAGE_PREVIEW_BRANCH} from main (${mainSha.substring(0, 7)})`);
+          return;
+        } catch (createError: any) {
+          if (createError.response?.status === 422 && /reference already exists/i.test(JSON.stringify(createError.response.data || ''))) {
+            if (attempt === 3) {
+              throw new Error(`Cannot prepare preview branch: ${formatGitHubError(createError)}`);
+            }
+            console.warn(`[CODING AGENT] Preview branch appeared during creation attempt ${attempt}; retrying reset`);
+            await _sleepFn(500 * attempt);
+            continue;
+          } else {
+            throw new Error(`Cannot prepare preview branch: ${formatGitHubError(createError)}`);
+          }
+        }
+      } else {
+        lastError = error;
+      }
+
+      const { retryable, reason } = isRetryableGithubPushError(lastError);
+      if (!retryable || attempt === 3) {
+        throw new Error(`Cannot prepare preview branch: ${formatGitHubError(lastError)}`);
+      }
+
+      console.warn(`[CODING AGENT] Preview branch reset attempt ${attempt} failed (${reason}); retrying`);
+      await _sleepFn(500 * attempt);
+    }
   }
 }
 

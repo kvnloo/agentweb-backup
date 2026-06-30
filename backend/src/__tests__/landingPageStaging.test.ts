@@ -283,6 +283,40 @@ describe("PUT /github-edit with draft branch", () => {
     );
   });
 
+  it("SUCCESS: retries a GitHub 422 content update with a fresh file SHA", async () => {
+    mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "branch-sha" } })); // branch exists
+    mockedAxios.get.mockResolvedValueOnce(axiosRes({ sha: "stale-file-sha" })); // first file SHA
+    mockedAxios.put
+      .mockRejectedValueOnce({
+        response: {
+          status: 422,
+          data: {
+            message: "Validation Failed",
+            errors: [{ message: "sha does not match latest file state" }],
+          },
+        },
+      })
+      .mockResolvedValueOnce(axiosRes({ commit: { html_url: "https://github.com/commit/retried" } }));
+    mockedAxios.get.mockResolvedValueOnce(axiosRes({ sha: "fresh-file-sha" })); // retry file SHA
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-123/github-edit")
+      .send({
+        file_path: "app/page.tsx",
+        content: "updated content",
+        branch: "draft/agentweb-preview",
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockedAxios.put).toHaveBeenCalledTimes(2);
+    expect(mockedAxios.put).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining("/contents/app/page.tsx"),
+      expect.objectContaining({ sha: "fresh-file-sha" }),
+      expect.any(Object)
+    );
+  });
+
   it("SUCCESS: no branch param → commits to main (backward compat)", async () => {
     mockedAxios.get.mockResolvedValueOnce(axiosRes({ sha: "file-sha" })); // get file SHA
     mockedAxios.put.mockResolvedValueOnce(axiosRes({ commit: { html_url: "https://github.com/commit/main" } }));
