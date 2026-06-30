@@ -12,7 +12,7 @@
  * breaking change for historical queries:
  *   timeout | auth | rate_limit | invalid_args | not_found | network |
  *   upstream_5xx | policy_blocked | repeated_failure |
- *   tool_unavailable | upstream_rejected | empty_result
+ *   tool_unavailable | upstream_rejected | empty_result | invalid_output
  *
  * The three trailing classes were added 2026-06-14 after a 7-day production
  * sweep of Dev-AW-LoopEvents `agent_tool_failed` events: re-classifying the
@@ -46,6 +46,10 @@ const GATEWAY_NAME_CLASSES: Record<string, string> = {
   AgentToolPolicyBlockedError: 'policy_blocked',
   AgentToolRepeatedFailureError: 'repeated_failure',
   AgentToolContractValidationError: 'invalid_args',
+  // A tool returned without throwing but produced no usable output (ENG-105).
+  // Distinct from an execution failure so telemetry can separate "tool ran and
+  // gave us nothing" from "tool errored".
+  ToolOutputContractError: 'invalid_output',
   TimeoutError: 'timeout',
   AbortError: 'timeout',
 };

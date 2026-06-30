@@ -135,6 +135,14 @@ export interface ToolDispatchPorts {
   executePreparedAgentTool: (input: any) => Promise<any>;
   /** classify a "successful" result that actually encodes an error -> downgrade to error */
   toolResultError: (result: any) => any;
+  /**
+   * Validate a "successful" result against the minimum-output contract (ENG-105):
+   * returns an Error when the output is empty/undefined/unusable so the boundary
+   * can downgrade it to a structured tool failure (telemetry class invalid_output),
+   * else null. Optional — when absent the contract check is skipped (behavior
+   * preserved for callers that don't wire it).
+   */
+  validateToolOutput?: (result: any) => any;
   /** record per-iteration tool telemetry (best-effort, observability-only) */
   recordToolTelemetry: (telemetryToolResults: Array<DispatchToolResult | PreflightToolResult>) => void;
   /** extract the minimal result stored on the toolCalls ledger entry */
@@ -492,10 +500,17 @@ export async function executePreparedTools(
     toolResults = await Promise.all(toolPromises);
   }
 
-  // Downgrade "successful" results that actually encode an error.
+  // Downgrade "successful" results that actually encode an error (toolResultError)
+  // OR that fail the minimum-output contract (ENG-105: undefined/empty/{}/empty
+  // content array). The encoded-error check runs first; the output-contract check
+  // catches the empty/invalid-output case the encoded-error check does not. Either
+  // way the call becomes a structured tool failure rather than feeding garbage to
+  // the model and being counted as a success.
   toolResults = toolResults.map((toolResult) => {
     if (toolResult.status !== 'success') return toolResult;
-    const error = ports.toolResultError(toolResult.result);
+    const encodedError = ports.toolResultError(toolResult.result);
+    const error = encodedError
+      ?? (ports.validateToolOutput ? ports.validateToolOutput(toolResult.result) : null);
     if (!error) return toolResult;
     return {
       status: 'error' as const,

@@ -131,6 +131,7 @@ import {
 } from './agentToolGatewayService';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { summarizeBreakdownSections } from './agentMode/metaBreakdownStatus';
+import { validateToolOutputContract } from '../utils/toolOutputContract';
 
 type MetaApiResult = {
   success: boolean;
@@ -3062,6 +3063,11 @@ export class AgentModeService {
             executeAgentToolThroughGateway,
             executePreparedAgentTool: (toolInput: any) => this.executePreparedAgentTool(toolInput),
             toolResultError,
+            // ENG-105: validate tool output against the minimum-output contract so
+            // an empty/undefined/invalid "success" becomes a structured tool
+            // failure (errorClass invalid_output) instead of feeding garbage to
+            // the model and counting as success.
+            validateToolOutput: (result: any) => validateToolOutputContract(result, extractToolContent),
             recordToolTelemetry: (telemetryToolResults) =>
               recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults as any, {
                 mediaAssetsProducedThisRun,
