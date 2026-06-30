@@ -63,6 +63,7 @@ import adminPromptTemplatesRoutes from "./routes/adminPromptTemplates";
 import adminScheduleTemplateRoutes from "./routes/adminScheduleTemplateRoutes";
 import supportRoutes from "./routes/support";
 import integrationsRoutes from "./routes/integrations";
+import featurebaseRoutes from "./routes/featurebase";
 import errorsRoutes from "./routes/errors";
 import agentApiRoutes from "./routes/agentApi";
 import emmaApiRoutes from "./routes/emmaApi";
@@ -346,6 +347,7 @@ app.use("/api/admin/prompt-templates", authenticateToken, isAdmin, adminPromptTe
 app.use("/api/admin/schedule-templates", authenticateToken, isAdmin, adminScheduleTemplateRoutes);
 app.use("/api/support", supportRoutes);
 app.use("/api/integrations", integrationsRoutes);
+app.use("/api/featurebase", featurebaseRoutes);
 app.use("/api/errors", errorsRoutes);
 app.use("/api/v1/agent", agentApiRoutes);
 app.use("/api/emma", emmaApiRoutes);

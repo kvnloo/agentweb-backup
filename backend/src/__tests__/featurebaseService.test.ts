@@ -1,4 +1,7 @@
+import jwt from 'jsonwebtoken';
 import {
+  signFeaturebaseIdentityJwt,
+  _resetCredentialsCache,
   addVoter,
   createPost,
   listOpenPosts,
@@ -174,5 +177,40 @@ describe('featurebaseService', () => {
       (global.fetch as any) = jest.fn(() => jsonRes({ message: 'bad' }, false, 400));
       await expect(addVoter('p', 'u@e.com')).rejects.toThrow(/Featurebase API error 400/);
     });
+  });
+});
+
+describe('signFeaturebaseIdentityJwt', () => {
+  const { getSecret } = require('../utils/secretsManager');
+  beforeEach(() => { _resetCredentialsCache(); });
+
+  it('signs an HS256 JWT carrying userId+email+name that verifies with the ssoSecret', async () => {
+    (getSecret as jest.Mock).mockResolvedValueOnce(JSON.stringify({ apiKey: 'sk', appId: 'app123', ssoSecret: 'sso-xyz' }));
+    const token = await signFeaturebaseIdentityJwt({ userId: 'u1', email: 'u@e.com', name: 'Test User' });
+    const decoded: any = jwt.verify(token, 'sso-xyz');
+    expect(decoded.userId).toBe('u1');
+    expect(decoded.email).toBe('u@e.com');
+    expect(decoded.name).toBe('Test User');
+    expect(decoded.exp).toBeGreaterThan(decoded.iat); // short-lived
+    const header: any = (jwt.decode(token, { complete: true }) as any)?.header;
+    expect(header.alg).toBe('HS256');
+  });
+
+  it('omits name when not provided', async () => {
+    (getSecret as jest.Mock).mockResolvedValueOnce(JSON.stringify({ apiKey: 'sk', ssoSecret: 'sso-xyz' }));
+    const token = await signFeaturebaseIdentityJwt({ userId: 'u1', email: 'u@e.com' });
+    const decoded: any = jwt.verify(token, 'sso-xyz');
+    expect(decoded.name).toBeUndefined();
+  });
+
+  it('throws when ssoSecret is not configured (so the route can surface a clean 503)', async () => {
+    (getSecret as jest.Mock).mockResolvedValueOnce(JSON.stringify({ apiKey: 'sk', appId: 'app123' }));
+    await expect(signFeaturebaseIdentityJwt({ userId: 'u1', email: 'u@e.com' })).rejects.toThrow(/ssoSecret not configured/);
+  });
+
+  it('is actually signed by the ssoSecret (a different secret fails verification)', async () => {
+    (getSecret as jest.Mock).mockResolvedValueOnce(JSON.stringify({ apiKey: 'sk', ssoSecret: 'sso-xyz' }));
+    const token = await signFeaturebaseIdentityJwt({ userId: 'u1', email: 'u@e.com' });
+    expect(() => jwt.verify(token, 'WRONG-SECRET')).toThrow();
   });
 });
