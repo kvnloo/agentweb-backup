@@ -867,21 +867,60 @@ function validateJsonSchemaConstraints(name: string, value: unknown, schema: any
   return issues;
 }
 
+function isNonEmptyString(value: unknown): boolean {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
 function validateSemanticToolContract(toolName: string, args: Record<string, unknown>): AgentToolContractIssue[] {
-  if (toolName !== 'linkedin_outreach') return [];
-  if (args.action !== 'send-invite') return [];
-  if (typeof args.message !== 'string') return [];
+  if (toolName === 'linkedin_outreach') {
+    if (args.action !== 'send-invite') return [];
+    if (typeof args.message !== 'string') return [];
 
-  const conservativeInviteLimit = 200;
-  if (args.message.length <= conservativeInviteLimit) return [];
+    const conservativeInviteLimit = 200;
+    if (args.message.length <= conservativeInviteLimit) return [];
 
-  return [{
-    code: 'invalid_args',
-    path: '$.message',
-    message:
-      `LinkedIn send-invite notes must be ${conservativeInviteLimit} characters or fewer for Agent Mode. ` +
-      `This note is ${args.message.length} characters. Rewrite it as a complete shorter note before retrying.`,
-  }];
+    return [{
+      code: 'invalid_args',
+      path: '$.message',
+      message:
+        `LinkedIn send-invite notes must be ${conservativeInviteLimit} characters or fewer for Agent Mode. ` +
+        `This note is ${args.message.length} characters. Rewrite it as a complete shorter note before retrying.`,
+    }];
+  }
+
+  // ENG-106: the send_email_from_sender schema can only mark `to`/`subject`
+  // required — the body is a 3-way alternative (html OR text OR body) the
+  // hand-rolled validator's `required` cannot express (no anyOf support). Enforce
+  // it semantically so a body-less email fails fast at validation with an
+  // actionable message instead of a wasted round-trip + soft execution failure.
+  if (toolName === 'send_email_from_sender') {
+    if (isNonEmptyString(args.html) || isNonEmptyString(args.text) || isNonEmptyString(args.body)) return [];
+    return [{
+      code: 'invalid_args',
+      path: '$.body',
+      message: 'Provide a non-empty email body via html, text, or body.',
+    }];
+  }
+
+  // ENG-106: get_meta_ads_metrics drops the hard `required: [campaign_ids]` so
+  // legacy scalar/string id shapes the impl normalizes pass static validation.
+  // Restore the "at least one usable campaign id" guarantee here, accepting every
+  // shape execute() normalizes: non-empty array campaign_ids, non-empty string
+  // campaign_ids, or non-empty string campaign_id.
+  if (toolName === 'get_meta_ads_metrics') {
+    const hasArrayIds = Array.isArray(args.campaign_ids)
+      && args.campaign_ids.some((id) => isNonEmptyString(id));
+    const hasStringIds = isNonEmptyString(args.campaign_ids);
+    const hasLegacyId = isNonEmptyString(args.campaign_id);
+    if (hasArrayIds || hasStringIds || hasLegacyId) return [];
+    return [{
+      code: 'invalid_args',
+      path: '$.campaign_ids',
+      message: 'Provide at least one campaign id via campaign_ids (array or string) or campaign_id. Use list_meta_ads_campaigns to find campaign IDs.',
+    }];
+  }
+
+  return [];
 }
 
 function isMissingRequiredValue(value: unknown, schema: any): boolean {
