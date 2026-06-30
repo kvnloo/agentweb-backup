@@ -44,6 +44,11 @@ export const EVT_TOOL_INVOKED = 'agent_tool_invoked';
 export const EVT_TOOL_SUCCEEDED = 'agent_tool_succeeded';
 /** A tool call threw / errored — the signal the policy groups by tool. */
 export const EVT_TOOL_FAILED = 'agent_tool_failed';
+/** A tool call was skipped without executing — neither success nor failure.
+ * Today this is media-gen calls deferred by the per-run time budget. Recorded
+ * as its own class so deferred/skipped is accounted separately from success and
+ * failure and never pollutes the reliability ratio or the failure policy. */
+export const EVT_TOOL_DEFERRED = 'agent_tool_deferred';
 /** The run finished and produced a final answer. */
 export const EVT_RUN_COMPLETED = 'agent_run_completed';
 /** The run aborted with an unrecovered error. */
@@ -60,6 +65,7 @@ export const AGENT_MODE_EVENT_TYPES = [
   EVT_TOOL_INVOKED,
   EVT_TOOL_SUCCEEDED,
   EVT_TOOL_FAILED,
+  EVT_TOOL_DEFERRED,
   EVT_RUN_COMPLETED,
   EVT_RUN_FAILED,
   EVT_RUN_VERDICT,

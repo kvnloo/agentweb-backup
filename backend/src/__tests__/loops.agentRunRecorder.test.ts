@@ -17,6 +17,7 @@ import {
   EVT_RUN_COMPLETED,
   EVT_RUN_FAILED,
   EVT_RUN_STARTED,
+  EVT_TOOL_DEFERRED,
   EVT_TOOL_FAILED,
   EVT_TOOL_INVOKED,
   EVT_TOOL_SUCCEEDED,
@@ -157,6 +158,29 @@ describe('AgentRunRecorder', () => {
     expect((puts[2].item as any).subjectId).toBe('sess-2');
     expect((puts[3].item as any).eventType).toBe('agent_run_verdict');
     expect((puts[3].item as any).dimensions.verdict).toBe('failed');
+  });
+
+  it('records a deferred tool call as its own event class with reason + budget context (ENG-103)', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    await rec.toolDeferred('sess-1', {
+      toolName: 'generate_image',
+      reason: 'media_generation_time_budget',
+      iteration: 4,
+      sessionId: 'sess-1',
+      mediaAssetsProducedThisRun: 3,
+      deadlineMs: 1700000000000,
+    });
+
+    const item = puts[0].item as any;
+    // Deferred is NOT toolInvoked/succeeded/failed — its own class.
+    expect(item.eventType).toBe(EVT_TOOL_DEFERRED);
+    expect(item.dimensions.toolName).toBe('generate_image');
+    expect(item.dimensions.reason).toBe('media_generation_time_budget');
+    expect(item.dimensions.iteration).toBe(4);
+    expect(item.dimensions.mediaAssetsProducedThisRun).toBe(3);
+    expect(item.dimensions.deadlineMs).toBe(1700000000000);
   });
 
   it('never throws into the caller hot path when Dynamo fails', async () => {

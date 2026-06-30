@@ -507,10 +507,13 @@ export async function executePreparedTools(
       policyDecision: toolResult.policyDecision,
     };
   });
-  // Deferred calls never executed, so they carry no success/error telemetry signal.
+  // Deferred calls never executed, but they ARE forwarded to telemetry as their
+  // own class (ENG-103): the telemetry layer records them via toolDeferred (not
+  // toolInvoked/succeeded/failed), so deferred/skipped is accounted separately
+  // from success and failure and never pollutes the reliability ratio.
   const telemetryToolResults: Array<DispatchToolResult | PreflightToolResult> = [
     ...preflightToolResults,
-    ...toolResults.filter((r) => r.status !== 'deferred'),
+    ...toolResults,
   ];
 
   // Runtime-spine telemetry (best-effort, observability-only).

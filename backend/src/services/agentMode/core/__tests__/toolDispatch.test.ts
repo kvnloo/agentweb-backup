@@ -415,6 +415,25 @@ describe('executePreparedTools', () => {
       expect(executed).toEqual(['read_brand_guidelines']);
     });
 
+    it('forwards a deferred call to telemetry as a deferred result (ENG-103)', async () => {
+      const { ports } = mediaPorts();
+      const recordToolTelemetry = jest.fn();
+      const input = makeInput(
+        [toolCall('a', 'generate_image', '{"prompt":"x"}')],
+        { ...ports, recordToolTelemetry },
+        { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 2 },
+      );
+      await executePreparedTools(input);
+
+      // The deferred result is now PASSED to telemetry (no longer filtered out),
+      // tagged status:'deferred' so the recorder routes it to toolDeferred — not
+      // success/failure.
+      expect(recordToolTelemetry).toHaveBeenCalledTimes(1);
+      const forwarded = recordToolTelemetry.mock.calls[0][0];
+      expect(forwarded).toHaveLength(1);
+      expect(forwarded[0]).toMatchObject({ status: 'deferred', toolCall: expect.objectContaining({ id: 'a' }) });
+    });
+
     it('a deferred call that did not run does not count as a produced asset', async () => {
       // Over budget with an asset already produced: a soft {success:false} would never
       // be reached because we defer BEFORE executing. Proves deferral short-circuits.

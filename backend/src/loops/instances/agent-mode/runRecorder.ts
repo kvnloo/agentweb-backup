@@ -38,6 +38,7 @@ import {
   EVT_RUN_FAILED,
   EVT_RUN_STARTED,
   EVT_RUN_VERDICT,
+  EVT_TOOL_DEFERRED,
   EVT_TOOL_FAILED,
   EVT_TOOL_INVOKED,
   EVT_TOOL_SUCCEEDED,
@@ -196,6 +197,27 @@ export class AgentRunRecorder {
       failureType: classifyToolFailureType(errorClass, errorMessage),
       ...(failedArgsJson ? { failedArgsJson } : {}),
     });
+  }
+
+  /**
+   * A tool call was DEFERRED — skipped without executing (ENG-103). Recorded as
+   * its own event class (not toolInvoked/succeeded/failed) so deferred calls are
+   * accounted separately from success and failure and never touch the
+   * reliability ratio or the failure-cluster policy. Carries the tool name, a
+   * reason/category, and the budget/defer context.
+   */
+  async toolDeferred(
+    runId: string,
+    info: {
+      toolName: string;
+      reason: string;
+      iteration?: number;
+      sessionId?: string;
+      mediaAssetsProducedThisRun?: number;
+      deadlineMs?: number;
+    },
+  ): Promise<void> {
+    await this.emit(runId, EVT_TOOL_DEFERRED, cleanDims(info));
   }
 
   async runCompleted(

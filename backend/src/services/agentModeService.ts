@@ -175,7 +175,8 @@ function recordAgentModeToolTelemetry(
   runId: string,
   sessionId: string,
   iteration: number,
-  toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>,
+  toolResults: Array<{ status: 'success' | 'error' | 'deferred'; toolCall: any; functionArgs?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>,
+  budgetContext?: { mediaAssetsProducedThisRun?: number; mediaGenerationDeadlineMs?: number },
 ): void {
   const recorder = getAgentRunRecorderSafe();
   if (!recorder || toolResults.length === 0) return;
@@ -213,6 +214,24 @@ function recordAgentModeToolTelemetry(
     });
     for (const r of toolResults) {
       const toolName = r.toolCall?.function?.name ?? 'unknown';
+      if (r.status === 'deferred') {
+        // ENG-103: a deferred call never executed → record it as its own class,
+        // NOT as toolInvoked (keeps the reliability denominator clean) and NOT
+        // as a failure (it carries no error signal).
+        void recorder.toolDeferred(runId, {
+          toolName,
+          reason: 'media_generation_time_budget',
+          iteration,
+          sessionId,
+          ...(budgetContext?.mediaAssetsProducedThisRun != null
+            ? { mediaAssetsProducedThisRun: budgetContext.mediaAssetsProducedThisRun }
+            : {}),
+          ...(budgetContext?.mediaGenerationDeadlineMs != null
+            ? { deadlineMs: budgetContext.mediaGenerationDeadlineMs }
+            : {}),
+        });
+        continue;
+      }
       void recorder.toolInvoked(runId, { toolName, iteration, sessionId });
       if (r.status === 'success') {
         void recorder.toolSucceeded(runId, { toolName, durationMs: r.duration, sessionId });
@@ -3043,7 +3062,10 @@ export class AgentModeService {
             executePreparedAgentTool: (toolInput: any) => this.executePreparedAgentTool(toolInput),
             toolResultError,
             recordToolTelemetry: (telemetryToolResults) =>
-              recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults as any),
+              recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults as any, {
+                mediaAssetsProducedThisRun,
+                mediaGenerationDeadlineMs,
+              }),
             extractMinimalToolResult: (result: any, toolName: string) => this.extractMinimalToolResult(result, toolName),
             extractToolContent,
             formatToolError: (toolName: string, errorMessage: string) => this.formatToolError(toolName, errorMessage),
