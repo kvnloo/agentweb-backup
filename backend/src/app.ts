@@ -441,9 +441,13 @@ app.get("/health", (req, res) => {
 // Global error handler — catches unhandled errors from all routes and reports them to Notion
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 app.use((err: Error, req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  // CORS rejections are expected for external bots/scanners — return 403 silently, don't report
+  // CORS rejections are expected for external bots/scanners — return 403 silently, don't report.
+  // Add ACAO header so the browser can read the 403 body (without it, fetch throws TypeError
+  // and the client sees "Failed to fetch" with no actionable error message).
   if (err.message === "Not allowed by CORS") {
     if (!res.headersSent) {
+      const origin = req.headers.origin;
+      if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
       res.status(403).json({ error: "Forbidden" });
     }
     return;

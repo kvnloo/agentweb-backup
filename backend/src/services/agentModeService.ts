@@ -118,7 +118,7 @@ import { linkedInOutreachService } from './linkedInOutreachService';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
 import { HubSpotService } from './hubspotService';
-import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
+import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
 import {
@@ -18300,30 +18300,64 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
-      // Fetch the file content
-      const response = await axios.get(normalizedFileUrl, {
-        timeout: 30000,
-        responseType: 'arraybuffer',
-        headers: {
-          'User-Agent': 'AgentWeb-Backend/1.0',
-        },
-      });
+      // Fetch the file content — S3 objects are private, use SDK directly for our bucket
+      let buffer: Buffer;
+      let contentType: string;
 
-      const buffer = Buffer.from(response.data as ArrayBuffer);
-      const contentType = response.headers['content-type'] || '';
+      const s3Key = extractS3KeyFromUrl(normalizedFileUrl);
+      if (s3Key) {
+        // Private bucket object — stream via SDK (same pattern as filesController)
+        const stream = getS3ObjectStream(s3Key);
+        const chunks: Buffer[] = [];
+        for await (const chunk of stream) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        buffer = Buffer.concat(chunks);
+        try {
+          const meta = await getS3ObjectMetadata(s3Key);
+          contentType = meta.ContentType || '';
+        } catch {
+          contentType = '';
+        }
+        console.log(`AgentMode: Fetched S3 file via SDK, size: ${buffer.length} bytes, type: ${contentType}`);
+      } else {
+        // Google Drive / Docs links require the user's OAuth token — unauthenticated
+        // fetches return 401 for Workspace-restricted orgs. Tell the user to upload instead.
+        const urlHost = new URL(normalizedFileUrl).hostname.toLowerCase();
+        if (urlHost === 'drive.google.com' || urlHost === 'docs.google.com') {
+          return {
+            success: false,
+            message: 'Google Drive and Docs links cannot be read directly — your organization may have restricted sharing. Please download the file and upload it using the attachment button in the chat instead.',
+            error: 'Google Drive links require authenticated access'
+          };
+        }
 
-      console.log(`AgentMode: Successfully fetched file, size: ${buffer.length} bytes, type: ${contentType}`);
+        // External URL — plain fetch
+        const response = await axios.get(normalizedFileUrl, {
+          timeout: 30000,
+          responseType: 'arraybuffer',
+          headers: { 'User-Agent': 'AgentWeb-Backend/1.0' },
+        });
+        buffer = Buffer.from(response.data as ArrayBuffer);
+        contentType = response.headers['content-type'] || '';
+        console.log(`AgentMode: Fetched external file, size: ${buffer.length} bytes, type: ${contentType}`);
+      }
 
       // Process content based on file type
       let extractedContent = '';
       let fileType = 'unknown';
 
+      const PDF_PARSE_TIMEOUT_MS = 60000;
       if (extension === 'pdf' || contentType.includes('application/pdf')) {
         // Handle PDF files
         try {
-          // Use require for dynamic loading to avoid TypeScript module resolution issues
           const pdfParse = require('pdf-parse');
-          const pdfData: PDFData = await pdfParse(buffer, { pagerender: pdfPageRender });
+          const pdfData: PDFData = await Promise.race([
+            pdfParse(buffer, { pagerender: pdfPageRender }),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error('PDF parse timed out')), PDF_PARSE_TIMEOUT_MS)
+            ),
+          ]);
           extractedContent = pdfData.text;
           fileType = 'pdf';
           console.log(`AgentMode: Successfully parsed PDF, extracted ${extractedContent.length} characters`);
@@ -18331,7 +18365,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           console.error('AgentMode: Error parsing PDF:', pdfError);
           return {
             success: false,
-            message: 'Failed to parse PDF file. The file may be corrupted or password-protected.',
+            message: 'Failed to parse PDF file. The file may be corrupted, password-protected, or too complex.',
             error: pdfError instanceof Error ? pdfError.message : 'PDF parsing failed'
           };
         }
@@ -18408,6 +18442,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
 
+      // Truncate to avoid overwhelming the LLM context window
+      const MAX_CONTENT_LENGTH = 100_000;
+      let truncated = false;
+      if (extractedContent.length > MAX_CONTENT_LENGTH) {
+        extractedContent = extractedContent.slice(0, MAX_CONTENT_LENGTH);
+        truncated = true;
+        console.log(`AgentMode: Content truncated to ${MAX_CONTENT_LENGTH} characters`);
+      }
+
       const contentHash = createHash('sha256').update(extractedContent).digest('hex');
       console.log(`AgentMode: Computed content hash: ${contentHash}`);
 
@@ -18418,8 +18461,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         file_type: fileType,
         file_size: buffer.length,
         content_length: extractedContent.length,
+        truncated,
         file_url: normalizedFileUrl,
-        message: `Successfully read ${fileType} file content (${extractedContent.length} characters)`
+        message: `Successfully read ${fileType} file content (${extractedContent.length} characters${truncated ? ' — content was truncated, call again with a byte-range if you need more' : ''})`
       };
 
     } catch (error: any) {
