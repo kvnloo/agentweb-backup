@@ -60,22 +60,12 @@ const MAX_TOOL_CONTENT_SIZE = 300_000;
 // get compressed to a 200-char preview. Storing them in S3 lets the LLM call search_tool_response
 // to retrieve specific fields from the original payload without needing the full text in context.
 
-/**
- * Extracts the string content from a tool result for LLM consumption and S3 storage.
- *
- * Tools registered via mcpToolRegistry use jsonResult() which wraps their output in the MCP
- * format: { content: [{ type: 'text', text: '<actual JSON>' }] }. If we store the entire
- * wrapper via JSON.stringify(), the inner JSON becomes double-escaped in S3: field names like
- * "sessionId" are stored as \"sessionId\", causing search_tool_response to return 0 matches.
- *
- * Priority: formattedContent > content[0].text (MCP inner text) > JSON.stringify fallback.
- */
-export function extractToolContent(result: any): string {
-  if (typeof result === 'string') return result;
-  if (result?.formattedContent) return result.formattedContent;
-  if (result?.content?.[0]?.text) return result.content[0].text;
-  return JSON.stringify(result);
-}
+// extractToolContent now lives in ../utils/extractToolContent (pure, monolith-free)
+// so the tool-output contract validator and the toolDispatch unit suite can wire
+// the REAL extractor without loading this 24k-line service. Re-exported here so
+// existing `from '../services/agentModeService'` importers are unaffected.
+export { extractToolContent } from '../utils/extractToolContent';
+import { extractToolContent } from '../utils/extractToolContent';
 
 /**
  * Normalize a video timecode to a numeric number of seconds.
@@ -130,6 +120,8 @@ import {
   validateAndRepairToolArgs,
 } from './agentToolGatewayService';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
+import { validateToolOutputContract } from '../utils/toolOutputContract';
 
 type MetaApiResult = {
   success: boolean;
@@ -175,48 +167,88 @@ function recordAgentModeToolTelemetry(
   runId: string,
   sessionId: string,
   iteration: number,
-  toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>,
+  toolResults: Array<{ status: 'success' | 'error' | 'deferred'; toolCall: any; functionArgs?: any; result?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>,
+  budgetContext?: { mediaAssetsProducedThisRun?: number; mediaGenerationDeadlineMs?: number },
 ): void {
   const recorder = getAgentRunRecorderSafe();
   if (!recorder || toolResults.length === 0) return;
 
-  void (async () => {
-    try {
-      const toolNames = toolResults.map(r => r.toolCall?.function?.name ?? 'unknown');
-      // PR #1818 follow-up: contract-layer activity as countable telemetry so
-      // the enforcement decision has data (args_repaired / schema-error rates).
-      const argsRepairedCount = toolResults.filter(
-        (r) => r.policyDecision?.flags?.some((flag) => flag.code === 'args_repaired'),
-      ).length;
-      const schemaErrorCount = toolResults.filter(
-        (r) => r.status === 'error' && classifyToolErrorClass(r.error) === 'invalid_args',
-      ).length;
-      await recorder.decision(runId, {
-        iteration,
-        toolNames,
-        sessionId,
-        toolArgKeys: summarizeToolArgKeys(toolResults),
-        toolArgsPreview: summarizeToolArgs(toolResults),
-        decisionExplanation: summarizeToolDecision(toolResults),
-        explanationSource: 'deterministic_tool_summary',
-        toolPolicyFlags: summarizeAgentToolPolicyFlags(toolResults.map((r) => r.policyDecision)),
-        toolPolicySummary: summarizeAgentToolPolicyModes(toolResults.map((r) => r.policyDecision)),
-        argsRepairedCount,
-        schemaErrorCount,
-      });
-      for (const r of toolResults) {
-        const toolName = r.toolCall?.function?.name ?? 'unknown';
-        await recorder.toolInvoked(runId, { toolName, iteration, sessionId });
-        if (r.status === 'success') {
-          await recorder.toolSucceeded(runId, { toolName, durationMs: r.duration, sessionId });
-        } else {
-          await recorder.toolFailed(runId, { toolName, error: r.error, durationMs: r.duration, sessionId, args: r.functionArgs });
-        }
+  // ENG-102: enqueue the per-tool records SYNCHRONOUSLY (no detached `void
+  // (async)` wrapper). The recorder's internal write chain serializes them in
+  // call order, so they always precede the terminal run record enqueued after
+  // the loop — and the terminal record's flush implies these are durably
+  // written before the worker exits. Still non-blocking from the caller's view:
+  // the recorder methods return immediately and the chain settles in the
+  // background (drained at run end). Only the synchronous summary computation is
+  // wrapped in try/catch — telemetry must never break the chat hot path.
+  try {
+    const toolNames = toolResults.map(r => r.toolCall?.function?.name ?? 'unknown');
+    // PR #1818 follow-up: contract-layer activity as countable telemetry so
+    // the enforcement decision has data (args_repaired / schema-error rates).
+    const argsRepairedCount = toolResults.filter(
+      (r) => r.policyDecision?.flags?.some((flag) => flag.code === 'args_repaired'),
+    ).length;
+    const schemaErrorCount = toolResults.filter(
+      (r) => r.status === 'error' && classifyToolErrorClass(r.error) === 'invalid_args',
+    ).length;
+    void recorder.decision(runId, {
+      iteration,
+      toolNames,
+      sessionId,
+      toolArgKeys: summarizeToolArgKeys(toolResults),
+      toolArgsPreview: summarizeToolArgs(toolResults),
+      decisionExplanation: summarizeToolDecision(toolResults),
+      explanationSource: 'deterministic_tool_summary',
+      toolPolicyFlags: summarizeAgentToolPolicyFlags(toolResults.map((r) => r.policyDecision)),
+      toolPolicySummary: summarizeAgentToolPolicyModes(toolResults.map((r) => r.policyDecision)),
+      argsRepairedCount,
+      schemaErrorCount,
+    });
+    for (const r of toolResults) {
+      const toolName = r.toolCall?.function?.name ?? 'unknown';
+      if (r.status === 'deferred') {
+        // ENG-103: a deferred call never executed → record it as its own class,
+        // NOT as toolInvoked (keeps the reliability denominator clean) and NOT
+        // as a failure (it carries no error signal).
+        void recorder.toolDeferred(runId, {
+          toolName,
+          reason: 'media_generation_time_budget',
+          iteration,
+          sessionId,
+          ...(budgetContext?.mediaAssetsProducedThisRun != null
+            ? { mediaAssetsProducedThisRun: budgetContext.mediaAssetsProducedThisRun }
+            : {}),
+          ...(budgetContext?.mediaGenerationDeadlineMs != null
+            ? { deadlineMs: budgetContext.mediaGenerationDeadlineMs }
+            : {}),
+        });
+        continue;
       }
-    } catch (err) {
-      console.error('[agent-mode] tool telemetry failed (swallowed):', err);
+      void recorder.toolInvoked(runId, { toolName, iteration, sessionId });
+      if (r.status === 'success') {
+        void recorder.toolSucceeded(runId, { toolName, durationMs: r.duration, sessionId });
+        // ENG-104: a success that returned an explicitly partial result (e.g.
+        // get_meta_ads_metrics with an errored breakdown section) is still a
+        // success, but its degradation is recorded as its own class so a section
+        // silently going dark is visible in telemetry instead of hiding behind
+        // success:true. Emitted only when the result is flagged partialFailure —
+        // the all-success path emits nothing (behavior-preserving).
+        const partial = buildToolPartialFailureTelemetry(toolName, r.result);
+        if (partial) {
+          void recorder.toolPartialFailure(runId, {
+            toolName: partial.toolName,
+            unavailableSections: partial.unavailableSections,
+            iteration,
+            sessionId,
+          });
+        }
+      } else {
+        void recorder.toolFailed(runId, { toolName, error: r.error, durationMs: r.duration, sessionId, args: r.functionArgs });
+      }
     }
-  })();
+  } catch (err) {
+    console.error('[agent-mode] tool telemetry failed (swallowed):', err);
+  }
 }
 
 
@@ -245,6 +277,34 @@ function recordAgentModeRunFailed(
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runFailed(runId, info);
+}
+
+/**
+ * Record same-turn duplicate tool-call suppression (ENG-108) as a structured,
+ * observability-only signal — SEPARATE from success/failure telemetry (a
+ * suppressed duplicate is neither). Best-effort: never throws into the chat hot
+ * path.
+ */
+function recordAgentModeDuplicateSuppression(
+  runId: string,
+  sessionId: string,
+  iteration: number,
+  entries: Array<{ toolCall: any; functionArgs: any; duplicateOfId: string }>,
+): void {
+  if (entries.length === 0) return;
+  try {
+    for (const entry of entries) {
+      console.warn('[agent-mode] duplicate tool call suppressed', {
+        runId,
+        sessionId,
+        iteration,
+        toolName: entry.toolCall?.function?.name ?? 'unknown',
+        duplicateOfId: entry.duplicateOfId,
+      });
+    }
+  } catch (err) {
+    console.error('[agent-mode] duplicate-suppression telemetry failed (swallowed):', err);
+  }
 }
 
 function countFailedToolCalls(toolCalls: any[]): number {
@@ -354,6 +414,25 @@ function getAgentRunRecorderSafe() {
   } catch (err) {
     console.error('[agent-mode] runtime spine recorder unavailable (swallowed):', err);
     return null;
+  }
+}
+
+/**
+ * Drain the recorder's pending writes before worker/IPC teardown (ENG-102) so
+ * per-tool + terminal telemetry are durably written before the worker process
+ * exits — bounded by a timeout (mirroring the 5s generateSuggestedReplies guard)
+ * so it can never hang the response. No-op when the runtime spine is disabled.
+ */
+async function flushAgentRunRecorderSafe(timeoutMs = 5000): Promise<void> {
+  const recorder = getAgentRunRecorderSafe();
+  if (!recorder) return;
+  try {
+    await Promise.race([
+      recorder.flush(),
+      new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+    ]);
+  } catch {
+    // best-effort — telemetry drain must never break the chat turn
   }
 }
 
@@ -3017,8 +3096,18 @@ export class AgentModeService {
             executeAgentToolThroughGateway,
             executePreparedAgentTool: (toolInput: any) => this.executePreparedAgentTool(toolInput),
             toolResultError,
+            // ENG-105: validate tool output against the minimum-output contract so
+            // an empty/undefined/invalid "success" becomes a structured tool
+            // failure (errorClass invalid_output) instead of feeding garbage to
+            // the model and counting as success.
+            validateToolOutput: (result: any) => validateToolOutputContract(result, extractToolContent),
             recordToolTelemetry: (telemetryToolResults) =>
-              recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults as any),
+              recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults as any, {
+                mediaAssetsProducedThisRun,
+                mediaGenerationDeadlineMs,
+              }),
+            recordDuplicateSuppression: (entries) =>
+              recordAgentModeDuplicateSuppression(agentRuntimeRunId, sessionId, iteration, entries),
             extractMinimalToolResult: (result: any, toolName: string) => this.extractMinimalToolResult(result, toolName),
             extractToolContent,
             formatToolError: (toolName: string, errorMessage: string) => this.formatToolError(toolName, errorMessage),
@@ -3193,6 +3282,10 @@ export class AgentModeService {
         failedToolCalls: countFailedToolCalls(toolCalls),
         maxSameToolFailures: maxSameToolFailureCount(toolCalls),
       });
+      // ENG-102: drain telemetry before the worker reports success to the parent
+      // process (fire-and-forget would race with IPC teardown — same treatment
+      // the suggested-replies tail work already gets). Bounded, so never hangs.
+      await flushAgentRunRecorderSafe();
       return {
         content,
         toolCalls,
@@ -3258,6 +3351,8 @@ export class AgentModeService {
         failedToolCalls: countFailedToolCalls(_toolCallsForTelemetry),
         maxSameToolFailures: maxSameToolFailureCount(_toolCallsForTelemetry),
       });
+      // ENG-102: drain telemetry before the error propagates / worker tears down.
+      await flushAgentRunRecorderSafe();
       throw wrappedError;
     }
   }
@@ -14451,17 +14546,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         console.error('AgentMode: Campaign-level Insights API Error:', campaignInsightsData.error);
         throw new Error(`Campaign-level Insights API Error: ${campaignInsightsData.error.message}`);
       }
-      if (insightsDemographicsData.error) {
-        console.error('AgentMode: Demographics Insights API Error:', insightsDemographicsData.error);
-        // Don't throw; proceed without demographics
-      }
-      if (insightsPlacementData.error) {
-        console.error('AgentMode: Placement Insights API Error:', insightsPlacementData.error);
-        // Don't throw; proceed without placements
-      }
-      if (insightsDeviceData.error) {
-        console.error('AgentMode: Device Insights API Error:', insightsDeviceData.error);
-        // Don't throw; proceed without devices
+      // ENG-104: breakdown endpoints are NON-fatal (we proceed without them), but
+      // a missing/errored breakdown must be distinguishable from an empty-but-OK
+      // one. Summarize the three raw responses into an explicit per-section status
+      // and surface partial failures in ONE structured warning (telemetry-visible)
+      // instead of three scattered console.errors.
+      const breakdownStatus = summarizeBreakdownSections({
+        demographics: insightsDemographicsData,
+        placement: insightsPlacementData,
+        device: insightsDeviceData,
+      });
+      if (breakdownStatus.partialFailure) {
+        console.warn('AgentMode: get_meta_ads_metrics partial breakdown failure', {
+          tool: 'get_meta_ads_metrics',
+          unavailableSections: breakdownStatus.unavailableSections,
+          sectionErrors: breakdownStatus.sectionErrors,
+        });
       }
 
       // Process the data using simplified logic (filtering is now done at API level)
@@ -14505,11 +14605,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       const result = {
         success: true,
-        message: `Meta ads metrics loaded for ${timeframe} timeframe`,
+        message: breakdownStatus.partialFailure
+          ? `Meta ads metrics loaded for ${timeframe} timeframe (some breakdown sections unavailable: ${breakdownStatus.unavailableSections.join(', ')})`
+          : `Meta ads metrics loaded for ${timeframe} timeframe`,
         timeframe,
         attributionWindow: { start: sinceStr, end: untilStr, days: attributionDays },
         campaignSummary,
-        formattedContent
+        formattedContent,
+        // ENG-104: which breakdown sections are complete vs unavailable, so a
+        // partial result is explicit in the tool result (and flows into the tool
+        // telemetry that captures the tool output) rather than looking fully ok.
+        sections: breakdownStatus.sections,
+        partialFailure: breakdownStatus.partialFailure,
+        unavailableSections: breakdownStatus.unavailableSections,
       };
 
       return result;
