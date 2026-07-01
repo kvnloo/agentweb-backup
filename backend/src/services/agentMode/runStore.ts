@@ -28,7 +28,12 @@
  *     aborts the request loudly.
  *   - markRunTerminal is the one sanctioned best-effort step: a terminal
  *     status update cannot retro-fail a chat that was already delivered, so
- *     it retries once and then fires a single deduped oncall alert.
+ *     it retries once and then fires a single deduped oncall alert. It is
+ *     conditioned on the run record existing (attribute_exists(pk)) — if
+ *     createRunRecord threw, the caller's outer catch still fires
+ *     markRunTerminal, and without the condition update() would UPSERT a
+ *     phantom run#<id> item with no ttl. Condition failure = documented
+ *     no-op (nothing to mark).
  *   - releaseIdempotency is best-effort: on delete failure the item expires
  *     via its ttl (bounded staleness, logged loudly).
  */
@@ -139,6 +144,12 @@ export async function createRunRecord(p: CreateRunRecordParams): Promise<void> {
  * failure cannot retro-fail a chat that was already delivered to the user.
  * Retries once; if the retry also fails, fires ONE deduped oncall alert and
  * returns. Never throws.
+ *
+ * NEVER upserts: the update is conditioned on the run record existing. If
+ * createRunRecord threw (the documented loud-500 path), the controller's
+ * outer catch still fires `void markRunTerminal(runId, 'failed')` — the
+ * condition makes that a no-op instead of writing a phantom run#<id> item
+ * with only status/finishedAt and NO ttl (which would never expire).
  */
 export async function markRunTerminal(
   runId: string,
@@ -150,6 +161,8 @@ export async function markRunTerminal(
       .update({
         TableName: AGENT_RUNS_TABLE,
         Key: { pk: `run#${runId}` },
+        // No upsert: only mark runs that were actually created (see doc above).
+        ConditionExpression: 'attribute_exists(pk)',
         UpdateExpression:
           'SET #status = :status, finishedAt = :finishedAt' +
           (extra?.finishReason ? ', finishReason = :finishReason' : '') +
@@ -168,12 +181,23 @@ export async function markRunTerminal(
     await update();
     return;
   } catch (firstErr) {
+    if (isConditionalCheckFailed(firstErr)) {
+      // Documented no-op: the run record was never created (createRunRecord
+      // threw before intake completed), so there is nothing to mark — and we
+      // must not upsert a ttl-less phantom record. No retry, no alert.
+      console.warn(`[runStore] markRunTerminal(${runId}, ${status}) no-op — run record does not exist`);
+      return;
+    }
     console.error(`[runStore] markRunTerminal(${runId}, ${status}) failed — retrying once:`, firstErr);
   }
 
   try {
     await update();
   } catch (secondErr) {
+    if (isConditionalCheckFailed(secondErr)) {
+      console.warn(`[runStore] markRunTerminal(${runId}, ${status}) no-op — run record does not exist`);
+      return;
+    }
     console.error(`[runStore] markRunTerminal(${runId}, ${status}) failed after retry:`, secondErr);
     try {
       // Dynamic import keeps this module light and avoids a load-time cycle
