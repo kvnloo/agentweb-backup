@@ -102,7 +102,12 @@ export async function listStaleInProgress(hours) {
   return data.issues.nodes;
 }
 
-const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
+// Video types matter: an upload stored as application/octet-stream makes Linear's inline
+// player show "failed to load" (bitten on the first ENG-129 recording upload).
+const MIME = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
+  webm: 'video/webm', mp4: 'video/mp4', mov: 'video/quicktime',
+};
 
 // Upload a local file to Linear's file storage and return its assetUrl — embeddable in any
 // comment/description as markdown `![alt](assetUrl)` (renders inline for workspace members).
