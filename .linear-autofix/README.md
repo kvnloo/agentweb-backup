@@ -4,11 +4,28 @@ A local poller that watches Linear for new `Bug` issues and, for each one:
 
 1. Assembles the **full project** into an isolated workspace — all repos, nested exactly like your local checkout (so Claude has cross-repo context).
 2. Runs Claude Code (`claude -p`) on **your Claude subscription** to investigate and fix the bug — the fixer only **commits** (no PR yet).
-3. **Reviews the fix** with a multi-agent gate: expert reviewers (correctness, conventions, security, tests) inspect the diff in parallel, a **manager** adversarially verifies their findings, and a **re-fix** pass applies the confirmed ones.
-4. **Browser-tests** the reviewed code in a real browser (Playwright), then opens a **draft PR in each repo it changed** (backend/partner-portal and/or customer-portal).
-5. Comments back on the Linear issue: PR link(s), a 🧪 test report, a 🔎 code-review summary, and a 🔍 manual-test guide.
+3. **Reviews the fix** with a multi-agent gate: expert reviewers (correctness, conventions, security, tests — lenses auto-scaled to the diff) inspect the diff in parallel, a **manager** adversarially verifies their findings, and a **re-fix** pass applies the confirmed ones. A `needs_rework` verdict triggers one **rework pass + manager re-check**.
+4. Runs **deterministic checks itself** (`npx tsc --noEmit` per changed package, `jest --findRelatedTests` in backend) — agent self-reported "pass" is never trusted alone.
+5. **Browser-tests** the reviewed code in a real browser (Playwright) against a per-bug preview. A deterministic HTTP **preflight** skips the agent entirely if the environment is down (`env_down`); a `not_fixed` verdict triggers one **re-fix + re-verify**. Then opens a **draft PR in each repo it changed**.
+6. **Triages** the result with a label (`autofix:green` / `autofix:needs-manual-test` / `autofix:needs-rework`) and comments back on the Linear issue: a merge-confidence header, PR link(s), a 🧪 test report, a 🔎 code-review summary, and a 🔍 manual-test guide. Only **green** advances to In Review.
 
-Nothing is auto-merged. If Claude can't confidently fix a bug, it posts its investigation as a Linear comment instead of opening a PR.
+Nothing is auto-merged. If Claude can't confidently fix a bug, it posts its investigation as a Linear comment instead of opening a PR (label `autofix:cannot-fix`).
+
+## Triage: what to do with each label
+
+| Label | Meaning | What you do |
+|---|---|---|
+| `autofix:green` | review sound + verified in a **real browser** + deterministic checks pass → moved to **In Review** | Skim the PR, merge. No manual testing. |
+| `autofix:needs-manual-test` | fix committed but not browser-verified (env down / inconclusive / api-only) — stays **In Progress** | Run the 🔍 manual steps from the comment, then merge. |
+| `autofix:needs-rework` | a gate failed (manager `needs_rework`, browser `not_fixed`, or a check failed) — stays **In Progress** | Real human work; the draft PR is a starting point. |
+| `autofix:cannot-fix` | no fix produced; investigation posted | Triage by hand. |
+
+## Revisions: steering a fix without opening an editor
+
+Comment **`revise: <what to change>`** on a fixed issue (e.g. `revise: also cover the empty-cart
+case and rename the flag`). The next poll cycle applies it to the existing branch in the kept
+workspace (rebuilt from the pushed branch if needed), pushes to the open PR(s), re-runs the
+deterministic checks, and comments the result back. Tunables in `config.revise`.
 
 > Runs on your subscription quota (no per-token API charge) because it's the Claude Code
 > CLI on your own machine — the only compliant way to use subscription quota for automation
@@ -49,6 +66,13 @@ in `config.mjs` if the layout changes.
    ```
 5. Review **`config.mjs`** — `bugLabel`, optional `teamKey`, the `repos` list, model defaults, and the Linear workflow state names (`inProgressState`, `reviewState`).
 
+## Where it runs: EC2 only
+
+Real fixes are gated by `AUTOFIX_RUN_ENABLED=1` in `.linear-autofix/.env` — set it **only on
+the designated EC2 runner** (see `deploy/ec2/RUNBOOK.md`). On any other machine the poller,
+autofix, and revise entrypoints refuse to run (dry-runs still work anywhere), so a laptop
+can't accidentally burn quota or post to Linear.
+
 ## Run ONE bug by hand first (recommended)
 
 ```bash
@@ -65,31 +89,41 @@ Watch it: assemble workspace → investigate (full context) → fix → tests �
 bash .linear-autofix/run.sh
 ```
 
-## Schedule it (cron, every 5 minutes)
+## Schedule it (cron, every 5 minutes) — INSTALLED
 
 ```cron
 */5 * * * * /usr/bin/env bash /home/harshit/IdeaProjects/Agentweb/agentweb/.linear-autofix/run.sh
 ```
 
+This entry is installed in the local crontab (check with `crontab -l`). Each cycle: fix new bugs
+(up to `config.maxConcurrent` in parallel, urgent-priority first), recover crashed runs, apply
+pending `revise:` comments, then gc worktrees for Done issues. `poll.log` auto-rotates at ~5MB.
+
 ## How issues flow
 
 | Step | Linear state |
 |---|---|
-| Poller picks up `Bug` issues in a backlog/unstarted state | → **In Progress** (so it's not picked up twice) |
-| Fix committed, review + verify gates pass, draft PR(s) opened | PR link(s) + reports commented + → **In Review** |
-| Gates fail (manager `needs_rework` or browser `not_fixed`) | Draft PR still opened but flagged `[needs human]`; issue stays **In Progress** |
-| Can't fix / no change | Comment posted; issue stays **In Progress** for a human; workspace kept for inspection |
+| Poller picks up `Bug` issues in a backlog/unstarted state **assigned to one of `config.assigneeEmails`** (Harshit / Manan / Anurag; unassigned bugs are skipped) | → **In Progress** (so it's not picked up twice) |
+| Fix committed, ALL gates green incl. real-browser verify | PR link(s) + reports commented + `autofix:green` + → **In Review** |
+| Fix committed but not browser-verified | Draft PR opened + `autofix:needs-manual-test`; stays **In Progress** |
+| A gate failed (`needs_rework` / `not_fixed` / check failed) | Draft PR flagged `[needs human]` + `autofix:needs-rework`; stays **In Progress** |
+| Can't fix / no change | Comment posted + `autofix:cannot-fix`; stays **In Progress**; workspace kept |
+| Crashed run (a run **autofix started** sat In Progress `staleInProgressHours` with no result) | Reset to Backlog for ONE retry; a second crash is flagged for a human. Issues a human moved to In Progress are never touched. |
 
-A local `state.json` (gitignored) is a secondary guard against reprocessing.
+A local `state.json` (gitignored) is a secondary guard against reprocessing. Raw per-stage
+transcripts + metadata (turns, duration, timeouts) land in `.linear-autofix/logs/<ID>/` for
+debugging and budget tuning.
 
 ## Models / cost
 
-All agents — the fixer, the four reviewers, the manager, the re-fix pass, and browser verify —
-run on **Opus** by default (set in `config.mjs`: `defaultModel`, `review.model`,
-`review.managerModel`, `verify.model`). The multi-agent review gate means one bug can be ~7
-`claude -p` runs, all drawing on the same subscription quota pool as your own interactive Claude
-use. Set `review.enabled: false` to revert to the lean fix→verify→PR flow. Workspaces live in
-`../autofix-worktrees/<id>/` outside the repos.
+The fixer, manager, re-fix/rework passes, and browser verify run on **Opus**; the four lens
+reviewers run on **Sonnet** (`review.model`) — the Opus manager adversarially filters their
+findings anyway, so cheap reviewers cost little quality and save ~4 Opus runs per bug.
+`review.autoScaleLenses` additionally skips lenses that can't apply to the diff (security on
+docs/styles-only diffs; tests when neither backend logic nor tests changed). Everything draws on
+the same subscription quota pool as your interactive Claude use. Set `review.enabled: false` to
+revert to the lean fix→verify→PR flow. Workspaces live in `../autofix-worktrees/<id>/` outside
+the repos.
 
 ## Local full-copy preview (per bug)
 
@@ -114,9 +148,15 @@ node .linear-autofix/preview/preview.mjs down LIN-123
 node .linear-autofix/preview/preview.mjs list
 ```
 
+- **Watcher-free:** the portals are `vite build`-once + `vite preview` (static) and the backend is
+  plain `ts-node --transpile-only` — no HMR, no chokidar, **zero inotify watches**. Dev servers per
+  kept preview used to exhaust `fs.inotify.max_user_watches` and 502 every verify run (that killed
+  ENG-123's verification). Kept previews are now cheap; still, raising the kernel limits is a good
+  belt-and-suspenders: `sudo sysctl fs.inotify.max_user_watches=1048576 fs.inotify.max_user_instances=1024`
+  (persist in `/etc/sysctl.d/90-autofix.conf`).
 - `node_modules` is symlinked and `.env`/`.env.local` copied from your local repos into the worktree, so copies boot fast with your dev config (the backend needs your local AWS dev creds).
-- Set `PREVIEW_IP` (default `192.168.29.76`) for a different reachable IP (e.g. `127.0.0.1` for this-machine-only).
-- **Browser verification (wired in):** after a fix passes the code-review gate, `autofix.mjs` auto-starts the proxy, brings up the full preview, and runs a Playwright verify pass (`claude -p` with a Playwright-only MCP config) that drives a real browser to confirm the bug is gone — *then* opens the draft PR(s) and attaches the verdict + screenshots to the PR and the Linear comment. The PR opens regardless of the verdict. Toggle with `config.verify.enabled`; test creds + model live in `config.verify`.
+- Set `PREVIEW_IP` (default `127.0.0.1`) to a LAN IP to reach previews from another device.
+- **Browser verification (wired in):** after a fix passes the code-review gate, `autofix.mjs` auto-starts the proxy, brings up the full preview, and **preflights it with plain HTTP checks** — if the environment isn't healthy it retries the bring-up once, then records `env_down` and skips the agent run instead of burning a 12-min pass against a dead env. When healthy, a Playwright verify pass (`claude -p` with a Playwright-only MCP config) drives a real browser to confirm the bug is gone — *then* the draft PR(s) open with the verdict + screenshots attached. A `not_fixed` verdict triggers ONE re-fix + re-verify (`verify.retryNotFixed`). Toggle with `config.verify.enabled`.
 
 ## Testing a fix (after a PR opens)
 
@@ -149,17 +189,35 @@ So in normal use (merge PR → issue auto-moves to Done) you rarely clean up by 
 
 | File | Purpose |
 |---|---|
-| `config.mjs` | All tunables (label, team, repos, models, states, paths) |
-| `linear.mjs` | Linear GraphQL client (read issue, list bugs, comment, move state) |
+| `config.mjs` | All tunables (label, team, repos, models, states, triage labels, checks, revise, paths) |
+| `linear.mjs` | Linear GraphQL client (read issue, list bugs/stale, comment, move state, triage labels) |
 | `autofix.mjs` | One bug, end to end — also `node autofix.mjs LIN-123` by hand |
-| `poll.mjs` | Finds new bugs, runs `autofix.mjs` per bug |
+| `poll.mjs` | Finds new bugs (parallel, priority-first), recovers crashed runs, dispatches revisions |
+| `revise.mjs` | Applies human `revise:` comments to a fixed bug's branch/PR |
 | `gc.mjs` | Removes kept worktrees once their Linear issue is Done/Canceled |
 | `prompt.md` | The fixer prompt (full-project context + CLAUDE.md TDD + commit-only + can't-fix path) |
 | `review-prompt.md` | Per-lens expert reviewer prompt (correctness / conventions / security / tests) |
 | `manager-prompt.md` | Manager prompt that adversarially verifies the reviewers' findings |
-| `refix-prompt.md` | Applies the manager-confirmed findings in the same worktree |
-| `run.sh` | One poll cycle with a lock; wire to cron |
+| `refix-prompt.md` | Applies gate-verified findings (review, rework, or verify-failure) in the same worktree |
+| `revise-prompt.md` | Applies human revision requests to the existing fix branch |
+| `run.sh` | One poll cycle with a lock + log rotation; wired to cron |
 | `preview/proxy.mjs` | Userspace host-based reverse proxy (nip.io → per-bug ports), no sudo |
-| `preview/preview.mjs` | Start/stop a full app copy per bug from its worktree |
+| `preview/preview.mjs` | Start/stop a watcher-free full app copy per bug from its worktree |
 | `verify-prompt.md` | Browser-verification prompt (drives the Playwright MCP, emits a verdict) |
 | `verify-mcp.json` | Playwright-only MCP config for the headless verify pass |
+| `logs/<ID>/` | Raw per-stage transcripts + deterministic check output per bug (gitignored) |
+
+## Security notes
+
+The fixer runs `--dangerously-skip-permissions` with full Bash, **read-only prod DynamoDB
+access**, and the Linear issue text injected into its prompt. The prompts instruct agents to
+treat issue text as untrusted data and never paste prod PII anywhere, but that is soft
+protection against prompt injection. Hardening that requires no code change here:
+
+1. **Restrict who can apply the `Bug` label** in Linear (it is the automation's trigger) — e.g.
+   don't let guests/customers set labels.
+2. **Scope the AWS credentials/role** this machine uses to `dynamodb:GetItem`/`Query` on the
+   specific `AW-*` tables only, and deny `Scan` — read-only creds are what make exfiltration of
+   arbitrary customer data possible if an injected issue ever slips through.
+3. PRs are always **draft** and nothing auto-merges — human review remains the final gate; skim
+   PR bodies/comments for data that shouldn't be there before merging.
