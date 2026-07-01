@@ -501,6 +501,43 @@ export function buildFieldGuidanceV3(fields: string[], configFieldsByName: Recor
   }).join('\n');
 }
 
+/**
+ * Reject web-tier extracted values that carry no citation (absent or empty
+ * sourceQuote). A web-tier value with no supporting quote was asserted by the
+ * LLM from its own training knowledge rather than the provided web context or a
+ * live-searched source — the fabricated-funding-data path (ENG-122: a small
+ * company's funding_stage returned as an invented "Series C, $100M"). Per the
+ * acceptance criteria, enrichment must return null/unknown for these instead of
+ * surfacing an invented figure. Mirrors the V2 rule in
+ * CrmEnrichmentService.verifyCitations ("rich-format value with a missing
+ * sourceQuote is unsupported → null").
+ *
+ * LinkedIn URL fields are exempt: rejectHallucinatedLinkedInUrls already
+ * citation-verifies them by slug-matching the URL against the source, and the
+ * URL itself is the evidence (there is no free-text quote to require).
+ */
+export function rejectUncitedWebValues(
+  filled: Record<string, LLMFilledValue>,
+): Record<string, LLMFilledValue> {
+  const result: Record<string, LLMFilledValue> = {};
+  for (const [field, entry] of Object.entries(filled)) {
+    if (/linkedin/i.test(field)) {
+      result[field] = entry;
+      continue;
+    }
+    const hasQuote = typeof entry.sourceQuote === 'string' && entry.sourceQuote.trim().length > 0;
+    if (!hasQuote) {
+      console.warn(
+        `[v3 deps] Rejected uncited web value "${entry.value}" for field "${field}" ` +
+        `— no sourceQuote (unverifiable/training-knowledge claim)`,
+      );
+      continue;
+    }
+    result[field] = entry;
+  }
+  return result;
+}
+
 export function rejectHallucinatedLinkedInUrls(
   filled: Record<string, LLMFilledValue>,
   sourceContext: string,
@@ -629,7 +666,13 @@ async function extractFieldsViaLLMReal(input: {
         missing.push(field);
       }
     }
-    const verified = rejectHallucinatedLinkedInUrls(filled, input.sourceContext);
+    let verified = rejectHallucinatedLinkedInUrls(filled, input.sourceContext);
+    // Web tier can fabricate factual firmographic/funding figures from training
+    // knowledge (ENG-122). Drop any web-tier value lacking a supporting quote so
+    // an unverifiable figure becomes null/missing rather than a stated fact.
+    if (isWebTier) {
+      verified = rejectUncitedWebValues(verified);
+    }
     const verifiedMissing = input.fields.filter(f => !(f in verified));
     console.log(`${ltag} DONE filled=[${Object.keys(verified).join(',')}] missing=[${verifiedMissing.join(',')}]`);
     return { filled: verified, missing: [...new Set([...missing, ...verifiedMissing])] };
