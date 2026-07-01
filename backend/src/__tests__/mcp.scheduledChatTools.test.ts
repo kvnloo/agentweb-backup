@@ -132,6 +132,21 @@ describe('Scheduled Chat MCP Tools', () => {
       }));
     });
 
+    it('should call POST /api/agent-mode/scheduled-chats without emailNotifications if omitted', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-new' });
+
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'create',
+        schedule_name: 'No Email Chat',
+        starting_message: 'Do not email me',
+        schedule_frequency: 'daily',
+      }, context);
+
+      const callBody = (mockMcpFetch.mock.calls[0][0] as any).body;
+      expect(callBody.emailNotifications).toBeUndefined();
+    });
+
+
     it('should pass optional fields (run_count, variables, next_run_time) on create', async () => {
       mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-new' });
 
