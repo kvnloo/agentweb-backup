@@ -32,7 +32,18 @@ export const config = {
   cleanupWorktreeOnSuccess: false, // keep the workspace after a PR so you can preview/test it; remove it yourself when done (see README "Testing a fix")
 
   // --- Preview proxy ---
-  proxyPort: 8791,                 // less-common port to avoid colliding with other dev servers (override: PREVIEW_PROXY_PORT env)
+  // The proxy listens on one fixed port per portal; the bug-id host picks the bug, the port
+  // picks the portal. So `<bug>.<ip>.nip.io:5173` = that bug's partner portal, `:5174` = its
+  // customer portal, `:3001` = its API — and many bugs coexist (host differentiates them).
+  // Matches the project's conventional dev ports. Open all three in the EC2 security group.
+  previewPorts: { partner: 5173, customer: 5174, api: 3001 },
+  keepPreviewUp: true,             // after browser-verify, LEAVE each bug's full preview running so its
+                                   // nip.io URL stays live to open. Only applies when the worktree is kept
+                                   // (cleanupWorktreeOnSuccess: false); gc.mjs stops it once the issue is
+                                   // Done/Canceled. Trade-off: each kept bug holds ~1-1.5 GB (backend + 2 dev
+                                   // servers) and they accumulate across open bugs. To reach the URL from
+                                   // another machine set PREVIEW_IP=<reachable-ip> and open the proxy port.
+                                   // Set false to tear the preview down immediately after verify.
 
   // --- Claude ---
   defaultModel: 'sonnet',          // the fixer model; conserve subscription quota

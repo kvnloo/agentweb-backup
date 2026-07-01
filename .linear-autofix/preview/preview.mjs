@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // .linear-autofix/preview/preview.mjs
 // Start/stop a FULL app copy per bug (backend + customer-portal + partner-portal) from a
-// fix's worktree, exposed via the proxy at <bug>.<ip>.nip.io:<PROXY_PORT>.
+// fix's worktree, exposed via the proxy at <bug>.<ip>.nip.io:<port-per-portal> (5173/5174/3001).
 //
 // Usage:
 //   node preview.mjs up   <bug-id> <worktree-path>
@@ -27,7 +27,9 @@ const LOGS = path.join(__dirname, 'logs');
 // avoids LAN/sandbox firewall issues. Set PREVIEW_IP to the LAN IP to reach it from another
 // device (e.g. a real phone for mobile testing).
 const IP = process.env.PREVIEW_IP || '127.0.0.1';
-const PROXY_PORT = Number(process.env.PREVIEW_PROXY_PORT || config.proxyPort || 8791);
+// One fixed port per portal (the bug-id host picks the bug, the port picks the portal).
+const PP = config.previewPorts || { partner: 5173, customer: 5174, api: 3001 };
+const ROLE_PORT = { '': PP.customer, admin: PP.partner, api: PP.api };
 
 // Each service: package dir (in the worktree), source repo (for node_modules/.env), and proxy role.
 const SERVICES = [
@@ -90,7 +92,7 @@ function ensureDeps(worktree, svc) {
   }
 }
 
-const urlFor = (bug, role) => `http://${bug}${role ? '-' + role : ''}.${IP}.nip.io:${PROXY_PORT}/`;
+const urlFor = (bug, role) => `http://${bug}.${IP}.nip.io:${ROLE_PORT[role]}/`;
 
 async function up(bugRaw, worktreeRaw) {
   const bug = bugRaw.toLowerCase();

@@ -90,18 +90,20 @@ your own interactive Claude use.
 ## Local full-copy preview (per bug)
 
 Every bug gets a **full running copy of the app** (backend + customer-portal + partner-portal)
-from its worktree, on its own ports, reachable through one proxy via nip.io — so you (or
-Playwright) can exercise the fix in a real browser. No new EC2; it all runs on this machine.
+from its worktree, reachable through a proxy via nip.io — so you (or Playwright) can exercise
+the fix in a real browser. The **port picks the portal** (5173 partner / 5174 customer / 3001
+API) and the **bug-id host picks the bug**, so many bugs coexist. No new EC2; it all runs on
+this machine.
 
 ```bash
 # 1. start the proxy once (leave it running)
-node .linear-autofix/preview/proxy.mjs            # listens on :8080
+node .linear-autofix/preview/proxy.mjs            # listens on :5173 :5174 :3001
 
 # 2. bring up a full copy for a bug's worktree
 node .linear-autofix/preview/preview.mjs up LIN-123 ../autofix-worktrees/LIN-123
-#   Customer portal: http://lin-123.192.168.29.76.nip.io:8080/
-#   Partner portal:  http://lin-123-admin.192.168.29.76.nip.io:8080/
-#   Backend API:     http://lin-123-api.192.168.29.76.nip.io:8080/
+#   Partner portal:  http://lin-123.192.168.29.76.nip.io:5173/
+#   Customer portal: http://lin-123.192.168.29.76.nip.io:5174/
+#   Backend API:     http://lin-123.192.168.29.76.nip.io:3001/
 
 # 3. open the customer URL in your browser to confirm it loads, then tear down
 node .linear-autofix/preview/preview.mjs down LIN-123
