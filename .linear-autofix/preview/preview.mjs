@@ -108,28 +108,36 @@ async function up(bugRaw, worktreeRaw) {
   const ports = { api: await freePort(31100), customer: await freePort(52100), partner: await freePort(51100) };
   const procs = {};
 
+  // WATCHER-FREE by design: dev servers (ts-node-dev + Vite HMR) each hold thousands of inotify
+  // watches, and kept previews accumulate until the kernel limit is hit and everything 502s
+  // (exactly how ENG-123's verify died). A preview of a COMMITTED fix never changes, so the
+  // portals are built once and served static, and the backend runs plain transpile-only ts-node.
   for (const svc of SERVICES) {
     const cwd = path.join(worktree, svc.dir);
     if (!existsSync(cwd)) { console.error(`[preview] missing ${svc.dir} in worktree — skipping`); continue; }
     ensureDeps(worktree, svc);
     const env = { ...process.env };
-    let args;
+    const port = svc.kind === 'backend' ? ports.api : (svc.name === 'customer-portal' ? ports.customer : ports.partner);
+    const out = openSync(path.join(LOGS, `${bug}-${svc.name}.log`), 'a');
+    let cmd, args;
     if (svc.kind === 'backend') {
       env.PORT = String(ports.api);
       env.NODE_ENV = env.NODE_ENV || 'development';
       env.BACKEND_URL = stripSlash(urls.api);
       env.CUSTOMER_FRONTEND_URL = stripSlash(urls.customer);
       env.FRONTEND_URL = stripSlash(urls.partner);
-      args = ['run', 'dev'];
+      cmd = 'npx'; args = ['ts-node', '--transpile-only', 'src/server.ts'];
     } else {
-      const port = svc.name === 'customer-portal' ? ports.customer : ports.partner;
       env.VITE_API_URL = stripSlash(urls.api);
-      args = ['run', 'dev', '--', '--port', String(port)];
+      // `npx vite build` (not `npm run build`) so a portal build script's `tsc &&` prefix can't
+      // block the preview; the deterministic tsc check in autofix.mjs covers type errors.
+      console.log(`[preview] building ${svc.name} (one-time, no watchers)...`);
+      const b = spawnSync('npx', ['vite', 'build'], { cwd, env, stdio: ['ignore', out, out] });
+      if (b.status !== 0) console.log(`[preview] WARNING: ${svc.name} build failed — check ${LOGS}/${bug}-${svc.name}.log`);
+      cmd = 'npx'; args = ['vite', 'preview', '--port', String(port), '--strictPort'];
     }
-    const out = openSync(path.join(LOGS, `${bug}-${svc.name}.log`), 'a');
-    const child = spawn('npm', args, { cwd, env, detached: true, stdio: ['ignore', out, out] });
+    const child = spawn(cmd, args, { cwd, env, detached: true, stdio: ['ignore', out, out] });
     child.unref();
-    const port = svc.kind === 'backend' ? ports.api : (svc.name === 'customer-portal' ? ports.customer : ports.partner);
     procs[svc.name] = { pid: child.pid, port };
     console.log(`[preview] ${bug}: started ${svc.name} (pid ${child.pid}) on :${port}`);
   }
