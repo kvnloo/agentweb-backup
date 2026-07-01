@@ -3,9 +3,10 @@
 A local poller that watches Linear for new `Bug` issues and, for each one:
 
 1. Assembles the **full project** into an isolated workspace — all repos, nested exactly like your local checkout (so Claude has cross-repo context).
-2. Runs Claude Code (`claude -p`) on **your Claude subscription** to investigate and fix the bug.
-3. Opens a **draft PR in each repo it changed** (backend/partner-portal and/or customer-portal).
-4. Comments the PR link(s) back on the Linear issue.
+2. Runs Claude Code (`claude -p`) on **your Claude subscription** to investigate and fix the bug — the fixer only **commits** (no PR yet).
+3. **Reviews the fix** with a multi-agent gate: expert reviewers (correctness, conventions, security, tests) inspect the diff in parallel, a **manager** adversarially verifies their findings, and a **re-fix** pass applies the confirmed ones.
+4. **Browser-tests** the reviewed code in a real browser (Playwright), then opens a **draft PR in each repo it changed** (backend/partner-portal and/or customer-portal).
+5. Comments back on the Linear issue: PR link(s), a 🧪 test report, a 🔎 code-review summary, and a 🔍 manual-test guide.
 
 Nothing is auto-merged. If Claude can't confidently fix a bug, it posts its investigation as a Linear comment instead of opening a PR.
 
@@ -75,17 +76,20 @@ bash .linear-autofix/run.sh
 | Step | Linear state |
 |---|---|
 | Poller picks up `Bug` issues in a backlog/unstarted state | → **In Progress** (so it's not picked up twice) |
-| Draft PR(s) opened | PR link(s) commented + → **In Review** (if that state exists) |
+| Fix committed, review + verify gates pass, draft PR(s) opened | PR link(s) + reports commented + → **In Review** |
+| Gates fail (manager `needs_rework` or browser `not_fixed`) | Draft PR still opened but flagged `[needs human]`; issue stays **In Progress** |
 | Can't fix / no change | Comment posted; issue stays **In Progress** for a human; workspace kept for inspection |
 
 A local `state.json` (gitignored) is a secondary guard against reprocessing.
 
 ## Models / cost
 
-Defaults to **Sonnet** to conserve subscription quota. Add an `opus` (or `hard` / `complex`)
-label to a Linear issue to use **Opus** for that one. Workspaces live in
-`../autofix-worktrees/<id>/` outside the repos. Heavy bug days draw on the same quota pool as
-your own interactive Claude use.
+All agents — the fixer, the four reviewers, the manager, the re-fix pass, and browser verify —
+run on **Opus** by default (set in `config.mjs`: `defaultModel`, `review.model`,
+`review.managerModel`, `verify.model`). The multi-agent review gate means one bug can be ~7
+`claude -p` runs, all drawing on the same subscription quota pool as your own interactive Claude
+use. Set `review.enabled: false` to revert to the lean fix→verify→PR flow. Workspaces live in
+`../autofix-worktrees/<id>/` outside the repos.
 
 ## Local full-copy preview (per bug)
 
@@ -112,7 +116,7 @@ node .linear-autofix/preview/preview.mjs list
 
 - `node_modules` is symlinked and `.env`/`.env.local` copied from your local repos into the worktree, so copies boot fast with your dev config (the backend needs your local AWS dev creds).
 - Set `PREVIEW_IP` (default `192.168.29.76`) for a different reachable IP (e.g. `127.0.0.1` for this-machine-only).
-- **Browser verification (wired in):** after a fix opens a PR, `autofix.mjs` auto-starts the proxy, brings up the full preview, runs a Playwright verify pass (`claude -p` with a Playwright-only MCP config) that drives a real browser to confirm the bug is gone, then tears the preview down and attaches the verdict + screenshots to the draft PR and the Linear comment. The PR opens regardless of the verdict. Toggle with `config.verify.enabled`; test creds + model live in `config.verify`.
+- **Browser verification (wired in):** after a fix passes the code-review gate, `autofix.mjs` auto-starts the proxy, brings up the full preview, and runs a Playwright verify pass (`claude -p` with a Playwright-only MCP config) that drives a real browser to confirm the bug is gone — *then* opens the draft PR(s) and attaches the verdict + screenshots to the PR and the Linear comment. The PR opens regardless of the verdict. Toggle with `config.verify.enabled`; test creds + model live in `config.verify`.
 
 ## Testing a fix (after a PR opens)
 
@@ -150,7 +154,10 @@ So in normal use (merge PR → issue auto-moves to Done) you rarely clean up by 
 | `autofix.mjs` | One bug, end to end — also `node autofix.mjs LIN-123` by hand |
 | `poll.mjs` | Finds new bugs, runs `autofix.mjs` per bug |
 | `gc.mjs` | Removes kept worktrees once their Linear issue is Done/Canceled |
-| `prompt.md` | The fixer prompt (full-project context + CLAUDE.md TDD + per-repo draft PRs + can't-fix path) |
+| `prompt.md` | The fixer prompt (full-project context + CLAUDE.md TDD + commit-only + can't-fix path) |
+| `review-prompt.md` | Per-lens expert reviewer prompt (correctness / conventions / security / tests) |
+| `manager-prompt.md` | Manager prompt that adversarially verifies the reviewers' findings |
+| `refix-prompt.md` | Applies the manager-confirmed findings in the same worktree |
 | `run.sh` | One poll cycle with a lock; wire to cron |
 | `preview/proxy.mjs` | Userspace host-based reverse proxy (nip.io → per-bug ports), no sudo |
 | `preview/preview.mjs` | Start/stop a full app copy per bug from its worktree |
