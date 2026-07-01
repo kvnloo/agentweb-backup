@@ -348,6 +348,128 @@ describe('agentToolGatewayService', () => {
       });
     });
 
+    describe('container coercion (stringified array/object repair)', () => {
+      // Mirrors read_knowledge_base_files (ENG-127): the model double-encodes the
+      // required `files` array as a JSON string, and the type validator hard-rejected
+      // it with "Expected array." even though the decoded value is a valid array.
+      const readKnowledgeBaseFilesSchema = {
+        type: 'object',
+        properties: {
+          files: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                kb_identifier: { type: 'string' },
+                file_name: { type: 'string' },
+              },
+              required: ['kb_identifier', 'file_name'],
+            },
+          },
+        },
+        required: ['files'],
+      };
+
+      it('coerces a stringified array of objects for read_knowledge_base_files (repro: ENG-127)', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'read_knowledge_base_files',
+          args: { files: '[{"kb_identifier":"task123","file_name":"knowledge-base.txt"}]' },
+          inputSchema: readKnowledgeBaseFilesSchema,
+          effect: 'read',
+        });
+
+        expect(result.status).toBe('repaired');
+        expect(result.args).toEqual({
+          files: [{ kb_identifier: 'task123', file_name: 'knowledge-base.txt' }],
+        });
+        expect(result.repairs).toEqual(expect.arrayContaining(['files:json_parse']));
+      });
+
+      it('coerces a stringified array of plain string identifiers', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'some_tool',
+          args: { ids: '["a","b","c"]' },
+          inputSchema: {
+            type: 'object',
+            properties: { ids: { type: 'array', items: { type: 'string' } } },
+            required: ['ids'],
+          },
+          effect: 'read',
+        });
+        expect(result.status).toBe('repaired');
+        expect(result.args).toEqual({ ids: ['a', 'b', 'c'] });
+        expect(result.repairs).toEqual(expect.arrayContaining(['ids:json_parse']));
+      });
+
+      it('coerces a stringified object when the schema expects an object', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'some_tool',
+          args: { config: '{"enabled":true,"limit":5}' },
+          inputSchema: {
+            type: 'object',
+            properties: { config: { type: 'object' } },
+            required: ['config'],
+          },
+          effect: 'read',
+        });
+        expect(result.status).toBe('repaired');
+        expect(result.args).toEqual({ config: { enabled: true, limit: 5 } });
+        expect(result.repairs).toEqual(expect.arrayContaining(['config:json_parse']));
+      });
+
+      it('leaves an already-valid array unchanged (behavior-preserving)', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'read_knowledge_base_files',
+          args: { files: [{ kb_identifier: 'task123', file_name: 'knowledge-base.txt' }] },
+          inputSchema: readKnowledgeBaseFilesSchema,
+          effect: 'read',
+        });
+        expect(result.status).toBe('valid');
+        expect(result.repairs).toEqual([]);
+      });
+
+      it('does NOT coerce when the schema also accepts string', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'some_tool',
+          args: { val: '["a"]' },
+          inputSchema: {
+            type: 'object',
+            properties: { val: { type: ['string', 'array'] } },
+            required: [],
+          },
+          effect: 'read',
+        });
+        expect(result.status).toBe('valid');
+        expect(result.args).toEqual({ val: '["a"]' });
+      });
+
+      it('still rejects a non-JSON string as a type mismatch (no silent pass)', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'read_knowledge_base_files',
+          args: { files: 'knowledge-base.txt' },
+          inputSchema: readKnowledgeBaseFilesSchema,
+          effect: 'read',
+        });
+        expect(result.status).toBe('invalid');
+        if (result.status === 'invalid') {
+          expect(result.issues.map((i) => i.code)).toContain('type_mismatch');
+        }
+      });
+
+      it('does NOT coerce a stringified object when the schema expects an array', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'read_knowledge_base_files',
+          args: { files: '{"kb_identifier":"task123"}' },
+          inputSchema: readKnowledgeBaseFilesSchema,
+          effect: 'read',
+        });
+        expect(result.status).toBe('invalid');
+        if (result.status === 'invalid') {
+          expect(result.issues.map((i) => i.code)).toContain('type_mismatch');
+        }
+      });
+    });
+
     it('repairs low-risk url alias drift before execution', () => {
       const result = validateAndRepairToolArgs({
         toolName: 'read_file_content',
