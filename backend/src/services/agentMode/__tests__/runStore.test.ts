@@ -70,6 +70,16 @@ class DdbFake {
     promise: async () => {
       this.calls.push({ op: 'update', params });
       this.maybeFail('update');
+      // Real DynamoDB semantics: update() UPSERTS unless the caller passes a
+      // ConditionExpression guarding on the item's existence.
+      if (
+        params.ConditionExpression === 'attribute_exists(pk)' &&
+        !this.items.has(params.Key.pk)
+      ) {
+        const err: any = new Error('The conditional request failed');
+        err.code = 'ConditionalCheckFailedException';
+        throw err;
+      }
       const item = this.items.get(params.Key.pk) || { pk: params.Key.pk };
       // Only supports the SET expression shape runStore uses.
       for (const [placeholder, value] of Object.entries(params.ExpressionAttributeValues || {})) {
@@ -213,6 +223,12 @@ describe('runStore', () => {
       fake.failNext = { op: 'update', error: new Error('blip') };
       await markRunTerminal('r1', 'interrupted');
       expect(fake.items.get('run#r1').status).toBe('interrupted');
+      expect(sendAgentModeOncallAlert).not.toHaveBeenCalled();
+    });
+
+    it('is a no-op when the run record was never created — no phantom un-TTLed run# item, no retry alert (createRunRecord threw, outer catch still fires markRunTerminal)', async () => {
+      await expect(markRunTerminal('never-created', 'failed')).resolves.toBeUndefined();
+      expect(fake.items.has('run#never-created')).toBe(false);
       expect(sendAgentModeOncallAlert).not.toHaveBeenCalled();
     });
 
