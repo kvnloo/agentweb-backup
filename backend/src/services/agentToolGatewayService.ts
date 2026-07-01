@@ -468,6 +468,12 @@ export function validateAndRepairToolArgs(
     if (coerced.changed) {
       repairedArgs[name] = coerced.value;
       repairs.push(`${name}:scalar_coerce`);
+      continue;
+    }
+    const container = coerceJsonContainerForSchema(repairedArgs[name], propSchema);
+    if (container.changed) {
+      repairedArgs[name] = container.value;
+      repairs.push(`${name}:json_parse`);
     }
   }
 
@@ -811,6 +817,52 @@ function coerceScalarForSchema(value: unknown, schema: any): { changed: boolean;
     if (lower === 'false') return { changed: true, value: false };
   }
 
+  return { changed: false, value };
+}
+
+/**
+ * Coerce a stringified JSON array/object to its parsed value when the schema
+ * expects an `array` or `object` (and does NOT also accept `string`). LLMs
+ * frequently double-encode a nested container argument — emitting
+ * `files: "[{...}]"` instead of `files: [{...}]` — which the type validator then
+ * hard-rejected with "Expected array." (ENG-127). Parse a string that cleanly
+ * round-trips to the expected container type so the call succeeds instead of
+ * bouncing back to the model.
+ *
+ * Behavior-preserving: returns `changed: false` for non-string inputs, for
+ * schemas that also accept `string`, for strings that don't look like / parse as
+ * JSON, and for parsed values whose type doesn't match the expected container —
+ * so a genuinely wrong value still surfaces as a type_mismatch issue downstream.
+ */
+function coerceJsonContainerForSchema(value: unknown, schema: any): { changed: boolean; value: unknown } {
+  if (typeof value !== 'string') return { changed: false, value };
+  const expected = schema?.type;
+  if (!expected) return { changed: false, value };
+  const expectedTypes = Array.isArray(expected) ? expected : [expected];
+
+  // If the schema accepts a string, the string is already valid — never coerce.
+  if (expectedTypes.includes('string')) return { changed: false, value };
+
+  const wantsArray = expectedTypes.includes('array');
+  const wantsObject = expectedTypes.includes('object');
+  if (!wantsArray && !wantsObject) return { changed: false, value };
+
+  const trimmed = value.trim();
+  const firstChar = trimmed[0];
+  // Only attempt a parse for values that actually look like a JSON container.
+  if (firstChar !== '[' && firstChar !== '{') return { changed: false, value };
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return { changed: false, value };
+  }
+
+  if (wantsArray && Array.isArray(parsed)) return { changed: true, value: parsed };
+  if (wantsObject && Boolean(parsed) && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    return { changed: true, value: parsed };
+  }
   return { changed: false, value };
 }
 
