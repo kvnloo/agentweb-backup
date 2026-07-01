@@ -468,6 +468,19 @@ describe('agentToolGatewayService', () => {
           expect(result.issues.map((i) => i.code)).toContain('type_mismatch');
         }
       });
+
+      it('rejects a container-looking but malformed JSON string as a type mismatch (JSON.parse throws)', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'read_knowledge_base_files',
+          args: { files: '[{' },
+          inputSchema: readKnowledgeBaseFilesSchema,
+          effect: 'read',
+        });
+        expect(result.status).toBe('invalid');
+        if (result.status === 'invalid') {
+          expect(result.issues.map((i) => i.code)).toContain('type_mismatch');
+        }
+      });
     });
 
     it('repairs low-risk url alias drift before execution', () => {
