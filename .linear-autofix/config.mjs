@@ -30,6 +30,21 @@ export const config = {
     cannotFix: 'autofix:cannot-fix',
   },
 
+  // --- Fixability gate (BEFORE the issue is touched) ---
+  // A cheap triage pass reads the issue text and decides: fixable by a code change now, or
+  // blocked on an external action (disconnected third-party account, pending credentials, a
+  // named person's to-do)? Blocked bugs get `blockedLabel` + an explanatory comment and are
+  // LEFT IN THEIR CURRENT STATE (never moved to In Progress, no 2h fixer run burned). The
+  // poller skips issues carrying the label; remove the label once the blocker is resolved
+  // and the next cycle picks the bug up fresh. `--force` bypasses the gate on manual runs.
+  fixabilityGate: {
+    enabled: true,
+    model: 'sonnet',
+    blockedLabel: 'autofix:blocked',
+    maxTurns: 8,
+    timeoutMs: 5 * 60 * 1000,
+  },
+
   // --- Poller ---
   maxConcurrent: 2,                // bugs fixed in parallel per poll cycle (worktrees, branches, and
                                    // preview ports are isolated per bug; 1 = old sequential behavior)

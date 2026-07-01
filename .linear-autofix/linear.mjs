@@ -45,6 +45,7 @@ export async function resolveIssue(ref) {
 
 // Issues with the bug label, in a not-yet-started state, optionally scoped to one team and
 // to a set of assignees (unassigned bugs are never picked up when assigneeEmails is set).
+// Issues carrying the fixability-gate's blocked label are skipped until a human removes it.
 export async function listNewBugs() {
   const filter = {
     labels: { name: { eq: config.bugLabel } },
@@ -56,7 +57,11 @@ export async function listNewBugs() {
     `query($filter: IssueFilter!){ issues(filter:$filter, first:50){ nodes{ ${ISSUE_FIELDS} } } }`,
     { filter },
   );
-  return data.issues.nodes;
+  // Label exclusion is client-side: IssueLabelCollectionFilter has no `none` comparator.
+  const blocked = (config.fixabilityGate?.blockedLabel || '').toLowerCase();
+  return blocked
+    ? data.issues.nodes.filter((n) => !(n.labels?.nodes || []).some((l) => l.name.toLowerCase() === blocked))
+    : data.issues.nodes;
 }
 
 export async function addComment(issueId, body) {
@@ -137,6 +142,7 @@ const AUTOFIX_LABEL_COLORS = {
   'autofix:needs-manual-test': '#B08800',
   'autofix:needs-rework': '#CF222E',
   'autofix:cannot-fix': '#57606A',
+  'autofix:blocked': '#F2994A',
 };
 
 // Replace any previous autofix:* label on the issue with `name` (find-or-create, team-scoped;

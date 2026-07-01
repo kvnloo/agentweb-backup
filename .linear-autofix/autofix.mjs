@@ -152,8 +152,10 @@ async function main() {
 
   const state = loadState();
   // Non-final outcomes may be re-processed: 'recovered' = the stale sweep reset a crashed run;
-  // 'started' = a run that crashed before recording any outcome (or is being retried by hand).
-  const NON_FINAL = ['recovered', 'started'];
+  // 'started' = a run that crashed before recording any outcome (or is being retried by hand);
+  // 'blocked' = the fixability gate held it — retried once the blocked label is removed
+  // (while the label is on, the poller's pickup filter never lists the issue).
+  const NON_FINAL = ['recovered', 'started', 'blocked'];
   if (state[issue.id] && !NON_FINAL.includes(state[issue.id].outcome) && !force) { log(`Already processed (${state[issue.id].outcome}). Use --force to redo.`); return; }
 
   const labelNames = (issue.labels?.nodes || []).map((l) => l.name.toLowerCase());
@@ -177,6 +179,32 @@ async function main() {
   }
 
   setStageLogDir(id);
+
+  // --- Fixability gate: BEFORE anything is touched (no state move, no fixer run). A cheap
+  // triage pass decides from the issue text whether this is fixable by a code change now, or
+  // blocked on an external action (e.g. a disconnected Unipile/Sales-Navigator account waiting
+  // on a human to reconnect it — ENG-100's shape). Blocked → label + comment, issue STAYS in
+  // Todo/backlog, and the poller skips it until the label is removed.
+  const commentsText = (issue.comments?.nodes || []).map((c) => `- ${c.user?.name || 'someone'}: ${c.body}`).join('\n') || '(none)';
+  if (config.fixabilityGate?.enabled && !force) {
+    const g = config.fixabilityGate;
+    const tp = fillTemplate(readFileSync(path.join(__dirname, 'triage-prompt.md'), 'utf8'), {
+      IDENTIFIER: id, TITLE: issue.title, DESCRIPTION: issue.description || '(no description)', COMMENTS: commentsText,
+    });
+    log(`Fixability gate (model=${g.model})...`);
+    const tr = extractJson(
+      await runClaude(claudeArgs({ model: g.model, maxTurns: g.maxTurns }), tp, agentRoot, g.timeoutMs, 'fixability'),
+      'TRIAGE_RESULT', { fixable: true },
+    );
+    if (tr.fixable === false) {
+      log(`Blocked on external action: ${tr.blockedOn || tr.reason || '(unspecified)'} — holding (issue stays in ${issue.state?.name}).`);
+      try { await setAutofixLabel(issue, g.blockedLabel); } catch (e) { log('Warn: could not set blocked label:', e.message); }
+      await addComment(issue.id, `⏸️ **Auto-fix on hold — blocked on an external action**\n\n${tr.reason || ''}\n\n**Waiting on:** ${tr.blockedOn || '(see reason)'}\n\nNo fix was attempted and the issue was left in **${issue.state?.name || 'its current state'}**. Once the blocker is resolved, remove the \`${g.blockedLabel}\` label and the poller will pick this bug up on its next cycle.`);
+      updateState(issue.id, { identifier: id, outcome: 'blocked', blockedOn: tr.blockedOn || '', stages, at: new Date().toISOString() });
+      return;
+    }
+    log('Fixability gate: fixable — proceeding.');
+  }
 
   // Mark the run as STARTED before anything else. This is what lets the stale-In-Progress sweep
   // distinguish "autofix crashed on this issue" from "a human is working on this issue" — the
@@ -202,13 +230,12 @@ async function main() {
   prepareWorktreeDeps(WT);
 
   // Build the fixer prompt.
-  const comments = (issue.comments?.nodes || []).map((c) => `- ${c.user?.name || 'someone'}: ${c.body}`).join('\n') || '(none)';
   const repoLayout = config.repos.map((r) => `- ${r.mount === '.' ? '(workspace root)' : r.mount + '/'} — ${r.key}: ${r.description}`).join('\n');
   const sessionContext = computeSessionContext([issue.description, ...(issue.comments?.nodes || []).map((c) => c.body)].filter(Boolean).join('\n'));
   log(`Session context: ${sessionContext.startsWith('(no session') ? 'none referenced' : 'attached'}`);
   const prompt = fillTemplate(readFileSync(path.join(__dirname, 'prompt.md'), 'utf8'), {
     IDENTIFIER: id, TITLE: issue.title, DESCRIPTION: issue.description || '(no description)',
-    COMMENTS: comments, URL: issue.url, BRANCH: branch, REPO_LAYOUT: repoLayout, SESSION_CONTEXT: sessionContext,
+    COMMENTS: commentsText, URL: issue.url, BRANCH: branch, REPO_LAYOUT: repoLayout, SESSION_CONTEXT: sessionContext,
   });
 
   // Run claude -p at the workspace root, on your subscription. The fixer only COMMITS; the PR is
