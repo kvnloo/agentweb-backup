@@ -18,6 +18,7 @@ import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
+import { isCronEnabled } from '../utils/instanceState';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
@@ -4438,7 +4439,12 @@ export const agentModeController = {
       const effectiveScheduleFrequency = scheduleFrequency || existingSchedule.frequency;
 
       if (!effectiveScheduleName || !effectiveStartingMessage || !effectiveScheduleFrequency) {
-        return res.status(400).json({ error: 'Missing required fields' });
+        const missing = [
+          !effectiveScheduleName && 'scheduleName',
+          !effectiveStartingMessage && 'startingMessage',
+          !effectiveScheduleFrequency && 'scheduleFrequency',
+        ].filter(Boolean).join(', ');
+        return res.status(400).json({ error: `Missing required fields: ${missing}` });
       }
 
       // Validate frequencyIntervalDays for every_n_days frequency
@@ -5170,6 +5176,12 @@ export const agentModeController = {
   },
 
   async runScheduledChats(req: Request, res: Response) {
+    // Reject immediately when this instance is draining — the agent-engine will
+    // retry in 5 seconds and the ALB will route that call to the new instance.
+    if (!isCronEnabled()) {
+      return res.status(503).json({ message: 'Instance draining — retry on new instance' });
+    }
+
     try {
       // Get all scheduled chats that are ready to run
       const scheduledChats = await scheduleDb.getSchedulesReadyToRun();

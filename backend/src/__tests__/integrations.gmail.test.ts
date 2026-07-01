@@ -4,6 +4,7 @@
  */
 
 // ── Mocks ──────────────────────────────────────────────────────────────────
+export {};
 
 const mockGetGmailCredentials = jest.fn();
 

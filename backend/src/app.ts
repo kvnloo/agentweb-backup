@@ -40,6 +40,7 @@ import subscriptionRoutes from "./routes/subscription";
 import booksRoutes from "./routes/books";
 import linkedinAuthRoutes from "./routes/linkedinAuth";
 import gmailAuthRoutes from "./routes/gmailAuth";
+import googleDriveAuthRoutes from "./routes/googleDriveAuth";
 import metaAuthRoutes from "./routes/metaAuth";
 import clickupAuthRoutes from "./routes/clickupAuth";
 import foreplayAuthRoutes from "./routes/foreplayAuth";
@@ -319,6 +320,7 @@ app.use("/api/oauth/linkedin", linkedinAuthRoutes);
 app.use("/api/oauth/linkedin-outreach", linkedInOutreachAuthRoutes);
 app.use("/api/oauth/linkedin-ads", linkedInAdsAuthRoutes);
 app.use("/api/oauth/gmail", gmailAuthRoutes);
+app.use("/api/oauth/google-drive", googleDriveAuthRoutes);
 app.use("/api/oauth/meta", metaAuthRoutes);
 app.use("/api/oauth/instagram", metaAuthRoutes);
 app.use("/api/oauth/youtube", youtubeAuthRoutes);
@@ -441,7 +443,8 @@ app.get("/health", (req, res) => {
 // Global error handler — catches unhandled errors from all routes and reports them to Notion
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 app.use((err: Error, req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  // CORS rejections are expected for external bots/scanners — return 403 silently, don't report
+  // CORS rejections are expected for external bots/scanners — return 403 silently, don't report.
+  // No ACAO header here: the origin was rejected, so it must stay unreadable to the browser.
   if (err.message === "Not allowed by CORS") {
     if (!res.headersSent) {
       res.status(403).json({ error: "Forbidden" });

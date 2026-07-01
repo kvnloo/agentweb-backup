@@ -1,4 +1,5 @@
 import app from './app';
+import { isCronEnabled, disableCron } from './utils/instanceState';
 import { agentModeService } from './services/agentModeService';
 import { generateMarketingResponseWorkerService } from './services/generateMarketingResponseWorkerService';
 import dotenv from 'dotenv';
@@ -331,7 +332,20 @@ process.on('unhandledRejection', (reason: unknown, promise: Promise<unknown>) =>
 const gracefulShutdown = async (signal: string) => {
   console.log(`\n${signal} received. Shutting down gracefully...`);
 
-  // Stop the proactive MCP OAuth refresh scheduler
+  // Register force-exit FIRST so it's always set, even if an await below hangs.
+  // 13 min = drain ceiling (10 min) + 3 min buffer.
+  // EB Timeout: 900 s (15 min) sits above this so EB never force-kills first.
+  setTimeout(() => {
+    console.error('[gracefulShutdown] Force-exiting after drain ceiling');
+    process.exit(1);
+  }, 13 * 60 * 1000).unref();
+
+  // 1. Disable cron immediately — agent-engine's next /run-scheduled-chats call
+  //    gets 503 and reroutes to the new instance within one 5-second poll cycle.
+  //    All setInterval/setTimeout workers skip their next tick.
+  disableCron();
+
+  // 2. Stop the proactive MCP OAuth refresh scheduler
   try {
     const { stopMcpOAuthRefreshScheduler } = await import('./mcp/client/mcpOAuthRefreshService');
     stopMcpOAuthRefreshScheduler();
@@ -339,13 +353,16 @@ const gracefulShutdown = async (signal: string) => {
     // ignore — scheduler may not have started
   }
 
-  // Shutdown Agent Mode services (closes MCP clients)
-  await agentModeService.shutdown();
+  // 3. Stop accepting new HTTP connections
+  server.close((err) => {
+    if (err) {
+      console.error('Error closing HTTP server:', err);
+    } else {
+      console.log('HTTP server closed');
+    }
+  });
 
-  // Shutdown worker service
-  await generateMarketingResponseWorkerService.shutdown();
-
-  // Close Socket.IO connections
+  // 4. Disconnect all Socket.IO clients (they auto-reconnect to the new instance)
   io.close((err) => {
     if (err) {
       console.error('Error closing Socket.IO:', err);
@@ -354,23 +371,15 @@ const gracefulShutdown = async (signal: string) => {
     }
   });
 
-  // Close HTTP server (stops accepting new connections)
-  server.close((err) => {
-    if (err) {
-      console.error('Error closing HTTP server:', err);
-    } else {
-      console.log('HTTP server closed');
-    }
+  // 5. Drain the worker — waits for all in-flight scheduled chats / EMMA runs
+  //    to complete naturally (up to 10 minutes). Only then kills the child process.
+  await generateMarketingResponseWorkerService.shutdown();
 
-    // Exit after cleanup
-    process.exit(0);
-  });
+  // 6. Close parent MCP clients after the drain (child has its own MCP instance)
+  await agentModeService.shutdown();
 
-  // Force exit if graceful shutdown takes too long
-  setTimeout(() => {
-    console.error('Forcing shutdown after timeout');
-    process.exit(1);
-  }, 5000);
+  // 7. Clean exit
+  process.exit(0);
 };
 
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
@@ -506,6 +515,7 @@ createTestAccount().then(async () => {
         scanner.runScanner().catch(e => console.error('[SocialEngagement] Scanner error:', e));
 
         setInterval(() => {
+          if (!isCronEnabled()) return;
           scanner.runScanner().catch(e => console.error('[SocialEngagement] Scanner error:', e));
         }, SCANNER_INTERVAL_MS);
 
@@ -529,8 +539,10 @@ createTestAccount().then(async () => {
 
         console.log(`[ActivationCron] Initialized — first run at 08:00 UTC (in ${Math.round(msUntilNextRun / 60000)} min)`);
         setTimeout(() => {
+          if (!isCronEnabled()) return;
           runActivationAnalysis().catch(e => console.error('[ActivationCron] Error:', e));
           setInterval(() => {
+            if (!isCronEnabled()) return;
             runActivationAnalysis().catch(e => console.error('[ActivationCron] Error:', e));
           }, ACTIVATION_INTERVAL_MS);
         }, msUntilNextRun);
@@ -545,6 +557,7 @@ createTestAccount().then(async () => {
         const DRIP_INTERVAL_MS = 5 * 60 * 1000;
         processDueEnrollments().catch(e => console.error('[dripWorker] Error on first run:', e));
         setInterval(() => {
+          if (!isCronEnabled()) return;
           processDueEnrollments().catch(e => console.error('[dripWorker] Error:', e));
         }, DRIP_INTERVAL_MS);
         console.log('[dripWorker] Initialized — running every 5 minutes');
@@ -569,6 +582,7 @@ createTestAccount().then(async () => {
         const LI_CONN_INTERVAL_MS = 10 * 60 * 1000;
         runLinkedInConnectionSync().catch(e => console.error('[linkedInConnectionSync] Error on first run:', e));
         setInterval(() => {
+          if (!isCronEnabled()) return;
           runLinkedInConnectionSync().catch(e => console.error('[linkedInConnectionSync] Error:', e));
         }, LI_CONN_INTERVAL_MS);
         console.log('[linkedInConnectionSync] Initialized — running every 10 minutes');
@@ -586,6 +600,7 @@ createTestAccount().then(async () => {
         const META_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
         runMetaTokenRefresh().catch(e => console.error('[metaTokenRefreshCron] Error on first run:', e));
         setInterval(() => {
+          if (!isCronEnabled()) return;
           runMetaTokenRefresh().catch(e => console.error('[metaTokenRefreshCron] Error:', e));
         }, META_REFRESH_INTERVAL_MS);
         console.log('[metaTokenRefreshCron] Initialized — running every 12 hours');
@@ -617,8 +632,10 @@ createTestAccount().then(async () => {
 
           console.log(`[OnboardingLoop] Initialized — first run at 15:00 UTC (in ${Math.round(msUntilLoop / 60000)} min)`);
           setTimeout(() => {
+            if (!isCronEnabled()) return;
             runOnboardingLoop().catch(e => console.error('[OnboardingLoop] Error:', e));
             setInterval(() => {
+              if (!isCronEnabled()) return;
               runOnboardingLoop().catch(e => console.error('[OnboardingLoop] Error:', e));
             }, LOOP_INTERVAL_MS);
           }, msUntilLoop);
@@ -634,6 +651,7 @@ createTestAccount().then(async () => {
           console.log('[OnboardingWatchdog] Initialized — running hourly');
           runOnboardingLoopWatchdog().catch(e => console.error('[OnboardingWatchdog] Error on first run:', e));
           setInterval(() => {
+            if (!isCronEnabled()) return;
             runOnboardingLoopWatchdog().catch(e => console.error('[OnboardingWatchdog] Error:', e));
           }, WATCHDOG_INTERVAL_MS);
         } catch (error) {
@@ -665,8 +683,10 @@ createTestAccount().then(async () => {
             `[AiEvalLoop] Initialized — first run at 16:00 UTC (in ${Math.round(msUntilAiEval / 60000)} min)`,
           );
           setTimeout(() => {
+            if (!isCronEnabled()) return;
             runAiEvalLoopOnce().catch(e => console.error('[AiEvalLoop] Error:', e));
             setInterval(() => {
+              if (!isCronEnabled()) return;
               runAiEvalLoopOnce().catch(e => console.error('[AiEvalLoop] Error:', e));
             }, AI_EVAL_LOOP_INTERVAL_MS);
           }, msUntilAiEval);
@@ -699,8 +719,10 @@ createTestAccount().then(async () => {
             `[AiReadinessLoop] Initialized — first run at 16:30 UTC (in ${Math.round(msUntilReadiness / 60000)} min)`,
           );
           setTimeout(() => {
+            if (!isCronEnabled()) return;
             runAiReadinessLoopOnce().catch(e => console.error('[AiReadinessLoop] Error:', e));
             setInterval(() => {
+              if (!isCronEnabled()) return;
               runAiReadinessLoopOnce().catch(e => console.error('[AiReadinessLoop] Error:', e));
             }, AI_READINESS_LOOP_INTERVAL_MS);
           }, msUntilReadiness);
@@ -732,8 +754,10 @@ createTestAccount().then(async () => {
             `[OnboardingLoopV2] Initialized — first run at 17:00 UTC (in ${Math.round(msUntilObV2 / 60000)} min)`,
           );
           setTimeout(() => {
+            if (!isCronEnabled()) return;
             runOnboardingLoopV2Once().catch(e => console.error('[OnboardingLoopV2] Error:', e));
             setInterval(() => {
+              if (!isCronEnabled()) return;
               runOnboardingLoopV2Once().catch(e => console.error('[OnboardingLoopV2] Error:', e));
             }, ONBOARDING_V2_INTERVAL_MS);
           }, msUntilObV2);
@@ -768,8 +792,10 @@ createTestAccount().then(async () => {
             `[AgentModeLoop] Initialized — first run at 17:30 UTC (in ${Math.round(msUntilAgentMode / 60000)} min)`,
           );
           setTimeout(() => {
+            if (!isCronEnabled()) return;
             runAgentModeLoopOnce().catch(e => console.error('[AgentModeLoop] Error:', e));
             setInterval(() => {
+              if (!isCronEnabled()) return;
               runAgentModeLoopOnce().catch(e => console.error('[AgentModeLoop] Error:', e));
             }, AGENT_MODE_INTERVAL_MS);
           }, msUntilAgentMode);
@@ -802,8 +828,10 @@ createTestAccount().then(async () => {
             `[AgentReliabilitySnapshot] Initialized — first run at 17:45 UTC (in ${Math.round(msUntilSnapshot / 60000)} min)`,
           );
           setTimeout(() => {
+            if (!isCronEnabled()) return;
             runAgentReliabilitySnapshot().catch(e => console.error('[AgentReliabilitySnapshot] Error:', e));
             setInterval(() => {
+              if (!isCronEnabled()) return;
               runAgentReliabilitySnapshot().catch(e => console.error('[AgentReliabilitySnapshot] Error:', e));
             }, SNAPSHOT_INTERVAL_MS);
           }, msUntilSnapshot);
@@ -835,8 +863,10 @@ createTestAccount().then(async () => {
             `[LoopAttribution] Initialized — first run at 18:00 UTC (in ${Math.round(msUntilAttribution / 60000)} min)`,
           );
           setTimeout(() => {
+            if (!isCronEnabled()) return;
             runLoopAttributionOnce().catch(e => console.error('[LoopAttribution] Error:', e));
             setInterval(() => {
+              if (!isCronEnabled()) return;
               runLoopAttributionOnce().catch(e => console.error('[LoopAttribution] Error:', e));
             }, LOOP_ATTRIBUTION_INTERVAL_MS);
           }, msUntilAttribution);

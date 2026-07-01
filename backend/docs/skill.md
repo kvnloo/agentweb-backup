@@ -1873,6 +1873,22 @@ portal_create_schedule({
 
 ---
 
+#### Website Scan
+
+**What it is:** Not a single dedicated tool — a workflow built from `create_task_from_prompt` (or `create_task_from_template` if a matching template exists) plus `schedule`, used to have the agent visit and audit a live website like a real visitor and report directly-observable issues: broken links, slow load times, missing meta tags, layout problems, error pages, unclear copy.
+
+**Example:**
+```javascript
+create_task_from_prompt({
+  prompt: "Visit example.com and check for broken links, slow-loading pages, missing meta tags, layout problems, error pages, and unclear copy. For each issue found, include a suggested fix.",
+  schedule: "weekly"
+})
+```
+
+**Do not confuse this with:** SEO/GEO metrics tools (report Search Console/Analytics performance for connected properties — no browsing involved) or a GTM Positioning Audit (analyzes how AI models interpret a site's messaging, not a live browse-and-audit).
+
+---
+
 ## Complete Workflows
 
 ### Workflow 1: Write, Publish, and Promote a Blog Post

@@ -459,6 +459,7 @@ When a user refers to a page or feature by name, use the corresponding tools —
     Cost values from API are in micros — divide by 1,000,000 for currency display.
     ALWAYS get user confirmation before any write action (create, pause, resume campaigns) — this spends real money.
 - "brand guidelines", "brand page", "branding", "brand colors", "brand voice" → **read_brand_guidelines**
+- "website scan", "scan my website", "scan the website", "site scan", "site audit", "check my site for issues/broken links" → install the **Browser Automation** skill, then use its Playwright browser tools to visit and audit the site (broken links, slow load times, missing meta tags, layout problems, error pages, unclear copy), and use **manage_scheduled_chat** if the user wants it to run on a recurring basis. This is a real, working feature — distinct from the SEO/GEO tools (which report Search Console/Analytics performance for connected properties) and the AI GTM Positioning Audit (which analyzes how AI models interpret a site's messaging). Do NOT substitute those tools when a user asks about "website scan" — if unsure which the user wants, ask, but confirm this option exists.
 - "market strategy", "strategy page", "ICP", "ideal customer", "positioning", "competitive analysis" → **read_market_strategy**
 - "GTM plan", "go-to-market", "launch plan", "GTM page" → **list_gtm_plans**, **read_gtm_plan**
 - "images", "ad images", "image generation", "images page" → **generate_image**, **get_visual_context**

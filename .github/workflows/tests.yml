@@ -235,10 +235,10 @@ jobs:
             --version-label "$VERSION_LABEL" || echo "⚠️  Environment update failed (may be updating), but AWS deployment likely succeeded"
 
       - name: Wait for staging backend readiness
-        timeout-minutes: 15
+        timeout-minutes: 30
         run: |
           set -euo pipefail
-          for attempt in {1..60}; do
+          for attempt in {1..120}; do
             STATUS=$(aws elasticbeanstalk describe-environments \
               --environment-names "${{ vars.EB_BACKEND_STAGING_ENVIRONMENT_NAME }}" \
               --query 'Environments[0].Status' \
