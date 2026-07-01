@@ -200,6 +200,57 @@ describe('AgentModeService - composeVideo', () => {
         })
       );
     });
+
+    // Regression (ENG-123): the compose_video tool advertises audio_url/audio_volume
+    // and remotionService.compose + the BrandedVideo composition both support an audio
+    // track, but composeVideo used to enumerate brand fields and silently drop the
+    // voiceover — so a spot composed via compose_video shipped SILENT.
+    it('should forward voiceover audioUrl and audioVolume to remotionService.compose', async () => {
+      mockRemotionService.compose.mockResolvedValue({
+        success: true,
+        videoUrl: 'https://s3.example.com/out.mp4',
+        filename: 'out.mp4',
+      });
+
+      await (agentModeService as any).composeVideo(
+        ['https://s3.example.com/clip1.mp4'],
+        'out.mp4',
+        'user1',
+        'session1',
+        {
+          ...baseComposeParams,
+          audioUrl: 'https://s3.example.com/voiceover.mp3',
+          audioVolume: 0.8,
+        }
+      );
+
+      expect(mockRemotionService.compose).toHaveBeenCalledWith(
+        expect.objectContaining({
+          audioUrl: 'https://s3.example.com/voiceover.mp3',
+          audioVolume: 0.8,
+        })
+      );
+    });
+
+    it('should not attach an audio track when no voiceover is provided', async () => {
+      mockRemotionService.compose.mockResolvedValue({
+        success: true,
+        videoUrl: 'https://s3.example.com/out.mp4',
+        filename: 'out.mp4',
+      });
+
+      await (agentModeService as any).composeVideo(
+        ['https://s3.example.com/clip1.mp4'],
+        'out.mp4',
+        'user1',
+        'session1',
+        baseComposeParams
+      );
+
+      const passed = mockRemotionService.compose.mock.calls[0][0];
+      expect(passed.audioUrl).toBeUndefined();
+      expect(passed.audioVolume).toBeUndefined();
+    });
   });
 
   describe('Tool registration', () => {
