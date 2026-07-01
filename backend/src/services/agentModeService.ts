@@ -3275,9 +3275,13 @@ export class AgentModeService {
         try {
           const finalizeLedger: FinalizeLedgerEntry[] = toolCalls.map((tc: any): FinalizeLedgerEntry => ({
             toolName: tc.name,
+            // A suppressed same-turn duplicate (duplicateOf) and a budget-deferred
+            // media call never EXECUTED — neither may back a claim on its own (the
+            // original executed call has its own ledger entry), so both map to
+            // 'deferred' (non-backing) rather than 'success'.
             status: tc.error !== undefined
               ? 'error'
-              : (tc.result && (tc.result as any).deferred === true ? 'deferred' : 'success'),
+              : (tc.duplicateOf || (tc.result && (tc.result as any).deferred === true) ? 'deferred' : 'success'),
             result: tc.result,
           }));
           const guardOutcome = await runFinalizeGuard({
