@@ -26,6 +26,18 @@
  */
 
 import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
+// OTel spine (ENG-141). Direct imports, NOT ports: both are pure/inert without
+// exporter env config (spans become no-ops), so they don't entangle the module
+// or affect the characterization contract — telemetry only, never behavior.
+import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
+import { endExecuteToolSpan, startRunChildSpan } from '../../../observability/tracing';
+import {
+  ATTR_GEN_AI_OPERATION_NAME,
+  ATTR_GEN_AI_TOOL_NAME,
+  ATTR_SESSION_ID,
+  GEN_AI_OP_EXECUTE_TOOL,
+  SPAN_EXECUTE_TOOL_PREFIX,
+} from '../../../observability/semconv';
 
 /**
  * Media-generation tools whose batches must run sequentially (rate limits) AND are
@@ -489,25 +501,44 @@ export async function executePreparedTools(
 
   let toolResults: DispatchToolResult[];
 
-  const runOne = (toolCall: any, functionArgs: any, policyDecision: AgentToolPolicyDecision) =>
-    ports.executeAgentToolThroughGateway({
-      toolName: toolCall.function.name,
-      args: functionArgs,
-      policyDecision,
-      runId: agentRuntimeRunId,
-      budgetScopeId: sessionId,
-      execute: () => ports.executePreparedAgentTool({
-        llmModel,
-        toolName: toolCall.function.name,
-        functionArgs,
-        userId,
-        sessionId,
-        mockMode,
-        socketEmit: ports.socketEmit,
-        screenshotUrl,
-        isDelegatedAccess,
-      }),
+  const runOne = async (toolCall: any, functionArgs: any, policyDecision: AgentToolPolicyDecision): Promise<ToolExecOutcome> => {
+    // OTel `execute_tool` span (ENG-141) — observability only; the gateway call,
+    // its outcome shape, and error propagation are untouched.
+    const span = startRunChildSpan(agentRuntimeRunId, `${SPAN_EXECUTE_TOOL_PREFIX} ${toolCall.function.name}`, {
+      [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OP_EXECUTE_TOOL,
+      [ATTR_GEN_AI_TOOL_NAME]: toolCall.function.name,
+      [ATTR_SESSION_ID]: sessionId,
     });
+    try {
+      const outcome = await ports.executeAgentToolThroughGateway({
+        toolName: toolCall.function.name,
+        args: functionArgs,
+        policyDecision,
+        runId: agentRuntimeRunId,
+        budgetScopeId: sessionId,
+        execute: () => ports.executePreparedAgentTool({
+          llmModel,
+          toolName: toolCall.function.name,
+          functionArgs,
+          userId,
+          sessionId,
+          mockMode,
+          socketEmit: ports.socketEmit,
+          screenshotUrl,
+          isDelegatedAccess,
+        }),
+      });
+      endExecuteToolSpan(span, outcome.status === 'error'
+        ? { errorClass: classifyToolErrorClass(outcome.error), error: outcome.error }
+        : {});
+      return outcome;
+    } catch (err) {
+      // The gateway normalizes tool failures into outcomes; a throw here is
+      // unexpected — record it on the span and rethrow unchanged.
+      endExecuteToolSpan(span, { errorClass: classifyToolErrorClass(err), error: err });
+      throw err;
+    }
+  };
 
   const toDispatchResult = (
     outcome: ToolExecOutcome,

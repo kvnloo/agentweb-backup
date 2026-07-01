@@ -111,6 +111,25 @@ import { HubSpotService } from './hubspotService';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
+import { computeRunVerdict } from '../loops/instances/agent-mode/runRecorder';
+// OTel spine (ENG-141) — inert no-ops unless exporter env config is present.
+import {
+  endChatSpan,
+  endInvokeAgentSpan,
+  getRunTraceId,
+  recordSpanError,
+  startInvokeAgentSpan,
+  startRunChildSpan,
+} from '../observability/tracing';
+import {
+  ATTR_GEN_AI_OPERATION_NAME,
+  ATTR_GEN_AI_PROVIDER_NAME,
+  ATTR_GEN_AI_REQUEST_MODEL,
+  ATTR_SESSION_ID,
+  GEN_AI_OP_CHAT,
+  SPAN_CHAT_PREFIX,
+  providerForModel,
+} from '../observability/semconv';
 import {
   AgentToolPolicyDecision,
   executeAgentToolThroughGateway,
@@ -256,15 +275,29 @@ function recordAgentModeRunStarted(
   runId: string,
   info: { llmModel?: string; sessionType?: string; userId?: string; sessionId?: string },
 ): void {
+  // OTel spine (ENG-141): the invoke_agent span opens here and closes in
+  // recordAgentModeRunCompleted/Failed — the run-telemetry lifecycle exactly.
+  // The traceId is bridged into the recorder's agent_run_started dimensions so
+  // Dev-AW-LoopEvents rows can be joined to Langfuse/Okareo traces by ID.
+  startInvokeAgentSpan(runId, info);
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
-  void recorder.runStarted(runId, info);
+  const traceId = getRunTraceId(runId);
+  void recorder.runStarted(runId, traceId ? { ...info, traceId } : info);
 }
 
 function recordAgentModeRunCompleted(
   runId: string,
   info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
 ): void {
+  endInvokeAgentSpan(runId, {
+    verdict: computeRunVerdict({
+      failed: false,
+      toolCalls: info.toolCalls ?? 0,
+      failedToolCalls: info.failedToolCalls ?? 0,
+      maxSameToolFailures: info.maxSameToolFailures,
+    }).verdict,
+  });
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runCompleted(runId, info);
@@ -274,6 +307,7 @@ function recordAgentModeRunFailed(
   runId: string,
   info: { error: unknown; toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
 ): void {
+  endInvokeAgentSpan(runId, { verdict: 'failed', error: info.error });
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runFailed(runId, info);
@@ -2837,6 +2871,15 @@ export class AgentModeService {
         // Make LLM call (with backup model fallback on transient errors)
         const llmStart = Date.now();
         let response: any;
+        // OTel `chat` span (ENG-141): brackets the primary call AND the backup
+        // retry; the `finally` closes it with the FINAL model + usage attrs
+        // (response undefined there = both attempts threw → status ERROR).
+        const chatSpan = startRunChildSpan(agentRuntimeRunId, `${SPAN_CHAT_PREFIX} ${llmModel}`, {
+          [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OP_CHAT,
+          [ATTR_GEN_AI_REQUEST_MODEL]: llmModel,
+          [ATTR_GEN_AI_PROVIDER_NAME]: providerForModel(llmModel),
+          [ATTR_SESSION_ID]: sessionId,
+        });
         try {
           response = await this.callLLM(llmModel, trimmedMessages, {
             tools: filteredToolsCache,
@@ -2868,11 +2911,15 @@ export class AgentModeService {
                 usageContext: { userId, sessionId, feature: 'agent_task' }
               });
             } else {
+              recordSpanError(chatSpan, callError);
               throw callError;
             }
           } else {
+            recordSpanError(chatSpan, callError);
             throw callError;
           }
+        } finally {
+          endChatSpan(chatSpan, { model: llmModel, response, inputMessages: trimmedMessages });
         }
         const llmDurationMs = Date.now() - llmStart;
 
