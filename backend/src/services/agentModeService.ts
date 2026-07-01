@@ -20063,6 +20063,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         logoUrl: composeParams.logoUrl,
         ctaText: composeParams.ctaText,
         ctaUrl: composeParams.ctaUrl,
+        // Forward the optional voiceover track so a spot composed via compose_video is
+        // never shipped silent (ENG-123). remotionService.compose + the BrandedVideo
+        // composition both support an audio overlay; omitting these here dropped it.
+        audioUrl: composeParams.audioUrl,
+        audioVolume: composeParams.audioVolume,
         clipUrl: clipUrls[0],
         extraClipUrls: clipUrls.slice(1),
         clipDurationSeconds: clipDurationSeconds ?? 8,
