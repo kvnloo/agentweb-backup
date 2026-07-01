@@ -15,6 +15,9 @@ Title: {{TITLE}}
 
 {{DESCRIPTION}}
 
+Referenced production session context (read-only; use it to verify the fix targets the real root cause):
+{{SESSION_CONTEXT}}
+
 ## The full project is in your working directory
 
 Read any file you need. The change under review is on the current branch; the diff:

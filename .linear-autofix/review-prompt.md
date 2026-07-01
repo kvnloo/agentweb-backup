@@ -14,6 +14,9 @@ Title: {{TITLE}}
 
 {{DESCRIPTION}}
 
+Referenced production session context (read-only; use it to check the root-cause claim):
+{{SESSION_CONTEXT}}
+
 ## The full project is in your working directory
 
 Read any file you need for context (both repos are present). The change under review is on the

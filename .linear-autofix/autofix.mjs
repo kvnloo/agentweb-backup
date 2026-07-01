@@ -12,6 +12,7 @@ import net from 'node:net';
 import path from 'node:path';
 import { config } from './config.mjs';
 import { resolveIssue, addComment, findStateId, moveIssue } from './linear.mjs';
+import { findSessionId, fetchItem, summarizeSession } from './tools/session.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '..'); // the agentweb (main) repo root
@@ -157,9 +158,11 @@ async function main() {
   // Build the fixer prompt.
   const comments = (issue.comments?.nodes || []).map((c) => `- ${c.user?.name || 'someone'}: ${c.body}`).join('\n') || '(none)';
   const repoLayout = config.repos.map((r) => `- ${r.mount === '.' ? '(workspace root)' : r.mount + '/'} — ${r.key}: ${r.description}`).join('\n');
+  const sessionContext = computeSessionContext([issue.description, ...(issue.comments?.nodes || []).map((c) => c.body)].filter(Boolean).join('\n'));
+  log(`Session context: ${sessionContext.startsWith('(no session') ? 'none referenced' : 'attached'}`);
   const prompt = fillTemplate(readFileSync(path.join(__dirname, 'prompt.md'), 'utf8'), {
     IDENTIFIER: id, TITLE: issue.title, DESCRIPTION: issue.description || '(no description)',
-    COMMENTS: comments, URL: issue.url, BRANCH: branch, REPO_LAYOUT: repoLayout,
+    COMMENTS: comments, URL: issue.url, BRANCH: branch, REPO_LAYOUT: repoLayout, SESSION_CONTEXT: sessionContext,
   });
 
   // Run claude -p at the workspace root, on your subscription. The fixer only COMMITS; the PR is
@@ -189,7 +192,7 @@ async function main() {
 
     // --- Code review gate: experts -> manager -> re-fix (BEFORE the PR and BEFORE browser verify) ---
     if (config.review?.enabled) {
-      try { review = await runReview(issue, WT, changed, branch); }
+      try { review = await runReview(issue, WT, changed, branch, sessionContext); }
       catch (e) { log('Review error:', e.message); }
       changed = detectChangedRepos(WT); // a re-fix may have added commits (or reverted to none)
     }
@@ -337,6 +340,16 @@ function prFromWorktree(cwd) {
   return r.status === 0 && r.stdout.trim() ? r.stdout.trim() : null;
 }
 
+// If the issue text names a session, pull a read-only summary from prod DynamoDB so the fixer and
+// reviewers can confirm the root cause against real data. Best-effort — never throws.
+function computeSessionContext(text) {
+  const sid = findSessionId(text);
+  if (!sid) return '(No session referenced in this issue.)';
+  const { item, error } = fetchItem(sid);
+  if (error) return `(Referenced session ${sid} — could not fetch: ${error})`;
+  return `Session ${sid} (production, read-only):\n${summarizeSession(item)}`;
+}
+
 // Which repos actually have local commits on the branch.
 function detectChangedRepos(WT) {
   const found = [];
@@ -401,12 +414,12 @@ function repoDiff(WT, changed) {
   return out;
 }
 
-async function runReview(issue, WT, changed, branch) {
+async function runReview(issue, WT, changed, branch, sessionContext = '') {
   const id = issue.identifier;
   const diff = repoDiff(WT, changed);
   const lenses = [...new Set(config.review.lenses || [])].filter((l) => LENS_FOCUS[l]);
   if (!lenses.length || !diff) { log('Review skipped (no lenses or empty diff).'); return null; }
-  const issueMap = { IDENTIFIER: id, TITLE: issue.title, DESCRIPTION: issue.description || '(no description)' };
+  const issueMap = { IDENTIFIER: id, TITLE: issue.title, DESCRIPTION: issue.description || '(no description)', SESSION_CONTEXT: sessionContext || '(none)' };
   const reviewArgs = () => claudeArgs({ model: config.review.model, maxTurns: config.review.maxTurns, skipPermissions: true });
 
   // 1. Expert reviewers, one per lens. Templated once with the (large) shared diff, then only the
