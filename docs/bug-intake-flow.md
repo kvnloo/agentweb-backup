@@ -14,7 +14,8 @@
 - **Featurebase** — customer-facing surface. Bugs = private per-reporter *tickets* (only the reporter
   sees their own). Feature requests = public votable *posts*.
 - **Linear (ENG team)** — engineering source of truth. One **canonical** issue per distinct bug.
-  Customer-reported items land in **Triage** (accept/decline/prioritize) before entering the board.
+  User-filed bugs land directly on the **board (Backlog)** so they're tracked and never lost. Triage
+  is reserved for *unvetted external* intake (Featurebase's public board), not our real bug reports.
 - **Our backend** (`intakeService`) — the matcher/router: creates the Featurebase ticket, dedups
   against open canonicals, creates-or-groups the Linear canonical, and bridges status back to reporters.
 
@@ -45,7 +46,7 @@
 | Public roadmap for feature requests | **Featurebase** | public votable posts |
 | "Same bug?" dedup (similar → one canonical) | **our code** | `dedupService` LLM judge (below) |
 | Non-lossy multi-reporter grouping | **our code today** (`[reporter-ticket]` comments) → *recommended:* **Linear Customer Requests** (native count) | see Open Decisions |
-| Land customer bugs in Triage | **Linear** (triage enabled) + our code sets triage state | canonical created in Triage |
+| Land user-filed bugs on the **Board** (Backlog), never gated | **our code** | canonical created in Backlog, never Triage — bugs must not be lost |
 | Assign to Harshit | **Linear** (native) | Triage Rule "on enter → assignee = Harshit" or Triage Responsibility |
 | Priority ≥Med@2 / ≥High@3 | **Linear** (target) | not native on reporter-count; via Customer-Requests count + Triage Automation, or manual triage — see Open Decisions |
 | Status-change comms to reporters | **our code** | Linear webhook → resolve bridge |
@@ -82,12 +83,16 @@ platform-native path is Linear **Customer Requests** (counts reporters natively)
   their reports. (Featurebase may provide a portal — verify.)
 
 ## Decisions (2026-07-01 — "value without adding complexity/spaghetti to our code")
-- **DO — ENG-6 (in progress):** route customer/auto issues into **Triage**, drop telemetry-noise
-  sources from issue creation, delete the Notion `createOncallItem` fallback. Pure subtraction.
+- **CORRECTION (2026-07-01):** user-filed bugs go on the **board (Backlog)**, NOT Triage — Triage
+  risks real bugs being lost if the inbox isn't cleared. Triage is only for unvetted *external*
+  intake (Featurebase public board). The flood was solved by *dropping* telemetry issue-creation,
+  not by gating.
+- **DO — ENG-6:** user-filed bugs + auto-issues land on the **Board (Backlog)** (not Triage); drop
+  telemetry-noise sources from issue creation; delete the Notion `createOncallItem` fallback. Pure subtraction.
 - **DO — assign to Harshit:** Linear-native — set **Triage Responsibility → Harshit** (one setting).
   No code.
-- **DO — priority floor (2→≥Med, 3→≥High) as a *triage guideline*, enforced by the human accepting
-  from Triage.** Reporter count is already visible in the canonical's `[reporter-ticket]` comments.
+- **DO — priority floor (2→≥Med, 3→≥High) as a *guideline*, applied by whoever grooms the board.**
+  Reporter count is already visible in the canonical's `[reporter-ticket]` comments.
   **No code, no automation** — Linear can't set priority from a running reporter count natively, and
   the only automatic options both add cost (a business-rule line in our code, or the Customer-Requests
   migration). Not worth it at current volume.
