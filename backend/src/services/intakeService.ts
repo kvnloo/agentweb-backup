@@ -1,15 +1,16 @@
 /**
  * Issue intake orchestration — one place that decides where a filing goes.
  *
- * The FEATUREBASE_INTAKE flag is an EXPLICIT migration switch (Linear when on, Notion
- * when off — the off branch is deleted once the migration completes). It is NOT an
- * on-error fallback: we do not silently reroute a failed Linear write to Notion.
- * Instead we fail well —
+ * Linear/Featurebase is the SINGLE unconditional path (the old FEATUREBASE_INTAKE migration
+ * switch and its Notion fallback were removed — there is one path, no fallback). We fail well:
  *   - non-critical sub-steps (dedup search, upvote, comment) are best-effort and degrade
  *     in place (dedup fails -> treat as new; upvote/comment fails -> still filed),
- *   - a core create failure propagates so the caller surfaces it (user-filed -> the user
+ *   - a core create failure PROPAGATES so the caller surfaces it (user-filed -> the user
  *     is told it didn't file; auto -> the call site logs and moves on, since a failed
- *     self-report must never break the user's real request).
+ *     self-report must never break the user's real request). We never reroute to another tracker.
+ *
+ * Filing is suppressed outside production (dev/staging return an empty result without touching
+ * the shared boards) — the same dev-suppress the deleted Notion path had.
  *
  * Two entry points:
  *  - fileUserIssue:  USER-filed feature/bug (Emma report_product_issues + the in-app
@@ -23,8 +24,12 @@
 
 const FEATUREBASE_BOARD_URL = 'https://agentweb.featurebase.app/';
 
-function intakeEnabled(): boolean {
-  return process.env.FEATUREBASE_INTAKE === 'true';
+/**
+ * Filing to Linear/Featurebase is suppressed outside production so dev/staging don't spam the
+ * shared boards — mirrors the dev-suppress the deleted Notion path had.
+ */
+function intakeSuppressedInDev(): boolean {
+  return process.env.NODE_ENV !== 'production';
 }
 
 function contextLines(context?: Record<string, any>): string[] {
@@ -45,30 +50,24 @@ export interface FileUserIssueParams {
   reportedByAdmin?: string;
   /** Chat session id of the reporter, so eng can jump straight to the offending session. */
   sessionId?: string;
-  /** Tags + context for the Notion path (flag off). */
+  /** Source tags (e.g. "Customer Reported" / "MCP Reported") + structured context. Context feeds
+   *  the Linear/Featurebase description + comments; tags are retained metadata from the caller. */
   notionTags?: string[];
   notionContext?: Record<string, any>;
 }
 
 export interface FiledUserResult {
-  pageId: string;       // Featurebase post id (or Notion pageId when the flag is off)
-  trackerUrl: string;   // internal tracker link (Featurebase post / Notion page)
+  pageId: string;       // Featurebase post id ('' when suppressed in dev)
+  trackerUrl: string;   // internal tracker link (Featurebase post)
   userUrl?: string;     // public, user-facing Featurebase post link
   deduped: boolean;
-  tracker: 'Featurebase' | 'Notion';
+  tracker: 'Featurebase';
 }
 
 export async function fileUserIssue(p: FileUserIssueParams): Promise<FiledUserResult> {
-  // Migration switch (NOT a fallback): off -> Notion, the pre-migration default.
-  if (!intakeEnabled()) {
-    const { createOncallItem } = await import('./notionService');
-    const o = await createOncallItem({
-      title: p.title,
-      description: p.description,
-      additionalTags: p.notionTags || ['Customer Reported'],
-      context: p.notionContext,
-    });
-    return { pageId: o.pageId, trackerUrl: o.notionUrl, deduped: false, tracker: 'Notion' };
+  if (intakeSuppressedInDev()) {
+    console.log(`[DEV] Suppressed issue intake (user): ${p.title}`);
+    return { pageId: '', trackerUrl: '', deduped: false, tracker: 'Featurebase' };
   }
 
   // Featurebase-first. Bugs -> a private per-reporter TICKET (their own card) grouped onto a
@@ -205,17 +204,18 @@ export interface FileAutoIssueParams {
   source: string;
   /** Extra Linear labels beyond "Auto" (e.g. ["Scheduled Chat"]). Unknown names are dropped. */
   extraLabels?: string[];
-  /** Tags + context for the Notion path (flag off). */
+  /** Source tags + structured context. Context feeds the Linear description + recur comment;
+   *  tags are retained metadata from the caller. */
   notionTags?: string[];
   notionContext?: Record<string, any>;
 }
 
 export interface FiledAutoResult {
   pageId: string;
-  /** Link to the filed item (Linear issue or Notion page), for alert emails. */
+  /** Link to the filed Linear issue, for alert emails. */
   url?: string;
   deduped: boolean;
-  tracker: 'Linear' | 'Notion';
+  tracker: 'Linear';
 }
 
 const LINEAR_ISSUE_BASE = 'https://linear.app/emmabyaw/issue';
@@ -226,16 +226,9 @@ const LINEAR_ISSUE_BASE = 'https://linear.app/emmabyaw/issue';
  * failure rather than rerouting to another tracker.
  */
 export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoResult> {
-  // Migration switch (NOT a fallback): off -> Notion.
-  if (!intakeEnabled()) {
-    const { createOncallItem } = await import('./notionService');
-    const o = await createOncallItem({
-      title: p.title,
-      description: p.description,
-      additionalTags: p.notionTags || ['Oncall'],
-      context: p.notionContext,
-    });
-    return { pageId: o.pageId, url: o.notionUrl, deduped: false, tracker: 'Notion' };
+  if (intakeSuppressedInDev()) {
+    console.log(`[DEV] Suppressed issue intake (auto): ${p.title}`);
+    return { pageId: '', deduped: false, tracker: 'Linear' };
   }
 
   const { listOpenIssuesByLabel, addIssueComment, createInternalLinearIssue } = await import('./linearService');

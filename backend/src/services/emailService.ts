@@ -1762,8 +1762,8 @@ View Session: ${sessionUrl}`;
       const envLabel = env === 'production' ? 'PROD' : env.toUpperCase();
 
       // File a tracked oncall item if no URL was provided. Routes via the shared intake
-      // service: behind FEATUREBASE_INTAKE this creates a PRIVATE Linear issue (Auto label,
-      // deduped by title) instead of Notion. Best-effort — a filing failure just means the
+      // service, which creates a PRIVATE Linear issue (Auto label, deduped by title). Single
+      // unconditional path, no Notion fallback. Best-effort — a filing failure just means the
       // alert email carries full details instead of a link.
       let resolvedNotionUrl = notionUrl || null;
       if (!resolvedNotionUrl) {
@@ -1774,8 +1774,6 @@ View Session: ${sessionUrl}`;
             description: message,
             source: 'Oncall alert',
             extraLabels: ['Oncall'],
-            // notionTags [] -> createOncallItem still adds its internal "Oncall" tag, so the
-            // Notion-path behaviour is unchanged (no duplicate Oncall tag).
             notionTags: [],
             notionContext: context,
           });
@@ -1790,7 +1788,7 @@ View Session: ${sessionUrl}`;
       let text: string;
 
       if (resolvedNotionUrl) {
-        // Slim email with Notion link
+        // Slim email with Linear link
         html = `
         <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f8f9fa;">
           <div style="background-color: #dc3545; color: white; padding: 20px; border-radius: 8px 8px 0 0;">
@@ -1799,18 +1797,18 @@ View Session: ${sessionUrl}`;
           <div style="background-color: white; padding: 20px; border-radius: 0 0 8px 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
             <h2 style="color: #dc3545; margin-top: 0;">${this.escapeHtml(subject)}</h2>
             <div style="margin: 20px 0;">
-              <a href="${this.escapeHtml(resolvedNotionUrl)}" style="display: inline-block; padding: 12px 24px; background-color: #dc3545; color: white; text-decoration: none; border-radius: 6px; font-weight: bold;">View in Notion</a>
+              <a href="${this.escapeHtml(resolvedNotionUrl)}" style="display: inline-block; padding: 12px 24px; background-color: #dc3545; color: white; text-decoration: none; border-radius: 6px; font-weight: bold;">View in Linear</a>
             </div>
             <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #e9ecef; color: #6c757d; font-size: 12px;">
-              <p>Full details available in the Notion item above.</p>
+              <p>Full details available in the Linear issue above.</p>
             </div>
           </div>
         </div>
         `;
 
-        text = `⚠️ [${envLabel}] Oncall Alert\n\n${subject}\n\nNotion: ${resolvedNotionUrl}`;
+        text = `⚠️ [${envLabel}] Oncall Alert\n\n${subject}\n\nLinear: ${resolvedNotionUrl}`;
       } else {
-        // Full detail email (fallback when Notion creation failed)
+        // Full detail email (fallback when Linear creation failed)
         const contextHtml = context
           ? Object.entries(context)
             .map(([key, value]) => {

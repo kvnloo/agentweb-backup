@@ -301,9 +301,9 @@ router.post("/report-ui-bug", async (req, res) => {
       issueContext["Reported By (Admin)"] = adminEmail;
     }
 
-    // File the user-reported issue. Behind FEATUREBASE_INTAKE this dedups and creates a
-    // public, votable canonical in Linear (Featurebase-mirrored); flag off -> Notion. Same
-    // shared path as Emma's report_product_issues tool.
+    // File the user-reported issue via the shared intake service: dedups and creates a
+    // public, votable canonical in Linear (Featurebase-mirrored). Single unconditional path,
+    // no Notion fallback. Same shared path as Emma's report_product_issues tool.
     const reportItemType: 'feature_request' | 'bug' = typeKey === 'bug' ? 'bug' : 'feature_request';
     const { fileUserIssue } = await import('../services/intakeService');
     const filed = await fileUserIssue({

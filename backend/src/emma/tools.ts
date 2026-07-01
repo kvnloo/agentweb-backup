@@ -6887,9 +6887,9 @@ emmaToolRegistry.register({
 
         // Route user-filed intake through the shared intake service: dedup -> stack onto an
         // existing public canonical, else create a new one (Featurebase-imported public post).
-        // The FEATUREBASE_INTAKE flag selects Linear vs Notion (migration switch, not a
-        // fallback). A hard failure here propagates to this loop's per-issue catch below,
-        // which records the issue as failed — we do NOT silently reroute to another tracker.
+        // Linear/Featurebase is the single unconditional path (no Notion fallback). A hard
+        // failure here propagates to this loop's per-issue catch below, which records the issue
+        // as failed — we do NOT silently reroute to another tracker.
         const itemType: 'feature_request' | 'bug' = issue.type === 'feature_request' ? 'feature_request' : 'bug';
         const { fileUserIssue } = await import('../services/intakeService');
         const filed = await fileUserIssue({

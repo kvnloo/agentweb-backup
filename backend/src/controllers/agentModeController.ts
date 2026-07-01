@@ -21,7 +21,6 @@ import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
-import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
 import { normalizeEmailList } from '../utils/validation';
 import { getAllowedSkills } from '../services/subscriptionService';
@@ -169,38 +168,18 @@ function getInteractiveShareExpiresAt(share: { expiresAt?: string; sharedAt?: st
 }
 
 /**
- * Auto-files a Notion "Customer Reported" issue for context-limit errors.
- * Skips if the session already has contextLimitReported set (dedup).
+ * Marks a session as having hit the context-limit so repeat hits in the same session don't
+ * re-set the flag (dedup). The oncall alert email is sent separately at the call site. ENG-6
+ * dropped the per-occurrence issue-creation for this telemetry source — the alert is enough.
  */
-async function autoReportContextLimitToNotion(
+function markContextLimitReported(
   sessionId: string | undefined,
-  userEmail: string | undefined,
-  userId: string | undefined,
-  llmModel: string | undefined,
   session: import('../services/chatbotService').ChatSession | null
-): Promise<void> {
+): void {
   if (!sessionId || session?.contextLimitReported) return;
-  try {
-    await fileAutoIssue({
-      title: `Context limit reached - session ${sessionId}`,
-      description: `User hit the context window limit in agent mode.\n\nUser: ${userEmail || 'Unknown'}\nModel: ${llmModel || 'Not specified'}\nSession messages: ${session?.messages?.length ?? 'N/A'}\nSession title: ${session?.title || 'N/A'}`,
-      source: 'Context limit',
-      notionTags: ['Customer Reported', 'Context Limit'],
-      notionContext: {
-        'User ID': userId || 'N/A',
-        'User Email': userEmail || 'N/A',
-        'Session ID': sessionId,
-        'LLM Model': llmModel || 'Not specified',
-        'Session Message Count': session?.messages?.length ?? 'N/A',
-        'Session Title': session?.title || 'N/A',
-      },
-    });
-    chatbotDb.updateSessionContextLimitReported(sessionId).catch(err =>
-      console.error('Failed to set contextLimitReported flag:', err)
-    );
-  } catch (err) {
-    console.error('Failed to create context-limit Notion item:', err);
-  }
+  chatbotDb.updateSessionContextLimitReported(sessionId).catch(err =>
+    console.error('Failed to set contextLimitReported flag:', err)
+  );
 }
 
 /** Classify an error for the diagnosis agent. */
@@ -1551,19 +1530,6 @@ export async function runScheduledChat(
           'Timestamp': finalResult.createdAt
         }
       }).catch(err => console.error('Failed to send oncall alert for scheduled chat failure:', err));
-      fileAutoIssue({
-        title: `Scheduled Chat Failed: ${schedule.scheduleName}`,
-        description: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
-        source: 'Scheduled chat (validation)',
-        extraLabels: ['Scheduled Chat'],
-        notionTags: ['Scheduled Chat'],
-        notionContext: {
-          'Schedule ID': schedule.scheduleId,
-          'User ID': userId,
-          'Session ID': sessionId,
-          'Attempts': finalResult.attempt,
-        }
-      }).catch(err => console.error('Failed to file scheduled-chat-failure issue:', err));
     }
 
     // Also sync Research Reports execution for email campaigns
@@ -1725,27 +1691,6 @@ export async function runScheduledChat(
         'Timestamp': errorResult.createdAt
       }
     }).catch(err => console.error('Failed to send oncall alert for scheduled chat error:', err));
-    fileAutoIssue({
-      title: zeroAssistantOutput
-        ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
-        : `Scheduled Chat Error: ${schedule.scheduleName}`,
-      description: zeroAssistantOutput
-        ? `Scheduled chat "${schedule.scheduleName}" terminated with zero assistant messages.${zeroAssistantRequeuedAt ? ` It was requeued for ${zeroAssistantRequeuedAt}.` : ''}\n\nError: ${errorMessage}${originalMessage ? `\n\nOriginal API error: ${originalMessage}` : ''}`
-        : `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}${originalMessage ? `\n\nOriginal API error: ${originalMessage}` : ''}`,
-      source: 'Scheduled chat (error)',
-      extraLabels: ['Scheduled Chat'],
-      notionTags: ['Scheduled Chat'],
-      notionContext: {
-        'Schedule ID': schedule.scheduleId,
-        'User ID': userId,
-        'Session ID': sessionId || 'N/A',
-        'Is Test Run': isTest ? 'Yes' : 'No',
-        'Zero Assistant Output': zeroAssistantOutput ? 'Yes' : 'No',
-        ...(zeroAssistantRequeuedAt ? { 'Requeued At': zeroAssistantRequeuedAt } : {}),
-        'Error Message': errorMessage,
-        ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
-      }
-    }).catch(err => console.error('Failed to file scheduled-chat-error issue:', err));
 
     // Return error result for error reporting
     return errorResult;
@@ -2792,8 +2737,7 @@ export const agentModeController = {
             }
           }).catch(err => console.error('Failed to send oncall alert:', err));
 
-          autoReportContextLimitToNotion(sessionId, user?.email, user?.userId, llmModel, session)
-            .catch(err => console.error('autoReportContextLimitToNotion failed:', err));
+          markContextLimitReported(sessionId, session);
 
           res.status(413).json({
             error: 'Context limit exceeded',
@@ -3471,8 +3415,7 @@ export const agentModeController = {
             }
           }).catch(err => console.error('Failed to send oncall alert:', err));
 
-          autoReportContextLimitToNotion(shareId, session?.userId, session?.userId, llmModel || session?.llmModel, session)
-            .catch(err => console.error('autoReportContextLimitToNotion failed (shared):', err));
+          markContextLimitReported(shareId, session);
 
           res.status(413).json({
             error: 'Context limit exceeded',
@@ -3785,26 +3728,8 @@ export const agentModeController = {
         console.warn('Failed to propagate message feedback to images:', propagateError);
       }
 
-      // Fire-and-forget: file an item so the team can review positive/negative feedback
-      fileAutoIssue({
-        title: `Agent Mode ${type === 'like' ? 'Like' : 'Dislike'} Feedback – ${session.title || sessionId}`,
-        description: [
-          `User ${user.email} voted ${type} on a message in session "${session.title || sessionId}".`,
-          comment ? `Comment: "${comment}"` : '',
-          '',
-          `Message preview: ${String(message.content || '').slice(0, 300)}`,
-        ].filter(Boolean).join('\n'),
-        source: `Feedback (${type})`,
-        notionTags: [type === 'like' ? 'Feedback-Like' : 'Feedback-Dislike'],
-        notionContext: {
-          sessionId,
-          messageIndex: messageIndexNum,
-          userId: user.userId,
-          userEmail: user.email,
-        },
-      }).catch((err: Error) => {
-        console.warn('Failed to file feedback item:', err.message);
-      });
+      // ENG-6: message-feedback votes are a pure telemetry signal — the vote itself is already
+      // persisted via updateMessageFeedback above, so we no longer file a per-vote Linear issue.
 
       res.json({
         success: true,
@@ -3950,25 +3875,8 @@ export const agentModeController = {
         console.warn('Failed to propagate ishare message feedback to images:', propagateError);
       }
 
-      // Fire-and-forget: file an item for anonymous ishare votes
-      fileAutoIssue({
-        title: `Agent Mode ${type === 'like' ? 'Like' : 'Dislike'} Feedback (iShare) – ${session.title || shareId}`,
-        description: [
-          `Anonymous visitor voted ${type} on a message in shared session "${session.title || shareId}".`,
-          comment ? `Comment: "${comment}"` : '',
-          '',
-          `Message preview: ${String(message.content || '').slice(0, 300)}`,
-        ].filter(Boolean).join('\n'),
-        source: `Feedback iShare (${type})`,
-        notionTags: [type === 'like' ? 'Feedback-Like' : 'Feedback-Dislike'],
-        notionContext: {
-          sessionId: shareId,
-          messageIndex: messageIndexNum,
-          source: 'ishare',
-        },
-      }).catch((err: Error) => {
-        console.warn('Failed to file feedback item (ishare):', err.message);
-      });
+      // ENG-6: iShare feedback votes are a pure telemetry signal — the vote itself is already
+      // persisted via updateMessageFeedback above, so we no longer file a per-vote Linear issue.
 
       res.json({
         success: true,
