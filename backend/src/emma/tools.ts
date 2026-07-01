@@ -6892,19 +6892,25 @@ emmaToolRegistry.register({
         // which records the issue as failed — we do NOT silently reroute to another tracker.
         const itemType: 'feature_request' | 'bug' = issue.type === 'feature_request' ? 'feature_request' : 'bug';
         const { fileUserIssue } = await import('../services/intakeService');
-        const filed = await fileUserIssue({
-          type: itemType,
-          title: issue.title,
-          description,
-          userEmail: user.email,
-          userName: user.displayName || user.email,
-          reportedByAdmin: isDelegatedAdmin && adminEmail ? adminEmail : undefined,
-          sessionId: context?.sessionId,
-          // External MCP clients (Claude Code etc.) are tagged distinctly so benchmark
-          // filters on Customer Reported stay clean (used on the flag-off Notion path).
-          notionTags: [context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported'],
-          notionContext: issueContext,
-        });
+        const INTAKE_TIMEOUT_MS = 30_000;
+        const filed = await Promise.race([
+          fileUserIssue({
+            type: itemType,
+            title: issue.title,
+            description,
+            userEmail: user.email,
+            userName: user.displayName || user.email,
+            reportedByAdmin: isDelegatedAdmin && adminEmail ? adminEmail : undefined,
+            sessionId: context?.sessionId,
+            // External MCP clients (Claude Code etc.) are tagged distinctly so benchmark
+            // filters on Customer Reported stay clean (used on the flag-off Notion path).
+            notionTags: [context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported'],
+            notionContext: issueContext,
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('Issue filing timed out after 30s')), INTAKE_TIMEOUT_MS)
+          ),
+        ]);
         const result = { pageId: filed.pageId, url: filed.trackerUrl, tracker: filed.tracker, deduped: filed.deduped, userUrl: filed.userUrl };
 
         // Never email the customer — internal team + admin (if known) only.
@@ -6913,7 +6919,8 @@ emmaToolRegistry.register({
           : [...productIssueEmails];
 
         const priorityColor = (issue.priority || 'Medium') === 'High' ? '#dc2626' : (issue.priority || 'Medium') === 'Low' ? '#6b7280' : '#d97706';
-        await resendService.sendEmail({
+        // Fire-and-forget — internal notification email; must not block the user-facing response
+        resendService.sendEmail({
           from: `${RESEND_SYSTEM_NAME} Support <${RESEND_SYSTEM_EMAIL}>`,
           to: emailRecipients,
           subject: `[Issue] ${issue.title} — reported by ${user.email}`,
@@ -6946,7 +6953,7 @@ emmaToolRegistry.register({
             </div>
           `,
           replyTo: user.email,
-        });
+        }).catch((e: any) => console.warn('[report_product_issues] notification email failed (non-critical):', e?.message));
 
         results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}`, deduped: result.deduped === true, url: result.url || undefined, trackingUrl: result.userUrl || undefined });
       } catch (err: any) {
