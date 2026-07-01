@@ -8,6 +8,7 @@ import {
   EVT_RUN_COMPLETED,
   EVT_RUN_FAILED,
   EVT_RUN_STARTED,
+  EVT_TOOL_DEFERRED,
   EVT_TOOL_FAILED,
   EVT_TOOL_INVOKED,
   EVT_TOOL_SUCCEEDED,
@@ -287,6 +288,57 @@ describe('agentRunInspectorService', () => {
       lastAssistantMessage: 'I created the requested HTML file and checked the tool results.',
       customerPortalUrl: 'https://app.agentweb.pro/agent-mode/sess-chat-1',
     }));
+  });
+
+  it('accounts deferred tool calls separately from success and failure (ENG-103)', () => {
+    const rows: AgentRunEventRow[] = [
+      {
+        eventType: EVT_RUN_STARTED,
+        subjectId: 'sess-1:run:def',
+        ts: '2026-06-09T22:00:00.000Z',
+        dimensions: { sessionId: 'sess-1' },
+      },
+      {
+        eventType: EVT_TOOL_INVOKED,
+        subjectId: 'sess-1:run:def',
+        ts: '2026-06-09T22:00:01.000Z',
+        dimensions: { sessionId: 'sess-1', toolName: 'generate_image' },
+      },
+      {
+        eventType: EVT_TOOL_SUCCEEDED,
+        subjectId: 'sess-1:run:def',
+        ts: '2026-06-09T22:00:01.500Z',
+        dimensions: { sessionId: 'sess-1', toolName: 'generate_image', durationMs: 500 },
+      },
+      {
+        eventType: EVT_TOOL_DEFERRED,
+        subjectId: 'sess-1:run:def',
+        ts: '2026-06-09T22:00:02.000Z',
+        dimensions: { sessionId: 'sess-1', toolName: 'generate_image', reason: 'media_generation_time_budget' },
+      },
+      {
+        eventType: EVT_TOOL_DEFERRED,
+        subjectId: 'sess-1:run:def',
+        ts: '2026-06-09T22:00:02.500Z',
+        dimensions: { sessionId: 'sess-1', toolName: 'generate_image', reason: 'media_generation_time_budget' },
+      },
+      {
+        eventType: EVT_RUN_COMPLETED,
+        subjectId: 'sess-1:run:def',
+        ts: '2026-06-09T22:00:03.000Z',
+        // terminal toolCalls/failedToolCalls absent → counts fall back to event tallies
+        dimensions: { sessionId: 'sess-1' },
+      },
+    ];
+
+    const [run] = buildAgentRunSummaries(rows);
+
+    // 1 invoked, 0 failed, 2 deferred — deferred is its own bucket.
+    expect(run.toolCalls).toBe(1);
+    expect(run.failedToolCalls).toBe(0);
+    expect(run.deferredToolCalls).toBe(2);
+    // Deferred does not produce a failed_tool_calls flag.
+    expect(run.flags.some((f) => f.code === 'failed_tool_calls')).toBe(false);
   });
 
   it('returns a clear not-found chat context when only spine telemetry exists', () => {
