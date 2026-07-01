@@ -17,6 +17,11 @@ VOLUME_GB="${VOLUME_GB:-100}"                 # kept worktrees + 3x node_modules
 KEY_NAME="${KEY_NAME:-linear-autofix}"
 SG_NAME="${SG_NAME:-linear-autofix-sg}"
 NAME_TAG="${NAME_TAG:-linear-autofix}"
+# The scoped account IAM policy only authorizes ec2:RunInstances for instances tagged
+# purpose=test-env, so this tag is REQUIRED to launch (teardown/watchdog target instances by
+# id, not by this tag, so the poller is not swept). Override PURPOSE_TAG= to drop it if your
+# identity has unconditional RunInstances.
+PURPOSE_TAG="${PURPOSE_TAG-test-env}"
 # Reuse the cloud test-env instance profile by default: it grants the backend preview
 # Dev-AW-* DynamoDB read/write + Secrets Manager read on agentweb/test-env/* (so bootstrap
 # can pull backend/.env). Same role the test-env uses. Set IAM_PROFILE= (empty) for none.
@@ -74,10 +79,12 @@ if [ "$OPEN_PREVIEW_PORT" = true ]; then
 fi
 
 # --- Launch ---
+TAGS="{Key=Name,Value=${NAME_TAG}}"
+[ -n "$PURPOSE_TAG" ] && TAGS="${TAGS},{Key=purpose,Value=${PURPOSE_TAG}},{Key=env-name,Value=${NAME_TAG}}"
 RUN_ARGS=(--region "$REGION" --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE"
   --key-name "$KEY_NAME" --security-group-ids "$SG_ID"
   --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=${VOLUME_GB},VolumeType=gp3}"
-  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${NAME_TAG}}]")
+  --tag-specifications "ResourceType=instance,Tags=[${TAGS}]")
 [ -n "$IAM_PROFILE" ] && RUN_ARGS+=(--iam-instance-profile "Name=$IAM_PROFILE")
 
 IID="$(aws ec2 run-instances "${RUN_ARGS[@]}" --query 'Instances[0].InstanceId' --output text)"
