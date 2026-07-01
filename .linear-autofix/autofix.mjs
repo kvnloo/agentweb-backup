@@ -6,12 +6,12 @@
 // Usage: node autofix.mjs <LIN-123 | issue-uuid> [--dry-run] [--force]
 
 import { spawn, spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, symlinkSync, copyFileSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, symlinkSync, copyFileSync, statSync, readdirSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import net from 'node:net';
 import path from 'node:path';
 import { config } from './config.mjs';
-import { resolveIssue, addComment, findStateId, moveIssue, setAutofixLabel } from './linear.mjs';
+import { resolveIssue, addComment, findStateId, moveIssue, setAutofixLabel, uploadFile } from './linear.mjs';
 import { findSessionId, fetchItem, summarizeSession } from './tools/session.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -300,6 +300,16 @@ async function main() {
       testPassword: config.verify?.testPassword,
       postCreds: config.verify?.postCredsInComment,
     };
+
+    // Embed the verify run's real visual evidence in the Linear report: the session RECORDING
+    // (primary) plus screenshots (fabricated paths are dropped).
+    if (verify) {
+      try {
+        const media = await uploadVerifyMedia(verify);
+        verify.screenshotUrls = media.shots;
+        verify.videoUrls = media.videos;
+      } catch (e) { log('Verify media upload error:', e.message); }
+    }
 
     // --- Label + comments back on Linear: fix -> verification (tests + review) -> manual guide ---
     try { await setAutofixLabel(issue, config.triageLabels?.[triage]); } catch (e) { log('Warn: could not set triage label:', e.message); }
@@ -756,8 +766,10 @@ async function runVerify(issue, WT) {
     });
     const args = claudeArgs({ model: config.verify.model, maxTurns: config.verify.maxTurns, mcp: verifyMcpPath, skipPermissions: true });
     log(`Running browser verification (model=${config.verify.model})...`);
+    const startedAt = Date.now(); // session recordings written after this belong to this verify
     const verdict = parseVerify(await runClaude(args, prompt, WT, config.verify.timeoutMs, 'verify'));
     verdict.urls = urls; // let the caller reuse these without re-reading preview-state
+    verdict.mediaSince = startedAt;
     log(`Verify verdict: ${verdict.verdict}`);
     return verdict;
   } finally {
@@ -768,6 +780,42 @@ async function runVerify(issue, WT) {
 
 function parseVerify(result) {
   return extractJson(result, 'VERIFY_RESULT', { verdict: 'inconclusive', method: '', scenario: '', summary: '(no verdict returned)', screenshots: [] });
+}
+
+// Upload the verify run's visual evidence to Linear's file storage for inline embedding.
+// Screenshots: resolve the agent-reported paths to files that ACTUALLY exist (on ENG-129 the
+// agent reported a path it never wrote) and drop fabrications. Videos: --save-video in
+// verify-mcp.json records the whole browser session; the .webm lands in the output dir when
+// the agent closes the browser, so pick up recordings written during THIS verify window.
+const SCREENSHOT_DIR = '/tmp/playwright-screenshots'; // must match verify-mcp.json --output-dir
+const MAX_UPLOAD_BYTES = 45 * 1024 * 1024; // stay under Linear's upload limit
+
+async function uploadVerifyMedia(verify) {
+  const shots = [];
+  for (const p of (verify.screenshots || []).slice(0, 4)) {
+    const tries = p ? [p, path.join(SCREENSHOT_DIR, path.basename(p))] : [];
+    const real = tries.find((t) => { try { return statSync(t).isFile(); } catch { return false; } });
+    if (!real) { log(`Verify screenshot not found on disk (agent reported "${p}") — dropping it.`); continue; }
+    try { shots.push({ name: path.basename(real), url: await uploadFile(real) }); log(`Screenshot uploaded to Linear: ${path.basename(real)}`); }
+    catch (e) { log(`Screenshot upload failed for ${real}: ${e.message}`); }
+  }
+
+  const videos = [];
+  try {
+    const since = verify.mediaSince || 0;
+    const webms = readdirSync(SCREENSHOT_DIR)
+      .filter((f) => f.endsWith('.webm'))
+      .map((f) => ({ f, full: path.join(SCREENSHOT_DIR, f), st: statSync(path.join(SCREENSHOT_DIR, f)) }))
+      .filter((x) => x.st.mtimeMs >= since)
+      .sort((a, b) => b.st.mtimeMs - a.st.mtimeMs)
+      .slice(0, 2); // a session normally yields one video per page
+    for (const v of webms) {
+      if (v.st.size > MAX_UPLOAD_BYTES) { log(`Recording ${v.f} is ${Math.round(v.st.size / 1e6)}MB — too big to upload, skipping.`); continue; }
+      try { videos.push({ name: v.f, url: await uploadFile(v.full) }); log(`Session recording uploaded to Linear: ${v.f}`); }
+      catch (e) { log(`Recording upload failed for ${v.f}: ${e.message}`); }
+    }
+  } catch { /* no output dir — nothing recorded */ }
+  return { shots, videos };
 }
 
 // ---- Linear comment bodies (pure functions; unit-tested from the scratchpad harness) ----
@@ -824,8 +872,20 @@ export function testReportBody(marker, verify, checks) {
       : verify.verdict === 'not_fixed' ? `❌ NOT fixed${via}${attempt}`
       : `❓ inconclusive${attempt}`;
     const scenario = verify.scenario ? `\nScenario: ${verify.scenario}` : '';
-    const shots = (verify.screenshots || []).length ? '\n_(screenshots saved on the runner; see the PR verification comment)_' : '';
-    browser = `${icon} — ${verify.summary || ''}${scenario}${shots}`;
+    // Embed the session recording (primary evidence) and screenshots inline; if the agent
+    // reported screenshot paths but none existed on disk, say so honestly instead of
+    // implying evidence that isn't there.
+    const videos = verify.videoUrls || [];
+    const recording = videos.length
+      ? '\n' + videos.map((v) => `🎬 Session recording:\n![${v.name}](${v.url})`).join('\n')
+      : '';
+    const urls = verify.screenshotUrls || [];
+    const shots = urls.length
+      ? '\n' + urls.map((s) => `![${s.name}](${s.url})`).join('\n')
+      : (verify.screenshots || []).length
+        ? '\n_(the verify agent reported a screenshot, but no file was found on the runner)_'
+        : '';
+    browser = `${icon} — ${verify.summary || ''}${scenario}${recording}${shots}`;
   }
   return `🧪 **Automated test report**\n\n**Agent-run checks (self-reported)**\n${agentChecks}\n\n**Orchestrator checks (deterministic)**\n${orchChecks}\n\n**Browser verification**\n${browser}`;
 }
@@ -883,8 +943,13 @@ export function manualTestBody(marker, opts = {}) {
 }
 
 function verifyBody(v) {
-  const shots = (v.screenshots || []).length
-    ? `\n\nScreenshots (local on the runner):\n${v.screenshots.map((s) => `- \`${s}\``).join('\n')}` : '';
+  // Linear asset URLs need workspace auth, so the PR gets links (not embeds) plus a pointer.
+  const media = [...(v.videoUrls || []).map((m) => ({ ...m, kind: 'session recording' })), ...(v.screenshotUrls || []).map((m) => ({ ...m, kind: 'screenshot' }))];
+  const shots = media.length
+    ? `\n\nEvidence (embedded on the Linear issue; links need Linear access):\n${media.map((m) => `- ${m.kind}: [${m.name}](${m.url})`).join('\n')}`
+    : (v.screenshots || []).length
+      ? `\n\nScreenshots (local on the runner):\n${v.screenshots.map((s) => `- \`${s}\``).join('\n')}`
+      : '';
   return `🔎 **Automated browser verification:** ${v.verdict}\n\n${v.summary || ''}${shots}`;
 }
 

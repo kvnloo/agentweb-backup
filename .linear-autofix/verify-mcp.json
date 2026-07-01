@@ -3,7 +3,7 @@
     "playwright": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@playwright/mcp@latest", "--output-dir", "/tmp/playwright-screenshots"]
+      "args": ["-y", "@playwright/mcp@latest", "--output-dir", "/tmp/playwright-screenshots", "--save-video", "800x450"]
     }
   }
 }

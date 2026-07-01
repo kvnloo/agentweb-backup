@@ -1,4 +1,6 @@
 // .linear-autofix/linear.mjs — minimal Linear GraphQL client.
+import { readFileSync, statSync } from 'node:fs';
+import path from 'node:path';
 import { config } from './config.mjs';
 
 const ENDPOINT = 'https://api.linear.app/graphql';
@@ -98,6 +100,31 @@ export async function listStaleInProgress(hours) {
     { filter },
   );
   return data.issues.nodes;
+}
+
+const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
+
+// Upload a local file to Linear's file storage and return its assetUrl — embeddable in any
+// comment/description as markdown `![alt](assetUrl)` (renders inline for workspace members).
+export async function uploadFile(filePath) {
+  const size = statSync(filePath).size;
+  const filename = path.basename(filePath);
+  const contentType = MIME[filename.split('.').pop().toLowerCase()] || 'application/octet-stream';
+  const data = await gql(
+    `mutation($contentType:String!,$filename:String!,$size:Int!){
+       fileUpload(contentType:$contentType, filename:$filename, size:$size){
+         success uploadFile { uploadUrl assetUrl headers { key value } }
+       }
+     }`,
+    { contentType, filename, size },
+  );
+  const uf = data.fileUpload?.uploadFile;
+  if (!uf?.uploadUrl) throw new Error('fileUpload returned no uploadUrl');
+  const headers = { 'Content-Type': contentType };
+  for (const h of uf.headers || []) headers[h.key] = h.value;
+  const put = await fetch(uf.uploadUrl, { method: 'PUT', headers, body: readFileSync(filePath) });
+  if (!put.ok) throw new Error(`upload PUT failed: HTTP ${put.status}`);
+  return uf.assetUrl;
 }
 
 const AUTOFIX_LABEL_COLORS = {
