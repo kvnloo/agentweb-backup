@@ -155,6 +155,43 @@ function classifyTurnlessSession(session: ChatSession): "in-flight" | "failed" {
   return age <= IN_FLIGHT_GRACE_MS ? "in-flight" : "failed";
 }
 
+/**
+ * Returns true when the transcript ends in a state an agent tool loop cannot
+ * terminate on — the run is still mid-flight even though hasAssistantTurn()
+ * would return true (a partial tool-call step was persisted).
+ *
+ * Mid-loop states:
+ *   - Last non-system message is a tool result  (agent hasn't replied yet)
+ *   - Last non-system message is an unanswered user prompt
+ *   - Last assistant message is a pure tool-call turn with no text
+ *
+ * Settled state (NOT mid-loop, score normally):
+ *   - Last assistant message has text content, even if it also carries toolCalls.
+ *     Completed scheduled runs aggregate tool calls into the final reply and still
+ *     include the natural-language summary as text, so they must not be deferred.
+ */
+function transcriptEndsMidToolLoop(messages: ChatMessage[]): boolean {
+  const nonSystem = (messages || []).filter((m: any) => m.role !== "system");
+  if (nonSystem.length === 0) return false;
+
+  const last: any = nonSystem[nonSystem.length - 1];
+
+  // Trailing tool result → agent hasn't responded yet
+  if (last.role === "tool") return true;
+
+  // Unanswered user/injected prompt → agent hasn't started this step
+  if (last.role === "user") return true;
+
+  // Pure tool-call assistant turn with no text → mid-loop
+  if (last.role === "assistant") {
+    const text = (typeof last.content === "string" ? last.content : JSON.stringify(last.content ?? "")).trim();
+    const toolCalls = last.metadata?.toolCalls;
+    if (!text && Array.isArray(toolCalls) && toolCalls.length > 0) return true;
+  }
+
+  return false;
+}
+
 const FAILED_RUN_REASON =
   "Session produced no assistant response — it appears to have crashed or timed out before completing. Flagged as a failed run.";
 
@@ -363,6 +400,14 @@ export async function scoreSessionWithJudgeIfNeeded(
       return null;
     }
     result = buildFailedRunResult(messageCount);
+  } else if (transcriptEndsMidToolLoop(session.messages)) {
+    if (classifyTurnlessSession(session) === "in-flight") {
+      return null;
+    }
+    result = await scoreSessionWithJudge(session.messages || [], messageCount, judge, session.sessionType, {
+      userId: session.userId,
+      sessionId: session.sessionId,
+    });
   } else {
     result = await scoreSessionWithJudge(session.messages || [], messageCount, judge, session.sessionType, {
       userId: session.userId,
@@ -418,6 +463,16 @@ export async function scoreSessionIfNeeded(
       return null;
     }
     result = buildFailedRunResult(messageCount);
+  } else if (transcriptEndsMidToolLoop(session.messages)) {
+    // Partial tool-loop persisted (tool result or pure tool-call turn is last).
+    // Defer if still within the grace window; score the partial transcript if stale.
+    if (classifyTurnlessSession(session) === "in-flight") {
+      return null;
+    }
+    result = await scoreSession(session.messages || [], messageCount, session.pageIdentifier, session.sessionType, {
+      userId: session.userId,
+      sessionId: session.sessionId,
+    });
   } else {
     result = await scoreSession(session.messages || [], messageCount, session.pageIdentifier, session.sessionType, {
       userId: session.userId,

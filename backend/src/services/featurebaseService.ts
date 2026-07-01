@@ -1,3 +1,4 @@
+import jwt from 'jsonwebtoken';
 import { getSecret } from '../utils/secretsManager';
 
 /**
@@ -31,9 +32,19 @@ const CLOSED_STATUS_TYPES = new Set(['completed', 'canceled']);
 export interface FeaturebaseCredentials {
   apiKey: string;
   appId?: string;
+  /** HMAC secret for signing Featurebase Identity-Verification (SSO) JWTs. Dashboard → Settings → Access & Security → Security. */
+  ssoSecret?: string;
 }
 
+/** The Featurebase board subdomain (`<org>.featurebase.app`) — the SDK `identify` call needs it. */
+export const FEATUREBASE_ORG = 'agentweb';
+
 const credentialsCache: Record<string, FeaturebaseCredentials> = {};
+
+/** Test seam — clear the cached Featurebase credentials. */
+export function _resetCredentialsCache(): void {
+  for (const k of Object.keys(credentialsCache)) delete credentialsCache[k];
+}
 
 export async function getFeaturebaseCredentialsForEnv(env: 'development' | 'production'): Promise<FeaturebaseCredentials> {
   if (credentialsCache[env]) return credentialsCache[env];
@@ -51,6 +62,21 @@ export async function getFeaturebaseCredentialsForEnv(env: 'development' | 'prod
 export async function getFeaturebaseCredentials(): Promise<FeaturebaseCredentials> {
   const environment = process.env.NODE_ENV || 'development';
   return getFeaturebaseCredentialsForEnv(environment === 'production' ? 'production' : 'development');
+}
+
+/**
+ * Mint a Featurebase Identity-Verification JWT (HS256) for a logged-in user, signed with the board's
+ * SSO secret. The frontend hands this to `Featurebase("identify", { organization, featurebaseJwt })`
+ * so the user is recognized in the embedded widget and sees their OWN posts + private tickets — no
+ * separate Featurebase login. Short-lived (minted per session). Throws if the SSO secret isn't
+ * configured, so the caller can surface a clean 503 instead of a widget that silently shows nobody.
+ */
+export async function signFeaturebaseIdentityJwt(p: { userId: string; email: string; name?: string }): Promise<string> {
+  const { ssoSecret } = await getFeaturebaseCredentials();
+  if (!ssoSecret) throw new Error('Featurebase ssoSecret not configured');
+  const payload: Record<string, unknown> = { userId: p.userId, email: p.email };
+  if (p.name) payload.name = p.name;
+  return jwt.sign(payload, ssoSecret, { algorithm: 'HS256', expiresIn: '10m' });
 }
 
 async function featurebaseFetch(path: string, options: RequestInit = {}): Promise<any> {

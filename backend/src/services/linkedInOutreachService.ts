@@ -23,12 +23,26 @@ export class LinkedInOutreachService {
     console.log(`[LinkedInOutreachService] ${message}`, data ? JSON.stringify(data, null, 2) : '');
   }
 
-  private handleError(error: any, context: string): never {
+  private async handleError(error: any, context: string): Promise<never> {
     console.error(`[LinkedInOutreachError] --- START ERROR LOG ---`);
     console.error(`[LinkedInOutreachError] Context: ${context}`);
 
-    // Unipile's UnsuccessfulRequestError uses error.body; fall back through all formats
-    const responseData = error.response?.data || error.response || error.body || {};
+    // Unipile's UnsuccessfulRequestError uses error.body; fall back through all formats.
+    // error.body can also be a Blob: the SDK's RequestSender calls response.blob()
+    // whenever Unipile's error response isn't application/json (e.g. a gateway/proxy
+    // error page, or a plain-text session error), and UnsuccessfulRequestError's own
+    // .message is always ''. Without unwrapping it here, those errors silently collapse
+    // to "Unknown error" below, hiding the real reason (e.g. a dead LinkedIn session).
+    let rawBody = error.response?.data || error.response || error.body;
+    if (rawBody instanceof Blob) {
+      try {
+        const text = (await rawBody.text()).trim();
+        rawBody = text ? { message: text.slice(0, 500) } : {};
+      } catch {
+        rawBody = {};
+      }
+    }
+    const responseData = rawBody || {};
 
     const structuredError: any = {
       message: responseData.message || responseData.title || responseData.detail || error.message || 'Unknown error',
