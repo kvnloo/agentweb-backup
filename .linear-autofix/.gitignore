@@ -4,3 +4,4 @@ state.json
 *.log.1
 .poll.lock
 logs/
+.verify-mcp.generated.json

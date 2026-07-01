@@ -21,7 +21,8 @@ const previewScript = path.join(__dirname, 'preview', 'preview.mjs');
 const proxyScript = path.join(__dirname, 'preview', 'proxy.mjs');
 const previewStatePath = path.join(__dirname, 'preview', 'preview-state.json');
 const verifyPromptPath = path.join(__dirname, 'verify-prompt.md');
-const verifyMcpPath = path.join(__dirname, 'verify-mcp.json');
+const verifyPwConfigPath = path.join(__dirname, 'verify-pw-config.json');
+const verifyMcpGenPath = path.join(__dirname, '.verify-mcp.generated.json');
 const reviewPromptPath = path.join(__dirname, 'review-prompt.md');
 const managerPromptPath = path.join(__dirname, 'manager-prompt.md');
 const refixPromptPath = path.join(__dirname, 'refix-prompt.md');
@@ -764,7 +765,17 @@ async function runVerify(issue, WT) {
       CUSTOMER_URL: urls.customer || '(n/a)', PARTNER_URL: urls.partner || '(n/a)', API_URL: urls.api || '(n/a)',
       TEST_EMAIL: config.verify.testEmail, TEST_PASSWORD: config.verify.testPassword,
     });
-    const args = claudeArgs({ model: config.verify.model, maxTurns: config.verify.maxTurns, mcp: verifyMcpPath, skipPermissions: true });
+    // The MCP config is generated per run so the --config path is absolute on any machine;
+    // verify-pw-config.json (checked in) turns on session video recording via contextOptions.
+    writeFileSync(verifyMcpGenPath, JSON.stringify({
+      mcpServers: {
+        playwright: {
+          type: 'stdio', command: 'npx',
+          args: ['-y', '@playwright/mcp@latest', '--config', verifyPwConfigPath, '--output-dir', SCREENSHOT_DIR],
+        },
+      },
+    }, null, 2));
+    const args = claudeArgs({ model: config.verify.model, maxTurns: config.verify.maxTurns, mcp: verifyMcpGenPath, skipPermissions: true });
     log(`Running browser verification (model=${config.verify.model})...`);
     const startedAt = Date.now(); // session recordings written after this belong to this verify
     const verdict = parseVerify(await runClaude(args, prompt, WT, config.verify.timeoutMs, 'verify'));

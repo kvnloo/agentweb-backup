@@ -7,7 +7,7 @@ A local poller that watches Linear for new `Bug` issues and, for each one:
 3. **Reviews the fix** with a multi-agent gate: expert reviewers (correctness, conventions, security, tests — lenses auto-scaled to the diff) inspect the diff in parallel, a **manager** adversarially verifies their findings, and a **re-fix** pass applies the confirmed ones. A `needs_rework` verdict triggers one **rework pass + manager re-check**.
 4. Runs **deterministic checks itself** (`npx tsc --noEmit` per changed package with a 4GB heap, `npx jest <changed test files>` in backend) — agent self-reported "pass" is never trusted alone.
 5. **Browser-tests** the reviewed code in a real browser (Playwright) against a per-bug preview. A deterministic HTTP **preflight** skips the agent entirely if the environment is down (`env_down`); a `not_fixed` verdict triggers one **re-fix + re-verify**. Then opens a **draft PR in each repo it changed**.
-6. **Triages** the result with a label (`autofix:green` / `autofix:needs-manual-test` / `autofix:needs-rework`) and comments back on the Linear issue: a merge-confidence header, PR link(s), a 🧪 test report, a 🔎 code-review summary, and a 🔍 manual-test guide. Only **green** advances to In Review.
+6. **Triages** the result with a label (`autofix:green` / `autofix:needs-manual-test` / `autofix:needs-rework`) and comments back on the Linear issue: a merge-confidence header, PR link(s), a 🧪 test report with the **verify session recording (video) and screenshots embedded**, a 🔎 code-review summary, and a 🔍 manual-test guide. Only **green** advances to In Review.
 
 Nothing is auto-merged. If Claude can't confidently fix a bug, it posts its investigation as a Linear comment instead of opening a PR (label `autofix:cannot-fix`).
 
@@ -204,7 +204,8 @@ So in normal use (merge PR → issue auto-moves to Done) you rarely clean up by 
 | `preview/proxy.mjs` | Userspace host-based reverse proxy (nip.io → per-bug ports), no sudo |
 | `preview/preview.mjs` | Start/stop a watcher-free full app copy per bug from its worktree |
 | `verify-prompt.md` | Browser-verification prompt (drives the Playwright MCP, emits a verdict) |
-| `verify-mcp.json` | Playwright-only MCP config for the headless verify pass |
+| `verify-pw-config.json` | Playwright MCP config: records the verify session as video (recordVideo) |
+| `.verify-mcp.generated.json` | Playwright-only MCP config, generated per verify run (gitignored) |
 | `logs/<ID>/` | Raw per-stage transcripts + deterministic check output per bug (gitignored) |
 
 ## Security notes

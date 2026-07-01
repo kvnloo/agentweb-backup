@@ -1,0 +1,8 @@
+{
+  "_comment": "Playwright MCP config for the browser-verify pass. recordVideo captures the whole session; the .webm flushes to the dir when the agent closes the browser (verify-prompt step 5). @playwright/mcp 0.0.77 has no --save-video CLI flag — contextOptions is the supported route.",
+  "browser": {
+    "contextOptions": {
+      "recordVideo": { "dir": "/tmp/playwright-screenshots", "size": { "width": 800, "height": 450 } }
+    }
+  }
+}
