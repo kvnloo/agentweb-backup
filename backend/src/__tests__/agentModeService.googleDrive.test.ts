@@ -286,7 +286,7 @@ describe('AgentModeService - Google Drive methods', () => {
       mockDriveFiles.list.mockRejectedValue(makeApiError(403));
       const result = await service.listGoogleDriveFolder('folder-id', USER_ID);
       expect(result.success).toBe(false);
-      expect(result.message).toMatch(/Cannot list this folder/i);
+      expect(result.message).toMatch(/Google Drive access denied/i);
     });
 
     it('returns friendly 404 message', async () => {
