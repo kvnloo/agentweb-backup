@@ -62,6 +62,8 @@ import adminWorkPlanRoutes from "./routes/adminWorkPlanRoutes";
 import adminPromptTemplatesRoutes from "./routes/adminPromptTemplates";
 import adminScheduleTemplateRoutes from "./routes/adminScheduleTemplateRoutes";
 import supportRoutes from "./routes/support";
+import integrationsRoutes from "./routes/integrations";
+import featurebaseRoutes from "./routes/featurebase";
 import errorsRoutes from "./routes/errors";
 import agentApiRoutes from "./routes/agentApi";
 import emmaApiRoutes from "./routes/emmaApi";
@@ -242,6 +244,8 @@ app.use("/api/stripe/webhook", express.raw({ type: "application/json" }));
 app.use("/api/stripe/connect/webhook", express.raw({ type: "application/json" }));
 // HubSpot webhook needs raw body for HMAC-SHA256 signature verification.
 app.use("/api/webhooks/hubspot", express.raw({ type: "application/json" }));
+// Linear webhook (bug-resolve bridge) needs raw body for HMAC signature verification — before express.json().
+app.use("/api/integrations/linear/webhook", express.raw({ type: "application/json" }));
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());
@@ -342,6 +346,8 @@ app.use("/api/admin/work-plans", authenticateToken, isAdmin, adminWorkPlanRoutes
 app.use("/api/admin/prompt-templates", authenticateToken, isAdmin, adminPromptTemplatesRoutes);
 app.use("/api/admin/schedule-templates", authenticateToken, isAdmin, adminScheduleTemplateRoutes);
 app.use("/api/support", supportRoutes);
+app.use("/api/integrations", integrationsRoutes);
+app.use("/api/featurebase", featurebaseRoutes);
 app.use("/api/errors", errorsRoutes);
 app.use("/api/v1/agent", agentApiRoutes);
 app.use("/api/emma", emmaApiRoutes);

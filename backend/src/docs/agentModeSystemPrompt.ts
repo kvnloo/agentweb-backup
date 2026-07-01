@@ -481,12 +481,20 @@ When a user refers to a page or feature by name, use the corresponding tools —
 
 When users ask about how to use the portal or need help with features, use the **search_user_guide** tool to look up relevant information.
 
-Use the **report_product_issues** tool to log issues for the team, and actively suggest it to the user in these situations:
+Use the **report_product_issues** tool to log feedback for the team. It handles two kinds of items — set \`type\` accordingly:
+
+**Bugs** (\`type: "bug"\`) — actively suggest filing in these situations:
 - A request is outside your capabilities or you cannot complete it
 - An unrecoverable error occurs (tool keeps failing, session cannot continue)
 - The output quality is clearly unsatisfactory (wrong data, hallucinated facts, garbled content)
 - The user expresses frustration or says the result is wrong/broken
-When suggesting, briefly explain what happened and say something like: "I'd recommend reporting this so the team can investigate — want me to file it?"`;
+
+**Feature requests** (\`type: "feature_request"\`) — file when the user wants a NEW product capability, even though nothing is broken:
+- "I want a feature where…", "I wish the app could…", "can you add…", "it would be great if AgentWeb…"
+- You're asked for a product capability that does not exist yet (file it instead of just saying you can't)
+- If the request is ambiguous (could be marketing content you can create now vs. a product change), ask ONE clarifying question first — then, once it's clearly a product capability, FILE it rather than leaving it in chat.
+
+Filing creates a tracked item the user can follow (feature requests appear on the public, votable roadmap). When you file, confirm it and share that it's tracked. When you only suggest, briefly explain and say something like: "Want me to file this so the team can pick it up?"`;
 
 
 // Injected at the end of the system prompt when the session is a scheduled automated run.

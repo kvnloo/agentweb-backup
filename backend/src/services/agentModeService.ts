@@ -1059,6 +1059,28 @@ export class AgentModeService {
     return fallbackModel;
   }
 
+  // Model for the internal dedup judge (report_product_issues duplicate detection).
+  // Sourced from settings so it is NOT pinned to a model that goes stale; admin can
+  // point `agent_mode_dedup_judge_model` at a cheap/fast model. Falls back to the
+  // configurable default model. TODO(ENG-9): route this call through OpenRouter so
+  // model choice becomes gateway/routing config rather than provider-specific.
+  async getDedupJudgeModel(): Promise<string> {
+    const fallbackModel = this.default_model;
+    try {
+      const setting = await settingsService.getSetting('agent_mode_dedup_judge_model');
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (this.llmModels[configuredModel]) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported dedup judge model "${configuredModel}" in settings; using fallback.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting dedup judge model setting:', error);
+    }
+    return fallbackModel;
+  }
+
   async getScheduledChatsDefaultModel(): Promise<string> {
     try {
       const setting = await settingsService.getSetting(this.scheduledChatsDefaultModelSettingName);

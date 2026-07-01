@@ -149,8 +149,9 @@ describe('report_product_issues tool', () => {
 
     expect(result.success).toBe(true);
     expect(result.results).toHaveLength(2);
-    expect(result.results[0]).toEqual({ title: 'Bug 1', success: true, issueId: 'AGW-p1' });
-    expect(result.results[1]).toEqual({ title: 'Bug 2', success: true, issueId: 'AGW-p2' });
+    // Notion fallback path: deduped=false; results now also carry the tracker url (additive).
+    expect(result.results[0]).toEqual({ title: 'Bug 1', success: true, issueId: 'AGW-p1', deduped: false, url: 'https://notion.so/p1' });
+    expect(result.results[1]).toEqual({ title: 'Bug 2', success: true, issueId: 'AGW-p2', deduped: false, url: 'https://notion.so/p2' });
     expect(mockCreateOncallItem).toHaveBeenCalledTimes(2);
     expect(mockResendSendEmail).toHaveBeenCalledTimes(2);
   });
