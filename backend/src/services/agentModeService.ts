@@ -16057,6 +16057,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // Helper to format tool error for LLM feedback
   private formatToolError(toolName: string, errorMessage: string): string {
     const safeMessage = typeof errorMessage === 'string' ? errorMessage : 'Unknown error';
+    console.error(`[AgentMode] Tool failed: ${toolName} — ${safeMessage}`);
     // Connection-level failures (timeouts, circuit open) require a different instruction:
     // tell the LLM to stop retrying and surface the error to the user instead of
     // spinning through other variants of the same tool.
@@ -16095,6 +16096,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: Use the exact parameter names from the schema: "file_name" (string, the filename with extension e.g. "report.html") and "file_content" (string, the full file content). Do NOT use "filename", "fileName", "content", "html_content", or other variants. Retry immediately with the correct parameters.`;
       }
       return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: Use the exact parameter names from the schema: "title" (string, document title) and "content_draft" (string, the full content). Both are required. Retry immediately with the correct parameters.`;
+    }
+    // manage_scheduled_chat validation errors — guide LLM to the exact fix instead of a generic retry
+    if (toolName === 'manage_scheduled_chat') {
+      if (safeMessage.includes('Missing required fields')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: For action "create", schedule_name, starting_message, and schedule_frequency are all required. For action "update", these three fall back to the schedule's existing values if omitted, but at least one must resolve to a non-empty value. Add the missing field(s) named above and retry immediately.`;
+      }
+      if (safeMessage.includes('frequencyIntervalDays')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: When schedule_frequency is "every_n_days", frequency_interval_days is required and must be a positive integer. Add it and retry immediately.`;
+      }
+      if (safeMessage.includes('runCount')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: run_count must be either -1 (unlimited) or a positive integer. Correct the value and retry immediately.`;
+      }
+      if (safeMessage.includes('Scheduled chat not found')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The schedule_id doesn't exist or doesn't belong to this user. Call list_scheduled_chats to get a valid schedule_id before retrying update/toggle/delete.`;
+      }
     }
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
   }
