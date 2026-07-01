@@ -2,14 +2,18 @@
  * report_product_issues enrichment (2026-06-12):
  *  - external MCP calls are tagged "MCP Reported" (in-portal keeps "Customer Reported"
  *    so Rui's benchmark filters stay clean)
- *  - per-issue attachment_urls land in the Notion item context
+ *  - per-issue attachment_urls land in the intake item context
  *  - per-issue run_id pulls the AgentRun dossier (verdict, failed tools,
  *    failedArgsJson) server-side and appends it to the description
  *  - enrichment failure never blocks the report
+ *
+ * ENG-6: the tool routes through the shared intake service (fileUserIssue) — the single
+ * unconditional Linear/Featurebase path. We assert on the payload the tool builds for intake
+ * (notionTags = source tag, notionContext = attachments, description = dossier).
  */
 
-jest.mock('../services/notionService', () => ({
-  createOncallItem: jest.fn(async () => ({ pageId: 'pg-1', notionUrl: 'https://notion.so/pg-1' })),
+jest.mock('../services/intakeService', () => ({
+  fileUserIssue: jest.fn(async () => ({ pageId: 'pg-1', trackerUrl: 'https://fb/p/pg-1', deduped: false, tracker: 'Featurebase' })),
 }));
 jest.mock('../services/resendService', () => ({
   resendService: { sendEmail: jest.fn(async () => ({ id: 'em-1' })) },
@@ -31,11 +35,11 @@ jest.mock('../services/agentRunInspectorService', () => {
 
 import '../emma/tools';
 import { emmaToolRegistry } from '../emma/registry';
-import { createOncallItem } from '../services/notionService';
+import { fileUserIssue } from '../services/intakeService';
 import { fetchAgentRunSummaries } from '../services/agentRunInspectorService';
 
 const tool = () => emmaToolRegistry.getTool('report_product_issues')!;
-const lastOncallCall = () => (createOncallItem as jest.Mock).mock.calls.at(-1)![0];
+const lastFiledIssue = () => (fileUserIssue as jest.Mock).mock.calls.at(-1)![0];
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -48,20 +52,20 @@ describe('report_product_issues source tagging', () => {
   it('tags external MCP calls as MCP Reported', async () => {
     await tool().execute({ issues: [issue] }, { userId: 'u-1', externalMcp: true });
 
-    expect(lastOncallCall().additionalTags).toContain('MCP Reported');
-    expect(lastOncallCall().additionalTags).not.toContain('Customer Reported');
+    expect(lastFiledIssue().notionTags).toContain('MCP Reported');
+    expect(lastFiledIssue().notionTags).not.toContain('Customer Reported');
   });
 
   it('keeps Customer Reported for in-portal calls (no externalMcp flag)', async () => {
     await tool().execute({ issues: [issue] }, { userId: 'u-1', sessionId: 'sess-1' });
 
-    expect(lastOncallCall().additionalTags).toContain('Customer Reported');
-    expect(lastOncallCall().additionalTags).not.toContain('MCP Reported');
+    expect(lastFiledIssue().notionTags).toContain('Customer Reported');
+    expect(lastFiledIssue().notionTags).not.toContain('MCP Reported');
   });
 });
 
 describe('report_product_issues attachments', () => {
-  it('passes attachment URLs into the Notion item context', async () => {
+  it('passes attachment URLs into the intake item context', async () => {
     await tool().execute({
       issues: [{
         title: 'Visual bug',
@@ -70,7 +74,7 @@ describe('report_product_issues attachments', () => {
       }],
     }, { userId: 'u-1', externalMcp: true });
 
-    const ctx = lastOncallCall().context;
+    const ctx = lastFiledIssue().notionContext;
     expect(ctx['Attachments']).toContain('https://s3.example.com/a.png');
     expect(ctx['Attachments']).toContain('https://s3.example.com/b.png');
   });
@@ -98,7 +102,7 @@ describe('report_product_issues run-dossier enrichment', () => {
     }, { userId: 'u-1', externalMcp: true });
 
     expect(fetchAgentRunSummaries).toHaveBeenCalledWith(expect.objectContaining({ runId: 'u-1:run:abc' }));
-    const description: string = lastOncallCall().description;
+    const description: string = lastFiledIssue().description;
     expect(description).toContain('Invites die');
     expect(description).toContain('linkedin_outreach');
     expect(description).toContain('invalid_args');
@@ -113,8 +117,8 @@ describe('report_product_issues run-dossier enrichment', () => {
       issues: [{ title: 'Bug', description: 'desc', run_id: 'u-1:run:gone' }],
     }, { userId: 'u-1', externalMcp: true });
 
-    expect(createOncallItem).toHaveBeenCalledTimes(1);
-    expect(lastOncallCall().description).toContain('desc');
+    expect(fileUserIssue).toHaveBeenCalledTimes(1);
+    expect(lastFiledIssue().description).toContain('desc');
     expect(JSON.stringify(result)).toContain('pg-1');
   });
 
@@ -123,6 +127,6 @@ describe('report_product_issues run-dossier enrichment', () => {
       issues: [{ title: 'Bug', description: 'plain', run_id: 'u-1:run:missing' }],
     }, { userId: 'u-1', externalMcp: true });
 
-    expect(lastOncallCall().description).toBe('plain');
+    expect(lastFiledIssue().description).toBe('plain');
   });
 });

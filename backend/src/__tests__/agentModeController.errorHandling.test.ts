@@ -3,7 +3,8 @@ import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { emailService } from '../services/emailService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import * as notionService from '../services/notionService';
+import { fileAutoIssue } from '../services/intakeService';
+import { __resetAgentModeAlertDedupeForTests } from '../utils/agentModeAlerts';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 
 // Mock dependencies
@@ -20,8 +21,10 @@ jest.mock('../services/chatbotService', () => ({
   updateTaskExecutionStatus: jest.fn(),
 }));
 
-jest.mock('../services/notionService', () => ({
-  createOncallItem: jest.fn().mockResolvedValue({ pageId: 'page-123', notionUrl: 'https://notion.so/page-123' }),
+// Telemetry sources (context-limit etc.) no longer file an issue — they only alert + set the
+// dedup flag. Mock the intake service so we can assert fileAutoIssue is NOT reached.
+jest.mock('../services/intakeService', () => ({
+  fileAutoIssue: jest.fn().mockResolvedValue({ pageId: 'ENG-1', url: 'https://linear.app/x', deduped: false, tracker: 'Linear' }),
 }));
 
 jest.mock('../services/emailService', () => ({
@@ -69,7 +72,7 @@ jest.mock('../utils/sseProgress', () => ({
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockEmailService = emailService as jest.Mocked<typeof emailService>;
 const mockGenerateMarketingResponseWorkerService = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
-const mockCreateOncallItem = notionService.createOncallItem as jest.MockedFunction<typeof notionService.createOncallItem>;
+const mockFileAutoIssue = fileAutoIssue as jest.MockedFunction<typeof fileAutoIssue>;
 
 describe('AgentModeController - Error Handling', () => {
   const mockUserId = 'test-user-123';
@@ -966,7 +969,9 @@ describe('AgentModeController - Error Handling', () => {
     });
   });
 
-  describe('generateResponse - context limit auto-report to Notion', () => {
+  describe('generateResponse - context limit (alert + dedup flag, no issue filed)', () => {
+    // Telemetry sources like context-limit no longer create a Linear/oncall issue (dropped in
+    // ENG-6). They STILL send the oncall alert email and set the contextLimitReported dedup flag.
     const contextError = new Error('The request exceeded the maximum context length');
 
     const makeReq = (sessionId = mockSessionId) => ({
@@ -983,9 +988,12 @@ describe('AgentModeController - Error Handling', () => {
 
     beforeEach(() => {
       mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(contextError);
+      // The oncall alert dedupes per (user, errorClass) via an in-memory map that persists across
+      // tests in this process — reset it so each test observes a fresh alert firing.
+      __resetAgentModeAlertDedupeForTests();
     });
 
-    it('should call createOncallItem when session has no contextLimitReported flag', async () => {
+    it('sets the contextLimitReported flag AND sends the alert, but files NO issue, when the session has no flag', async () => {
       mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, contextLimitReported: undefined } as any);
 
       await agentModeController.generateResponse(makeReq(), makeRes());
@@ -993,26 +1001,26 @@ describe('AgentModeController - Error Handling', () => {
       // Allow fire-and-forget to settle
       await new Promise(r => setImmediate(r));
 
-      expect(mockCreateOncallItem).toHaveBeenCalledWith(
-        expect.objectContaining({
-          additionalTags: expect.arrayContaining(['Customer Reported', 'Context Limit']),
-        })
-      );
+      // Dedup flag still set
       expect(mockChatbotDb.updateSessionContextLimitReported).toHaveBeenCalledWith(mockSessionId);
+      // Oncall alert still sent
+      expect(mockEmailService.sendOncallAlert).toHaveBeenCalled();
+      // But NO Linear/oncall issue is filed anymore
+      expect(mockFileAutoIssue).not.toHaveBeenCalled();
     });
 
-    it('should NOT call createOncallItem when session already has contextLimitReported = true', async () => {
+    it('does NOT set the flag when the session already has contextLimitReported = true', async () => {
       mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, contextLimitReported: true } as any);
 
       await agentModeController.generateResponse(makeReq(), makeRes());
 
       await new Promise(r => setImmediate(r));
 
-      expect(mockCreateOncallItem).not.toHaveBeenCalled();
       expect(mockChatbotDb.updateSessionContextLimitReported).not.toHaveBeenCalled();
+      expect(mockFileAutoIssue).not.toHaveBeenCalled();
     });
 
-    it('should NOT call createOncallItem when there is no sessionId', async () => {
+    it('does NOT set the flag when there is no sessionId', async () => {
       await agentModeController.generateResponse(
         { ...makeReq(), body: { userMessage: 'hi', llmModel: 'gpt-5-chat-2', attachments: [] } } as unknown as Request,
         makeRes()
@@ -1020,11 +1028,11 @@ describe('AgentModeController - Error Handling', () => {
 
       await new Promise(r => setImmediate(r));
 
-      expect(mockCreateOncallItem).not.toHaveBeenCalled();
+      expect(mockChatbotDb.updateSessionContextLimitReported).not.toHaveBeenCalled();
+      expect(mockFileAutoIssue).not.toHaveBeenCalled();
     });
 
-    it('should return 413 CONTEXT_LIMIT_EXCEEDED regardless of Notion call success', async () => {
-      mockCreateOncallItem.mockRejectedValueOnce(new Error('Notion unavailable'));
+    it('returns 413 CONTEXT_LIMIT_EXCEEDED', async () => {
       mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession } as any);
 
       const mockRes = makeRes();

@@ -1,8 +1,10 @@
 // Unit tests for report_product_issues tool
 
 // Mock dependencies BEFORE any imports
-jest.mock('../../services/notionService', () => ({
-  createOncallItem: jest.fn(),
+// ENG-6: report_product_issues routes through the shared intake service (fileUserIssue) — the
+// single unconditional Linear/Featurebase path. Assert on the intake payload + returned tracker.
+jest.mock('../../services/intakeService', () => ({
+  fileUserIssue: jest.fn(),
 }));
 
 jest.mock('../../services/resendService', () => ({
@@ -60,11 +62,11 @@ jest.mock('../../mcp/server/apiTools', () => ({
 
 import { emmaToolRegistry } from '../../emma/registry';
 
-import { createOncallItem } from '../../services/notionService';
+import { fileUserIssue } from '../../services/intakeService';
 import { resendService } from '../../services/resendService';
 import { userDb } from '../../services/db';
 
-const mockCreateOncallItem = createOncallItem as jest.MockedFunction<typeof createOncallItem>;
+const mockFileUserIssue = fileUserIssue as jest.MockedFunction<typeof fileUserIssue>;
 const mockGetUserById = userDb.getUserById as jest.MockedFunction<typeof userDb.getUserById>;
 const mockResendSendEmail = resendService.sendEmail as jest.MockedFunction<typeof resendService.sendEmail>;
 
@@ -82,9 +84,11 @@ describe('report_product_issues tool', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    mockCreateOncallItem.mockResolvedValue({
+    mockFileUserIssue.mockResolvedValue({
       pageId: 'notion-page-id',
-      notionUrl: 'https://notion.so/notionpageid',
+      trackerUrl: 'https://fb/p/notionpageid',
+      deduped: false,
+      tracker: 'Featurebase',
     });
     mockGetUserById.mockResolvedValue({
       userId: 'user-123',
@@ -119,25 +123,27 @@ describe('report_product_issues tool', () => {
     expect(result.results).toHaveLength(1);
     expect(result.results[0].issueId).toBe('AGW-notion-page-id');
 
-    expect(mockCreateOncallItem).toHaveBeenCalledWith({
+    expect(mockFileUserIssue).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'bug',
       title: 'Login fails',
       description: 'Cannot log in on mobile',
-      additionalTags: ['Customer Reported'],
-      context: {
+      userEmail: 'customer@example.com',
+      notionTags: ['Customer Reported'],
+      notionContext: expect.objectContaining({
         'User Name': 'Test Customer',
         'User Email': 'customer@example.com',
         'User ID': 'user-123',
         'Priority': 'High',
         'Page URL': 'https://app.example.com/login',
         'Session ID': 'sess-456',
-      },
-    });
+      }),
+    }));
   });
 
   it('should process multiple issues in one call', async () => {
-    mockCreateOncallItem
-      .mockResolvedValueOnce({ pageId: 'p1', notionUrl: 'https://notion.so/p1' })
-      .mockResolvedValueOnce({ pageId: 'p2', notionUrl: 'https://notion.so/p2' });
+    mockFileUserIssue
+      .mockResolvedValueOnce({ pageId: 'p1', trackerUrl: 'https://fb/p/p1', deduped: false, tracker: 'Featurebase' })
+      .mockResolvedValueOnce({ pageId: 'p2', trackerUrl: 'https://fb/p/p2', deduped: false, tracker: 'Featurebase' });
 
     const result = await toolExecute(
       { issues: [
@@ -149,17 +155,17 @@ describe('report_product_issues tool', () => {
 
     expect(result.success).toBe(true);
     expect(result.results).toHaveLength(2);
-    // Notion fallback path: deduped=false; results now also carry the tracker url (additive).
-    expect(result.results[0]).toEqual({ title: 'Bug 1', success: true, issueId: 'AGW-p1', deduped: false, url: 'https://notion.so/p1' });
-    expect(result.results[1]).toEqual({ title: 'Bug 2', success: true, issueId: 'AGW-p2', deduped: false, url: 'https://notion.so/p2' });
-    expect(mockCreateOncallItem).toHaveBeenCalledTimes(2);
+    // deduped=false; results carry the tracker url from fileUserIssue.trackerUrl.
+    expect(result.results[0]).toEqual({ title: 'Bug 1', success: true, issueId: 'AGW-p1', deduped: false, url: 'https://fb/p/p1' });
+    expect(result.results[1]).toEqual({ title: 'Bug 2', success: true, issueId: 'AGW-p2', deduped: false, url: 'https://fb/p/p2' });
+    expect(mockFileUserIssue).toHaveBeenCalledTimes(2);
     expect(mockResendSendEmail).toHaveBeenCalledTimes(2);
   });
 
   it('should handle partial failures gracefully', async () => {
-    mockCreateOncallItem
-      .mockResolvedValueOnce({ pageId: 'p1', notionUrl: 'https://notion.so/p1' })
-      .mockRejectedValueOnce(new Error('Notion API error'));
+    mockFileUserIssue
+      .mockResolvedValueOnce({ pageId: 'p1', trackerUrl: 'https://fb/p/p1', deduped: false, tracker: 'Featurebase' })
+      .mockRejectedValueOnce(new Error('intake down'));
 
     const result = await toolExecute(
       { issues: [
@@ -173,7 +179,7 @@ describe('report_product_issues tool', () => {
     expect(result.results).toHaveLength(2);
     expect(result.results[0].success).toBe(true);
     expect(result.results[1].success).toBe(false);
-    expect(result.results[1].error).toBe('Notion API error');
+    expect(result.results[1].error).toBe('intake down');
     expect(result.message).toContain('1 of 2');
   });
 
@@ -210,9 +216,9 @@ describe('report_product_issues tool', () => {
       { userId: 'user-123' }
     );
 
-    expect(mockCreateOncallItem).toHaveBeenCalledWith(
+    expect(mockFileUserIssue).toHaveBeenCalledWith(
       expect.objectContaining({
-        context: expect.objectContaining({
+        notionContext: expect.objectContaining({
           'Priority': 'Medium',
           'Page URL': 'N/A',
           'Session ID': 'N/A',
@@ -257,15 +263,16 @@ describe('report_product_issues tool', () => {
       expect(callArgs.html).toContain('customer@example.com');
     });
 
-    it('should add Reported By (Admin) field to Notion context when isDelegatedAdmin', async () => {
+    it('should add Reported By (Admin) field to intake context when isDelegatedAdmin', async () => {
       await toolExecute(
         { issues: [{ title: 'Admin-reported bug', description: 'Found via delegation' }] },
         delegateContext
       );
 
-      expect(mockCreateOncallItem).toHaveBeenCalledWith(
+      expect(mockFileUserIssue).toHaveBeenCalledWith(
         expect.objectContaining({
-          context: expect.objectContaining({
+          reportedByAdmin: 'admin@agentweb.pro',
+          notionContext: expect.objectContaining({
             'Reported By (Admin)': 'admin@agentweb.pro',
           }),
         })

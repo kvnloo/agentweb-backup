@@ -3,8 +3,8 @@
  *
  * The detector no longer fires per-user reportUIError calls. It scans all
  * users once per day, groups non-terminal users by their onboardingStage,
- * and posts ONE Notion oncall item summarizing the counts. These tests mock
- * userDb.getAllUsers + notionService.createOncallItem and assert on the
+ * and files ONE aggregated oncall item summarizing the counts. These tests mock
+ * userDb.getAllUsers + intakeService.fileAutoIssue and assert on the
  * aggregated shape + the single-task post.
  */
 jest.mock('../../services/db', () => ({
@@ -13,16 +13,20 @@ jest.mock('../../services/db', () => ({
   },
 }));
 
-jest.mock('../../services/notionService', () => ({
-  createOncallItem: jest.fn().mockResolvedValue({
-    pageId: 'page-id',
-    notionUrl: 'https://notion.so/page-id',
+// ENG-6: the daily report files via the shared intake service (fileAutoIssue) -> a private Linear
+// issue (Auto label, Triage). Assert on the intake payload it builds.
+jest.mock('../../services/intakeService', () => ({
+  fileAutoIssue: jest.fn().mockResolvedValue({
+    pageId: 'ENG-1',
+    url: 'https://linear.app/emmabyaw/issue/ENG-1',
+    deduped: false,
+    tracker: 'Linear',
   }),
 }));
 
 import { runOnboardingStuckDetector } from '../onboardingStuckDetector';
 const { userDb } = require('../../services/db');
-const { createOncallItem } = require('../../services/notionService');
+const { fileAutoIssue } = require('../../services/intakeService');
 
 const HOUR_MS = 60 * 60 * 1000;
 
@@ -74,7 +78,7 @@ describe('runOnboardingStuckDetector — daily aggregated report', () => {
     expect(r.totalStuck).toBe(0);
     expect(r.byStage).toEqual({});
     expect(r.notionUrl).toBeNull();
-    expect(createOncallItem).not.toHaveBeenCalled();
+    expect(fileAutoIssue).not.toHaveBeenCalled();
   });
 
   it('groups stuck users by stage and posts ONE Notion task with per-stage counts', async () => {
@@ -95,18 +99,18 @@ describe('runOnboardingStuckDetector — daily aggregated report', () => {
     expect(r.byStage.brand_submitted.oldestHours).toBeGreaterThanOrEqual(29);
     expect(r.byStage.brand_submitted.oldestHours).toBeLessThan(31);
     // Exactly one Notion task posted, regardless of N stuck users
-    expect(createOncallItem).toHaveBeenCalledTimes(1);
-    expect(createOncallItem).toHaveBeenCalledWith(
+    expect(fileAutoIssue).toHaveBeenCalledTimes(1);
+    expect(fileAutoIssue).toHaveBeenCalledWith(
       expect.objectContaining({
         title: expect.stringMatching(/^Onboarding stuck users — daily report /),
-        additionalTags: expect.arrayContaining(['Onboarding']),
+        notionTags: expect.arrayContaining(['Onboarding']),
       }),
     );
     // Title carries today's date (YYYY-MM-DD)
-    const callArg = createOncallItem.mock.calls[0][0];
+    const callArg = fileAutoIssue.mock.calls[0][0];
     expect(callArg.title).toMatch(/\d{4}-\d{2}-\d{2}$/);
     // Context surfaces totalStuck + per-stage rows
-    expect(callArg.context).toEqual(
+    expect(callArg.notionContext).toEqual(
       expect.objectContaining({
         'Total Stuck Users': '5',
         'Stage: brand_submitted': expect.stringContaining('3 users'),
@@ -124,7 +128,7 @@ describe('runOnboardingStuckDetector — daily aggregated report', () => {
     const r = await runOnboardingStuckDetector();
     expect(r.byStage.brand_submitted.count).toBe(8);
     expect(r.byStage.brand_submitted.sampleEmails.length).toBe(5);
-    const stageRow = createOncallItem.mock.calls[0][0].context['Stage: brand_submitted'];
+    const stageRow = fileAutoIssue.mock.calls[0][0].notionContext['Stage: brand_submitted'];
     // The row should mention "+3 more" since we capped at 5 of 8
     expect(stageRow).toMatch(/\+3 more/);
   });
@@ -173,7 +177,7 @@ describe('runOnboardingStuckDetector — daily aggregated report', () => {
     ]);
     const r = await runOnboardingStuckDetector();
     expect(r.totalStuck).toBe(0);
-    expect(createOncallItem).not.toHaveBeenCalled();
+    expect(fileAutoIssue).not.toHaveBeenCalled();
   });
 
   it('skips users whose last event is more recent than STUCK_HOURS', async () => {
@@ -182,11 +186,11 @@ describe('runOnboardingStuckDetector — daily aggregated report', () => {
     ]);
     const r = await runOnboardingStuckDetector();
     expect(r.totalStuck).toBe(0);
-    expect(createOncallItem).not.toHaveBeenCalled();
+    expect(fileAutoIssue).not.toHaveBeenCalled();
   });
 
   it('survives a Notion API failure — returns the report with notionUrl=null', async () => {
-    createOncallItem.mockRejectedValueOnce(new Error('Notion API down'));
+    fileAutoIssue.mockRejectedValueOnce(new Error('Notion API down'));
     userDb.getAllUsers.mockResolvedValue([
       makeUser({ userId: 'u1', email: 'u1@real.com', stage: 'brand_submitted', hoursIdle: 8 }),
     ]);

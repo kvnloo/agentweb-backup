@@ -1,5 +1,7 @@
 import { fileUserIssue, fileAutoIssue } from '../services/intakeService';
 
+// notionService is mocked ONLY so we can assert createOncallItem is NEVER reached — the Notion
+// fallback was deleted, Linear/Featurebase is the single unconditional path.
 jest.mock('../services/notionService', () => ({
   createOncallItem: jest.fn().mockResolvedValue({ pageId: 'notion-1', notionUrl: 'https://notion.so/notion-1' }),
 }));
@@ -28,31 +30,22 @@ const fb = require('../services/featurebaseService');
 const linear = require('../services/linearService');
 const resend = require('../services/resendService').resendService;
 
-describe('fileUserIssue — flag off', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+const realEnv = process.env.NODE_ENV;
 
-  it('files to Notion (migration default, not a fallback)', async () => {
-    process.env.FEATUREBASE_INTAKE = 'false';
-    const r = await fileUserIssue({ type: 'bug', title: 't', description: 'd', userEmail: 'u@e.com' });
-    expect(notion.createOncallItem).toHaveBeenCalled();
-    expect(r.tracker).toBe('Notion');
-    expect(dedup.findDuplicate).not.toHaveBeenCalled();
-  });
-});
-
+// Filing to Linear/Featurebase is suppressed outside production (mirrors the old Notion
+// dev-suppress), so the "real path" tests pin NODE_ENV=production.
 describe('fileUserIssue — feature_request (public post)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; fb.listOpenPosts.mockResolvedValue([]); });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  beforeEach(() => { process.env.NODE_ENV = 'production'; fb.listOpenPosts.mockResolvedValue([]); });
+  afterEach(() => { process.env.NODE_ENV = realEnv; jest.clearAllMocks(); });
 
-  it('no match -> creates a public post authored by the filer + a private eng note', async () => {
+  it('no match -> creates a public post authored by the filer + a private eng note; NEVER Notion', async () => {
     dedup.findDuplicate.mockResolvedValue(null);
     fb.createPost.mockResolvedValue({ id: 'post9', url: 'https://fb/p/new' });
     const r = await fileUserIssue({ type: 'feature_request', title: 'new thing', description: 'd', userEmail: 'u@e.com', userName: 'U', sessionId: 'sess-1' });
     expect(fb.createPost).toHaveBeenCalledWith(expect.objectContaining({ title: 'new thing', authorEmail: 'u@e.com', authorName: 'U' }));
     expect(fb.addComment).toHaveBeenCalledWith('post9', expect.stringContaining('Session: sess-1'), true);
     expect(fb.createTicket).not.toHaveBeenCalled();
+    expect(notion.createOncallItem).not.toHaveBeenCalled();
     expect(r).toMatchObject({ pageId: 'post9', deduped: false, tracker: 'Featurebase', userUrl: 'https://fb/p/new' });
   });
 
@@ -68,24 +61,20 @@ describe('fileUserIssue — feature_request (public post)', () => {
 });
 
 describe('fileUserIssue — bug (private own-card + one canonical listing affected users)', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; linear.listOpenBugCanonicals.mockResolvedValue([]); });
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+  beforeEach(() => { process.env.NODE_ENV = 'production'; linear.listOpenBugCanonicals.mockResolvedValue([]); });
+  afterEach(() => { process.env.NODE_ENV = realEnv; jest.clearAllMocks(); });
 
   it('no canonical -> creates the card + ONE canonical Linear ticket (lists affected user) + a reporter-ticket comment', async () => {
     dedup.findDuplicate.mockResolvedValue(null);
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
     fb.createTicket.mockResolvedValue({ id: 'tk', number: 7, url: 'https://fb/t/7' });
     const r = await fileUserIssue({ type: 'bug', title: 'crash', description: 'on save', userEmail: 'u@e.com', userName: 'U', sessionId: 'sess-2' });
-    // reporter's own private card = their words
     expect(fb.createTicket).toHaveBeenCalledWith(expect.objectContaining({ title: 'crash', content: 'on save', authorEmail: 'u@e.com', authorName: 'U' }));
-    // ONE canonical, listing the affected user
     expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({ labelNames: ['Bug', 'Customer Reported'] }));
     expect(linear.createInternalLinearIssue.mock.calls[0][0].description).toContain('Affected user: u@e.com');
-    // reporter-ticket comment (bridge contract + affected user + session). Marker embeds the
-    // reporter email so the resolve bridge can email them directly.
     expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-9', expect.stringContaining('[reporter-ticket #7 u@e.com]'));
     expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-9', expect.stringContaining('Session: sess-2'));
+    expect(notion.createOncallItem).not.toHaveBeenCalled();
     expect(r).toMatchObject({ pageId: '7', deduped: false, tracker: 'Featurebase', userUrl: 'https://fb/t/7' });
   });
 
@@ -94,16 +83,24 @@ describe('fileUserIssue — bug (private own-card + one canonical listing affect
     dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-5', title: 'crash', description: 'x' });
     fb.createTicket.mockResolvedValue({ id: 'tk2', number: 8, url: 'https://fb/t/8' });
     const r = await fileUserIssue({ type: 'bug', title: 'crashes too', description: 'also on save', userEmail: 'u2@e.com', sessionId: 'sess-3' });
-    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled(); // grouped onto the existing canonical
-    expect(fb.createTicket).toHaveBeenCalled(); // still gets its own card
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(fb.createTicket).toHaveBeenCalled();
     expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-5', expect.stringContaining('[reporter-ticket #8 u2@e.com]'));
-    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-5', expect.stringContaining('also on save')); // dup folds their text in
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-5', expect.stringContaining('also on save'));
     expect(r).toMatchObject({ pageId: '8', deduped: true, tracker: 'Featurebase', userUrl: 'https://fb/t/8' });
   });
 
-  it('createTicket throws -> PROPAGATES (no Notion fallback)', async () => {
+  it('createTicket throws -> PROPAGATES, no Notion fallback', async () => {
     fb.createTicket.mockRejectedValue(new Error('FB tickets down'));
     await expect(fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'u@e.com' })).rejects.toThrow('FB tickets down');
+    expect(notion.createOncallItem).not.toHaveBeenCalled();
+  });
+
+  it('canonical Linear create throws -> PROPAGATES, no Notion fallback', async () => {
+    dedup.findDuplicate.mockResolvedValue(null);
+    fb.createTicket.mockResolvedValue({ id: 'tk', number: 7, url: 'https://fb/t/7' });
+    linear.createInternalLinearIssue.mockRejectedValue(new Error('Linear down'));
+    await expect(fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'u@e.com' })).rejects.toThrow('Linear down');
     expect(notion.createOncallItem).not.toHaveBeenCalled();
   });
 
@@ -114,6 +111,30 @@ describe('fileUserIssue — bug (private own-card + one canonical listing affect
     linear.addIssueComment.mockRejectedValue(new Error('comment down'));
     const r = await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'u@e.com' });
     expect(r).toMatchObject({ pageId: '7', deduped: false });
+  });
+});
+
+describe('intake — dev-suppress (non-production, mirrors the old Notion dev-suppress)', () => {
+  afterEach(() => { process.env.NODE_ENV = realEnv; jest.clearAllMocks(); });
+
+  it('fileUserIssue: suppressed outside production — no FB/Linear/Notion write, empty result', async () => {
+    process.env.NODE_ENV = 'development';
+    const r = await fileUserIssue({ type: 'bug', title: 't', description: 'd', userEmail: 'u@e.com' });
+    expect(fb.createTicket).not.toHaveBeenCalled();
+    expect(fb.createPost).not.toHaveBeenCalled();
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(notion.createOncallItem).not.toHaveBeenCalled();
+    expect(dedup.findDuplicate).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ pageId: '', deduped: false });
+  });
+
+  it('fileAutoIssue: suppressed outside production — no Linear/Notion write, empty result', async () => {
+    process.env.NODE_ENV = 'test';
+    const r = await fileAutoIssue({ title: 't', description: 'd', source: 'Context limit' });
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(linear.listOpenIssuesByLabel).not.toHaveBeenCalled();
+    expect(notion.createOncallItem).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ pageId: '', deduped: false });
   });
 });
 
@@ -129,10 +150,8 @@ describe('intakeService.notifyCanonicalResolved (resolve bridge)', () => {
     ]);
     const r = await notifyCanonicalResolved('issue-uuid', 'Save button crashes');
     expect(r.ticketNumbers.sort()).toEqual([10, 11]);
-    // The EMAIL is the notification — sent to each reporter's address, with the issue title.
     expect(resend.sendSystemEmail).toHaveBeenCalledWith(expect.objectContaining({ to: 'a@e.com', subject: 'Resolved: Save button crashes' }));
     expect(resend.sendSystemEmail).toHaveBeenCalledWith(expect.objectContaining({ to: 'b@e.com', subject: 'Resolved: Save button crashes' }));
-    // The card status flip reflects the resolved state.
     expect(fb.patchTicketStatus).toHaveBeenCalledWith(10, 'status-completed');
     expect(fb.patchTicketStatus).toHaveBeenCalledWith(11, 'status-completed');
   });
@@ -164,37 +183,36 @@ describe('intakeService.notifyCanonicalResolved (resolve bridge)', () => {
     linear.getIssueComments.mockResolvedValue(['[reporter-ticket #10 a@e.com] a', '[reporter-ticket #11 b@e.com] b']);
     resend.sendSystemEmail.mockImplementation((p: any) => (p.to === 'a@e.com' ? Promise.reject(new Error('down')) : Promise.resolve()));
     const r = await notifyCanonicalResolved('issue-uuid');
-    expect(r.ticketNumbers).toEqual([11]); // 10 failed, 11 succeeded
+    expect(r.ticketNumbers).toEqual([11]);
     expect(fb.patchTicketStatus).toHaveBeenCalledWith(11, 'status-completed');
   });
 });
 
-describe('intakeService.fileAutoIssue', () => {
-  const realFlag = process.env.FEATUREBASE_INTAKE;
-  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+describe('intakeService.fileAutoIssue (production path)', () => {
+  beforeEach(() => { process.env.NODE_ENV = 'production'; });
+  afterEach(() => { process.env.NODE_ENV = realEnv; jest.clearAllMocks(); });
 
-  it('flag OFF -> Notion', async () => {
-    process.env.FEATUREBASE_INTAKE = 'false';
-    const r = await fileAutoIssue({ title: 't', description: 'd', source: 'Context limit' });
-    expect(notion.createOncallItem).toHaveBeenCalled();
-    expect(r.tracker).toBe('Notion');
-  });
-
-  it('flag ON + open Auto issue with same title -> groups (comment), no new issue', async () => {
-    process.env.FEATUREBASE_INTAKE = 'true';
+  it('open Auto issue with same title -> groups (comment), no new issue; NEVER Notion', async () => {
     linear.listOpenIssuesByLabel.mockResolvedValue([{ identifier: 'ENG-7', issueId: 'uuid-7', title: 'Context limit reached' }]);
     const r = await fileAutoIssue({ title: '  Context Limit Reached ', description: 'd', source: 'Context limit' });
     expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-7', expect.stringContaining('Recurred on'));
     expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(notion.createOncallItem).not.toHaveBeenCalled();
     expect(r).toMatchObject({ deduped: true, tracker: 'Linear' });
   });
 
-  it('flag ON + no match -> creates a private internal issue with the Auto label', async () => {
-    process.env.FEATUREBASE_INTAKE = 'true';
+  it('no match -> creates a private internal issue with the Auto label', async () => {
     linear.listOpenIssuesByLabel.mockResolvedValue([]);
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-8', url: 'u' });
     const r = await fileAutoIssue({ title: 'new auto', description: 'd', source: 'Scheduled chat', extraLabels: ['Scheduled Chat'] });
     expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({ labelNames: ['Auto', 'Scheduled Chat'] }));
     expect(r).toMatchObject({ deduped: false, tracker: 'Linear' });
+  });
+
+  it('Linear create throws -> PROPAGATES, no Notion fallback', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([]);
+    linear.createInternalLinearIssue.mockRejectedValue(new Error('Linear down'));
+    await expect(fileAutoIssue({ title: 't', description: 'd', source: 'x' })).rejects.toThrow('Linear down');
+    expect(notion.createOncallItem).not.toHaveBeenCalled();
   });
 });

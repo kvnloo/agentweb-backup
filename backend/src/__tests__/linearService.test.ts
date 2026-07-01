@@ -52,6 +52,69 @@ describe('linearService.createInternalLinearIssue', () => {
   });
 });
 
+describe('linearService.createInternalLinearIssue — target state (Triage-first)', () => {
+  beforeEach(() => { _resetLinearTeamCache(); });
+  afterEach(() => jest.clearAllMocks());
+
+  const teamWith = (states: any[]) => ({
+    data: { teams: { nodes: [{ id: 'team_eng', states: { nodes: states }, labels: { nodes: [{ id: 'lab_auto', name: 'Auto' }] } }] } },
+  });
+
+  const mockFetchSeq = (teamBody: any) => {
+    let n = 0;
+    (global.fetch as any) = jest.fn(() => {
+      n += 1;
+      const body = n === 1 ? teamBody : { data: { issueCreate: { success: true, issue: { id: 'uuid-1', identifier: 'ENG-1', url: 'u' } } } };
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) } as any);
+    });
+  };
+
+  it('sets stateId to the Triage state when the team has one (auto + reported issues land in Triage)', async () => {
+    mockFetchSeq(teamWith([
+      { id: 'st_triage', name: 'Triage', type: 'triage' },
+      { id: 'st_backlog', name: 'Backlog', type: 'backlog' },
+      { id: 'st_done', name: 'Done', type: 'completed' },
+    ]));
+    await createInternalLinearIssue({ title: 't', description: 'd', labelNames: ['Auto'] });
+    expect(lastCreateInput().stateId).toBe('st_triage');
+  });
+
+  it('prefers Triage regardless of state ordering (Triage listed after backlog)', async () => {
+    mockFetchSeq(teamWith([
+      { id: 'st_backlog', name: 'Backlog', type: 'backlog' },
+      { id: 'st_triage', name: 'Triage', type: 'triage' },
+    ]));
+    await createInternalLinearIssue({ title: 't', description: 'd', labelNames: ['Auto'] });
+    expect(lastCreateInput().stateId).toBe('st_triage');
+  });
+
+  it('does NOT use the backlog state when a Triage state exists', async () => {
+    mockFetchSeq(teamWith([
+      { id: 'st_triage', name: 'Triage', type: 'triage' },
+      { id: 'st_backlog', name: 'Backlog', type: 'backlog' },
+    ]));
+    await createInternalLinearIssue({ title: 't', description: 'd', labelNames: ['Auto'] });
+    expect(lastCreateInput().stateId).not.toBe('st_backlog');
+  });
+
+  it('falls back to the backlog state when the team has no Triage (behavior-preserving for old teams)', async () => {
+    mockFetchSeq(teamWith([
+      { id: 'st_backlog', name: 'Backlog', type: 'backlog' },
+      { id: 'st_done', name: 'Done', type: 'completed' },
+    ]));
+    await createInternalLinearIssue({ title: 't', description: 'd', labelNames: ['Auto'] });
+    expect(lastCreateInput().stateId).toBe('st_backlog');
+  });
+
+  it('omits stateId entirely when the team has neither Triage nor a backlog/unstarted state', async () => {
+    mockFetchSeq(teamWith([
+      { id: 'st_started', name: 'In Progress', type: 'started' },
+    ]));
+    await createInternalLinearIssue({ title: 't', description: 'd', labelNames: ['Auto'] });
+    expect(lastCreateInput().stateId).toBeUndefined();
+  });
+});
+
 describe('linearService.listOpenIssuesByLabel', () => {
   afterEach(() => jest.clearAllMocks());
 

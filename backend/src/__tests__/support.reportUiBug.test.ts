@@ -25,8 +25,10 @@ jest.mock('../services/settingsService', () => ({
   }
 }));
 
-jest.mock('../services/notionService', () => ({
-  createOncallItem: jest.fn().mockResolvedValue({ pageId: 'page-abc', notionUrl: 'https://notion.so/pageabc' })
+// ENG-6: report-ui-bug routes through the shared intake service (fileUserIssue) — the single
+// unconditional Linear/Featurebase path. Assert on the intake payload it builds.
+jest.mock('../services/intakeService', () => ({
+  fileUserIssue: jest.fn().mockResolvedValue({ pageId: 'page-abc', trackerUrl: 'https://fb/p/pageabc', deduped: false, tracker: 'Featurebase' })
 }));
 
 jest.mock('../utils/s3Utils', () => ({
@@ -51,7 +53,7 @@ jest.mock('../middleware/auth', () => ({
 }));
 
 const { resendService } = require('../services/resendService');
-const { createOncallItem } = require('../services/notionService');
+const { fileUserIssue } = require('../services/intakeService');
 const { uploadScreenshotToS3 } = require('../utils/s3Utils');
 
 function buildApp() {
@@ -75,7 +77,7 @@ describe('POST /api/support/report-ui-bug', () => {
 
     expect(res.status).toBe(400);
     expect(res.body.message).toMatch(/description is required/i);
-    expect(createOncallItem).not.toHaveBeenCalled();
+    expect(fileUserIssue).not.toHaveBeenCalled();
   });
 
   it('returns 400 when description is an empty/whitespace string', async () => {
@@ -119,13 +121,13 @@ describe('POST /api/support/report-ui-bug', () => {
     expect(uploadScreenshotToS3).toHaveBeenCalledWith(dataUrl, 'user-123');
 
     // Tracked item created on the sprint board with the right tags + context
-    expect(createOncallItem).toHaveBeenCalledTimes(1);
-    const itemArg = createOncallItem.mock.calls[0][0];
-    expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'Bug']));
+    expect(fileUserIssue).toHaveBeenCalledTimes(1);
+    const itemArg = fileUserIssue.mock.calls[0][0];
+    expect(itemArg.notionTags).toEqual(expect.arrayContaining(['Customer Reported', 'Bug']));
     expect(itemArg.title).toMatch(/^UI Bug:/);
     expect(itemArg.description).toContain('The save button is cut off');
-    expect(itemArg.context['Page URL']).toBe('https://app.agentweb.pro/settings');
-    expect(itemArg.context['Screenshot']).toContain('s3.amazonaws.com');
+    expect(itemArg.notionContext['Page URL']).toBe('https://app.agentweb.pro/settings');
+    expect(itemArg.notionContext['Screenshot']).toContain('s3.amazonaws.com');
 
     // Team notified, reply-to the customer
     expect(resendService.sendEmail).toHaveBeenCalledTimes(1);
@@ -145,9 +147,9 @@ describe('POST /api/support/report-ui-bug', () => {
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
     expect(uploadScreenshotToS3).not.toHaveBeenCalled();
-    expect(createOncallItem).toHaveBeenCalledTimes(1);
-    const itemArg = createOncallItem.mock.calls[0][0];
-    expect(itemArg.context['Screenshot']).toBe('Not provided');
+    expect(fileUserIssue).toHaveBeenCalledTimes(1);
+    const itemArg = fileUserIssue.mock.calls[0][0];
+    expect(itemArg.notionContext['Screenshot']).toBe('Not provided');
   });
 
   it('still reports the bug if screenshot upload fails (degrades gracefully)', async () => {
@@ -163,9 +165,9 @@ describe('POST /api/support/report-ui-bug', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
-    expect(createOncallItem).toHaveBeenCalledTimes(1);
-    const itemArg = createOncallItem.mock.calls[0][0];
-    expect(itemArg.context['Screenshot']).toBe('Upload failed');
+    expect(fileUserIssue).toHaveBeenCalledTimes(1);
+    const itemArg = fileUserIssue.mock.calls[0][0];
+    expect(itemArg.notionContext['Screenshot']).toBe('Upload failed');
   });
 
   // Report types — bugs, feature requests, improvements, general feedback
@@ -176,8 +178,8 @@ describe('POST /api/support/report-ui-bug', () => {
       .send({ description: 'The layout is broken' });
 
     expect(res.status).toBe(200);
-    const itemArg = createOncallItem.mock.calls[0][0];
-    expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'Bug']));
+    const itemArg = fileUserIssue.mock.calls[0][0];
+    expect(itemArg.notionTags).toEqual(expect.arrayContaining(['Customer Reported', 'Bug']));
     expect(itemArg.title).toMatch(/^UI Bug:/);
     expect(resendService.sendEmail.mock.calls[0][0].subject).toContain('[Bug]');
   });
@@ -189,8 +191,8 @@ describe('POST /api/support/report-ui-bug', () => {
       .send({ description: 'Weird thing', reportType: 'not-a-real-type' });
 
     expect(res.status).toBe(200);
-    const itemArg = createOncallItem.mock.calls[0][0];
-    expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'Bug']));
+    const itemArg = fileUserIssue.mock.calls[0][0];
+    expect(itemArg.notionTags).toEqual(expect.arrayContaining(['Customer Reported', 'Bug']));
   });
 
   it('tags and labels a feature request', async () => {
@@ -200,8 +202,8 @@ describe('POST /api/support/report-ui-bug', () => {
       .send({ description: 'Please add dark mode', reportType: 'feature_request' });
 
     expect(res.status).toBe(200);
-    const itemArg = createOncallItem.mock.calls[0][0];
-    expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'Feature Request']));
+    const itemArg = fileUserIssue.mock.calls[0][0];
+    expect(itemArg.notionTags).toEqual(expect.arrayContaining(['Customer Reported', 'Feature Request']));
     expect(itemArg.title).toMatch(/^Feature Request:/);
     const emailCall = resendService.sendEmail.mock.calls[0][0];
     expect(emailCall.subject).toContain('[Feature Request]');
@@ -215,8 +217,8 @@ describe('POST /api/support/report-ui-bug', () => {
       .send({ description: 'Make the dashboard faster', reportType: 'improvement' });
 
     expect(res.status).toBe(200);
-    const itemArg = createOncallItem.mock.calls[0][0];
-    expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'Improvement']));
+    const itemArg = fileUserIssue.mock.calls[0][0];
+    expect(itemArg.notionTags).toEqual(expect.arrayContaining(['Customer Reported', 'Improvement']));
     expect(itemArg.title).toMatch(/^Improvement:/);
     expect(resendService.sendEmail.mock.calls[0][0].subject).toContain('[Improvement]');
   });
@@ -228,8 +230,8 @@ describe('POST /api/support/report-ui-bug', () => {
       .send({ description: 'Love the product!', reportType: 'feedback' });
 
     expect(res.status).toBe(200);
-    const itemArg = createOncallItem.mock.calls[0][0];
-    expect(itemArg.additionalTags).toEqual(expect.arrayContaining(['Customer Reported', 'Feedback']));
+    const itemArg = fileUserIssue.mock.calls[0][0];
+    expect(itemArg.notionTags).toEqual(expect.arrayContaining(['Customer Reported', 'Feedback']));
     expect(itemArg.title).toMatch(/^Feedback:/);
     expect(resendService.sendEmail.mock.calls[0][0].subject).toContain('[Feedback]');
   });

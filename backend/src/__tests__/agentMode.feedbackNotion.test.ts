@@ -1,7 +1,7 @@
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb, ChatMessage } from '../services/chatbotService';
 import { AuthenticatedRequest } from '../middleware/auth';
-import * as notionService from '../services/notionService';
+import { fileAutoIssue } from '../services/intakeService';
 
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
@@ -13,9 +13,14 @@ jest.mock('../services/chatbotService', () => ({
   },
 }));
 
-jest.mock('../services/notionService', () => ({
-  createOncallItem: jest.fn().mockResolvedValue({ pageId: 'notion-page-1', notionUrl: 'https://notion.so/notion-page-1' }),
+// ENG-6: message-feedback votes are a telemetry source that no longer files an issue. The vote
+// itself is persisted via chatbotDb.updateMessageFeedback (its own durable record), so dropping
+// the issue-creation loses nothing. Mock the intake service to assert it is NOT reached.
+jest.mock('../services/intakeService', () => ({
+  fileAutoIssue: jest.fn().mockResolvedValue({ pageId: 'ENG-1', url: 'https://linear.app/x', deduped: false, tracker: 'Linear' }),
 }));
+
+const mockFileAutoIssue = fileAutoIssue as jest.MockedFunction<typeof fileAutoIssue>;
 
 const mockUser: AuthenticatedRequest['user'] = {
   userId: 'user-123',
@@ -59,9 +64,9 @@ beforeEach(() => {
   (chatbotDb.addMessageToSession as jest.Mock).mockResolvedValue(undefined);
 });
 
-describe('Agent Mode feedback → Notion item creation', () => {
+describe('Agent Mode message feedback — persists vote, files NO issue', () => {
   describe('submitMessageFeedback (authenticated)', () => {
-    it('should create a Notion item when user dislikes a message', async () => {
+    it('persists the vote (updateMessageFeedback) and files NO issue on a dislike', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
       (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(mockMessages);
 
@@ -69,20 +74,20 @@ describe('Agent Mode feedback → Notion item creation', () => {
       const res = mockResponse();
 
       await agentModeController.submitMessageFeedback(req, res);
-
-      // Allow async fire-and-forget to settle
       await Promise.resolve();
 
-      expect(notionService.createOncallItem).toHaveBeenCalledWith(
-        expect.objectContaining({
-          title: expect.stringContaining('Dislike'),
-          description: expect.stringContaining('Not helpful'),
-        }),
+      // The vote is persisted to its own store — the durable record of the vote.
+      expect(chatbotDb.updateMessageFeedback).toHaveBeenCalledWith(
+        'session-abc',
+        1,
+        expect.objectContaining({ type: 'dislike', comment: 'Not helpful', userId: 'user-123' }),
       );
+      // Telemetry issue-creation removed — no Linear/oncall item filed for a vote.
+      expect(mockFileAutoIssue).not.toHaveBeenCalled();
       expect(res.json).toHaveBeenCalledWith({ success: true, message: expect.any(Object) });
     });
 
-    it('should create a Notion item when user likes a message', async () => {
+    it('persists the vote and files NO issue on a like', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
       (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(mockMessages);
 
@@ -90,18 +95,17 @@ describe('Agent Mode feedback → Notion item creation', () => {
       const res = mockResponse();
 
       await agentModeController.submitMessageFeedback(req, res);
-
       await Promise.resolve();
 
-      expect(notionService.createOncallItem).toHaveBeenCalledWith(
-        expect.objectContaining({
-          title: expect.stringContaining('Like'),
-          description: expect.stringContaining('Excellent!'),
-        }),
+      expect(chatbotDb.updateMessageFeedback).toHaveBeenCalledWith(
+        'session-abc',
+        1,
+        expect.objectContaining({ type: 'like', comment: 'Excellent!' }),
       );
+      expect(mockFileAutoIssue).not.toHaveBeenCalled();
     });
 
-    it('should create a Notion item without comment when no comment provided', async () => {
+    it('persists the vote without a comment', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
       (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(mockMessages);
 
@@ -109,46 +113,13 @@ describe('Agent Mode feedback → Notion item creation', () => {
       const res = mockResponse();
 
       await agentModeController.submitMessageFeedback(req, res);
-
       await Promise.resolve();
 
-      expect(notionService.createOncallItem).toHaveBeenCalled();
+      expect(chatbotDb.updateMessageFeedback).toHaveBeenCalled();
+      expect(mockFileAutoIssue).not.toHaveBeenCalled();
     });
 
-    it('should include session title and session link in the Notion item', async () => {
-      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
-      (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(mockMessages);
-
-      const req = mockRequest(mockUser, 'session-abc', '1', { type: 'like' });
-      const res = mockResponse();
-
-      await agentModeController.submitMessageFeedback(req, res);
-
-      await Promise.resolve();
-
-      expect(notionService.createOncallItem).toHaveBeenCalledWith(
-        expect.objectContaining({
-          context: expect.objectContaining({
-            sessionId: 'session-abc',
-          }),
-        }),
-      );
-    });
-
-    it('should still return success even when Notion item creation fails', async () => {
-      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
-      (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(mockMessages);
-      (notionService.createOncallItem as jest.Mock).mockRejectedValue(new Error('Notion API down'));
-
-      const req = mockRequest(mockUser, 'session-abc', '1', { type: 'dislike', comment: 'Bad' });
-      const res = mockResponse();
-
-      await agentModeController.submitMessageFeedback(req, res);
-
-      expect(res.json).toHaveBeenCalledWith({ success: true, message: expect.any(Object) });
-    });
-
-    it('should not create Notion item when session is not found', async () => {
+    it('does not persist a vote or file an issue when the session is not found', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(null);
 
       const req = mockRequest(mockUser, 'session-abc', '1', { type: 'dislike' });
@@ -156,17 +127,19 @@ describe('Agent Mode feedback → Notion item creation', () => {
 
       await agentModeController.submitMessageFeedback(req, res);
 
-      expect(notionService.createOncallItem).not.toHaveBeenCalled();
+      expect(chatbotDb.updateMessageFeedback).not.toHaveBeenCalled();
+      expect(mockFileAutoIssue).not.toHaveBeenCalled();
       expect(res.status).toHaveBeenCalledWith(404);
     });
 
-    it('should not create Notion item when user is unauthorized', async () => {
+    it('rejects an unauthorized request without persisting or filing', async () => {
       const req = mockRequest(undefined, 'session-abc', '1', { type: 'dislike' });
       const res = mockResponse();
 
       await agentModeController.submitMessageFeedback(req, res);
 
-      expect(notionService.createOncallItem).not.toHaveBeenCalled();
+      expect(chatbotDb.updateMessageFeedback).not.toHaveBeenCalled();
+      expect(mockFileAutoIssue).not.toHaveBeenCalled();
       expect(res.status).toHaveBeenCalledWith(401);
     });
   });
