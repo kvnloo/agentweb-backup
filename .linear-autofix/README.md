@@ -19,6 +19,7 @@ Nothing is auto-merged. If Claude can't confidently fix a bug, it posts its inve
 | `autofix:needs-manual-test` | fix committed but not browser-verified (env down / inconclusive / api-only) — stays **In Progress** | Run the 🔍 manual steps from the comment, then merge. |
 | `autofix:needs-rework` | a gate failed (manager `needs_rework`, browser `not_fixed`, or a check failed) — stays **In Progress** | Real human work; the draft PR is a starting point. |
 | `autofix:cannot-fix` | no fix produced; investigation posted | Triage by hand. |
+| `autofix:blocked` | fixability gate: blocked on an EXTERNAL action (disconnected account, pending credentials, someone's to-do) — no fix attempted, issue **stays in Todo** | Resolve the blocker, then remove the label; the poller picks it up next cycle. |
 
 ## Revisions: steering a fix without opening an editor
 
@@ -103,7 +104,8 @@ pending `revise:` comments, then gc worktrees for Done issues. `poll.log` auto-r
 
 | Step | Linear state |
 |---|---|
-| Poller picks up `Bug` issues in a backlog/unstarted state **assigned to one of `config.assigneeEmails`** (Harshit / Manan / Anurag; unassigned bugs are skipped) | → **In Progress** (so it's not picked up twice) |
+| Poller picks up `Bug` issues in a backlog/unstarted state **assigned to one of `config.assigneeEmails`** (Harshit / Manan / Anurag; unassigned bugs are skipped) | picked up |
+| **Fixability gate** (cheap Sonnet pass over the issue text): blocked on an external action? | Blocked → `autofix:blocked` + comment, stays **Todo**, skipped until the label is removed. Fixable → **In Progress** (so it's not picked up twice) |
 | Fix committed, ALL gates green incl. real-browser verify | PR link(s) + reports commented + `autofix:green` + → **In Review** |
 | Fix committed but not browser-verified | Draft PR opened + `autofix:needs-manual-test`; stays **In Progress** |
 | A gate failed (`needs_rework` / `not_fixed` / check failed) | Draft PR flagged `[needs human]` + `autofix:needs-rework`; stays **In Progress** |
