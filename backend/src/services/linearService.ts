@@ -72,7 +72,6 @@ async function linearGraphQL(query: string, variables?: Record<string, any>): Pr
 interface TeamMeta {
   teamId: string;
   backlogStateId: string;
-  triageStateId?: string;
   labelIds: Record<string, string>; // name -> id
 }
 let teamMetaCache: TeamMeta | null = null;
@@ -91,13 +90,11 @@ async function getTeamMeta(): Promise<TeamMeta> {
   if (!team) throw new Error(`Linear team "${TEAM_KEY}" not found`);
   const states: any[] = team.states?.nodes || [];
   const backlog = states.find(s => s.type === 'backlog') || states.find(s => s.type === 'unstarted');
-  const triage = states.find(s => s.type === 'triage');
   const labelIds: Record<string, string> = {};
   for (const l of (team.labels?.nodes || [])) labelIds[l.name.toLowerCase()] = l.id;
   teamMetaCache = {
     teamId: team.id,
     backlogStateId: backlog?.id,
-    triageStateId: triage?.id,
     labelIds,
   };
   return teamMetaCache;
@@ -190,10 +187,9 @@ export async function createInternalLinearIssue(params: { title: string; descrip
     description: params.description,
     labelIds,
   };
-  // Prefer the Triage state so auto-filed + customer-reported issues land in Triage for a human
-  // to grade, not silently in the backlog. Falls back to backlog for teams without a Triage state.
-  const stateId = meta.triageStateId ?? meta.backlogStateId;
-  if (stateId) input.stateId = stateId;
+  // Land on the board (Backlog), NOT Triage — user-reported bugs + auto-issues must be tracked and
+  // never sit un-accepted in a triage inbox. Triage stays for unvetted external/integration intake.
+  if (meta.backlogStateId) input.stateId = meta.backlogStateId;
   const data = await linearGraphQL(
     `mutation($input: IssueCreateInput!) {
       issueCreate(input: $input) { success issue { id identifier url } }
