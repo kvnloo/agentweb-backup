@@ -17531,7 +17531,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     } catch (err: any) {
       const code = err?.code || err?.status;
       if (code === 403 || code === 401) {
-        return { success: false, message: 'Cannot list this folder — it was not created by Emma or you don\'t have access.' };
+        return { success: false, message: 'Google Drive access denied. Your Google Drive connection may have expired — reconnect in Settings → Connected Accounts.' };
       }
       if (code === 404) {
         return { success: false, message: 'Folder not found. Check the URL or ID and try again.' };
@@ -17610,6 +17610,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   // ── Markdown → HTML (for Google Drive HTML import) ───────────────────────
 
+  static readonly DEFAULT_STYLE_OPTIONS = {
+    primaryColor: '#1a73e8',
+    fontFamily: 'Arial, sans-serif',
+    fontSize: 14,
+    lineHeight: 1.7,
+    compact: false,
+  };
+
   private static escapeHtml(s: string): string {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
@@ -17626,7 +17634,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       m = remaining.match(/^\*([^*\n]+?)\*/s) ?? remaining.match(/^_([^_\n]+?)_/s);
       if (m) { result += `<em>${AgentModeService.escapeHtml(m[1])}</em>`; remaining = remaining.slice(m[0].length); continue; }
       m = remaining.match(/^`([^`\n]+)`/s);
-      if (m) { result += `<code>${AgentModeService.escapeHtml(m[1])}</code>`; remaining = remaining.slice(m[0].length); continue; }
+      if (m) { result += `<code style="background-color:#f1f3f4;padding:1px 5px;border-radius:3px;font-family:Courier New,monospace;font-size:90%;text-decoration:none">${AgentModeService.escapeHtml(m[1])}</code>`; remaining = remaining.slice(m[0].length); continue; }
       m = remaining.match(/^\[([^\]]+)\]\(([^)]+)\)/);
       if (m) { result += `<a href="${AgentModeService.escapeHtml(m[2])}">${AgentModeService.escapeHtml(m[1])}</a>`; remaining = remaining.slice(m[0].length); continue; }
       m = remaining.match(/^<[^>]+>/);
@@ -17639,33 +17647,59 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   /** Convert markdown to an HTML string for Google Drive HTML import.
    *  style='plain'  → bare semantic HTML; Google Docs applies its own default styling (default)
-   *  style='styled' → inline CSS with modern colors, table headers, spacing
+   *  style='styled' → inline CSS with colors, table headers, and spacing derived from styleOptions
    */
-  static markdownToHtml(markdown: string, style: 'plain' | 'styled' = 'plain', primaryColor = '#1a73e8'): string {
+  static markdownToHtml(
+    markdown: string,
+    style: 'plain' | 'styled' = 'plain',
+    styleOptions: {
+      primaryColor?: string;
+      fontFamily?: string;
+      fontSize?: number;
+      lineHeight?: number;
+      compact?: boolean;
+    } = {},
+  ): string {
     if (!markdown?.trim()) return '';
     const tokens = AgentModeService.lexMarkdown(markdown);
     const styled = style === 'styled';
-    const pc = primaryColor || '#1a73e8';
+
+    // Resolve options with defaults
+    const d = AgentModeService.DEFAULT_STYLE_OPTIONS;
+    const pc  = styleOptions.primaryColor ?? d.primaryColor;
+    const ff  = styleOptions.fontFamily   ?? d.fontFamily;
+    const fs  = styleOptions.fontSize     ?? d.fontSize;
+    const lh  = styleOptions.lineHeight   ?? d.lineHeight;
+    const compact = styleOptions.compact  ?? d.compact;
+
+    // Proportional heading sizes
+    const h1fs = Math.round(fs * 1.86);
+    const h2fs = Math.round(fs * 1.29);
+    const h3fs = fs;
+
+    // Cell padding
+    const thPad = compact ? '5px 8px' : '8px 12px';
+    const tdPad = compact ? '4px 8px' : '6px 12px';
 
     // Style tokens — empty strings when plain so attrs are omitted cleanly
-    const bodyAttr   = styled ? ' style="font-family:Arial,sans-serif;font-size:14px;color:#202124;line-height:1.6;max-width:900px;margin:0 auto;padding:24px"' : '';
+    const bodyAttr   = styled ? ` style="font-family:${ff};font-size:${fs}px;color:#202124;line-height:${lh}"` : '';
     const hStyles: Record<number, string> = styled ? {
-      1: ` style="font-size:24px;font-weight:700;color:${pc};border-bottom:2px solid #e8eaed;padding-bottom:8px;margin-top:32px;margin-bottom:16px"`,
-      2: ' style="font-size:20px;font-weight:700;color:#202124;margin-top:28px;margin-bottom:12px"',
-      3: ' style="font-size:16px;font-weight:700;color:#3c4043;margin-top:24px;margin-bottom:8px"',
+      1: ` style="font-size:${h1fs}px;font-weight:700;color:${pc};margin-top:12px;margin-bottom:4px;text-decoration:none"`,
+      2: ` style="font-size:${h2fs}px;font-weight:600;color:${pc};margin-top:18px;margin-bottom:6px;text-decoration:none"`,
+      3: ` style="font-size:${h3fs}px;font-weight:700;color:#3c4043;margin-top:14px;margin-bottom:4px;text-decoration:none"`,
     } : {};
-    const pAttr      = styled ? ' style="margin:8px 0;line-height:1.7"' : '';
-    const ulAttr     = styled ? ' style="margin:8px 0;padding-left:24px;line-height:1.7"' : '';
-    const liAttr     = styled ? ' style="margin:4px 0"' : '';
-    const bqAttr     = styled ? ` style="border-left:4px solid ${pc};margin:16px 0;padding:8px 16px;background-color:#f8f9fa;color:#5f6368;font-style:italic"` : '';
-    const preAttr    = styled ? ' style="background-color:#f8f9fa;border:1px solid #e8eaed;padding:16px;margin:12px 0"' : '';
-    const codeAttr   = styled ? ' style="font-family:Courier New,monospace;font-size:13px"' : '';
-    const tableAttr  = styled ? ' style="border-collapse:collapse;width:100%;margin:16px 0;font-size:14px"' : '';
-    const thAttr     = styled ? ` style="padding:10px 16px;text-align:left;background-color:${pc};color:#ffffff;font-weight:bold;font-size:14px"` : '';
-    const hrAttr     = styled ? ' style="border:none;border-top:1px solid #e8eaed;margin:24px 0"' : '';
+    const pAttr      = styled ? ` style="margin:6px 0;line-height:${lh}"` : '';
+    const ulAttr     = styled ? ` style="margin:6px 0;padding-left:22px;line-height:${lh}"` : '';
+    const liAttr     = styled ? ' style="margin:3px 0"' : '';
+    const bqAttr     = styled ? ` style="border-left:3px solid ${pc};margin:12px 0;padding:6px 14px;background-color:#f8f9fa;color:#5f6368;font-style:italic"` : '';
+    const preAttr    = styled ? ` style="background-color:#f8f9fa;border:1px solid #e8eaed;border-radius:4px;padding:14px;margin:10px 0;font-family:Courier New,monospace;font-size:${Math.round(fs * 0.93)}px;overflow-x:auto"` : '';
+    const codeAttr   = styled ? ` style="font-family:Courier New,monospace;font-size:${Math.round(fs * 0.93)}px"` : '';
+    const tableAttr  = styled ? ` style="border-collapse:collapse;width:100%;margin:10px 0;font-size:${fs}px"` : '';
+    const thAttr     = styled ? ` style="padding:${thPad};text-align:left;background-color:${pc};color:#ffffff;font-weight:600;white-space:nowrap"` : '';
+    const hrAttr     = styled ? ' style="border:none;border-top:1px solid #d1d5db;margin:16px 0"' : '';
 
     const tdStyle = (ri: number) => styled
-      ? ` style="padding:10px 16px;border-bottom:1px solid #e8eaed;vertical-align:top;background-color:${ri % 2 === 0 ? '#ffffff' : '#f8f9fa'}"`
+      ? ` style="padding:${tdPad};border-bottom:1px solid #e8eaed;vertical-align:top;background-color:${ri % 2 === 0 ? '#ffffff' : '#f8f9fa'}"`
       : '';
 
     const parts: string[] = [
@@ -18231,14 +18265,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   // ─────────────────────────────────────────────────────────────────────────
 
-  public async createGoogleDoc(title: string, content: string, userId: string, folderId?: string, shareWithEmails?: string[], style: 'plain' | 'styled' = 'plain', primaryColor?: string): Promise<any> {
+  public async createGoogleDoc(title: string, content: string, userId: string, folderId?: string, shareWithEmails?: string[], style: 'plain' | 'styled' = 'plain', styleOptions?: { primaryColor?: string; fontFamily?: string; fontSize?: number; lineHeight?: number; compact?: boolean }): Promise<any> {
     let docId: string | undefined;
     let drive: any;
     try {
       const auth = await this.getGoogleDriveOAuthClient(userId);
       drive = google.drive({ version: 'v3', auth });
 
-      const htmlBody = content ? AgentModeService.markdownToHtml(content, style, primaryColor) : undefined;
+      const htmlBody = content ? AgentModeService.markdownToHtml(content, style, styleOptions) : undefined;
       const createResp = await drive.files.create({
         requestBody: {
           name: title,
@@ -18284,14 +18318,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async updateGoogleDoc(fileIdOrUrl: string, content: string, userId: string, style: 'plain' | 'styled' = 'plain', primaryColor?: string): Promise<any> {
+  public async updateGoogleDoc(fileIdOrUrl: string, content: string, userId: string, style: 'plain' | 'styled' = 'plain', styleOptions?: { primaryColor?: string; fontFamily?: string; fontSize?: number; lineHeight?: number; compact?: boolean }): Promise<any> {
     try {
       const auth = await this.getGoogleDriveOAuthClient(userId);
       const drive = google.drive({ version: 'v3', auth });
       const fileId = this.extractGoogleFileId(fileIdOrUrl);
 
       if (content) {
-        const htmlBody = AgentModeService.markdownToHtml(content, style, primaryColor);
+        const htmlBody = AgentModeService.markdownToHtml(content, style, styleOptions);
         await drive.files.update({
           fileId,
           media: { mimeType: 'text/html', body: htmlBody },

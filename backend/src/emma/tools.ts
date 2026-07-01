@@ -8062,77 +8062,61 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
-  name: 'list_google_drive_folder',
+  name: 'google_drive',
   definition: {
-    name: 'list_google_drive_folder',
-    description: 'List files and folders inside a Google Drive folder. Works on folders Emma created (drive.file scope). Returns file names, IDs, types, and URLs. Use this when the user asks what\'s inside a folder or wants to reference a file Emma previously created.',
+    name: 'google_drive',
+    description: 'Google Drive utility actions. Use action="search" when user refers to a file/folder by name or wants to browse/find something — search immediately, do NOT ask the user for a URL. Use action="list" to list contents of a folder — use folder_url_or_id="root" when user asks to browse their Drive or list folders without specifying a location. Use action="create_folder" when the user asks to create a folder — just do it.',
     inputSchema: {
       type: 'object',
       properties: {
-        folder_url_or_id: {
+        action: {
           type: 'string',
-          description: 'Google Drive folder URL or folder ID',
+          enum: ['search', 'list', 'create_folder'],
+          description: '"search" — find files/folders by name. "list" — list contents of a folder (use "root" for root Drive). "create_folder" — create a new Drive folder.',
         },
-      },
-      required: ['folder_url_or_id'],
-    },
-  },
-  execute: async (args: any, context?: any) => {
-    if (!context?.userId) return { success: false, message: 'Authentication required' };
-    return agentModeService.listGoogleDriveFolder(args.folder_url_or_id, context.userId);
-  },
-});
-
-emmaToolRegistry.register({
-  name: 'search_google_drive',
-  definition: {
-    name: 'search_google_drive',
-    description: 'Search for files or folders in the user\'s Google Drive by name. Use this when the user refers to a folder or file by name (e.g. "Emma Test folder", "Q2 report") — search for it first, then use the returned ID with create_google_doc, list_google_drive_folder, or other tools. Do NOT ask the user for a folder URL if they gave you a name — search first.',
-    inputSchema: {
-      type: 'object',
-      properties: {
+        // search params
         query: {
           type: 'string',
-          description: 'Name or partial name to search for',
+          description: '[search] Name or partial name to search for.',
         },
         type: {
           type: 'string',
           enum: ['folder', 'file', 'any'],
-          description: 'Filter results: "folder" for folders only, "file" for files only, "any" for both. Default: "any"',
+          description: '[search] Filter: "folder", "file", or "any" (default).',
         },
-      },
-      required: ['query'],
-    },
-  },
-  execute: async (args: any, context?: any) => {
-    if (!context?.userId) return { success: false, message: 'Authentication required' };
-    return agentModeService.searchGoogleDrive(args.query, context.userId, args.type);
-  },
-});
-
-emmaToolRegistry.register({
-  name: 'create_google_drive_folder',
-  definition: {
-    name: 'create_google_drive_folder',
-    description: 'Create a new folder in the user\'s Google Drive. Requires Google Drive connected in Settings → Connected Accounts. Returns the folder ID and URL. Use the returned folder_id to place Docs or Sheets inside it via create_google_doc or create_google_sheet. Just do it when the user has asked for a folder — do not ask for additional confirmation.',
-    inputSchema: {
-      type: 'object',
-      properties: {
+        // list params
+        folder_url_or_id: {
+          type: 'string',
+          description: '[list] Google Drive folder URL, folder ID, or "root" to list the root Drive.',
+        },
+        // create_folder params
         name: {
           type: 'string',
-          description: 'Name of the folder to create',
+          description: '[create_folder] Name of the folder to create.',
         },
         parent_folder_id: {
           type: 'string',
-          description: 'Optional: ID of a parent folder to create this folder inside. If omitted, creates in the root of the user\'s Drive.',
+          description: '[create_folder] Optional parent folder ID. Omit to create in Drive root.',
         },
       },
-      required: ['name'],
+      required: ['action'],
     },
   },
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
-    return agentModeService.createGoogleDriveFolder(args.name, context.userId, args.parent_folder_id);
+    if (args.action === 'search') {
+      if (!args.query) return { success: false, message: 'query is required for action=search' };
+      return agentModeService.searchGoogleDrive(args.query, context.userId, args.type);
+    }
+    if (args.action === 'list') {
+      if (!args.folder_url_or_id) return { success: false, message: 'folder_url_or_id is required for action=list' };
+      return agentModeService.listGoogleDriveFolder(args.folder_url_or_id, context.userId);
+    }
+    if (args.action === 'create_folder') {
+      if (!args.name) return { success: false, message: 'name is required for action=create_folder' };
+      return agentModeService.createGoogleDriveFolder(args.name, context.userId, args.parent_folder_id);
+    }
+    return { success: false, message: `Unknown action: ${args.action}` };
   },
 });
 
@@ -8140,7 +8124,7 @@ emmaToolRegistry.register({
   name: 'create_google_doc',
   definition: {
     name: 'create_google_doc',
-    description: 'Create a new Google Doc with rich formatting. Requires the user to have connected Google Drive in Settings → Connected Accounts. The Doc is created in the user\'s own Drive (or a specific folder if folder_id is provided) and optionally shared with additional emails. Returns the Doc URL. Content is written in markdown and automatically converted to rich Google Docs formatting (headings, bold, italic, bullet lists, numbered lists, tables, code blocks, blockquotes, etc.) — write full markdown, do NOT flatten to plain text. BEHAVIOR: Just do it — do NOT present options or ask the user to choose a format. Make the best judgment call from context and create the doc immediately. If the user names a destination folder by name (e.g. "Emma Test folder"), use search_google_drive first to find its ID — do NOT ask the user for the URL. Images and logos cannot be embedded inline via the API — include them as clickable links in the doc content instead. For style: use "styled" when the user wants polished/branded/professional output, "plain" for quick or simple docs. For primary_color: derive from brand colors or user\'s explicit color request.',
+    description: 'Create a new Google Doc with rich formatting. Requires the user to have connected Google Drive in Settings → Connected Accounts. The Doc is created in the user\'s own Drive (or a specific folder if folder_id is provided) and optionally shared with additional emails. Returns the Doc URL. Content is written in markdown and automatically converted to rich Google Docs formatting (headings, bold, italic, bullet lists, numbered lists, tables, code blocks, blockquotes, etc.) — write full markdown, do NOT flatten to plain text. BEHAVIOR: Just do it — do NOT present options or ask the user to choose a format. Make the best judgment call from context and create the doc immediately. If the user names a destination folder by name (e.g. "Emma Test folder"), use google_drive action=search first to find its ID — do NOT ask the user for the URL. Images and logos cannot be embedded inline via the API — include them as clickable links in the doc content instead. Docs are styled by default — set plain=true only if the user explicitly wants a simple/minimal doc with no formatting. Use style_options.primary_color to apply brand colors or a color the user requested.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -8161,14 +8145,35 @@ emmaToolRegistry.register({
           items: { type: 'string' },
           description: 'Optional: additional email addresses to share the Doc with (writer access). The calling user is always shared automatically.',
         },
-        style: {
-          type: 'string',
-          enum: ['plain', 'styled'],
-          description: 'Optional: "plain" (default) = standard Google Doc appearance, Google\'s own default formatting. "styled" = modern visual design with colored table headers, accent colors, and enhanced spacing. Use "styled" when the user asks for a polished, professional, branded, or nicely formatted document. Use "plain" (or omit) for everyday documents, quick notes, or when the user says "simple" or "just put it in a doc".',
+        plain: {
+          type: 'boolean',
+          description: 'Set true ONLY if the user explicitly asks for a plain/simple/minimal doc or quick note with no formatting. Omit (or false) for everything else.',
         },
-        primary_color: {
-          type: 'string',
-          description: 'Optional: hex color code (e.g. "#6B21A8") used as the accent color when style is "styled". Applied to table headers, H1 headings, and blockquote borders. Derive from the user\'s brand colors or their explicit request (e.g. "use purple" → "#7C3AED"). Omit to use the default blue (#1a73e8).',
+        style_options: {
+          type: 'object',
+          description: 'Visual customizations. Only set what the user asked for — everything else uses sensible defaults (Arial 14px, blue accent). Set primary_color if you know the brand or the user specified a color. Set font_family or font_size only if the user asks.',
+          properties: {
+            primary_color: {
+              type: 'string',
+              description: 'Hex accent color for headings and table headers. Derive from brand colors or user request (e.g. brand pink → "#e6518d", "use purple" → "#7C3AED"). Default: #1a73e8.',
+            },
+            font_family: {
+              type: 'string',
+              description: 'Body font. Examples: "Georgia, serif" (editorial), "Times New Roman, serif" (formal), "Trebuchet MS, sans-serif" (modern), "Courier New, monospace" (technical). Default: "Arial, sans-serif".',
+            },
+            font_size: {
+              type: 'number',
+              description: 'Base body font size in px. Heading sizes scale proportionally. Use 12 for compact, 16-18 for larger. Default: 14.',
+            },
+            line_height: {
+              type: 'number',
+              description: 'Line spacing multiplier. 1.4 = tight, 1.7 = default, 2.0 = spacious.',
+            },
+            compact: {
+              type: 'boolean',
+              description: 'Reduce table cell padding and element spacing. Default: false.',
+            },
+          },
         },
       },
       required: ['title', 'content'],
@@ -8176,7 +8181,10 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
-    return agentModeService.createGoogleDoc(args.title, args.content, context.userId, args.folder_id, args.share_with_emails, args.style, args.primary_color);
+    const style = args.plain === true ? 'plain' : 'styled';
+    const so = args.style_options;
+    const styleOptions = so ? { primaryColor: so.primary_color, fontFamily: so.font_family, fontSize: so.font_size, lineHeight: so.line_height, compact: so.compact } : undefined;
+    return agentModeService.createGoogleDoc(args.title, args.content, context.userId, args.folder_id, args.share_with_emails, style, styleOptions);
   },
 });
 
@@ -8196,14 +8204,20 @@ emmaToolRegistry.register({
           type: 'string',
           description: 'New content in markdown format (replaces all existing content). Write full markdown — it is automatically converted to rich Google Docs formatting. Do NOT flatten to plain text.',
         },
-        style: {
-          type: 'string',
-          enum: ['plain', 'styled'],
-          description: 'Optional: "plain" (default) = standard Google Doc appearance. "styled" = modern visual design with colors and enhanced formatting. Match whatever style was used when the doc was created.',
+        plain: {
+          type: 'boolean',
+          description: 'Set true ONLY if the original doc was plain or user wants no formatting.',
         },
-        primary_color: {
-          type: 'string',
-          description: 'Optional: hex color code (e.g. "#6B21A8") for the accent color when style is "styled". Match the color used when the doc was originally created.',
+        style_options: {
+          type: 'object',
+          description: 'Visual customizations. Match what was used when the doc was originally created, or apply any new style the user requests.',
+          properties: {
+            primary_color: { type: 'string', description: 'Hex accent color.' },
+            font_family: { type: 'string', description: 'Body font family.' },
+            font_size: { type: 'number', description: 'Base font size in px.' },
+            line_height: { type: 'number', description: 'Line spacing multiplier.' },
+            compact: { type: 'boolean', description: 'Tighter table/element spacing.' },
+          },
         },
       },
       required: ['url_or_id', 'content'],
@@ -8211,7 +8225,10 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
-    return agentModeService.updateGoogleDoc(args.url_or_id, args.content, context.userId, args.style, args.primary_color);
+    const style = args.plain === true ? 'plain' : 'styled';
+    const so = args.style_options;
+    const styleOptions = so ? { primaryColor: so.primary_color, fontFamily: so.font_family, fontSize: so.font_size, lineHeight: so.line_height, compact: so.compact } : undefined;
+    return agentModeService.updateGoogleDoc(args.url_or_id, args.content, context.userId, style, styleOptions);
   },
 });
 

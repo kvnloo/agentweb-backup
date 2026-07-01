@@ -1,6 +1,6 @@
 /**
  * Tests for Emma Google Drive tools (defined in emma/tools.ts).
- * Tools: read_google_doc, list_google_drive_folder, create_google_drive_folder,
+ * Tools: read_google_doc, google_drive,
  *        create_google_doc, update_google_doc, create_google_sheet, update_google_sheet
  */
 
@@ -46,6 +46,7 @@ jest.mock('../../services/contactCaptureHooks', () => ({
 
 const mockReadGoogleFileById = jest.fn();
 const mockListGoogleDriveFolder = jest.fn();
+const mockSearchGoogleDrive = jest.fn();
 const mockCreateGoogleDriveFolder = jest.fn();
 const mockCreateGoogleDoc = jest.fn();
 const mockUpdateGoogleDoc = jest.fn();
@@ -56,6 +57,7 @@ jest.mock('../../services/agentModeService', () => ({
   agentModeService: {
     readGoogleFileById: (...a: any[]) => mockReadGoogleFileById(...a),
     listGoogleDriveFolder: (...a: any[]) => mockListGoogleDriveFolder(...a),
+    searchGoogleDrive: (...a: any[]) => mockSearchGoogleDrive(...a),
     createGoogleDriveFolder: (...a: any[]) => mockCreateGoogleDriveFolder(...a),
     createGoogleDoc: (...a: any[]) => mockCreateGoogleDoc(...a),
     updateGoogleDoc: (...a: any[]) => mockUpdateGoogleDoc(...a),
@@ -179,130 +181,151 @@ describe('read_google_doc — URL parsing', () => {
   });
 });
 
-// ─── list_google_drive_folder ────────────────────────────────────────────────
+// ─── google_drive — action=list ──────────────────────────────────────────────
 
-describe('list_google_drive_folder — registration', () => {
-  it('is registered with correct name', async () => {
-    const tool = await getTool('list_google_drive_folder');
-    expect(tool.definition.name).toBe('list_google_drive_folder');
-  });
-
-  it('schema requires folder_url_or_id', async () => {
-    const tool = await getTool('list_google_drive_folder');
-    expect(tool.definition.inputSchema.required).toContain('folder_url_or_id');
-  });
-});
-
-describe('list_google_drive_folder — auth guard', () => {
-  it('returns auth error when userId is missing', async () => {
-    const tool = await getTool('list_google_drive_folder');
-    const result = await tool.execute({ folder_url_or_id: 'folder-id-1' }, {});
-    expect(result.success).toBe(false);
-    expect(result.message).toMatch(/authentication required/i);
-    expect(mockListGoogleDriveFolder).not.toHaveBeenCalled();
-  });
-
-  it('returns auth error when context is undefined', async () => {
-    const tool = await getTool('list_google_drive_folder');
-    const result = await tool.execute({ folder_url_or_id: 'folder-id-1' }, undefined);
-    expect(result.success).toBe(false);
-    expect(result.message).toMatch(/authentication required/i);
-  });
-});
-
-describe('list_google_drive_folder — delegation', () => {
-  it('calls agentModeService.listGoogleDriveFolder with correct args', async () => {
+describe('google_drive — action=list', () => {
+  it('calls listGoogleDriveFolder with folder_url_or_id and userId', async () => {
     mockListGoogleDriveFolder.mockResolvedValue({ success: true, files: [] });
-    const tool = await getTool('list_google_drive_folder');
-    await tool.execute({ folder_url_or_id: 'folder-abc' }, { userId: USER });
+    const tool = await getTool('google_drive');
+    await tool.execute({ action: 'list', folder_url_or_id: 'folder-abc' }, { userId: USER });
     expect(mockListGoogleDriveFolder).toHaveBeenCalledWith('folder-abc', USER);
+  });
+
+  it('passes "root" to list root Drive', async () => {
+    mockListGoogleDriveFolder.mockResolvedValue({ success: true, files: [] });
+    const tool = await getTool('google_drive');
+    await tool.execute({ action: 'list', folder_url_or_id: 'root' }, { userId: USER });
+    expect(mockListGoogleDriveFolder).toHaveBeenCalledWith('root', USER);
+  });
+
+  it('passes a folder URL through to the service unchanged', async () => {
+    mockListGoogleDriveFolder.mockResolvedValue({ success: true, files: [] });
+    const tool = await getTool('google_drive');
+    const folderUrl = 'https://drive.google.com/drive/folders/FOLDER_ID_99';
+    await tool.execute({ action: 'list', folder_url_or_id: folderUrl }, { userId: USER });
+    expect(mockListGoogleDriveFolder).toHaveBeenCalledWith(folderUrl, USER);
+  });
+
+  it('returns error when folder_url_or_id missing', async () => {
+    const tool = await getTool('google_drive');
+    const result = await tool.execute({ action: 'list' }, { userId: USER });
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/folder_url_or_id/i);
   });
 
   it('returns the service result to the caller', async () => {
     const serviceResult = { success: true, files: [{ id: 'f1', name: 'Report.docx' }] };
     mockListGoogleDriveFolder.mockResolvedValue(serviceResult);
-    const tool = await getTool('list_google_drive_folder');
-    const result = await tool.execute({ folder_url_or_id: 'folder-abc' }, { userId: USER });
+    const tool = await getTool('google_drive');
+    const result = await tool.execute({ action: 'list', folder_url_or_id: 'folder-abc' }, { userId: USER });
     expect(result).toEqual(serviceResult);
-  });
-
-  it('passes a folder URL through to the service unchanged', async () => {
-    mockListGoogleDriveFolder.mockResolvedValue({ success: true, files: [] });
-    const tool = await getTool('list_google_drive_folder');
-    const folderUrl = 'https://drive.google.com/drive/folders/FOLDER_ID_99';
-    await tool.execute({ folder_url_or_id: folderUrl }, { userId: USER });
-    expect(mockListGoogleDriveFolder).toHaveBeenCalledWith(folderUrl, USER);
   });
 
   it('passes service error through to caller', async () => {
     mockListGoogleDriveFolder.mockResolvedValue({ success: false, error: 'Folder not found' });
-    const tool = await getTool('list_google_drive_folder');
-    const result = await tool.execute({ folder_url_or_id: 'bad-folder' }, { userId: USER });
+    const tool = await getTool('google_drive');
+    const result = await tool.execute({ action: 'list', folder_url_or_id: 'bad-folder' }, { userId: USER });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/folder not found/i);
   });
 });
 
-// ─── create_google_drive_folder ──────────────────────────────────────────────
+// ─── google_drive ─────────────────────────────────────────────────────────────
 
-describe('create_google_drive_folder — registration', () => {
+describe('google_drive — registration', () => {
   it('is registered with correct name', async () => {
-    const tool = await getTool('create_google_drive_folder');
-    expect(tool.definition.name).toBe('create_google_drive_folder');
+    const tool = await getTool('google_drive');
+    expect(tool.definition.name).toBe('google_drive');
   });
 
-  it('schema requires name', async () => {
-    const tool = await getTool('create_google_drive_folder');
-    expect(tool.definition.inputSchema.required).toContain('name');
+  it('schema requires action', async () => {
+    const tool = await getTool('google_drive');
+    expect(tool.definition.inputSchema.required).toContain('action');
   });
 });
 
-describe('create_google_drive_folder — auth guard', () => {
+describe('google_drive — auth guard', () => {
   it('returns auth error when userId is missing', async () => {
-    const tool = await getTool('create_google_drive_folder');
-    const result = await tool.execute({ name: 'My Folder' }, {});
+    const tool = await getTool('google_drive');
+    const result = await tool.execute({ action: 'search', query: 'test' }, {});
     expect(result.success).toBe(false);
     expect(result.message).toMatch(/authentication required/i);
-    expect(mockCreateGoogleDriveFolder).not.toHaveBeenCalled();
   });
 
   it('returns auth error when context is undefined', async () => {
-    const tool = await getTool('create_google_drive_folder');
-    const result = await tool.execute({ name: 'My Folder' }, undefined);
+    const tool = await getTool('google_drive');
+    const result = await tool.execute({ action: 'create_folder', name: 'My Folder' }, undefined);
     expect(result.success).toBe(false);
     expect(result.message).toMatch(/authentication required/i);
   });
 });
 
-describe('create_google_drive_folder — delegation', () => {
-  it('calls agentModeService.createGoogleDriveFolder with name, userId, and undefined parent', async () => {
+describe('google_drive — action=search', () => {
+  it('calls searchGoogleDrive with query and userId', async () => {
+    mockSearchGoogleDrive.mockResolvedValue({ success: true, results: [] });
+    const tool = await getTool('google_drive');
+    await tool.execute({ action: 'search', query: 'Emma Test' }, { userId: USER });
+    expect(mockSearchGoogleDrive).toHaveBeenCalledWith('Emma Test', USER, undefined);
+  });
+
+  it('passes type filter when provided', async () => {
+    mockSearchGoogleDrive.mockResolvedValue({ success: true, results: [] });
+    const tool = await getTool('google_drive');
+    await tool.execute({ action: 'search', query: 'Reports', type: 'folder' }, { userId: USER });
+    expect(mockSearchGoogleDrive).toHaveBeenCalledWith('Reports', USER, 'folder');
+  });
+
+  it('returns error when query missing', async () => {
+    const tool = await getTool('google_drive');
+    const result = await tool.execute({ action: 'search' }, { userId: USER });
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/query/i);
+  });
+});
+
+describe('google_drive — action=create_folder', () => {
+  it('calls createGoogleDriveFolder with name, userId, and undefined parent', async () => {
     mockCreateGoogleDriveFolder.mockResolvedValue({ success: true, folderId: 'new-folder-1', url: 'https://drive.google.com/...' });
-    const tool = await getTool('create_google_drive_folder');
-    await tool.execute({ name: 'Campaigns 2026' }, { userId: USER });
+    const tool = await getTool('google_drive');
+    await tool.execute({ action: 'create_folder', name: 'Campaigns 2026' }, { userId: USER });
     expect(mockCreateGoogleDriveFolder).toHaveBeenCalledWith('Campaigns 2026', USER, undefined);
   });
 
-  it('passes parent_folder_id to the service when provided', async () => {
+  it('passes parent_folder_id when provided', async () => {
     mockCreateGoogleDriveFolder.mockResolvedValue({ success: true, folderId: 'child-folder', url: 'https://drive.google.com/...' });
-    const tool = await getTool('create_google_drive_folder');
-    await tool.execute({ name: 'Sub Folder', parent_folder_id: 'parent-99' }, { userId: USER });
+    const tool = await getTool('google_drive');
+    await tool.execute({ action: 'create_folder', name: 'Sub Folder', parent_folder_id: 'parent-99' }, { userId: USER });
     expect(mockCreateGoogleDriveFolder).toHaveBeenCalledWith('Sub Folder', USER, 'parent-99');
+  });
+
+  it('returns error when name missing', async () => {
+    const tool = await getTool('google_drive');
+    const result = await tool.execute({ action: 'create_folder' }, { userId: USER });
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/name/i);
   });
 
   it('returns the service result to the caller', async () => {
     const serviceResult = { success: true, folderId: 'folder-xyz', url: 'https://drive.google.com/drive/folders/folder-xyz' };
     mockCreateGoogleDriveFolder.mockResolvedValue(serviceResult);
-    const tool = await getTool('create_google_drive_folder');
-    const result = await tool.execute({ name: 'Q1 Assets' }, { userId: USER });
+    const tool = await getTool('google_drive');
+    const result = await tool.execute({ action: 'create_folder', name: 'Q1 Assets' }, { userId: USER });
     expect(result).toEqual(serviceResult);
   });
 
   it('passes service error through to caller', async () => {
     mockCreateGoogleDriveFolder.mockResolvedValue({ success: false, error: 'Drive not connected' });
-    const tool = await getTool('create_google_drive_folder');
-    const result = await tool.execute({ name: 'Fail Folder' }, { userId: USER });
+    const tool = await getTool('google_drive');
+    const result = await tool.execute({ action: 'create_folder', name: 'Fail Folder' }, { userId: USER });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/drive not connected/i);
+  });
+
+  it('returns error for unknown action', async () => {
+    const tool = await getTool('google_drive');
+    const result = await tool.execute({ action: 'delete' }, { userId: USER });
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/unknown action/i);
   });
 });
 
@@ -342,7 +365,7 @@ describe('create_google_doc — delegation', () => {
     mockCreateGoogleDoc.mockResolvedValue({ success: true, url: 'https://docs.google.com/document/d/doc1/edit' });
     const tool = await getTool('create_google_doc');
     await tool.execute({ title: 'GTM Plan', content: 'Strategy content here' }, { userId: USER });
-    expect(mockCreateGoogleDoc).toHaveBeenCalledWith('GTM Plan', 'Strategy content here', USER, undefined, undefined, undefined, undefined);
+    expect(mockCreateGoogleDoc).toHaveBeenCalledWith('GTM Plan', 'Strategy content here', USER, undefined, undefined, 'styled', undefined);
   });
 
   it('passes folder_id and share_with_emails to the service when provided', async () => {
@@ -363,7 +386,7 @@ describe('create_google_doc — delegation', () => {
       USER,
       'folder-abc',
       ['alice@co.com', 'bob@co.com'],
-      undefined,
+      'styled',
       undefined,
     );
   });
@@ -382,6 +405,35 @@ describe('create_google_doc — delegation', () => {
     const result = await tool.execute({ title: 'Fail Doc', content: 'x' }, { userId: USER });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/drive not connected/i);
+  });
+
+  it('passes plain=true as style="plain" to the service', async () => {
+    mockCreateGoogleDoc.mockResolvedValue({ success: true });
+    const tool = await getTool('create_google_doc');
+    await tool.execute({ title: 'Quick Note', content: 'Just text', plain: true }, { userId: USER });
+    expect(mockCreateGoogleDoc).toHaveBeenCalledWith('Quick Note', 'Just text', USER, undefined, undefined, 'plain', undefined);
+  });
+
+  it('maps style_options fields to camelCase styleOptions for the service', async () => {
+    mockCreateGoogleDoc.mockResolvedValue({ success: true });
+    const tool = await getTool('create_google_doc');
+    await tool.execute(
+      {
+        title: 'Brand Doc',
+        content: 'Content',
+        style_options: { primary_color: '#e6518d', font_family: 'Georgia, serif', font_size: 16, line_height: 1.8, compact: true },
+      },
+      { userId: USER },
+    );
+    expect(mockCreateGoogleDoc).toHaveBeenCalledWith(
+      'Brand Doc',
+      'Content',
+      USER,
+      undefined,
+      undefined,
+      'styled',
+      { primaryColor: '#e6518d', fontFamily: 'Georgia, serif', fontSize: 16, lineHeight: 1.8, compact: true },
+    );
   });
 });
 
@@ -428,7 +480,7 @@ describe('update_google_doc — delegation', () => {
       'https://docs.google.com/document/d/docABC/edit',
       'Updated content',
       USER,
-      undefined,
+      'styled',
       undefined,
     );
   });
@@ -437,7 +489,7 @@ describe('update_google_doc — delegation', () => {
     mockUpdateGoogleDoc.mockResolvedValue({ success: true });
     const tool = await getTool('update_google_doc');
     await tool.execute({ url_or_id: 'raw-doc-id-555', content: 'Replaced content' }, { userId: USER });
-    expect(mockUpdateGoogleDoc).toHaveBeenCalledWith('raw-doc-id-555', 'Replaced content', USER, undefined, undefined);
+    expect(mockUpdateGoogleDoc).toHaveBeenCalledWith('raw-doc-id-555', 'Replaced content', USER, 'styled', undefined);
   });
 
   it('returns the service result to the caller', async () => {
@@ -454,6 +506,29 @@ describe('update_google_doc — delegation', () => {
     const result = await tool.execute({ url_or_id: 'bad-id', content: 'x' }, { userId: USER });
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/file not found/i);
+  });
+
+  it('passes plain=true as style="plain" to the service', async () => {
+    mockUpdateGoogleDoc.mockResolvedValue({ success: true });
+    const tool = await getTool('update_google_doc');
+    await tool.execute({ url_or_id: 'doc-plain', content: 'Plain content', plain: true }, { userId: USER });
+    expect(mockUpdateGoogleDoc).toHaveBeenCalledWith('doc-plain', 'Plain content', USER, 'plain', undefined);
+  });
+
+  it('maps style_options fields to camelCase styleOptions for the service', async () => {
+    mockUpdateGoogleDoc.mockResolvedValue({ success: true });
+    const tool = await getTool('update_google_doc');
+    await tool.execute(
+      { url_or_id: 'doc-styled', content: 'Updated', style_options: { primary_color: '#7C3AED', font_size: 12, compact: true } },
+      { userId: USER },
+    );
+    expect(mockUpdateGoogleDoc).toHaveBeenCalledWith(
+      'doc-styled',
+      'Updated',
+      USER,
+      'styled',
+      { primaryColor: '#7C3AED', fontFamily: undefined, fontSize: 12, lineHeight: undefined, compact: true },
+    );
   });
 });
 
