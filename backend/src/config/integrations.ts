@@ -86,6 +86,21 @@ export const INTEGRATION_CONFIG = {
     ],
   },
 
+  googleDrive: {
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/google-drive/callback`,
+    authorizationUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+    tokenUrl: 'https://oauth2.googleapis.com/token',
+    revokeUrl: 'https://oauth2.googleapis.com/revoke',
+    profileUrl: 'https://www.googleapis.com/oauth2/v2/userinfo',
+    scopes: [
+      'https://www.googleapis.com/auth/drive.file',
+      'https://www.googleapis.com/auth/documents',
+      'https://www.googleapis.com/auth/spreadsheets',
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/userinfo.profile',
+    ],
+  },
+
   youtube: {
     redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/youtube/callback`,
     authorizationUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
@@ -324,6 +339,41 @@ export async function getGmailConfig(): Promise<GmailOAuthConfig> {
   };
   gmailConfigCacheExpiresAt = Date.now() + GMAIL_CONFIG_CACHE_TTL_MS;
   return cachedGmailConfig;
+}
+
+// Google Drive OAuth configuration
+export interface GoogleDriveOAuthConfig {
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+  scopes: string[];
+  authorizationUrl: string;
+  tokenUrl: string;
+  revokeUrl: string;
+  profileUrl: string;
+}
+
+let cachedGoogleDriveConfig: GoogleDriveOAuthConfig | null = null;
+let googleDriveConfigCacheExpiresAt = 0;
+const GOOGLE_DRIVE_CONFIG_CACHE_TTL_MS = 5 * 60 * 1000;
+
+export async function getGoogleDriveConfig(): Promise<GoogleDriveOAuthConfig> {
+  if (cachedGoogleDriveConfig && Date.now() < googleDriveConfigCacheExpiresAt) {
+    return cachedGoogleDriveConfig;
+  }
+  const credentials = await getGmailCredentials(); // reuses same Google OAuth client
+  cachedGoogleDriveConfig = {
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    redirectUri: INTEGRATION_CONFIG.googleDrive.redirectUri,
+    scopes: INTEGRATION_CONFIG.googleDrive.scopes,
+    authorizationUrl: INTEGRATION_CONFIG.googleDrive.authorizationUrl,
+    tokenUrl: INTEGRATION_CONFIG.googleDrive.tokenUrl,
+    revokeUrl: INTEGRATION_CONFIG.googleDrive.revokeUrl,
+    profileUrl: INTEGRATION_CONFIG.googleDrive.profileUrl,
+  };
+  googleDriveConfigCacheExpiresAt = Date.now() + GOOGLE_DRIVE_CONFIG_CACHE_TTL_MS;
+  return cachedGoogleDriveConfig;
 }
 
 // YouTube configuration interface
