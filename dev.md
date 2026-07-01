@@ -1,3 +1,16 @@
+## Truthfulness bundle — finalize guard + instructive-error retryability (2026-07-02)
+
+Built the ENG-143/135/124 truthfulness bundle from the EMMA-HARNESS-PARITY-PLAN "Build-Now Design" (PR-T1 + the ENG-124 retry-spiral half). Generalizes the shipped ENG-104 single-tool pattern into ONE enforcement seam at the loop edge.
+
+### What shipped
+1. **`services/agentMode/core/finalizeGuard.ts`** (PURE, ports-injected, same style as `toolDispatch.ts`). Runs after the final assistant message, before emit/persist, behind **`AGENT_FINALIZE_GUARD` (env, DEFAULT OFF — A-or-B migration flag, not an on-error fallback)**. Flow: lexicon prefilter for 6 high-harm completed-action claim classes (email_sent, task_created_or_updated, post_published, schedule_created, crm_saved, asset_generated) → ONLY on hit, one structured-output judge call via the existing `callLLM` → deterministic match against successful ledger entries (`status==='success' && !toolResultError(result)`; asset claims via `mediaGenProducedAsset` — the xCures 76×-images check generalized) → mismatch → ONE corrective turn → re-check → still mismatched → VISIBLE appended correction + `claim_mismatch` verdict reason (`computeRunVerdict` → degraded → 17:30 UTC cluster cron sees the class). Judge failure = deliver unchanged + loud `agent_claim_check_error` event (documented best-effort; blocking delivery on a judge outage would be failing badly). Never a silent rewrite.
+2. **`services/agentMode/core/errorRetryability.ts`** — every model-visible tool error at the dispatch boundary now carries `[Retryable: yes/no — <next step>]` derived from `toolErrorClassifier` classes (rate_limit/timeout/network/upstream_5xx → yes; auth/upstream_rejected/invalid_args/tool_unavailable/invalid_output/policy_blocked → no + stop signal). Non-retryable classes **fast-trip the per-run breaker at 2 identical failures instead of 3** (`agentToolGatewayService`). empty_result/not_found deliberately NOT fast-tripped (same error text across different legitimate args).
+
+### Assumptions to validate
+- The lexicon prefilter windows (120 chars, completion verbs) are tuned on synthetic examples, not a prod claim corpus — expect some false negatives; the judge bill is bounded by prefilter hits.
+- Claim-class → tool-name matchers are name-pattern based (e.g. `/^send_.*email/`); new tools with unusual names need a matcher touch. One seam to update.
+- The ON-path characterization pins the corrective-turn transcript with the run's own `llmModel` as judge. If a cheaper judge model is wanted (DIAGNOSIS_MODEL), that's a one-line port change — deliberately not done to keep the flip decision (and prompt lane) with Harsha.
+- Fast-trip threshold 2 changes when `AgentToolRepeatedFailureError` fires for terminal classes — reliability tightening (fewer wasted identical retries), verified against the June retry-spiral shape in gateway tests.
 ## Prod outage: partner-portal "Failed to load users" — full disk + nginx PrivateTmp trap (2026-06-26)
 
 Three stacked failures, only the last self-inflicted by the attempted fixes:
