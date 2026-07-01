@@ -224,13 +224,11 @@ describe('SessionScoring - sessions with an assistant turn score normally', () =
     expect(mockUpdateScore).toHaveBeenCalledTimes(1);
   });
 
-  it('scores a session when the assistant turn only contains tool calls', async () => {
-    mockCallLLM.mockResolvedValue(
-      makeLLMResponse(4, 'tools invoked', { goalCompletion: 4, dataAccuracy: 4, outputQuality: 4 })
-    );
-
+  // This shape (ends in tool result, RECENT) is mid-loop — must be deferred, not scored.
+  // The previous test name was wrong; this is now a negative test for the fix.
+  it('defers (returns null) a recent session ending in a tool result — mid-loop, not settled', async () => {
     const session = {
-      sessionId: 'completed-2',
+      sessionId: 'mid-loop-1',
       userId: 'u1',
       sessionType: 'scheduled',
       messages: [
@@ -245,9 +243,114 @@ describe('SessionScoring - sessions with an assistant turn score normally', () =
 
     const result = await scoreSessionIfNeeded(session);
 
+    expect(result).toBeNull();
+    expect(mockCallLLM).not.toHaveBeenCalled();
+    expect(mockUpdateScore).not.toHaveBeenCalled();
+  });
+
+  it('defers a recent session whose last message is a pure tool-call assistant turn (no text)', async () => {
+    const session = {
+      sessionId: 'mid-loop-2',
+      userId: 'u1',
+      sessionType: 'scheduled',
+      messages: [
+        { role: 'user', content: 'Run the report.' },
+        { role: 'assistant', content: '', metadata: { toolCalls: [{ name: 'get_chat_history' }] } } as any,
+      ],
+      messageCount: 2,
+      createdAt: RECENT(),
+      updatedAt: RECENT(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    expect(result).toBeNull();
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('scores a stale session ending in a tool result (never skipped forever)', async () => {
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse(2, 'partial run', { goalCompletion: 2, dataAccuracy: 2, outputQuality: 2 })
+    );
+
+    const session = {
+      sessionId: 'mid-loop-stale-1',
+      userId: 'u1',
+      sessionType: 'scheduled',
+      messages: [
+        { role: 'user', content: 'Run the report.' },
+        { role: 'assistant', content: '', metadata: { toolCalls: [{ name: 'get_chat_history' }] } } as any,
+        { role: 'tool', content: 'sessions: [...]' } as any,
+      ],
+      messageCount: 3,
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
     expect(result).not.toBeNull();
-    expect(result?.score).toBe(4);
+    expect(result?.score).toBe(2);
     expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(mockUpdateScore).toHaveBeenCalledTimes(1);
+  });
+
+  it('scores a settled session: assistant text + aggregated toolCalls (completed scheduled run shape)', async () => {
+    // Mirrors the real prod session shape: final assistant message has BOTH
+    // natural-language report text AND an aggregated toolCalls array.
+    // This must NOT be deferred — it is fully settled.
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse(5, 'report delivered', { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 })
+    );
+
+    const session = {
+      sessionId: 'settled-with-toolcalls-1',
+      userId: 'u1',
+      sessionType: 'scheduled',
+      messages: [
+        { role: 'user', content: 'Generate the daily satisfaction score report.' },
+        { role: 'assistant', content: '', metadata: { toolCalls: [{ name: 'get_chat_history' }] } } as any,
+        { role: 'tool', content: 'sessions: [...]' } as any,
+        {
+          role: 'assistant',
+          content: 'Here is the daily satisfaction score report...',
+          metadata: { toolCalls: [{ name: 'get_chat_history' }, { name: 'send_email' }] },
+        } as any,
+      ],
+      messageCount: 4,
+      createdAt: RECENT(),
+      updatedAt: RECENT(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    expect(result).not.toBeNull();
+    expect(result?.score).toBe(5);
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(mockUpdateScore).toHaveBeenCalledTimes(1);
+  });
+
+  it('judge path: defers a recent mid-loop session', async () => {
+    const session = {
+      sessionId: 'mid-loop-judge-1',
+      userId: 'u1',
+      sessionType: 'scheduled',
+      messages: [
+        { role: 'user', content: 'Run the report.' },
+        { role: 'assistant', content: '', metadata: { toolCalls: [{ name: 'get_chat_history' }] } } as any,
+        { role: 'tool', content: 'sessions: [...]' } as any,
+      ],
+      messageCount: 3,
+      judgeScores: {},
+      createdAt: RECENT(),
+      updatedAt: RECENT(),
+    } as any;
+
+    const result = await scoreSessionWithJudgeIfNeeded(session, testJudge);
+
+    expect(result).toBeNull();
+    expect(mockCallLLM).not.toHaveBeenCalled();
+    expect(mockUpdateJudgeScore).not.toHaveBeenCalled();
   });
 
   it('judge scoring proceeds once an assistant turn is present', async () => {
@@ -271,6 +374,57 @@ describe('SessionScoring - sessions with an assistant turn score normally', () =
 
     expect(result).not.toBeNull();
     expect(result?.score).toBe(5);
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    expect(mockUpdateJudgeScore).toHaveBeenCalledTimes(1);
+  });
+
+  it('defers a recent session ending in a trailing user message', async () => {
+    const session = {
+      sessionId: 'mid-loop-trailing-user-1',
+      userId: 'u1',
+      sessionType: 'scheduled',
+      messages: [
+        { role: 'user', content: 'Run the report.' },
+        { role: 'assistant', content: 'Report generated.' },
+        { role: 'user', content: 'Thanks!' },
+      ],
+      messageCount: 3,
+      createdAt: RECENT(),
+      updatedAt: RECENT(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    expect(result).toBeNull();
+    expect(mockCallLLM).not.toHaveBeenCalled();
+    expect(mockUpdateScore).not.toHaveBeenCalled();
+  });
+
+  it('judge path: stale mid-loop session is scored, not skipped forever', async () => {
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse(2, 'partial run', { goalCompletion: 2, dataAccuracy: 2, outputQuality: 2 })
+    );
+
+    const session = {
+      sessionId: 'mid-loop-judge-stale-1',
+      userId: 'u1',
+      sessionType: 'scheduled',
+      messages: [
+        { role: 'user', content: 'Run the report.' },
+        { role: 'assistant', content: '', metadata: { toolCalls: [{ name: 'get_chat_history' }] } } as any,
+        { role: 'tool', content: 'sessions: [...]' } as any,
+      ],
+      messageCount: 3,
+      judgeScores: {},
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    const result = await scoreSessionWithJudgeIfNeeded(session, testJudge);
+
+    expect(result).not.toBeNull();
+    expect(result?.score).toBe(2);
+    expect(result?.judgeName).toBe('Test Judge');
     expect(mockCallLLM).toHaveBeenCalledTimes(1);
     expect(mockUpdateJudgeScore).toHaveBeenCalledTimes(1);
   });
