@@ -11,7 +11,8 @@ import { rankMemoriesByRelevance } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { computeTermination } from './agentMode/core/agentStep';
-import { executePreparedTools } from './agentMode/core/toolDispatch';
+import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
+import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
@@ -263,11 +264,29 @@ function recordAgentModeRunStarted(
 
 function recordAgentModeRunCompleted(
   runId: string,
-  info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
+  info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string; claimMismatch?: boolean },
 ): void {
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runCompleted(runId, info);
+}
+
+/**
+ * The finalize guard's claim check itself failed (judge/correction LLM call
+ * errored, ENG-143). LOUD by contract: the guard delivers the chat unchanged on
+ * judge failure — this signal (console + durable agent_claim_check_error event)
+ * is the only trace that a truthfulness check was skipped. Best-effort: must
+ * never throw into the chat hot path.
+ */
+function recordAgentModeClaimCheckError(runId: string, sessionId: string, error: unknown): void {
+  console.error('[agent-mode] finalize-guard claim check FAILED (message delivered unchanged):', {
+    runId,
+    sessionId,
+    error: error instanceof Error ? error.message : String(error),
+  });
+  const recorder = getAgentRunRecorderSafe();
+  if (!recorder) return;
+  void recorder.claimCheckError(runId, { error, sessionId });
 }
 
 function recordAgentModeRunFailed(
@@ -3242,6 +3261,68 @@ export class AgentModeService {
         }
       }
 
+      // Finalize guard (ENG-143/135/124): claimed-vs-executed truthfulness check at
+      // the loop edge, AFTER the final message and BEFORE emit/persist. Behind
+      // AGENT_FINALIZE_GUARD (A-or-B migration flag, DEFAULT OFF — with the flag off
+      // this block is inert and the characterization harness is byte-identical).
+      // NO-FALLBACK compliance: the guard never silently rewrites the message — a
+      // mismatch produces either the model's own corrective restatement or a VISIBLE
+      // appended correction; a judge/guard failure delivers the text unchanged plus
+      // a loud claim_check_error signal (documented best-effort — blocking chat
+      // delivery on a judge outage would be failing badly).
+      let finalizeClaimMismatch = false;
+      if (process.env.AGENT_FINALIZE_GUARD === 'true' && content && !wasCancelled && !mockMode) {
+        try {
+          const finalizeLedger: FinalizeLedgerEntry[] = toolCalls.map((tc: any): FinalizeLedgerEntry => ({
+            toolName: tc.name,
+            status: tc.error !== undefined
+              ? 'error'
+              : (tc.result && (tc.result as any).deferred === true ? 'deferred' : 'success'),
+            result: tc.result,
+          }));
+          const guardOutcome = await runFinalizeGuard({
+            finalText: content,
+            ledger: finalizeLedger,
+            ports: {
+              judgeExtractClaims: (text, candidateClasses) =>
+                this.judgeFinalizeClaims(text, candidateClasses, llmModel),
+              requestCorrection: ({ finalText, systemNote }) =>
+                this.requestFinalizeCorrection(finalText, systemNote, llmModel),
+              toolResultError,
+              mediaGenProducedAsset,
+              recordClaimCheckError: (err) => recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, err),
+            },
+          });
+          finalizeClaimMismatch = guardOutcome.claimMismatch;
+          if (guardOutcome.finalText !== content) {
+            console.warn(`AgentMode: finalize guard ${guardOutcome.action} in session ${sessionId}`, {
+              claimClasses: guardOutcome.mismatchedClaimClasses,
+            });
+            content = guardOutcome.finalText;
+            // Keep the persisted transcript consistent with what the user sees:
+            // correct the LAST assistant message in place (same message count) and
+            // stamp guard metadata so the correction is auditable in the session.
+            for (let i = messages.length - 1; i >= 0; i--) {
+              if ((messages[i] as any).role === 'assistant') {
+                (messages[i] as any).content = content;
+                (messages[i] as any).metadata = {
+                  ...(messages[i] as any).metadata,
+                  finalizeGuard: {
+                    action: guardOutcome.action,
+                    claimClasses: guardOutcome.mismatchedClaimClasses,
+                  },
+                };
+                break;
+              }
+            }
+          }
+        } catch (guardError) {
+          // Guard is advisory — a guard bug must never block delivery. Loud, not
+          // silent: recorded as claim_check_error (same contract as judge failure).
+          recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, guardError);
+        }
+      }
+
       // Attach timing metadata, memory usage, and tool calls to the last assistant message
       if (messages.length > 0) {
         const lastAssistantIdx = messages.length - 1 - [...messages].reverse().findIndex((m: any) => m.role === 'assistant');
@@ -3281,6 +3362,9 @@ export class AgentModeService {
         toolCalls: toolCalls.length,
         failedToolCalls: countFailedToolCalls(toolCalls),
         maxSameToolFailures: maxSameToolFailureCount(toolCalls),
+        // ENG-143: an unresolved claim mismatch grades the run degraded
+        // (claim_mismatch verdict reason) so the 17:30 UTC cluster cron sees it.
+        ...(finalizeClaimMismatch ? { claimMismatch: true } : {}),
       });
       // ENG-102: drain telemetry before the worker reports success to the parent
       // process (fire-and-forget would race with IPC teardown — same treatment
@@ -12617,6 +12701,76 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
       console.error('AgentMode: generateSuggestedReplies failed:', error);
       return null;
     }
+  }
+
+  /**
+   * Finalize-guard judge (ENG-143): ONE structured-output claim-extraction call
+   * through the existing callLLM machinery. Extracts the completed-action claims
+   * the final reply makes, restricted to the prefiltered candidate classes.
+   * THROWS on any judge failure (no content / unparseable output / transport
+   * error) — the guard then delivers the message unchanged and records a loud
+   * claim_check_error (see core/finalizeGuard.ts).
+   */
+  private async judgeFinalizeClaims(
+    finalText: string,
+    candidateClasses: readonly ClaimClass[],
+    llmModel: string,
+  ): Promise<JudgedClaim[]> {
+    const response = await this.callLLM(llmModel, [
+      {
+        role: 'user',
+        content:
+          'You are auditing an AI assistant\'s reply for COMPLETED-ACTION claims — statements that an action already happened '
+          + '(not offers, plans, or suggestions). The possible claim classes are: '
+          + `${CLAIM_CLASSES.join(', ')}. Candidate classes detected in this reply: ${candidateClasses.join(', ')}.\n\n`
+          + 'Return ONLY a JSON array, one element per claimed completed action, each shaped '
+          + '{"claimClass":"<class>","statement":"<short quote from the reply>"}. '
+          + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
+          + finalText,
+      },
+    ], { max_completion_tokens: 500, temperature: 0 });
+
+    const text = (response as any)?.choices?.[0]?.message?.content;
+    if (typeof text !== 'string' || !text.trim()) {
+      throw new Error('finalize-guard judge returned no content');
+    }
+    const match = text.match(/\[[\s\S]*\]/);
+    if (!match) {
+      throw new Error(`finalize-guard judge returned unparseable output: ${text.slice(0, 200)}`);
+    }
+    const parsed = JSON.parse(match[0]); // throws on invalid JSON → judge_error path
+    if (!Array.isArray(parsed)) {
+      throw new Error('finalize-guard judge output is not an array');
+    }
+    return (parsed as any[]).filter((c) => c && typeof c.claimClass === 'string');
+  }
+
+  /**
+   * Finalize-guard corrective turn (ENG-143): ONE model call asking for the
+   * truthful restatement of a reply whose claims the run ledger does not back.
+   * THROWS on failure — the guard then appends the visible correction instead
+   * (never delivers the unbacked claim silently).
+   */
+  private async requestFinalizeCorrection(
+    finalText: string,
+    systemNote: string,
+    llmModel: string,
+  ): Promise<string> {
+    const response = await this.callLLM(llmModel, [
+      {
+        role: 'user',
+        content:
+          `[SYSTEM NOTE] ${systemNote}\n\nPrevious reply:\n${finalText}\n\n`
+          + 'Rewrite the reply now. Keep everything that is accurate, but only claim actions the run log confirms succeeded, '
+          + 'clearly state what was NOT completed, and tell the user what to do next. Reply ONLY with the corrected message text.',
+      },
+    ], { temperature: 0 });
+
+    const text = (response as any)?.choices?.[0]?.message?.content;
+    if (typeof text !== 'string' || !text.trim()) {
+      throw new Error('finalize-guard correction returned no content');
+    }
+    return text.trim();
   }
 
   /**
