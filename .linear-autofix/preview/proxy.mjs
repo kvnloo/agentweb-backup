@@ -42,6 +42,9 @@ function keyOf(host) { return (host || '').split(':')[0].split('.')[0]; }
 
 function makeRequestHandler(suffix) {
   return (req, res) => {
+    // A client that resets the connection mid-request must not crash the proxy.
+    req.on('error', () => {});
+    res.on('error', () => {});
     if (req.url === HEALTH) { res.writeHead(200, { 'content-type': 'text/plain' }).end('preview-proxy-ok'); return; }
     const key = keyOf(req.headers.host) + suffix;
     const port = getRoutes()[key];
@@ -50,7 +53,7 @@ function makeRequestHandler(suffix) {
       { host: '127.0.0.1', port, method: req.method, path: req.url, headers: { ...req.headers, host: `localhost:${port}` } },
       (r) => { res.writeHead(r.statusCode || 502, r.headers); r.pipe(res); },
     );
-    up.on('error', (e) => { res.writeHead(502).end(`preview upstream error: ${e.message}`); });
+    up.on('error', (e) => { try { if (!res.headersSent) res.writeHead(502); res.end(`preview upstream error: ${e.message}`); } catch { /* already closed */ } });
     req.pipe(up);
   };
 }
@@ -58,6 +61,7 @@ function makeRequestHandler(suffix) {
 // Proxy websockets (Vite HMR) as well.
 function makeUpgradeHandler(suffix) {
   return (req, socket, head) => {
+    socket.on('error', () => socket.destroy());   // client socket reset must not crash the proxy
     const port = getRoutes()[keyOf(req.headers.host) + suffix];
     if (!port) { socket.destroy(); return; }
     const up = net.connect(port, '127.0.0.1', () => {
@@ -72,10 +76,16 @@ function makeUpgradeHandler(suffix) {
   };
 }
 
+// Last-resort guard: a stray socket error (e.g. ECONNRESET from an internet scanner when the
+// ports are public) must never take the proxy down — it's a long-running, stateless router.
+process.on('uncaughtException', (e) => console.error(`[preview-proxy] uncaught (ignored): ${e && e.message}`));
+
 for (const [port, suffix] of PORT_SUFFIX) {
   const role = suffix === '' ? 'customer' : suffix === '-admin' ? 'partner' : 'api';
   const server = http.createServer(makeRequestHandler(suffix));
   server.on('upgrade', makeUpgradeHandler(suffix));
+  // Malformed request from a scanner/bot: drop it, don't crash.
+  server.on('clientError', (_e, socket) => { try { socket.destroy(); } catch { /* already gone */ } });
   // One bad port (e.g. already in use) must not take down the others.
   server.on('error', (e) => console.error(`[preview-proxy] :${port} (${role}) error: ${e.message}`));
   server.listen(port, () => console.log(`[preview-proxy] listening on :${port} (${role})`));
