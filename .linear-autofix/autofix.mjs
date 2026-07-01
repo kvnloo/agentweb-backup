@@ -11,7 +11,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import net from 'node:net';
 import path from 'node:path';
 import { config } from './config.mjs';
-import { resolveIssue, addComment, findStateId, moveIssue } from './linear.mjs';
+import { resolveIssue, addComment, findStateId, moveIssue, setAutofixLabel } from './linear.mjs';
 import { findSessionId, fetchItem, summarizeSession } from './tools/session.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -27,13 +27,23 @@ const managerPromptPath = path.join(__dirname, 'manager-prompt.md');
 const refixPromptPath = path.join(__dirname, 'refix-prompt.md');
 const log = (...a) => console.log('[autofix]', ...a);
 
+// Raw per-stage transcripts + metadata (turns, duration, timedOut) — kept for debugging failed
+// runs and tuning budgets; the transcripts cost nothing (they were paid for anyway).
+const logsDir = path.join(__dirname, 'logs');
+let stageLogDir = null;
+const stages = {};
+export function setStageLogDir(id) { stageLogDir = path.join(logsDir, id); mkdirSync(stageLogDir, { recursive: true }); }
+
 function loadState() { try { return JSON.parse(readFileSync(statePath, 'utf8')); } catch { return {}; } }
 function saveState(s) { writeFileSync(statePath, JSON.stringify(s, null, 2)); }
+// Read-modify-write against a FRESH read, so concurrent autofix/revise processes (maxConcurrent > 1)
+// can't clobber each other's entries with a stale in-memory copy.
+function updateState(issueId, entry) { const s = loadState(); s[issueId] = entry; saveState(s); }
 function gitIn(cwd, args) { return spawnSync('git', args, { cwd, encoding: 'utf8' }); }
 function repoRootOf(repo) { return path.resolve(agentRoot, repo.root); }
 function wtPathOf(WT, repo) { return repo.mount === '.' ? WT : path.join(WT, repo.mount); }
 
-function kebab(s, max = 40) {
+export function kebab(s, max = 40) {
   return (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, max).replace(/-+$/, '') || 'bug';
 }
 
@@ -49,7 +59,7 @@ export function fillTemplate(tmpl, map) {
 
 // Build claude-CLI args in one place so the fixer, reviewers, manager, re-fix, and verify passes
 // stay in sync. `mcp` adds a strict MCP config (browser-verify only).
-function claudeArgs({ model, maxTurns, mcp, skipPermissions = config.skipPermissions }) {
+export function claudeArgs({ model, maxTurns, mcp, skipPermissions = config.skipPermissions }) {
   const a = ['-p', '--output-format', 'json', '--model', model, '--max-turns', String(maxTurns)];
   if (mcp) a.push('--mcp-config', mcp, '--strict-mcp-config');
   if (skipPermissions) a.push('--dangerously-skip-permissions');
@@ -79,6 +89,23 @@ function assemble(WT, branch) {
   return { ok: true };
 }
 
+// Rebuild the workspace from an ALREADY-PUSHED fix branch (used by revise.mjs when the original
+// worktree was cleaned up). Repos the fix never touched fall back to origin/<base>.
+export function assembleFromBranch(WT, branch) {
+  teardown(WT);
+  for (const repo of config.repos) {
+    const wt = wtPathOf(WT, repo);
+    const root = repoRootOf(repo);
+    const hasRemoteBranch = gitIn(root, ['fetch', 'origin', branch]).status === 0;
+    gitIn(root, ['fetch', 'origin', repo.base]);
+    mkdirSync(path.dirname(wt), { recursive: true });
+    const start = hasRemoteBranch ? `origin/${branch}` : `origin/${repo.base}`;
+    const add = gitIn(root, ['worktree', 'add', '-B', branch, wt, start]);
+    if (add.status !== 0) return { ok: false, repo: repo.key, err: add.stderr };
+  }
+  return { ok: true };
+}
+
 // Make the fresh worktree buildable for the fix run: link node_modules + copy .env from
 // the local repos so `npx tsc` / `npm test` work without a slow install.
 const PKG_DIRS = ['backend', 'partner-portal', 'customer-portal'];
@@ -90,7 +117,7 @@ function installDeps(pkgDir, name) {
   const r = spawnSync('npm', ['install', '--no-audit', '--no-fund'], { cwd: pkgDir, stdio: 'inherit' });
   if (r.status !== 0) log(`WARNING: npm install failed for ${name}`);
 }
-function prepareWorktreeDeps(WT) {
+export function prepareWorktreeDeps(WT) {
   for (const dir of PKG_DIRS) {
     const wtPkg = path.join(WT, dir);
     if (!existsSync(wtPkg)) continue;
@@ -123,7 +150,10 @@ async function main() {
   log(`Issue ${id}: ${issue.title}`);
 
   const state = loadState();
-  if (state[issue.id] && !force) { log(`Already processed (${state[issue.id].outcome}). Use --force to redo.`); return; }
+  // Non-final outcomes may be re-processed: 'recovered' = the stale sweep reset a crashed run;
+  // 'started' = a run that crashed before recording any outcome (or is being retried by hand).
+  const NON_FINAL = ['recovered', 'started'];
+  if (state[issue.id] && !NON_FINAL.includes(state[issue.id].outcome) && !force) { log(`Already processed (${state[issue.id].outcome}). Use --force to redo.`); return; }
 
   const labelNames = (issue.labels?.nodes || []).map((l) => l.name.toLowerCase());
   const model = labelNames.some((n) => config.opusLabels.includes(n)) ? config.opusModel : config.defaultModel;
@@ -137,6 +167,22 @@ async function main() {
     return;
   }
 
+  // Real fixes run ONLY on the designated runner (the EC2 box sets this in its .env).
+  // Dry-runs above stay allowed anywhere. Guards against accidentally burning quota /
+  // posting to Linear from a dev laptop.
+  if (process.env.AUTOFIX_RUN_ENABLED !== '1') {
+    console.error('[autofix] refusing to run: AUTOFIX_RUN_ENABLED != 1 (fixes are EC2-only; set it in .linear-autofix/.env on the designated runner)');
+    process.exit(2);
+  }
+
+  setStageLogDir(id);
+
+  // Mark the run as STARTED before anything else. This is what lets the stale-In-Progress sweep
+  // distinguish "autofix crashed on this issue" from "a human is working on this issue" — the
+  // sweep only ever touches issues with a 'started' record. `recoveries` survives a retry so the
+  // sweep can stop after one automatic recovery.
+  updateState(issue.id, { identifier: id, outcome: 'started', recoveries: state[issue.id]?.recoveries || 0, at: new Date().toISOString() });
+
   // Guard: move to In Progress so the poller won't pick the issue up again.
   try {
     const sid = await findStateId(issue.team.id, config.inProgressState, 'started');
@@ -148,8 +194,7 @@ async function main() {
   if (!asm.ok) {
     log(`Failed to set up worktree (${asm.repo}):`, asm.err);
     await addComment(issue.id, `⚠️ Auto-fix could not start: failed to create the \`${asm.repo}\` worktree.\n\n\`\`\`\n${asm.err}\n\`\`\``);
-    state[issue.id] = { identifier: id, outcome: 'setup_failed', at: new Date().toISOString() };
-    saveState(state);
+    updateState(issue.id, { identifier: id, outcome: 'setup_failed', at: new Date().toISOString() });
     return;
   }
   log(`Workspace ready at ${WT} on ${branch} (${config.repos.map((r) => r.key).join(', ')})`);
@@ -168,7 +213,7 @@ async function main() {
   // Run claude -p at the workspace root, on your subscription. The fixer only COMMITS; the PR is
   // opened later by this orchestrator, after the review + browser-verify gates.
   log(`Running claude (model=${model}) — this can take up to ${Math.round(config.timeoutMs / 60000)} min...`);
-  const result = await runClaude(claudeArgs({ model, maxTurns: config.maxTurns }), prompt, WT);
+  const result = await runClaude(claudeArgs({ model, maxTurns: config.maxTurns }), prompt, WT, config.timeoutMs, 'fixer');
   let marker = parseMarker(result);
   let changed = detectChangedRepos(WT);
 
@@ -178,7 +223,7 @@ async function main() {
   if (changed.length === 0 && config.escalateToOpus && model !== config.opusModel) {
     log(`No committed change from ${model} — escalating to ${config.opusModel} on the same workspace...`);
     const escalationNote = '\n\n## Escalation pass\nA previous automated attempt with a smaller model may have left UNCOMMITTED changes in this workspace without finishing. Review any existing changes, complete or correct the fix, then COMMIT per the steps above (do NOT push or open a PR — a later stage does that). The work only counts once it is committed. Do not restart from scratch unless the existing changes are wrong.';
-    const r2 = await runClaude(claudeArgs({ model: config.opusModel, maxTurns: config.maxTurns }), prompt + escalationNote, WT);
+    const r2 = await runClaude(claudeArgs({ model: config.opusModel, maxTurns: config.maxTurns }), prompt + escalationNote, WT, config.timeoutMs, 'fixer-escalation');
     marker = parseMarker(r2);
     changed = detectChangedRepos(WT);
   }
@@ -195,26 +240,52 @@ async function main() {
       try { review = await runReview(issue, WT, changed, branch, sessionContext); }
       catch (e) { log('Review error:', e.message); }
       changed = detectChangedRepos(WT); // a re-fix may have added commits (or reverted to none)
+      pushChanged(changed); // durability: re-fix/rework commits shouldn't be stranded by a crash in verify
     }
   }
 
   if (changed.length > 0) {
+    // --- Deterministic checks by the orchestrator (never trust agent-reported "pass" alone) ---
+    let checks = runChecks(WT, changed);
+
     // --- Final test: bring up a full preview and drive a real browser on the reviewed code ---
     let verify = null;
     if (config.verify?.enabled) {
       try { verify = await runVerify(issue, WT); } catch (e) { log('Verify error:', e.message); }
     }
 
-    // Gate outcome: the draft PR opens regardless (it is a draft), but a failed gate keeps the
-    // issue In Progress for a human and is flagged loudly instead of advancing to In Review.
-    const managerVerdict = review?.manager?.verdict;
-    const gatesFailed = managerVerdict === 'needs_rework' || verify?.verdict === 'not_fixed';
+    // A not_fixed verdict gets ONE bounded re-fix (fed the verify failure report) + re-verify.
+    if (verify?.verdict === 'not_fixed' && config.verify?.retryNotFixed) {
+      log('Browser verify says not_fixed — running one re-fix + re-verify...');
+      const before = countCommits(changed);
+      const feedback = `1. [browser-verify/high] (root cause) — Automated browser verification reproduced the bug's scenario against the CURRENT code and it is STILL BROKEN. Scenario: ${verify.scenario || '(from the bug report)'}. Observed: ${verify.summary || '(no detail)'} → Re-investigate the root cause and fix it so this exact scenario passes.`;
+      const rp = fillTemplate(readFileSync(refixPromptPath, 'utf8'), {
+        IDENTIFIER: id, TITLE: issue.title, DESCRIPTION: issue.description || '(no description)', BRANCH: branch, CONFIRMED: feedback,
+      });
+      await runClaude(claudeArgs({ model: config.review?.refixModel || config.opusModel, maxTurns: config.review?.maxTurns || 60 }), rp, WT, config.review?.timeoutMs || 20 * 60 * 1000, 'verify-refix');
+      changed = detectChangedRepos(WT);
+      if (countCommits(changed) > before) {
+        pushChanged(changed);
+        checks = runChecks(WT, changed);
+        try { const v2 = await runVerify(issue, WT); if (v2) verify = { ...v2, attempt: 2 }; }
+        catch (e) { log('Re-verify error:', e.message); }
+      } else {
+        log('Re-fix made no new commit — keeping the not_fixed verdict.');
+      }
+    }
+
+    // --- Triage: the one signal that tells a human what to do with this bug ---
+    // green  → skim & merge; manual → run the manual steps first; rework → human takes over.
+    const triage = computeTriage({ review, verify, checks, reviewEnabled: !!config.review?.enabled });
+    log(`Triage: ${triage}`);
 
     // --- Open the draft PR(s), now that the code is reviewed + verified ---
-    const prTitle = `${gatesFailed ? '[needs human] ' : ''}${marker.prTitle || marker.summary || issue.title || 'Automated fix'} (${id})`;
+    const prTitle = `${triage === 'rework' ? '[needs human] ' : ''}${marker.prTitle || marker.summary || issue.title || 'Automated fix'} (${id})`;
+    const checksAllPass = checks.length > 0 && checks.every((c) => c.result === 'pass');
     const gateSummary = [
-      review ? `Code review: ${managerVerdict === 'needs_rework' ? '⚠️ needs rework' : '✅ sound'}${review.manager?.confirmed?.length ? ` — ${review.manager.confirmed.length} finding(s) fixed` : ''}` : null,
-      verify ? `Browser verify: ${verify.verdict === 'verified' ? '✅ verified' : verify.verdict === 'not_fixed' ? '❌ not fixed' : '❓ inconclusive'}` : null,
+      review ? `Code review: ${review.manager?.verdict === 'needs_rework' ? '⚠️ needs rework' : '✅ sound'}${review.manager?.confirmed?.length ? ` — ${review.manager.confirmed.length} finding(s) fixed` : ''}` : null,
+      checks.length ? `Deterministic checks: ${checksAllPass ? '✅ all passed' : '❌ FAILED — ' + checks.filter((c) => c.result !== 'pass').map((c) => c.cmd).join('; ')}` : null,
+      verify ? `Browser verify: ${verify.verdict === 'verified' ? '✅ verified' : verify.verdict === 'not_fixed' ? '❌ not fixed' : verify.verdict === 'env_down' ? '⚠️ environment down (not verified)' : '❓ inconclusive'}` : null,
     ].filter(Boolean).join('\n');
     const prBody = `${marker.prBody || marker.summary || ''}\n\n---\n**Automated gates**\n${gateSummary || '(none run)'}\n\nFixes ${id} — ${issue.url || ''}`;
     const prs = openPrs(changed, prTitle, prBody);
@@ -230,9 +301,10 @@ async function main() {
       postCreds: config.verify?.postCredsInComment,
     };
 
-    // --- Comments back on the Linear issue: fix -> verification (test report + code review) -> manual ---
-    await addComment(issue.id, fixCommentBody(prs, marker, { gatesFailed }));
-    const verification = [testReportBody(marker, verify), reviewReportBody(review)].filter(Boolean).join('\n\n---\n\n');
+    // --- Label + comments back on Linear: fix -> verification (tests + review) -> manual guide ---
+    try { await setAutofixLabel(issue, config.triageLabels?.[triage]); } catch (e) { log('Warn: could not set triage label:', e.message); }
+    await addComment(issue.id, fixCommentBody(prs, marker, { triage }));
+    const verification = [testReportBody(marker, verify, checks), reviewReportBody(review)].filter(Boolean).join('\n\n---\n\n');
     await addComment(issue.id, verification);
     await addComment(issue.id, manualTestBody(marker, manualOpts));
 
@@ -240,16 +312,21 @@ async function main() {
       for (const p of prs) if (p.url) spawnSync('gh', ['pr', 'comment', p.url, '--body', verifyBody(verify)], { encoding: 'utf8' });
     }
 
-    if (gatesFailed) {
-      log(`Gate failed (${[managerVerdict === 'needs_rework' && 'review', verify?.verdict === 'not_fixed' && 'verify'].filter(Boolean).join(', ')}) — leaving ${id} In Progress for a human.`);
-    } else {
+    if (triage === 'green') {
       try {
         const sid = await findStateId(issue.team.id, config.reviewState, null);
         if (sid) { await moveIssue(issue.id, sid); log(`Moved ${id} -> ${config.reviewState}`); }
       } catch (e) { log('Warn: could not move to review state:', e.message); }
+    } else {
+      log(`Triage "${triage}" — leaving ${id} In Progress (label set) for a human.`);
     }
     if (config.cleanupWorktreeOnSuccess) teardown(WT);
-    state[issue.id] = { identifier: id, outcome: gatesFailed ? 'fixed_needs_human' : 'fixed', prs, review: review || null, verify: verify || null, at: new Date().toISOString() };
+    updateState(issue.id, {
+      identifier: id, branch, triage,
+      outcome: triage === 'green' ? 'fixed' : triage === 'rework' ? 'fixed_needs_human' : 'fixed_needs_manual_test',
+      summary: marker.summary || '', prs, review: review || null, verify: verify || null, checks, stages,
+      at: new Date().toISOString(),
+    });
   } else {
     const revertedByReview = review && marker.status === 'fixed';
     const body = marker.status === 'cannot_fix'
@@ -258,20 +335,37 @@ async function main() {
         ? `⚠️ **Automated fix produced no net change** (the review pass reverted it). Workspace kept at \`${WT}\` for inspection.`
         : `⚠️ **Automated fix run produced no changes.** Workspace kept at \`${WT}\` for inspection.`;
     await addComment(issue.id, body);
+    try { await setAutofixLabel(issue, config.triageLabels?.cannotFix); } catch (e) { log('Warn: could not set triage label:', e.message); }
     log(`No PR. Workspace kept at ${WT}.`);
-    state[issue.id] = { identifier: id, outcome: marker.status === 'cannot_fix' ? 'cannot_fix' : 'no_change', at: new Date().toISOString() };
+    updateState(issue.id, { identifier: id, branch, outcome: marker.status === 'cannot_fix' ? 'cannot_fix' : 'no_change', stages, at: new Date().toISOString() });
   }
-  saveState(state);
 }
 
-function runClaude(args, prompt, cwd, timeoutMs = config.timeoutMs) {
+export function runClaude(args, prompt, cwd, timeoutMs = config.timeoutMs, stage = null) {
   return new Promise((resolve) => {
     const child = spawn('claude', args, { cwd, env: process.env });
     let out = '';
-    const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeoutMs);
+    // A spawn failure (e.g. `claude` not on PATH under cron) emits 'error' and would otherwise
+    // CRASH the whole run as an unhandled event — resolve with empty output instead.
+    child.on('error', (e) => { clearTimeout(timer); log(`claude spawn failed${stage ? ` (stage ${stage})` : ''}: ${e.message}`); resolve({ out, timedOut, spawnError: e.message }); });
     child.stdout.on('data', (d) => { out += d; });
     child.stderr.on('data', (d) => process.stderr.write(d));
-    child.on('close', () => { clearTimeout(timer); resolve({ out }); });
+    child.stdin.on('error', () => { /* EPIPE when the child never started */ });
+    child.on('close', () => {
+      clearTimeout(timer);
+      if (stage) {
+        if (timedOut) log(`Stage ${stage} hit its ${Math.round(timeoutMs / 60000)}min timeout (SIGKILL) — continuing with partial output.`);
+        try {
+          if (stageLogDir) writeFileSync(path.join(stageLogDir, `${stage}.txt`), out);
+          let meta = {};
+          try { const j = JSON.parse(out); meta = { turns: j.num_turns, ms: j.duration_ms, sessionId: j.session_id }; } catch { /* not the CLI JSON envelope */ }
+          stages[stage] = { timedOut, ...meta };
+        } catch { /* stage logging is best-effort */ }
+      }
+      resolve({ out, timedOut });
+    });
     child.stdin.write(prompt);
     child.stdin.end();
   });
@@ -351,7 +445,7 @@ function computeSessionContext(text) {
 }
 
 // Which repos actually have local commits on the branch.
-function detectChangedRepos(WT) {
+export function detectChangedRepos(WT) {
   const found = [];
   for (const repo of config.repos) {
     const wt = wtPathOf(WT, repo);
@@ -364,13 +458,84 @@ function detectChangedRepos(WT) {
 }
 
 // Push each changed repo's branch to origin (idempotent). Returns the repos whose push failed.
-function pushChanged(changed) {
+export function pushChanged(changed) {
   const failed = [];
   for (const c of changed) {
     const push = gitIn(c.wt, ['push', '-u', 'origin', 'HEAD']);
     if (push.status !== 0) { log(`Push failed for ${c.repo}: ${push.stderr}`); failed.push(c.repo); }
   }
   return failed;
+}
+
+// Total commits on the branch across all changed repos — used to detect whether a re-fix pass
+// actually committed anything new.
+export function countCommits(changed) {
+  return changed.reduce((n, c) => {
+    const r = gitIn(c.wt, ['rev-list', '--count', `origin/${c.base}..HEAD`]);
+    return n + (r.status === 0 ? parseInt((r.stdout || '0').trim(), 10) || 0 : 0);
+  }, 0);
+}
+
+// All changed files across repos, workspace-relative (nested repos get their mount prefix).
+function changedFiles(changed) {
+  const files = [];
+  for (const c of changed) {
+    const mount = (config.repos.find((r) => r.key === c.repo) || {}).mount;
+    const names = (gitIn(c.wt, ['diff', '--name-only', `origin/${c.base}...HEAD`]).stdout || '').split('\n').filter(Boolean);
+    for (const f of names) files.push(mount && mount !== '.' ? `${mount}/${f}` : f);
+  }
+  return files;
+}
+
+// ---- Deterministic post-fix checks (run by the orchestrator, never trusted from agent output) ----
+// Typecheck every changed package; run backend's jest related-tests for the changed files.
+// A failure forces triage to `rework`. Full command output lands in the stage log dir.
+function checkResult(cmd, r) {
+  const pass = r.status === 0 && !r.error;
+  return { cmd, result: pass ? 'pass' : 'fail', detail: pass ? '' : (((r.stdout || '') + (r.stderr || '')).slice(-4000) || String(r.error || r.signal || 'failed')) };
+}
+
+export function runChecks(WT, changed) {
+  if (config.checks?.enabled === false || !changed.length) return [];
+  const byPkg = {};
+  for (const f of changedFiles(changed)) {
+    const pkg = PKG_DIRS.find((d) => f.startsWith(d + '/'));
+    if (pkg) (byPkg[pkg] ??= []).push(f.slice(pkg.length + 1));
+  }
+  const results = [];
+  for (const [pkg, files] of Object.entries(byPkg)) {
+    const dir = path.join(WT, pkg);
+    if (existsSync(path.join(dir, 'tsconfig.json'))) {
+      log(`Deterministic check: npx tsc --noEmit (${pkg})...`);
+      const r = spawnSync('npx', ['tsc', '--noEmit'], { cwd: dir, encoding: 'utf8', timeout: config.checks?.tscTimeoutMs || 300000 });
+      results.push(checkResult(`npx tsc --noEmit (${pkg})`, r));
+    }
+    if (pkg === 'backend') {
+      // Only source files that still exist (a deleted path makes --findRelatedTests error out).
+      const src = files.filter((f) => /\.(ts|tsx)$/.test(f) && existsSync(path.join(dir, f)));
+      if (src.length) {
+        log(`Deterministic check: npx jest --findRelatedTests (${src.length} file(s), backend)...`);
+        const r = spawnSync('npx', ['jest', '--findRelatedTests', ...src, '--passWithNoTests', '--silent'], { cwd: dir, encoding: 'utf8', timeout: config.checks?.jestTimeoutMs || 600000 });
+        results.push(checkResult('npx jest --findRelatedTests (backend)', r));
+      }
+    }
+  }
+  for (const c of results) log(`Check ${c.result === 'pass' ? 'PASS' : 'FAIL'}: ${c.cmd}`);
+  try { if (stageLogDir) writeFileSync(path.join(stageLogDir, 'checks.json'), JSON.stringify(results, null, 2)); } catch { /* best-effort */ }
+  return results.map(({ detail, ...rest }) => rest); // keep Linear comments and state.json lean
+}
+
+// One triage bucket per fixed bug (drives the label, the Linear state, and the comment header):
+//   rework — a gate says the fix is wrong (manager needs_rework, browser not_fixed, failed check)
+//   green  — every enabled gate is green AND the fix was verified in a REAL browser
+//   manual — everything else (verify inconclusive / env_down / api-only / review errored)
+export function computeTriage({ review, verify, checks, reviewEnabled }) {
+  const checksFailed = (checks || []).some((c) => c.result === 'fail');
+  const managerVerdict = review?.manager?.verdict;
+  if (managerVerdict === 'needs_rework' || verify?.verdict === 'not_fixed' || checksFailed) return 'rework';
+  const reviewGreen = reviewEnabled ? managerVerdict === 'sound' : true;
+  const verifyGreen = verify?.verdict === 'verified' && verify?.method === 'browser';
+  return reviewGreen && verifyGreen ? 'green' : 'manual';
 }
 
 // Push (idempotent) and open a draft PR from inside each changed repo (so `gh` targets the right
@@ -414,10 +579,29 @@ function repoDiff(WT, changed) {
   return out;
 }
 
+// Lenses that cannot apply to this diff are skipped (saves runs): security needs code changes;
+// tests only applies when backend logic or test files changed (frontend UI is TDD-exempt per CLAUDE.md).
+function selectLenses(all, changed) {
+  if (config.review?.autoScaleLenses === false) return all;
+  const files = changedFiles(changed);
+  const nonCode = /\.(md|css|scss|less|svg|png|jpe?g|gif|webp|txt)$/i;
+  const hasCode = files.some((f) => !nonCode.test(f));
+  const backendTouched = files.some((f) => f.startsWith('backend/'));
+  const testsTouched = files.some((f) => /(__tests__\/|\.test\.|\.spec\.)/.test(f));
+  return all.filter((lens) => {
+    if (lens === 'security' && !hasCode) return false;
+    if (lens === 'tests' && !backendTouched && !testsTouched) return false;
+    return true;
+  });
+}
+
 async function runReview(issue, WT, changed, branch, sessionContext = '') {
   const id = issue.identifier;
   const diff = repoDiff(WT, changed);
-  const lenses = [...new Set(config.review.lenses || [])].filter((l) => LENS_FOCUS[l]);
+  const allLenses = [...new Set(config.review.lenses || [])].filter((l) => LENS_FOCUS[l]);
+  const lenses = selectLenses(allLenses, changed);
+  const skipped = allLenses.filter((l) => !lenses.includes(l));
+  if (skipped.length) log(`Lenses skipped for this diff: ${skipped.join(', ')}`);
   if (!lenses.length || !diff) { log('Review skipped (no lenses or empty diff).'); return null; }
   const issueMap = { IDENTIFIER: id, TITLE: issue.title, DESCRIPTION: issue.description || '(no description)', SESSION_CONTEXT: sessionContext || '(none)' };
   const reviewArgs = () => claudeArgs({ model: config.review.model, maxTurns: config.review.maxTurns, skipPermissions: true });
@@ -428,7 +612,7 @@ async function runReview(issue, WT, changed, branch, sessionContext = '') {
     ...issueMap, REPOS: changed.map((c) => `- ${c.repo}`).join('\n'), DIFF: diff,
   });
   const runLens = (lens) =>
-    runClaude(reviewArgs(), fillTemplate(base, { LENS: lens, LENS_FOCUS: LENS_FOCUS[lens] }), WT, config.review.timeoutMs)
+    runClaude(reviewArgs(), fillTemplate(base, { LENS: lens, LENS_FOCUS: LENS_FOCUS[lens] }), WT, config.review.timeoutMs, `review-${lens}`)
       .then((r) => parseReview(r, lens));
   log(`Running ${lenses.length} expert reviewers (model=${config.review.model}${config.review.parallel === false ? ', sequential' : ''}): ${lenses.join(', ')}...`);
   let results;
@@ -443,26 +627,45 @@ async function runReview(issue, WT, changed, branch, sessionContext = '') {
 
   // 2. Manager adversarially verifies which findings must actually be fixed.
   let manager = { verdict: 'sound', confirmed: [], rejectedCount: 0, assessment: '' };
+  const findingsBlock = allFindings.length
+    ? allFindings
+        .map((f, i) => `${i + 1}. [${f.lens}/${f.severity || 'n/a'}] ${f.file || '?'}${f.line ? ':' + f.line : ''} — ${f.issue || ''} (suggested: ${f.suggestedFix || 'n/a'})`)
+        .join('\n')
+    : '(no reviewer findings were filed)';
   if (allFindings.length) {
-    const findingsBlock = allFindings
-      .map((f, i) => `${i + 1}. [${f.lens}/${f.severity || 'n/a'}] ${f.file || '?'}${f.line ? ':' + f.line : ''} — ${f.issue || ''} (suggested: ${f.suggestedFix || 'n/a'})`)
-      .join('\n');
     const mp = fillTemplate(readFileSync(managerPromptPath, 'utf8'), { ...issueMap, DIFF: diff, FINDINGS: findingsBlock });
     log(`Running manager verification (model=${config.review.managerModel})...`);
-    manager = parseManager(await runClaude(claudeArgs({ model: config.review.managerModel, maxTurns: config.review.maxTurns, skipPermissions: true }), mp, WT, config.review.timeoutMs));
+    manager = parseManager(await runClaude(claudeArgs({ model: config.review.managerModel, maxTurns: config.review.maxTurns, skipPermissions: true }), mp, WT, config.review.timeoutMs, 'manager'));
   }
   log(`Manager verdict: ${manager.verdict}; confirmed ${manager.confirmed.length}, rejected ${manager.rejectedCount}.`);
 
-  // 3. Re-fix pass for the confirmed findings only.
+  // 3. Re-fix pass: apply the confirmed findings; on a needs_rework verdict, also rework the fix
+  //    itself (the manager's assessment becomes a finding) and have the manager re-check ONCE.
   let refix = null;
-  if (manager.confirmed.length) {
-    const confirmedBlock = manager.confirmed
-      .map((f, i) => `${i + 1}. [${f.lens || '?'}/${f.severity || 'n/a'}] ${f.file || '?'} — ${f.issue || ''} → ${f.fix || ''}`)
-      .join('\n');
-    const rp = fillTemplate(readFileSync(refixPromptPath, 'utf8'), { ...issueMap, BRANCH: branch, CONFIRMED: confirmedBlock });
-    log(`Re-fixing ${manager.confirmed.length} confirmed finding(s) (model=${config.review.model})...`);
-    refix = parseRefix(await runClaude(reviewArgs(), rp, WT, config.review.timeoutMs));
+  const needsRework = manager.verdict === 'needs_rework';
+  const refixModel = config.review.refixModel || config.review.model;
+  if (manager.confirmed.length || needsRework) {
+    const items = manager.confirmed
+      .map((f, i) => `${i + 1}. [${f.lens || '?'}/${f.severity || 'n/a'}] ${f.file || '?'} — ${f.issue || ''} → ${f.fix || ''}`);
+    if (needsRework) {
+      items.push(`${items.length + 1}. [manager/high] (the fix as a whole) — The review manager judged the current fix UNSOUND: ${manager.assessment || 'it does not correctly address the root cause.'} → Rework the fix so it actually resolves the bug's root cause; keep it minimal.`);
+    }
+    const rp = fillTemplate(readFileSync(refixPromptPath, 'utf8'), { ...issueMap, BRANCH: branch, CONFIRMED: items.join('\n') });
+    log(`${needsRework ? 'Reworking the fix' : 'Re-fixing'} — ${items.length} item(s) (model=${refixModel})...`);
+    refix = parseRefix(await runClaude(claudeArgs({ model: refixModel, maxTurns: config.review.maxTurns, skipPermissions: true }), rp, WT, config.review.timeoutMs, 'refix'));
     log(`Re-fix status: ${refix.status}`);
+
+    if (needsRework && config.review.recheckAfterRework !== false) {
+      const diff2 = repoDiff(WT, detectChangedRepos(WT));
+      const recheckNote = 'NOTE: These findings were filed against an EARLIER revision of this branch; a rework pass has since been applied (the diff above is CURRENT). This is the FINAL gate — return "sound" only if no must-fix defect remains in the current code; otherwise return "needs_rework". Do not assume any further fix pass will run.\n\n';
+      const mp2 = fillTemplate(readFileSync(managerPromptPath, 'utf8'), { ...issueMap, DIFF: diff2, FINDINGS: recheckNote + findingsBlock });
+      log('Manager re-check after rework...');
+      const m2 = parseManager(await runClaude(claudeArgs({ model: config.review.managerModel, maxTurns: config.review.maxTurns, skipPermissions: true }), mp2, WT, config.review.timeoutMs, 'manager-recheck'));
+      log(`Manager re-check verdict: ${m2.verdict}.`);
+      // Keep the ORIGINAL confirmed list (those were applied); the re-check contributes the
+      // final verdict + assessment. initialVerdict records that a rework round happened.
+      manager = { verdict: m2.verdict, assessment: m2.assessment, rejectedCount: manager.rejectedCount, confirmed: manager.confirmed, initialVerdict: 'needs_rework' };
+    }
   }
   return { lenses, manager, refix };
 }
@@ -495,18 +698,49 @@ async function ensureProxy() {
   throw new Error(`preview proxy did not become healthy on :${port}`);
 }
 
+async function httpUp(url) {
+  try { const r = await fetch(url, { signal: AbortSignal.timeout(8000) }); return r.status < 500; }
+  catch { return false; }
+}
+// Deterministic preflight through the proxy URLs the verify agent will actually use — a 502
+// (no route / dead upstream) or connection error means the environment is down.
+async function previewHealthy(urls) {
+  if (!urls.customer || !urls.api) return false;
+  return (await httpUp(urls.customer)) && (await httpUp(urls.api));
+}
+
 async function runVerify(issue, WT) {
   const id = issue.identifier;
   await ensureProxy();
   log('Bringing up full preview for browser verification...');
-  spawnSync('node', [previewScript, 'up', id, WT], { stdio: 'inherit', env: process.env });
+  const bringUp = () => spawnSync('node', [previewScript, 'up', id, WT], { stdio: 'inherit', env: process.env });
+  const tearDown = () => spawnSync('node', [previewScript, 'down', id], { stdio: 'inherit', env: process.env });
+  const readUrls = () => { try { return (JSON.parse(readFileSync(previewStatePath, 'utf8'))[id.toLowerCase()] || {}).urls || {}; } catch { return {}; } };
 
-  let urls = {};
-  try { urls = (JSON.parse(readFileSync(previewStatePath, 'utf8'))[id.toLowerCase()] || {}).urls || {}; } catch { /* no state */ }
+  bringUp();
+  let urls = readUrls();
+
+  // Preflight: never burn a long agent run against a dead environment. One rebuild retry (also
+  // self-heals transient port collisions between concurrent bugs), then give up with `env_down`.
+  if (!(await previewHealthy(urls))) {
+    log('Preview not healthy — retrying bring-up once...');
+    tearDown();
+    bringUp();
+    urls = readUrls();
+    if (!(await previewHealthy(urls))) {
+      log('Preview environment failed to become healthy — skipping the browser-verify agent (env_down).');
+      tearDown(); // don't leave dead processes registered in routes/preview-state
+      return {
+        verdict: 'env_down', method: '', scenario: '',
+        summary: `The per-bug preview environment failed to start (see .linear-autofix/preview/logs/${id.toLowerCase()}-*.log), so automated browser verification was skipped.`,
+        screenshots: [], urls,
+      };
+    }
+  }
 
   // Keep the preview running (URL stays live) only when the worktree is also kept; otherwise the
   // worktree is about to be removed and the running servers would break. Tear it down in `finally`
-  // so a throw after `up` (missing prompt, parse error) can't leak the ~1.5GB of dev servers.
+  // so a throw after `up` (missing prompt, parse error) can't leak the running servers.
   const keepUp = config.keepPreviewUp && !config.cleanupWorktreeOnSuccess;
   try {
     const prompt = fillTemplate(readFileSync(verifyPromptPath, 'utf8'), {
@@ -516,13 +750,13 @@ async function runVerify(issue, WT) {
     });
     const args = claudeArgs({ model: config.verify.model, maxTurns: config.verify.maxTurns, mcp: verifyMcpPath, skipPermissions: true });
     log(`Running browser verification (model=${config.verify.model})...`);
-    const verdict = parseVerify(await runClaude(args, prompt, WT, config.verify.timeoutMs));
+    const verdict = parseVerify(await runClaude(args, prompt, WT, config.verify.timeoutMs, 'verify'));
     verdict.urls = urls; // let the caller reuse these without re-reading preview-state
     log(`Verify verdict: ${verdict.verdict}`);
     return verdict;
   } finally {
     if (keepUp) log(`Preview kept running for ${id}${urls.customer ? ` — ${urls.customer}` : ''} (gc stops it when the issue is Done)`);
-    else spawnSync('node', [previewScript, 'down', id], { stdio: 'inherit', env: process.env });
+    else tearDown();
   }
 }
 
@@ -531,6 +765,22 @@ function parseVerify(result) {
 }
 
 // ---- Linear comment bodies (pure functions; unit-tested from the scratchpad harness) ----
+
+// The merge-confidence verdict leads the comment so triage is a one-glance decision.
+const TRIAGE_HEADERS = {
+  green: {
+    head: '🟢 **Automated fix — HIGH confidence** (code review sound + verified in a real browser + checks pass)',
+    note: 'Skim the PR and merge — no manual testing needed.',
+  },
+  manual: {
+    head: '🟡 **Automated fix — needs your manual test** (automated browser verification could not confirm the fix)',
+    note: 'Run the manual steps in the comment below before merging. The issue stays In Progress.',
+  },
+  rework: {
+    head: '🔴 **Automated fix — needs human rework** (an automated gate failed)',
+    note: 'The draft PR is open for reference; see the test report / code review below. The issue stays In Progress.',
+  },
+};
 
 export function fixCommentBody(prs, marker, opts = {}) {
   const links = (prs || []).length
@@ -541,36 +791,37 @@ export function fixCommentBody(prs, marker, opts = {}) {
         return `- \`${p.repo}\`: ${loc}`;
       }).join('\n')
     : '- (no PR opened)';
-  const header = opts.gatesFailed
-    ? '⚠️ **Automated fix — needs a human (an automated gate failed)**'
-    : '🤖 **Automated fix — draft PR opened**';
-  const warn = opts.gatesFailed
-    ? '\n\n> One or more automated gates failed (see the test report / code review below). The draft PR is open but the issue was left **In Progress** for a human.'
-    : '';
-  return `${header}${warn}\n\n${links}\n\n${marker.summary || ''}\n\n_Generated by the Linear auto-fix agent — please review._`;
+  const t = TRIAGE_HEADERS[opts.triage] || { head: '🤖 **Automated fix — draft PR opened**', note: '' };
+  return `${t.head}\n\n${t.note ? '> ' + t.note + '\n\n' : ''}${links}\n\n${marker.summary || ''}\n\n_Generated by the Linear auto-fix agent — please review._`;
 }
 
 const checkIcon = (r) => (r === 'pass' ? '✅' : r === 'fail' ? '❌' : '▫️');
 
-export function testReportBody(marker, verify) {
+export function testReportBody(marker, verify, checks) {
   const tests = Array.isArray(marker.tests) ? marker.tests : [];
-  const checks = tests.length
+  const agentChecks = tests.length
     ? tests.map((t) => `${checkIcon(t.result)} \`${t.cmd}\``).join('\n')
     : '_(no automated checks reported)_';
+  const orchChecks = (checks || []).length
+    ? checks.map((c) => `${checkIcon(c.result)} \`${c.cmd}\``).join('\n')
+    : '_(none ran)_';
   let browser;
   if (!verify) browser = '_skipped_';
-  else {
+  else if (verify.verdict === 'env_down') {
+    browser = `⚠️ preview environment failed to start — browser verification skipped. ${verify.summary || ''}`;
+  } else {
     // Only claim "browser" when the verify pass actually drove a browser; "api" = logic-layer fallback.
     const via = verify.method === 'api' ? ' (via API/logic — not a browser repro)'
       : verify.method === 'browser' ? ' (browser)' : '';
-    const icon = verify.verdict === 'verified' ? `✅ verified${via}`
-      : verify.verdict === 'not_fixed' ? `❌ NOT fixed${via}`
-      : '❓ inconclusive';
+    const attempt = verify.attempt === 2 ? ' — 2nd attempt, after an automated re-fix' : '';
+    const icon = verify.verdict === 'verified' ? `✅ verified${via}${attempt}`
+      : verify.verdict === 'not_fixed' ? `❌ NOT fixed${via}${attempt}`
+      : `❓ inconclusive${attempt}`;
     const scenario = verify.scenario ? `\nScenario: ${verify.scenario}` : '';
     const shots = (verify.screenshots || []).length ? '\n_(screenshots saved on the runner; see the PR verification comment)_' : '';
     browser = `${icon} — ${verify.summary || ''}${scenario}${shots}`;
   }
-  return `🧪 **Automated test report**\n\n**Code checks**\n${checks}\n\n**Verification**\n${browser}`;
+  return `🧪 **Automated test report**\n\n**Agent-run checks (self-reported)**\n${agentChecks}\n\n**Orchestrator checks (deterministic)**\n${orchChecks}\n\n**Browser verification**\n${browser}`;
 }
 
 export function reviewReportBody(review) {
@@ -596,8 +847,11 @@ export function reviewReportBody(review) {
   const hasUnlabeled = confirmed.some((f) => !f.lens);
   const cleanLenses = hasUnlabeled ? [] : lenses.filter((l) => !confirmedLenses.has(l));
   const cleanLine = cleanLenses.length ? `\n\nReviewed clean: ${cleanLenses.join(', ')}` : '';
+  const rework = m.initialVerdict === 'needs_rework'
+    ? `\n\nRework: the initial fix was judged ⚠️ unsound; an automated rework pass was applied and the manager re-checked it → ${m.verdict === 'sound' ? '✅ sound' : '⚠️ still needs rework'}.`
+    : '';
   const assess = m.assessment ? `\n\n_${m.assessment}_` : '';
-  return `🔎 **Code review — ${lenses.length} expert lens${lenses.length === 1 ? '' : 'es'} + manager verification**\n\nManager verdict: ${verdictIcon}${rejected}\n\n${fixedBlock}${cleanLine}${assess}`;
+  return `🔎 **Code review — ${lenses.length} expert lens${lenses.length === 1 ? '' : 'es'} + manager verification**\n\nManager verdict: ${verdictIcon}${rejected}\n\n${fixedBlock}${cleanLine}${rework}${assess}`;
 }
 
 export function manualTestBody(marker, opts = {}) {

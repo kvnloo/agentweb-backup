@@ -14,9 +14,10 @@ fix already committed. Before changing a repo, follow its `CLAUDE.md`.
 
 ## What to do
 
-A manager verified these findings from a code review of the current diff. Apply ALL of them —
-minimally and only these. Do not re-litigate them, do not refactor unrelated code, do not undo
-the existing fix.
+The findings below were VERIFIED by an automated gate (the code-review manager, or a browser
+verification pass that reproduced the bug against the current code). Apply ALL of them —
+minimally and only these. Do not re-litigate them, do not refactor unrelated code, and do not
+undo the existing fix except where a finding explicitly says it is wrong.
 
 {{CONFIRMED}}
 
