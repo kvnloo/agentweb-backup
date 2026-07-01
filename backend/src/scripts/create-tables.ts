@@ -1719,6 +1719,37 @@ const createUsageRecordsTable = async () => {
   }
 };
 
+// Create Agent Runs table (run-survival core — durable run records,
+// idempotency submit-locks, incident-dedupe claims; see
+// services/agentMode/runStore.ts). Single pk hash key with three item kinds:
+// run#<runId>, idem#<key>, incident#<runId>.
+// TTL: rows carry a `ttl` attr (epoch seconds — 30d runs / 10m-24h idem /
+// 24h incidents). Enable DynamoDB native TTL on the `ttl` attribute manually —
+// same manual TTL-enable step as the UsageRecords/LoopEvents tables.
+const createAgentRunsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-AgentRuns`,
+    AttributeDefinitions: [
+      { AttributeName: 'pk', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'pk', KeyType: 'HASH' }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const createAccountMemoryTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: `${TABLE_PREFIX}AW-AccountMemory`,
@@ -2249,6 +2280,7 @@ const main = async () => {
     await createCRMCompaniesTable();
     await createCodingAgentRunsTable();
     await createV0UsageTable();
+    await createAgentRunsTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);
