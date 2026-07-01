@@ -4,7 +4,7 @@ import { userDb, User } from './db';
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive';
 
 /**
  * Base OAuth configuration shared across all platforms
@@ -230,7 +230,15 @@ export interface GoogleAdsConfig extends BaseOAuthConfig {
   login_customer_id?: string;
 }
 
-export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig; // | TwitterConfig
+export interface GoogleDriveConfig extends BaseOAuthConfig {
+  account_type: 'oauth';
+  email: string;
+  display_name?: string;
+  picture_url?: string;
+  granted_scopes: string[];
+}
+
+export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig; // | TwitterConfig
 
 /**
  * Per-connection engagement memory: a persona profile generated from LinkedIn data

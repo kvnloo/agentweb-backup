@@ -8037,3 +8037,264 @@ TYPICAL WORKFLOW:
     return agentModeService.handleHubspotApi(userId, args);
   },
 });
+
+emmaToolRegistry.register({
+  name: 'read_google_doc',
+  definition: {
+    name: 'read_google_doc',
+    description: 'Read a Google Doc or Google Sheet by URL or file ID, including all inline comments and replies. If the user has connected Google Drive in Settings → Connected Accounts, uses their credentials (works for internal Workspace files). Otherwise falls back to the service account (file must be shared with the SA). Use this to ingest a specific Doc or Sheet that is NOT inside a registered Drive folder.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url_or_id: {
+          type: 'string',
+          description: 'Google Doc/Sheet URL (e.g. https://docs.google.com/document/d/FILE_ID/edit) or raw file ID',
+        },
+      },
+      required: ['url_or_id'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    const fileId = (args.url_or_id as string).match(/\/d\/([a-zA-Z0-9_-]+)/)?.[1] ?? args.url_or_id.trim();
+    return agentModeService.readGoogleFileById(fileId, context.userId);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'google_drive',
+  definition: {
+    name: 'google_drive',
+    description: 'Google Drive utility actions. Use action="search" when user refers to a file/folder by name or wants to browse/find something — search immediately, do NOT ask the user for a URL. Use action="list" to list contents of a folder — use folder_url_or_id="root" when user asks to browse their Drive or list folders without specifying a location. Use action="create_folder" when the user asks to create a folder — just do it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['search', 'list', 'create_folder'],
+          description: '"search" — find files/folders by name. "list" — list contents of a folder (use "root" for root Drive). "create_folder" — create a new Drive folder.',
+        },
+        // search params
+        query: {
+          type: 'string',
+          description: '[search] Name or partial name to search for.',
+        },
+        type: {
+          type: 'string',
+          enum: ['folder', 'file', 'any'],
+          description: '[search] Filter: "folder", "file", or "any" (default).',
+        },
+        // list params
+        folder_url_or_id: {
+          type: 'string',
+          description: '[list] Google Drive folder URL, folder ID, or "root" to list the root Drive.',
+        },
+        // create_folder params
+        name: {
+          type: 'string',
+          description: '[create_folder] Name of the folder to create.',
+        },
+        parent_folder_id: {
+          type: 'string',
+          description: '[create_folder] Optional parent folder ID. Omit to create in Drive root.',
+        },
+      },
+      required: ['action'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    if (args.action === 'search') {
+      if (!args.query) return { success: false, message: 'query is required for action=search' };
+      return agentModeService.searchGoogleDrive(args.query, context.userId, args.type);
+    }
+    if (args.action === 'list') {
+      if (!args.folder_url_or_id) return { success: false, message: 'folder_url_or_id is required for action=list' };
+      return agentModeService.listGoogleDriveFolder(args.folder_url_or_id, context.userId);
+    }
+    if (args.action === 'create_folder') {
+      if (!args.name) return { success: false, message: 'name is required for action=create_folder' };
+      return agentModeService.createGoogleDriveFolder(args.name, context.userId, args.parent_folder_id);
+    }
+    return { success: false, message: `Unknown action: ${args.action}` };
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'create_google_doc',
+  definition: {
+    name: 'create_google_doc',
+    description: 'Create a new Google Doc with rich formatting. Requires the user to have connected Google Drive in Settings → Connected Accounts. The Doc is created in the user\'s own Drive (or a specific folder if folder_id is provided) and optionally shared with additional emails. Returns the Doc URL. Content is written in markdown and automatically converted to rich Google Docs formatting (headings, bold, italic, bullet lists, numbered lists, tables, code blocks, blockquotes, etc.) — write full markdown, do NOT flatten to plain text. BEHAVIOR: Just do it — do NOT present options or ask the user to choose a format. Make the best judgment call from context and create the doc immediately. If the user names a destination folder by name (e.g. "Emma Test folder"), use google_drive action=search first to find its ID — do NOT ask the user for the URL. Images and logos cannot be embedded inline via the API — include them as clickable links in the doc content instead. Docs are styled by default — set plain=true only if the user explicitly wants a simple/minimal doc with no formatting. Use style_options.primary_color to apply brand colors or a color the user requested.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: {
+          type: 'string',
+          description: 'Title of the Google Doc',
+        },
+        content: {
+          type: 'string',
+          description: 'Content in markdown format. Write full markdown (# Heading 1, ## Heading 2, **bold**, *italic*, - bullet lists, 1. numbered lists, | tables |, ```code blocks```, > blockquotes, [text](url) links). Markdown is automatically converted to rich Google Docs formatting — do NOT flatten to plain text.',
+        },
+        folder_id: {
+          type: 'string',
+          description: 'Optional: Google Drive folder ID to create the Doc in. If omitted, creates in the user\'s root Drive or first connected folder. Get folder IDs from list_knowledge_base_files (gdrive: identifiers).',
+        },
+        share_with_emails: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional: additional email addresses to share the Doc with (writer access). The calling user is always shared automatically.',
+        },
+        plain: {
+          type: 'boolean',
+          description: 'Set true ONLY if the user explicitly asks for a plain/simple/minimal doc or quick note with no formatting. Omit (or false) for everything else.',
+        },
+        style_options: {
+          type: 'object',
+          description: 'Visual customizations. Only set what the user asked for — everything else uses sensible defaults (Arial 14px, blue accent). Set primary_color if you know the brand or the user specified a color. Set font_family or font_size only if the user asks.',
+          properties: {
+            primary_color: {
+              type: 'string',
+              description: 'Hex accent color for headings and table headers. Derive from brand colors or user request (e.g. brand pink → "#e6518d", "use purple" → "#7C3AED"). Default: #1a73e8.',
+            },
+            font_family: {
+              type: 'string',
+              description: 'Body font. Examples: "Georgia, serif" (editorial), "Times New Roman, serif" (formal), "Trebuchet MS, sans-serif" (modern), "Courier New, monospace" (technical). Default: "Arial, sans-serif".',
+            },
+            font_size: {
+              type: 'number',
+              description: 'Base body font size in px. Heading sizes scale proportionally. Use 12 for compact, 16-18 for larger. Default: 14.',
+            },
+            line_height: {
+              type: 'number',
+              description: 'Line spacing multiplier. 1.4 = tight, 1.7 = default, 2.0 = spacious.',
+            },
+            compact: {
+              type: 'boolean',
+              description: 'Reduce table cell padding and element spacing. Default: false.',
+            },
+          },
+        },
+      },
+      required: ['title', 'content'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    const style = args.plain === true ? 'plain' : 'styled';
+    const so = args.style_options;
+    const styleOptions = so ? { primaryColor: so.primary_color, fontFamily: so.font_family, fontSize: so.font_size, lineHeight: so.line_height, compact: so.compact } : undefined;
+    return agentModeService.createGoogleDoc(args.title, args.content, context.userId, args.folder_id, args.share_with_emails, style, styleOptions);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'update_google_doc',
+  definition: {
+    name: 'update_google_doc',
+    description: 'Replace the entire content of an existing Google Doc with rich formatting. Content is written in markdown and automatically converted to rich Google Docs formatting — write full markdown, do NOT flatten to plain text. Use this to write revised content back to a Doc after the team has left comments and the user has approved edits. Accepts a Doc URL or file ID. BEHAVIOR: Just do it when the user has clearly asked for an update. Only ask for clarification if multiple Docs are in context and it\'s genuinely ambiguous which one to update.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url_or_id: {
+          type: 'string',
+          description: 'Google Doc URL or file ID',
+        },
+        content: {
+          type: 'string',
+          description: 'New content in markdown format (replaces all existing content). Write full markdown — it is automatically converted to rich Google Docs formatting. Do NOT flatten to plain text.',
+        },
+        plain: {
+          type: 'boolean',
+          description: 'Set true ONLY if the original doc was plain or user wants no formatting.',
+        },
+        style_options: {
+          type: 'object',
+          description: 'Visual customizations. Match what was used when the doc was originally created, or apply any new style the user requests.',
+          properties: {
+            primary_color: { type: 'string', description: 'Hex accent color.' },
+            font_family: { type: 'string', description: 'Body font family.' },
+            font_size: { type: 'number', description: 'Base font size in px.' },
+            line_height: { type: 'number', description: 'Line spacing multiplier.' },
+            compact: { type: 'boolean', description: 'Tighter table/element spacing.' },
+          },
+        },
+      },
+      required: ['url_or_id', 'content'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    const style = args.plain === true ? 'plain' : 'styled';
+    const so = args.style_options;
+    const styleOptions = so ? { primaryColor: so.primary_color, fontFamily: so.font_family, fontSize: so.font_size, lineHeight: so.line_height, compact: so.compact } : undefined;
+    return agentModeService.updateGoogleDoc(args.url_or_id, args.content, context.userId, style, styleOptions);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'create_google_sheet',
+  definition: {
+    name: 'create_google_sheet',
+    description: 'Create a new Google Sheet with structured data. Requires the user to have connected Google Drive in Settings → Connected Accounts. The Sheet is created in the user\'s own Drive and optionally shared with additional emails. Data is a 2D array (rows × columns). Use this to deliver tabular output as a native Google Sheet. IMPORTANT: Before calling this tool, always ask the user two things and wait for explicit answers: (1) "Should I go ahead and create this Google Sheet titled X?" (2) "Where should I put it — your root Drive, or a specific folder? If a folder, please share the folder ID or URL."',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: {
+          type: 'string',
+          description: 'Title of the Google Sheet',
+        },
+        data: {
+          type: 'array',
+          items: { type: 'array', items: { type: 'string' } },
+          description: 'Rows of data. First row is typically headers. Example: [["Name","Email","Score"],["Alice","a@co.com","90"]]',
+        },
+        folder_id: {
+          type: 'string',
+          description: 'Optional: Google Drive folder ID to create the Sheet in. If omitted, creates in the user\'s root Drive or first connected folder.',
+        },
+        share_with_emails: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional: additional emails to share with (writer access).',
+        },
+      },
+      required: ['title', 'data'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    return agentModeService.createGoogleSheet(args.title, args.data, context.userId, args.folder_id, args.share_with_emails);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'update_google_sheet',
+  definition: {
+    name: 'update_google_sheet',
+    description: 'Write data into a range of an existing Google Sheet. Use this to update specific cells or add new rows to a Sheet. Existing data outside the range is preserved. IMPORTANT: Before calling this tool, always confirm with the user — e.g. "Should I update [Sheet title/URL] range X with the new data?" — and wait for explicit approval. If multiple Sheets are in the conversation context and the user says "update the sheet" without specifying which one, ask them to clarify before proceeding.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url_or_id: {
+          type: 'string',
+          description: 'Google Sheet URL or file ID',
+        },
+        range: {
+          type: 'string',
+          description: 'A1 notation range to write into, e.g. "Sheet1!A1" or "Sheet1!B2:D10"',
+        },
+        data: {
+          type: 'array',
+          items: { type: 'array', items: { type: 'string' } },
+          description: 'Rows of data to write into the range',
+        },
+      },
+      required: ['url_or_id', 'range', 'data'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    return agentModeService.updateGoogleSheet(args.url_or_id, args.range, args.data, context.userId);
+  },
+});
