@@ -4531,7 +4531,12 @@ export const agentModeController = {
       const effectiveScheduleFrequency = scheduleFrequency || existingSchedule.frequency;
 
       if (!effectiveScheduleName || !effectiveStartingMessage || !effectiveScheduleFrequency) {
-        return res.status(400).json({ error: 'Missing required fields' });
+        const missing = [
+          !effectiveScheduleName && 'scheduleName',
+          !effectiveStartingMessage && 'startingMessage',
+          !effectiveScheduleFrequency && 'scheduleFrequency',
+        ].filter(Boolean).join(', ');
+        return res.status(400).json({ error: `Missing required fields: ${missing}` });
       }
 
       // Validate frequencyIntervalDays for every_n_days frequency

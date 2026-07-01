@@ -1,12 +1,22 @@
 import axios from 'axios';
-import { AgentModeService } from '../services/agentModeService';
 import { uploadFileToS3, getS3ObjectAsString } from '../utils/s3Utils';
 import { getSecret } from '../utils/secretsManager';
+
+jest.mock('@slack/web-api', () => ({
+  WebClient: jest.fn().mockImplementation(() => ({
+    chat: { postMessage: jest.fn() },
+    conversations: { info: jest.fn(), list: jest.fn() },
+    views: { open: jest.fn() },
+  })),
+}));
+
+import { AgentModeService } from '../services/agentModeService';
 
 jest.mock('axios', () => ({
   get: jest.fn(),
   post: jest.fn()
 }));
+
 
 jest.mock('@google/generative-ai', () => ({
   GoogleGenerativeAI: jest.fn().mockImplementation(() => ({}))
@@ -824,5 +834,58 @@ describe('formatToolError for perform_data_analysis', () => {
   it('returns save_file guidance when error message says too large (payload, not timeout)', () => {
     const result = (svc as any).formatToolError('perform_data_analysis', 'The data payload sent to Gemini was too large.');
     expect(result).toContain('save_file');
+  });
+
+  describe('general logging', () => {
+    let consoleErrorSpy: jest.SpyInstance;
+
+    beforeEach(() => {
+      consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+    });
+
+    afterEach(() => {
+      consoleErrorSpy.mockRestore();
+    });
+
+    it('logs string errors to console.error', () => {
+      (svc as any).formatToolError('test_tool', 'something went wrong');
+      expect(consoleErrorSpy).toHaveBeenCalledWith('[AgentMode] Tool failed: test_tool — something went wrong');
+    });
+
+    it('logs non-string errors as Unknown error to console.error', () => {
+      (svc as any).formatToolError('test_tool', null as any);
+      expect(consoleErrorSpy).toHaveBeenCalledWith('[AgentMode] Tool failed: test_tool — Unknown error');
+    });
+  });
+
+  describe('manage_scheduled_chat guidance', () => {
+    it('returns field-specific guidance for missing required fields', () => {
+      const result = (svc as any).formatToolError('manage_scheduled_chat', 'Missing required fields: scheduleName, startingMessage');
+      expect(result).toContain('schedule_name, starting_message, and schedule_frequency');
+      expect(result).toContain('retry immediately');
+    });
+
+    it('returns guidance for frequencyIntervalDays validation errors', () => {
+      const result = (svc as any).formatToolError('manage_scheduled_chat', 'frequencyIntervalDays must be a positive integer when frequency is every_n_days');
+      expect(result).toContain('frequency_interval_days');
+      expect(result).toContain('positive integer');
+    });
+
+    it('returns guidance for runCount validation errors', () => {
+      const result = (svc as any).formatToolError('manage_scheduled_chat', 'runCount must be -1 (unlimited) or a positive integer');
+      expect(result).toContain('run_count');
+      expect(result).toContain('-1');
+    });
+
+    it('returns guidance for schedule not found errors', () => {
+      const result = (svc as any).formatToolError('manage_scheduled_chat', 'Scheduled chat not found');
+      expect(result).toContain('list_scheduled_chats');
+      expect(result).toContain('schedule_id');
+    });
+
+    it('falls through to generic guidance for unrecognized manage_scheduled_chat errors', () => {
+      const result = (svc as any).formatToolError('manage_scheduled_chat', 'Internal server error');
+      expect(result).toContain('Adjust the plan or ask the user for missing info');
+    });
   });
 });
