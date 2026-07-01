@@ -27,6 +27,10 @@ Be rigorous and HONEST. A page that merely loads is NOT proof — you must actua
 
 ## Required final output
 
+Set `method` to how you actually confirmed it: `"browser"` if you drove the real browser, or
+`"api"` if you fell back to exercising the backend/API directly (curl). Do not claim `"browser"`
+if you only hit the API/logic layer.
+
 The VERY LAST line of your response must be exactly:
 
-VERIFY_RESULT: {"verdict":"verified|not_fixed|inconclusive","scenario":"<the exact scenario you reproduced>","summary":"<one or two sentences on what you did and saw>","screenshots":["<screenshot path>"]}
+VERIFY_RESULT: {"verdict":"verified|not_fixed|inconclusive","method":"browser|api","scenario":"<the exact scenario you reproduced>","summary":"<one or two sentences on what you did and saw>","screenshots":["<screenshot path>"]}

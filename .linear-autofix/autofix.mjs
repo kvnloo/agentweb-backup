@@ -224,13 +224,13 @@ async function main() {
       previewDownCmd: `node .linear-autofix/preview/preview.mjs down ${id}`,
       testEmail: config.verify?.testEmail,
       testPassword: config.verify?.testPassword,
+      postCreds: config.verify?.postCredsInComment,
     };
 
-    // --- Comments back on the Linear issue, in order: fix -> test report -> code review -> manual ---
+    // --- Comments back on the Linear issue: fix -> verification (test report + code review) -> manual ---
     await addComment(issue.id, fixCommentBody(prs, marker, { gatesFailed }));
-    await addComment(issue.id, testReportBody(marker, verify));
-    const reviewComment = reviewReportBody(review);
-    if (reviewComment) await addComment(issue.id, reviewComment);
+    const verification = [testReportBody(marker, verify), reviewReportBody(review)].filter(Boolean).join('\n\n---\n\n');
+    await addComment(issue.id, verification);
     await addComment(issue.id, manualTestBody(marker, manualOpts));
 
     if (verify) {
@@ -514,7 +514,7 @@ async function runVerify(issue, WT) {
 }
 
 function parseVerify(result) {
-  return extractJson(result, 'VERIFY_RESULT', { verdict: 'inconclusive', scenario: '', summary: '(no verdict returned)', screenshots: [] });
+  return extractJson(result, 'VERIFY_RESULT', { verdict: 'inconclusive', method: '', scenario: '', summary: '(no verdict returned)', screenshots: [] });
 }
 
 // ---- Linear comment bodies (pure functions; unit-tested from the scratchpad harness) ----
@@ -547,14 +547,17 @@ export function testReportBody(marker, verify) {
   let browser;
   if (!verify) browser = '_skipped_';
   else {
-    const icon = verify.verdict === 'verified' ? '✅ verified'
-      : verify.verdict === 'not_fixed' ? '❌ NOT fixed'
+    // Only claim "browser" when the verify pass actually drove a browser; "api" = logic-layer fallback.
+    const via = verify.method === 'api' ? ' (via API/logic — not a browser repro)'
+      : verify.method === 'browser' ? ' (browser)' : '';
+    const icon = verify.verdict === 'verified' ? `✅ verified${via}`
+      : verify.verdict === 'not_fixed' ? `❌ NOT fixed${via}`
       : '❓ inconclusive';
     const scenario = verify.scenario ? `\nScenario: ${verify.scenario}` : '';
     const shots = (verify.screenshots || []).length ? '\n_(screenshots saved on the runner; see the PR verification comment)_' : '';
     browser = `${icon} — ${verify.summary || ''}${scenario}${shots}`;
   }
-  return `🧪 **Automated test report**\n\n**Code checks**\n${checks}\n\n**Browser verification**\n${browser}`;
+  return `🧪 **Automated test report**\n\n**Code checks**\n${checks}\n\n**Verification**\n${browser}`;
 }
 
 export function reviewReportBody(review) {
@@ -591,7 +594,11 @@ export function manualTestBody(marker, opts = {}) {
   if (opts.cleanup) access = "_(the fix's worktree was removed on success — recreate it to preview)_";
   else if (opts.liveUrl) access = `**Live preview** (kept running): ${opts.liveUrl}\nStop it when done: \`${opts.previewDownCmd}\``;
   else access = `**Bring up a live copy** (the fix's worktree is kept):\n\`\`\`bash\n${opts.previewUpCmd}\n# open the printed nip.io URL, then when done:\n${opts.previewDownCmd}\n\`\`\``;
-  const login = needsLogin && opts.testEmail ? `\n\nLogin (scenarios marked 🔐): \`${opts.testEmail}\` / \`${opts.testPassword}\`` : '';
+  const login = needsLogin && opts.testEmail
+    ? (opts.postCreds
+        ? `\n\nLogin (scenarios marked 🔐): \`${opts.testEmail}\` / \`${opts.testPassword}\``
+        : `\n\nLogin (scenarios marked 🔐): use the shared test account \`${opts.testEmail}\` (password in the team vault / CLAUDE.md test accounts)`)
+    : '';
   const body = steps.length
     ? steps.map((s, i) => {
         const lock = s.requiresLogin ? ' 🔐' : '';

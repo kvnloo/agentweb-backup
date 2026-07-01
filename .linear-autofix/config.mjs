@@ -88,6 +88,10 @@ export const config = {
     model: 'opus',
     testEmail: 'test@example.com',
     testPassword: 'Test123!',
+    postCredsInComment: false,       // false: the manual-test comment references the shared test
+                                     // account by email only (password left to the team vault /
+                                     // CLAUDE.md) — avoids posting a plaintext password on
+                                     // customer-reported issues. Set true to inline the password.
     maxTurns: 40,
     timeoutMs: 12 * 60 * 1000,
   },
