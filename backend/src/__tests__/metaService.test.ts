@@ -35,12 +35,17 @@ jest.mock('facebook-nodejs-business-sdk', () => {
             delete: jest.fn(),
         })),
         // AdCreative typically doesn't have update/delete in this service yet
-        AdCreative: {
-            Fields: {
-                name: 'name',
-                object_story_spec: 'object_story_spec',
+        AdCreative: Object.assign(
+            jest.fn().mockImplementation(() => ({
+                get: jest.fn(),
+            })),
+            {
+                Fields: {
+                    name: 'name',
+                    object_story_spec: 'object_story_spec',
+                }
             }
-        },
+        ),
         Ad: jest.fn().mockImplementation(() => ({
             update: jest.fn(),
             delete: jest.fn(),
@@ -366,6 +371,66 @@ describe('MetaService', () => {
             // object_story_spec carries only the Page; all copy/link lives in asset_feed_spec
             expect(callArgs.object_story_spec.page_id).toBe('page_123');
             expect(callArgs.object_story_spec.link_data).toBeUndefined();
+        });
+
+        describe('getAdCreative', () => {
+            // Meta's Graph API only returns the subfields of object_story_spec that are
+            // explicitly requested via field-expansion syntax (e.g. "object_story_spec{link_data{image_hash}}").
+            // Requesting the bare "object_story_spec" field omits image_hash and returns only the
+            // hosted "picture" URL, even for creatives that were created from an image_hash.
+            // COPY_AD relies on getAdCreative to read back image_hash so it can reuse the same
+            // account-scoped hash on the copy; if the hash isn't requested, COPY_AD instead
+            // re-uploads Meta's low-res preview "picture" URL, which Meta's own AdCreative
+            // create endpoint rejects (error code 100, subcode 1487390).
+            it('requests link_data.image_hash as an explicit subfield of object_story_spec', async () => {
+                const mockGet = jest.fn().mockResolvedValue({ _data: { id: 'creative_1' } });
+                (AdCreative as unknown as jest.Mock).mockImplementation(() => ({ get: mockGet }));
+
+                await service.getAdCreative(mockAccessToken, 'creative_1');
+
+                expect(mockGet).toHaveBeenCalled();
+                const fields: string[] = mockGet.mock.calls[0][0];
+                const objectStorySpecField = fields.find(f => f.startsWith('object_story_spec'));
+                expect(objectStorySpecField).toBeDefined();
+                expect(objectStorySpecField).toContain('link_data');
+                expect(objectStorySpecField).toContain('image_hash');
+            });
+
+            it('requests video_data.image_hash as an explicit subfield of object_story_spec', async () => {
+                const mockGet = jest.fn().mockResolvedValue({ _data: { id: 'creative_2' } });
+                (AdCreative as unknown as jest.Mock).mockImplementation(() => ({ get: mockGet }));
+
+                await service.getAdCreative(mockAccessToken, 'creative_2');
+
+                const fields: string[] = mockGet.mock.calls[0][0];
+                const objectStorySpecField = fields.find(f => f.startsWith('object_story_spec'));
+                expect(objectStorySpecField).toContain('video_data');
+                expect((objectStorySpecField ?? '').match(/image_hash/g)?.length).toBeGreaterThanOrEqual(2);
+            });
+
+            it('requests child_attachments.image_hash for carousel creatives', async () => {
+                const mockGet = jest.fn().mockResolvedValue({ _data: { id: 'creative_3' } });
+                (AdCreative as unknown as jest.Mock).mockImplementation(() => ({ get: mockGet }));
+
+                await service.getAdCreative(mockAccessToken, 'creative_3');
+
+                const fields: string[] = mockGet.mock.calls[0][0];
+                const objectStorySpecField = fields.find(f => f.startsWith('object_story_spec'));
+                expect(objectStorySpecField).toContain('child_attachments');
+            });
+
+            it('returns the raw creative data from the Graph API response', async () => {
+                const mockCreativeData = {
+                    id: 'creative_4',
+                    object_story_spec: { link_data: { image_hash: 'abc123', link: 'https://example.com' } }
+                };
+                const mockGet = jest.fn().mockResolvedValue({ _data: mockCreativeData });
+                (AdCreative as unknown as jest.Mock).mockImplementation(() => ({ get: mockGet }));
+
+                const result = await service.getAdCreative(mockAccessToken, 'creative_4');
+
+                expect(result).toEqual(mockCreativeData);
+            });
         });
     });
 
