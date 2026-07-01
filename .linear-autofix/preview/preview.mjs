@@ -28,6 +28,9 @@ const LOGS = path.join(__dirname, 'logs');
 // avoids LAN/sandbox firewall issues. Set PREVIEW_IP to the LAN IP to reach it from another
 // device (e.g. a real phone for mobile testing).
 const IP = process.env.PREVIEW_IP || '127.0.0.1';
+// Dash-separated IP for nip.io: a dotted <bug>.<ip>.nip.io is mis-parsed when the bug id ends
+// in digits (e.g. eng-138.44.250.109.186 → nip.io reads "138.44.250.109"). Dashes are unambiguous.
+const IPDASH = IP.replace(/\./g, '-');
 // One fixed port per portal (the bug-id host picks the bug, the port picks the portal).
 const PP = config.previewPorts || { partner: 5173, customer: 5174, api: 3001 };
 const ROLE_PORT = { '': PP.customer, admin: PP.partner, api: PP.api };
@@ -93,7 +96,7 @@ function ensureDeps(worktree, svc) {
   }
 }
 
-const urlFor = (bug, role) => `http://${bug}.${IP}.nip.io:${ROLE_PORT[role]}/`;
+const urlFor = (bug, role) => `http://${bug}.${IPDASH}.nip.io:${ROLE_PORT[role]}/`;
 
 async function up(bugRaw, worktreeRaw) {
   const bug = bugRaw.toLowerCase();

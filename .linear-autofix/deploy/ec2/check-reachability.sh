@@ -13,11 +13,13 @@ BUG="$(printf '%s' "${2:?bug id required}" | tr '[:upper:]' '[:lower:]')"
 PARTNER_PORT="${PARTNER_PORT:-5173}"
 CUSTOMER_PORT="${CUSTOMER_PORT:-5174}"
 API_PORT="${API_PORT:-3001}"
-HOST="${BUG}.${IP}.nip.io"
+# Dash-separated IP for nip.io: dotted <bug>.<ip> is mis-parsed when the bug id ends in digits.
+IPDASH="$(printf '%s' "$IP" | tr '.' '-')"
+HOST="${BUG}.${IPDASH}.nip.io"
 
 pass(){ printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 fail(){ printf '  \033[31mFAIL\033[0m %s\n       fix: %s\n' "$1" "$2"; }
-code(){ curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$1" 2>/dev/null || echo 000; }
+code(){ local c; c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$1" 2>/dev/null)"; printf '%s' "${c:-000}"; }
 
 echo "Reachability check for '$BUG' at $IP (partner:$PARTNER_PORT customer:$CUSTOMER_PORT api:$API_PORT)"
 
