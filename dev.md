@@ -1,3 +1,14 @@
+## OTel spine shipped — spans over the agent loop, dual-emit with the loops recorder (2026-07-02, ENG-141)
+
+Added `backend/src/observability/` (tracing.ts + semconv.ts) and three span sites: `invoke_agent` opens/closes exactly with the run-recorder lifecycle in `agentModeService` (verdict from `computeRunVerdict` on end), `chat` brackets the loop's `callLLM` including the backup-model retry, `execute_tool` wraps the gateway call inside `toolDispatch.runOne` (errorClass from `toolErrorClassifier`). Two direct OTLP/proto exporters — Langfuse (`LANGFUSE_OTEL_HOST`+`LANGFUSE_PUBLIC_KEY`+`LANGFUSE_SECRET_KEY`, Basic auth) and Okareo (`OKAREO_API_KEY`, api-key header) — each registered ONLY when its env config is present; no env = tracing off; no collector. `session.id` + `gen_ai.conversation.id` carry the Emma sessionId for Okareo sim-linking. DUAL-EMIT: `Dev-AW-LoopEvents` stays the policy/learning store; the bridge is by IDs only (`traceId` added to `agent_run_started` dimensions). Prompt/completion content capture is `AGENT_OTEL_CAPTURE_CONTENT`-flagged, default OFF.
+
+**Design choices to remember:** provider is module-private and NOT registered on the global OTel API, no context manager — parenting is explicit via a runId-keyed span registry (async-context propagation through a 24k-line monolith would be un-auditable). `gen_ai.*` names are pinned in `semconv.ts` because the upstream semconv is Development-status (renames must land in one file).
+
+**Assumptions to validate:**
+- Spans are produced in the WORKER process; `flushTelemetry()` runs in the parent's `gracefulShutdown`. The 2s BatchSpanProcessor delay + the worker drain window should export worker spans before the child is killed, but a worker SIGKILL <2s after a run ends can still drop that run's spans. If deploy-window traces go missing, add a bounded flush to the worker's per-run tail (next to `flushAgentRunRecorderSafe`).
+- Langfuse OTLP trace path is `{host}/api/public/otel/v1/traces` (signal-specific URL, since the exporter takes the full URL). Verify on first real export.
+- Okareo protobuf ingest accepts the `api-key` header form and links sims via `session.id`.
+
 ## Prod outage: partner-portal "Failed to load users" — full disk + nginx PrivateTmp trap (2026-06-26)
 
 Three stacked failures, only the last self-inflicted by the attempted fixes:
