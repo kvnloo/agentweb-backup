@@ -414,9 +414,12 @@ describe('AgentModeService - buildMarketingContext with Attachments', () => {
 
       const result = (agentModeService as any).buildMarketingContext('continue', sessionHistory, []);
 
-      const assistantMsg = result.find((msg: any) => msg.role === 'assistant');
-      expect(assistantMsg).toBeDefined();
-      expect(assistantMsg.tool_calls).toBeUndefined();
+      // The orphaned tool_call assistant message must not leak into the context —
+      // no assistant message may carry the unresolved tool_calls.
+      const assistantWithToolCalls = result.find(
+        (msg: any) => msg.role === 'assistant' && msg.tool_calls
+      );
+      expect(assistantWithToolCalls).toBeUndefined();
     });
 
     it('should preserve tool_calls when immediately followed by a tool result', () => {
@@ -545,6 +548,50 @@ describe('AgentModeService - buildMarketingContext with Attachments', () => {
         (msg: any) => msg.role === 'user' && msg.content === messageContent
       );
       expect(taskStatusIndex).toBeLessThan(lastUserMessageIndex);
+    });
+
+    it('should NOT inject a "no tasks have been run" assistant message when there are no task statuses (ENG-129)', () => {
+      // Regression: an empty session used to push an assistant context message
+      // reading "📋 Task Status: No tasks have been run in this session yet."
+      // right before the user's message. On a terse confirmation (e.g.
+      // "go with defaults") the model could parrot that injected assistant turn
+      // verbatim instead of proceeding with the actual work. The empty-status
+      // note carries no useful signal, so it must not be injected at all.
+      const sessionHistory: ChatMessage[] = [
+        {
+          role: 'system',
+          content: 'You are a helpful assistant',
+          timestamp: '2025-01-01T00:00:00.000Z',
+        },
+        {
+          role: 'assistant',
+          content: 'I propose 6 ad groups for the campaign. Should I proceed?',
+          timestamp: '2025-01-01T00:01:00.000Z',
+        },
+      ];
+
+      const messageContent = 'go with defaults';
+
+      // No task statuses (empty array)
+      const result = (agentModeService as any).buildMarketingContext(
+        messageContent,
+        sessionHistory,
+        []
+      );
+
+      // The misleading empty-status assistant message must not appear anywhere.
+      const emptyStatusMessage = result.find(
+        (msg: any) =>
+          typeof msg.content === 'string' &&
+          msg.content.includes('No tasks have been run in this session yet')
+      );
+      expect(emptyStatusMessage).toBeUndefined();
+
+      // The last message is still the user's confirmation, adjacent to the real
+      // assistant proposal (not separated by an injected status turn).
+      const lastMessage = result[result.length - 1];
+      expect(lastMessage.role).toBe('user');
+      expect(lastMessage.content).toBe(messageContent);
     });
 
     describe('work plan all-steps-complete detection', () => {
