@@ -27,7 +27,7 @@ Comments:
 
 1. Find the ROOT CAUSE. It may live in any repo above — or span more than one.
 2. Fix it where it belongs, minimally — fix the root cause, don't refactor unrelated code. For backend/logic, follow TDD (write a FAILING test first, then the minimal fix). For UI, follow that repo's existing test approach.
-3. Verify with each changed repo's OWN checks (typecheck + tests, e.g. `npx tsc` and `npm test` in `backend/`, `npm test` in a portal). All must pass.
+3. Verify with each changed repo's OWN checks: run the typecheck (`npx tsc`) and ONLY the specific test file(s) that cover your change (e.g. `npx jest src/path/to/YourFile.test.ts` in `backend/`, the equivalent single-file test command in a portal) — do NOT run the whole suite, it wastes your time budget. These targeted checks must pass.
 4. For EACH repository you changed:
    a. Commit, one logical change per commit. Do NOT add any Claude/AI co-author trailer.
    b. From inside that repo's directory, push the branch and open a DRAFT PR (run `gh` there so it targets the correct GitHub repo):

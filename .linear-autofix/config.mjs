@@ -49,10 +49,13 @@ export const config = {
   defaultModel: 'sonnet',          // the fixer model; conserve subscription quota
   opusModel: 'opus',
   opusLabels: ['opus', 'hard', 'complex'], // any of these labels on the issue → use Opus for it
+  escalateToOpus: true,            // if the default model finishes with no committed PR (the "heavy bug"
+                                   // signal — e.g. it ran out of budget mid-fix), automatically re-run the
+                                   // SAME workspace with Opus to finish the job. Skipped if already on Opus.
   skipPermissions: true,           // required for unattended runs; the fix is confined to an isolated
                                    // workspace and PRs are draft-only (human review is the safety net)
-  maxTurns: 80,
-  timeoutMs: 25 * 60 * 1000,       // hard cap per bug
+  maxTurns: 400,                   // raised alongside the 2h timeout below so wall-clock, not turns, is the cap
+  timeoutMs: 2 * 60 * 60 * 1000,   // hard cap per bug (2h) — SIGKILLs claude; also the cap for the Opus retry
 
   // --- Browser verification (Playwright) ---
   // After a fix opens a PR, bring up a full preview and drive a real browser to confirm the

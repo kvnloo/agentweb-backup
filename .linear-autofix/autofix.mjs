@@ -148,17 +148,34 @@ async function main() {
   if (config.skipPermissions) args.push('--dangerously-skip-permissions');
   else args.push('--permission-mode', 'acceptEdits');
 
-  log(`Running claude (model=${model}) — this can take several minutes...`);
-  const result = await runClaude(args, prompt, WT);
-  const marker = parseMarker(result);
-
   // Authoritative: which repos actually got commits, and their PR URLs.
-  const prs = [];
-  for (const repo of config.repos) {
-    const wt = wtPathOf(WT, repo);
-    const cnt = gitIn(wt, ['rev-list', '--count', `origin/${repo.base}..HEAD`]);
-    const changed = cnt.status === 0 && parseInt((cnt.stdout || '0').trim(), 10) > 0;
-    if (changed) prs.push({ repo: repo.key, url: prFromWorktree(wt) });
+  const detectPrs = () => {
+    const found = [];
+    for (const repo of config.repos) {
+      const wt = wtPathOf(WT, repo);
+      const cnt = gitIn(wt, ['rev-list', '--count', `origin/${repo.base}..HEAD`]);
+      const changed = cnt.status === 0 && parseInt((cnt.stdout || '0').trim(), 10) > 0;
+      if (changed) found.push({ repo: repo.key, url: prFromWorktree(wt) });
+    }
+    return found;
+  };
+
+  log(`Running claude (model=${model}) — this can take up to ${Math.round(config.timeoutMs / 60000)} min...`);
+  const result = await runClaude(args, prompt, WT);
+  let marker = parseMarker(result);
+  let prs = detectPrs();
+
+  // Escalate a "heavy" bug (default model finished with no committed PR) to Opus, continuing
+  // in the SAME workspace so it can finish/commit whatever the first pass left behind.
+  if (prs.length === 0 && config.escalateToOpus && model !== config.opusModel) {
+    log(`No committed PR from ${model} — escalating to ${config.opusModel} on the same workspace...`);
+    const opusArgs = ['-p', '--output-format', 'json', '--model', config.opusModel, '--max-turns', String(config.maxTurns)];
+    if (config.skipPermissions) opusArgs.push('--dangerously-skip-permissions');
+    else opusArgs.push('--permission-mode', 'acceptEdits');
+    const escalationNote = '\n\n## Escalation pass\nA previous automated attempt with a smaller model may have left UNCOMMITTED changes in this workspace without finishing. Review any existing changes, complete or correct the fix, and follow the commit + push + draft-PR steps above — the work only counts once it is committed and a PR is open. Do not restart from scratch unless the existing changes are wrong.';
+    const r2 = await runClaude(opusArgs, prompt + escalationNote, WT);
+    marker = parseMarker(r2);
+    prs = detectPrs();
   }
   log(`Changed repos: ${prs.map((p) => p.repo).join(', ') || 'none'}`);
 
