@@ -1,4 +1,6 @@
 .env
 state.json
 *.log
+*.log.1
 .poll.lock
+logs/
