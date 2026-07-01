@@ -37,7 +37,7 @@ describe('isRetryableErrorClass', () => {
 });
 
 describe('isFastTripErrorClass', () => {
-  it.each(['auth', 'upstream_rejected', 'invalid_args', 'tool_unavailable', 'invalid_output'])(
+  it.each(['auth', 'upstream_rejected', 'invalid_args', 'tool_unavailable', 'invalid_output', 'policy_blocked'])(
     'known-pointless-retry class %s fast-trips the breaker',
     (cls) => expect(isFastTripErrorClass(cls)).toBe(true),
   );
