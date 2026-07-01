@@ -16,6 +16,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, symlinkSync, copyFi
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { config } from '../config.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '../..'); // the agentweb (main) repo root
