@@ -35,8 +35,12 @@ export function isContextLimitError(error: unknown): boolean {
 export function isWorkerShutdownError(error: unknown): boolean {
   if (!error) return false;
   const message = error instanceof Error ? error.message : String(error);
-  // Graceful shutdown (server stopping)
-  if (message === 'Worker shutdown') return true;
+  // Graceful shutdown (server stopping) — the plain reject and the
+  // drain-ceiling variant ('Worker shutdown — drain ceiling exceeded'), so a
+  // run killed by the drain gets the interrupted treatment, not a diagnosis.
+  // Deliberately NOT a loose prefix match: unrelated 'Worker shutdown …'
+  // strings stay unclassified (pinned by agentModeErrors tests).
+  if (message === 'Worker shutdown' || message.startsWith('Worker shutdown — ')) return true;
   // Unexpected worker subprocess crash (e.g. OOM kill, EB instance replacement)
   if (message.startsWith('Worker process exited with code')) return true;
   return false;

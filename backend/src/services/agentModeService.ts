@@ -2460,13 +2460,17 @@ export class AgentModeService {
     isCancelled?: () => boolean,
     excludeTools?: string[],
     screenshotUrl?: string,
-    isDelegatedAccess: boolean = false
+    isDelegatedAccess: boolean = false,
+    runId?: string
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
     let _toolCallsForTelemetry: any[] = [];
-    const agentRuntimeRunId = buildAgentRuntimeRunId(sessionId);
+    // Run-survival core: when intake minted a durable runId, the telemetry
+    // runId IS that id — one run, one identity across AW-AgentRuns and
+    // Dev-AW-LoopEvents. Otherwise keep today's locally-minted id.
+    const agentRuntimeRunId = runId || buildAgentRuntimeRunId(sessionId);
     recordAgentModeRunStarted(agentRuntimeRunId, {
       llmModel,
       userId,

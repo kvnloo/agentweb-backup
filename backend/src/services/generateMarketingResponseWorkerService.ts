@@ -18,6 +18,12 @@ interface GenerateMarketingResponseParams {
   isDelegatedAccess?: boolean;
   excludeTools?: string[];
   screenshotUrl?: string;
+  /**
+   * Durable run id minted once at intake (run-survival core). Threaded through
+   * the worker into agentModeService so the telemetry runId and the durable
+   * run record share one identity. Optional — absent when the run store is off.
+   */
+  runId?: string;
 }
 
 interface GenerateMarketingResponseResult {
@@ -34,7 +40,7 @@ interface GenerateMarketingResponseResult {
 
 export class GenerateMarketingResponseWorkerService {
   private worker: ChildProcess | null = null;
-  private pendingRequests: Map<string, { resolve: Function; reject: Function; onProgress?: Function; timeout: NodeJS.Timeout }> = new Map();
+  private pendingRequests: Map<string, { resolve: Function; reject: Function; onProgress?: Function; timeout: NodeJS.Timeout; sessionId: string; lastPendingTools?: string[] }> = new Map();
   private sessionToRequestId: Map<string, string> = new Map();
   private requestIdCounter = 0;
   private workerReady = false;
@@ -149,6 +155,13 @@ export class GenerateMarketingResponseWorkerService {
               p.reject(new Error('generateMarketingResponse worker timed out after 45 minutes of inactivity'));
             }
           }, 45 * 60 * 1000);
+          // Remember the tools reported in flight so a worker death can
+          // disclose exactly which tool calls were interrupted (NOT executed).
+          if (Array.isArray(message.progress?.pendingTools) && message.progress.pendingTools.length > 0) {
+            pending.lastPendingTools = message.progress.pendingTools;
+          } else if (message.progress?.status && message.progress.status !== 'executing_tools') {
+            pending.lastPendingTools = undefined;
+          }
           if (pending.onProgress) {
             pending.onProgress(message.progress);
           }
@@ -251,7 +264,15 @@ export class GenerateMarketingResponseWorkerService {
   private failAllPendingRequests(error: Error): void {
     for (const pending of this.pendingRequests.values()) {
       clearTimeout(pending.timeout);
-      pending.reject(error);
+      // Each request gets its OWN error instance carrying the tools that were
+      // in flight when the worker died, so the controller's interruption
+      // disclosure can state "these were NOT executed" per session.
+      const perRequestError: any = new Error(error.message);
+      perRequestError.stack = error.stack;
+      if (pending.lastPendingTools?.length) {
+        perRequestError.pendingTools = pending.lastPendingTools;
+      }
+      pending.reject(perRequestError);
     }
     this.pendingRequests.clear();
     this.sessionToRequestId.clear();
@@ -405,7 +426,8 @@ export class GenerateMarketingResponseWorkerService {
         resolve,
         reject,
         onProgress,
-        timeout
+        timeout,
+        sessionId: params.sessionId
       });
       this.sessionToRequestId.set(params.sessionId, requestId);
 

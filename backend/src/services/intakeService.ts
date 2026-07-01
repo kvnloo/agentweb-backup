@@ -205,6 +205,13 @@ export interface FileAutoIssueParams {
   source: string;
   /** Extra Linear labels beyond "Auto" (e.g. ["Scheduled Chat"]). Unknown names are dropped. */
   extraLabels?: string[];
+  /**
+   * Incident dedupe key — the runId. When set (and the run store is enabled),
+   * a conditional put on incident#<key> guarantees at most ONE filed incident
+   * per run, even when multiple failure paths fire for the same run
+   * (the exact ENG-145/146 double-filing failure). Losers get {deduped: true}.
+   */
+  dedupeKey?: string;
   /** Tags + context for the Notion path (flag off). */
   notionTags?: string[];
   notionContext?: Record<string, any>;
@@ -226,6 +233,20 @@ const LINEAR_ISSUE_BASE = 'https://linear.app/emmabyaw/issue';
  * failure rather than rerouting to another tracker.
  */
 export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoResult> {
+  // Per-run incident dedupe (guards BOTH tracker paths): the conditional
+  // incident#<runId> claim in the run store makes "one run, one incident"
+  // structural. A claim error propagates to the caller's best-effort wrapper —
+  // no silent double-file, no silent reroute.
+  if (p.dedupeKey) {
+    const { isRunStoreEnabled, claimIncident } = await import('./agentMode/runStore');
+    if (isRunStoreEnabled()) {
+      const claimed = await claimIncident(p.dedupeKey);
+      if (!claimed) {
+        return { pageId: '', deduped: true, tracker: intakeEnabled() ? 'Linear' : 'Notion' };
+      }
+    }
+  }
+
   // Migration switch (NOT a fallback): off -> Notion.
   if (!intakeEnabled()) {
     const { createOncallItem } = await import('./notionService');

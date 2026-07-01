@@ -18,7 +18,18 @@ import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
-import { isCronEnabled } from '../utils/instanceState';
+import { isCronEnabled, isAcceptingRequests } from '../utils/instanceState';
+import {
+  isRunStoreEnabled,
+  interactiveIdempotencyKey,
+  scheduledIdempotencyKey,
+  claimIdempotency,
+  releaseIdempotency,
+  createRunRecord,
+  markRunTerminal,
+  IDEM_TTL_INTERACTIVE_S,
+  IDEM_TTL_SCHEDULED_S,
+} from '../services/agentMode/runStore';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
@@ -112,6 +123,21 @@ async function withGenerationTimeout<T>(
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle);
   }
+}
+
+/**
+ * User-facing interruption disclosure for a worker-shutdown error (ENG-40's
+ * user-facing half): state the restart AND name exactly which in-flight tool
+ * calls were NOT executed (the worker service attaches `pendingTools` from the
+ * dying run's last progress update) — never a silent half-done run.
+ */
+function buildWorkerShutdownDisclosure(error: unknown): string {
+  let content = 'The server restarted while processing your request. Please send your message again.';
+  const pendingTools: string[] | undefined = (error as any)?.pendingTools;
+  if (Array.isArray(pendingTools) && pendingTools.length > 0) {
+    content += ` The run was interrupted mid-execution — these in-flight tool calls were NOT executed: ${pendingTools.join(', ')}.`;
+  }
+  return content;
 }
 
 /**
@@ -1518,6 +1544,21 @@ export async function runScheduledChat(
       // Continue even if saving fails - we still want to return the result
     }
 
+    // Run-survival: mark the durable run record terminal with the tool ledger.
+    // Best-effort BY DESIGN — markRunTerminal retries once then fires one
+    // deduped alert; a stale record cannot retro-fail a delivered run.
+    if (isRunStoreEnabled() && preGeneratedRunId) {
+      const failedToolCalls = result.toolCalls.filter((tc: any) => tc.error).length;
+      void markRunTerminal(preGeneratedRunId, finalResult.passed ? 'completed' : 'failed', {
+        finishReason: finalResult.passed ? 'ok' : 'validation_failed',
+        ledgerSummary: {
+          invoked: result.toolCalls.length,
+          succeeded: result.toolCalls.length - failedToolCalls,
+          failed: failedToolCalls,
+        },
+      });
+    }
+
     // Self-improve: when enabled, run a reflection turn in the same session that may
     // rewrite the schedule's prompt so future runs do better. Runs on test runs too so
     // it's easy to try out. Best-effort — never fails the run.
@@ -1540,6 +1581,10 @@ export async function runScheduledChat(
         subject: `Scheduled Chat Failed: ${schedule.scheduleName}`,
         message: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
         sessionId,
+        // One alert per (user, schedule, errorClass) per hour — a flapping
+        // schedule cannot flood oncall (B5 / ENG-145/146 class).
+        dedupeKey: `scheduled_chat:${userId}:${schedule.scheduleId}:validation_failed`,
+        dedupeWindowMs: 60 * 60 * 1000,
         context: {
           'Schedule ID': schedule.scheduleId,
           'Schedule Name': schedule.scheduleName,
@@ -1556,6 +1601,8 @@ export async function runScheduledChat(
         title: `Scheduled Chat Failed: ${schedule.scheduleName}`,
         description: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
         source: 'Scheduled chat (validation)',
+        // Same runId as the exception site below — one run can never file twice.
+        dedupeKey: finalResult.runId,
         extraLabels: ['Scheduled Chat'],
         notionTags: ['Scheduled Chat'],
         notionContext: {
@@ -1671,12 +1718,21 @@ export async function runScheduledChat(
 
     // Build error result
     const errorMessage = error instanceof Error ? error.message : String(error);
+    // Worker death / graceful-drain kill: store an EXPLICIT interrupted result
+    // with what's known — never the ENG-40 zero-output mystery. (Requeue stays
+    // with the existing zero-output ladder; a durable requeue engine is a
+    // separate gated decision.)
+    const wasInterrupted = error instanceof Error && isWorkerShutdownError(error);
     const errorResult = {
       scheduleId: schedule.scheduleId,
       runId: preGeneratedRunId || require('uuid').v4(),
       status: 'failure' as const,
       passed: false,
-      actualResponse: `Error during execution: ${errorMessage}`,
+      ...(wasInterrupted ? { interrupted: true } : {}),
+      actualResponse: wasInterrupted
+        ? `Run interrupted by a server restart/deploy before completion (${errorMessage}). ` +
+          `Partial work may exist in session ${sessionId || 'N/A'}; in-flight tool calls were NOT executed.`
+        : `Error during execution: ${errorMessage}`,
       actualFunctionCalls: [],
       keywordMatches: [],
       keywordMisses: schedule.keywords || [],
@@ -1702,6 +1758,13 @@ export async function runScheduledChat(
       // Continue even if saving fails - we still want to return the result
     }
 
+    // Run-survival: durable terminal state (best-effort by design — see markRunTerminal).
+    if (isRunStoreEnabled() && preGeneratedRunId) {
+      void markRunTerminal(preGeneratedRunId, wasInterrupted ? 'interrupted' : 'failed', {
+        finishReason: wasInterrupted ? 'worker_exit' : (zeroAssistantOutput ? 'zero_output' : 'error'),
+      });
+    }
+
     // Send oncall alert and Notion ticket for scheduled chat exception (always, including test runs)
     const originalMessage = (error as any)?.originalMessage;
     sendAgentModeOncallAlert({
@@ -1712,6 +1775,9 @@ export async function runScheduledChat(
         ? `Scheduled chat "${schedule.scheduleName}" terminated with zero assistant messages.${zeroAssistantRequeuedAt ? ` It was requeued for ${zeroAssistantRequeuedAt}.` : ''}\n\nError: ${errorMessage}`
         : `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
       sessionId: sessionId || undefined,
+      // One alert per (user, schedule, errorClass) per hour (B5).
+      dedupeKey: `scheduled_chat:${userId}:${schedule.scheduleId}:${zeroAssistantOutput ? 'zero_output' : 'run_error'}`,
+      dedupeWindowMs: 60 * 60 * 1000,
       context: {
         'Schedule ID': schedule.scheduleId,
         'Schedule Name': schedule.scheduleName,
@@ -1734,6 +1800,8 @@ export async function runScheduledChat(
         ? `Scheduled chat "${schedule.scheduleName}" terminated with zero assistant messages.${zeroAssistantRequeuedAt ? ` It was requeued for ${zeroAssistantRequeuedAt}.` : ''}\n\nError: ${errorMessage}${originalMessage ? `\n\nOriginal API error: ${originalMessage}` : ''}`
         : `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}${originalMessage ? `\n\nOriginal API error: ${originalMessage}` : ''}`,
       source: 'Scheduled chat (error)',
+      // Same runId as the validation site above — one run can never file twice.
+      dedupeKey: errorResult.runId,
       extraLabels: ['Scheduled Chat'],
       notionTags: ['Scheduled Chat'],
       notionContext: {
@@ -1909,7 +1977,8 @@ export async function generateSessionResponse(
   isInteractiveShare?: boolean,
   pageContext?: { currentUrl?: string; structuredContext?: string; screenshot?: string },
   isDelegatedAccess?: boolean,
-  ishareSenderInfo?: { ip?: string; userAgent?: string }
+  ishareSenderInfo?: { ip?: string; userAgent?: string },
+  runId?: string
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -2120,7 +2189,8 @@ export async function generateSessionResponse(
       isInteractiveShare: isInteractiveShare || false,
       isDelegatedAccess,
       excludeTools,
-      screenshotUrl
+      screenshotUrl,
+      runId
     },
     (progress) => {
       // Emit progress updates via SSE
@@ -2465,7 +2535,21 @@ export const agentModeController = {
 
   // Generate AI response for marketing conversation
   async generateResponse(req: Request, res: Response) {
+    // Run-survival tracking (ENG-40/147) — hoisted so the catch block can mark
+    // the durable run record terminal after an error unwinds the inner finally.
+    let runSurvivalRunId: string | undefined;
+    let idemKeyHeld: string | undefined;
     try {
+      // Graceful drain: no NEW runs start while in-flight ones drain. Clients
+      // retry; the ALB routes the retry to the replacement instance.
+      if (!isAcceptingRequests()) {
+        return res.status(503).json({
+          error: 'Server is shutting down',
+          message: 'The server is restarting. Please retry in a moment.',
+          code: 'SHUTTING_DOWN',
+        });
+      }
+
       const user = req.user as User;
       const { sessionId, llmModel, attachments, currentUrl, structuredContext, screenshot, audioInput } = req.body;
       let { userMessage } = req.body;
@@ -2484,10 +2568,36 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Session ID and user message are required' });
       }
 
+      // Cross-restart duplicate-submit lock (ENG-147: one question spawned ~30
+      // sessions). Claimed BEFORE the in-process Set: two layers, ONE concept —
+      // the conditional idem#sha256(sessionId+userMessage+llmModel) put dedupes
+      // duplicates across retries/restarts, the Set guards in-process
+      // concurrency. The loser gets the existing 409 shape + in-flight runId.
+      if (isRunStoreEnabled()) {
+        runSurvivalRunId = uuidv4();
+        const idemKey = interactiveIdempotencyKey(sessionId, userMessage, llmModel || '');
+        const claim = await claimIdempotency(idemKey, runSurvivalRunId, IDEM_TTL_INTERACTIVE_S);
+        if (!claim.claimed) {
+          return res.status(409).json({
+            error: 'Session is busy',
+            message: 'A response is already being generated for this session. Please wait.',
+            code: 'SESSION_BUSY',
+            ...(claim.inFlightRunId ? { runId: claim.inFlightRunId } : {}),
+          });
+        }
+        idemKeyHeld = idemKey;
+      }
+
       // Reject concurrent requests for the same session. The claim is atomic
       // (check-and-set in one call) so two near-simultaneous requests can never
       // both proceed — exactly one wins, the other gets 409 SESSION_BUSY.
       if (!tryClaimSessionGeneration(sessionId)) {
+        // A DIFFERENT message on a busy session: give back the idem claim we
+        // just took so the user's retry (after the busy run finishes) is accepted.
+        if (idemKeyHeld) {
+          await releaseIdempotency(idemKeyHeld);
+          idemKeyHeld = undefined;
+        }
         return res.status(409).json({
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
@@ -2515,6 +2625,19 @@ export const agentModeController = {
       // Clear old progress store (but keep active connections)
       // Don't call cleanupProgress here as it removes active SSE connections
       progressStore.delete(sessionId);
+
+      // Durable run record, minted ONCE at intake and threaded through the
+      // worker into the telemetry runId. NO-FALLBACK: creation failure aborts
+      // this request loudly (dedupe + interruption disclosure would lie
+      // without the record) — lock and idem claim release in finally.
+      if (isRunStoreEnabled() && runSurvivalRunId) {
+        await createRunRecord({
+          runId: runSurvivalRunId,
+          kind: 'interactive',
+          sessionId,
+          userId: session.userId,
+        });
+      }
 
       // Cancel generation immediately when the client disconnects (e.g. Stop button aborts the fetch).
       // This fires before /stop reaches the backend and ensures the worker receives the cancel signal
@@ -2573,7 +2696,9 @@ export const agentModeController = {
         attachments,
         undefined, // isInteractiveShare
         pageContext,
-        isDelegatedAccessForMessage
+        isDelegatedAccessForMessage,
+        undefined, // ishareSenderInfo
+        runSurvivalRunId
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
@@ -2668,11 +2793,38 @@ export const agentModeController = {
         ...(invalidations ? { invalidations } : {}),
         ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
+
+      // Terminal update is best-effort BY DESIGN: markRunTerminal retries once,
+      // then fires one deduped oncall alert — it can never retro-fail a chat
+      // that was already delivered above.
+      if (runSurvivalRunId) {
+        void markRunTerminal(runSurvivalRunId, 'completed');
+      }
       } finally {
         releaseSessionGeneration(sessionId);
+        // Terminal state reached (success OR error unwinding through here):
+        // release the submit-lock so an identical, legitimate resubmit is
+        // accepted. Best-effort — on failure the item expires via its 10m ttl.
+        if (idemKeyHeld) {
+          await releaseIdempotency(idemKeyHeld);
+          idemKeyHeld = undefined;
+        }
       }
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
+
+      // Run-survival: record the terminal state on the durable run record.
+      // Worker death / drain = 'interrupted' (the honest state — tools may not
+      // have executed); anything else = 'failed'. Best-effort by design (see
+      // markRunTerminal) — never blocks the error response below.
+      if (runSurvivalRunId) {
+        const wasInterrupted = error instanceof Error && isWorkerShutdownError(error);
+        void markRunTerminal(
+          runSurvivalRunId,
+          wasInterrupted ? 'interrupted' : 'failed',
+          { finishReason: wasInterrupted ? 'worker_exit' : 'error' }
+        );
+      }
 
       // Clean up progress store on error so session doesn't appear stuck in generating state
       const sessionId = req.body?.sessionId;
@@ -2700,7 +2852,7 @@ export const agentModeController = {
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
-            diagnosticContent = 'The server restarted while processing your request. Please send your message again.';
+            diagnosticContent = buildWorkerShutdownDisclosure(error);
           } else {
             const userMessage = req.body?.userMessage || '';
             diagnosticContent = await getDiagnosticErrorMessage(error, sessionId, userMessage);
@@ -3271,7 +3423,19 @@ export const agentModeController = {
 
   // Generate response for shared conversation (with conversable token)
   async generateSharedResponse(req: Request, res: Response) {
+    // Run-survival tracking — see generateResponse for the full contract.
+    let runSurvivalRunId: string | undefined;
+    let idemKeyHeld: string | undefined;
     try {
+      // Graceful drain: no new runs during shutdown (mirrors /generate).
+      if (!isAcceptingRequests()) {
+        return res.status(503).json({
+          error: 'Server is shutting down',
+          message: 'The server is restarting. Please retry in a moment.',
+          code: 'SHUTTING_DOWN',
+        });
+      }
+
       const { shareId } = req.params;
       const { conversable } = req.query;
       const { userMessage, llmModel, attachments = [] } = req.body;
@@ -3306,10 +3470,32 @@ export const agentModeController = {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
 
+      // Cross-restart duplicate-submit lock — same two-layer contract as
+      // /generate (idem item across restarts, Set in process). ishare ignores
+      // the request body's llmModel, so the key uses the session's model.
+      if (isRunStoreEnabled()) {
+        runSurvivalRunId = uuidv4();
+        const idemKey = interactiveIdempotencyKey(session.sessionId, userMessage, session.llmModel || '');
+        const claim = await claimIdempotency(idemKey, runSurvivalRunId, IDEM_TTL_INTERACTIVE_S);
+        if (!claim.claimed) {
+          return res.status(409).json({
+            error: 'Session is busy',
+            message: 'A response is already being generated for this session. Please wait.',
+            code: 'SESSION_BUSY',
+            ...(claim.inFlightRunId ? { runId: claim.inFlightRunId } : {}),
+          });
+        }
+        idemKeyHeld = idemKey;
+      }
+
       // Reject concurrent requests for the same session. Atomic check-and-set
       // (see tryClaimSessionGeneration) — two near-simultaneous requests can
       // never both proceed; exactly one wins, the other gets 409 SESSION_BUSY.
       if (!tryClaimSessionGeneration(session.sessionId)) {
+        if (idemKeyHeld) {
+          await releaseIdempotency(idemKeyHeld);
+          idemKeyHeld = undefined;
+        }
         return res.status(409).json({
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
@@ -3321,6 +3507,17 @@ export const agentModeController = {
 
       // Clear old progress store (but keep active connections)
       progressStore.delete(session.sessionId);
+
+      // Durable run record — NO-FALLBACK: creation failure aborts loudly
+      // (lock + idem claim release in finally).
+      if (isRunStoreEnabled() && runSurvivalRunId) {
+        await createRunRecord({
+          runId: runSurvivalRunId,
+          kind: 'interactive',
+          sessionId: session.sessionId,
+          userId: session.userId,
+        });
+      }
 
       // Always use session's llmModel for ishare endpoints (ignore request body's llmModel)
       // This ensures anonymous users get the correct model from the session
@@ -3343,7 +3540,8 @@ export const agentModeController = {
           true, // isInteractiveShare - block admin tools for security
           undefined, // pageContext
           undefined, // isDelegatedAccess
-          ishareSenderInfo
+          ishareSenderInfo,
+          runSurvivalRunId
         ),
         session.sessionId
       );
@@ -3359,11 +3557,31 @@ export const agentModeController = {
         skills: response.skills,
         ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
+
+      // Best-effort by design — see markRunTerminal (retry once, deduped alert).
+      if (runSurvivalRunId) {
+        void markRunTerminal(runSurvivalRunId, 'completed');
+      }
       } finally {
         releaseSessionGeneration(session.sessionId);
+        // Terminal state reached — release the submit-lock (best-effort; ttl bounds staleness).
+        if (idemKeyHeld) {
+          await releaseIdempotency(idemKeyHeld);
+          idemKeyHeld = undefined;
+        }
       }
     } catch (error) {
       console.error('AgentMode: Generate shared response error:', error);
+
+      // Run-survival: durable terminal state (interrupted on worker death/drain).
+      if (runSurvivalRunId) {
+        const wasInterrupted = error instanceof Error && isWorkerShutdownError(error);
+        void markRunTerminal(
+          runSurvivalRunId,
+          wasInterrupted ? 'interrupted' : 'failed',
+          { finishReason: wasInterrupted ? 'worker_exit' : 'error' }
+        );
+      }
 
       // Clean up progress store on error so session doesn't appear stuck in generating state
       const shareId = req.params?.shareId;
@@ -3388,7 +3606,7 @@ export const agentModeController = {
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
-            diagnosticContent = 'The server restarted while processing your request. Please send your message again.';
+            diagnosticContent = buildWorkerShutdownDisclosure(error);
           } else {
             const userMessage = req.body?.userMessage || '';
             diagnosticContent = await getDiagnosticErrorMessage(error, shareId, userMessage);
@@ -5413,6 +5631,41 @@ export const agentModeController = {
             continue;
           }
 
+          // Run-survival (scheduled lane): one durable runId per fire, claimed
+          // against (scheduleId + fireTime) BEFORE any schedule mutation — a
+          // duplicate trigger for the same fire window (racing cron callers,
+          // restart replays) starts NOTHING. Claim + record failures throw into
+          // the per-schedule catch below (loud, no silent skip).
+          let scheduledRunId: string | undefined;
+          if (isRunStoreEnabled()) {
+            scheduledRunId = uuidv4();
+            const fireTime = schedule.nextRunTime || now.toISOString();
+            const claim = await claimIdempotency(
+              scheduledIdempotencyKey(schedule.scheduleId, fireTime),
+              scheduledRunId,
+              IDEM_TTL_SCHEDULED_S
+            );
+            if (!claim.claimed) {
+              console.log(
+                `Scheduled chat ${schedule.scheduleName} (${schedule.scheduleId}) already claimed for fire window ${fireTime} (run ${claim.inFlightRunId || 'unknown'}) — skipping duplicate trigger`
+              );
+              results.push({
+                scheduleId: schedule.scheduleId,
+                scheduleName: schedule.scheduleName,
+                status: 'deduped',
+                reason: `Fire window ${fireTime} already claimed by run ${claim.inFlightRunId || 'unknown'}`,
+              });
+              continue;
+            }
+            await createRunRecord({
+              runId: scheduledRunId,
+              kind: 'scheduled',
+              sessionId: '',
+              userId: schedule.userId,
+              scheduleId: schedule.scheduleId,
+            });
+          }
+
           // Update the schedule with next run time FIRST (synchronously)
           // This prevents agent-engine from repeatedly calling the same schedule
 
@@ -5434,7 +5687,7 @@ export const agentModeController = {
           const shouldClearVariablesAfterRun = hasVariableRequestSentAt && accessTokenWasConsumed;
 
           // Start the scheduled chat run asynchronously (don't await)
-          runScheduledChat(schedule, schedule.userId, false).then(async (result) => {
+          runScheduledChat(schedule, schedule.userId, false, scheduledRunId).then(async (result) => {
             // Decrement concurrent run counter when done
             currentConcurrentRuns--;
             if (scheduleVariables.length > 0 && shouldClearVariablesAfterRun) {

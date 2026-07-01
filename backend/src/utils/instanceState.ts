@@ -19,3 +19,25 @@ export const disableCron = (): void => {
   cronEnabled = false;
   console.log('[instanceState] Cron disabled — instance is draining, no new scheduled work accepted');
 };
+
+/**
+ * Interactive-request acceptance flag. gracefulShutdown() flips this OFF so
+ * /generate (and the shared-conversation variant) return 503 SHUTTING_DOWN
+ * during the drain — no new runs start while in-flight ones are drained.
+ * Clients retry and the ALB routes them to the new instance. Same in-memory,
+ * per-instance semantics as cronEnabled.
+ */
+let acceptingRequests = true;
+
+export const isAcceptingRequests = (): boolean => acceptingRequests;
+
+export const stopAcceptingRequests = (): void => {
+  acceptingRequests = false;
+  console.log('[instanceState] Request acceptance disabled — instance is draining, /generate now returns 503 SHUTTING_DOWN');
+};
+
+/** Test-only: restore both flags to their boot state. */
+export const __resetInstanceStateForTests = (): void => {
+  cronEnabled = true;
+  acceptingRequests = true;
+};

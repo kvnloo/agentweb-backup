@@ -1,5 +1,5 @@
 import app from './app';
-import { isCronEnabled, disableCron } from './utils/instanceState';
+import { isCronEnabled, disableCron, stopAcceptingRequests } from './utils/instanceState';
 import { agentModeService } from './services/agentModeService';
 import { generateMarketingResponseWorkerService } from './services/generateMarketingResponseWorkerService';
 import dotenv from 'dotenv';
@@ -344,6 +344,11 @@ const gracefulShutdown = async (signal: string) => {
   //    gets 503 and reroutes to the new instance within one 5-second poll cycle.
   //    All setInterval/setTimeout workers skip their next tick.
   disableCron();
+
+  // 1b. Stop accepting NEW interactive runs — /generate (and the shared
+  //     variant) return 503 SHUTTING_DOWN while in-flight runs drain below.
+  //     Clients retry; the ALB routes retries to the replacement instance.
+  stopAcceptingRequests();
 
   // 2. Stop the proactive MCP OAuth refresh scheduler
   try {
