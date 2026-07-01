@@ -1109,8 +1109,47 @@ describe('agentToolGatewayService', () => {
       expect(execute).not.toHaveBeenCalled();
     });
 
+    it('trips after TWO identical NON-retryable failures (ENG-124 — retrying is known-pointless)', async () => {
+      // 'Unauthorized: invalid api key' classifies as auth → fast-trip threshold 2.
+      await failNTimes('run-nr', 'send_email', 'Unauthorized: invalid api key', 2);
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'send_email',
+        args: { to: 'x@example.com' },
+        runId: 'run-nr',
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+        expect((outcome.error as Error).message).toContain('send_email');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('still allows a third attempt after two identical RETRYABLE failures (transient classes keep threshold 3)', async () => {
+      // 'temporary network glitch, please retry' has no transient-class marker beyond
+      // network → classifies as network → retryable → threshold stays 3.
+      await failNTimes('run-r', 'you_search_web', 'network error, please retry', 2);
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'you_search_web',
+        args: { query: 'retry me' },
+        runId: 'run-r',
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
     it('resets the failure count when the tool succeeds', async () => {
-      await failNTimes('run-b', 'linkedin_outreach', 'Invitation message is too long', 2);
+      // Retryable-class message (timeout) so the fast-trip threshold does not
+      // apply — this test pins reset-on-success, not the threshold.
+      await failNTimes('run-b', 'linkedin_outreach', 'request timed out, please retry', 2);
 
       const success = await executeAgentToolThroughGateway({
         toolName: 'linkedin_outreach',
@@ -1120,7 +1159,7 @@ describe('agentToolGatewayService', () => {
       });
       expect(success.status).toBe('success');
 
-      await failNTimes('run-b', 'linkedin_outreach', 'Invitation message is too long', 2);
+      await failNTimes('run-b', 'linkedin_outreach', 'request timed out, please retry', 2);
 
       const execute = jest.fn().mockResolvedValue({ ok: true });
       const outcome = await executeAgentToolThroughGateway({
@@ -1291,15 +1330,17 @@ describe('agentToolGatewayService', () => {
     });
 
     it('does NOT clear prior thrown-error counts when a structured failure resolves', async () => {
-      // Two thrown failures with the same message...
-      await failNTimes('run-mixed', 'getMetaAdsMetrics', 'Invalid parameters', 2);
+      // Two thrown failures with the same message... ('Metric window mismatch' has no
+      // semantic class → legacy 'Error' → default threshold 3, so the third call below
+      // is not yet blocked and can demonstrate the no-clear accounting.)
+      await failNTimes('run-mixed', 'getMetaAdsMetrics', 'Metric window mismatch', 2);
       // ...then a resolved structured failure carrying the SAME reason. Before the
       // fix this cleared the two thrown counts; now it adds a third on the same key.
       const resolved = await executeAgentToolThroughGateway({
         toolName: 'getMetaAdsMetrics',
         args: {},
         runId: 'run-mixed',
-        execute: () => Promise.resolve({ success: false, error: 'Invalid parameters' }),
+        execute: () => Promise.resolve({ success: false, error: 'Metric window mismatch' }),
       });
       expect(resolved.status).toBe('success');
 
