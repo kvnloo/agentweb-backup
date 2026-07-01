@@ -24734,6 +24734,23 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         accounts = accounts.filter(acc => acc.platform === platform);
       }
 
+      // Unipile-managed (LinkedIn Outreach) accounts are saved with
+      // token_expires_at = Number.MAX_SAFE_INTEGER (see linkedInOutreachAuth.ts)
+      // since Unipile — not us — owns the session lifecycle. isTokenValid() only
+      // performs a live API check for platform === 'linkedin'; for 'unipile' it
+      // falls through to the timestamp-only check, which never expires and so
+      // always reports is_active: true even after the underlying LinkedIn
+      // session has died on Unipile's side (checkpoint, remote logout, etc).
+      // Use the real Unipile connectivity check instead — the same one already
+      // used by GET /api/oauth/connected-accounts (routes/connectedAccounts.ts)
+      // — so this tool doesn't report a dead account as active.
+      const unipileAccountIds = accounts
+        .filter(acc => acc.platform === 'unipile')
+        .map(acc => acc.account_id);
+      const unipileStatusMap = unipileAccountIds.length > 0
+        ? await linkedInOutreachService.getStatusesForAccounts(unipileAccountIds)
+        : new Map<string, string>();
+
       return {
         success: true,
         message: `Found ${accounts.length} connected account(s)`,
@@ -24742,7 +24759,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           platform: acc.platform,
           account_name: acc.account_name,
           account_type: acc.config.account_type,
-          is_active: await isTokenValid(acc),
+          is_active: acc.platform === 'unipile'
+            ? unipileStatusMap.get(acc.account_id) === 'OK'
+            : await isTokenValid(acc),
           ...(acc.platform === 'google_ads' && (acc.config as { customer_id?: string })?.customer_id
             ? {
                 customer_id: (acc.config as { customer_id: string }).customer_id,
