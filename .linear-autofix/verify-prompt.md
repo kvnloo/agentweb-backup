@@ -29,4 +29,4 @@ Be rigorous and HONEST. A page that merely loads is NOT proof — you must actua
 
 The VERY LAST line of your response must be exactly:
 
-VERIFY_RESULT: {"verdict":"verified|not_fixed|inconclusive","summary":"<one or two sentences on what you did and saw>","screenshots":["<screenshot path>"]}
+VERIFY_RESULT: {"verdict":"verified|not_fixed|inconclusive","scenario":"<the exact scenario you reproduced>","summary":"<one or two sentences on what you did and saw>","screenshots":["<screenshot path>"]}

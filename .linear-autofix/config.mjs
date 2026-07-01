@@ -46,23 +46,46 @@ export const config = {
                                    // Set false to tear the preview down immediately after verify.
 
   // --- Claude ---
-  defaultModel: 'sonnet',          // the fixer model; conserve subscription quota
+  defaultModel: 'opus',            // the fixer model (all agents on Opus for now)
   opusModel: 'opus',
   opusLabels: ['opus', 'hard', 'complex'], // any of these labels on the issue → use Opus for it
-  escalateToOpus: true,            // if the default model finishes with no committed PR (the "heavy bug"
+  escalateToOpus: true,            // if the default model finishes with no committed change (the "heavy bug"
                                    // signal — e.g. it ran out of budget mid-fix), automatically re-run the
-                                   // SAME workspace with Opus to finish the job. Skipped if already on Opus.
+                                   // SAME workspace with Opus to finish the job. Skipped if already on Opus —
+                                   // so this is DORMANT while defaultModel === 'opus'; it re-activates
+                                   // automatically if defaultModel is lowered (e.g. back to 'sonnet').
   skipPermissions: true,           // required for unattended runs; the fix is confined to an isolated
                                    // workspace and PRs are draft-only (human review is the safety net)
   maxTurns: 400,                   // raised alongside the 2h timeout below so wall-clock, not turns, is the cap
   timeoutMs: 2 * 60 * 60 * 1000,   // hard cap per bug (2h) — SIGKILLs claude; also the cap for the Opus retry
 
+  // --- Code review gate (multi-agent) ---
+  // After the fixer commits (but BEFORE the PR opens and BEFORE browser verify), N expert
+  // reviewers inspect the diff in parallel, a manager adversarially verifies their findings
+  // (real & must-fix vs noise), and a re-fix pass applies the confirmed ones — then the final
+  // browser test runs and the draft PR opens on the reviewed code.
+  review: {
+    enabled: true,
+    model: 'opus',                 // the expert reviewers (and the re-fix pass)
+    managerModel: 'opus',          // the verifier that gates which findings get fixed
+    lenses: ['correctness', 'conventions', 'security', 'tests'], // which expert lenses to run (de-duped)
+    parallel: true,                // run the reviewers concurrently; set false to run them one at a
+                                   // time (slower, but avoids concurrent claude processes sharing the
+                                   // one worktree — note true isolation isn't possible while the
+                                   // subscription login lives in the shared claude config dir)
+    maxTurns: 60,                  // per reviewer / manager / re-fix pass
+    timeoutMs: 20 * 60 * 1000,     // per reviewer / manager / re-fix pass
+    maxDiffChars: 60000,           // truncate a huge per-repo diff injected into reviewer prompts
+  },
+
   // --- Browser verification (Playwright) ---
-  // After a fix opens a PR, bring up a full preview and drive a real browser to confirm the
-  // bug is gone; attach the verdict + screenshots to the draft PR and Linear (PR opens either way).
+  // After the code-review gate and BEFORE the PR opens, bring up a full preview and drive a real
+  // browser to confirm the bug is gone; the verdict + screenshots are attached to the draft PR and
+  // Linear. The PR opens regardless of the verdict, but a `not_fixed` verdict keeps the issue
+  // In Progress for a human instead of advancing it to In Review.
   verify: {
     enabled: true,
-    model: 'sonnet',
+    model: 'opus',
     testEmail: 'test@example.com',
     testPassword: 'Test123!',
     maxTurns: 40,
