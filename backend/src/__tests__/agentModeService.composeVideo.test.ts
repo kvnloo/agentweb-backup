@@ -232,7 +232,12 @@ describe('AgentModeService - composeVideo', () => {
       );
     });
 
-    it('should not attach an audio track when no voiceover is provided', async () => {
+    // Boundary/regression (ENG-123): audioVolume === 0 is a falsy value. The pre-fix
+    // code that enumerated brand fields and omitted the audio track entirely — or any
+    // truthiness guard like `if (audioVolume)` — would drop it. Asserting the explicit
+    // 0 is forwarded together with its audioUrl fails on the unfixed (audio-dropping)
+    // code, so this is a real regression guard rather than a tautology.
+    it('should forward audioUrl with a boundary audioVolume of 0 (not drop a falsy volume)', async () => {
       mockRemotionService.compose.mockResolvedValue({
         success: true,
         videoUrl: 'https://s3.example.com/out.mp4',
@@ -244,12 +249,16 @@ describe('AgentModeService - composeVideo', () => {
         'out.mp4',
         'user1',
         'session1',
-        baseComposeParams
+        {
+          ...baseComposeParams,
+          audioUrl: 'https://s3.example.com/voiceover.mp3',
+          audioVolume: 0,
+        }
       );
 
       const passed = mockRemotionService.compose.mock.calls[0][0];
-      expect(passed.audioUrl).toBeUndefined();
-      expect(passed.audioVolume).toBeUndefined();
+      expect(passed.audioUrl).toBe('https://s3.example.com/voiceover.mp3');
+      expect(passed.audioVolume).toBe(0);
     });
   });
 
