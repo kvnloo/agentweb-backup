@@ -5,7 +5,7 @@ A local poller that watches Linear for new `Bug` issues and, for each one:
 1. Assembles the **full project** into an isolated workspace — all repos, nested exactly like your local checkout (so Claude has cross-repo context).
 2. Runs Claude Code (`claude -p`) on **your Claude subscription** to investigate and fix the bug — the fixer only **commits** (no PR yet).
 3. **Reviews the fix** with a multi-agent gate: expert reviewers (correctness, conventions, security, tests — lenses auto-scaled to the diff) inspect the diff in parallel, a **manager** adversarially verifies their findings, and a **re-fix** pass applies the confirmed ones. A `needs_rework` verdict triggers one **rework pass + manager re-check**.
-4. Runs **deterministic checks itself** (`npx tsc --noEmit` per changed package, `jest --findRelatedTests` in backend) — agent self-reported "pass" is never trusted alone.
+4. Runs **deterministic checks itself** (`npx tsc --noEmit` per changed package with a 4GB heap, `npx jest <changed test files>` in backend) — agent self-reported "pass" is never trusted alone.
 5. **Browser-tests** the reviewed code in a real browser (Playwright) against a per-bug preview. A deterministic HTTP **preflight** skips the agent entirely if the environment is down (`env_down`); a `not_fixed` verdict triggers one **re-fix + re-verify**. Then opens a **draft PR in each repo it changed**.
 6. **Triages** the result with a label (`autofix:green` / `autofix:needs-manual-test` / `autofix:needs-rework`) and comments back on the Linear issue: a merge-confidence header, PR link(s), a 🧪 test report, a 🔎 code-review summary, and a 🔍 manual-test guide. Only **green** advances to In Review.
 

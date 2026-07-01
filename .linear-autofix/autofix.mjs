@@ -503,20 +503,26 @@ export function runChecks(WT, changed) {
     if (pkg) (byPkg[pkg] ??= []).push(f.slice(pkg.length + 1));
   }
   const results = [];
+  // The backend is too big for node's default ~2GB heap under tsc (proven OOM on ENG-129);
+  // match the repo's own dev tooling headroom.
+  const env = { ...process.env, NODE_OPTIONS: '--max-old-space-size=4096' };
   for (const [pkg, files] of Object.entries(byPkg)) {
     const dir = path.join(WT, pkg);
     if (existsSync(path.join(dir, 'tsconfig.json'))) {
       log(`Deterministic check: npx tsc --noEmit (${pkg})...`);
-      const r = spawnSync('npx', ['tsc', '--noEmit'], { cwd: dir, encoding: 'utf8', timeout: config.checks?.tscTimeoutMs || 300000 });
+      const r = spawnSync('npx', ['tsc', '--noEmit'], { cwd: dir, env, encoding: 'utf8', timeout: config.checks?.tscTimeoutMs || 300000 });
       results.push(checkResult(`npx tsc --noEmit (${pkg})`, r));
     }
     if (pkg === 'backend') {
-      // Only source files that still exist (a deleted path makes --findRelatedTests error out).
-      const src = files.filter((f) => /\.(ts|tsx)$/.test(f) && existsSync(path.join(dir, f)));
-      if (src.length) {
-        log(`Deterministic check: npx jest --findRelatedTests (${src.length} file(s), backend)...`);
-        const r = spawnSync('npx', ['jest', '--findRelatedTests', ...src, '--passWithNoTests', '--silent'], { cwd: dir, encoding: 'utf8', timeout: config.checks?.jestTimeoutMs || 600000 });
-        results.push(checkResult('npx jest --findRelatedTests (backend)', r));
+      // Run exactly the test files the diff touched/added — the fixer wrote them, so running
+      // them deterministically catches fabricated "pass" claims. NOT --findRelatedTests: on a
+      // hub file like agentModeService.ts it drags in half the suite, minutes of runtime, and
+      // pre-existing failures unrelated to this fix (proven on ENG-129).
+      const testFiles = files.filter((f) => /(__tests__\/|\.test\.|\.spec\.)/.test(f) && /\.(ts|tsx|js)$/.test(f) && existsSync(path.join(dir, f)));
+      if (testFiles.length) {
+        log(`Deterministic check: npx jest on ${testFiles.length} changed test file(s) (backend)...`);
+        const r = spawnSync('npx', ['jest', ...testFiles, '--silent'], { cwd: dir, env, encoding: 'utf8', timeout: config.checks?.jestTimeoutMs || 600000 });
+        results.push(checkResult(`npx jest ${testFiles.join(' ')} (backend)`, r));
       }
     }
   }

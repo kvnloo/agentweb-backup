@@ -89,13 +89,14 @@ export const config = {
 
   // --- Deterministic post-fix checks (run by the ORCHESTRATOR, not the agents) ---
   // After the last code-modifying stage, autofix.mjs itself runs the typecheck in every changed
-  // package and jest related-tests in backend, and uses THOSE results in the test report and the
-  // triage gate — an agent's self-reported "pass" is never trusted on its own. A failed check
-  // forces triage to `rework`.
+  // package and jest on the CHANGED TEST FILES in backend, and uses THOSE results in the test
+  // report and the triage gate — an agent's self-reported "pass" is never trusted on its own.
+  // A failed check forces triage to `rework`. (tsc gets a 4GB heap; --findRelatedTests was
+  // dropped after ENG-129: hub-file blast radius pulls in pre-existing unrelated failures.)
   checks: {
     enabled: true,
     tscTimeoutMs: 5 * 60 * 1000,   // per-package `npx tsc --noEmit`
-    jestTimeoutMs: 10 * 60 * 1000, // backend `npx jest --findRelatedTests <changed files>`
+    jestTimeoutMs: 10 * 60 * 1000, // backend `npx jest <changed test files>`
   },
 
   // --- Code review gate (multi-agent) ---
