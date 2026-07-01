@@ -42,8 +42,16 @@ when the bug names a Session ID, User ID, or execution ID.
 - Query any prod table directly, e.g.:
   `aws dynamodb get-item --table-name AW-ChatSessions --key '{"sessionId":{"S":"<id>"}}'`
   (useful tables: `AW-ChatSessions`, `AW-TaskExecutions`, `AW-Tasks`, `AW-Users`, `AW-Configs`).
-- Backend logs are unreliable here (EB `request`/`retrieve-environment-info` runs but usually
-  returns a stale/expired bundle, and logs rotate fast) — prefer the DynamoDB session/records above.
+- Recent backend logs (best-effort; they rotate fast, so only useful for a just-reported bug):
+  `request-environment-info`, wait ~40s, then retrieve the NEWEST bundle — do NOT take `[0]`, which
+  can be a stale entry from a terminated instance:
+  ```
+  aws elasticbeanstalk request-environment-info --environment-name Agentweb-backend-env-prod-3 --info-type tail
+  # wait ~40s, then get the freshest bundle's presigned URL and curl it:
+  aws elasticbeanstalk retrieve-environment-info --environment-name Agentweb-backend-env-prod-3 --info-type tail \
+    --query 'reverse(sort_by(EnvironmentInfo, &SampleTimestamp))[0].Message' --output text
+  ```
+  Prefer the DynamoDB session/records above when they answer the question.
 
 Rules: **read-only — never write to prod.** This is real customer data (PII): use it to understand
 the bug, but NEVER paste raw session/user/log data into commits, the PR, tests, or comments.
