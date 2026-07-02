@@ -2148,7 +2148,7 @@ export class AgentModeService {
   }
   /**
    * Make an LLM call with the specified model and parameters
-   * @param model - The model to use (e.g., 'gpt-5.1', 'gemini-3-pro-preview')
+   * @param model - The model to use (e.g., 'gpt-5.5', 'gemini-3-pro-preview')
    * @param messages - Array of chat messages
    * @param options - Optional parameters for the LLM call
    * @returns The LLM response
@@ -2166,6 +2166,27 @@ export class AgentModeService {
       return LEGACY_MODEL_ALIASES[model] as T;
     }
     return model;
+  }
+
+  /**
+   * Resolve the model id for a generation request up front: normalize legacy
+   * ids, then validate against the allow-list. A model that is no longer served
+   * (e.g. a stale default or smoke-test config pinned to a removed id like
+   * 'gpt-5.1') would otherwise throw an opaque "Invalid model" deep inside
+   * callLLM, which the outer handler surfaces to the user as "Unknown Error"
+   * (ENG-46). Instead, fall back to the configured default model so the request
+   * still completes, and report whether a fallback happened so callers can log
+   * it / expose it via telemetry.
+   */
+  public resolveGenerationModel(model: string): { model: string; fellBack: boolean; requestedModel: string } {
+    const normalized = this.normalizeModelId(model);
+    if (normalized && this.llmModels[normalized]) {
+      return { model: normalized, fellBack: false, requestedModel: model };
+    }
+    console.warn(
+      `AgentMode: Requested model '${model ?? '(none)'}' is not in the allow-list; falling back to default '${this.default_model}'.`
+    );
+    return { model: this.default_model, fellBack: true, requestedModel: model };
   }
 
   async callLLM(
@@ -2474,10 +2495,20 @@ export class AgentModeService {
       sessionType: isInteractiveShare ? 'interactive_share' : 'regular',
     });
     try {
-      // Map legacy/renamed model ids forward (e.g. old sessions persisted the
-      // pre-rename "claude-opus-4-8") so metadata, pricing, and routing all use
-      // the canonical registry key.
-      llmModel = this.normalizeModelId(llmModel);
+      // Resolve the model up front: map legacy/renamed ids forward (e.g. old
+      // sessions persisted the pre-rename "claude-opus-4-8") AND validate against
+      // the allow-list. A removed/stale id (e.g. a smoke-test config pinned to
+      // 'gpt-5.1') would otherwise throw an opaque "Invalid model" deep inside
+      // callLLM and surface to the user as "Unknown Error" (ENG-46); instead fall
+      // back to the default model so the request still completes.
+      const requestedLlmModel = llmModel;
+      const modelResolution = this.resolveGenerationModel(llmModel);
+      llmModel = modelResolution.model;
+      if (modelResolution.fellBack) {
+        console.warn(
+          `AgentMode: Session ${sessionId} requested unavailable model '${requestedLlmModel}'; using default '${llmModel}' instead.`
+        );
+      }
       // Track backup model usage
       const originalLlmModel = llmModel;
       let backupModelUsed = false;
