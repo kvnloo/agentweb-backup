@@ -221,6 +221,15 @@ describe('makeRequest — LinkedIn account-access error enrichment', () => {
     expect(result.error).toContain(ACCOUNT_ID);
   });
 
+  it('includes the ad account id from the request body when the path has no /adAccounts/ segment', async () => {
+    mockAxiosFn.mockRejectedValue({
+      response: { status: 403, data: { message: RAW_ACCOUNT_ACCESS_ERROR } },
+    });
+    // POST /rest/conversationAds carries the account only in body.parentAccount
+    const result = await svc.createConversationAd(ACCESS_TOKEN, ACCOUNT_ID, { name: 'x' });
+    expect(result.error).toContain(ACCOUNT_ID);
+  });
+
   it('matches the LinkedIn error case-insensitively', async () => {
     mockAxiosFn.mockRejectedValue({
       response: { status: 403, data: { message: RAW_ACCOUNT_ACCESS_ERROR.toUpperCase() } },
@@ -775,6 +784,13 @@ describe('createConversationAd', () => {
     await svc.createConversationAd(ACCESS_TOKEN, ACCOUNT_ID, { headline_text: 'Direct headline' });
     const call = mockAxiosFn.mock.calls[0][0];
     expect(call.data.headlineText).toBe('Direct headline');
+  });
+
+  it("accepts LinkedIn's documented camelCase headlineText spelling", async () => {
+    mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:conversationAd:ca-1' }, status: 201 });
+    await svc.createConversationAd(ACCESS_TOKEN, ACCOUNT_ID, { headlineText: 'Camel headline' });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.headlineText).toBe('Camel headline');
   });
 
   it('omits headlineText entirely when neither name nor headline_text is provided — LinkedIn treats it as optional', async () => {
