@@ -110,6 +110,44 @@ describe("findInFlightJobForSession — reconnect lookup", () => {
     const job = await findInFlightJobForSession("u1", "s1");
     expect(job).toBeNull();
   });
+
+  // Zombie guard: a build stuck in an in-flight status past the stuck ceiling has no
+  // live process behind it (the owning run crashed/redeployed before the timeout could
+  // flag it awaitingReconnect, so the poller never cleans it up). Reconnecting to it
+  // would short-circuit every retry to "still building" forever, so it must be ignored
+  // and a fresh build allowed to start.
+  const NOW = new Date("2026-07-02T02:00:00Z").getTime();
+  const FORTY_MIN_AGO = new Date(NOW - 40 * 60 * 1000).toISOString();
+  const FIVE_MIN_AGO = new Date(NOW - 5 * 60 * 1000).toISOString();
+
+  it("ignores a generating build whose age exceeds the stuck ceiling (zombie, no live process)", async () => {
+    mockQuery.mockReturnValue(
+      ok({ Items: [{ id: "z", userId: "u1", status: "generating", originatingSessionId: "s1", createdAt: FORTY_MIN_AGO }] })
+    );
+    const job = await findInFlightJobForSession("u1", "s1", NOW);
+    expect(job).toBeNull();
+  });
+
+  it("still reconnects to a genuinely in-flight build within the ceiling", async () => {
+    mockQuery.mockReturnValue(
+      ok({ Items: [{ id: "live", userId: "u1", status: "generating", originatingSessionId: "s1", createdAt: FIVE_MIN_AGO }] })
+    );
+    const job = await findInFlightJobForSession("u1", "s1", NOW);
+    expect(job?.id).toBe("live");
+  });
+
+  it("skips a zombie and reconnects to a fresh in-flight build for the same session", async () => {
+    mockQuery.mockReturnValue(
+      ok({
+        Items: [
+          { id: "z", userId: "u1", status: "deploying", originatingSessionId: "s1", createdAt: FORTY_MIN_AGO },
+          { id: "live", userId: "u1", status: "generating", originatingSessionId: "s1", createdAt: FIVE_MIN_AGO },
+        ],
+      })
+    );
+    const job = await findInFlightJobForSession("u1", "s1", NOW);
+    expect(job?.id).toBe("live");
+  });
 });
 
 describe("buildCompletionMessage", () => {
