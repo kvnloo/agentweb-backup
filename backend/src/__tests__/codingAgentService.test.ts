@@ -2235,6 +2235,13 @@ describe('runCodingAgent — sequential edits do not clobber (ENG-176)', () => {
     // The reusable branch was preserved: no reset (PATCH) and no re-create (POST).
     expect(mockedAxios.patch).not.toHaveBeenCalled();
     expect(mockedAxios.post).not.toHaveBeenCalled();
+    // The ahead-check hit the correct compare endpoint (main...<encoded preview>).
+    // If URL construction ever broke, the compare would 404, be read as "0 ahead
+    // → reset", and silently reintroduce the clobber — so assert it explicitly.
+    expect(mockedAxios.get).toHaveBeenLastCalledWith(
+      expect.stringContaining('/compare/main...draft%2Fagentweb-preview'),
+      expect.anything(),
+    );
     expect(result.success).toBe(true);
   });
 
@@ -2270,6 +2277,13 @@ describe('_previewBranchCommitsAheadOfMain', () => {
   test('returns the ahead count when the branch has unpublished commits', async () => {
     mockedAxios.get.mockResolvedValueOnce({ data: { status: 'ahead', ahead_by: 2, behind_by: 0 } } as any);
     await expect(_previewBranchCommitsAheadOfMain(repoBase, headers)).resolves.toBe(2);
+    // Guard the single safety-critical call: a broken URL (wrong encoding/ref
+    // order/path) would 404, be read as "0 ahead → reset", and silently
+    // reintroduce the ENG-176 clobber while every other assertion still passed.
+    expect(mockedAxios.get).toHaveBeenLastCalledWith(
+      expect.stringContaining('/compare/main...draft%2Fagentweb-preview'),
+      expect.objectContaining({ headers }),
+    );
   });
 
   test('returns 0 when identical to main', async () => {
@@ -2282,8 +2296,12 @@ describe('_previewBranchCommitsAheadOfMain', () => {
     await expect(_previewBranchCommitsAheadOfMain(repoBase, headers)).resolves.toBe(0);
   });
 
-  test('fails open to 0 on a transient comparison error so edits are never wedged', async () => {
+  test('fails CLOSED (treats branch as ahead) on a transient comparison error so unpublished work is never clobbered', async () => {
+    // A 5xx/timeout/rate-limit must NOT be read as "0 ahead → safe to reset":
+    // that would let a transient GitHub hiccup force-reset the preview branch to
+    // main and destroy genuine unpublished edits (the ENG-176 clobber). Fail
+    // closed by reporting the branch as ahead so the caller skips the reset.
     mockedAxios.get.mockRejectedValueOnce(githubAxiosError(500, { message: 'Service Unavailable' }));
-    await expect(_previewBranchCommitsAheadOfMain(repoBase, headers)).resolves.toBe(0);
+    await expect(_previewBranchCommitsAheadOfMain(repoBase, headers)).resolves.toBeGreaterThan(0);
   });
 });
