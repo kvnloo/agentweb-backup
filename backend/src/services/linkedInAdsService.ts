@@ -1110,7 +1110,7 @@ export async function createConversationAd(
   // LinkedIn's SponsoredConversation schema has no "name" field — only the optional
   // headlineText. Sending "name" is rejected with "unrecognized field found but not
   // allowed". When absent, LinkedIn falls back to the first message content as the headline.
-  const headlineText = params.headline_text || params.name;
+  const headlineText = params.headline_text || params.headlineText || params.name;
   if (headlineText) body.headlineText = headlineText;
 
   return makeRequest('POST', '/rest/conversationAds', accessToken, body);
