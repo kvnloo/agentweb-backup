@@ -136,17 +136,21 @@ describe("findInFlightJobForSession — reconnect lookup", () => {
     expect(job?.id).toBe("live");
   });
 
-  it("skips a zombie and reconnects to a fresh in-flight build for the same session", async () => {
+  it("returns null when every in-flight record for the session is a zombie past the ceiling", async () => {
+    // Two in-flight builds, both older than STUCK_CEILING_MS. The pre-fix newest-first
+    // sort would return the newer zombie ("z2"); the zombie guard must filter both and
+    // yield null so a fresh build can start.
+    const FIFTY_MIN_AGO = new Date(NOW - 50 * 60 * 1000).toISOString();
     mockQuery.mockReturnValue(
       ok({
         Items: [
-          { id: "z", userId: "u1", status: "deploying", originatingSessionId: "s1", createdAt: FORTY_MIN_AGO },
-          { id: "live", userId: "u1", status: "generating", originatingSessionId: "s1", createdAt: FIVE_MIN_AGO },
+          { id: "z1", userId: "u1", status: "deploying", originatingSessionId: "s1", createdAt: FIFTY_MIN_AGO },
+          { id: "z2", userId: "u1", status: "generating", originatingSessionId: "s1", createdAt: FORTY_MIN_AGO },
         ],
       })
     );
     const job = await findInFlightJobForSession("u1", "s1", NOW);
-    expect(job?.id).toBe("live");
+    expect(job).toBeNull();
   });
 });
 
