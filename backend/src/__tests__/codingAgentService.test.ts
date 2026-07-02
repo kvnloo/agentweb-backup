@@ -1,4 +1,4 @@
-import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream } from '../services/codingAgentService';
+import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, isMissingRefError, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream } from '../services/codingAgentService';
 import { agentModeService } from '../services/agentModeService';
 
 // Mock mcpFetch
@@ -125,6 +125,44 @@ describe('applySearchReplace', () => {
     expect(result.errors).toHaveLength(0);
     expect(result.appliedCount).toBe(1);
     expect(result.result).toBe('const x = 1;');
+  });
+});
+
+describe('isMissingRefError (preview branch reset — ENG-157)', () => {
+  const ghError = (status: number, message?: string) => ({
+    response: { status, data: message === undefined ? {} : { message } },
+  });
+
+  // --- FAIL CASES: not a missing-ref error, so the reset must re-throw ---
+
+  test('returns false for a 422 that is NOT a missing ref (e.g. fast-forward)', () => {
+    expect(isMissingRefError(ghError(422, 'Update is not a fast forward'))).toBe(false);
+  });
+
+  test('returns false for auth errors (401/403)', () => {
+    expect(isMissingRefError(ghError(401, 'Bad credentials'))).toBe(false);
+    expect(isMissingRefError(ghError(403, 'Forbidden'))).toBe(false);
+  });
+
+  test('returns false for a network error with no HTTP response', () => {
+    expect(isMissingRefError({ code: 'ECONNRESET', message: 'socket hang up' })).toBe(false);
+    expect(isMissingRefError(new Error('boom'))).toBe(false);
+    expect(isMissingRefError(undefined)).toBe(false);
+  });
+
+  // --- SUCCESS CASES: ref is missing, so the reset should create the branch ---
+
+  test('returns true for GitHub 422 "Reference does not exist" (deleted branch)', () => {
+    expect(isMissingRefError(ghError(422, 'Reference does not exist'))).toBe(true);
+  });
+
+  test('returns true for a legacy 404 response', () => {
+    expect(isMissingRefError(ghError(404, 'Not Found'))).toBe(true);
+  });
+
+  test('matches the missing-ref message case-insensitively and in string bodies', () => {
+    expect(isMissingRefError(ghError(422, 'reference does not exist'))).toBe(true);
+    expect(isMissingRefError({ response: { status: 422, data: 'Reference does not exist' } })).toBe(true);
   });
 });
 
