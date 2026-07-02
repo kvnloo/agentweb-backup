@@ -58,6 +58,12 @@ export function fillTemplate(tmpl, map) {
   return out;
 }
 
+// Human comment thread on the issue, formatted for the {{COMMENTS}} placeholder (fixer,
+// triage, and refix prompts all take the same shape).
+export function issueCommentsText(issue) {
+  return (issue.comments?.nodes || []).map((c) => `- ${c.user?.name || 'someone'}: ${c.body}`).join('\n') || '(none)';
+}
+
 // Build claude-CLI args in one place so the fixer, reviewers, manager, re-fix, and verify passes
 // stay in sync. `mcp` adds a strict MCP config (browser-verify only).
 export function claudeArgs({ model, maxTurns, mcp, skipPermissions = config.skipPermissions }) {
@@ -190,7 +196,7 @@ async function main() {
   // blocked on an external action (e.g. a disconnected Unipile/Sales-Navigator account waiting
   // on a human to reconnect it — ENG-100's shape). Blocked → label + comment, issue STAYS in
   // Todo/backlog, and the poller skips it until the label is removed.
-  const commentsText = (issue.comments?.nodes || []).map((c) => `- ${c.user?.name || 'someone'}: ${c.body}`).join('\n') || '(none)';
+  const commentsText = issueCommentsText(issue);
   if (config.fixabilityGate?.enabled && !force) {
     const g = config.fixabilityGate;
     const tp = fillTemplate(readFileSync(path.join(__dirname, 'triage-prompt.md'), 'utf8'), {
@@ -293,7 +299,7 @@ async function main() {
       const before = countCommits(changed);
       const feedback = `1. [browser-verify/high] (root cause) — Automated browser verification reproduced the bug's scenario against the CURRENT code and it is STILL BROKEN. Scenario: ${verify.scenario || '(from the bug report)'}. Observed: ${verify.summary || '(no detail)'} → Re-investigate the root cause and fix it so this exact scenario passes.`;
       const rp = fillTemplate(readFileSync(refixPromptPath, 'utf8'), {
-        IDENTIFIER: id, TITLE: issue.title, DESCRIPTION: issue.description || '(no description)', BRANCH: branch, CONFIRMED: feedback,
+        IDENTIFIER: id, TITLE: issue.title, DESCRIPTION: issue.description || '(no description)', COMMENTS: commentsText, BRANCH: branch, CONFIRMED: feedback,
       });
       await runClaude(claudeArgs({ model: config.review?.refixModel || config.opusModel, maxTurns: config.review?.maxTurns || 60 }), rp, WT, config.review?.timeoutMs || 20 * 60 * 1000, 'verify-refix');
       changed = detectChangedRepos(WT);
@@ -670,7 +676,7 @@ async function runReview(issue, WT, changed, branch, sessionContext = '') {
   const skipped = allLenses.filter((l) => !lenses.includes(l));
   if (skipped.length) log(`Lenses skipped for this diff: ${skipped.join(', ')}`);
   if (!lenses.length || !diff) { log('Review skipped (no lenses or empty diff).'); return null; }
-  const issueMap = { IDENTIFIER: id, TITLE: issue.title, DESCRIPTION: issue.description || '(no description)', SESSION_CONTEXT: sessionContext || '(none)' };
+  const issueMap = { IDENTIFIER: id, TITLE: issue.title, DESCRIPTION: issue.description || '(no description)', COMMENTS: issueCommentsText(issue), SESSION_CONTEXT: sessionContext || '(none)' };
   const reviewArgs = () => claudeArgs({ model: config.review.model, maxTurns: config.review.maxTurns, skipPermissions: true });
 
   // 1. Expert reviewers, one per lens. Templated once with the (large) shared diff, then only the
