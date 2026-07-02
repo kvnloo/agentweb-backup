@@ -174,18 +174,12 @@ function toEvents(analyses: readonly SessionAnalysis[]): NormalizedEvent[] {
         dimensions: { elapsedMs: a.durationMs ?? 0 },
       });
     }
-    if (a.lowSat) {
-      events.push({
-        subjectId: sid,
-        eventType: 'complaint_received',
-        ts: a.lastMessageTs ?? created,
-        dimensions: {
-          complaintText: a.meta.satisfactionScore?.reason ?? 'low satisfaction',
-          complaintChannel: 'llm_judge',
-          satisfactionScore: a.meta.satisfactionScore?.score ?? 0,
-        },
-      });
-    }
+    // NOTE: the `lowSat` flag is still computed and reported as a passive
+    // aggregate (lowSatisfactionCount / lowSatSamples), but it no longer emits
+    // a `complaint_received` event. The only real-data feeder of a "complaint"
+    // was a fuzzy LLM satisfaction score (complaintChannel: 'llm_judge'), which
+    // is noise rather than a hard complaint signal — the complaint path was
+    // removed (founder decision 2026-07-02).
   }
   return events;
 }

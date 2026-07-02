@@ -215,7 +215,7 @@ export class NotionDigestTool implements MutationTools<AiEvalProposalPayload> {
   }
 
   private priorityFor(p: MutationProposal<AiEvalProposalPayload>): string {
-    if (p.sourceRuleId === 'eval-failing' || p.sourceRuleId === 'complaint-received') return 'High';
+    if (p.sourceRuleId === 'eval-failing') return 'High';
     if (p.sourceRuleId === 'top-of-funnel-cold' || p.sourceRuleId === 'capture-broken') return 'High';
     if (p.sourceRuleId === 'wait-too-long') return 'Medium';
     return 'Medium';

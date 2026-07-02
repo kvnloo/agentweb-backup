@@ -106,22 +106,6 @@ export const aiEvalRules: readonly Rule<AiEvalProposalPayload>[] = [
     priority: 90,
   },
   {
-    id: 'complaint-received',
-    when: 'complaint_received_count > 0 over 7d',
-    then: {
-      hypothesis:
-        'Explicit complaints arrived in the funnel data. ' +
-        'Surface the complaint text + open a cloud-dev investigation task.',
-      kind: 'code_change',
-      payload: {
-        targetKey: 'complaint_review',
-        directive: 'open a cloud-dev investigation task with the complaint sample inline',
-        autoShipSafe: false,
-      },
-    },
-    priority: 100,
-  },
-  {
     id: 'no-signup',
     when: 'signup_clicked_count / eval_completed_count < 0.1 over 7d',
     then: {

@@ -129,8 +129,6 @@ function summarizePersonas(events: readonly NormalizedEvent[]): PersonaSummary[]
       friction.push({ subjectId, lastStage: last, frictionType: 'eval_failed' });
     } else if (types.includes('eval_abandoned')) {
       friction.push({ subjectId, lastStage: last, frictionType: 'eval_timeout' });
-    } else if (types.includes('complaint_received')) {
-      friction.push({ subjectId, lastStage: last, frictionType: 'complaint' });
     } else if (types.includes('signed_up')) {
       completed++;
       if (!firstCompleter) {
@@ -331,7 +329,7 @@ async function main(): Promise<void> {
       failures.push('Expected ≥1 completer persona; found 0.');
     }
     if (frictionCount < 1) {
-      failures.push('Expected ≥1 friction_signal persona (eval_failed/timeout/complaint); found 0.');
+      failures.push('Expected ≥1 friction_signal persona (eval_failed/timeout); found 0.');
     }
     if (result.proposals.length === 0) {
       failures.push('Expected ≥1 rule fired in default smoke; none fired.');
@@ -347,9 +345,6 @@ async function main(): Promise<void> {
     }
     if (!firedIds.has('wait-too-long')) {
       failures.push("Expected 'wait-too-long' rule to fire from timeout persona events; did not.");
-    }
-    if (!firedIds.has('complaint-received')) {
-      failures.push("Expected 'complaint-received' rule to fire from complaint persona events; did not.");
     }
   } else if (scenarioName === 'completer-only') {
     if (result.proposals.length !== 0) {

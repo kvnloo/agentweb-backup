@@ -4,6 +4,17 @@
 
 This is the contract. If the apparatus doesn't satisfy what's below, the apparatus is broken — fix it and re-run. Iterate until it passes.
 
+> **Amendment 2026-07-02 (founder decision): the complaint / low-CSAT friction variant was REMOVED.**
+> The only real-data feeder of a "complaint" was a fuzzy LLM satisfaction score
+> (`complaintChannel: 'llm_judge'`, score ≤ 3 — which even includes NEUTRAL). There is no wired
+> real-complaint source (support ticket / email / NPS), so the `complaint-received` rule only ever
+> fired from unreliable LLM sentiment against a `> 0 over 7d` threshold — pure noise that opened
+> spurious cloud-dev tasks. The `complaint_received` event, the `complaint-received` rule, and the
+> `complaint_review` mutation surface are gone. The hard-signal friction variants — **failure**
+> (`eval_failed`) and **timeout** (`eval_abandoned`) — remain the contract. The low-satisfaction
+> score is kept only as a passive aggregate stat (`lowSatisfactionCount` / `lowSatSamples`), not as
+> a rule trigger. The strikethrough annotations below mark what was removed.
+
 ---
 
 ## The three required personas
@@ -22,14 +33,14 @@ A smoke-test run replays scripted event streams for these three personas through
 - Event stream: `landed` → `form_submitted` → `eval_started` → `eval_completed` → `report_viewed` → `signup_clicked` → `signed_up`.
 - **Expected marking:** the smoke report classifies this persona as `completed` with the dimension `funnel_completion = 1.0`. No rule fires solely on this persona's data — they're the healthy baseline.
 
-### 3. Complainer / Timeout — *"if a person complains or something (or if the wait times are too long and so people get distracted) that would get marked"*
+### 3. Failure / Timeout — *"if a person complains or something (or if the wait times are too long and so people get distracted) that would get marked"*
 
-- Either: the eval fails (LLM-side failure caught by the agent-mode session and surfaced via `metadata.isErrorMessage`), OR the user abandons during the polling phase because the wait exceeds patience (>120 seconds without `eval_completed`), OR a downstream complaint signal arrives (support ticket, email, low CSAT — any explicit negative).
+- Either: the eval fails (LLM-side failure caught by the agent-mode session and surfaced via `metadata.isErrorMessage`), OR the user abandons during the polling phase because the wait exceeds patience (>120 seconds without `eval_completed`). ~~OR a downstream complaint signal arrives (support ticket, email, low CSAT — any explicit negative).~~ *(complaint variant REMOVED 2026-07-02 — see amendment above; no real complaint source was ever wired, only an LLM satisfaction score.)*
 - Event stream variants:
   - **Failure variant:** `landed` → `form_submitted` → `eval_started` → `eval_failed` (with `errorMessage` dimension carrying the LLM failure text).
   - **Timeout variant:** `landed` → `form_submitted` → `eval_started` → (>120s elapsed) → `eval_abandoned` (with `elapsed_ms` dimension).
-  - **Complaint variant:** `landed` → `form_submitted` → `eval_completed` → `complaint_received` (with `complaint_text` dimension).
-- **Expected marking:** the smoke report classifies the persona as `friction_signal` with the dimension `friction_type ∈ {eval_failed, eval_timeout, complaint}`. The policy layer fires a rule of class `eval-failing` (failure variant), `wait-too-long` (timeout variant), or `complaint-received` (complaint variant). The triggering error text / elapsed time / complaint text MUST appear in the resulting mutation proposal so the human reviewer sees what broke.
+  - ~~**Complaint variant:** `landed` → `form_submitted` → `eval_completed` → `complaint_received` (with `complaint_text` dimension).~~ *(REMOVED 2026-07-02.)*
+- **Expected marking:** the smoke report classifies the persona as `friction_signal` with the dimension `friction_type ∈ {eval_failed, eval_timeout}`. The policy layer fires a rule of class `eval-failing` (failure variant) or `wait-too-long` (timeout variant). The triggering error text / elapsed time MUST appear in the resulting mutation proposal so the human reviewer sees what broke. *(The `complaint` friction type and the `complaint-received` rule were removed 2026-07-02.)*
 
 ---
 
@@ -41,7 +52,7 @@ After running the smoke test, the apparatus MUST execute the following sequence 
 2. **Sensor returns events** — the `EventSource` implementation normalizes and returns the events as a unified stream.
 3. **Policy bubbles up suggested fixes** — *"the apparatus needs to immediately start bubbling up suggested fixes"*. The policy layer evaluates the events against the rule DSL, fires at least one rule per friction-signal class, and produces `MutationProposal` records.
 4. **Generator + Critic produce concrete fix text** — the Bedrock-backed Generator turns each proposal into a concrete change (new copy variant, code-change spec, Emma question, etc.). The Critic filters by rubric.
-5. **Cloud-dev gets triggered** — *"submitting those fixes to cloud dev which triggers the cloud dev"*. Each surviving proposal produces a real Notion task in the Sprint Tasks DB tagged for cloud-dev pickup. The Notion task contains: the rule that fired, the triggering data (with error text / timeout / complaint inline), the proposed code change spec, and the human-review context.
+5. **Cloud-dev gets triggered** — *"submitting those fixes to cloud dev which triggers the cloud dev"*. Each surviving proposal produces a real Notion task in the Sprint Tasks DB tagged for cloud-dev pickup. The Notion task contains: the rule that fired, the triggering data (with error text / timeout inline; complaint text removed 2026-07-02), the proposed code change spec, and the human-review context.
 6. **Cloud-dev builds the fix** — cloud-dev picks up the Notion task and produces a PR. (This step uses the existing cloud-dev pipeline; the framework only triggers it.)
 7. **Slack DM lands for Harsha's review** — *"once it is built and ready for review it should send me a slack dm that I review"*. The approval-gate layer posts a real DM to Harsha's Slack with: the smoke-test summary, the personas processed, the rules that fired, links to the Notion tasks + PRs, and ✅/❌/🛑 reactions for the decision.
 

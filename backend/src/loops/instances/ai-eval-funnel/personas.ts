@@ -2,7 +2,10 @@
  * Three scripted personas per ACCEPTANCE_SPEC.md:
  *   1. Early-Dipper      — lands, doesn't submit, leaves
  *   2. Completer         — finishes the full funnel
- *   3. Complainer/Timeout — eval fails OR exceeds patience OR complaint received
+ *   3. Failure/Timeout   — eval fails OR exceeds patience
+ *
+ * (The old complaint variant was removed 2026-07-02 — its only real-data
+ * feeder was a fuzzy LLM satisfaction score, i.e. noise, not a hard complaint.)
  *
  * All event timestamps are computed as `anchor - offset minutes ago` so they
  * fall in the recent past relative to runtime, well inside the orchestrator's
@@ -74,7 +77,7 @@ export function completerEvents(idx: number, baseOffsetMinutesAgo = 20): Normali
 }
 
 // ---------------------------------------------------------------------------
-// Persona 3 — Complainer / Timeout. Three variants per spec.
+// Persona 3 — Failure / Timeout. Two variants per spec.
 // ---------------------------------------------------------------------------
 
 /** Variant A: the eval fails with a concrete LLM-side error. */
@@ -106,45 +109,28 @@ export function timeoutEvents(idx: number, baseOffsetMinutesAgo = 40): Normalize
   ];
 }
 
-/** Variant C: the user completes but then files a complaint downstream. */
-export function complaintEvents(idx: number, baseOffsetMinutesAgo = 50): NormalizedEvent[] {
-  const id = `complaint-${idx}`;
-  return [
-    mk(id, 'landed', baseOffsetMinutesAgo, { landerPath: '/ai-eval' }),
-    mk(id, 'form_submitted', baseOffsetMinutesAgo - 1),
-    mk(id, 'eval_started', baseOffsetMinutesAgo - 1),
-    mk(id, 'eval_completed', baseOffsetMinutesAgo - 3),
-    mk(id, 'report_viewed', baseOffsetMinutesAgo - 4),
-    mk(id, 'complaint_received', baseOffsetMinutesAgo - 30, {
-      complaintText:
-        "The eval said my brand was 'generic' but didn't say what specifically to change. I was hoping for actionable advice.",
-      complaintChannel: 'email',
-    }),
-  ];
-}
-
 // ---------------------------------------------------------------------------
 // Composite scenarios — 3+ instances of each persona type, enough to fire
 // the relevant rules per the ACCEPTANCE_SPEC.
 //
 // Tuning notes (so a reviewer doesn't have to redo this math):
 //   All landed events carry dimensions.landerPath='/ai-eval', so the
-//   landerPath-scoped rules see the full 111.
+//   landerPath-scoped rules see the full 109.
 //   landed_count[landerPath=/ai-eval] = 100 dippers + 2 completers + 4 failures
-//                + 3 timeouts + 2 complaints = 111 landed events
-//   eval_started_count = 2 + 4 + 3 + 2 = 11 (dippers don't submit/start)
-//   capture-broken: eval_started_count / landed[/ai-eval] = 11/111 = 0.099 < 0.1  → fires ✓
-//   top-of-funnel-cold: landed_count[landerPath=/ai-eval] (111) < 100  → does NOT fire
+//                + 3 timeouts = 109 landed events
+//   eval_started_count = 2 + 4 + 3 = 9 (dippers don't submit/start)
+//   capture-broken: eval_started_count / landed[/ai-eval] = 9/109 = 0.083 < 0.1  → fires ✓
+//   top-of-funnel-cold: landed_count[landerPath=/ai-eval] (109) < 100  → does NOT fire
 //     (intentional — one rule per friction class, not extra duplicates)
-//   eval-failing: 4 failed / (4 + 3 + 2 + 2) started = 4/11 = 0.36 > 0.2 → fires ✓
+//   eval-failing: 4 failed / (4 + 3 + 2) started = 4/9 = 0.44 > 0.2 → fires ✓
 //   wait-too-long: 3 abandoned > 0 → fires ✓
-//   complaint-received: 2 > 0 → fires ✓
-//   no-signup: 2 signup_clicked / (2 + 2) eval_completed = 2/4 = 0.5 → does NOT fire ✓
+//   no-signup: 2 signup_clicked / 2 eval_completed = 1.0 → does NOT fire ✓
 //   sign-then-bail: 2 signed_up, both started onboarding → does NOT fire ✓
+// (complaint-received rule + complaint persona removed 2026-07-02.)
 // ---------------------------------------------------------------------------
 
 /** Default smoke scenario: produces enough events to fire `capture-broken`,
- * `eval-failing`, `wait-too-long`, and `complaint-received`. */
+ * `eval-failing`, and `wait-too-long`. */
 export function defaultSmokeEvents(): NormalizedEvent[] {
   const events: NormalizedEvent[] = [];
 
@@ -159,9 +145,6 @@ export function defaultSmokeEvents(): NormalizedEvent[] {
 
   // 3 timeouts.
   for (let i = 0; i < 3; i++) events.push(...timeoutEvents(i, 800 + i * 15));
-
-  // 2 complaints.
-  for (let i = 0; i < 2; i++) events.push(...complaintEvents(i, 900 + i * 30));
 
   return events;
 }

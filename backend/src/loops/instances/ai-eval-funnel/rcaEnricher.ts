@@ -87,7 +87,6 @@ function buildSystemPrompt(mutationSurface: readonly MutationSurfaceEntry[]): st
     '  - signup_clicked: user clicked the signup CTA from ReportView.',
     '  - signed_up: account creation completed.',
     '  - onboarding_started: post-signup onboarding began.',
-    '  - complaint_received: explicit complaint surfaced (NPS / Slack / email forwarded).',
     '  - icp_match: subject matched the ICP-1 segment.',
     '',
     'NOTE on denominators: events may include logged-in subjects who are not part of the funnel.',
