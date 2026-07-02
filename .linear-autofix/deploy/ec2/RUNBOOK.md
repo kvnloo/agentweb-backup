@@ -188,6 +188,28 @@ It probes each port's Host-agnostic `/__preview_health__` (port/SG), nip.io DNS,
 portal URL — so you know it's reachable before opening a browser. Quick manual check of one
 port: `curl http://<public-ip>:5174/__preview_health__` → `preview-proxy-ok`.
 
+## 7c. Chat UI (talk to the agent that made a fix)
+
+A localhost-only web chat over the issues in `state.json`. Opening an issue shows every
+pipeline step that ran (expandable reports); one conversation per issue — full access on the
+runner (changes commit + auto-push to the open PR), read-only anywhere else. The first message
+resumes the pipeline's own Claude session, so the agent remembers making the fix. See the tool
+README "Chat UI".
+
+```bash
+# on the instance (long-running, like the preview proxy — survives until stop/reboot)
+~/agentweb/.linear-autofix/chat/run-chat.sh start     # also: stop | status | restart
+
+# from your laptop — the tunnel IS the auth; no port is opened in the security group
+ssh -i <key> -L 8790:localhost:8790 ec2-user@<public-ip>
+# then open http://localhost:8790
+```
+
+- Full access needs `AUTOFIX_RUN_ENABLED=1` (already set in `.env` on the runner); elsewhere the chat is read-only.
+- Logs: `tail -f ~/agentweb/.linear-autofix/chat/chat.log`; per-turn transcripts in `logs/<ID>/chat-*.txt`.
+- After a stop/start cycle, restart it: `chat/run-chat.sh start` (optionally add a crontab line
+  `@reboot ~/agentweb/.linear-autofix/chat/run-chat.sh start`).
+
 ## 8. Operations
 
 - **Logs:** `tail -f ~/agentweb/.linear-autofix/poll.log`

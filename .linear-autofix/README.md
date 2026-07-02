@@ -32,6 +32,43 @@ deterministic checks, and comments the result back. Tunables in `config.revise`.
 > CLI on your own machine — the only compliant way to use subscription quota for automation
 > (CI/GitHub Actions would require an API key).
 
+## Chat UI: talk to the agent that made the fix
+
+A local web UI (`chat/`) to chat about any issue the machine is handling — the interactive
+sibling of `revise:`. Open an issue and you first see **every step the automation took**
+(fixability gate, fixer, review lenses, manager verdict, re-fix, checks, browser verify —
+each expandable to that agent's full report). Below it, ONE conversation — no mode toggle.
+The first message **resumes the pipeline's own Claude session** (per-stage session ids are
+recorded in `state.json`), so the agent natively remembers investigating and making the fix;
+if that session is gone it falls back to a fresh one with the issue + pipeline context injected.
+
+What a message may do follows the environment, not a switch:
+
+- **Full access** (on the runner: `AUTOFIX_RUN_ENABLED=1`, pipeline not mid-run on the issue,
+  fix branch exists): ask anything, or request changes — the agent edits the issue's branch in
+  its worktree, verifies its own work (`npx tsc`, targeted tests), commits, and the server
+  **auto-pushes to the open PR(s)**. Takes a per-issue lock (`chat/locks/<ID>.lock`) that
+  `gc.mjs` respects. The full review/browser gates are NOT re-run — you're already in the loop.
+- **Read-only** (anywhere else, or while the pipeline owns the issue): the agent answers from
+  the workspace and pipeline logs but cannot change code — enforced by a tool allowlist
+  (`config.chat.readOnly.allowedTools`), no permissions bypass, anything else auto-denies.
+  The composer shows which level you're at and why.
+
+The header also has an **Enable preview / Disable preview** button per issue: it drives
+`preview/preview.mjs up|down` (starting the proxy if needed) and shows the live
+Customer / Partner / API links right there once the services are up. Same nip.io URLs and
+build-lock behavior as the pipeline's own previews.
+
+```bash
+chat/run-chat.sh start                          # on the runner (long-running, like the proxy)
+ssh -L 8790:localhost:8790 ec2-user@<ip>        # from your laptop
+# → http://localhost:8790
+```
+
+Binds `127.0.0.1` only, no auth layer — anyone with SSH to the box already has this access.
+Chat transcripts persist in `chat/chat-state.json`; raw turn logs land in `logs/<ID>/chat-*.txt`.
+Tunables in `config.chat`.
+
 ## Repositories (full-project workspace)
 
 The AgentWeb checkout is **two separate git repos**, and the workspace reproduces that layout:
@@ -203,6 +240,10 @@ So in normal use (merge PR → issue auto-moves to Done) you rarely clean up by 
 | `refix-prompt.md` | Applies gate-verified findings (review, rework, or verify-failure) in the same worktree |
 | `revise-prompt.md` | Applies human revision requests to the existing fix branch |
 | `run.sh` | One poll cycle with a lock + log rotation; wired to cron |
+| `chat/server.mjs` | Chat UI backend: issue list + SSE-streamed Ask/Fix turns that resume pipeline sessions |
+| `chat/ui.html` | The chat UI (single static page, no build step) |
+| `chat/run-chat.sh` | Start/stop the chat server (long-running; localhost-only, SSH tunnel to reach) |
+| `chat/chat-state.json` | Per-issue chat sessions + transcripts (gitignored) |
 | `preview/proxy.mjs` | Userspace host-based reverse proxy (nip.io → per-bug ports), no sudo |
 | `preview/preview.mjs` | Start/stop a watcher-free full app copy per bug from its worktree |
 | `verify-prompt.md` | Browser-verification prompt (drives the Playwright MCP, emits a verdict) |
