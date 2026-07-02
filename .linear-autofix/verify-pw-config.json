@@ -1,0 +1,9 @@
+{
+  "_comment": "Playwright MCP config for the browser-verify pass. Viewport is pinned to desktop 1280x720 and the session video records at the SAME size — if they differ, Playwright scales the page into the frame and the result looks like a small/mobile capture. recordVideo flushes the .webm on browser close (verify-prompt step 5). @playwright/mcp 0.0.77 has no --save-video CLI flag — contextOptions is the supported route.",
+  "browser": {
+    "contextOptions": {
+      "viewport": { "width": 1280, "height": 720 },
+      "recordVideo": { "dir": "/tmp/playwright-screenshots", "size": { "width": 1280, "height": 720 } }
+    }
+  }
+}
