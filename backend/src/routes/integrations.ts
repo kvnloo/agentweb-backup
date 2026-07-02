@@ -86,8 +86,14 @@ router.post('/featurebase/webhook', async (req, res) => {
 
     const event = JSON.parse(raw.toString('utf8'));
     const item = event?.data?.item;
+    // Live-verified payload shape (2026-07-02): status changes arrive as DOTTED change
+    // entries — `status.id`/`status.name`/`status.type` — not a bare `status` field.
+    // Accept both spellings in case Featurebase ever flattens it.
     const statusChanged =
-      Array.isArray(event?.data?.changes) && event.data.changes.some((c: any) => c?.field === 'status');
+      Array.isArray(event?.data?.changes) &&
+      event.data.changes.some(
+        (c: any) => typeof c?.field === 'string' && (c.field === 'status' || c.field.startsWith('status.')),
+      );
     const completed =
       event?.topic === 'post.updated' && statusChanged && item?.status?.type === 'completed' && item?.id;
     if (!completed) return res.json({ ok: true, notified: 0 });

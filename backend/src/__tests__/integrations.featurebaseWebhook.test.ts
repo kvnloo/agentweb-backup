@@ -48,7 +48,14 @@ function completedEvent(overrides: Record<string, any> = {}): any {
         status: { name: 'Completed', type: 'completed' },
         author: { email: 'u@e.com', name: 'U' },
       },
-      changes: [{ field: 'status', oldValue: 'In Review', newValue: 'Completed' }],
+      // Live-captured shape (2026-07-02): status transitions arrive as DOTTED entries,
+      // never a bare `status` field.
+      changes: [
+        { field: 'status.id', oldValue: 'st-old', newValue: 'st-new' },
+        { field: 'status.name', oldValue: 'In Review', newValue: 'Completed' },
+        { field: 'status.type', oldValue: 'reviewing', newValue: 'completed' },
+        { field: 'updatedAt', oldValue: '2026-07-02T00:00:00Z', newValue: '2026-07-02T00:01:00Z' },
+      ],
     },
     ...overrides,
   };
@@ -134,11 +141,22 @@ describe('POST /api/integrations/featurebase/webhook — event filtering', () =>
 
   it('post.updated WITHOUT a status field change -> no-op (title edit on a completed post)', async () => {
     const ev = completedEvent();
-    ev.data.changes = [{ field: 'title', oldValue: 'a', newValue: 'b' }];
+    ev.data.changes = [
+      { field: 'title', oldValue: 'a', newValue: 'b' },
+      { field: 'updatedAt', oldValue: 't0', newValue: 't1' },
+    ];
     const res = await post(ev);
     expect(res.status).toBe(200);
     expect(res.body.notified).toBe(0);
     expect(shipNotify.notifyPostShippedRecipients).not.toHaveBeenCalled();
+  });
+
+  it('tolerates a flattened bare `status` change entry too', async () => {
+    const ev = completedEvent();
+    ev.data.changes = [{ field: 'status', oldValue: 'In Review', newValue: 'Completed' }];
+    const res = await post(ev);
+    expect(res.body).toEqual({ ok: true, accepted: true });
+    expect(shipNotify.notifyPostShippedRecipients).toHaveBeenCalledTimes(1);
   });
 
   it('status change to a non-completed type -> no-op', async () => {
