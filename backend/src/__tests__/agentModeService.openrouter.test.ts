@@ -275,6 +275,72 @@ describe('AgentModeService - OpenRouter gateway (ENG-9)', () => {
     });
   });
 
+  describe('isModelRestrictedForUser — adminOnly enforcement at point of use', () => {
+    it('restricts OpenRouter slugs for non-admins', () => {
+      for (const slug of OPENROUTER_MODELS) {
+        expect(agentModeService.isModelRestrictedForUser(slug, false)).toBe(true);
+      }
+    });
+
+    it('allows OpenRouter slugs for admins', () => {
+      for (const slug of OPENROUTER_MODELS) {
+        expect(agentModeService.isModelRestrictedForUser(slug, true)).toBe(false);
+      }
+    });
+
+    it('does not restrict public models for non-admins', () => {
+      expect(agentModeService.isModelRestrictedForUser('anthropic.claude-opus-4-8', false)).toBe(false);
+      expect(agentModeService.isModelRestrictedForUser('gpt-5.5', false)).toBe(false);
+    });
+
+    it('restricts pre-existing adminOnly models for non-admins', () => {
+      expect(agentModeService.isModelRestrictedForUser('anthropic.claude-opus-4-6-v1', false)).toBe(true);
+    });
+
+    it('does not restrict unknown models (they keep the existing Invalid-model failure mode)', () => {
+      expect(agentModeService.isModelRestrictedForUser('nonexistent-model-xyz', false)).toBe(false);
+    });
+
+    it('resolves legacy aliases before checking (claude-opus-4-8 → public Bedrock id)', () => {
+      expect(agentModeService.isModelRestrictedForUser('claude-opus-4-8', false)).toBe(false);
+    });
+  });
+
+  describe('getCodingAgentDefaultModel rejects OpenRouter slugs', () => {
+    it('falls back when the setting is an OpenRouter slug (coding agent has its own dispatch)', async () => {
+      const { settingsService } = require('../services/settingsService');
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: 'anthropic/claude-sonnet-4.6',
+      });
+
+      const model = await agentModeService.getCodingAgentDefaultModel();
+      expect(model).toBe('anthropic.claude-sonnet-4-6');
+    });
+  });
+
+  describe('callLLM maxTools truncation via OpenRouter (behavioral)', () => {
+    it('truncates tools to 128 for openai/gpt-5.5 through the real callLLM path', async () => {
+      const mockCreate = jest.fn().mockResolvedValue({
+        choices: [{ message: { content: 'response', tool_calls: null } }],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      });
+      jest
+        .spyOn(agentModeService as any, 'getOpenRouterClient')
+        .mockResolvedValue({ chat: { completions: { create: mockCreate } } });
+
+      const tools = Array.from({ length: 143 }, (_, i) => ({
+        type: 'function',
+        function: { name: `tool_${i}`, description: `Tool ${i}`, parameters: { type: 'object', properties: {} } },
+      }));
+
+      await (agentModeService as any).callLLM('openai/gpt-5.5', [{ role: 'user', content: 'test' }], { tools });
+
+      const calledParams = mockCreate.mock.calls[0][0];
+      expect(calledParams.tools).toHaveLength(128);
+      expect(calledParams.tools[127].function.name).toBe('tool_127');
+    });
+  });
+
   describe('estimateCost pricing for OpenRouter models', () => {
     it('should price OpenRouter models per their live per-1M rates', () => {
       const cost = (svc: any, model: string) => svc.estimateCost(model, 1_000_000, 1_000_000);

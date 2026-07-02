@@ -35,6 +35,7 @@ jest.mock('../services/generateMarketingResponseWorkerService', () => ({
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
+    isModelRestrictedForUser: jest.fn().mockReturnValue(false),
     default_model: 'gpt-5-chat-2',
     getDefaultModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
     generateSessionTitle: jest.fn().mockResolvedValue('Test Title'),

@@ -28,6 +28,7 @@ jest.mock('../services/generateMarketingResponseWorkerService', () => ({
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
+    isModelRestrictedForUser: jest.fn().mockReturnValue(false),
     generateSessionTitle: jest.fn().mockResolvedValue('Test Session Title'),
     getSkillsForDisplay: jest.fn().mockResolvedValue([])
   }
