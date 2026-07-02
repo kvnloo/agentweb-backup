@@ -41,6 +41,7 @@ export class GenerateMarketingResponseWorkerService {
   private workerInitPromise: Promise<void> | null = null;
   private pingIdCounter = 0;
   private pendingPings: Map<string, (alive: boolean) => void> = new Map();
+  private draining = false;
 
   /**
    * Initialize and start the worker process
@@ -293,15 +294,32 @@ export class GenerateMarketingResponseWorkerService {
   }
 
   /**
-   * Shutdown the worker process
+   * Shutdown the worker process, draining any in-flight requests first.
+   * Blocks until pendingRequests.size === 0 or 35 minutes elapse.
    */
   async shutdown(): Promise<void> {
+    this.draining = true;
+    console.log(`[Worker] Drain started — ${this.pendingRequests.size} in-flight request(s)`);
+
+    const DRAIN_CEILING_MS = 10 * 60 * 1000;
+    const POLL_INTERVAL_MS = 2000;
+    const deadline = Date.now() + DRAIN_CEILING_MS;
+
+    while (this.pendingRequests.size > 0 && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
+    }
+
+    if (this.pendingRequests.size > 0) {
+      console.warn(`[Worker] Drain ceiling reached — ${this.pendingRequests.size} request(s) still in-flight; force-killing`);
+      this.failAllPendingRequests(new Error('Worker shutdown — drain ceiling exceeded'));
+    } else {
+      console.log('[Worker] All in-flight requests completed — shutting down worker process');
+    }
+
     if (this.worker && !this.worker.killed) {
       this.worker.kill('SIGTERM');
       this.worker = null;
     }
-    // Reject all pending requests and clear the request/session bookkeeping.
-    this.failAllPendingRequests(new Error('Worker shutdown'));
   }
 
   /**
@@ -359,6 +377,9 @@ export class GenerateMarketingResponseWorkerService {
     params: GenerateMarketingResponseParams,
     onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[]; suggestions?: string[] }) => void
   ): Promise<GenerateMarketingResponseResult> {
+    if (this.draining) {
+      throw new Error('Worker is draining — no new requests accepted');
+    }
     // Ensure worker is running
     await this.ensureWorker();
 

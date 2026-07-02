@@ -2382,6 +2382,31 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         );
       });
 
+      it('should list the missing field names when a required field resolves to empty', async () => {
+        // baseSchedule (default mock) has no `frequency`, so omitting scheduleFrequency
+        // in the request leaves effectiveScheduleFrequency undefined.
+        const mockReq = {
+          user: { userId: mockUserId },
+          params: { scheduleId: mockScheduleId },
+          body: {
+            scheduleName: 'Updated Schedule',
+            startingMessage: 'Updated message',
+          },
+        } as unknown as Request;
+
+        const mockRes = {
+          json: jest.fn(),
+          status: jest.fn().mockReturnThis(),
+        } as unknown as Response;
+
+        await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+        expect(mockRes.status).toHaveBeenCalledWith(400);
+        expect(mockRes.json).toHaveBeenCalledWith({
+          error: 'Missing required fields: scheduleFrequency',
+        });
+      });
+
       it('should reject updating schedule without email notifications (no variables)', async () => {
         mockScheduleDb.getScheduleById.mockResolvedValue({
           scheduleId: mockScheduleId,

@@ -65,6 +65,7 @@ const AVAILABLE_CONNECTED_ACCOUNTS = [
   { id: 'hubspot', label: 'HubSpot' },
   { id: 'attio', label: 'Attio' },
   { id: 'google_ads', label: 'Google Ads' },
+  { id: 'google_drive', label: 'Google Drive' },
 ];
 
 interface AvailableSkill {

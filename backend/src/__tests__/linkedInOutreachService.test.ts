@@ -605,6 +605,38 @@ describe('LinkedInOutreachService', () => {
       ).rejects.toThrow('Bad search request');
     });
 
+    // Regression: the unipile-node-sdk's RequestSender calls response.blob() (not
+    // response.json()) whenever Unipile's error response isn't application/json —
+    // e.g. a dead LinkedIn session surfaced as a plain-text/HTML body. Its
+    // UnsuccessfulRequestError.message is always ''. Before this fix, that combo
+    // fell through every extraction branch in handleError() and collapsed to the
+    // generic "Unknown error", which is exactly what was observed in production
+    // for session-drop failures ("Unknown error" with no actionable detail).
+    it('surfaces the raw response text instead of "Unknown error" when Unipile returns a non-JSON error body', async () => {
+      const blobBody = new Blob(['No client session'], { type: 'text/plain' });
+      const apiError = Object.assign(new Error(''), { body: blobBody });
+      (mockUnipileClient.request.send as jest.Mock).mockRejectedValueOnce(apiError);
+
+      const thrown = await linkedInOutreachService
+        .searchPeople('account-123', { keywords: 'cto' })
+        .catch((e) => e);
+
+      expect(thrown.message).toBe('No client session');
+      expect(thrown.message).not.toBe('Unknown error');
+    });
+
+    it('falls back to "Unknown error" when the non-JSON error body is empty', async () => {
+      const blobBody = new Blob([''], { type: 'text/plain' });
+      const apiError = Object.assign(new Error(''), { body: blobBody });
+      (mockUnipileClient.request.send as jest.Mock).mockRejectedValueOnce(apiError);
+
+      const thrown = await linkedInOutreachService
+        .searchPeople('account-123', { keywords: 'cto' })
+        .catch((e) => e);
+
+      expect(thrown.message).toBe('Unknown error');
+    });
+
     // ─── Stage 2: ID-based filters + auto-resolve free-text via UnipileSearchParamService
     describe('id-based filters and auto-resolve', () => {
       const {
