@@ -49,14 +49,14 @@ describe('AgentModeService - Generation model validation (ENG-46)', () => {
     expect(result.fellBack).toBe(false);
   });
 
-  it('falls back to the default model for a removed/invalid id instead of throwing', () => {
+  it('falls back to the default model for a removed/invalid id instead of throwing', async () => {
     // 'gpt-5.1' was removed from the allow-list — the smoke-test config still pins it.
     const result = agentModeService.resolveGenerationModel('gpt-5.1');
     expect(result.fellBack).toBe(true);
     expect(result.model).toBe(agentModeService.default_model);
     expect(result.requestedModel).toBe('gpt-5.1');
     // The fallback target must itself be a valid, servable model.
-    expect(agentModeService.getSupportedModels(true)).resolves.toContain(result.model);
+    await expect(agentModeService.getSupportedModels(true)).resolves.toContain(result.model);
   });
 
   it('falls back to the default model for an undefined/empty model id', () => {
@@ -67,5 +67,69 @@ describe('AgentModeService - Generation model validation (ENG-46)', () => {
     const resultEmpty = agentModeService.resolveGenerationModel('');
     expect(resultEmpty.fellBack).toBe(true);
     expect(resultEmpty.model).toBe(agentModeService.default_model);
+  });
+
+  it('does not treat inherited Object.prototype keys as valid models', () => {
+    // Without a hasOwnProperty guard, 'constructor'/'toString' would resolve
+    // truthily off the prototype chain and masquerade as a valid allow-list id.
+    for (const protoKey of ['constructor', 'toString', 'hasOwnProperty', '__proto__']) {
+      const result = agentModeService.resolveGenerationModel(protoKey);
+      expect(result.fellBack).toBe(true);
+      expect(result.model).not.toBe(protoKey);
+      // The fallback target must itself be a real, servable model.
+      expect(Object.prototype.hasOwnProperty.call((agentModeService as any).llmModels, result.model)).toBe(true);
+    }
+  });
+
+  it('falls back to a known-good model when the configured default is itself unavailable', () => {
+    // Simulate a stale AZURE_OPENAI_DEPLOYMENT_AGENT_MODE pinning a retired id.
+    agentModeService.default_model = 'gpt-retired-does-not-exist';
+    const result = agentModeService.resolveGenerationModel('gpt-5.1');
+    expect(result.fellBack).toBe(true);
+    // Must NOT return the invalid default (which would re-throw inside callLLM)…
+    expect(result.model).not.toBe('gpt-retired-does-not-exist');
+    // …and must return a real, servable model instead.
+    expect(Object.prototype.hasOwnProperty.call((agentModeService as any).llmModels, result.model)).toBe(true);
+  });
+
+  it('routes an invalid model through up-front resolution in generateMarketingResponse (no opaque "Unknown Error")', async () => {
+    // Capture the REAL resolver before spying so we can assert the genuine fallback.
+    const realResolve = agentModeService.resolveGenerationModel.bind(agentModeService);
+    let captured: { model: string; fellBack: boolean; requestedModel: string } | undefined;
+    const resolveSpy = jest
+      .spyOn(agentModeService, 'resolveGenerationModel')
+      .mockImplementation((m: string) => {
+        captured = realResolve(m);
+        // Halt right after the up-front resolution so we exercise generateMarketingResponse's
+        // changed call path without driving the full generation engine (which would spawn
+        // unmockable downstream work). callLLM is never reached with the invalid id.
+        throw new Error('STOP_AFTER_RESOLVE');
+      });
+
+    let thrown: any;
+    try {
+      await agentModeService.generateMarketingResponse(
+        'edit my landing page',
+        [],
+        'user-1',
+        'gpt-5.1',
+        'session-1',
+        true
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    // generateMarketingResponse must route the requested id through resolveGenerationModel…
+    expect(resolveSpy).toHaveBeenCalledWith('gpt-5.1');
+    // …and the removed id must resolve to a valid fallback rather than reaching callLLM.
+    expect(captured).toBeDefined();
+    expect(captured!.fellBack).toBe(true);
+    expect(captured!.model).not.toBe('gpt-5.1');
+    expect(Object.prototype.hasOwnProperty.call((agentModeService as any).llmModels, captured!.model)).toBe(true);
+    // The failure is our controlled halt — NOT an opaque "Invalid model 'gpt-5.1'" from callLLM.
+    const rawMessage = thrown?.originalMessage || thrown?.message || '';
+    expect(rawMessage).toBe('STOP_AFTER_RESOLVE');
+    expect(rawMessage).not.toMatch(/Invalid model/i);
   });
 });
