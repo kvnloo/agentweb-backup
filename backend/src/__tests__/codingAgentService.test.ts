@@ -2145,4 +2145,37 @@ describe('runCodingAgent — preview-branch reset resilience', () => {
     // Did NOT try to create the branch for a non-missing-ref error.
     expect(mockedAxios.post).not.toHaveBeenCalled();
   });
+
+  test('surfaces the real GitHub detail when reading the main ref fails (GET rejects)', async () => {
+    // GET main ref fails outright → the catch must surface the actual GitHub
+    // detail, not a bare status code (codingAgentService.ts GET catch).
+    mockedAxios.get.mockRejectedValueOnce(githubAxiosError(500, { message: 'Service Unavailable' }));
+
+    const result = await runCodingAgent('swap the logo image', previewContext);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('Service Unavailable');
+    expect(result.message).not.toBe('Request failed with status code 500');
+    // Never got far enough to update or create the branch.
+    expect(mockedAxios.patch).not.toHaveBeenCalled();
+    expect(mockedAxios.post).not.toHaveBeenCalled();
+  });
+
+  test('surfaces the real GitHub detail when creating the branch fails (POST rejects after missing-ref fallthrough)', async () => {
+    // main ref read OK, PATCH fails with a missing-ref 422 (falls through to
+    // create), but the POST create itself fails → surface the POST detail, not
+    // a bare status code (codingAgentService.ts POST catch).
+    mockedAxios.get.mockResolvedValueOnce({ data: { object: { sha: 'main-sha-abc' } } } as any);
+    mockedAxios.patch.mockRejectedValueOnce(githubAxiosError(422, { message: 'Reference does not exist' }));
+    mockedAxios.post.mockRejectedValueOnce(
+      githubAxiosError(422, { message: 'Validation Failed', errors: [{ message: 'Reference already exists' }] }),
+    );
+
+    const result = await runCodingAgent('swap the logo image', previewContext);
+
+    expect(mockedAxios.post).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('Reference already exists');
+    expect(result.message).not.toBe('Request failed with status code 422');
+  });
 });
