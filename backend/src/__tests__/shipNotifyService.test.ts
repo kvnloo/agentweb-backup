@@ -15,7 +15,7 @@ jest.mock('../services/db', () => ({
   orgDb: { getOrgById: jest.fn() },
 }));
 jest.mock('../services/settingsService', () => ({
-  settingsService: { getSetting: jest.fn(), setSetting: jest.fn() },
+  settingsService: { claimSetMember: jest.fn(), releaseSetMember: jest.fn() },
 }));
 jest.mock('../services/slackService', () => {
   const actual = jest.requireActual('../services/slackService');
@@ -41,8 +41,8 @@ const base = {
 
 beforeEach(() => {
   jest.clearAllMocks();
-  settingsService.getSetting.mockResolvedValue(null);
-  settingsService.setSetting.mockResolvedValue({});
+  settingsService.claimSetMember.mockResolvedValue(true);
+  settingsService.releaseSetMember.mockResolvedValue(undefined);
   postSlackMessage.mockResolvedValue({ ts: '1', channel: 'C1' });
 });
 
@@ -63,7 +63,7 @@ describe('notifyReporterShipped — recipient resolution', () => {
     userDb.getUserByEmail.mockResolvedValue({ userId: 'u1' });
     await expect(notifyReporterShipped(base)).resolves.toBe('no_channel');
     expect(postSlackMessage).not.toHaveBeenCalled();
-    expect(settingsService.setSetting).not.toHaveBeenCalled();
+    expect(settingsService.claimSetMember).not.toHaveBeenCalled();
   });
 
   it('legacy singular slackChannel is honored', async () => {
@@ -81,7 +81,7 @@ describe('notifyReporterShipped — recipient resolution', () => {
 });
 
 describe('notifyReporterShipped — sending', () => {
-  it('multiple channels -> ONE post to the FIRST channel, with title + link, marker recorded', async () => {
+  it('multiple channels -> ONE post to the FIRST channel, with title + link, claim taken first', async () => {
     userDb.getUserByEmail.mockResolvedValue({ userId: 'u1', slackChannels: ['C1', 'C2'] });
     await expect(notifyReporterShipped(base)).resolves.toBe('sent');
     expect(postSlackMessage).toHaveBeenCalledTimes(1);
@@ -89,10 +89,30 @@ describe('notifyReporterShipped — sending', () => {
     expect(channel).toBe('C1');
     expect(text).toContain('Dark mode');
     expect(text).toContain('https://fb/p/dark');
-    expect(settingsService.setSetting).toHaveBeenCalledWith(
-      'ship-notify:post-1',
-      expect.stringContaining('u@e.com'),
-    );
+    expect(settingsService.claimSetMember).toHaveBeenCalledWith('ship-notify:post-1', 'u@e.com');
+    expect(settingsService.releaseSetMember).not.toHaveBeenCalled();
+  });
+
+  it('escapes Slack control chars in user-generated titles (no @channel/link smuggling)', async () => {
+    userDb.getUserByEmail.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
+    await notifyReporterShipped({
+      ...base,
+      title: '<!channel> URGENT & reset at <https://evil.example|account.security>',
+    });
+    const text = postSlackMessage.mock.calls[0][1];
+    expect(text).not.toMatch(/<!channel>/);
+    expect(text).not.toMatch(/<https:\/\/evil/);
+    expect(text).toContain('&lt;!channel&gt;');
+    expect(text).toContain('&amp;');
+  });
+
+  it('drops URLs that are not plain http(s) (no control chars into the message)', async () => {
+    userDb.getUserByEmail.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
+    await notifyReporterShipped({ ...base, url: 'https://x.example/a|evil<label>' });
+    const text = postSlackMessage.mock.calls[0][1];
+    expect(text).not.toContain('evil');
+    await notifyReporterShipped({ ...base, itemId: 'post-2', url: 'javascript:alert(1)' });
+    expect(postSlackMessage.mock.calls[1][1]).not.toContain('javascript:');
   });
 
   it('feature_request vs bug wording', async () => {
@@ -112,27 +132,21 @@ describe('notifyReporterShipped — sending', () => {
   });
 });
 
-describe('notifyReporterShipped — idempotency', () => {
-  it('already notified for this item -> already_sent, no repost', async () => {
+describe('notifyReporterShipped — idempotency (atomic claim)', () => {
+  it('claim lost (already notified / concurrent winner) -> already_sent, no repost', async () => {
     userDb.getUserByEmail.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
-    settingsService.getSetting.mockResolvedValue({
-      settingName: 'ship-notify:post-1',
-      settingValue: JSON.stringify(['u@e.com']),
-    });
+    settingsService.claimSetMember.mockResolvedValue(false);
     await expect(notifyReporterShipped(base)).resolves.toBe('already_sent');
     expect(postSlackMessage).not.toHaveBeenCalled();
+    expect(settingsService.releaseSetMember).not.toHaveBeenCalled();
   });
 
-  it('marker for a DIFFERENT reporter of the same item does not block this one', async () => {
+  it('claim is scoped per item × reporter (key + member)', async () => {
     userDb.getUserByEmail.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
-    settingsService.getSetting.mockResolvedValue({
-      settingName: 'ship-notify:post-1',
-      settingValue: JSON.stringify(['other@e.com']),
-    });
-    await expect(notifyReporterShipped(base)).resolves.toBe('sent');
-    // marker now holds both reporters
-    const stored = JSON.parse(settingsService.setSetting.mock.calls[0][1]);
-    expect(stored.sort()).toEqual(['other@e.com', 'u@e.com']);
+    await notifyReporterShipped(base);
+    await notifyReporterShipped({ ...base, itemId: 'issue-9', kind: 'bug' });
+    expect(settingsService.claimSetMember).toHaveBeenNthCalledWith(1, 'ship-notify:post-1', 'u@e.com');
+    expect(settingsService.claimSetMember).toHaveBeenNthCalledWith(2, 'ship-notify:issue-9', 'u@e.com');
   });
 });
 
@@ -176,11 +190,11 @@ describe('notifyPostShippedRecipients — feature-request fan-out', () => {
 });
 
 describe('notifyReporterShipped — never throws (AC6)', () => {
-  it('Slack API failure -> failed, no marker recorded', async () => {
+  it('Slack API failure -> failed, claim released so a delivery retry can re-send', async () => {
     userDb.getUserByEmail.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
     postSlackMessage.mockRejectedValueOnce(new Error('slack down'));
     await expect(notifyReporterShipped(base)).resolves.toBe('failed');
-    expect(settingsService.setSetting).not.toHaveBeenCalled();
+    expect(settingsService.releaseSetMember).toHaveBeenCalledWith('ship-notify:post-1', 'u@e.com');
   });
 
   it('user lookup throwing -> failed, never throws', async () => {
@@ -189,10 +203,17 @@ describe('notifyReporterShipped — never throws (AC6)', () => {
     expect(postSlackMessage).not.toHaveBeenCalled();
   });
 
-  it('marker write failure after a successful post -> still reports sent (post already happened)', async () => {
+  it('claim service failure -> failed, no Slack post (safe: no ping beats a maybe-duplicate)', async () => {
     userDb.getUserByEmail.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
-    settingsService.setSetting.mockRejectedValueOnce(new Error('settings down'));
-    await expect(notifyReporterShipped(base)).resolves.toBe('sent');
-    expect(postSlackMessage).toHaveBeenCalledTimes(1);
+    settingsService.claimSetMember.mockRejectedValueOnce(new Error('settings down'));
+    await expect(notifyReporterShipped(base)).resolves.toBe('failed');
+    expect(postSlackMessage).not.toHaveBeenCalled();
+  });
+
+  it('release failure after a Slack failure -> still failed, never throws', async () => {
+    userDb.getUserByEmail.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
+    postSlackMessage.mockRejectedValueOnce(new Error('slack down'));
+    settingsService.releaseSetMember.mockRejectedValueOnce(new Error('settings down'));
+    await expect(notifyReporterShipped(base)).resolves.toBe('failed');
   });
 });

@@ -109,16 +109,27 @@ describe('POST /api/integrations/featurebase/webhook — gating + auth', () => {
 });
 
 describe('POST /api/integrations/featurebase/webhook — event filtering', () => {
-  it('post.updated with a status change to completed -> notifies author + voters', async () => {
+  it('post.updated with a status change to completed -> 200 immediately, fan-out detached', async () => {
     const res = await post(completedEvent());
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ ok: true, notified: 1 });
+    // Responds `accepted` without awaiting the fan-out — a slow fan-out must not push
+    // the delivery past Featurebase's timeout (its retry would double-ping).
+    expect(res.body).toEqual({ ok: true, accepted: true });
     expect(shipNotify.notifyPostShippedRecipients).toHaveBeenCalledWith({
       postId: 'post-1',
       title: 'Dark mode',
       url: 'https://fb/p/dark',
       authorEmail: 'u@e.com',
     });
+  });
+
+  it('fan-out rejecting after the response does not crash the process (backstop catch)', async () => {
+    shipNotify.notifyPostShippedRecipients.mockRejectedValueOnce(new Error('unexpected'));
+    const res = await post(completedEvent());
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, accepted: true });
+    // let the detached rejection settle through the catch
+    await new Promise((r) => setImmediate(r));
   });
 
   it('post.updated WITHOUT a status field change -> no-op (title edit on a completed post)', async () => {

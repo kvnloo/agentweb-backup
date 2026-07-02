@@ -11,11 +11,11 @@
  * org-owner resolution Emma's Slack tools use (getEffectiveAllowedChannels) — the
  * channel the portal's Get Support modal calls "your Slack channel".
  *
- * Idempotency: an AW-Settings marker per item listing already-notified reporter
- * emails, so a re-completed item or a duplicate webhook delivery doesn't re-ping.
- * A concurrent duplicate delivery can race past the marker read; accepted for a
- * notification. A failed send records no marker, so Featurebase's delivery retry
- * gets another chance.
+ * Idempotency: an atomic per-item claim (DynamoDB string-set ADD via
+ * settingsService.claimSetMember) taken BEFORE the send, so concurrent or replayed
+ * webhook deliveries produce exactly one ping per item × reporter. A failed send
+ * releases the claim, so a delivery retry gets another chance; a failed release
+ * costs a missed ping, never a duplicate — email still lands either way.
  */
 import { getEffectiveAllowedChannels, postSlackMessage } from './slackService';
 import { userDb } from './db';
@@ -25,7 +25,7 @@ export type ShipNotifyOutcome = 'sent' | 'no_user' | 'opted_out' | 'no_channel' 
 
 export interface ShipNotifyParams {
   email: string;
-  /** Unique id of the shipped item (Featurebase post id / Linear canonical uuid) — scopes the idempotency marker. */
+  /** Unique id of the shipped item (Featurebase post id / Linear canonical uuid) — scopes the idempotency claim. */
   itemId: string;
   title: string;
   url?: string;
@@ -34,16 +34,15 @@ export interface ShipNotifyParams {
 
 const markerKey = (itemId: string) => `ship-notify:${itemId}`;
 
-async function readNotifiedMarker(itemId: string): Promise<string[]> {
-  const setting = await settingsService.getSetting(markerKey(itemId));
-  if (!setting?.settingValue) return [];
-  try {
-    const arr = JSON.parse(setting.settingValue);
-    return Array.isArray(arr) ? arr.filter((x): x is string => typeof x === 'string') : [];
-  } catch {
-    return [];
-  }
-}
+/**
+ * Titles are user-generated (anyone can author a public Featurebase post) — escape
+ * Slack's control characters so a title can't smuggle <!channel>/<!here> broadcasts
+ * or <url|label> disguised links into a customer's channel.
+ */
+const escapeSlackText = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/** Only plain http(s) URLs with no Slack control chars make it into the message. */
+const safeUrl = (url?: string) => (url && /^https?:\/\/[^\s<>|]+$/.test(url) ? url : undefined);
 
 export async function notifyReporterShipped(p: ShipNotifyParams): Promise<ShipNotifyOutcome> {
   try {
@@ -54,22 +53,30 @@ export async function notifyReporterShipped(p: ShipNotifyParams): Promise<ShipNo
     const channels = await getEffectiveAllowedChannels(user);
     if (channels.length === 0) return 'no_channel';
 
-    const notified = await readNotifiedMarker(p.itemId);
-    if (notified.includes(p.email)) return 'already_sent';
+    // Claim BEFORE the send: exactly one winner per item × reporter, even across
+    // concurrent deliveries / replays. Losing the claim means someone else sent it.
+    const claimed = await settingsService.claimSetMember(markerKey(p.itemId), p.email);
+    if (!claimed) return 'already_sent';
 
+    const title = escapeSlackText(p.title);
+    const url = safeUrl(p.url);
     const text =
       p.kind === 'feature_request'
-        ? `🎉 Shipped: *${p.title}*\nA feature you requested is now live.${p.url ? `\n${p.url}` : ''}`
-        : `✅ Resolved: *${p.title}*\nAn issue you reported has been fixed — thanks for flagging it.${p.url ? `\n${p.url}` : ''}`;
+        ? `🎉 Shipped: *${title}*\nA feature you requested is now live.${url ? `\n${url}` : ''}`
+        : `✅ Resolved: *${title}*\nAn issue you reported has been fixed — thanks for flagging it.${url ? `\n${url}` : ''}`;
 
-    await postSlackMessage(channels[0], text);
-
-    // Marker write is best-effort: the message is already out, so a failure here must
-    // not turn a delivered notification into a reported error.
     try {
-      await settingsService.setSetting(markerKey(p.itemId), JSON.stringify([...notified, p.email]));
+      await postSlackMessage(channels[0], text);
     } catch (e) {
-      console.warn('[ship-notify] marker write failed:', e instanceof Error ? e.message : e);
+      console.warn(`[ship-notify] Slack post to ${channels[0]} for ${p.email} failed:`, e instanceof Error ? e.message : e);
+      // Release the claim so a delivery retry can re-attempt. Release failing too just
+      // costs a missed ping (never a duplicate) — the email baseline is unaffected.
+      try {
+        await settingsService.releaseSetMember(markerKey(p.itemId), p.email);
+      } catch (re) {
+        console.warn('[ship-notify] claim release failed:', re instanceof Error ? re.message : re);
+      }
+      return 'failed';
     }
     return 'sent';
   } catch (e) {
@@ -82,8 +89,8 @@ export async function notifyReporterShipped(p: ShipNotifyParams): Promise<ShipNo
  * Notify everyone who asked for a feature-request post: the author plus its voters
  * (dedup stacks additional reporters as voters at intake). The webhook payload may
  * omit author.email / postUrl, so gaps are filled from the Featurebase API. Voter
- * fetch failure degrades to author-only. Never throws — the webhook handler must
- * always be able to 200.
+ * fetch failure degrades to author-only. Never throws — the webhook handler
+ * fire-and-forgets this and must always be able to 200 immediately.
  */
 export async function notifyPostShippedRecipients(p: {
   postId: string;

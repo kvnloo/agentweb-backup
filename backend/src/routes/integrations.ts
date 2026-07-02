@@ -93,13 +93,18 @@ router.post('/featurebase/webhook', async (req, res) => {
     if (!completed) return res.json({ ok: true, notified: 0 });
 
     const { notifyPostShippedRecipients } = await import('../services/shipNotifyService');
-    const r = await notifyPostShippedRecipients({
+    // Respond 200 immediately and fan out detached: per-recipient Dynamo + Slack calls
+    // (rate-limited ~1 msg/sec/channel) can outlast Featurebase's delivery timeout, and
+    // a timed-out delivery is retried CONCURRENTLY — the exact duplicate-ping scenario
+    // the idempotency claim exists to prevent. notifyPostShippedRecipients never throws;
+    // the catch is a backstop against unhandled rejections.
+    notifyPostShippedRecipients({
       postId: item.id,
       title: item.title || 'your request',
       url: item.postUrl || item.url,
       authorEmail: item.author?.email,
-    });
-    return res.json({ ok: true, notified: r.sent });
+    }).catch((e) => console.error('[featurebase-webhook] fan-out error:', e instanceof Error ? e.message : e));
+    return res.json({ ok: true, accepted: true });
   } catch (e) {
     // Return 200 so Featurebase doesn't retry-storm / auto-suspend the webhook on our own errors.
     console.error('[featurebase-webhook] error:', e instanceof Error ? e.message : e);
