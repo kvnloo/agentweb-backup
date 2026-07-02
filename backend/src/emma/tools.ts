@@ -4496,6 +4496,9 @@ emmaToolRegistry.register({
         ctaUrl: args.cta_url,
         audioUrl: args.audio_url,
         audioVolume: args.audio_volume,
+        // Runtime budget (not a model arg): the run's media-gen deadline, so a long render
+        // hands off before the run's hard wall-clock timeout instead of being killed (ENG-123).
+        renderDeadlineMs: context?.renderDeadlineMs,
       },
       args.clip_duration_seconds,
       args.target_duration_seconds,
