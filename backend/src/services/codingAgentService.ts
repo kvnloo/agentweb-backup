@@ -222,11 +222,17 @@ export function _isMissingGithubRefError(error: any): boolean {
 /**
  * How many commits the reusable preview branch is ahead of main — i.e. how many
  * unpublished coding_agent edits currently sit on draft/agentweb-preview. Uses
- * GitHub's compare API (base...head). Returns 0 when the branch is absent (404),
- * identical to / behind main, or when the comparison can't be read — in all of
- * those cases resetting the branch to main is safe (nothing to lose). Only a
- * positive result means "there is unpublished work here, do not reset."
- * Exported for tests.
+ * GitHub's compare API (base...head). Returns 0 ONLY when the branch is absent
+ * (404) or is genuinely identical to / behind main — the cases where resetting
+ * the branch to main loses nothing. A positive result means "there is unpublished
+ * work here, do not reset."
+ *
+ * On any OTHER error (5xx / timeout / rate-limit / unparseable body) we fail
+ * CLOSED: return a positive count so the caller skips the reset (ENG-176). A
+ * transient compare failure must never be read as "0 ahead → safe to force-reset",
+ * because that would silently discard genuine unpublished edits — the exact
+ * clobber this guard exists to prevent. At worst the new edit builds on a slightly
+ * stale branch, which is recoverable; a destroyed edit is not. Exported for tests.
  */
 export async function _previewBranchCommitsAheadOfMain(
   repoBase: string,
@@ -241,15 +247,19 @@ export async function _previewBranchCommitsAheadOfMain(
     return typeof aheadBy === 'number' && aheadBy > 0 ? aheadBy : 0;
   } catch (error) {
     // 404 = preview branch doesn't exist yet → nothing unpublished, reset/create
-    // as usual. Any other error → fail open to the existing reset behavior rather
-    // than blocking the edit; a transient compare failure must not wedge edits.
-    if (!_isMissingGithubRefError(error)) {
-      console.warn(
-        '[CODING AGENT] Could not compare preview branch to main; proceeding with reset:',
-        error instanceof Error ? error.message : error,
-      );
+    // as usual (fail open — creating a fresh branch loses nothing).
+    if (_isMissingGithubRefError(error)) {
+      return 0;
     }
-    return 0;
+    // Any other error (5xx / timeout / rate-limit) → fail CLOSED: treat the branch
+    // as ahead so the caller skips the reset and layers on top, rather than
+    // force-resetting to main and destroying unpublished work on a transient hiccup.
+    console.warn(
+      '[CODING AGENT] Could not compare preview branch to main; assuming unpublished ' +
+        'commits exist and skipping reset to avoid clobbering them (ENG-176):',
+      error instanceof Error ? error.message : error,
+    );
+    return 1;
   }
 }
 
