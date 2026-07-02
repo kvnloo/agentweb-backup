@@ -20,7 +20,9 @@
 import { dynamodb } from '../config/aws';
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
-const TABLE_NAME = `${TABLE_PREFIX}AW-ContactEvents`;
+export const CONTACT_EVENTS_TABLE = `${TABLE_PREFIX}AW-ContactEvents`;
+export const CONTACT_EVENTS_SOURCE_RECORD_INDEX = 'sourceRecordId-index';
+const TABLE_NAME = CONTACT_EVENTS_TABLE;
 
 export type ContactEventSource =
   | 'signup'
@@ -167,7 +169,7 @@ class ContactEventsDb {
     const result = await dynamodb
       .query({
         TableName: TABLE_NAME,
-        IndexName: 'sourceRecordId-index',
+        IndexName: CONTACT_EVENTS_SOURCE_RECORD_INDEX,
         KeyConditionExpression: 'sourceRecordId = :sri',
         ExpressionAttributeValues: { ':sri': sourceRecordId },
         Limit: 1,
