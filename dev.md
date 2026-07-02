@@ -13,6 +13,13 @@ First slice of the ENG-9 "route LLM calls via OpenRouter" migration: an OpenAI-c
 ### What this unlocks (no further code needed)
 Every settings-driven model getter (`agent_mode_dedup_judge_model`, coding agent, content agent, reports, scheduled chats, …) validates against `llmModels` — pointing any of them at an OpenRouter slug routes that feature through the gateway. The two TODO(ENG-9) comments (dedup judge) are satisfied and updated.
 
+### Adversarial review findings (all fixed pre-PR, same branch)
+A 3-lens adversarial review (correctness / security / hidden-consumer blast radius) of the diff found real issues, fixed before the PR opened:
+- **`adminOnly` was decorative at the point of use.** It was only a `getSupportedModels()` display filter; `/generate` takes `llmModel` straight from the request body, `updateSessionLlmModel` only blocked the `opus` substring, and `updateSharedSessionLlmModel` (reachable by UNAUTHENTICATED share-link visitors) likewise. Any user could route to the org's OpenRouter key. Fixed with `agentModeService.isModelRestrictedForUser()` enforced at all three boundaries (opus substring checks preserved unchanged). Pre-existing gap (opus-4-6-v1 was equally decorative) — now closed for the whole adminOnly set.
+- **`llmPricing.ts` coverage guard was red** — the price book's "every registry id has an entry" CI test failed on the 5 slugs, and shadow metering would have recorded all OpenRouter cost as $0. Entries added (same gateway rates as estimateCost). Lesson: `npx jest agentModeService` alone misses the price-book guard; run `llmPricing` too when touching the registry.
+- **Two non-callLLM consumers would mis-handle slugs:** `codingAgentService` has its own provider dispatch (no OpenRouter branch) — a slug configured as coding-agent model passed validation then hard-failed every run; `getCodingAgentDefaultModel` now rejects slugs to the safe fallback. The chatbot's substring dispatch would mis-route all three slug families (incl. embedding "/" in the Azure deployment URL path); `generateChatResponse` now fails fast with a clear error for "/" models.
+- Noted, not fixed (pre-existing classes, fail safe): work-plan default model validated as non-admin silently discards adminOnly picks; `agent_mode_vision_model` set to a slug via raw settings API would skip the S3→data-URI conversion (UI picker filters on supportsVision so it can't select slugs).
+
 ### Not done yet (rest of ENG-9)
 - BYOK provider keys (Azure/GCP/AWS) into the OpenRouter dashboard — needs Harsha (dashboard-only).
 - Deprecating the four direct provider paths — only after OpenRouter has real traffic + credits; the subtraction is the point of ENG-9, this slice is the enabler.
