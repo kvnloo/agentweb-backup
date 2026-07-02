@@ -1,6 +1,3 @@
-import axios from 'axios';
-import { getSecret } from '../utils/secretsManager';
-
 jest.mock('@slack/web-api', () => ({
   WebClient: jest.fn().mockImplementation(() => ({
     chat: { postMessage: jest.fn() },
@@ -10,11 +7,6 @@ jest.mock('@slack/web-api', () => ({
 }));
 
 import { AgentModeService } from '../services/agentModeService';
-
-jest.mock('axios', () => ({
-  get: jest.fn(),
-  post: jest.fn(),
-}));
 
 jest.mock('@google/generative-ai', () => ({
   GoogleGenerativeAI: jest.fn().mockImplementation(() => ({})),
@@ -28,9 +20,6 @@ jest.mock('../utils/s3Utils', () => ({
 jest.mock('../utils/secretsManager', () => ({
   getSecret: jest.fn(),
 }));
-
-void axios;
-void getSecret;
 
 /**
  * ENG-43: Research / external-lookup tool calls time out and abandon the goal
@@ -106,5 +95,69 @@ describe('formatToolError — research/external-lookup timeout graceful degradat
     const result = (svc as any).formatToolError('perform_data_analysis', 'timeout of 1200000ms exceeded');
     expect(result).toContain('smaller pieces');
     expect(result).not.toMatch(/alternate search|google_search_web/i);
+  });
+});
+
+/**
+ * ENG-43 (session 74bb2c5d): a LinkedIn public-profile lookup (linkedin_outreach
+ * get-profile via Unipile) that hits a "processing timeout" abandoned the goal with a
+ * blanket retry prompt. Per the manager-confirmed high finding, linkedin_outreach is now
+ * part of RESEARCH_LOOKUP_TOOLS, so its timeouts degrade through the SAME graceful branch:
+ * keep partial results, retry once, and fall back to a public web-search provider —
+ * NOT the opaque "adjust the plan / ask the user" fallback.
+ */
+describe('formatToolError — LinkedIn public-profile lookup timeout graceful degradation (ENG-43)', () => {
+  let svc: AgentModeService;
+  let consoleErrorSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    svc = new AgentModeService();
+    consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+  });
+
+  afterEach(() => {
+    consoleErrorSpy.mockRestore();
+  });
+
+  const TIMEOUT_MESSAGES = [
+    'processing timeout',
+    'timeout of 120000ms exceeded',
+    'The request timed out',
+    'ETIMEDOUT',
+    'socket hang up',
+    'Request failed with status code 504',
+  ];
+
+  it.each(TIMEOUT_MESSAGES)(
+    'degrades gracefully (partial results + web-search fallback) when linkedin_outreach times out with "%s"',
+    (message) => {
+      const result = (svc as any).formatToolError('linkedin_outreach', message);
+      // Routed through the research/lookup degradation branch: keep partial results,
+      // retry once, and fall back to an alternate public web-search provider.
+      expect(result).toMatch(/partial/i);
+      expect(result).toMatch(/retry/i);
+      expect(result).toMatch(/fall ?back|alternate/i);
+      expect(result).toMatch(/you_search_web|google_search_web/i);
+      // Must NOT be the opaque default fallback.
+      expect(result).not.toContain('Adjust the plan or ask the user for missing info');
+    }
+  );
+
+  it('degrades a skill-prefixed linkedin_outreach tool name on timeout', () => {
+    const result = (svc as any).formatToolError('some_skill_linkedin_outreach', 'processing timeout');
+    expect(result).toMatch(/fall ?back|alternate/i);
+    expect(result).not.toContain('Adjust the plan or ask the user for missing info');
+  });
+
+  it('does NOT hijack the linkedin_outreach "message too long" branch', () => {
+    // The invite-too-long branch must still fire for non-timeout failures.
+    const result = (svc as any).formatToolError('linkedin_outreach', 'Invitation message too long');
+    expect(result).toContain("LinkedIn's per-account character limit");
+    expect(result).not.toMatch(/Research\/Lookup Timeout/i);
+  });
+
+  it('does NOT degrade non-timeout linkedin_outreach failures', () => {
+    const result = (svc as any).formatToolError('linkedin_outreach', 'Invalid recipient profile URL');
+    expect(result).not.toMatch(/Research\/Lookup Timeout|fall ?back/i);
   });
 });
