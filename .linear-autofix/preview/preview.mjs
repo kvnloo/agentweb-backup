@@ -131,8 +131,10 @@ async function up(bugRaw, worktreeRaw) {
       env.VITE_API_URL = stripSlash(urls.api);
       // `npx vite build` (not `npm run build`) so a portal build script's `tsc &&` prefix can't
       // block the preview; the deterministic tsc check in autofix.mjs covers type errors.
-      console.log(`[preview] building ${svc.name} (one-time, no watchers)...`);
-      const b = spawnSync('npx', ['vite', 'build'], { cwd, env, stdio: ['ignore', out, out] });
+      // flock serializes heavy builds MACHINE-WIDE (same lock as autofix's checks): concurrent
+      // vite builds + a verify browser saturated the 4-vCPU runner to the point sshd starved.
+      console.log(`[preview] building ${svc.name} (one-time, no watchers; queued on the build lock)...`);
+      const b = spawnSync('flock', ['/tmp/aw-heavy-build.lock', 'npx', 'vite', 'build'], { cwd, env, stdio: ['ignore', out, out] });
       if (b.status !== 0) console.log(`[preview] WARNING: ${svc.name} build failed — check ${LOGS}/${bug}-${svc.name}.log`);
       cmd = 'npx'; args = ['vite', 'preview', '--port', String(port), '--strictPort'];
     }

@@ -566,9 +566,11 @@ export function runChecks(WT, changed) {
   for (const [pkg, files] of Object.entries(byPkg)) {
     const dir = path.join(WT, pkg);
     if (existsSync(path.join(dir, 'tsconfig.json'))) {
-      log(`Deterministic check: tsc --noEmit (${pkg})...`);
+      log(`Deterministic check: tsc --noEmit (${pkg}) — queued on the machine-wide build lock...`);
       const tsc = bin(dir, 'tsc');
-      const r = spawnSync(tsc.cmd, [...tsc.args, '--noEmit'], { cwd: dir, env, encoding: 'utf8', timeout: config.checks?.tscTimeoutMs || 300000 });
+      // Serialized with preview vite builds via the same lock: concurrent 4GB tsc + builds +
+      // a verify browser saturate the 4-vCPU runner (sshd starves). Timeout covers lock wait.
+      const r = spawnSync('flock', ['/tmp/aw-heavy-build.lock', tsc.cmd, ...tsc.args, '--noEmit'], { cwd: dir, env, encoding: 'utf8', timeout: (config.checks?.tscTimeoutMs || 300000) + 10 * 60 * 1000 });
       results.push(checkResult(`npx tsc --noEmit (${pkg})`, r));
     }
     if (pkg === 'backend') {
