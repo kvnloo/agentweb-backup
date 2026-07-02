@@ -6,12 +6,22 @@
 import jwt from 'jsonwebtoken';
 import { Agent, setGlobalDispatcher } from 'undici';
 
-// Extend Node's built-in fetch timeouts. The default undici headersTimeout (300s)
-// is too short for MCP tools that call slow endpoints (e.g. generate_landing_page
-// calls v0 API which can take 2-5 min).
+// Longest timeoutMs any MCP tool passes to mcpFetch (see generate_landing_page /
+// deploy_landing_page in apiTools.ts, which need headroom for v0 generation + GitHub +
+// Vercel deploy). Tools should import and use this constant rather than hardcoding their
+// own value, so the dispatcher timeouts below can never fall behind a per-call timeout.
+export const MCP_MAX_CALL_TIMEOUT_MS = 25 * 60 * 1000; // 25 minutes
+
+// Extend Node's built-in fetch timeouts. The default undici headersTimeout (300s) is too
+// short for MCP tools that call slow endpoints. These MUST stay strictly greater than
+// MCP_MAX_CALL_TIMEOUT_MS — otherwise undici kills the socket before mcpFetch's own
+// AbortController fires, and the caller sees a generic "TypeError: fetch failed" instead
+// of the intended timeout, even though the server-side handler keeps running to
+// completion (this is a same-process self-call).
+export const DISPATCHER_TIMEOUT_MS = MCP_MAX_CALL_TIMEOUT_MS + 5 * 60 * 1000; // 30 minutes
 setGlobalDispatcher(new Agent({
-  headersTimeout: 15 * 60 * 1000,  // 15 minutes
-  bodyTimeout: 15 * 60 * 1000,     // 15 minutes
+  headersTimeout: DISPATCHER_TIMEOUT_MS,
+  bodyTimeout: DISPATCHER_TIMEOUT_MS,
   connectTimeout: 30 * 1000,       // 30 seconds
 }));
 

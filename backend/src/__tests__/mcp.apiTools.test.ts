@@ -8,6 +8,7 @@ jest.mock('../mcp/server/httpClient', () => ({
   mcpFetch: jest.fn(),
   generateSelfCallToken: jest.fn().mockReturnValue('mock-token'),
   clearUserCache: jest.fn(),
+  MCP_MAX_CALL_TIMEOUT_MS: 25 * 60 * 1000,
 }));
 
 // Mock skillService and subscriptionService for install_skills/list_available_skills
@@ -718,6 +719,59 @@ describe('apiTools', () => {
       await expect(
         mcpToolRegistry.execute('get_account_status', {}, context)
       ).rejects.toThrow('API error (401): Unauthorized');
+    });
+  });
+
+  // ─── generate_landing_page / deploy_landing_page timeout regression ───
+  //
+  // Regression coverage for a bug where these tools passed a hardcoded 25-minute
+  // timeoutMs to mcpFetch while httpClient's underlying undici dispatcher was still
+  // capped at 15 minutes. The socket died before mcpFetch's AbortController did,
+  // surfacing as a generic "fetch failed" with no page ID ever returned — even though
+  // the server-side self-call handler kept running in the background. Both values must
+  // now come from the same exported constant so they cannot drift apart again.
+
+  describe('generate_landing_page', () => {
+    it('should pass a timeoutMs that matches MCP_MAX_CALL_TIMEOUT_MS (must stay below the dispatcher timeout in httpClient.ts)', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'page_1', url: 'https://example.vercel.app' });
+
+      await mcpToolRegistry.execute(
+        'generate_landing_page',
+        { prompt: 'A landing page for our new product', lead_list_id: 'list_1' },
+        context
+      );
+
+      expect(mockMcpFetch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          method: 'POST',
+          path: '/api/landing-pages/v0/generate',
+          timeoutMs: 25 * 60 * 1000,
+        })
+      );
+    });
+
+    it('should propagate a fetch failure without swallowing it (no page ID fabricated)', async () => {
+      mockMcpFetch.mockRejectedValue(new TypeError('fetch failed'));
+
+      await expect(
+        mcpToolRegistry.execute('generate_landing_page', { prompt: 'A landing page' }, context)
+      ).rejects.toThrow('fetch failed');
+    });
+  });
+
+  describe('deploy_landing_page', () => {
+    it('should pass a timeoutMs that matches MCP_MAX_CALL_TIMEOUT_MS', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'page_1', status: 'deployed' });
+
+      await mcpToolRegistry.execute('deploy_landing_page', { page_id: 'page_1' }, context);
+
+      expect(mockMcpFetch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          method: 'POST',
+          path: '/api/landing-pages/v0/generated/page_1/deploy',
+          timeoutMs: 25 * 60 * 1000,
+        })
+      );
     });
   });
 

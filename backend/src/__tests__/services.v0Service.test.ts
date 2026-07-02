@@ -666,6 +666,11 @@ describe("v0Service - findReusablePageForRoute (route-level idempotency, kills d
     expect(await findReusablePageForRoute("u1", "pricing")).toBeNull();
   });
 
+  it("does NOT crash on a FAILED page with no slug/name — a partial record left behind by a failed commit", async () => {
+    items(page({ status: "failed", slug: undefined, name: undefined }));
+    await expect(findReusablePageForRoute("u1", "pricing")).resolves.toBeNull();
+  });
+
   it("does NOT match a different route", async () => {
     items(page({ slug: "about", status: "deployed" }));
     expect(await findReusablePageForRoute("u1", "pricing")).toBeNull();
@@ -774,6 +779,27 @@ describe("v0Service - commitFilesToRepoMain (retry + rebase)", () => {
     mockAxiosGet.mockRejectedValue({ response: { status: 404, data: {} }, message: "Not Found" });
     await expect(commitFilesToRepoMain("o/r", {}, files, "msg")).rejects.toBeDefined();
     expect(mockAxiosGet).toHaveBeenCalledTimes(1); // one attempt, no retry
+  });
+
+  it("throws a clear, specific error when a write 404s because the repo is archived on GitHub", async () => {
+    // getMainSha succeeds (repo is real, readable) — then a write 404s. That combination
+    // is the signature of an archived repo: GitHub allows reads but blocks writes with a
+    // plain 404 instead of 403. The follow-up GET on the repo itself confirms archived=true.
+    mockAxiosGet
+      .mockResolvedValueOnce(ref) // getMainSha
+      .mockResolvedValueOnce({ data: { archived: true } }); // archived-check
+    mockAxiosPost.mockRejectedValue({ response: { status: 404, data: {} }, message: "Not Found" });
+
+    await expect(commitFilesToRepoMain("o/r", {}, files, "msg")).rejects.toThrow(/archived/i);
+  });
+
+  it("falls back to the original error when a write 404s but the repo is NOT archived", async () => {
+    mockAxiosGet
+      .mockResolvedValueOnce(ref)
+      .mockResolvedValueOnce({ data: { archived: false } });
+    mockAxiosPost.mockRejectedValue({ response: { status: 404, data: {} }, message: "Not Found" });
+
+    await expect(commitFilesToRepoMain("o/r", {}, files, "msg")).rejects.toMatchObject({ message: "Not Found" });
   });
 });
 
@@ -2396,6 +2422,43 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
 
     expect(result.status).toBe("failed");
     expect(result.errorMessage).toContain("timed out");
+  });
+
+  it("FAIL: Vercel project deleted (repeated 404) → fails fast with a clear error, not the full poll window", async () => {
+    setupSiteRecordMock();
+    await setupV0Mocks();
+    setupGitHubMocks();
+    // Every attempt 404s — a genuinely deleted/inaccessible project, not "still building".
+    // Only queue what the fail-fast fix actually consumes (2) — jest.clearAllMocks() in
+    // the global beforeEach clears call history but not queued *Once implementations,
+    // so leftover unconsumed entries here would leak into and break later tests.
+    mockAxiosGet
+      .mockRejectedValueOnce({ response: { status: 404, data: {} }, message: "Not Found" })
+      .mockRejectedValueOnce({ response: { status: 404, data: {} }, message: "Not Found" });
+    const callsBefore = mockAxiosGet.mock.calls.length;
+
+    const result = await generateLandingPage("user-1", "Create ABM page", "ABM Page", {});
+
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toContain("no longer exists");
+    // Fails fast on the confirmed-repeated 404 — must not burn through all 30 attempts.
+    const pollCalls = mockAxiosGet.mock.calls.length - callsBefore;
+    expect(pollCalls).toBeLessThan(5);
+  });
+
+  it("does NOT fail fast on a single, isolated 404 (tolerates a brief indexing delay on a new project)", async () => {
+    setupSiteRecordMock();
+    await setupV0Mocks();
+    setupGitHubMocks();
+    mockAxiosGet
+      .mockRejectedValueOnce({ response: { status: 404, data: {} }, message: "Not Found" }) // one-off blip
+      .mockResolvedValueOnce({
+        data: { deployments: [{ uid: "dpl_ok", readyState: "READY", meta: { githubCommitSha: "commit_sha" } }] },
+      });
+
+    const result = await generateLandingPage("user-1", "Create ABM page", "ABM Page", {});
+
+    expect(result.status).toBe("deployed");
   });
 
   it("SUCCESS: Vercel build succeeds → record status set to deployed", async () => {

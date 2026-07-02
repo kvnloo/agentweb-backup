@@ -13,8 +13,10 @@ import { paginatedQuery } from "../utils/dynamoPagination";
 import { guardedV0ChatCreate, guardedV0CorrectionMessage } from "./v0UsageGuard";
 import { enqueueAutoHumanEval } from "./autoHumanEvalService";
 
-// Note: global fetch (undici) timeouts are managed by httpClient.ts (15 min headersTimeout/bodyTimeout).
-// No setGlobalDispatcher call here — duplicate calls cause the last-loaded config to win unpredictably.
+// Note: global fetch (undici) timeouts are managed by httpClient.ts (kept above
+// MCP_MAX_CALL_TIMEOUT_MS so the socket never times out before mcpFetch's own
+// AbortController does). No setGlobalDispatcher call here — duplicate calls cause the
+// last-loaded config to win unpredictably.
 
 // Timeout constants for external API calls
 const GITHUB_API_TIMEOUT_MS = 60_000;
@@ -35,9 +37,14 @@ export function setV0PollIntervals(intervals: number[]) {
   v0PollIntervalsMs = intervals;
 }
 
-// Vercel deployment polling config
+// Vercel deployment polling config. 15 minutes total — leaves headroom within the
+// 25-minute MCP_MAX_CALL_TIMEOUT_MS budget (httpClient.ts) for the v0 generation +
+// GitHub commit steps that run before this poll starts. The previous 5-minute window
+// was shorter than real-world build times, so a slow-but-legitimate build got marked
+// "failed" here before the caller's own, more generous timeout ever had a chance to
+// matter — the same class of bug MCP_MAX_CALL_TIMEOUT_MS fixed one layer up.
 let vercelPollIntervalMs = 5_000;
-let vercelPollMaxAttempts = 60;
+let vercelPollMaxAttempts = 180;
 
 /** Override Vercel polling config (for testing) */
 export function setVercelPollConfig(intervalMs: number, maxAttempts: number) {
@@ -514,7 +521,7 @@ export async function findReusablePageForRoute(
   const pages = await listLandingPages(userId);
   const REUSE_STATUSES = ["deployed", "generating", "deploying"];
   const match = pages.find(
-    (p) => (p.slug || buildPageSlug(p.name)) === slug && REUSE_STATUSES.includes(p.status)
+    (p) => REUSE_STATUSES.includes(p.status) && (p.slug || buildPageSlug(p.name)) === slug
   );
   return match || null;
 }
@@ -916,6 +923,36 @@ export function isRetryableGithubPushError(err: any): { retryable: boolean; reas
 }
 
 /**
+ * Best-effort check for the specific cause of a write-404: the repo has been
+ * archived on GitHub. Archived repos are read-only — GET requests succeed, but
+ * git-data writes (blobs/trees/commits) come back 404 instead of the more
+ * descriptive 403, making it indistinguishable from a missing repo without this
+ * extra lookup. Returns a clear, actionable Error when archived is confirmed,
+ * or null (including on any failure of this check itself) so the caller falls
+ * back to the original, unmodified error.
+ */
+async function checkArchivedRepoError(
+  repoFullName: string,
+  ghHeaders: Record<string, string>
+): Promise<Error | null> {
+  try {
+    const repoRes = await axios.get<any>(
+      `https://api.github.com/repos/${repoFullName}`,
+      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+    );
+    if (repoRes.data?.archived) {
+      return new Error(
+        `This site's GitHub repo (${repoFullName}) has been archived on GitHub and is read-only. ` +
+        `Contact support to reactivate it, or create a new site to continue generating pages.`
+      );
+    }
+  } catch {
+    // best-effort — if this check itself fails, fall through to the original error
+  }
+  return null;
+}
+
+/**
  * Commit files to a repo's `main` and advance the ref, with retry + rebase.
  *
  * Every attempt re-reads the current `main` SHA and bases the new commit on it,
@@ -950,8 +987,12 @@ export async function commitFilesToRepoMain(
   let pendingCommitSha: string | undefined;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // True once getMainSha() succeeds this attempt — i.e. the repo is real and
+    // readable, so any 404 from here on is a WRITE being rejected, not a missing repo.
+    let readSucceeded = false;
     try {
       const latestCommitSha = await getMainSha();
+      readSucceeded = true;
 
       // Idempotency: a prior attempt's patch already landed (lost-response case).
       if (pendingCommitSha && latestCommitSha === pendingCommitSha) {
@@ -1011,6 +1052,18 @@ export async function commitFilesToRepoMain(
 
       const { retryable, reason } = isRetryableGithubPushError(err);
       if (!retryable || attempt === maxAttempts) {
+        // A write 404 on a repo we just successfully read is the signature of an
+        // archived GitHub repo: GitHub allows reads but rejects git-data writes
+        // (blobs/trees/commits) with a plain 404 instead of 403. Disambiguate with
+        // one extra GET so callers see a clear, actionable error instead of a
+        // generic "Not Found" that looks like the repo is simply missing.
+        if (readSucceeded && err?.response?.status === 404) {
+          const archivedErr = await checkArchivedRepoError(repoFullName, ghHeaders);
+          if (archivedErr) {
+            console.error(`[V0 SERVICE] commit to ${repoFullName} failed — repo is archived on GitHub (read-only)`);
+            throw archivedErr;
+          }
+        }
         console.error(`[V0 SERVICE] commit to ${repoFullName} failed after ${attempt} attempt(s) (${reason}): ${err?.message}`);
         throw err;
       }
@@ -2441,6 +2494,14 @@ async function pollVercelDeployment(
   // deployment — a stale build can momentarily be the latest entry.
   const limit = expectedCommitSha ? 10 : 1;
 
+  // A deleted project (or a token that's lost access) 404s/403s on every single
+  // attempt — retrying for the full poll window just burns minutes hammering a call
+  // that will never succeed. Require 2 CONSECUTIVE occurrences (not 1) before
+  // concluding the project is really gone, so a brief indexing delay right after
+  // creating a brand-new project isn't mistaken for permanent failure.
+  const ACCESS_ERROR_CONFIRM_THRESHOLD = 2;
+  let consecutiveAccessErrors = 0;
+
   for (let attempt = 0; attempt < vercelPollMaxAttempts; attempt++) {
     try {
       const sinceParam = sinceMs !== undefined ? `&since=${sinceMs}` : "";
@@ -2448,6 +2509,7 @@ async function pollVercelDeployment(
         `https://api.vercel.com/v6/deployments?projectId=${projectId}&limit=${limit}${sinceParam}`,
         { headers, timeout: VERCEL_POLL_TIMEOUT_MS }
       );
+      consecutiveAccessErrors = 0;
 
       const deployments: any[] = deploymentsRes.data?.deployments || [];
 
@@ -2487,12 +2549,30 @@ async function pollVercelDeployment(
       // Still building (QUEUED, BUILDING, INITIALIZING) — wait and retry
       await new Promise(r => setTimeout(r, vercelPollIntervalMs));
     } catch (err: any) {
+      const status = err?.response?.status;
+      if (status === 404 || status === 403) {
+        consecutiveAccessErrors++;
+        if (consecutiveAccessErrors >= ACCESS_ERROR_CONFIRM_THRESHOLD) {
+          const reason = status === 404 ? "no longer exists" : "is no longer accessible (permission revoked)";
+          console.error(`[V0 SERVICE] Vercel project ${projectId} ${reason} — failing fast after ${consecutiveAccessErrors} consecutive ${status}s (attempt ${attempt + 1})`);
+          return {
+            buildStatus: "error",
+            buildError: `This site's Vercel project ${reason}. Contact support to reconnect it, or create a new site to continue.`,
+          };
+        }
+      } else {
+        consecutiveAccessErrors = 0;
+      }
       console.error(`[V0 SERVICE] Error polling deployment (attempt ${attempt + 1}):`, err.message);
       await new Promise(r => setTimeout(r, vercelPollIntervalMs));
     }
   }
 
-  return { buildStatus: "timeout", buildError: "Deployment timed out after 5 minutes. Check Vercel dashboard." };
+  const pollWindowMinutes = Math.round((vercelPollMaxAttempts * vercelPollIntervalMs) / 60_000);
+  return {
+    buildStatus: "timeout",
+    buildError: `Deployment timed out after ${pollWindowMinutes} minutes. Check Vercel dashboard.`,
+  };
 }
 
 /**

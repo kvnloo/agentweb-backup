@@ -12,7 +12,13 @@ jest.mock('../services/db', () => ({
   },
 }));
 
-import { generateSelfCallToken, mcpFetch, clearUserCache } from '../mcp/server/httpClient';
+import {
+  generateSelfCallToken,
+  mcpFetch,
+  clearUserCache,
+  MCP_MAX_CALL_TIMEOUT_MS,
+  DISPATCHER_TIMEOUT_MS,
+} from '../mcp/server/httpClient';
 import { userDb } from '../services/db';
 
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
@@ -194,6 +200,25 @@ describe('httpClient', () => {
 
       // getUserById should only be called once due to caching
       expect(mockUserDb.getUserById).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ─── Dispatcher / per-call timeout invariant ─────────────────────────
+  //
+  // Regression coverage for a bug where the undici global dispatcher (headersTimeout /
+  // bodyTimeout) was hardcoded to 15 minutes while generate_landing_page /
+  // deploy_landing_page passed a 25-minute timeoutMs to mcpFetch. The dispatcher killed
+  // the socket at 15 minutes — before mcpFetch's own AbortController could — so slow but
+  // legitimate v0 generations (15-25 min) surfaced as a generic "TypeError: fetch failed"
+  // instead of completing or hitting the intended 25-minute abort.
+
+  describe('timeout configuration', () => {
+    it('should keep the dispatcher timeout strictly greater than the longest per-call timeoutMs', () => {
+      expect(DISPATCHER_TIMEOUT_MS).toBeGreaterThan(MCP_MAX_CALL_TIMEOUT_MS);
+    });
+
+    it('should give generate_landing_page/deploy_landing_page at least their full 25-minute budget', () => {
+      expect(MCP_MAX_CALL_TIMEOUT_MS).toBeGreaterThanOrEqual(25 * 60 * 1000);
     });
   });
 

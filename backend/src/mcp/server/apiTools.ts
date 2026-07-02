@@ -9,7 +9,7 @@
  */
 
 import { mcpToolRegistry } from './registry';
-import { mcpFetch } from './httpClient';
+import { mcpFetch, MCP_MAX_CALL_TIMEOUT_MS } from './httpClient';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -1300,7 +1300,7 @@ mcpToolRegistry.register({
     const data = await mcpFetch({
       method: 'POST', path: '/api/landing-pages/v0/generate', context: ctx(context),
       body: { prompt: args.prompt, name: args.name, lead_list_id: args.lead_list_id, template_id: args.template_id, site_id: args.site_id, mode: args.mode, originating_session_id: context?.sessionId },
-      timeoutMs: 25 * 60 * 1000, // 25 minutes — v0 generation + GitHub + Vercel deploy (extra headroom vs 15 min default)
+      timeoutMs: MCP_MAX_CALL_TIMEOUT_MS, // v0 generation + GitHub + Vercel deploy
     });
     return jsonResult(data);
   }
@@ -1323,7 +1323,7 @@ mcpToolRegistry.register({
     const data = await mcpFetch({
       method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/deploy`, context: ctx(context),
       body: {},
-      timeoutMs: 25 * 60 * 1000, // 25 minutes — GitHub + Vercel deploy (extra headroom)
+      timeoutMs: MCP_MAX_CALL_TIMEOUT_MS, // GitHub + Vercel deploy
     });
     return jsonResult(data);
   }
