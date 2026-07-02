@@ -1,6 +1,5 @@
 import express from "express";
 import { workPlanService, WorkPlan } from "../services/workPlanService";
-import { emailService } from "../services/emailService";
 import { userDb, orgDb } from "../services/db";
 import {
   canEditItem,
@@ -196,16 +195,9 @@ router.delete("/:planId", async (req, res) => {
 router.post("/:planId/submit-for-review", async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const userEmail = (req as any).user.email;
     const { planId } = req.params;
 
     const plan = await workPlanService.submitForReview(planId, userId);
-
-    emailService.sendOncallAlert(
-      'Work Plan Submitted for Review',
-      `User ${userEmail} submitted work plan "${plan.title}" for platform review.`,
-      { planId: plan.planId, planTitle: plan.title, userId, userEmail }
-    ).catch(err => console.error('Failed to send oncall alert for plan review:', err));
 
     res.json(plan);
   } catch (error: any) {

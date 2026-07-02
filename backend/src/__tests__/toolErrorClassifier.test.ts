@@ -17,6 +17,7 @@
  */
 
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { ToolOutputContractError } from '../utils/toolOutputContract';
 
 function err(message: string, name?: string): Error {
   const e = new Error(message);
@@ -134,6 +135,10 @@ describe('classifyToolErrorClass', () => {
     const provider429 =
       '429 Too Many Requests\n{\n  "type": "ErrorResponse",\n  "error": {\n    "id": "5df087ef",\n    "status": 429,\n    "detail": "Request rate limit exceeded for plan",\n    "meta": { "plan": "Free" }\n  }\n}';
     expect(classifyToolErrorClass(err(provider429))).toBe('rate_limit');
+  });
+
+  it('classifies a ToolOutputContractError as invalid_output, distinct from execution failures (ENG-105)', () => {
+    expect(classifyToolErrorClass(new ToolOutputContractError('Tool returned no output (null/undefined).'))).toBe('invalid_output');
   });
 
   it('leaves genuinely idiosyncratic one-offs in the legacy fallback', () => {

@@ -1062,6 +1062,119 @@ describe('agentToolGatewayService', () => {
     });
   });
 
+  // ENG-106: schema/impl contract alignment + semantic validation at the boundary.
+  // Inlined copies of the POST-FIX schemas (the real ones in emma/tools.ts) so the
+  // test exercises the narrow validateAndRepairToolArgs unit without booting the
+  // agentModeService monolith.
+  describe('semantic tool contract (ENG-106)', () => {
+    describe('send_email_from_sender requires a non-empty body', () => {
+      const sendEmailSchema = {
+        type: 'object',
+        properties: {
+          to: { type: 'string' },
+          subject: { type: 'string' },
+          html: { type: 'string' },
+          text: { type: 'string', 'x-aliases': ['body'] },
+          body: { type: 'string' },
+          sender_id: { type: 'string' },
+        },
+        required: ['to', 'subject'],
+      };
+
+      const validate = (args: Record<string, unknown>) =>
+        validateAndRepairToolArgs({
+          toolName: 'send_email_from_sender',
+          args,
+          inputSchema: sendEmailSchema,
+          effect: 'external_send',
+        });
+
+      it('rejects {to, subject} with no body', () => {
+        const result = validate({ to: 'a@example.com', subject: 'Hi' });
+        expect(result.status).toBe('invalid');
+        if (result.status === 'invalid') {
+          expect(result.issues).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({ code: 'invalid_args', path: '$.body' }),
+            ]),
+          );
+          expect(result.modelMessage.toLowerCase()).toContain('body');
+        }
+      });
+
+      it('rejects a whitespace-only body', () => {
+        const result = validate({ to: 'a@example.com', subject: 'Hi', html: '   ' });
+        expect(result.status).toBe('invalid');
+      });
+
+      it('accepts a non-empty html body', () => {
+        const result = validate({ to: 'a@example.com', subject: 'Hi', html: '<p>hi</p>' });
+        expect(result.status).toBe('valid');
+      });
+
+      it('accepts a non-empty text body', () => {
+        const result = validate({ to: 'a@example.com', subject: 'Hi', text: 'hi' });
+        expect(result.status).toBe('valid');
+      });
+
+      it('accepts a non-empty body alias', () => {
+        // `body` is an x-alias of `text`; the repair maps it before semantic check.
+        const result = validate({ to: 'a@example.com', subject: 'Hi', body: 'hi' });
+        expect(result.status === 'valid' || result.status === 'repaired').toBe(true);
+      });
+    });
+
+    describe('get_meta_ads_metrics accepts legacy + current campaign-id shapes', () => {
+      const metaSchema = {
+        type: 'object',
+        properties: {
+          timeframe: { type: 'string', enum: ['7d', '14d', '30d', '90d'], default: '7d' },
+          campaign_ids: { type: ['array', 'string'], items: { type: 'string' }, minItems: 1 },
+          campaign_id: { type: 'string' },
+        },
+      };
+
+      const validate = (args: Record<string, unknown>) =>
+        validateAndRepairToolArgs({
+          toolName: 'get_meta_ads_metrics',
+          args,
+          inputSchema: metaSchema,
+          effect: 'read',
+        });
+
+      it('accepts a non-empty array campaign_ids (current shape)', () => {
+        expect(validate({ campaign_ids: ['123'] }).status).toBe('valid');
+      });
+
+      it('accepts a legacy string campaign_ids', () => {
+        // Was a type_mismatch before broadening the schema to a union type.
+        expect(validate({ campaign_ids: '123' }).status).toBe('valid');
+      });
+
+      it('accepts a legacy scalar campaign_id', () => {
+        // Was missing_required before dropping `required: [campaign_ids]`.
+        expect(validate({ campaign_id: '123' }).status).toBe('valid');
+      });
+
+      it('rejects a call with no campaign id at all', () => {
+        const result = validate({ timeframe: '7d' });
+        expect(result.status).toBe('invalid');
+        if (result.status === 'invalid') {
+          expect(result.issues).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({ code: 'invalid_args', path: '$.campaign_ids' }),
+            ]),
+          );
+          expect(result.modelMessage.toLowerCase()).toContain('campaign id');
+        }
+      });
+
+      it('rejects an empty campaign_ids array', () => {
+        expect(validate({ campaign_ids: [] }).status).toBe('invalid');
+      });
+    });
+  });
+
   describe('call_hubspot_api effect classification', () => {
     const cases: Array<{ action: string; expectedEffect: string }> = [
       { action: 'LIST', expectedEffect: 'read' },
@@ -1272,6 +1385,136 @@ describe('agentToolGatewayService', () => {
         execute,
       });
 
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    // ENG-101: structured failures ({ success:false } / { isError:true }) must
+    // trip the SAME breaker as thrown errors. Tools like performDataAnalysis,
+    // getMetaAdsMetrics, fathom_get_meetings, coding_agent resolve with a failure
+    // payload instead of throwing; before the fix the gateway treated those as
+    // success and even CLEARED prior thrown-error counts, so a tool returning
+    // success:false could retry-spiral forever.
+    it('trips the breaker when a tool repeatedly RESOLVES with success:false', async () => {
+      for (let i = 0; i < 3; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'performDataAnalysis',
+          args: { attempt: i },
+          runId: 'run-struct',
+          execute: () => Promise.resolve({ success: false, error: 'Query failed' }),
+        });
+        // Shape preserved: still status:'success' so the dispatcher can downgrade
+        // and carry the structured payload to the model.
+        expect(outcome.status).toBe('success');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ success: false, error: 'Query failed' });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'performDataAnalysis',
+        args: { attempt: 3 },
+        runId: 'run-struct',
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+        expect((outcome.error as Error).message).toContain('performDataAnalysis');
+        expect((outcome.error as Error).message).toContain('Query failed');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('does NOT clear prior thrown-error counts when a structured failure resolves', async () => {
+      // Two thrown failures with the same message...
+      await failNTimes('run-mixed', 'getMetaAdsMetrics', 'Invalid parameters', 2);
+      // ...then a resolved structured failure carrying the SAME reason. Before the
+      // fix this cleared the two thrown counts; now it adds a third on the same key.
+      const resolved = await executeAgentToolThroughGateway({
+        toolName: 'getMetaAdsMetrics',
+        args: {},
+        runId: 'run-mixed',
+        execute: () => Promise.resolve({ success: false, error: 'Invalid parameters' }),
+      });
+      expect(resolved.status).toBe('success');
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'getMetaAdsMetrics',
+        args: {},
+        runId: 'run-mixed',
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('trips the breaker on repeated isError:true structured failures', async () => {
+      for (let i = 0; i < 3; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'fathom_get_meetings',
+          args: { attempt: i },
+          runId: 'run-iserror',
+          execute: () => Promise.resolve({ isError: true, message: 'boom' }),
+        });
+        expect(outcome.status).toBe('success');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ isError: true, message: 'boom' });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'fathom_get_meetings',
+        args: { attempt: 3 },
+        runId: 'run-iserror',
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+        expect((outcome.error as Error).message).toContain('boom');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('still clears the count on a genuine success after structured failures', async () => {
+      // Two structured failures, then a genuine success (toolResultError -> null)
+      // clears the count; two more failures must not yet trip on the next call.
+      for (let i = 0; i < 2; i += 1) {
+        await executeAgentToolThroughGateway({
+          toolName: 'coding_agent',
+          args: { attempt: i },
+          runId: 'run-clear',
+          execute: () => Promise.resolve({ success: false, error: 'compile error' }),
+        });
+      }
+      const success = await executeAgentToolThroughGateway({
+        toolName: 'coding_agent',
+        args: {},
+        runId: 'run-clear',
+        execute: () => Promise.resolve({ success: true, ok: true }),
+      });
+      expect(success.status).toBe('success');
+
+      for (let i = 0; i < 2; i += 1) {
+        await executeAgentToolThroughGateway({
+          toolName: 'coding_agent',
+          args: { attempt: i },
+          runId: 'run-clear',
+          execute: () => Promise.resolve({ success: false, error: 'compile error' }),
+        });
+      }
+
+      const execute = jest.fn().mockResolvedValue({ success: true, ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'coding_agent',
+        args: {},
+        runId: 'run-clear',
+        execute,
+      });
       expect(outcome.status).toBe('success');
       expect(execute).toHaveBeenCalledTimes(1);
     });
