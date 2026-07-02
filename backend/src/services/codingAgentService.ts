@@ -168,6 +168,30 @@ async function getCurrentCommitSha(context: CodingAgentContext): Promise<string 
   }
 }
 
+/**
+ * Whether a GitHub error from updating a branch ref means the ref doesn't exist
+ * (so we should create it instead of failing).
+ *
+ * GitHub's `PATCH /repos/{owner}/{repo}/git/refs/{ref}` on a **non-existent** ref
+ * does NOT return 404 — it returns **422 Unprocessable Entity** with the message
+ * "Reference does not exist". Handling only 404 here meant that once the reusable
+ * preview branch was deleted (e.g. after a publish, which deletes it), the next
+ * coding-agent run's force-reset PATCH failed with a bare "Request failed with
+ * status code 422" instead of falling back to re-creating the branch — so every
+ * subsequent edit in that session failed. (ENG-157)
+ */
+export function isMissingRefError(error: any): boolean {
+  const status: number | undefined = error?.response?.status;
+  if (status === 404) return true;
+  if (status === 422) {
+    const message =
+      error?.response?.data?.message ??
+      (typeof error?.response?.data === 'string' ? error.response.data : '');
+    return /reference does not exist/i.test(String(message));
+  }
+  return false;
+}
+
 async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Promise<void> {
   if (context.draftBranch !== LANDING_PAGE_PREVIEW_BRANCH) return;
 
@@ -207,7 +231,10 @@ async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Pr
     );
     console.log(`[CODING AGENT] Reset ${LANDING_PAGE_PREVIEW_BRANCH} to main (${mainSha.substring(0, 7)})`);
   } catch (error: any) {
-    if (error.response?.status !== 404) throw error;
+    // The branch may not exist yet (first edit of a session, or it was deleted by
+    // a prior publish). GitHub reports a missing ref on PATCH as 422 "Reference
+    // does not exist" — not 404 — so both must trigger the create fallback.
+    if (!isMissingRefError(error)) throw error;
 
     await axios.post(
       `${repoBase}/git/refs`,
