@@ -133,10 +133,10 @@ export const config = {
                                    // diffs; tests when neither backend logic nor test files changed
     recheckAfterRework: true,      // a needs_rework verdict triggers a rework pass, then the manager
                                    // re-checks the result ONCE (bounded) before the verdict is final
-    parallel: true,                // run the reviewers concurrently; set false to run them one at a
-                                   // time (slower, but avoids concurrent claude processes sharing the
-                                   // one worktree — note true isolation isn't possible while the
-                                   // subscription login lives in the shared claude config dir)
+    parallel: false,               // run the reviewers ONE AT A TIME. Parallel reviewers (+ the rest
+                                   // of a single pipeline's fan-out) produced load spikes that starved
+                                   // sshd and the human-facing previews on the 16GB runner. Costs a few
+                                   // minutes of wall-clock per bug; re-enable only on a bigger box.
     maxTurns: 60,                  // per reviewer / manager / re-fix pass
     timeoutMs: 20 * 60 * 1000,     // per reviewer / manager / re-fix pass
     maxDiffChars: 60000,           // truncate a huge per-repo diff injected into reviewer prompts
