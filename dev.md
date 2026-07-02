@@ -1,3 +1,23 @@
+## OpenRouter gateway lands behind the model registry (ENG-9, 2026-07-02)
+
+First slice of the ENG-9 "route LLM calls via OpenRouter" migration: an OpenAI-compatible OpenRouter client is now a first-class provider in `agentModeService` — additive only, zero change to existing model routing.
+
+### Design decisions (and the assumptions behind them)
+- **"/" is the routing discriminator.** OpenRouter model ids are provider-prefixed slugs (`anthropic/claude-opus-4.8`); no direct-provider registry key contains "/". `getClientForModel`/`callLLM` route any "/" id to the OpenRouter client. Assumption to watch: no future direct-provider id ever contains "/".
+- **One lazy singleton client** (mirrors `getGeminiClient`): key from `OPENROUTER_API_KEY` env, falling back to Secrets Manager `{env}/AgentWeb/OpenRouter` (created 2026-07-02, dev+prod). Attribution headers point at hireemma.ai.
+- **All 5 registered slugs are `adminOnly: true`** — the OpenRouter account is free-tier with $0 credits until the YC deal (Bookface #3222, $5k credits + $0 BYOK fees, referral ORxYC-8J3Q) is redeemed; paid models would 402 for regular users. Flip to public after credits/BYOK land and a burn-in.
+- **`supportsVision` deliberately unset** on OpenRouter entries — the registry doc requires empirical verification, impossible on a $0 balance. Follow-up after credits land.
+- **No cross-provider fallback added** (per the no-fallbacks discipline): a failed OpenRouter call throws after the standard retry loop, same as every other provider. Migration remains an explicit A-or-B model-id choice per feature setting.
+- Usage metering tags `provider: "openrouter"`; `estimateCost` carries the live gateway rates (openrouter.ai/api/v1/models, 2026-07-02) — note Opus 4.8 via OpenRouter is [5, 25] vs [15, 75] direct Bedrock, and google/gemini-3.5-flash is 10x the direct Gemini API rate ([1.5, 9] vs [0.15, 0.6]) — gateway pricing differs from direct in BOTH directions; check before flipping a per-feature default.
+
+### What this unlocks (no further code needed)
+Every settings-driven model getter (`agent_mode_dedup_judge_model`, coding agent, content agent, reports, scheduled chats, …) validates against `llmModels` — pointing any of them at an OpenRouter slug routes that feature through the gateway. The two TODO(ENG-9) comments (dedup judge) are satisfied and updated.
+
+### Not done yet (rest of ENG-9)
+- BYOK provider keys (Azure/GCP/AWS) into the OpenRouter dashboard — needs Harsha (dashboard-only).
+- Deprecating the four direct provider paths — only after OpenRouter has real traffic + credits; the subtraction is the point of ENG-9, this slice is the enabler.
+- ENG-111 multi-model A/B and ENG-155 (Vercel AI SDK provider layer) build on this.
+
 ## Prod outage: partner-portal "Failed to load users" — full disk + nginx PrivateTmp trap (2026-06-26)
 
 Three stacked failures, only the last self-inflicted by the attempted fixes:
