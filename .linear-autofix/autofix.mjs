@@ -150,6 +150,11 @@ async function main() {
   const id = issue.identifier;
   log(`Issue ${id}: ${issue.title}`);
 
+  // --verify-only: re-run just the deterministic gates (checks + preview + browser verify +
+  // media upload) against an ALREADY-FIXED bug's branch, then re-triage. For fixes whose
+  // verification was lost to an infrastructure failure — not for changing code.
+  if (process.argv.includes('--verify-only')) { await verifyOnlyRun(issue); return; }
+
   const state = loadState();
   // Non-final outcomes may be re-processed: 'recovered' = the stale sweep reset a crashed run;
   // 'started' = a run that crashed before recording any outcome (or is being retried by hand);
@@ -838,6 +843,56 @@ async function runVerify(issue, WT) {
   }
 }
 
+async function verifyOnlyRun(issue) {
+  if (process.env.AUTOFIX_RUN_ENABLED !== '1') {
+    console.error('[autofix] refusing to run: AUTOFIX_RUN_ENABLED != 1 (fixes are EC2-only)');
+    process.exit(2);
+  }
+  const id = issue.identifier;
+  const entry = loadState()[issue.id];
+  if (!entry || !String(entry.outcome || '').startsWith('fixed')) { log(`${id}: no completed fix on record — nothing to re-verify.`); return; }
+  const WT = path.resolve(agentRoot, config.worktreesDir, id);
+  const branch = entry.branch || `${config.branchPrefix}${id.toLowerCase()}-${kebab(issue.title)}`;
+  if (!existsSync(WT)) {
+    log('Workspace missing — rebuilding from the pushed branch...');
+    const asm = assembleFromBranch(WT, branch);
+    if (!asm.ok) { log(`Failed to rebuild ${asm.repo}: ${asm.err}`); return; }
+  }
+  prepareWorktreeDeps(WT);
+  setStageLogDir(id);
+
+  const changed = detectChangedRepos(WT);
+  const checks = runChecks(WT, changed);
+  let verify = null;
+  if (config.verify?.enabled) {
+    try { verify = await runVerify(issue, WT); } catch (e) { log('Verify error:', e.message); }
+  }
+  if (verify) {
+    try {
+      const media = await uploadVerifyMedia(verify);
+      verify.screenshotUrls = media.shots;
+      verify.videoUrls = media.videos;
+    } catch (e) { log('Verify media upload error:', e.message); }
+  }
+
+  const triage = computeTriage({ review: entry.review, verify, checks, reviewEnabled: !!config.review?.enabled });
+  log(`Re-verify: checks ${checks.every((c) => c.result === 'pass') ? 'pass' : 'FAIL'}, verdict ${verify?.verdict || 'none'} — triage now: ${triage}`);
+  try { await setAutofixLabel(issue, config.triageLabels?.[triage]); } catch (e) { log('Warn: could not set triage label:', e.message); }
+  const head = triage === 'green' ? '🟢 green — skim the PR and merge' : triage === 'manual' ? '🟡 needs manual test' : '🔴 needs rework';
+  await addComment(issue.id, `🔁 **Deterministic gates re-run** (checks + browser verification on the existing fix)\n\n${testReportBody({ tests: [] }, verify, checks)}\n\n**Triage now: ${head}.**`);
+  if (triage === 'green') {
+    try {
+      const sid = await findStateId(issue.team.id, config.reviewState, null);
+      if (sid) { await moveIssue(issue.id, sid); log(`Moved ${id} -> ${config.reviewState}`); }
+    } catch (e) { log('Warn: could not move state:', e.message); }
+  }
+  updateState(issue.id, {
+    ...entry, triage, checks, verify: verify || entry.verify || null, stages: { ...(entry.stages || {}), ...stages },
+    outcome: triage === 'green' ? 'fixed' : triage === 'rework' ? 'fixed_needs_human' : 'fixed_needs_manual_test',
+    at: new Date().toISOString(),
+  });
+}
+
 function parseVerify(result) {
   return extractJson(result, 'VERIFY_RESULT', { verdict: 'inconclusive', method: '', scenario: '', summary: '(no verdict returned)', screenshots: [] });
 }
@@ -870,12 +925,40 @@ async function uploadVerifyMedia(verify) {
       .sort((a, b) => b.st.mtimeMs - a.st.mtimeMs)
       .slice(0, 2); // a session normally yields one video per page
     for (const v of webms) {
-      if (v.st.size > MAX_UPLOAD_BYTES) { log(`Recording ${v.f} is ${Math.round(v.st.size / 1e6)}MB — too big to upload, skipping.`); continue; }
-      try { videos.push({ name: v.f, url: await uploadFile(v.full) }); log(`Session recording uploaded to Linear: ${v.f}`); }
-      catch (e) { log(`Recording upload failed for ${v.f}: ${e.message}`); }
+      // Raw session recordings are mostly loading spinners and think-time between agent
+      // actions (a real 5m19s verify had ~90 visual changes) — condense to just the frames
+      // where the page actually changed, so a reviewer watches ~1 min of pure activity.
+      const c = condenseVideo(v.full);
+      const up = c || { path: v.full, name: v.f };
+      if (statSync(up.path).size > MAX_UPLOAD_BYTES) { log(`Recording ${up.name} is too big to upload, skipping.`); continue; }
+      try { videos.push({ name: up.name, url: await uploadFile(up.path) }); log(`Session recording uploaded to Linear: ${up.name}${c ? ' (condensed)' : ' (raw — ffmpeg unavailable)'}`); }
+      catch (e) { log(`Recording upload failed for ${up.name}: ${e.message}`); }
     }
   } catch { /* no output dir — nothing recorded */ }
   return { shots, videos };
+}
+
+// Condense a session recording to only the frames where the page visibly changed, played at
+// 2fps (each kept moment shown 500ms). Thresholds tuned on a real verify recording:
+// hi=2000/lo=800 turned 5m19s into 1m12s while keeping every UI transition readable.
+// Returns null when ffmpeg is missing or fails — caller falls back to the raw webm.
+function ffmpegBin() {
+  for (const p of [path.join(process.env.HOME || '', 'bin', 'ffmpeg'), '/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg']) {
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+function condenseVideo(full) {
+  const ff = ffmpegBin();
+  if (!ff) return null;
+  const out = full.replace(/\.webm$/, '-condensed.mp4');
+  const r = spawnSync(ff, [
+    '-y', '-i', full,
+    '-vf', 'mpdecimate=hi=2000:lo=800:frac=0.33,setpts=N/(2*TB)',
+    '-fps_mode', 'vfr', '-an', '-pix_fmt', 'yuv420p', out,
+  ], { encoding: 'utf8', timeout: 5 * 60 * 1000 });
+  if (r.status !== 0 || !existsSync(out) || statSync(out).size < 1024) { log('Video condense failed — using the raw recording.'); return null; }
+  return { path: out, name: path.basename(out) };
 }
 
 // ---- Linear comment bodies (pure functions; unit-tested from the scratchpad harness) ----
