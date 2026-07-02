@@ -262,6 +262,95 @@ describe('AgentModeService - composeVideo', () => {
     });
   });
 
+  // ENG-123: detached-handoff passthrough. When a render can't finish in the run's
+  // remaining budget, remotionService returns status:'processing' with the deterministic
+  // URL. composeVideo must surface that as a usable success (URL + "still finalizing"
+  // note) rather than treating the non-final result as a failure.
+  describe('detached-handoff (status: processing)', () => {
+    it('surfaces a processing render as success with the detached URL and message', async () => {
+      mockRemotionService.compose.mockResolvedValue({
+        success: true,
+        status: 'processing',
+        videoUrl: 'https://s3.us-east-1.amazonaws.com/bucket/renders/r1/out.mp4',
+        filename: 'out.mp4',
+        message: 'The video is still finalizing and will be ready at this link in a minute or two — no need to regenerate it.',
+      });
+
+      const result = await (agentModeService as any).composeVideo(
+        ['https://s3.example.com/clip1.mp4'],
+        'out.mp4',
+        'user1',
+        'session1',
+        { ...baseComposeParams, audioUrl: 'https://s3.example.com/vo.mp3' }
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.status).toBe('processing');
+      expect(result.videoUrl).toBe('https://s3.us-east-1.amazonaws.com/bucket/renders/r1/out.mp4');
+      expect(result.message).toMatch(/finalizing|ready at this link/i);
+    });
+
+    it('forwards renderDeadlineMs from composeParams to remotionService.compose', async () => {
+      mockRemotionService.compose.mockResolvedValue({
+        success: true, status: 'complete', videoUrl: 'https://s3.example.com/final.mp4', filename: 'final.mp4',
+      });
+      const deadline = 1_700_000_000_000;
+
+      await (agentModeService as any).composeVideo(
+        ['https://s3.example.com/clip1.mp4'],
+        'final.mp4',
+        'user1',
+        'session1',
+        { ...baseComposeParams, audioUrl: 'https://s3.example.com/vo.mp3', renderDeadlineMs: deadline }
+      );
+
+      expect(mockRemotionService.compose).toHaveBeenCalledWith(
+        expect.objectContaining({ renderDeadlineMs: deadline })
+      );
+    });
+  });
+
+  // ENG-123 regression tripwire: a spot must never silently ship without a voiceover.
+  // composeVideo returns a soft `warning` when composed with no audioUrl — this catches
+  // revision passes where the agent recomposes and forgets to re-attach the VO. It is a
+  // nudge, not a hard failure (silent b-roll is still allowed to compose).
+  describe('voiceover tripwire', () => {
+    it('warns when a spot is composed with no audioUrl', async () => {
+      mockRemotionService.compose.mockResolvedValue({
+        success: true, status: 'complete', videoUrl: 'https://s3.example.com/final.mp4', filename: 'final.mp4',
+      });
+
+      const result = await (agentModeService as any).composeVideo(
+        ['https://s3.example.com/clip1.mp4', 'https://s3.example.com/clip2.mp4'],
+        'final.mp4',
+        'user1',
+        'session1',
+        baseComposeParams // no audioUrl
+      );
+
+      expect(result.success).toBe(true);
+      expect(typeof result.warning).toBe('string');
+      expect(result.warning).toMatch(/voiceover|audio/i);
+    });
+
+    it('does NOT warn when an audioUrl is present', async () => {
+      mockRemotionService.compose.mockResolvedValue({
+        success: true, status: 'complete', videoUrl: 'https://s3.example.com/final.mp4', filename: 'final.mp4',
+      });
+
+      const result = await (agentModeService as any).composeVideo(
+        ['https://s3.example.com/clip1.mp4'],
+        'final.mp4',
+        'user1',
+        'session1',
+        { ...baseComposeParams, audioUrl: 'https://s3.example.com/vo.mp3' }
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.warning).toBeUndefined();
+    });
+  });
+
   describe('Tool registration', () => {
     it('should have compose_video tool registered', () => {
       const tools = agentModeService.getAvailableTools();
