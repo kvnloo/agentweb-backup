@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Autofix Chat</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔧</text></svg>">
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e2230; --border: #2a2f3d;
+    --text: #e6e9f0; --dim: #8b93a7; --accent: #6ea8fe; --user: #2b3a55;
+    --green: #3fb27f; --amber: #d9a441; --red: #e5655e; --gray: #6b7280; --blue: #5b9dd9; --orange: #e08a3c;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, sans-serif; height: 100vh; display: flex; overflow: hidden; }
+
+  /* Sidebar */
+  #side { width: 290px; min-width: 290px; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+  #side h1 { font-size: 15px; padding: 14px 16px 6px; }
+  #side .sub { padding: 0 16px 10px; color: var(--dim); font-size: 12px; display: flex; justify-content: space-between; align-items: center; }
+  #showAll { color: var(--accent); cursor: pointer; user-select: none; }
+  #issues { overflow-y: auto; flex: 1; }
+  .issue { padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer; }
+  .issue:hover { background: var(--panel2); }
+  .issue.sel { background: var(--panel2); border-left: 3px solid var(--accent); padding-left: 11px; }
+  .issue .row1 { display: flex; align-items: center; gap: 8px; }
+  .issue .id { font-weight: 600; }
+  .issue .time { margin-left: auto; color: var(--dim); font-size: 11px; }
+  .issue .summ { color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
+  .badge { font-size: 10px; padding: 1px 7px; border-radius: 9px; color: #0d0f13; font-weight: 600; }
+  .b-green { background: var(--green); } .b-amber { background: var(--amber); } .b-red { background: var(--red); }
+  .b-gray { background: var(--gray); } .b-orange { background: var(--orange); }
+  .b-blue { background: var(--blue); animation: pulse 1.5s infinite; }
+  @keyframes pulse { 50% { opacity: .5; } }
+  .busydot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); animation: pulse 1.2s infinite; }
+
+  /* Main */
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #hdr { padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  #hdr .t { font-size: 15px; font-weight: 600; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  #hdr .meta { color: var(--dim); font-size: 12px; margin-top: 3px; display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+  #hdr a { color: var(--accent); text-decoration: none; }
+  .btn { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 7px; padding: 3px 12px; font: inherit; font-size: 12px; cursor: pointer; }
+  .btn:hover { border-color: var(--accent); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.on { border-color: var(--green); color: var(--green); }
+  #empty { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--dim); }
+
+  #chat { flex: 1; overflow-y: auto; padding: 18px 20px; display: flex; flex-direction: column; gap: 12px; }
+
+  /* Pipeline steps */
+  #pipeline { max-width: 820px; }
+  #pipeline .ptitle { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: .6px; margin-bottom: 8px; }
+  .stage { border: 1px solid var(--border); border-radius: 8px; background: var(--panel); margin-bottom: 6px; overflow: hidden; }
+  .stage .shead { display: flex; align-items: center; gap: 8px; padding: 8px 12px; cursor: pointer; font-size: 13px; }
+  .stage .shead:hover { background: var(--panel2); }
+  .stage .arrow { color: var(--dim); font-size: 11px; transition: transform .12s; }
+  .stage.open .arrow { transform: rotate(90deg); }
+  .stage .smeta { margin-left: auto; color: var(--dim); font-size: 11px; white-space: nowrap; }
+  .stage .sbody { display: none; border-top: 1px solid var(--border); background: #10131a; padding: 10px 14px; white-space: pre-wrap; overflow-wrap: break-word; font-size: 12.5px; color: #c3cadb; max-height: 400px; overflow-y: auto; }
+  .stage.open .sbody { display: block; }
+  .stage .nolog { color: var(--dim); font-style: italic; }
+
+  .msg { max-width: 780px; padding: 10px 14px; border-radius: 10px; white-space: pre-wrap; overflow-wrap: break-word; }
+  .msg.user { background: var(--user); align-self: flex-end; }
+  .msg.assistant { background: var(--panel2); align-self: flex-start; }
+  .msg code { background: #10131a; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+  .msg pre { background: #10131a; padding: 10px; border-radius: 8px; overflow-x: auto; margin: 6px 0; white-space: pre; }
+  .msg pre code { background: none; padding: 0; }
+  .sys { color: var(--dim); font-size: 12px; align-self: flex-start; padding: 0 6px; }
+  .err { color: var(--red); font-size: 13px; align-self: flex-start; padding: 0 6px; }
+  .tool { display: block; font-size: 12px; color: var(--dim); background: #12151d; border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; margin: 4px 0; cursor: pointer; max-width: 740px; }
+  .tool .st { margin-right: 6px; }
+  .tool .inp { display: none; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; color: #a8b0c2; }
+  .tool.open .inp { display: block; }
+  .fixcard { border: 1px solid var(--border); border-left: 3px solid var(--green); background: var(--panel2); border-radius: 8px; padding: 10px 14px; align-self: flex-start; font-size: 13px; max-width: 780px; }
+  .fixcard.failed { border-left-color: var(--red); }
+  .fixcard a { color: var(--accent); }
+  .turnmeta { color: var(--dim); font-size: 11px; align-self: flex-start; padding: 0 6px; }
+
+  /* Composer */
+  #composer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 20px; }
+  #composer .row { display: flex; gap: 10px; align-items: flex-end; }
+  #input { flex: 1; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font: inherit; resize: none; min-height: 42px; max-height: 160px; }
+  #input:focus { outline: 1px solid var(--accent); }
+  #send { background: var(--accent); color: #0d0f13; border: 0; border-radius: 8px; padding: 10px 18px; font-weight: 600; cursor: pointer; }
+  #send.stop { background: var(--red); color: #fff; }
+  #hint { color: var(--dim); font-size: 11px; margin-top: 6px; }
+  #hint .cap-full { color: var(--amber); }
+</style>
+</head>
+<body>
+  <div id="side">
+    <h1>🔧 Autofix Chat</h1>
+    <div class="sub"><span id="count"></span><span id="showAll">show all</span></div>
+    <div id="issues"></div>
+  </div>
+  <div id="main">
+    <div id="hdr" style="display:none">
+      <div class="t"><span id="h-id"></span><span id="h-badges"></span></div>
+      <div class="meta" id="h-meta"></div>
+      <div class="meta" id="h-preview"></div>
+    </div>
+    <div id="empty">Select an issue to see what the automation did and chat about it.</div>
+    <div id="chat" style="display:none"></div>
+    <div id="composer" style="display:none">
+      <div class="row">
+        <textarea id="input" rows="1" placeholder="Ask about this fix, or tell the agent what to change…"></textarea>
+        <button id="send">Send</button>
+      </div>
+      <div id="hint"></div>
+    </div>
+  </div>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+// Minimal markdown: fenced code, inline code, links, bold. Input is escaped first.
+function md(s) {
+  let h = esc(s);
+  h = h.replace(/```(\w*)\n([\s\S]*?)```/g, (_, l, c) => `<pre><code>${c}</code></pre>`);
+  h = h.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  h = h.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+  h = h.replace(/(^|\s)(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank">$2</a>');
+  h = h.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+  return h;
+}
+
+const OUTCOME_BADGE = {
+  fixed: ['fixed','b-green'], fixed_needs_manual_test: ['manual test','b-amber'],
+  fixed_needs_human: ['needs human','b-red'], cannot_fix: ['cannot fix','b-gray'],
+  no_change: ['no change','b-gray'], started: ['running','b-blue'], recovered: ['retrying','b-blue'],
+  blocked: ['blocked','b-orange'], recovery_failed: ['crashed','b-red'], setup_failed: ['setup failed','b-red'],
+};
+const badge = (o) => { const [t, c] = OUTCOME_BADGE[o] || [o, 'b-gray']; return `<span class="badge ${c}">${esc(t)}</span>`; };
+const rel = (iso) => {
+  if (!iso) return '';
+  const m = Math.round((Date.now() - new Date(iso)) / 60000);
+  return m < 60 ? `${m}m` : m < 1440 ? `${Math.round(m/60)}h` : `${Math.round(m/1440)}d`;
+};
+
+const S = { issues: [], sel: null, detail: null, showAll: false, busy: false, es: null, curBubble: null };
+
+// ---------- sidebar ----------
+let lastIssuesJson = '';
+async function loadIssues() {
+  try {
+    const r = await (await fetch('/api/issues')).json();
+    S.issues = r.issues || [];
+    // Skip DOM churn when nothing changed (also keeps click targets stable).
+    const j = JSON.stringify(S.issues) + S.showAll + S.sel;
+    if (j !== lastIssuesJson) { lastIssuesJson = j; renderIssues(); }
+  } catch { /* server briefly down */ }
+}
+function renderIssues() {
+  const list = S.showAll ? S.issues : S.issues.filter((i) => i.active);
+  $('count').textContent = `${list.length} issue${list.length === 1 ? '' : 's'}${S.showAll ? '' : ' active'}`;
+  $('showAll').textContent = S.showAll ? 'active only' : 'show all';
+  $('issues').innerHTML = list.map((i) => `
+    <div class="issue ${i.identifier === S.sel ? 'sel' : ''}" data-id="${i.identifier}">
+      <div class="row1"><span class="id">${esc(i.identifier)}</span>${badge(i.outcome)}
+        ${i.chat.busy ? '<span class="busydot"></span>' : ''}<span class="time">${rel(i.at)}</span></div>
+      <div class="summ">${esc(i.summary || i.branch || '')}</div>
+    </div>`).join('') || '<div style="padding:16px;color:var(--dim)">Nothing active on this machine.</div>';
+  for (const el of $('issues').children) el.onclick = () => el.dataset.id && select(el.dataset.id);
+}
+$('showAll').onclick = () => { S.showAll = !S.showAll; lastIssuesJson = ''; renderIssues(); };
+
+// ---------- selection / detail ----------
+async function select(id) {
+  S.sel = id; S.curBubble = null;
+  lastIssuesJson = ''; renderIssues();
+  $('empty').style.display = 'none';
+  $('hdr').style.display = ''; $('chat').style.display = ''; $('composer').style.display = '';
+  $('h-id').textContent = id; $('h-badges').innerHTML = ''; $('h-meta').textContent = 'loading…';
+  $('chat').innerHTML = '';
+  if (S.es) { S.es.close(); S.es = null; }
+  try {
+    const d = await (await fetch(`/api/issues/${id}`)).json();
+    if (S.sel !== id) return;
+    S.detail = d;
+    renderHeader(d); renderAll(d);
+    setBusy(!!d.busy);
+    openEvents(id);
+  } catch { $('h-meta').textContent = 'failed to load'; }
+  updateHint();
+}
+function renderHeader(d) {
+  const e = d.entry || {};
+  $('h-id').textContent = d.identifier + (d.linear?.title ? ` — ${d.linear.title}` : '');
+  $('h-badges').innerHTML = badge(e.outcome) + (e.triage ? ` <span class="badge b-gray">${esc(e.triage)}</span>` : '');
+  const prs = (e.prs || []).map((p) => `<a href="${esc(p.url || p)}" target="_blank">PR (${esc(p.repo || 'repo')})</a>`).join(' ');
+  $('h-meta').innerHTML = [
+    e.branch ? `<span>⎇ ${esc(e.branch)}</span>` : '',
+    prs,
+    d.linear?.url ? `<a href="${esc(d.linear.url)}" target="_blank">Linear ↗</a>` : '',
+    d.worktree?.exists ? '' : '<span>worktree gone (rebuilds on first message)</span>',
+  ].filter(Boolean).join(' · ');
+  renderPreviewBar();
+}
+
+// ---------- preview ----------
+function renderPreviewBar() {
+  const p = S.detail?.preview;
+  const el = $('h-preview');
+  if (!p) { el.innerHTML = ''; return; }
+  if (p.busy) {
+    el.innerHTML = '<button class="btn" disabled>⏳ preview working…</button>';
+  } else if (p.running && p.urls) {
+    el.innerHTML = `<button class="btn on" id="pv-btn">■ Disable preview</button>
+      <span>live:</span>
+      <a href="${esc(p.urls.customer)}" target="_blank">Customer ↗</a>
+      <a href="${esc(p.urls.partner)}" target="_blank">Partner ↗</a>
+      <a href="${esc(p.urls.api)}" target="_blank">API ↗</a>`;
+    $('pv-btn').onclick = () => previewAction('down');
+  } else {
+    el.innerHTML = '<button class="btn" id="pv-btn">▶ Enable preview</button>';
+    $('pv-btn').onclick = () => previewAction('up');
+  }
+}
+async function previewAction(action) {
+  const r = await fetch(`/api/issues/${S.sel}/preview`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action }),
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    addSys('⚠ ' + (err.error || `preview request failed (${r.status})`), 'err');
+    return;
+  }
+  if (S.detail) { S.detail.preview = { ...(S.detail.preview || {}), busy: true }; renderPreviewBar(); }
+}
+
+// ---------- pipeline steps ----------
+function fmtMs(ms) { if (!ms) return ''; const m = Math.round(ms / 60000); return m >= 1 ? `${m}m` : `${Math.round(ms/1000)}s`; }
+function renderPipeline(d) {
+  const steps = d.pipeline || [];
+  if (!steps.length) return;
+  const wrap = document.createElement('div');
+  wrap.id = 'pipeline';
+  wrap.innerHTML = `<div class="ptitle">⚙ What the automation did (${steps.length} steps — click to expand)</div>`;
+  for (const s of steps) {
+    const el = document.createElement('div');
+    el.className = 'stage';
+    const meta = [s.turns ? `${s.turns} turns` : '', fmtMs(s.ms), s.timedOut ? '⚠ timed out' : ''].filter(Boolean).join(' · ');
+    el.innerHTML = `<div class="shead"><span class="arrow">▶</span><b>${esc(s.title)}</b><span class="smeta">${esc(meta)}</span></div>`
+      + `<div class="sbody">${s.report ? md(s.report) : '<span class="nolog">(transcript not available on this machine)</span>'}</div>`;
+    el.querySelector('.shead').onclick = () => el.classList.toggle('open');
+    wrap.appendChild(el);
+  }
+  chatEl().appendChild(wrap);
+}
+
+// ---------- transcript rendering ----------
+const chatEl = () => $('chat');
+const scroll = () => { chatEl().scrollTop = chatEl().scrollHeight; };
+function addUser(text) {
+  const el = document.createElement('div');
+  el.className = 'msg user';
+  el.innerHTML = md(text);
+  chatEl().appendChild(el); scroll();
+  return el;
+}
+function newAssistant() {
+  const el = document.createElement('div');
+  el.className = 'msg assistant';
+  chatEl().appendChild(el); scroll();
+  return el;
+}
+function addSys(text, cls) {
+  const el = document.createElement('div');
+  el.className = cls || 'sys'; el.textContent = text;
+  chatEl().appendChild(el); scroll();
+}
+function addTool(bubble, t) {
+  const el = document.createElement('span');
+  el.className = 'tool'; el.dataset.tid = t.id || '';
+  el.innerHTML = `<span class="st">▸</span><b>${esc(t.name)}</b><span class="inp">${esc(t.input || '')}</span>`;
+  el.onclick = () => el.classList.toggle('open');
+  bubble.appendChild(el); scroll();
+}
+function addText(bubble, text) {
+  const el = document.createElement('div');
+  el.innerHTML = md(text);
+  bubble.appendChild(el); scroll();
+}
+function addFixCard(fix) {
+  const el = document.createElement('div');
+  el.className = 'fixcard ' + (fix.pushedOk ? '' : 'failed');
+  const prs = (fix.prs || []).map((p) => `<a href="${esc(p.url || p)}" target="_blank">${esc(p.repo || 'PR')}</a>`).join(' ');
+  el.innerHTML = fix.pushedOk
+    ? `✅ Changes committed &amp; pushed to the open PR(s). ${prs}`
+    : `❌ Committed but push failed: ${esc((fix.failedRepos || []).join(', '))} ${prs}`;
+  chatEl().appendChild(el); scroll();
+}
+function renderAll(d) {
+  chatEl().innerHTML = '';
+  renderPipeline(d);
+  for (const m of d.chat?.messages || []) {
+    if (m.role === 'user') addUser(m.text);
+    else {
+      const b = newAssistant();
+      for (const t of m.tools || []) addTool(b, t);
+      addText(b, m.text || '');
+      if (m.fix) addFixCard(m.fix);
+    }
+  }
+  scroll();
+}
+
+// ---------- SSE ----------
+let reconnects = 0;
+function openEvents(id) {
+  reconnects = 0;
+  const es = new EventSource(`/api/issues/${id}/events`);
+  S.es = es;
+  es.onopen = async () => {
+    // After a drop, re-render from persisted history; the server replays the current turn.
+    if (reconnects++ > 0 && S.sel === id) {
+      try {
+        const d = await (await fetch(`/api/issues/${id}`)).json();
+        if (S.sel === id) { S.detail = d; renderAll(d); S.curBubble = null; setBusy(!!d.busy); }
+      } catch { /* retry on next reconnect */ }
+    }
+  };
+  es.onmessage = (ev) => {
+    let e; try { e = JSON.parse(ev.data); } catch { return; }
+    if (S.sel !== id) return;
+    handleEvent(e);
+  };
+}
+function handleEvent(e) {
+  switch (e.type) {
+    case 'turn_start': {
+      S.curBubble = null; setBusy(true);
+      const msgs = chatEl().querySelectorAll('.msg.user');
+      const last = msgs[msgs.length - 1];
+      if (!last || last.textContent !== e.message) addUser(e.message);
+      break;
+    }
+    case 'init': break;
+    case 'status': addSys('⏳ ' + e.text); break;
+    case 'text':
+      if (!S.curBubble) S.curBubble = newAssistant();
+      addText(S.curBubble, e.text);
+      break;
+    case 'tool':
+      if (!S.curBubble) S.curBubble = newAssistant();
+      addTool(S.curBubble, e);
+      break;
+    case 'tool_result': {
+      const chip = chatEl().querySelector(`.tool[data-tid="${e.id}"] .st`);
+      if (chip) chip.textContent = e.ok ? '✓' : '✗';
+      break;
+    }
+    case 'result': addSys(`⏱ ${e.turns ?? '?'} turns · ${e.ms ? Math.round(e.ms/1000)+'s' : ''}`, 'turnmeta'); break;
+    case 'fix_summary': addFixCard(e); break;
+    case 'preview':
+      if (S.detail) { S.detail.preview = { running: e.running, busy: e.busy, urls: e.urls }; renderPreviewBar(); }
+      addSys(e.running ? '🌐 preview is up' : '⏹ preview stopped');
+      break;
+    case 'error': addSys('⚠ ' + e.error, 'err'); break;
+    case 'aborted': addSys('⏹ aborted', 'err'); break;
+    case 'done': S.curBubble = null; setBusy(false); loadIssues(); break;
+  }
+}
+
+// ---------- composer ----------
+function setBusy(b) {
+  S.busy = b;
+  $('send').textContent = b ? 'Stop' : 'Send';
+  $('send').classList.toggle('stop', b);
+}
+function updateHint() {
+  const cap = S.detail?.capability;
+  if (!cap) { $('hint').textContent = ''; return; }
+  $('hint').innerHTML = cap.level === 'full'
+    ? '<span class="cap-full">Full access</span> — ask anything, or request changes: the agent edits this issue\'s branch and new commits auto-push to the open PR.'
+    : `Read-only — ${esc(cap.reason || '')}. The agent can answer anything but cannot change code here.`;
+}
+
+async function send() {
+  if (S.busy) { // Stop
+    await fetch(`/api/issues/${S.sel}/chat/abort`, { method: 'POST' });
+    return;
+  }
+  const message = $('input').value.trim();
+  if (!message || !S.sel) return;
+  $('input').value = ''; autosize();
+  const r = await fetch(`/api/issues/${S.sel}/chat`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ message }),
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    addSys('⚠ ' + (err.error || `request failed (${r.status})`), 'err');
+    $('input').value = message;
+  } else {
+    setBusy(true);
+  }
+}
+$('send').onclick = send;
+$('input').addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); send(); }
+});
+function autosize() { const i = $('input'); i.style.height = 'auto'; i.style.height = Math.min(i.scrollHeight, 160) + 'px'; }
+$('input').addEventListener('input', autosize);
+
+// ---------- boot ----------
+loadIssues();
+setInterval(loadIssues, 30000);
+</script>
+</body>
+</html>

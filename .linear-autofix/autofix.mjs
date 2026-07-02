@@ -764,7 +764,7 @@ async function proxyIsOurs(port) {
   try { const r = await fetch(`http://127.0.0.1:${port}/__preview_health__`); return (await r.text()).trim() === 'preview-proxy-ok'; }
   catch { return false; }
 }
-async function ensureProxy() {
+export async function ensureProxy() {
   // The proxy listens on all previewPorts; the customer port is our health/liveness probe.
   const port = Number((config.previewPorts && config.previewPorts.customer) || 5174);
   if (await portOpen(port)) {

@@ -52,6 +52,12 @@ async function main() {
     try { issue = await resolveIssue(id); }
     catch (e) { log(`skip ${id} (could not resolve: ${e.message})`); continue; }
     const type = issue.state?.type;
+    // A chat Fix turn may be mid-flight in this worktree (chat/server.mjs holds a marker file
+    // for the turn's duration) — removing it under the agent corrupts the run. Next gc gets it.
+    if (existsSync(path.join(__dirname, 'chat', 'locks', `${id}.lock`))) {
+      log(`skip ${id} (chat fix turn in progress)`);
+      continue;
+    }
     if (DONE_TYPES.includes(type)) {
       log(`${id} is "${issue.state.name}" (${type}) → removing worktree`);
       removeWorktree(id);

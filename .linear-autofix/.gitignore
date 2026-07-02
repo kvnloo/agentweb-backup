@@ -5,3 +5,7 @@ state.json
 .poll.lock
 logs/
 .verify-mcp.generated.json
+chat/chat-state.json
+chat/chat.log*
+chat/server.pid
+chat/locks/

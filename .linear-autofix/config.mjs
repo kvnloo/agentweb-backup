@@ -179,4 +179,35 @@ export const config = {
     maxTurns: 100,
     timeoutMs: 30 * 60 * 1000,
   },
+
+  // --- Chat UI (chat/server.mjs) ---
+  // A local web UI to chat about any issue the machine is handling. ONE conversation per issue
+  // (no mode toggle) — opening it shows every pipeline step that ran, and the first message
+  // RESUMES the pipeline's own Claude session (per-stage session_ids in state.json), so the
+  // agent natively remembers making the fix. Capability follows the environment: on the runner
+  // (AUTOFIX_RUN_ENABLED=1, pipeline not mid-run, fix branch exists) the chat has FULL access
+  // and new commits auto-push to the open PR; anywhere else it is READ-ONLY. Binds localhost
+  // only — reach it via `ssh -L 8790:localhost:8790 ec2-user@<ip>`; SSH is the auth.
+  chat: {
+    port: 8790,
+    bind: '127.0.0.1',               // NEVER 0.0.0.0 — no auth layer; SSH tunnel only
+    full: {
+      model: 'opus',
+      maxTurns: 100,
+      timeoutMs: 30 * 60 * 1000,     // mirrors revise — a full-access turn is an interactive revise
+    },
+    readOnly: {
+      model: 'sonnet',
+      maxTurns: 30,
+      timeoutMs: 10 * 60 * 1000,
+      // Read-only enforcement: headless -p auto-denies any tool not listed here (and there is
+      // deliberately NO --dangerously-skip-permissions). The prompt text is just alignment;
+      // this list is the actual guard.
+      allowedTools: [
+        'Read', 'Grep', 'Glob', 'LS',
+        'Bash(git log:*)', 'Bash(git diff:*)', 'Bash(git show:*)',
+        'Bash(git status:*)', 'Bash(git blame:*)',
+      ],
+    },
+  },
 };
