@@ -3964,6 +3964,13 @@ export class AgentModeService {
     'you_search_web',         // Explicit You.com web search
     'you_search_news',        // Explicit You.com news search
 
+    // Basic file reading — always available so an attached file (text, PDF,
+    // CSV, docx, etc.) can be read immediately without first installing a
+    // skill. Being gated behind __other_skills__ produced a transient
+    // "read_file_content unavailable/failed" until the user manually installed
+    // other_skills (ENG-152).
+    'read_file_content',
+
     // Work Plans (Emma's execution planning system)
     'create_work_plan',
     'modify_work_plan',
@@ -4071,6 +4078,12 @@ export class AgentModeService {
     // this, users with a configured sender but no connected Gmail still cannot send
     // a one-off email from chat (the reported bug).
     'send_email_from_sender',
+    // Basic file reading. Force-merged because the prod `foundation_tools`
+    // AW-Settings override omits DEFAULT-only additions — without this, an
+    // attached file cannot be read until the user manually installs
+    // other_skills, producing the transient "read_file_content
+    // unavailable/failed" failure (ENG-152).
+    'read_file_content',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
