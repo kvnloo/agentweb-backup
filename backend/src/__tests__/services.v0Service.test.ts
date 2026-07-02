@@ -168,6 +168,8 @@ import {
   recordLandingPagePublish,
   markLandingPagePublishReverted,
   triggerVercelDeployment,
+  injectLeadCaptureAttribution,
+  assertNoDuplicateInjectedRoutes,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
@@ -267,6 +269,181 @@ describe("v0Service - buildBrandEnrichedPrompt", () => {
     expect(result).toContain("Create hero section");
     expect(result).not.toContain("Brand Guidelines:");
     expect(result).toContain("production-ready landing page");
+  });
+
+  it("SUCCESS: with leadListId, instructs v0 to build only the form and NOT create the capture route", () => {
+    const result = buildBrandEnrichedPrompt("Build page", {}, "list_abc123");
+
+    expect(result).toContain("/api/capture");
+    expect(result).toContain("Do NOT create app/api/capture/route.ts");
+    // Relative fetch path required — no hardcoded backend host in the prompt's capture instructions
+    expect(result).toMatch(/fetch\('\/api\/capture'/);
+  });
+
+  it("FAIL: without leadListId, no lead capture instructions are included", () => {
+    const result = buildBrandEnrichedPrompt("Build page", {});
+
+    expect(result).not.toContain("LEAD CAPTURE FORM");
+    expect(result).not.toContain("/api/capture");
+    expect(result).not.toContain("app/api/capture/route.ts");
+  });
+});
+
+// =============================================================================
+// injectLeadCaptureAttribution
+// =============================================================================
+describe("v0Service - injectLeadCaptureAttribution", () => {
+  const file = (path: string, content = "// v0 generated") => ({ path, content: Buffer.from(content) });
+
+  it("SUCCESS: injects middleware.ts and app/api/capture/route.ts with the list id and forward URL", () => {
+    const result = injectLeadCaptureAttribution([file("app/page.tsx")], "list_xyz");
+
+    const middleware = result.find((f) => f.path === "middleware.ts");
+    const route = result.find((f) => f.path === "app/api/capture/route.ts");
+
+    expect(middleware).toBeDefined();
+    expect(middleware!.content.toString()).toContain("aw_first_touch");
+    expect(middleware!.content.toString()).toContain("60 * 60 * 24 * 90");
+
+    expect(route).toBeDefined();
+    const routeSrc = route!.content.toString();
+    expect(routeSrc).toContain('const LIST_ID = "list_xyz"');
+    expect(routeSrc).toContain("/api/webhooks/forward-lead");
+    expect(routeSrc).toContain('from "next/headers"');
+    expect(routeSrc).toContain("aw_first_touch");
+  });
+
+  it("FAIL: v0-generated app/api/capture/route.ts is replaced, not duplicated", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("app/api/capture/route.ts", "// v0's own capture route"), file("app/page.tsx")],
+      "list_xyz"
+    );
+
+    const captureRoutes = result.filter((f) => f.path === "app/api/capture/route.ts");
+    expect(captureRoutes).toHaveLength(1);
+    expect(captureRoutes[0].content.toString()).not.toContain("v0's own capture route");
+  });
+
+  it("FAIL: route-group variant of v0's capture route is also dropped", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("app/(frontend)/api/capture/route.ts", "// v0 route-group capture"), file("app/page.tsx")],
+      "list_xyz"
+    );
+
+    expect(result.some((f) => f.path === "app/(frontend)/api/capture/route.ts")).toBe(false);
+    const captureRoutes = result.filter((f) => f.path === "app/api/capture/route.ts");
+    expect(captureRoutes).toHaveLength(1);
+  });
+
+  it("FAIL: v0-generated middleware.ts is replaced, not duplicated", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("middleware.ts", "// v0's own middleware"), file("app/page.tsx")],
+      "list_xyz"
+    );
+
+    const middlewares = result.filter((f) => f.path === "middleware.ts");
+    expect(middlewares).toHaveLength(1);
+    expect(middlewares[0].content.toString()).not.toContain("v0's own middleware");
+  });
+
+  it("SUCCESS: unrelated files are left untouched", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("app/page.tsx", "// page"), file("lib/utils.ts", "// utils")],
+      "list_xyz"
+    );
+
+    expect(result.find((f) => f.path === "app/page.tsx")!.content.toString()).toBe("// page");
+    expect(result.find((f) => f.path === "lib/utils.ts")!.content.toString()).toBe("// utils");
+  });
+
+  it("FAIL: src/app capture route variant is dropped, not duplicated", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("src/app/api/capture/route.ts", "// v0 src/app capture"), file("app/page.tsx")],
+      "list_xyz"
+    );
+
+    expect(result.some((f) => f.path === "src/app/api/capture/route.ts")).toBe(false);
+    const captureRoutes = result.filter((f) => f.path === "app/api/capture/route.ts");
+    expect(captureRoutes).toHaveLength(1);
+  });
+
+  it("FAIL: nested/multiple route-group capture variant is dropped, not duplicated", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("src/app/(marketing)/(v2)/api/capture/route.tsx", "// v0 nested"), file("app/page.tsx")],
+      "list_xyz"
+    );
+
+    expect(result.some((f) => f.path.includes("(marketing)"))).toBe(false);
+    const captureRoutes = result.filter((f) => f.path === "app/api/capture/route.ts");
+    expect(captureRoutes).toHaveLength(1);
+  });
+
+  it("FAIL: src/middleware.ts variant is replaced, not duplicated", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("src/middleware.ts", "// v0's own src middleware"), file("app/page.tsx")],
+      "list_xyz"
+    );
+
+    expect(result.some((f) => f.path === "src/middleware.ts")).toBe(false);
+    const middlewares = result.filter((f) => f.path === "middleware.ts");
+    expect(middlewares).toHaveLength(1);
+    expect(middlewares[0].content.toString()).not.toContain("v0's own src middleware");
+  });
+
+  it("SUCCESS: a non-root helper file literally named middleware.ts is left alone (not a real Next.js middleware)", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("components/middleware.ts", "// unrelated helper, not Next middleware"), file("app/page.tsx")],
+      "list_xyz"
+    );
+
+    const helper = result.find((f) => f.path === "components/middleware.ts");
+    expect(helper).toBeDefined();
+    expect(helper!.content.toString()).toBe("// unrelated helper, not Next middleware");
+  });
+
+  it("SUCCESS: injectLeadCaptureAttribution never trips the duplicate guard on the normal path", () => {
+    const files = [file("app/page.tsx"), file("app/api/capture/route.ts", "// v0's own"), file("middleware.ts", "// v0's own")];
+    expect(() => injectLeadCaptureAttribution(files, "list_xyz")).not.toThrow();
+  });
+});
+
+// =============================================================================
+// assertNoDuplicateInjectedRoutes
+// =============================================================================
+describe("v0Service - assertNoDuplicateInjectedRoutes", () => {
+  const file = (path: string, content = "x") => ({ path, content: Buffer.from(content) });
+
+  it("SUCCESS: does not throw with exactly one capture route and one middleware", () => {
+    expect(() =>
+      assertNoDuplicateInjectedRoutes([file("app/api/capture/route.ts"), file("middleware.ts"), file("app/page.tsx")])
+    ).not.toThrow();
+  });
+
+  it("SUCCESS: does not throw with neither file present", () => {
+    expect(() => assertNoDuplicateInjectedRoutes([file("app/page.tsx")])).not.toThrow();
+  });
+
+  it("FAIL: throws when two capture routes are present", () => {
+    expect(() =>
+      assertNoDuplicateInjectedRoutes([file("app/api/capture/route.ts"), file("app/api/capture/route.ts")])
+    ).toThrow(/duplicate route/);
+  });
+
+  it("FAIL: throws when two middleware files are present", () => {
+    expect(() => assertNoDuplicateInjectedRoutes([file("middleware.ts"), file("middleware.ts")])).toThrow(
+      /duplicate route/
+    );
+  });
+
+  it("FAIL: throws when both are duplicated, reporting both counts", () => {
+    expect(() =>
+      assertNoDuplicateInjectedRoutes([
+        file("app/api/capture/route.ts"),
+        file("app/api/capture/route.ts"),
+        file("middleware.ts"),
+        file("middleware.ts"),
+      ])
+    ).toThrow(/capture routes: 2, middleware: 2/);
   });
 });
 
