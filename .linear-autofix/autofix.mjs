@@ -381,10 +381,16 @@ async function main() {
 
 export function runClaude(args, prompt, cwd, timeoutMs = config.timeoutMs, stage = null) {
   return new Promise((resolve) => {
-    const child = spawn('claude', args, { cwd, env: process.env });
+    // detached => own process group, so a timeout kill takes claude AND everything it spawned
+    // (dev servers, workers, test runners). A plain child.kill orphaned a 3.7GB backend worker
+    // for 6 hours on ENG-124 and helped OOM the box.
+    const child = spawn('claude', args, { cwd, env: process.env, detached: true });
     let out = '';
     let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeoutMs);
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
+    }, timeoutMs);
     // A spawn failure (e.g. `claude` not on PATH under cron) emits 'error' and would otherwise
     // CRASH the whole run as an unhandled event — resolve with empty output instead.
     child.on('error', (e) => { clearTimeout(timer); log(`claude spawn failed${stage ? ` (stage ${stage})` : ''}: ${e.message}`); resolve({ out, timedOut, spawnError: e.message }); });
@@ -544,11 +550,19 @@ export function runChecks(WT, changed) {
   // The backend is too big for node's default ~2GB heap under tsc (proven OOM on ENG-129);
   // match the repo's own dev tooling headroom.
   const env = { ...process.env, NODE_OPTIONS: '--max-old-space-size=4096' };
+  // Invoke the package's own binaries DIRECTLY (not through npx): spawnSync's timeout only
+  // kills the process it spawned, and killing the npx wrapper orphaned a 4GB tsc grandchild
+  // for hours on the runner. With the direct binary, the timeout hits the real process.
+  const bin = (dir, name) => {
+    const p = path.join(dir, 'node_modules', '.bin', name);
+    return existsSync(p) ? { cmd: p, args: [] } : { cmd: 'npx', args: [name] };
+  };
   for (const [pkg, files] of Object.entries(byPkg)) {
     const dir = path.join(WT, pkg);
     if (existsSync(path.join(dir, 'tsconfig.json'))) {
-      log(`Deterministic check: npx tsc --noEmit (${pkg})...`);
-      const r = spawnSync('npx', ['tsc', '--noEmit'], { cwd: dir, env, encoding: 'utf8', timeout: config.checks?.tscTimeoutMs || 300000 });
+      log(`Deterministic check: tsc --noEmit (${pkg})...`);
+      const tsc = bin(dir, 'tsc');
+      const r = spawnSync(tsc.cmd, [...tsc.args, '--noEmit'], { cwd: dir, env, encoding: 'utf8', timeout: config.checks?.tscTimeoutMs || 300000 });
       results.push(checkResult(`npx tsc --noEmit (${pkg})`, r));
     }
     if (pkg === 'backend') {
@@ -558,8 +572,9 @@ export function runChecks(WT, changed) {
       // pre-existing failures unrelated to this fix (proven on ENG-129).
       const testFiles = files.filter((f) => /(__tests__\/|\.test\.|\.spec\.)/.test(f) && /\.(ts|tsx|js)$/.test(f) && existsSync(path.join(dir, f)));
       if (testFiles.length) {
-        log(`Deterministic check: npx jest on ${testFiles.length} changed test file(s) (backend)...`);
-        const r = spawnSync('npx', ['jest', ...testFiles, '--silent'], { cwd: dir, env, encoding: 'utf8', timeout: config.checks?.jestTimeoutMs || 600000 });
+        log(`Deterministic check: jest on ${testFiles.length} changed test file(s) (backend)...`);
+        const jest = bin(dir, 'jest');
+        const r = spawnSync(jest.cmd, [...jest.args, ...testFiles, '--silent'], { cwd: dir, env, encoding: 'utf8', timeout: config.checks?.jestTimeoutMs || 600000 });
         results.push(checkResult(`npx jest ${testFiles.join(' ')} (backend)`, r));
       }
     }
@@ -679,7 +694,11 @@ async function runReview(issue, WT, changed, branch, sessionContext = '') {
   if (allFindings.length) {
     const mp = fillTemplate(readFileSync(managerPromptPath, 'utf8'), { ...issueMap, DIFF: diff, FINDINGS: findingsBlock });
     log(`Running manager verification (model=${config.review.managerModel})...`);
-    manager = parseManager(await runClaude(claudeArgs({ model: config.review.managerModel, maxTurns: config.review.maxTurns, skipPermissions: true }), mp, WT, config.review.timeoutMs, 'manager'));
+    const mres = await runClaude(claudeArgs({ model: config.review.managerModel, maxTurns: config.review.maxTurns, skipPermissions: true }), mp, WT, config.review.timeoutMs, 'manager');
+    manager = parseManager(mres);
+    // A killed manager must never approve: parseManager defaults to 'sound' when no marker
+    // was emitted, which a timeout SIGKILL guarantees. Be conservative instead.
+    if (mres.timedOut) manager = { ...manager, verdict: 'needs_rework', assessment: manager.assessment || 'Manager verification timed out before reaching a verdict — treat the fix as unapproved.' };
   }
   log(`Manager verdict: ${manager.verdict}; confirmed ${manager.confirmed.length}, rejected ${manager.rejectedCount}.`);
 
@@ -704,7 +723,10 @@ async function runReview(issue, WT, changed, branch, sessionContext = '') {
       const recheckNote = 'NOTE: These findings were filed against an EARLIER revision of this branch; a rework pass has since been applied (the diff above is CURRENT). This is the FINAL gate — return "sound" only if no must-fix defect remains in the current code; otherwise return "needs_rework". Do not assume any further fix pass will run.\n\n';
       const mp2 = fillTemplate(readFileSync(managerPromptPath, 'utf8'), { ...issueMap, DIFF: diff2, FINDINGS: recheckNote + findingsBlock });
       log('Manager re-check after rework...');
-      const m2 = parseManager(await runClaude(claudeArgs({ model: config.review.managerModel, maxTurns: config.review.maxTurns, skipPermissions: true }), mp2, WT, config.review.timeoutMs, 'manager-recheck'));
+      const m2res = await runClaude(claudeArgs({ model: config.review.managerModel, maxTurns: config.review.maxTurns, skipPermissions: true }), mp2, WT, config.review.timeoutMs, 'manager-recheck');
+      const m2 = parseManager(m2res);
+      // Same conservatism as above: a re-check killed by its timeout cannot clear the fix.
+      if (m2res.timedOut) { m2.verdict = 'needs_rework'; m2.assessment = m2.assessment || 'Manager re-check timed out — the rework remains unapproved.'; }
       log(`Manager re-check verdict: ${m2.verdict}.`);
       // Keep the ORIGINAL confirmed list (those were applied); the re-check contributes the
       // final verdict + assessment. initialVerdict records that a rework round happened.

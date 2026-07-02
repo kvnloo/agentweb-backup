@@ -46,8 +46,11 @@ export const config = {
   },
 
   // --- Poller ---
-  maxConcurrent: 2,                // bugs fixed in parallel per poll cycle (worktrees, branches, and
-                                   // preview ports are isolated per bug; 1 = old sequential behavior)
+  maxConcurrent: 1,                // bugs fixed in parallel per poll cycle. ONE pipeline already fans
+                                   // out hard (parallel reviewers, 4GB tsc check, preview builds,
+                                   // verify browser); 2 concurrent bugs OOM-stalled the 16GB runner on
+                                   // 2026-07-02 (load 57, sshd unresponsive). Raise only after adding
+                                   // RAM — swap alone just makes the thrash survivable.
   staleInProgressHours: 6,         // an issue autofix STARTED (recorded in state.json) still In Progress
                                    // this long with no final outcome = a crashed run; poll.mjs resets it for
                                    // ONE retry, then flags it for a human. Issues moved to In Progress by
