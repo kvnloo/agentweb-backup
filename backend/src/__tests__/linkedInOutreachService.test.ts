@@ -980,6 +980,58 @@ describe('LinkedInOutreachService', () => {
     });
   });
 
+  describe('profile lookup timeout + retry (ENG-144)', () => {
+    const TIMEOUT_MS = 30_000;
+    const hang = () => new Promise(() => {}); // never resolves — simulates a stuck Unipile session
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('times out a hung profile lookup instead of blocking indefinitely, and retries once', async () => {
+      jest.useFakeTimers();
+      const profile = { provider_id: 'john-doe', first_name: 'John' };
+      // First call hangs (stuck session), second call (the automatic retry) succeeds.
+      (mockUnipileClient.request.send as jest.Mock)
+        .mockImplementationOnce(() => hang())
+        .mockResolvedValueOnce(profile);
+
+      const resultPromise = linkedInOutreachService.getProfile('john-doe', 'account-123');
+      // Advance past the first internal timeout so the retry fires.
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+
+      await expect(resultPromise).resolves.toEqual(profile);
+      expect(mockUnipileClient.request.send).toHaveBeenCalledTimes(2);
+    });
+
+    it('rejects with a TIMEOUT_ERROR classification when both the initial call and the retry hang', async () => {
+      jest.useFakeTimers();
+      (mockUnipileClient.request.send as jest.Mock).mockImplementation(() => hang());
+
+      const resultPromise = linkedInOutreachService.getProfile('john-doe', 'account-123');
+      const assertion = expect(resultPromise).rejects.toMatchObject({
+        structuredError: { classification: 'TIMEOUT_ERROR' },
+      });
+      // Two timeouts: the initial lookup and its single retry.
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+      await assertion;
+      expect(mockUnipileClient.request.send).toHaveBeenCalledTimes(2);
+    });
+
+    it('does NOT retry on a real (non-timeout) API error — surfaces it immediately', async () => {
+      const apiError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 404, title: 'Profile not found' },
+      });
+      (mockUnipileClient.request.send as jest.Mock).mockRejectedValueOnce(apiError);
+
+      await expect(
+        linkedInOutreachService.getProfile('nonexistent', 'account-123')
+      ).rejects.toThrow('Profile not found');
+      expect(mockUnipileClient.request.send).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('listConnections', () => {
     it('should return connections list', async () => {
       const mockRelations = {
