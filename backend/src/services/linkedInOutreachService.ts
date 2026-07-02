@@ -52,6 +52,14 @@ export class LinkedInOutreachService {
       classification: 'UNKNOWN_ERROR'
     };
 
+    // Internal timeouts (from withTimeout) have no HTTP status — preserve the
+    // TIMEOUT_ERROR classification so callers/agent can surface a retry-friendly
+    // message instead of a generic "Unknown error".
+    if (error?.isTimeout || error?.classification === 'TIMEOUT_ERROR') {
+      structuredError.classification = 'TIMEOUT_ERROR';
+      structuredError.isTimeout = true;
+    }
+
     // Basic classification based on HTTP status or error code
     const status = Number(structuredError.status);
     if (status === 401 || status === 403) {
@@ -76,6 +84,69 @@ export class LinkedInOutreachService {
       : (error instanceof Error ? error : new Error(structuredError.message));
     (enhancedError as any).structuredError = structuredError;
     throw enhancedError;
+  }
+
+  // ─── Timeout / retry helpers ─────────────────────────────────────────────────
+
+  // Profile lookups occasionally hang when Unipile's upstream LinkedIn session is
+  // stuck (CAPTCHA/auth wall or a dead browser session). The Unipile SDK's fetch
+  // has no timeout, so a hung request blocks the agent for minutes — a real session
+  // (ENG-144) waited 167s before failing and returned no data. Bound each lookup
+  // with an internal timeout and one automatic retry so we surface a clear,
+  // classified error quickly instead of stalling the conversation.
+  static readonly PROFILE_LOOKUP_TIMEOUT_MS = 30_000;
+
+  /**
+   * Race a promise against a timeout. If the timeout fires first, reject with a
+   * TIMEOUT_ERROR-classified Error carrying `isTimeout = true`. The underlying
+   * promise is left to settle on its own (the SDK's fetch is not abortable), but
+   * the caller is unblocked. The timer is unref'd so it never keeps the process
+   * alive and is always cleared once the race settles.
+   */
+  private static withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const err: any = new Error(`${label} timed out after ${ms}ms`);
+        err.isTimeout = true;
+        err.classification = 'TIMEOUT_ERROR';
+        reject(err);
+      }, ms);
+      if (typeof (timer as any).unref === 'function') (timer as any).unref();
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  }
+
+  /**
+   * Fetch a full LinkedIn profile from Unipile with a bounded timeout and a single
+   * automatic retry on timeout. Non-timeout errors (404/401/etc.) bubble straight
+   * up to the caller's handleError without a retry — retrying those just wastes
+   * credits. Shared by getLinkedInProfile (URL input) and getProfile (raw id).
+   */
+  private async fetchProfileFromUnipile(identifier: string, accountId: string): Promise<any> {
+    const client = await this.getClient();
+    const doFetch = () => client.request.send({
+      method: 'GET',
+      path: ['users', identifier],
+      // linkedin_sections='*' returns ALL profile sections (experience,
+      // education, skills, languages, certifications, volunteer, etc.).
+      parameters: { account_id: accountId, linkedin_sections: '*' }
+    });
+    try {
+      return await LinkedInOutreachService.withTimeout(
+        doFetch(),
+        LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+        `LinkedIn profile lookup for ${identifier}`
+      );
+    } catch (err: any) {
+      if (!err?.isTimeout) throw err; // real API error — surface immediately, no retry
+      this.log(`Profile lookup timed out after ${LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS}ms; retrying once`, { identifier });
+      return await LinkedInOutreachService.withTimeout(
+        doFetch(),
+        LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+        `LinkedIn profile lookup (retry) for ${identifier}`
+      );
+    }
   }
 
   // ─── Client initialization ───────────────────────────────────────────────────
@@ -329,15 +400,7 @@ export class LinkedInOutreachService {
 
     try {
       this.log(`Fetching LinkedIn profile: ${identifier}`, { account_id });
-      const client = await this.getClient();
-      const profile = await client.request.send({
-        method: 'GET',
-        path: ['users', identifier],
-        // linkedin_sections='*' returns ALL profile sections (experience,
-        // education, skills, languages, certifications, volunteer, etc.).
-        // Without it, Unipile returns only the base profile fields.
-        parameters: { account_id, linkedin_sections: '*' }
-      });
+      const profile = await this.fetchProfileFromUnipile(identifier, account_id);
       this.log(`Successfully fetched profile: ${identifier}`);
       return profile;
     } catch (error: any) {
@@ -747,13 +810,7 @@ export class LinkedInOutreachService {
   async getProfile(identifier: string, accountId: string): Promise<any> {
     try {
       this.log(`Fetching profile: ${identifier}`, { accountId });
-      const client = await this.getClient();
-      const profile = await client.request.send({
-        method: 'GET',
-        path: ['users', identifier],
-        // See getLinkedInProfile — linkedin_sections=* pulls all sections.
-        parameters: { account_id: accountId, linkedin_sections: '*' }
-      });
+      const profile = await this.fetchProfileFromUnipile(identifier, accountId);
       this.log(`Successfully fetched profile: ${identifier}`);
       return profile;
     } catch (error: any) {
