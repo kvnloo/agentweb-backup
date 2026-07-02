@@ -1,3 +1,15 @@
+## Slack ship-notify: Featurebase webhook → customer channel ping (2026-07-02, ENG-170)
+
+Added `shipNotifyService` + `POST /api/integrations/featurebase/webhook`: when a reported item ships, ping the reporter in their own Slack channel — additive to the email paths (bug resolve-bridge Resend email; Featurebase-native upvoter email for feature requests). Channel = first of the existing personal → org → org-owner resolution (`getEffectiveAllowedChannels`, moved from `emma/slackMessageTools` into `slackService`). Idempotency = per-item AW-Settings marker listing notified emails (a failed Slack send records no marker, so Featurebase's delivery retry gets a second chance). Endpoint is dark until `FEATUREBASE_WEBHOOK_SECRET` is set; signature = HMAC-SHA256 over `${timestamp}.${rawBody}` (headers `X-Webhook-Signature` hex + `X-Webhook-Timestamp`, ±300s).
+
+**Assumptions to validate on first live webhook (docs are thin here — developers.featurebase.app/guides/webhooks):**
+- `post.updated` fires with `data.changes[].field === "status"` on a status flip — the exact `changes` value shape for status transitions is undocumented; we only gate on the field name + `data.item.status.type === 'completed'`.
+- `data.item.postUrl` and `data.item.author.email` may be absent on `post.updated` (documented for `post.created` only) — handler falls back to `GET /v2/posts/{id}`; verify the fallback fires rarely, not always.
+- Dashboard "test delivery" pings are undocumented — handler 200s anything signed that isn't a completed-status post.updated, so pings are safe no-ops.
+- Voter list is fetched single-page (limit 100, warn on `nextCursor`) — fine at current board size.
+
+Rollout: create webhook in Featurebase Settings → Advanced → Webhooks (topic `post.updated`, nova version) pointing at prod, set `FEATUREBASE_WEBHOOK_SECRET` (value in the Featurebase dashboard per-webhook), redeploy. Kill switch: unset the env var (endpoint goes dark again). Per-user opt-out: `slackShipNotifyDisabled` on AW-Users.
+
 ## Prod outage: partner-portal "Failed to load users" — full disk + nginx PrivateTmp trap (2026-06-26)
 
 Three stacked failures, only the last self-inflicted by the attempted fixes:
