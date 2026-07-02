@@ -18,7 +18,7 @@
  */
 import AWS from "aws-sdk";
 import type { GeneratedLandingPage } from "./v0Service";
-import { deliverCompletion, deliverStuckFailure } from "./durableLandingService";
+import { deliverCompletion, deliverStuckFailure, STUCK_CEILING_MS } from "./durableLandingService";
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || "us-west-2",
@@ -27,9 +27,6 @@ const dynamodb = new AWS.DynamoDB.DocumentClient({
 
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 const TABLE_NAME = `${TABLE_PREFIX}AW-LandingPages`;
-
-/** A build still in this state past the ceiling is considered dead. */
-const STUCK_CEILING_MS = 30 * 60 * 1000;
 
 function isStuck(page: GeneratedLandingPage, nowMs: number): boolean {
   if (page.status !== "generating" && page.status !== "deploying") return false;
