@@ -1141,8 +1141,9 @@ export class AgentModeService {
   // Model for the internal dedup judge (report_product_issues duplicate detection).
   // Sourced from settings so it is NOT pinned to a model that goes stale; admin can
   // point `agent_mode_dedup_judge_model` at a cheap/fast model. Falls back to the
-  // configurable default model. TODO(ENG-9): route this call through OpenRouter so
-  // model choice becomes gateway/routing config rather than provider-specific.
+  // configurable default model. OpenRouter routing (ENG-9) is live: point
+  // `agent_mode_dedup_judge_model` at an OpenRouter slug (e.g. "google/gemini-3.5-flash")
+  // and the call goes through the gateway — no provider-specific wiring needed.
   async getDedupJudgeModel(): Promise<string> {
     const fallbackModel = this.default_model;
     try {
@@ -1370,6 +1371,8 @@ export class AgentModeService {
   private gemini_client_promise: Promise<OpenAI> | null = null;
   private vertex_client: any | null = null;
   private vertex_client_promise: Promise<any> | null = null;
+  private openrouter_client: OpenAI | null = null;
+  private openrouter_client_promise: Promise<OpenAI> | null = null;
 
   // Helper method to get Gemini client (lazy-loaded from secrets manager)
   public async getGeminiClient(): Promise<OpenAI> {
@@ -1412,6 +1415,53 @@ export class AgentModeService {
     })();
 
     return this.gemini_client_promise;
+  }
+
+  // Helper method to get the OpenRouter client (lazy-loaded from env/secrets manager).
+  // OpenRouter is OpenAI-compatible, so this is a plain OpenAI client pointed at the
+  // gateway. One client serves every OpenRouter slug — the model id in the request
+  // body selects the upstream provider.
+  public async getOpenRouterClient(): Promise<OpenAI> {
+    if (this.openrouter_client) {
+      return this.openrouter_client;
+    }
+
+    if (this.openrouter_client_promise) {
+      return this.openrouter_client_promise;
+    }
+
+    this.openrouter_client_promise = (async () => {
+      try {
+        let openRouterApiKey = process.env.OPENROUTER_API_KEY;
+
+        if (!openRouterApiKey) {
+          const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+          openRouterApiKey = await getSecret(`${environment}/AgentWeb/OpenRouter`);
+        }
+
+        if (!openRouterApiKey || !openRouterApiKey.trim()) {
+          throw new Error('OpenRouter API key is empty or not found in env/secrets');
+        }
+
+        this.openrouter_client = new OpenAI({
+          apiKey: openRouterApiKey.trim(),
+          baseURL: 'https://openrouter.ai/api/v1',
+          // Optional OpenRouter attribution headers (app discoverability on openrouter.ai)
+          defaultHeaders: {
+            'HTTP-Referer': 'https://www.hireemma.ai',
+            'X-Title': 'Emma by AgentWeb',
+          },
+        });
+
+        return this.openrouter_client;
+      } catch (error) {
+        console.error('Error initializing OpenRouter client:', error);
+        this.openrouter_client_promise = null; // Reset promise on error
+        throw error;
+      }
+    })();
+
+    return this.openrouter_client_promise;
   }
 
   public async getVertexClient(modelId: string): Promise<any> {
@@ -1595,6 +1645,10 @@ export class AgentModeService {
   }
 
   public async getClientForModel(model: string): Promise<any> {
+    // OpenRouter slugs are the only model ids containing "/" (e.g. "anthropic/claude-opus-4.8")
+    if (model.includes('/')) {
+      return this.getOpenRouterClient();
+    }
     if (model.startsWith('anthropic.')) {
       return this.getBedrockClient(model);
     }
@@ -2131,6 +2185,16 @@ export class AgentModeService {
     // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
     // temperature is deprecated for this model
     'anthropic.claude-opus-4-8': { client: null, supportsTemperature: false, supportsVision: true },
+    // OpenRouter unified gateway (ENG-9) — OpenAI-compatible, client lazy-loaded.
+    // Ids are OpenRouter slugs (provider-prefixed with "/"); no direct-provider key
+    // contains "/", so it is the routing discriminator in getClientForModel/callLLM.
+    // adminOnly until the account has credits/BYOK (paid models 402 on the free tier);
+    // supportsVision intentionally unset until verified empirically per the interface doc.
+    'anthropic/claude-opus-4.8': { client: null, supportsTemperature: false, adminOnly: true },
+    'anthropic/claude-sonnet-4.6': { client: null, supportsTemperature: true, adminOnly: true },
+    'openai/gpt-5.5': { client: null, supportsTemperature: false, maxTools: 128, adminOnly: true },
+    'google/gemini-3.5-flash': { client: null, supportsTemperature: true, adminOnly: true },
+    'google/gemini-3.1-pro-preview': { client: null, supportsTemperature: true, adminOnly: true },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
@@ -2228,7 +2292,10 @@ export class AgentModeService {
     // Get the client - lazy-load Gemini, Bedrock, or Vertex client if needed
     let client = this.llmModels[model].client;
     if (!client) {
-      if (model.startsWith('gemini-')) {
+      if (model.includes('/')) {
+        client = await this.getOpenRouterClient();
+        this.llmModels[model].client = client;
+      } else if (model.startsWith('gemini-')) {
         client = await this.getGeminiClient();
         this.llmModels[model].client = client;
       } else if (model.startsWith('anthropic.')) {
@@ -2265,7 +2332,8 @@ export class AgentModeService {
               userId: usageContext?.userId,
               sessionId: usageContext?.sessionId,
               model,
-              provider: model.startsWith('gemini-') ? 'gemini'
+              provider: model.includes('/') ? 'openrouter'
+                : model.startsWith('gemini-') ? 'gemini'
                 : model.startsWith('anthropic.') ? 'bedrock'
                 : model.startsWith('claude-') ? 'vertex'
                 : 'azure-openai',
@@ -2340,6 +2408,12 @@ export class AgentModeService {
       'gemini-3.1-pro-preview': [1.25, 10],
       'gemini-3.1-flash-lite': [0.075, 0.3],
       'gemini-3.5-flash': [0.15, 0.6],
+      // OpenRouter gateway rates (openrouter.ai/api/v1/models, 2026-07-02)
+      'anthropic/claude-opus-4.8': [5, 25],
+      'anthropic/claude-sonnet-4.6': [3, 15],
+      'openai/gpt-5.5': [5, 30],
+      'google/gemini-3.5-flash': [1.5, 9],
+      'google/gemini-3.1-pro-preview': [2, 12],
     };
     const [inputPrice, outputPrice] = pricing[model] || [3, 15]; // Default to Sonnet pricing
     // Cache reads are 10% of input price; cache writes are 125% of input price
