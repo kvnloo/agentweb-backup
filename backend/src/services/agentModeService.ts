@@ -4087,6 +4087,10 @@ export class AgentModeService {
     'you_search_news',
     'google_search_web',
     'perform_deep_research',
+    // ENG-43 (session 74bb2c5d): LinkedIn public-profile lookups (Unipile get-profile)
+    // that time out must degrade through the same branch — keep partial results, retry
+    // once, and fall back to a public web-search provider — instead of abandoning the goal.
+    'linkedin_outreach',
   ]);
 
   /**
