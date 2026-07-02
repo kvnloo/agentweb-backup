@@ -64,6 +64,18 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'gemini-3.5-flash': withDerivedCache(0.15, 0.6), // ported from estimateCost
   'gemini-3.1-flash-live-preview': withDerivedCache(0.75, 4.5), // text rate per public listings (cloudprice, Jun 2026); UNVERIFIED — audio/video tokens are billed at higher live-API rates not modeled here
 
+  // ── OpenRouter gateway (ENG-9) ───────────────────────────────────────────────
+  // Rates are what OpenRouter bills for these slugs (openrouter.ai/api/v1/models,
+  // fetched 2026-07-02). They intentionally differ from the direct-provider rates
+  // for the same upstream models — in both directions (e.g. opus 4.8 is cheaper
+  // via the gateway, gemini flash is pricier). Cost telemetry SHOULD diverge by
+  // route; re-verify against the live endpoint before flipping a per-feature default.
+  'anthropic/claude-opus-4.8': withDerivedCache(5, 25),
+  'anthropic/claude-sonnet-4.6': withDerivedCache(3, 15),
+  'openai/gpt-5.5': withDerivedCache(5, 30),
+  'google/gemini-3.5-flash': withDerivedCache(1.5, 9),
+  'google/gemini-3.1-pro-preview': withDerivedCache(2, 12),
+
   // ── Chatbot (Emma) Azure deployments ────────────────────────────────────────
   // NOTE: chatbotService.calculateCost() carries per-1K rates that are 10x the
   // published Azure list prices (likely a long-standing bug). The shadow price

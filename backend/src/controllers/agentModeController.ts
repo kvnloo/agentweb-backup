@@ -2532,6 +2532,14 @@ export const agentModeController = {
       // Use llmModel from request, session, or default
       const modelToUse = llmModel || session.llmModel || agentModeService.default_model;
 
+      // adminOnly is enforced here at the point of use — the picker's
+      // getSupportedModels() filter is display-only and llmModel arrives straight
+      // from the request body (ENG-9 staged rollout relies on this gate).
+      if (agentModeService.isModelRestrictedForUser(modelToUse, user.isAdmin === true)) {
+        // The enclosing finally releases the session-generation claim.
+        return res.status(403).json({ error: `Model '${modelToUse}' is not available for your account` });
+      }
+
       // Build page context for emma-sidebar sessions
       const pageContext = session.portalType === 'emma-sidebar'
         ? { currentUrl, structuredContext, screenshot }
@@ -6423,6 +6431,12 @@ export const agentModeController = {
         return res.status(403).json({ error: 'Opus models are not available for your account' });
       }
 
+      // adminOnly registry models (e.g. OpenRouter slugs during staged rollout) —
+      // enforced at the point of use, not just the picker filter (ENG-9).
+      if (agentModeService.isModelRestrictedForUser(llmModel, user.isAdmin)) {
+        return res.status(403).json({ error: 'This model is not available for your account' });
+      }
+
       // Get the session to verify ownership
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -6458,6 +6472,12 @@ export const agentModeController = {
       // Shared sessions are non-admin; block opus models
       if (llmModel.includes('opus')) {
         return res.status(403).json({ error: 'Opus models are not available for shared sessions' });
+      }
+
+      // Shared-link visitors are never admins — block adminOnly registry models
+      // (e.g. OpenRouter slugs) at this unauthenticated boundary too (ENG-9).
+      if (agentModeService.isModelRestrictedForUser(llmModel, false)) {
+        return res.status(403).json({ error: 'This model is not available for shared sessions' });
       }
 
       // Get the session to verify the conversable token

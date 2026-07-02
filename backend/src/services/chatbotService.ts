@@ -3827,6 +3827,14 @@ export async function generateChatResponse(
     adminEmail,
     orgRole,
   } = options;
+
+  // OpenRouter slugs (contain "/") are Agent Mode callLLM-only ids — the chatbot's
+  // substring dispatch below would mis-route them (Bedrock rejects the slug, Gemini
+  // 404s, Azure would embed the "/" in the deployment URL path). Fail fast (ENG-9).
+  if (model && model.includes('/')) {
+    throw new Error(`Model '${model}' is an OpenRouter id, which the chatbot does not support. Choose a direct-provider model.`);
+  }
+
   try {
     const timestamp = new Date().toISOString();
 

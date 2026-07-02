@@ -1296,10 +1296,16 @@ export class AgentModeService {
       const setting = await settingsService.getSetting(this.codingAgentDefaultModelSettingName);
       const configuredModel = setting?.settingValue?.trim();
       if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
+        if (configuredModel.includes('/')) {
+          // OpenRouter slugs validate against the registry, but codingAgentService
+          // has its own provider dispatch with no OpenRouter branch — fall back
+          // safely instead of hard-failing every coding-agent run (ENG-9).
+          console.warn(`AgentMode: Coding agent default model "${configuredModel}" is an OpenRouter slug, which the coding agent does not support; using fallback.`);
+        } else if (this.llmModels[configuredModel]) {
           return configuredModel;
+        } else {
+          console.warn(`AgentMode: Unsupported coding agent default model "${configuredModel}" in settings; using fallback.`);
         }
-        console.warn(`AgentMode: Unsupported coding agent default model "${configuredModel}" in settings; using fallback.`);
       }
     } catch (error) {
       console.error('AgentMode: Error getting coding agent default model setting:', error);
@@ -2230,6 +2236,19 @@ export class AgentModeService {
       return LEGACY_MODEL_ALIASES[model] as T;
     }
     return model;
+  }
+
+  /**
+   * True when a registry model is adminOnly and the caller is not an admin.
+   * This is the POINT-OF-USE gate — getSupportedModels() filtering is only a
+   * display filter, and model ids arrive straight in request bodies. Unknown
+   * ids return false so they keep their existing failure mode (callLLM throws
+   * "Invalid model") instead of a misleading 403.
+   */
+  public isModelRestrictedForUser(model: string, isAdmin: boolean): boolean {
+    const config = this.llmModels[this.normalizeModelId(model)];
+    if (!config) return false;
+    return !!config.adminOnly && !isAdmin;
   }
 
   async callLLM(
