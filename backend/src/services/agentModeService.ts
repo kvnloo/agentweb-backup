@@ -2180,13 +2180,36 @@ export class AgentModeService {
    */
   public resolveGenerationModel(model: string): { model: string; fellBack: boolean; requestedModel: string } {
     const normalized = this.normalizeModelId(model);
-    if (normalized && this.llmModels[normalized]) {
+    // Use hasOwnProperty so inherited Object.prototype keys (e.g. 'constructor',
+    // 'toString') can't masquerade as valid allow-list entries.
+    if (normalized && Object.prototype.hasOwnProperty.call(this.llmModels, normalized)) {
       return { model: normalized, fellBack: false, requestedModel: model };
     }
+    const fallbackModel = this.resolveFallbackModel();
     console.warn(
-      `AgentMode: Requested model '${model ?? '(none)'}' is not in the allow-list; falling back to default '${this.default_model}'.`
+      `AgentMode: Requested model '${model ?? '(none)'}' is not in the allow-list; falling back to default '${fallbackModel}'.`
     );
-    return { model: this.default_model, fellBack: true, requestedModel: model };
+    return { model: fallbackModel, fellBack: true, requestedModel: model };
+  }
+
+  /**
+   * Resolve the model to fall back to when a requested id is unavailable.
+   * Normally this is the configured default_model, but if that itself has been
+   * removed from the allow-list (e.g. a stale AZURE_OPENAI_DEPLOYMENT_AGENT_MODE
+   * env override pinning a retired deployment) returning it would just re-throw
+   * "Invalid model" inside callLLM. Guard against that by validating the default
+   * and falling back to a known-good served model otherwise (ENG-46).
+   */
+  private resolveFallbackModel(): string {
+    if (Object.prototype.hasOwnProperty.call(this.llmModels, this.default_model)) {
+      return this.default_model;
+    }
+    const knownGoodModel = Object.keys(this.llmModels)[0];
+    console.warn(
+      `AgentMode: Configured default model '${this.default_model}' is not in the allow-list; ` +
+      `falling back to known-good model '${knownGoodModel}'.`
+    );
+    return knownGoodModel;
   }
 
   async callLLM(
