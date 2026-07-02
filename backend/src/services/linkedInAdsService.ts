@@ -78,7 +78,11 @@ async function makeRequest(
     // their own app to fix — without this rewrite, the model tells the user to check
     // "their" LinkedIn Developer Portal, which doesn't exist for them and can't resolve it.
     if (/not configured to access the related advertiser account/i.test(message)) {
-      const acctMatch = path.match(/\/adAccounts\/(\d+)/);
+      // Body-only endpoints (conversationAds, posts, inMailContents, uploads) carry the
+      // account as urn:li:sponsoredAccount:{id} in the body instead of an /adAccounts/{id}
+      // path segment — support needs the ID either way to allowlist the account.
+      const acctMatch = path.match(/\/adAccounts\/(\d+)/)
+        || (body ? JSON.stringify(body).match(/urn:li:sponsoredAccount:(\d+)/) : null);
       const acctNote = acctMatch ? ` (${acctMatch[1]})` : '';
       return {
         success: false,
