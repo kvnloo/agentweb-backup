@@ -1099,12 +1099,15 @@ export async function createConversationAd(
   params: Record<string, any>
 ): Promise<LinkedInAdsApiResult> {
   if (!adAccountId) return { success: false, error: 'createConversationAd requires ad_account_id' };
-  if (!params.name) return { success: false, error: 'createConversationAd requires name' };
 
   const body: Record<string, any> = {
     parentAccount: `urn:li:sponsoredAccount:${adAccountId}`,
-    name: params.name,
   };
+  // LinkedIn's SponsoredConversation schema has no "name" field — only the optional
+  // headlineText. Sending "name" is rejected with "unrecognized field found but not
+  // allowed". When absent, LinkedIn falls back to the first message content as the headline.
+  const headlineText = params.headline_text || params.name;
+  if (headlineText) body.headlineText = headlineText;
 
   return makeRequest('POST', '/rest/conversationAds', accessToken, body);
 }

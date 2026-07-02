@@ -757,20 +757,39 @@ describe('createDynamicCreative', () => {
 });
 
 describe('createConversationAd', () => {
-  it('POSTs to /rest/conversationAds with parentAccount', async () => {
+  it('POSTs to /rest/conversationAds with parentAccount and maps name to headlineText', async () => {
     mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:conversationAd:ca-1' }, status: 201 });
     const result = await svc.createConversationAd(ACCESS_TOKEN, ACCOUNT_ID, { name: 'My Conversation Ad' });
     const call = mockAxiosFn.mock.calls[0][0];
     expect(call.url).toContain('/rest/conversationAds');
     expect(call.data.parentAccount).toBe(`urn:li:sponsoredAccount:${ACCOUNT_ID}`);
-    expect(call.data.name).toBe('My Conversation Ad');
+    expect(call.data.headlineText).toBe('My Conversation Ad');
+    // LinkedIn's SponsoredConversation schema has no "name" field — sending one is
+    // rejected with "ERROR :: /name :: unrecognized field found but not allowed".
+    expect(call.data.name).toBeUndefined();
     expect(result.success).toBe(true);
   });
 
-  it('returns error when name missing', async () => {
+  it('accepts headline_text directly as an alias for name', async () => {
+    mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:conversationAd:ca-1' }, status: 201 });
+    await svc.createConversationAd(ACCESS_TOKEN, ACCOUNT_ID, { headline_text: 'Direct headline' });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.headlineText).toBe('Direct headline');
+  });
+
+  it('omits headlineText entirely when neither name nor headline_text is provided — LinkedIn treats it as optional', async () => {
+    mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:conversationAd:ca-1' }, status: 201 });
     const result = await svc.createConversationAd(ACCESS_TOKEN, ACCOUNT_ID, {});
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.parentAccount).toBe(`urn:li:sponsoredAccount:${ACCOUNT_ID}`);
+    expect('headlineText' in call.data).toBe(false);
+    expect(result.success).toBe(true);
+  });
+
+  it('still requires ad_account_id', async () => {
+    const result = await svc.createConversationAd(ACCESS_TOKEN, '', { name: 'x' });
     expect(result.success).toBe(false);
-    expect(result.error).toContain('name');
+    expect(result.error).toContain('ad_account_id');
   });
 });
 
