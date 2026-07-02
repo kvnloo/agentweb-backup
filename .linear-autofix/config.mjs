@@ -84,12 +84,15 @@ export const config = {
   // customer portal, `:3001` = its API — and many bugs coexist (host differentiates them).
   // Matches the project's conventional dev ports. Open all three in the EC2 security group.
   previewPorts: { partner: 5173, customer: 5174, api: 3001 },
-  keepPreviewUp: true,             // after browser-verify, LEAVE each bug's full preview running so its
-                                   // nip.io URL stays live to open. Only applies when the worktree is kept
-                                   // (cleanupWorktreeOnSuccess: false); gc.mjs stops it once the issue is
-                                   // Done/Canceled. Previews are watcher-free static builds (see
-                                   // preview.mjs), so kept previews are cheap on RAM and inotify.
-                                   // Set false to tear the preview down immediately after verify.
+  keepPreviewUp: true,             // after browser-verify, LEAVE the bug's full preview running so its
+                                   // nip.io URL stays live to open — but ONLY for bugs triaged
+                                   // needs-manual-test (the ones a human actually opens); green/rework
+                                   // previews tear down right after the run. gc.mjs stops kept ones once
+                                   // the issue is Done/Canceled. Set false to always tear down.
+  maxKeptPreviews: 3,              // cap on simultaneously-running kept previews (oldest evicted first).
+                                   // Unbounded accumulation (~0.8GB each) crept the box into swapping,
+                                   // and swap-on-EBS I/O is what actually stalled the runner (load 26-56
+                                   // with CPU <50% = disk-wait, not compute).
 
   // --- Claude ---
   defaultModel: 'opus',            // the fixer model

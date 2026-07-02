@@ -311,6 +311,7 @@ async function main() {
     // green  → skim & merge; manual → run the manual steps first; rework → human takes over.
     const triage = computeTriage({ review, verify, checks, reviewEnabled: !!config.review?.enabled });
     log(`Triage: ${triage}`);
+    enforcePreviewPolicy(id, triage);
 
     // --- Open the draft PR(s), now that the code is reviewed + verified ---
     const prTitle = `${triage === 'rework' ? '[needs human] ' : ''}${marker.prTitle || marker.summary || issue.title || 'Automated fix'} (${id})`;
@@ -323,7 +324,7 @@ async function main() {
     const prBody = `${marker.prBody || marker.summary || ''}\n\n---\n**Automated gates**\n${gateSummary || '(none run)'}\n\nFixes ${id} — ${issue.url || ''}`;
     const prs = openPrs(changed, prTitle, prBody);
 
-    const liveUrl = (config.keepPreviewUp && !config.cleanupWorktreeOnSuccess && verify) ? (verify.urls?.customer || '') : '';
+    const liveUrl = (triage === 'manual' && config.keepPreviewUp && !config.cleanupWorktreeOnSuccess && verify) ? (verify.urls?.customer || '') : '';
     const manualOpts = {
       liveUrl,
       cleanup: config.cleanupWorktreeOnSuccess,
@@ -780,12 +781,36 @@ async function previewHealthy(urls) {
   return (await httpUp(urls.customer)) && (await httpUp(urls.api));
 }
 
+const previewDown = (id) => spawnSync('node', [previewScript, 'down', id], { stdio: 'inherit', env: process.env });
+
+// Keep a live preview ONLY when a human will actually open it (triage 'manual'), and cap how
+// many stay up at once (oldest evicted). Unbounded kept previews crept the runner into
+// swapping, and swap-on-EBS is what stalled the box — this is the accumulation valve.
+export function enforcePreviewPolicy(id, triage) {
+  if (!config.keepPreviewUp || config.cleanupWorktreeOnSuccess) return; // nothing was kept
+  if (triage !== 'manual') {
+    log(`Triage "${triage}" — tearing down the preview (only needs-manual-test bugs keep one).`);
+    previewDown(id);
+    return;
+  }
+  try {
+    const st = JSON.parse(readFileSync(previewStatePath, 'utf8'));
+    const byAge = Object.entries(st).sort((a, b) => new Date(a[1].at) - new Date(b[1].at)).map(([k]) => k);
+    const max = config.maxKeptPreviews ?? 3;
+    while (byAge.length > max) {
+      const evict = byAge.shift();
+      log(`Kept-preview cap (${max}) reached — evicting oldest preview: ${evict}`);
+      previewDown(evict);
+    }
+  } catch { /* no preview state */ }
+}
+
 async function runVerify(issue, WT) {
   const id = issue.identifier;
   await ensureProxy();
   log('Bringing up full preview for browser verification...');
   const bringUp = () => spawnSync('node', [previewScript, 'up', id, WT], { stdio: 'inherit', env: process.env });
-  const tearDown = () => spawnSync('node', [previewScript, 'down', id], { stdio: 'inherit', env: process.env });
+  const tearDown = () => previewDown(id);
   const readUrls = () => { try { return (JSON.parse(readFileSync(previewStatePath, 'utf8'))[id.toLowerCase()] || {}).urls || {}; } catch { return {}; } };
 
   bringUp();
@@ -877,6 +902,7 @@ async function verifyOnlyRun(issue) {
 
   const triage = computeTriage({ review: entry.review, verify, checks, reviewEnabled: !!config.review?.enabled });
   log(`Re-verify: checks ${checks.every((c) => c.result === 'pass') ? 'pass' : 'FAIL'}, verdict ${verify?.verdict || 'none'} — triage now: ${triage}`);
+  enforcePreviewPolicy(id, triage);
   try { await setAutofixLabel(issue, config.triageLabels?.[triage]); } catch (e) { log('Warn: could not set triage label:', e.message); }
   const head = triage === 'green' ? '🟢 green — skim the PR and merge' : triage === 'manual' ? '🟡 needs manual test' : '🔴 needs rework';
   await addComment(issue.id, `🔁 **Deterministic gates re-run** (checks + browser verification on the existing fix)\n\n${testReportBody({ tests: [] }, verify, checks)}\n\n**Triage now: ${head}.**`);
