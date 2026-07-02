@@ -118,10 +118,31 @@ describe('notifyReporterShipped — sending', () => {
   it('feature_request vs bug wording', async () => {
     userDb.getUserByEmail.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
     await notifyReporterShipped(base);
-    expect(postSlackMessage.mock.calls[0][1]).toContain('Shipped');
+    expect(postSlackMessage.mock.calls[0][1]).toContain('just shipped');
     await notifyReporterShipped({ ...base, itemId: 'issue-2', kind: 'bug' });
-    expect(postSlackMessage.mock.calls[1][1]).toContain('Resolved');
+    expect(postSlackMessage.mock.calls[1][1]).toContain('is fixed');
   });
+
+  it('greets the requester by first name (shared channels need an addressee)', async () => {
+    userDb.getUserByEmail.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'], displayName: 'Juan Perez' });
+    await notifyReporterShipped(base);
+    expect(postSlackMessage.mock.calls[0][1]).toContain('Juan, you asked for this one');
+  });
+
+  it('no display name -> impersonal but still valid copy', async () => {
+    userDb.getUserByEmail.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
+    await notifyReporterShipped(base);
+    expect(postSlackMessage.mock.calls[0][1]).toContain('You asked for this one');
+  });
+
+  it('malicious display name is escaped too', async () => {
+    userDb.getUserByEmail.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'], displayName: '<!here>Evil' });
+    await notifyReporterShipped(base);
+    const text = postSlackMessage.mock.calls[0][1];
+    expect(text).not.toMatch(/<!here>/);
+    expect(text).toContain('&lt;!here&gt;Evil');
+  });
+
 
   it('no url -> message still sends without a dangling link line', async () => {
     userDb.getUserByEmail.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });

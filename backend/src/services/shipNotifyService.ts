@@ -7,9 +7,13 @@
  * failure mode here degrades to that baseline: `notifyReporterShipped` NEVER throws,
  * so a Slack hiccup can't block an email or a ticket flip (callers rely on that).
  *
- * Channel choice: the user's FIRST mapped channel via the same personal → org →
- * org-owner resolution Emma's Slack tools use (getEffectiveAllowedChannels) — the
- * channel the portal's Get Support modal calls "your Slack channel".
+ * Channel choice: the user's first mapped channel via getEffectiveAllowedChannels —
+ * the ONE platform-wide answer to "which Slack channel belongs to this user" (Emma's
+ * Slack tools, the Get Support modal, and lead alerts all resolve through the same
+ * mapping). For customers this mapping IS their Slack Connect channel
+ * ("{company}-agentweb", verified ext-shared + bot-member on prod 2026-07-02).
+ * The message greets the requester by name so it reads as addressed to them inside
+ * a shared customer channel.
  *
  * Idempotency: an atomic per-item claim (DynamoDB string-set ADD via
  * settingsService.claimSetMember) taken BEFORE the send, so concurrent or replayed
@@ -50,8 +54,8 @@ export async function notifyReporterShipped(p: ShipNotifyParams): Promise<ShipNo
     if (!user) return 'no_user';
     if (user.slackShipNotifyDisabled) return 'opted_out';
 
-    const channels = await getEffectiveAllowedChannels(user);
-    if (channels.length === 0) return 'no_channel';
+    const channel = (await getEffectiveAllowedChannels(user))[0];
+    if (!channel) return 'no_channel';
 
     // Claim BEFORE the send: exactly one winner per item × reporter, even across
     // concurrent deliveries / replays. Losing the claim means someone else sent it.
@@ -60,15 +64,20 @@ export async function notifyReporterShipped(p: ShipNotifyParams): Promise<ShipNo
 
     const title = escapeSlackText(p.title);
     const url = safeUrl(p.url);
+    // Greet by first name so the message is addressed to the requester, not the room —
+    // customer channels are shared. (A real <@mention> needs the users:read.email bot
+    // scope, which the app doesn't have yet.)
+    const firstName = (user.displayName || '').trim().split(/\s+/)[0];
+    const you = firstName ? `${escapeSlackText(firstName)}, you` : 'You';
     const text =
       p.kind === 'feature_request'
-        ? `🎉 Shipped: *${title}*\nA feature you requested is now live.${url ? `\n${url}` : ''}`
-        : `✅ Resolved: *${title}*\nAn issue you reported has been fixed — thanks for flagging it.${url ? `\n${url}` : ''}`;
+        ? `🎉 *${title}* just shipped!\n${you} asked for this one — it's now live.${url ? `\n${url}` : ''}`
+        : `✅ *${title}* is fixed.\n${you} reported this — thanks for flagging it.${url ? `\n${url}` : ''}`;
 
     try {
-      await postSlackMessage(channels[0], text);
+      await postSlackMessage(channel, text);
     } catch (e) {
-      console.warn(`[ship-notify] Slack post to ${channels[0]} for ${p.email} failed:`, e instanceof Error ? e.message : e);
+      console.warn(`[ship-notify] Slack post to ${channel} for ${p.email} failed:`, e instanceof Error ? e.message : e);
       // Release the claim so a delivery retry can re-attempt. Release failing too just
       // costs a missed ping (never a duplicate) — the email baseline is unaffected.
       try {
