@@ -78,6 +78,12 @@ export interface RemotionComposeResult {
   status?: 'complete' | 'processing';
   /** Human-facing note (e.g. the "still finalizing" handoff message). */
   message?: string;
+  /**
+   * Non-fatal advisory to surface to the user (e.g. the requested target duration
+   * exceeded the available clip footage so the video was trimmed). The composition
+   * still rendered successfully.
+   */
+  warning?: string;
 }
 
 /**
@@ -345,12 +351,14 @@ export class RemotionService {
         maxClipSeconds: params.maxClipSeconds,
         fps: FPS,
       });
-      if (targetExceededFootage) {
-        console.warn(
-          `RemotionService: targetDurationSeconds=${params.targetDurationSeconds}s exceeds available footage ${sumSeconds}s ` +
-          `for ${clipCount} clip(s) — clamping to ${totalDurationSeconds}s to avoid a black tail. ` +
-          `Generate more/longer clips to reach the requested length.`
-        );
+      // User-facing advisory when the requested length outran the footage. Surfaced in
+      // the result so the caller can tell the user their video is shorter than requested
+      // (instead of silently handing back a clamped clip — ENG-123 graceful UX).
+      const durationWarning = targetExceededFootage
+        ? `The requested length (${params.targetDurationSeconds}s) is longer than the available clip footage (${sumSeconds}s), so the video was trimmed to ${totalDurationSeconds}s rather than padded with black. Generate more or longer clips to reach the full length.`
+        : undefined;
+      if (durationWarning) {
+        console.warn(`RemotionService: ${durationWarning}`);
       }
       console.log(`RemotionService: ${clipCount} clip(s) [${perClipSeconds.join(',')}]s = ${totalDurationSeconds}s → durationInFrames=${durationInFrames}`);
 
@@ -456,6 +464,7 @@ export class RemotionService {
             status: "complete",
             videoUrl: outputFile,
             filename,
+            ...(durationWarning && { warning: durationWarning }),
           };
         }
 
@@ -476,8 +485,10 @@ export class RemotionService {
         videoUrl: detachedOutputUrl,
         filename,
         message:
-          "The video is still finalizing and will be ready at this link in a minute or two — " +
-          "no need to regenerate it.",
+          "The render is taking longer than usual and is still finalizing in the background. " +
+          "It should appear at this link within a few minutes — no need to regenerate it. " +
+          "If it hasn't shown up after that, ask me to check on it.",
+        ...(durationWarning && { warning: durationWarning }),
       };
     } catch (error: any) {
       console.error("RemotionService: Error composing video:", error);

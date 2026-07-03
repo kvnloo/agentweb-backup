@@ -20095,6 +20095,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       if (composeResult.success && composeResult.videoUrl) {
         const stillProcessing = composeResult.status === 'processing';
+        // Combine any composition-layer advisory (e.g. duration clamp) with the voiceover
+        // tripwire so the user sees every relevant note, not just one.
+        const warning = [composeResult.warning, voiceoverWarning].filter(Boolean).join(' ') || undefined;
         return {
           success: true,
           message: stillProcessing
@@ -20103,7 +20106,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           videoUrl: composeResult.videoUrl,
           filename: composeResult.filename ?? filename,
           ...(stillProcessing && { status: 'processing' as const }),
-          ...(voiceoverWarning && { warning: voiceoverWarning }),
+          ...(warning && { warning }),
         };
       }
 
