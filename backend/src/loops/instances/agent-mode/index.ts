@@ -102,6 +102,29 @@ export function isAgentRuntimeSpineEnabled(): boolean {
 }
 
 /**
+ * Foot-gun check (ENG-143, found by live-testing on env1): AGENT_FINALIZE_GUARD
+ * gates the finalize guard itself, but claim_mismatch verdicts only reach
+ * Dev-AW-LoopEvents (and therefore the 17:30 UTC cron) through the recorder,
+ * which is a no-op unless the runtime spine is SEPARATELY enabled. Flipping
+ * only AGENT_FINALIZE_GUARD gives you working correction behavior in chat
+ * with zero telemetry and zero error — this makes that silent gap loud.
+ * Returns a warning string to log, or null when correctly configured (or when
+ * the guard itself is off, in which case the spine is irrelevant to it).
+ */
+export function checkFinalizeGuardMisconfiguration(): string | null {
+  if (process.env.AGENT_FINALIZE_GUARD === 'true' && !isAgentRuntimeSpineEnabled()) {
+    return (
+      'AGENT_FINALIZE_GUARD is enabled but the runtime spine is not '
+      + '(AGENT_RUNTIME_SPINE_ENABLED / AGENT_MODE_LOOP_ENABLED are both unset/false). '
+      + 'The finalize guard will still correct replies in chat, but claim_mismatch '
+      + 'verdicts will never be recorded, so the 17:30 UTC agent-mode cron will never '
+      + 'see them. Set AGENT_RUNTIME_SPINE_ENABLED=true to get truthfulness telemetry.'
+    );
+  }
+  return null;
+}
+
+/**
  * Opt-in flag for the real Slack-reaction approval gate (INCREMENT C1).
  *
  * Production still runs `CaptureGate` (pollDecision() always pending, so
