@@ -247,6 +247,8 @@ app.use("/api/stripe/connect/webhook", express.raw({ type: "application/json" })
 app.use("/api/webhooks/hubspot", express.raw({ type: "application/json" }));
 // Linear webhook (bug-resolve bridge) needs raw body for HMAC signature verification — before express.json().
 app.use("/api/integrations/linear/webhook", express.raw({ type: "application/json" }));
+// Featurebase webhook (Slack ship-notify) signs the raw body too — before express.json().
+app.use("/api/integrations/featurebase/webhook", express.raw({ type: "application/json" }));
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());

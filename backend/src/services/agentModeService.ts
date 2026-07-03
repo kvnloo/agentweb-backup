@@ -326,6 +326,34 @@ function recordAgentModeDuplicateSuppression(
   }
 }
 
+/**
+ * Record a model fallback (ENG-46) as a structured, greppable, observability-only
+ * signal. When a request pins a model id that is no longer served (e.g. a stale
+ * post-deploy smoke-test config or a retired DB default), `resolveGenerationModel`
+ * substitutes the default so the request still completes — but that substitution
+ * MUST be visible to ops, not silently buried, otherwise a stale config keeps
+ * shipping the wrong model unnoticed. The stable `[agent-mode] model fallback`
+ * tag is what log dashboards/alerts key on. Best-effort: never throws into the
+ * chat hot path.
+ */
+function recordAgentModeModelFallback(
+  runId: string,
+  sessionId: string,
+  requestedModel: string,
+  resolvedModel: string,
+): void {
+  try {
+    console.warn('[agent-mode] model fallback', {
+      runId,
+      sessionId,
+      requestedModel: requestedModel || '(none)',
+      resolvedModel,
+    });
+  } catch (err) {
+    console.error('[agent-mode] model-fallback telemetry failed (swallowed):', err);
+  }
+}
+
 function countFailedToolCalls(toolCalls: any[]): number {
   return toolCalls.filter((toolCall) => toolCall && 'error' in toolCall).length;
 }
@@ -2134,7 +2162,7 @@ export class AgentModeService {
     // Azure OpenAI enforces a 128-tool limit per request
     // supportsVision flags below were verified empirically against the describe_image
     // path (probe against a real image). All GPT-5 deployments handle vision.
-    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true },
     'gpt-5.4-nano': { client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
@@ -2172,7 +2200,7 @@ export class AgentModeService {
   }
   /**
    * Make an LLM call with the specified model and parameters
-   * @param model - The model to use (e.g., 'gpt-5.1', 'gemini-3-pro-preview')
+   * @param model - The model to use (e.g., 'gpt-5.5', 'gemini-3-pro-preview')
    * @param messages - Array of chat messages
    * @param options - Optional parameters for the LLM call
    * @returns The LLM response
@@ -2190,6 +2218,50 @@ export class AgentModeService {
       return LEGACY_MODEL_ALIASES[model] as T;
     }
     return model;
+  }
+
+  /**
+   * Resolve the model id for a generation request up front: normalize legacy
+   * ids, then validate against the allow-list. A model that is no longer served
+   * (e.g. a stale default or smoke-test config pinned to a removed id like
+   * 'gpt-5.1') would otherwise throw an opaque "Invalid model" deep inside
+   * callLLM, which the outer handler surfaces to the user as "Unknown Error"
+   * (ENG-46). Instead, fall back to the configured default model so the request
+   * still completes, and report whether a fallback happened so callers can log
+   * it / expose it via telemetry.
+   */
+  public resolveGenerationModel(model: string): { model: string; fellBack: boolean; requestedModel: string } {
+    const normalized = this.normalizeModelId(model);
+    // Use hasOwnProperty so inherited Object.prototype keys (e.g. 'constructor',
+    // 'toString') can't masquerade as valid allow-list entries.
+    if (normalized && Object.prototype.hasOwnProperty.call(this.llmModels, normalized)) {
+      return { model: normalized, fellBack: false, requestedModel: model };
+    }
+    const fallbackModel = this.resolveFallbackModel();
+    console.warn(
+      `AgentMode: Requested model '${model ?? '(none)'}' is not in the allow-list; falling back to default '${fallbackModel}'.`
+    );
+    return { model: fallbackModel, fellBack: true, requestedModel: model };
+  }
+
+  /**
+   * Resolve the model to fall back to when a requested id is unavailable.
+   * Normally this is the configured default_model, but if that itself has been
+   * removed from the allow-list (e.g. a stale AZURE_OPENAI_DEPLOYMENT_AGENT_MODE
+   * env override pinning a retired deployment) returning it would just re-throw
+   * "Invalid model" inside callLLM. Guard against that by validating the default
+   * and falling back to a known-good served model otherwise (ENG-46).
+   */
+  private resolveFallbackModel(): string {
+    if (Object.prototype.hasOwnProperty.call(this.llmModels, this.default_model)) {
+      return this.default_model;
+    }
+    const knownGoodModel = Object.keys(this.llmModels)[0];
+    console.warn(
+      `AgentMode: Configured default model '${this.default_model}' is not in the allow-list; ` +
+      `falling back to known-good model '${knownGoodModel}'.`
+    );
+    return knownGoodModel;
   }
 
   async callLLM(
@@ -2498,10 +2570,21 @@ export class AgentModeService {
       sessionType: isInteractiveShare ? 'interactive_share' : 'regular',
     });
     try {
-      // Map legacy/renamed model ids forward (e.g. old sessions persisted the
-      // pre-rename "claude-opus-4-8") so metadata, pricing, and routing all use
-      // the canonical registry key.
-      llmModel = this.normalizeModelId(llmModel);
+      // Resolve the model up front: map legacy/renamed ids forward (e.g. old
+      // sessions persisted the pre-rename "claude-opus-4-8") AND validate against
+      // the allow-list. A removed/stale id (e.g. a smoke-test config pinned to
+      // 'gpt-5.1') would otherwise throw an opaque "Invalid model" deep inside
+      // callLLM and surface to the user as "Unknown Error" (ENG-46); instead fall
+      // back to the default model so the request still completes.
+      const requestedLlmModel = llmModel;
+      const modelResolution = this.resolveGenerationModel(llmModel);
+      llmModel = modelResolution.model;
+      if (modelResolution.fellBack) {
+        // Surface the substitution as a structured, alertable telemetry signal so
+        // a stale model id (smoke-test / DB default) is caught in dashboards rather
+        // than silently masked (ENG-46).
+        recordAgentModeModelFallback(agentRuntimeRunId, sessionId, requestedLlmModel, llmModel);
+      }
       // Track backup model usage
       const originalLlmModel = llmModel;
       let backupModelUsed = false;
@@ -3961,17 +4044,21 @@ export class AgentModeService {
       completed: '✅',
       failed: '❌'
     };
-    let statusesContent = '';
+    // Only inject a task-status context message when there ARE task statuses to
+    // report. Previously an empty session pushed an assistant message reading
+    // "📋 Task Status: No tasks have been run in this session yet." right before
+    // the user's message. On a terse confirmation (e.g. "go with defaults") the
+    // model could parrot that injected assistant turn verbatim instead of
+    // proceeding with the actual work (ENG-129). The empty-status note conveys
+    // nothing the model needs, so skip it entirely.
     if (currentTaskStatuses && currentTaskStatuses.length > 0) {
-      statusesContent += 'Current Task Statuses:\n';
+      let statusesContent = 'Current Task Statuses:\n';
       currentTaskStatuses.forEach(task => {
         const emoji = statusEmoji[task.status] || '⏳';
         statusesContent += `${emoji} ${task.taskName} (${task.status}) - Task ID: ${task.taskId}, Execution ID: ${task.executionId}\n`;
       });
-    } else {
-      statusesContent = '📋 **Task Status**: No tasks have been run in this session yet.';
+      messages.push({ role: 'assistant', content: statusesContent });
     }
-    messages.push({ role: 'assistant', content: statusesContent });
 
     // Insert work plan status as an assistant message if exists. Pass the set of
     // images already generated this session (scanned from full history, not the
@@ -22776,6 +22863,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
       if (!llmModel) {
         llmModel = await this.getDefaultModel();
+      } else {
+        // ENG-46 sibling path: this method is reached with the SESSION's model
+        // (emma create_html_from_template tool / route), so a stale/removed id
+        // (e.g. gpt-5.1) would otherwise throw an opaque "Invalid model" inside
+        // callLLM here too. Resolve it up front so template substitution falls
+        // back to a served model instead of failing.
+        const templateModelResolution = this.resolveGenerationModel(llmModel);
+        if (templateModelResolution.fellBack) {
+          recordAgentModeModelFallback('create-html-from-template', sessionId || '', llmModel, templateModelResolution.model);
+        }
+        llmModel = templateModelResolution.model;
       }
       // Validate that all required variables are provided
       const templateVariables = template.variables || [];
@@ -26425,7 +26523,6 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       case 'CONVERSATION_AD': {
         if (action === 'CREATE') {
-          if (!params.name) throw new Error('CONVERSATION_AD CREATE requires name');
           const result = await linkedInAdsService.createConversationAd(accessToken, accountId, params);
           if (!result.success) throw new Error(result.error || 'Failed to create conversation ad');
           const conversationAdUrn = result.data?.id;
