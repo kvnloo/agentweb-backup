@@ -66,6 +66,31 @@ describe('prefilterClaimClasses', () => {
     expect(prefilterClaimClasses('Here are three subject-line options for you to review.'))
       .toEqual([]);
   });
+
+  // ENG-143 gap: the ticket's own Filipe/competitor-research example — "saved
+  // the setup for future sessions" — had no matching claim class at all.
+  it('flags a completed settings/setup-persistence claim (the ENG-143 "saved the setup" example)', () => {
+    expect(prefilterClaimClasses("I've saved the setup for future sessions, so you won't need to repeat this."))
+      .toContain('settings_saved');
+  });
+
+  it('flags a "remembered your preferences" persistence claim', () => {
+    expect(prefilterClaimClasses('Got it — I remembered your preferences for next time.'))
+      .toContain('settings_saved');
+  });
+
+  // ENG-143 gap: the ticket's own literal example — "the test task landed in
+  // ClickUp" — used "landed", not created/updated/added/completed, so it
+  // never matched the original task_created_or_updated regex.
+  it('flags "landed in ClickUp" as a completed task claim (the ENG-143 literal example)', () => {
+    expect(prefilterClaimClasses('The test task landed in ClickUp.'))
+      .toContain('task_created_or_updated');
+  });
+
+  it('flags "is now in ClickUp" as a completed task claim', () => {
+    expect(prefilterClaimClasses("I've put together the competitor research task — it's now in ClickUp."))
+      .toContain('task_created_or_updated');
+  });
 });
 
 describe('runFinalizeGuard', () => {
@@ -250,6 +275,89 @@ describe('runFinalizeGuard', () => {
     expect(outcome.action).toBe('appended_correction');
     expect(outcome.claimMismatch).toBe(true);
     expect(claimCheckErrors).toHaveLength(1);
+  });
+
+  it('settings_saved claim with NO successful memory/config tool in ledger → corrective turn (ENG-143 gap)', async () => {
+    const { ports, judge, correct } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'settings_saved' }]);
+    correct.mockResolvedValue("I wasn't able to save that setup — nothing was persisted this session. Want me to try again?");
+
+    const outcome = await runFinalizeGuard({
+      finalText: "Done! I've saved the setup for future sessions.",
+      ledger: emptyLedger,
+      ports,
+    });
+
+    expect(correct).toHaveBeenCalledTimes(1);
+    expect(correct.mock.calls[0][0].systemNote).toContain('no successful settings_saved');
+    expect(outcome.action).toBe('corrected');
+  });
+
+  it('settings_saved claim backed by a successful save_memory ledger entry → clean (happy path)', async () => {
+    const { ports, judge, correct } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'settings_saved' }]);
+    const ledger: FinalizeLedgerEntry[] = [
+      { toolName: 'save_memory', status: 'success', result: { success: true } },
+    ];
+
+    const outcome = await runFinalizeGuard({
+      finalText: "Done! I've saved the setup for future sessions.",
+      ledger,
+      ports,
+    });
+
+    expect(outcome.action).toBe('clean');
+    expect(correct).not.toHaveBeenCalled();
+  });
+
+  it('settings_saved claim backed by a successful update_brand_guidelines ledger entry → clean', async () => {
+    const { ports, judge, correct } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'settings_saved' }]);
+    const ledger: FinalizeLedgerEntry[] = [
+      { toolName: 'update_brand_guidelines', status: 'success', result: { success: true } },
+    ];
+
+    const outcome = await runFinalizeGuard({
+      finalText: "I've updated and saved your brand setup.",
+      ledger,
+      ports,
+    });
+
+    expect(outcome.action).toBe('clean');
+    expect(correct).not.toHaveBeenCalled();
+  });
+
+  it('"landed in ClickUp" claim end-to-end: no ClickUp task tool exists → unbacked → corrective turn (ENG-143 literal example)', async () => {
+    const { ports, judge, correct } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'task_created_or_updated' }]);
+    correct.mockResolvedValue('The task was not actually created in ClickUp this session — I do not have a tool to do that yet. I can create it as an internal task instead, or you can add it manually.');
+
+    const outcome = await runFinalizeGuard({
+      finalText: 'The test task landed in ClickUp.',
+      ledger: emptyLedger, // no ClickUp task-creation tool exists in the schema today
+      ports,
+    });
+
+    expect(correct).toHaveBeenCalledTimes(1);
+    expect(correct.mock.calls[0][0].systemNote).toContain('no successful task_created_or_updated');
+    expect(outcome.action).toBe('corrected');
+  });
+
+  it('task claim backed by a successful create_task_from_prompt ledger entry → clean (happy path)', async () => {
+    const { ports, judge, correct } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'task_created_or_updated' }]);
+    const ledger: FinalizeLedgerEntry[] = [
+      { toolName: 'create_task_from_prompt', status: 'success', result: { success: true, taskId: 't-1' } },
+    ];
+
+    const outcome = await runFinalizeGuard({
+      finalText: 'The task was created and is now in your queue.',
+      ledger,
+      ports,
+    });
+
+    expect(outcome.action).toBe('clean');
+    expect(correct).not.toHaveBeenCalled();
   });
 
   it('judge returning unknown claim classes ignores them (never crashes the guard)', async () => {

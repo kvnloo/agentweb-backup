@@ -12,9 +12,10 @@
  * built for the xCures 76×-images incident (mediaGenProducedAsset).
  *
  * Flow (all LLM access via injected ports — this module is PURE):
- *   1. Cheap lexicon prefilter for 6 high-harm completed-action claim classes
+ *   1. Cheap lexicon prefilter for 7 high-harm completed-action claim classes
  *      (email_sent, task_created_or_updated, post_published, schedule_created,
- *      crm_saved, asset_generated). No hit → zero LLM cost, text unchanged.
+ *      crm_saved, asset_generated, settings_saved). No hit → zero LLM cost,
+ *      text unchanged.
  *   2. ONLY on a hit: one structured-output judge call extracts the concrete
  *      claims the reply makes.
  *   3. Deterministic match of each claim class against SUCCESSFUL ledger
@@ -43,14 +44,24 @@
 
 import { MEDIA_GEN_TOOLS } from './toolDispatch';
 
-/** The 6 high-harm completed-action claim classes the guard verifies. */
+/** Tools that actually persist settings/setup across sessions (settings_saved
+ * claim class) — confirmed against backend/src/emma/tools.ts. */
+const SETTINGS_PERSISTENCE_TOOLS = new Set<string>([
+  'save_memory',
+  'save_org_memory',
+  'update_brand_guidelines',
+  'update_market_strategy',
+]);
+
+/** The 7 high-harm completed-action claim classes the guard verifies. */
 export type ClaimClass =
   | 'email_sent'
   | 'task_created_or_updated'
   | 'post_published'
   | 'schedule_created'
   | 'crm_saved'
-  | 'asset_generated';
+  | 'asset_generated'
+  | 'settings_saved';
 
 export const CLAIM_CLASSES: readonly ClaimClass[] = [
   'email_sent',
@@ -59,6 +70,7 @@ export const CLAIM_CLASSES: readonly ClaimClass[] = [
   'schedule_created',
   'crm_saved',
   'asset_generated',
+  'settings_saved',
 ];
 
 /**
@@ -71,7 +83,7 @@ const CLAIM_LEXICON: Record<ClaimClass, RegExp> = {
   email_sent:
     /\bemailed\b|\b(email|emails)\b[^.!\n]{0,120}\b(sent|delivered|went out)\b|\b(sent|delivered)\b[^.!\n]{0,120}\b(email|emails|inbox)\b/i,
   task_created_or_updated:
-    /\btasks?\b[^.!\n]{0,120}\b(created|updated|added|completed)\b|\b(created|updated|added)\b[^.!\n]{0,120}\btasks?\b/i,
+    /\btasks?\b[^.!\n]{0,120}\b(created|updated|added|completed|landed|now in)\b|\b(created|updated|added)\b[^.!\n]{0,120}\btasks?\b/i,
   post_published:
     /\b(published|posted)\b[^.!\n]{0,120}\b(post|posts|blog|article|linkedin|social)\b|\b(post|posts|blog|article)\b[^.!\n]{0,120}\b(published|posted|is live|went live)\b/i,
   schedule_created:
@@ -80,6 +92,11 @@ const CLAIM_LEXICON: Record<ClaimClass, RegExp> = {
     /\b(saved|added|updated|imported)\b[^.!\n]{0,120}\b(crm|leads?|contacts?)\b|\b(crm|leads?|contacts?)\b[^.!\n]{0,120}\b(saved|added|updated|imported)\b/i,
   asset_generated:
     /\b(generated|created|produced)\b[^.!\n]{0,120}\b(image|images|video|videos|voiceover|visuals?|assets?)\b|\b(image|images|video|videos|voiceover)\b[^.!\n]{0,120}\b(generated|created|ready|saved)\b/i,
+  // ENG-143's own "saved the setup for future sessions" example — cross-session
+  // persistence claims (memory, brand guidelines, market strategy, preferences)
+  // had no claim class at all before this.
+  settings_saved:
+    /\b(saved|remembered|stored)\b[^.!\n]{0,120}\b(setup|settings?|preferences?|configuration|for (future|next) (session|time)|for later)\b|\b(setup|settings?|preferences?|configuration)\b[^.!\n]{0,120}\b(saved|remembered|stored)\b/i,
 };
 
 /** Which claim classes the final text plausibly asserts (prefilter only). */
@@ -98,6 +115,10 @@ const CLAIM_TOOL_MATCHERS: Record<ClaimClass, (toolName: string) => boolean> = {
   schedule_created: (n) => /schedul/.test(n) && /^(create_|manage_|add_|update_)/.test(n),
   crm_saved: (n) => /lead|contact|crm/.test(n) && /^(create_|update_|manage_|add_|save_|import_)/.test(n),
   asset_generated: (n) => MEDIA_GEN_TOOLS.has(n),
+  // Grounded in the actual persistence tools Emma has: save_memory,
+  // save_org_memory (cross-session "Memory & Lessons"), update_brand_guidelines,
+  // update_market_strategy (the "setup" onboarding/brand context tools).
+  settings_saved: (n) => SETTINGS_PERSISTENCE_TOOLS.has(n),
 };
 
 /** A run-ledger entry, normalized from the loop's toolCalls ledger. */
