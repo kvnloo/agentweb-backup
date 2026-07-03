@@ -27,6 +27,85 @@ const VERCEL_POLL_TIMEOUT_MS = 30_000;
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 2_000; // 2s, 4s, 8s
 
+// Hard ceiling for a single external-API network call inside withRetry. Node's
+// global fetch (undici) can otherwise wait up to the 15-min headersTimeout set in
+// httpClient.ts, so a v0 request that connects but never responds hangs the whole
+// generation with no output and no error (ENG-158). Bounding each attempt turns
+// that silent hang into a loud, retryable timeout. 5 minutes comfortably exceeds
+// any healthy single v0/GitHub call (generation progress is polled separately).
+const V0_ATTEMPT_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * Build a diagnostic message from an error, unwrapping the undici `cause` chain.
+ *
+ * Node's global fetch (undici) throws a bare `TypeError: fetch failed` and stashes
+ * the REAL reason (Connect Timeout, ECONNREFUSED, ENOTFOUND, TLS failure, …) on
+ * `error.cause` — often itself an `AggregateError` whose `errors[]` hold the codes.
+ * Persisting only `error.message` gave users a useless "fetch failed" with zero
+ * detail (ENG-135), and the same swallowing hid v0's HTTP error bodies behind a
+ * bare status (ENG-159). This walks message → code → cause → aggregate errors and
+ * joins the distinct pieces so callers surface WHY a call failed. Safe on any input.
+ */
+export function describeError(err: any): string {
+  const parts: string[] = [];
+  const seen = new Set<any>();
+  const push = (s: unknown) => {
+    if (typeof s === "string" && s.trim() && !parts.includes(s)) parts.push(s);
+  };
+
+  let cur: any = err;
+  let depth = 0;
+  while (cur && depth < 10) {
+    if (typeof cur === "string") {
+      push(cur);
+      break;
+    }
+    if (typeof cur === "object") {
+      if (seen.has(cur)) break;
+      seen.add(cur);
+      push(cur.message);
+      // Surface a distinct error code (e.g. ECONNRESET, UND_ERR_CONNECT_TIMEOUT)
+      // when it isn't already visible in the message text.
+      if (typeof cur.code === "string" && !parts.some((p) => p.includes(cur.code))) {
+        push(cur.code);
+      }
+      // AggregateError (multiple connect attempts) carries the real codes here.
+      if (Array.isArray(cur.errors)) {
+        for (const e of cur.errors) push(describeError(e));
+      }
+    }
+    cur = cur?.cause;
+    depth++;
+  }
+
+  return parts.join(" | ") || (err == null ? "Unknown error" : String(err));
+}
+
+/**
+ * Reject if `promise` has not settled within `ms`. The timeout error message
+ * contains "timed out" so withRetry treats it as retryable, and it surfaces
+ * clearly to the caller after retries are exhausted (never a silent hang).
+ * The underlying request is not aborted — undici's socket-level timeouts still
+ * apply — we just stop waiting on it so generation can fail loudly.
+ */
+export async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const e: any = new Error(`${label} timed out after ${Math.round(ms / 1000)}s`);
+      e.code = "V0_CALL_TIMEOUT";
+      reject(e);
+    }, ms);
+    // Don't keep the event loop alive solely for this guard timer.
+    if (typeof timer.unref === "function") timer.unref();
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 // Poll intervals for waiting on v0 generation to complete
 let v0PollIntervalsMs = [0, 15_000, 30_000, 45_000, 60_000];
 
@@ -49,40 +128,47 @@ export async function withRetry<T>(
   fn: () => Promise<T>,
   label: string,
   maxRetries = MAX_RETRIES,
-  baseDelayMs = BASE_DELAY_MS
+  baseDelayMs = BASE_DELAY_MS,
+  timeoutMs = V0_ATTEMPT_TIMEOUT_MS
 ): Promise<T> {
   let lastError: Error | undefined;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      return await fn();
+      // Bound each attempt so a request that never responds fails loudly instead
+      // of hanging until undici's 15-min headersTimeout (ENG-158).
+      return await withTimeout(Promise.resolve().then(fn), timeoutMs, label);
     } catch (err: any) {
       lastError = err;
+      // Unwrap the full failure reason (undici hides it on `err.cause`) so both the
+      // retry decision and the surfaced error see the REAL problem, not "fetch failed".
+      const detail = describeError(err);
       // The v0 SDK throws `Error("HTTP <status>: <body>")` on any non-2xx response.
       // Transient server-side failures (5xx) and rate limiting (429) should be
       // retried with backoff — a v0 500 is the documented symptom of a v0 outage
       // that often recovers within seconds.
-      const isRetryableHttpStatus = /\bHTTP (429|408|5\d\d)\b/.test(err.message || "");
+      const isRetryableHttpStatus = /\bHTTP (429|408|5\d\d)\b/.test(detail);
       const isRetryable =
         isRetryableHttpStatus ||
-        err.message?.includes("fetch failed") ||
-        err.message?.includes("ECONNREFUSED") ||
-        err.message?.includes("ENOTFOUND") ||
-        err.message?.includes("network error") ||
-        err.message?.includes("NetworkError") ||
-        err.message?.includes("ETIMEDOUT") ||
-        err.message?.includes("socket hang up") ||
+        /fetch failed|ECONNREFUSED|ENOTFOUND|network error|NetworkError|ETIMEDOUT|socket hang up|Connect Timeout|timed out|UND_ERR/i.test(
+          detail
+        ) ||
         err.code === "ECONNRESET" ||
         err.code === "UND_ERR_HEADERS_TIMEOUT";
 
       if (!isRetryable || attempt === maxRetries) {
-        console.error(`[V0 SERVICE] ${label} failed after ${attempt} attempt(s):`, err.message);
+        console.error(`[V0 SERVICE] ${label} failed after ${attempt} attempt(s):`, detail);
+        // Surface the unwrapped detail to the caller (who persists it as the page's
+        // errorMessage and returns it to the user) — never a bare "fetch failed"/422.
+        if (err && typeof err === "object" && detail && detail !== err.message) {
+          try { err.message = detail; } catch { /* frozen error — leave as-is */ }
+        }
         throw err;
       }
 
       const jitter = Math.random() * 500;
       const delay = baseDelayMs * Math.pow(2, attempt - 1) + jitter;
       console.warn(
-        `[V0 SERVICE] ${label} attempt ${attempt}/${maxRetries} failed (${err.message}), retrying in ${delay}ms...`
+        `[V0 SERVICE] ${label} attempt ${attempt}/${maxRetries} failed (${detail}), retrying in ${delay}ms...`
       );
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
@@ -397,16 +483,13 @@ export function buildBrandEnrichedPrompt(
   }
 
   if (leadListId) {
-    const apiBase = process.env.BACKEND_URL || 'https://api.agentweb.pro';
     parts.push(
       `\n\nLEAD CAPTURE FORM — IMPORTANT ARCHITECTURE:\n` +
-      `1. Create a Next.js API route at app/api/capture/route.ts that proxies form submissions to the backend.\n` +
-      `   The proxy route should POST to: ${apiBase}/api/webhooks/forward-lead\n` +
-      `   The proxy route must add listId: '${leadListId}' and source: 'landing-page' to the body before forwarding.\n` +
-      `2. The frontend form component MUST fetch('/api/capture', ...) using the RELATIVE path — never hardcode any backend URL in client-side code.\n` +
-      `   The form should collect: email (required), firstName, lastName, company, phone.\n` +
+      `1. Build a lead capture form component collecting: email (required), firstName, lastName, company, phone.\n` +
+      `   The form MUST submit via fetch('/api/capture', { method: 'POST', ... }) using the RELATIVE path — never hardcode any backend URL in client-side code.\n` +
       `   Show a success message after submission. Show an error message on failure.\n` +
-      `3. NEVER put absolute backend URLs (like ${apiBase}) in any client-side .tsx file. Only the server-side API route should know the backend URL.`
+      `2. Do NOT create app/api/capture/route.ts yourself — the platform injects this API route automatically. Only build the form component that posts to the relative /api/capture path.\n` +
+      `3. NEVER put absolute backend URLs in any client-side .tsx file.`
     );
   }
 
@@ -1635,7 +1718,7 @@ export async function deployLandingPage(
     console.log("[V0 SERVICE] Step 3: Creating GitHub repo and pushing files");
     const slug = buildPageSlug(record.name);
     const repoName = `lp-${slug}-${id.slice(0, 8)}`;
-    const { githubRepoUrl, repoFullName, commitSha } = await createGitHubRepoAndPush(repoName, zipBuffer, record.name);
+    const { githubRepoUrl, repoFullName, commitSha } = await createGitHubRepoAndPush(repoName, zipBuffer, record.name, record.leadListId);
 
     // Save GitHub repo URL immediately so it's not lost if Vercel step fails
     await dynamodb
@@ -1967,12 +2050,145 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
 }
 
 /**
+ * Deterministically inject platform-owned lead-capture attribution files into a
+ * generated repo's file set, and drop any v0-generated capture route / middleware
+ * that would conflict with them.
+ *
+ * Design: relying on v0 (an LLM) to capture/forward UTM attribution is
+ * non-deterministic. Instead we force-inject a server-side middleware that
+ * stamps a first-touch cookie, and a capture API route that reads that cookie
+ * and forwards `attribution` (top-level, not customFields) to the backend
+ * webhook. Any v0-generated `app/api/capture/route.ts` (or route-group
+ * variants) and any v0 `middleware.ts` are dropped first so ours are
+ * authoritative (avoids "conflicting routes" build errors / duplicate
+ * middleware).
+ */
+/**
+ * Normalizes a generated file path to its effective Next.js route by stripping
+ * an optional `src/` root prefix and any route-group segments (`(group)`),
+ * neither of which affect the resulting URL/route. Used to detect v0 output
+ * that is *semantically* the same route as our injected files even when the
+ * literal path differs (e.g. `src/app/(marketing)/api/capture/route.tsx`).
+ */
+function normalizeGeneratedPath(p: string): string {
+  return p
+    .replace(/^src\//, "")
+    .split("/")
+    .filter((seg) => !/^\([^)]*\)$/.test(seg))
+    .join("/");
+}
+
+function isV0CaptureRoute(p: string): boolean {
+  return /^app\/api\/capture\/route\.(ts|tsx|js|jsx)$/.test(normalizeGeneratedPath(p));
+}
+
+function isV0Middleware(p: string): boolean {
+  return /^middleware\.(ts|js)$/.test(normalizeGeneratedPath(p));
+}
+
+/**
+ * Defense in depth: if a v0-generated file somehow survives the drop-filter above
+ * and still collides with our injected route/middleware, fail loudly here
+ * (generation time, before any GitHub push) rather than silently at Vercel build
+ * time later. Exported standalone so the throw path can be exercised directly,
+ * since it is structurally unreachable through injectLeadCaptureAttribution itself
+ * (the same filter that would let a duplicate through would also drop it).
+ */
+export function assertNoDuplicateInjectedRoutes(files: Array<{ path: string; content: Buffer }>): void {
+  const captureRouteCount = files.filter((f) => f.path === "app/api/capture/route.ts").length;
+  const middlewareCount = files.filter((f) => f.path === "middleware.ts").length;
+  if (captureRouteCount > 1 || middlewareCount > 1) {
+    throw new Error(
+      `[V0 SERVICE] duplicate route after lead-capture injection (capture routes: ${captureRouteCount}, middleware: ${middlewareCount})`
+    );
+  }
+}
+
+export function injectLeadCaptureAttribution(
+  files: Array<{ path: string; content: Buffer }>,
+  leadListId: string
+): Array<{ path: string; content: Buffer }> {
+  const filtered = files.filter((f) => !isV0CaptureRoute(f.path) && !isV0Middleware(f.path));
+
+  const apiBase = process.env.BACKEND_URL || "https://api.agentweb.pro";
+
+  const middlewareContent = `import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
+
+const COOKIE = "aw_first_touch";
+const MAX_AGE = 60 * 60 * 24 * 90; // 90 days
+
+export function middleware(req: NextRequest) {
+  const res = NextResponse.next();
+  if (req.cookies.get(COOKIE)) return res;              // first-touch: never overwrite
+
+  const sp = req.nextUrl.searchParams;
+  const utm: Record<string, string> = {};
+  for (const k of ["source", "medium", "campaign", "content", "term"]) {
+    const v = sp.get("utm_" + k); if (v) utm[k] = v;
+  }
+  const clickIds: Record<string, string> = {};
+  for (const [q, key] of [["gclid","gclid"],["fbclid","fbclid"],["ttclid","ttclid"],["li_fat_id","liFatId"]] as const) {
+    const v = sp.get(q); if (v) clickIds[key] = v;
+  }
+  const referrer = req.headers.get("referer") || "";
+  const ref = sp.get("ref") || "";
+
+  const touch: Record<string, unknown> = { timestamp: new Date().toISOString(), landingUrl: req.nextUrl.href };
+  if (Object.keys(utm).length) touch.utm = utm;
+  if (Object.keys(clickIds).length) touch.clickIds = clickIds;
+  if (referrer && !referrer.includes(req.nextUrl.host)) touch.referrer = referrer;
+  if (ref) touch.ref = ref;
+
+  res.cookies.set(COOKIE, JSON.stringify(touch), { maxAge: MAX_AGE, path: "/", sameSite: "lax" });
+  return res;
+}
+
+export const config = { matcher: ["/((?!api|_next/static|_next/image|favicon.ico).*)"] };
+`;
+
+  const routeContent = `import { NextResponse } from "next/server";
+import { cookies } from "next/headers";
+
+const LIST_ID = "${leadListId}";
+const FORWARD_URL = "${apiBase}/api/webhooks/forward-lead";
+
+export async function POST(req: Request) {
+  try {
+    const body = await req.json().catch(() => ({}));
+    let attribution: unknown;
+    const raw = (await cookies()).get("aw_first_touch")?.value;
+    if (raw) { try { attribution = JSON.parse(raw); } catch {} }
+
+    const res = await fetch(FORWARD_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, listId: LIST_ID, source: "landing-page", ...(attribution ? { attribution } : {}) }),
+    });
+    if (!res.ok) return NextResponse.json({ success: false }, { status: 502 });
+    return NextResponse.json({ success: true });
+  } catch {
+    return NextResponse.json({ success: false }, { status: 500 });
+  }
+}
+`;
+
+  filtered.push({ path: "middleware.ts", content: Buffer.from(middlewareContent) });
+  filtered.push({ path: "app/api/capture/route.ts", content: Buffer.from(routeContent) });
+
+  assertNoDuplicateInjectedRoutes(filtered);
+
+  return filtered;
+}
+
+/**
  * Create a GitHub repo under the AgentWebPro org and push all files via the Contents API.
  */
 async function createGitHubRepoAndPush(
   repoName: string,
   zipData: any,
-  description: string
+  description: string,
+  leadListId?: string
 ): Promise<{ githubRepoUrl: string; repoFullName: string; commitSha: string }> {
   const { token, org } = await getGitHubOrgToken();
   const headers = {
@@ -2094,8 +2310,16 @@ async function createGitHubRepoAndPush(
     files.push(...scaffoldFiles);
   }
 
+  // Deterministically inject platform-owned lead-capture attribution (middleware.ts +
+  // app/api/capture/route.ts), force-replacing any v0-generated equivalents.
+  let finalFiles = files;
+  if (leadListId) {
+    finalFiles = injectLeadCaptureAttribution(files, leadListId);
+    console.log(`[V0 SERVICE] Injected lead-capture attribution files (middleware.ts, app/api/capture/route.ts) for list ${leadListId}`);
+  }
+
   // Auto-fix common v0 build issues before pushing to GitHub
-  const fixCount = autoFixV0Files(files);
+  const fixCount = autoFixV0Files(finalFiles);
   if (fixCount > 0) {
     console.log(`[V0 SERVICE] Auto-fixed ${fixCount} files for build compatibility`);
   }
@@ -2109,7 +2333,7 @@ async function createGitHubRepoAndPush(
   const latestCommitSha = refRes.data.object.sha;
 
   // Step B: Create blobs for each file
-  const blobPromises = files.map(async (file) => {
+  const blobPromises = finalFiles.map(async (file) => {
     const blobRes = await axios.post<any>(
       `https://api.github.com/repos/${repoFullName}/git/blobs`,
       {
@@ -2156,7 +2380,7 @@ async function createGitHubRepoAndPush(
     { headers, timeout: GITHUB_API_TIMEOUT_MS }
   );
 
-  console.log(`[V0 SERVICE] Pushed ${files.length} files to ${repoFullName} (${commitSha.substring(0, 7)})`);
+  console.log(`[V0 SERVICE] Pushed ${finalFiles.length} files to ${repoFullName} (${commitSha.substring(0, 7)})`);
 
   return { githubRepoUrl, repoFullName, commitSha };
 }

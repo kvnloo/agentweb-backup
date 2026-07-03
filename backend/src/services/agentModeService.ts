@@ -3837,17 +3837,21 @@ export class AgentModeService {
       completed: '✅',
       failed: '❌'
     };
-    let statusesContent = '';
+    // Only inject a task-status context message when there ARE task statuses to
+    // report. Previously an empty session pushed an assistant message reading
+    // "📋 Task Status: No tasks have been run in this session yet." right before
+    // the user's message. On a terse confirmation (e.g. "go with defaults") the
+    // model could parrot that injected assistant turn verbatim instead of
+    // proceeding with the actual work (ENG-129). The empty-status note conveys
+    // nothing the model needs, so skip it entirely.
     if (currentTaskStatuses && currentTaskStatuses.length > 0) {
-      statusesContent += 'Current Task Statuses:\n';
+      let statusesContent = 'Current Task Statuses:\n';
       currentTaskStatuses.forEach(task => {
         const emoji = statusEmoji[task.status] || '⏳';
         statusesContent += `${emoji} ${task.taskName} (${task.status}) - Task ID: ${task.taskId}, Execution ID: ${task.executionId}\n`;
       });
-    } else {
-      statusesContent = '📋 **Task Status**: No tasks have been run in this session yet.';
+      messages.push({ role: 'assistant', content: statusesContent });
     }
-    messages.push({ role: 'assistant', content: statusesContent });
 
     // Insert work plan status as an assistant message if exists. Pass the set of
     // images already generated this session (scanned from full history, not the
