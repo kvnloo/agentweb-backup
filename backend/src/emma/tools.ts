@@ -900,13 +900,20 @@ emmaToolRegistry.register({
           default: '7d'
         },
         campaign_ids: {
-          type: 'array',
+          // Union type so the static schema accepts exactly the shapes execute()
+          // normalizes (array preferred; legacy single string also accepted).
+          // minItems only fires for arrays, so a string id is not rejected.
+          type: ['array', 'string'],
           items: { type: 'string' },
           minItems: 1,
-          description: 'Required list of campaign IDs to filter metrics by. Use list_meta_ads_campaigns to get available campaign IDs (works even without a connected Meta account).'
+          description: 'List of campaign IDs to filter metrics by (array preferred; a single campaign id string is also accepted). Use list_meta_ads_campaigns to get available campaign IDs (works even without a connected Meta account).'
+        },
+        campaign_id: {
+          // Legacy single-id alias. execute() normalizes this into campaign_ids.
+          type: 'string',
+          description: 'Legacy alias for a single campaign id. Prefer campaign_ids. Provide at least one of campaign_ids or campaign_id.'
         }
-      },
-      required: ['campaign_ids']
+      }
     }
   },
   execute: async (args, context) => {
@@ -986,7 +993,7 @@ ENTITY HIERARCHY: Ad Account → Campaign Group → Campaign → Creative
     sender is auto-resolved from the connected account — do NOT ask the user for it.
 
   CONVERSATION AD (branching message, campaign type: SPONSORED_INMAILS):
-    CONVERSATION_AD/CREATE (name) → CONVERSATION_AD/CREATE_CONTENT (×N message nodes with buttons) → CONVERSATION_AD/SET_FIRST_CONTENT → CREATIVE/CREATE (inmail_content_urn=conversation_ad_urn, campaign_id)
+    CONVERSATION_AD/CREATE (name, optional — becomes the ad's headline text; omit to let LinkedIn use the first message as the headline) → CONVERSATION_AD/CREATE_CONTENT (×N message nodes with buttons) → CONVERSATION_AD/SET_FIRST_CONTENT → CREATIVE/CREATE (inmail_content_urn=conversation_ad_urn, campaign_id)
     Each button can link to another message node (SEND_MESSAGE action) or a URL (OPEN_URL action).
 
   JOBS AD (campaign type: DYNAMIC, campaign format: JOBS):
@@ -1035,7 +1042,7 @@ REQUIRED PARAMS PER ENTITY + ACTION:
   MEDIA UPLOAD_DOCUMENT: document_url (public URL to PDF/PPT/DOC). Returns document_urn.
   INMAIL CREATE_CONTENT: name, subject, htmlBody, callToActionText (max 20 chars), callToActionLandingPageUrl. Optional: salutationText, senderName, senderTitle, senderCompany. (sender auto-resolved — do NOT pass it)
   INMAIL SEND_TEST: inmail_content_urn, recipient_email
-  CONVERSATION_AD CREATE: name
+  CONVERSATION_AD CREATE: none required. Optional: name (becomes the ad's headlineText — LinkedIn has no "name" field on this resource, so it is mapped for you)
   CONVERSATION_AD CREATE_CONTENT: conversation_ad_urn, body (message text), buttons (array of { text, action: OPEN_URL|SEND_MESSAGE, url? }). Optional: subject, footer.
   CONVERSATION_AD SET_FIRST_CONTENT: conversation_ad_urn, first_content_urn
 
@@ -1065,7 +1072,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
           description: 'Action-specific parameters. See tool description for required fields per entity + action.',
           properties: {
             // Campaign Group / Campaign common
-            name: { type: 'string', description: 'Entity name.' },
+            name: { type: 'string', description: 'Entity name (internal label). Exception: for CONVERSATION_AD CREATE it becomes the member-visible headline text shown in LinkedIn inboxes — write headline copy, not an internal label.' },
             status: { type: 'string', enum: ['ACTIVE', 'PAUSED', 'ARCHIVED', 'DRAFT', 'CANCELED', 'COMPLETED'], description: 'Entity status.' },
             campaign_group_id: { type: 'string', description: 'Campaign Group numeric ID. Used for CAMPAIGN LIST.' },
             campaignGroup: { type: 'string', description: 'Campaign Group URN (urn:li:sponsoredCampaignGroup:ID). Required for CAMPAIGN CREATE.' },

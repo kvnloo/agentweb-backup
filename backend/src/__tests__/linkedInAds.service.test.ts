@@ -198,6 +198,55 @@ describe('createCampaign', () => {
   });
 });
 
+describe('makeRequest — LinkedIn account-access error enrichment', () => {
+  const RAW_ACCOUNT_ACCESS_ERROR =
+    'Your application is not configured to access the related advertiser account(s), please ensure you have added the account ID(s) in your Account Management list.';
+
+  it('rewrites the raw LinkedIn account-access error with AgentWeb-side guidance', async () => {
+    mockAxiosFn.mockRejectedValue({
+      response: { status: 403, data: { message: RAW_ACCOUNT_ACCESS_ERROR } },
+    });
+    const result = await svc.createCampaign(ACCESS_TOKEN, ACCOUNT_ID, { name: 'Camp 1' });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('AgentWeb platform configuration');
+    expect(result.error).toContain('does not have their own');
+    expect(result.error).toContain('contact AgentWeb support');
+  });
+
+  it('includes the ad account id extracted from the request path', async () => {
+    mockAxiosFn.mockRejectedValue({
+      response: { status: 403, data: { message: RAW_ACCOUNT_ACCESS_ERROR } },
+    });
+    const result = await svc.createCampaign(ACCESS_TOKEN, ACCOUNT_ID, { name: 'Camp 1' });
+    expect(result.error).toContain(ACCOUNT_ID);
+  });
+
+  it('includes the ad account id from the request body when the path has no /adAccounts/ segment', async () => {
+    mockAxiosFn.mockRejectedValue({
+      response: { status: 403, data: { message: RAW_ACCOUNT_ACCESS_ERROR } },
+    });
+    // POST /rest/conversationAds carries the account only in body.parentAccount
+    const result = await svc.createConversationAd(ACCESS_TOKEN, ACCOUNT_ID, { name: 'x' });
+    expect(result.error).toContain(ACCOUNT_ID);
+  });
+
+  it('matches the LinkedIn error case-insensitively', async () => {
+    mockAxiosFn.mockRejectedValue({
+      response: { status: 403, data: { message: RAW_ACCOUNT_ACCESS_ERROR.toUpperCase() } },
+    });
+    const result = await svc.createCampaign(ACCESS_TOKEN, ACCOUNT_ID, { name: 'Camp 1' });
+    expect(result.error).toContain('AgentWeb platform configuration');
+  });
+
+  it('does not rewrite unrelated LinkedIn errors', async () => {
+    mockAxiosFn.mockRejectedValue({
+      response: { status: 422, data: { message: 'ERROR :: /name :: unrecognized field found but not allowed' } },
+    });
+    const result = await svc.createCampaign(ACCESS_TOKEN, ACCOUNT_ID, { name: 'Camp 1' });
+    expect(result.error).toBe('ERROR :: /name :: unrecognized field found but not allowed');
+  });
+});
+
 describe('updateCampaign', () => {
   it('sends PARTIAL_UPDATE for campaign', async () => {
     await svc.updateCampaign(ACCESS_TOKEN, ACCOUNT_ID, 'camp-1', { status: 'PAUSED' });
@@ -717,20 +766,46 @@ describe('createDynamicCreative', () => {
 });
 
 describe('createConversationAd', () => {
-  it('POSTs to /rest/conversationAds with parentAccount', async () => {
+  it('POSTs to /rest/conversationAds with parentAccount and maps name to headlineText', async () => {
     mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:conversationAd:ca-1' }, status: 201 });
     const result = await svc.createConversationAd(ACCESS_TOKEN, ACCOUNT_ID, { name: 'My Conversation Ad' });
     const call = mockAxiosFn.mock.calls[0][0];
     expect(call.url).toContain('/rest/conversationAds');
     expect(call.data.parentAccount).toBe(`urn:li:sponsoredAccount:${ACCOUNT_ID}`);
-    expect(call.data.name).toBe('My Conversation Ad');
+    expect(call.data.headlineText).toBe('My Conversation Ad');
+    // LinkedIn's SponsoredConversation schema has no "name" field — sending one is
+    // rejected with "ERROR :: /name :: unrecognized field found but not allowed".
+    expect(call.data.name).toBeUndefined();
     expect(result.success).toBe(true);
   });
 
-  it('returns error when name missing', async () => {
+  it('accepts headline_text directly as an alias for name', async () => {
+    mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:conversationAd:ca-1' }, status: 201 });
+    await svc.createConversationAd(ACCESS_TOKEN, ACCOUNT_ID, { headline_text: 'Direct headline' });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.headlineText).toBe('Direct headline');
+  });
+
+  it("accepts LinkedIn's documented camelCase headlineText spelling", async () => {
+    mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:conversationAd:ca-1' }, status: 201 });
+    await svc.createConversationAd(ACCESS_TOKEN, ACCOUNT_ID, { headlineText: 'Camel headline' });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.headlineText).toBe('Camel headline');
+  });
+
+  it('omits headlineText entirely when neither name nor headline_text is provided — LinkedIn treats it as optional', async () => {
+    mockAxiosFn.mockResolvedValue({ data: {}, headers: { 'x-restli-id': 'urn:li:conversationAd:ca-1' }, status: 201 });
     const result = await svc.createConversationAd(ACCESS_TOKEN, ACCOUNT_ID, {});
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.parentAccount).toBe(`urn:li:sponsoredAccount:${ACCOUNT_ID}`);
+    expect('headlineText' in call.data).toBe(false);
+    expect(result.success).toBe(true);
+  });
+
+  it('still requires ad_account_id', async () => {
+    const result = await svc.createConversationAd(ACCESS_TOKEN, '', { name: 'x' });
     expect(result.success).toBe(false);
-    expect(result.error).toContain('name');
+    expect(result.error).toContain('ad_account_id');
   });
 });
 

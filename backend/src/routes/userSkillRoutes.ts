@@ -1,6 +1,5 @@
 import express from "express";
 import { skillService, Skill } from "../services/skillService";
-import { emailService } from "../services/emailService";
 import { userDb, orgDb } from "../services/db";
 import {
   canEditItem,
@@ -174,17 +173,9 @@ router.delete("/:skillId", async (req, res) => {
 router.post("/:skillId/submit-for-review", async (req, res) => {
   try {
     const { userId } = (req as any).user;
-    const userEmail = (req as any).user.email;
     const { skillId } = req.params;
 
     const skill = await skillService.submitForReview(skillId, userId);
-
-    // Notify oncall
-    emailService.sendOncallAlert(
-      'Skill Submitted for Review',
-      `User ${userEmail} submitted skill "${skill.name}" for platform review.`,
-      { skillId: skill.skillId, skillName: skill.name, userId, userEmail }
-    ).catch(err => console.error('Failed to send oncall alert for skill review:', err));
 
     res.json(skill);
   } catch (error: any) {

@@ -74,4 +74,23 @@ describe('ensureCriticalTables', () => {
     const om = CRITICAL_TABLE_SPECS.find((s) => s.TableName.endsWith('AW-OnboardingMetrics'))!;
     expect((om.GlobalSecondaryIndexes ?? []).some((g: any) => g.IndexName === 'StepStartedAtIndex')).toBe(true);
   });
+
+  it('provisions AW-ContactEvents with contactId/eventTimestamp keys and the sourceRecordId-index GSI', () => {
+    const ce = CRITICAL_TABLE_SPECS.find((s) => s.TableName.endsWith('AW-ContactEvents'));
+    expect(ce).toBeDefined();
+    expect(ce!.KeySchema).toEqual([
+      { AttributeName: 'contactId', KeyType: 'HASH' },
+      { AttributeName: 'eventTimestamp', KeyType: 'RANGE' },
+    ]);
+    expect(ce!.AttributeDefinitions).toEqual(expect.arrayContaining([
+      { AttributeName: 'contactId', AttributeType: 'S' },
+      { AttributeName: 'eventTimestamp', AttributeType: 'S' },
+      { AttributeName: 'sourceRecordId', AttributeType: 'S' },
+    ]));
+    const gsi = (ce!.GlobalSecondaryIndexes ?? []).find((g: any) => g.IndexName === 'sourceRecordId-index');
+    expect(gsi).toBeDefined();
+    expect(gsi!.KeySchema).toEqual([{ AttributeName: 'sourceRecordId', KeyType: 'HASH' }]);
+    expect(gsi!.Projection).toEqual({ ProjectionType: 'ALL' });
+    expect(ce!.BillingMode).toBe('PAY_PER_REQUEST');
+  });
 });

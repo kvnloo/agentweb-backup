@@ -89,7 +89,9 @@ export function getAgentRunRecorder(): AgentRunRecorder | null {
   if (!isAgentRuntimeSpineEnabled()) return null;
   if (!recorderSingleton) {
     const ports = productionLoopPorts();
-    recorderSingleton = new AgentRunRecorder(ports.dynamo, ports.clock);
+    // Pass the logger so Dynamo write failures surface as a structured signal +
+    // writeFailures counter rather than console-only (ENG-102).
+    recorderSingleton = new AgentRunRecorder(ports.dynamo, ports.clock, undefined, ports.logger);
   }
   return recorderSingleton;
 }

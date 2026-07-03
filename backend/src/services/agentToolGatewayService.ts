@@ -1,3 +1,5 @@
+import { toolResultError } from '../utils/toolResultError';
+
 export type AgentToolEffect =
   | 'read'
   | 'session_state'
@@ -468,6 +470,12 @@ export function validateAndRepairToolArgs(
     if (coerced.changed) {
       repairedArgs[name] = coerced.value;
       repairs.push(`${name}:scalar_coerce`);
+      continue;
+    }
+    const container = coerceJsonContainerForSchema(repairedArgs[name], propSchema);
+    if (container.changed) {
+      repairedArgs[name] = container.value;
+      repairs.push(`${name}:json_parse`);
     }
   }
 
@@ -570,6 +578,34 @@ export async function executeAgentToolThroughGateway(
 
   try {
     const result = await input.execute();
+    // A resolved result can still encode a failure ({ success: false } /
+    // { isError: true }). Tools like performDataAnalysis, getMetaAdsMetrics,
+    // fathom_get_meetings and coding_agent signal failure this way instead of
+    // throwing. Use the SAME canonical detector the dispatcher uses to downgrade
+    // these (toolResultError, see toolDispatch.ts) so gateway failure accounting
+    // and dispatcher classification stay in lockstep. Account a structured
+    // failure exactly like the catch path; do NOT clear prior failure counts.
+    const structuredFailure = toolResultError(result);
+    if (structuredFailure) {
+      if (input.runId) recordToolFailure(input.runId, policyDecision.toolName, structuredFailure);
+      if (
+        input.budgetScopeId
+        && input.budgetScopeId !== input.runId
+        && mediaFailureBudget(policyDecision.toolName) != null
+      ) {
+        recordToolFailure(input.budgetScopeId, policyDecision.toolName, structuredFailure);
+      }
+      // Keep returning status:'success' with the result so the dispatcher's
+      // downgrade (toolDispatch.ts) carries the structured payload to the model.
+      // Flipping to status:'error' here would strip `result`. The only observable
+      // change is internal accounting — counts increment instead of being cleared.
+      return {
+        status: 'success',
+        result,
+        policyDecision,
+        durationMs: Math.max(0, now() - startedAt),
+      };
+    }
     if (input.runId) clearToolFailures(input.runId, policyDecision.toolName);
     if (input.budgetScopeId && input.budgetScopeId !== input.runId) {
       clearToolFailures(input.budgetScopeId, policyDecision.toolName);
@@ -814,6 +850,52 @@ function coerceScalarForSchema(value: unknown, schema: any): { changed: boolean;
   return { changed: false, value };
 }
 
+/**
+ * Coerce a stringified JSON array/object to its parsed value when the schema
+ * expects an `array` or `object` (and does NOT also accept `string`). LLMs
+ * frequently double-encode a nested container argument — emitting
+ * `files: "[{...}]"` instead of `files: [{...}]` — which the type validator then
+ * hard-rejected with "Expected array." (ENG-127). Parse a string that cleanly
+ * round-trips to the expected container type so the call succeeds instead of
+ * bouncing back to the model.
+ *
+ * Behavior-preserving: returns `changed: false` for non-string inputs, for
+ * schemas that also accept `string`, for strings that don't look like / parse as
+ * JSON, and for parsed values whose type doesn't match the expected container —
+ * so a genuinely wrong value still surfaces as a type_mismatch issue downstream.
+ */
+function coerceJsonContainerForSchema(value: unknown, schema: any): { changed: boolean; value: unknown } {
+  if (typeof value !== 'string') return { changed: false, value };
+  const expected = schema?.type;
+  if (!expected) return { changed: false, value };
+  const expectedTypes = Array.isArray(expected) ? expected : [expected];
+
+  // If the schema accepts a string, the string is already valid — never coerce.
+  if (expectedTypes.includes('string')) return { changed: false, value };
+
+  const wantsArray = expectedTypes.includes('array');
+  const wantsObject = expectedTypes.includes('object');
+  if (!wantsArray && !wantsObject) return { changed: false, value };
+
+  const trimmed = value.trim();
+  const firstChar = trimmed[0];
+  // Only attempt a parse for values that actually look like a JSON container.
+  if (firstChar !== '[' && firstChar !== '{') return { changed: false, value };
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return { changed: false, value };
+  }
+
+  if (wantsArray && Array.isArray(parsed)) return { changed: true, value: parsed };
+  if (wantsObject && Boolean(parsed) && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    return { changed: true, value: parsed };
+  }
+  return { changed: false, value };
+}
+
 function validateJsonSchemaConstraints(name: string, value: unknown, schema: any): AgentToolContractIssue[] {
   const issues: AgentToolContractIssue[] = [];
 
@@ -837,21 +919,60 @@ function validateJsonSchemaConstraints(name: string, value: unknown, schema: any
   return issues;
 }
 
+function isNonEmptyString(value: unknown): boolean {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
 function validateSemanticToolContract(toolName: string, args: Record<string, unknown>): AgentToolContractIssue[] {
-  if (toolName !== 'linkedin_outreach') return [];
-  if (args.action !== 'send-invite') return [];
-  if (typeof args.message !== 'string') return [];
+  if (toolName === 'linkedin_outreach') {
+    if (args.action !== 'send-invite') return [];
+    if (typeof args.message !== 'string') return [];
 
-  const conservativeInviteLimit = 200;
-  if (args.message.length <= conservativeInviteLimit) return [];
+    const conservativeInviteLimit = 200;
+    if (args.message.length <= conservativeInviteLimit) return [];
 
-  return [{
-    code: 'invalid_args',
-    path: '$.message',
-    message:
-      `LinkedIn send-invite notes must be ${conservativeInviteLimit} characters or fewer for Agent Mode. ` +
-      `This note is ${args.message.length} characters. Rewrite it as a complete shorter note before retrying.`,
-  }];
+    return [{
+      code: 'invalid_args',
+      path: '$.message',
+      message:
+        `LinkedIn send-invite notes must be ${conservativeInviteLimit} characters or fewer for Agent Mode. ` +
+        `This note is ${args.message.length} characters. Rewrite it as a complete shorter note before retrying.`,
+    }];
+  }
+
+  // ENG-106: the send_email_from_sender schema can only mark `to`/`subject`
+  // required — the body is a 3-way alternative (html OR text OR body) the
+  // hand-rolled validator's `required` cannot express (no anyOf support). Enforce
+  // it semantically so a body-less email fails fast at validation with an
+  // actionable message instead of a wasted round-trip + soft execution failure.
+  if (toolName === 'send_email_from_sender') {
+    if (isNonEmptyString(args.html) || isNonEmptyString(args.text) || isNonEmptyString(args.body)) return [];
+    return [{
+      code: 'invalid_args',
+      path: '$.body',
+      message: 'Provide a non-empty email body via html, text, or body.',
+    }];
+  }
+
+  // ENG-106: get_meta_ads_metrics drops the hard `required: [campaign_ids]` so
+  // legacy scalar/string id shapes the impl normalizes pass static validation.
+  // Restore the "at least one usable campaign id" guarantee here, accepting every
+  // shape execute() normalizes: non-empty array campaign_ids, non-empty string
+  // campaign_ids, or non-empty string campaign_id.
+  if (toolName === 'get_meta_ads_metrics') {
+    const hasArrayIds = Array.isArray(args.campaign_ids)
+      && args.campaign_ids.some((id) => isNonEmptyString(id));
+    const hasStringIds = isNonEmptyString(args.campaign_ids);
+    const hasLegacyId = isNonEmptyString(args.campaign_id);
+    if (hasArrayIds || hasStringIds || hasLegacyId) return [];
+    return [{
+      code: 'invalid_args',
+      path: '$.campaign_ids',
+      message: 'Provide at least one campaign id via campaign_ids (array or string) or campaign_id. Use list_meta_ads_campaigns to find campaign IDs.',
+    }];
+  }
+
+  return [];
 }
 
 function isMissingRequiredValue(value: unknown, schema: any): boolean {

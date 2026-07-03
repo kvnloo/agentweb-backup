@@ -60,22 +60,12 @@ const MAX_TOOL_CONTENT_SIZE = 300_000;
 // get compressed to a 200-char preview. Storing them in S3 lets the LLM call search_tool_response
 // to retrieve specific fields from the original payload without needing the full text in context.
 
-/**
- * Extracts the string content from a tool result for LLM consumption and S3 storage.
- *
- * Tools registered via mcpToolRegistry use jsonResult() which wraps their output in the MCP
- * format: { content: [{ type: 'text', text: '<actual JSON>' }] }. If we store the entire
- * wrapper via JSON.stringify(), the inner JSON becomes double-escaped in S3: field names like
- * "sessionId" are stored as \"sessionId\", causing search_tool_response to return 0 matches.
- *
- * Priority: formattedContent > content[0].text (MCP inner text) > JSON.stringify fallback.
- */
-export function extractToolContent(result: any): string {
-  if (typeof result === 'string') return result;
-  if (result?.formattedContent) return result.formattedContent;
-  if (result?.content?.[0]?.text) return result.content[0].text;
-  return JSON.stringify(result);
-}
+// extractToolContent now lives in ../utils/extractToolContent (pure, monolith-free)
+// so the tool-output contract validator and the toolDispatch unit suite can wire
+// the REAL extractor without loading this 24k-line service. Re-exported here so
+// existing `from '../services/agentModeService'` importers are unaffected.
+export { extractToolContent } from '../utils/extractToolContent';
+import { extractToolContent } from '../utils/extractToolContent';
 
 /**
  * Normalize a video timecode to a numeric number of seconds.
@@ -130,6 +120,8 @@ import {
   validateAndRepairToolArgs,
 } from './agentToolGatewayService';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
+import { validateToolOutputContract } from '../utils/toolOutputContract';
 
 type MetaApiResult = {
   success: boolean;
@@ -175,48 +167,88 @@ function recordAgentModeToolTelemetry(
   runId: string,
   sessionId: string,
   iteration: number,
-  toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>,
+  toolResults: Array<{ status: 'success' | 'error' | 'deferred'; toolCall: any; functionArgs?: any; result?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>,
+  budgetContext?: { mediaAssetsProducedThisRun?: number; mediaGenerationDeadlineMs?: number },
 ): void {
   const recorder = getAgentRunRecorderSafe();
   if (!recorder || toolResults.length === 0) return;
 
-  void (async () => {
-    try {
-      const toolNames = toolResults.map(r => r.toolCall?.function?.name ?? 'unknown');
-      // PR #1818 follow-up: contract-layer activity as countable telemetry so
-      // the enforcement decision has data (args_repaired / schema-error rates).
-      const argsRepairedCount = toolResults.filter(
-        (r) => r.policyDecision?.flags?.some((flag) => flag.code === 'args_repaired'),
-      ).length;
-      const schemaErrorCount = toolResults.filter(
-        (r) => r.status === 'error' && classifyToolErrorClass(r.error) === 'invalid_args',
-      ).length;
-      await recorder.decision(runId, {
-        iteration,
-        toolNames,
-        sessionId,
-        toolArgKeys: summarizeToolArgKeys(toolResults),
-        toolArgsPreview: summarizeToolArgs(toolResults),
-        decisionExplanation: summarizeToolDecision(toolResults),
-        explanationSource: 'deterministic_tool_summary',
-        toolPolicyFlags: summarizeAgentToolPolicyFlags(toolResults.map((r) => r.policyDecision)),
-        toolPolicySummary: summarizeAgentToolPolicyModes(toolResults.map((r) => r.policyDecision)),
-        argsRepairedCount,
-        schemaErrorCount,
-      });
-      for (const r of toolResults) {
-        const toolName = r.toolCall?.function?.name ?? 'unknown';
-        await recorder.toolInvoked(runId, { toolName, iteration, sessionId });
-        if (r.status === 'success') {
-          await recorder.toolSucceeded(runId, { toolName, durationMs: r.duration, sessionId });
-        } else {
-          await recorder.toolFailed(runId, { toolName, error: r.error, durationMs: r.duration, sessionId, args: r.functionArgs });
-        }
+  // ENG-102: enqueue the per-tool records SYNCHRONOUSLY (no detached `void
+  // (async)` wrapper). The recorder's internal write chain serializes them in
+  // call order, so they always precede the terminal run record enqueued after
+  // the loop — and the terminal record's flush implies these are durably
+  // written before the worker exits. Still non-blocking from the caller's view:
+  // the recorder methods return immediately and the chain settles in the
+  // background (drained at run end). Only the synchronous summary computation is
+  // wrapped in try/catch — telemetry must never break the chat hot path.
+  try {
+    const toolNames = toolResults.map(r => r.toolCall?.function?.name ?? 'unknown');
+    // PR #1818 follow-up: contract-layer activity as countable telemetry so
+    // the enforcement decision has data (args_repaired / schema-error rates).
+    const argsRepairedCount = toolResults.filter(
+      (r) => r.policyDecision?.flags?.some((flag) => flag.code === 'args_repaired'),
+    ).length;
+    const schemaErrorCount = toolResults.filter(
+      (r) => r.status === 'error' && classifyToolErrorClass(r.error) === 'invalid_args',
+    ).length;
+    void recorder.decision(runId, {
+      iteration,
+      toolNames,
+      sessionId,
+      toolArgKeys: summarizeToolArgKeys(toolResults),
+      toolArgsPreview: summarizeToolArgs(toolResults),
+      decisionExplanation: summarizeToolDecision(toolResults),
+      explanationSource: 'deterministic_tool_summary',
+      toolPolicyFlags: summarizeAgentToolPolicyFlags(toolResults.map((r) => r.policyDecision)),
+      toolPolicySummary: summarizeAgentToolPolicyModes(toolResults.map((r) => r.policyDecision)),
+      argsRepairedCount,
+      schemaErrorCount,
+    });
+    for (const r of toolResults) {
+      const toolName = r.toolCall?.function?.name ?? 'unknown';
+      if (r.status === 'deferred') {
+        // ENG-103: a deferred call never executed → record it as its own class,
+        // NOT as toolInvoked (keeps the reliability denominator clean) and NOT
+        // as a failure (it carries no error signal).
+        void recorder.toolDeferred(runId, {
+          toolName,
+          reason: 'media_generation_time_budget',
+          iteration,
+          sessionId,
+          ...(budgetContext?.mediaAssetsProducedThisRun != null
+            ? { mediaAssetsProducedThisRun: budgetContext.mediaAssetsProducedThisRun }
+            : {}),
+          ...(budgetContext?.mediaGenerationDeadlineMs != null
+            ? { deadlineMs: budgetContext.mediaGenerationDeadlineMs }
+            : {}),
+        });
+        continue;
       }
-    } catch (err) {
-      console.error('[agent-mode] tool telemetry failed (swallowed):', err);
+      void recorder.toolInvoked(runId, { toolName, iteration, sessionId });
+      if (r.status === 'success') {
+        void recorder.toolSucceeded(runId, { toolName, durationMs: r.duration, sessionId });
+        // ENG-104: a success that returned an explicitly partial result (e.g.
+        // get_meta_ads_metrics with an errored breakdown section) is still a
+        // success, but its degradation is recorded as its own class so a section
+        // silently going dark is visible in telemetry instead of hiding behind
+        // success:true. Emitted only when the result is flagged partialFailure —
+        // the all-success path emits nothing (behavior-preserving).
+        const partial = buildToolPartialFailureTelemetry(toolName, r.result);
+        if (partial) {
+          void recorder.toolPartialFailure(runId, {
+            toolName: partial.toolName,
+            unavailableSections: partial.unavailableSections,
+            iteration,
+            sessionId,
+          });
+        }
+      } else {
+        void recorder.toolFailed(runId, { toolName, error: r.error, durationMs: r.duration, sessionId, args: r.functionArgs });
+      }
     }
-  })();
+  } catch (err) {
+    console.error('[agent-mode] tool telemetry failed (swallowed):', err);
+  }
 }
 
 
@@ -245,6 +277,62 @@ function recordAgentModeRunFailed(
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runFailed(runId, info);
+}
+
+/**
+ * Record same-turn duplicate tool-call suppression (ENG-108) as a structured,
+ * observability-only signal — SEPARATE from success/failure telemetry (a
+ * suppressed duplicate is neither). Best-effort: never throws into the chat hot
+ * path.
+ */
+function recordAgentModeDuplicateSuppression(
+  runId: string,
+  sessionId: string,
+  iteration: number,
+  entries: Array<{ toolCall: any; functionArgs: any; duplicateOfId: string }>,
+): void {
+  if (entries.length === 0) return;
+  try {
+    for (const entry of entries) {
+      console.warn('[agent-mode] duplicate tool call suppressed', {
+        runId,
+        sessionId,
+        iteration,
+        toolName: entry.toolCall?.function?.name ?? 'unknown',
+        duplicateOfId: entry.duplicateOfId,
+      });
+    }
+  } catch (err) {
+    console.error('[agent-mode] duplicate-suppression telemetry failed (swallowed):', err);
+  }
+}
+
+/**
+ * Record a model fallback (ENG-46) as a structured, greppable, observability-only
+ * signal. When a request pins a model id that is no longer served (e.g. a stale
+ * post-deploy smoke-test config or a retired DB default), `resolveGenerationModel`
+ * substitutes the default so the request still completes — but that substitution
+ * MUST be visible to ops, not silently buried, otherwise a stale config keeps
+ * shipping the wrong model unnoticed. The stable `[agent-mode] model fallback`
+ * tag is what log dashboards/alerts key on. Best-effort: never throws into the
+ * chat hot path.
+ */
+function recordAgentModeModelFallback(
+  runId: string,
+  sessionId: string,
+  requestedModel: string,
+  resolvedModel: string,
+): void {
+  try {
+    console.warn('[agent-mode] model fallback', {
+      runId,
+      sessionId,
+      requestedModel: requestedModel || '(none)',
+      resolvedModel,
+    });
+  } catch (err) {
+    console.error('[agent-mode] model-fallback telemetry failed (swallowed):', err);
+  }
 }
 
 function countFailedToolCalls(toolCalls: any[]): number {
@@ -354,6 +442,25 @@ function getAgentRunRecorderSafe() {
   } catch (err) {
     console.error('[agent-mode] runtime spine recorder unavailable (swallowed):', err);
     return null;
+  }
+}
+
+/**
+ * Drain the recorder's pending writes before worker/IPC teardown (ENG-102) so
+ * per-tool + terminal telemetry are durably written before the worker process
+ * exits — bounded by a timeout (mirroring the 5s generateSuggestedReplies guard)
+ * so it can never hang the response. No-op when the runtime spine is disabled.
+ */
+async function flushAgentRunRecorderSafe(timeoutMs = 5000): Promise<void> {
+  const recorder = getAgentRunRecorderSafe();
+  if (!recorder) return;
+  try {
+    await Promise.race([
+      recorder.flush(),
+      new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+    ]);
+  } catch {
+    // best-effort — telemetry drain must never break the chat turn
   }
 }
 
@@ -2031,7 +2138,7 @@ export class AgentModeService {
     // Azure OpenAI enforces a 128-tool limit per request
     // supportsVision flags below were verified empirically against the describe_image
     // path (probe against a real image). All GPT-5 deployments handle vision.
-    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true },
     'gpt-5.4-nano': { client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
@@ -2069,7 +2176,7 @@ export class AgentModeService {
   }
   /**
    * Make an LLM call with the specified model and parameters
-   * @param model - The model to use (e.g., 'gpt-5.1', 'gemini-3-pro-preview')
+   * @param model - The model to use (e.g., 'gpt-5.5', 'gemini-3-pro-preview')
    * @param messages - Array of chat messages
    * @param options - Optional parameters for the LLM call
    * @returns The LLM response
@@ -2087,6 +2194,50 @@ export class AgentModeService {
       return LEGACY_MODEL_ALIASES[model] as T;
     }
     return model;
+  }
+
+  /**
+   * Resolve the model id for a generation request up front: normalize legacy
+   * ids, then validate against the allow-list. A model that is no longer served
+   * (e.g. a stale default or smoke-test config pinned to a removed id like
+   * 'gpt-5.1') would otherwise throw an opaque "Invalid model" deep inside
+   * callLLM, which the outer handler surfaces to the user as "Unknown Error"
+   * (ENG-46). Instead, fall back to the configured default model so the request
+   * still completes, and report whether a fallback happened so callers can log
+   * it / expose it via telemetry.
+   */
+  public resolveGenerationModel(model: string): { model: string; fellBack: boolean; requestedModel: string } {
+    const normalized = this.normalizeModelId(model);
+    // Use hasOwnProperty so inherited Object.prototype keys (e.g. 'constructor',
+    // 'toString') can't masquerade as valid allow-list entries.
+    if (normalized && Object.prototype.hasOwnProperty.call(this.llmModels, normalized)) {
+      return { model: normalized, fellBack: false, requestedModel: model };
+    }
+    const fallbackModel = this.resolveFallbackModel();
+    console.warn(
+      `AgentMode: Requested model '${model ?? '(none)'}' is not in the allow-list; falling back to default '${fallbackModel}'.`
+    );
+    return { model: fallbackModel, fellBack: true, requestedModel: model };
+  }
+
+  /**
+   * Resolve the model to fall back to when a requested id is unavailable.
+   * Normally this is the configured default_model, but if that itself has been
+   * removed from the allow-list (e.g. a stale AZURE_OPENAI_DEPLOYMENT_AGENT_MODE
+   * env override pinning a retired deployment) returning it would just re-throw
+   * "Invalid model" inside callLLM. Guard against that by validating the default
+   * and falling back to a known-good served model otherwise (ENG-46).
+   */
+  private resolveFallbackModel(): string {
+    if (Object.prototype.hasOwnProperty.call(this.llmModels, this.default_model)) {
+      return this.default_model;
+    }
+    const knownGoodModel = Object.keys(this.llmModels)[0];
+    console.warn(
+      `AgentMode: Configured default model '${this.default_model}' is not in the allow-list; ` +
+      `falling back to known-good model '${knownGoodModel}'.`
+    );
+    return knownGoodModel;
   }
 
   async callLLM(
@@ -2395,10 +2546,21 @@ export class AgentModeService {
       sessionType: isInteractiveShare ? 'interactive_share' : 'regular',
     });
     try {
-      // Map legacy/renamed model ids forward (e.g. old sessions persisted the
-      // pre-rename "claude-opus-4-8") so metadata, pricing, and routing all use
-      // the canonical registry key.
-      llmModel = this.normalizeModelId(llmModel);
+      // Resolve the model up front: map legacy/renamed ids forward (e.g. old
+      // sessions persisted the pre-rename "claude-opus-4-8") AND validate against
+      // the allow-list. A removed/stale id (e.g. a smoke-test config pinned to
+      // 'gpt-5.1') would otherwise throw an opaque "Invalid model" deep inside
+      // callLLM and surface to the user as "Unknown Error" (ENG-46); instead fall
+      // back to the default model so the request still completes.
+      const requestedLlmModel = llmModel;
+      const modelResolution = this.resolveGenerationModel(llmModel);
+      llmModel = modelResolution.model;
+      if (modelResolution.fellBack) {
+        // Surface the substitution as a structured, alertable telemetry signal so
+        // a stale model id (smoke-test / DB default) is caught in dashboards rather
+        // than silently masked (ENG-46).
+        recordAgentModeModelFallback(agentRuntimeRunId, sessionId, requestedLlmModel, llmModel);
+      }
       // Track backup model usage
       const originalLlmModel = llmModel;
       let backupModelUsed = false;
@@ -3017,8 +3179,18 @@ export class AgentModeService {
             executeAgentToolThroughGateway,
             executePreparedAgentTool: (toolInput: any) => this.executePreparedAgentTool(toolInput),
             toolResultError,
+            // ENG-105: validate tool output against the minimum-output contract so
+            // an empty/undefined/invalid "success" becomes a structured tool
+            // failure (errorClass invalid_output) instead of feeding garbage to
+            // the model and counting as success.
+            validateToolOutput: (result: any) => validateToolOutputContract(result, extractToolContent),
             recordToolTelemetry: (telemetryToolResults) =>
-              recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults as any),
+              recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults as any, {
+                mediaAssetsProducedThisRun,
+                mediaGenerationDeadlineMs,
+              }),
+            recordDuplicateSuppression: (entries) =>
+              recordAgentModeDuplicateSuppression(agentRuntimeRunId, sessionId, iteration, entries),
             extractMinimalToolResult: (result: any, toolName: string) => this.extractMinimalToolResult(result, toolName),
             extractToolContent,
             formatToolError: (toolName: string, errorMessage: string) => this.formatToolError(toolName, errorMessage),
@@ -3193,6 +3365,10 @@ export class AgentModeService {
         failedToolCalls: countFailedToolCalls(toolCalls),
         maxSameToolFailures: maxSameToolFailureCount(toolCalls),
       });
+      // ENG-102: drain telemetry before the worker reports success to the parent
+      // process (fire-and-forget would race with IPC teardown — same treatment
+      // the suggested-replies tail work already gets). Bounded, so never hangs.
+      await flushAgentRunRecorderSafe();
       return {
         content,
         toolCalls,
@@ -3258,6 +3434,8 @@ export class AgentModeService {
         failedToolCalls: countFailedToolCalls(_toolCallsForTelemetry),
         maxSameToolFailures: maxSameToolFailureCount(_toolCallsForTelemetry),
       });
+      // ENG-102: drain telemetry before the error propagates / worker tears down.
+      await flushAgentRunRecorderSafe();
       throw wrappedError;
     }
   }
@@ -3742,17 +3920,21 @@ export class AgentModeService {
       completed: '✅',
       failed: '❌'
     };
-    let statusesContent = '';
+    // Only inject a task-status context message when there ARE task statuses to
+    // report. Previously an empty session pushed an assistant message reading
+    // "📋 Task Status: No tasks have been run in this session yet." right before
+    // the user's message. On a terse confirmation (e.g. "go with defaults") the
+    // model could parrot that injected assistant turn verbatim instead of
+    // proceeding with the actual work (ENG-129). The empty-status note conveys
+    // nothing the model needs, so skip it entirely.
     if (currentTaskStatuses && currentTaskStatuses.length > 0) {
-      statusesContent += 'Current Task Statuses:\n';
+      let statusesContent = 'Current Task Statuses:\n';
       currentTaskStatuses.forEach(task => {
         const emoji = statusEmoji[task.status] || '⏳';
         statusesContent += `${emoji} ${task.taskName} (${task.status}) - Task ID: ${task.taskId}, Execution ID: ${task.executionId}\n`;
       });
-    } else {
-      statusesContent = '📋 **Task Status**: No tasks have been run in this session yet.';
+      messages.push({ role: 'assistant', content: statusesContent });
     }
-    messages.push({ role: 'assistant', content: statusesContent });
 
     // Insert work plan status as an assistant message if exists. Pass the set of
     // images already generated this session (scanned from full history, not the
@@ -3983,6 +4165,20 @@ export class AgentModeService {
   // Subset of foundation tools that must execute for real in mock/benchmark mode
   // because they modify session state (no external side effects).
   private static readonly MOCK_BYPASS_TOOLS = new Set(['install_skills']);
+
+  // ENG-43: Research / external-lookup tools whose TIMEOUTS should degrade
+  // gracefully (partial results + per-entity decomposition + provider fallback)
+  // rather than abandoning the goal. See formatToolError.
+  private static readonly RESEARCH_LOOKUP_TOOLS = new Set([
+    'you_search_web',
+    'you_search_news',
+    'google_search_web',
+    'perform_deep_research',
+    // ENG-43 (session 74bb2c5d): LinkedIn public-profile lookups (Unipile get-profile)
+    // that time out must degrade through the same branch — keep partial results, retry
+    // once, and fall back to a public web-search provider — instead of abandoning the goal.
+    'linkedin_outreach',
+  ]);
 
   /**
    * Get tools that are not associated with any published skill.
@@ -14455,17 +14651,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         console.error('AgentMode: Campaign-level Insights API Error:', campaignInsightsData.error);
         throw new Error(`Campaign-level Insights API Error: ${campaignInsightsData.error.message}`);
       }
-      if (insightsDemographicsData.error) {
-        console.error('AgentMode: Demographics Insights API Error:', insightsDemographicsData.error);
-        // Don't throw; proceed without demographics
-      }
-      if (insightsPlacementData.error) {
-        console.error('AgentMode: Placement Insights API Error:', insightsPlacementData.error);
-        // Don't throw; proceed without placements
-      }
-      if (insightsDeviceData.error) {
-        console.error('AgentMode: Device Insights API Error:', insightsDeviceData.error);
-        // Don't throw; proceed without devices
+      // ENG-104: breakdown endpoints are NON-fatal (we proceed without them), but
+      // a missing/errored breakdown must be distinguishable from an empty-but-OK
+      // one. Summarize the three raw responses into an explicit per-section status
+      // and surface partial failures in ONE structured warning (telemetry-visible)
+      // instead of three scattered console.errors.
+      const breakdownStatus = summarizeBreakdownSections({
+        demographics: insightsDemographicsData,
+        placement: insightsPlacementData,
+        device: insightsDeviceData,
+      });
+      if (breakdownStatus.partialFailure) {
+        console.warn('AgentMode: get_meta_ads_metrics partial breakdown failure', {
+          tool: 'get_meta_ads_metrics',
+          unavailableSections: breakdownStatus.unavailableSections,
+          sectionErrors: breakdownStatus.sectionErrors,
+        });
       }
 
       // Process the data using simplified logic (filtering is now done at API level)
@@ -14509,11 +14710,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       const result = {
         success: true,
-        message: `Meta ads metrics loaded for ${timeframe} timeframe`,
+        message: breakdownStatus.partialFailure
+          ? `Meta ads metrics loaded for ${timeframe} timeframe (some breakdown sections unavailable: ${breakdownStatus.unavailableSections.join(', ')})`
+          : `Meta ads metrics loaded for ${timeframe} timeframe`,
         timeframe,
         attributionWindow: { start: sinceStr, end: untilStr, days: attributionDays },
         campaignSummary,
-        formattedContent
+        formattedContent,
+        // ENG-104: which breakdown sections are complete vs unavailable, so a
+        // partial result is explicit in the tool result (and flows into the tool
+        // telemetry that captures the tool output) rather than looking fully ok.
+        sections: breakdownStatus.sections,
+        partialFailure: breakdownStatus.partialFailure,
+        unavailableSections: breakdownStatus.unavailableSections,
       };
 
       return result;
@@ -16062,6 +16271,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   private formatToolError(toolName: string, errorMessage: string): string {
     const safeMessage = typeof errorMessage === 'string' ? errorMessage : 'Unknown error';
     console.error(`[AgentMode] Tool failed: ${toolName} — ${safeMessage}`);
+    // ENG-43: Research / external-lookup tools (web/news search, deep research)
+    // that TIME OUT must degrade gracefully instead of abandoning the goal with a
+    // blanket "ask the user to retry". A heavy multi-entity research query (e.g.
+    // "research 3 people + their overlaps") or a slow public-profile lookup should
+    // fall back to: keep whatever partial results were already gathered, decompose
+    // the request into one focused sub-query per entity, and switch to an alternate
+    // search provider — NOT surface a bare retry prompt. This is checked BEFORE the
+    // generic connection-timeout "stop" branch so these tools degrade rather than halt.
+    const isResearchLookupTool =
+      AgentModeService.RESEARCH_LOOKUP_TOOLS.has(toolName) ||
+      Array.from(AgentModeService.RESEARCH_LOOKUP_TOOLS).some((name) => toolName.endsWith(`_${name}`));
+    const isTimeoutOrTransient =
+      /timed out|timeout|ETIMEDOUT|ESOCKETTIMEDOUT|ECONNRESET|ECONNABORTED|socket hang up|deadline exceeded|processing timeout|temporarily unavailable|\b(408|429|500|502|503|504)\b|gateway time-?out/i.test(
+        safeMessage
+      );
+    if (isResearchLookupTool && isTimeoutOrTransient) {
+      return `⚠️ Research/Lookup Timeout: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: Do NOT abandon the goal or simply ask the user to retry. Degrade gracefully instead:\n1. KEEP any partial results you already gathered for earlier entities/queries and present them, clearly noting which parts are still pending and offering to continue.\n2. If the request covers multiple entities or topics, decompose it into one focused sub-query per entity and call the search tool separately for each, rather than one heavy combined query.\n3. Narrow or simplify the query, then retry it once.\n4. If this provider keeps timing out, fall back to an alternate search provider (e.g. switch between you_search_web and google_search_web) to gather what you can.\nOnly tell the user the lookup failed AFTER you have returned every partial result you were able to collect.`;
+    }
     // Connection-level failures (timeouts, circuit open) require a different instruction:
     // tell the LLM to stop retrying and surface the error to the user instead of
     // spinning through other variants of the same tool.
@@ -22496,6 +22723,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
       if (!llmModel) {
         llmModel = await this.getDefaultModel();
+      } else {
+        // ENG-46 sibling path: this method is reached with the SESSION's model
+        // (emma create_html_from_template tool / route), so a stale/removed id
+        // (e.g. gpt-5.1) would otherwise throw an opaque "Invalid model" inside
+        // callLLM here too. Resolve it up front so template substitution falls
+        // back to a served model instead of failing.
+        const templateModelResolution = this.resolveGenerationModel(llmModel);
+        if (templateModelResolution.fellBack) {
+          recordAgentModeModelFallback('create-html-from-template', sessionId || '', llmModel, templateModelResolution.model);
+        }
+        llmModel = templateModelResolution.model;
       }
       // Validate that all required variables are provided
       const templateVariables = template.variables || [];
@@ -26145,7 +26383,6 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       case 'CONVERSATION_AD': {
         if (action === 'CREATE') {
-          if (!params.name) throw new Error('CONVERSATION_AD CREATE requires name');
           const result = await linkedInAdsService.createConversationAd(accessToken, accountId, params);
           if (!result.success) throw new Error(result.error || 'Failed to create conversation ad');
           const conversationAdUrn = result.data?.id;

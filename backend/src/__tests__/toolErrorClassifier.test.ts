@@ -17,6 +17,7 @@
  */
 
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { ToolOutputContractError } from '../utils/toolOutputContract';
 
 function err(message: string, name?: string): Error {
   const e = new Error(message);
@@ -122,6 +123,7 @@ describe('classifyToolErrorClass', () => {
     expect(classifyToolErrorClass(err('The Slack bot is not a member of channel C09JUSTFITKITCHEN. Please invite the bot to the channel first.'))).toBe('auth');
     expect(classifyToolErrorClass(err('MCP: User "67bec77c" has no secrets configured. Required for server "github".'))).toBe('auth');
     expect(classifyToolErrorClass(err('Ad account not configured'))).toBe('auth');
+    expect(classifyToolErrorClass(err('Your application is not configured to access the related advertiser account(s), please ensure you have added the account ID(s) in your Account Management list.'))).toBe('auth');
   });
 
   it('classifies aborts as timeout and missing resources as not_found', () => {
@@ -134,6 +136,10 @@ describe('classifyToolErrorClass', () => {
     const provider429 =
       '429 Too Many Requests\n{\n  "type": "ErrorResponse",\n  "error": {\n    "id": "5df087ef",\n    "status": 429,\n    "detail": "Request rate limit exceeded for plan",\n    "meta": { "plan": "Free" }\n  }\n}';
     expect(classifyToolErrorClass(err(provider429))).toBe('rate_limit');
+  });
+
+  it('classifies a ToolOutputContractError as invalid_output, distinct from execution failures (ENG-105)', () => {
+    expect(classifyToolErrorClass(new ToolOutputContractError('Tool returned no output (null/undefined).'))).toBe('invalid_output');
   });
 
   it('leaves genuinely idiosyncratic one-offs in the legacy fallback', () => {
