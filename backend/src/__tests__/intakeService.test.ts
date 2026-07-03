@@ -21,12 +21,14 @@ jest.mock('../services/linearService', () => ({
   getIssueComments: jest.fn(),
 }));
 jest.mock('../services/resendService', () => ({ resendService: { sendSystemEmail: jest.fn() } }));
+jest.mock('../services/shipNotifyService', () => ({ notifyReporterShipped: jest.fn().mockResolvedValue('sent') }));
 
 const notion = require('../services/notionService');
 const dedup = require('../services/dedupService');
 const fb = require('../services/featurebaseService');
 const linear = require('../services/linearService');
 const resend = require('../services/resendService').resendService;
+const shipNotify = require('../services/shipNotifyService');
 
 describe('fileUserIssue — flag off', () => {
   const realFlag = process.env.FEATUREBASE_INTAKE;
@@ -166,6 +168,41 @@ describe('intakeService.notifyCanonicalResolved (resolve bridge)', () => {
     const r = await notifyCanonicalResolved('issue-uuid');
     expect(r.ticketNumbers).toEqual([11]); // 10 failed, 11 succeeded
     expect(fb.patchTicketStatus).toHaveBeenCalledWith(11, 'status-completed');
+  });
+
+  it('pings each reporter on Slack beside the email (kind bug, canonical id as the idempotency key)', async () => {
+    linear.getIssueComments.mockResolvedValue([
+      '[reporter-ticket #10 a@e.com] a',
+      '[reporter-ticket #11 b@e.com] b',
+    ]);
+    await notifyCanonicalResolved('issue-uuid', 'Save button crashes');
+    expect(shipNotify.notifyReporterShipped).toHaveBeenCalledWith(
+      expect.objectContaining({ email: 'a@e.com', itemId: 'issue-uuid', title: 'Save button crashes', kind: 'bug' }),
+    );
+    expect(shipNotify.notifyReporterShipped).toHaveBeenCalledWith(
+      expect.objectContaining({ email: 'b@e.com', kind: 'bug' }),
+    );
+    // Both notified: the EMAIL is still sent to each — Slack is additive, not a replacement.
+    expect(resend.sendSystemEmail).toHaveBeenCalledTimes(2);
+  });
+
+  it('Slack notifier blowing up does not block the email or the card flip', async () => {
+    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #10 a@e.com] a']);
+    // Pin the email mock: an earlier test installs a persistent per-address rejection
+    // via mockImplementation, which jest.clearAllMocks() does not remove.
+    resend.sendSystemEmail.mockImplementation(() => Promise.resolve());
+    shipNotify.notifyReporterShipped.mockRejectedValueOnce(new Error('slack down'));
+    const r = await notifyCanonicalResolved('issue-uuid', 'T');
+    expect(r.ticketNumbers).toEqual([10]);
+    expect(resend.sendSystemEmail).toHaveBeenCalledWith(expect.objectContaining({ to: 'a@e.com' }));
+    expect(fb.patchTicketStatus).toHaveBeenCalledWith(10, 'status-completed');
+  });
+
+  it('email failure does not suppress the Slack ping (channels are independent)', async () => {
+    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #10 a@e.com] a']);
+    resend.sendSystemEmail.mockRejectedValueOnce(new Error('resend down'));
+    await notifyCanonicalResolved('issue-uuid', 'T');
+    expect(shipNotify.notifyReporterShipped).toHaveBeenCalledWith(expect.objectContaining({ email: 'a@e.com' }));
   });
 });
 

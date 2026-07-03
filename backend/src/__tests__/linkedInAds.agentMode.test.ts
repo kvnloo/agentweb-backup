@@ -798,10 +798,10 @@ describe('callLinkedInMarketingApi — CONVERSATION_AD', () => {
     expect(result.conversation_ad_urn).toBe('urn:li:conversationAd:ca-1');
   });
 
-  it('CREATE throws when name missing', async () => {
-    await expect(
-      service.callLinkedInMarketingApi(USER_ID, 'CONVERSATION_AD', 'CREATE', ACCOUNT_ID, {})
-    ).rejects.toThrow('name');
+  it('CREATE succeeds without name — headline text is optional per LinkedIn schema', async () => {
+    const result = await service.callLinkedInMarketingApi(USER_ID, 'CONVERSATION_AD', 'CREATE', ACCOUNT_ID, {});
+    expect(linkedInAdsService.createConversationAd).toHaveBeenCalledWith(ACCESS_TOKEN, ACCOUNT_ID, {});
+    expect(result.success).toBe(true);
   });
 
   it('CREATE_CONTENT adds message node and returns content_urn', async () => {
