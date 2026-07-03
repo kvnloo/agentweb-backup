@@ -123,6 +123,7 @@ describe('classifyToolErrorClass', () => {
     expect(classifyToolErrorClass(err('The Slack bot is not a member of channel C09JUSTFITKITCHEN. Please invite the bot to the channel first.'))).toBe('auth');
     expect(classifyToolErrorClass(err('MCP: User "67bec77c" has no secrets configured. Required for server "github".'))).toBe('auth');
     expect(classifyToolErrorClass(err('Ad account not configured'))).toBe('auth');
+    expect(classifyToolErrorClass(err('Your application is not configured to access the related advertiser account(s), please ensure you have added the account ID(s) in your Account Management list.'))).toBe('auth');
   });
 
   it('classifies aborts as timeout and missing resources as not_found', () => {

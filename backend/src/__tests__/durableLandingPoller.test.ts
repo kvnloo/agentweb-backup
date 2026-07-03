@@ -18,6 +18,7 @@ const mockDeliverStuckFailure = jest.fn();
 jest.mock("../services/durableLandingService", () => ({
   deliverCompletion: (...a: any[]) => mockDeliverCompletion(...a),
   deliverStuckFailure: (...a: any[]) => mockDeliverStuckFailure(...a),
+  STUCK_CEILING_MS: 30 * 60 * 1000,
 }));
 
 import { runDurableLandingPollerOnce } from "../services/durableLandingPoller";

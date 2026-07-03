@@ -1,3 +1,17 @@
+## Slack ship-notify: Featurebase webhook → customer channel ping (2026-07-02, ENG-170)
+
+Added `shipNotifyService` + `POST /api/integrations/featurebase/webhook`: when a reported item ships, ping the reporter in their own Slack channel — additive to the email paths (bug resolve-bridge Resend email; Featurebase-native upvoter email for feature requests). Channel = first of the existing personal → org → org-owner resolution (`getEffectiveAllowedChannels`, moved from `emma/slackMessageTools` into `slackService`). Idempotency = atomic per-item claim (`settingsService.claimSetMember`, DynamoDB string-set ADD with UPDATED_OLD — no read-modify-write) taken BEFORE the send; a failed send releases the claim so Featurebase's delivery retry re-attempts. The webhook 200s immediately and fans out detached (a slow fan-out must not trip Featurebase's delivery timeout → concurrent retry → duplicate pings). Post titles are user-generated → Slack control chars (`&<>`) escaped and non-plain-http(s) URLs dropped, so a public post title can't smuggle `<!channel>` or disguised links into customers' channels. Endpoint is dark until `FEATUREBASE_WEBHOOK_SECRET` is set; signature = HMAC-SHA256 over `${timestamp}.${rawBody}` (headers `X-Webhook-Signature` hex + `X-Webhook-Timestamp`, ±300s).
+
+**Assumptions — VALIDATED LIVE 2026-07-02 (full E2E on test env, real Featurebase deliveries):**
+- ~~`changes[].field === "status"`~~ **WRONG — caught live.** Status transitions arrive as DOTTED entries (`status.id`, `status.name`, `status.type`), never a bare `status`. Fixed in commit `e2067f84` (filter accepts both). This was the one silent-drop bug; a hand-written payload test would have locked it in — the live capture caught it.
+- `data.item.postUrl` and `data.item.author.email` ARE present on `post.updated` (captured payload) — the `GET /v2/posts/{id}` fallback is rare-path as designed.
+- Featurebase webhook `timeoutMs` is **5000ms** (from the webhook object) — the immediate-200 + detached fan-out design is mandatory, not optional.
+- E2E proof (Linear ENG-174 → FB post flip → webhook → Slack): ping delivered to the mapped channel in ~4s; `<!channel>` injection probe in the title arrived ESCAPED (no broadcast); re-completing the item did NOT re-ping (atomic claim held); unsigned requests 401; endpoint dark without the secret.
+- Ops finding: `SLACK_BOT_TOKEN` in the `agentweb/test-env` backend-env secret is STALE (`invalid_auth`) — E2E used the prod token. Refresh the secret so future test envs have working Slack.
+- Voter list is fetched single-page (limit 100, warn on `nextCursor`) — fine at current board size.
+
+Rollout: create webhook in Featurebase Settings → Advanced → Webhooks (topic `post.updated`, nova version) pointing at prod, set `FEATUREBASE_WEBHOOK_SECRET` (value in the Featurebase dashboard per-webhook), redeploy. Kill switch: unset the env var (endpoint goes dark again). Per-user opt-out: `slackShipNotifyDisabled` on AW-Users.
+
 ## Prod outage: partner-portal "Failed to load users" — full disk + nginx PrivateTmp trap (2026-06-26)
 
 Three stacked failures, only the last self-inflicted by the attempted fixes:
