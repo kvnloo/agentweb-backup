@@ -132,4 +132,21 @@ describe('AgentModeService - Generation model validation (ENG-46)', () => {
     expect(rawMessage).toBe('STOP_AFTER_RESOLVE');
     expect(rawMessage).not.toMatch(/Invalid model/i);
   });
+
+  // --- Stale-default guard (ENG-46 caveat 1) -------------------------------
+  // The runtime fallback masks a stale requested model, but the SHIPPED default
+  // must itself always be a served model — otherwise every fallback would target
+  // an invalid id and re-throw inside callLLM. These pin that invariant in CI so
+  // the repo can never ship a stale `default_model` (e.g. after a model is
+  // retired from the allow-list) without this test failing first.
+  it('ships a default_model that is an actually-served allow-list model', async () => {
+    const servedModels = await agentModeService.getSupportedModels(true);
+    expect(servedModels).toContain(agentModeService.default_model);
+  });
+
+  it('resolves the configured default model without ever falling back', () => {
+    const result = agentModeService.resolveGenerationModel(agentModeService.default_model);
+    expect(result.fellBack).toBe(false);
+    expect(result.model).toBe(agentModeService.default_model);
+  });
 });
