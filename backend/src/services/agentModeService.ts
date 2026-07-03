@@ -123,6 +123,7 @@ import {
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
 import { validateToolOutputContract } from '../utils/toolOutputContract';
+import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
 
 type MetaApiResult = {
   success: boolean;
@@ -1132,25 +1133,31 @@ export class AgentModeService {
         function: {
           name: 'wait_seconds',
           description: 'Wait for a specified number of seconds before continuing. Use this when you need to pause before checking a result — for example, waiting for a post to propagate, an email to arrive, a page to update, or any async operation to complete. When used in a batch with other tool calls, the entire batch executes sequentially so the wait happens in order.',
-          parameters: {
-            type: 'object',
-            properties: {
-              seconds: {
-                type: 'number',
-                description: 'Number of seconds to wait (max 300)'
-              },
-              reason: {
-                type: 'string',
-                description: 'Brief explanation of what you are waiting for (shown to the user)'
-              }
-            },
-            required: ['seconds', 'reason']
-          }
+          parameters: WAIT_SECONDS_PARAMETERS
         }
       },
-      execute: async (args: any, _context: any) => {
-        const seconds = Math.min(Math.max(1, Math.round(args.seconds)), 300);
-        await new Promise(resolve => setTimeout(resolve, seconds * 1000));
+      execute: async (args: any, context: any) => {
+        // Cap the sleep to the run's remaining wall-clock budget so a long wait can't
+        // be guillotined mid-sleep by the generation timeout and logged as a spurious
+        // wait_seconds failure (ENG-124). runBudgetDeadlineMs is threaded in from the
+        // dispatcher; when absent (e.g. budget disabled) the wait is unchanged.
+        const { seconds, requestedSeconds, deadlineReached } = computeWaitSeconds({
+          requestedSeconds: args.seconds,
+          deadlineMs: context?.runBudgetDeadlineMs,
+        });
+        if (seconds > 0) {
+          await new Promise(resolve => setTimeout(resolve, seconds * 1000));
+        }
+        if (deadlineReached) {
+          return {
+            waited_seconds: seconds,
+            reason: args.reason || 'Waiting before continuing',
+            deadlineReached: true,
+            message: seconds > 0
+              ? `Waited ${seconds} seconds (shortened from ${requestedSeconds}s — this response is approaching its time limit). Do NOT wait again; check the result now. If it is still pending, tell the user it is still processing and to check back shortly rather than waiting further.`
+              : `Did not wait — this response is at its time limit. Do NOT wait again; check the result now. If it is still pending, tell the user it is still processing and to check back shortly rather than waiting further.`,
+          };
+        }
         return { waited_seconds: seconds, reason: args.reason, message: `Waited ${seconds} seconds.` };
       }
     });
@@ -5999,6 +6006,7 @@ export class AgentModeService {
     screenshotUrl?: string;
     isDelegatedAccess?: boolean;
     renderDeadlineMs?: number;
+    runBudgetDeadlineMs?: number;
   }): Promise<any> {
     const toolOptions: Record<string, any> = {};
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
@@ -6010,6 +6018,9 @@ export class AgentModeService {
     if (input.renderDeadlineMs != null && input.toolName === 'compose_video') {
       toolOptions.renderDeadlineMs = input.renderDeadlineMs;
     }
+    // Run wall-clock budget deadline (epoch ms) — used by wait_seconds to cap its
+    // sleep so it can't be killed mid-wait by the generation timeout (ENG-124).
+    if (input.runBudgetDeadlineMs != null) toolOptions.runBudgetDeadlineMs = input.runBudgetDeadlineMs;
 
     return this.executeTool(
       input.llmModel,

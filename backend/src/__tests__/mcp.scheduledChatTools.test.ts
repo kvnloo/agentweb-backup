@@ -345,6 +345,23 @@ describe('Scheduled Chat MCP Tools', () => {
       });
       expect(result.content[0].text).toContain('run-1');
     });
+
+    it('should surface a diagnostic (not a bare empty array) when history is empty', async () => {
+      mockMcpFetch.mockResolvedValue([]);
+
+      const result = await mcpToolRegistry.execute('get_scheduled_chat_test_history', {
+        schedule_id: 'sc-1',
+      }, context);
+
+      const text = result.content[0].text;
+      // Must not be a bare empty array that the model reports as "empty results"
+      expect(text.trim()).not.toBe('[]');
+      // Must explain that the run may still be executing and to poll again
+      expect(text.toLowerCase()).toContain('still');
+      expect(text.toLowerCase()).toContain('poll');
+      // Must instruct the model not to report an empty result as a finished run
+      expect(text.toLowerCase()).toContain('do not');
+    });
   });
 
   describe('submit_scheduled_chat_variables', () => {

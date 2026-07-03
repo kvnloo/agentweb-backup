@@ -521,6 +521,9 @@ export async function executePreparedTools(
         // Long-render tools (compose_video) read this to hand off before the run's hard
         // wall-clock timeout rather than blocking until killed with no asset (ENG-123).
         renderDeadlineMs: mediaGenerationDeadlineMs,
+        // Run wall-clock budget deadline so wait_seconds can cap its sleep and not be
+        // killed mid-wait by the generation timeout (ENG-124).
+        runBudgetDeadlineMs: mediaGenerationDeadlineMs,
       }),
     });
 
