@@ -123,7 +123,7 @@ import {
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
 import { validateToolOutputContract } from '../utils/toolOutputContract';
-import { computeWaitSeconds } from '../utils/waitSecondsBudget';
+import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
 
 type MetaApiResult = {
   success: boolean;
@@ -1133,20 +1133,7 @@ export class AgentModeService {
         function: {
           name: 'wait_seconds',
           description: 'Wait for a specified number of seconds before continuing. Use this when you need to pause before checking a result — for example, waiting for a post to propagate, an email to arrive, a page to update, or any async operation to complete. When used in a batch with other tool calls, the entire batch executes sequentially so the wait happens in order.',
-          parameters: {
-            type: 'object',
-            properties: {
-              seconds: {
-                type: 'number',
-                description: 'Number of seconds to wait (max 300)'
-              },
-              reason: {
-                type: 'string',
-                description: 'Brief explanation of what you are waiting for (shown to the user)'
-              }
-            },
-            required: ['seconds', 'reason']
-          }
+          parameters: WAIT_SECONDS_PARAMETERS
         }
       },
       execute: async (args: any, context: any) => {
@@ -1164,7 +1151,7 @@ export class AgentModeService {
         if (deadlineReached) {
           return {
             waited_seconds: seconds,
-            reason: args.reason,
+            reason: args.reason || 'Waiting before continuing',
             deadlineReached: true,
             message: seconds > 0
               ? `Waited ${seconds} seconds (shortened from ${requestedSeconds}s — this response is approaching its time limit). Do NOT wait again; check the result now. If it is still pending, tell the user it is still processing and to check back shortly rather than waiting further.`

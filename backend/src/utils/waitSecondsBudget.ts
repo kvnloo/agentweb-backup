@@ -18,6 +18,31 @@
  * `wait_seconds` tool without loading the agent-mode monolith.
  */
 
+/**
+ * Input schema for the `wait_seconds` tool. Extracted here so the tool definition
+ * and its contract test share ONE source of truth.
+ *
+ * `reason` is intentionally NOT in `required`: the model (gemini/opus) routinely
+ * omits this cosmetic, user-facing label, and marking it required made
+ * validateAndRepairToolArgs reject the call BEFORE execution — recorded as a
+ * spurious wait_seconds failure on its very first call (ENG-124). Only `seconds`
+ * is required.
+ */
+export const WAIT_SECONDS_PARAMETERS = {
+  type: 'object',
+  properties: {
+    seconds: {
+      type: 'number',
+      description: 'Number of seconds to wait (max 300)',
+    },
+    reason: {
+      type: 'string',
+      description: 'Brief explanation of what you are waiting for (shown to the user)',
+    },
+  },
+  required: ['seconds'],
+} as const;
+
 export interface WaitBudgetInput {
   /** Seconds the model asked to wait. */
   requestedSeconds: unknown;
