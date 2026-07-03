@@ -288,6 +288,7 @@ export async function notifyCanonicalResolved(
   const { getIssueComments } = await import('./linearService');
   const { getTicketStatusId, patchTicketStatus } = await import('./featurebaseService');
   const { resendService } = await import('./resendService');
+  const { notifyReporterShipped } = await import('./shipNotifyService');
 
   const comments = await getIssueComments(canonicalIssueId);
   const reporters = new Map<number, string>(); // ticket number -> reporter email
@@ -302,6 +303,14 @@ export async function notifyCanonicalResolved(
   const safeTitle = escapeHtml(issueTitle);
   const acted: number[] = [];
   for (const [num, email] of reporters) {
+    // Slack ping in the reporter's own channel — ADDITIVE to the email, independent of it.
+    // notifyReporterShipped never throws by contract; guarded anyway so a bug there can
+    // never block the email or the card flip.
+    try {
+      await notifyReporterShipped({ email, itemId: canonicalIssueId, title: issueTitle, kind: 'bug' });
+    } catch (e) {
+      console.warn(`[resolve-bridge] Slack ping for reporter #${num} failed:`, e instanceof Error ? e.message : e);
+    }
     try {
       // The EMAIL is what notifies the reporter; the status flip reflects the resolved state on their card.
       await resendService.sendSystemEmail({

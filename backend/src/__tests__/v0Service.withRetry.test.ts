@@ -48,10 +48,12 @@ jest.mock("../services/settingsService", () => ({
   settingsService: { getSetting: jest.fn().mockResolvedValue(null) },
 }));
 
-import { withRetry } from "../services/v0Service";
+import { withRetry, describeError } from "../services/v0Service";
 
 // Use 1ms base delay for fast tests
 const FAST = 1;
+// Large per-attempt timeout so timeout logic never fires in the retry tests below.
+const NO_TIMEOUT = 60_000;
 
 describe("withRetry", () => {
   it("SUCCESS: returns on first attempt if no error", async () => {
@@ -174,5 +176,60 @@ describe("withRetry", () => {
     const fn = jest.fn().mockRejectedValueOnce(new Error("HTTP 400: Bad Request"));
     await expect(withRetry(fn, "test-op", 3, FAST)).rejects.toThrow("HTTP 400");
     expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  // ENG-135/159: the underlying reason must be surfaced, never a bare "fetch failed".
+  it("FAIL: surfaces the undici cause chain on the thrown error", async () => {
+    const err: any = new TypeError("fetch failed");
+    err.cause = new Error("Connect Timeout Error (api.v0.dev:443)");
+    const fn = jest.fn().mockRejectedValue(err);
+
+    await expect(withRetry(fn, "v0 chat creation", 2, FAST, NO_TIMEOUT)).rejects.toThrow(
+      /Connect Timeout Error/
+    );
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  // ENG-158: a v0 call that never resolves must fail loudly, not hang forever.
+  it("FAIL: times out a hung call and reports a clear timeout error", async () => {
+    const fn = jest.fn().mockImplementation(() => new Promise(() => {})); // never settles
+    await expect(withRetry(fn, "v0 chat creation", 2, FAST, 20)).rejects.toThrow(/timed out/i);
+    expect(fn).toHaveBeenCalledTimes(2); // timeout is retryable, so it retries then gives up
+  });
+});
+
+describe("describeError", () => {
+  it("unwraps the undici cause chain (fetch failed -> real reason)", () => {
+    const err: any = new TypeError("fetch failed");
+    err.cause = new Error("getaddrinfo ENOTFOUND api.v0.dev");
+    const detail = describeError(err);
+    expect(detail).toContain("fetch failed");
+    expect(detail).toContain("ENOTFOUND api.v0.dev");
+  });
+
+  it("includes an AggregateError's inner failures", () => {
+    const inner: any = new Error("Connect Timeout Error");
+    inner.code = "UND_ERR_CONNECT_TIMEOUT";
+    const agg: any = new Error("fetch failed");
+    agg.cause = { name: "AggregateError", message: "", errors: [inner] };
+    const detail = describeError(agg);
+    expect(detail).toContain("fetch failed");
+    expect(detail).toContain("Connect Timeout Error");
+  });
+
+  it("appends a distinct error code that is not already in the message", () => {
+    const err: any = new Error("socket problem");
+    err.code = "ECONNRESET";
+    expect(describeError(err)).toContain("ECONNRESET");
+  });
+
+  it("preserves a v0 HTTP error body verbatim (no cause to unwrap)", () => {
+    const err = new Error('HTTP 422: {"error":{"message":"insufficient credits"}}');
+    expect(describeError(err)).toBe('HTTP 422: {"error":{"message":"insufficient credits"}}');
+  });
+
+  it("is safe on non-error inputs", () => {
+    expect(describeError("plain string")).toBe("plain string");
+    expect(describeError(undefined)).toBe("Unknown error");
   });
 });
