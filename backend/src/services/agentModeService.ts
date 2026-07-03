@@ -556,6 +556,11 @@ interface LLMCallOptions {
 const DIAGNOSIS_MODEL = 'gemini-3.1-flash-lite';
 const DIAGNOSIS_TIMEOUT_MS = 10_000;
 
+// Finalize-guard judge model (ENG-143): a bounded claim-extraction
+// classification, not conversational generation, so it deliberately does NOT
+// reuse the run's own (often pricier) llmModel — see judgeFinalizeClaims.
+const FINALIZE_GUARD_JUDGE_MODEL = DIAGNOSIS_MODEL;
+
 // Markers used by perform_data_analysis to capture files the Gemini code-execution
 // sandbox produces. The sandbox filesystem is discarded after execution and Gemini
 // never returns arbitrary on-disk files (only inline images), so the model is told
@@ -3262,16 +3267,30 @@ export class AgentModeService {
       }
 
       // Finalize guard (ENG-143/135/124): claimed-vs-executed truthfulness check at
-      // the loop edge, AFTER the final message and BEFORE emit/persist. Behind
-      // AGENT_FINALIZE_GUARD (A-or-B migration flag, DEFAULT OFF — with the flag off
-      // this block is inert and the characterization harness is byte-identical).
-      // NO-FALLBACK compliance: the guard never silently rewrites the message — a
-      // mismatch produces either the model's own corrective restatement or a VISIBLE
-      // appended correction; a judge/guard failure delivers the text unchanged plus
-      // a loud claim_check_error signal (documented best-effort — blocking chat
-      // delivery on a judge outage would be failing badly).
+      // the loop edge, AFTER the final message and BEFORE emit/persist.
+      // Two independent flags, most-enforcing wins:
+      //   AGENT_FINALIZE_GUARD=true        → 'enforce': detect AND rewrite the message.
+      //   AGENT_FINALIZE_GUARD_SHADOW=true → 'shadow': detect + telemetry only, the
+      //     message the user sees is NEVER touched. Lets Harsha collect real
+      //     judge precision/recall data on production traffic (the Okareo
+      //     claim-faithfulness gap) with zero user-facing risk before deciding
+      //     on enforcement.
+      // Both default OFF — with neither set this block is inert and the
+      // characterization harness is byte-identical.
+      // NO-FALLBACK compliance: in enforce mode the guard never silently rewrites
+      // the message — a mismatch produces either the model's own corrective
+      // restatement or a VISIBLE appended correction; a judge/guard failure
+      // delivers the text unchanged plus a loud claim_check_error signal
+      // (documented best-effort — blocking chat delivery on a judge outage would
+      // be failing badly).
       let finalizeClaimMismatch = false;
-      if (process.env.AGENT_FINALIZE_GUARD === 'true' && content && !wasCancelled && !mockMode) {
+      const finalizeGuardMode: 'enforce' | 'shadow' | null =
+        process.env.AGENT_FINALIZE_GUARD === 'true'
+          ? 'enforce'
+          : process.env.AGENT_FINALIZE_GUARD_SHADOW === 'true'
+            ? 'shadow'
+            : null;
+      if (finalizeGuardMode && content && !wasCancelled && !mockMode) {
         try {
           const finalizeLedger: FinalizeLedgerEntry[] = toolCalls.map((tc: any): FinalizeLedgerEntry => ({
             toolName: tc.name,
@@ -3289,7 +3308,7 @@ export class AgentModeService {
             ledger: finalizeLedger,
             ports: {
               judgeExtractClaims: (text, candidateClasses) =>
-                this.judgeFinalizeClaims(text, candidateClasses, llmModel),
+                this.judgeFinalizeClaims(text, candidateClasses),
               requestCorrection: ({ finalText, systemNote }) =>
                 this.requestFinalizeCorrection(finalText, systemNote, llmModel),
               toolResultError,
@@ -3298,25 +3317,42 @@ export class AgentModeService {
             },
           });
           finalizeClaimMismatch = guardOutcome.claimMismatch;
-          if (guardOutcome.finalText !== content) {
-            console.warn(`AgentMode: finalize guard ${guardOutcome.action} in session ${sessionId}`, {
-              claimClasses: guardOutcome.mismatchedClaimClasses,
+          // Ambiguous claims never change finalText (by design — see
+          // finalizeGuard.ts), so without this they'd be invisible even though
+          // the whole point of the confidence tier is to surface them for
+          // review instead of silently risking a false correction.
+          if (guardOutcome.ambiguousClaimClasses.length > 0) {
+            console.warn(`AgentMode: finalize guard found AMBIGUOUS (uncorrected) claim(s) in session ${sessionId} — possible matcher coverage gap`, {
+              ambiguousClaimClasses: guardOutcome.ambiguousClaimClasses,
             });
-            content = guardOutcome.finalText;
-            // Keep the persisted transcript consistent with what the user sees:
-            // correct the LAST assistant message in place (same message count) and
-            // stamp guard metadata so the correction is auditable in the session.
-            for (let i = messages.length - 1; i >= 0; i--) {
-              if ((messages[i] as any).role === 'assistant') {
-                (messages[i] as any).content = content;
-                (messages[i] as any).metadata = {
-                  ...(messages[i] as any).metadata,
-                  finalizeGuard: {
-                    action: guardOutcome.action,
-                    claimClasses: guardOutcome.mismatchedClaimClasses,
-                  },
-                };
-                break;
+          }
+          if (guardOutcome.finalText !== content) {
+            if (finalizeGuardMode === 'shadow') {
+              // Shadow mode: log what WOULD have changed, but the user-visible
+              // message and the persisted transcript are left untouched.
+              console.warn(`AgentMode: finalize guard SHADOW ${guardOutcome.action} in session ${sessionId} (message NOT modified)`, {
+                claimClasses: guardOutcome.mismatchedClaimClasses,
+              });
+            } else {
+              console.warn(`AgentMode: finalize guard ${guardOutcome.action} in session ${sessionId}`, {
+                claimClasses: guardOutcome.mismatchedClaimClasses,
+              });
+              content = guardOutcome.finalText;
+              // Keep the persisted transcript consistent with what the user sees:
+              // correct the LAST assistant message in place (same message count) and
+              // stamp guard metadata so the correction is auditable in the session.
+              for (let i = messages.length - 1; i >= 0; i--) {
+                if ((messages[i] as any).role === 'assistant') {
+                  (messages[i] as any).content = content;
+                  (messages[i] as any).metadata = {
+                    ...(messages[i] as any).metadata,
+                    finalizeGuard: {
+                      action: guardOutcome.action,
+                      claimClasses: guardOutcome.mismatchedClaimClasses,
+                    },
+                  };
+                  break;
+                }
               }
             }
           }
@@ -12714,13 +12750,20 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
    * THROWS on any judge failure (no content / unparseable output / transport
    * error) — the guard then delivers the message unchanged and records a loud
    * claim_check_error (see core/finalizeGuard.ts).
+   *
+   * Deliberately uses FINALIZE_GUARD_JUDGE_MODEL (the same cheap/fast model as
+   * triageSlackMessage) instead of the run's own llmModel: this is a bounded
+   * classification task, not conversational generation, and every flagged
+   * reply pays for this call, so keeping it cheap directly reduces the
+   * guard's latency/cost footprint at scale (PR #2005 left this as a
+   * deliberate one-line follow-up rather than reusing the run's often-pricier
+   * model for every judge call).
    */
   private async judgeFinalizeClaims(
     finalText: string,
     candidateClasses: readonly ClaimClass[],
-    llmModel: string,
   ): Promise<JudgedClaim[]> {
-    const response = await this.callLLM(llmModel, [
+    const response = await this.callLLM(FINALIZE_GUARD_JUDGE_MODEL, [
       {
         role: 'user',
         content:

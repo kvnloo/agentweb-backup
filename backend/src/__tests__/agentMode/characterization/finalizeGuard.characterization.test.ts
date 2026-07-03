@@ -99,4 +99,47 @@ describe('AgentMode finalize guard — ON-path characterization (flag pinned bef
     };
     expect(snapshot).toEqual(expected);
   });
+
+  it('SHADOW mode: judge + corrective turn still run (for telemetry), but the delivered message is the ORIGINAL untrue claim, never the correction', async () => {
+    delete process.env.AGENT_FINALIZE_GUARD;
+    process.env.AGENT_FINALIZE_GUARD_SHADOW = 'true';
+
+    const snapshot = await runScenario(service, {
+      message: 'Send the report email to the client.',
+      transcript: [
+        { content: UNTRUE_CLAIM },     // main loop final turn (no tools ran)
+        { content: JUDGE_VERDICT },    // judge call still runs — shadow mode still detects
+        { content: CORRECTED },        // corrective turn still runs — its output is discarded
+      ],
+    });
+
+    const expected: BehaviorSnapshot = {
+      content: UNTRUE_CLAIM, // NOT corrected — shadow mode never rewrites what the user sees
+      toolCallSequence: [],
+      llmTurnsConsumed: 3, // same LLM cost as enforce mode — only the message delivery differs
+      responseMessageShape: [{ role: 'assistant' }],
+      cancelled: false,
+    };
+    expect(snapshot).toEqual(expected);
+
+    delete process.env.AGENT_FINALIZE_GUARD_SHADOW;
+  });
+
+  it('enforce mode wins when both AGENT_FINALIZE_GUARD and AGENT_FINALIZE_GUARD_SHADOW are set', async () => {
+    process.env.AGENT_FINALIZE_GUARD = 'true';
+    process.env.AGENT_FINALIZE_GUARD_SHADOW = 'true';
+
+    const snapshot = await runScenario(service, {
+      message: 'Send the report email to the client.',
+      transcript: [
+        { content: UNTRUE_CLAIM },
+        { content: JUDGE_VERDICT },
+        { content: CORRECTED },
+      ],
+    });
+
+    expect(snapshot.content).toBe(CORRECTED);
+
+    delete process.env.AGENT_FINALIZE_GUARD_SHADOW;
+  });
 });

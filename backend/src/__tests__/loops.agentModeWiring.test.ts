@@ -136,5 +136,39 @@ describe('agent-mode loop wiring', () => {
 
       expect(checkFinalizeGuardMisconfiguration()).toBeNull();
     });
+
+    // Shadow mode's ENTIRE purpose is telemetry (it never rewrites the
+    // message) — without the spine it does nothing but burn judge-call cost
+    // for zero benefit, which is worse than the enforce-mode gap above.
+    it('warns (urgently) when shadow mode is on but the runtime spine is off', () => {
+      delete process.env.AGENT_FINALIZE_GUARD;
+      process.env.AGENT_FINALIZE_GUARD_SHADOW = 'true';
+      delete process.env.AGENT_RUNTIME_SPINE_ENABLED;
+      delete process.env.AGENT_MODE_LOOP_ENABLED;
+
+      const warning = checkFinalizeGuardMisconfiguration();
+      expect(warning).toContain('AGENT_FINALIZE_GUARD_SHADOW');
+      expect(warning).toContain('AGENT_RUNTIME_SPINE_ENABLED');
+      delete process.env.AGENT_FINALIZE_GUARD_SHADOW;
+    });
+
+    it('returns null when shadow mode is on and the spine is also on', () => {
+      process.env.AGENT_FINALIZE_GUARD_SHADOW = 'true';
+      process.env.AGENT_RUNTIME_SPINE_ENABLED = 'true';
+
+      expect(checkFinalizeGuardMisconfiguration()).toBeNull();
+      delete process.env.AGENT_FINALIZE_GUARD_SHADOW;
+    });
+
+    it('enforce mode takes precedence over shadow mode for the warning message', () => {
+      process.env.AGENT_FINALIZE_GUARD = 'true';
+      process.env.AGENT_FINALIZE_GUARD_SHADOW = 'true';
+      delete process.env.AGENT_RUNTIME_SPINE_ENABLED;
+      delete process.env.AGENT_MODE_LOOP_ENABLED;
+
+      const warning = checkFinalizeGuardMisconfiguration();
+      expect(warning).toContain('AGENT_FINALIZE_GUARD');
+      delete process.env.AGENT_FINALIZE_GUARD_SHADOW;
+    });
   });
 });
