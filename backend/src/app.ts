@@ -93,7 +93,7 @@ import loopEventsRoutes from "./routes/loopEvents";
 import humanEvalRoutes from "./routes/humanEval";
 import { registerAiEvalFunnelForProduction } from "./loops/instances/ai-eval-funnel";
 import { registerAiReadinessFunnel } from "./loops/instances/ai-readiness-funnel";
-import { registerAgentModeLoop } from "./loops/instances/agent-mode";
+import { checkFinalizeGuardMisconfiguration, registerAgentModeLoop } from "./loops/instances/agent-mode";
 import loopHealthRoutes from "./routes/loopHealth";
 import brandBuildRoutes from "./routes/brandBuild";
 import adGenRoutes from "./routes/adGen";
@@ -383,6 +383,10 @@ try {
 // AGENT_MODE_LOOP_ENABLED.
 try {
   registerAgentModeLoop();
+  const finalizeGuardWarning = checkFinalizeGuardMisconfiguration();
+  if (finalizeGuardWarning) {
+    console.warn("[loops] finalize guard misconfigured:", finalizeGuardWarning);
+  }
 } catch (err) {
   console.warn("[loops] registerAgentModeLoop skipped:", String(err));
 }
