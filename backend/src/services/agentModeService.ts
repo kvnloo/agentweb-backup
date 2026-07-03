@@ -2138,7 +2138,7 @@ export class AgentModeService {
     // Azure OpenAI enforces a 128-tool limit per request
     // supportsVision flags below were verified empirically against the describe_image
     // path (probe against a real image). All GPT-5 deployments handle vision.
-    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true },
     'gpt-5.4-nano': { client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
