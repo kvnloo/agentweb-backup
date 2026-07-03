@@ -168,8 +168,6 @@ describe('POST /api/admin/users/:userId/notes', () => {
   });
 });
 
-describe('DELETE /api/admin/users/:userId/notes/:noteId'
-
 describe('PUT /api/admin/users/:userId/funnel-status', () => {
   beforeEach(() => jest.clearAllMocks());
 

@@ -134,9 +134,6 @@ describe('report_product_issues tool', () => {
     });
   });
 
-  it('should process multiple issues in one call'    });
-  });
-
   it('adds user funnel status context and triage tags when set', async () => {
     mockGetUserById.mockResolvedValueOnce({
       userId: 'user-123',
