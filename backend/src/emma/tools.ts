@@ -993,7 +993,7 @@ ENTITY HIERARCHY: Ad Account → Campaign Group → Campaign → Creative
     sender is auto-resolved from the connected account — do NOT ask the user for it.
 
   CONVERSATION AD (branching message, campaign type: SPONSORED_INMAILS):
-    CONVERSATION_AD/CREATE (name) → CONVERSATION_AD/CREATE_CONTENT (×N message nodes with buttons) → CONVERSATION_AD/SET_FIRST_CONTENT → CREATIVE/CREATE (inmail_content_urn=conversation_ad_urn, campaign_id)
+    CONVERSATION_AD/CREATE (name, optional — becomes the ad's headline text; omit to let LinkedIn use the first message as the headline) → CONVERSATION_AD/CREATE_CONTENT (×N message nodes with buttons) → CONVERSATION_AD/SET_FIRST_CONTENT → CREATIVE/CREATE (inmail_content_urn=conversation_ad_urn, campaign_id)
     Each button can link to another message node (SEND_MESSAGE action) or a URL (OPEN_URL action).
 
   JOBS AD (campaign type: DYNAMIC, campaign format: JOBS):
@@ -1042,7 +1042,7 @@ REQUIRED PARAMS PER ENTITY + ACTION:
   MEDIA UPLOAD_DOCUMENT: document_url (public URL to PDF/PPT/DOC). Returns document_urn.
   INMAIL CREATE_CONTENT: name, subject, htmlBody, callToActionText (max 20 chars), callToActionLandingPageUrl. Optional: salutationText, senderName, senderTitle, senderCompany. (sender auto-resolved — do NOT pass it)
   INMAIL SEND_TEST: inmail_content_urn, recipient_email
-  CONVERSATION_AD CREATE: name
+  CONVERSATION_AD CREATE: none required. Optional: name (becomes the ad's headlineText — LinkedIn has no "name" field on this resource, so it is mapped for you)
   CONVERSATION_AD CREATE_CONTENT: conversation_ad_urn, body (message text), buttons (array of { text, action: OPEN_URL|SEND_MESSAGE, url? }). Optional: subject, footer.
   CONVERSATION_AD SET_FIRST_CONTENT: conversation_ad_urn, first_content_urn
 
@@ -1072,7 +1072,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
           description: 'Action-specific parameters. See tool description for required fields per entity + action.',
           properties: {
             // Campaign Group / Campaign common
-            name: { type: 'string', description: 'Entity name.' },
+            name: { type: 'string', description: 'Entity name (internal label). Exception: for CONVERSATION_AD CREATE it becomes the member-visible headline text shown in LinkedIn inboxes — write headline copy, not an internal label.' },
             status: { type: 'string', enum: ['ACTIVE', 'PAUSED', 'ARCHIVED', 'DRAFT', 'CANCELED', 'COMPLETED'], description: 'Entity status.' },
             campaign_group_id: { type: 'string', description: 'Campaign Group numeric ID. Used for CAMPAIGN LIST.' },
             campaignGroup: { type: 'string', description: 'Campaign Group URN (urn:li:sponsoredCampaignGroup:ID). Required for CAMPAIGN CREATE.' },
