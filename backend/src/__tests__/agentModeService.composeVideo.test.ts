@@ -351,6 +351,45 @@ describe('AgentModeService - composeVideo', () => {
     });
   });
 
+  // ENG-123 graceful UX: when the composition is clamped shorter than the requested
+  // target (clips didn't cover the full length), remotionService returns a `warning`.
+  // composeVideo must surface it to the user so they aren't silently handed a shorter
+  // video than they asked for — and it must combine cleanly with the voiceover warning.
+  describe('duration-clamp warning', () => {
+    it('surfaces the composition duration warning to the user', async () => {
+      mockRemotionService.compose.mockResolvedValue({
+        success: true, status: 'complete', videoUrl: 'https://s3.example.com/final.mp4', filename: 'final.mp4',
+        warning: 'Requested 30s but the clip footage only totals 16s, so the video was trimmed to 16s.',
+      });
+
+      const result = await (agentModeService as any).composeVideo(
+        ['https://s3.example.com/clip1.mp4', 'https://s3.example.com/clip2.mp4'],
+        'final.mp4', 'user1', 'session1',
+        { ...baseComposeParams, audioUrl: 'https://s3.example.com/vo.mp3', targetDurationSeconds: 30 }
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.warning).toMatch(/trimmed to 16s|only totals 16s/i);
+    });
+
+    it('combines the duration warning with the voiceover warning when both apply', async () => {
+      mockRemotionService.compose.mockResolvedValue({
+        success: true, status: 'complete', videoUrl: 'https://s3.example.com/final.mp4', filename: 'final.mp4',
+        warning: 'Requested 30s but the clip footage only totals 16s, so the video was trimmed to 16s.',
+      });
+
+      const result = await (agentModeService as any).composeVideo(
+        ['https://s3.example.com/clip1.mp4', 'https://s3.example.com/clip2.mp4'],
+        'final.mp4', 'user1', 'session1',
+        { ...baseComposeParams, targetDurationSeconds: 30 } // no audioUrl
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.warning).toMatch(/trimmed to 16s/i);   // duration warning
+      expect(result.warning).toMatch(/voiceover|audio/i);  // voiceover warning
+    });
+  });
+
   describe('Tool registration', () => {
     it('should have compose_video tool registered', () => {
       const tools = agentModeService.getAvailableTools();
