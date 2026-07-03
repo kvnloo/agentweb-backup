@@ -146,6 +146,24 @@ const IntroOverlay: React.FC<{
 };
 
 /**
+ * Pick a legible text color (near-black or white) for text placed on top of `hexBg`,
+ * based on perceived luminance. Guards the end-card button against unreadable
+ * dark-on-dark / light-on-light when a brand's secondary color is at either extreme.
+ */
+const readableOn = (hexBg: string): string => {
+  const h = (hexBg || "").replace("#", "");
+  const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h;
+  const r = parseInt(full.slice(0, 2), 16);
+  const g = parseInt(full.slice(2, 4), 16);
+  const b = parseInt(full.slice(4, 6), 16);
+  // Unparseable (e.g. a CSS named color) → keep the prior dark-text behavior so we never
+  // regress; the luminance branch only ever improves the valid-hex cases.
+  if ([r, g, b].some((v) => Number.isNaN(v))) return "#0a0a0f";
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luminance > 0.6 ? "#0a0a0f" : "#ffffff";
+};
+
+/**
  * Full-frame branded end card (skill Layer 8): brand mark, single offer line, URL button.
  * An OPAQUE brand-anchored slate that replaces the footage for the final beats — a
  * dedicated CTA frame, not the old translucent wash over the last clip (which, combined
@@ -184,8 +202,10 @@ const OutroOverlay: React.FC<{
     <AbsoluteFill
       style={{
         opacity: cardOpacity,
-        // Opaque brand-anchored slate with depth.
-        background: `radial-gradient(circle at 50% 34%, ${secondaryColor}22, transparent 62%), linear-gradient(160deg, ${primaryColor}, #0a0a0f)`,
+        // Opaque brand-anchored slate with depth. A light (18%) dark scrim just takes the
+        // edge off so the white headline stays legible on very light brand primaries —
+        // intentionally subtle so the brand color still reads (not a gloomy overlay).
+        background: `linear-gradient(rgba(10,10,15,0.18), rgba(10,10,15,0.18)), radial-gradient(circle at 50% 34%, ${secondaryColor}22, transparent 62%), linear-gradient(160deg, ${primaryColor}, #0a0a0f)`,
         display: "flex",
         flexDirection: "column",
         alignItems: "center",
@@ -228,7 +248,7 @@ const OutroOverlay: React.FC<{
             marginTop: 6,
             fontSize: 30,
             fontWeight: 700,
-            color: "#0a0a0f",
+            color: readableOn(secondaryColor),
             background: secondaryColor,
             padding: "16px 40px",
             borderRadius: 999,
