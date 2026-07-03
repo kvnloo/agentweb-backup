@@ -134,6 +134,38 @@ describe('report_product_issues tool', () => {
     });
   });
 
+  it('should process multiple issues in one call'    });
+  });
+
+  it('adds user funnel status context and triage tags when set', async () => {
+    mockGetUserById.mockResolvedValueOnce({
+      userId: 'user-123',
+      email: 'customer@example.com',
+      displayName: 'Test Customer',
+      funnelStatus: 'paid_retention_handoff',
+    } as any);
+
+    await toolExecute(
+      { issues: [{ title: 'Export fails', description: 'CSV export breaks', priority: 'High' }] },
+      { userId: 'user-123', sessionId: 'sess-456' }
+    );
+
+    const itemArg = mockCreateOncallItem.mock.calls[0][0];
+    expect(itemArg.additionalTags).toEqual(expect.arrayContaining([
+      'Customer Reported',
+      'Status: Paid / Retention Handoff',
+      'Retention',
+    ]));
+    expect(itemArg.context).toEqual(expect.objectContaining({
+      'User Status': 'Paid / Retention Handoff',
+    }));
+
+    const emailCall = mockResendSendEmail.mock.calls[0][0];
+    expect(emailCall.html).toContain('User status');
+    expect(emailCall.html).toContain('Paid / Retention Handoff');
+  });
+
+
   it('should process multiple issues in one call', async () => {
     mockCreateOncallItem
       .mockResolvedValueOnce({ pageId: 'p1', notionUrl: 'https://notion.so/p1' })

@@ -168,6 +168,79 @@ describe('POST /api/admin/users/:userId/notes', () => {
   });
 });
 
+describe('DELETE /api/admin/users/:userId/notes/:noteId'
+
+describe('PUT /api/admin/users/:userId/funnel-status', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('returns 404 when user does not exist', async () => {
+    mockUserDb.getUserById.mockResolvedValue(null as any);
+
+    const res = await request(app)
+      .put('/api/admin/users/nonexistent/funnel-status')
+      .send({ funnelStatus: 'account_setup' });
+
+    expect(res.status).toBe(404);
+    expect(res.body.message).toBe('User not found');
+  });
+
+  it('returns 400 when funnelStatus is not a string or null', async () => {
+    const res = await request(app)
+      .put('/api/admin/users/user-1/funnel-status')
+      .send({ funnelStatus: ['account_setup'] });
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toBe('funnelStatus must be a string or null');
+    expect(mockUserDb.getUserById).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 when funnelStatus is too long', async () => {
+    const res = await request(app)
+      .put('/api/admin/users/user-1/funnel-status')
+      .send({ funnelStatus: 'x'.repeat(81) });
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toBe('funnelStatus must be 80 characters or fewer');
+    expect(mockUserDb.getUserById).not.toHaveBeenCalled();
+  });
+
+  it('saves a trimmed funnel status', async () => {
+    mockUserDb.getUserById.mockResolvedValue(existingUser as any);
+    mockUserDb.updateUser.mockResolvedValue({
+      ...existingUser,
+      funnelStatus: 'evaluation_period',
+    } as any);
+
+    const res = await request(app)
+      .put('/api/admin/users/user-1/funnel-status')
+      .send({ funnelStatus: ' evaluation_period ' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.funnelStatus).toBe('evaluation_period');
+    expect(mockUserDb.updateUser).toHaveBeenCalledWith('user-1', {
+      funnelStatus: 'evaluation_period',
+    });
+  });
+
+  it('clears funnel status when blank', async () => {
+    mockUserDb.getUserById.mockResolvedValue(existingUser as any);
+    mockUserDb.updateUser.mockResolvedValue({
+      ...existingUser,
+      funnelStatus: null,
+    } as any);
+
+    const res = await request(app)
+      .put('/api/admin/users/user-1/funnel-status')
+      .send({ funnelStatus: '   ' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.funnelStatus).toBeNull();
+    expect(mockUserDb.updateUser).toHaveBeenCalledWith('user-1', {
+      funnelStatus: null,
+    });
+  });
+});
+
 describe('DELETE /api/admin/users/:userId/notes/:noteId', () => {
   beforeEach(() => jest.clearAllMocks());
 

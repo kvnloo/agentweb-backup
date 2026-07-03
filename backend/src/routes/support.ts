@@ -5,6 +5,7 @@ import { userDb } from "../services/db";
 import { settingsService } from "../services/settingsService";
 import { uploadScreenshotToS3, presignS3Url } from "../utils/s3Utils";
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from "../config";
+import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from "../utils/userFunnelStatus";
 
 const router = express.Router();
 
@@ -297,6 +298,11 @@ router.post("/report-ui-bug", async (req, res) => {
       "Page URL": pageUrl || "N/A",
       "Screenshot": screenshotContext,
     };
+    const funnelStatusLabel = getUserFunnelStatusLabel(user.funnelStatus);
+    const funnelStatusTags = getUserFunnelStatusIssueTags(user.funnelStatus);
+    if (funnelStatusLabel) {
+      issueContext["User Status"] = funnelStatusLabel;
+    }
     if (isDelegated && adminEmail) {
       issueContext["Reported By (Admin)"] = adminEmail;
     }
@@ -314,7 +320,7 @@ router.post("/report-ui-bug", async (req, res) => {
       userName: user.displayName || user.email,
       reportedByAdmin: isDelegated && adminEmail ? adminEmail : undefined,
       sessionId: typeof sessionId === "string" ? sessionId : undefined,
-      notionTags: ["Customer Reported", config.tag],
+      notionTags: ["Customer Reported", config.tag, ...funnelStatusTags],
       notionContext: issueContext,
     });
     const issueId = filed.pageId ? `AGW-${filed.pageId}` : undefined;
@@ -343,6 +349,7 @@ router.post("/report-ui-bug", async (req, res) => {
 
     <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
       <tr><td style="padding: 6px 0; color: #666; width: 140px; vertical-align: top;"><strong>Reported by</strong></td><td style="padding: 6px 0;"><a href="mailto:${user.email}" style="color: #4F46E5;">${user.displayName || user.email}</a> (${user.email})</td></tr>
+      ${funnelStatusLabel ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>User status</strong></td><td style="padding: 6px 0;">${funnelStatusLabel}</td></tr>` : ""}
       ${issueId ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Issue ID</strong></td><td style="padding: 6px 0; font-family: monospace;">${issueId}</td></tr>` : ""}
       ${filed.trackerUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>${filed.tracker}</strong></td><td style="padding: 6px 0;"><a href="${filed.trackerUrl}" style="color: #4F46E5; font-weight: 600;">→ Open in ${filed.tracker}</a></td></tr>` : ""}
       ${pageUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Page URL</strong></td><td style="padding: 6px 0;"><a href="${pageUrl}" style="color: #4F46E5;">${pageUrl}</a></td></tr>` : ""}
