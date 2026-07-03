@@ -518,6 +518,9 @@ export async function executePreparedTools(
         socketEmit: ports.socketEmit,
         screenshotUrl,
         isDelegatedAccess,
+        // Long-render tools (compose_video) read this to hand off before the run's hard
+        // wall-clock timeout rather than blocking until killed with no asset (ENG-123).
+        renderDeadlineMs: mediaGenerationDeadlineMs,
       }),
     });
 

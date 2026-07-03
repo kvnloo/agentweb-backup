@@ -5998,11 +5998,18 @@ export class AgentModeService {
     socketEmit?: any;
     screenshotUrl?: string;
     isDelegatedAccess?: boolean;
+    renderDeadlineMs?: number;
   }): Promise<any> {
     const toolOptions: Record<string, any> = {};
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
     if (input.screenshotUrl) toolOptions.screenshotUrl = input.screenshotUrl;
     if (input.isDelegatedAccess) toolOptions.isDelegatedAccess = true;
+    // Thread the run's media-gen deadline into the tool context ONLY for compose_video —
+    // the sole tool that consumes it (to hand off before the run's hard wall-clock timeout,
+    // ENG-123). Scoping it here keeps every other tool's context unchanged.
+    if (input.renderDeadlineMs != null && input.toolName === 'compose_video') {
+      toolOptions.renderDeadlineMs = input.renderDeadlineMs;
+    }
 
     return this.executeTool(
       input.llmModel,
@@ -20491,21 +20498,46 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         logoUrl: composeParams.logoUrl,
         ctaText: composeParams.ctaText,
         ctaUrl: composeParams.ctaUrl,
+        // Forward the optional voiceover track so a spot composed via compose_video is
+        // never shipped silent (ENG-123). remotionService.compose + the BrandedVideo
+        // composition both support an audio overlay; omitting these here dropped it.
+        audioUrl: composeParams.audioUrl,
+        audioVolume: composeParams.audioVolume,
         clipUrl: clipUrls[0],
         extraClipUrls: clipUrls.slice(1),
         clipDurationSeconds: clipDurationSeconds ?? 8,
         targetDurationSeconds,
         clipDurationsSeconds,
+        // Run's remaining media-gen budget (epoch ms), threaded from the tool context, so a
+        // long render on a revision pass hands off instead of blocking until the run's hard
+        // wall-clock timeout kills it with no asset (ENG-123).
+        renderDeadlineMs: composeParams.renderDeadlineMs,
         filename,
         userId,
       });
 
+      // Regression tripwire (ENG-123): a spot must never silently ship without a voiceover.
+      // Surface a soft warning when composed with no audio track — catches revision passes
+      // where the agent recomposes and forgets to re-attach the VO. Not a hard failure:
+      // silent b-roll stitching is still valid.
+      const voiceoverWarning = !composeParams.audioUrl
+        ? 'Composed with no voiceover track. If this is an ad spot, generate one with generate_voiceover and pass audio_url so it is not shipped silent.'
+        : undefined;
+
       if (composeResult.success && composeResult.videoUrl) {
+        const stillProcessing = composeResult.status === 'processing';
+        // Combine any composition-layer advisory (e.g. duration clamp) with the voiceover
+        // tripwire so the user sees every relevant note, not just one.
+        const warning = [composeResult.warning, voiceoverWarning].filter(Boolean).join(' ') || undefined;
         return {
           success: true,
-          message: `✅ ${clipUrls.length} clip(s) composed into branded video!`,
+          message: stillProcessing
+            ? (composeResult.message ?? `🎬 ${clipUrls.length} clip(s) are still finalizing — the video will be ready at this link shortly.`)
+            : `✅ ${clipUrls.length} clip(s) composed into branded video!`,
           videoUrl: composeResult.videoUrl,
           filename: composeResult.filename ?? filename,
+          ...(stillProcessing && { status: 'processing' as const }),
+          ...(warning && { warning }),
         };
       }
 
