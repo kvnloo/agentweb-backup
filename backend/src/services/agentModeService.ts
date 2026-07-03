@@ -5880,9 +5880,12 @@ export class AgentModeService {
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
     if (input.screenshotUrl) toolOptions.screenshotUrl = input.screenshotUrl;
     if (input.isDelegatedAccess) toolOptions.isDelegatedAccess = true;
-    // Thread the run's media-gen deadline into the tool context so long renders
-    // (compose_video) can hand off before the run's hard wall-clock timeout (ENG-123).
-    if (input.renderDeadlineMs != null) toolOptions.renderDeadlineMs = input.renderDeadlineMs;
+    // Thread the run's media-gen deadline into the tool context ONLY for compose_video —
+    // the sole tool that consumes it (to hand off before the run's hard wall-clock timeout,
+    // ENG-123). Scoping it here keeps every other tool's context unchanged.
+    if (input.renderDeadlineMs != null && input.toolName === 'compose_video') {
+      toolOptions.renderDeadlineMs = input.renderDeadlineMs;
+    }
 
     return this.executeTool(
       input.llmModel,
