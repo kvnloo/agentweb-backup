@@ -228,6 +228,10 @@ describe('runFinalizeGuard', () => {
 
     expect(correct).toHaveBeenCalledTimes(1);
     expect(outcome.action).toBe('corrected');
+    // Regression guard: a KNOWN media-gen tool failing the strict matcher is a
+    // confident exclusion (xCures 76x-images case), NOT an ambiguous
+    // coverage-gap match — must never get downgraded to ambiguous_unmatched.
+    expect(outcome.ambiguousClaimClasses).toEqual([]);
   });
 
   it('asset claim: a real generate_image asset backs asset_generated (happy path)', async () => {
@@ -369,6 +373,93 @@ describe('runFinalizeGuard', () => {
     const outcome = await runFinalizeGuard({ finalText: CLAIMING_TEXT, ledger: emptyLedger, ports });
 
     expect(outcome.action).toBe('clean');
+    expect(correct).not.toHaveBeenCalled();
+  });
+});
+
+describe('runFinalizeGuard — ambiguous coverage-gap matches (risk reduction, ENG-143)', () => {
+  const emptyLedger: FinalizeLedgerEntry[] = [];
+
+  // Our tool-matchers are pattern-based (prefix + keyword) and will always
+  // have coverage gaps for tools that don't follow the expected naming
+  // convention. Correcting a TRUE claim because of a matcher miss is worse
+  // than the original bug (it visibly contradicts a correct statement), so a
+  // successful tool call that loosely matches the claim's keyword — even
+  // without hitting the strict prefix pattern — should hold off correction
+  // and just surface the gap for review instead of rewriting the message.
+  it('a claim with only a LOOSE tool-name match (no strict match) is left unchanged: action ambiguous_unmatched', async () => {
+    const { ports, judge, correct } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'task_created_or_updated' }]);
+    // "sync_task_from_calendar" contains "task" but doesn't start with
+    // create_/update_/manage_/add_/execute_ — strict matcher misses it.
+    const ledger: FinalizeLedgerEntry[] = [
+      { toolName: 'sync_task_from_calendar', status: 'success', result: { success: true } },
+    ];
+
+    const outcome = await runFinalizeGuard({
+      finalText: 'The task was created and is now in your queue.',
+      ledger,
+      ports,
+    });
+
+    expect(outcome.action).toBe('ambiguous_unmatched');
+    expect(outcome.finalText).toBe('The task was created and is now in your queue.');
+    expect(outcome.claimMismatch).toBe(false);
+    expect(outcome.ambiguousClaimClasses).toEqual(['task_created_or_updated']);
+    expect(correct).not.toHaveBeenCalled();
+  });
+
+  it('a claim with NO match at all (not even loose) still gets corrected as before (no regression)', async () => {
+    const { ports, judge, correct } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'task_created_or_updated' }]);
+    correct.mockResolvedValue('The task was not actually created this session.');
+
+    const outcome = await runFinalizeGuard({
+      finalText: 'The test task landed in ClickUp.',
+      ledger: emptyLedger,
+      ports,
+    });
+
+    expect(correct).toHaveBeenCalledTimes(1);
+    expect(outcome.action).toBe('corrected');
+    expect(outcome.ambiguousClaimClasses).toEqual([]);
+  });
+
+  it('mixed: a confidently-unbacked class still corrects, an ambiguous class in the same reply is left out of the correction and reported separately', async () => {
+    const { ports, judge, correct } = makePorts();
+    judge.mockResolvedValueOnce([
+      { claimClass: 'email_sent' },
+      { claimClass: 'task_created_or_updated' },
+    ]);
+    correct.mockResolvedValue('I was not able to send the email this session.');
+    const ledger: FinalizeLedgerEntry[] = [
+      // email_sent: no matching tool at all → confidently unbacked
+      { toolName: 'sync_task_from_calendar', status: 'success', result: { success: true } }, // loose task match only
+    ];
+
+    const outcome = await runFinalizeGuard({
+      finalText: "Done! I've sent the email and the task landed in ClickUp.",
+      ledger,
+      ports,
+    });
+
+    expect(correct).toHaveBeenCalledTimes(1);
+    expect(correct.mock.calls[0][0].systemNote).toContain('no successful email_sent');
+    expect(correct.mock.calls[0][0].systemNote).not.toContain('task_created_or_updated');
+    expect(outcome.ambiguousClaimClasses).toEqual(['task_created_or_updated']);
+  });
+
+  it('strict match still wins cleanly when both strict and loose would match (no behavior change for the common case)', async () => {
+    const { ports, judge, correct } = makePorts();
+    judge.mockResolvedValueOnce([{ claimClass: 'email_sent' }]);
+    const ledger: FinalizeLedgerEntry[] = [
+      { toolName: 'send_email', status: 'success', result: { success: true, messageId: 'm-1' } },
+    ];
+
+    const outcome = await runFinalizeGuard({ finalText: CLAIMING_TEXT, ledger, ports });
+
+    expect(outcome.action).toBe('clean');
+    expect(outcome.ambiguousClaimClasses).toEqual([]);
     expect(correct).not.toHaveBeenCalled();
   });
 });

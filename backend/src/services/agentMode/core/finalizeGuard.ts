@@ -121,6 +121,34 @@ const CLAIM_TOOL_MATCHERS: Record<ClaimClass, (toolName: string) => boolean> = {
   settings_saved: (n) => SETTINGS_PERSISTENCE_TOOLS.has(n),
 };
 
+/**
+ * Loose, keyword-only counterpart to CLAIM_TOOL_MATCHERS (no prefix/exact-set
+ * requirement) — risk-reduction measure: these regex-based matchers will
+ * always have coverage gaps for tools that don't follow the expected naming
+ * convention (we've already found and fixed two: ClickUp, settings). Wrongly
+ * correcting a TRUE claim because of a matcher miss is worse than the
+ * original bug — it visibly contradicts a statement that was actually
+ * correct. When the strict matcher misses but this loose one hits a real
+ * successful tool call, the guard treats the claim as AMBIGUOUS instead of
+ * unbacked: it does not correct the message, only surfaces the gap for
+ * review (see FinalizeGuardOutcome.ambiguousClaimClasses).
+ */
+const CLAIM_TOOL_LOOSE_MATCHERS: Record<ClaimClass, (toolName: string) => boolean> = {
+  email_sent: (n) => /email/.test(n),
+  task_created_or_updated: (n) => /task/.test(n),
+  post_published: (n) => /post|social|blog|article|content/.test(n),
+  schedule_created: (n) => /schedul/.test(n),
+  crm_saved: (n) => /lead|contact|crm/.test(n),
+  // Excludes MEDIA_GEN_TOOLS itself: a KNOWN media-gen tool that fails the
+  // strict matcher already failed it for a confident reason (the
+  // confirmation-gate-pause check, mediaGenProducedAsset) — that's a deliberate
+  // exclusion, not a naming-convention coverage gap, so it must NOT be
+  // downgraded to "ambiguous, don't correct" (the xCures 76x-images case
+  // depends on this staying a confident, corrected mismatch).
+  asset_generated: (n) => !MEDIA_GEN_TOOLS.has(n) && /image|video|voiceover|asset/.test(n),
+  settings_saved: (n) => /memory|setting|preference|brand_guideline|market_strategy|config/.test(n),
+};
+
 /** A run-ledger entry, normalized from the loop's toolCalls ledger. */
 export interface FinalizeLedgerEntry {
   toolName: string;
@@ -164,6 +192,9 @@ export type FinalizeGuardAction =
   | 'no_claims'
   /** claims found and every one is backed by the ledger */
   | 'clean'
+  /** every unbacked claim was only ambiguous (loose match, no strict match) —
+   * left uncorrected, surfaced via ambiguousClaimClasses for review */
+  | 'ambiguous_unmatched'
   /** mismatch found; the corrective turn resolved it */
   | 'corrected'
   /** mismatch unresolved; a visible truthful correction was appended */
@@ -176,12 +207,17 @@ export interface FinalizeGuardOutcome {
   action: FinalizeGuardAction;
   /** unresolved mismatched classes (non-empty only for appended_correction) */
   mismatchedClaimClasses: ClaimClass[];
+  /** claim classes that had NO strict tool-name match but DID have a loose
+   * keyword match on a real successful tool call — deliberately excluded from
+   * correction (see CLAIM_TOOL_LOOSE_MATCHERS) and reported for review rather
+   * than risking a false correction of a claim that may well be true. */
+  ambiguousClaimClasses: ClaimClass[];
   /** true only when the mismatch stayed unresolved — the caller records this
    * as the claim_mismatch computeRunVerdict reason (run grades degraded) */
   claimMismatch: boolean;
 }
 
-/** Is a claim class backed by a SUCCESSFUL ledger entry? */
+/** Is a claim class backed by a SUCCESSFUL ledger entry (strict match)? */
 export function claimBackedByLedger(
   claimClass: ClaimClass,
   ledger: FinalizeLedgerEntry[],
@@ -194,6 +230,20 @@ export function claimBackedByLedger(
       && matches(entry.toolName)
       && !ports.toolResultError(entry.result)
       && (claimClass !== 'asset_generated' || ports.mediaGenProducedAsset(entry.toolName, entry.result)),
+  );
+}
+
+/** Is a claim class loosely (keyword-only) matched by a SUCCESSFUL ledger
+ * entry? Used only to downgrade a strict-matcher miss to "ambiguous" instead
+ * of "confidently unbacked" — see CLAIM_TOOL_LOOSE_MATCHERS. */
+function claimLooselyMatchedByLedger(
+  claimClass: ClaimClass,
+  ledger: FinalizeLedgerEntry[],
+  ports: Pick<FinalizeGuardPorts, 'toolResultError'>,
+): boolean {
+  const looseMatch = CLAIM_TOOL_LOOSE_MATCHERS[claimClass];
+  return ledger.some(
+    (entry) => entry.status === 'success' && looseMatch(entry.toolName) && !ports.toolResultError(entry.result),
   );
 }
 
@@ -225,21 +275,34 @@ function judgedClasses(claims: JudgedClaim[]): ClaimClass[] {
   return [...seen];
 }
 
-/** The classes among `claims` that no successful ledger entry backs. */
-function unbackedClasses(
+/**
+ * Split the claim classes among `claims` that no successful ledger entry
+ * strictly backs into two confidence tiers: confidentlyUnbacked (no match at
+ * all, not even loose) vs ambiguous (a loose keyword match exists — likely a
+ * matcher coverage gap, not an actual false claim).
+ */
+function splitUnbackedClasses(
   claims: JudgedClaim[],
   ledger: FinalizeLedgerEntry[],
   ports: FinalizeGuardPorts,
-): ClaimClass[] {
-  return judgedClasses(claims).filter((cls) => !claimBackedByLedger(cls, ledger, ports));
+): { confidentlyUnbacked: ClaimClass[]; ambiguous: ClaimClass[] } {
+  const confidentlyUnbacked: ClaimClass[] = [];
+  const ambiguous: ClaimClass[] = [];
+  for (const cls of judgedClasses(claims)) {
+    if (claimBackedByLedger(cls, ledger, ports)) continue;
+    if (claimLooselyMatchedByLedger(cls, ledger, ports)) ambiguous.push(cls);
+    else confidentlyUnbacked.push(cls);
+  }
+  return { confidentlyUnbacked, ambiguous };
 }
 
 export async function runFinalizeGuard(input: FinalizeGuardInput): Promise<FinalizeGuardOutcome> {
   const { finalText, ledger, ports } = input;
-  const unchanged = (action: FinalizeGuardAction): FinalizeGuardOutcome => ({
+  const unchanged = (action: FinalizeGuardAction, ambiguousClaimClasses: ClaimClass[] = []): FinalizeGuardOutcome => ({
     finalText,
     action,
     mismatchedClaimClasses: [],
+    ambiguousClaimClasses,
     claimMismatch: false,
   });
 
@@ -257,13 +320,17 @@ export async function runFinalizeGuard(input: FinalizeGuardInput): Promise<Final
     return unchanged('judge_error');
   }
 
-  // 3. Deterministic ledger match.
-  const mismatched = unbackedClasses(claims, ledger, ports);
-  if (mismatched.length === 0) return unchanged('clean');
+  // 3. Deterministic ledger match, split by confidence (risk reduction):
+  //    ambiguous (loose-only) matches are never corrected, only reported.
+  const { confidentlyUnbacked: mismatched, ambiguous } = splitUnbackedClasses(claims, ledger, ports);
+  if (mismatched.length === 0) {
+    return unchanged(ambiguous.length > 0 ? 'ambiguous_unmatched' : 'clean', ambiguous);
+  }
 
-  // 4. ONE corrective turn. If the correction call itself fails, fail VISIBLY:
-  //    append the truthful correction to the original text (never deliver the
-  //    unbacked claim silently) and record the port failure loudly.
+  // 4. ONE corrective turn — targets only the confidently-unbacked classes.
+  //    If the correction call itself fails, fail VISIBLY: append the truthful
+  //    correction to the original text (never deliver the unbacked claim
+  //    silently) and record the port failure loudly.
   let corrected: string;
   try {
     corrected = (await ports.requestCorrection({
@@ -277,6 +344,7 @@ export async function runFinalizeGuard(input: FinalizeGuardInput): Promise<Final
       finalText: `${finalText}\n\n${buildVisibleCorrection(mismatched)}`,
       action: 'appended_correction',
       mismatchedClaimClasses: mismatched,
+      ambiguousClaimClasses: ambiguous,
       claimMismatch: true,
     };
   }
@@ -289,7 +357,7 @@ export async function runFinalizeGuard(input: FinalizeGuardInput): Promise<Final
   if (recheckCandidates.length > 0) {
     try {
       const recheckClaims = await ports.judgeExtractClaims(corrected, recheckCandidates);
-      stillMismatched = unbackedClasses(recheckClaims, ledger, ports);
+      stillMismatched = splitUnbackedClasses(recheckClaims, ledger, ports).confidentlyUnbacked;
     } catch (err) {
       ports.recordClaimCheckError(err);
       stillMismatched = mismatched;
@@ -297,13 +365,20 @@ export async function runFinalizeGuard(input: FinalizeGuardInput): Promise<Final
   }
 
   if (stillMismatched.length === 0) {
-    return { finalText: corrected, action: 'corrected', mismatchedClaimClasses: [], claimMismatch: false };
+    return {
+      finalText: corrected,
+      action: 'corrected',
+      mismatchedClaimClasses: [],
+      ambiguousClaimClasses: ambiguous,
+      claimMismatch: false,
+    };
   }
 
   return {
     finalText: `${corrected}\n\n${buildVisibleCorrection(stillMismatched)}`,
     action: 'appended_correction',
     mismatchedClaimClasses: stillMismatched,
+    ambiguousClaimClasses: ambiguous,
     claimMismatch: true,
   };
 }
