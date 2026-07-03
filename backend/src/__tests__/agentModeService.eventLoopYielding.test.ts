@@ -322,7 +322,9 @@ describe('AgentModeService - generateMarketingResponse', () => {
         'test-session'
       );
 
-      // Verify tool was executed
+      // Verify tool was executed. The tool context now carries runBudgetDeadlineMs
+      // (the run's wall-clock budget, used by wait_seconds to cap its sleep — ENG-124),
+      // so extraContext is an object rather than undefined.
       expect((agentModeService as any).executeTool).toHaveBeenCalledWith(
         agentModeService.default_model,
         'search_knowledge_base',
@@ -330,7 +332,7 @@ describe('AgentModeService - generateMarketingResponse', () => {
         'test-user',
         'test-session',
         false,
-        undefined
+        expect.objectContaining({ runBudgetDeadlineMs: expect.any(Number) })
       );
 
       // Verify final response includes tool results
