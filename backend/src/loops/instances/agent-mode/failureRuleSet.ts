@@ -26,7 +26,7 @@ import type {
   TimeWindow,
 } from '../../core/types';
 import { asMutationId } from '../../core/types';
-import { EVT_TOOL_FAILED, EVT_TOOL_INVOKED } from './eventTypes';
+import { EVT_RUN_VERDICT, EVT_TOOL_FAILED, EVT_TOOL_INVOKED } from './eventTypes';
 
 export interface AgentFailureProposalPayload {
   toolName: string;
@@ -37,6 +37,19 @@ export interface AgentFailureProposalPayload {
   directive: string;
 }
 
+/**
+ * Truthfulness proposal payload (ENG-143): the finalize guard's claim_mismatch
+ * verdict reason clustered across the window. Distinct from
+ * AgentFailureProposalPayload because these are whole-run verdicts, not
+ * per-tool outcomes — agent_run_verdict carries no toolName dimension.
+ */
+export interface AgentClaimMismatchProposalPayload {
+  occurrences: number;
+  /** Up to 5 sample sessionIds for the reviewer to pull transcripts from. */
+  sessionIds: string[];
+  directive: string;
+}
+
 export interface AgentFailureRuleSetOptions {
   /** Minimum absolute failures for a tool before a fix is proposed. Default 3 —
    * below this it's noise, not a pattern. */
@@ -44,6 +57,11 @@ export interface AgentFailureRuleSetOptions {
   /** Minimum failure rate (failures / invocations) before proposing. Default
    * 0.2 — a tool failing 20%+ of the time is broken enough to act on. */
   minFailureRate?: number;
+  /** Minimum agent_run_verdict events carrying 'claim_mismatch' in the window
+   * before proposing a truthfulness fix (ENG-143). Default 2 — a single
+   * mismatch is reviewed inline by the guard's own visible correction; a
+   * second one in the same window is a pattern worth a fix spec. */
+  minClaimMismatches?: number;
 }
 
 interface ToolStats {
@@ -54,23 +72,33 @@ interface ToolStats {
 }
 
 export class AgentFailureRuleSet
-  implements RuleSet<NormalizedEvent, AgentFailureProposalPayload>
+  implements RuleSet<NormalizedEvent, AgentFailureProposalPayload | AgentClaimMismatchProposalPayload>
 {
   private readonly minFailures: number;
   private readonly minFailureRate: number;
+  private readonly minClaimMismatches: number;
 
   constructor(options: AgentFailureRuleSetOptions = {}) {
     this.minFailures = options.minFailures ?? 3;
     this.minFailureRate = options.minFailureRate ?? 0.2;
+    this.minClaimMismatches = options.minClaimMismatches ?? 2;
   }
 
   async evaluate(
     events: NormalizedEvent[],
     _window: TimeWindow,
-  ): Promise<MutationProposal<AgentFailureProposalPayload>[]> {
+  ): Promise<MutationProposal<AgentFailureProposalPayload | AgentClaimMismatchProposalPayload>[]> {
     const byTool = new Map<string, ToolStats>();
+    const claimMismatchSessions: string[] = [];
 
     for (const e of events) {
+      if (e.eventType === EVT_RUN_VERDICT) {
+        const reasons = strDim(e.dimensions?.reasons) ?? '';
+        if (reasons.split(',').includes('claim_mismatch')) {
+          claimMismatchSessions.push(strDim(e.dimensions?.sessionId) ?? String(e.subjectId));
+        }
+        continue;
+      }
       if (e.eventType !== EVT_TOOL_INVOKED && e.eventType !== EVT_TOOL_FAILED) continue;
       const toolName = strDim(e.dimensions?.toolName);
       if (!toolName) continue; // can't attribute a fix without a tool name
@@ -91,7 +119,33 @@ export class AgentFailureRuleSet
       byTool.set(toolName, stats);
     }
 
-    const proposals: MutationProposal<AgentFailureProposalPayload>[] = [];
+    const proposals: MutationProposal<AgentFailureProposalPayload | AgentClaimMismatchProposalPayload>[] = [];
+
+    if (claimMismatchSessions.length >= this.minClaimMismatches) {
+      const sampleSessionIds = claimMismatchSessions.slice(0, 5);
+      proposals.push({
+        proposalId: asMutationId('agent-mode:claim-mismatch:truthfulness'),
+        sourceRuleId: 'claim-mismatch:truthfulness',
+        hypothesis:
+          `The finalize guard recorded ${claimMismatchSessions.length} unresolved claim_mismatch ` +
+          `verdicts this window (Emma claimed a completed action the run's tool ledger did not back, ` +
+          `and the corrective turn did not resolve it). Review the flagged sessions for a systemic ` +
+          `over-claiming pattern.`,
+        kind: 'code_change',
+        payload: {
+          occurrences: claimMismatchSessions.length,
+          sessionIds: sampleSessionIds,
+          directive:
+            `Pull the ${sampleSessionIds.length} sample session(s) [${sampleSessionIds.join(', ')}] and ` +
+            `review what Emma claimed vs. what the tool ledger shows. If a claim class or tool keeps ` +
+            `recurring, widen the finalize guard's lexicon/claim-class coverage or fix the underlying tool.`,
+        },
+        triggeringStats: {
+          occurrences: claimMismatchSessions.length,
+          sampleSessionIds: sampleSessionIds.join(','),
+        },
+      });
+    }
     for (const stats of byTool.values()) {
       // Denominator is invocations; when only failures were recorded (no
       // matching invoked events in window), treat failures as the denominator
@@ -134,9 +188,15 @@ export class AgentFailureRuleSet
       });
     }
 
-    // Worst failure rate first — the orchestrator caps proposals per cycle, so
+    // Worst failure rate first (tool proposals only — the claim-mismatch
+    // proposal has no failure rate and sorts first as the highest-signal
+    // truthfulness pattern) — the orchestrator caps proposals per cycle, so
     // the highest-signal fixes survive the cap.
-    proposals.sort((a, b) => b.payload.failureRate - a.payload.failureRate);
+    proposals.sort((a, b) => {
+      const rateA = 'failureRate' in a.payload ? a.payload.failureRate : Infinity;
+      const rateB = 'failureRate' in b.payload ? b.payload.failureRate : Infinity;
+      return rateB - rateA;
+    });
     return proposals;
   }
 }
