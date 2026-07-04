@@ -71,6 +71,11 @@ describe('GET /init', () => {
     expect(res.body.url).toContain('oauth2');
     expect(mockGenerateOAuth2AuthLink).toHaveBeenCalled();
   });
+
+  it('sets force_login=true so a second account can be connected', async () => {
+    const res = await request(app).get('/api/oauth/twitter/init');
+    expect(res.body.url).toContain('force_login=true');
+  });
 });
 
 describe('GET /callback', () => {
@@ -134,6 +139,11 @@ describe('POST /reconnect', () => {
     expect(res.body.success).toBe(true);
     expect(res.body.url).toContain('oauth2');
     expect(mockGenerateOAuth2AuthLink).toHaveBeenCalled();
+  });
+
+  it('sets force_login=true, matching /init, so reconnect shows a fresh login screen', async () => {
+    const res = await request(app).post('/api/oauth/twitter/reconnect');
+    expect(res.body.url).toContain('force_login=true');
   });
 
   it('returns 500 when getAppClient fails', async () => {

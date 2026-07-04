@@ -164,7 +164,12 @@ router.post('/reconnect', authenticateToken, async (req: any, res) => {
     if (!storePkceSession(state, req.user.userId, codeVerifier)) {
       return res.status(429).json({ error: 'Too many pending OAuth sessions. Complete or wait for existing sessions to expire.' });
     }
-    res.json({ success: true, url });
+    // force_login=true makes X show a fresh login page instead of silently
+    // re-authorizing the same session — matches /init so a user reconnecting
+    // a broken account isn't stuck re-authorizing the same broken session.
+    const authUrl = new URL(url);
+    authUrl.searchParams.set('force_login', 'true');
+    res.json({ success: true, url: authUrl.toString() });
   } catch (error: any) {
     console.error('[Twitter OAuth /reconnect]', error);
     res.status(500).json({ error: 'Failed to initialize Twitter reconnect' });
