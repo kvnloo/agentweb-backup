@@ -273,7 +273,7 @@ export class TwitterService {
   ): Promise<T> {
     const client = await this.getClient(ownerUserId, accountId);
     const isXAuthError = (e: unknown): boolean =>
-      typeof e === 'object' && e !== null && (e as any).statusCode === 401;
+      typeof e === 'object' && e !== null && (e as any).code === 401;
 
     try {
       return await fn(client);

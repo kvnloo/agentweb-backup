@@ -109,8 +109,10 @@ const makeAccount = (overrides: any = {}) => ({
   updated_at: '2026-06-23T00:00:00.000Z',
 });
 
-// Convenience: build an error that looks like an X API 401 response.
-const makeXAuthError = () => Object.assign(new Error('Unauthorized'), { statusCode: 401 });
+// Convenience: build an error that looks like an X API 401 response. Mirrors the real
+// twitter-api-v2 ApiResponseError shape, which exposes the HTTP status as `.code`
+// (there is no `.statusCode` property on that class).
+const makeXAuthError = () => Object.assign(new Error('Unauthorized'), { code: 401 });
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -318,6 +320,27 @@ describe('TwitterService — withRetryOn401 (via postTweet)', () => {
     );
     // Two calls to v2.tweet: first fails, second (with fresh token) succeeds.
     expect(mockTweet).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries on a real twitter-api-v2 ApiResponseError shape (code=401, no statusCode)', async () => {
+    // Regression test: the real SDK's ApiResponseError only ever sets `.code`,
+    // never `.statusCode`. Assert against that exact shape so a future edit
+    // that reverts to checking `.statusCode` fails here immediately.
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    const realShapedError = Object.assign(new Error('Unauthorized'), {
+      code: 401,
+      type: 'response',
+      data: { title: 'Unauthorized', detail: 'Invalid or expired token.' },
+    });
+    expect((realShapedError as any).statusCode).toBeUndefined();
+
+    mockTweet
+      .mockRejectedValueOnce(realShapedError)
+      .mockResolvedValueOnce({ data: { id: '999', text: 'retried' } });
+
+    const res = await twitterService.postTweet(OWNER, ACCOUNT_ID, 'hello');
+    expect(res.id).toBe('999');
+    expect(mockRefreshOAuth2Token).toHaveBeenCalledTimes(1);
   });
 
   it('does NOT retry on non-401 errors', async () => {
