@@ -410,25 +410,6 @@ export class TwitterService {
     });
   }
 
-  /**
-   * Edit an existing tweet. Creates a new tweet in the same edit chain.
-   * Tweets are editable for 30 minutes and up to 5 times. Each edit produces
-   * a new tweet id. Polls and scheduled tweets cannot be edited.
-   */
-  async editTweet(ownerUserId: string, accountId: string, tweetId: string, newText: string): Promise<TweetResult> {
-    if (!tweetId || tweetId.trim() === '') {
-      throw new Error('tweet_id is required for edit-tweet');
-    }
-    if (!newText || newText.trim() === '') {
-      throw new Error('text is required for edit-tweet');
-    }
-    const finalText = this.trimToLimit(newText.trim(), TWEET_CHAR_LIMIT);
-    return this.withRetryOn401(ownerUserId, accountId, (client) =>
-      (client.v2 as any).tweet({ text: finalText, edit_options: { previous_post_id: tweetId.trim() } })
-        .then((r: any) => ({ id: r.data.id, text: r.data.text }))
-    );
-  }
-
   // ─── Private helpers for actions that need the authed user's own Twitter ID ──
 
   /** Read the authed user's numeric Twitter user ID from their stored config. */

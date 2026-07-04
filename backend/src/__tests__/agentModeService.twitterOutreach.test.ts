@@ -28,7 +28,6 @@ const mockPostTweet = jest.fn();
 const mockPostThread = jest.fn();
 const mockQuoteTweet = jest.fn();
 const mockDeleteTweet = jest.fn();
-const mockEditTweet = jest.fn();
 const mockLikeTweet = jest.fn();
 const mockUnlikeTweet = jest.fn();
 const mockRetweetTweet = jest.fn();
@@ -63,7 +62,6 @@ jest.mock('../services/twitterService', () => ({
     postThread: (...a: any[]) => mockPostThread(...a),
     quoteTweet: (...a: any[]) => mockQuoteTweet(...a),
     deleteTweet: (...a: any[]) => mockDeleteTweet(...a),
-    editTweet: (...a: any[]) => mockEditTweet(...a),
     likeTweet: (...a: any[]) => mockLikeTweet(...a),
     unlikeTweet: (...a: any[]) => mockUnlikeTweet(...a),
     retweetTweet: (...a: any[]) => mockRetweetTweet(...a),
@@ -123,7 +121,6 @@ describe('AgentModeService.twitterManagePost', () => {
     mockPostThread.mockResolvedValue([{ id: 't1', text: 'a' }, { id: 't2', text: 'b' }]);
     mockQuoteTweet.mockResolvedValue({ id: 'qt1', text: 'quoting...' });
     mockDeleteTweet.mockResolvedValue({ deleted: true });
-    mockEditTweet.mockResolvedValue({ id: 't200', text: 'edited' });
     mockLikeTweet.mockResolvedValue({ liked: true });
     mockUnlikeTweet.mockResolvedValue({ liked: false });
     mockRetweetTweet.mockResolvedValue({ retweeted: true });
@@ -255,13 +252,6 @@ describe('AgentModeService.twitterManagePost', () => {
     expect(res.data.deleted).toBe(true);
   });
 
-  it('edit_tweet calls editTweet with tweet_id and text', async () => {
-    const res = await service.twitterManagePost('u', { action: 'edit_tweet', tweet_id: 'tw42', text: 'edited' });
-    expect(mockEditTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'tw42', 'edited');
-    expect(res.success).toBe(true);
-    expect(res.data.id).toBe('t200');
-  });
-
   it('like calls likeTweet with tweet_id', async () => {
     const res = await service.twitterManagePost('u', { action: 'like', tweet_id: 'tw42' });
     expect(mockLikeTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'tw42');
@@ -348,15 +338,15 @@ describe('AgentModeService.twitterManagePost', () => {
   });
 
   // ── CRM logging ──
-  it('logs an edited tweet to CRM when list_id/lead_id/lead_email present', async () => {
+  it('logs a quote-tweet to CRM when list_id/lead_id/lead_email present', async () => {
     await service.twitterManagePost('u', {
-      action: 'edit_tweet', tweet_id: 'tw42', text: 'updated', list_id: 'L1', lead_id: 'LD1', lead_email: 'a@b.com',
+      action: 'quote_tweet', tweet_id: 'tw42', text: 'quoting...', list_id: 'L1', lead_id: 'LD1', lead_email: 'a@b.com',
     });
     expect(mockAddTwitterMessageEvent).toHaveBeenCalledWith(expect.objectContaining({
       eventType: 'twitter.tweet.sent',
       emailDomain: 'twitter-L1',
       leadEmail: 'a@b.com',
-      messageProviderId: 't200',
+      messageProviderId: 'qt1',
     }));
   });
 
@@ -368,7 +358,7 @@ describe('AgentModeService.twitterManagePost', () => {
   it('CRM logging failure does not fail the action', async () => {
     mockAddTwitterMessageEvent.mockRejectedValueOnce(new Error('dynamo down'));
     const res = await service.twitterManagePost('u', {
-      action: 'edit_tweet', tweet_id: 'tw42', text: 'updated', list_id: 'L1', lead_id: 'LD1', lead_email: 'a@b.com',
+      action: 'quote_tweet', tweet_id: 'tw42', text: 'quoting...', list_id: 'L1', lead_id: 'LD1', lead_email: 'a@b.com',
     });
     expect(res.success).toBe(true);
   });

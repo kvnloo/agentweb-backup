@@ -424,39 +424,6 @@ describe('TwitterService.deleteTweet', () => {
   });
 });
 
-// ─── edit-tweet ───────────────────────────────────────────────────────────────
-
-describe('TwitterService.editTweet', () => {
-  beforeEach(() => {
-    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
-    mockTweet.mockResolvedValue({ data: { id: 'tweet-edited', text: 'edited text' } });
-  });
-
-  it('calls tweet() with edit_options and returns the new tweet id', async () => {
-    const res = await twitterService.editTweet(OWNER, ACCOUNT_ID, 'tweet-123', 'edited text');
-    expect(mockTweet).toHaveBeenCalledWith({
-      text: 'edited text',
-      edit_options: { previous_post_id: 'tweet-123' },
-    });
-    expect(res).toEqual({ id: 'tweet-edited', text: 'edited text' });
-  });
-
-  it('throws when tweet_id is empty', async () => {
-    await expect(twitterService.editTweet(OWNER, ACCOUNT_ID, '', 'new text')).rejects.toThrow(/tweet_id/i);
-  });
-
-  it('throws when text is empty', async () => {
-    await expect(twitterService.editTweet(OWNER, ACCOUNT_ID, 'tweet-123', '')).rejects.toThrow(/text/i);
-  });
-
-  it('trims edit text longer than 280 chars', async () => {
-    const longText = 'word '.repeat(100).trim();
-    await twitterService.editTweet(OWNER, ACCOUNT_ID, 'tweet-123', longText);
-    const call = mockTweet.mock.calls[0][0];
-    expect(call.text.length).toBeLessThanOrEqual(280);
-  });
-});
-
 // ─── get-tweet-metrics ────────────────────────────────────────────────────────
 
 describe('TwitterService.getTweetMetrics', () => {

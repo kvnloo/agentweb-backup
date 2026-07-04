@@ -26394,14 +26394,6 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: result };
         }
 
-        case 'edit-tweet': {
-          if (!tweet_id) throw new Error('tweet_id is required for edit-tweet');
-          if (!text) throw new Error('text is required for edit-tweet');
-          const result = await twitterService.editTweet(ownerUserId, account_id, tweet_id, text);
-          await logCrm('twitter.tweet.sent', result.id, result.text);
-          return { success: true, data: result };
-        }
-
         case 'like': {
           if (!tweet_id) throw new Error('tweet_id is required for like');
           const result = await twitterService.likeTweet(ownerUserId, account_id, tweet_id);
@@ -26459,7 +26451,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         default: {
           const validActions = [
             'reply', 'post-thread', 'quote-tweet',
-            'delete-tweet', 'edit-tweet',
+            'delete-tweet',
             'like', 'unlike', 'retweet', 'unretweet',
             'list-replies', 'get-tweet-metrics',
             'get-retweeters', 'get-liking-users', 'get-quote-tweets',

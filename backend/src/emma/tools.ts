@@ -480,7 +480,7 @@ emmaToolRegistry.register({
   name: 'twitter_manage_post',
   definition: {
     name: 'twitter_manage_post',
-    description: `Manage X (Twitter) tweet interactions. ⚠️ NEVER use this tool to post a single new tweet — use post_on_connected_account for that. This tool is for: multi-tweet threads (2+ tweets), replies, quote-tweets, edits, deletes, likes, retweets, and analytics.
+    description: `Manage X (Twitter) tweet interactions. ⚠️ NEVER use this tool to post a single new tweet — use post_on_connected_account for that. This tool is for: multi-tweet threads (2+ tweets), replies, quote-tweets, deletes, likes, retweets, and analytics. NOTE: X's public API does not support editing tweets — there is no edit action; to fix a mistake, delete_tweet and post a new one.
 
 To find the account_id, call list_connected_accounts(platform='twitter'). account_id is optional when the user has exactly one X account connected.
 
@@ -489,7 +489,6 @@ Actions:
 - post_thread: Post a NEW chain of 2 or more tweets in sequence. Requires tweets array with MINIMUM 2 entries — if you only have 1 tweet, use post_on_connected_account instead. Each entry auto-trimmed to 280 chars.
 - quote_tweet: Quote-tweet a tweet with added commentary. Requires text and tweet_id.
 - delete_tweet: Delete a tweet you authored. Requires tweet_id. CRITICAL: Always get explicit user approval before deleting.
-- edit_tweet: Edit an existing tweet (editable within 30 min, up to 5 times). Requires tweet_id and text. Each edit produces a new tweet id.
 - like: Like a tweet. Requires tweet_id.
 - unlike: Remove a like from a tweet. Requires tweet_id.
 - retweet: Retweet a tweet. Requires tweet_id.
@@ -508,7 +507,7 @@ For CRM logging of sent tweets, optionally pass list_id, lead_id and lead_email.
           type: 'string',
           enum: [
             'reply', 'post_thread', 'quote_tweet',
-            'delete_tweet', 'edit_tweet',
+            'delete_tweet',
             'like', 'unlike', 'retweet', 'unretweet',
             'get_tweet_metrics', 'list_replies',
             'get_retweeters', 'get_liking_users', 'get_quote_tweets',
@@ -521,11 +520,11 @@ For CRM logging of sent tweets, optionally pass list_id, lead_id and lead_email.
         },
         text: {
           type: 'string',
-          description: 'Tweet text. Required for reply, edit_tweet, quote_tweet. Auto-trimmed to 280 chars on a word boundary.'
+          description: 'Tweet text. Required for reply, quote_tweet. Auto-trimmed to 280 chars on a word boundary.'
         },
         tweet_id: {
           type: 'string',
-          description: 'Tweet ID. Required for delete_tweet, edit_tweet, like, unlike, retweet, unretweet, quote_tweet, list_replies, get_retweeters, get_liking_users, get_quote_tweets.'
+          description: 'Tweet ID. Required for delete_tweet, like, unlike, retweet, unretweet, quote_tweet, list_replies, get_retweeters, get_liking_users, get_quote_tweets.'
         },
         in_reply_to_tweet_id: {
           type: 'string',
