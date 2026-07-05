@@ -308,7 +308,7 @@ function runClaudeStream(args, prompt, cwd, timeoutMs, onEvent, register) {
         for (const block of j.message?.content || []) {
           if (block.type === 'text' && block.text) { out.texts.push(block.text); onEvent({ type: 'text', text: block.text }); }
           if (block.type === 'tool_use') {
-            const input = JSON.stringify(block.input || {}).slice(0, 400);
+            const input = JSON.stringify(block.input || {}).slice(0, 1500); // enough for most Bash cmds/paths to stay valid JSON for the UI formatter
             out.tools.push({ name: block.name, input });
             onEvent({ type: 'tool', id: block.id, name: block.name, input });
           }

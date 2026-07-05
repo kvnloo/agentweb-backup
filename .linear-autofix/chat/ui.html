@@ -75,7 +75,7 @@
   .stage.open .sbody { display: block; }
   .stage .nolog { color: var(--dim); font-style: italic; }
 
-  .msg { max-width: 780px; padding: 10px 14px; border-radius: 10px; white-space: pre-wrap; overflow-wrap: break-word; }
+  .msg { max-width: 780px; padding: 10px 14px 21px; border-radius: 10px; white-space: pre-wrap; overflow-wrap: break-word; position: relative; }
   .msg.user { background: var(--user); align-self: flex-end; position: relative; padding-right: 52px; }
   /* Edit/delete icons live INSIDE the bubble's top-right (in the reserved right padding) so they
      never depend on bubble width — a wide bubble used to push a left-positioned icon over the sidebar. */
@@ -91,6 +91,8 @@
   #editbar button:hover { border-color: var(--accent); }
   #editbar .spacer { margin-left: auto; }
   .msg.assistant { background: var(--panel2); align-self: flex-start; }
+  /* WhatsApp-style local-time stamp tucked into the bubble's bottom-right corner (no extra row). */
+  .ts-in { position: absolute; right: 12px; bottom: 5px; font-size: 10px; line-height: 1; color: var(--dim); }
   /* Markdown styling applies in BOTH chat bubbles (.msg) and pipeline stage bodies (.sbody),
      since both render md() output. Scoping to .msg only left stage reports with no spacing. */
   :is(.msg, .sbody) code { background: #10131a; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
@@ -109,12 +111,14 @@
   /* Trim the very first/last block's outer margin so content sits flush with the container padding
      (one level of nesting, since assistant text lives inside a run <div>). */
   :is(.msg, .sbody) > :first-child, :is(.msg, .sbody) > :first-child > :first-child { margin-top: 0; }
-  :is(.msg, .sbody) > :last-child, :is(.msg, .sbody) > :last-child > :last-child { margin-bottom: 0; }
+  :is(.msg, .sbody) > :nth-last-child(1 of :not(.ts-in):not(.edit):not(.del)), :is(.msg, .sbody) > :nth-last-child(1 of :not(.ts-in):not(.edit):not(.del)) > :last-child { margin-bottom: 0; }
   .sys { color: var(--dim); font-size: 12px; align-self: flex-start; padding: 0 6px; }
   .err { color: var(--red); font-size: 13px; align-self: flex-start; padding: 0 6px; }
   .tool { display: block; font-size: 12px; color: var(--dim); background: #12151d; border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; margin: 4px 0; cursor: pointer; max-width: 740px; }
   .tool .st { margin-right: 6px; }
-  .tool .inp { display: none; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; color: #a8b0c2; }
+  .tool .tprev { margin-left: 8px; color: #7f8798; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .tool.open .tprev { display: none; } /* hide the truncated preview once the full body is shown */
+  .tool .inp { display: none; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; color: #a8b0c2; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   .tool.open .inp { display: block; }
   .fixcard { border: 1px solid var(--border); border-left: 3px solid var(--green); background: var(--panel2); border-radius: 8px; padding: 10px 14px; align-self: flex-start; font-size: 13px; max-width: 780px; }
   .fixcard.failed { border-left-color: var(--red); }
@@ -270,6 +274,21 @@ const rel = (iso) => {
 };
 
 const fmtAt = (iso) => { try { return new Date(iso).toLocaleString(); } catch { return ''; } };
+// Local-time label in the viewer's own timezone: just the time for today, else prefixed with the
+// date (so older stamps — e.g. a fix run from days ago — aren't mistaken for today).
+const fmtTime = (iso) => {
+  try {
+    const d = new Date(iso), t = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    return d.toDateString() === new Date().toDateString() ? t : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ', ' + t;
+  } catch { return ''; }
+};
+function stampTime(bubbleEl, iso) {
+  if (!bubbleEl || !iso) return;
+  const ts = document.createElement('span');
+  ts.className = 'ts-in';
+  ts.textContent = fmtTime(iso); ts.title = fmtAt(iso); // full date on hover
+  bubbleEl.appendChild(ts); // bottom-right corner of the bubble (absolute)
+}
 
 const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true };
 
@@ -391,10 +410,11 @@ function renderPipeline(d) {
   const wrap = document.createElement('div');
   wrap.id = 'pipeline';
   wrap.innerHTML = `<div class="ptitle">⚙ What the automation did (${steps.length} steps — click to expand)</div>`;
+  const runAt = d.entry?.at ? fmtTime(d.entry.at) : ''; // stages have no per-step time; use the fix run time
   for (const s of steps) {
     const el = document.createElement('div');
     el.className = 'stage';
-    const meta = [s.turns ? `${s.turns} turns` : '', fmtMs(s.ms), s.timedOut ? '⚠ timed out' : ''].filter(Boolean).join(' · ');
+    const meta = [s.turns ? `${s.turns} turns` : '', fmtMs(s.ms), s.timedOut ? '⚠ timed out' : '', runAt].filter(Boolean).join(' · ');
     el.innerHTML = `<div class="shead"><span class="arrow">▶</span><b>${esc(s.title)}</b><span class="smeta">${esc(meta)}</span></div>`
       + `<div class="sbody">${s.report ? md(s.report) : '<span class="nolog">(transcript not available on this machine)</span>'}</div>`;
     el.querySelector('.shead').onclick = () => el.classList.toggle('open');
@@ -441,10 +461,33 @@ function addSys(text, cls) {
   el.className = cls || 'sys'; el.textContent = text;
   chatEl().appendChild(el); scroll();
 }
+// The most meaningful argument per tool — shown inline in the tool header so you don't have to expand.
+const TOOL_PRIMARY = { Bash: 'command', Read: 'file_path', Write: 'file_path', Edit: 'file_path', MultiEdit: 'file_path', NotebookEdit: 'notebook_path', Grep: 'pattern', Glob: 'pattern', LS: 'path', Task: 'description', WebFetch: 'url', WebSearch: 'query' };
+// Turn the raw tool-input JSON into { preview, full } for display. Falls back gracefully when the
+// server truncated the JSON (it's capped) so it still shows something useful instead of raw braces.
+function toolParts(name, raw) {
+  raw = String(raw || '');
+  let obj = null;
+  try { obj = JSON.parse(raw); } catch { /* truncated or not JSON */ }
+  const pk = TOOL_PRIMARY[name];
+  if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+    const preview = pk && obj[pk] != null ? String(obj[pk]) : '';
+    let full;
+    if (name === 'Bash') { full = String(obj.command || ''); if (obj.description) full += '\n\n# ' + obj.description; }
+    else full = JSON.stringify(obj, null, 2);
+    return { preview, full };
+  }
+  // Truncated JSON: best-effort pull the primary string field for the preview; show raw as the body.
+  let preview = '';
+  if (pk) { const m = raw.match(new RegExp('"' + pk + '"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)')); if (m) { try { preview = JSON.parse('"' + m[1] + '"'); } catch { preview = m[1]; } } }
+  return { preview, full: raw };
+}
 function addTool(bubble, t) {
   const el = document.createElement('span');
   el.className = 'tool'; el.dataset.tid = t.id || '';
-  el.innerHTML = `<span class="st">▸</span><b>${esc(t.name)}</b><span class="inp">${esc(t.input || '')}</span>`;
+  const { preview, full } = toolParts(t.name, t.input || '');
+  const prev = preview ? `<span class="tprev">${esc(preview.replace(/\s+/g, ' ').slice(0, 90))}</span>` : '';
+  el.innerHTML = `<span class="st">▸</span><b>${esc(t.name)}</b>${prev}<span class="inp">${esc(full)}</span>`;
   el.onclick = () => el.classList.toggle('open');
   bubble.appendChild(el); scroll();
   bubble._run = null; // end the current text run so following text starts a fresh md() block
@@ -471,13 +514,14 @@ function renderAll(d) {
   chatEl().innerHTML = '';
   renderPipeline(d);
   (d.chat?.messages || []).forEach((m, i) => {
-    if (m.role === 'user') { const el = addUser(m.text, i); if (m.at) el.title = fmtAt(m.at); }
+    if (m.role === 'user') { const el = addUser(m.text, i); if (m.at) el.title = fmtAt(m.at); stampTime(el, m.at); }
     else {
       const b = newAssistant();
       if (m.at) b.title = fmtAt(m.at);
       for (const t of m.tools || []) addTool(b, t);
       addText(b, m.text || '');
       if (m.fix) addFixCard(m.fix);
+      stampTime(b, m.at);
     }
   });
   scrollBottom();
@@ -723,6 +767,7 @@ async function send() {
   // Show the bubble immediately (like edit does) so it doesn't vanish into limbo until turn_start.
   // turn_start's dataset.text dedup then skips re-adding it.
   const bubble = addUser(message);
+  stampTime(bubble, new Date().toISOString()); // show a time right away; renderAll re-stamps from the persisted `at`
   setBusy(true);
   const r = await fetch(`/api/issues/${S.sel}/chat`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
