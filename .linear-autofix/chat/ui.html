@@ -132,6 +132,11 @@
   #send:disabled { opacity: .45; cursor: not-allowed; }
   #hint { color: var(--dim); font-size: 11px; margin-top: 6px; }
   #hint .cap-full { color: var(--amber); }
+  #hint .vhint { opacity: .7; }
+  /* Voice (push-to-talk) indicator — shown while the mic is open */
+  #voice { display: none; align-items: center; gap: 9px; padding: 8px 20px; color: var(--red); font-size: 12px; border-top: 1px solid var(--border); background: var(--panel); }
+  #voice .mic { width: 9px; height: 9px; border-radius: 50%; background: var(--red); animation: pulse 1.1s infinite; }
+  #input.recording { outline: 1px solid var(--red); }
 </style>
 </head>
 <body>
@@ -154,6 +159,7 @@
     <div id="chat" style="display:none"></div>
     <button id="jumpDown">↓ New messages</button>
     <div id="thinking"><span class="dots"><i></i><i></i><i></i></span><span id="thinking-label">Claude is working…</span></div>
+    <div id="voice"><span class="mic"></span><span>🎤 Listening… — release space to stop · Esc to cancel</span></div>
     <div id="composer" style="display:none">
       <div id="editbar" style="display:none"></div>
       <div class="row">
@@ -266,6 +272,16 @@ const rel = (iso) => {
 const fmtAt = (iso) => { try { return new Date(iso).toLocaleString(); } catch { return ''; } };
 
 const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true };
+
+// ---------- voice (push-to-talk): hold space to dictate via the browser's Web Speech API ----------
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+// Auto-repeat of a held Space (esp. on X11) arrives as keyup→keydown pairs whose event timestamps
+// are ~identical. We classify a space-keydown as auto-repeat only when it lands within REPEAT_GAP ms
+// of the previous space-keyup — genuinely-typed spaces are always separated by other keystrokes, so
+// their gap is far larger. RELEASE_MS is the tiny grace period after a keyup before we treat the key
+// as truly released (must outlast the auto-repeat keyup→keydown gap).
+const HOLD_MS = 300, REPEAT_GAP = 12, RELEASE_MS = 20, VOICE_LANG = 'en-US';
+const V = { supported: !!SR, denied: false, pressActive: false, recording: false, holdTimer: null, releaseTimer: null, spaceUpTs: -1e9, interveningKey: true, rec: null, before: '', after: '', spaceAt: 0, snapshot: '', awaitingFinal: false, finalTimer: null };
 
 // ---------- sidebar ----------
 let lastIssuesJson = '';
@@ -558,6 +574,7 @@ function updateHint() {
   $('hint').innerHTML = cap.level === 'full'
     ? '<span class="cap-full">Full access</span> — ask anything, or request changes: the agent edits this issue\'s branch and new commits auto-push to the open PR.'
     : `Read-only — ${esc(cap.reason || '')}. The agent can answer anything but cannot change code here.`;
+  if (V.supported && !V.denied) $('hint').innerHTML += ' <span class="vhint">· Hold <b>space</b> to talk.</span>';
 }
 
 // ---------- edit & rewrite history ----------
@@ -686,6 +703,7 @@ async function doEditSend(revert) {
 }
 
 async function send() {
+  if (V.recording) return; // mid-dictation (space held): don't send a partial transcript — release first
   if (S.busy) { // Stop
     await fetch(`/api/issues/${S.sel}/chat/abort`, { method: 'POST' });
     return;
@@ -727,6 +745,184 @@ $('chat').addEventListener('scroll', () => { S.stick = nearBottom(); if (S.stick
 $('jumpDown').onclick = () => scrollBottom();
 function autosize() { const i = $('input'); i.style.height = 'auto'; i.style.height = Math.min(i.scrollHeight, 160) + 'px'; }
 $('input').addEventListener('input', autosize);
+
+// ---------- voice: push-to-talk dictation ----------
+// Only intercept space when the composer is actually usable; otherwise spaces behave normally.
+function voiceEnabled() {
+  return V.supported && !V.denied && !!S.sel && !S.busy && !S.deleting && !$('input').disabled;
+}
+function showVoice(on) { $('voice').style.display = on ? 'flex' : 'none'; $('input').classList.toggle('recording', on); }
+function voiceNote(msg) { const v = $('voice'); if (v) v.lastElementChild.textContent = msg; }
+function startVoice() {
+  if (V.recording) return;
+  V.recording = true;
+  showVoice(true); // show the bar first, so we can tell startVoice ran even if the recognizer fails
+  voiceNote('🎤 Starting mic…'); // rec.onstart flips this to "Listening…" once audio is actually captured
+  const el = $('input'), val = el.value, at = V.spaceAt;
+  const hadSpace = val[at] === ' ';
+  // Snapshot = state with that throwaway space removed, for Esc-to-cancel.
+  V.snapshot = hadSpace ? (val.slice(0, at) + val.slice(at + 1)) : val;
+  // Keep the tapped space as a word separator (so "hello"+dictate = "hello world"),
+  // but drop it when it would just be leading whitespace in an otherwise-empty composer.
+  let before = val.slice(0, at + (hadSpace ? 1 : 0));
+  const after = val.slice(at + (hadSpace ? 1 : 0));
+  if (!before.trim()) before = '';
+  V.before = before; V.after = after;
+  el.value = before + after; // reflect the trim immediately (no stray leading space)
+  const caret0 = before.length;
+  try { el.setSelectionRange(caret0, caret0); } catch {}
+  autosize();
+  try {
+    const rec = new SR();
+    V.rec = rec;
+    rec.lang = VOICE_LANG; rec.continuous = true; rec.interimResults = true; rec.maxAlternatives = 1;
+    rec.onstart = () => voiceNote('🎤 Listening… — release space to stop · Esc to cancel');
+    rec.onresult = (ev) => {
+      let out = '';
+      for (let i = 0; i < ev.results.length; i++) out += ev.results[i][0].transcript;
+      const t = out.replace(/^\s+/, '');
+      el.value = V.before + t + V.after;
+      const caret = (V.before + t).length;
+      try { el.setSelectionRange(caret, caret); } catch {}
+      autosize();
+    };
+    rec.onerror = (ev) => {
+      const e = ev.error;
+      if (e === 'not-allowed' || e === 'service-not-allowed') {
+        V.denied = true; V.recording = false; V.pressActive = false; V.awaitingFinal = false; showVoice(false);
+        $('hint').innerHTML = '⚠ Microphone blocked — click the address-bar mic/site icon, allow access, then reload.';
+        setTimeout(updateHint, 6000); // restore the capability line instead of clobbering it for good
+      } else if (e === 'network') {
+        voiceNote('⚠ Voice: network error reaching the speech service.');
+      } else if (e !== 'no-speech' && e !== 'aborted') {
+        voiceNote('⚠ Voice error: ' + e);
+      }
+      // 'no-speech' / 'aborted' are benign — onend handles restart-while-held or cleanup.
+    };
+    rec.onend = () => {
+      // Web Speech auto-stops on a silence gap; if the key is still physically held, reopen the mic.
+      if (V.recording && V.pressActive && !V.denied) { try { rec.start(); } catch { V.recording = false; showVoice(false); finalizeVoice(); } }
+      else finalizeVoice(); // released (or auto-ended) → clean up the transcript
+    };
+    rec.start();
+  } catch (e) { voiceNote('⚠ Voice failed to start: ' + (e && e.message || e)); }
+}
+function endVoice() { // release: stop recognition; the transcript stays and then gets polished
+  V.pressActive = false;
+  if (!V.recording) return;
+  V.recording = false;
+  $('input').classList.remove('recording'); // drop the red outline; keep the bar for the polish phase
+  $('input').focus();
+  V.awaitingFinal = true;
+  if (V.rec) { try { V.rec.stop(); } catch {} } // → final onresult, then onend → finalizeVoice
+  clearTimeout(V.finalTimer);
+  V.finalTimer = setTimeout(finalizeVoice, 1500); // fallback if onend never fires
+}
+function cancelVoice() { // Esc: discard and restore what was there before
+  clearTimeout(V.holdTimer); clearTimeout(V.releaseTimer); clearTimeout(V.finalTimer); V.releaseTimer = null;
+  if (!V.recording && !V.pressActive) return;
+  if (V.recording) { $('input').value = V.snapshot; autosize(); }
+  V.recording = false; V.pressActive = false; V.awaitingFinal = false; // suppress the abort's finalize
+  showVoice(false);
+  if (V.rec) { try { V.rec.abort(); } catch {} }
+}
+// Instant, zero-cost cleanup so the box looks right the moment you release.
+function heuristicClean(s) {
+  let t = s.trim().replace(/\s+/g, ' ');
+  if (!t) return t;
+  t = t.replace(/(^\s*|[.!?]\s+)([a-z])/g, (_, pre, ch) => pre + ch.toUpperCase()); // capitalize sentence starts
+  t = t.replace(/\bi\b/g, 'I');                                                      // standalone "i" → "I"
+  if (!/[.!?]$/.test(t)) {
+    const q = /^(who|what|when|where|why|how|which|whose|whom|is|are|am|do|does|did|can|could|would|should|will|shall|may|might|have|has|had)\b/i;
+    t += q.test(t) ? '?' : '.';
+  }
+  return t;
+}
+// On release: heuristic-clean the dictated segment instantly, then ask the server for an LLM polish
+// and swap it in only if you haven't touched the box meanwhile.
+function finalizeVoice() {
+  if (!V.awaitingFinal) return;
+  V.awaitingFinal = false;
+  clearTimeout(V.finalTimer);
+  const el = $('input'), val = el.value, before = V.before, after = V.after;
+  if (val.length < before.length + after.length) { showVoice(false); return; }
+  const raw = val.slice(before.length, val.length - after.length);
+  if (!raw.trim()) { showVoice(false); return; }
+  const heur = heuristicClean(raw);
+  const heurVal = before + heur + after;
+  el.value = heurVal; autosize();
+  const c = (before + heur).length; try { el.setSelectionRange(c, c); } catch {}
+  voicePolish(raw, before, after, heurVal);
+}
+async function voicePolish(raw, before, after, baseline) {
+  if (!S.sel) { showVoice(false); return; }
+  const sel = S.sel; // pin the issue so a late result can't land on a composer you've navigated away from
+  $('voice').style.display = 'flex'; $('input').classList.remove('recording'); voiceNote('✨ Polishing…');
+  let out = null;
+  try {
+    const r = await fetch(`/api/issues/${sel}/chat/polish`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: raw }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (d && d.polished && typeof d.text === 'string') out = d.text;
+  } catch { /* keep the heuristic version */ }
+  // Swap in the polished text only if you're still on the same issue, haven't edited the box, and
+  // aren't actively editing mid-text (caret away from the end) — so nothing reshuffles under you.
+  if (out != null && S.sel === sel) {
+    const el = $('input');
+    const caretAtEnd = document.activeElement !== el || el.selectionStart === baseline.length;
+    if (el.value === baseline && caretAtEnd) {
+      el.value = before + out + after; autosize();
+      const c = (before + out).length; try { el.setSelectionRange(c, c); } catch {}
+    }
+  }
+  showVoice(false);
+}
+if (V.supported) {
+  const inp = $('input');
+  // Cross-platform push-to-talk. ev.repeat is unreliable (X11 sends auto-repeat as keyup/keydown
+  // pairs with repeat===false). The definitive tell of a held key is that NO other key event occurs
+  // between the space-keyup and the next space-keydown, and they share ~the same timestamp — whereas
+  // real typing ("and a") always has an intervening keystroke. So we require both: no intervening key
+  // AND a sub-REPEAT_GAP gap. That leaves genuinely-typed spaces untouched at any typing speed.
+  inp.addEventListener('keydown', (ev) => {
+    if (ev.code === 'Escape' && (V.recording || V.pressActive)) { ev.preventDefault(); cancelVoice(); return; }
+    if (ev.code !== 'Space') { V.interveningKey = true; return; } // a non-space key breaks any auto-repeat run
+    if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.isComposing) return;
+    const isRepeat = ev.repeat || (V.pressActive && !V.interveningKey && (ev.timeStamp - V.spaceUpTs) < REPEAT_GAP);
+    if (isRepeat) {                                         // held key: swallow the extra space, keep the hold alive
+      clearTimeout(V.releaseTimer); V.releaseTimer = null;
+      ev.preventDefault();
+      return;
+    }
+    if (V.recording) { clearTimeout(V.releaseTimer); V.releaseTimer = null; ev.preventDefault(); return; } // held key: swallow the space, cancel any pending release
+    if (!voiceEnabled()) return;                            // let the space type normally
+    // Genuine new press: let this one space type natively (keeps undo/tap), then arm the hold timer.
+    V.pressActive = true;
+    V.spaceAt = inp.selectionStart;
+    clearTimeout(V.holdTimer);
+    V.holdTimer = setTimeout(() => { if (V.pressActive && !V.recording && voiceEnabled()) startVoice(); }, HOLD_MS);
+  });
+  inp.addEventListener('keyup', (ev) => {
+    if (ev.code !== 'Space') return;
+    V.spaceUpTs = ev.timeStamp;
+    V.interveningKey = false; // start watching for an immediate same-key auto-repeat keydown
+    if (!V.pressActive && !V.recording) return;
+    if (V.recording) ev.preventDefault();
+    // Grace period: an auto-repeat keydown will cancel this; a real release lets it fire.
+    clearTimeout(V.releaseTimer);
+    V.releaseTimer = setTimeout(() => {
+      V.releaseTimer = null;
+      clearTimeout(V.holdTimer);
+      if (V.recording) endVoice(); else V.pressActive = false; // tap: native space already typed
+    }, RELEASE_MS);
+  });
+  // If focus leaves mid-hold, don't leave a dangling timer or open mic.
+  inp.addEventListener('blur', () => {
+    clearTimeout(V.holdTimer); clearTimeout(V.releaseTimer); V.releaseTimer = null;
+    if (V.recording) endVoice(); else V.pressActive = false;
+  });
+}
 
 // ---------- boot ----------
 loadIssues();

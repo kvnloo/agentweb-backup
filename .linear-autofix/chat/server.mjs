@@ -337,6 +337,114 @@ function runClaudeStream(args, prompt, cwd, timeoutMs, onEvent, register) {
   });
 }
 
+// Voice cleanup runs against the Anthropic API directly with the Claude Code subscription's OAuth
+// token (read fresh each call so CLI refreshes are picked up). This is ~1s vs ~7-15s for spawning
+// `claude -p`, which cold-starts a whole CLI process every time. The OAuth path requires the Claude
+// Code identity as the system prompt, so the actual task goes in the user message.
+const credsPath = path.join(process.env.HOME || '', '.claude', '.credentials.json');
+function oauthCreds() {
+  try { return JSON.parse(readFileSync(credsPath, 'utf8')).claudeAiOauth || {}; } catch { return {}; }
+}
+function oauthToken() {
+  const o = oauthCreds();
+  return (o.accessToken && (!o.expiresAt || o.expiresAt > Date.now() + 60000)) ? o.accessToken : null;
+}
+async function claudeApiText(userMessage, model, timeoutMs, maxTokens = 600) {
+  const token = oauthToken();
+  if (!token) return { ok: false };
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': 'oauth-2025-04-20',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model, max_tokens: maxTokens,
+        system: "You are Claude Code, Anthropic's official CLI for Claude.",
+        messages: [{ role: 'user', content: userMessage }],
+      }),
+      signal: ac.signal,
+    });
+    if (!r.ok) return { ok: false };
+    const j = await r.json();
+    const text = Array.isArray(j.content) ? j.content.filter((b) => b.type === 'text').map((b) => b.text).join('') : '';
+    return { ok: !!text, text, stopReason: j.stop_reason };
+  } catch { return { ok: false }; }
+  finally { clearTimeout(timer); }
+}
+
+// Self-heal fallback: if the direct API fails (usually an expired OAuth token that nothing has
+// refreshed yet), run the CLI once. It's slow (~7s) but it refreshes ~/.claude/.credentials.json as
+// a side effect, so the very next call goes back to the fast API path. Keeps voice fully dynamic.
+function runClaudeCleanup(prompt, timeoutMs) {
+  return new Promise((resolve) => {
+    const args = ['-p', '--model', 'haiku', '--max-turns', '1', '--output-format', 'json', '--strict-mcp-config'];
+    const child = spawn('claude', args, { cwd: __dirname, env: process.env, detached: true });
+    let out = '';
+    const timer = setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); } }, timeoutMs);
+    child.stdout.on('data', (d) => { out += d; });
+    child.stdin.on('error', () => {});
+    child.on('error', () => { clearTimeout(timer); resolve({ ok: false }); });
+    child.on('close', () => {
+      clearTimeout(timer);
+      try { const j = JSON.parse(out); resolve({ ok: !j.is_error && typeof j.result === 'string', text: j.result }); }
+      catch { resolve({ ok: false }); }
+    });
+    child.stdin.write(prompt); child.stdin.end();
+  });
+}
+
+// Clean up a raw speech-to-text transcript: punctuation, casing, and context-aware mishear fixes.
+// Meaning-preserving by instruction; falls back to null (client keeps its instant heuristic) on any
+// failure or if the model goes off-script. `text` is only the dictated segment, never the whole box.
+async function polishVoice(identifier, body) {
+  const text = String(body?.text || '').trim();
+  if (!text) return { code: 200, body: { text: null, polished: false } };
+  // Very long dictation: skip the LLM pass entirely — the instant heuristic is already fine, and
+  // polishing risks a truncated reply silently replacing complete text. ~4000 chars is a big message.
+  if (text.length > 4000) return { code: 200, body: { text: null, polished: false } };
+  const found = findEntry(identifier);
+  const title = String(found?.entry?.title || '').slice(0, 200);
+  const summary = String(found?.entry?.summary || '').slice(0, 500);
+  const model = CHAT.polish?.model || 'claude-haiku-4-5-20251001';
+  // Recent thread turns ground the correction in what's actually being discussed here (so a mishear
+  // is fixed toward the terms in play). Last few messages, each trimmed; oldest first.
+  const recent = (loadChatState()[identifier]?.messages || [])
+    .slice(-5)
+    .map((mm) => `${mm.role === 'assistant' ? 'Assistant' : 'You'}: ${String(mm.text || '').replace(/\s+/g, ' ').slice(0, 240)}`)
+    .join('\n');
+  const instruction = [
+    'Clean up this raw speech-to-text dictation typed by a developer into a chat about a software issue.',
+    'Fix capitalization, punctuation, and obvious speech-recognition mishears of technical terms, using the context below to correct domain words (for example a spoken "why" that means "UI", or "git hub" that means "GitHub"). Add a question mark when the sentence is clearly a question.',
+    'STRICT RULES: do not rephrase, reorder, translate, summarize, or add or remove information — only correct transcription errors, casing, and punctuation. Output ONLY the corrected text: no quotes, no explanation, no preamble.',
+    '',
+    'Issue — Title: ' + (title || '(none)') + (summary ? '; Summary: ' + summary : ''),
+    recent ? '\nRecent conversation (for terminology only):\n' + recent : '',
+    '',
+    'Raw dictation: ' + text,
+  ].filter(Boolean).join('\n');
+  // Give the reply enough room to never truncate a legitimate cleanup (output ≈ input length).
+  const maxTokens = Math.min(2000, Math.ceil(text.length / 3) + 200);
+  let r = await claudeApiText(instruction, model, 8000, maxTokens);
+  // Self-heal only when a refresh token exists (expired access token the CLI can refresh). If fully
+  // logged out there's nothing to refresh, so skip the CLI and let the client keep its heuristic —
+  // no pointless ~15s wait per dictation. Logging back in makes the fast path resume automatically.
+  if (!r.ok && oauthCreds().refreshToken) r = await runClaudeCleanup(instruction, 15000);
+  let cleaned = (r.ok && typeof r.text === 'string') ? r.text.trim() : '';
+  // Strip a wrapping pair of quotes the model may have added.
+  if (cleaned.length >= 2 && cleaned[0] === cleaned[cleaned.length - 1] && (cleaned[0] === '"' || cleaned[0] === "'")) cleaned = cleaned.slice(1, -1).trim();
+  // Reject anything that isn't a faithful cleanup: empty, hit the token cap (truncated), ballooned,
+  // or lost a big chunk of content. On reject the client keeps the complete heuristic version.
+  const truncated = r.stopReason === 'max_tokens';
+  const ok = !!cleaned && !truncated && cleaned.length <= text.length * 3 + 40 && cleaned.length >= text.length * 0.5;
+  return { code: 200, body: ok ? { text: cleaned, polished: true } : { text: null, polished: false } };
+}
+
 // ---------------------------------------------------------------------------
 // Prompts
 
@@ -785,7 +893,7 @@ async function route(req, res) {
   }
   if (req.method === 'GET' && p === '/api/issues') { json(res, 200, { fixEnabled: fixEnabled(), issues: listIssues() }); return; }
 
-  const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat|\/preview)?$/);
+  const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat|\/preview)?$/);
   if (!m) { json(res, 404, { error: 'not found' }); return; }
   const identifier = m[1].toUpperCase();
   const sub = m[2] || '';
@@ -822,6 +930,11 @@ async function route(req, res) {
   if (req.method === 'POST' && sub === '/chat/delete') {
     const r = startDeleteHistory(identifier, await readBody(req));
     json(res, r.code, r.body || { error: r.error });
+    return;
+  }
+  if (req.method === 'POST' && sub === '/chat/polish') {
+    const r = await polishVoice(identifier, await readBody(req));
+    json(res, r.code, r.body);
     return;
   }
   if (req.method === 'POST' && sub === '/chat/abort') {
