@@ -11,6 +11,7 @@
 
 import http from 'node:http';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import {
   readFileSync, writeFileSync, existsSync, mkdirSync, statSync, unlinkSync, createWriteStream, readdirSync,
 } from 'node:fs';
@@ -20,6 +21,7 @@ import { config } from '../config.mjs';
 import { resolveIssue } from '../linear.mjs';
 import {
   assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, countCommits, ensureProxy,
+  headShas, resetTo,
 } from '../autofix.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -73,6 +75,7 @@ function listIssues() {
         triage: e.triage || null,
         branch: e.branch || null,
         at: e.at || null,
+        title: e.title || '',
         summary: e.summary || '',
         prs: e.prs || [],
         hasWorktree,
@@ -350,7 +353,16 @@ function preamble(cap) {
 }
 
 // First turn with no pipeline session to resume: rebuild the context as text.
-function freshPrompt(cap, identifier, entry, linear, cwd, message) {
+// Render retained chat turns as plain text so a fresh (unforkable) edit turn still has the
+// conversation up to the edit point. Empty string when there's nothing retained.
+function historyBlock(msgs) {
+  const kept = (msgs || []).filter((mm) => mm && mm.text);
+  if (!kept.length) return '';
+  const body = kept.map((mm) => `${mm.role === 'user' ? 'Developer' : 'You'}: ${mm.text}`).join('\n\n');
+  return `\nConversation so far (context — continue from here, do not repeat it):\n${body}\n`;
+}
+
+function freshPrompt(cap, identifier, entry, linear, cwd, message, history = '') {
   const stages = Object.keys(entry.stages || {}).join(', ') || '(none recorded)';
   const prs = (entry.prs || []).map((p) => `- ${p.repo || ''} ${p.url || p}`).join('\n') || '(none)';
   const comments = (linear?.comments || []).map((c) => `- ${c.author}: ${c.body}`).join('\n') || '(none)';
@@ -373,7 +385,7 @@ ${prs}
 
 Pipeline stages that ran: ${stages}
 Raw stage transcripts are in ${path.join(logsDir, identifier)}/<stage>.txt — each is a JSON envelope whose .result field is that agent's final report. Read them if asked about pipeline behavior.
-
+${history}
 ${preamble(cap)}${message}`;
 }
 
@@ -391,6 +403,54 @@ function pipelineSessionId(entry) {
     if (sid) return sid;
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Session transcripts on disk. The Claude CLI stores each session as a JSONL file at
+// ~/.claude/projects/<cwd-with-non-alnum-replaced-by-dash>/<sessionId>.jsonl and APPENDS to it
+// on every --resume. Editing a past message must rewrite that transcript, not just cs.messages
+// (which is display-only). We fork: copy the file truncated to the edit point into a NEW session
+// id (rewriting the internal sessionId), then resume the fork — native memory is preserved up to
+// the cut and the dropped turns are gone. Validated against CLI 2.1.197.
+function projectsDir(cwd) {
+  return path.join(process.env.HOME || '', '.claude', 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'));
+}
+function sessionFile(cwd, sid) { return path.join(projectsDir(cwd), `${sid}.jsonl`); }
+
+// Number of JSONL lines currently in a session's transcript (0 if none / unreadable). Snapshotted
+// at each turn's start and stored on the user message so a later edit knows exactly where to cut.
+function transcriptLines(cwd, sid) {
+  if (!sid) return 0;
+  try { return readFileSync(sessionFile(cwd, sid), 'utf8').split('\n').filter(Boolean).length; }
+  catch { return 0; }
+}
+
+// Copy `sid`'s transcript truncated to `lines` lines into a fresh session id, rewriting every
+// line's sessionId to the new id. Returns the new sid, or null if it can't be forked (missing
+// file, degenerate length) — the caller then falls back to a fresh context-injected turn.
+function forkTruncated(cwd, sid, lines) {
+  if (!sid || lines <= 0) return null;
+  try {
+    const all = readFileSync(sessionFile(cwd, sid), 'utf8').split('\n').filter(Boolean);
+    if (lines > all.length) return null;
+    const newSid = randomUUID();
+    const kept = all.slice(0, lines).map((l) => {
+      try { const o = JSON.parse(l); if (o.sessionId) o.sessionId = newSid; return JSON.stringify(o); }
+      catch { return l; }
+    });
+    mkdirSync(projectsDir(cwd), { recursive: true });
+    writeFileSync(sessionFile(cwd, newSid), kept.join('\n') + '\n');
+    return newSid;
+  } catch { return null; }
+}
+
+// Delete every fork transcript except `keepSid`. Only ever touches ids we minted (cs.forks) — the
+// pipeline's own session and the original chat session are never in that list, so never deleted.
+function pruneForks(cwd, forks, keepSid) {
+  for (const sid of forks || []) {
+    if (sid === keepSid) continue;
+    try { unlinkSync(sessionFile(cwd, sid)); } catch { /* already gone */ }
+  }
 }
 
 function acquireFixLock(identifier) {
@@ -418,44 +478,104 @@ function resolveCwd(identifier, entry, emit) {
   return { cwd: agentRoot };
 }
 
-async function runTurn(identifier, entry, cap, message, turnId, lockPath) {
+async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit = null) {
   const emit = (e) => broadcast(identifier, { turnId, ...e });
   const m = CHAT[cap] || {};
   let tee = null;
   try {
     emit({ type: 'turn_start', cap, message });
-    updateChatState(identifier, (cs) => {
-      cs.messages.push({ role: 'user', cap, text: message, at: new Date().toISOString() });
-      cs.messages = cs.messages.slice(-500);
-      return cs;
-    });
 
     const loc = resolveCwd(identifier, entry, emit);
     if (loc.error) { emit({ type: 'error', error: loc.error }); return; }
     const cwd = loc.cwd;
 
-    // Session strategy: our own chat session -> the pipeline's session -> fresh with context.
-    const cs0 = loadChatState()[identifier] || {};
-    const sameCwd = !cs0.cwd || cs0.cwd === cwd;
-    let resumeSid = (sameCwd && cs0.sessions?.chat) || null;
-    let prompt;
-    if (resumeSid) {
-      prompt = message;
-    } else if (cwd !== agentRoot && pipelineSessionId(entry)) {
-      resumeSid = pipelineSessionId(entry);
-      prompt = preamble(cap) + message;
-    } else {
-      prompt = freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, message);
+    // Edit prelude: rewrite history at edit.index. Optionally rewind the code, fork the transcript
+    // at the cut point (native memory preserved; null -> fresh fallback), then drop the messages
+    // from the edit point down. Mutates `edit` with forkSid + the retained conversation.
+    if (edit && edit.index != null && !edit.prepared) {
+      const csE = loadChatState()[identifier] || {};
+      const msgsE = csE.messages || [];
+      const em = msgsE[edit.index] || {};
+      edit.retained = msgsE.slice(0, edit.index);
+
+      if (edit.revert && cap === 'full' && em.headBefore) {
+        emit({ type: 'status', text: 'Rewinding the branch to before the dropped turns…' });
+        const orig = headShas(cwd); // snapshot so we can undo a partial rewind
+        const failed = resetTo(cwd, em.headBefore);
+        if (failed.length) {
+          // Rewind didn't fully land (e.g. force-push rejected). Don't run the agent on a
+          // half-reverted tree — restore the branch and abort WITHOUT rewriting any history.
+          const restoreFailed = resetTo(cwd, orig);
+          emit({ type: 'error', error: restoreFailed.length
+            ? `Could not rewind ${failed.join(', ')} and the restore also failed for ${restoreFailed.join(', ')} — the branch may be inconsistent; resolve it manually. No history was rewritten.`
+            : `Could not rewind ${failed.join(', ')} (restore point unavailable); the branch was left as it was and no history was rewritten. Resend without "Revert code".` });
+          return; // finally releases the lock and emits 'done'; messages untouched, no fork
+        }
+        emit({ type: 'status', text: 'Branch rewound and force-pushed.' });
+      }
+
+      const forkSid = forkTruncated(cwd, em.sid, em.tLines);
+      const prevForks = csE.forks || [];
+      edit.forkSid = forkSid;
+      edit.prepared = true;
+      updateChatState(identifier, (cs) => {
+        cs.messages = (cs.messages || []).slice(0, edit.index);
+        pruneForks(cwd, prevForks, forkSid);
+        if (forkSid) { cs.forks = [forkSid]; cs.sessions.chat = forkSid; }
+        else { cs.forks = []; delete cs.sessions.chat; }
+        return cs;
+      });
     }
+
+    // Session strategy. Edit turns resume the pre-forked transcript (or, if the fork failed,
+    // start fresh with the retained conversation re-injected). Normal turns: our own chat
+    // session -> the pipeline's session -> fresh with context.
+    const cs0 = loadChatState()[identifier] || {};
+    const histText = edit ? historyBlock(edit.retained) : '';
+    let resumeSid;
+    let prompt;
+    if (edit) {
+      resumeSid = edit.forkSid || null;
+      prompt = resumeSid ? message : freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, message, histText);
+    } else {
+      const sameCwd = !cs0.cwd || cs0.cwd === cwd;
+      resumeSid = (sameCwd && cs0.sessions?.chat) || null;
+      if (resumeSid) {
+        prompt = message;
+      } else if (cwd !== agentRoot && pipelineSessionId(entry)) {
+        resumeSid = pipelineSessionId(entry);
+        prompt = preamble(cap) + message;
+      } else {
+        prompt = freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, message);
+      }
+    }
+
+    // Snapshot the cut point for THIS message before the turn appends to the transcript, so a
+    // later edit of it knows exactly where to fork. sid is filled in at init for fresh turns.
+    const tLines = transcriptLines(cwd, resumeSid);
+    const headBefore = cap === 'full' ? headShas(cwd) : null;
+    updateChatState(identifier, (cs) => {
+      cs.messages.push({
+        role: 'user', cap, text: message, at: new Date().toISOString(),
+        sid: resumeSid || null, tLines, ...(headBefore ? { headBefore } : {}),
+      });
+      cs.messages = cs.messages.slice(-500);
+      return cs;
+    });
 
     const preCommits = cap === 'full' ? countCommits(detectChangedRepos(cwd)) : 0;
 
     mkdirSync(path.join(logsDir, identifier), { recursive: true });
     tee = createWriteStream(path.join(logsDir, identifier, `chat-${Date.now()}.txt`));
-    tee.write(`# turn ${turnId} cap=${cap} resume=${resumeSid || 'none'} cwd=${cwd}\n${prompt}\n---\n`);
+    tee.write(`# turn ${turnId} cap=${cap} resume=${resumeSid || 'none'}${edit ? ' (edit)' : ''} cwd=${cwd}\n${prompt}\n---\n`);
     const onEvent = (e) => {
       tee.write(JSON.stringify(e) + '\n');
-      if (e.type === 'init') updateChatState(identifier, (cs) => { cs.cwd = cwd; cs.sessions.chat = e.sessionId; return cs; });
+      if (e.type === 'init') updateChatState(identifier, (cs) => {
+        cs.cwd = cwd; cs.sessions.chat = e.sessionId;
+        const lastUser = [...cs.messages].reverse().find((x) => x.role === 'user');
+        if (lastUser && !lastUser.sid) lastUser.sid = e.sessionId; // fresh session: record its id
+        return cs;
+      });
       if (e.type === 'result' && e.isError) return; // surfaced below as a proper error event
       emit(e);
     };
@@ -463,12 +583,13 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath) {
 
     let out = await runClaudeStream(chatArgs(cap, resumeSid), prompt, cwd, m.timeoutMs, onEvent, register);
 
-    // A dead --resume target (pruned session file, foreign session id) fails before init.
-    // Drop the stored session and retry ONCE as a fresh, context-injected turn.
+    // A dead --resume target (pruned session file, foreign/forked session id) fails before init.
+    // Drop the stored session and retry ONCE as a fresh, context-injected turn (carrying the
+    // retained conversation when this is an edit — the fork we tried to resume is abandoned).
     if (resumeSid && !out.gotInit && !out.timedOut && !aborted(identifier, turnId)) {
       emit({ type: 'status', text: 'Previous session unavailable — starting a fresh one with re-injected context…' });
       updateChatState(identifier, (cs) => { delete cs.sessions.chat; return cs; });
-      prompt = freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, message);
+      prompt = freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, message, histText);
       tee.write(`# retry fresh\n${prompt}\n---\n`);
       out = await runClaudeStream(chatArgs(cap, null), prompt, cwd, m.timeoutMs, onEvent, register);
     }
@@ -535,6 +656,87 @@ function startTurn(identifier, body) {
   return { code: 202, body: { turnId, cap } };
 }
 
+// Edit a previously-sent user message and re-run from there: drop that message + everything below
+// it, fork the CLI session's transcript to the cut point (memory preserved), then run the edited
+// message as a new turn. `revert` additionally rewinds the branch to before the dropped turns.
+function startEditTurn(identifier, body) {
+  const index = Number.parseInt(body?.index, 10);
+  const message = String(body?.message || '').trim();
+  const revert = !!body?.revert;
+  if (!message) return { code: 400, error: 'message must be non-empty' };
+  if (!Number.isInteger(index) || index < 0) return { code: 400, error: 'index must be a non-negative integer' };
+  const found = findEntry(identifier);
+  if (!found) return { code: 404, error: `no autofix record for ${identifier}` };
+  if (activeTurns.has(identifier)) return { code: 409, error: 'a turn is already running for this issue' };
+
+  const msgs = (loadChatState()[identifier] || {}).messages || [];
+  if (index >= msgs.length) return { code: 400, error: 'index out of range' };
+  if (msgs[index].role !== 'user') return { code: 400, error: 'only user messages can be edited' };
+
+  const cap = capabilityOf(found.entry).level;
+  if (revert && cap !== 'full') return { code: 400, error: 'cannot revert code in a read-only session' };
+  if (revert && !msgs[index].headBefore) return { code: 400, error: 'no recorded restore point for this message — resend without revert' };
+  // Every edit turn takes the lock (even read-only): it forks a session transcript, and the lock
+  // is what makes gc skip this issue so the fork can't be deleted out from under a live --resume.
+  const lockPath = acquireFixLock(identifier);
+  if (!lockPath) return { code: 409, error: 'another operation holds the lock for this issue' };
+
+  const turnId = `t${Date.now()}-${++turnSeq}`;
+  activeTurns.set(identifier, { child: null, cap, turnId, startedAt: new Date().toISOString(), lockPath });
+  runTurn(identifier, found.entry, cap, message, turnId, lockPath, { index, revert });
+  return { code: 202, body: { turnId, cap } };
+}
+
+// Delete a user message and everything below it, rewriting the agent's memory to before it — the
+// same fork+truncate as edit, but WITHOUT re-running (no new turn). `revert` also rewinds the
+// branch. Runs synchronously (only file/git ops, no agent), under the lock so gc won't race it.
+function startDeleteHistory(identifier, body) {
+  const index = Number.parseInt(body?.index, 10);
+  const revert = !!body?.revert;
+  if (!Number.isInteger(index) || index < 0) return { code: 400, error: 'index must be a non-negative integer' };
+  const found = findEntry(identifier);
+  if (!found) return { code: 404, error: `no autofix record for ${identifier}` };
+  if (activeTurns.has(identifier)) return { code: 409, error: 'a turn is running for this issue' };
+
+  const cs0 = loadChatState()[identifier] || {};
+  const msgs = cs0.messages || [];
+  if (index >= msgs.length) return { code: 400, error: 'index out of range' };
+  if (msgs[index].role !== 'user') return { code: 400, error: 'only user messages can be deleted' };
+
+  const cap = capabilityOf(found.entry).level;
+  if (revert && cap !== 'full') return { code: 400, error: 'cannot revert code in a read-only session' };
+  if (revert && !msgs[index].headBefore) return { code: 400, error: 'no recorded restore point for this message — delete without revert' };
+  const lockPath = acquireFixLock(identifier);
+  if (!lockPath) return { code: 409, error: 'another operation holds the lock for this issue' };
+
+  try {
+    const cwd = cs0.cwd || resolveCwd(identifier, found.entry, () => {}).cwd;
+    const em = msgs[index];
+    if (revert && cap === 'full' && em.headBefore) {
+      const orig = headShas(cwd);
+      const failed = resetTo(cwd, em.headBefore);
+      if (failed.length) {
+        const restoreFailed = resetTo(cwd, orig);
+        return { code: 500, error: restoreFailed.length
+          ? `Could not rewind ${failed.join(', ')} and the restore also failed for ${restoreFailed.join(', ')} — resolve manually. Nothing was deleted.`
+          : `Could not rewind ${failed.join(', ')} (restore point unavailable); nothing was deleted. Delete without revert.` };
+      }
+    }
+    const forkSid = forkTruncated(cwd, em.sid, em.tLines);
+    const prevForks = cs0.forks || [];
+    updateChatState(identifier, (cs) => {
+      cs.messages = (cs.messages || []).slice(0, index);
+      pruneForks(cwd, prevForks, forkSid);
+      if (forkSid) { cs.forks = [forkSid]; cs.sessions.chat = forkSid; }
+      else { cs.forks = []; delete cs.sessions.chat; }
+      return cs;
+    });
+    return { code: 200, body: { deleted: true, forked: !!forkSid, remaining: index } };
+  } finally {
+    try { unlinkSync(lockPath); } catch { /* already gone */ }
+  }
+}
+
 function abortTurn(identifier) {
   const t = activeTurns.get(identifier);
   if (!t) return { code: 404, error: 'no turn is running for this issue' };
@@ -583,7 +785,7 @@ async function route(req, res) {
   }
   if (req.method === 'GET' && p === '/api/issues') { json(res, 200, { fixEnabled: fixEnabled(), issues: listIssues() }); return; }
 
-  const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/chat\/abort|\/chat|\/preview)?$/);
+  const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat|\/preview)?$/);
   if (!m) { json(res, 404, { error: 'not found' }); return; }
   const identifier = m[1].toUpperCase();
   const sub = m[2] || '';
@@ -609,6 +811,16 @@ async function route(req, res) {
   }
   if (req.method === 'POST' && sub === '/chat') {
     const r = startTurn(identifier, await readBody(req));
+    json(res, r.code, r.body || { error: r.error });
+    return;
+  }
+  if (req.method === 'POST' && sub === '/chat/edit') {
+    const r = startEditTurn(identifier, await readBody(req));
+    json(res, r.code, r.body || { error: r.error });
+    return;
+  }
+  if (req.method === 'POST' && sub === '/chat/delete') {
+    const r = startDeleteHistory(identifier, await readBody(req));
     json(res, r.code, r.body || { error: r.error });
     return;
   }

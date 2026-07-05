@@ -211,7 +211,7 @@ async function main() {
       log(`Blocked on external action: ${tr.blockedOn || tr.reason || '(unspecified)'} — holding (issue stays in ${issue.state?.name}).`);
       try { await setAutofixLabel(issue, g.blockedLabel); } catch (e) { log('Warn: could not set blocked label:', e.message); }
       await addComment(issue.id, `⏸️ **Auto-fix on hold — blocked on an external action**\n\n${tr.reason || ''}\n\n**Waiting on:** ${tr.blockedOn || '(see reason)'}\n\nNo fix was attempted and the issue was left in **${issue.state?.name || 'its current state'}**. Once the blocker is resolved, remove the \`${g.blockedLabel}\` label and the poller will pick this bug up on its next cycle.`);
-      updateState(issue.id, { identifier: id, outcome: 'blocked', blockedOn: tr.blockedOn || '', stages, at: new Date().toISOString() });
+      updateState(issue.id, { identifier: id, title: issue.title || '', outcome: 'blocked', blockedOn: tr.blockedOn || '', stages, at: new Date().toISOString() });
       return;
     }
     log('Fixability gate: fixable — proceeding.');
@@ -221,7 +221,7 @@ async function main() {
   // distinguish "autofix crashed on this issue" from "a human is working on this issue" — the
   // sweep only ever touches issues with a 'started' record. `recoveries` survives a retry so the
   // sweep can stop after one automatic recovery.
-  updateState(issue.id, { identifier: id, outcome: 'started', recoveries: state[issue.id]?.recoveries || 0, at: new Date().toISOString() });
+  updateState(issue.id, { identifier: id, title: issue.title || '', outcome: 'started', recoveries: state[issue.id]?.recoveries || 0, at: new Date().toISOString() });
 
   // Guard: move to In Progress so the poller won't pick the issue up again.
   try {
@@ -234,7 +234,7 @@ async function main() {
   if (!asm.ok) {
     log(`Failed to set up worktree (${asm.repo}):`, asm.err);
     await addComment(issue.id, `⚠️ Auto-fix could not start: failed to create the \`${asm.repo}\` worktree.\n\n\`\`\`\n${asm.err}\n\`\`\``);
-    updateState(issue.id, { identifier: id, outcome: 'setup_failed', at: new Date().toISOString() });
+    updateState(issue.id, { identifier: id, title: issue.title || '', outcome: 'setup_failed', at: new Date().toISOString() });
     return;
   }
   log(`Workspace ready at ${WT} on ${branch} (${config.repos.map((r) => r.key).join(', ')})`);
@@ -372,7 +372,7 @@ async function main() {
     }
     if (config.cleanupWorktreeOnSuccess) teardown(WT);
     updateState(issue.id, {
-      identifier: id, branch, triage,
+      identifier: id, title: issue.title || '', branch, triage,
       outcome: triage === 'green' ? 'fixed' : triage === 'rework' ? 'fixed_needs_human' : 'fixed_needs_manual_test',
       summary: marker.summary || '', prs, review: review || null, verify: verify || null, checks, stages,
       at: new Date().toISOString(),
@@ -387,7 +387,7 @@ async function main() {
     await addComment(issue.id, body);
     try { await setAutofixLabel(issue, config.triageLabels?.cannotFix); } catch (e) { log('Warn: could not set triage label:', e.message); }
     log(`No PR. Workspace kept at ${WT}.`);
-    updateState(issue.id, { identifier: id, branch, outcome: marker.status === 'cannot_fix' ? 'cannot_fix' : 'no_change', stages, at: new Date().toISOString() });
+    updateState(issue.id, { identifier: id, title: issue.title || '', branch, outcome: marker.status === 'cannot_fix' ? 'cannot_fix' : 'no_change', stages, at: new Date().toISOString() });
   }
 }
 
@@ -519,6 +519,34 @@ export function pushChanged(changed) {
   for (const c of changed) {
     const push = gitIn(c.wt, ['push', '-u', 'origin', 'HEAD']);
     if (push.status !== 0) { log(`Push failed for ${c.repo}: ${push.stderr}`); failed.push(c.repo); }
+  }
+  return failed;
+}
+
+// Current HEAD sha per repo in a worktree, keyed by repo.key. Snapshotted before a chat turn so
+// an edit can later rewind the branch to exactly this point.
+export function headShas(WT) {
+  const out = {};
+  for (const repo of config.repos) {
+    const r = gitIn(wtPathOf(WT, repo), ['rev-parse', 'HEAD']);
+    if (r.status === 0) out[repo.key] = (r.stdout || '').trim();
+  }
+  return out;
+}
+
+// Hard-reset each repo to a recorded sha and force-push (with lease). Repos already at the sha
+// are skipped. Returns the repo keys whose reset or push failed.
+export function resetTo(WT, shas) {
+  const failed = [];
+  for (const repo of config.repos) {
+    const sha = shas?.[repo.key];
+    if (!sha) continue;
+    const wt = wtPathOf(WT, repo);
+    const cur = (gitIn(wt, ['rev-parse', 'HEAD']).stdout || '').trim();
+    if (cur === sha) continue;
+    if (gitIn(wt, ['reset', '--hard', sha]).status !== 0) { failed.push(repo.key); continue; }
+    const push = gitIn(wt, ['push', '--force-with-lease', 'origin', 'HEAD']);
+    if (push.status !== 0) { log(`Force-push failed for ${repo.key}: ${push.stderr}`); failed.push(repo.key); }
   }
   return failed;
 }

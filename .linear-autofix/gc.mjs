@@ -14,6 +14,7 @@ import { resolveIssue } from './linear.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '..');
 const statePath = path.join(__dirname, 'state.json');
+const chatStatePath = path.join(__dirname, 'chat', 'chat-state.json');
 const previewScript = path.join(__dirname, 'preview', 'preview.mjs');
 const worktreesDir = path.resolve(agentRoot, config.worktreesDir);
 const DONE_TYPES = config.gcDoneStateTypes || ['completed', 'canceled'];
@@ -22,6 +23,19 @@ const log = (...a) => console.log('[gc]', ...a);
 const repoRootOf = (repo) => path.resolve(agentRoot, repo.root);
 const wtPathOf = (WT, repo) => (repo.mount === '.' ? WT : path.join(WT, repo.mount));
 const gitIn = (cwd, args) => spawnSync('git', args, { cwd, encoding: 'utf8' });
+
+// Delete the chat session-transcript forks minted for this issue (from message edits). Forks live
+// at ~/.claude/projects/<escaped-cwd>/<sid>.jsonl; only ids we created (cs.forks) are touched —
+// never the pipeline or original chat session. This is READ-ONLY on chat-state.json: the chat
+// server is its sole writer, so there is no cross-process lost-update race. The leftover chat-state
+// entry (a few KB, and invisible in the UI since the sidebar is driven by state.json) is harmless.
+function cleanChatForks(id) {
+  let cs; try { cs = JSON.parse(readFileSync(chatStatePath, 'utf8')); } catch { return; }
+  const entry = cs[id];
+  if (!entry?.cwd) return;
+  const projDir = path.join(process.env.HOME || '', '.claude', 'projects', entry.cwd.replace(/[^a-zA-Z0-9]/g, '-'));
+  for (const sid of entry.forks || []) rmSync(path.join(projDir, `${sid}.jsonl`), { force: true });
+}
 
 function removeWorktree(id) {
   const WT = path.join(worktreesDir, id);
@@ -61,6 +75,7 @@ async function main() {
     if (DONE_TYPES.includes(type)) {
       log(`${id} is "${issue.state.name}" (${type}) → removing worktree`);
       removeWorktree(id);
+      cleanChatForks(id);
       for (const k of Object.keys(state)) if (state[k].identifier === id) delete state[k];
       removed++;
     } else {
