@@ -27,6 +27,85 @@ const VERCEL_POLL_TIMEOUT_MS = 30_000;
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 2_000; // 2s, 4s, 8s
 
+// Hard ceiling for a single external-API network call inside withRetry. Node's
+// global fetch (undici) can otherwise wait up to the 15-min headersTimeout set in
+// httpClient.ts, so a v0 request that connects but never responds hangs the whole
+// generation with no output and no error (ENG-158). Bounding each attempt turns
+// that silent hang into a loud, retryable timeout. 5 minutes comfortably exceeds
+// any healthy single v0/GitHub call (generation progress is polled separately).
+const V0_ATTEMPT_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * Build a diagnostic message from an error, unwrapping the undici `cause` chain.
+ *
+ * Node's global fetch (undici) throws a bare `TypeError: fetch failed` and stashes
+ * the REAL reason (Connect Timeout, ECONNREFUSED, ENOTFOUND, TLS failure, …) on
+ * `error.cause` — often itself an `AggregateError` whose `errors[]` hold the codes.
+ * Persisting only `error.message` gave users a useless "fetch failed" with zero
+ * detail (ENG-135), and the same swallowing hid v0's HTTP error bodies behind a
+ * bare status (ENG-159). This walks message → code → cause → aggregate errors and
+ * joins the distinct pieces so callers surface WHY a call failed. Safe on any input.
+ */
+export function describeError(err: any): string {
+  const parts: string[] = [];
+  const seen = new Set<any>();
+  const push = (s: unknown) => {
+    if (typeof s === "string" && s.trim() && !parts.includes(s)) parts.push(s);
+  };
+
+  let cur: any = err;
+  let depth = 0;
+  while (cur && depth < 10) {
+    if (typeof cur === "string") {
+      push(cur);
+      break;
+    }
+    if (typeof cur === "object") {
+      if (seen.has(cur)) break;
+      seen.add(cur);
+      push(cur.message);
+      // Surface a distinct error code (e.g. ECONNRESET, UND_ERR_CONNECT_TIMEOUT)
+      // when it isn't already visible in the message text.
+      if (typeof cur.code === "string" && !parts.some((p) => p.includes(cur.code))) {
+        push(cur.code);
+      }
+      // AggregateError (multiple connect attempts) carries the real codes here.
+      if (Array.isArray(cur.errors)) {
+        for (const e of cur.errors) push(describeError(e));
+      }
+    }
+    cur = cur?.cause;
+    depth++;
+  }
+
+  return parts.join(" | ") || (err == null ? "Unknown error" : String(err));
+}
+
+/**
+ * Reject if `promise` has not settled within `ms`. The timeout error message
+ * contains "timed out" so withRetry treats it as retryable, and it surfaces
+ * clearly to the caller after retries are exhausted (never a silent hang).
+ * The underlying request is not aborted — undici's socket-level timeouts still
+ * apply — we just stop waiting on it so generation can fail loudly.
+ */
+export async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const e: any = new Error(`${label} timed out after ${Math.round(ms / 1000)}s`);
+      e.code = "V0_CALL_TIMEOUT";
+      reject(e);
+    }, ms);
+    // Don't keep the event loop alive solely for this guard timer.
+    if (typeof timer.unref === "function") timer.unref();
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 // Poll intervals for waiting on v0 generation to complete
 let v0PollIntervalsMs = [0, 15_000, 30_000, 45_000, 60_000];
 
@@ -49,40 +128,47 @@ export async function withRetry<T>(
   fn: () => Promise<T>,
   label: string,
   maxRetries = MAX_RETRIES,
-  baseDelayMs = BASE_DELAY_MS
+  baseDelayMs = BASE_DELAY_MS,
+  timeoutMs = V0_ATTEMPT_TIMEOUT_MS
 ): Promise<T> {
   let lastError: Error | undefined;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      return await fn();
+      // Bound each attempt so a request that never responds fails loudly instead
+      // of hanging until undici's 15-min headersTimeout (ENG-158).
+      return await withTimeout(Promise.resolve().then(fn), timeoutMs, label);
     } catch (err: any) {
       lastError = err;
+      // Unwrap the full failure reason (undici hides it on `err.cause`) so both the
+      // retry decision and the surfaced error see the REAL problem, not "fetch failed".
+      const detail = describeError(err);
       // The v0 SDK throws `Error("HTTP <status>: <body>")` on any non-2xx response.
       // Transient server-side failures (5xx) and rate limiting (429) should be
       // retried with backoff — a v0 500 is the documented symptom of a v0 outage
       // that often recovers within seconds.
-      const isRetryableHttpStatus = /\bHTTP (429|408|5\d\d)\b/.test(err.message || "");
+      const isRetryableHttpStatus = /\bHTTP (429|408|5\d\d)\b/.test(detail);
       const isRetryable =
         isRetryableHttpStatus ||
-        err.message?.includes("fetch failed") ||
-        err.message?.includes("ECONNREFUSED") ||
-        err.message?.includes("ENOTFOUND") ||
-        err.message?.includes("network error") ||
-        err.message?.includes("NetworkError") ||
-        err.message?.includes("ETIMEDOUT") ||
-        err.message?.includes("socket hang up") ||
+        /fetch failed|ECONNREFUSED|ENOTFOUND|network error|NetworkError|ETIMEDOUT|socket hang up|Connect Timeout|timed out|UND_ERR/i.test(
+          detail
+        ) ||
         err.code === "ECONNRESET" ||
         err.code === "UND_ERR_HEADERS_TIMEOUT";
 
       if (!isRetryable || attempt === maxRetries) {
-        console.error(`[V0 SERVICE] ${label} failed after ${attempt} attempt(s):`, err.message);
+        console.error(`[V0 SERVICE] ${label} failed after ${attempt} attempt(s):`, detail);
+        // Surface the unwrapped detail to the caller (who persists it as the page's
+        // errorMessage and returns it to the user) — never a bare "fetch failed"/422.
+        if (err && typeof err === "object" && detail && detail !== err.message) {
+          try { err.message = detail; } catch { /* frozen error — leave as-is */ }
+        }
         throw err;
       }
 
       const jitter = Math.random() * 500;
       const delay = baseDelayMs * Math.pow(2, attempt - 1) + jitter;
       console.warn(
-        `[V0 SERVICE] ${label} attempt ${attempt}/${maxRetries} failed (${err.message}), retrying in ${delay}ms...`
+        `[V0 SERVICE] ${label} attempt ${attempt}/${maxRetries} failed (${detail}), retrying in ${delay}ms...`
       );
       await new Promise((resolve) => setTimeout(resolve, delay));
     }

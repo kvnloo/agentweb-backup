@@ -1371,3 +1371,39 @@ export async function downloadSlackFile(urlPrivate: string): Promise<Buffer> {
   }
   return buffer;
 }
+
+// ---------------------------------------------------------------------------
+// User → channel resolution (moved from emma/slackMessageTools.ts so non-Emma
+// callers — e.g. shipNotifyService — can resolve "the customer's channel"
+// without pulling in the Emma tool registry).
+// ---------------------------------------------------------------------------
+
+/** The channels configured for a user (supports slackChannels array + legacy slackChannel). */
+export function getUserAllowedChannels(user: { slackChannels?: string[]; slackChannel?: string }): string[] {
+  if (user.slackChannels && user.slackChannels.length > 0) return user.slackChannels;
+  if (user.slackChannel) return [user.slackChannel];
+  return [];
+}
+
+/**
+ * Allowed channels for a user, falling back to the org's channel config for org members.
+ * Priority: personal channels → org.slackChannel (if set on org record) → org owner's user channels.
+ */
+export async function getEffectiveAllowedChannels(
+  user: { slackChannels?: string[]; slackChannel?: string; orgId?: string } | null | undefined,
+): Promise<string[]> {
+  const { userDb, orgDb } = await import('./db');
+  const personal = getUserAllowedChannels(user ?? {});
+  if (personal.length > 0) return personal;
+  if (user?.orgId) {
+    const org = await orgDb.getOrgById(user.orgId);
+    if (org?.slackChannel) return [org.slackChannel];
+    // Channels are typically stored on the org owner's user record, not the org record itself
+    if (org?.ownerUserId) {
+      const owner = await userDb.getUserById(org.ownerUserId);
+      const ownerChannels = getUserAllowedChannels(owner ?? {});
+      if (ownerChannels.length > 0) return ownerChannels;
+    }
+  }
+  return [];
+}

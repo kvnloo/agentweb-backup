@@ -102,6 +102,52 @@ export function isAgentRuntimeSpineEnabled(): boolean {
 }
 
 /**
+ * Foot-gun check (ENG-143, found by live-testing on env1): AGENT_FINALIZE_GUARD
+ * gates the finalize guard itself, but claim_mismatch verdicts only reach
+ * Dev-AW-LoopEvents (and therefore the 17:30 UTC cron) through the recorder,
+ * which is a no-op unless the runtime spine is SEPARATELY enabled. Flipping
+ * only AGENT_FINALIZE_GUARD gives you working correction behavior in chat
+ * with zero telemetry and zero error — this makes that silent gap loud.
+ *
+ * AGENT_FINALIZE_GUARD_SHADOW (detect + telemetry only, never rewrites the
+ * message — see agentModeService.ts) has the SAME dependency, but the
+ * consequence is worse: shadow mode's entire purpose is collecting
+ * claim_mismatch telemetry, so without the spine it does nothing at all
+ * except pay for judge-call latency/cost on every flagged reply.
+ *
+ * Enforce mode takes precedence in the returned message when both are set,
+ * since AGENT_FINALIZE_GUARD alone already implies shadow's checks are also
+ * running (runFinalizeGuard is the same call either way).
+ *
+ * Returns a warning string to log, or null when correctly configured (or when
+ * neither guard mode is on, in which case the spine is irrelevant to this).
+ */
+export function checkFinalizeGuardMisconfiguration(): string | null {
+  const enforceOn = process.env.AGENT_FINALIZE_GUARD === 'true';
+  const shadowOn = process.env.AGENT_FINALIZE_GUARD_SHADOW === 'true';
+  if (!enforceOn && !shadowOn) return null;
+  if (isAgentRuntimeSpineEnabled()) return null;
+
+  if (enforceOn) {
+    return (
+      'AGENT_FINALIZE_GUARD is enabled but the runtime spine is not '
+      + '(AGENT_RUNTIME_SPINE_ENABLED / AGENT_MODE_LOOP_ENABLED are both unset/false). '
+      + 'The finalize guard will still correct replies in chat, but claim_mismatch '
+      + 'verdicts will never be recorded, so the 17:30 UTC agent-mode cron will never '
+      + 'see them. Set AGENT_RUNTIME_SPINE_ENABLED=true to get truthfulness telemetry.'
+    );
+  }
+  return (
+    'AGENT_FINALIZE_GUARD_SHADOW is enabled but the runtime spine is not '
+    + '(AGENT_RUNTIME_SPINE_ENABLED / AGENT_MODE_LOOP_ENABLED are both unset/false). '
+    + 'Shadow mode NEVER rewrites the message it sees — its only output is '
+    + 'claim_mismatch telemetry — so with the spine off it is doing nothing but '
+    + 'paying judge-call latency/cost on every flagged reply for zero benefit. '
+    + 'Set AGENT_RUNTIME_SPINE_ENABLED=true or turn AGENT_FINALIZE_GUARD_SHADOW off.'
+  );
+}
+
+/**
  * Opt-in flag for the real Slack-reaction approval gate (INCREMENT C1).
  *
  * Production still runs `CaptureGate` (pollDecision() always pending, so
