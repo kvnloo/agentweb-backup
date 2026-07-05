@@ -19,6 +19,11 @@
   #side h1 { font-size: 15px; padding: 14px 16px 6px; }
   #side .sub { padding: 0 16px 10px; color: var(--dim); font-size: 12px; display: flex; justify-content: space-between; align-items: center; }
   #showAll { color: var(--accent); cursor: pointer; user-select: none; }
+  #searchWrap { padding: 0 12px 10px; position: relative; }
+  #search { width: 100%; box-sizing: border-box; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 7px 26px 7px 10px; font: inherit; font-size: 12px; }
+  #search:focus { outline: none; border-color: var(--accent); }
+  #searchClear { position: absolute; right: 20px; top: 50%; transform: translateY(-50%); color: var(--dim); cursor: pointer; font-size: 14px; line-height: 1; display: none; user-select: none; }
+  #searchClear:hover { color: var(--text); }
   #issues { overflow-y: auto; flex: 1; }
   .issue { padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer; }
   .issue:hover { background: var(--panel2); }
@@ -33,9 +38,18 @@
   .b-blue { background: var(--blue); animation: pulse 1.5s infinite; }
   @keyframes pulse { 50% { opacity: .5; } }
   .busydot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); animation: pulse 1.2s infinite; }
+  /* Thinking indicator (above composer while a turn runs) */
+  #thinking { display: none; align-items: center; gap: 9px; padding: 8px 20px; color: var(--dim); font-size: 12px; border-top: 1px solid var(--border); background: var(--panel); }
+  #thinking .dots { display: inline-flex; gap: 4px; }
+  #thinking .dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: bounce 1.2s infinite ease-in-out; }
+  #thinking .dots i:nth-child(2) { animation-delay: .16s; }
+  #thinking .dots i:nth-child(3) { animation-delay: .32s; }
+  @keyframes bounce { 0%, 75%, 100% { transform: translateY(0); opacity: .35; } 35% { transform: translateY(-5px); opacity: 1; } }
 
   /* Main */
-  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
+  #jumpDown { position: absolute; right: 24px; bottom: 96px; z-index: 5; display: none; background: var(--accent); color: #0d0f13; border: 0; border-radius: 16px; padding: 6px 14px; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,.45); }
+  #jumpDown:hover { filter: brightness(1.08); }
   #hdr { padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--panel); }
   #hdr .t { font-size: 15px; font-weight: 600; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   #hdr .meta { color: var(--dim); font-size: 12px; margin-top: 3px; display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
@@ -57,16 +71,45 @@
   .stage .arrow { color: var(--dim); font-size: 11px; transition: transform .12s; }
   .stage.open .arrow { transform: rotate(90deg); }
   .stage .smeta { margin-left: auto; color: var(--dim); font-size: 11px; white-space: nowrap; }
-  .stage .sbody { display: none; border-top: 1px solid var(--border); background: #10131a; padding: 10px 14px; white-space: pre-wrap; overflow-wrap: break-word; font-size: 12.5px; color: #c3cadb; max-height: 400px; overflow-y: auto; }
+  .stage .sbody { display: none; border-top: 1px solid var(--border); background: #10131a; padding: 10px 14px; overflow-wrap: break-word; font-size: 12.5px; color: #c3cadb; max-height: 400px; overflow-y: auto; }
   .stage.open .sbody { display: block; }
   .stage .nolog { color: var(--dim); font-style: italic; }
 
   .msg { max-width: 780px; padding: 10px 14px; border-radius: 10px; white-space: pre-wrap; overflow-wrap: break-word; }
-  .msg.user { background: var(--user); align-self: flex-end; }
+  .msg.user { background: var(--user); align-self: flex-end; position: relative; padding-right: 52px; }
+  /* Edit/delete icons live INSIDE the bubble's top-right (in the reserved right padding) so they
+     never depend on bubble width — a wide bubble used to push a left-positioned icon over the sidebar. */
+  .msg.user .edit, .msg.user .del { position: absolute; top: 7px; cursor: pointer; font-size: 13px; line-height: 1; opacity: 0; transition: opacity .12s; user-select: none; }
+  .msg.user .edit { right: 9px; }
+  .msg.user .del { right: 30px; }
+  .msg.user:hover .edit, .msg.user:hover .del { opacity: .55; }
+  .msg.user .edit:hover, .msg.user .del:hover { opacity: 1; }
+  .msg.user.editing { outline: 1px solid var(--accent); }
+  #editbar { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin-bottom: 8px; font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  #editbar .warn { color: var(--amber); }
+  #editbar button { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 3px 10px; font: inherit; font-size: 12px; cursor: pointer; }
+  #editbar button:hover { border-color: var(--accent); }
+  #editbar .spacer { margin-left: auto; }
   .msg.assistant { background: var(--panel2); align-self: flex-start; }
-  .msg code { background: #10131a; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
-  .msg pre { background: #10131a; padding: 10px; border-radius: 8px; overflow-x: auto; margin: 6px 0; white-space: pre; }
-  .msg pre code { background: none; padding: 0; }
+  /* Markdown styling applies in BOTH chat bubbles (.msg) and pipeline stage bodies (.sbody),
+     since both render md() output. Scoping to .msg only left stage reports with no spacing. */
+  :is(.msg, .sbody) code { background: #10131a; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+  :is(.msg, .sbody) pre { background: #10131a; padding: 10px; border-radius: 8px; overflow-x: auto; margin: 10px 0; white-space: pre; }
+  :is(.msg, .sbody) pre code { background: none; padding: 0; }
+  :is(.msg, .sbody) h3, :is(.msg, .sbody) h4 { font-size: 14px; font-weight: 600; line-height: 1.3; margin: 16px 0 6px; }
+  :is(.msg, .sbody) p { margin: 9px 0; }
+  :is(.msg, .sbody) ul, :is(.msg, .sbody) ol { margin: 9px 0; padding-left: 22px; }
+  :is(.msg, .sbody) li { margin: 3px 0; }
+  :is(.msg, .sbody) li > ul, :is(.msg, .sbody) li > ol { margin: 3px 0; }
+  :is(.msg, .sbody) blockquote { border-left: 2px solid var(--border); padding-left: 10px; margin: 10px 0; color: var(--dim); }
+  :is(.msg, .sbody) hr { border: 0; border-top: 1px solid var(--border); margin: 16px 0; }
+  :is(.msg, .sbody) table { border-collapse: collapse; margin: 10px 0; display: block; overflow-x: auto; }
+  :is(.msg, .sbody) th, :is(.msg, .sbody) td { border: 1px solid var(--border); padding: 4px 9px; text-align: left; }
+  :is(.msg, .sbody) th { background: #10131a; font-weight: 600; }
+  /* Trim the very first/last block's outer margin so content sits flush with the container padding
+     (one level of nesting, since assistant text lives inside a run <div>). */
+  :is(.msg, .sbody) > :first-child, :is(.msg, .sbody) > :first-child > :first-child { margin-top: 0; }
+  :is(.msg, .sbody) > :last-child, :is(.msg, .sbody) > :last-child > :last-child { margin-bottom: 0; }
   .sys { color: var(--dim); font-size: 12px; align-self: flex-start; padding: 0 6px; }
   .err { color: var(--red); font-size: 13px; align-self: flex-start; padding: 0 6px; }
   .tool { display: block; font-size: 12px; color: var(--dim); background: #12151d; border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; margin: 4px 0; cursor: pointer; max-width: 740px; }
@@ -83,8 +126,10 @@
   #composer .row { display: flex; gap: 10px; align-items: flex-end; }
   #input { flex: 1; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font: inherit; resize: none; min-height: 42px; max-height: 160px; }
   #input:focus { outline: 1px solid var(--accent); }
+  #input:disabled { opacity: .45; cursor: not-allowed; }
   #send { background: var(--accent); color: #0d0f13; border: 0; border-radius: 8px; padding: 10px 18px; font-weight: 600; cursor: pointer; }
   #send.stop { background: var(--red); color: #fff; }
+  #send:disabled { opacity: .45; cursor: not-allowed; }
   #hint { color: var(--dim); font-size: 11px; margin-top: 6px; }
   #hint .cap-full { color: var(--amber); }
 </style>
@@ -93,6 +138,10 @@
   <div id="side">
     <h1>🔧 Autofix Chat</h1>
     <div class="sub"><span id="count"></span><span id="showAll">show all</span></div>
+    <div id="searchWrap">
+      <input id="search" type="text" placeholder="Search ID, name or summary…" autocomplete="off" spellcheck="false" />
+      <span id="searchClear" title="Clear">×</span>
+    </div>
     <div id="issues"></div>
   </div>
   <div id="main">
@@ -103,7 +152,10 @@
     </div>
     <div id="empty">Select an issue to see what the automation did and chat about it.</div>
     <div id="chat" style="display:none"></div>
+    <button id="jumpDown">↓ New messages</button>
+    <div id="thinking"><span class="dots"><i></i><i></i><i></i></span><span id="thinking-label">Claude is working…</span></div>
     <div id="composer" style="display:none">
+      <div id="editbar" style="display:none"></div>
       <div class="row">
         <textarea id="input" rows="1" placeholder="Ask about this fix, or tell the agent what to change…"></textarea>
         <button id="send">Send</button>
@@ -117,15 +169,85 @@
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
-// Minimal markdown: fenced code, inline code, links, bold. Input is escaped first.
-function md(s) {
-  let h = esc(s);
-  h = h.replace(/```(\w*)\n([\s\S]*?)```/g, (_, l, c) => `<pre><code>${c}</code></pre>`);
-  h = h.replace(/`([^`\n]+)`/g, '<code>$1</code>');
-  h = h.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank">$1</a>');
-  h = h.replace(/(^|\s)(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank">$2</a>');
-  h = h.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+// Line-based markdown renderer. Everything is HTML-escaped BEFORE any transform (XSS-safe), code
+// (fenced + inline) is shielded from inline transforms, and only http/https/mailto URLs are linked.
+function safeHref(u) { return /^(https?:\/\/|mailto:)/i.test(u) ? u : null; }
+function mdInline(t) {
+  const codes = [];
+  let h = esc(t);
+  // Shield inline code behind a   sentinel (can't occur in real text) before other transforms.
+  h = h.replace(/`([^`]+)`/g, (_, c) => { codes.push(c); return ` ${codes.length - 1} `; });
+  h = h.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, txt, url) => { const s = safeHref(url); return s ? `<a href="${s}" target="_blank" rel="noopener noreferrer">${txt}</a>` : txt; });
+  h = h.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
+  h = h.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+  h = h.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<i>$2</i>');
+  h = h.replace(/(^|[\s(])_([^_\n]+)_(?=[\s).,!?]|$)/g, '$1<i>$2</i>');
+  h = h.replace(/ (\d+) /g, (_, n) => `<code>${codes[+n]}</code>`);
   return h;
+}
+// A whole message that is one JSON value (optionally after a LABEL: prefix) -> pretty-print it.
+function tryJsonBlock(s) {
+  const m = String(s).match(/^\s*([A-Za-z_][A-Za-z0-9_]*\s*:)?\s*([[{][\s\S]*[\]}])\s*$/);
+  if (!m) return null;
+  try { const v = JSON.parse(m[2]); if (v && typeof v === 'object') return (m[1] ? m[1].replace(/\s*$/, '') + '\n' : '') + JSON.stringify(v, null, 2); } catch { /* not JSON */ }
+  return null;
+}
+const codeBlock = (lang, body) => `<pre><code${lang ? ` class="language-${esc(lang)}"` : ''}>${esc(body)}</code></pre>`;
+function md(s) {
+  const jb = tryJsonBlock(s);
+  if (jb != null) return codeBlock('json', jb);
+  const lines = String(s).replace(/\r\n?/g, '\n').split('\n');
+  let html = '', inCode = false, codeLang = '', code = [], list = null, para = [];
+  const flushPara = () => { if (para.length) { html += `<p>${para.join('<br>')}</p>`; para = []; } };
+  const flushList = () => { if (list) { html += `</${list}>`; list = null; } };
+  const isSep = (l) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/.test(l);
+  const splitRow = (l) => l.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const open = !inCode && line.match(/^```(\w*)\s?(.*)$/);
+    if (open) {
+      const oneLine = open[2].match(/^(.*?)```\s*$/);
+      if (oneLine) { flushPara(); flushList(); html += codeBlock(open[1], oneLine[1]); continue; }
+      flushPara(); flushList(); inCode = true; codeLang = open[1]; code = [];
+      if (open[2]) code.push(open[2]);
+      continue;
+    }
+    if (inCode) {
+      if (/^```\s*$/.test(line)) { html += codeBlock(codeLang, code.join('\n')); inCode = false; }
+      else code.push(line);
+      continue;
+    }
+    if (/^\s{0,3}(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { flushPara(); flushList(); html += '<hr>'; continue; }
+    if (line.includes('|') && i + 1 < lines.length && isSep(lines[i + 1])) {
+      flushPara(); flushList();
+      const headers = splitRow(line);
+      const aligns = splitRow(lines[i + 1]).map((c) => (/^:-+:$/.test(c) ? 'center' : /-+:$/.test(c) ? 'right' : /^:-+/.test(c) ? 'left' : ''));
+      i++;
+      let body = '';
+      while (i + 1 < lines.length && lines[i + 1].includes('|') && lines[i + 1].trim() !== '') {
+        const cells = splitRow(lines[++i]);
+        body += '<tr>' + cells.map((c, k) => `<td${aligns[k] ? ` style="text-align:${aligns[k]}"` : ''}>${mdInline(c)}</td>`).join('') + '</tr>';
+      }
+      const head = '<tr>' + headers.map((c, k) => `<th${aligns[k] ? ` style="text-align:${aligns[k]}"` : ''}>${mdInline(c)}</th>`).join('') + '</tr>';
+      html += `<table>${head}${body}</table>`;
+      continue;
+    }
+    let m;
+    if ((m = line.match(/^(#{1,6})\s+(.*)$/))) { flushPara(); flushList(); const l = m[1].length > 3 ? 4 : 3; html += `<h${l}>${mdInline(m[2])}</h${l}>`; continue; }
+    const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+    const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (ul || ol) { flushPara(); const want = ul ? 'ul' : 'ol'; if (list !== want) { flushList(); html += `<${want}>`; list = want; } html += `<li>${mdInline((ul || ol)[1])}</li>`; continue; }
+    if ((m = line.match(/^>\s?(.*)$/))) { flushPara(); flushList(); html += `<blockquote>${mdInline(m[1])}</blockquote>`; continue; }
+    if (line.trim() === '') { flushPara(); flushList(); continue; }
+    // A standalone JSON line (e.g. a `LABEL: {…}` agent marker embedded in a prose transcript)
+    // pretty-prints too — not just a whole-message JSON body.
+    const jl = tryJsonBlock(line);
+    if (jl != null) { flushPara(); flushList(); html += codeBlock('json', jl); continue; }
+    flushList(); para.push(mdInline(line));
+  }
+  if (inCode) html += codeBlock(codeLang, code.join('\n'));
+  flushPara(); flushList();
+  return html;
 }
 
 const OUTCOME_BADGE = {
@@ -141,7 +263,9 @@ const rel = (iso) => {
   return m < 60 ? `${m}m` : m < 1440 ? `${Math.round(m/60)}h` : `${Math.round(m/1440)}d`;
 };
 
-const S = { issues: [], sel: null, detail: null, showAll: false, busy: false, es: null, curBubble: null };
+const fmtAt = (iso) => { try { return new Date(iso).toLocaleString(); } catch { return ''; } };
+
+const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true };
 
 // ---------- sidebar ----------
 let lastIssuesJson = '';
@@ -150,27 +274,36 @@ async function loadIssues() {
     const r = await (await fetch('/api/issues')).json();
     S.issues = r.issues || [];
     // Skip DOM churn when nothing changed (also keeps click targets stable).
-    const j = JSON.stringify(S.issues) + S.showAll + S.sel;
+    const j = JSON.stringify(S.issues) + S.showAll + S.search + S.sel;
     if (j !== lastIssuesJson) { lastIssuesJson = j; renderIssues(); }
   } catch { /* server briefly down */ }
 }
 function renderIssues() {
-  const list = S.showAll ? S.issues : S.issues.filter((i) => i.active);
-  $('count').textContent = `${list.length} issue${list.length === 1 ? '' : 's'}${S.showAll ? '' : ' active'}`;
+  const q = S.search.trim().toLowerCase();
+  // When searching, look across ALL issues (not just the active set) so a resolved issue isn't
+  // hidden by the active-only filter — otherwise you'd get "no match" for an issue that exists.
+  let list = q ? S.issues : (S.showAll ? S.issues : S.issues.filter((i) => i.active));
+  if (q) list = list.filter((i) => `${i.identifier} ${i.summary || ''} ${i.title || ''} ${i.branch || ''}`.toLowerCase().includes(q));
+  $('count').textContent = `${list.length} issue${list.length === 1 ? '' : 's'}${q ? ' matched' : S.showAll ? '' : ' active'}`;
   $('showAll').textContent = S.showAll ? 'active only' : 'show all';
+  $('searchClear').style.display = S.search ? 'block' : 'none';
+  const empty = q ? `No issues match “${esc(S.search.trim())}”.` : 'Nothing active on this machine.';
   $('issues').innerHTML = list.map((i) => `
     <div class="issue ${i.identifier === S.sel ? 'sel' : ''}" data-id="${i.identifier}">
       <div class="row1"><span class="id">${esc(i.identifier)}</span>${badge(i.outcome)}
         ${i.chat.busy ? '<span class="busydot"></span>' : ''}<span class="time">${rel(i.at)}</span></div>
-      <div class="summ">${esc(i.summary || i.branch || '')}</div>
-    </div>`).join('') || '<div style="padding:16px;color:var(--dim)">Nothing active on this machine.</div>';
+      <div class="summ">${esc(i.summary || i.title || i.branch || '')}</div>
+    </div>`).join('') || `<div style="padding:16px;color:var(--dim)">${empty}</div>`;
   for (const el of $('issues').children) el.onclick = () => el.dataset.id && select(el.dataset.id);
 }
 $('showAll').onclick = () => { S.showAll = !S.showAll; lastIssuesJson = ''; renderIssues(); };
+$('search').addEventListener('input', (ev) => { S.search = ev.target.value; lastIssuesJson = ''; renderIssues(); });
+$('searchClear').onclick = () => { S.search = ''; $('search').value = ''; $('search').focus(); lastIssuesJson = ''; renderIssues(); };
 
 // ---------- selection / detail ----------
 async function select(id) {
-  S.sel = id; S.curBubble = null;
+  S.sel = id; S.curBubble = null; S.stick = true;
+  clearBars();
   lastIssuesJson = ''; renderIssues();
   $('empty').style.display = 'none';
   $('hdr').style.display = ''; $('chat').style.display = ''; $('composer').style.display = '';
@@ -186,6 +319,7 @@ async function select(id) {
     openEvents(id);
   } catch { $('h-meta').textContent = 'failed to load'; }
   updateHint();
+  if (!S.busy) $('input').focus(); // put the cursor in the composer, ready to type
 }
 function renderHeader(d) {
   const e = d.entry || {};
@@ -255,11 +389,28 @@ function renderPipeline(d) {
 
 // ---------- transcript rendering ----------
 const chatEl = () => $('chat');
-const scroll = () => { chatEl().scrollTop = chatEl().scrollHeight; };
-function addUser(text) {
+const nearBottom = () => { const c = chatEl(); return c.scrollHeight - c.scrollTop - c.clientHeight < 80; };
+const scrollBottom = () => { chatEl().scrollTop = chatEl().scrollHeight; S.stick = true; $('jumpDown').style.display = 'none'; };
+// Append-time scroll: only follow new content if the user is already at the bottom; otherwise leave
+// their scroll position alone and surface a "jump to latest" pill so they can catch up on demand.
+const scroll = () => { if (S.stick) chatEl().scrollTop = chatEl().scrollHeight; else $('jumpDown').style.display = 'block'; };
+function addUser(text, index) {
   const el = document.createElement('div');
   el.className = 'msg user';
+  el.dataset.text = text; // raw text for reliable dedup (textContent includes the ✏️ + markdown)
   el.innerHTML = md(text);
+  if (index != null) {
+    el.dataset.idx = index;
+    const ed = document.createElement('span');
+    ed.className = 'edit'; ed.title = 'Edit this message & rewrite the conversation from here';
+    ed.textContent = '✏️';
+    ed.onclick = () => beginEdit(index, text);
+    const del = document.createElement('span');
+    del.className = 'del'; del.title = 'Delete this message and everything below it';
+    del.textContent = '🗑';
+    del.onclick = () => beginDelete(index);
+    el.appendChild(ed); el.appendChild(del);
+  }
   chatEl().appendChild(el); scroll();
   return el;
 }
@@ -280,11 +431,16 @@ function addTool(bubble, t) {
   el.innerHTML = `<span class="st">▸</span><b>${esc(t.name)}</b><span class="inp">${esc(t.input || '')}</span>`;
   el.onclick = () => el.classList.toggle('open');
   bubble.appendChild(el); scroll();
+  bubble._run = null; // end the current text run so following text starts a fresh md() block
 }
+// Accumulate streamed text into ONE content element per run and re-render md() over the whole run,
+// so a code fence (or any multi-line construct) split across chunks renders correctly. A tool chip
+// between chunks ends the run (via addTool) so interleaving order is preserved.
 function addText(bubble, text) {
-  const el = document.createElement('div');
-  el.innerHTML = md(text);
-  bubble.appendChild(el); scroll();
+  if (!bubble._run) { bubble._run = document.createElement('div'); bubble._runRaw = ''; bubble.appendChild(bubble._run); }
+  bubble._runRaw += text;
+  bubble._run.innerHTML = md(bubble._runRaw);
+  scroll();
 }
 function addFixCard(fix) {
   const el = document.createElement('div');
@@ -298,16 +454,33 @@ function addFixCard(fix) {
 function renderAll(d) {
   chatEl().innerHTML = '';
   renderPipeline(d);
-  for (const m of d.chat?.messages || []) {
-    if (m.role === 'user') addUser(m.text);
+  (d.chat?.messages || []).forEach((m, i) => {
+    if (m.role === 'user') { const el = addUser(m.text, i); if (m.at) el.title = fmtAt(m.at); }
     else {
       const b = newAssistant();
+      if (m.at) b.title = fmtAt(m.at);
       for (const t of m.tools || []) addTool(b, t);
       addText(b, m.text || '');
       if (m.fix) addFixCard(m.fix);
     }
-  }
-  scroll();
+  });
+  scrollBottom();
+}
+
+// After a turn ends, pull the authoritative message list so edit indices, the ✏️ buttons, and the
+// commit-warning check reflect what the server persisted (the streamed DOM doesn't update
+// S.detail.chat.messages). Skip the re-render if a new turn started or the user is mid-edit, but
+// still refresh the data so the next edit decision is made against current state.
+async function refreshDetail(id) {
+  if (!id) return;
+  try {
+    const d = await (await fetch(`/api/issues/${id}`)).json();
+    if (S.sel !== id || S.busy) return; // a newer turn owns the view now
+    S.detail = d;
+    // Re-render (to sync ✏️/🗑 + fresh data) only when at the bottom and not mid-edit — otherwise
+    // rebuilding the DOM would yank a reader who scrolled up. Data is still refreshed either way.
+    if (!S.editing && S.stick) renderAll(d);
+  } catch { /* keep the current view */ }
 }
 
 // ---------- SSE ----------
@@ -337,7 +510,7 @@ function handleEvent(e) {
       S.curBubble = null; setBusy(true);
       const msgs = chatEl().querySelectorAll('.msg.user');
       const last = msgs[msgs.length - 1];
-      if (!last || last.textContent !== e.message) addUser(e.message);
+      if (!last || last.dataset.text !== e.message) addUser(e.message);
       break;
     }
     case 'init': break;
@@ -345,14 +518,17 @@ function handleEvent(e) {
     case 'text':
       if (!S.curBubble) S.curBubble = newAssistant();
       addText(S.curBubble, e.text);
+      setThinking('Claude is responding…');
       break;
     case 'tool':
       if (!S.curBubble) S.curBubble = newAssistant();
       addTool(S.curBubble, e);
+      setThinking('Working… (running tools)');
       break;
     case 'tool_result': {
       const chip = chatEl().querySelector(`.tool[data-tid="${e.id}"] .st`);
       if (chip) chip.textContent = e.ok ? '✓' : '✗';
+      setThinking('Claude is thinking…');
       break;
     }
     case 'result': addSys(`⏱ ${e.turns ?? '?'} turns · ${e.ms ? Math.round(e.ms/1000)+'s' : ''}`, 'turnmeta'); break;
@@ -363,7 +539,7 @@ function handleEvent(e) {
       break;
     case 'error': addSys('⚠ ' + e.error, 'err'); break;
     case 'aborted': addSys('⏹ aborted', 'err'); break;
-    case 'done': S.curBubble = null; setBusy(false); loadIssues(); break;
+    case 'done': S.curBubble = null; setBusy(false); loadIssues(); refreshDetail(S.sel); break;
   }
 }
 
@@ -372,7 +548,10 @@ function setBusy(b) {
   S.busy = b;
   $('send').textContent = b ? 'Stop' : 'Send';
   $('send').classList.toggle('stop', b);
+  if (b) setThinking('Claude is working…');
+  $('thinking').style.display = b ? 'flex' : 'none';
 }
+function setThinking(label) { $('thinking-label').textContent = label; }
 function updateHint() {
   const cap = S.detail?.capability;
   if (!cap) { $('hint').textContent = ''; return; }
@@ -381,14 +560,152 @@ function updateHint() {
     : `Read-only — ${esc(cap.reason || '')}. The agent can answer anything but cannot change code here.`;
 }
 
+// ---------- edit & rewrite history ----------
+function droppedHasCommits(index) {
+  return (S.detail?.chat?.messages || []).slice(index + 1).some((m) => m && m.fix);
+}
+function highlightTarget(index) {
+  for (const el of chatEl().querySelectorAll('.msg.user.editing')) el.classList.remove('editing');
+  const t = chatEl().querySelector(`.msg.user[data-idx="${index}"]`);
+  if (t) t.classList.add('editing');
+}
+function beginEdit(index, text) {
+  if (S.busy) return;
+  S.deleting = null; S.editing = { index };
+  $('input').value = text; autosize(); $('input').focus();
+  highlightTarget(index);
+  renderEditBar();
+}
+function beginDelete(index) {
+  if (S.busy) return;
+  S.editing = null; S.deleting = { index };
+  highlightTarget(index);
+  // Delete doesn't use the composer, so disable it — otherwise it looks usable but Send is a no-op.
+  $('input').disabled = true; $('send').disabled = true;
+  $('input').placeholder = 'Confirm or cancel the delete above…';
+  renderDeleteBar();
+}
+const COMPOSER_PLACEHOLDER = 'Ask about this fix, or tell the agent what to change…';
+// Clears whichever action bar is open. Only wipes the composer if we were editing (delete never
+// touches the composer, so cancelling a delete must not clobber text the user was typing).
+function clearBars() {
+  const wasEditing = !!S.editing;
+  S.editing = null; S.deleting = null;
+  $('editbar').style.display = 'none'; $('editbar').innerHTML = '';
+  for (const el of chatEl().querySelectorAll('.msg.user.editing')) el.classList.remove('editing');
+  $('input').disabled = false; $('send').disabled = false;
+  $('input').placeholder = COMPOSER_PLACEHOLDER;
+  if (wasEditing) { $('input').value = ''; autosize(); }
+}
+function renderEditBar(mode) {
+  const bar = $('editbar');
+  if (!S.editing) { bar.style.display = 'none'; bar.innerHTML = ''; return; }
+  const msgs = S.detail?.chat?.messages || [];
+  const below = Math.max(0, msgs.length - S.editing.index - 1);
+  bar.style.display = 'flex';
+  if (mode === 'confirm') {
+    // Only offer the code-revert when the edited message actually has a recorded restore point
+    // (full-access turns from this feature onward); otherwise the server can't rewind and would 400.
+    const canRevert = !!msgs[S.editing.index]?.headBefore;
+    bar.innerHTML = `<span class="warn">⚠ Some of the ${below} message(s) below already pushed commits to the PR — rewriting the chat won't remove them.</span>`
+      + `<span class="spacer"></span>${canRevert ? '<button data-a="revert">Revert code + chat</button>' : ''}<button data-a="just">Just chat</button><button data-a="cancel">Cancel</button>`;
+    if (canRevert) bar.querySelector('[data-a="revert"]').onclick = () => doEditSend(true);
+    bar.querySelector('[data-a="just"]').onclick = () => doEditSend(false);
+  } else {
+    bar.innerHTML = `✏️ Editing — sending rewrites the conversation and removes the ${below} message(s) below it.`
+      + `<span class="spacer"></span><button data-a="cancel">Cancel</button>`;
+  }
+  bar.querySelector('[data-a="cancel"]').onclick = clearBars;
+}
+// Confirmation bar for deleting a message + everything below it (no re-run). Mirrors edit's
+// commit warning: if dropped turns pushed code, offer to also rewind (when a restore point exists).
+function renderDeleteBar() {
+  const bar = $('editbar');
+  if (!S.deleting) { bar.style.display = 'none'; bar.innerHTML = ''; return; }
+  const msgs = S.detail?.chat?.messages || [];
+  const i = S.deleting.index;
+  const below = Math.max(0, msgs.length - i - 1);
+  const committed = msgs.slice(i + 1).some((m) => m && m.fix);
+  const canRevert = S.detail?.capability?.level === 'full' && committed && !!msgs[i]?.headBefore;
+  bar.style.display = 'flex';
+  bar.innerHTML = (committed
+    ? `<span class="warn">⚠ Delete this message and the ${below} below it? Some pushed commits won't be removed.</span>`
+    : `🗑 Delete this message and the ${below} below it? The agent will forget them.`)
+    + `<span class="spacer"></span>${canRevert ? '<button data-a="delrevert">Delete + revert code</button>' : ''}`
+    + `<button data-a="del">${committed ? 'Delete (chat only)' : 'Delete'}</button><button data-a="cancel">Cancel</button>`;
+  if (canRevert) bar.querySelector('[data-a="delrevert"]').onclick = () => doDelete(true);
+  bar.querySelector('[data-a="del"]').onclick = () => doDelete(false);
+  bar.querySelector('[data-a="cancel"]').onclick = clearBars;
+}
+async function doDelete(revert) {
+  if (!S.deleting || !S.sel) return;
+  const index = S.deleting.index;
+  const r = await fetch(`/api/issues/${S.sel}/chat/delete`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ index, revert }),
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    addSys('⚠ ' + (err.error || `delete failed (${r.status})`), 'err');
+    return; // keep the bar so the user can retry or cancel
+  }
+  if (S.detail?.chat?.messages) S.detail.chat.messages = S.detail.chat.messages.slice(0, index);
+  clearBars();
+  if (S.detail) renderAll(S.detail);
+  refreshDetail(S.sel); // sync ✏️/🗑 buttons and state with the server
+}
+async function doEditSend(revert) {
+  if (!S.editing || !S.sel) return;
+  const index = S.editing.index;
+  const message = $('input').value.trim();
+  if (!message) return;
+  const backup = S.detail?.chat?.messages ? S.detail.chat.messages.slice() : null;
+
+  // Rewrite the UI to the new state BEFORE sending, so the streamed turn_start (which can only
+  // arrive after the server gets this request) sees the edited message already in place and skips
+  // re-adding it. Doing this after the await races with turn_start and wipes the message.
+  if (S.detail?.chat) {
+    S.detail.chat.messages = S.detail.chat.messages.slice(0, index);
+    S.detail.chat.messages.push({ role: 'user', text: message });
+    S.curBubble = null;
+    renderAll(S.detail);
+  }
+  clearBars();
+  setBusy(true);
+
+  const r = await fetch(`/api/issues/${S.sel}/chat/edit`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ index, message, revert }),
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    addSys('⚠ ' + (err.error || `edit failed (${r.status})`), 'err');
+    if (backup && S.detail?.chat) { S.detail.chat.messages = backup; renderAll(S.detail); } // restore
+    setBusy(false);
+  }
+}
+
 async function send() {
   if (S.busy) { // Stop
     await fetch(`/api/issues/${S.sel}/chat/abort`, { method: 'POST' });
     return;
   }
+  if (S.deleting) return; // a delete confirmation is open — use its buttons, don't send a new message
+  if (S.editing) {
+    const message = $('input').value.trim();
+    if (!message) return;
+    const full = S.detail?.capability?.level === 'full';
+    if (full && droppedHasCommits(S.editing.index)) { renderEditBar('confirm'); return; }
+    await doEditSend(false);
+    return;
+  }
   const message = $('input').value.trim();
   if (!message || !S.sel) return;
   $('input').value = ''; autosize();
+  // Show the bubble immediately (like edit does) so it doesn't vanish into limbo until turn_start.
+  // turn_start's dataset.text dedup then skips re-adding it.
+  const bubble = addUser(message);
+  setBusy(true);
   const r = await fetch(`/api/issues/${S.sel}/chat`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ message }),
@@ -396,15 +713,18 @@ async function send() {
   if (!r.ok) {
     const err = await r.json().catch(() => ({}));
     addSys('⚠ ' + (err.error || `request failed (${r.status})`), 'err');
-    $('input').value = message;
-  } else {
-    setBusy(true);
+    bubble.remove();
+    $('input').value = message; autosize();
+    setBusy(false);
   }
 }
 $('send').onclick = send;
 $('input').addEventListener('keydown', (ev) => {
   if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); send(); }
 });
+// Follow-new-content behaviour: track whether the user is at the bottom; hide the pill once caught up.
+$('chat').addEventListener('scroll', () => { S.stick = nearBottom(); if (S.stick) $('jumpDown').style.display = 'none'; });
+$('jumpDown').onclick = () => scrollBottom();
 function autosize() { const i = $('input'); i.style.height = 'auto'; i.style.height = Math.min(i.scrollHeight, 160) + 'px'; }
 $('input').addEventListener('input', autosize);
 
