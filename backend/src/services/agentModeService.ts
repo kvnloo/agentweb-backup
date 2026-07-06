@@ -17327,9 +17327,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       ].filter(Boolean) as string[];
 
       if (knowledgeBases.length === 0) {
+        // ENG-173: an explicit Google Drive query (kb_type=google-drive) that returns
+        // empty reflects only the READ-ONLY shared-folder path (service account) — it
+        // says nothing about Docs/Sheets CREATE/EDIT, a separate OAuth-backed skill.
+        // Point the model to the catalog so empty doesn't read as "Docs unavailable".
+        // Scoped to the explicit drive query: an unfiltered/other empty gets the plain
+        // message (this path lists all sources, and nudging Docs there is off-topic).
+        const message = options?.kb_type === 'google-drive'
+          ? 'No Google Drive shared folders found here — this lists only READ-ONLY shared folders (surfaced via the service account). Creating and editing Google Docs & Sheets is a SEPARATE capability — call list_available_skills to find and install the skill that provides Google Docs / Sheets create/edit tools.'
+          : 'No knowledge bases found';
         return {
           success: true,
-          message: 'No knowledge bases found',
+          message,
           knowledge_bases: [],
           totalKnowledgeBases: 0,
           totalFiles: 0,
