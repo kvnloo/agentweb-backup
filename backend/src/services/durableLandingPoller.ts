@@ -19,6 +19,8 @@
 import AWS from "aws-sdk";
 import type { GeneratedLandingPage } from "./v0Service";
 import { deliverCompletion, deliverStuckFailure, STUCK_CEILING_MS } from "./durableLandingService";
+import { isCronEnabled } from "../utils/instanceState";
+import { cronJobRegistry } from "../utils/cronJobRegistry";
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || "us-west-2",
@@ -86,7 +88,8 @@ export function startDurableLandingPoller(intervalMs = 5 * 60 * 1000): void {
   if (process.env.DURABLE_LANDING_GENERATION !== "true") return;
   if (pollerHandle) return;
   pollerHandle = setInterval(() => {
-    runDurableLandingPollerOnce().catch((err) =>
+    if (!isCronEnabled()) return;
+    cronJobRegistry.track("durableLandingPoller", runDurableLandingPollerOnce()).catch((err) =>
       console.error("[DURABLE LANDING POLLER] sweep failed:", err)
     );
   }, intervalMs);

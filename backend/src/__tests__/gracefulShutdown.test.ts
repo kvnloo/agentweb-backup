@@ -3,6 +3,7 @@
  *   1. instanceState — isCronEnabled / disableCron
  *   2. GenerateMarketingResponseWorkerService — drain-aware shutdown
  *   3. agentModeController — 503 guard when cron is disabled
+ *   4. cronJobRegistry — drains concurrently with the worker shutdown
  */
 
 // --------------------------------------------------------------------------
@@ -162,5 +163,35 @@ describe('isCronEnabled 503 guard — pattern verification', () => {
 
     await guardHandler({}, res);
     expect(res.status).not.toHaveBeenCalled();
+  });
+});
+
+// --------------------------------------------------------------------------
+// 4. cronJobRegistry — drains concurrently with the worker shutdown
+//
+// gracefulShutdown() runs `Promise.all([workerService.shutdown(), cronJobRegistry.drain()])`
+// rather than awaiting them sequentially. This proves the two waits overlap —
+// total elapsed time is the MAX of the two drains, not their sum — so the
+// unified drain step stays within the existing 10-min ceiling / 13-min
+// force-exit budget instead of doubling it.
+// --------------------------------------------------------------------------
+describe('cronJobRegistry drains concurrently with the worker shutdown', () => {
+  it('takes the max of the two drain durations, not the sum, under Promise.all', async () => {
+    const { CronJobRegistry } = require('../utils/cronJobRegistry');
+    const registry = new CronJobRegistry();
+
+    // Fake "worker shutdown" — resolves after 150ms.
+    const fakeWorkerShutdown = () => new Promise((resolve) => setTimeout(resolve, 150));
+
+    // Fake in-flight cron job — resolves after 250ms (the longer of the two).
+    registry.track('slowJob', new Promise((resolve) => setTimeout(resolve, 250)));
+
+    const start = Date.now();
+    await Promise.all([fakeWorkerShutdown(), registry.drain(5000, 20)]);
+    const elapsed = Date.now() - start;
+
+    // If the two ran sequentially this would be ~400ms; concurrently it's ~250ms.
+    expect(elapsed).toBeGreaterThanOrEqual(240);
+    expect(elapsed).toBeLessThan(400);
   });
 });
