@@ -48,7 +48,10 @@
 
   /* Main */
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
-  #jumpDown { position: absolute; right: 24px; bottom: 96px; z-index: 5; display: none; background: var(--accent); color: #0d0f13; border: 0; border-radius: 16px; padding: 6px 14px; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,.45); }
+  /* Holds the chat scroll area + the jump pill, so the pill anchors to the BOTTOM OF THE CHAT
+     (just above the thinking/composer stack) rather than a fixed distance from the window. */
+  #chatwrap { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
+  #jumpDown { position: absolute; left: 50%; transform: translateX(-50%); bottom: 14px; z-index: 5; display: none; background: var(--accent); color: #0d0f13; border: 0; border-radius: 16px; padding: 6px 14px; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,.45); }
   #jumpDown:hover { filter: brightness(1.08); }
   #hdr { padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--panel); }
   #hdr .t { font-size: 15px; font-weight: 600; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
@@ -159,9 +162,11 @@
       <div class="meta" id="h-meta"></div>
       <div class="meta" id="h-preview"></div>
     </div>
-    <div id="empty">Select an issue to see what the automation did and chat about it.</div>
-    <div id="chat" style="display:none"></div>
-    <button id="jumpDown">↓ New messages</button>
+    <div id="chatwrap">
+      <div id="empty">Select an issue to see what the automation did and chat about it.</div>
+      <div id="chat" style="display:none"></div>
+      <button id="jumpDown">↓ New messages</button>
+    </div>
     <div id="thinking"><span class="dots"><i></i><i></i><i></i></span><span id="thinking-label">Claude is working…</span></div>
     <div id="voice"><span class="mic"></span><span>🎤 Listening… — release space to stop · Esc to cancel</span></div>
     <div id="composer" style="display:none">
