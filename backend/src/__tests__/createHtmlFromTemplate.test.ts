@@ -607,5 +607,29 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(result.message).toContain('Missing required array variables');
       expect(result.message).toContain('features_n');
     });
+
+    // ENG-46 sibling path: this method is reached with the SESSION's model, so a
+    // stale/removed id (e.g. gpt-5.1) must fall back to a served model rather than
+    // throwing an opaque "Invalid model" inside callLLM.
+    it('falls back to a served model when the session pins a retired model id', async () => {
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        'gpt-5.1', // retired id — no longer in the allow-list
+        'test-template-id',
+        { title: 'Test Title', content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      // The substitution still completes instead of failing.
+      expect(result.success).toBe(true);
+      // callLLM was invoked with the fallback default — never the retired id.
+      const callLLMSpy = agentModeService.callLLM as jest.Mock;
+      expect(callLLMSpy).toHaveBeenCalled();
+      for (const call of callLLMSpy.mock.calls) {
+        expect(call[0]).not.toBe('gpt-5.1');
+      }
+      expect(callLLMSpy.mock.calls[0][0]).toBe(agentModeService.default_model);
+    });
   });
 });

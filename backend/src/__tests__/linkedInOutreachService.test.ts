@@ -39,6 +39,10 @@ describe('LinkedInOutreachService', () => {
     linkedInOutreachService.cachedApiKey = null;
     // @ts-ignore
     linkedInOutreachService.client = null;
+    // Reset the per-account invitation cooldown breaker so tests don't leak state
+    // (the service is a module singleton shared across tests).
+    // @ts-ignore
+    linkedInOutreachService.invitationCooldownUntil = new Map();
 
     mockGetUnipileCredentials.mockResolvedValue({
       dsn: 'api.unipile.com',
@@ -368,6 +372,104 @@ describe('LinkedInOutreachService', () => {
       // Still a clean whitespace-delimited prefix, no trailing space.
       expect(msg.startsWith(sent.message)).toBe(true);
       expect(sent.message.endsWith(' ')).toBe(false);
+    });
+
+    // ─── Account-level invitation cooldown breaker (ENG-126) ──────────────────
+    describe('account-level "Cannot resend yet" cooldown breaker', () => {
+      // Shape a Unipile rejection the way handleError expects (body.title becomes
+      // the normalized message when no body.message is present).
+      function cannotResendYetError() {
+        return Object.assign(new Error('UnsuccessfulRequestError'), {
+          body: {
+            status: 422,
+            type: 'errors/cannot_resend_yet',
+            title: 'Cannot resend yet',
+          },
+        });
+      }
+
+      it('short-circuits the NEXT invite to any recipient after a "Cannot resend yet" — no second Unipile call', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(cannotResendYetError());
+
+        // First send hits the cap and rejects.
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false)
+        ).rejects.toThrow(/cannot resend yet/i);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+
+        // Second send is a DIFFERENT, fresh recipient — must be short-circuited by
+        // the breaker: no new sendInvitation call, no profile-fetch round-trip.
+        const requestCallsBefore = (mockUnipileClient.request.send as jest.Mock).mock.calls.length;
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-2', false)
+        ).rejects.toThrow(/cannot resend yet/i);
+
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1); // still 1
+        expect((mockUnipileClient.request.send as jest.Mock).mock.calls.length).toBe(requestCallsBefore);
+      });
+
+      it('does NOT arm the account-wide breaker on a per-recipient "Should delay new invitation" rejection', async () => {
+        const perRecipient = Object.assign(new Error('UnsuccessfulRequestError'), {
+          body: {
+            status: 422,
+            type: 'errors/already_invited_recently',
+            title: 'Should delay new invitation to this recipient',
+          },
+        });
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(perRecipient);
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false)
+        ).rejects.toThrow(/should delay new invitation/i);
+
+        // A different recipient must still be attempted (breaker not armed).
+        await linkedInOutreachService.sendInvitation('acct-A', 'recipient-2', false);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(2);
+      });
+
+      it('scopes the breaker per account — a throttled account does not block a different one', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(cannotResendYetError());
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false)
+        ).rejects.toThrow(/cannot resend yet/i);
+
+        // acct-B is untouched — its invite must go through to Unipile.
+        await linkedInOutreachService.sendInvitation('acct-B', 'recipient-1', false);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(2);
+      });
+
+      it('self-heals: a fresh invite is attempted again once the cooldown window elapses', async () => {
+        // Arm an ALREADY-EXPIRED cooldown for the account, then confirm the next
+        // send clears it and actually calls Unipile.
+        // @ts-ignore private map
+        linkedInOutreachService.invitationCooldownUntil.set('acct-A', Date.now() - 1);
+
+        await linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+        // @ts-ignore private map — the stale entry was removed.
+        expect(linkedInOutreachService.invitationCooldownUntil.has('acct-A')).toBe(false);
+      });
+
+      it('a successful send clears a previously armed breaker for that account', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock)
+          .mockRejectedValueOnce(cannotResendYetError()) // first: hit the cap
+          .mockResolvedValue({ id: 'invitation-id' });     // later: succeeds
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false)
+        ).rejects.toThrow(/cannot resend yet/i);
+        // @ts-ignore private map — breaker armed.
+        expect(linkedInOutreachService.invitationCooldownUntil.has('acct-A')).toBe(true);
+
+        // Simulate the window elapsing so the next call proceeds and succeeds.
+        // @ts-ignore private map
+        linkedInOutreachService.invitationCooldownUntil.set('acct-A', Date.now() - 1);
+        await linkedInOutreachService.sendInvitation('acct-A', 'recipient-2', false);
+
+        // @ts-ignore private map — success cleared the breaker.
+        expect(linkedInOutreachService.invitationCooldownUntil.has('acct-A')).toBe(false);
+      });
     });
   });
 

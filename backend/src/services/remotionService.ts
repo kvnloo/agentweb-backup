@@ -55,6 +55,14 @@ export interface RemotionComposeParams {
   audioUrl?: string;
   /** Voiceover volume (0.0–1.0, default 1.0) */
   audioVolume?: number;
+  /**
+   * Epoch-ms deadline (from the agent run's media-generation time budget) by which this
+   * compose should stop blocking and hand off. When the render can't finish in the
+   * remaining budget we return a `processing` result with the deterministic output URL
+   * rather than blocking until the run's hard wall-clock timeout kills it (ENG-123).
+   * When omitted, the legacy 5-minute poll cap applies.
+   */
+  renderDeadlineMs?: number;
 }
 
 export interface RemotionComposeResult {
@@ -62,6 +70,20 @@ export interface RemotionComposeResult {
   videoUrl?: string;
   filename?: string;
   error?: string;
+  /**
+   * 'complete' — the render finished and videoUrl is ready now.
+   * 'processing' — the render is still finalizing on Lambda (detached); videoUrl is the
+   * deterministic S3 location where it will appear shortly. Used for the timeout handoff.
+   */
+  status?: 'complete' | 'processing';
+  /** Human-facing note (e.g. the "still finalizing" handoff message). */
+  message?: string;
+  /**
+   * Non-fatal advisory to surface to the user (e.g. the requested target duration
+   * exceeded the available clip footage so the video was trimmed). The composition
+   * still rendered successfully.
+   */
+  warning?: string;
 }
 
 /**
@@ -83,6 +105,102 @@ interface RemotionConfig {
 }
 
 const FPS = 30;
+
+/**
+ * Resolve the per-clip and total durations for a composition — the pure math behind
+ * remotionService.compose, extracted so it can be unit-tested without invoking Lambda.
+ *
+ * ENG-123 "black hole": when a caller passes a `targetDurationSeconds` LONGER than the
+ * actual clip footage (e.g. target 30s but 3×8s = 24s of clips), the old code set the
+ * composition to the full target. The clip <Sequence>s only covered the footage, so the
+ * trailing frames rendered the bare black background — a multi-second black tail. We now
+ * clamp the composition to the available footage: a target can only ever TRIM, never pad.
+ */
+export function resolveCompositionDuration(input: {
+  clipCount: number;
+  clipDurationSeconds?: number;
+  clipDurationsSeconds?: number[];
+  targetDurationSeconds?: number;
+  maxClipSeconds?: number;
+  fps?: number;
+}): {
+  perClipSeconds: number[];
+  sumSeconds: number;
+  totalDurationSeconds: number;
+  durationInFrames: number;
+  clipDurationInFrames: number[];
+  targetExceededFootage: boolean;
+} {
+  const fps = input.fps ?? FPS;
+  // Default cap is 8s (Veo per-clip max). Seedance produces one clip up to 15s and
+  // passes maxClipSeconds=15 so the full paid clip isn't truncated to 8s.
+  const maxClipSeconds = input.maxClipSeconds ?? 8;
+  const uniformSeconds = Math.min((input.clipDurationSeconds || maxClipSeconds), maxClipSeconds);
+  const perClipSeconds: number[] = Array.from({ length: input.clipCount }, (_, i) =>
+    input.clipDurationsSeconds?.[i] != null
+      ? Math.min(input.clipDurationsSeconds[i], maxClipSeconds)
+      : uniformSeconds
+  );
+
+  const sumSeconds = perClipSeconds.reduce((a, b) => a + b, 0);
+  // A target can only TRIM the footage, never pad it: clamp to the clip sum so the
+  // composition never outruns the clips (the black-tail guard).
+  const targetExceededFootage =
+    input.targetDurationSeconds != null && input.targetDurationSeconds > sumSeconds;
+  const totalDurationSeconds = Math.min(input.targetDurationSeconds ?? sumSeconds, sumSeconds);
+  const durationInFrames = Math.round(totalDurationSeconds * fps);
+  const clipDurationInFrames = perClipSeconds.map(s => Math.round(s * fps));
+
+  return {
+    perClipSeconds,
+    sumSeconds,
+    totalDurationSeconds,
+    durationInFrames,
+    clipDurationInFrames,
+    targetExceededFootage,
+  };
+}
+
+/**
+ * Number of poll iterations compose should run before handing off, bounded by the run's
+ * remaining media-generation budget. Extracted as a pure function so the timeout handoff
+ * math is unit-testable without invoking Lambda (ENG-123).
+ *
+ * - No deadline → the legacy hard cap (unchanged behavior).
+ * - Deadline in the future → floor(remaining / interval), clamped to [1, hardCap].
+ * - Already past the deadline (e.g. clip regen ate the whole budget) → 1 poll, so we
+ *   catch an instant completion/failure and otherwise hand off immediately.
+ */
+export function computeRenderPollBudget(input: {
+  renderDeadlineMs?: number;
+  now: number;
+  pollIntervalMs: number;
+  hardCapPolls: number;
+  safetyMarginMs?: number;
+}): number {
+  const { renderDeadlineMs, now, pollIntervalMs, hardCapPolls } = input;
+  if (renderDeadlineMs == null) return hardCapPolls;
+  const safetyMarginMs = input.safetyMarginMs ?? 0;
+  const remainingMs = renderDeadlineMs - now - safetyMarginMs;
+  if (remainingMs <= 0) return 1;
+  return Math.max(1, Math.min(hardCapPolls, Math.floor(remainingMs / pollIntervalMs)));
+}
+
+/**
+ * Construct the deterministic S3 URL that the detached Remotion Lambda writes its output
+ * to, mirroring Remotion's own getOutputUrlFromMetadata:
+ *   https://s3.<region>.amazonaws.com/<bucket>/renders/<renderId>/<outName>
+ * We know all four parts the instant renderMediaOnLambda returns, so we can hand this
+ * back before the render finishes — the Lambda keeps rendering and the URL resolves.
+ */
+export function buildRemotionOutputUrl(
+  region: string,
+  bucketName: string,
+  renderId: string,
+  outName: string
+): string {
+  return `https://s3.${region}.amazonaws.com/${bucketName}/renders/${renderId}/${outName}`;
+}
 
 export class RemotionService {
   private config: RemotionConfig | null = null;
@@ -215,22 +333,33 @@ export class RemotionService {
       const allClipUrls = [params.clipUrl, ...(params.extraClipUrls ?? [])];
       const clipCount = allClipUrls.length;
 
-      // Resolve per-clip durations (seconds). Variable lengths take priority over uniform.
-      // Default cap is 8s (Veo per-clip max). Seedance produces one clip up to 15s and
-      // passes maxClipSeconds=15 so the full paid clip isn't truncated to 8s.
-      const maxClipSeconds = params.maxClipSeconds ?? 8;
-      const uniformSeconds = Math.min((params.clipDurationSeconds || maxClipSeconds), maxClipSeconds);
-      const perClipSeconds: number[] = allClipUrls.map((_, i) =>
-        params.clipDurationsSeconds?.[i] != null
-          ? Math.min(params.clipDurationsSeconds[i], maxClipSeconds)
-          : uniformSeconds
-      );
-
-      // Total = sum of per-clip durations, optionally overridden by targetDurationSeconds
-      const sumSeconds = perClipSeconds.reduce((a, b) => a + b, 0);
-      const totalDurationSeconds = params.targetDurationSeconds ?? sumSeconds;
-      const durationInFrames = Math.round(totalDurationSeconds * FPS);
-      const clipDurationInFrames = perClipSeconds.map(s => Math.round(s * FPS));
+      // Resolve per-clip and total durations. Variable lengths take priority over uniform,
+      // each clip is capped at maxClipSeconds, and the total is CLAMPED to the clip sum so
+      // a target longer than the footage can only trim, never pad with a black tail (ENG-123).
+      const {
+        perClipSeconds,
+        sumSeconds,
+        totalDurationSeconds,
+        durationInFrames,
+        clipDurationInFrames,
+        targetExceededFootage,
+      } = resolveCompositionDuration({
+        clipCount,
+        clipDurationSeconds: params.clipDurationSeconds,
+        clipDurationsSeconds: params.clipDurationsSeconds,
+        targetDurationSeconds: params.targetDurationSeconds,
+        maxClipSeconds: params.maxClipSeconds,
+        fps: FPS,
+      });
+      // User-facing advisory when the requested length outran the footage. Surfaced in
+      // the result so the caller can tell the user their video is shorter than requested
+      // (instead of silently handing back a clamped clip — ENG-123 graceful UX).
+      const durationWarning = targetExceededFootage
+        ? `The requested length (${params.targetDurationSeconds}s) is longer than the available clip footage (${sumSeconds}s), so the video was trimmed to ${totalDurationSeconds}s rather than padded with black. Generate more or longer clips to reach the full length.`
+        : undefined;
+      if (durationWarning) {
+        console.warn(`RemotionService: ${durationWarning}`);
+      }
       console.log(`RemotionService: ${clipCount} clip(s) [${perClipSeconds.join(',')}]s = ${totalDurationSeconds}s → durationInFrames=${durationInFrames}`);
 
       // Ensure filename ends with .mp4
@@ -266,6 +395,10 @@ export class RemotionService {
         `RemotionService: Rendering BrandedVideo for user ${params.userId}, clips=${clipCount}, durationInFrames=${durationInFrames}, introDurationFrames=${introDurationFrames}, outroDurationFrames=${outroDurationFrames}, hasCtaText=${Boolean(params.ctaText)}`
       );
 
+      // Capture the exact output key once (it embeds Date.now()) so the detached-handoff
+      // URL below matches what the Lambda actually writes.
+      const outName = `users/${params.userId}/remotion/${Date.now()}_${filename}`;
+
       const renderResult = await renderMediaOnLambda({
         region: config.region as any,
         functionName: config.functionName,
@@ -275,7 +408,7 @@ export class RemotionService {
         codec: "h264",
         imageFormat: "jpeg",
         framesPerLambda: 60,
-        outName: `users/${params.userId}/remotion/${Date.now()}_${filename}` as any,
+        outName: outName as any,
         timeoutInMilliseconds: 300000, // 5 minutes
       });
 
@@ -283,11 +416,27 @@ export class RemotionService {
       const bucketName = renderResult.bucketName;
       const renderId = renderResult.renderId;
 
-      const maxPolls = 60; // 5 minutes at 5s intervals
+      // The Lambda renders detached — it finishes and writes to this deterministic URL
+      // even if we stop polling. So if we run out of budget we can hand this back and the
+      // video will appear here shortly, instead of blocking until the run is hard-killed.
+      const detachedOutputUrl = buildRemotionOutputUrl(config.region, bucketName, renderId, outName);
+
+      const POLL_INTERVAL_MS = 5000;
+      const HARD_CAP_POLLS = 60; // 5 minutes at 5s intervals — secondary ceiling
+      // Bound the poll to the run's remaining media-generation budget (when supplied) so
+      // compose hands off BEFORE the run's hard wall-clock timeout. Keep a safety margin
+      // so the handoff result has time to propagate back through the agent loop.
+      const maxPolls = computeRenderPollBudget({
+        renderDeadlineMs: params.renderDeadlineMs,
+        now: Date.now(),
+        pollIntervalMs: POLL_INTERVAL_MS,
+        hardCapPolls: HARD_CAP_POLLS,
+        safetyMarginMs: 15000,
+      });
       let polls = 0;
 
       while (polls < maxPolls) {
-        await new Promise((r) => setTimeout(r, 5000));
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
         polls++;
 
         const progress = await getRenderProgress({
@@ -312,8 +461,10 @@ export class RemotionService {
           console.log(`RemotionService: Render complete → ${outputFile}`);
           return {
             success: true,
+            status: "complete",
             videoUrl: outputFile,
             filename,
+            ...(durationWarning && { warning: durationWarning }),
           };
         }
 
@@ -322,9 +473,22 @@ export class RemotionService {
         );
       }
 
+      // Out of poll budget but the render is still going. Rather than block until the run
+      // is killed with nothing to show, hand off the detached render: the Lambda keeps
+      // going and writes to detachedOutputUrl, which resolves shortly (ENG-123).
+      console.log(
+        `RemotionService: Render still processing after ${polls} poll(s) — handing off detached URL ${detachedOutputUrl}`
+      );
       return {
-        success: false,
-        error: "Remotion render timed out after 5 minutes",
+        success: true,
+        status: "processing",
+        videoUrl: detachedOutputUrl,
+        filename,
+        message:
+          "The render is taking longer than usual and is still finalizing in the background. " +
+          "It should appear at this link within a few minutes — no need to regenerate it. " +
+          "If it hasn't shown up after that, ask me to check on it.",
+        ...(durationWarning && { warning: durationWarning }),
       };
     } catch (error: any) {
       console.error("RemotionService: Error composing video:", error);

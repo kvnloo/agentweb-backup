@@ -21,6 +21,16 @@ jest.mock("../services/durableLandingService", () => ({
   STUCK_CEILING_MS: 30 * 60 * 1000,
 }));
 
+const mockIsCronEnabled = jest.fn();
+jest.mock("../utils/instanceState", () => ({
+  isCronEnabled: () => mockIsCronEnabled(),
+}));
+
+const mockTrack = jest.fn((_name: string, promise: Promise<any>) => promise);
+jest.mock("../utils/cronJobRegistry", () => ({
+  cronJobRegistry: { track: (name: string, promise: Promise<any>) => mockTrack(name, promise) },
+}));
+
 import { runDurableLandingPollerOnce } from "../services/durableLandingPoller";
 
 const ok = (v: any) => ({ promise: () => Promise.resolve(v) });
@@ -88,5 +98,51 @@ describe("runDurableLandingPollerOnce", () => {
     const r = await runDurableLandingPollerOnce(NOW);
     expect(mockDeliverStuckFailure).toHaveBeenCalledTimes(1); // p5 still processed after p4 threw
     expect(r.scanned).toBe(2);
+  });
+});
+
+describe("startDurableLandingPoller interval wiring", () => {
+  const originalEnv = process.env.DURABLE_LANDING_GENERATION;
+
+  // pollerHandle is a module-private singleton guard, so each test needs a
+  // fresh module instance (jest.resetModules + re-require) or the second
+  // startDurableLandingPoller() call in the suite silently no-ops.
+  const freshStartPoller = (): ((intervalMs?: number) => void) => {
+    jest.resetModules();
+    return require("../services/durableLandingPoller").startDurableLandingPoller;
+  };
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    process.env.DURABLE_LANDING_GENERATION = "true";
+    mockIsCronEnabled.mockReset();
+    mockTrack.mockClear();
+    mockScan.mockReturnValue(ok({ Items: [] }));
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+    process.env.DURABLE_LANDING_GENERATION = originalEnv;
+  });
+
+  it("skips the sweep on tick when isCronEnabled() is false (drain in progress)", () => {
+    mockIsCronEnabled.mockReturnValue(false);
+    const startDurableLandingPoller = freshStartPoller();
+
+    startDurableLandingPoller(1000);
+    jest.advanceTimersByTime(1000);
+
+    expect(mockTrack).not.toHaveBeenCalled();
+    expect(mockScan).not.toHaveBeenCalled();
+  });
+
+  it("tracks the sweep via cronJobRegistry on tick when cron is enabled", () => {
+    mockIsCronEnabled.mockReturnValue(true);
+    const startDurableLandingPoller = freshStartPoller();
+
+    startDurableLandingPoller(1000);
+    jest.advanceTimersByTime(1000);
+
+    expect(mockTrack).toHaveBeenCalledWith("durableLandingPoller", expect.any(Promise));
   });
 });
