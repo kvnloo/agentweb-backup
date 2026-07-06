@@ -1,5 +1,6 @@
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import { McpOAuthClientProvider, listMcpServers } from "./mcpOAuthClientProvider";
+import { cronJobRegistry } from "../../utils/cronJobRegistry";
 
 /**
  * Proactive, in-process refresh of OAuth access tokens for outbound MCP servers.
@@ -85,7 +86,7 @@ let timer: NodeJS.Timeout | null = null;
 export function startMcpOAuthRefreshScheduler(): void {
   if (timer) return;
   timer = setInterval(() => {
-    refreshExpiringOAuthTokens().catch((err) =>
+    cronJobRegistry.track("mcpOAuthRefresh", refreshExpiringOAuthTokens()).catch((err) =>
       console.error("MCP OAuth refresh tick error:", (err as Error).message)
     );
   }, CHECK_INTERVAL_MS);

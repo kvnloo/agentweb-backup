@@ -1,5 +1,7 @@
 import app from './app';
 import { isCronEnabled, disableCron } from './utils/instanceState';
+import { cronJobRegistry } from './utils/cronJobRegistry';
+import { DRAIN_CEILING_MS } from './utils/shutdownConstants';
 import { agentModeService } from './services/agentModeService';
 import { generateMarketingResponseWorkerService } from './services/generateMarketingResponseWorkerService';
 import dotenv from 'dotenv';
@@ -333,12 +335,12 @@ const gracefulShutdown = async (signal: string) => {
   console.log(`\n${signal} received. Shutting down gracefully...`);
 
   // Register force-exit FIRST so it's always set, even if an await below hangs.
-  // 13 min = drain ceiling (10 min) + 3 min buffer.
+  // Force-exit buffer = drain ceiling + 3 min.
   // EB Timeout: 900 s (15 min) sits above this so EB never force-kills first.
   setTimeout(() => {
     console.error('[gracefulShutdown] Force-exiting after drain ceiling');
     process.exit(1);
-  }, 13 * 60 * 1000).unref();
+  }, DRAIN_CEILING_MS + 3 * 60 * 1000).unref();
 
   // 1. Disable cron immediately — agent-engine's next /run-scheduled-chats call
   //    gets 503 and reroutes to the new instance within one 5-second poll cycle.
@@ -371,9 +373,20 @@ const gracefulShutdown = async (signal: string) => {
     }
   });
 
-  // 5. Drain the worker — waits for all in-flight scheduled chats / EMMA runs
-  //    to complete naturally (up to 10 minutes). Only then kills the child process.
-  await generateMarketingResponseWorkerService.shutdown();
+  // 5. Drain the LLM worker (scheduled chats / EMMA runs) and every other
+  //    in-flight cron job (LinkedIn sync, drip worker, meta token refresh,
+  //    etc. — see cronJobRegistry) concurrently, up to the same ceiling, so
+  //    the total wait is the max of the two rather than their sum.
+  const [, cronDrain] = await Promise.all([
+    generateMarketingResponseWorkerService.shutdown(),
+    cronJobRegistry.drain(),
+  ]);
+  if (!cronDrain.drained) {
+    console.warn(
+      `[gracefulShutdown] Cron drain ceiling reached — ${cronDrain.stuckCount} job(s) still in-flight:`,
+      cronDrain.stuckJobs
+    );
+  }
 
   // 6. Close parent MCP clients after the drain (child has its own MCP instance)
   await agentModeService.shutdown();
@@ -507,16 +520,20 @@ createTestAccount().then(async () => {
         // Pass callback: when scanner schedules an action within 30 min, register a direct setTimeout
         const scanner = new SocialEngagementScanner((delayMs) => {
           setTimeout(() => {
-            executor.processQueue().catch(e => console.error('[SocialEngagement] Direct executor error:', e));
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('SocialEngagementExecutor.processQueue', executor.processQueue())
+              .catch(e => console.error('[SocialEngagement] Direct executor error:', e));
           }, delayMs);
         });
 
         console.log('[SocialEngagement] Scanner initialized — running first pass...');
-        scanner.runScanner().catch(e => console.error('[SocialEngagement] Scanner error:', e));
+        cronJobRegistry.track('SocialEngagementScanner', scanner.runScanner())
+          .catch(e => console.error('[SocialEngagement] Scanner error:', e));
 
         setInterval(() => {
           if (!isCronEnabled()) return;
-          scanner.runScanner().catch(e => console.error('[SocialEngagement] Scanner error:', e));
+          cronJobRegistry.track('SocialEngagementScanner', scanner.runScanner())
+            .catch(e => console.error('[SocialEngagement] Scanner error:', e));
         }, SCANNER_INTERVAL_MS);
 
       } catch (error) {
@@ -540,10 +557,12 @@ createTestAccount().then(async () => {
         console.log(`[ActivationCron] Initialized — first run at 08:00 UTC (in ${Math.round(msUntilNextRun / 60000)} min)`);
         setTimeout(() => {
           if (!isCronEnabled()) return;
-          runActivationAnalysis().catch(e => console.error('[ActivationCron] Error:', e));
+          cronJobRegistry.track('ActivationCron', runActivationAnalysis())
+            .catch(e => console.error('[ActivationCron] Error:', e));
           setInterval(() => {
             if (!isCronEnabled()) return;
-            runActivationAnalysis().catch(e => console.error('[ActivationCron] Error:', e));
+            cronJobRegistry.track('ActivationCron', runActivationAnalysis())
+              .catch(e => console.error('[ActivationCron] Error:', e));
           }, ACTIVATION_INTERVAL_MS);
         }, msUntilNextRun);
       } catch (error) {
@@ -555,10 +574,12 @@ createTestAccount().then(async () => {
       try {
         const { processDueEnrollments } = await import('./services/dripSequenceWorker');
         const DRIP_INTERVAL_MS = 5 * 60 * 1000;
-        processDueEnrollments().catch(e => console.error('[dripWorker] Error on first run:', e));
+        cronJobRegistry.track('dripWorker', processDueEnrollments())
+          .catch(e => console.error('[dripWorker] Error on first run:', e));
         setInterval(() => {
           if (!isCronEnabled()) return;
-          processDueEnrollments().catch(e => console.error('[dripWorker] Error:', e));
+          cronJobRegistry.track('dripWorker', processDueEnrollments())
+            .catch(e => console.error('[dripWorker] Error:', e));
         }, DRIP_INTERVAL_MS);
         console.log('[dripWorker] Initialized — running every 5 minutes');
       } catch (error) {
@@ -580,10 +601,12 @@ createTestAccount().then(async () => {
       try {
         const { runLinkedInConnectionSync } = await import('./cron/linkedInConnectionSyncCron');
         const LI_CONN_INTERVAL_MS = 10 * 60 * 1000;
-        runLinkedInConnectionSync().catch(e => console.error('[linkedInConnectionSync] Error on first run:', e));
+        cronJobRegistry.track('linkedInConnectionSync', runLinkedInConnectionSync())
+          .catch(e => console.error('[linkedInConnectionSync] Error on first run:', e));
         setInterval(() => {
           if (!isCronEnabled()) return;
-          runLinkedInConnectionSync().catch(e => console.error('[linkedInConnectionSync] Error:', e));
+          cronJobRegistry.track('linkedInConnectionSync', runLinkedInConnectionSync())
+            .catch(e => console.error('[linkedInConnectionSync] Error:', e));
         }, LI_CONN_INTERVAL_MS);
         console.log('[linkedInConnectionSync] Initialized — running every 10 minutes');
       } catch (error) {
@@ -598,10 +621,12 @@ createTestAccount().then(async () => {
       try {
         const { runMetaTokenRefresh } = await import('./cron/metaTokenRefreshCron');
         const META_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
-        runMetaTokenRefresh().catch(e => console.error('[metaTokenRefreshCron] Error on first run:', e));
+        cronJobRegistry.track('metaTokenRefreshCron', runMetaTokenRefresh())
+          .catch(e => console.error('[metaTokenRefreshCron] Error on first run:', e));
         setInterval(() => {
           if (!isCronEnabled()) return;
-          runMetaTokenRefresh().catch(e => console.error('[metaTokenRefreshCron] Error:', e));
+          cronJobRegistry.track('metaTokenRefreshCron', runMetaTokenRefresh())
+            .catch(e => console.error('[metaTokenRefreshCron] Error:', e));
         }, META_REFRESH_INTERVAL_MS);
         console.log('[metaTokenRefreshCron] Initialized — running every 12 hours');
       } catch (error) {
@@ -633,10 +658,12 @@ createTestAccount().then(async () => {
           console.log(`[OnboardingLoop] Initialized — first run at 15:00 UTC (in ${Math.round(msUntilLoop / 60000)} min)`);
           setTimeout(() => {
             if (!isCronEnabled()) return;
-            runOnboardingLoop().catch(e => console.error('[OnboardingLoop] Error:', e));
+            cronJobRegistry.track('OnboardingLoop', runOnboardingLoop())
+              .catch(e => console.error('[OnboardingLoop] Error:', e));
             setInterval(() => {
               if (!isCronEnabled()) return;
-              runOnboardingLoop().catch(e => console.error('[OnboardingLoop] Error:', e));
+              cronJobRegistry.track('OnboardingLoop', runOnboardingLoop())
+                .catch(e => console.error('[OnboardingLoop] Error:', e));
             }, LOOP_INTERVAL_MS);
           }, msUntilLoop);
         } catch (error) {
@@ -649,10 +676,12 @@ createTestAccount().then(async () => {
           const { runOnboardingLoopWatchdog } = await import('./cron/onboardingLoopWatchdog');
 
           console.log('[OnboardingWatchdog] Initialized — running hourly');
-          runOnboardingLoopWatchdog().catch(e => console.error('[OnboardingWatchdog] Error on first run:', e));
+          cronJobRegistry.track('OnboardingWatchdog', runOnboardingLoopWatchdog())
+            .catch(e => console.error('[OnboardingWatchdog] Error on first run:', e));
           setInterval(() => {
             if (!isCronEnabled()) return;
-            runOnboardingLoopWatchdog().catch(e => console.error('[OnboardingWatchdog] Error:', e));
+            cronJobRegistry.track('OnboardingWatchdog', runOnboardingLoopWatchdog())
+              .catch(e => console.error('[OnboardingWatchdog] Error:', e));
           }, WATCHDOG_INTERVAL_MS);
         } catch (error) {
           console.error('[OnboardingWatchdog] Failed to initialize:', error);
@@ -684,10 +713,12 @@ createTestAccount().then(async () => {
           );
           setTimeout(() => {
             if (!isCronEnabled()) return;
-            runAiEvalLoopOnce().catch(e => console.error('[AiEvalLoop] Error:', e));
+            cronJobRegistry.track('AiEvalLoop', runAiEvalLoopOnce())
+              .catch(e => console.error('[AiEvalLoop] Error:', e));
             setInterval(() => {
               if (!isCronEnabled()) return;
-              runAiEvalLoopOnce().catch(e => console.error('[AiEvalLoop] Error:', e));
+              cronJobRegistry.track('AiEvalLoop', runAiEvalLoopOnce())
+                .catch(e => console.error('[AiEvalLoop] Error:', e));
             }, AI_EVAL_LOOP_INTERVAL_MS);
           }, msUntilAiEval);
         } catch (error) {
@@ -720,10 +751,12 @@ createTestAccount().then(async () => {
           );
           setTimeout(() => {
             if (!isCronEnabled()) return;
-            runAiReadinessLoopOnce().catch(e => console.error('[AiReadinessLoop] Error:', e));
+            cronJobRegistry.track('AiReadinessLoop', runAiReadinessLoopOnce())
+              .catch(e => console.error('[AiReadinessLoop] Error:', e));
             setInterval(() => {
               if (!isCronEnabled()) return;
-              runAiReadinessLoopOnce().catch(e => console.error('[AiReadinessLoop] Error:', e));
+              cronJobRegistry.track('AiReadinessLoop', runAiReadinessLoopOnce())
+                .catch(e => console.error('[AiReadinessLoop] Error:', e));
             }, AI_READINESS_LOOP_INTERVAL_MS);
           }, msUntilReadiness);
         } catch (error) {
@@ -755,10 +788,12 @@ createTestAccount().then(async () => {
           );
           setTimeout(() => {
             if (!isCronEnabled()) return;
-            runOnboardingLoopV2Once().catch(e => console.error('[OnboardingLoopV2] Error:', e));
+            cronJobRegistry.track('OnboardingLoopV2', runOnboardingLoopV2Once())
+              .catch(e => console.error('[OnboardingLoopV2] Error:', e));
             setInterval(() => {
               if (!isCronEnabled()) return;
-              runOnboardingLoopV2Once().catch(e => console.error('[OnboardingLoopV2] Error:', e));
+              cronJobRegistry.track('OnboardingLoopV2', runOnboardingLoopV2Once())
+                .catch(e => console.error('[OnboardingLoopV2] Error:', e));
             }, ONBOARDING_V2_INTERVAL_MS);
           }, msUntilObV2);
         } catch (error) {
@@ -793,10 +828,12 @@ createTestAccount().then(async () => {
           );
           setTimeout(() => {
             if (!isCronEnabled()) return;
-            runAgentModeLoopOnce().catch(e => console.error('[AgentModeLoop] Error:', e));
+            cronJobRegistry.track('AgentModeLoop', runAgentModeLoopOnce())
+              .catch(e => console.error('[AgentModeLoop] Error:', e));
             setInterval(() => {
               if (!isCronEnabled()) return;
-              runAgentModeLoopOnce().catch(e => console.error('[AgentModeLoop] Error:', e));
+              cronJobRegistry.track('AgentModeLoop', runAgentModeLoopOnce())
+                .catch(e => console.error('[AgentModeLoop] Error:', e));
             }, AGENT_MODE_INTERVAL_MS);
           }, msUntilAgentMode);
         } catch (error) {
@@ -829,10 +866,12 @@ createTestAccount().then(async () => {
           );
           setTimeout(() => {
             if (!isCronEnabled()) return;
-            runAgentReliabilitySnapshot().catch(e => console.error('[AgentReliabilitySnapshot] Error:', e));
+            cronJobRegistry.track('AgentReliabilitySnapshot', runAgentReliabilitySnapshot())
+              .catch(e => console.error('[AgentReliabilitySnapshot] Error:', e));
             setInterval(() => {
               if (!isCronEnabled()) return;
-              runAgentReliabilitySnapshot().catch(e => console.error('[AgentReliabilitySnapshot] Error:', e));
+              cronJobRegistry.track('AgentReliabilitySnapshot', runAgentReliabilitySnapshot())
+                .catch(e => console.error('[AgentReliabilitySnapshot] Error:', e));
             }, SNAPSHOT_INTERVAL_MS);
           }, msUntilSnapshot);
         } catch (error) {
@@ -864,10 +903,12 @@ createTestAccount().then(async () => {
           );
           setTimeout(() => {
             if (!isCronEnabled()) return;
-            runLoopAttributionOnce().catch(e => console.error('[LoopAttribution] Error:', e));
+            cronJobRegistry.track('LoopAttribution', runLoopAttributionOnce())
+              .catch(e => console.error('[LoopAttribution] Error:', e));
             setInterval(() => {
               if (!isCronEnabled()) return;
-              runLoopAttributionOnce().catch(e => console.error('[LoopAttribution] Error:', e));
+              cronJobRegistry.track('LoopAttribution', runLoopAttributionOnce())
+                .catch(e => console.error('[LoopAttribution] Error:', e));
             }, LOOP_ATTRIBUTION_INTERVAL_MS);
           }, msUntilAttribution);
         } catch (error) {
