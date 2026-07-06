@@ -11,7 +11,8 @@ import { rankMemoriesByRelevance } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { computeTermination } from './agentMode/core/agentStep';
-import { executePreparedTools } from './agentMode/core/toolDispatch';
+import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
+import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
@@ -122,6 +123,7 @@ import {
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
 import { validateToolOutputContract } from '../utils/toolOutputContract';
+import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
 
 type MetaApiResult = {
   success: boolean;
@@ -263,11 +265,29 @@ function recordAgentModeRunStarted(
 
 function recordAgentModeRunCompleted(
   runId: string,
-  info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
+  info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string; claimMismatch?: boolean },
 ): void {
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runCompleted(runId, info);
+}
+
+/**
+ * The finalize guard's claim check itself failed (judge/correction LLM call
+ * errored, ENG-143). LOUD by contract: the guard delivers the chat unchanged on
+ * judge failure — this signal (console + durable agent_claim_check_error event)
+ * is the only trace that a truthfulness check was skipped. Best-effort: must
+ * never throw into the chat hot path.
+ */
+function recordAgentModeClaimCheckError(runId: string, sessionId: string, error: unknown): void {
+  console.error('[agent-mode] finalize-guard claim check FAILED (message delivered unchanged):', {
+    runId,
+    sessionId,
+    error: error instanceof Error ? error.message : String(error),
+  });
+  const recorder = getAgentRunRecorderSafe();
+  if (!recorder) return;
+  void recorder.claimCheckError(runId, { error, sessionId });
 }
 
 function recordAgentModeRunFailed(
@@ -304,6 +324,34 @@ function recordAgentModeDuplicateSuppression(
     }
   } catch (err) {
     console.error('[agent-mode] duplicate-suppression telemetry failed (swallowed):', err);
+  }
+}
+
+/**
+ * Record a model fallback (ENG-46) as a structured, greppable, observability-only
+ * signal. When a request pins a model id that is no longer served (e.g. a stale
+ * post-deploy smoke-test config or a retired DB default), `resolveGenerationModel`
+ * substitutes the default so the request still completes — but that substitution
+ * MUST be visible to ops, not silently buried, otherwise a stale config keeps
+ * shipping the wrong model unnoticed. The stable `[agent-mode] model fallback`
+ * tag is what log dashboards/alerts key on. Best-effort: never throws into the
+ * chat hot path.
+ */
+function recordAgentModeModelFallback(
+  runId: string,
+  sessionId: string,
+  requestedModel: string,
+  resolvedModel: string,
+): void {
+  try {
+    console.warn('[agent-mode] model fallback', {
+      runId,
+      sessionId,
+      requestedModel: requestedModel || '(none)',
+      resolvedModel,
+    });
+  } catch (err) {
+    console.error('[agent-mode] model-fallback telemetry failed (swallowed):', err);
   }
 }
 
@@ -536,6 +584,11 @@ interface LLMCallOptions {
 // Diagnosis agent configuration
 const DIAGNOSIS_MODEL = 'gemini-3.1-flash-lite';
 const DIAGNOSIS_TIMEOUT_MS = 10_000;
+
+// Finalize-guard judge model (ENG-143): a bounded claim-extraction
+// classification, not conversational generation, so it deliberately does NOT
+// reuse the run's own (often pricier) llmModel — see judgeFinalizeClaims.
+const FINALIZE_GUARD_JUDGE_MODEL = DIAGNOSIS_MODEL;
 
 // Markers used by perform_data_analysis to capture files the Gemini code-execution
 // sandbox produces. The sandbox filesystem is discarded after execution and Gemini
@@ -1080,25 +1133,31 @@ export class AgentModeService {
         function: {
           name: 'wait_seconds',
           description: 'Wait for a specified number of seconds before continuing. Use this when you need to pause before checking a result — for example, waiting for a post to propagate, an email to arrive, a page to update, or any async operation to complete. When used in a batch with other tool calls, the entire batch executes sequentially so the wait happens in order.',
-          parameters: {
-            type: 'object',
-            properties: {
-              seconds: {
-                type: 'number',
-                description: 'Number of seconds to wait (max 300)'
-              },
-              reason: {
-                type: 'string',
-                description: 'Brief explanation of what you are waiting for (shown to the user)'
-              }
-            },
-            required: ['seconds', 'reason']
-          }
+          parameters: WAIT_SECONDS_PARAMETERS
         }
       },
-      execute: async (args: any, _context: any) => {
-        const seconds = Math.min(Math.max(1, Math.round(args.seconds)), 300);
-        await new Promise(resolve => setTimeout(resolve, seconds * 1000));
+      execute: async (args: any, context: any) => {
+        // Cap the sleep to the run's remaining wall-clock budget so a long wait can't
+        // be guillotined mid-sleep by the generation timeout and logged as a spurious
+        // wait_seconds failure (ENG-124). runBudgetDeadlineMs is threaded in from the
+        // dispatcher; when absent (e.g. budget disabled) the wait is unchanged.
+        const { seconds, requestedSeconds, deadlineReached } = computeWaitSeconds({
+          requestedSeconds: args.seconds,
+          deadlineMs: context?.runBudgetDeadlineMs,
+        });
+        if (seconds > 0) {
+          await new Promise(resolve => setTimeout(resolve, seconds * 1000));
+        }
+        if (deadlineReached) {
+          return {
+            waited_seconds: seconds,
+            reason: args.reason || 'Waiting before continuing',
+            deadlineReached: true,
+            message: seconds > 0
+              ? `Waited ${seconds} seconds (shortened from ${requestedSeconds}s — this response is approaching its time limit). Do NOT wait again; check the result now. If it is still pending, tell the user it is still processing and to check back shortly rather than waiting further.`
+              : `Did not wait — this response is at its time limit. Do NOT wait again; check the result now. If it is still pending, tell the user it is still processing and to check back shortly rather than waiting further.`,
+          };
+        }
         return { waited_seconds: seconds, reason: args.reason, message: `Waited ${seconds} seconds.` };
       }
     });
@@ -2110,7 +2169,7 @@ export class AgentModeService {
     // Azure OpenAI enforces a 128-tool limit per request
     // supportsVision flags below were verified empirically against the describe_image
     // path (probe against a real image). All GPT-5 deployments handle vision.
-    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true },
     'gpt-5.4-nano': { client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
@@ -2148,7 +2207,7 @@ export class AgentModeService {
   }
   /**
    * Make an LLM call with the specified model and parameters
-   * @param model - The model to use (e.g., 'gpt-5.1', 'gemini-3-pro-preview')
+   * @param model - The model to use (e.g., 'gpt-5.5', 'gemini-3-pro-preview')
    * @param messages - Array of chat messages
    * @param options - Optional parameters for the LLM call
    * @returns The LLM response
@@ -2166,6 +2225,50 @@ export class AgentModeService {
       return LEGACY_MODEL_ALIASES[model] as T;
     }
     return model;
+  }
+
+  /**
+   * Resolve the model id for a generation request up front: normalize legacy
+   * ids, then validate against the allow-list. A model that is no longer served
+   * (e.g. a stale default or smoke-test config pinned to a removed id like
+   * 'gpt-5.1') would otherwise throw an opaque "Invalid model" deep inside
+   * callLLM, which the outer handler surfaces to the user as "Unknown Error"
+   * (ENG-46). Instead, fall back to the configured default model so the request
+   * still completes, and report whether a fallback happened so callers can log
+   * it / expose it via telemetry.
+   */
+  public resolveGenerationModel(model: string): { model: string; fellBack: boolean; requestedModel: string } {
+    const normalized = this.normalizeModelId(model);
+    // Use hasOwnProperty so inherited Object.prototype keys (e.g. 'constructor',
+    // 'toString') can't masquerade as valid allow-list entries.
+    if (normalized && Object.prototype.hasOwnProperty.call(this.llmModels, normalized)) {
+      return { model: normalized, fellBack: false, requestedModel: model };
+    }
+    const fallbackModel = this.resolveFallbackModel();
+    console.warn(
+      `AgentMode: Requested model '${model ?? '(none)'}' is not in the allow-list; falling back to default '${fallbackModel}'.`
+    );
+    return { model: fallbackModel, fellBack: true, requestedModel: model };
+  }
+
+  /**
+   * Resolve the model to fall back to when a requested id is unavailable.
+   * Normally this is the configured default_model, but if that itself has been
+   * removed from the allow-list (e.g. a stale AZURE_OPENAI_DEPLOYMENT_AGENT_MODE
+   * env override pinning a retired deployment) returning it would just re-throw
+   * "Invalid model" inside callLLM. Guard against that by validating the default
+   * and falling back to a known-good served model otherwise (ENG-46).
+   */
+  private resolveFallbackModel(): string {
+    if (Object.prototype.hasOwnProperty.call(this.llmModels, this.default_model)) {
+      return this.default_model;
+    }
+    const knownGoodModel = Object.keys(this.llmModels)[0];
+    console.warn(
+      `AgentMode: Configured default model '${this.default_model}' is not in the allow-list; ` +
+      `falling back to known-good model '${knownGoodModel}'.`
+    );
+    return knownGoodModel;
   }
 
   async callLLM(
@@ -2474,10 +2577,21 @@ export class AgentModeService {
       sessionType: isInteractiveShare ? 'interactive_share' : 'regular',
     });
     try {
-      // Map legacy/renamed model ids forward (e.g. old sessions persisted the
-      // pre-rename "claude-opus-4-8") so metadata, pricing, and routing all use
-      // the canonical registry key.
-      llmModel = this.normalizeModelId(llmModel);
+      // Resolve the model up front: map legacy/renamed ids forward (e.g. old
+      // sessions persisted the pre-rename "claude-opus-4-8") AND validate against
+      // the allow-list. A removed/stale id (e.g. a smoke-test config pinned to
+      // 'gpt-5.1') would otherwise throw an opaque "Invalid model" deep inside
+      // callLLM and surface to the user as "Unknown Error" (ENG-46); instead fall
+      // back to the default model so the request still completes.
+      const requestedLlmModel = llmModel;
+      const modelResolution = this.resolveGenerationModel(llmModel);
+      llmModel = modelResolution.model;
+      if (modelResolution.fellBack) {
+        // Surface the substitution as a structured, alertable telemetry signal so
+        // a stale model id (smoke-test / DB default) is caught in dashboards rather
+        // than silently masked (ENG-46).
+        recordAgentModeModelFallback(agentRuntimeRunId, sessionId, requestedLlmModel, llmModel);
+      }
       // Track backup model usage
       const originalLlmModel = llmModel;
       let backupModelUsed = false;
@@ -3242,6 +3356,103 @@ export class AgentModeService {
         }
       }
 
+      // Finalize guard (ENG-143/135/124): claimed-vs-executed truthfulness check at
+      // the loop edge, AFTER the final message and BEFORE emit/persist.
+      // Two independent flags, most-enforcing wins:
+      //   AGENT_FINALIZE_GUARD=true        → 'enforce': detect AND rewrite the message.
+      //   AGENT_FINALIZE_GUARD_SHADOW=true → 'shadow': detect + telemetry only, the
+      //     message the user sees is NEVER touched. Lets Harsha collect real
+      //     judge precision/recall data on production traffic (the Okareo
+      //     claim-faithfulness gap) with zero user-facing risk before deciding
+      //     on enforcement.
+      // Both default OFF — with neither set this block is inert and the
+      // characterization harness is byte-identical.
+      // NO-FALLBACK compliance: in enforce mode the guard never silently rewrites
+      // the message — a mismatch produces either the model's own corrective
+      // restatement or a VISIBLE appended correction; a judge/guard failure
+      // delivers the text unchanged plus a loud claim_check_error signal
+      // (documented best-effort — blocking chat delivery on a judge outage would
+      // be failing badly).
+      let finalizeClaimMismatch = false;
+      const finalizeGuardMode: 'enforce' | 'shadow' | null =
+        process.env.AGENT_FINALIZE_GUARD === 'true'
+          ? 'enforce'
+          : process.env.AGENT_FINALIZE_GUARD_SHADOW === 'true'
+            ? 'shadow'
+            : null;
+      if (finalizeGuardMode && content && !wasCancelled && !mockMode) {
+        try {
+          const finalizeLedger: FinalizeLedgerEntry[] = toolCalls.map((tc: any): FinalizeLedgerEntry => ({
+            toolName: tc.name,
+            // A suppressed same-turn duplicate (duplicateOf) and a budget-deferred
+            // media call never EXECUTED — neither may back a claim on its own (the
+            // original executed call has its own ledger entry), so both map to
+            // 'deferred' (non-backing) rather than 'success'.
+            status: tc.error !== undefined
+              ? 'error'
+              : (tc.duplicateOf || (tc.result && (tc.result as any).deferred === true) ? 'deferred' : 'success'),
+            result: tc.result,
+          }));
+          const guardOutcome = await runFinalizeGuard({
+            finalText: content,
+            ledger: finalizeLedger,
+            ports: {
+              judgeExtractClaims: (text, candidateClasses) =>
+                this.judgeFinalizeClaims(text, candidateClasses),
+              requestCorrection: ({ finalText, systemNote }) =>
+                this.requestFinalizeCorrection(finalText, systemNote, llmModel),
+              toolResultError,
+              mediaGenProducedAsset,
+              recordClaimCheckError: (err) => recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, err),
+            },
+          });
+          finalizeClaimMismatch = guardOutcome.claimMismatch;
+          // Ambiguous claims never change finalText (by design — see
+          // finalizeGuard.ts), so without this they'd be invisible even though
+          // the whole point of the confidence tier is to surface them for
+          // review instead of silently risking a false correction.
+          if (guardOutcome.ambiguousClaimClasses.length > 0) {
+            console.warn(`AgentMode: finalize guard found AMBIGUOUS (uncorrected) claim(s) in session ${sessionId} — possible matcher coverage gap`, {
+              ambiguousClaimClasses: guardOutcome.ambiguousClaimClasses,
+            });
+          }
+          if (guardOutcome.finalText !== content) {
+            if (finalizeGuardMode === 'shadow') {
+              // Shadow mode: log what WOULD have changed, but the user-visible
+              // message and the persisted transcript are left untouched.
+              console.warn(`AgentMode: finalize guard SHADOW ${guardOutcome.action} in session ${sessionId} (message NOT modified)`, {
+                claimClasses: guardOutcome.mismatchedClaimClasses,
+              });
+            } else {
+              console.warn(`AgentMode: finalize guard ${guardOutcome.action} in session ${sessionId}`, {
+                claimClasses: guardOutcome.mismatchedClaimClasses,
+              });
+              content = guardOutcome.finalText;
+              // Keep the persisted transcript consistent with what the user sees:
+              // correct the LAST assistant message in place (same message count) and
+              // stamp guard metadata so the correction is auditable in the session.
+              for (let i = messages.length - 1; i >= 0; i--) {
+                if ((messages[i] as any).role === 'assistant') {
+                  (messages[i] as any).content = content;
+                  (messages[i] as any).metadata = {
+                    ...(messages[i] as any).metadata,
+                    finalizeGuard: {
+                      action: guardOutcome.action,
+                      claimClasses: guardOutcome.mismatchedClaimClasses,
+                    },
+                  };
+                  break;
+                }
+              }
+            }
+          }
+        } catch (guardError) {
+          // Guard is advisory — a guard bug must never block delivery. Loud, not
+          // silent: recorded as claim_check_error (same contract as judge failure).
+          recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, guardError);
+        }
+      }
+
       // Attach timing metadata, memory usage, and tool calls to the last assistant message
       if (messages.length > 0) {
         const lastAssistantIdx = messages.length - 1 - [...messages].reverse().findIndex((m: any) => m.role === 'assistant');
@@ -3281,6 +3492,9 @@ export class AgentModeService {
         toolCalls: toolCalls.length,
         failedToolCalls: countFailedToolCalls(toolCalls),
         maxSameToolFailures: maxSameToolFailureCount(toolCalls),
+        // ENG-143: an unresolved claim mismatch grades the run degraded
+        // (claim_mismatch verdict reason) so the 17:30 UTC cluster cron sees it.
+        ...(finalizeClaimMismatch ? { claimMismatch: true } : {}),
       });
       // ENG-102: drain telemetry before the worker reports success to the parent
       // process (fire-and-forget would race with IPC teardown — same treatment
@@ -3837,17 +4051,21 @@ export class AgentModeService {
       completed: '✅',
       failed: '❌'
     };
-    let statusesContent = '';
+    // Only inject a task-status context message when there ARE task statuses to
+    // report. Previously an empty session pushed an assistant message reading
+    // "📋 Task Status: No tasks have been run in this session yet." right before
+    // the user's message. On a terse confirmation (e.g. "go with defaults") the
+    // model could parrot that injected assistant turn verbatim instead of
+    // proceeding with the actual work (ENG-129). The empty-status note conveys
+    // nothing the model needs, so skip it entirely.
     if (currentTaskStatuses && currentTaskStatuses.length > 0) {
-      statusesContent += 'Current Task Statuses:\n';
+      let statusesContent = 'Current Task Statuses:\n';
       currentTaskStatuses.forEach(task => {
         const emoji = statusEmoji[task.status] || '⏳';
         statusesContent += `${emoji} ${task.taskName} (${task.status}) - Task ID: ${task.taskId}, Execution ID: ${task.executionId}\n`;
       });
-    } else {
-      statusesContent = '📋 **Task Status**: No tasks have been run in this session yet.';
+      messages.push({ role: 'assistant', content: statusesContent });
     }
-    messages.push({ role: 'assistant', content: statusesContent });
 
     // Insert work plan status as an assistant message if exists. Pass the set of
     // images already generated this session (scanned from full history, not the
@@ -3964,6 +4182,13 @@ export class AgentModeService {
     'you_search_web',         // Explicit You.com web search
     'you_search_news',        // Explicit You.com news search
 
+    // Basic file reading — always available so an attached file (text, PDF,
+    // CSV, docx, etc.) can be read immediately without first installing a
+    // skill. Being gated behind __other_skills__ produced a transient
+    // "read_file_content unavailable/failed" until the user manually installed
+    // other_skills (ENG-152).
+    'read_file_content',
+
     // Work Plans (Emma's execution planning system)
     'create_work_plan',
     'modify_work_plan',
@@ -4071,6 +4296,12 @@ export class AgentModeService {
     // this, users with a configured sender but no connected Gmail still cannot send
     // a one-off email from chat (the reported bug).
     'send_email_from_sender',
+    // Basic file reading. Force-merged because the prod `foundation_tools`
+    // AW-Settings override omits DEFAULT-only additions — without this, an
+    // attached file cannot be read until the user manually installs
+    // other_skills, producing the transient "read_file_content
+    // unavailable/failed" failure (ENG-152).
+    'read_file_content',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
@@ -4078,6 +4309,20 @@ export class AgentModeService {
   // Subset of foundation tools that must execute for real in mock/benchmark mode
   // because they modify session state (no external side effects).
   private static readonly MOCK_BYPASS_TOOLS = new Set(['install_skills']);
+
+  // ENG-43: Research / external-lookup tools whose TIMEOUTS should degrade
+  // gracefully (partial results + per-entity decomposition + provider fallback)
+  // rather than abandoning the goal. See formatToolError.
+  private static readonly RESEARCH_LOOKUP_TOOLS = new Set([
+    'you_search_web',
+    'you_search_news',
+    'google_search_web',
+    'perform_deep_research',
+    // ENG-43 (session 74bb2c5d): LinkedIn public-profile lookups (Unipile get-profile)
+    // that time out must degrade through the same branch — keep partial results, retry
+    // once, and fall back to a public web-search provider — instead of abandoning the goal.
+    'linkedin_outreach',
+  ]);
 
   /**
    * Get tools that are not associated with any published skill.
@@ -5773,11 +6018,22 @@ export class AgentModeService {
     socketEmit?: any;
     screenshotUrl?: string;
     isDelegatedAccess?: boolean;
+    renderDeadlineMs?: number;
+    runBudgetDeadlineMs?: number;
   }): Promise<any> {
     const toolOptions: Record<string, any> = {};
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
     if (input.screenshotUrl) toolOptions.screenshotUrl = input.screenshotUrl;
     if (input.isDelegatedAccess) toolOptions.isDelegatedAccess = true;
+    // Thread the run's media-gen deadline into the tool context ONLY for compose_video —
+    // the sole tool that consumes it (to hand off before the run's hard wall-clock timeout,
+    // ENG-123). Scoping it here keeps every other tool's context unchanged.
+    if (input.renderDeadlineMs != null && input.toolName === 'compose_video') {
+      toolOptions.renderDeadlineMs = input.renderDeadlineMs;
+    }
+    // Run wall-clock budget deadline (epoch ms) — used by wait_seconds to cap its
+    // sleep so it can't be killed mid-wait by the generation timeout (ENG-124).
+    if (input.runBudgetDeadlineMs != null) toolOptions.runBudgetDeadlineMs = input.runBudgetDeadlineMs;
 
     return this.executeTool(
       input.llmModel,
@@ -12620,6 +12876,83 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
   }
 
   /**
+   * Finalize-guard judge (ENG-143): ONE structured-output claim-extraction call
+   * through the existing callLLM machinery. Extracts the completed-action claims
+   * the final reply makes, restricted to the prefiltered candidate classes.
+   * THROWS on any judge failure (no content / unparseable output / transport
+   * error) — the guard then delivers the message unchanged and records a loud
+   * claim_check_error (see core/finalizeGuard.ts).
+   *
+   * Deliberately uses FINALIZE_GUARD_JUDGE_MODEL (the same cheap/fast model as
+   * triageSlackMessage) instead of the run's own llmModel: this is a bounded
+   * classification task, not conversational generation, and every flagged
+   * reply pays for this call, so keeping it cheap directly reduces the
+   * guard's latency/cost footprint at scale (PR #2005 left this as a
+   * deliberate one-line follow-up rather than reusing the run's often-pricier
+   * model for every judge call).
+   */
+  private async judgeFinalizeClaims(
+    finalText: string,
+    candidateClasses: readonly ClaimClass[],
+  ): Promise<JudgedClaim[]> {
+    const response = await this.callLLM(FINALIZE_GUARD_JUDGE_MODEL, [
+      {
+        role: 'user',
+        content:
+          'You are auditing an AI assistant\'s reply for COMPLETED-ACTION claims — statements that an action already happened '
+          + '(not offers, plans, or suggestions). The possible claim classes are: '
+          + `${CLAIM_CLASSES.join(', ')}. Candidate classes detected in this reply: ${candidateClasses.join(', ')}.\n\n`
+          + 'Return ONLY a JSON array, one element per claimed completed action, each shaped '
+          + '{"claimClass":"<class>","statement":"<short quote from the reply>"}. '
+          + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
+          + finalText,
+      },
+    ], { max_completion_tokens: 500, temperature: 0 });
+
+    const text = (response as any)?.choices?.[0]?.message?.content;
+    if (typeof text !== 'string' || !text.trim()) {
+      throw new Error('finalize-guard judge returned no content');
+    }
+    const match = text.match(/\[[\s\S]*\]/);
+    if (!match) {
+      throw new Error(`finalize-guard judge returned unparseable output: ${text.slice(0, 200)}`);
+    }
+    const parsed = JSON.parse(match[0]); // throws on invalid JSON → judge_error path
+    if (!Array.isArray(parsed)) {
+      throw new Error('finalize-guard judge output is not an array');
+    }
+    return (parsed as any[]).filter((c) => c && typeof c.claimClass === 'string');
+  }
+
+  /**
+   * Finalize-guard corrective turn (ENG-143): ONE model call asking for the
+   * truthful restatement of a reply whose claims the run ledger does not back.
+   * THROWS on failure — the guard then appends the visible correction instead
+   * (never delivers the unbacked claim silently).
+   */
+  private async requestFinalizeCorrection(
+    finalText: string,
+    systemNote: string,
+    llmModel: string,
+  ): Promise<string> {
+    const response = await this.callLLM(llmModel, [
+      {
+        role: 'user',
+        content:
+          `[SYSTEM NOTE] ${systemNote}\n\nPrevious reply:\n${finalText}\n\n`
+          + 'Rewrite the reply now. Keep everything that is accurate, but only claim actions the run log confirms succeeded, '
+          + 'clearly state what was NOT completed, and tell the user what to do next. Reply ONLY with the corrected message text.',
+      },
+    ], { temperature: 0 });
+
+    const text = (response as any)?.choices?.[0]?.message?.content;
+    if (typeof text !== 'string' || !text.trim()) {
+      throw new Error('finalize-guard correction returned no content');
+    }
+    return text.trim();
+  }
+
+  /**
    * Triage a Slack message to determine if it requires handling (e.g. a client question).
    * Uses gemini-3.1-flash-lite for fast, low-cost classification.
    * Returns true if the message needs to be handled, false otherwise.
@@ -16166,6 +16499,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   private formatToolError(toolName: string, errorMessage: string): string {
     const safeMessage = typeof errorMessage === 'string' ? errorMessage : 'Unknown error';
     console.error(`[AgentMode] Tool failed: ${toolName} — ${safeMessage}`);
+    // ENG-43: Research / external-lookup tools (web/news search, deep research)
+    // that TIME OUT must degrade gracefully instead of abandoning the goal with a
+    // blanket "ask the user to retry". A heavy multi-entity research query (e.g.
+    // "research 3 people + their overlaps") or a slow public-profile lookup should
+    // fall back to: keep whatever partial results were already gathered, decompose
+    // the request into one focused sub-query per entity, and switch to an alternate
+    // search provider — NOT surface a bare retry prompt. This is checked BEFORE the
+    // generic connection-timeout "stop" branch so these tools degrade rather than halt.
+    const isResearchLookupTool =
+      AgentModeService.RESEARCH_LOOKUP_TOOLS.has(toolName) ||
+      Array.from(AgentModeService.RESEARCH_LOOKUP_TOOLS).some((name) => toolName.endsWith(`_${name}`));
+    const isTimeoutOrTransient =
+      /timed out|timeout|ETIMEDOUT|ESOCKETTIMEDOUT|ECONNRESET|ECONNABORTED|socket hang up|deadline exceeded|processing timeout|temporarily unavailable|\b(408|429|500|502|503|504)\b|gateway time-?out/i.test(
+        safeMessage
+      );
+    if (isResearchLookupTool && isTimeoutOrTransient) {
+      return `⚠️ Research/Lookup Timeout: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: Do NOT abandon the goal or simply ask the user to retry. Degrade gracefully instead:\n1. KEEP any partial results you already gathered for earlier entities/queries and present them, clearly noting which parts are still pending and offering to continue.\n2. If the request covers multiple entities or topics, decompose it into one focused sub-query per entity and call the search tool separately for each, rather than one heavy combined query.\n3. Narrow or simplify the query, then retry it once.\n4. If this provider keeps timing out, fall back to an alternate search provider (e.g. switch between you_search_web and google_search_web) to gather what you can.\nOnly tell the user the lookup failed AFTER you have returned every partial result you were able to collect.`;
+    }
     // Connection-level failures (timeouts, circuit open) require a different instruction:
     // tell the LLM to stop retrying and surface the error to the user instead of
     // spinning through other variants of the same tool.
@@ -20171,21 +20522,46 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         logoUrl: composeParams.logoUrl,
         ctaText: composeParams.ctaText,
         ctaUrl: composeParams.ctaUrl,
+        // Forward the optional voiceover track so a spot composed via compose_video is
+        // never shipped silent (ENG-123). remotionService.compose + the BrandedVideo
+        // composition both support an audio overlay; omitting these here dropped it.
+        audioUrl: composeParams.audioUrl,
+        audioVolume: composeParams.audioVolume,
         clipUrl: clipUrls[0],
         extraClipUrls: clipUrls.slice(1),
         clipDurationSeconds: clipDurationSeconds ?? 8,
         targetDurationSeconds,
         clipDurationsSeconds,
+        // Run's remaining media-gen budget (epoch ms), threaded from the tool context, so a
+        // long render on a revision pass hands off instead of blocking until the run's hard
+        // wall-clock timeout kills it with no asset (ENG-123).
+        renderDeadlineMs: composeParams.renderDeadlineMs,
         filename,
         userId,
       });
 
+      // Regression tripwire (ENG-123): a spot must never silently ship without a voiceover.
+      // Surface a soft warning when composed with no audio track — catches revision passes
+      // where the agent recomposes and forgets to re-attach the VO. Not a hard failure:
+      // silent b-roll stitching is still valid.
+      const voiceoverWarning = !composeParams.audioUrl
+        ? 'Composed with no voiceover track. If this is an ad spot, generate one with generate_voiceover and pass audio_url so it is not shipped silent.'
+        : undefined;
+
       if (composeResult.success && composeResult.videoUrl) {
+        const stillProcessing = composeResult.status === 'processing';
+        // Combine any composition-layer advisory (e.g. duration clamp) with the voiceover
+        // tripwire so the user sees every relevant note, not just one.
+        const warning = [composeResult.warning, voiceoverWarning].filter(Boolean).join(' ') || undefined;
         return {
           success: true,
-          message: `✅ ${clipUrls.length} clip(s) composed into branded video!`,
+          message: stillProcessing
+            ? (composeResult.message ?? `🎬 ${clipUrls.length} clip(s) are still finalizing — the video will be ready at this link shortly.`)
+            : `✅ ${clipUrls.length} clip(s) composed into branded video!`,
           videoUrl: composeResult.videoUrl,
           filename: composeResult.filename ?? filename,
+          ...(stillProcessing && { status: 'processing' as const }),
+          ...(warning && { warning }),
         };
       }
 
@@ -22575,6 +22951,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
       if (!llmModel) {
         llmModel = await this.getDefaultModel();
+      } else {
+        // ENG-46 sibling path: this method is reached with the SESSION's model
+        // (emma create_html_from_template tool / route), so a stale/removed id
+        // (e.g. gpt-5.1) would otherwise throw an opaque "Invalid model" inside
+        // callLLM here too. Resolve it up front so template substitution falls
+        // back to a served model instead of failing.
+        const templateModelResolution = this.resolveGenerationModel(llmModel);
+        if (templateModelResolution.fellBack) {
+          recordAgentModeModelFallback('create-html-from-template', sessionId || '', llmModel, templateModelResolution.model);
+        }
+        llmModel = templateModelResolution.model;
       }
       // Validate that all required variables are provided
       const templateVariables = template.variables || [];
@@ -26249,7 +26636,6 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       case 'CONVERSATION_AD': {
         if (action === 'CREATE') {
-          if (!params.name) throw new Error('CONVERSATION_AD CREATE requires name');
           const result = await linkedInAdsService.createConversationAd(accessToken, accountId, params);
           if (!result.success) throw new Error(result.error || 'Failed to create conversation ad');
           const conversationAdUrn = result.data?.id;

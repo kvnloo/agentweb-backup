@@ -26,6 +26,8 @@
  */
 
 import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
+import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
+import { appendRetryabilityGuidance } from './errorRetryability';
 
 /**
  * Media-generation tools whose batches must run sequentially (rate limits) AND are
@@ -430,7 +432,12 @@ export async function executePreparedTools(
       });
 
       if (contractResult.status === 'invalid') {
-        const errorContent = ports.formatToolError(toolCall.function.name, contractResult.modelMessage);
+        // ENG-124: schema rejects carry the explicit not-retryable-as-is verdict
+        // (fix the args first) so the model can't spiral on the identical call.
+        const errorContent = appendRetryabilityGuidance(
+          ports.formatToolError(toolCall.function.name, contractResult.modelMessage),
+          classifyToolErrorClass(contractResult.modelMessage),
+        );
         appendPreflightToolFailure(toolCall, functionArgs, contractResult.modelMessage, errorContent, initialPolicyDecision);
         continue;
       }
@@ -474,7 +481,12 @@ export async function executePreparedTools(
     } catch (error) {
       console.error(`AgentMode: Tool argument parse error for ${toolCall.function.name}:`, error);
       const errMsg = error instanceof Error ? error.message : String(error);
-      const errorContent = ports.formatToolError(toolCall.function.name, `Failed to parse arguments: ${errMsg}`);
+      // ENG-124: unparseable args are never retryable as-is — emit the corrected-
+      // arguments verdict alongside the formatted error.
+      const errorContent = appendRetryabilityGuidance(
+        ports.formatToolError(toolCall.function.name, `Failed to parse arguments: ${errMsg}`),
+        'invalid_args',
+      );
       appendPreflightToolFailure(toolCall, undefined, `Failed to parse arguments: ${errMsg}`, errorContent);
     }
   }
@@ -506,6 +518,12 @@ export async function executePreparedTools(
         socketEmit: ports.socketEmit,
         screenshotUrl,
         isDelegatedAccess,
+        // Long-render tools (compose_video) read this to hand off before the run's hard
+        // wall-clock timeout rather than blocking until killed with no asset (ENG-123).
+        renderDeadlineMs: mediaGenerationDeadlineMs,
+        // Run wall-clock budget deadline so wait_seconds can cap its sleep and not be
+        // killed mid-wait by the generation timeout (ENG-124).
+        runBudgetDeadlineMs: mediaGenerationDeadlineMs,
       }),
     });
 
@@ -773,8 +791,17 @@ export async function executePreparedTools(
       failedCounterUpdates[toolCall.function.name] =
         (failedCounterUpdates[toolCall.function.name] || 0) + 1;
 
+      // ENG-124: the model-visible error carries (a) what failed (formatToolError
+      // names the tool + reason, with per-tool fix text), and (b+c) an explicit
+      // retryable yes/no verdict + actionable next step derived from the same
+      // classifier the telemetry uses — so a terminal failure (auth, provider
+      // rejection, schema reject) carries a hard stop signal instead of inviting
+      // a retry spiral.
       const errMsg = error instanceof Error ? error.message : String(error);
-      const errorContent = ports.formatToolError(toolCall.function.name, errMsg);
+      const errorContent = appendRetryabilityGuidance(
+        ports.formatToolError(toolCall.function.name, errMsg),
+        classifyToolErrorClass(error),
+      );
       messages.push({
         tool_call_id: toolCall.id,
         role: 'tool',

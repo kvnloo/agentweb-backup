@@ -1,0 +1,7 @@
+.env
+state.json
+*.log
+*.log.1
+.poll.lock
+logs/
+.verify-mcp.generated.json

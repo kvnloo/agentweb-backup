@@ -84,7 +84,7 @@ describe('B4: worker crash clears progressStore (no zombie SSE progress)', () =>
     messageContent: 'Test message',
     sessionHistory: [],
     userId: 'user-1',
-    llmModel: 'gpt-5.1',
+    llmModel: 'gpt-5.5',
     sessionId: 'crash-session',
     mockMode: false,
   };

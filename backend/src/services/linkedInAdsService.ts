@@ -71,6 +71,29 @@ async function makeRequest(
     ];
     const fullError = allErrors.length > 0 ? `${message}\n${allErrors.join('\n')}` : message;
     console.error(`LinkedIn Ads API error [${method} ${path}]:`, status, fullError, errData ? JSON.stringify(errData) : '');
+
+    // LinkedIn rejects writes with this exact message when the ad account hasn't been
+    // added to AgentWeb's Developer Portal app (one shared app for all customers, on
+    // LinkedIn's Developer access tier). The raw message reads as if the customer has
+    // their own app to fix — without this rewrite, the model tells the user to check
+    // "their" LinkedIn Developer Portal, which doesn't exist for them and can't resolve it.
+    if (/not configured to access the related advertiser account/i.test(message)) {
+      // Body-only endpoints (conversationAds, posts, inMailContents, uploads) carry the
+      // account as urn:li:sponsoredAccount:{id} in the body instead of an /adAccounts/{id}
+      // path segment — support needs the ID either way to allowlist the account.
+      const acctMatch = path.match(/\/adAccounts\/(\d+)/)
+        || (body ? JSON.stringify(body).match(/urn:li:sponsoredAccount:(\d+)/) : null);
+      const acctNote = acctMatch ? ` (${acctMatch[1]})` : '';
+      return {
+        success: false,
+        error: `${fullError}\n\nThis is an AgentWeb platform configuration gap, not something the customer can fix. ` +
+          `AgentWeb uses one shared LinkedIn Developer Portal app for all customers — the customer does not have their own app to configure. ` +
+          `Do not tell the user to check "their" LinkedIn Developer Portal or Account Management settings. Instead, tell them this ad account${acctNote} ` +
+          `needs to be allowlisted by AgentWeb staff and to contact AgentWeb support — retrying will not resolve it.`,
+        status,
+      };
+    }
+
     return { success: false, error: fullError, status };
   }
 }
@@ -1080,12 +1103,15 @@ export async function createConversationAd(
   params: Record<string, any>
 ): Promise<LinkedInAdsApiResult> {
   if (!adAccountId) return { success: false, error: 'createConversationAd requires ad_account_id' };
-  if (!params.name) return { success: false, error: 'createConversationAd requires name' };
 
   const body: Record<string, any> = {
     parentAccount: `urn:li:sponsoredAccount:${adAccountId}`,
-    name: params.name,
   };
+  // LinkedIn's SponsoredConversation schema has no "name" field — only the optional
+  // headlineText. Sending "name" is rejected with "unrecognized field found but not
+  // allowed". When absent, LinkedIn falls back to the first message content as the headline.
+  const headlineText = params.headline_text || params.headlineText || params.name;
+  if (headlineText) body.headlineText = headlineText;
 
   return makeRequest('POST', '/rest/conversationAds', accessToken, body);
 }
