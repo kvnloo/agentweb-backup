@@ -1325,6 +1325,96 @@ describe('agentToolGatewayService', () => {
       expect(execute).toHaveBeenCalledTimes(1);
     });
 
+    it('ENG-182: a per-recipient LinkedIn refusal does not block invites to other recipients', async () => {
+      const runId = 'run-eng182';
+      // Two DIFFERENT profiles each hit LinkedIn's terminal "Cannot resend yet"
+      // (upstream_rejected → fast-trip threshold 2). Keyed on the error text alone
+      // these two identical refusals would trip the breaker for the whole tool.
+      for (const profile of [
+        'https://www.linkedin.com/in/chang-liu/',
+        'https://www.linkedin.com/in/liang-guo/',
+      ]) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'linkedin_outreach',
+          args: { action: 'send-invite', profile_url: profile },
+          runId,
+          execute: failingExecute('Cannot resend yet'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      // A genuinely different recipient, never individually attempted, must still run.
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: 'https://www.linkedin.com/in/mei-chen/' },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('ENG-182: still trips the breaker when the SAME LinkedIn recipient refuses repeatedly', async () => {
+      const runId = 'run-eng182-same';
+      const profile = 'https://www.linkedin.com/in/chang-liu/';
+      for (let i = 0; i < 2; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'linkedin_outreach',
+          args: { action: 'send-invite', profile_url: profile },
+          runId,
+          execute: failingExecute('Cannot resend yet'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: profile },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('ENG-182: collapses query/trailing-slash variants of one recipient into a single scope', async () => {
+      const runId = 'run-eng182-norm';
+      // Same profile, two URL shapes LinkedIn hands back (trailing slash + tracking query).
+      for (const profile of [
+        'https://www.linkedin.com/in/chang-liu/',
+        'https://www.linkedin.com/in/chang-liu?miniProfileUrn=urn%3Ali%3Aabc',
+      ]) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'linkedin_outreach',
+          args: { action: 'send-invite', profile_url: profile },
+          runId,
+          execute: failingExecute('Cannot resend yet'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: 'https://www.linkedin.com/in/chang-liu' },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
     it('blocks expensive media tools after two failures even when the error messages differ', async () => {
       await failNTimes('run-media', 'generate_image', 'Safety filter rejected image prompt', 1);
       await failNTimes('run-media', 'generate_image', 'Google image generation timed out after 10 minutes', 1);
