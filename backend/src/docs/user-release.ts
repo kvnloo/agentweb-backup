@@ -9,6 +9,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-07-06',
+    changes: [
+      'Fixed: Emma No Longer Says She "Can\'t" Create Google Docs',
+      '- Previously, if you had connected Google Drive but had not shared any folder with AgentWeb, Emma could wrongly conclude she was unable to create Google Docs or Sheets — even though that capability was available',
+      '- Emma now correctly recognizes that creating and editing Google Docs and Sheets is a separate capability from browsing shared Drive folders, so she no longer turns down a request she can actually fulfill',
+    ],
+  },
+  {
     date: '2026-06-30',
     changes: [
       'New: Emma Can Now Create and Edit Google Docs, Sheets, and Folders in Your Drive',
