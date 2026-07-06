@@ -160,6 +160,11 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
     const grantedScopes = (scope || '').split(' ').filter(Boolean);
     const hasAdwords = grantedScopes.some(s => s.includes('/auth/adwords'));
     if (!hasAdwords) {
+      console.warn('[GoogleAds OAuth /finalize] insufficient_scopes', {
+        userId,
+        grantedScopes,
+        missingScope: 'https://www.googleapis.com/auth/adwords',
+      });
       return res.status(422).json({
         error: 'insufficient_scopes',
         message: 'Google Ads permission was not granted. This can happen when your Google Workspace admin restricts third-party app access, or when the Google Ads permission was not approved on the consent screen. Please try again and allow all requested permissions.',
@@ -183,9 +188,20 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
     const connectableLeaves = googleAdsService.flattenConnectableLeaves(markedTree);
     const tokenSessionId = storeTokenSession(userId, { access_token, refresh_token, expires_in }, connectableLeaves);
 
+    console.log('[GoogleAds OAuth /finalize] success', {
+      userId,
+      accountCount: connectableLeaves.length,
+      grantedScopes,
+    });
+
     res.json({ success: true, accountTree: markedTree, tokenSessionId });
   } catch (error: any) {
-    console.error('[Google Ads OAuth /finalize]', error);
+    console.error('[Google Ads OAuth /finalize]', {
+      userId,
+      status: error.response?.status,
+      data: error.response?.data,
+      message: error.message,
+    });
     const details = IS_PRODUCTION ? undefined : error.message;
     res.status(500).json({ error: 'Failed to finalize Google Ads connection', ...(details && { details }) });
   }

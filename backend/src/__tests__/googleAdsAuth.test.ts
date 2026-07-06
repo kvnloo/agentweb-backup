@@ -181,6 +181,71 @@ describe('POST /finalize', () => {
     expect(res.body.error).toBe('insufficient_scopes');
     expect(listAccountHierarchy).not.toHaveBeenCalled();
   });
+
+  describe('diagnostic logging', () => {
+    let warnSpy: jest.SpyInstance;
+    let errorSpy: jest.SpyInstance;
+    let logSpy: jest.SpyInstance;
+
+    beforeEach(() => {
+      warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+      logSpy.mockRestore();
+    });
+
+    it('logs userId and the missing/granted scopes when adwords scope is absent', async () => {
+      mockAxiosPost.mockResolvedValueOnce({
+        data: {
+          access_token: 'gads-token',
+          refresh_token: 'gads-refresh',
+          expires_in: 3600,
+          scope: 'https://www.googleapis.com/auth/userinfo.email',
+        },
+      });
+      const state = makeState('user-123');
+      await request(app).post('/finalize').send({ code: 'auth-code', state }).expect(422);
+
+      const logged = warnSpy.mock.calls.map(c => JSON.stringify(c)).join('\n');
+      expect(logged).toMatch(/insufficient_scopes/);
+      expect(logged).toContain('user-123');
+      expect(logged).toContain('https://www.googleapis.com/auth/userinfo.email');
+      expect(logged).not.toContain('gads-token');
+      expect(logged).not.toContain('gads-refresh');
+    });
+
+    it('logs the Google API error status/body (not just a generic message) when the account probe fails', async () => {
+      const { listAccountHierarchy } = require('../services/googleAdsService').googleAdsService;
+      const apiError: any = new Error('Request failed with status code 403');
+      apiError.response = {
+        status: 403,
+        data: { error: { code: 403, message: 'The caller does not have permission', status: 'PERMISSION_DENIED' } },
+      };
+      (listAccountHierarchy as jest.Mock).mockRejectedValueOnce(apiError);
+
+      const state = makeState('user-123');
+      await request(app).post('/finalize').send({ code: 'auth-code', state }).expect(500);
+
+      const logged = errorSpy.mock.calls.map(c => JSON.stringify(c)).join('\n');
+      expect(logged).toContain('user-123');
+      expect(logged).toContain('PERMISSION_DENIED');
+      expect(logged).toContain('403');
+    });
+
+    it('logs userId and account count on a successful finalize', async () => {
+      const state = makeState('user-123');
+      await request(app).post('/finalize').send({ code: 'auth-code', state }).expect(200);
+
+      const logged = logSpy.mock.calls.map(c => JSON.stringify(c)).join('\n');
+      expect(logged).toContain('user-123');
+      expect(logged).toMatch(/finalize/i);
+    });
+  });
 });
 
 describe('POST /connect', () => {
