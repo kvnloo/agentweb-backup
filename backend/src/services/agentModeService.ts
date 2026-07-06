@@ -26280,6 +26280,31 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         };
       }
 
+      // Account-level invitation throttle (ENG-126). Once a LinkedIn account hits
+      // its invitation cap — a weekly limit that is far lower on non-Premium
+      // accounts and shrinks as the pending-invitation backlog grows — Unipile
+      // returns "Cannot resend yet" for send-invite on EVERY recipient, including
+      // brand-new ones. Surfaced verbatim, that phrase reads like a per-recipient
+      // cooldown, so the agent moves on to the next recipient and repeats, burning
+      // attempt after attempt (10+ in the reported session) and reporting nothing
+      // useful. Re-label it as the account-wide throttle it is so the agent stops
+      // and reports proactively. The raw phrase is preserved in the body so the
+      // error classifier still buckets this as an upstream_rejected business rule.
+      if (action === 'send-invite' && /cannot resend yet/i.test(errorMessage)) {
+        return {
+          success: false,
+          message: 'LinkedIn invitation limit reached',
+          error: [
+            "LinkedIn rejected this invitation with 'Cannot resend yet'. This is an ACCOUNT-LEVEL invitation cooldown/throttle, NOT a per-recipient one — LinkedIn caps how many pending invitations an account may have (the cap is much lower on non-Premium accounts), so it applies to every recipient equally.",
+            '',
+            'DO NOT keep trying other recipients — every send-invite will fail the same way until the cooldown lifts. Stop sending invitations now and report to the user that their LinkedIn account has hit its invitation limit and has a large pending-invitation backlog.',
+            '',
+            'To free up capacity the user can withdraw old unanswered invitations (use list-sent-invitations to see the backlog, then cancel-invitation on the stale ones) or wait a few days before the next outreach run. Prefer queueing these invites for a later run over retrying now.',
+          ].join('\n'),
+          accountThrottled: true,
+        };
+      }
+
       return {
         success: false,
         message: 'LinkedIn outreach action failed',

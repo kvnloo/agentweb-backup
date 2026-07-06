@@ -16,6 +16,17 @@ export class LinkedInOutreachService {
   // Per-user resolved account cache — avoids re-running the full account resolution chain on every call
   private resolvedAccountCache: Map<string, { accountId: string; timestamp: number }> = new Map();
   private static readonly RESOLVED_ACCOUNT_TTL_MS = 30 * 60 * 1000; // 30 minutes
+  // Per-account invitation cooldown breaker (ENG-126). Once LinkedIn rejects a
+  // send-invite with "Cannot resend yet", the account has hit its invitation cap
+  // and EVERY subsequent invite — to any recipient — fails the same way until the
+  // cap resets. We record the epoch-ms until which further sends are short-circuited
+  // (no Unipile round-trip), so a runaway session or scheduled run can't burn attempt
+  // after attempt across fresh recipients. Self-heals on TTL expiry or the next
+  // successful send. Scoped per account_id, so one throttled account never blocks
+  // another. Note: the per-recipient "Should delay new invitation" rejection does
+  // NOT arm this breaker — that one is specific to a single recipient.
+  private invitationCooldownUntil: Map<string, number> = new Map();
+  private static readonly INVITATION_COOLDOWN_TTL_MS = 60 * 60 * 1000; // 1 hour
 
   // ─── Logging helpers ────────────────────────────────────────────────────────
 
@@ -422,6 +433,26 @@ export class LinkedInOutreachService {
     message?: string,
     maxChars: number = LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS
   ): Promise<any> {
+    // Account-level cooldown breaker: if a prior send already hit LinkedIn's
+    // invitation cap, skip the network round-trip entirely and fail fast with the
+    // same signal, so callers (agent-mode, CRM) stop burning attempts recipient
+    // after recipient. The message keeps the "Cannot resend yet" phrase so the
+    // agent-mode handler surfaces it as the account-level throttle it is.
+    const cooldownUntil = this.invitationCooldownUntil.get(account_id);
+    if (cooldownUntil !== undefined) {
+      if (cooldownUntil > Date.now()) {
+        this.log(`Skipping invite — account under invitation cooldown`, { account_id, cooldownUntil });
+        const err: any = new Error(
+          'Cannot resend yet — this LinkedIn account is under an active account-level invitation ' +
+          'cooldown (its invitation cap was hit on an earlier send this run); skipped to avoid burning attempts.'
+        );
+        err.structuredError = { message: err.message, classification: 'VALIDATION_ERROR', status: 422 };
+        throw err;
+      }
+      // Cooldown window elapsed — clear it and allow a fresh attempt.
+      this.invitationCooldownUntil.delete(account_id);
+    }
+
     let outgoingMessage = message;
     if (outgoingMessage !== undefined && outgoingMessage.length > maxChars) {
       const trimmed = LinkedInOutreachService.trimInviteMessage(outgoingMessage, maxChars);
@@ -443,9 +474,26 @@ export class LinkedInOutreachService {
         message: outgoingMessage
       });
       this.log(`Invitation sent successfully`, { account_id, provider_id });
+      // A successful send proves the account is not capped — clear any stale breaker.
+      this.invitationCooldownUntil.delete(account_id);
       return res;
     } catch (error: any) {
-      return this.handleError(error, 'sendInvitation');
+      // handleError always throws; inspect the normalized message it produces so
+      // an account-level "Cannot resend yet" arms the breaker for future calls.
+      // Per-recipient rejections (e.g. "Should delay new invitation") do not match
+      // and so never arm the account-wide breaker.
+      try {
+        return await this.handleError(error, 'sendInvitation');
+      } catch (enhanced: any) {
+        if (/cannot resend yet/i.test(enhanced?.message ?? '')) {
+          this.invitationCooldownUntil.set(
+            account_id,
+            Date.now() + LinkedInOutreachService.INVITATION_COOLDOWN_TTL_MS
+          );
+          this.log(`Armed invitation cooldown breaker`, { account_id });
+        }
+        throw enhanced;
+      }
     }
   }
 
