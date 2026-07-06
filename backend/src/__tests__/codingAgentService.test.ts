@@ -1,4 +1,4 @@
-import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, LANDING_PAGE_PREVIEW_BRANCH, _isMissingGithubRefError, _describeGithubError, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream } from '../services/codingAgentService';
+import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, LANDING_PAGE_PREVIEW_BRANCH, _isMissingGithubRefError, _describeGithubError, _previewBranchCommitsAheadOfMain, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream } from '../services/codingAgentService';
 import { agentModeService } from '../services/agentModeService';
 
 // Mock mcpFetch
@@ -2177,5 +2177,131 @@ describe('runCodingAgent — preview-branch reset resilience', () => {
     expect(result.success).toBe(false);
     expect(result.message).toContain('Reference already exists');
     expect(result.message).not.toBe('Request failed with status code 422');
+  });
+});
+
+// ─── Preview-branch reset: preserve unpublished sequential edits (ENG-176) ─────
+
+describe('runCodingAgent — sequential edits do not clobber (ENG-176)', () => {
+  const previewContext: CodingAgentContext = {
+    pageId: 'test-page-123',
+    userId: 'user-456',
+    sessionId: 'session-789',
+    llmModel: 'anthropic.claude-sonnet-4-6',
+    draftBranch: LANDING_PAGE_PREVIEW_BRANCH,
+  };
+
+  const editablePage = {
+    id: 'test-page-123',
+    githubRepoUrl: 'https://github.com/AgentWebPro/lp-free-ai-seo-geo-audit-37343865',
+  };
+
+  const reportSuccess = () =>
+    mockCreate.mockResolvedValueOnce({
+      content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Added the book card.', status: 'success' } }],
+      stop_reason: 'tool_use',
+    });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedMcpFetch.mockReset();
+    mockCreate.mockReset();
+    _setBedrockClientForTest(mockClient);
+    _setSleepFnForTest(async () => {});
+    mockGetLandingPageById.mockResolvedValue(editablePage);
+    mockGetLandingPagesByOwner.mockResolvedValue([]);
+    mockCanUserEditLandingPage.mockResolvedValue(true);
+    mockedAxios.get.mockReset();
+    mockedAxios.patch.mockReset();
+    mockedAxios.post.mockReset();
+  });
+
+  afterAll(() => {
+    _setBedrockClientForTest(null);
+  });
+
+  test('does NOT reset the preview branch when it has unpublished commits ahead of main', async () => {
+    // A previous coding_agent run already added the first book card to the
+    // preview branch (1 unpublished commit ahead of main) and it was never
+    // published. The second edit must layer on top — NOT force-reset to main,
+    // which would discard the first book. This is the exact ENG-176 clobber.
+    mockedAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: 'main-sha-abc' } } } as any) // main ref
+      .mockResolvedValueOnce({ data: { status: 'ahead', ahead_by: 1, behind_by: 0 } } as any); // compare main...preview
+    reportSuccess();
+
+    const result = await runCodingAgent('append a second book card', previewContext);
+
+    // The reusable branch was preserved: no reset (PATCH) and no re-create (POST).
+    expect(mockedAxios.patch).not.toHaveBeenCalled();
+    expect(mockedAxios.post).not.toHaveBeenCalled();
+    // The ahead-check hit the correct compare endpoint (main...<encoded preview>).
+    // If URL construction ever broke, the compare would 404, be read as "0 ahead
+    // → reset", and silently reintroduce the clobber — so assert it explicitly.
+    expect(mockedAxios.get).toHaveBeenLastCalledWith(
+      expect.stringContaining('/compare/main...draft%2Fagentweb-preview'),
+      expect.anything(),
+    );
+    expect(result.success).toBe(true);
+  });
+
+  test('resets the preview branch to main when it is not ahead (fully published / identical)', async () => {
+    // No unpublished work on the branch → safe to reset to the latest main so
+    // the edit starts from the freshest published state (original behavior).
+    mockedAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: 'main-sha-abc' } } } as any) // main ref
+      .mockResolvedValueOnce({ data: { status: 'identical', ahead_by: 0, behind_by: 0 } } as any); // compare
+    mockedAxios.patch.mockResolvedValueOnce({ data: {} } as any);
+    reportSuccess();
+
+    const result = await runCodingAgent('edit the hero', previewContext);
+
+    expect(mockedAxios.patch).toHaveBeenCalledTimes(1);
+    expect(mockedAxios.patch).toHaveBeenCalledWith(
+      expect.stringContaining(`/git/refs/heads/${LANDING_PAGE_PREVIEW_BRANCH}`),
+      expect.objectContaining({ sha: 'main-sha-abc', force: true }),
+      expect.anything(),
+    );
+    expect(result.success).toBe(true);
+  });
+});
+
+describe('_previewBranchCommitsAheadOfMain', () => {
+  const repoBase = 'https://api.github.com/repos/AgentWebPro/lp-example';
+  const headers = { Authorization: 'Bearer x', Accept: 'application/vnd.github.v3+json' };
+
+  beforeEach(() => {
+    mockedAxios.get.mockReset();
+  });
+
+  test('returns the ahead count when the branch has unpublished commits', async () => {
+    mockedAxios.get.mockResolvedValueOnce({ data: { status: 'ahead', ahead_by: 2, behind_by: 0 } } as any);
+    await expect(_previewBranchCommitsAheadOfMain(repoBase, headers)).resolves.toBe(2);
+    // Guard the single safety-critical call: a broken URL (wrong encoding/ref
+    // order/path) would 404, be read as "0 ahead → reset", and silently
+    // reintroduce the ENG-176 clobber while every other assertion still passed.
+    expect(mockedAxios.get).toHaveBeenLastCalledWith(
+      expect.stringContaining('/compare/main...draft%2Fagentweb-preview'),
+      expect.objectContaining({ headers }),
+    );
+  });
+
+  test('returns 0 when identical to main', async () => {
+    mockedAxios.get.mockResolvedValueOnce({ data: { status: 'identical', ahead_by: 0, behind_by: 0 } } as any);
+    await expect(_previewBranchCommitsAheadOfMain(repoBase, headers)).resolves.toBe(0);
+  });
+
+  test('returns 0 when the preview branch does not exist yet (404)', async () => {
+    mockedAxios.get.mockRejectedValueOnce(githubAxiosError(404, { message: 'Not Found' }));
+    await expect(_previewBranchCommitsAheadOfMain(repoBase, headers)).resolves.toBe(0);
+  });
+
+  test('fails CLOSED (treats branch as ahead) on a transient comparison error so unpublished work is never clobbered', async () => {
+    // A 5xx/timeout/rate-limit must NOT be read as "0 ahead → safe to reset":
+    // that would let a transient GitHub hiccup force-reset the preview branch to
+    // main and destroy genuine unpublished edits (the ENG-176 clobber). Fail
+    // closed by reporting the branch as ahead so the caller skips the reset.
+    mockedAxios.get.mockRejectedValueOnce(githubAxiosError(500, { message: 'Service Unavailable' }));
+    await expect(_previewBranchCommitsAheadOfMain(repoBase, headers)).resolves.toBeGreaterThan(0);
   });
 });
