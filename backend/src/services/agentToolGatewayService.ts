@@ -178,6 +178,11 @@ function errorHead(error: unknown): string {
 // A does not block an invite to profile B. Every other tool (and any LinkedIn
 // action without a recipient, e.g. search-people) returns '' — a single shared
 // scope, exactly preserving the prior per-tool behavior.
+//
+// send-invite/send-message/send-inmail identify the recipient by profile_url or
+// provider_id; accept-invitation/cancel-invitation identify it by invitation_id
+// (see agentModeService.ts). Read whichever this action actually carries so every
+// allowlisted action resolves to a real per-recipient scope instead of ''.
 const LINKEDIN_RECIPIENT_ACTIONS = new Set([
   'send-invite',
   'send-message',
@@ -194,7 +199,11 @@ function failureScope(toolName: string, args: unknown): string {
   if (!LINKEDIN_RECIPIENT_ACTIONS.has(action)) return '';
   const target = typeof record.profile_url === 'string' && record.profile_url.trim()
     ? record.profile_url
-    : typeof record.provider_id === 'string' ? record.provider_id : '';
+    : typeof record.provider_id === 'string' && record.provider_id.trim()
+    ? record.provider_id
+    : typeof record.invitation_id === 'string'
+    ? record.invitation_id
+    : '';
   // Normalize so the same recipient with a trailing slash or query params
   // (LinkedIn appends miniProfileUrn tracking) collapses to one scope.
   return target.trim().toLowerCase().split('?')[0].replace(/\/+$/, '').slice(0, ERROR_KEY_LENGTH);
@@ -264,10 +273,15 @@ function recordToolFailure(runId: string, toolName: string, args: unknown, error
   counts.set(key, (counts.get(key) ?? 0) + 1);
 }
 
-function clearToolFailures(runId: string, toolName: string): void {
+function clearToolFailures(runId: string, toolName: string, args: unknown): void {
   const counts = runFailureCounts.get(runId);
   if (!counts) return;
-  const prefix = `${toolName}\0`;
+  // ENG-182: scope the clear to the SAME recipient that succeeded. A tool-wide
+  // clear (prefix `${toolName}\0`) would let a success for recipient B wipe a
+  // tripped/pending breaker for an unrelated recipient A, re-enabling the wasted
+  // retries the per-recipient isolation exists to prevent. Non-recipient tools
+  // resolve to scope '' — prefix `${toolName}\0\0` — preserving prior behavior.
+  const prefix = `${toolName}\0${failureScope(toolName, args)}\0`;
   for (const key of counts.keys()) {
     if (key.startsWith(prefix)) counts.delete(key);
   }
@@ -662,9 +676,9 @@ export async function executeAgentToolThroughGateway(
         durationMs: Math.max(0, now() - startedAt),
       };
     }
-    if (input.runId) clearToolFailures(input.runId, policyDecision.toolName);
+    if (input.runId) clearToolFailures(input.runId, policyDecision.toolName, input.args);
     if (input.budgetScopeId && input.budgetScopeId !== input.runId) {
-      clearToolFailures(input.budgetScopeId, policyDecision.toolName);
+      clearToolFailures(input.budgetScopeId, policyDecision.toolName, input.args);
     }
     return {
       status: 'success',
