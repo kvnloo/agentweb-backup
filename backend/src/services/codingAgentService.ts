@@ -219,6 +219,50 @@ export function _isMissingGithubRefError(error: any): boolean {
   return false;
 }
 
+/**
+ * How many commits the reusable preview branch is ahead of main — i.e. how many
+ * unpublished coding_agent edits currently sit on draft/agentweb-preview. Uses
+ * GitHub's compare API (base...head). Returns 0 ONLY when the branch is absent
+ * (404) or is genuinely identical to / behind main — the cases where resetting
+ * the branch to main loses nothing. A positive result means "there is unpublished
+ * work here, do not reset."
+ *
+ * On any OTHER error (5xx / timeout / rate-limit / unparseable body) we fail
+ * CLOSED: return a positive count so the caller skips the reset (ENG-176). A
+ * transient compare failure must never be read as "0 ahead → safe to force-reset",
+ * because that would silently discard genuine unpublished edits — the exact
+ * clobber this guard exists to prevent. At worst the new edit builds on a slightly
+ * stale branch, which is recoverable; a destroyed edit is not. Exported for tests.
+ */
+export async function _previewBranchCommitsAheadOfMain(
+  repoBase: string,
+  headers: Record<string, string>,
+): Promise<number> {
+  try {
+    const res = await axios.get<any>(
+      `${repoBase}/compare/main...${encodeURIComponent(LANDING_PAGE_PREVIEW_BRANCH)}`,
+      { headers, timeout: GITHUB_API_TIMEOUT_MS },
+    );
+    const aheadBy = res?.data?.ahead_by;
+    return typeof aheadBy === 'number' && aheadBy > 0 ? aheadBy : 0;
+  } catch (error) {
+    // 404 = preview branch doesn't exist yet → nothing unpublished, reset/create
+    // as usual (fail open — creating a fresh branch loses nothing).
+    if (_isMissingGithubRefError(error)) {
+      return 0;
+    }
+    // Any other error (5xx / timeout / rate-limit) → fail CLOSED: treat the branch
+    // as ahead so the caller skips the reset and layers on top, rather than
+    // force-resetting to main and destroying unpublished work on a transient hiccup.
+    console.warn(
+      '[CODING AGENT] Could not compare preview branch to main; assuming unpublished ' +
+        'commits exist and skipping reset to avoid clobbering them (ENG-176):',
+      error instanceof Error ? error.message : error,
+    );
+    return 1;
+  }
+}
+
 async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Promise<void> {
   if (context.draftBranch !== LANDING_PAGE_PREVIEW_BRANCH) return;
 
@@ -253,6 +297,23 @@ async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Pr
   }
   if (!mainSha) {
     throw new Error('Cannot prepare preview branch: main SHA not found');
+  }
+
+  // ENG-176: If the reusable preview branch already carries commits that are not
+  // yet on main, those are UNPUBLISHED edits from an earlier coding_agent run on
+  // this page. Force-resetting the branch to main here would silently discard
+  // them, so a later sequential edit on the same page clobbers the earlier one
+  // (e.g. the first-added book card disappears after publish). In that case we
+  // must layer the new edit on top of the existing preview branch instead of
+  // resetting. We only reset when the branch is absent or fully published
+  // (not ahead of main) — the case the reusable branch was designed for.
+  const aheadBy = await _previewBranchCommitsAheadOfMain(repoBase, headers);
+  if (aheadBy > 0) {
+    console.log(
+      `[CODING AGENT] ${LANDING_PAGE_PREVIEW_BRANCH} has ${aheadBy} unpublished commit(s) ahead of main; ` +
+        `layering new edit on top instead of resetting (ENG-176)`,
+    );
+    return;
   }
 
   try {
