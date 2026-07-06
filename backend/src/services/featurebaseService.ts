@@ -277,6 +277,45 @@ export async function createTicket(p: {
   return { id: t.id, number: t.ticketNumber, url: t.ticketUrl || '' };
 }
 
+/** Post details for the ship-notify path — fills webhook-payload gaps (author email, public URL). */
+export interface PostDetails {
+  id: string;
+  title: string;
+  url?: string;
+  authorEmail?: string;
+  statusType?: string;
+}
+
+export async function getPost(postId: string): Promise<PostDetails> {
+  const data = await featurebaseFetch(`/posts/${encodeURIComponent(postId)}`, { method: 'GET' });
+  const post = data?.data || data?.post || data;
+  if (!post?.id) throw new Error(`Featurebase getPost did not return a post: ${JSON.stringify(data).slice(0, 200)}`);
+  return {
+    id: post.id,
+    title: post.title || '',
+    url: post.postUrl || post.url,
+    authorEmail: post.author?.email,
+    statusType: post.status?.type,
+  };
+}
+
+export interface PostVoter {
+  email?: string;
+  name?: string;
+}
+
+/**
+ * List a post's voters (the additional reporters stacked by dedup). Single page,
+ * capped at the API max of 100 — logged when truncated so a silent cap can't read
+ * as full coverage.
+ */
+export async function listPostVoters(postId: string, limit = 100): Promise<PostVoter[]> {
+  const data = await featurebaseFetch(`/posts/${encodeURIComponent(postId)}/voters?limit=${limit}`, { method: 'GET' });
+  const voters: any[] = data?.data || [];
+  if (data?.nextCursor) console.warn(`[featurebase] post ${postId} has >${limit} voters — notifying the first ${limit} only`);
+  return voters.map((v) => ({ email: v.email, name: v.name }));
+}
+
 /** Set a ticket's status (keyed by ticketNumber). Used by the resolve bridge to flip cards on fix. */
 export async function patchTicketStatus(ticketNumber: number, statusId: string): Promise<void> {
   await featurebaseFetch(`/tickets/${ticketNumber}`, {

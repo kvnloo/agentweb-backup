@@ -116,7 +116,7 @@ describe('GenerateMarketingResponseWorkerService', () => {
     messageContent: 'Test message',
     sessionHistory: [],
     userId: 'test-user-id',
-    llmModel: 'gpt-5.1',
+    llmModel: 'gpt-5.5',
     sessionId: 'test-session-id',
     mockMode: false
   };
