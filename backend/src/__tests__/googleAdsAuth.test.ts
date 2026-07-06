@@ -65,7 +65,13 @@ beforeEach(() => {
   mockAuthUserId = 'user-123';
   jest.clearAllMocks();
   mockAxiosPost.mockResolvedValue({
-    data: { access_token: 'gads-token', refresh_token: 'gads-refresh', expires_in: 3600 },
+    data: {
+      access_token: 'gads-token',
+      refresh_token: 'gads-refresh',
+      expires_in: 3600,
+      // Google returns the scopes actually granted; the adwords scope must be present.
+      scope: 'https://www.googleapis.com/auth/adwords https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile',
+    },
   });
 });
 
@@ -135,6 +141,45 @@ describe('POST /finalize', () => {
   it('returns 400 for missing code', async () => {
     const state = makeState('user-123');
     await request(app).post('/finalize').send({ state }).expect(400);
+  });
+
+  it('returns 422 insufficient_scopes when the adwords scope was not granted', async () => {
+    const { listAccountHierarchy } = require('../services/googleAdsService').googleAdsService;
+    // Google Workspace admin policy (or an unchecked box on the "unverified app"
+    // consent screen) can drop the sensitive adwords scope while still issuing a
+    // token for the userinfo scopes — the connection must fail with a clear error.
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        access_token: 'gads-token',
+        refresh_token: 'gads-refresh',
+        expires_in: 3600,
+        scope: 'https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile',
+      },
+    });
+    const state = makeState('user-123');
+    const res = await request(app)
+      .post('/finalize')
+      .send({ code: 'auth-code', state })
+      .expect(422);
+    expect(res.body.error).toBe('insufficient_scopes');
+    expect(res.body.message).toMatch(/permission/i);
+    expect(res.body.grantedScopes).not.toContain('https://www.googleapis.com/auth/adwords');
+    // Must fail fast — never probe the Google Ads API with a scope-less token.
+    expect(listAccountHierarchy).not.toHaveBeenCalled();
+  });
+
+  it('returns 422 insufficient_scopes when the token response has no scope field', async () => {
+    const { listAccountHierarchy } = require('../services/googleAdsService').googleAdsService;
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { access_token: 'gads-token', refresh_token: 'gads-refresh', expires_in: 3600 },
+    });
+    const state = makeState('user-123');
+    const res = await request(app)
+      .post('/finalize')
+      .send({ code: 'auth-code', state })
+      .expect(422);
+    expect(res.body.error).toBe('insufficient_scopes');
+    expect(listAccountHierarchy).not.toHaveBeenCalled();
   });
 });
 
