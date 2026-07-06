@@ -21,6 +21,7 @@ import { runWaterfall as pureRunWaterfall, type LLMFilledValue, type EnrichSoFet
 import { apolloAsyncRequestCacheKey, APOLLO_SCHEMA_VERSION } from './apolloCacheKeys';
 import { FIELD_GROUPS } from './enrichmentGroups';
 import { trimQuote } from '../utils/enrichedFieldValue';
+import { groundWebValue, companyNameMatches } from '../utils/enrichmentGrounding';
 import { waitForApolloAsyncResult } from './enrichmentWaterfall';
 import { STANDARD_ENRICHABLE_FIELDS } from './enrichmentConfigService';
 import {
@@ -470,8 +471,12 @@ async function fetchWebForGroupReal(
   // Build context = SERP + page bodies (truncated)
   let webContext = JSON.stringify(rawData.webResults, null, 2);
   if (pages.length > 0) {
+    // Keep a generous slice of each page so a funding/firmographic fact that
+    // sits lower on the page still lands in the grounding source and isn't
+    // false-dropped for being "unsourced" (ENG-122). Grounding matches against
+    // this full context (cheap string ops); only the LLM prompt is capped.
     const pageText = pages
-      .map(p => `--- ${p.title}\n${p.url}\n${p.text.slice(0, 4000)}`)
+      .map(p => `--- ${p.title}\n${p.url}\n${p.text.slice(0, 12000)}`)
       .join('\n\n');
     webContext += '\n\nPage contents:\n' + pageText;
   }
@@ -502,38 +507,69 @@ export function buildFieldGuidanceV3(fields: string[], configFieldsByName: Recor
 }
 
 /**
- * Reject web-tier extracted values that carry no citation (absent or empty
- * sourceQuote). A web-tier value with no supporting quote was asserted by the
- * LLM from its own training knowledge rather than the provided web context or a
- * live-searched source — the fabricated-funding-data path (ENG-122: a small
- * company's funding_stage returned as an invented "Series C, $100M"). Per the
- * acceptance criteria, enrichment must return null/unknown for these instead of
- * surfacing an invented figure. Mirrors the V2 rule in
- * CrmEnrichmentService.verifyCitations ("rich-format value with a missing
- * sourceQuote is unsupported → null").
+ * Classify each web-tier extracted value by how well it can be trusted, and drop
+ * only wrong-entity values — never drop merely for being unverifiable (ENG-122).
+ *
+ * For each field, sets `grounding`:
+ *  - 'grounded': the fact was found in the real fetched source (groundWebValue,
+ *    which is format-insensitive so "$100M" matches a page saying "$100 million").
+ *    Safe to state.
+ *  - 'web-unverified': the model cited a web source (has sourceUrl) but the quote
+ *    couldn't be matched to our captured source — e.g. a live-searched page we
+ *    didn't fetch. Kept, badged "Web — unverified".
+ *  - 'ai-knowledge': no groundable quote and no source URL → asserted from the
+ *    model's training memory. Kept ONLY when the company the model says it
+ *    describes matches the lead's company (companyNameMatches, which separates
+ *    "Slash" from "Slashy"); otherwise DROPPED as an unconfirmable/wrong entity.
+ *    Kept values are badged "AI knowledge — unverified".
  *
  * LinkedIn URL fields are exempt: rejectHallucinatedLinkedInUrls already
- * citation-verifies them by slug-matching the URL against the source, and the
- * URL itself is the evidence (there is no free-text quote to require).
+ * citation-verifies them by slug-matching the URL against the source.
  */
-export function rejectUncitedWebValues(
+export function classifyWebValues(
   filled: Record<string, LLMFilledValue>,
+  opts: { source: string; leadCompany?: string; claimedCompany?: string },
 ): Record<string, LLMFilledValue> {
   const result: Record<string, LLMFilledValue> = {};
+  // Wrong-entity guard (ENG-122 AC#2): the model returns __entity_company__ =
+  // the company its firmographic/funding answers actually describe. If it named
+  // one and it isn't the lead's company, the web source is about a DIFFERENT,
+  // similarly-named company ("Quill Meetings" for a "Quillwork AI" lead;
+  // "Slashy" for "Slash") — so EVERY web value is wrong for this lead and must
+  // be dropped, even when the figure is genuinely grounded in that wrong source.
+  // Absent claimedCompany → no mismatch asserted → values keep their normal
+  // classification (avoids over-dropping when the model just omits the name).
+  const wrongEntity =
+    !!opts.claimedCompany && !companyNameMatches(opts.leadCompany, opts.claimedCompany);
   for (const [field, entry] of Object.entries(filled)) {
     if (/linkedin/i.test(field)) {
       result[field] = entry;
       continue;
     }
-    const hasQuote = typeof entry.sourceQuote === 'string' && entry.sourceQuote.trim().length > 0;
-    if (!hasQuote) {
+    if (wrongEntity) {
       console.warn(
-        `[v3 deps] Rejected uncited web value "${entry.value}" for field "${field}" ` +
-        `— no sourceQuote (unverifiable/training-knowledge claim)`,
+        `[v3 deps] Dropped web value "${entry.value}" for field "${field}" ` +
+        `— source describes "${opts.claimedCompany}" ≠ lead company "${opts.leadCompany ?? ''}" ` +
+        `(wrong-entity guard)`,
       );
       continue;
     }
-    result[field] = entry;
+    let grounding: 'grounded' | 'web-unverified' | 'ai-knowledge';
+    if (groundWebValue(entry.value, entry.sourceQuote, opts.source)) {
+      grounding = 'grounded';
+    } else if (typeof entry.sourceUrl === 'string' && entry.sourceUrl.trim()) {
+      grounding = 'web-unverified';
+    } else if (companyNameMatches(opts.leadCompany, opts.claimedCompany)) {
+      grounding = 'ai-knowledge';
+    } else {
+      console.warn(
+        `[v3 deps] Dropped ungrounded web value "${entry.value}" for field "${field}" ` +
+        `— no source and company unconfirmed (lead="${opts.leadCompany ?? ''}" ` +
+        `claimed="${opts.claimedCompany ?? ''}"): anti-fabrication guard`,
+      );
+      continue;
+    }
+    result[field] = { ...entry, grounding };
   }
   return result;
 }
@@ -562,7 +598,7 @@ export function rejectHallucinatedLinkedInUrls(
   return result;
 }
 
-async function extractFieldsViaLLMReal(input: {
+export async function extractFieldsViaLLMReal(input: {
   tier: 'apollo' | 'web';
   sourceContext: string;
   fields: string[];
@@ -597,10 +633,14 @@ async function extractFieldsViaLLMReal(input: {
     ? `You extract structured CRM data for a given lead. Follow this priority order:\n` +
       `1. Extract from the provided web context if the information is clearly present.\n` +
       `2. If information is missing or insufficient, use your web search capability to look it up.\n` +
-      `3. If web search yields no result, use your own training knowledge if you are FULLY confident.\n` +
+      `3. If neither yields a result, you MAY use your own training knowledge, but only if you are FULLY confident.\n` +
       `4. If you do not know a value with confidence, return null for that field.\n` +
-      `NEVER guess, infer, or fabricate. For each field return an object ` +
-      `{"value": <string>, "sourceUrl": <url or null>, "sourceQuote": <short verbatim snippet or null>}. ` +
+      `NEVER guess, infer, or fabricate.\n` +
+      `PROVENANCE IS MANDATORY AND MUST BE TRUTHFUL — for each field return an object ` +
+      `{"value": <string>, "sourceUrl": <url or null>, "sourceQuote": <short verbatim snippet or null>}:\n` +
+      `- If the value comes from the provided context or a web page, copy a SHORT VERBATIM snippet that contains it into sourceQuote (do not paraphrase) and put the page URL in sourceUrl.\n` +
+      `- If the value comes ONLY from your own training memory (no source found), set BOTH sourceUrl and sourceQuote to null. Do NOT invent a quote or URL to make an unsourced value look sourced.\n` +
+      `Also return a top-level key "__entity_company__": the company name EXACTLY as written in the source you actually used (or in your memory) — copy it verbatim from the source, do NOT substitute or normalize it to the lead's company name. If the best source you found is about a differently-named company (e.g. the lead is "Quillwork AI" but the funding article is about "Quill Meetings"), report that different name so we can detect the mismatch — do not pretend it matches.\n` +
       `Return strict JSON only, no markdown. If you have no data for any field, return {} — never return explanations or apologies.\n` +
       `IMPORTANT — for linkedin_url: name alone is never sufficient to confirm a match (e.g. "John Smith" is too common). ` +
       `Use ALL available lead signals — email address, email domain, company name, job title, location — to verify the profile belongs to this specific person. ` +
@@ -613,10 +653,10 @@ async function extractFieldsViaLLMReal(input: {
 
   const userPrompt = isWebTier
     ? `Lead: ${leadContext}\n\n` +
-      `Source (${input.tier}):\n${input.sourceContext.slice(0, 16000)}\n\n` +
+      `Source (${input.tier}):\n${input.sourceContext.slice(0, 24000)}\n\n` +
       `Extract these fields (return one JSON object with these exact keys):\n${fieldGuide}\n\n` +
       `Return ONLY a JSON object like ` +
-      `{"field_name": {"value": "...", "sourceUrl": "...", "sourceQuote": "..."}, "other_field": null}. ` +
+      `{"field_name": {"value": "...", "sourceUrl": "...", "sourceQuote": "..."}, "other_field": null, "__entity_company__": "<company these answers describe>"}. ` +
       `No prose. If nothing is found, return {}.`
     : `Lead: ${leadContext}\n\n` +
       `Source (${input.tier}):\n${input.sourceContext.slice(0, 16000)}\n\n` +
@@ -667,11 +707,19 @@ async function extractFieldsViaLLMReal(input: {
       }
     }
     let verified = rejectHallucinatedLinkedInUrls(filled, input.sourceContext);
-    // Web tier can fabricate factual firmographic/funding figures from training
-    // knowledge (ENG-122). Drop any web-tier value lacking a supporting quote so
-    // an unverifiable figure becomes null/missing rather than a stated fact.
+    // Web tier can surface funding/firmographic figures the model asserted from
+    // training memory or an unverifiable source (ENG-122). Classify each value by
+    // how well it grounds in the real fetched source and drop only wrong-entity
+    // fabrications (company mismatch); everything else is kept but badged.
     if (isWebTier) {
-      verified = rejectUncitedWebValues(verified);
+      const claimedCompany = typeof parsed?.__entity_company__ === 'string'
+        ? parsed.__entity_company__.trim()
+        : undefined;
+      verified = classifyWebValues(verified, {
+        source: input.sourceContext,
+        leadCompany: input.lead.company,
+        claimedCompany,
+      });
     }
     const verifiedMissing = input.fields.filter(f => !(f in verified));
     console.log(`${ltag} DONE filled=[${Object.keys(verified).join(',')}] missing=[${verifiedMissing.join(',')}]`);
@@ -1413,9 +1461,11 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
             meta: {
               source: 'web_search',
               provider: 'llm_web_search',
-              confidence: 'medium',
+              // Grounded → trustworthy; ungrounded stays low for an "— unverified" badge (ENG-122).
+              confidence: entry.grounding === 'grounded' ? 'high' : 'low',
               ...(entry.sourceUrl ? { sourceUrl: entry.sourceUrl } : {}),
               ...(entry.sourceQuote ? { sourceQuote: entry.sourceQuote } : {}),
+              ...(entry.grounding ? { grounding: entry.grounding } : {}),
               enrichedAt: new Date().toISOString(),
             },
           });
