@@ -144,11 +144,28 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
 
-    const { access_token, refresh_token, expires_in } = tokenResponse.data as {
+    const { access_token, refresh_token, expires_in, scope } = tokenResponse.data as {
       access_token: string;
       refresh_token?: string;
       expires_in: number;
+      scope?: string;
     };
+
+    // Google returns the scopes actually granted. A Google Workspace admin policy
+    // (common in regulated orgs) or an unchecked box on the "unverified app" consent
+    // screen can drop the sensitive adwords scope while still issuing a token for the
+    // userinfo scopes. Without adwords, listAccessibleCustomers fails or returns nothing,
+    // so the connection silently ends with 0 accounts. Detect it here and return an
+    // actionable error instead — mirrors the google_drive finalize flow.
+    const grantedScopes = (scope || '').split(' ').filter(Boolean);
+    const hasAdwords = grantedScopes.some(s => s.includes('/auth/adwords'));
+    if (!hasAdwords) {
+      return res.status(422).json({
+        error: 'insufficient_scopes',
+        message: 'Google Ads permission was not granted. This can happen when your Google Workspace admin restricts third-party app access, or when the Google Ads permission was not approved on the consent screen. Please try again and allow all requested permissions.',
+        grantedScopes,
+      });
+    }
 
     const accountTree = await googleAdsService.listAccountHierarchy(access_token);
 
