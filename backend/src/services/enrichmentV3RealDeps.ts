@@ -528,19 +528,36 @@ export function buildFieldGuidanceV3(fields: string[], configFieldsByName: Recor
  */
 export function classifyWebValues(
   filled: Record<string, LLMFilledValue>,
-  opts: { source: string; leadCompany?: string; claimedCompany?: string },
+  opts: {
+    source: string;
+    leadCompany?: string;
+    claimedCompany?: string;
+    /** The model's alias-aware self-judgment of whether the company its answers
+     *  describe is the SAME real-world company as the lead's (accounting for
+     *  abbreviations, rebrands, legal names). From __entity_matches_lead__. */
+    claimedMatchesLead?: boolean;
+  },
 ): Record<string, LLMFilledValue> {
   const result: Record<string, LLMFilledValue> = {};
   // Wrong-entity guard (ENG-122 AC#2): the model returns __entity_company__ =
-  // the company its firmographic/funding answers actually describe. If it named
-  // one and it isn't the lead's company, the web source is about a DIFFERENT,
-  // similarly-named company ("Quill Meetings" for a "Quillwork AI" lead;
-  // "Slashy" for "Slash") — so EVERY web value is wrong for this lead and must
-  // be dropped, even when the figure is genuinely grounded in that wrong source.
-  // Absent claimedCompany → no mismatch asserted → values keep their normal
-  // classification (avoids over-dropping when the model just omits the name).
-  const wrongEntity =
+  // the company its firmographic/funding answers actually describe. If it isn't
+  // the lead's company, the web source is about a DIFFERENT, similarly-named
+  // company ("Quill Meetings" for "Quillwork AI"; "Slashy" for "Slash") — so
+  // every web value is wrong for this lead and is dropped, even when genuinely
+  // grounded in that wrong source.
+  //
+  // The company name check is a cheap, alias-BLIND token match, so on its own it
+  // would over-drop legitimate aliases ("IBM" vs "International Business
+  // Machines", a "Facebook" article for a "Meta" lead). The extraction model
+  // also returns an alias-AWARE __entity_matches_lead__. So we drop only when the
+  // tokens mismatch AND the model does NOT affirm it's the same company:
+  //   - tokens match                       → keep (fast path, no model reliance)
+  //   - tokens mismatch + model says true  → alias → keep
+  //   - tokens mismatch + model false/absent → wrong entity → drop
+  // Failure mode is "keep a wrong-entity value (badged)" not "lose a real one".
+  const tokenMismatch =
     !!opts.claimedCompany && !companyNameMatches(opts.leadCompany, opts.claimedCompany);
+  const wrongEntity = tokenMismatch && opts.claimedMatchesLead !== true;
   for (const [field, entry] of Object.entries(filled)) {
     if (/linkedin/i.test(field)) {
       result[field] = entry;
@@ -641,6 +658,7 @@ export async function extractFieldsViaLLMReal(input: {
       `- If the value comes from the provided context or a web page, copy a SHORT VERBATIM snippet that contains it into sourceQuote (do not paraphrase) and put the page URL in sourceUrl.\n` +
       `- If the value comes ONLY from your own training memory (no source found), set BOTH sourceUrl and sourceQuote to null. Do NOT invent a quote or URL to make an unsourced value look sourced.\n` +
       `Also return a top-level key "__entity_company__": the company name EXACTLY as written in the source you actually used (or in your memory) — copy it verbatim from the source, do NOT substitute or normalize it to the lead's company name. If the best source you found is about a differently-named company (e.g. the lead is "Quillwork AI" but the funding article is about "Quill Meetings"), report that different name so we can detect the mismatch — do not pretend it matches.\n` +
+      `Also return a top-level key "__entity_matches_lead__": a boolean — true ONLY if the company your answers describe is the SAME real-world company as the lead's company, accounting for abbreviations, rebrands, and legal names (e.g. "IBM" = "International Business Machines", "Meta" = "Facebook", "Slash Inc" = "Slash"). Return false if it is a different company that merely has a similar name (e.g. "Quill Meetings" is NOT "Quillwork AI", "Slashy" is NOT "Slash"). Be honest — this is used to discard data about the wrong company.\n` +
       `Return strict JSON only, no markdown. If you have no data for any field, return {} — never return explanations or apologies.\n` +
       `IMPORTANT — for linkedin_url: name alone is never sufficient to confirm a match (e.g. "John Smith" is too common). ` +
       `Use ALL available lead signals — email address, email domain, company name, job title, location — to verify the profile belongs to this specific person. ` +
@@ -656,7 +674,7 @@ export async function extractFieldsViaLLMReal(input: {
       `Source (${input.tier}):\n${input.sourceContext.slice(0, 24000)}\n\n` +
       `Extract these fields (return one JSON object with these exact keys):\n${fieldGuide}\n\n` +
       `Return ONLY a JSON object like ` +
-      `{"field_name": {"value": "...", "sourceUrl": "...", "sourceQuote": "..."}, "other_field": null, "__entity_company__": "<company these answers describe>"}. ` +
+      `{"field_name": {"value": "...", "sourceUrl": "...", "sourceQuote": "..."}, "other_field": null, "__entity_company__": "<company these answers describe>", "__entity_matches_lead__": true}. ` +
       `No prose. If nothing is found, return {}.`
     : `Lead: ${leadContext}\n\n` +
       `Source (${input.tier}):\n${input.sourceContext.slice(0, 16000)}\n\n` +
@@ -715,10 +733,19 @@ export async function extractFieldsViaLLMReal(input: {
       const claimedCompany = typeof parsed?.__entity_company__ === 'string'
         ? parsed.__entity_company__.trim()
         : undefined;
+      // Alias-aware self-judgment. Accept a real boolean or a "true"/"false"
+      // string (LLMs sometimes stringify); anything else → undefined (unknown).
+      const rawMatch = parsed?.__entity_matches_lead__;
+      const claimedMatchesLead =
+        typeof rawMatch === 'boolean' ? rawMatch
+        : typeof rawMatch === 'string' ? (rawMatch.trim().toLowerCase() === 'true' ? true
+          : rawMatch.trim().toLowerCase() === 'false' ? false : undefined)
+        : undefined;
       verified = classifyWebValues(verified, {
         source: input.sourceContext,
         leadCompany: input.lead.company,
         claimedCompany,
+        claimedMatchesLead,
       });
     }
     const verifiedMissing = input.fields.filter(f => !(f in verified));
