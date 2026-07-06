@@ -1132,6 +1132,27 @@ describe('LinkedInOutreachService', () => {
       ).rejects.toThrow('Profile not found');
       expect(mockUnipileClient.request.send).toHaveBeenCalledTimes(1);
     });
+
+    it('surfaced timeout error is classified as a retryable "timeout" by the agent error pipeline', async () => {
+      // Guards the cross-module contract: the timeout message emitted here must
+      // match toolErrorClassifier's timeout regex so the agent tells the model
+      // "retry once, then stop" instead of hanging. If the message ever changes
+      // and stops matching, this fails loudly.
+      const { classifyToolErrorClass } = require('../utils/toolErrorClassifier');
+      const { isRetryableErrorClass } = require('../services/agentMode/core/errorRetryability');
+      jest.useFakeTimers();
+      (mockUnipileClient.request.send as jest.Mock).mockImplementation(() => hang());
+
+      const resultPromise = linkedInOutreachService.getProfile('john-doe', 'account-123');
+      const captured = resultPromise.catch((e: any) => e);
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+      const err = await captured;
+
+      const cls = classifyToolErrorClass(err);
+      expect(cls).toBe('timeout');
+      expect(isRetryableErrorClass(cls)).toBe(true);
+    });
   });
 
   describe('listConnections', () => {
