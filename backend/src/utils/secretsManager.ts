@@ -344,7 +344,7 @@ export interface TwitterCredentials {
 /**
  * Get Twitter/X OAuth2 (Authorization Code + PKCE) client credentials from AWS Secrets Manager.
  *
- * Secret location: dev/AgentWeb/TwitterX (or prod/AgentWeb/TwitterX for production)
+ * Secret location: dev/AgentWeb/Twitter (or prod/AgentWeb/Twitter for production)
  * Secret format: { "clientId": "...", "clientSecret": "..." }
  *
  * @returns Twitter/X OAuth2 client credentials
@@ -353,8 +353,8 @@ export async function getTwitterCredentials(): Promise<TwitterCredentials> {
   try {
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production'
-      ? 'prod/AgentWeb/TwitterX'
-      : 'dev/AgentWeb/TwitterX';
+      ? 'prod/AgentWeb/Twitter'
+      : 'dev/AgentWeb/Twitter';
 
     const secretString = await getSecret(secretName);
 
