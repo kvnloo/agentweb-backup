@@ -46,6 +46,35 @@ describe('extractFieldsViaLLMReal — grounding wiring (ENG-122)', () => {
     expect(res.missing).toContain('funding_stage');
   });
 
+  it('KEEPS an aliased value when the model returns __entity_matches_lead__ true despite a name-form mismatch', async () => {
+    mockWebSearch.mockResolvedValue({
+      arr: { value: '$60B', sourceUrl: 'https://x', sourceQuote: 'reported $60B in annual revenue' },
+      __entity_company__: 'International Business Machines',
+      __entity_matches_lead__: true,
+    });
+    const res = await extractFieldsViaLLMReal(
+      input({
+        fields: ['arr'],
+        sourceContext: 'International Business Machines reported $60B in annual revenue.',
+        lead: { leadId: 'l1', email: 'a@ibm.com', company: 'IBM' },
+        configFieldsByName: { arr: {} },
+      }),
+    );
+    expect(res.filled.arr?.grounding).toBe('grounded');
+  });
+
+  it('drops when the model returns __entity_matches_lead__ false (wrong entity)', async () => {
+    mockWebSearch.mockResolvedValue({
+      funding_stage: { value: 'Seed', sourceUrl: 'https://x', sourceQuote: 'announced $6.5M seed' },
+      __entity_company__: 'Quill Meetings',
+      __entity_matches_lead__: false,
+    });
+    const res = await extractFieldsViaLLMReal(
+      input({ lead: { leadId: 'l1', email: 'a@quillwork.ai', company: 'Quillwork AI' } }),
+    );
+    expect(res.filled.funding_stage).toBeUndefined();
+  });
+
   it('tags the value "grounded" when it appears in the source and the entity matches', async () => {
     mockWebSearch.mockResolvedValue({
       funding_stage: { value: 'Series B', sourceUrl: 'https://x', sourceQuote: 'raised $100M in a Series B round' },

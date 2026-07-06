@@ -102,6 +102,34 @@ describe('classifyWebValues', () => {
     expect(r.funding_stage?.grounding).toBe('grounded');
   });
 
+  it('KEEPS an aliased grounded value when the model affirms same company (IBM = International Business Machines)', () => {
+    // Token match is alias-blind (no shared token), but __entity_matches_lead__
+    // rescues the legitimate alias so real data isn't over-dropped.
+    const source = 'International Business Machines reported $60B in annual revenue in 2023.';
+    const r = classifyWebValues(
+      { arr: fv('$60B', { sourceQuote: 'reported $60B in annual revenue' }) },
+      { source, leadCompany: 'IBM', claimedCompany: 'International Business Machines', claimedMatchesLead: true },
+    );
+    expect(r.arr?.grounding).toBe('grounded');
+  });
+
+  it('DROPS a wrong-entity value when the model confirms a different company (__entity_matches_lead__ false)', () => {
+    const source = 'Quill Meetings today announced $6.5 million in seed funding.';
+    const r = classifyWebValues(
+      { funding_stage: fv('Seed', { sourceQuote: 'announced $6.5 million in seed funding' }) },
+      { source, leadCompany: 'Quillwork AI', claimedCompany: 'Quill Meetings', claimedMatchesLead: false },
+    );
+    expect(r.funding_stage).toBeUndefined();
+  });
+
+  it('falls back to dropping on a token mismatch when the model omits the boolean', () => {
+    const r = classifyWebValues(
+      { funding_stage: fv('Series C', { sourceQuote: 'raised a Series C' }) },
+      { source: SOURCE, leadCompany: 'Quillwork AI', claimedCompany: 'Quill Meetings' }, // no claimedMatchesLead
+    );
+    expect(r.funding_stage).toBeUndefined();
+  });
+
   it('does not over-drop a grounded value when no company was claimed', () => {
     const r = classifyWebValues(
       { funding_stage: fv('Series B', { sourceQuote: 'raised $100 million in a Series B round' }) },
