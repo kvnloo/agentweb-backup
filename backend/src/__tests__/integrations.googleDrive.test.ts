@@ -34,22 +34,22 @@ describe('getGoogleDriveConfig', () => {
     expect(config.clientSecret).toBe('test-secret');
   });
 
-  it('includes drive.file scope in scopes array', async () => {
+  it('includes drive scope in scopes array', async () => {
     mockGetGmailCredentials.mockResolvedValue(mockCredentials);
     const { getGoogleDriveConfig } = await import('../config/integrations');
 
     const config = await getGoogleDriveConfig();
 
-    expect(config.scopes).toContain('https://www.googleapis.com/auth/drive.file');
+    expect(config.scopes).toContain('https://www.googleapis.com/auth/drive');
   });
 
-  it('includes drive.file, documents, and spreadsheets scopes', async () => {
+  it('includes drive, documents, and spreadsheets scopes', async () => {
     mockGetGmailCredentials.mockResolvedValue(mockCredentials);
     const { getGoogleDriveConfig } = await import('../config/integrations');
 
     const config = await getGoogleDriveConfig();
 
-    expect(config.scopes).toContain('https://www.googleapis.com/auth/drive.file');
+    expect(config.scopes).toContain('https://www.googleapis.com/auth/drive');
     expect(config.scopes).toContain('https://www.googleapis.com/auth/documents');
     expect(config.scopes).toContain('https://www.googleapis.com/auth/spreadsheets');
   });

@@ -8214,7 +8214,7 @@ emmaToolRegistry.register({
   name: 'update_google_doc',
   definition: {
     name: 'update_google_doc',
-    description: 'Replace the entire content of an existing Google Doc with rich formatting. Content is written in markdown and automatically converted to rich Google Docs formatting — write full markdown, do NOT flatten to plain text. Use this to write revised content back to a Doc after the team has left comments and the user has approved edits. Accepts a Doc URL or file ID. BEHAVIOR: Just do it when the user has clearly asked for an update. Only ask for clarification if multiple Docs are in context and it\'s genuinely ambiguous which one to update.',
+    description: 'Replace the entire content of an existing Google Doc with rich formatting. Content is written in markdown and automatically converted to rich Google Docs formatting — write full markdown, do NOT flatten to plain text. Use this to write revised content back to a Doc after the team has left comments and the user has approved edits. Accepts a Doc URL or file ID. BEHAVIOR: Just do it when the user has clearly asked for an update. Only ask for clarification if multiple Docs are in context and it\'s genuinely ambiguous which one to update. This replaces the WHOLE document — after a successful update, briefly mention that the previous version is recoverable via File → Version History in Google Docs, in case the result isn\'t what the user expected. STYLING: unlike create_google_doc, an update defaults to leaving the doc\'s existing visual decoration alone (headings/bullets/tables still render properly, just without imposed colors/fonts) — only pass plain=false or style_options when the user explicitly asks for the doc to be restyled/colorized.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -8247,7 +8247,9 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
-    const style = args.plain === true ? 'plain' : 'styled';
+    // Unlike create (styled by default), an update defaults to leaving the doc's existing
+    // look alone — only restyle when the user explicitly asked (plain: false) or gave style_options.
+    const style = args.plain === true ? 'plain' : (args.plain === false || args.style_options) ? 'styled' : 'plain';
     const so = args.style_options;
     const styleOptions = so ? { primaryColor: so.primary_color, fontFamily: so.font_family, fontSize: so.font_size, lineHeight: so.line_height, compact: so.compact } : undefined;
     return agentModeService.updateGoogleDoc(args.url_or_id, args.content, context.userId, style, styleOptions);
