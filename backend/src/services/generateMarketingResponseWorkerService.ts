@@ -316,7 +316,11 @@ export class GenerateMarketingResponseWorkerService {
     }
 
     if (this.worker && !this.worker.killed) {
-      this.worker.kill('SIGTERM');
+      // The worker ignores SIGTERM (installWorkerSignalGuards) so a
+      // process-group signal can't abort an in-flight run; teardown here must
+      // therefore use SIGKILL. Safe by this point — the drain above already let
+      // in-flight requests finish (or force-failed them at the ceiling).
+      this.worker.kill('SIGKILL');
       this.worker = null;
     }
   }

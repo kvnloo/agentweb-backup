@@ -4,6 +4,13 @@
  */
 
 import { AgentModeService } from '../services/agentModeService';
+import { installWorkerSignalGuards } from './workerSignalGuards';
+
+// Ignore process-group SIGTERM/SIGINT so an instance-termination signal (EB
+// deploy, autoscaling replacement, health-check restart) broadcast to the whole
+// group cannot abort an in-flight run mid-execution. The parent orchestrates
+// shutdown via a graceful drain and an explicit SIGKILL (ENG-202).
+installWorkerSignalGuards();
 
 // Initialize the service
 const agentModeService = new AgentModeService();
