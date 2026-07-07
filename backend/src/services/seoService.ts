@@ -231,7 +231,7 @@ export async function fetchSearchConsoleMetrics(userId: string, timeframe: strin
 
   const resolved = resolvedConfig ?? (await resolveAnalyticsConfig(user));
   if (!resolved.seoDomains || resolved.seoDomains.length === 0) {
-    return { message: "Google Search Console is not configured. Use the search_user_guide tool to find setup instructions and share them with the user." };
+    return { message: "Google Search Console is not configured. This is a self-serve setup, not a product bug — do not file a product issue. Guide the user to connect it: in Settings → Analytics & SEO (/settings/analytics-seo) they can add their domain under \"SEO Domains\" and grant the AgentWeb service account access in Search Console. (If they belong to an organization and can't see that page, their org owner or an analytics editor must set it up.) You can use the search_user_guide tool for detailed step-by-step instructions." };
   }
 
   const accessToken = await getGoogleSearchConsoleAccessToken();
@@ -487,7 +487,7 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
   const resolved = resolvedConfig ?? (await resolveAnalyticsConfig(user));
   const gaProperties = resolved.properties;
   if (gaProperties.length === 0) {
-    return { message: "Google Analytics (GA4) is not configured. Use the search_user_guide tool to find setup instructions and share them with the user." };
+    return { message: "Google Analytics (GA4) is not configured. This is a self-serve setup, not a product bug — do not file a product issue. Guide the user to connect it: in Settings → Analytics & SEO (/settings/analytics-seo) they can add their GA4 Property ID under \"Google Analytics\" and grant the AgentWeb service account Viewer access. (If they belong to an organization and can't see that page, their org owner or an analytics editor must set it up.) You can use the search_user_guide tool for detailed step-by-step instructions." };
   }
 
   // Filter to a specific property if requested
