@@ -176,12 +176,17 @@ export class AgentToolBudgetExceededError extends Error {
 // model gets no signal to stop, so the gateway provides one. Counts are keyed
 // by (runId, toolName, error head); a success for the tool clears its counts.
 //
-// ENG-124: NON-retryable error classes (auth / upstream_rejected / invalid_args /
+// ENG-124: NON-retryable error classes (auth / upstream_rejected /
 // tool_unavailable / invalid_output — see core/errorRetryability.ts) trip one
 // attempt earlier (threshold 2): for those classes an identical retry is
 // KNOWN-pointless, so a second identical failure is already a spiral. The class
 // is derived from the stored error head via the same classifier the telemetry
 // uses, so breaker accounting and error taxonomy stay in lockstep.
+// ENG-197: invalid_args is intentionally NOT fast-tripped. Schema rejects are
+// caught pre-dispatch and never reach this breaker; the invalid_args failures it
+// does see are execution-time refusals (e.g. LinkedIn "Invalid parameters" for an
+// over-limit note) whose text repeats across legitimately different arguments, so
+// fast-tripping locked whole send-invite batches out. It keeps threshold 3.
 const REPEATED_FAILURE_THRESHOLD = 3;
 const NON_RETRYABLE_FAILURE_THRESHOLD = 2;
 // ENG-167: timeouts are retryable per-error-head (a single timeout message trips at

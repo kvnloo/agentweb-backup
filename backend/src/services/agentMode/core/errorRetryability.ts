@@ -21,10 +21,10 @@
  * The FAST_TRIP subset additionally lowers the per-run circuit-breaker
  * threshold in agentToolGatewayService (2 identical failures instead of 3):
  * for those classes a retry is KNOWN-pointless, so the gateway stops the
- * spiral one attempt earlier. empty_result / not_found are deliberately NOT
- * fast-tripped — their error text is identical across different arguments
- * ("No search results found"), so two legitimate different-args attempts would
- * otherwise trip the breaker.
+ * spiral one attempt earlier. empty_result / not_found / invalid_args are
+ * deliberately NOT fast-tripped — their error text is identical across
+ * different arguments ("No search results found", "Invalid parameters"), so two
+ * legitimate different-args attempts would otherwise trip the breaker (ENG-197).
  *
  * PURE: no imports from the monolith, no I/O. Used by core/toolDispatch.ts
  * (model-visible guidance) and agentToolGatewayService.ts (breaker threshold).
@@ -43,11 +43,23 @@ export const RETRYABLE_ERROR_CLASSES: ReadonlySet<string> = new Set([
  * the per-run repeated-failure breaker threshold to 2 (see
  * agentToolGatewayService). Deliberately excludes empty_result / not_found
  * (same error text across different, legitimate arguments).
+ *
+ * ENG-197: invalid_args is also excluded. Schema-reject invalid_args is caught
+ * PRE-dispatch (AgentToolContractValidationError) and never reaches the breaker,
+ * so the only invalid_args the breaker ever counts are EXECUTION-time refusals
+ * (e.g. LinkedIn's generic "Invalid parameters" for an over-limit invite note).
+ * That error text is identical across legitimately different arguments — a
+ * send-invite batch to five distinct profiles — so fast-tripping it at 2 locked
+ * the whole run out of send-invite after two per-note failures, blocking even
+ * corrected notes and unrelated profiles. Keep it at the default threshold (3),
+ * exactly like empty_result / not_found. This does NOT change the model-facing
+ * verdict: invalid_args stays NON-retryable-as-identical (see
+ * RETRYABLE_ERROR_CLASSES / NEXT_STEP_BY_CLASS), so the "fix the arguments
+ * first" guidance is unchanged.
  */
 export const FAST_TRIP_ERROR_CLASSES: ReadonlySet<string> = new Set([
   'auth',
   'upstream_rejected',
-  'invalid_args',
   'tool_unavailable',
   'invalid_output',
   'policy_blocked',
