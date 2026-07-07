@@ -245,3 +245,47 @@ describe('linearService.addIssueComment', () => {
     await expect(addIssueComment('uuid-1', 'x')).rejects.toThrow(/commentCreate failed/);
   });
 });
+
+describe('linearService.getTeamMeta — pagination guard (2026-07-07 live-smoke finding)', () => {
+  beforeEach(() => { _resetLinearTeamCache(); });
+  afterEach(() => jest.clearAllMocks());
+
+  it('explicitly sizes the states and labels connections at 250 (Linear defaults to 50 and truncates silently)', async () => {
+    let n = 0;
+    (global.fetch as any) = jest.fn(() => {
+      n += 1;
+      const body = n === 1 ? TEAM_RESPONSE : { data: { issueCreate: { success: true, issue: { id: 'uuid-59', identifier: 'ENG-59', url: 'u' } } } };
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) } as any);
+    });
+    await createInternalLinearIssue({ title: 't', description: 'd', labelNames: ['Bug'] });
+    const metaCall = (global.fetch as jest.Mock).mock.calls.find(c => (c[1]?.body || '').includes('teams(filter'));
+    expect(metaCall).toBeDefined();
+    const query: string = JSON.parse(metaCall![1].body).query;
+    expect(query).toContain('states(first: 250)');
+    expect(query).toContain('labels(first: 250)');
+  });
+
+  it('logs a LOUD error when the team has more states/labels than one 250 page (no silent truncation)', async () => {
+    const err = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const TRUNCATED = {
+      data: {
+        teams: {
+          nodes: [{
+            id: 'team_eng',
+            states: { nodes: TEAM_RESPONSE.data.teams.nodes[0].states.nodes, pageInfo: { hasNextPage: false } },
+            labels: { nodes: TEAM_RESPONSE.data.teams.nodes[0].labels.nodes, pageInfo: { hasNextPage: true } },
+          }],
+        },
+      },
+    };
+    let n = 0;
+    (global.fetch as any) = jest.fn(() => {
+      n += 1;
+      const body = n === 1 ? TRUNCATED : { data: { issueCreate: { success: true, issue: { id: 'uuid-60', identifier: 'ENG-60', url: 'u' } } } };
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) } as any);
+    });
+    await createInternalLinearIssue({ title: 't', description: 'd', labelNames: ['Bug'] });
+    expect(err.mock.calls.some(c => String(c[0]).includes('exceeds 250'))).toBe(true);
+    err.mockRestore();
+  });
+});

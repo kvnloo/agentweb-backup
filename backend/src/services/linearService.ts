@@ -79,16 +79,28 @@ let teamMetaCache: TeamMeta | null = null;
 
 async function getTeamMeta(): Promise<TeamMeta> {
   if (teamMetaCache) return teamMetaCache;
+  // Both connections MUST be explicitly sized: Linear defaults to 50 nodes, and the ENG team
+  // already has >50 labels — the un-sized query silently truncated "Bug" out of the page
+  // (caught by the 2026-07-07 live smoke). 250 is Linear's max page size.
   const data = await linearGraphQL(
     `query($key: String!) {
       teams(filter: { key: { eq: $key } }, first: 1) {
-        nodes { id states { nodes { id name type } } labels { nodes { id name } } }
+        nodes {
+          id
+          states(first: 250) { nodes { id name type } pageInfo { hasNextPage } }
+          labels(first: 250) { nodes { id name } pageInfo { hasNextPage } }
+        }
       }
     }`,
     { key: TEAM_KEY },
   );
   const team = data?.teams?.nodes?.[0];
   if (!team) throw new Error(`Linear team "${TEAM_KEY}" not found`);
+  if (team.states?.pageInfo?.hasNextPage || team.labels?.pageInfo?.hasNextPage) {
+    console.error(
+      `[linear] team "${TEAM_KEY}" metadata exceeds 250 states/labels — resolution map is truncated and names may be dropped; add pagination to getTeamMeta`,
+    );
+  }
   const states: any[] = team.states?.nodes || [];
   const backlog = states.find(s => s.type === 'backlog') || states.find(s => s.type === 'unstarted');
   const stateIds: Record<string, string> = {};
