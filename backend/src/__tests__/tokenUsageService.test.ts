@@ -246,6 +246,135 @@ describe("checkTokenUsage", () => {
   });
 });
 
+// ─── COST-BASED LIMIT (ENG-200) ──────────────────────────────────────────────
+
+describe("getUserTokenAllowance - cost allowance", () => {
+  it("returns null costAllowance when subscription has no cost limit", async () => {
+    mockGetUserSubscriptionType.mockResolvedValue("Pro");
+    mockGetSubscriptionTypeConfig.mockResolvedValue({
+      name: "Pro",
+      allowedPages: ["*"],
+      allowedSkills: ["*"],
+      monthlyTokenAllowance: 500000,
+      // no monthlyCostAllowance
+    });
+    mockGetUserById.mockResolvedValue({ userId: "u1", email: "a@b.com", tokenAllowanceBonus: 0 });
+
+    const result = await getUserTokenAllowance("u1");
+    expect(result.costAllowance).toBeNull();
+  });
+
+  it("returns the configured monthlyCostAllowance", async () => {
+    mockGetUserSubscriptionType.mockResolvedValue("Basic");
+    mockGetSubscriptionTypeConfig.mockResolvedValue({
+      name: "Basic",
+      allowedPages: ["*"],
+      allowedSkills: ["*"],
+      monthlyTokenAllowance: 100000,
+      monthlyCostAllowance: 20,
+    });
+    mockGetUserById.mockResolvedValue({ userId: "u1", email: "a@b.com", tokenAllowanceBonus: 0 });
+
+    const result = await getUserTokenAllowance("u1");
+    expect(result.costAllowance).toBe(20);
+  });
+});
+
+describe("checkTokenUsage - cost-based limit", () => {
+  it("blocks when monthly LLM cost reaches the cost allowance even though tokens are under limit", async () => {
+    mockGetUserById.mockResolvedValue({
+      userId: "u1",
+      email: "a@b.com",
+      // Only 10% of tokens used, but the full dollar budget is spent (e.g. via an expensive model)
+      tokenUsage: { month: currentMonth(), totalTokens: 10000, totalCost: 20.0, resetDate: "2026-05-01T00:00:00.000Z" },
+      tokenAllowanceBonus: 0,
+    });
+    mockGetUserSubscriptionType.mockResolvedValue("Basic");
+    mockGetSubscriptionTypeConfig.mockResolvedValue({
+      name: "Basic",
+      allowedPages: ["*"],
+      allowedSkills: ["*"],
+      monthlyTokenAllowance: 100000,
+      monthlyCostAllowance: 20,
+    });
+
+    const result = await checkTokenUsage("u1");
+    expect(result.allowed).toBe(false);
+    expect(result.costUsed).toBe(20.0);
+    expect(result.costAllowance).toBe(20);
+    expect(result.costPercentUsed).toBe(100);
+    // token dimension alone would have allowed the request
+    expect(result.percentUsed).toBe(10);
+  });
+
+  it("blocks purely on cost when token allowance is unlimited (Fable rollout scenario)", async () => {
+    mockGetUserById.mockResolvedValue({
+      userId: "u1",
+      email: "a@b.com",
+      tokenUsage: { month: currentMonth(), totalTokens: 5_000_000, totalCost: 55.0, resetDate: "2026-05-01T00:00:00.000Z" },
+      tokenAllowanceBonus: 0,
+    });
+    mockGetUserSubscriptionType.mockResolvedValue("Enterprise");
+    mockGetSubscriptionTypeConfig.mockResolvedValue({
+      name: "Enterprise",
+      allowedPages: ["*"],
+      allowedSkills: ["*"],
+      // unlimited tokens, but a hard dollar cap
+      monthlyCostAllowance: 50,
+    });
+
+    const result = await checkTokenUsage("u1");
+    expect(result.allowed).toBe(false);
+    expect(result.effectiveAllowance).toBeNull();
+    expect(result.percentUsed).toBe(0);
+    expect(result.costPercentUsed).toBe(110);
+  });
+
+  it("warns at 80% of the cost allowance", async () => {
+    mockGetUserById.mockResolvedValue({
+      userId: "u1",
+      email: "a@b.com",
+      tokenUsage: { month: currentMonth(), totalTokens: 1000, totalCost: 16.0, resetDate: "2026-05-01T00:00:00.000Z" },
+      tokenAllowanceBonus: 0,
+    });
+    mockGetUserSubscriptionType.mockResolvedValue("Basic");
+    mockGetSubscriptionTypeConfig.mockResolvedValue({
+      name: "Basic",
+      allowedPages: ["*"],
+      allowedSkills: ["*"],
+      monthlyTokenAllowance: 100000,
+      monthlyCostAllowance: 20,
+    });
+
+    const result = await checkTokenUsage("u1");
+    expect(result.allowed).toBe(true);
+    expect(result.warning).toBe(true);
+    expect(result.costPercentUsed).toBe(80);
+  });
+
+  it("does not enforce a cost limit when monthlyCostAllowance is unset (backward compatible)", async () => {
+    mockGetUserById.mockResolvedValue({
+      userId: "u1",
+      email: "a@b.com",
+      tokenUsage: { month: currentMonth(), totalTokens: 1000, totalCost: 999.0, resetDate: "2026-05-01T00:00:00.000Z" },
+      tokenAllowanceBonus: 0,
+    });
+    mockGetUserSubscriptionType.mockResolvedValue("Basic");
+    mockGetSubscriptionTypeConfig.mockResolvedValue({
+      name: "Basic",
+      allowedPages: ["*"],
+      allowedSkills: ["*"],
+      monthlyTokenAllowance: 100000,
+      // no monthlyCostAllowance → cost is unlimited
+    });
+
+    const result = await checkTokenUsage("u1");
+    expect(result.allowed).toBe(true);
+    expect(result.costAllowance).toBeNull();
+    expect(result.costPercentUsed).toBe(0);
+  });
+});
+
 describe("incrementUserTokenUsage", () => {
   it("initializes usage for new month (lazy reset)", async () => {
     mockGetUserById.mockResolvedValue({

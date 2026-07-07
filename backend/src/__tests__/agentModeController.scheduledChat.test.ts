@@ -2719,6 +2719,9 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         effectiveAllowance: 1000000,
         bonus: 0,
         month: '2026-04',
+        costUsed: 0,
+        costAllowance: null,
+        costPercentUsed: 0,
       });
 
       const scheduleWithEmails = {
@@ -2750,6 +2753,9 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         effectiveAllowance: 1000000,
         bonus: 0,
         month: '2026-04',
+        costUsed: 0,
+        costAllowance: null,
+        costPercentUsed: 0,
       });
 
       const scheduleNoEmails = {
@@ -2779,6 +2785,9 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         effectiveAllowance: 1000000,
         bonus: 0,
         month: '2026-04',
+        costUsed: 0,
+        costAllowance: null,
+        costPercentUsed: 0,
       });
 
       const scheduleWithEmails = { ...baseSchedule, requiredFunctionCalls: [], emailNotifications: ['owner@example.com'] };
