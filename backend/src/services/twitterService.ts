@@ -339,18 +339,33 @@ export class TwitterService {
   }
 
   /**
-   * Post a chained thread. Each entry is trimmed to 280 on a word boundary.
+   * Post a chained thread, one tweet at a time. Each entry is trimmed to 280 on a
+   * word boundary; every tweet after the first is posted as a reply to the one
+   * before it.
+   *
+   * We post per-tweet through postTweet (rather than the library's tweetThread)
+   * so each step is individually retry-safe: withRetryOn401 wraps each call, so a
+   * token 401 partway through the thread retries only the tweet that failed. The
+   * previous whole-thread call, wrapped in a single withRetryOn401, would re-run
+   * the entire chain on a mid-thread 401 and duplicate the already-posted tweets.
    */
   async postThread(ownerUserId: string, accountId: string, texts: string[]): Promise<TweetResult[]> {
     if (!Array.isArray(texts) || texts.length === 0) {
       throw new Error('Thread must contain at least one tweet');
     }
-    const trimmed = texts.map((t) => this.trimToLimit((t || '').trim(), TWEET_CHAR_LIMIT));
-    return this.withRetryOn401(ownerUserId, accountId, (client) =>
-      client.v2.tweetThread(trimmed).then((res: any) =>
-        (res as any[]).map((r: any) => ({ id: r.data.id, text: r.data.text }))
-      )
-    );
+    const results: TweetResult[] = [];
+    let inReplyToTweetId: string | undefined;
+    for (const text of texts) {
+      const result = await this.postTweet(
+        ownerUserId,
+        accountId,
+        text,
+        inReplyToTweetId ? { inReplyToTweetId } : undefined
+      );
+      results.push(result);
+      inReplyToTweetId = result.id;
+    }
+    return results;
   }
 
   /**
