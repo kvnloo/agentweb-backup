@@ -480,7 +480,7 @@ describe('update_google_doc — delegation', () => {
       'https://docs.google.com/document/d/docABC/edit',
       'Updated content',
       USER,
-      'styled',
+      'plain',
       undefined,
     );
   });
@@ -489,7 +489,21 @@ describe('update_google_doc — delegation', () => {
     mockUpdateGoogleDoc.mockResolvedValue({ success: true });
     const tool = await getTool('update_google_doc');
     await tool.execute({ url_or_id: 'raw-doc-id-555', content: 'Replaced content' }, { userId: USER });
-    expect(mockUpdateGoogleDoc).toHaveBeenCalledWith('raw-doc-id-555', 'Replaced content', USER, 'styled', undefined);
+    expect(mockUpdateGoogleDoc).toHaveBeenCalledWith('raw-doc-id-555', 'Replaced content', USER, 'plain', undefined);
+  });
+
+  it('defaults to plain (does not restyle) when neither plain nor style_options is given', async () => {
+    mockUpdateGoogleDoc.mockResolvedValue({ success: true });
+    const tool = await getTool('update_google_doc');
+    await tool.execute({ url_or_id: 'doc-untouched-style', content: 'Just an edit' }, { userId: USER });
+    expect(mockUpdateGoogleDoc).toHaveBeenCalledWith('doc-untouched-style', 'Just an edit', USER, 'plain', undefined);
+  });
+
+  it('stylizes when the user explicitly asks (plain: false)', async () => {
+    mockUpdateGoogleDoc.mockResolvedValue({ success: true });
+    const tool = await getTool('update_google_doc');
+    await tool.execute({ url_or_id: 'doc-explicit-style', content: 'Make it pretty', plain: false }, { userId: USER });
+    expect(mockUpdateGoogleDoc).toHaveBeenCalledWith('doc-explicit-style', 'Make it pretty', USER, 'styled', undefined);
   });
 
   it('returns the service result to the caller', async () => {
