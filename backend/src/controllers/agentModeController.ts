@@ -2592,8 +2592,17 @@ export const agentModeController = {
           try {
             const inFlight = await findInFlightJobForSession(session.userId, sessionId);
             if (inFlight) {
-              await markAwaitingReconnect(inFlight.id);
-              attachInProcessCompletion(genPromise, inFlight.id, session.userId, sessionId);
+              // Only bind a completion hook the first time this build's run times out.
+              // markAwaitingReconnect already ran for it, so a prior timeout attached a
+              // hook to THIS build's own genPromise. A second, unrelated generation in the
+              // same session that also times out must NOT re-attach: its genPromise resolves
+              // with different content and would win the exactly-once claimCompletion race,
+              // delivering wrong content and permanently dropping this build's real link
+              // (there is no backstop poller when DURABLE_LANDING_GENERATION is off).
+              if (!inFlight.awaitingReconnect) {
+                await markAwaitingReconnect(inFlight.id);
+                attachInProcessCompletion(genPromise, inFlight.id, session.userId, sessionId);
+              }
               markProgressComplete(sessionId);
               await chatbotDb.addMessageToSession(sessionId, {
                 role: 'assistant',
