@@ -193,6 +193,19 @@ export class UnipileProfileService {
     try {
       apiData = await this.deps.http.fetchProfile(identifierOrUrl, accountId);
     } catch (err: any) {
+      // A lookup timeout (ENG-144) is transient — the same profile typically
+      // succeeds again within minutes (Rui's session: one lookup timed out, then
+      // all but one succeeded ~10 min later). Caching it as an error would trap the
+      // identifier behind the 1h ERROR_TTL and make an immediate user/agent retry
+      // fail fast from cache instead of re-hitting Unipile live. So we do NOT cache
+      // timeouts — only durable failures (4xx/5xx) get the error-row backoff.
+      const isTimeout =
+        err?.isTimeout === true ||
+        err?.classification === 'TIMEOUT_ERROR' ||
+        err?.structuredError?.classification === 'TIMEOUT_ERROR';
+      if (isTimeout) {
+        throw err;
+      }
       const message = err?.message ?? String(err);
       const errorRow: UnipileCacheRow = {
         canonicalId: key.canonicalId,
