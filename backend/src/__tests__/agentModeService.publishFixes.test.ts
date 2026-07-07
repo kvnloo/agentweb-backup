@@ -393,4 +393,20 @@ describe('Worker uncaught error requestId', () => {
     // The message handler should set currentRequestId when processing starts
     expect(workerSource).toMatch(/currentRequestId\s*=\s*requestId/);
   });
+
+  it('should wire installWorkerSignalGuards() at module load (ENG-202)', async () => {
+    // The signal guards (ignore process-group SIGTERM/SIGINT) must be installed
+    // when the worker module loads, not merely imported — accidental removal of
+    // the call would silently reintroduce the mid-run crash on instance teardown.
+    const fs = await import('fs');
+    const workerSource = fs.readFileSync(
+      require.resolve('../workers/generateMarketingResponseWorker'),
+      'utf-8'
+    );
+
+    // The guards helper must be imported...
+    expect(workerSource).toMatch(/installWorkerSignalGuards/);
+    // ...and actually invoked at module load (not just referenced in a comment).
+    expect(workerSource).toMatch(/installWorkerSignalGuards\(\)/);
+  });
 });
