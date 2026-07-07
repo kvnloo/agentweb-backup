@@ -119,6 +119,73 @@ describe('fileUserIssue — bug (private own-card + one canonical listing affect
   });
 });
 
+describe('fileUserIssue — bug priority mapping (ENG-231: stated priority becomes the Linear field, High+ lands in Todo assigned)', () => {
+  const realFlag = process.env.FEATUREBASE_INTAKE;
+  const realAssignee = process.env.LINEAR_BUG_DEFAULT_ASSIGNEE_ID;
+  beforeEach(() => {
+    process.env.FEATUREBASE_INTAKE = 'true';
+    linear.listOpenBugCanonicals.mockResolvedValue([]);
+    dedup.findDuplicate.mockResolvedValue(null);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
+    fb.createTicket.mockResolvedValue({ id: 'tk', number: 7, url: 'https://fb/t/7' });
+  });
+  afterEach(() => {
+    process.env.FEATUREBASE_INTAKE = realFlag;
+    if (realAssignee === undefined) delete process.env.LINEAR_BUG_DEFAULT_ASSIGNEE_ID;
+    else process.env.LINEAR_BUG_DEFAULT_ASSIGNEE_ID = realAssignee;
+    jest.clearAllMocks();
+  });
+
+  it('High -> priority field 2 + lands in Todo + assigned to the default bug assignee', async () => {
+    await fileUserIssue({ type: 'bug', title: 'crash', description: 'd', userEmail: 'u@e.com', priority: 'High' });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({
+      priority: 2,
+      startInTodo: true,
+      assigneeId: expect.any(String),
+    }));
+  });
+
+  it('Urgent -> priority field 1 + Todo + assignee', async () => {
+    await fileUserIssue({ type: 'bug', title: 'down', description: 'd', userEmail: 'u@e.com', priority: 'Urgent' });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({ priority: 1, startInTodo: true }));
+  });
+
+  it('Low -> priority field 4, stays in Backlog unassigned (no escalation)', async () => {
+    await fileUserIssue({ type: 'bug', title: 'nit', description: 'd', userEmail: 'u@e.com', priority: 'low' });
+    const input = linear.createInternalLinearIssue.mock.calls[0][0];
+    expect(input.priority).toBe(4);
+    expect(input.startInTodo).toBeUndefined();
+    expect(input.assigneeId).toBeUndefined();
+  });
+
+  it('no stated priority -> Medium (3), never "No priority"; no escalation', async () => {
+    await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'u@e.com' });
+    const input = linear.createInternalLinearIssue.mock.calls[0][0];
+    expect(input.priority).toBe(3);
+    expect(input.startInTodo).toBeUndefined();
+  });
+
+  it('unrecognized priority text -> Medium (3), does not crash or escalate', async () => {
+    await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'u@e.com', priority: 'ASAP!!' });
+    const input = linear.createInternalLinearIssue.mock.calls[0][0];
+    expect(input.priority).toBe(3);
+    expect(input.startInTodo).toBeUndefined();
+  });
+
+  it('LINEAR_BUG_DEFAULT_ASSIGNEE_ID env overrides the built-in default assignee', async () => {
+    process.env.LINEAR_BUG_DEFAULT_ASSIGNEE_ID = 'usr-override';
+    await fileUserIssue({ type: 'bug', title: 'crash', description: 'd', userEmail: 'u@e.com', priority: 'High' });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({ assigneeId: 'usr-override' }));
+  });
+
+  it('grouped onto an existing canonical -> no new issue, so no priority escalation either', async () => {
+    linear.listOpenBugCanonicals.mockResolvedValue([{ identifier: 'ENG-5', issueId: 'uuid-5', title: 'crash', description: 'x' }]);
+    dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-5', title: 'crash', description: 'x' });
+    await fileUserIssue({ type: 'bug', title: 'crash', description: 'd', userEmail: 'u@e.com', priority: 'High' });
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+  });
+});
+
 describe('intakeService.notifyCanonicalResolved (resolve bridge)', () => {
   const { notifyCanonicalResolved } = require('../services/intakeService');
   afterEach(() => jest.clearAllMocks());

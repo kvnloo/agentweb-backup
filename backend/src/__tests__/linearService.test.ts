@@ -50,6 +50,49 @@ describe('linearService.createInternalLinearIssue', () => {
     expect(input.labelIds.sort()).toEqual(['lab_auto', 'lab_bug'].sort());
     expect(input.labelIds).not.toContain('lab_fb'); // no Featurebase label -> never public
   });
+
+  const TEAM_WITH_TODO = { data: { teams: { nodes: [{
+    id: 'team_eng',
+    states: { nodes: [
+      { id: 'st_backlog', name: 'Backlog', type: 'backlog' },
+      { id: 'st_todo', name: 'Todo', type: 'unstarted' },
+      { id: 'st_done', name: 'Done', type: 'completed' },
+    ] },
+    labels: TEAM_RESPONSE.data.teams.nodes[0].labels,
+  }] } } };
+
+  function mockCreateSequence(team: any) {
+    let n = 0;
+    (global.fetch as any) = jest.fn(() => {
+      n += 1;
+      const body = n === 1 ? team : { data: { issueCreate: { success: true, issue: { id: 'uuid-51', identifier: 'ENG-51', url: 'u' } } } };
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) } as any);
+    });
+  }
+
+  it('maps priority + assignee + Todo state onto the issueCreate input when escalated (ENG-231)', async () => {
+    mockCreateSequence(TEAM_WITH_TODO);
+    await createInternalLinearIssue({ title: 't', description: 'd', labelNames: ['Bug'], priority: 2, assigneeId: 'usr_harshit', startInTodo: true });
+    const input = lastCreateInput();
+    expect(input.priority).toBe(2);
+    expect(input.assigneeId).toBe('usr_harshit');
+    expect(input.stateId).toBe('st_todo');
+  });
+
+  it('without escalation params keeps the existing shape: Backlog state, no assignee', async () => {
+    mockCreateSequence(TEAM_WITH_TODO);
+    await createInternalLinearIssue({ title: 't', description: 'd', labelNames: ['Bug'], priority: 3 });
+    const input = lastCreateInput();
+    expect(input.priority).toBe(3);
+    expect(input.assigneeId).toBeUndefined();
+    expect(input.stateId).toBe('st_backlog');
+  });
+
+  it('startInTodo when the team has no unstarted state falls back to Backlog (stateId never dropped)', async () => {
+    mockCreateSequence(TEAM_RESPONSE); // fixture without an unstarted state
+    await createInternalLinearIssue({ title: 't', description: 'd', labelNames: ['Bug'], startInTodo: true });
+    expect(lastCreateInput().stateId).toBe('st_backlog');
+  });
 });
 
 describe('linearService.listOpenIssuesByLabel', () => {
