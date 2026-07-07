@@ -48,6 +48,23 @@ export interface FileUserIssueParams {
   /** Tags + context for the Notion path (flag off). */
   notionTags?: string[];
   notionContext?: Record<string, any>;
+  /**
+   * Reporter-stated priority (Urgent | High | Medium | Low, case-insensitive). Mapped onto the
+   * Linear priority FIELD so the description text and the board never disagree; High+ lands in
+   * Todo assigned to the default bug assignee instead of rotting in Backlog (ENG-231).
+   */
+  priority?: string;
+}
+
+// Linear priority scale: 1=Urgent, 2=High, 3=Medium, 4=Low. Unknown/absent -> Medium, because
+// the board contract is "bugs never arrive with No priority" (board doc, ENG-231).
+const LINEAR_PRIORITY: Record<string, number> = { urgent: 1, high: 2, medium: 3, low: 4 };
+
+// Default bug assignee for High+ intake = Harshit Shah (Argusoft), per the ENG board's bug
+// routing. Env-overridable so other workspaces/teams don't inherit a foreign user id.
+const DEFAULT_BUG_ASSIGNEE_ID = '4c29baa4-7778-42d9-8b35-045e4d9ec0b0';
+function bugAssigneeId(): string {
+  return process.env.LINEAR_BUG_DEFAULT_ASSIGNEE_ID || DEFAULT_BUG_ASSIGNEE_ID;
 }
 
 export interface FiledUserResult {
@@ -159,6 +176,9 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
     const filedBy = p.reportedByAdmin
       ? `via ${p.reportedByAdmin} acting on their behalf (delegated session)`
       : 'self-reported';
+    // The stated priority becomes the real Linear field (never just description text), and
+    // High+ lands triage-visible: Todo + default bug assignee (ENG-231).
+    const priority = LINEAR_PRIORITY[(p.priority || 'medium').toLowerCase()] ?? LINEAR_PRIORITY.medium;
     const li = await createInternalLinearIssue({
       title: p.title,
       description: [
@@ -172,6 +192,8 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
         ...contextLines(p.notionContext),
       ].join('\n'),
       labelNames: ['Bug', 'Customer Reported'],
+      priority,
+      ...(priority <= 2 ? { startInTodo: true, assigneeId: bugAssigneeId() } : {}),
     });
     canonicalUuid = li.id || '';
   }

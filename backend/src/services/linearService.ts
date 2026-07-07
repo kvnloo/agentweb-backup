@@ -72,6 +72,7 @@ async function linearGraphQL(query: string, variables?: Record<string, any>): Pr
 interface TeamMeta {
   teamId: string;
   backlogStateId: string;
+  todoStateId?: string; // first unstarted-type state — the triage-visible landing spot for High+ intake (ENG-231)
   labelIds: Record<string, string>; // name -> id
 }
 let teamMetaCache: TeamMeta | null = null;
@@ -90,11 +91,13 @@ async function getTeamMeta(): Promise<TeamMeta> {
   if (!team) throw new Error(`Linear team "${TEAM_KEY}" not found`);
   const states: any[] = team.states?.nodes || [];
   const backlog = states.find(s => s.type === 'backlog') || states.find(s => s.type === 'unstarted');
+  const todo = states.find(s => s.type === 'unstarted');
   const labelIds: Record<string, string> = {};
   for (const l of (team.labels?.nodes || [])) labelIds[l.name.toLowerCase()] = l.id;
   teamMetaCache = {
     teamId: team.id,
     backlogStateId: backlog?.id,
+    todoStateId: todo?.id,
     labelIds,
   };
   return teamMetaCache;
@@ -176,7 +179,17 @@ export async function addIssueComment(issueId: string, body: string): Promise<vo
  * these stay private engineering items. labelNames (e.g. ["Auto","Oncall"]) are
  * resolved against the team's labels; unknown names are dropped.
  */
-export async function createInternalLinearIssue(params: { title: string; description: string; labelNames: string[] }): Promise<LinearIssueResult> {
+export async function createInternalLinearIssue(params: {
+  title: string;
+  description: string;
+  labelNames: string[];
+  /** Linear priority: 1=Urgent, 2=High, 3=Medium, 4=Low. Omitted -> field stays unset. */
+  priority?: number;
+  /** Linear user uuid to assign on creation. */
+  assigneeId?: string;
+  /** Land in the Todo (unstarted) state instead of Backlog — High+ intake must be triage-visible (ENG-231). */
+  startInTodo?: boolean;
+}): Promise<LinearIssueResult> {
   const meta = await getTeamMeta();
   const labelIds = params.labelNames
     .map((n) => meta.labelIds[n.toLowerCase()])
@@ -187,7 +200,10 @@ export async function createInternalLinearIssue(params: { title: string; descrip
     description: params.description,
     labelIds,
   };
-  if (meta.backlogStateId) input.stateId = meta.backlogStateId;
+  if (typeof params.priority === 'number') input.priority = params.priority;
+  if (params.assigneeId) input.assigneeId = params.assigneeId;
+  const stateId = params.startInTodo ? (meta.todoStateId || meta.backlogStateId) : meta.backlogStateId;
+  if (stateId) input.stateId = stateId;
   const data = await linearGraphQL(
     `mutation($input: IssueCreateInput!) {
       issueCreate(input: $input) { success issue { id identifier url } }

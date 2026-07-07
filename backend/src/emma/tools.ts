@@ -6912,6 +6912,9 @@ emmaToolRegistry.register({
             userName: user.displayName || user.email,
             reportedByAdmin: isDelegatedAdmin && adminEmail ? adminEmail : undefined,
             sessionId: context?.sessionId,
+            // Same value that lands as "Priority:" text in issueContext — the intake service
+            // maps it onto the Linear priority field so text and board agree (ENG-231).
+            priority: issue.priority,
             // External MCP clients (Claude Code etc.) are tagged distinctly so benchmark
             // filters on Customer Reported stay clean (used on the flag-off Notion path).
             notionTags: [context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported'],
