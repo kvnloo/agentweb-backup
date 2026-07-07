@@ -902,6 +902,38 @@ router.put("/users/:userId/support-note", async (req, res) => {
 });
 
 // Update user display name
+
+// Update user funnel status
+router.put("/users/:userId/funnel-status", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { funnelStatus } = req.body;
+
+    if (funnelStatus !== null && funnelStatus !== undefined && typeof funnelStatus !== "string") {
+      return res.status(400).json({ message: "funnelStatus must be a string or null" });
+    }
+
+    const normalizedStatus = typeof funnelStatus === "string" ? funnelStatus.trim() : "";
+    if (normalizedStatus.length > 80) {
+      return res.status(400).json({ message: "funnelStatus must be 80 characters or fewer" });
+    }
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const updatedUser = await userDb.updateUser(userId, {
+      funnelStatus: normalizedStatus || null,
+    });
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error updating user funnel status:", error);
+    res.status(500).json({ message: "Error updating funnel status" });
+  }
+});
+
+// Update user display name
 router.put("/users/:userId/name", async (req, res) => {
   try {
     const { userId } = req.params;

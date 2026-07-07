@@ -29,6 +29,70 @@ const FB_VERSION = '2026-01-01.nova';
 /** Status types that mean "closed" — excluded when listing open canonicals for dedup. */
 const CLOSED_STATUS_TYPES = new Set(['completed', 'canceled']);
 
+/**
+ * Convert the intake layer's markdown/plaintext into the HTML that Featurebase's `content` field
+ * expects (their documented API contract: "content should be formatted as HTML").
+ *
+ * WHY THIS EXISTS: Emma's report_product_issues (and the in-app reporter) hand us markdown/plaintext
+ * with bare newlines. Featurebase renders those newlines on its own board (it nl2br's on display),
+ * but its native Linear push treats them as insignificant HTML whitespace and collapses the whole
+ * body into one run-on paragraph — the "blob" a synced Linear issue shows (e.g. ENG-204). Real HTML
+ * block tags (<p>/<ul>/<h2>…) survive BOTH the Featurebase render and the Linear push.
+ *
+ * WHY HAND-ROLLED (not `marked`): the backend compiles to CommonJS and `marked` is ESM-only, so a
+ * static import risks an ERR_REQUIRE_ESM at load time on older Node (which would break ALL intake,
+ * not just formatting), and dynamic-import/jest-ESM plumbing is disproportionate for the handful of
+ * constructs Emma/users actually emit. This converter is total and dependency-free, and it
+ * HTML-escapes the input FIRST — so raw user text can never inject markup (no reliance on
+ * Featurebase-side sanitization). Best-effort by construction: any input yields valid HTML, so a
+ * filing never fails on formatting.
+ *
+ * Handles: headings (#..######), unordered lists (-/*), ordered lists (N.), blank-line paragraphs,
+ * single-newline <br>, inline **bold** and `code`.
+ */
+export function mdToFeaturebaseHtml(md: string): string {
+  const src = (md ?? '').replace(/\r\n?/g, '\n').trim();
+  if (!src) return '';
+
+  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const inline = (s: string) =>
+    esc(s)
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/`([^`]+?)`/g, '<code>$1</code>');
+
+  const out: string[] = [];
+  let para: string[] = [];
+  let list: string[] | null = null;
+  let listTag: 'ul' | 'ol' = 'ul';
+  const flushPara = () => { if (para.length) { out.push('<p>' + para.map(inline).join('<br>') + '</p>'); para = []; } };
+  const flushList = () => { if (list) { out.push(`<${listTag}>` + list.map((li) => `<li>${inline(li)}</li>`).join('') + `</${listTag}>`); list = null; } };
+
+  for (const raw of src.split('\n')) {
+    const line = raw.trimEnd();
+    if (line.trim() === '') { flushPara(); flushList(); continue; }
+    const heading = line.match(/^(#{1,6})\s+(.*)$/);
+    const uli = line.match(/^[-*]\s+(.*)$/);
+    const oli = line.match(/^\d+\.\s+(.*)$/);
+    if (heading) {
+      flushPara(); flushList();
+      out.push(`<h${heading[1].length}>${inline(heading[2])}</h${heading[1].length}>`);
+    } else if (uli) {
+      flushPara();
+      if (!list || listTag !== 'ul') { flushList(); list = []; listTag = 'ul'; }
+      list.push(uli[1]);
+    } else if (oli) {
+      flushPara();
+      if (!list || listTag !== 'ol') { flushList(); list = []; listTag = 'ol'; }
+      list.push(oli[1]);
+    } else {
+      flushList();
+      para.push(line);
+    }
+  }
+  flushPara(); flushList();
+  return out.join('\n');
+}
+
 export interface FeaturebaseCredentials {
   apiKey: string;
   appId?: string;
@@ -159,7 +223,7 @@ export async function createPost(p: {
     method: 'POST',
     body: JSON.stringify({
       title: p.title,
-      content: p.description,
+      content: mdToFeaturebaseHtml(p.description),
       boardId,
       author: { email: p.authorEmail, name: p.authorName || p.authorEmail },
       integrations: { linear: true },
@@ -181,6 +245,28 @@ export async function listOpenPosts(limit = 50): Promise<OpenPost[]> {
   return posts
     .filter((p) => !CLOSED_STATUS_TYPES.has((p.postStatus?.type || p.status?.type || '').toLowerCase()))
     .map((p) => ({ id: p.id, title: p.title || '', description: p.content || p.description || '', url: p.postUrl || p.url }));
+}
+
+/**
+ * Resolve a Featurebase post by EXACT title match (ENG-187 contract #4). The FB->Linear sync
+ * copies the post title onto the Linear issue verbatim, so a synced issue's title is the join key
+ * back to its post — and its author. Uses the verified `GET /v2/posts?q=` search, then filters to
+ * exact (case/whitespace-insensitive) matches; zero or multiple matches return null, because
+ * attributing the WRONG author's funnel stage to an issue is worse than no attribution. Falls back
+ * to `getPost` when the search result omits the author.
+ */
+export async function findPostByTitle(title: string): Promise<{ id: string; authorEmail?: string } | null> {
+  const norm = (s: string) => (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  const want = norm(title);
+  if (!want) return null;
+  const data = await featurebaseFetch(`/posts?q=${encodeURIComponent(title.trim().slice(0, 200))}&limit=20`, { method: 'GET' });
+  const posts: any[] = data?.data || [];
+  const matches = posts.filter((p) => norm(p.title) === want);
+  if (matches.length !== 1) return null;
+  const post = matches[0];
+  if (post.author?.email) return { id: post.id, authorEmail: post.author.email };
+  const full = await getPost(post.id);
+  return { id: full.id, authorEmail: full.authorEmail };
 }
 
 /**
@@ -266,7 +352,7 @@ export async function createTicket(p: {
     body: JSON.stringify({
       ticketCategoryId,
       title: p.title,
-      content: p.content,
+      content: mdToFeaturebaseHtml(p.content),
       author: { email: p.authorEmail, name: p.authorName || p.authorEmail },
     }),
   });
