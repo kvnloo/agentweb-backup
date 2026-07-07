@@ -471,6 +471,93 @@ describe('LinkedInOutreachService', () => {
         expect(linkedInOutreachService.invitationCooldownUntil.has('acct-A')).toBe(false);
       });
     });
+
+    describe('note-quota "Invalid parameters" fallback (ENG-213)', () => {
+      // Free LinkedIn accounts may only attach a note to ~5 invitations per month,
+      // but can send ~150 note-less invites per week. Once the note quota is spent,
+      // LinkedIn rejects every note-bearing invite with a generic "Invalid parameters"
+      // (422) even though the provider_id/recipient are perfectly valid.
+      function invalidParametersError() {
+        return Object.assign(new Error('UnsuccessfulRequestError'), {
+          body: {
+            status: 422,
+            type: 'errors/invalid_parameters',
+            title: 'Invalid parameters',
+          },
+        });
+      }
+
+      it('retries WITHOUT the note when a note-bearing invite is rejected with "Invalid parameters", and succeeds', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock)
+          .mockRejectedValueOnce(invalidParametersError()) // note-bearing invite rejected
+          .mockResolvedValueOnce({ id: 'invitation-id' });  // note-less retry succeeds
+
+        const result = await linkedInOutreachService.sendInvitation(
+          'acct-A', 'recipient-1', false, 'Hi there — would love to connect!'
+        );
+
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(2);
+        // First attempt carried the note.
+        expect((mockUnipileClient.users.sendInvitation as jest.Mock).mock.calls[0][0]).toEqual(
+          expect.objectContaining({ message: 'Hi there — would love to connect!' })
+        );
+        // Retry dropped the note.
+        expect((mockUnipileClient.users.sendInvitation as jest.Mock).mock.calls[1][0]).toEqual(
+          expect.objectContaining({ account_id: 'acct-A', provider_id: 'recipient-1', message: undefined })
+        );
+        expect(result).toEqual(expect.objectContaining({ note_dropped: true }));
+      });
+
+      it('does NOT retry when there was no note — a bare invite rejected with "Invalid parameters" bubbles up', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(invalidParametersError());
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false)
+        ).rejects.toThrow(/invalid parameters/i);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+      });
+
+      it('surfaces the error when the note-less retry ALSO fails (e.g. genuinely invalid provider_id)', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock)
+          .mockRejectedValueOnce(invalidParametersError())  // note-bearing attempt
+          .mockRejectedValueOnce(invalidParametersError()); // note-less retry also fails
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false, 'Let us connect!')
+        ).rejects.toThrow(/invalid parameters/i);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(2);
+      });
+
+      it('does NOT retry note-less on "Cannot resend yet" — that cap is not fixed by dropping the note', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(
+          Object.assign(new Error('UnsuccessfulRequestError'), {
+            body: { status: 422, type: 'errors/cannot_resend_yet', title: 'Cannot resend yet' },
+          })
+        );
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false, 'A personalised note')
+        ).rejects.toThrow(/cannot resend yet/i);
+        // Only the single note-bearing attempt — no note-less retry.
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+        // The account-wide cooldown breaker is still armed.
+        // @ts-ignore private map
+        expect(linkedInOutreachService.invitationCooldownUntil.has('acct-A')).toBe(true);
+      });
+
+      it('does NOT retry note-less on a per-recipient "Should delay new invitation" rejection', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(
+          Object.assign(new Error('UnsuccessfulRequestError'), {
+            body: { status: 422, type: 'errors/already_invited_recently', title: 'Should delay new invitation to this recipient' },
+          })
+        );
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false, 'A personalised note')
+        ).rejects.toThrow(/should delay new invitation/i);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+      });
+    });
   });
 
   describe('sendMessage', () => {
