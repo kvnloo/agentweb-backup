@@ -1,3 +1,18 @@
+## Featurebase feature requests land as run-on blobs in Linear — root cause + fix (2026-07-06)
+
+Customer feature requests filed via Emma's `report_product_issues` were showing up in Linear as one giant run-on paragraph (reported on ENG-204). Chased it to ground truth.
+
+### Root cause (NOT Emma's output)
+Emma authors reasonable paragraph structure — the stored Featurebase post for ENG-204 had 39 newlines. Featurebase's `content` field is **HTML** (their docs: "content should be formatted as HTML"; it entity-encodes `&`/`<`/`>`). We send Emma's markdown/plaintext with raw `\n` and **no block tags**, so Featurebase renders `\n` as line breaks on its own board (nl2br) but its native `integrations.linear:true` push treats `\n` as insignificant HTML whitespace and collapses the whole body into one paragraph. Inline markers (`**bold**`, `##`) survive; all vertical structure dies.
+
+Proof: FB-pushed issues (ENG-204; ENG-166 `"## The ask When a customer…"` — heading newline collapsed) are blobs, while issues our own code creates via `linearService.createInternalLinearIssue` (bugs ENG-151, autos ENG-205) preserve `\n\n` + `* ` bullets. The Linear API faithfully returns `\n`, so the flattening is genuinely in Featurebase's push. Editing an existing FB post's content does NOT re-sync to Linear.
+
+### Fix
+`featurebaseService.mdToFeaturebaseHtml()` converts the intake layer's markdown/plaintext to HTML block tags, applied at both send sites (`createPost`, `createTicket`). Hand-rolled (not `marked`) because the backend is CommonJS and marked is ESM-only — a static import risks ERR_REQUIRE_ESM breaking all intake; the converter also HTML-escapes input so raw user text can't inject markup. Native `integrations.linear:true` sync is left intact (it's load-bearing for the resolve→notify-upvoters flow).
+
+### Assumption — VERIFIED live
+That Featurebase's create-time Linear push preserves HTML block structure. Confirmed via a hidden (`inReview:true`) test post → pushed Linear issue: `<p>` → `\n\n` paragraphs, `<ul><li>` → `* ` markdown bullets. Headings lose their `#` and `<strong>` is dropped (cosmetic), but the vertical structure that caused the blob is fully preserved. Test artifacts cleaned up (FB post deleted; Linear ENG-216 canceled).
+
 ## Truthfulness bundle — finalize guard + instructive-error retryability (2026-07-02)
 
 Built the ENG-143/135/124 truthfulness bundle from the EMMA-HARNESS-PARITY-PLAN "Build-Now Design" (PR-T1 + the ENG-124 retry-spiral half). Generalizes the shipped ENG-104 single-tool pattern into ONE enforcement seam at the loop edge.

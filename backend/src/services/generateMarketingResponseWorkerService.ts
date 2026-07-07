@@ -6,6 +6,7 @@
 import { fork, ChildProcess } from 'child_process';
 import path from 'path';
 import { clearTerminalProgress } from '../utils/sseProgress';
+import { DRAIN_CEILING_MS, DRAIN_POLL_INTERVAL_MS } from '../utils/shutdownConstants';
 
 interface GenerateMarketingResponseParams {
   messageContent: string;
@@ -295,18 +296,16 @@ export class GenerateMarketingResponseWorkerService {
 
   /**
    * Shutdown the worker process, draining any in-flight requests first.
-   * Blocks until pendingRequests.size === 0 or 35 minutes elapse.
+   * Blocks until pendingRequests.size === 0 or DRAIN_CEILING_MS elapses.
    */
   async shutdown(): Promise<void> {
     this.draining = true;
     console.log(`[Worker] Drain started — ${this.pendingRequests.size} in-flight request(s)`);
 
-    const DRAIN_CEILING_MS = 10 * 60 * 1000;
-    const POLL_INTERVAL_MS = 2000;
     const deadline = Date.now() + DRAIN_CEILING_MS;
 
     while (this.pendingRequests.size > 0 && Date.now() < deadline) {
-      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
+      await new Promise(resolve => setTimeout(resolve, DRAIN_POLL_INTERVAL_MS));
     }
 
     if (this.pendingRequests.size > 0) {

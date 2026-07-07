@@ -3,6 +3,8 @@ import { LinkedInAdapter } from '../services/adapters/linkedInAdapter';
 import { ConnectedAccount } from '../services/connectedAccountsDb';
 import { agentModeService } from '../services/agentModeService';
 import { v4 as uuidv4 } from 'uuid';
+import { isCronEnabled } from '../utils/instanceState';
+import { cronJobRegistry } from '../utils/cronJobRegistry';
 
 const INSTANCE_ID = uuidv4();
 // gemini-3.5-flash follows the "no questions / no generic openers" instructions far more
@@ -617,8 +619,13 @@ export class SocialEngagementTimerScheduler {
     public start() {
         console.log('[TimerScheduler] Starting — first pass in 1s...');
         // Small delay on startup so the executor is fully initialised first
-        setTimeout(() => this.scheduleUpcoming(), 1000);
-        setInterval(() => this.scheduleUpcoming(), TIMER_CHECK_INTERVAL_MS);
+        setTimeout(() => {
+            cronJobRegistry.track('SocialEngagementTimerScheduler.scheduleUpcoming', this.scheduleUpcoming());
+        }, 1000);
+        setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('SocialEngagementTimerScheduler.scheduleUpcoming', this.scheduleUpcoming());
+        }, TIMER_CHECK_INTERVAL_MS);
     }
 
     private async scheduleUpcoming() {
@@ -634,7 +641,8 @@ export class SocialEngagementTimerScheduler {
                 const delay = Math.max(0, new Date(nextRunTime).getTime() - Date.now());
                 setTimeout(() => {
                     this.pendingTimers.delete(scheduleId);
-                    this.executor.processQueue()
+                    if (!isCronEnabled()) return;
+                    cronJobRegistry.track('SocialEngagementExecutor.processQueue', this.executor.processQueue())
                         .catch(e => console.error('[TimerScheduler] processQueue error:', e));
                 }, delay);
                 this.pendingTimers.add(scheduleId);

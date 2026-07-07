@@ -13,6 +13,7 @@ import {
   getAllowedSkills,
   getPublicAllowedSkills,
   resolveSkillsToToolNames,
+  findTiersAllowingSkill,
 } from '../services/subscriptionService';
 
 jest.mock('../services/settingsService', () => ({
@@ -153,6 +154,92 @@ describe('subscriptionService', () => {
     const cfg = await getSubscriptionTypeConfig('Legacy');
     expect(cfg).not.toBeNull();
     expect(cfg!.allowedSkills).toEqual(['*']);
+  });
+
+  // ---- findTiersAllowingSkill (ENG-173 publish guardrail) ----
+
+  const tiersSetting = (types: any[]) => ({
+    settingName: 'subscription_types',
+    settingValue: JSON.stringify(types),
+  });
+
+  it('findTiersAllowingSkill: reachable when skill is in a tier allowedSkills', async () => {
+    mockedSettingsService.getSetting.mockResolvedValueOnce(tiersSetting([
+      { name: 'Free', allowedPages: [], allowedSkills: ['other'] },
+      { name: 'Pro', allowedPages: [], allowedSkills: ['skill-x', 'other'] },
+    ]) as any);
+
+    const res = await findTiersAllowingSkill('skill-x');
+    expect(res.reachable).toBe(true);
+    expect(res.allowingTiers).toContain('Pro');
+    expect(res.totalTiers).toBe(2);
+  });
+
+  it('findTiersAllowingSkill: NOT reachable when skill is in no tier', async () => {
+    mockedSettingsService.getSetting.mockResolvedValueOnce(tiersSetting([
+      { name: 'Free', allowedPages: [], allowedSkills: ['other'] },
+      { name: 'Pro', allowedPages: [], allowedSkills: ['another'] },
+    ]) as any);
+
+    const res = await findTiersAllowingSkill('skill-x');
+    expect(res.reachable).toBe(false);
+    expect(res.allowingTiers).toEqual([]);
+    expect(res.totalTiers).toBe(2);
+  });
+
+  it('findTiersAllowingSkill: wildcard tier makes any skill reachable', async () => {
+    mockedSettingsService.getSetting.mockResolvedValueOnce(tiersSetting([
+      { name: 'Super', allowedPages: [], allowedSkills: ['*'] },
+    ]) as any);
+
+    const res = await findTiersAllowingSkill('skill-x');
+    expect(res.reachable).toBe(true);
+    expect(res.allowingTiers).toContain('Super');
+  });
+
+  it('findTiersAllowingSkill: tier missing allowedSkills is treated as wildcard (backward compat)', async () => {
+    mockedSettingsService.getSetting.mockResolvedValueOnce(tiersSetting([
+      { name: 'Legacy', allowedPages: [], allowedFunctionCalls: ['x'] },
+    ]) as any);
+
+    const res = await findTiersAllowingSkill('skill-x');
+    expect(res.reachable).toBe(true);
+  });
+
+  it('findTiersAllowingSkill: fail-open (reachable) when no subscription_types setting exists', async () => {
+    mockedSettingsService.getSetting.mockResolvedValueOnce(null as any);
+
+    const res = await findTiersAllowingSkill('skill-x');
+    expect(res.reachable).toBe(true);
+    expect(res.totalTiers).toBe(0);
+  });
+
+  it('findTiersAllowingSkill: fail-open when settingValue is malformed JSON', async () => {
+    mockedSettingsService.getSetting.mockResolvedValueOnce({
+      settingName: 'subscription_types',
+      settingValue: '{ not valid json',
+    } as any);
+
+    const res = await findTiersAllowingSkill('skill-x');
+    expect(res.reachable).toBe(true);
+    expect(res.totalTiers).toBe(0);
+  });
+
+  it('findTiersAllowingSkill: fail-open when tiers array is empty', async () => {
+    mockedSettingsService.getSetting.mockResolvedValueOnce(tiersSetting([]) as any);
+
+    const res = await findTiersAllowingSkill('skill-x');
+    expect(res.reachable).toBe(true);
+    expect(res.totalTiers).toBe(0);
+  });
+
+  it('findTiersAllowingSkill: fail-open when the settings lookup throws', async () => {
+    mockedSettingsService.getSetting.mockRejectedValueOnce(new Error('dynamo down'));
+
+    const res = await findTiersAllowingSkill('skill-x');
+    expect(res.reachable).toBe(true);
+    expect(res.allowingTiers).toEqual([]);
+    expect(res.totalTiers).toBe(0);
   });
 
   // ---- getAllAvailableSkills tests ----
