@@ -596,8 +596,13 @@ export class LinkedInOutreachService {
       outgoingMessage = trimmed;
     }
     try {
-      const provider_id = await this.resolveProviderId(profileUrlOrId, isUrl, account_id);
-      await this.checkIsNotAlreadyConnected(account_id, provider_id);
+      const resolvedTarget = await this.resolveProviderId(profileUrlOrId, isUrl, account_id);
+      // Unipile's invite endpoint requires the canonical provider_id (the member URN);
+      // a public-identifier slug (e.g. "william-kwak") is rejected with a generic
+      // "Invalid parameters" (ENG-213). The connection-check profile fetch accepts
+      // either form and reveals the canonical provider_id, so use that for the send
+      // rather than whatever identifier the caller happened to pass.
+      const provider_id = await this.checkIsNotAlreadyConnected(account_id, resolvedTarget);
       this.log(`Sending invitation`, { account_id, provider_id });
       const client = await this.getClient();
       const res = await this.sendInvitationRequest(client, account_id, provider_id, outgoingMessage);
@@ -686,8 +691,15 @@ export class LinkedInOutreachService {
   /**
    * Check that a target profile is not already a 1st-degree connection before sending an invite.
    * Uses raw API call to avoid SDK validator failures.
+   *
+   * Returns the canonical Unipile provider_id (member URN) revealed by the profile
+   * lookup. The lookup accepts either a public-identifier slug or a provider_id, but
+   * the invite endpoint only accepts the canonical provider_id — so callers must send
+   * the returned value, not the identifier they passed in (ENG-213). Falls back to the
+   * passed identifier when the lookup fails or reveals no provider_id, so a transient
+   * lookup failure never blocks (or breaks) the invite.
    */
-  private async checkIsNotAlreadyConnected(accountId: string, providerId: string): Promise<void> {
+  private async checkIsNotAlreadyConnected(accountId: string, providerId: string): Promise<string> {
     try {
       const client = await this.getClient();
       this.log(`Fetching profile for connection check`, { accountId, providerId });
@@ -713,10 +725,16 @@ export class LinkedInOutreachService {
           `Use the send-message action to reach them directly.`
         );
       }
+      // Prefer the canonical provider_id from the live profile — the invite endpoint
+      // rejects a public-identifier slug with "Invalid parameters".
+      const canonical = profile?.provider_id;
+      return typeof canonical === 'string' && canonical.length > 0 ? canonical : providerId;
     } catch (error: any) {
       if (error.message?.startsWith('Cannot send invite:')) throw error;
-      // Profile lookup failed — log and proceed rather than blocking the invite
+      // Profile lookup failed — log and proceed with the identifier we were given
+      // rather than blocking the invite.
       this.log(`Connection status check skipped (profile fetch failed)`, { providerId, reason: error.message });
+      return providerId;
     }
   }
 
