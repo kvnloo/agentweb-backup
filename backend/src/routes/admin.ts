@@ -4856,8 +4856,24 @@ router.put("/users/:userId/subscription-type", async (req, res) => {
       }
     }
 
-    // Update the user's subscription type
-    const updatedUser = await userDb.updateUser(userId, { subscriptionType });
+    // Update the user's subscription type. This is the MANUAL grant path
+    // (partner portal). If the user previously churned off Stripe, a stale
+    // *terminal* subscription_status (e.g. "canceled") left on the record would
+    // make the customer-portal subscription card treat the freshly-granted tier
+    // as a lapsed/Free plan (ENG-218 follow-up). Clear the Stripe lifecycle
+    // fields so the manual grant is a clean, Stripe-free record — but leave an
+    // ACTIVE Stripe subscriber (active/trialing/past_due/canceling) untouched
+    // so we don't strip billing surfaces from a genuinely paying user.
+    const TERMINAL_STRIPE_STATUSES = ["canceled", "unpaid", "incomplete_expired"];
+    const updates: Partial<typeof user> = { subscriptionType };
+    if (
+      user.subscription_status &&
+      TERMINAL_STRIPE_STATUSES.includes(user.subscription_status)
+    ) {
+      updates.subscription_status = "";
+      updates.current_period_end = "";
+    }
+    const updatedUser = await userDb.updateUser(userId, updates);
     syncUserUpdateToLeadList(user.email, { subscriptionType });
     res.json(updatedUser);
   } catch (error) {
