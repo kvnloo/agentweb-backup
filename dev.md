@@ -1,3 +1,17 @@
+## Linear webhook fired customer comms too early / repeatedly — root cause + fix (2026-07-07)
+
+The Linear→customer-comms bridge (`POST /api/integrations/linear/webhook`, `backend/src/routes/integrations.ts`) was firing the full resolve bridge (`notifyCanonicalResolved`: Resend "Resolved" email to every reporter + Featurebase card flip to Completed + Slack ship ping) on the wrong events. Surfaced during the 2026-07-07 merged≠done investigation; the premature-email proof is ENG-173 (an xCures reporter was emailed 2.9s after PR merge, pre-deploy).
+
+### Two root causes
+1. **Gated on state CATEGORY, not the Done state.** The predicate was `data.state.type === 'completed'`. The board now runs Merged → Verifying → Done and all three are completed-type in Linear, but only **Done** is customer-communicable — so a move into Merged or Verifying emailed reporters. Fix: gate by the Done **state ID** (`LINEAR_DONE_STATE_ID`, ENG Done = `b36918be-3026-4a37-b788-47eef453a581`), not by name — a rename would silently kill or misroute the bridge.
+2. **Not transition-detecting.** It fired on EVERY Issue `update` while the issue sat in a completed state (a later title/label edit on an already-Done bug re-emailed every reporter — the Slack ping is deduped via `claimSetMember`, but the email + card re-flip are not) and also on `action:'create'`. Fix: use the webhook's `updatedFrom.stateId` (Linear puts the prior value of each changed field there) to fire only on an ACTUAL transition into Done — `updatedFrom` must carry a `stateId` key whose value ≠ Done.
+
+### Fail-loud config guard
+If `LINEAR_DONE_STATE_ID` is unset the handler refuses to fire (logs a distinct `[linear-webhook] LINEAR_DONE_STATE_ID is not set …` line, returns 200 `ok:false`) rather than reverting to firing on any completed state — not silently open, not silently closed. 200 is kept so Linear doesn't retry-storm.
+
+### Tests
+`backend/src/__tests__/integrations.linearWebhook.test.ts` (new — the route had zero tests): Merged/Verifying → 0 comms, already-Done edit → nothing, transition into Done → fires once, non-Done completed ID → nothing, missing config → loud no-op, signature enforcement. The Linear-side fix (git-automation merge→Merged, states created) shipped 2026-07-07; this is the code-side hardening (ENG-222).
+
 ## Featurebase feature requests land as run-on blobs in Linear — root cause + fix (2026-07-06)
 
 Customer feature requests filed via Emma's `report_product_issues` were showing up in Linear as one giant run-on paragraph (reported on ENG-204). Chased it to ground truth.
