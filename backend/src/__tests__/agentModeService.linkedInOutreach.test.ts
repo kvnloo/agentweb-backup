@@ -67,11 +67,12 @@ jest.mock('../services/db', () => ({
   },
 }));
 
-// Mock unipileSentInvitationsDb (ENG-182 pre-invite dedup cache)
-const mockGetSentInvitationByPublicIdAndAccount = jest.fn().mockResolvedValue(null);
+// Mock unipileSentInvitationsDb (ENG-182 pre-invite dedup cache). The pre-check
+// uses the publicProfileUrl GSI getter (case-robust, matches the CRM path).
+const mockGetSentInvitationByProfileUrlAndAccount = jest.fn().mockResolvedValue(null);
 const mockUpsertSentInvitation = jest.fn().mockResolvedValue(undefined);
 jest.mock('../services/unipileSentInvitationsDb', () => ({
-  getSentInvitationByPublicIdAndAccount: (...args: any[]) => mockGetSentInvitationByPublicIdAndAccount(...args),
+  getSentInvitationByProfileUrlAndAccount: (...args: any[]) => mockGetSentInvitationByProfileUrlAndAccount(...args),
   upsertSentInvitation: (...args: any[]) => mockUpsertSentInvitation(...args),
 }));
 
@@ -292,7 +293,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     };
 
     it('skips the send (no quota used) when a pending invitation already exists in the cache', async () => {
-      mockGetSentInvitationByPublicIdAndAccount.mockResolvedValueOnce({
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValueOnce({
         accountId: 'test-account-id',
         invitedUserPublicId: 'chang-liu',
         sentAt: '2026-07-01T00:00:00.000Z',
@@ -303,12 +304,16 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(result.success).toBe(true);
       expect(result.alreadyInvited).toBe(true);
       expect(mockSendInvitation).not.toHaveBeenCalled();
-      // Must look up by the public id parsed from the URL, scoped to the account.
-      expect(mockGetSentInvitationByPublicIdAndAccount).toHaveBeenCalledWith('test-account-id', 'chang-liu');
+      // Must look up by a CANONICAL /in/{publicId}/ URL parsed from the profile URL,
+      // scoped to the account (the getter itself lowercases via normalizeLinkedInUrl).
+      expect(mockGetSentInvitationByProfileUrlAndAccount).toHaveBeenCalledWith(
+        'https://www.linkedin.com/in/chang-liu/',
+        'test-account-id',
+      );
     });
 
-    it('parses the public id ignoring query params / trailing slash when checking the cache', async () => {
-      mockGetSentInvitationByPublicIdAndAccount.mockResolvedValueOnce({ sentAt: null });
+    it('canonicalizes the lookup URL, stripping query params / trailing slash', async () => {
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValueOnce({ sentAt: null });
 
       const result = await service.linkedinOutreach('user-1', {
         ...inviteArgs,
@@ -316,12 +321,32 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       });
 
       expect(result.alreadyInvited).toBe(true);
-      expect(mockGetSentInvitationByPublicIdAndAccount).toHaveBeenCalledWith('test-account-id', 'chang-liu');
+      // Query string must be stripped so it matches the cron's clean stored key.
+      expect(mockGetSentInvitationByProfileUrlAndAccount).toHaveBeenCalledWith(
+        'https://www.linkedin.com/in/chang-liu/',
+        'test-account-id',
+      );
       expect(mockSendInvitation).not.toHaveBeenCalled();
     });
 
+    it('is case-insensitive on the public id (canonical URL is matched via the lowercasing GSI getter)', async () => {
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValueOnce({ sentAt: null });
+
+      const result = await service.linkedinOutreach('user-1', {
+        ...inviteArgs,
+        profile_url: 'https://www.linkedin.com/in/Chang-Liu/',
+      });
+
+      expect(result.alreadyInvited).toBe(true);
+      // Public id is lowercased when building the canonical URL.
+      expect(mockGetSentInvitationByProfileUrlAndAccount).toHaveBeenCalledWith(
+        'https://www.linkedin.com/in/chang-liu/',
+        'test-account-id',
+      );
+    });
+
     it('sends and writes the invite through to the cache when no pending invitation exists', async () => {
-      mockGetSentInvitationByPublicIdAndAccount.mockResolvedValueOnce(null);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValueOnce(null);
       mockSendInvitation.mockResolvedValueOnce({ id: 'inv-xyz' });
 
       const result = await service.linkedinOutreach('user-1', inviteArgs);
@@ -329,7 +354,8 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(result.success).toBe(true);
       expect(result.alreadyInvited).toBeUndefined();
       expect(mockSendInvitation).toHaveBeenCalledTimes(1);
-      // Write-through so a later invite for the same profile in this run is deduped.
+      // Write-through with the SAME lowercased publicProfileUrl the GSI reads, so a
+      // subsequent run (before the next sync cron) dedups.
       expect(mockUpsertSentInvitation).toHaveBeenCalledWith(
         expect.objectContaining({
           accountId: 'test-account-id',
@@ -351,13 +377,13 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       });
 
       expect(result.success).toBe(true);
-      expect(mockGetSentInvitationByPublicIdAndAccount).not.toHaveBeenCalled();
+      expect(mockGetSentInvitationByProfileUrlAndAccount).not.toHaveBeenCalled();
       expect(mockUpsertSentInvitation).not.toHaveBeenCalled();
       expect(mockSendInvitation).toHaveBeenCalledTimes(1);
     });
 
     it('still sends when the cache lookup throws (dedup is best-effort, never blocks a genuine invite)', async () => {
-      mockGetSentInvitationByPublicIdAndAccount.mockRejectedValueOnce(new Error('dynamo down'));
+      mockGetSentInvitationByProfileUrlAndAccount.mockRejectedValueOnce(new Error('dynamo down'));
       mockSendInvitation.mockResolvedValueOnce({ id: 'inv-2' });
 
       const result = await service.linkedinOutreach('user-1', inviteArgs);
@@ -368,7 +394,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     });
 
     it('does not fail the invite when the write-through cache upsert throws', async () => {
-      mockGetSentInvitationByPublicIdAndAccount.mockResolvedValueOnce(null);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValueOnce(null);
       mockSendInvitation.mockResolvedValueOnce({ id: 'inv-3' });
       mockUpsertSentInvitation.mockRejectedValueOnce(new Error('dynamo down'));
 

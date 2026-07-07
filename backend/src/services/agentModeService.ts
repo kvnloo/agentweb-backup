@@ -26196,13 +26196,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // the resend with "Cannot resend yet" — which both wastes the run's quota and
           // surfaces as a per-recipient tool failure. The cache (AW-UnipileSentInvitations)
           // is refreshed every ~10 min by the connection-sync cron straight from Unipile's
-          // live sent feed, so it also reflects invites made outside this system. It is
-          // keyed by the invited user's LinkedIn public id, so we can only dedup a
-          // /in/{publicId} URL; a raw provider_id invite falls through to the live send.
+          // live sent feed, so it also reflects invites made outside this system.
+          //
+          // Look up via the publicProfileUrl GSI, matching the CRM path (crm.ts): both
+          // this URL and the cron's stored key are lowercased by normalizeLinkedInUrl, so
+          // the match is case-insensitive. We rebuild a CANONICAL /in/{publicId}/ URL from
+          // the parsed public id first, because normalizeLinkedInUrl does NOT strip query
+          // params (e.g. LinkedIn's ?miniProfileUrn tracking) — passing the raw URL through
+          // would miss. The cache is keyed by public id, so only a /in/{publicId} URL can be
+          // deduped; a raw provider_id invite falls through to the live send unchanged.
           const invitePublicId = isUrl && profile_url ? linkedInPublicIdFromUrl(profile_url) : null;
-          if (invitePublicId) {
-            const { getSentInvitationByPublicIdAndAccount } = await import('./unipileSentInvitationsDb');
-            const pending = await getSentInvitationByPublicIdAndAccount(account_id, invitePublicId).catch(() => null);
+          const inviteCanonicalUrl = invitePublicId ? `https://www.linkedin.com/in/${invitePublicId}/` : null;
+          if (inviteCanonicalUrl) {
+            const { getSentInvitationByProfileUrlAndAccount } = await import('./unipileSentInvitationsDb');
+            const pending = await getSentInvitationByProfileUrlAndAccount(inviteCanonicalUrl, account_id).catch(() => null);
             if (pending) {
               console.log(`[AgentMode] send-invite: skipping ${profile_url} — invitation already pending (sent ${pending.sentAt ?? 'previously'})`);
               return {
@@ -26227,9 +26234,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             );
 
             // ENG-182: write the pending invite through to the cache immediately (mirrors
-            // the CRM route) so a later send-invite for the SAME profile in this run — or
-            // before the next sync cron — is deduped by the check above. Best-effort: a
-            // cache write must never fail an invite that Unipile already accepted.
+            // the CRM route) so a subsequent run — before the next ~10-min sync cron — sees
+            // it and dedups via the check above. Best-effort: a cache write must never fail
+            // an invite that Unipile already accepted. (Written with the same lowercased
+            // publicProfileUrl the GSI reads, so the next lookup matches case-insensitively.)
             if (invitePublicId) {
               try {
                 const { upsertSentInvitation } = await import('./unipileSentInvitationsDb');
