@@ -557,6 +557,27 @@ describe('LinkedInOutreachService', () => {
         ).rejects.toThrow(/should delay new invitation/i);
         expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
       });
+
+      it('does NOT retry note-less when the rejection text contains BOTH "Invalid parameters" and an exclusion phrase — the exclusion wins', async () => {
+        // If LinkedIn's body pairs the generic "Invalid parameters" wording with a
+        // cap/duplicate signal, dropping the note cannot fix it: the exclusion branch
+        // must suppress the note-less retry (proving the exclusion regex is decisive,
+        // not incidental). Without the exclusion this would fall through and retry.
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(
+          Object.assign(new Error('UnsuccessfulRequestError'), {
+            body: { status: 422, type: 'errors/cannot_resend_yet', title: 'Invalid parameters — cannot resend yet' },
+          })
+        );
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false, 'A personalised note')
+        ).rejects.toThrow(/cannot resend yet/i);
+        // Single note-bearing attempt only — the exclusion suppressed the note-less retry.
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+        // And the account-wide cooldown breaker armed off the "cannot resend yet" phrase.
+        // @ts-ignore private map
+        expect(linkedInOutreachService.invitationCooldownUntil.has('acct-A')).toBe(true);
+      });
     });
   });
 
