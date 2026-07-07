@@ -21,6 +21,8 @@
  *    so recurring auto-issues group onto one item instead of flooding the board.
  */
 
+import { getUserFunnelStatusIssueTags, getUserFunnelStatusCoarseTag } from '../utils/userFunnelStatus';
+
 const FEATUREBASE_BOARD_URL = 'https://agentweb.featurebase.app/';
 
 function intakeEnabled(): boolean {
@@ -35,6 +37,37 @@ function contextLines(context?: Record<string, any>): string[] {
   });
 }
 
+/**
+ * Context keys carrying the reporter's funnel stage — PRIVATE internal info (ENG-187). They may
+ * reach Linear (labels / canonical description / eng comments) but must never reach Featurebase,
+ * not even in a private note: nothing customer-adjacent carries funnel state.
+ */
+const LINEAR_ONLY_CONTEXT_KEYS = ['User Status'];
+function featurebaseSafeContext(ctx?: Record<string, any>): Record<string, any> | undefined {
+  if (!ctx) return ctx;
+  return Object.fromEntries(Object.entries(ctx).filter(([k]) => !LINEAR_ONLY_CONTEXT_KEYS.includes(k)));
+}
+
+/**
+ * Creation-time triage defaults for customer-filed bug canonicals (ENG-187): a user-filed bug is
+ * NEVER created unassigned, unprioritized, or sitting in Backlog — bugs must not rot. Priority
+ * follows the reporter's coarse funnel bucket per the board doc ("How this board works —
+ * Engineering"): Retention -> Urgent, Setup/Activated -> High, Sales/Parked/unknown -> Medium.
+ */
+const BUG_CANONICAL_STATE = 'Todo';
+const BUG_DEFAULT_ASSIGNEE_ID = '4c29baa4-7778-42d9-8b35-045e4d9ec0b0'; // Harshit Shah — default bug owner
+const BUG_PRIORITY = { URGENT: 1, HIGH: 2, MEDIUM: 3 } as const; // Linear priority enum (1=Urgent … 4=Low)
+const BUG_PRIORITY_BY_COARSE_TAG: Record<string, number> = {
+  Retention: BUG_PRIORITY.URGENT,
+  Setup: BUG_PRIORITY.HIGH,
+  Activated: BUG_PRIORITY.HIGH,
+};
+
+function bugPriorityForFunnel(funnelStatus?: string | null): number {
+  const coarse = getUserFunnelStatusCoarseTag(funnelStatus);
+  return (coarse && BUG_PRIORITY_BY_COARSE_TAG[coarse]) || BUG_PRIORITY.MEDIUM;
+}
+
 export interface FileUserIssueParams {
   type: 'feature_request' | 'bug';
   title: string;
@@ -45,27 +78,27 @@ export interface FileUserIssueParams {
   reportedByAdmin?: string;
   /** Chat session id of the reporter, so eng can jump straight to the offending session. */
   sessionId?: string;
+  /**
+   * Reporter's funnel stage (user record `funnelStatus`, PR #2025) — drives the Linear-side triage
+   * enrichment (stage labels + priority, ENG-187). PRIVATE internal info: never surfaces in
+   * Featurebase content or any reporter-facing email.
+   */
+  funnelStatus?: string | null;
   /** Tags + context for the Notion path (flag off). */
   notionTags?: string[];
   notionContext?: Record<string, any>;
   /**
    * Reporter-stated priority (Urgent | High | Medium | Low, case-insensitive). Mapped onto the
-   * Linear priority FIELD so the description text and the board never disagree; High+ lands in
-   * Todo assigned to the default bug assignee instead of rotting in Backlog (ENG-231).
+   * Linear priority FIELD so the description text and the board never disagree (ENG-231). Blended
+   * with the funnel-tier default: the more severe of the two wins, so a stated High/Urgent
+   * upgrades the tier and a stated Low never downgrades it.
    */
   priority?: string;
 }
 
-// Linear priority scale: 1=Urgent, 2=High, 3=Medium, 4=Low. Unknown/absent -> Medium, because
-// the board contract is "bugs never arrive with No priority" (board doc, ENG-231).
+// Reporter-stated priority text -> Linear enum (1=Urgent, 2=High, 3=Medium, 4=Low). Unknown or
+// absent text contributes nothing — the funnel-tier default (ENG-187) then decides alone.
 const LINEAR_PRIORITY: Record<string, number> = { urgent: 1, high: 2, medium: 3, low: 4 };
-
-// Default bug assignee for High+ intake = Harshit Shah (Argusoft), per the ENG board's bug
-// routing. Env-overridable so other workspaces/teams don't inherit a foreign user id.
-const DEFAULT_BUG_ASSIGNEE_ID = '4c29baa4-7778-42d9-8b35-045e4d9ec0b0';
-function bugAssigneeId(): string {
-  return process.env.LINEAR_BUG_DEFAULT_ASSIGNEE_ID || DEFAULT_BUG_ASSIGNEE_ID;
-}
 
 export interface FiledUserResult {
   pageId: string;       // Featurebase post id (or Notion pageId when the flag is off)
@@ -121,7 +154,7 @@ async function fileFeatureRequest(p: FileUserIssueParams): Promise<FiledUserResu
       '',
       'Their report:',
       p.description,
-      ...contextLines(p.notionContext),
+      ...contextLines(featurebaseSafeContext(p.notionContext)),
     ].join('\n');
     try { await addComment(post.id, reportedNote, true); } catch (e) { console.warn('[intake] feature dedup comment failed:', e instanceof Error ? e.message : e); }
     try { await addVoter(post.id, p.userEmail, p.userName); } catch (e) { console.warn('[intake] feature dedup upvote failed:', e instanceof Error ? e.message : e); }
@@ -134,7 +167,7 @@ async function fileFeatureRequest(p: FileUserIssueParams): Promise<FiledUserResu
   const filedNote = [
     p.reportedByAdmin ? `Filed by ${reporterLabel(p)} via ${p.reportedByAdmin} acting on their behalf (delegated session).` : `Filed by ${reporterLabel(p)}.`,
     ...(p.sessionId ? [`Session: ${p.sessionId}`] : []),
-    ...contextLines(p.notionContext),
+    ...contextLines(featurebaseSafeContext(p.notionContext)),
   ].join('\n');
   try { await addComment(post.id, filedNote, true); } catch (e) { console.warn('[intake] feature filed comment failed:', e instanceof Error ? e.message : e); }
   return { pageId: post.id, trackerUrl: post.url || FEATUREBASE_BOARD_URL, userUrl: post.url || FEATUREBASE_BOARD_URL, deduped: false, tracker: 'Featurebase' };
@@ -155,8 +188,17 @@ async function fileFeatureRequest(p: FileUserIssueParams): Promise<FiledUserResu
  */
 async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   const { findDuplicate, MAX_CANDIDATES } = await import('./dedupService');
-  const { listOpenBugCanonicals, createInternalLinearIssue, addIssueComment } = await import('./linearService');
+  const { listOpenBugCanonicals, createInternalLinearIssue, addIssueComment, raiseIssueTriage } = await import('./linearService');
   const { createTicket } = await import('./featurebaseService');
+
+  // Linear-side triage enrichment (ENG-187): the reporter's funnel stage becomes stage labels
+  // ("Status: <stage>" + coarse bucket) and sets the priority default. Linear-only — the stage
+  // never reaches the Featurebase ticket or any reporter-facing surface.
+  const stageTags = getUserFunnelStatusIssueTags(p.funnelStatus);
+  // Priority = the more severe of the funnel-tier default (ENG-187) and the reporter's stated
+  // priority (ENG-231): a stated High/Urgent upgrades the tier; a stated Low never downgrades it.
+  const stated = p.priority ? LINEAR_PRIORITY[p.priority.toLowerCase()] : undefined;
+  const priority = stated ? Math.min(bugPriorityForFunnel(p.funnelStatus), stated) : bugPriorityForFunnel(p.funnelStatus);
 
   // 1. The reporter's OWN private card. Body = their words (what THEY see). Propagates on failure.
   const ticket = await createTicket({ title: p.title, content: p.description, authorEmail: p.userEmail, authorName: p.userName });
@@ -172,13 +214,18 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   let canonicalUuid = '';
   if (dup) {
     canonicalUuid = byRef.get(dup.ref)!.issueId;
+    // Dedup triage upgrade (ENG-187): a higher-tier reporter hitting an existing canonical unions
+    // its stage labels in and raises the priority — never lowers it (raise-only by contract of
+    // raiseIssueTriage). Best-effort: a failed upgrade must not block the filing.
+    try {
+      await raiseIssueTriage(canonicalUuid, { addLabelNames: stageTags, priority });
+    } catch (e) {
+      console.warn('[intake] bug canonical triage upgrade failed:', e instanceof Error ? e.message : e);
+    }
   } else {
     const filedBy = p.reportedByAdmin
       ? `via ${p.reportedByAdmin} acting on their behalf (delegated session)`
       : 'self-reported';
-    // The stated priority becomes the real Linear field (never just description text), and
-    // High+ lands triage-visible: Todo + default bug assignee (ENG-231).
-    const priority = LINEAR_PRIORITY[(p.priority || 'medium').toLowerCase()] ?? LINEAR_PRIORITY.medium;
     const li = await createInternalLinearIssue({
       title: p.title,
       description: [
@@ -191,9 +238,12 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
         ...(p.sessionId ? [`Session: ${p.sessionId}`] : []),
         ...contextLines(p.notionContext),
       ].join('\n'),
-      labelNames: ['Bug', 'Customer Reported'],
+      // Stage labels + no-rot defaults (ENG-187): every customer bug lands in Todo, assigned,
+      // with a funnel-derived priority — never unowned in Backlog.
+      labelNames: ['Bug', 'Customer Reported', ...stageTags],
       priority,
-      ...(priority <= 2 ? { startInTodo: true, assigneeId: bugAssigneeId() } : {}),
+      stateName: BUG_CANONICAL_STATE,
+      assigneeId: BUG_DEFAULT_ASSIGNEE_ID,
     });
     canonicalUuid = li.id || '';
   }
@@ -218,6 +268,61 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
     deduped: !!dup,
     tracker: 'Featurebase',
   };
+}
+
+/**
+ * Enrich a Featurebase-SYNCED Linear issue at creation time (ENG-187 contract #4).
+ *
+ * Feature requests are Featurebase-first: `fileFeatureRequest` creates a public post
+ * (`integrations.linear:true`) and the linked Linear issue is created ~10s later by Featurebase's
+ * native FB->Linear sync INSIDE their SaaS — there is no repo seam at issue creation. The Linear
+ * webhook (routes/integrations.ts) therefore calls this for every created issue carrying the
+ * "Featurebase" label (the sync's marker — issues our own code creates never carry it, see
+ * createInternalLinearIssue), so the synced issue still ends up with the reporter's PRIVATE
+ * funnel-stage labels + "Needs PM", resting in Backlog. Deliberately NO priority and NO assignee:
+ * feature requests await the weekly PM pass (that's what "Needs PM" flags) — only bugs get the
+ * no-rot auto-triage.
+ *
+ * Author resolution: synced issue title -> exact-match Featurebase post -> post author email ->
+ * AgentWeb user -> funnelStatus. Every miss in that chain is LOUD (console.error) and degrades to
+ * "Needs PM" alone — never a throw, so a resolution miss can't take down the webhook route (which
+ * also serves the resolve bridge). Only a hard failure applying the labels/state propagates.
+ * Idempotent under webhook retries: labels union (re-applying is a no-op) and the Backlog settle
+ * never moves an issue a human already advanced. Privacy (contract #5) holds by construction:
+ * this READS from Featurebase and writes only Linear labels/state — nothing funnel-related flows
+ * back to Featurebase or any user-visible surface.
+ */
+const FEATURE_REQUEST_TRIAGE_LABEL = 'Needs PM';
+const FEATURE_REQUEST_RESTING_STATE = 'Backlog';
+
+export async function enrichFeaturebaseSyncedIssue(p: { issueId: string; title: string }): Promise<{ labelNames: string[] }> {
+  const { raiseIssueTriage } = await import('./linearService');
+
+  let stageTags: string[] = [];
+  try {
+    const { findPostByTitle } = await import('./featurebaseService');
+    const post = await findPostByTitle(p.title);
+    if (!post?.authorEmail) {
+      console.error(`[intake] FB-synced issue ${p.issueId} ("${p.title}"): no unambiguous Featurebase post author — applying "${FEATURE_REQUEST_TRIAGE_LABEL}" only.`);
+    } else {
+      const { userDb } = await import('./db');
+      const user = await userDb.getUserByEmail(post.authorEmail);
+      if (!user) {
+        console.error(`[intake] FB-synced issue ${p.issueId}: post author ${post.authorEmail} has no AgentWeb user — applying "${FEATURE_REQUEST_TRIAGE_LABEL}" only.`);
+      } else {
+        // A real user with no funnelStatus is a normal state (not yet staged) — no error, no stage labels.
+        stageTags = getUserFunnelStatusIssueTags(user.funnelStatus);
+      }
+    }
+  } catch (e) {
+    console.error(`[intake] FB-synced issue ${p.issueId}: author/funnel resolution failed — applying "${FEATURE_REQUEST_TRIAGE_LABEL}" only:`, e instanceof Error ? e.message : e);
+  }
+
+  const labelNames = [...stageTags, FEATURE_REQUEST_TRIAGE_LABEL];
+  // The label/state write is the core step — let a hard failure propagate to the webhook route's
+  // catch (logged, 200 response) rather than half-succeed silently.
+  await raiseIssueTriage(p.issueId, { addLabelNames: labelNames, settleStateName: FEATURE_REQUEST_RESTING_STATE });
+  return { labelNames };
 }
 
 export interface FileAutoIssueParams {

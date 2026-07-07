@@ -9,6 +9,7 @@ import { contactEventsDb, normalizeContactId } from '../services/contactEventsDb
 import { chatbotDb } from '../services/chatbotService';
 import { getExecutionsWithAssets } from '../routes/tasks';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
+import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
 import { enqueueAutoHumanEval } from '../services/autoHumanEvalService';
 
@@ -6837,6 +6838,8 @@ emmaToolRegistry.register({
     // Fetch once before the loop to avoid N DynamoDB reads for a batch of issues
     const { settingsService } = await import('../services/settingsService');
     const productIssueEmails = await settingsService.getJsonArraySetting('product_issue_emails', ['founders@agentweb.pro']);
+    const funnelStatusLabel = getUserFunnelStatusLabel(user.funnelStatus);
+    const funnelStatusTags = getUserFunnelStatusIssueTags(user.funnelStatus);
 
     for (const rawIssue of args.issues) {
       // Gemini may serialize array items as JSON strings instead of objects — normalize
@@ -6850,6 +6853,9 @@ emmaToolRegistry.register({
           'Page URL': issue.pageUrl || 'N/A',
           'Session ID': context?.sessionId || 'N/A',
         };
+        if (funnelStatusLabel) {
+          issueContext['User Status'] = funnelStatusLabel;
+        }
 
         const attachmentUrls = Array.isArray(issue.attachment_urls)
           ? issue.attachment_urls.filter((u: unknown): u is string => typeof u === 'string' && /^https?:\/\//.test(u))
@@ -6915,9 +6921,14 @@ emmaToolRegistry.register({
             // Same value that lands as "Priority:" text in issueContext — the intake service
             // maps it onto the Linear priority field so text and board agree (ENG-231).
             priority: issue.priority,
+            // Linear-side triage enrichment (ENG-187): stage labels + priority/state/assignee defaults.
+            funnelStatus: user.funnelStatus,
             // External MCP clients (Claude Code etc.) are tagged distinctly so benchmark
             // filters on Customer Reported stay clean (used on the flag-off Notion path).
-            notionTags: [context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported'],
+            notionTags: [
+              context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported',
+              ...funnelStatusTags,
+            ],
             notionContext: issueContext,
           }),
           new Promise<never>((_, reject) =>
@@ -6949,6 +6960,7 @@ emmaToolRegistry.register({
                   <td style="padding: 6px 0; color: #666; width: 140px; vertical-align: top;"><strong>Reported by</strong></td>
                   <td style="padding: 6px 0;"><a href="mailto:${user.email}" style="color: #4F46E5;">${user.displayName || user.email}</a> (${user.email})</td>
                 </tr>
+                ${funnelStatusLabel ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>User status</strong></td><td style="padding: 6px 0;">${funnelStatusLabel}</td></tr>` : ''}
                 ${isDelegatedAdmin && adminEmail ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Via delegation</strong></td><td style="padding: 6px 0;">${adminEmail}</td></tr>` : ''}
                 ${result.pageId ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Issue ID</strong></td><td style="padding: 6px 0; font-family: monospace;">AGW-${result.pageId}</td></tr>` : ''}
                 ${result.url ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>${result.tracker}</strong></td><td style="padding: 6px 0;"><a href="${result.url}" style="color: #4F46E5; font-weight: 600;">→ Open in ${result.tracker}</a></td></tr>` : ''}

@@ -248,6 +248,28 @@ export async function listOpenPosts(limit = 50): Promise<OpenPost[]> {
 }
 
 /**
+ * Resolve a Featurebase post by EXACT title match (ENG-187 contract #4). The FB->Linear sync
+ * copies the post title onto the Linear issue verbatim, so a synced issue's title is the join key
+ * back to its post — and its author. Uses the verified `GET /v2/posts?q=` search, then filters to
+ * exact (case/whitespace-insensitive) matches; zero or multiple matches return null, because
+ * attributing the WRONG author's funnel stage to an issue is worse than no attribution. Falls back
+ * to `getPost` when the search result omits the author.
+ */
+export async function findPostByTitle(title: string): Promise<{ id: string; authorEmail?: string } | null> {
+  const norm = (s: string) => (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  const want = norm(title);
+  if (!want) return null;
+  const data = await featurebaseFetch(`/posts?q=${encodeURIComponent(title.trim().slice(0, 200))}&limit=20`, { method: 'GET' });
+  const posts: any[] = data?.data || [];
+  const matches = posts.filter((p) => norm(p.title) === want);
+  if (matches.length !== 1) return null;
+  const post = matches[0];
+  if (post.author?.email) return { id: post.id, authorEmail: post.author.email };
+  const full = await getPost(post.id);
+  return { id: full.id, authorEmail: full.authorEmail };
+}
+
+/**
  * Add a comment to a post. isPrivate=true makes it an eng-only (internal) note — use it for
  * session ids / reporter attribution / a duplicate's full text so nothing private goes public.
  */
