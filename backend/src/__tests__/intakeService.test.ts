@@ -17,6 +17,7 @@ jest.mock('../services/linearService', () => ({
   listOpenBugCanonicals: jest.fn().mockResolvedValue([]),
   createInternalLinearIssue: jest.fn(),
   addIssueComment: jest.fn(),
+  raiseIssueTriage: jest.fn(),
   listOpenIssuesByLabel: jest.fn(),
   getIssueComments: jest.fn(),
 }));

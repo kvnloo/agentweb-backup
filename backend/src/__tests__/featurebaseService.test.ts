@@ -5,6 +5,7 @@ import {
   addVoter,
   createPost,
   listOpenPosts,
+  findPostByTitle,
   addComment,
   getDefaultBoardId,
   _resetBoardCache,
@@ -192,6 +193,55 @@ describe('featurebaseService', () => {
       });
       const posts = await listOpenPosts(10);
       expect(posts).toEqual([{ id: 'p1', title: 'Open one', description: 'desc1', url: 'u1' }]);
+    });
+  });
+
+  // ENG-187 contract #4 — the FB->Linear sync copies the post title onto the Linear issue, so the
+  // synced issue's title is the join key back to its post (and its author). Ambiguity must resolve
+  // to null: attributing the WRONG author's funnel stage is worse than no attribution.
+  describe('findPostByTitle', () => {
+    it('returns the unique exact-title match with its author email (fuzzy hits ignored)', async () => {
+      (global.fetch as any) = jest.fn(() => jsonRes({ data: [
+        { id: 'p1', title: 'Dark mode', author: { email: 'a@e.com' } },
+        { id: 'p2', title: 'Dark mode for emails', author: { email: 'b@e.com' } },
+      ] }));
+      const r = await findPostByTitle('Dark mode');
+      expect(r).toEqual({ id: 'p1', authorEmail: 'a@e.com' });
+      const url = String((global.fetch as jest.Mock).mock.calls[0][0]);
+      expect(url).toContain('/posts?q=Dark%20mode');
+    });
+
+    it('matches case/whitespace-insensitively (title may be normalized in transit)', async () => {
+      (global.fetch as any) = jest.fn(() => jsonRes({ data: [{ id: 'p1', title: '  Dark   Mode ', author: { email: 'a@e.com' } }] }));
+      const r = await findPostByTitle('dark mode');
+      expect(r).toEqual({ id: 'p1', authorEmail: 'a@e.com' });
+    });
+
+    it('falls back to getPost when the search result omits the author', async () => {
+      (global.fetch as any) = jest.fn((url: any) => String(url).includes('/posts/p1')
+        ? jsonRes({ id: 'p1', title: 'Dark mode', author: { email: 'a@e.com' } })
+        : jsonRes({ data: [{ id: 'p1', title: 'Dark mode' }] }));
+      const r = await findPostByTitle('Dark mode');
+      expect(r).toEqual({ id: 'p1', authorEmail: 'a@e.com' });
+    });
+
+    it('returns null on ZERO exact matches', async () => {
+      (global.fetch as any) = jest.fn(() => jsonRes({ data: [{ id: 'p2', title: 'Dark mode for emails', author: { email: 'b@e.com' } }] }));
+      expect(await findPostByTitle('Dark mode')).toBeNull();
+    });
+
+    it('returns null on MULTIPLE exact matches (never guess between two authors)', async () => {
+      (global.fetch as any) = jest.fn(() => jsonRes({ data: [
+        { id: 'p1', title: 'Dark mode', author: { email: 'a@e.com' } },
+        { id: 'p3', title: 'dark mode', author: { email: 'c@e.com' } },
+      ] }));
+      expect(await findPostByTitle('Dark mode')).toBeNull();
+    });
+
+    it('returns null for a blank title without calling the API', async () => {
+      (global.fetch as any) = jest.fn();
+      expect(await findPostByTitle('  ')).toBeNull();
+      expect(global.fetch).not.toHaveBeenCalled();
     });
   });
 
