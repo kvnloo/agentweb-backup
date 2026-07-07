@@ -1133,6 +1133,29 @@ describe('LinkedInOutreachService', () => {
       expect(mockUnipileClient.request.send).toHaveBeenCalledTimes(1);
     });
 
+    it('emits greppable CloudWatch markers (PROFILE_LOOKUP_TIMEOUT per attempt + PROFILE_LOOKUP_FAILED_TIMEOUT) so a future hang is diagnosable by time window', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      jest.useFakeTimers();
+      (mockUnipileClient.request.send as jest.Mock).mockImplementation(() => hang());
+
+      const resultPromise = linkedInOutreachService.getProfile('john-doe', 'account-123');
+      const captured = resultPromise.catch(() => {}); // swallow the eventual rejection
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1); // attempt 1 times out
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1); // retry times out
+      await captured;
+
+      const lines = warnSpy.mock.calls.map((c) => `${c[0]} ${c[1] ?? ''}`);
+      // One per-attempt timeout marker for each of the 2 attempts…
+      expect(lines.filter((l) => l.includes('PROFILE_LOOKUP_TIMEOUT'))).toHaveLength(2);
+      // …plus a single terminal marker naming the identifier + account for grepping.
+      const terminal = lines.find((l) => l.includes('PROFILE_LOOKUP_FAILED_TIMEOUT'));
+      expect(terminal).toBeDefined();
+      expect(terminal).toContain('john-doe');
+      expect(terminal).toContain('account-123');
+
+      warnSpy.mockRestore();
+    });
+
     it('surfaced timeout error is classified as a retryable "timeout" by the agent error pipeline', async () => {
       // Guards the cross-module contract: the timeout message emitted here must
       // match toolErrorClassifier's timeout regex so the agent tells the model
