@@ -656,6 +656,19 @@ function buildFindReason(filters: {
   return joined.length > 200 ? joined.slice(0, 197) + '...' : joined;
 }
 
+/**
+ * ENG-182: extract a LinkedIn public identifier from a profile URL, e.g.
+ * "https://www.linkedin.com/in/chang-liu?miniProfileUrn=..." -> "chang-liu".
+ * Strips query string, fragment, trailing slash and casing so it matches the
+ * public id the sent-invitation cache is keyed on. Returns null for anything
+ * that isn't a /in/{id} profile URL (e.g. a raw provider_id).
+ */
+function linkedInPublicIdFromUrl(url: string | undefined | null): string | null {
+  if (!url || typeof url !== 'string') return null;
+  const match = url.trim().toLowerCase().match(/\/in\/([^/?#]+)/);
+  return match ? match[1] : null;
+}
+
 
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
@@ -26175,6 +26188,32 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'send-invite': {
           if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
+
+          // ENG-182: cross-check the account's PENDING sent-invitation cache before
+          // spending a run's invite quota. A profile with an OUTSTANDING (sent but
+          // not-yet-accepted) invite is NOT a 1st-degree connection, so it slips past
+          // the already-connected guard inside sendInvitation and Unipile then rejects
+          // the resend with "Cannot resend yet" — which both wastes the run's quota and
+          // surfaces as a per-recipient tool failure. The cache (AW-UnipileSentInvitations)
+          // is refreshed every ~10 min by the connection-sync cron straight from Unipile's
+          // live sent feed, so it also reflects invites made outside this system. It is
+          // keyed by the invited user's LinkedIn public id, so we can only dedup a
+          // /in/{publicId} URL; a raw provider_id invite falls through to the live send.
+          const invitePublicId = isUrl && profile_url ? linkedInPublicIdFromUrl(profile_url) : null;
+          if (invitePublicId) {
+            const { getSentInvitationByPublicIdAndAccount } = await import('./unipileSentInvitationsDb');
+            const pending = await getSentInvitationByPublicIdAndAccount(account_id, invitePublicId).catch(() => null);
+            if (pending) {
+              console.log(`[AgentMode] send-invite: skipping ${profile_url} — invitation already pending (sent ${pending.sentAt ?? 'previously'})`);
+              return {
+                success: true,
+                alreadyInvited: true,
+                message: `A LinkedIn connection invitation is already pending for this profile (sent ${pending.sentAt ?? 'previously'}). Skipped to avoid a duplicate — no invite quota was used. Move on to the next lead.`,
+                data: { alreadyInvited: true, sentAt: pending.sentAt ?? null },
+              };
+            }
+          }
+
           // Premium accounts allow 300-char invites; free accounts 200.
           const inviteCharLimit = await linkedInOutreachService.getInviteCharLimitForAccount(userId, account_id);
           // Note-quota policy (ENG-213). Default to 'skip' — HOLD rather than silently
@@ -26186,6 +26225,31 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             const inviteResult = await linkedInOutreachService.sendInvitation(
               account_id, target, isUrl, message, inviteCharLimit, { onNoteQuota },
             );
+
+            // ENG-182: write the pending invite through to the cache immediately (mirrors
+            // the CRM route) so a later send-invite for the SAME profile in this run — or
+            // before the next sync cron — is deduped by the check above. Best-effort: a
+            // cache write must never fail an invite that Unipile already accepted.
+            if (invitePublicId) {
+              try {
+                const { upsertSentInvitation } = await import('./unipileSentInvitationsDb');
+                const { normalizeLinkedInUrl } = await import('./unipileConnectionsDb');
+                const nowIso = new Date().toISOString();
+                await upsertSentInvitation({
+                  accountId: account_id,
+                  invitedUserPublicId: invitePublicId,
+                  publicProfileUrl: normalizeLinkedInUrl(`https://www.linkedin.com/in/${invitePublicId}/`),
+                  invitationId: (inviteResult && (inviteResult.invitation_id || inviteResult.id)) || '',
+                  invitedUserName: '',
+                  invitationText: message ?? '',
+                  sentAt: nowIso,
+                  syncedAt: nowIso,
+                });
+              } catch (cacheErr) {
+                console.warn('[AgentMode] send-invite: failed to cache sent invitation (non-fatal):', cacheErr);
+              }
+            }
+
             return { success: true, data: inviteResult };
           } catch (inviteErr: any) {
             if (inviteErr?.noteQuotaExceeded) {

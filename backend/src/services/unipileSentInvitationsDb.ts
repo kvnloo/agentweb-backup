@@ -89,6 +89,25 @@ export async function pruneStaleSentInvitations(
   return stale.length;
 }
 
+/**
+ * Look up a pending invitation by the invited user's LinkedIn public id for a
+ * specific account. Uses the base-table PK (accountId, invitedUserPublicId) so
+ * the read is STRONGLY consistent — unlike the GSI variant below, this reflects
+ * a write-through upsert made earlier in the same run immediately (the GSI is
+ * only eventually consistent). Returns the record or null.
+ */
+export async function getSentInvitationByPublicIdAndAccount(
+  accountId: string,
+  invitedUserPublicId: string,
+): Promise<UnipileSentInvitation | null> {
+  if (!accountId || !invitedUserPublicId) return null;
+  const result = await dynamodb.get({
+    TableName: TABLE,
+    Key: { accountId, invitedUserPublicId },
+  }).promise();
+  return (result.Item as UnipileSentInvitation) ?? null;
+}
+
 /** Look up a pending invitation by profile URL for a specific account. Returns the record or null. */
 export async function getSentInvitationByProfileUrlAndAccount(
   publicProfileUrl: string,
