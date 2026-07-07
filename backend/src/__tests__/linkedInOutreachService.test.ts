@@ -1354,14 +1354,64 @@ describe('LinkedInOutreachService', () => {
       }));
     });
 
-    it('returns user account_id when user has a connected unipile account', async () => {
+    it('returns user account_id when user has a live connected unipile account', async () => {
       mockGetAccountsByUserId.mockResolvedValue([
         { platform: 'unipile', account_id: 'user-acct-123' },
       ]);
+      const liveSpy = jest.spyOn(linkedInOutreachService, 'isAccountConnected').mockResolvedValue(true);
 
       const result = await linkedInOutreachService.resolveAccountId('user-1');
 
       expect(result).toBe('user-acct-123');
+      liveSpy.mockRestore();
+    });
+
+    it('skips a dead own account and returns the next LIVE own account (no site-wide fallback)', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'own-dead' },
+        { platform: 'unipile', account_id: 'own-live' },
+      ]);
+      const liveSpy = jest
+        .spyOn(linkedInOutreachService, 'isAccountConnected')
+        .mockImplementation(async (id: string) => id === 'own-live');
+
+      const result = await linkedInOutreachService.resolveAccountId('user-1');
+
+      expect(result).toBe('own-live');
+      // Never consulted site-wide settings because a live own account existed.
+      expect(mockGetSetting).not.toHaveBeenCalled();
+      liveSpy.mockRestore();
+    });
+
+    it('falls back to a site-wide account ONLY after every own account is dead', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'own-dead-1' },
+        { platform: 'unipile', account_id: 'own-dead-2' },
+      ]);
+      mockGetSetting.mockResolvedValue({
+        settingValue: JSON.stringify([{ account_id: 'site-live', enabled: true }]),
+      });
+      const liveSpy = jest
+        .spyOn(linkedInOutreachService, 'isAccountConnected')
+        .mockImplementation(async (id: string) => id === 'site-live');
+
+      const result = await linkedInOutreachService.resolveAccountId('user-1');
+
+      expect(result).toBe('site-live');
+      liveSpy.mockRestore();
+    });
+
+    it('returns null when the user has own accounts but ALL of them (and no site-wide) are dead', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'own-dead-1' },
+      ]);
+      mockGetSetting.mockResolvedValue(null);
+      const liveSpy = jest.spyOn(linkedInOutreachService, 'isAccountConnected').mockResolvedValue(false);
+
+      const result = await linkedInOutreachService.resolveAccountId('user-1');
+
+      expect(result).toBeNull();
+      liveSpy.mockRestore();
     });
 
     it('returns site-wide account_id when user has no account but site-wide accounts are configured', async () => {
