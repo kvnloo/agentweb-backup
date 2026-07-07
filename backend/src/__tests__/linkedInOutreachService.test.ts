@@ -1340,6 +1340,40 @@ describe('LinkedInOutreachService', () => {
     });
   });
 
+  describe('isAccountConnected timeout guard (ENG-144)', () => {
+    const CHECK_MS = 15_000;
+    const hang = () => new Promise(() => {}); // never resolves — stuck upstream
+
+    beforeEach(() => {
+      // @ts-ignore private cache — clear so the live probe actually runs
+      linkedInOutreachService.connectedStatusCache = new Map();
+    });
+    afterEach(() => jest.useRealTimers());
+
+    it('treats a hung account probe as NOT connected instead of blocking the caller', async () => {
+      jest.useFakeTimers();
+      (mockUnipileClient.account.getOne as jest.Mock).mockImplementation(() => hang());
+
+      const settled = linkedInOutreachService.isAccountConnected('acct-hang').then((v) => ({ v }));
+      await jest.advanceTimersByTimeAsync(CHECK_MS + 1);
+
+      expect(await settled).toEqual({ v: false });
+    });
+
+    it('treats a hung self-profile probe as NOT connected', async () => {
+      jest.useFakeTimers();
+      (mockUnipileClient.account.getOne as jest.Mock).mockResolvedValue({
+        connection_params: { im: { publicIdentifier: 'me' } },
+      });
+      (mockUnipileClient.request.send as jest.Mock).mockImplementation(() => hang());
+
+      const settled = linkedInOutreachService.isAccountConnected('acct-hang-2').then((v) => ({ v }));
+      await jest.advanceTimersByTimeAsync(CHECK_MS + 1);
+
+      expect(await settled).toEqual({ v: false });
+    });
+  });
+
   describe('resolveAccountId', () => {
     const mockGetAccountsByUserId = jest.fn();
     const mockGetSetting = jest.fn();
