@@ -600,11 +600,7 @@ export class LinkedInOutreachService {
       await this.checkIsNotAlreadyConnected(account_id, provider_id);
       this.log(`Sending invitation`, { account_id, provider_id });
       const client = await this.getClient();
-      const res = await client.users.sendInvitation({
-        account_id,
-        provider_id,
-        message: outgoingMessage
-      });
+      const res = await this.sendInvitationRequest(client, account_id, provider_id, outgoingMessage);
       this.log(`Invitation sent successfully`, { account_id, provider_id });
       // A successful send proves the account is not capped — clear any stale breaker.
       this.invitationCooldownUntil.delete(account_id);
@@ -627,6 +623,64 @@ export class LinkedInOutreachService {
         throw enhanced;
       }
     }
+  }
+
+  /**
+   * Send the invite to Unipile, transparently retrying WITHOUT the personalized
+   * note if LinkedIn rejects the note-bearing invite with a generic
+   * "Invalid parameters" (ENG-213). Free LinkedIn accounts may only attach a note
+   * to ~5 invitations per month, but can still send ~150 note-less invites per
+   * week; once the monthly note quota is spent, LinkedIn rejects every note-bearing
+   * invite with that generic validation error even though the recipient/provider_id
+   * are perfectly valid. Dropping the note lets the connection request still go out
+   * instead of failing the whole outreach. A note-less invite that STILL fails, or
+   * any non-note rejection (bad provider_id, already-invited, account cap), bubbles
+   * up unchanged for the caller/handleError to classify.
+   */
+  private async sendInvitationRequest(
+    client: UnipileClient,
+    account_id: string,
+    provider_id: string,
+    message: string | undefined,
+  ): Promise<any> {
+    try {
+      return await client.users.sendInvitation({ account_id, provider_id, message });
+    } catch (error: any) {
+      const hadNote = typeof message === 'string' && message.length > 0;
+      if (hadNote && LinkedInOutreachService.isInviteNoteRejection(error)) {
+        this.warn('INVITE_NOTE_REJECTED_RETRY_WITHOUT_NOTE', { account_id, provider_id });
+        const res = await client.users.sendInvitation({ account_id, provider_id, message: undefined });
+        // Signal to callers that the note was dropped — the invite still went out,
+        // just without the personalization, so they can report it accurately.
+        if (res && typeof res === 'object') (res as any).note_dropped = true;
+        return res;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * True when a Unipile invite rejection is the generic "Invalid parameters"
+   * validation error LinkedIn returns for a note-bearing invite once a free
+   * account's monthly personalized-invite quota is spent (ENG-213). Deliberately
+   * excludes the distinct cap/duplicate signals ("cannot resend yet",
+   * "already invited/connected", "should delay") — dropping the note cannot fix
+   * those, so we must not silently retry and mask them.
+   */
+  private static isInviteNoteRejection(error: any): boolean {
+    const body = error?.body;
+    if (!body || typeof body !== 'object' || (typeof Blob !== 'undefined' && body instanceof Blob)) {
+      return false;
+    }
+    const text = [body.title, body.message, body.detail, body.type]
+      .filter((v: any) => typeof v === 'string')
+      .join(' ')
+      .toLowerCase();
+    if (!text) return false;
+    if (/cannot resend yet|already invited|already connected|should delay|insufficient/.test(text)) {
+      return false;
+    }
+    return /invalid parameters?/.test(text);
   }
 
   /**
