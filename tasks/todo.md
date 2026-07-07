@@ -1,26 +1,37 @@
 # Project TODO
 
-## Follow-ups
+## Completed
 
-### ENG-182 (partial): pre-invite LinkedIn dedup cross-check — NOT YET DONE
+### ENG-182: CRM ↔ LinkedIn invite dedup gap — RESOLVED
 
-ENG-182 has two suggested fixes. Only fix (b) — the per-recipient retry breaker
-scoping — is implemented on branch
-`autofix/eng-182-crm-linkedin-invite-dedup-gap-newly-park`
-(see `backend/src/services/agentToolGatewayService.ts`, `failureScope` /
-`clearToolFailures`). **ENG-182 is therefore NOT fully resolved.**
+Both suggested fixes are now implemented on branch
+`autofix/eng-182-crm-linkedin-invite-dedup-gap-newly-park`:
 
-Fix (a) is still open and must be tracked as its own follow-up ticket:
+- **Fix (b) — per-recipient retry breaker scoping** (`backend/src/services/agentToolGatewayService.ts`,
+  `failureScope` / `findTrippedFailure` / `recordToolFailure` / `clearToolFailures`):
+  the run-level tool-failure breaker is now keyed on `(tool, recipient, error-head)`
+  so a per-recipient "Cannot resend yet" refusal no longer blocks send-invite to
+  genuinely different recipients in the same run.
 
-- **What:** Before parking/inviting Dream-100 candidates, cross-check each
-  candidate against `list-sent-invitations` on the connected LinkedIn account
-  (Unipile), not just against the CRM list.
-- **Why:** The user's primary symptom — send-invite to profiles that look
-  net-new in CRM still returns "Cannot resend yet" and burns a run's invite
-  quota — persists without this. The breaker-scoping fix only stops one
-  already-invited recipient from blocking *unrelated* recipients; it does not
-  prevent the wasted invite attempts themselves.
-- **Where:** LinkedIn outreach path in
-  `backend/src/services/agentModeService.ts` (`send-invite` case) and/or the
-  parking flow; reconcile CRM "already-invited" state against pending
-  LinkedIn invitations before attempting a send.
+- **Fix (a) — pre-invite LinkedIn dedup cross-check** (`backend/src/services/agentModeService.ts`,
+  `send-invite` case + `linkedInPublicIdFromUrl`; `backend/src/services/unipileSentInvitationsDb.ts`,
+  `getSentInvitationByPublicIdAndAccount`): before spending a run's invite quota,
+  the agent send-invite path cross-checks the target against the account's PENDING
+  sent-invitation cache (`AW-UnipileSentInvitations`, kept fresh by the ~10-min
+  connection-sync cron straight from Unipile's live sent feed — so it also reflects
+  invites made outside this system). A profile with an outstanding invite is skipped
+  (`success: true, alreadyInvited: true`, no quota used) instead of hitting Unipile
+  and getting "Cannot resend yet". Every successful agent invite is also written
+  through to the cache immediately (strongly-consistent PK read on recheck) so a
+  later invite for the same profile in the same run is deduped before the next cron.
+
+## Known limitations / follow-ups
+
+- Fix (a) can only dedup an invite sent by a `/in/{public-id}` profile URL (the cache
+  is keyed by public id). A raw `provider_id` invite falls through to the live send;
+  fix (b) still prevents it from cross-blocking other recipients. If provider_id
+  invites become common, resolve provider_id → public id (extra profile fetch) before
+  the cache check.
+- The manual CRM send-invite route (`backend/src/routes/crm.ts`) still sends-then-caches
+  without a pre-check, but the CRM UI already surfaces "Invitation pending" badges via
+  `check-linkedin-connections`, so a user rarely clicks invite on an already-pending lead.
