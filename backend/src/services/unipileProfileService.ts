@@ -193,20 +193,28 @@ export class UnipileProfileService {
     try {
       apiData = await this.deps.http.fetchProfile(identifierOrUrl, accountId);
     } catch (err: any) {
-      // A lookup timeout (ENG-144) is transient — the same profile typically
-      // succeeds again within minutes (Rui's session: one lookup timed out, then
-      // all but one succeeded ~10 min later). Caching it as an error would trap the
-      // identifier behind the 1h ERROR_TTL and make an immediate user/agent retry
-      // fail fast from cache instead of re-hitting Unipile live. So we do NOT cache
-      // timeouts — only durable failures (4xx/5xx) get the error-row backoff.
-      const isTimeout =
+      const message = err?.message ?? String(err);
+      // Do NOT cache errors that are transient or that are NOT about this profile —
+      // caching them under the profile key traps the identifier behind the 1h
+      // ERROR_TTL and keeps serving a stale failure long after the real cause clears:
+      //   • Timeout (ENG-144): the same profile usually succeeds again in minutes.
+      //   • Account-level failure (disconnected/expired session, auth): this describes
+      //     the ACCOUNT, not the profile. A dead session poisons EVERY profile looked
+      //     up through it, and stays poisoned even after the account reconnects and
+      //     the very same profile fetches fine live (observed: get-profile kept
+      //     returning "Disconnected account" while account.getOne=OK and a
+      //     forceRefresh fetch succeeded). Both self-heal, so let the next lookup
+      //     re-hit Unipile live instead of caching. Only durable, profile-specific
+      //     failures (5xx / validation) get the error-row backoff.
+      const cls = err?.classification || err?.structuredError?.classification;
+      const doNotCache =
         err?.isTimeout === true ||
-        err?.classification === 'TIMEOUT_ERROR' ||
-        err?.structuredError?.classification === 'TIMEOUT_ERROR';
-      if (isTimeout) {
+        cls === 'TIMEOUT_ERROR' ||
+        cls === 'AUTH_ERROR' ||
+        /disconnected|session (?:expired|invalid)|not connected|please reconnect/i.test(message);
+      if (doNotCache) {
         throw err;
       }
-      const message = err?.message ?? String(err);
       const errorRow: UnipileCacheRow = {
         canonicalId: key.canonicalId,
         fieldGroup: key.sk,
