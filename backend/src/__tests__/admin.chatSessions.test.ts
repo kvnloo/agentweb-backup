@@ -22,11 +22,43 @@ jest.mock("../services/settingsService", () => ({
   },
 }));
 
-jest.mock("../services/sessionScoringService", () => ({
-  scoreSessionIfNeeded: jest.fn(),
-  scoreSessionWithJudgeIfNeeded: jest.fn(),
-  ScoringJudge: {},
-}));
+jest.mock("../services/sessionScoringService", () => {
+  const scoreSessionIfNeeded = jest.fn();
+  const scoreSessionWithJudgeIfNeeded = jest.fn();
+  // Delegating stub for the real budget-bounded pass: iterate sessions and
+  // judges through the mocked per-session/per-judge fns (catching errors like
+  // the real impl) so the existing sync-mode assertions still hold. See ENG-190.
+  const scoreSessionsWithinBudget = jest.fn(
+    async (sessions: any[], judges: any[] = []) => {
+      for (const session of sessions) {
+        try {
+          await scoreSessionIfNeeded(session);
+        } catch {
+          /* per-session errors are isolated */
+        }
+        for (const judge of judges) {
+          try {
+            await scoreSessionWithJudgeIfNeeded(session, judge);
+          } catch {
+            /* per-judge errors are isolated */
+          }
+        }
+      }
+      return {
+        processedCount: sessions.length,
+        totalCount: sessions.length,
+        complete: true,
+      };
+    }
+  );
+  return {
+    scoreSessionIfNeeded,
+    scoreSessionWithJudgeIfNeeded,
+    scoreSessionsWithinBudget,
+    SYNC_SCORING_BUDGET_MS: 180000,
+    ScoringJudge: {},
+  };
+});
 
 jest.mock("../middleware/auth", () => ({
   authenticateToken: (_req: any, _res: any, next: any) => next(),
