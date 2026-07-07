@@ -253,6 +253,84 @@ describe('AgentModeService - createHtmlFile', () => {
       expect(result.error).toContain('LLM did not generate HTML content');
     });
 
+    // ENG-203: the final HTML render is a single long-running LLM call that can
+    // hit the Bedrock 5-minute requestTimeout. Without a retry, one transient
+    // timeout discards ALL completed upstream work. createHtmlFile must retry the
+    // render step on transient errors so a single blip no longer loses the report.
+    describe('transient render failure retry (ENG-203)', () => {
+      beforeEach(() => {
+        // Avoid real backoff delays in tests.
+        jest.spyOn(agentModeService as any, 'sleep').mockResolvedValue(undefined);
+      });
+
+      it('retries the render step on a transient timeout and then succeeds', async () => {
+        const timeoutError = Object.assign(new Error('Connection timed out'), { name: 'TimeoutError' });
+        mockGenerateHTML
+          .mockRejectedValueOnce(timeoutError)
+          .mockResolvedValueOnce(mockHtmlContent);
+
+        const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+        const result = await (agentModeService as any).createHtmlFile(
+          'Test Title',
+          'Test content',
+          '',
+          'user123',
+          'session123'
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.s3_url).toBeDefined();
+        expect(mockGenerateHTML).toHaveBeenCalledTimes(2);
+
+        consoleWarnSpy.mockRestore();
+      });
+
+      it('does NOT retry a non-transient render error', async () => {
+        // "invalid" is a terminal error — retrying the identical call is pointless.
+        mockGenerateHTML.mockRejectedValue(new Error('invalid request payload'));
+
+        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+
+        const result = await (agentModeService as any).createHtmlFile(
+          'Test Title',
+          'Test content',
+          '',
+          'user123',
+          'session123'
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('invalid request payload');
+        expect(mockGenerateHTML).toHaveBeenCalledTimes(1);
+
+        consoleErrorSpy.mockRestore();
+      });
+
+      it('gives up after exhausting retries on a persistent transient error', async () => {
+        const timeoutError = Object.assign(new Error('Connection timed out'), { name: 'TimeoutError' });
+        mockGenerateHTML.mockRejectedValue(timeoutError);
+
+        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+        const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+        const result = await (agentModeService as any).createHtmlFile(
+          'Test Title',
+          'Test content',
+          '',
+          'user123',
+          'session123'
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('timed out');
+        expect(mockGenerateHTML).toHaveBeenCalledTimes(3);
+
+        consoleErrorSpy.mockRestore();
+        consoleWarnSpy.mockRestore();
+      });
+    });
+
     it('should pass correct parameters to uploadFileToS3', async () => {
       await (agentModeService as any).createHtmlFile(
         'Test Title',
