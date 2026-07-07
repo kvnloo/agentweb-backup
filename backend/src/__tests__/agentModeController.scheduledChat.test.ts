@@ -2799,6 +2799,36 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       );
     });
 
+    it('should render a cost-based block message when the cost cap is the cause and tokens are unlimited', async () => {
+      mockedCheckTokenUsage.mockResolvedValueOnce({
+        allowed: false,
+        warning: true,
+        used: 5000000,
+        allowance: null,
+        percentUsed: 0,
+        effectiveAllowance: null,
+        bonus: 0,
+        month: '2026-04',
+        costUsed: 42.5,
+        costAllowance: 40,
+        costPercentUsed: 106,
+      });
+
+      const scheduleWithEmails = {
+        ...baseSchedule,
+        requiredFunctionCalls: [],
+        emailNotifications: ['owner@example.com'],
+      };
+
+      const result = await runScheduledChat(scheduleWithEmails, mockUserId, true);
+
+      expect(mockEmailService.sendScheduledChatTokenLimitEmail).toHaveBeenCalled();
+      expect(result.actualResponse).toContain('Monthly cost limit reached');
+      expect(result.actualResponse).toContain('$42.50 / $40.00 spent this month');
+      expect(result.actualResponse).not.toContain('tokens used');
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+    });
+
     it('should allow scheduled chat when token usage is under the limit', async () => {
       // Default mock returns allowed: true — just verify normal execution proceeds
       const successfulResponse = {
