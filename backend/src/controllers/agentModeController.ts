@@ -1658,7 +1658,7 @@ export async function runScheduledChat(
               isErrorMessage: true,
               jobIncomplete: true,
             },
-          } as ChatMessage);
+          });
         } catch (persistError) {
           console.error('Failed to persist job-incomplete message to session:', persistError);
         }
