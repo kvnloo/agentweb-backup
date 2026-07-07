@@ -72,6 +72,7 @@ async function linearGraphQL(query: string, variables?: Record<string, any>): Pr
 interface TeamMeta {
   teamId: string;
   backlogStateId: string;
+  stateIds: Record<string, string>; // name (lowercased) -> id
   labelIds: Record<string, string>; // name -> id
 }
 let teamMetaCache: TeamMeta | null = null;
@@ -90,14 +91,35 @@ async function getTeamMeta(): Promise<TeamMeta> {
   if (!team) throw new Error(`Linear team "${TEAM_KEY}" not found`);
   const states: any[] = team.states?.nodes || [];
   const backlog = states.find(s => s.type === 'backlog') || states.find(s => s.type === 'unstarted');
+  const stateIds: Record<string, string> = {};
+  for (const s of states) stateIds[s.name.toLowerCase()] = s.id;
   const labelIds: Record<string, string> = {};
   for (const l of (team.labels?.nodes || [])) labelIds[l.name.toLowerCase()] = l.id;
   teamMetaCache = {
     teamId: team.id,
     backlogStateId: backlog?.id,
+    stateIds,
     labelIds,
   };
   return teamMetaCache;
+}
+
+/**
+ * Resolve label names -> ids against the team, LOUDLY (ENG-187): a silently dropped label erases
+ * triage signal (funnel-stage labels drive the bug priority ladder), so every name that fails to
+ * resolve is an error log naming the label — never a silent drop.
+ */
+function resolveLabelIdsLoud(meta: TeamMeta, labelNames: string[]): string[] {
+  const ids: string[] = [];
+  for (const name of labelNames) {
+    const id = meta.labelIds[name.toLowerCase()];
+    if (id) {
+      ids.push(id);
+    } else {
+      console.error(`[linear] label "${name}" does not exist in team ${TEAM_KEY} — dropped from the issue. Create it in Linear to restore the triage signal.`);
+    }
+  }
+  return ids;
 }
 
 /** Test seam — reset the cached team metadata. */
@@ -174,20 +196,40 @@ export async function addIssueComment(issueId: string, body: string): Promise<vo
  * Create an INTERNAL Linear issue (auto-identified by the system). Crucially does NOT
  * carry the "Featurebase" label, so Featurebase never imports it as a public post —
  * these stay private engineering items. labelNames (e.g. ["Auto","Oncall"]) are
- * resolved against the team's labels; unknown names are dropped.
+ * resolved against the team's labels; unknown names are dropped LOUDLY (error log per name).
+ *
+ * Optional triage fields (ENG-187): `priority` (Linear enum 1=Urgent 2=High 3=Medium 4=Low),
+ * `stateName` (workflow state by name, e.g. "Todo"; falls back to the backlog state when omitted
+ * or unknown), `assigneeId` (Linear user uuid).
  */
-export async function createInternalLinearIssue(params: { title: string; description: string; labelNames: string[] }): Promise<LinearIssueResult> {
+export async function createInternalLinearIssue(params: {
+  title: string;
+  description: string;
+  labelNames: string[];
+  priority?: number;
+  stateName?: string;
+  assigneeId?: string;
+}): Promise<LinearIssueResult> {
   const meta = await getTeamMeta();
-  const labelIds = params.labelNames
-    .map((n) => meta.labelIds[n.toLowerCase()])
-    .filter((id): id is string => Boolean(id));
+  const labelIds = resolveLabelIdsLoud(meta, params.labelNames);
   const input: Record<string, any> = {
     teamId: meta.teamId,
     title: params.title,
     description: params.description,
     labelIds,
   };
-  if (meta.backlogStateId) input.stateId = meta.backlogStateId;
+  let stateId = meta.backlogStateId;
+  if (params.stateName) {
+    const named = meta.stateIds[params.stateName.toLowerCase()];
+    if (named) {
+      stateId = named;
+    } else {
+      console.error(`[linear] state "${params.stateName}" not found in team ${TEAM_KEY} — falling back to the backlog state.`);
+    }
+  }
+  if (stateId) input.stateId = stateId;
+  if (typeof params.priority === 'number') input.priority = params.priority;
+  if (params.assigneeId) input.assigneeId = params.assigneeId;
   const data = await linearGraphQL(
     `mutation($input: IssueCreateInput!) {
       issueCreate(input: $input) { success issue { id identifier url } }
@@ -199,6 +241,45 @@ export async function createInternalLinearIssue(params: { title: string; descrip
     throw new Error('Linear issueCreate (internal) did not return an issue');
   }
   return { id: issue.id, identifier: issue.identifier, url: issue.url };
+}
+
+/**
+ * Raise-only triage update on an existing issue (ENG-187 dedup upgrade): UNION the given labels in,
+ * and RAISE the priority to `priority` when it is more urgent than the current one. Never lowers
+ * priority and never removes labels — a later lower-tier reporter must not downgrade a canonical
+ * that a higher-tier reporter already escalated. Linear priority enum: 0=None, 1=Urgent … 4=Low,
+ * so "more urgent" = smaller non-zero number (and anything beats 0/None).
+ * No-op (no mutation) when neither labels nor priority would change.
+ */
+export async function raiseIssueTriage(issueId: string, params: { addLabelNames: string[]; priority?: number }): Promise<void> {
+  const meta = await getTeamMeta();
+  const data = await linearGraphQL(
+    `query($id: String!) { issue(id: $id) { priority labels { nodes { id } } } }`,
+    { id: issueId },
+  );
+  const issue = data?.issue;
+  if (!issue) throw new Error('Linear issue not found for triage raise');
+
+  const currentLabelIds: string[] = (issue.labels?.nodes || []).map((n: any) => n.id);
+  const addIds = resolveLabelIdsLoud(meta, params.addLabelNames).filter((id) => !currentLabelIds.includes(id));
+
+  const input: Record<string, any> = {};
+  if (addIds.length > 0) input.labelIds = [...currentLabelIds, ...addIds];
+  const current: number = typeof issue.priority === 'number' ? issue.priority : 0;
+  if (typeof params.priority === 'number' && params.priority > 0 && (current === 0 || params.priority < current)) {
+    input.priority = params.priority;
+  }
+  if (Object.keys(input).length === 0) return;
+
+  const res = await linearGraphQL(
+    `mutation($id: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $id, input: $input) { success }
+    }`,
+    { id: issueId, input },
+  );
+  if (!res?.issueUpdate?.success) {
+    throw new Error('Linear issueUpdate (triage raise) failed');
+  }
 }
 
 export interface OpenIssue {

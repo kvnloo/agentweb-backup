@@ -320,6 +320,8 @@ router.post("/report-ui-bug", async (req, res) => {
       userName: user.displayName || user.email,
       reportedByAdmin: isDelegated && adminEmail ? adminEmail : undefined,
       sessionId: typeof sessionId === "string" ? sessionId : undefined,
+      // Linear-side triage enrichment (ENG-187): stage labels + priority/state/assignee defaults.
+      funnelStatus: user.funnelStatus,
       notionTags: ["Customer Reported", config.tag, ...funnelStatusTags],
       notionContext: issueContext,
     });

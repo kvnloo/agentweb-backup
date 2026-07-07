@@ -33,6 +33,13 @@ export function getUserFunnelStatusLabel(funnelStatus?: string | null): string |
   return USER_FUNNEL_STATUS_LABELS[funnelStatus] ?? funnelStatus;
 }
 
+/** Coarse triage bucket (Sales/Setup/Activated/Retention/Parked) for a funnel stage, or null when
+ *  the stage is missing/unknown. Drives bug priority defaults (see intakeService, ENG-187). */
+export function getUserFunnelStatusCoarseTag(funnelStatus?: string | null): string | null {
+  if (!funnelStatus) return null;
+  return USER_FUNNEL_STATUS_PRIORITY_TAGS[funnelStatus] ?? null;
+}
+
 export function getUserFunnelStatusIssueTags(funnelStatus?: string | null): string[] {
   const label = getUserFunnelStatusLabel(funnelStatus);
   if (!label) return [];

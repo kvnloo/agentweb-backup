@@ -21,6 +21,8 @@
  *    so recurring auto-issues group onto one item instead of flooding the board.
  */
 
+import { getUserFunnelStatusIssueTags, getUserFunnelStatusCoarseTag } from '../utils/userFunnelStatus';
+
 const FEATUREBASE_BOARD_URL = 'https://agentweb.featurebase.app/';
 
 function intakeEnabled(): boolean {
@@ -35,6 +37,37 @@ function contextLines(context?: Record<string, any>): string[] {
   });
 }
 
+/**
+ * Context keys carrying the reporter's funnel stage — PRIVATE internal info (ENG-187). They may
+ * reach Linear (labels / canonical description / eng comments) but must never reach Featurebase,
+ * not even in a private note: nothing customer-adjacent carries funnel state.
+ */
+const LINEAR_ONLY_CONTEXT_KEYS = ['User Status'];
+function featurebaseSafeContext(ctx?: Record<string, any>): Record<string, any> | undefined {
+  if (!ctx) return ctx;
+  return Object.fromEntries(Object.entries(ctx).filter(([k]) => !LINEAR_ONLY_CONTEXT_KEYS.includes(k)));
+}
+
+/**
+ * Creation-time triage defaults for customer-filed bug canonicals (ENG-187): a user-filed bug is
+ * NEVER created unassigned, unprioritized, or sitting in Backlog — bugs must not rot. Priority
+ * follows the reporter's coarse funnel bucket per the board doc ("How this board works —
+ * Engineering"): Retention -> Urgent, Setup/Activated -> High, Sales/Parked/unknown -> Medium.
+ */
+const BUG_CANONICAL_STATE = 'Todo';
+const BUG_DEFAULT_ASSIGNEE_ID = '4c29baa4-7778-42d9-8b35-045e4d9ec0b0'; // Harshit Shah — default bug owner
+const BUG_PRIORITY = { URGENT: 1, HIGH: 2, MEDIUM: 3 } as const; // Linear priority enum (1=Urgent … 4=Low)
+const BUG_PRIORITY_BY_COARSE_TAG: Record<string, number> = {
+  Retention: BUG_PRIORITY.URGENT,
+  Setup: BUG_PRIORITY.HIGH,
+  Activated: BUG_PRIORITY.HIGH,
+};
+
+function bugPriorityForFunnel(funnelStatus?: string | null): number {
+  const coarse = getUserFunnelStatusCoarseTag(funnelStatus);
+  return (coarse && BUG_PRIORITY_BY_COARSE_TAG[coarse]) || BUG_PRIORITY.MEDIUM;
+}
+
 export interface FileUserIssueParams {
   type: 'feature_request' | 'bug';
   title: string;
@@ -45,6 +78,12 @@ export interface FileUserIssueParams {
   reportedByAdmin?: string;
   /** Chat session id of the reporter, so eng can jump straight to the offending session. */
   sessionId?: string;
+  /**
+   * Reporter's funnel stage (user record `funnelStatus`, PR #2025) — drives the Linear-side triage
+   * enrichment (stage labels + priority, ENG-187). PRIVATE internal info: never surfaces in
+   * Featurebase content or any reporter-facing email.
+   */
+  funnelStatus?: string | null;
   /** Tags + context for the Notion path (flag off). */
   notionTags?: string[];
   notionContext?: Record<string, any>;
@@ -104,7 +143,7 @@ async function fileFeatureRequest(p: FileUserIssueParams): Promise<FiledUserResu
       '',
       'Their report:',
       p.description,
-      ...contextLines(p.notionContext),
+      ...contextLines(featurebaseSafeContext(p.notionContext)),
     ].join('\n');
     try { await addComment(post.id, reportedNote, true); } catch (e) { console.warn('[intake] feature dedup comment failed:', e instanceof Error ? e.message : e); }
     try { await addVoter(post.id, p.userEmail, p.userName); } catch (e) { console.warn('[intake] feature dedup upvote failed:', e instanceof Error ? e.message : e); }
@@ -117,7 +156,7 @@ async function fileFeatureRequest(p: FileUserIssueParams): Promise<FiledUserResu
   const filedNote = [
     p.reportedByAdmin ? `Filed by ${reporterLabel(p)} via ${p.reportedByAdmin} acting on their behalf (delegated session).` : `Filed by ${reporterLabel(p)}.`,
     ...(p.sessionId ? [`Session: ${p.sessionId}`] : []),
-    ...contextLines(p.notionContext),
+    ...contextLines(featurebaseSafeContext(p.notionContext)),
   ].join('\n');
   try { await addComment(post.id, filedNote, true); } catch (e) { console.warn('[intake] feature filed comment failed:', e instanceof Error ? e.message : e); }
   return { pageId: post.id, trackerUrl: post.url || FEATUREBASE_BOARD_URL, userUrl: post.url || FEATUREBASE_BOARD_URL, deduped: false, tracker: 'Featurebase' };
@@ -138,8 +177,14 @@ async function fileFeatureRequest(p: FileUserIssueParams): Promise<FiledUserResu
  */
 async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   const { findDuplicate, MAX_CANDIDATES } = await import('./dedupService');
-  const { listOpenBugCanonicals, createInternalLinearIssue, addIssueComment } = await import('./linearService');
+  const { listOpenBugCanonicals, createInternalLinearIssue, addIssueComment, raiseIssueTriage } = await import('./linearService');
   const { createTicket } = await import('./featurebaseService');
+
+  // Linear-side triage enrichment (ENG-187): the reporter's funnel stage becomes stage labels
+  // ("Status: <stage>" + coarse bucket) and sets the priority default. Linear-only — the stage
+  // never reaches the Featurebase ticket or any reporter-facing surface.
+  const stageTags = getUserFunnelStatusIssueTags(p.funnelStatus);
+  const priority = bugPriorityForFunnel(p.funnelStatus);
 
   // 1. The reporter's OWN private card. Body = their words (what THEY see). Propagates on failure.
   const ticket = await createTicket({ title: p.title, content: p.description, authorEmail: p.userEmail, authorName: p.userName });
@@ -155,6 +200,14 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   let canonicalUuid = '';
   if (dup) {
     canonicalUuid = byRef.get(dup.ref)!.issueId;
+    // Dedup triage upgrade (ENG-187): a higher-tier reporter hitting an existing canonical unions
+    // its stage labels in and raises the priority — never lowers it (raise-only by contract of
+    // raiseIssueTriage). Best-effort: a failed upgrade must not block the filing.
+    try {
+      await raiseIssueTriage(canonicalUuid, { addLabelNames: stageTags, priority });
+    } catch (e) {
+      console.warn('[intake] bug canonical triage upgrade failed:', e instanceof Error ? e.message : e);
+    }
   } else {
     const filedBy = p.reportedByAdmin
       ? `via ${p.reportedByAdmin} acting on their behalf (delegated session)`
@@ -171,7 +224,12 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
         ...(p.sessionId ? [`Session: ${p.sessionId}`] : []),
         ...contextLines(p.notionContext),
       ].join('\n'),
-      labelNames: ['Bug', 'Customer Reported'],
+      // Stage labels + no-rot defaults (ENG-187): every customer bug lands in Todo, assigned,
+      // with a funnel-derived priority — never unowned in Backlog.
+      labelNames: ['Bug', 'Customer Reported', ...stageTags],
+      priority,
+      stateName: BUG_CANONICAL_STATE,
+      assigneeId: BUG_DEFAULT_ASSIGNEE_ID,
     });
     canonicalUuid = li.id || '';
   }

@@ -6918,6 +6918,8 @@ emmaToolRegistry.register({
             userName: user.displayName || user.email,
             reportedByAdmin: isDelegatedAdmin && adminEmail ? adminEmail : undefined,
             sessionId: context?.sessionId,
+            // Linear-side triage enrichment (ENG-187): stage labels + priority/state/assignee defaults.
+            funnelStatus: user.funnelStatus,
             // External MCP clients (Claude Code etc.) are tagged distinctly so benchmark
             // filters on Customer Reported stay clean (used on the flag-off Notion path).
             notionTags: [
