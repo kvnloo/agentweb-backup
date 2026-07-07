@@ -212,10 +212,14 @@ describe('TwitterService — happy paths', () => {
     expect(res.id).toBe('222');
   });
 
-  it('postThread chains tweets', async () => {
+  it('postThread posts the first tweet then chains replies to the previous id', async () => {
     const res = await twitterService.postThread(OWNER, ACCOUNT_ID, ['a', 'b']);
-    expect(mockTweetThread).toHaveBeenCalledWith(['a', 'b']);
+    expect(mockTweet).toHaveBeenCalledWith('a');         // first entry is a root tweet
+    expect(mockReply).toHaveBeenCalledWith('b', '111');  // second entry replies to the first tweet's id
+    expect(mockTweetThread).not.toHaveBeenCalled();      // must NOT use the non-idempotent whole-thread call
     expect(res).toHaveLength(2);
+    expect(res[0].id).toBe('111');
+    expect(res[1].id).toBe('222');
   });
 
   it('sendDm resolves handle then sends to participant id', async () => {
@@ -296,6 +300,37 @@ describe('TwitterService.getClient — marks needs_reconnect on refresh failure'
     expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
       OWNER, 'twitter', ACCOUNT_ID, { needs_reconnect: true }
     );
+  });
+});
+
+// ─── postThread idempotency on mid-thread 401 ────────────────────────────────
+
+describe('TwitterService.postThread — idempotent retry', () => {
+  it('does NOT re-post already-sent tweets when a later tweet hits a 401', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    // Tweet 'a' (root) succeeds once. Reply 'b' returns 401 on its first attempt,
+    // then succeeds after force-refresh. Reply 'c' succeeds. The root tweet must
+    // be posted exactly once — the 401 retry must not re-run the whole thread.
+    mockTweet.mockResolvedValue({ data: { id: '111', text: 'a' } });
+    mockReply
+      .mockRejectedValueOnce(makeXAuthError())            // 'b' first attempt: 401
+      .mockResolvedValueOnce({ data: { id: '222', text: 'b' } }) // 'b' retry after refresh
+      .mockResolvedValueOnce({ data: { id: '333', text: 'c' } }); // 'c'
+
+    const res = await twitterService.postThread(OWNER, ACCOUNT_ID, ['a', 'b', 'c']);
+
+    expect(res.map((r) => r.id)).toEqual(['111', '222', '333']);
+    // Root tweet posted exactly once — NOT duplicated by the retry.
+    expect(mockTweet).toHaveBeenCalledTimes(1);
+    expect(mockTweet).toHaveBeenCalledWith('a');
+    // Reply called 3x total: 'b' (fail) + 'b' (retry) + 'c'.
+    expect(mockReply).toHaveBeenCalledTimes(3);
+    // Only the failing tweet triggered a refresh.
+    expect(mockRefreshOAuth2Token).toHaveBeenCalledTimes(1);
+    // Chaining stays correct across the retry: 'b'→root(111), 'c'→b(222).
+    expect(mockReply).toHaveBeenNthCalledWith(1, 'b', '111');
+    expect(mockReply).toHaveBeenNthCalledWith(2, 'b', '111');
+    expect(mockReply).toHaveBeenNthCalledWith(3, 'c', '222');
   });
 });
 
