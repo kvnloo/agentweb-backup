@@ -563,6 +563,69 @@ describe('apiTools', () => {
 
       expect(session.delegateInfo).toBeNull();
     });
+
+    // ── ENG-190: partial-scoring surfacing (the customer-facing fix) ──
+
+    it('surfaces partial scoring coverage with a resume note when sync=true and complete=false', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{ sessionId: 'sess-p', userId: 'u1', title: 't', createdAt: '2026-03-28T00:00:00Z', updatedAt: '2026-03-28T01:00:00Z', messages: [] }],
+        nextCursor: null,
+        scoring: { complete: false, scoredSessionCount: 12, totalSessionCount: 40 },
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+        sync: true,
+      }, context);
+
+      const parsed = JSON.parse((result as any).content[0].text);
+      expect(parsed.scoring).toBeDefined();
+      expect(parsed.scoring.complete).toBe(false);
+      expect(parsed.scoring.scoredSessionCount).toBe(12);
+      expect(parsed.scoring.totalSessionCount).toBe(40);
+      // complete=false must include the re-invoke note so the caller resumes.
+      expect(typeof parsed.scoring.note).toBe('string');
+      expect(parsed.scoring.note).toMatch(/sync=true/);
+    });
+
+    it('surfaces full scoring coverage without a resume note when sync=true and complete=true', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{ sessionId: 'sess-c', userId: 'u1', title: 't', createdAt: '2026-03-28T00:00:00Z', updatedAt: '2026-03-28T01:00:00Z', messages: [] }],
+        nextCursor: null,
+        scoring: { complete: true, scoredSessionCount: 40, totalSessionCount: 40 },
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+        sync: true,
+      }, context);
+
+      const parsed = JSON.parse((result as any).content[0].text);
+      expect(parsed.scoring).toBeDefined();
+      expect(parsed.scoring.complete).toBe(true);
+      expect(parsed.scoring.scoredSessionCount).toBe(40);
+      expect(parsed.scoring.note).toBeUndefined();
+    });
+
+    it('omits the scoring block entirely when sync is not set', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{ sessionId: 'sess-n', userId: 'u1', title: 't', createdAt: '2026-03-28T00:00:00Z', updatedAt: '2026-03-28T01:00:00Z', messages: [] }],
+        nextCursor: null,
+        // Even if the backend returned a scoring block, sync=false must not surface it.
+        scoring: { complete: true, scoredSessionCount: 40, totalSessionCount: 40 },
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const parsed = JSON.parse((result as any).content[0].text);
+      expect(parsed.scoring).toBeUndefined();
+      expect(parsed.syncMode).toBe(false);
+    });
   });
 
   // ─── get_account_status ───────────────────────────────────────────────
