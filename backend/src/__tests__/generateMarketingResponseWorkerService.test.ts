@@ -627,8 +627,10 @@ describe('GenerateMarketingResponseWorkerService', () => {
       // Shutdown should wait for the in-flight request and then kill the worker
       await workerService.shutdown();
 
-      // Worker is killed after drain completes
-      expect(mockWorker.kill).toHaveBeenCalledWith('SIGTERM');
+      // Worker is killed after drain completes. Teardown uses SIGKILL, not
+      // SIGTERM, because the worker now ignores SIGTERM so a process-group
+      // termination signal cannot abort an in-flight run mid-execution (ENG-202).
+      expect(mockWorker.kill).toHaveBeenCalledWith('SIGKILL');
 
       // The in-flight request resolved naturally (not rejected)
       await expect(promise).resolves.toMatchObject({ content: 'done' });
