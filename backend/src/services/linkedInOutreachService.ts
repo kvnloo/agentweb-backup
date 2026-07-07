@@ -1219,12 +1219,24 @@ export class LinkedInOutreachService {
    * Returns null if no account can be found.
    */
   async resolveAccountId(userId: string): Promise<string | null> {
-    // 1. User's own account
+    // 1. User's own accounts — try ALL of them and return the first whose LinkedIn
+    //    session is still live. A single disconnected account must not shadow a
+    //    working one, nor force a needless fall-through to the shared site-wide
+    //    pool: the user's own accounts are ALWAYS preferred, and only when EVERY
+    //    one of them is dead do we move on to the site-wide accounts below.
+    //    (Previously this returned the FIRST own account with no liveness check,
+    //    so a dead first account failed the whole lookup even when the user had a
+    //    second, working account. Mirrors resolveAccountIdForEnrichment.)
     try {
       const { getAccountsByUserId } = await import('./connectedAccountsDb');
       const accounts = await getAccountsByUserId(userId);
-      const userAccount = (accounts as any[]).find((a) => a.platform === 'unipile');
-      if (userAccount?.account_id) return userAccount.account_id;
+      const userAccounts = (accounts as any[]).filter((a) => a.platform === 'unipile' && a.account_id);
+      for (const account of userAccounts) {
+        if (await this.isAccountConnected(account.account_id)) {
+          return account.account_id;
+        }
+        this.log(`User account ${account.account_id} is disconnected — trying next own account`);
+      }
     } catch { /* ignore */ }
 
     // 2. Site-wide accounts — verify each one is still connected before returning
