@@ -69,7 +69,9 @@ the bug, but NEVER paste raw session/user/log data into commits, the PR, tests, 
    suite, it wastes your time budget. These targeted checks must pass.
 4. COMMIT your work in each repo you changed, following that repo's CLAUDE.md commit-granularity
    rules — one logical change per commit, and if it separates the fix from its tests, make them
-   SEPARATE commits. Do NOT add any Claude/AI co-author trailer. Stage only the files you changed —
+   SEPARATE commits. Do NOT add any Claude/AI co-author trailer. Do NOT set a git author/committer,
+   run `git config user.*`, or pass `git commit --author` — the commit identity is preconfigured
+   for you (commits are attributed to the issue's assignee). Stage only the files you changed —
    never `git add -A`, and never commit `.env*`, credentials, or `node_modules`.
 
 ## Do NOT push or open a PR

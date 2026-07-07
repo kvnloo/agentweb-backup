@@ -12,6 +12,7 @@ import net from 'node:net';
 import path from 'node:path';
 import { config } from './config.mjs';
 import { resolveIssue, addComment, findStateId, moveIssue, setAutofixLabel, uploadFile } from './linear.mjs';
+import { applyAssigneeIdentity, resolveAssigneeGhToken } from './git-identity.mjs';
 import { findSessionId, fetchItem, summarizeSession } from './tools/session.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -37,9 +38,22 @@ export function setStageLogDir(id) { stageLogDir = path.join(logsDir, id); mkdir
 
 function loadState() { try { return JSON.parse(readFileSync(statePath, 'utf8')); } catch { return {}; } }
 function saveState(s) { writeFileSync(statePath, JSON.stringify(s, null, 2)); }
+// Fields resolved once at pickup that later full-replacement writes don't carry: the assignee's
+// git identity (commit attribution) and their raw Linear email (keys the per-assignee PR-token map,
+// which may differ from the commit email when a git-identity override is used). Both are needed by
+// the chat UI to attribute its own commits/PRs, so they must survive every rewrite.
+const STICKY_FIELDS = ['assignee', 'assigneeEmail'];
 // Read-modify-write against a FRESH read, so concurrent autofix/revise processes (maxConcurrent > 1)
-// can't clobber each other's entries with a stale in-memory copy.
-function updateState(issueId, entry) { const s = loadState(); s[issueId] = entry; saveState(s); }
+// can't clobber each other's entries with a stale in-memory copy. Sticky fields are carried forward
+// from the prior entry unless the new one sets them explicitly.
+function updateState(issueId, entry) {
+  const s = loadState();
+  const prev = s[issueId] || {};
+  const carried = {};
+  for (const k of STICKY_FIELDS) if (k in prev && !(k in entry)) carried[k] = prev[k];
+  s[issueId] = { ...entry, ...carried };
+  saveState(s);
+}
 function gitIn(cwd, args) { return spawnSync('git', args, { cwd, encoding: 'utf8' }); }
 function repoRootOf(repo) { return path.resolve(agentRoot, repo.root); }
 function wtPathOf(WT, repo) { return repo.mount === '.' ? WT : path.join(WT, repo.mount); }
@@ -156,6 +170,11 @@ async function main() {
   const id = issue.identifier;
   log(`Issue ${id}: ${issue.title}`);
 
+  // Attribute every commit this run makes (fixer, escalation, review re-fix, verify re-fix) to the
+  // issue's Linear assignee. Set here — before any commit-making stage and before the verify-only
+  // branch — so all of them inherit it via process.env.
+  const identity = applyAssigneeIdentity(issue, log);
+
   // --verify-only: re-run just the deterministic gates (checks + preview + browser verify +
   // media upload) against an ALREADY-FIXED bug's branch, then re-triage. For fixes whose
   // verification was lost to an infrastructure failure — not for changing code.
@@ -221,7 +240,7 @@ async function main() {
   // distinguish "autofix crashed on this issue" from "a human is working on this issue" — the
   // sweep only ever touches issues with a 'started' record. `recoveries` survives a retry so the
   // sweep can stop after one automatic recovery.
-  updateState(issue.id, { identifier: id, title: issue.title || '', outcome: 'started', recoveries: state[issue.id]?.recoveries || 0, at: new Date().toISOString() });
+  updateState(issue.id, { identifier: id, title: issue.title || '', outcome: 'started', recoveries: state[issue.id]?.recoveries || 0, assignee: identity || state[issue.id]?.assignee, assigneeEmail: issue.assignee?.email || state[issue.id]?.assigneeEmail, at: new Date().toISOString() });
 
   // Guard: move to In Progress so the poller won't pick the issue up again.
   try {
@@ -328,7 +347,7 @@ async function main() {
       verify ? `Browser verify: ${verify.verdict === 'verified' ? '✅ verified' : verify.verdict === 'not_fixed' ? '❌ not fixed' : verify.verdict === 'env_down' ? '⚠️ environment down (not verified)' : '❓ inconclusive'}` : null,
     ].filter(Boolean).join('\n');
     const prBody = `${marker.prBody || marker.summary || ''}\n\n---\n**Automated gates**\n${gateSummary || '(none run)'}\n\nFixes ${id} — ${issue.url || ''}`;
-    const prs = openPrs(changed, prTitle, prBody);
+    const prs = openPrs(changed, prTitle, prBody, issue.assignee);
 
     const liveUrl = (triage === 'manual' && config.keepPreviewUp && !config.cleanupWorktreeOnSuccess && verify) ? (verify.urls?.customer || '') : '';
     const manualOpts = {
@@ -642,14 +661,25 @@ export function computeTriage({ review, verify, checks, reviewEnabled }) {
 // Push (idempotent) and open a draft PR from inside each changed repo (so `gh` targets the right
 // GitHub remote). Each PR body is scoped with that repo's own file list. Best-effort: a push/create
 // failure yields {pushed:false}/{url:null} but never throws.
-function openPrs(changed, title, body) {
+//
+// The PR is OPENED BY the issue's assignee when a GitHub token is configured for them (GH_TOKEN
+// overrides `gh`'s stored auth for that one spawn); with no token it falls back to the box's `gh`
+// account. Push stays on the box credentials — it definitely has write access, and push identity
+// isn't shown on the PR anyway; only PR authorship switches. The commits are attributed to the
+// assignee upstream via GIT_* env either way.
+function openPrs(changed, title, body, assignee) {
+  const ghToken = resolveAssigneeGhToken(assignee);
+  const prEnv = ghToken ? { ...process.env, GH_TOKEN: ghToken } : process.env;
+  log(ghToken
+    ? `PR authorship: opening the draft PR(s) as the assignee (${assignee?.email || 'assignee'}) via their configured GitHub token.`
+    : 'PR authorship: no assignee GitHub token configured — opening the draft PR(s) as the box `gh` account.');
   const out = [];
   for (const c of changed) {
     const push = gitIn(c.wt, ['push', '-u', 'origin', 'HEAD']);
     if (push.status !== 0) { log(`Push failed for ${c.repo}: ${push.stderr}`); out.push({ repo: c.repo, pushed: false, url: null }); continue; }
     const stat = (gitIn(c.wt, ['diff', '--stat', `origin/${c.base}...HEAD`]).stdout || '').trim();
     const repoBody = `${body}\n\n**Files changed in \`${c.repo}\`:**\n\`\`\`\n${stat}\n\`\`\``;
-    const create = spawnSync('gh', ['pr', 'create', '--draft', '--base', c.base, '--title', title, '--body', repoBody], { cwd: c.wt, encoding: 'utf8' });
+    const create = spawnSync('gh', ['pr', 'create', '--draft', '--base', c.base, '--title', title, '--body', repoBody], { cwd: c.wt, encoding: 'utf8', env: prEnv });
     if (create.status !== 0 && !/already exists/i.test(create.stderr || '')) log(`gh pr create warning for ${c.repo}: ${create.stderr}`);
     // `gh pr create` prints the new PR URL to stdout; fall back to `gh pr view` (e.g. PR existed).
     const url = (create.status === 0 && (create.stdout || '').trim()) || prFromWorktree(c.wt) || null;

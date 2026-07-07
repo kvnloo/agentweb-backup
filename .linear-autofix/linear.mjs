@@ -9,6 +9,7 @@ const ISSUE_FIELDS = `
   id identifier title description url priority updatedAt
   state { id name type }
   team { id key }
+  assignee { id name displayName email }
   labels { nodes { id name } }
   comments { nodes { id body createdAt user { name } } }
 `;

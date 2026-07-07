@@ -11,6 +11,37 @@ export const config = {
     'mvarma@argusoft.com',         // Manan Varma
     'aseth@argusoft.com',          // Anurag Seth
   ],                               // set to null/[] to pick up bugs regardless of assignee
+  // Attribute the automated fix's commits to the issue's ASSIGNEE (not the runner box), so git
+  // history + the GitHub contribution graph credit the person the bug was assigned to. Author AND
+  // committer are set. Identity resolution: an explicit override in `assigneeGitIdentity` (keyed by
+  // Linear email) wins; otherwise the assignee's own Linear name + email is used; an unassigned
+  // issue keeps the box's default git identity. Set commitAsAssignee: false to always use the box.
+  // NOTE: GitHub only links a commit to a profile when the author email is one VERIFIED on that
+  // GitHub account — override an entry below with the person's GitHub-verified/noreply email if
+  // their Linear email isn't on their GitHub account.
+  commitAsAssignee: true,
+  assigneeGitIdentity: {
+    'hshah@argusoft.com':  { name: 'Harshit Shah', email: 'hshah@argusoft.com' },
+    'mvarma@argusoft.com': { name: 'Manan Varma',  email: 'mvarma@argusoft.com' },
+    'aseth@argusoft.com':  { name: 'Anurag Seth',  email: 'aseth@argusoft.com' },
+  },
+  // Open the draft PR AS the assignee too — not just its commits. Commit attribution above is
+  // only git metadata; GitHub ties PR authorship to the API token, so this needs a real GitHub
+  // token per person. Tokens live in .linear-autofix/.env (gitignored, sourced by run.sh) — the
+  // map below references each one BY ENV-VAR NAME, never the literal token (this file is committed).
+  // Each token needs classic `repo` scope (fine-grained: Pull requests + Contents, read & write)
+  // on BOTH agentweb AND customer-portal, since one fix can span both repos. Used by the pipeline
+  // AND the chat UI's full-mode turns (if the agent opens a PR there). If a person has no token
+  // configured (env var unset/empty) or prAsAssignee is false, that PR falls back to the runner
+  // box's own `gh` account — commits are still attributed to the assignee regardless. So this is a
+  // safe no-op until the tokens are added.
+  prAsAssignee: true,
+  assigneeGhTokenEnv: {
+    'hshah@argusoft.com':  'GH_TOKEN_HSHAH',
+    'mvarma@argusoft.com': 'GH_TOKEN_MVARMA',
+    'aseth@argusoft.com':  'GH_TOKEN_ASETH',
+  },
+
   inProgressState: 'In Progress',  // moved here on pickup (guards against re-processing)
   reviewState: 'In Review',        // moved here ONLY when triage is green (see triageLabels)
   gcDoneStateTypes: ['completed', 'canceled'], // gc.mjs removes a kept worktree once its issue reaches one of these state types

@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { config } from '../config.mjs';
 import { resolveIssue } from '../linear.mjs';
+import { gitIdentityEnv, resolveAssigneeGhToken } from '../git-identity.mjs';
 import {
   assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, countCommits, ensureProxy,
   headShas, resetTo,
@@ -288,9 +289,9 @@ function chatArgs(cap, sessionId) {
   return a;
 }
 
-function runClaudeStream(args, prompt, cwd, timeoutMs, onEvent, register) {
+function runClaudeStream(args, prompt, cwd, timeoutMs, onEvent, register, env = process.env) {
   return new Promise((resolve) => {
-    const child = spawn('claude', args, { cwd, env: process.env, detached: true });
+    const child = spawn('claude', args, { cwd, env, detached: true });
     if (register) register(child);
     const out = { timedOut: false, gotInit: false, result: null, texts: [], tools: [], stderr: '' };
     const timer = setTimeout(() => {
@@ -672,6 +673,19 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
     });
 
     const preCommits = cap === 'full' ? countCommits(detectChangedRepos(cwd)) : 0;
+    // Full-mode turns can commit to the open PR, and may open a NEW PR if asked. Attribute both to
+    // the issue's assignee, exactly like the pipeline: GIT_* gives commits the assignee's identity,
+    // and GH_TOKEN makes any `gh pr create` the agent runs open the PR as the assignee (falling back
+    // to the box `gh` account when no token is configured). Both are resolved from what the pipeline
+    // stored on the state entry — the git identity for commits, and the raw Linear email to key the
+    // PR-token map — so no extra Linear call. Read-only turns never write, so they keep the plain env.
+    const turnEnv = (() => {
+      if (cap !== 'full') return process.env;
+      const idEnv = entry?.assignee ? gitIdentityEnv(entry.assignee) : {};
+      const ghToken = entry?.assigneeEmail ? resolveAssigneeGhToken({ email: entry.assigneeEmail }) : null;
+      if (!Object.keys(idEnv).length && !ghToken) return process.env;
+      return { ...process.env, ...idEnv, ...(ghToken ? { GH_TOKEN: ghToken } : {}) };
+    })();
 
     mkdirSync(path.join(logsDir, identifier), { recursive: true });
     tee = createWriteStream(path.join(logsDir, identifier, `chat-${Date.now()}.txt`));
@@ -689,7 +703,7 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
     };
     const register = (child) => { const t = activeTurns.get(identifier); if (t) t.child = child; };
 
-    let out = await runClaudeStream(chatArgs(cap, resumeSid), prompt, cwd, m.timeoutMs, onEvent, register);
+    let out = await runClaudeStream(chatArgs(cap, resumeSid), prompt, cwd, m.timeoutMs, onEvent, register, turnEnv);
 
     // A dead --resume target (pruned session file, foreign/forked session id) fails before init.
     // Drop the stored session and retry ONCE as a fresh, context-injected turn (carrying the
@@ -699,7 +713,7 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
       updateChatState(identifier, (cs) => { delete cs.sessions.chat; return cs; });
       prompt = freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, message, histText);
       tee.write(`# retry fresh\n${prompt}\n---\n`);
-      out = await runClaudeStream(chatArgs(cap, null), prompt, cwd, m.timeoutMs, onEvent, register);
+      out = await runClaudeStream(chatArgs(cap, null), prompt, cwd, m.timeoutMs, onEvent, register, turnEnv);
     }
 
     let fix = null;

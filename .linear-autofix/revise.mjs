@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { config } from './config.mjs';
 import { resolveIssue, addComment } from './linear.mjs';
+import { applyAssigneeIdentity } from './git-identity.mjs';
 import {
   fillTemplate, extractJson, claudeArgs, runClaude, setStageLogDir, kebab,
   assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, countCommits, runChecks,
@@ -45,6 +46,8 @@ async function main() {
 
   const issue = await resolveIssue(ref);
   const id = issue.identifier;
+  // Attribute the revision's commits to the issue's assignee, same as the original fix.
+  applyAssigneeIdentity(issue, log);
   const entry = loadState()[issue.id];
   if (!entry || !String(entry.outcome || '').startsWith('fixed')) { log(`${id} has no completed fix on record — nothing to revise.`); return; }
 
