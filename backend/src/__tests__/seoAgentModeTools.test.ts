@@ -146,6 +146,10 @@ describe('SEO Agent Mode Tools', () => {
       const tool = emmaToolRegistry.getTool('get_seo_metrics');
       const result = await tool!.execute({}, { userId: 'test-user' });
       expect(result.message).toContain('Google Search Console is not configured');
+      // The message must give a concrete self-serve handoff (Settings → Analytics
+      // & SEO) so the agent guides the user to connect rather than filing a bug.
+      expect(result.message).toContain('/settings/analytics-seo');
+      expect(result.message).toContain('do not file a product issue');
     });
 
     it('should return helpful message when user has no seoDomains field', async () => {
@@ -156,6 +160,7 @@ describe('SEO Agent Mode Tools', () => {
       const tool = emmaToolRegistry.getTool('get_seo_metrics');
       const result = await tool!.execute({}, { userId: 'test-user' });
       expect(result.message).toContain('Google Search Console is not configured');
+      expect(result.message).toContain('/settings/analytics-seo');
     });
 
     it('should return error when user not found', async () => {
@@ -296,6 +301,10 @@ describe('SEO Agent Mode Tools', () => {
       const tool = emmaToolRegistry.getTool('get_website_analytics');
       const result = await tool!.execute({}, { userId: 'test-user' });
       expect(result.message).toContain('Google Analytics (GA4) is not configured');
+      // Self-serve handoff so the agent points the user to connect GA4 instead of
+      // treating a missing connection as a product bug.
+      expect(result.message).toContain('/settings/analytics-seo');
+      expect(result.message).toContain('do not file a product issue');
     });
 
     it('should return error when user not found', async () => {
