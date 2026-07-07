@@ -287,6 +287,45 @@ describe('UnipileProfileService.getProfile — error caching', () => {
     await expect(svc.getProfile('alice-smith', 'acct-1')).rejects.toThrow(/upstream 500/);
     expect(http.fetchProfile).toHaveBeenCalledTimes(1);
   });
+
+  it('does NOT cache a transient timeout (ENG-144) — a subsequent lookup re-hits the API live', async () => {
+    // A hung profile lookup self-heals within minutes, so caching it behind the
+    // 1h ERROR_TTL would strand the user. First call times out, second succeeds.
+    const timeoutErr: any = new Error('LinkedIn profile lookup for alice-smith timed out after 30000ms');
+    timeoutErr.isTimeout = true;
+    timeoutErr.classification = 'TIMEOUT_ERROR';
+    const profile = { public_identifier: 'alice-smith', first_name: 'Alice' };
+    const http = makeHttp({
+      fetchProfile: jest.fn()
+        .mockRejectedValueOnce(timeoutErr)
+        .mockResolvedValueOnce(profile),
+    });
+    const store = makeStore();
+    const svc = makeService(http, store);
+
+    // First call surfaces the timeout…
+    await expect(svc.getProfile('alice-smith', 'acct-1')).rejects.toThrow(/timed out/);
+    // …but nothing is written to the cache (no error row poisoning the identifier).
+    expect(store.put).not.toHaveBeenCalled();
+
+    // Retry re-hits the API live and succeeds — no hour-long cooldown.
+    const result = await svc.getProfile('alice-smith', 'acct-1');
+    expect(result.rawData).toEqual(profile);
+    expect(http.fetchProfile).toHaveBeenCalledTimes(2);
+  });
+
+  it('also skips caching when the timeout is only tagged via structuredError.classification', async () => {
+    // The linkedInOutreachService path rethrows through handleError, which attaches
+    // structuredError rather than a top-level isTimeout on some shapes — guard both.
+    const timeoutErr: any = new Error('lookup timed out');
+    timeoutErr.structuredError = { classification: 'TIMEOUT_ERROR' };
+    const http = makeHttp({ fetchProfile: jest.fn().mockRejectedValue(timeoutErr) });
+    const store = makeStore();
+    const svc = makeService(http, store);
+
+    await expect(svc.getProfile('bob-jones', 'acct-1')).rejects.toThrow(/timed out/);
+    expect(store.put).not.toHaveBeenCalled();
+  });
 });
 
 // ─── Dual-key write (public_identifier + provider_id) ────────────────────────
