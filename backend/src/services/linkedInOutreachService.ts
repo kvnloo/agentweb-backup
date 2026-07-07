@@ -119,6 +119,11 @@ export class LinkedInOutreachService {
   // toward the ENG-144 hang — logged so we catch trouble before it's a full
   // timeout.
   static readonly PROFILE_LOOKUP_SLOW_MS = 10_000;
+  // Liveness probe timeout for isAccountConnected. Shorter than a real profile
+  // lookup: a hung probe should be treated as "not connected" quickly so
+  // resolveAccountId moves on to the next account instead of stalling the whole
+  // request on the same upstream hang ENG-144 is about.
+  static readonly CONNECTIVITY_CHECK_TIMEOUT_MS = 15_000;
 
   /**
    * Race a promise against a timeout. If the timeout fires first, reject with a
@@ -319,26 +324,38 @@ export class LinkedInOutreachService {
     let connected: boolean;
     try {
       const client = await this.getClient();
+      const timeoutMs = LinkedInOutreachService.CONNECTIVITY_CHECK_TIMEOUT_MS;
       // account.getOne() returns account metadata but no session status field.
       // Use the account's own LinkedIn publicIdentifier for a self-profile lookup —
-      // this fails with 401 if the LinkedIn session is disconnected.
-      const account = await client.account.getOne(accountId) as any;
+      // this fails with 401 if the LinkedIn session is disconnected. Both Unipile
+      // calls are timeout-bounded so a hung upstream (ENG-144) can't stall the
+      // caller (resolveAccountId loops this over every account) — a probe that
+      // times out is treated as "not connected" and resolution moves on.
+      const account = await LinkedInOutreachService.withTimeout(
+        client.account.getOne(accountId) as Promise<any>,
+        timeoutMs,
+        `LinkedIn connectivity check (account) for ${accountId}`,
+      ) as any;
       const publicIdentifier = account?.connection_params?.im?.publicIdentifier;
       if (!publicIdentifier) {
         this.log(`Account ${accountId} has no publicIdentifier — assuming connected`);
         connected = true;
       } else {
-        await client.request.send({
-          method: 'GET',
-          path: ['users', publicIdentifier],
-          parameters: { account_id: accountId },
-        });
+        await LinkedInOutreachService.withTimeout(
+          client.request.send({
+            method: 'GET',
+            path: ['users', publicIdentifier],
+            parameters: { account_id: accountId },
+          }),
+          timeoutMs,
+          `LinkedIn connectivity check (profile) for ${accountId}`,
+        );
         connected = true;
       }
     } catch (error: any) {
       const code = error?.body?.code || error?.code || '';
       const status = error?.body?.status || error?.status;
-      this.log(`Account ${accountId} connectivity check failed (${status} ${code})`);
+      this.log(`Account ${accountId} connectivity check failed (${status} ${code}${error?.isTimeout ? ' timeout' : ''})`);
       connected = false;
     }
     this.connectedStatusCache.set(accountId, { connected, timestamp: Date.now() });
