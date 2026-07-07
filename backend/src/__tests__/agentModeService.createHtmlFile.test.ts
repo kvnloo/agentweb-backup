@@ -259,6 +259,11 @@ describe('AgentModeService - createHtmlFile', () => {
     // render step on transient errors so a single blip no longer loses the report.
     describe('transient render failure retry (ENG-203)', () => {
       beforeEach(() => {
+        // Reset the render mock's queue so each test starts clean. jest.clearAllMocks()
+        // only clears call data, not queued mockRejectedValueOnce/mockResolvedValueOnce
+        // values — without this reset, a test's leftover once-values could leak into the
+        // next test depending on how many times the fix happens to call generateHTML.
+        mockGenerateHTML.mockReset();
         // Avoid real backoff delays in tests.
         jest.spyOn(agentModeService as any, 'sleep').mockResolvedValue(undefined);
       });
