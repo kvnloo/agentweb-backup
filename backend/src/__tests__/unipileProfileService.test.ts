@@ -326,6 +326,56 @@ describe('UnipileProfileService.getProfile — error caching', () => {
     await expect(svc.getProfile('bob-jones', 'acct-1')).rejects.toThrow(/timed out/);
     expect(store.put).not.toHaveBeenCalled();
   });
+
+  it('does NOT cache an account-level "Disconnected account" error — it poisons EVERY profile through that account', async () => {
+    // The error is about the account (dead session), not the profile. Caching it
+    // under the profile key kept serving a stale failure even after the account
+    // reconnected and the same profile fetched fine live. First call disconnected,
+    // second (account recovered) succeeds.
+    const disconnectedErr: any = Object.assign(new Error('Disconnected account'), {
+      structuredError: { classification: 'AUTH_ERROR' },
+    });
+    const profile = { public_identifier: 'jennifer-adlakha', first_name: 'Jennifer' };
+    const http = makeHttp({
+      fetchProfile: jest.fn()
+        .mockRejectedValueOnce(disconnectedErr)
+        .mockResolvedValueOnce(profile),
+    });
+    const store = makeStore();
+    const svc = makeService(http, store);
+
+    await expect(svc.getProfile('jennifer-adlakha', 'acct-1')).rejects.toThrow(/Disconnected account/);
+    expect(store.put).not.toHaveBeenCalled();
+
+    // Account reconnected → the very next lookup re-hits Unipile live and succeeds.
+    const result = await svc.getProfile('jennifer-adlakha', 'acct-1');
+    expect(result.rawData).toEqual(profile);
+    expect(http.fetchProfile).toHaveBeenCalledTimes(2);
+  });
+
+  it('detects a disconnected session by message even without a classification tag', async () => {
+    const err = new Error('This account is disconnected — please reconnect');
+    const http = makeHttp({ fetchProfile: jest.fn().mockRejectedValue(err) });
+    const store = makeStore();
+    const svc = makeService(http, store);
+
+    await expect(svc.getProfile('carol-lee', 'acct-1')).rejects.toThrow(/disconnected/i);
+    expect(store.put).not.toHaveBeenCalled();
+  });
+
+  it('STILL caches a durable, profile-specific upstream 5xx (backoff preserved)', async () => {
+    // Regression guard: the no-cache exception must not swallow genuine 5xx caching.
+    const err = Object.assign(new Error('internal server error'), {
+      structuredError: { classification: 'SERVER_ERROR' },
+    });
+    const http = makeHttp({ fetchProfile: jest.fn().mockRejectedValue(err) });
+    const store = makeStore();
+    const svc = makeService(http, store);
+
+    await expect(svc.getProfile('dave-kim', 'acct-1')).rejects.toThrow(/internal server error/);
+    expect(store.put).toHaveBeenCalledTimes(1);
+    expect((store.put as jest.Mock).mock.calls[0][0].status).toBe('error');
+  });
 });
 
 // ─── Dual-key write (public_identifier + provider_id) ────────────────────────
