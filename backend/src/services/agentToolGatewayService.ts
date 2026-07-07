@@ -111,11 +111,24 @@ export class AgentToolContractValidationError extends Error {
 }
 
 export class AgentToolRepeatedFailureError extends Error {
-  constructor(readonly toolName: string, readonly failureCount: number, readonly lastErrorMessage: string) {
+  constructor(
+    readonly toolName: string,
+    readonly failureCount: number,
+    readonly lastErrorMessage: string,
+    // ENG-167: 'timeout' surfaces a distinct, timeout-specific stop signal — a tool
+    // that keeps timing out has no arguments to "fix", so the generic repeated-error
+    // guidance is misleading and let the model keep retrying the slow tool.
+    readonly reason: 'repeated' | 'timeout' = 'repeated',
+  ) {
     super(
-      `Tool "${toolName}" already failed ${failureCount} times in this run with the same error: "${lastErrorMessage}". ` +
-      'Do not retry it with the same approach. Fix the arguments to address that exact error, use a different tool, ' +
-      'or tell the user what is blocking you.',
+      reason === 'timeout'
+        ? `Tool "${toolName}" has timed out ${failureCount} times in this run and is consistently unable to complete in time. ` +
+          'STOP retrying it — retrying will keep timing out. Deliver whatever you have already produced, tell the user this step ' +
+          'timed out and could not be completed, and offer either to try a smaller/simpler version or to file a bug report on ' +
+          'their behalf with report_product_issues.'
+        : `Tool "${toolName}" already failed ${failureCount} times in this run with the same error: "${lastErrorMessage}". ` +
+          'Do not retry it with the same approach. Fix the arguments to address that exact error, use a different tool, ' +
+          'or tell the user what is blocking you.',
     );
     this.name = 'AgentToolRepeatedFailureError';
   }
@@ -149,6 +162,15 @@ export class AgentToolBudgetExceededError extends Error {
 // uses, so breaker accounting and error taxonomy stay in lockstep.
 const REPEATED_FAILURE_THRESHOLD = 3;
 const NON_RETRYABLE_FAILURE_THRESHOLD = 2;
+// ENG-167: timeouts are retryable per-error-head (a single timeout message trips at
+// REPEATED_FAILURE_THRESHOLD), but a heavy tool that keeps timing out reports a
+// slightly DIFFERENT message each attempt ("connection timed out after Nms", an
+// AbortError, a Bedrock "ModelTimeoutException"), so no single head ever reaches the
+// threshold and the model retried the same ~2-min tool until the run was exhausted —
+// never reaching any other tool (including report_product_issues). Aggregate timeout-
+// class failures for a tool across differing messages and trip at this count. Kept at
+// 3 so a tool that succeeds after one or two transient timeouts is never blocked.
+const TIMEOUT_FAILURE_THRESHOLD = 3;
 const EXPENSIVE_MEDIA_FAILURE_BUDGET = 2;
 const MAX_TRACKED_RUNS = 500;
 const ERROR_KEY_LENGTH = 80;
@@ -191,15 +213,42 @@ function failureThresholdFor(errorMessageHead: string): number {
     : REPEATED_FAILURE_THRESHOLD;
 }
 
-function findTrippedFailure(runId: string, toolName: string): { count: number; errorMessage: string } | null {
+/** Sum this tool's failures whose stored error head classifies as `timeout`,
+ * regardless of the exact wording (ENG-167). Returns null when there are none. */
+function countTimeoutFailures(runId: string, toolName: string): { count: number; errorMessage: string } | null {
   const counts = runFailureCounts.get(runId);
   if (!counts) return null;
   const prefix = `${toolName}\0`;
+  let total = 0;
+  let sampleMessage = '';
+  for (const [key, count] of counts) {
+    if (!key.startsWith(prefix)) continue;
+    const errorMessage = key.slice(prefix.length);
+    if (classifyToolErrorClass(errorMessage) !== 'timeout') continue;
+    total += count;
+    if (!sampleMessage) sampleMessage = errorMessage;
+  }
+  return total > 0 ? { count: total, errorMessage: sampleMessage } : null;
+}
+
+function findTrippedFailure(
+  runId: string,
+  toolName: string,
+): { count: number; errorMessage: string; reason: 'repeated' | 'timeout' } | null {
+  const counts = runFailureCounts.get(runId);
+  if (!counts) return null;
+  const prefix = `${toolName}\0`;
+  // Timeout aggregate first so a spiral of same-tool timeouts (identical OR varied
+  // wording) yields the timeout-specific stop guidance instead of the generic one.
+  const timeoutAgg = countTimeoutFailures(runId, toolName);
+  if (timeoutAgg && timeoutAgg.count >= TIMEOUT_FAILURE_THRESHOLD) {
+    return { ...timeoutAgg, reason: 'timeout' };
+  }
   for (const [key, count] of counts) {
     if (!key.startsWith(prefix)) continue;
     const errorMessage = key.slice(prefix.length);
     if (count >= failureThresholdFor(errorMessage)) {
-      return { count, errorMessage };
+      return { count, errorMessage, reason: 'repeated' };
     }
   }
   return null;
@@ -590,7 +639,7 @@ export async function executeAgentToolThroughGateway(
     if (tripped) {
       return {
         status: 'error',
-        error: new AgentToolRepeatedFailureError(policyDecision.toolName, tripped.count, tripped.errorMessage),
+        error: new AgentToolRepeatedFailureError(policyDecision.toolName, tripped.count, tripped.errorMessage, tripped.reason),
         policyDecision,
         durationMs: Math.max(0, now() - startedAt),
       };
