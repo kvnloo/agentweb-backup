@@ -1325,6 +1325,71 @@ describe('agentToolGatewayService', () => {
       expect(execute).toHaveBeenCalledTimes(1);
     });
 
+    // ENG-167: a heavy content-generation tool (create_html_file / campaign-brief
+    // generation) that keeps TIMING OUT surfaces a slightly different message each
+    // attempt (a raw "connection timed out after Nms", an AbortError, a Bedrock
+    // "ModelTimeoutException"). Keyed by exact error head, none reaches the per-key
+    // threshold, so the model retried the same ~2-min tool until the whole run was
+    // consumed and it could never reach any other tool. Timeouts are aggregated by
+    // CLASS so N timeouts of one tool trip the breaker regardless of exact wording.
+    it('trips the breaker after repeated TIMEOUTS of one tool even when each timeout message differs (ENG-167)', async () => {
+      await failNTimes('run-timeout-spiral', 'create_html_file', 'connection timed out after 300000ms', 1);
+      await failNTimes('run-timeout-spiral', 'create_html_file', 'The operation was aborted due to timeout', 1);
+      await failNTimes('run-timeout-spiral', 'create_html_file', 'ModelTimeoutException: model invocation timed out', 1);
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'create_html_file',
+        args: { title: 'Campaign Brief', content_draft: 'try again' },
+        runId: 'run-timeout-spiral',
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+        const message = (outcome.error as Error).message;
+        expect(message).toContain('create_html_file');
+        expect(message.toLowerCase()).toContain('timed out');
+        // The model must be told to stop AND given the escalation/report path.
+        expect(message.toLowerCase()).toContain('report_product_issues');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('does not trip the timeout aggregate after only two differing timeouts (threshold is 3)', async () => {
+      await failNTimes('run-timeout-two', 'create_html_file', 'connection timed out after 300000ms', 1);
+      await failNTimes('run-timeout-two', 'create_html_file', 'The operation was aborted due to timeout', 1);
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'create_html_file',
+        args: { title: 'Campaign Brief', content_draft: 'third attempt' },
+        runId: 'run-timeout-two',
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not let one tool\'s timeout spiral block a DIFFERENT lightweight tool (report_product_issues stays callable)', async () => {
+      await failNTimes('run-timeout-iso', 'create_html_file', 'connection timed out after 300000ms', 1);
+      await failNTimes('run-timeout-iso', 'create_html_file', 'The operation was aborted due to timeout', 1);
+      await failNTimes('run-timeout-iso', 'create_html_file', 'ModelTimeoutException: model invocation timed out', 1);
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'report_product_issues',
+        args: { title: 'Skill run keeps timing out' },
+        runId: 'run-timeout-iso',
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
     it('blocks expensive media tools after two failures even when the error messages differ', async () => {
       await failNTimes('run-media', 'generate_image', 'Safety filter rejected image prompt', 1);
       await failNTimes('run-media', 'generate_image', 'Google image generation timed out after 10 minutes', 1);
