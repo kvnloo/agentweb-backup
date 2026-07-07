@@ -6,10 +6,20 @@ const router = express.Router();
 /**
  * Linear webhook -> resolve bridge.
  *
- * When a bug-canonical Linear issue transitions to a completed state, notify every reporter whose
- * private Featurebase card is grouped onto it (intakeService.notifyCanonicalResolved reads the
- * canonical's `[reporter-ticket #N <email>]` comments, emails each reporter, and flips their card
- * to Completed).
+ * Fires the customer-facing resolve bridge (intakeService.notifyCanonicalResolved: Resend email to
+ * every reporter whose private Featurebase card is grouped onto the canonical, Featurebase card flip
+ * to Completed, Slack ship ping) ONLY when a bug-canonical Linear issue TRANSITIONS INTO the Done
+ * state. Two guards make this precise (ENG-222):
+ *
+ *  1. Gate by the Done state ID (`LINEAR_DONE_STATE_ID`), not by state category. The board runs
+ *     Merged -> Verifying -> Done and all three are completed-type; only Done is customer-communicable,
+ *     so gating on `state.type === 'completed'` would email reporters on Merged/Verifying. We match the
+ *     state ID (not name) so a rename can't silently kill or misroute the bridge — if the ID is unset
+ *     we fail loud rather than fire blindly.
+ *  2. Fire only on the transition INTO Done, not on every edit while the issue sits in Done. Linear's
+ *     `updatedFrom` carries the prior value of each changed field, so a real state change puts the old
+ *     `stateId` there; a title/label edit on an already-Done issue (or an `action:'create'`) has no
+ *     `stateId` in `updatedFrom` and must fire nothing (the email + card flip are not deduped).
  *
  * Mounted with express.raw() in app.ts (BEFORE express.json) so req.body is the raw Buffer —
  * required to verify Linear's HMAC-SHA256 `linear-signature` over the exact payload bytes.
@@ -29,14 +39,33 @@ router.post('/linear/webhook', async (req, res) => {
       if (!ok) return res.status(401).json({ error: 'invalid signature' });
     }
 
+    // Fail loud on missing config: without the Done-state ID we cannot safely gate customer comms,
+    // so refuse to fire (rather than silently emailing on any completed-type state). Returned 200 so
+    // Linear does not retry-storm; the distinct log line is the loud signal.
+    const doneStateId = process.env.LINEAR_DONE_STATE_ID || '';
+    if (!doneStateId) {
+      console.error(
+        '[linear-webhook] LINEAR_DONE_STATE_ID is not set — refusing to fire resolve bridge (config missing)',
+      );
+      return res.status(200).json({ ok: false, error: 'LINEAR_DONE_STATE_ID not configured' });
+    }
+
     const payload = JSON.parse(raw.toString('utf8'));
-    const completed =
+
+    // Only an `update` whose new state IS the Done state AND whose `updatedFrom` shows the state
+    // actually changed (from something other than Done) counts as a transition into Done.
+    const stateChanged =
+      payload?.updatedFrom &&
+      Object.prototype.hasOwnProperty.call(payload.updatedFrom, 'stateId');
+    const transitionedIntoDone =
       payload?.type === 'Issue' &&
-      (payload?.action === 'update' || payload?.action === 'create') &&
-      payload?.data?.state?.type === 'completed' &&
+      payload?.action === 'update' &&
+      payload?.data?.state?.id === doneStateId &&
+      stateChanged &&
+      payload.updatedFrom.stateId !== doneStateId &&
       payload?.data?.id;
 
-    if (completed) {
+    if (transitionedIntoDone) {
       const { notifyCanonicalResolved } = await import('../services/intakeService');
       const r = await notifyCanonicalResolved(payload.data.id, payload.data.title || undefined);
       return res.json({ ok: true, notified: r.ticketNumbers.length, ticketNumbers: r.ticketNumbers });
