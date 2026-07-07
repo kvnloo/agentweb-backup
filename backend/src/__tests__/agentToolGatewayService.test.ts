@@ -1252,6 +1252,28 @@ describe('agentToolGatewayService', () => {
       expect(execute).not.toHaveBeenCalled();
     });
 
+    it('does NOT lock out a multi-target tool after two execution-time invalid_args failures (ENG-197)', async () => {
+      // ENG-197: in a LinkedIn send-invite batch, two over-limit notes to two
+      // DIFFERENT profiles each came back from upstream as the generic
+      // 'Invalid parameters' (classified invalid_args). That is argument-specific
+      // — a corrected note, or an invite to an entirely different profile, must
+      // still be allowed to run. Execution-time invalid_args recurs across
+      // legitimately different arguments (like empty_result / not_found), so it
+      // must keep the default threshold (3), not the fast-trip threshold (2).
+      await failNTimes('run-eng197', 'linkedin_outreach', 'Invalid parameters', 2);
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: 'https://linkedin.com/in/vetted-lead', message: 'a correctly trimmed note' },
+        runId: 'run-eng197',
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
     it('trips after TWO identical NON-retryable failures (ENG-124 — retrying is known-pointless)', async () => {
       // 'Unauthorized: invalid api key' classifies as auth → fast-trip threshold 2.
       await failNTimes('run-nr', 'send_email', 'Unauthorized: invalid api key', 2);

@@ -8,8 +8,11 @@
  *   reject) / tool_unavailable / invalid_output /
  *   policy_blocked                                     → NOT retryable (stop retrying)
  *
- * The non-retryable classes additionally FAST-TRIP the per-run circuit breaker
+ * Most non-retryable classes additionally FAST-TRIP the per-run circuit breaker
  * (threshold 2 instead of 3) — asserted in agentToolGatewayService.test.ts.
+ * invalid_args is the exception (ENG-197): non-retryable for the model verdict,
+ * but NOT fast-tripped, since the breaker only ever sees its execution-time text
+ * ("Invalid parameters"), which repeats across legitimately different arguments.
  */
 
 import {
@@ -37,12 +40,17 @@ describe('isRetryableErrorClass', () => {
 });
 
 describe('isFastTripErrorClass', () => {
-  it.each(['auth', 'upstream_rejected', 'invalid_args', 'tool_unavailable', 'invalid_output', 'policy_blocked'])(
+  it.each(['auth', 'upstream_rejected', 'tool_unavailable', 'invalid_output', 'policy_blocked'])(
     'known-pointless-retry class %s fast-trips the breaker',
     (cls) => expect(isFastTripErrorClass(cls)).toBe(true),
   );
 
-  it.each(['rate_limit', 'timeout', 'network', 'upstream_5xx', 'empty_result', 'not_found', 'Error'])(
+  // ENG-197: invalid_args joins empty_result / not_found — its execution-time text
+  // ("Invalid parameters") repeats across legitimately different arguments, so
+  // fast-tripping it locked whole send-invite batches out. Still NON-retryable for
+  // the model verdict (asserted in isRetryableErrorClass above); only the breaker
+  // threshold changes.
+  it.each(['rate_limit', 'timeout', 'network', 'upstream_5xx', 'empty_result', 'not_found', 'invalid_args', 'Error'])(
     'class %s keeps the default breaker threshold',
     (cls) => expect(isFastTripErrorClass(cls)).toBe(false),
   );
