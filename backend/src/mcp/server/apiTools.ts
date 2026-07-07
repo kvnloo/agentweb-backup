@@ -2236,11 +2236,31 @@ mcpToolRegistry.register({
       };
     });
 
+    // When sync=true the endpoint scores sessions under a time budget and may
+    // return partial score coverage rather than aborting on busy ranges. Surface
+    // that so the caller can re-invoke to finish scoring the remainder (ENG-190).
+    const scoring = (data as any)?.scoring;
+    const scoringInfo = args.sync && scoring
+      ? {
+          scoring: {
+            complete: scoring.complete,
+            scoredSessionCount: scoring.scoredSessionCount,
+            totalSessionCount: scoring.totalSessionCount,
+            ...(scoring.complete === false
+              ? {
+                  note: 'Score generation hit its time budget and returned partial coverage. Call get_chat_history again with the same time range and sync=true to score the remaining sessions (already-scored sessions are skipped).',
+                }
+              : {}),
+          },
+        }
+      : {};
+
     return jsonResult({
       sessions: formattedSessions,
       count: formattedSessions.length,
       timeRange: { startTime: args.start_time, endTime: args.end_time },
       syncMode: args.sync || false,
+      ...scoringInfo,
     });
   }
 });

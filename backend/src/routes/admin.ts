@@ -14,7 +14,7 @@ import { resendService } from "../services/resendService";
 import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
 import { notifySlackWorkItemCompleted } from "../services/gtmPlanService";
 import { chatbotDb, ChatSession } from "../services/chatbotService";
-import { scoreSessionIfNeeded, scoreSessionWithJudgeIfNeeded, ScoringJudge } from "../services/sessionScoringService";
+import { scoreSessionIfNeeded, scoreSessionWithJudgeIfNeeded, scoreSessionsWithinBudget, ScoringJudge, SyncScoringSummary } from "../services/sessionScoringService";
 import { DynamoDB } from "aws-sdk";
 import { workflowDb } from "../services/workflowDb";
 import { paginatedScan } from "../utils/dynamoPagination";
@@ -3096,7 +3096,13 @@ router.get("/chat-sessions", async (req, res) => {
       })
     );
 
-    // Sync mode: batch-score sessions that need it (default + all judges)
+    // Sync mode: batch-score sessions that need it (default + all judges).
+    // Scoring is bounded by a time budget so a busy time range degrades to
+    // partial results with a resume marker instead of running past the request
+    // timeout and aborting the whole operation ("This operation was aborted").
+    // See ENG-190. Because already-scored sessions are skipped, the caller can
+    // re-invoke to make progress on the remaining sessions.
+    let scoringSummary: SyncScoringSummary | undefined;
     if (syncMode) {
       // Load all configured judges
       let judges: ScoringJudge[] = [];
@@ -3109,22 +3115,7 @@ router.get("/chat-sessions", async (req, res) => {
         console.error("Error loading scoring judges for sync mode:", error);
       }
 
-      for (const session of sessionsWithMessages) {
-        const s = session as any;
-        try {
-          await scoreSessionIfNeeded(s);
-        } catch (error) {
-          console.error(`Error scoring session ${s.sessionId}:`, error);
-        }
-
-        for (const judge of judges) {
-          try {
-            await scoreSessionWithJudgeIfNeeded(s, judge);
-          } catch (error) {
-            console.error(`Error scoring session ${s.sessionId} with judge ${judge.id}:`, error);
-          }
-        }
-      }
+      scoringSummary = await scoreSessionsWithinBudget(sessionsWithMessages as any, judges);
 
       // Re-fetch sessions so response includes newly generated scores (both default and judge)
       for (let i = 0; i < sessionsWithMessages.length; i++) {
@@ -3148,7 +3139,19 @@ router.get("/chat-sessions", async (req, res) => {
     );
 
     await ensureIshareLinkForReview(nonEmptySessions);
-    res.json({ sessions: nonEmptySessions, nextCursor });
+    res.json({
+      sessions: nonEmptySessions,
+      nextCursor,
+      ...(scoringSummary
+        ? {
+            scoring: {
+              complete: scoringSummary.complete,
+              scoredSessionCount: scoringSummary.processedCount,
+              totalSessionCount: scoringSummary.totalCount,
+            },
+          }
+        : {}),
+    });
   } catch (error) {
     console.error("Error fetching chat sessions:", error);
     res.status(500).json({ message: "Failed to fetch chat sessions" });

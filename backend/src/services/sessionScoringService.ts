@@ -496,3 +496,74 @@ export async function scoreSessionIfNeeded(
 
   return satisfactionScore;
 }
+
+/**
+ * Time budget (ms) for a synchronous score-generation pass driven by
+ * get_chat_history sync=true (GET /admin/chat-sessions?sync=true). Scoring each
+ * session is an LLM call (up to SCORING_TIMEOUT_MS each, times every configured
+ * judge), so a busy time range of dozens of sessions can run for many minutes.
+ * Kept well under the 5-minute mcpFetch / request timeout so the endpoint returns
+ * PARTIAL results with a resume marker instead of being aborted mid-scoring
+ * ("This operation was aborted"). Because already-scored sessions are skipped, a
+ * caller can simply re-invoke to make progress on the remainder. See ENG-190.
+ */
+export const SYNC_SCORING_BUDGET_MS = 3 * 60 * 1000; // 3 minutes
+
+export interface SyncScoringSummary {
+  /** Sessions fully processed this pass (scored, skipped-as-current, or errored). */
+  processedCount: number;
+  /** Total sessions handed to this pass. */
+  totalCount: number;
+  /** False when the pass stopped early because the time budget was exhausted. */
+  complete: boolean;
+}
+
+/**
+ * Score a batch of sessions (default satisfaction score + every configured judge)
+ * under a wall-clock budget. Stops BEFORE starting work that would push past the
+ * deadline and reports how far it got, so long score-generation runs degrade to
+ * partial results instead of exceeding the request timeout and aborting the whole
+ * operation. Per-session errors are logged and skipped — one bad session never
+ * aborts the batch. See ENG-190.
+ */
+export async function scoreSessionsWithinBudget(
+  sessions: ChatSession[],
+  judges: ScoringJudge[] = [],
+  options: { budgetMs?: number; now?: () => number } = {}
+): Promise<SyncScoringSummary> {
+  const budgetMs = options.budgetMs ?? SYNC_SCORING_BUDGET_MS;
+  const now = options.now ?? (() => Date.now());
+  const totalCount = sessions.length;
+  const deadline = now() + budgetMs;
+
+  let processedCount = 0;
+  for (const session of sessions) {
+    // Don't start another session's scoring once the budget is spent.
+    if (now() >= deadline) {
+      return { processedCount, totalCount, complete: false };
+    }
+
+    const s = session as any;
+    try {
+      await scoreSessionIfNeeded(session);
+    } catch (error) {
+      console.error(`Error scoring session ${s.sessionId}:`, error);
+    }
+
+    for (const judge of judges) {
+      // Re-check between judges so a long judge list can't blow the budget.
+      if (now() >= deadline) {
+        return { processedCount, totalCount, complete: false };
+      }
+      try {
+        await scoreSessionWithJudgeIfNeeded(session, judge);
+      } catch (error) {
+        console.error(`Error scoring session ${s.sessionId} with judge ${judge.id}:`, error);
+      }
+    }
+
+    processedCount++;
+  }
+
+  return { processedCount, totalCount, complete: true };
+}
