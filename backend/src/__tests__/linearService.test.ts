@@ -171,6 +171,48 @@ describe('linearService.createInternalLinearIssue — triage fields + loud label
       expect(input.labelIds.sort()).toEqual(['lab_bug', 'lab_ret'].sort());
       expect(input.priority).toBeUndefined();
     });
+
+    // ENG-187 contract #4 — settleStateName: an FB-synced feature request must END UP in Backlog,
+    // without ever yanking back an issue a human already picked up (webhook retries are harmless).
+    describe('settleStateName (ENG-187 contract #4)', () => {
+      const issueResponseWithState = (priority: number, labelIds: string[], state: { id: string; type: string }) => ({
+        data: { issue: { priority, state, labels: { nodes: labelIds.map((id) => ({ id })) } } },
+      });
+
+      it('moves a pre-work (unstarted) issue to Backlog, together with the label union', async () => {
+        mockFetchSequence(TEAM_TRIAGE, issueResponseWithState(0, ['lab_bug'], { id: 'st_todo', type: 'unstarted' }), UPDATE_OK);
+        await raiseIssueTriage('uuid-6', { addLabelNames: ['Retention'], settleStateName: 'Backlog' });
+        const input = lastUpdateInput();
+        expect(input.stateId).toBe('st_backlog');
+        expect(input.labelIds.sort()).toEqual(['lab_bug', 'lab_ret'].sort());
+        expect(input.priority).toBeUndefined(); // no priority requested -> none set
+      });
+
+      it('is idempotent: already in a backlog state + labels already present -> NO mutation at all (retry-safe)', async () => {
+        mockFetchSequence(TEAM_TRIAGE, issueResponseWithState(0, ['lab_ret'], { id: 'st_backlog', type: 'backlog' }), UPDATE_OK);
+        await raiseIssueTriage('uuid-6', { addLabelNames: ['Retention'], settleStateName: 'Backlog' });
+        const updateCall = (global.fetch as jest.Mock).mock.calls.find(c => (c[1]?.body || '').includes('issueUpdate'));
+        expect(updateCall).toBeUndefined();
+      });
+
+      it('never yanks a STARTED issue back to Backlog (a human decision beats a webhook retry)', async () => {
+        mockFetchSequence(TEAM_TRIAGE, issueResponseWithState(2, ['lab_bug'], { id: 'st_prog', type: 'started' }), UPDATE_OK);
+        await raiseIssueTriage('uuid-6', { addLabelNames: ['Retention'], settleStateName: 'Backlog' });
+        const input = lastUpdateInput();
+        expect(input.labelIds.sort()).toEqual(['lab_bug', 'lab_ret'].sort()); // labels still union
+        expect(input.stateId).toBeUndefined(); // state untouched
+      });
+
+      it('unknown settle-state name -> LOUD error naming it, labels still applied, state untouched', async () => {
+        const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+        mockFetchSequence(TEAM_TRIAGE, issueResponseWithState(0, ['lab_bug'], { id: 'st_todo', type: 'unstarted' }), UPDATE_OK);
+        await raiseIssueTriage('uuid-6', { addLabelNames: ['Retention'], settleStateName: 'NoSuchState' });
+        expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('NoSuchState'));
+        const input = lastUpdateInput();
+        expect(input.labelIds.sort()).toEqual(['lab_bug', 'lab_ret'].sort());
+        expect(input.stateId).toBeUndefined();
+      });
+    });
   });
 });
 

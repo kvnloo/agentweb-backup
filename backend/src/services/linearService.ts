@@ -249,12 +249,22 @@ export async function createInternalLinearIssue(params: {
  * priority and never removes labels — a later lower-tier reporter must not downgrade a canonical
  * that a higher-tier reporter already escalated. Linear priority enum: 0=None, 1=Urgent … 4=Low,
  * so "more urgent" = smaller non-zero number (and anything beats 0/None).
- * No-op (no mutation) when neither labels nor priority would change.
+ *
+ * `settleStateName` (ENG-187 contract #4): ensure a freshly synced issue SITS in the named state
+ * (e.g. Backlog for FB-synced feature requests). Applied only while the issue is still in a
+ * pre-work state (`triage`/`unstarted`) — an issue already in a backlog state needs no move, and
+ * one a human advanced to started/completed/canceled is never yanked back, so webhook retries
+ * can't fight people. An unknown state name is a LOUD error (no silent drop), state left untouched.
+ *
+ * No-op (no mutation) when nothing — labels, priority, state — would change.
  */
-export async function raiseIssueTriage(issueId: string, params: { addLabelNames: string[]; priority?: number }): Promise<void> {
+export async function raiseIssueTriage(
+  issueId: string,
+  params: { addLabelNames: string[]; priority?: number; settleStateName?: string },
+): Promise<void> {
   const meta = await getTeamMeta();
   const data = await linearGraphQL(
-    `query($id: String!) { issue(id: $id) { priority labels { nodes { id } } } }`,
+    `query($id: String!) { issue(id: $id) { priority state { id type } labels { nodes { id } } } }`,
     { id: issueId },
   );
   const issue = data?.issue;
@@ -268,6 +278,17 @@ export async function raiseIssueTriage(issueId: string, params: { addLabelNames:
   const current: number = typeof issue.priority === 'number' ? issue.priority : 0;
   if (typeof params.priority === 'number' && params.priority > 0 && (current === 0 || params.priority < current)) {
     input.priority = params.priority;
+  }
+  if (params.settleStateName) {
+    const targetId = meta.stateIds[params.settleStateName.toLowerCase()];
+    if (!targetId) {
+      console.error(`[linear] state "${params.settleStateName}" not found in team ${TEAM_KEY} — leaving the issue's state untouched.`);
+    } else {
+      const currentType = issue.state?.type;
+      if ((currentType === 'triage' || currentType === 'unstarted') && issue.state?.id !== targetId) {
+        input.stateId = targetId;
+      }
+    }
   }
   if (Object.keys(input).length === 0) return;
 

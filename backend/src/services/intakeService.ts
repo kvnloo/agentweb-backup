@@ -256,6 +256,61 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   };
 }
 
+/**
+ * Enrich a Featurebase-SYNCED Linear issue at creation time (ENG-187 contract #4).
+ *
+ * Feature requests are Featurebase-first: `fileFeatureRequest` creates a public post
+ * (`integrations.linear:true`) and the linked Linear issue is created ~10s later by Featurebase's
+ * native FB->Linear sync INSIDE their SaaS — there is no repo seam at issue creation. The Linear
+ * webhook (routes/integrations.ts) therefore calls this for every created issue carrying the
+ * "Featurebase" label (the sync's marker — issues our own code creates never carry it, see
+ * createInternalLinearIssue), so the synced issue still ends up with the reporter's PRIVATE
+ * funnel-stage labels + "Needs PM", resting in Backlog. Deliberately NO priority and NO assignee:
+ * feature requests await the weekly PM pass (that's what "Needs PM" flags) — only bugs get the
+ * no-rot auto-triage.
+ *
+ * Author resolution: synced issue title -> exact-match Featurebase post -> post author email ->
+ * AgentWeb user -> funnelStatus. Every miss in that chain is LOUD (console.error) and degrades to
+ * "Needs PM" alone — never a throw, so a resolution miss can't take down the webhook route (which
+ * also serves the resolve bridge). Only a hard failure applying the labels/state propagates.
+ * Idempotent under webhook retries: labels union (re-applying is a no-op) and the Backlog settle
+ * never moves an issue a human already advanced. Privacy (contract #5) holds by construction:
+ * this READS from Featurebase and writes only Linear labels/state — nothing funnel-related flows
+ * back to Featurebase or any user-visible surface.
+ */
+const FEATURE_REQUEST_TRIAGE_LABEL = 'Needs PM';
+const FEATURE_REQUEST_RESTING_STATE = 'Backlog';
+
+export async function enrichFeaturebaseSyncedIssue(p: { issueId: string; title: string }): Promise<{ labelNames: string[] }> {
+  const { raiseIssueTriage } = await import('./linearService');
+
+  let stageTags: string[] = [];
+  try {
+    const { findPostByTitle } = await import('./featurebaseService');
+    const post = await findPostByTitle(p.title);
+    if (!post?.authorEmail) {
+      console.error(`[intake] FB-synced issue ${p.issueId} ("${p.title}"): no unambiguous Featurebase post author — applying "${FEATURE_REQUEST_TRIAGE_LABEL}" only.`);
+    } else {
+      const { userDb } = await import('./db');
+      const user = await userDb.getUserByEmail(post.authorEmail);
+      if (!user) {
+        console.error(`[intake] FB-synced issue ${p.issueId}: post author ${post.authorEmail} has no AgentWeb user — applying "${FEATURE_REQUEST_TRIAGE_LABEL}" only.`);
+      } else {
+        // A real user with no funnelStatus is a normal state (not yet staged) — no error, no stage labels.
+        stageTags = getUserFunnelStatusIssueTags(user.funnelStatus);
+      }
+    }
+  } catch (e) {
+    console.error(`[intake] FB-synced issue ${p.issueId}: author/funnel resolution failed — applying "${FEATURE_REQUEST_TRIAGE_LABEL}" only:`, e instanceof Error ? e.message : e);
+  }
+
+  const labelNames = [...stageTags, FEATURE_REQUEST_TRIAGE_LABEL];
+  // The label/state write is the core step — let a hard failure propagate to the webhook route's
+  // catch (logged, 200 response) rather than half-succeed silently.
+  await raiseIssueTriage(p.issueId, { addLabelNames: labelNames, settleStateName: FEATURE_REQUEST_RESTING_STATE });
+  return { labelNames };
+}
+
 export interface FileAutoIssueParams {
   title: string;
   description: string;
