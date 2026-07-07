@@ -34,6 +34,14 @@ export class LinkedInOutreachService {
     console.log(`[LinkedInOutreachService] ${message}`, data ? JSON.stringify(data, null, 2) : '');
   }
 
+  // Warnings go to stderr, which Elastic Beanstalk also captures into the
+  // web.stdout.log CloudWatch group — so these markers are queryable there by
+  // time window (14-day retention). Kept single-line + prefixed so a future
+  // profile-lookup hang is greppable without spelunking (see ENG-144).
+  private warn(message: string, data?: any) {
+    console.warn(`[LinkedInOutreachService] ${message}`, data ? JSON.stringify(data) : '');
+  }
+
   private async handleError(error: any, context: string): Promise<never> {
     console.error(`[LinkedInOutreachError] --- START ERROR LOG ---`);
     console.error(`[LinkedInOutreachError] Context: ${context}`);
@@ -63,6 +71,14 @@ export class LinkedInOutreachService {
       classification: 'UNKNOWN_ERROR'
     };
 
+    // Internal timeouts (from withTimeout) have no HTTP status — preserve the
+    // TIMEOUT_ERROR classification so callers/agent can surface a retry-friendly
+    // message instead of a generic "Unknown error".
+    if (error?.isTimeout || error?.classification === 'TIMEOUT_ERROR') {
+      structuredError.classification = 'TIMEOUT_ERROR';
+      structuredError.isTimeout = true;
+    }
+
     // Basic classification based on HTTP status or error code
     const status = Number(structuredError.status);
     if (status === 401 || status === 403) {
@@ -87,6 +103,118 @@ export class LinkedInOutreachService {
       : (error instanceof Error ? error : new Error(structuredError.message));
     (enhancedError as any).structuredError = structuredError;
     throw enhancedError;
+  }
+
+  // ─── Timeout / retry helpers ─────────────────────────────────────────────────
+
+  // Profile lookups occasionally hang when Unipile's upstream LinkedIn session is
+  // stuck (CAPTCHA/auth wall or a dead browser session). The Unipile SDK's fetch
+  // has no timeout, so a hung request blocks the agent for minutes — a real session
+  // (ENG-144) waited 167s before failing and returned no data. Bound each lookup
+  // with an internal timeout and one automatic retry so we surface a clear,
+  // classified error quickly instead of stalling the conversation.
+  static readonly PROFILE_LOOKUP_TIMEOUT_MS = 30_000;
+  // Healthy lookups return in ~1–3s (confirmed against prod CloudWatch logs). A
+  // success slower than this is an early warning that the upstream is degrading
+  // toward the ENG-144 hang — logged so we catch trouble before it's a full
+  // timeout.
+  static readonly PROFILE_LOOKUP_SLOW_MS = 10_000;
+  // Liveness probe timeout for isAccountConnected. Shorter than a real profile
+  // lookup: a hung probe should be treated as "not connected" quickly so
+  // resolveAccountId moves on to the next account instead of stalling the whole
+  // request on the same upstream hang ENG-144 is about.
+  static readonly CONNECTIVITY_CHECK_TIMEOUT_MS = 15_000;
+
+  /**
+   * Race a promise against a timeout. If the timeout fires first, reject with a
+   * TIMEOUT_ERROR-classified Error carrying `isTimeout = true`. The underlying
+   * promise is left to settle on its own (the SDK's fetch is not abortable), but
+   * the caller is unblocked. The timer is unref'd so it never keeps the process
+   * alive and is always cleared once the race settles.
+   */
+  private static withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const err: any = new Error(`${label} timed out after ${ms}ms`);
+        err.isTimeout = true;
+        err.classification = 'TIMEOUT_ERROR';
+        reject(err);
+      }, ms);
+      if (typeof (timer as any).unref === 'function') (timer as any).unref();
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  }
+
+  /**
+   * Fetch a full LinkedIn profile from Unipile with a bounded timeout and a single
+   * automatic retry on timeout. Non-timeout errors (404/401/etc.) bubble straight
+   * up to the caller's handleError without a retry — retrying those just wastes
+   * credits. Shared by getLinkedInProfile (URL input) and getProfile (raw id).
+   */
+  private async fetchProfileFromUnipile(identifier: string, accountId: string): Promise<any> {
+    const client = await this.getClient();
+    const doFetch = () => client.request.send({
+      method: 'GET',
+      path: ['users', identifier],
+      // linkedin_sections='*' returns ALL profile sections (experience,
+      // education, skills, languages, certifications, volunteer, etc.).
+      parameters: { account_id: accountId, linkedin_sections: '*' }
+    });
+
+    // One timed attempt. Emits structured, greppable markers so a future hang is
+    // diagnosable straight from CloudWatch given only a time window:
+    //   PROFILE_LOOKUP_TIMEOUT — this attempt exceeded PROFILE_LOOKUP_TIMEOUT_MS
+    //   PROFILE_LOOKUP_SLOW    — succeeded, but slower than the healthy baseline
+    // Every marker carries identifier + accountId + attempt + elapsedMs.
+    const attemptFetch = async (attempt: number): Promise<any> => {
+      const startedAt = Date.now();
+      try {
+        const result = await LinkedInOutreachService.withTimeout(
+          doFetch(),
+          LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+          `LinkedIn profile lookup for ${identifier}`
+        );
+        const elapsedMs = Date.now() - startedAt;
+        if (elapsedMs >= LinkedInOutreachService.PROFILE_LOOKUP_SLOW_MS) {
+          this.warn('PROFILE_LOOKUP_SLOW', { identifier, accountId, attempt, elapsedMs });
+        }
+        return result;
+      } catch (err: any) {
+        if (err?.isTimeout) {
+          this.warn('PROFILE_LOOKUP_TIMEOUT', {
+            identifier,
+            accountId,
+            attempt,
+            elapsedMs: Date.now() - startedAt,
+            timeoutMs: LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+          });
+        }
+        throw err;
+      }
+    };
+
+    try {
+      return await attemptFetch(1);
+    } catch (err: any) {
+      if (!err?.isTimeout) throw err; // real API error — surface immediately, no retry
+      this.log(`Profile lookup timed out; retrying once`, { identifier, accountId });
+      try {
+        return await attemptFetch(2);
+      } catch (retryErr: any) {
+        if (retryErr?.isTimeout) {
+          // Both attempts hung — this is the ENG-144 failure. One clear ERROR-level
+          // marker to alert on / grep for when a user reports "no data returned".
+          this.warn('PROFILE_LOOKUP_FAILED_TIMEOUT', {
+            identifier,
+            accountId,
+            attempts: 2,
+            timeoutMs: LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+          });
+        }
+        throw retryErr;
+      }
+    }
   }
 
   // ─── Client initialization ───────────────────────────────────────────────────
@@ -196,26 +324,38 @@ export class LinkedInOutreachService {
     let connected: boolean;
     try {
       const client = await this.getClient();
+      const timeoutMs = LinkedInOutreachService.CONNECTIVITY_CHECK_TIMEOUT_MS;
       // account.getOne() returns account metadata but no session status field.
       // Use the account's own LinkedIn publicIdentifier for a self-profile lookup —
-      // this fails with 401 if the LinkedIn session is disconnected.
-      const account = await client.account.getOne(accountId) as any;
+      // this fails with 401 if the LinkedIn session is disconnected. Both Unipile
+      // calls are timeout-bounded so a hung upstream (ENG-144) can't stall the
+      // caller (resolveAccountId loops this over every account) — a probe that
+      // times out is treated as "not connected" and resolution moves on.
+      const account = await LinkedInOutreachService.withTimeout(
+        client.account.getOne(accountId) as Promise<any>,
+        timeoutMs,
+        `LinkedIn connectivity check (account) for ${accountId}`,
+      ) as any;
       const publicIdentifier = account?.connection_params?.im?.publicIdentifier;
       if (!publicIdentifier) {
         this.log(`Account ${accountId} has no publicIdentifier — assuming connected`);
         connected = true;
       } else {
-        await client.request.send({
-          method: 'GET',
-          path: ['users', publicIdentifier],
-          parameters: { account_id: accountId },
-        });
+        await LinkedInOutreachService.withTimeout(
+          client.request.send({
+            method: 'GET',
+            path: ['users', publicIdentifier],
+            parameters: { account_id: accountId },
+          }),
+          timeoutMs,
+          `LinkedIn connectivity check (profile) for ${accountId}`,
+        );
         connected = true;
       }
     } catch (error: any) {
       const code = error?.body?.code || error?.code || '';
       const status = error?.body?.status || error?.status;
-      this.log(`Account ${accountId} connectivity check failed (${status} ${code})`);
+      this.log(`Account ${accountId} connectivity check failed (${status} ${code}${error?.isTimeout ? ' timeout' : ''})`);
       connected = false;
     }
     this.connectedStatusCache.set(accountId, { connected, timestamp: Date.now() });
@@ -340,15 +480,7 @@ export class LinkedInOutreachService {
 
     try {
       this.log(`Fetching LinkedIn profile: ${identifier}`, { account_id });
-      const client = await this.getClient();
-      const profile = await client.request.send({
-        method: 'GET',
-        path: ['users', identifier],
-        // linkedin_sections='*' returns ALL profile sections (experience,
-        // education, skills, languages, certifications, volunteer, etc.).
-        // Without it, Unipile returns only the base profile fields.
-        parameters: { account_id, linkedin_sections: '*' }
-      });
+      const profile = await this.fetchProfileFromUnipile(identifier, account_id);
       this.log(`Successfully fetched profile: ${identifier}`);
       return profile;
     } catch (error: any) {
@@ -795,13 +927,7 @@ export class LinkedInOutreachService {
   async getProfile(identifier: string, accountId: string): Promise<any> {
     try {
       this.log(`Fetching profile: ${identifier}`, { accountId });
-      const client = await this.getClient();
-      const profile = await client.request.send({
-        method: 'GET',
-        path: ['users', identifier],
-        // See getLinkedInProfile — linkedin_sections=* pulls all sections.
-        parameters: { account_id: accountId, linkedin_sections: '*' }
-      });
+      const profile = await this.fetchProfileFromUnipile(identifier, accountId);
       this.log(`Successfully fetched profile: ${identifier}`);
       return profile;
     } catch (error: any) {
@@ -1110,12 +1236,24 @@ export class LinkedInOutreachService {
    * Returns null if no account can be found.
    */
   async resolveAccountId(userId: string): Promise<string | null> {
-    // 1. User's own account
+    // 1. User's own accounts — try ALL of them and return the first whose LinkedIn
+    //    session is still live. A single disconnected account must not shadow a
+    //    working one, nor force a needless fall-through to the shared site-wide
+    //    pool: the user's own accounts are ALWAYS preferred, and only when EVERY
+    //    one of them is dead do we move on to the site-wide accounts below.
+    //    (Previously this returned the FIRST own account with no liveness check,
+    //    so a dead first account failed the whole lookup even when the user had a
+    //    second, working account. Mirrors resolveAccountIdForEnrichment.)
     try {
       const { getAccountsByUserId } = await import('./connectedAccountsDb');
       const accounts = await getAccountsByUserId(userId);
-      const userAccount = (accounts as any[]).find((a) => a.platform === 'unipile');
-      if (userAccount?.account_id) return userAccount.account_id;
+      const userAccounts = (accounts as any[]).filter((a) => a.platform === 'unipile' && a.account_id);
+      for (const account of userAccounts) {
+        if (await this.isAccountConnected(account.account_id)) {
+          return account.account_id;
+        }
+        this.log(`User account ${account.account_id} is disconnected — trying next own account`);
+      }
     } catch { /* ignore */ }
 
     // 2. Site-wide accounts — verify each one is still connected before returning
