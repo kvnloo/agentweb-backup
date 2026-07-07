@@ -14,16 +14,19 @@ Both suggested fixes are now implemented on branch
   genuinely different recipients in the same run.
 
 - **Fix (a) — pre-invite LinkedIn dedup cross-check** (`backend/src/services/agentModeService.ts`,
-  `send-invite` case + `linkedInPublicIdFromUrl`; `backend/src/services/unipileSentInvitationsDb.ts`,
-  `getSentInvitationByPublicIdAndAccount`): before spending a run's invite quota,
+  `send-invite` case + `linkedInPublicIdFromUrl`): before spending a run's invite quota,
   the agent send-invite path cross-checks the target against the account's PENDING
   sent-invitation cache (`AW-UnipileSentInvitations`, kept fresh by the ~10-min
   connection-sync cron straight from Unipile's live sent feed — so it also reflects
-  invites made outside this system). A profile with an outstanding invite is skipped
-  (`success: true, alreadyInvited: true`, no quota used) instead of hitting Unipile
-  and getting "Cannot resend yet". Every successful agent invite is also written
-  through to the cache immediately (strongly-consistent PK read on recheck) so a
-  later invite for the same profile in the same run is deduped before the next cron.
+  invites made outside this system). The lookup rebuilds a canonical
+  `https://www.linkedin.com/in/{publicId}/` URL from the parsed public id and matches
+  via the existing case-robust `getSentInvitationByProfileUrlAndAccount` GSI getter
+  (both sides lowercased by `normalizeLinkedInUrl`, matching the CRM path). A profile
+  with an outstanding invite is skipped (`success: true, alreadyInvited: true`, no
+  quota used) instead of hitting Unipile and getting "Cannot resend yet". Every
+  successful agent invite is also written through to the cache so a SUBSEQUENT run —
+  before the next sync cron — dedups it (the GSI is eventually consistent, so this is
+  not relied on for same-run same-turn dedup, which `toolDispatch` already handles).
 
 ## Known limitations / follow-ups
 
