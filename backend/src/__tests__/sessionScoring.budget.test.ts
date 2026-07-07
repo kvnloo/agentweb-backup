@@ -1,7 +1,6 @@
 import {
   scoreSessionsWithinBudget,
   SYNC_SCORING_BUDGET_MS,
-  ScoringJudge,
 } from '../services/sessionScoringService';
 import { ChatSession, chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
@@ -27,6 +26,18 @@ jest.mock('../services/settingsService', () => ({
 
 const mockCallLLM = agentModeService.callLLM as jest.MockedFunction<typeof agentModeService.callLLM>;
 const mockUpdateScore = chatbotDb.updateSessionSatisfactionScore as jest.Mock;
+const mockUpdateJudgeScore = chatbotDb.updateSessionJudgeScore as jest.Mock;
+
+// A configured scoring judge (the multi-judge slow path from the bug report).
+function makeJudge(id: string) {
+  return {
+    id,
+    name: `Judge ${id}`,
+    systemPrompt: 'Rate this conversation.',
+    createdAt: '2026-07-01T00:00:00.000Z',
+    updatedAt: '2026-07-01T00:00:00.000Z',
+  };
+}
 
 function makeLLMResponse(score: number, reason: string) {
   return {
@@ -145,6 +156,51 @@ describe('scoreSessionsWithinBudget (ENG-190 — degrade gracefully instead of a
     expect(summary).toEqual({ processedCount: 2, totalCount: 2, complete: true });
     // Only the un-scored session hit the LLM.
     expect(mockCallLLM).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-checks the deadline between judges and stops mid-judge-list when the budget is exhausted', async () => {
+    const session = makeScoreableSession('a');
+    const judges = [makeJudge('j1'), makeJudge('j2')];
+
+    // Clock advances 50ms per read. deadline = 0 + 120 = 120.
+    // Reads: init(0); session-a check(50<120 ok); j1 check(100<120 ok);
+    // j2 check(150>=120 → stop before scoring j2, before processedCount++).
+    const summary = await scoreSessionsWithinBudget([session], judges, {
+      budgetMs: 120,
+      now: fakeClock(50),
+    });
+
+    expect(summary.complete).toBe(false);
+    expect(summary.processedCount).toBe(0);
+    expect(summary.totalCount).toBe(1);
+    // Default score (1) + first judge (1) ran; the second judge was never called.
+    expect(mockCallLLM).toHaveBeenCalledTimes(2);
+    expect(mockUpdateJudgeScore).toHaveBeenCalledTimes(1);
+    expect(mockUpdateJudgeScore).toHaveBeenCalledWith('a', 'j1', expect.anything());
+  });
+
+  it('isolates a judge that throws — it logs and continues to the remaining judges', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    const session = makeScoreableSession('a');
+    const judges = [makeJudge('j1'), makeJudge('j2')];
+
+    // Calls in order: default score (ok), judge j1 (throws), judge j2 (ok).
+    mockCallLLM
+      .mockResolvedValueOnce(makeLLMResponse(5, 'good'))
+      .mockRejectedValueOnce(new Error('judge boom'))
+      .mockResolvedValue(makeLLMResponse(4, 'ok'));
+
+    const summary = await scoreSessionsWithinBudget([session], judges, {
+      budgetMs: 10_000,
+      now: fakeClock(1),
+    });
+
+    expect(summary).toEqual({ processedCount: 1, totalCount: 1, complete: true });
+    // All three LLM calls attempted despite the middle one throwing.
+    expect(mockCallLLM).toHaveBeenCalledTimes(3);
+    // Only the surviving judge persisted a score; the throwing one did not abort the batch.
+    expect(mockUpdateJudgeScore).toHaveBeenCalledTimes(1);
+    expect(mockUpdateJudgeScore).toHaveBeenCalledWith('a', 'j2', expect.anything());
   });
 
   it('exposes a default budget well under the 5-minute request timeout', () => {
