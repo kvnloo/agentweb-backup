@@ -34,6 +34,14 @@ export class LinkedInOutreachService {
     console.log(`[LinkedInOutreachService] ${message}`, data ? JSON.stringify(data, null, 2) : '');
   }
 
+  // Warnings go to stderr, which Elastic Beanstalk also captures into the
+  // web.stdout.log CloudWatch group — so these markers are queryable there by
+  // time window (14-day retention). Kept single-line + prefixed so a future
+  // profile-lookup hang is greppable without spelunking (see ENG-144).
+  private warn(message: string, data?: any) {
+    console.warn(`[LinkedInOutreachService] ${message}`, data ? JSON.stringify(data) : '');
+  }
+
   private async handleError(error: any, context: string): Promise<never> {
     console.error(`[LinkedInOutreachError] --- START ERROR LOG ---`);
     console.error(`[LinkedInOutreachError] Context: ${context}`);
@@ -106,6 +114,11 @@ export class LinkedInOutreachService {
   // with an internal timeout and one automatic retry so we surface a clear,
   // classified error quickly instead of stalling the conversation.
   static readonly PROFILE_LOOKUP_TIMEOUT_MS = 30_000;
+  // Healthy lookups return in ~1–3s (confirmed against prod CloudWatch logs). A
+  // success slower than this is an early warning that the upstream is degrading
+  // toward the ENG-144 hang — logged so we catch trouble before it's a full
+  // timeout.
+  static readonly PROFILE_LOOKUP_SLOW_MS = 10_000;
 
   /**
    * Race a promise against a timeout. If the timeout fires first, reject with a
@@ -143,20 +156,59 @@ export class LinkedInOutreachService {
       // education, skills, languages, certifications, volunteer, etc.).
       parameters: { account_id: accountId, linkedin_sections: '*' }
     });
+
+    // One timed attempt. Emits structured, greppable markers so a future hang is
+    // diagnosable straight from CloudWatch given only a time window:
+    //   PROFILE_LOOKUP_TIMEOUT — this attempt exceeded PROFILE_LOOKUP_TIMEOUT_MS
+    //   PROFILE_LOOKUP_SLOW    — succeeded, but slower than the healthy baseline
+    // Every marker carries identifier + accountId + attempt + elapsedMs.
+    const attemptFetch = async (attempt: number): Promise<any> => {
+      const startedAt = Date.now();
+      try {
+        const result = await LinkedInOutreachService.withTimeout(
+          doFetch(),
+          LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+          `LinkedIn profile lookup for ${identifier}`
+        );
+        const elapsedMs = Date.now() - startedAt;
+        if (elapsedMs >= LinkedInOutreachService.PROFILE_LOOKUP_SLOW_MS) {
+          this.warn('PROFILE_LOOKUP_SLOW', { identifier, accountId, attempt, elapsedMs });
+        }
+        return result;
+      } catch (err: any) {
+        if (err?.isTimeout) {
+          this.warn('PROFILE_LOOKUP_TIMEOUT', {
+            identifier,
+            accountId,
+            attempt,
+            elapsedMs: Date.now() - startedAt,
+            timeoutMs: LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+          });
+        }
+        throw err;
+      }
+    };
+
     try {
-      return await LinkedInOutreachService.withTimeout(
-        doFetch(),
-        LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
-        `LinkedIn profile lookup for ${identifier}`
-      );
+      return await attemptFetch(1);
     } catch (err: any) {
       if (!err?.isTimeout) throw err; // real API error — surface immediately, no retry
-      this.log(`Profile lookup timed out after ${LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS}ms; retrying once`, { identifier });
-      return await LinkedInOutreachService.withTimeout(
-        doFetch(),
-        LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
-        `LinkedIn profile lookup (retry) for ${identifier}`
-      );
+      this.log(`Profile lookup timed out; retrying once`, { identifier, accountId });
+      try {
+        return await attemptFetch(2);
+      } catch (retryErr: any) {
+        if (retryErr?.isTimeout) {
+          // Both attempts hung — this is the ENG-144 failure. One clear ERROR-level
+          // marker to alert on / grep for when a user reports "no data returned".
+          this.warn('PROFILE_LOOKUP_FAILED_TIMEOUT', {
+            identifier,
+            accountId,
+            attempts: 2,
+            timeoutMs: LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+          });
+        }
+        throw retryErr;
+      }
     }
   }
 
