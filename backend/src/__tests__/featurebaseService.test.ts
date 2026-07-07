@@ -10,6 +10,7 @@ import {
   _resetBoardCache,
   getCustomerTicketCategoryId,
   createTicket,
+  mdToFeaturebaseHtml,
   patchTicketStatus,
   getTicketStatusId,
   _resetTicketCategoryCache,
@@ -76,7 +77,9 @@ describe('featurebaseService', () => {
       expect(r).toEqual({ id: 'hex1', number: 12, url: 'https://fb/t/12' });
       const postCall = (global.fetch as jest.Mock).mock.calls.find((c) => String(c[0]).endsWith('/tickets'));
       const body = JSON.parse(postCall[1].body);
-      expect(body).toMatchObject({ ticketCategoryId: 'cat-bug', title: 't', content: 'd', author: { email: 'u@e.com', name: 'U' } });
+      expect(body).toMatchObject({ ticketCategoryId: 'cat-bug', title: 't', author: { email: 'u@e.com', name: 'U' } });
+      // Featurebase content is HTML — the reporter's markdown/plaintext is converted before send.
+      expect(body.content).toBe('<p>d</p>');
     });
 
     it('throws when the API does not return id+number', async () => {
@@ -108,6 +111,39 @@ describe('featurebaseService', () => {
     });
   });
 
+  describe('mdToFeaturebaseHtml', () => {
+    it('returns a synchronous string (no Promise)', () => {
+      const out = mdToFeaturebaseHtml('hello');
+      expect(typeof out).toBe('string');
+      expect(out).toBe('<p>hello</p>');
+    });
+
+    it('renders markdown headings, paragraphs, and lists as HTML block tags', () => {
+      const out = mdToFeaturebaseHtml('## Part 1\n\nIntro text.\n\n- a\n- b\n\n1. first\n2. second');
+      expect(out).toContain('<h2>Part 1</h2>');
+      expect(out).toContain('<p>Intro text.</p>');
+      expect(out).toContain('<ul>');
+      expect(out).toContain('<li>a</li>');
+      expect(out).toContain('<ol>');
+      expect(out).toContain('<li>first</li>');
+    });
+
+    it('turns blank-line-separated plaintext into separate paragraphs (the un-blobbed shape)', () => {
+      const out = mdToFeaturebaseHtml('Para one.\n\nPara two.');
+      expect((out.match(/<p>/g) || []).length).toBe(2);
+    });
+
+    it('preserves a single newline as a <br> (breaks:true — line breaks are intentional)', () => {
+      const out = mdToFeaturebaseHtml('line a\nline b');
+      expect(out).toContain('<br>');
+    });
+
+    it('returns empty string for empty/whitespace input', () => {
+      expect(mdToFeaturebaseHtml('')).toBe('');
+      expect(mdToFeaturebaseHtml('   \n  ')).toBe('');
+    });
+  });
+
   describe('createPost', () => {
     it('creates a post with integrations.linear:true + author, returns id + url', async () => {
       (global.fetch as any) = routed([{ id: 'board1', name: 'Feature Request' }], { id: 'post1', postUrl: 'https://fb/p/x' });
@@ -117,11 +153,26 @@ describe('featurebaseService', () => {
       const body = JSON.parse(postCall[1].body);
       expect(body).toMatchObject({
         title: 't',
-        content: 'd',
         boardId: 'board1',
         author: { email: 'u@e.com', name: 'U' },
         integrations: { linear: true },
       });
+      // Featurebase content is HTML — a bare description is wrapped in a block tag, not sent raw.
+      expect(body.content).toBe('<p>d</p>');
+    });
+
+    it('converts a markdown description into HTML block tags so structure survives the Linear push', async () => {
+      (global.fetch as any) = routed([{ id: 'board1', name: 'Feature Request' }], { id: 'post1', postUrl: 'https://fb/p/x' });
+      const md = '## Heading\n\nA paragraph.\n\n- one\n- two';
+      await createPost({ title: 't', description: md, authorEmail: 'u@e.com' });
+      const postCall = (global.fetch as jest.Mock).mock.calls.find((c) => String(c[0]).endsWith('/posts'));
+      const body = JSON.parse(postCall[1].body);
+      expect(body.content).toContain('<h2>Heading</h2>');
+      expect(body.content).toContain('<p>A paragraph.</p>');
+      expect(body.content).toContain('<li>one</li>');
+      expect(body.content).toContain('<li>two</li>');
+      // No bare newline-separated blob: the two list items are wrapped, not run together.
+      expect(body.content).not.toContain('- one');
     });
 
     it('throws when the API does not return a post id', async () => {
