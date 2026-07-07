@@ -529,6 +529,45 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(retryAt).toBeLessThanOrEqual(Date.now() + 16 * 60 * 1000);
     });
 
+    it('should persist a structured incomplete-job assistant message so the session is never left silent after zero assistant output', async () => {
+      // Reproduces ENG-209: a large scheduled research job (e.g. 40-competitor
+      // report) crashes/times out and the run produces zero assistant output.
+      // The session must NOT be left blank — the user should see a graceful
+      // "job incomplete" message rather than an empty session.
+      const simpleSchedule = {
+        ...baseSchedule,
+        keywords: [],
+        requiredFunctionCalls: [],
+        zeroAssistantRetryCount: 0,
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: '',
+        toolCalls: [],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      await runScheduledChat(simpleSchedule, mockUserId, false);
+
+      const fallbackCall = mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call: any[]) => call[1]?.metadata?.jobIncomplete === true
+      );
+      expect(fallbackCall).toBeDefined();
+      expect(fallbackCall![0]).toBe('test-session-123');
+      expect(fallbackCall![1]).toEqual(
+        expect.objectContaining({
+          role: 'assistant',
+          content: expect.any(String),
+          metadata: expect.objectContaining({
+            isErrorMessage: true,
+            jobIncomplete: true,
+          }),
+        })
+      );
+      expect(fallbackCall![1].content.length).toBeGreaterThan(0);
+    });
+
     it('should reset zero assistant retry tracking after a successful production run', async () => {
       const recoveringSchedule = {
         ...baseSchedule,
