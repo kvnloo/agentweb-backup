@@ -77,7 +77,10 @@ describe('LinkedInOutreachService', () => {
         getAllMessagesFromChat: jest.fn().mockResolvedValue({ items: [] }),
       },
       request: {
-        send: jest.fn().mockResolvedValue({ provider_id: 'provider-123' })
+        // Default profile lookup echoes back the same id the caller passed, so
+        // canonicalisation is a no-op in the baseline tests. Tests that exercise a
+        // public-identifier → URN resolution override this per-call.
+        send: jest.fn().mockResolvedValue({ provider_id: 'provider-id' })
       },
       account: {
         getOne: jest.fn().mockResolvedValue({ status: 'CONNECTED' }),
@@ -127,6 +130,44 @@ describe('LinkedInOutreachService', () => {
         account_id: 'account-id',
         provider_id: 'provider-id',
         message: customMessage
+      });
+    });
+
+    it('resolves a public-identifier target to the canonical provider_id before inviting', async () => {
+      // ENG-213: the agent passed a public identifier (vanity slug) as provider_id.
+      // Unipile's invite endpoint requires the canonical member URN — a public
+      // identifier is rejected with a generic "Invalid parameters". The profile
+      // lookup accepts either form and reveals the canonical provider_id, so the
+      // invite must be sent with that resolved id, not the raw slug.
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
+        network_distance: 'SECOND_DEGREE',
+        public_identifier: 'william-kwak',
+        provider_id: 'ACoAABcanonicalURN',
+      });
+
+      await linkedInOutreachService.sendInvitation('account-id', 'william-kwak', false, 'Hi William');
+
+      expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledWith({
+        account_id: 'account-id',
+        provider_id: 'ACoAABcanonicalURN',
+        message: 'Hi William',
+      });
+    });
+
+    it('falls back to the passed provider_id when the profile lookup reveals no canonical id', async () => {
+      // If the connection-check profile fetch returns no provider_id we must still
+      // attempt the invite with what the caller gave us (resilient fallback), never
+      // send an undefined provider_id.
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
+        network_distance: 'SECOND_DEGREE',
+      });
+
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, 'Hello');
+
+      expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledWith({
+        account_id: 'account-id',
+        provider_id: 'provider-id',
+        message: 'Hello',
       });
     });
 
