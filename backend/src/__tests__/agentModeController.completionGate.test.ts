@@ -34,6 +34,23 @@ describe('scheduledRunSignalsIncompleteWork — completion-gate detector', () =>
     expect(scheduledRunSignalsIncompleteWork(text)).toBe(true);
   });
 
+  // ── Fires on the step-budget truncation apology (ENG-244) ───────────────────
+  // When a long data-gathering scheduled run exhausts its step budget
+  // (maxIterations), generateSessionResponse emits this apology as the final
+  // content instead of the deliverable. The gate must recognize it so a
+  // continuation turn runs the final synthesis/output step (the report) rather
+  // than finishing with no deliverable and a misleading "— Report Generated" title.
+  const stepBudgetTruncations = [
+    // Exact message emitted by agentModeService when iteration >= maxIterations.
+    "I've reached the maximum number of processing steps for this request. Here's what was completed so far — please review and let me know if you'd like me to continue with any remaining items.",
+    'I have reached the maximum number of steps for this request.',
+    'Reached the maximum number of processing steps.',
+  ];
+
+  it.each(stepBudgetTruncations)('fires on step-budget truncation apology: %s', (text) => {
+    expect(scheduledRunSignalsIncompleteWork(text)).toBe(true);
+  });
+
   it('fires when the admission is embedded in a larger report', () => {
     const report = `# Lead Report
 Event 1 — done, full verdict.
