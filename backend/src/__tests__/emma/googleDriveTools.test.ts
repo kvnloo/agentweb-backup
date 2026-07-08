@@ -449,6 +449,44 @@ describe('update_google_doc — registration', () => {
     const tool = await getTool('update_google_doc');
     expect(tool.definition.inputSchema.required).toEqual(expect.arrayContaining(['url_or_id', 'content']));
   });
+
+  it('description requires warning + explicit confirmation on the FIRST call only, not immediate execution', async () => {
+    // Regression guard: this tool replaces the whole doc and can silently destroy formatting
+    // (read_google_doc round-trips through plain text). Emma must warn and wait for the user
+    // to confirm on the first update_google_doc call in a conversation — never call it on the
+    // first ask. Every subsequent call in the same conversation should just proceed (no repeated
+    // confirmation), but must still mention Version History recoverability every time.
+    const tool = await getTool('update_google_doc');
+    expect(tool.definition.description).toContain('wait for explicit confirmation');
+    expect(tool.definition.description).toContain('do NOT call it on the first ask');
+    expect(tool.definition.description).toContain('SUBSEQUENT update_google_doc call later in the SAME conversation');
+    expect(tool.definition.description).toContain('do not ask again');
+    expect(tool.definition.description).not.toContain('Just do it');
+  });
+
+  it('content schema clarifies that heading markdown and inline styling compose, not mutually exclusive', async () => {
+    // Regression guard: Emma initially treated "make it a heading" and "color it" as two
+    // alternate options and asked the user to pick one, instead of realizing "# [text]{color=X}"
+    // achieves big+bold+color for one specific line without recoloring the whole document.
+    const tool = await getTool('update_google_doc');
+    const contentDesc = tool.definition.inputSchema.properties.content.description as string;
+    expect(contentDesc).toContain('composes with heading markdown');
+    expect(contentDesc).toContain('do NOT treat "make it a heading" and "color it" as mutually exclusive');
+  });
+
+  it('content schema documents the full inline style span syntax (color, font, underline, italic, bold)', async () => {
+    // Regression guard: a real user asked for italic + underline + a specific font + color on a
+    // single line in one go — the description must teach the combined multi-attribute syntax,
+    // not just color alone, so Emma doesn't present these as mutually-exclusive single-attribute options.
+    const tool = await getTool('update_google_doc');
+    const contentDesc = tool.definition.inputSchema.properties.content.description as string;
+    expect(contentDesc).toContain('[text]{attr=value;flag;...}');
+    expect(contentDesc).toContain('font=Verdana');
+    expect(contentDesc).toContain('underline (flag');
+    expect(contentDesc).toContain('italic (flag)');
+    expect(contentDesc).toContain('bold (flag)');
+    expect(contentDesc).toContain('color=yellow;font=Verdana;italic;underline');
+  });
 });
 
 describe('update_google_doc — auth guard', () => {
