@@ -622,6 +622,74 @@ describe('LinkedInOutreachService', () => {
         expect(linkedInOutreachService.invitationCooldownUntil.has('acct-A')).toBe(true);
       });
     });
+
+    describe('note-quota policy via opts.onNoteQuota (ENG-213 hold-vs-drop)', () => {
+      // The service is a pure mechanism: the CALLER decides what to do when the
+      // monthly note quota is spent. `send_without_note` keeps the legacy behavior
+      // (drop the note, send anyway); `skip` holds the invite — it throws a typed
+      // `noteQuotaExceeded` signal WITHOUT sending, so the caller can ask the user
+      // or defer the lead rather than silently downgrading a deliberate note.
+      function invalidParametersError() {
+        return Object.assign(new Error('UnsuccessfulRequestError'), {
+          body: { status: 422, type: 'errors/invalid_parameters', title: 'Invalid parameters' },
+        });
+      }
+
+      it("onNoteQuota:'skip' does NOT send a note-less invite — it throws a typed noteQuotaExceeded signal", async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(invalidParametersError());
+
+        const thrown = await linkedInOutreachService.sendInvitation(
+          'acct-A', 'recipient-1', false, 'A deliberately personalised note', 200, { onNoteQuota: 'skip' }
+        ).catch((e: any) => e);
+
+        expect(thrown?.noteQuotaExceeded).toBe(true);
+        expect(thrown?.structuredError?.classification).toBe('NOTE_QUOTA_EXCEEDED');
+        // Only the note-bearing attempt happened — NO second, note-less send.
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+      });
+
+      it("onNoteQuota:'send_without_note' drops the note and sends (legacy behavior, now explicit)", async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock)
+          .mockRejectedValueOnce(invalidParametersError())
+          .mockResolvedValueOnce({ id: 'invitation-id' });
+
+        const result = await linkedInOutreachService.sendInvitation(
+          'acct-A', 'recipient-1', false, 'A personalised note', 200, { onNoteQuota: 'send_without_note' }
+        );
+
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(2);
+        expect(result).toEqual(expect.objectContaining({ note_dropped: true }));
+      });
+
+      it("defaults to legacy send_without_note when opts is omitted (back-compat)", async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock)
+          .mockRejectedValueOnce(invalidParametersError())
+          .mockResolvedValueOnce({ id: 'invitation-id' });
+
+        const result = await linkedInOutreachService.sendInvitation(
+          'acct-A', 'recipient-1', false, 'A personalised note'
+        );
+
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(2);
+        expect(result).toEqual(expect.objectContaining({ note_dropped: true }));
+      });
+
+      it("onNoteQuota:'skip' still lets a cap/duplicate signal bubble unchanged (not treated as a note-quota hold)", async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(
+          Object.assign(new Error('UnsuccessfulRequestError'), {
+            body: { status: 422, type: 'errors/cannot_resend_yet', title: 'Cannot resend yet' },
+          })
+        );
+
+        const thrown = await linkedInOutreachService.sendInvitation(
+          'acct-A', 'recipient-1', false, 'A personalised note', 200, { onNoteQuota: 'skip' }
+        ).catch((e: any) => e);
+
+        expect(thrown?.noteQuotaExceeded).toBeFalsy();
+        expect(thrown?.message).toMatch(/cannot resend yet/i);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+      });
+    });
   });
 
   describe('sendMessage', () => {
