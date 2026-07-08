@@ -1,20 +1,13 @@
 /**
- * ENG-44 end-to-end (Design 2 — ask scope up front, then act).
+ * ENG-44 end-to-end: broad brand re-setup refreshes brand + market strategy.
  *
- * Per Fangfang's chosen design, when a user asks to "re-setup the brand" Emma
- * FIRST asks what to update — (1) brand only, or (2) also re-do positioning
- * (value prop / ICPs / competitors, which REPLACES the current ones) — then acts.
- * The up-front question itself is conversational (driven by the tool-description
- * instruction asserted below); it is not unit-testable. What IS asserted here, via
- * the real emmaToolRegistry against a stateful in-memory DB, is the deterministic
- * behaviour of the two branches:
+ * When a user asks Emma to "re-setup the brand" from /market-strategy, the
+ * market strategy cannot stay stale. Assert the deterministic tool behavior via
+ * the real emmaToolRegistry against a stateful in-memory DB:
  *
- *   Option 1 (brand only) -> update_brand_guidelines updates the brand and leaves
- *     the market strategy untouched (and carries no auto "offer" — the offer is
- *     front-loaded, so there is no back-loaded hint to double-ask).
- *   Option 2 (also positioning) -> update_brand_guidelines THEN
- *     regenerate_market_strategy regenerates ICPs+competitors from the NEW brand
- *     and REPLACES the stale ones (business overview preserved).
+ *   - Full brand re-setup -> update_brand_guidelines updates the brand AND
+ *     refreshes market strategy when refreshMarketStrategy is true.
+ *   - Brand-only/single-field edits remain brand-only.
  *
  * Only the LLM call is canned; brand-context extraction, mappers, persistence,
  * tool registration and registry dispatch are all real.
@@ -84,57 +77,53 @@ function seedUser() {
   };
 }
 
-describe('ENG-44 e2e (Design 2): ask scope up front, then act (real tools)', () => {
+describe('ENG-44 e2e: brand re-setup refreshes market strategy (real tools)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     seedUser();
   });
 
-  it('registers the new tool and wires the up-front scope question into the brand tool', () => {
+  it('registers the regeneration tool and exposes the one-shot brand re-setup switch', () => {
     expect(emmaToolRegistry.getTool('regenerate_market_strategy')).toBeDefined();
     const brandTool = emmaToolRegistry.getTool('update_brand_guidelines');
     expect(brandTool).toBeDefined();
-    // The front-loaded "ask first" instruction must be present (it is what drives
-    // Design 2 — Emma asking scope before editing). Conversational, so this guards
-    // that the instruction is wired even though the LLM behaviour itself isn't unit-testable.
     const desc = brandTool!.definition.description as string;
-    expect(desc).toMatch(/FIRST ask/i);
-    expect(desc).toContain('regenerate_market_strategy');
+    expect(desc).toContain('refreshMarketStrategy');
     expect(desc).toMatch(/single-field edit/i);
+    expect((brandTool!.definition as any).inputSchema.properties.refreshMarketStrategy).toBeDefined();
   });
 
-  it('OPTION 1 (brand only): updates the brand, leaves market strategy untouched, no back-loaded offer', async () => {
+  it('full re-setup: one update_brand_guidelines call updates brand and replaces ICPs/competitors from the new brand', async () => {
     const r = await emmaToolRegistry.execute(
       'update_brand_guidelines',
-      { brandData: { brandName: 'Acme', tagline: 'Widgets, reinvented', toneOfVoice: 'bold', valueProposition: 'Ship faster' } },
+      {
+        brandData: { brandName: 'Acme', tagline: 'Widgets, reinvented', toneOfVoice: 'bold', valueProposition: 'Ship faster' },
+        refreshMarketStrategy: true,
+      },
+      ctx,
+    );
+    expect(r.success).toBe(true);
+    expect(r.marketStrategyRefresh).toEqual({
+      success: true,
+      replaced: { competitors: 2, icps: 1 },
+      generated: { competitors: 2, icps: 2 },
+    });
+    expect(mockStore.user.brandGuidelines.brandData.tagline).toBe('Widgets, reinvented');
+    expect(mockStore.user.marketStrategy.competitors.map((c: any) => c.name)).toEqual(['RivalAI', 'CompeteCo']);
+    expect(mockStore.user.marketStrategy.icp.map((i: any) => i.title)).toEqual(['Series-A Founders', 'Growth Leads']);
+    expect(mockStore.user.marketStrategy.businessOverview).toBe('Acme sells widgets.');
+  });
+
+  it('brand-only edit: updates the brand and leaves market strategy untouched', async () => {
+    const r = await emmaToolRegistry.execute(
+      'update_brand_guidelines',
+      { brandData: { tagline: 'Widgets, reinvented' } },
       ctx,
     );
     expect(r.success).toBe(true);
     expect(mockStore.user.brandGuidelines.brandData.tagline).toBe('Widgets, reinvented');
-    // Market strategy untouched...
     expect(mockStore.user.marketStrategy.competitors.map((c: any) => c.name)).toEqual(['StaleCo', 'OldRival']);
     expect(mockStore.user.marketStrategy.icp.map((i: any) => i.title)).toEqual(['Old ICP']);
-    // ...and NO auto/back-loaded offer rides on the result (the offer is front-loaded).
     expect(r.marketStrategyRefresh).toBeUndefined();
-  });
-
-  it('OPTION 2 (also positioning): brand update + regenerate replaces ICPs/competitors from the new brand', async () => {
-    // User chose option 2 → Emma updates brand, then calls regenerate_market_strategy.
-    await emmaToolRegistry.execute(
-      'update_brand_guidelines',
-      { brandData: { brandName: 'Acme', tagline: 'Widgets, reinvented', toneOfVoice: 'bold', valueProposition: 'Ship faster' } },
-      ctx,
-    );
-    const r2 = await emmaToolRegistry.execute('regenerate_market_strategy', {}, ctx);
-
-    expect(r2.success).toBe(true);
-    expect(r2.replaced).toEqual({ competitors: 2, icps: 1 });
-    expect(r2.generated).toEqual({ competitors: 2, icps: 2 });
-
-    // Stale competitors/ICPs are GONE, replaced with ones derived from the new brand.
-    expect(mockStore.user.marketStrategy.competitors.map((c: any) => c.name)).toEqual(['RivalAI', 'CompeteCo']);
-    expect(mockStore.user.marketStrategy.icp.map((i: any) => i.title)).toEqual(['Series-A Founders', 'Growth Leads']);
-    // Business overview is preserved (not regenerated).
-    expect(mockStore.user.marketStrategy.businessOverview).toBe('Acme sells widgets.');
   });
 });

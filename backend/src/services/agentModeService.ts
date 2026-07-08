@@ -11019,8 +11019,8 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         existingBrand = initialBrandGuidelines;
       }
 
-      // Extract brandData and brandAssets from updateData
-      const { brandData, brandAssets, ...otherFields } = updateData;
+      // Extract brandData, brandAssets, and optional market-strategy refresh from updateData
+      const { brandData, brandAssets, refreshMarketStrategy, ...otherFields } = updateData;
 
       // Merge with existing brandData - only update provided fields
       const updatedBrandData = {
@@ -11144,6 +11144,10 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         await userDb.updateUser(userId, { brandGuidelines: updatedGuidelines });
       }
 
+      const marketStrategyRefresh = refreshMarketStrategy === true
+        ? await this.regenerateMarketStrategy(userId)
+        : undefined;
+
       // Onboarding v2 Phase 1: flip brand-build status to ready if we were
       // building. Best-effort; wrapped in try/catch so metrics failures don't
       // break the tool-call response path.
@@ -11174,11 +11178,23 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
 
       return {
         success: true,
-        message: 'Brand guidelines updated successfully',
+        message: marketStrategyRefresh?.success
+          ? 'Brand guidelines and market strategy updated successfully'
+          : 'Brand guidelines updated successfully',
         updatedFields,
         brandData: updatedBrandData,
         attachments: updatedAttachments,
         updatedAssets: updatedAssets, // Only the assets that were actually updated
+        ...(marketStrategyRefresh
+          ? {
+            marketStrategyRefresh: {
+              success: marketStrategyRefresh.success,
+              replaced: marketStrategyRefresh.replaced,
+              generated: marketStrategyRefresh.generated,
+              ...(marketStrategyRefresh.error ? { error: marketStrategyRefresh.error } : {}),
+            }
+          }
+          : {}),
         formattedContent
       };
     } catch (error) {

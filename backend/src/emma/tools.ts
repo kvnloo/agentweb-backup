@@ -1333,7 +1333,7 @@ emmaToolRegistry.register({
   name: 'update_brand_guidelines',
   definition: {
     name: 'update_brand_guidelines',
-    description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.). NOTE: SVG files are NOT allowed for logo or secondaryLogo uploads. If the user provides an SVG file, ask them to convert it to PNG or another raster format first. RE-SETUP SCOPE: a brand re-setup often reflects a positioning change that should also refresh the market strategy (value proposition, ICPs, competitors). So when the user asks for a broad brand re-setup or refresh (NOT a single-field edit like changing just the tagline or one color), do NOT immediately edit — FIRST ask them what they want to update: (1) just the brand guideline (look + messaging), or (2) also re-do their positioning — value proposition, ICPs and competitors. Make clear that option (2) REPLACES their current ICPs and competitors. After they choose: for (1) call this tool; for (2) call this tool AND regenerate_market_strategy. For a small single-field edit, just make the change — do not ask.',
+    description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.). NOTE: SVG files are NOT allowed for logo or secondaryLogo uploads. If the user provides an SVG file, ask them to convert it to PNG or another raster format first. RE-SETUP SCOPE: when the user asks for a broad brand re-setup or refresh (NOT a single-field edit like changing just the tagline or one color), pass refreshMarketStrategy=true so the same operation also refreshes market strategy positioning by regenerating ICPs and competitors from the updated brand. This REPLACES current ICPs and competitors while preserving the business overview. For a small single-field edit, leave refreshMarketStrategy false/omitted.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1392,6 +1392,10 @@ emmaToolRegistry.register({
               filename: { type: 'string', description: 'Original filename of the brand asset' }
             }
           }
+        },
+        refreshMarketStrategy: {
+          type: 'boolean',
+          description: 'Set true for a broad brand re-setup/refresh so ICPs and competitors are regenerated from the updated brand in the same operation. Omit or false for single-field edits and brand-only updates.'
         }
       },
       required: []
