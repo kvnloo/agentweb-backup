@@ -1,6 +1,7 @@
 import express from "express";
 import { disconnectStaleUserSockets } from "../services/sessionSockets";
 import jwt from "jsonwebtoken";
+import { getJwtSecret } from "../config/jwt";
 import bcrypt from "bcryptjs";
 import axios from "axios";
 import { authenticateToken } from "../middleware/auth";
@@ -1557,7 +1558,7 @@ router.put("/users/:userId/password", async (req, res) => {
           isAdmin: user.isAdmin || false,
           sv: newSessionVersion,
         },
-        process.env.JWT_SECRET || "your-secret-key",
+        getJwtSecret(),
         { expiresIn: "90d" }
       );
     }
@@ -1730,7 +1731,7 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
 
     const delegateToken = jwt.sign(
       delegatePayload,
-      process.env.JWT_SECRET || "your-secret-key",
+      getJwtSecret(),
       { expiresIn: "90d" } // Delegate tokens expire in 90 days for security
     );
 

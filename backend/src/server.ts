@@ -5,6 +5,7 @@ import { DRAIN_CEILING_MS } from './utils/shutdownConstants';
 import { agentModeService } from './services/agentModeService';
 import { generateMarketingResponseWorkerService } from './services/generateMarketingResponseWorkerService';
 import dotenv from 'dotenv';
+import { getJwtSecret, assertJwtSecretAtBoot } from './config/jwt';
 import bcrypt from 'bcryptjs';
 import http from 'http';
 import { Server, Socket } from 'socket.io';
@@ -22,6 +23,10 @@ import {
 } from './services/liveVoiceService';
 
 dotenv.config();
+
+// Fail fast at boot (before binding the port) if the JWT secret is missing, rather than
+// letting tokens be signed/verified with a fallback secret or erroring on first request.
+assertJwtSecretAtBoot();
 
 const port = process.env.PORT || 3001;
 const server = http.createServer(app);
@@ -77,7 +82,7 @@ io.use(async (socket, next) => {
 
   if (token) {
     try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key') as {
+      const decoded = jwt.verify(token, getJwtSecret()) as {
         userId?: string;
         sv?: number;
         delegateAccess?: unknown;
@@ -136,7 +141,7 @@ io.on('connection', (socket: Socket) => {
   try {
     const token = socket.handshake.auth.token;
     if (token) {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as { userId: string };
+      const decoded = jwt.verify(token, getJwtSecret()) as { userId: string };
       if (decoded.userId) {
         socket.join(`user:${decoded.userId}`);
       }
@@ -174,7 +179,7 @@ io.on('connection', (socket: Socket) => {
     }
     const token = socket.handshake.auth.token;
     if (!token) throw new Error('No auth token');
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as {
+    const decoded = jwt.verify(token, getJwtSecret()) as {
       userId: string;
       delegateAccess?: { targetUserId: string };
     };
@@ -237,7 +242,7 @@ io.on('connection', (socket: Socket) => {
         throw new Error('No authentication token provided');
       }
 
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as { userId: string; isAdmin?: boolean; delegateAccess?: { adminUserId: string; adminEmail: string; targetUserId: string; targetEmail: string } };
+      const decoded = jwt.verify(token, getJwtSecret()) as { userId: string; isAdmin?: boolean; delegateAccess?: { adminUserId: string; adminEmail: string; targetUserId: string; targetEmail: string } };
       const userId = decoded.delegateAccess?.targetUserId || decoded.userId;
       const isDelegatedAdmin = !!decoded.delegateAccess || decoded.isAdmin === true;
 
