@@ -17,8 +17,10 @@ describe('AgentMode system prompt - skill resolution policy', () => {
     // Regression guard for ENG-245: the agent HALLUCINATED that it had found a Google Drive
     // document and FABRICATED fake links before ever calling a real Drive tool, then only
     // installed the correct skill after the user called it out.
-    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('Never claim a file, document, or record was found — and never emit any link or URL — unless it came from an actual tool result');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('Never claim a file, document, or record was found — and never emit a link, URL, or ID that points to one');
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('install the skill first (per the Page & Feature Tool Reference) or state the limitation — never fabricate');
+    // The anti-fabrication rule must NOT clobber legitimate static routes / attachment URLs.
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('This does NOT restrict static app routes such as `/settings/login-credentials`, nor user-provided or attachment URLs');
   });
 
   it('routes "Google Drive" phrasing to the real Drive tools, not the knowledge-base tools', () => {
