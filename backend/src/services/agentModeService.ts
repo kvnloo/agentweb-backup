@@ -761,7 +761,7 @@ export class AgentModeService {
         description:
           'Access meeting recordings, transcripts, and action items from Fathom. ' +
           'Requires a connected Fathom account (Settings → Connected Accounts).',
-        toolNames: ['fathom_get_meetings', 'fathom_get_transcript'],
+        toolNames: ['fathom_get_meetings', 'fathom_get_transcript', 'fathom_get_onboarding_context'],
         category: 'tool_bundle',
       },
       {
@@ -4227,6 +4227,7 @@ export class AgentModeService {
     // Meeting Intelligence (Fathom)
     'fathom_get_meetings',
     'fathom_get_transcript',
+    'fathom_get_onboarding_context',
 
     // Coding Agent (sub-agent for code editing tasks)
     'coding_agent',
