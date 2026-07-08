@@ -1526,7 +1526,7 @@ emmaToolRegistry.register({
   name: 'update_brand_guidelines',
   definition: {
     name: 'update_brand_guidelines',
-    description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.). NOTE: SVG files are NOT allowed for logo or secondaryLogo uploads. If the user provides an SVG file, ask them to convert it to PNG or another raster format first.',
+    description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.). NOTE: SVG files are NOT allowed for logo or secondaryLogo uploads. If the user provides an SVG file, ask them to convert it to PNG or another raster format first. RE-SETUP SCOPE: when the user asks for a broad brand re-setup or refresh (NOT a single-field edit like changing just the tagline or one color), pass refreshMarketStrategy=true so the same operation also refreshes market strategy positioning by regenerating ICPs and competitors from the updated brand. This REPLACES current ICPs and competitors while preserving the business overview. For a small single-field edit, leave refreshMarketStrategy false/omitted.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1585,6 +1585,10 @@ emmaToolRegistry.register({
               filename: { type: 'string', description: 'Original filename of the brand asset' }
             }
           }
+        },
+        refreshMarketStrategy: {
+          type: 'boolean',
+          description: 'Set true for a broad brand re-setup/refresh so ICPs and competitors are regenerated from the updated brand in the same operation. Omit or false for single-field edits and brand-only updates.'
         }
       },
       required: []
@@ -1656,6 +1660,23 @@ emmaToolRegistry.register({
   },
   execute: async (args, context) => {
     return await agentModeService.updateMarketStrategy(args, context?.userId);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'regenerate_market_strategy',
+  definition: {
+    name: 'regenerate_market_strategy',
+    description: 'Regenerate the user\'s market strategy (ideal customer profiles and competitors) from their CURRENT brand guidelines, so the strategy matches the latest brand. DESTRUCTIVE: this REPLACES the existing competitors and ICPs (the business overview is preserved). Only call this AFTER the user has explicitly confirmed they want to regenerate — if they already have competitors/ICPs, first tell them how many will be replaced and get a clear yes. Takes ~30-60s. Typically used as part of a brand re-setup when the user chose to also refresh their positioning/market strategy (option 2 of the brand re-setup scope question).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+      },
+      required: []
+    }
+  },
+  execute: async (args, context) => {
+    return await agentModeService.regenerateMarketStrategy(context?.userId);
   }
 });
 
