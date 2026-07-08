@@ -53,6 +53,7 @@ jest.mock('../middleware/auth', () => ({
 const { resendService } = require('../services/resendService');
 const { createOncallItem } = require('../services/notionService');
 const { uploadScreenshotToS3 } = require('../utils/s3Utils');
+const { userDb } = require('../services/db');
 
 function buildApp() {
   const app = express();
@@ -134,6 +135,32 @@ describe('POST /api/support/report-ui-bug', () => {
     expect(emailCall.subject).toContain('UI Bug');
     expect(emailCall.replyTo).toBe('user@example.com');
     expect(emailCall.html).toContain('The save button is cut off');
+  });
+
+
+  it('adds user funnel status context and triage tags when set', async () => {
+    userDb.getUserById.mockResolvedValueOnce({
+      userId: 'user-123',
+      email: 'user@example.com',
+      displayName: 'Test User',
+      funnelStatus: 'account_setup',
+    });
+
+    const app = buildApp();
+    const res = await request(app)
+      .post('/api/support/report-ui-bug')
+      .send({ description: 'Connector setup is blocked', reportType: 'bug' });
+
+    expect(res.status).toBe(200);
+    const itemArg = createOncallItem.mock.calls[0][0];
+    expect(itemArg.additionalTags).toEqual(expect.arrayContaining([
+      'Bug',
+      'Status: Account Setup',
+      'Setup',
+    ]));
+    expect(itemArg.context['User Status']).toBe('Account Setup');
+    expect(resendService.sendEmail.mock.calls[0][0].html).toContain('User status');
+    expect(resendService.sendEmail.mock.calls[0][0].html).toContain('Account Setup');
   });
 
   it('succeeds without a screenshot (does not attempt upload)', async () => {

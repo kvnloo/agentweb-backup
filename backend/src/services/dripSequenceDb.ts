@@ -181,6 +181,10 @@ export interface SequenceEnrollment {
   status: EnrollmentStatus;
   exitReason?: ExitReason;
 
+  claimedAt?: string;      // ISO — set while a worker instance is sending this
+                           // enrollment's step; self-heals after the stale
+                           // window so a crashed worker doesn't strand it
+
   linkedInProviderId?: string;       // Unipile provider_id of the lead; cached on first LinkedIn step send
 
   enrolledAt: string;
@@ -518,7 +522,7 @@ async function snoozeEnrollment(enrollmentId: string, retryAt: string): Promise<
   await dynamodb.update({
     TableName: ENROLLMENTS_TABLE,
     Key: { enrollmentId },
-    UpdateExpression: 'SET nextSendAt = :next',
+    UpdateExpression: 'SET nextSendAt = :next REMOVE claimedAt',
     ExpressionAttributeValues: { ':next': retryAt },
   }).promise();
 }
@@ -533,7 +537,7 @@ async function advanceEnrollment(
   await dynamodb.update({
     TableName: ENROLLMENTS_TABLE,
     Key: { enrollmentId },
-    UpdateExpression: `SET currentStep = :step, nextSendAt = :next, ${sentField} = :sent`,
+    UpdateExpression: `SET currentStep = :step, nextSendAt = :next, ${sentField} = :sent REMOVE claimedAt`,
     ExpressionAttributeValues: {
       ':step': nextStep,
       ':next': nextSendAt,
@@ -552,7 +556,7 @@ async function completeEnrollment(
   await dynamodb.update({
     TableName: ENROLLMENTS_TABLE,
     Key: { enrollmentId },
-    UpdateExpression: `SET #s = :status, exitReason = :reason, completedAt = :ts, ${sentField} = :sent`,
+    UpdateExpression: `SET #s = :status, exitReason = :reason, completedAt = :ts, ${sentField} = :sent REMOVE claimedAt`,
     ExpressionAttributeNames: { '#s': 'status' },
     ExpressionAttributeValues: {
       ':status': finalStatus,
@@ -561,6 +565,51 @@ async function completeEnrollment(
       ':sent': now(),
     },
   }).promise();
+}
+
+/**
+ * Conditionally claim an enrollment before sending its step. Self-heals like
+ * db.ts's claimAction: a claim older than staleThresholdMs is reclaimable, so
+ * a worker that crashed mid-send doesn't strand the enrollment forever.
+ */
+async function claimEnrollment(
+  enrollmentId: string,
+  instanceId: string,
+  staleThresholdMs: number = 10 * 60 * 1000,
+): Promise<boolean> {
+  const staleThreshold = new Date(Date.now() - staleThresholdMs).toISOString();
+  try {
+    await dynamodb.update({
+      TableName: ENROLLMENTS_TABLE,
+      Key: { enrollmentId },
+      UpdateExpression: 'SET claimedAt = :now, claimedBy = :instanceId',
+      ConditionExpression: 'attribute_not_exists(claimedAt) OR claimedAt <= :staleThreshold',
+      ExpressionAttributeValues: {
+        ':now': now(),
+        ':instanceId': instanceId,
+        ':staleThreshold': staleThreshold,
+      },
+    }).promise();
+    return true;
+  } catch (error: any) {
+    if (error.code === 'ConditionalCheckFailedException') return false;
+    throw error;
+  }
+}
+
+/** Best-effort claim release (e.g. after a generic processing error) so the
+ * enrollment can be retried on the very next tick instead of waiting out the
+ * stale-claim window. Never throws — the stale threshold self-heals anyway. */
+async function releaseEnrollmentClaim(enrollmentId: string): Promise<void> {
+  try {
+    await dynamodb.update({
+      TableName: ENROLLMENTS_TABLE,
+      Key: { enrollmentId },
+      UpdateExpression: 'REMOVE claimedAt',
+    }).promise();
+  } catch (error) {
+    console.error(`[dripSequenceDb] Failed to release claim for enrollment ${enrollmentId}:`, error);
+  }
 }
 
 async function exitEnrollment(
@@ -668,4 +717,6 @@ export const dripSequenceDb = {
   completeEnrollment,
   exitEnrollment,
   getEnrollmentStats,
+  claimEnrollment,
+  releaseEnrollmentClaim,
 };

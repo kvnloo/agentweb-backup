@@ -17328,9 +17328,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       ].filter(Boolean) as string[];
 
       if (knowledgeBases.length === 0) {
+        // ENG-173: an explicit Google Drive query (kb_type=google-drive) that returns
+        // empty reflects only the READ-ONLY shared-folder path (service account) — it
+        // says nothing about Docs/Sheets CREATE/EDIT, a separate OAuth-backed skill.
+        // Point the model to the catalog so empty doesn't read as "Docs unavailable".
+        // Scoped to the explicit drive query: an unfiltered/other empty gets the plain
+        // message (this path lists all sources, and nudging Docs there is off-topic).
+        const message = options?.kb_type === 'google-drive'
+          ? 'No Google Drive shared folders found here — this lists only READ-ONLY shared folders (surfaced via the service account). Creating and editing Google Docs & Sheets is a SEPARATE capability — call list_available_skills to find and install the skill that provides Google Docs / Sheets create/edit tools.'
+          : 'No knowledge bases found';
         return {
           success: true,
-          message: 'No knowledge bases found',
+          message,
           knowledge_bases: [],
           totalKnowledgeBases: 0,
           totalFiles: 0,
@@ -18113,6 +18122,36 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (m) { result += `<code style="background-color:#f1f3f4;padding:1px 5px;border-radius:3px;font-family:Courier New,monospace;font-size:90%;text-decoration:none">${AgentModeService.escapeHtml(m[1])}</code>`; remaining = remaining.slice(m[0].length); continue; }
       m = remaining.match(/^\[([^\]]+)\]\(([^)]+)\)/);
       if (m) { result += `<a href="${AgentModeService.escapeHtml(m[2])}">${AgentModeService.escapeHtml(m[1])}</a>`; remaining = remaining.slice(m[0].length); continue; }
+      // Inline style span for a single word/phrase — [text]{color=blue}, [text]{underline},
+      // [text]{color=yellow;font=Verdana;italic;underline}, etc. The attribute-string charset is
+      // restricted to letters/digits/#/=/;/space — no quotes, parens, or angle brackets can ever
+      // appear, so a malformed/hostile value can never break out of the style attribute. Each
+      // ';'-separated segment is checked against a fixed whitelist (color, font, bold, italic,
+      // underline); unrecognized segments are silently ignored rather than rejecting the whole
+      // span. If nothing recognized survives, this doesn't match at all — falls through to plain
+      // escaped text below, preserving the original literal text (including the brackets).
+      m = remaining.match(/^\[([^\]]+)\]\{([a-zA-Z0-9#=; ]+)\}/);
+      if (m) {
+        const decls: string[] = [];
+        for (const rawSeg of m[2].split(';')) {
+          const seg = rawSeg.trim();
+          if (!seg) continue;
+          if (seg === 'underline') { decls.push('text-decoration:underline'); continue; }
+          if (seg === 'italic') { decls.push('font-style:italic'); continue; }
+          if (seg === 'bold') { decls.push('font-weight:700'); continue; }
+          let am = seg.match(/^color=(#[0-9a-fA-F]{3,8}|[a-zA-Z]+)$/);
+          if (am) { decls.push(`color:${am[1]}`); continue; }
+          am = seg.match(/^font=([a-zA-Z ]+)$/);
+          if (am) { decls.push(`font-family:${am[1]}`); continue; }
+          // Unrecognized attribute name/value — ignore silently, do not fail the whole span.
+        }
+        if (decls.length > 0) {
+          result += `<span style="${decls.join(';')}">${AgentModeService.escapeHtml(m[1])}</span>`;
+          remaining = remaining.slice(m[0].length);
+          continue;
+        }
+        // Nothing recognized — fall through to ordinary text below (do not consume the match).
+      }
       m = remaining.match(/^<[^>]+>/);
       if (m) { remaining = remaining.slice(m[0].length); continue; }
       result += AgentModeService.escapeHtml(remaining[0]);
@@ -26286,6 +26325,31 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             '1. Go to Settings > Connected Accounts and click Reconnect on your LinkedIn account.',
             '2. If reconnect does not work, remove the connection entirely and add it again as a new connection.',
           ].join('\n')
+        };
+      }
+
+      // Account-level invitation throttle (ENG-126). Once a LinkedIn account hits
+      // its invitation cap — a weekly limit that is far lower on non-Premium
+      // accounts and shrinks as the pending-invitation backlog grows — Unipile
+      // returns "Cannot resend yet" for send-invite on EVERY recipient, including
+      // brand-new ones. Surfaced verbatim, that phrase reads like a per-recipient
+      // cooldown, so the agent moves on to the next recipient and repeats, burning
+      // attempt after attempt (10+ in the reported session) and reporting nothing
+      // useful. Re-label it as the account-wide throttle it is so the agent stops
+      // and reports proactively. The raw phrase is preserved in the body so the
+      // error classifier still buckets this as an upstream_rejected business rule.
+      if (action === 'send-invite' && /cannot resend yet/i.test(errorMessage)) {
+        return {
+          success: false,
+          message: 'LinkedIn invitation limit reached',
+          error: [
+            "LinkedIn rejected this invitation with 'Cannot resend yet'. This is an ACCOUNT-LEVEL invitation cooldown/throttle, NOT a per-recipient one — LinkedIn caps how many pending invitations an account may have (the cap is much lower on non-Premium accounts), so it applies to every recipient equally.",
+            '',
+            'DO NOT keep trying other recipients — every send-invite will fail the same way until the cooldown lifts. Stop sending invitations now and report to the user that their LinkedIn account has hit its invitation limit and has a large pending-invitation backlog.',
+            '',
+            'To free up capacity the user can withdraw old unanswered invitations (use list-sent-invitations to see the backlog, then cancel-invitation on the stale ones) or wait a few days before the next outreach run. Prefer queueing these invites for a later run over retrying now.',
+          ].join('\n'),
+          accountThrottled: true,
         };
       }
 

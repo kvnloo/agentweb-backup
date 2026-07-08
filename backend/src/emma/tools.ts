@@ -9,6 +9,7 @@ import { contactEventsDb, normalizeContactId } from '../services/contactEventsDb
 import { chatbotDb } from '../services/chatbotService';
 import { getExecutionsWithAssets } from '../routes/tasks';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
+import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
 import { enqueueAutoHumanEval } from '../services/autoHumanEvalService';
 
@@ -5066,7 +5067,7 @@ emmaToolRegistry.register({
   name: "list_knowledge_base_files",
   definition: {
     name: "list_knowledge_base_files",
-    description: 'List available knowledge base files for the current user, including private/public task KBs, Google Drive shared folders, ClickUp docs, and Foreplay boards. Google Drive entries have identifiers starting with "gdrive:". ClickUp doc entries start with "clickup:" and include a docId field — use docId as parent_doc_id in write_clickup_doc to nest content inside that doc. ClickUp folder entries start with "clickup-folder:" (these are task-hierarchy folders, for reference only — not writable doc parents). Use modified_after/modified_before to filter by date (ISO format, e.g. "2026-04-15") — this is the most efficient way to find recent files. Use limit/offset to paginate through large folders (default limit is 100). Use kb_type to narrow to a specific source ("google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"). Returns file names, identifiers, sizes, types, and last modified timestamps. IMPORTANT: Use this tool (not search_knowledge_base) when you need to browse or list files by name or date.',
+    description: 'List available knowledge base files for the current user, including private/public task KBs, Google Drive shared folders, ClickUp docs, and Foreplay boards. Google Drive entries have identifiers starting with "gdrive:". ClickUp doc entries start with "clickup:" and include a docId field — use docId as parent_doc_id in write_clickup_doc to nest content inside that doc. ClickUp folder entries start with "clickup-folder:" (these are task-hierarchy folders, for reference only — not writable doc parents). Use modified_after/modified_before to filter by date (ISO format, e.g. "2026-04-15") — this is the most efficient way to find recent files. Use limit/offset to paginate through large folders (default limit is 100). Use kb_type to narrow to a specific source ("google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"). Returns file names, identifiers, sizes, types, and last modified timestamps. IMPORTANT: Use this tool (not search_knowledge_base) when you need to browse or list files by name or date. NOTE: the Google Drive entries here are READ-ONLY shared folders — CREATING or EDITING Google Docs/Sheets is a SEPARATE capability; discover and install the skill that provides Google Docs/Sheets create/edit tools via list_available_skills.',
     inputSchema: {
       type: "object",
       properties: {
@@ -7023,6 +7024,8 @@ emmaToolRegistry.register({
     // Fetch once before the loop to avoid N DynamoDB reads for a batch of issues
     const { settingsService } = await import('../services/settingsService');
     const productIssueEmails = await settingsService.getJsonArraySetting('product_issue_emails', ['founders@agentweb.pro']);
+    const funnelStatusLabel = getUserFunnelStatusLabel(user.funnelStatus);
+    const funnelStatusTags = getUserFunnelStatusIssueTags(user.funnelStatus);
 
     for (const rawIssue of args.issues) {
       // Gemini may serialize array items as JSON strings instead of objects — normalize
@@ -7036,6 +7039,9 @@ emmaToolRegistry.register({
           'Page URL': issue.pageUrl || 'N/A',
           'Session ID': context?.sessionId || 'N/A',
         };
+        if (funnelStatusLabel) {
+          issueContext['User Status'] = funnelStatusLabel;
+        }
 
         const attachmentUrls = Array.isArray(issue.attachment_urls)
           ? issue.attachment_urls.filter((u: unknown): u is string => typeof u === 'string' && /^https?:\/\//.test(u))
@@ -7098,9 +7104,17 @@ emmaToolRegistry.register({
             userName: user.displayName || user.email,
             reportedByAdmin: isDelegatedAdmin && adminEmail ? adminEmail : undefined,
             sessionId: context?.sessionId,
+            // Same value that lands as "Priority:" text in issueContext — the intake service
+            // maps it onto the Linear priority field so text and board agree (ENG-231).
+            priority: issue.priority,
+            // Linear-side triage enrichment (ENG-187): stage labels + priority/state/assignee defaults.
+            funnelStatus: user.funnelStatus,
             // External MCP clients (Claude Code etc.) are tagged distinctly so benchmark
             // filters on Customer Reported stay clean (used on the flag-off Notion path).
-            notionTags: [context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported'],
+            notionTags: [
+              context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported',
+              ...funnelStatusTags,
+            ],
             notionContext: issueContext,
           }),
           new Promise<never>((_, reject) =>
@@ -7132,6 +7146,7 @@ emmaToolRegistry.register({
                   <td style="padding: 6px 0; color: #666; width: 140px; vertical-align: top;"><strong>Reported by</strong></td>
                   <td style="padding: 6px 0;"><a href="mailto:${user.email}" style="color: #4F46E5;">${user.displayName || user.email}</a> (${user.email})</td>
                 </tr>
+                ${funnelStatusLabel ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>User status</strong></td><td style="padding: 6px 0;">${funnelStatusLabel}</td></tr>` : ''}
                 ${isDelegatedAdmin && adminEmail ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Via delegation</strong></td><td style="padding: 6px 0;">${adminEmail}</td></tr>` : ''}
                 ${result.pageId ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Issue ID</strong></td><td style="padding: 6px 0; font-family: monospace;">AGW-${result.pageId}</td></tr>` : ''}
                 ${result.url ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>${result.tracker}</strong></td><td style="padding: 6px 0;"><a href="${result.url}" style="color: #4F46E5; font-weight: 600;">→ Open in ${result.tracker}</a></td></tr>` : ''}
@@ -8330,7 +8345,7 @@ emmaToolRegistry.register({
         },
         content: {
           type: 'string',
-          description: 'Content in markdown format. Write full markdown (# Heading 1, ## Heading 2, **bold**, *italic*, - bullet lists, 1. numbered lists, | tables |, ```code blocks```, > blockquotes, [text](url) links). Markdown is automatically converted to rich Google Docs formatting — do NOT flatten to plain text.',
+          description: 'Content in markdown format. Write full markdown (# Heading 1, ## Heading 2, **bold**, *italic*, - bullet lists, 1. numbered lists, | tables |, ```code blocks```, > blockquotes, [text](url) links). Markdown is automatically converted to rich Google Docs formatting — do NOT flatten to plain text. To style just one word/phrase without affecting the rest of the document (not the document-wide accent/font from style_options), use an inline style span: [text]{attr=value;flag;...}. Supported: color=blue or color=#ff0000 (text color), font=Verdana (font family — letters/spaces only, e.g. "Times New Roman"), underline (flag, no value), italic (flag), bold (flag). Combine multiple in one span with semicolons, e.g. [Phase 1]{color=yellow;font=Verdana;italic;underline}. Only use this when the user explicitly asks for specific word/line formatting, not proactively. This composes with heading markdown: writing "# [test 2]{color=blue}" makes that one heading big+bold (from the # itself) AND blue, without recoloring any other heading in the document — do NOT treat "make it a heading" and "color it" as mutually exclusive options; combine them in a single line for a "big, bold, and [color]" request on one specific item.',
         },
         folder_id: {
           type: 'string',
@@ -8388,7 +8403,7 @@ emmaToolRegistry.register({
   name: 'update_google_doc',
   definition: {
     name: 'update_google_doc',
-    description: 'Replace the entire content of an existing Google Doc with rich formatting. Content is written in markdown and automatically converted to rich Google Docs formatting — write full markdown, do NOT flatten to plain text. Use this to write revised content back to a Doc after the team has left comments and the user has approved edits. Accepts a Doc URL or file ID. BEHAVIOR: Just do it when the user has clearly asked for an update. Only ask for clarification if multiple Docs are in context and it\'s genuinely ambiguous which one to update.',
+    description: 'Replace the entire content of an existing Google Doc with rich formatting. Content is written in markdown and automatically converted to rich Google Docs formatting — write full markdown, do NOT flatten to plain text. Use this to write revised content back to a Doc after the team has left comments and the user has approved edits. Accepts a Doc URL or file ID. BEHAVIOR: this REPLACES THE WHOLE DOCUMENT. On the FIRST update_google_doc call in a conversation, warn the user first (e.g. "this will replace the entire doc\'s content — the previous version stays recoverable via File → Version History if needed. Want me to go ahead?") and wait for explicit confirmation before calling this tool — do NOT call it on the first ask. For any SUBSEQUENT update_google_doc call later in the SAME conversation (i.e. you already asked and the user confirmed once before), do not ask again — just call it directly, but still briefly mention afterward that the previous version is recoverable via File → Version History, every time. STYLING: unlike create_google_doc, an update defaults to leaving the doc\'s existing visual decoration alone (headings/bullets/tables still render properly, just without imposed colors/fonts) — only pass plain=false or style_options when the user explicitly asks for the doc to be restyled/colorized.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -8398,7 +8413,7 @@ emmaToolRegistry.register({
         },
         content: {
           type: 'string',
-          description: 'New content in markdown format (replaces all existing content). Write full markdown — it is automatically converted to rich Google Docs formatting. Do NOT flatten to plain text.',
+          description: 'New content in markdown format (replaces all existing content). Write full markdown — it is automatically converted to rich Google Docs formatting. Do NOT flatten to plain text. To style just one word/phrase without affecting the rest of the document (not the document-wide accent/font from style_options), use an inline style span: [text]{attr=value;flag;...}. Supported: color=blue or color=#ff0000 (text color), font=Verdana (font family — letters/spaces only, e.g. "Times New Roman"), underline (flag, no value), italic (flag), bold (flag). Combine multiple in one span with semicolons, e.g. [Phase 1]{color=yellow;font=Verdana;italic;underline}. Only use this when the user explicitly asks for specific word/line formatting, not proactively. This composes with heading markdown: writing "# [test 2]{color=blue}" makes that one heading big+bold (from the # itself) AND blue, without recoloring any other heading in the document — do NOT treat "make it a heading" and "color it" as mutually exclusive options; combine them in a single line for a "big, bold, and [color]" request on one specific item.',
         },
         plain: {
           type: 'boolean',
@@ -8421,7 +8436,9 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
-    const style = args.plain === true ? 'plain' : 'styled';
+    // Unlike create (styled by default), an update defaults to leaving the doc's existing
+    // look alone — only restyle when the user explicitly asked (plain: false) or gave style_options.
+    const style = args.plain === true ? 'plain' : (args.plain === false || args.style_options) ? 'styled' : 'plain';
     const so = args.style_options;
     const styleOptions = so ? { primaryColor: so.primary_color, fontFamily: so.font_family, fontSize: so.font_size, lineHeight: so.line_height, compact: so.compact } : undefined;
     return agentModeService.updateGoogleDoc(args.url_or_id, args.content, context.userId, style, styleOptions);

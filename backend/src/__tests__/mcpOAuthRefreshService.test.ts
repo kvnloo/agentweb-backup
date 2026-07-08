@@ -28,6 +28,7 @@ import {
   OAUTH_REFRESH_LEAD_MS,
 } from "../mcp/client/mcpOAuthRefreshService";
 import { getServerConfig } from "../mcp/client/mcpOAuthClientProvider";
+import { cronJobRegistry } from "../utils/cronJobRegistry";
 
 let mockServer: http.Server;
 let mockBase: string;
@@ -197,6 +198,26 @@ describe("refresh scheduler", () => {
     await Promise.resolve();
 
     expect(getSetting).toHaveBeenCalled(); // the tick loaded servers
+    stopMcpOAuthRefreshScheduler();
+    jest.useRealTimers();
+  });
+
+  it("tracks each tick's refresh pass via cronJobRegistry so gracefulShutdown() can drain it", async () => {
+    jest.useFakeTimers();
+    const getSetting = require("../services/settingsService").settingsService.getSetting as jest.Mock;
+    store.clear();
+    store.set("mcp_servers", JSON.stringify([]));
+    getSetting.mockClear();
+
+    const trackSpy = jest.spyOn(cronJobRegistry, "track");
+
+    startMcpOAuthRefreshScheduler();
+    jest.advanceTimersByTime(60 * 1000); // one tick
+    await Promise.resolve();
+
+    expect(trackSpy).toHaveBeenCalledWith("mcpOAuthRefresh", expect.any(Promise));
+
+    trackSpy.mockRestore();
     stopMcpOAuthRefreshScheduler();
     jest.useRealTimers();
   });

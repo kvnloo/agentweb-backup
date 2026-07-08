@@ -17,6 +17,8 @@ jest.mock('../services/dripSequenceDb', () => ({
     advanceEnrollment: jest.fn(),
     snoozeEnrollment: jest.fn(),
     setEnrollmentLinkedInProviderId: jest.fn(),
+    claimEnrollment: jest.fn(),
+    releaseEnrollmentClaim: jest.fn(),
   },
 }));
 
@@ -87,6 +89,8 @@ beforeEach(() => {
   mockUserDb.getUserById.mockResolvedValue(baseUser as any);
   mockEmailEventsDb.getEventsByEmailDomainAndLeadEmail.mockResolvedValue([]);
   (require('../services/settingsService').settingsService.getSetting as jest.Mock).mockResolvedValue(null);
+  mockDripSequenceDb.claimEnrollment.mockResolvedValue(true);
+  mockDripSequenceDb.releaseEnrollmentClaim.mockResolvedValue(undefined as any);
 });
 
 describe('dripSequenceWorker - custom field substitution', () => {
