@@ -280,8 +280,12 @@ describe("getUserTokenAllowance - cost allowance", () => {
   });
 });
 
-describe("checkTokenUsage - cost-based limit", () => {
-  it("blocks when monthly LLM cost reaches the cost allowance even though tokens are under limit", async () => {
+describe("checkTokenUsage - cost tracking (observe-only by default)", () => {
+  afterEach(() => {
+    delete process.env.ENFORCE_COST_CAP;
+  });
+
+  it("does NOT block on cost by default (enforcement off) but still surfaces cost usage", async () => {
     mockGetUserById.mockResolvedValue({
       userId: "u1",
       email: "a@b.com",
@@ -299,15 +303,40 @@ describe("checkTokenUsage - cost-based limit", () => {
     });
 
     const result = await checkTokenUsage("u1");
-    expect(result.allowed).toBe(false);
+    // Cost is at 100% but enforcement is off → user is NOT blocked...
+    expect(result.allowed).toBe(true);
+    // ...while cost is still tracked and surfaced for background data collection
     expect(result.costUsed).toBe(20.0);
     expect(result.costAllowance).toBe(20);
+    expect(result.costPercentUsed).toBe(100);
+    expect(result.percentUsed).toBe(10);
+  });
+
+  it("blocks on cost when ENFORCE_COST_CAP=true even though tokens are under limit", async () => {
+    process.env.ENFORCE_COST_CAP = "true";
+    mockGetUserById.mockResolvedValue({
+      userId: "u1",
+      email: "a@b.com",
+      tokenUsage: { month: currentMonth(), totalTokens: 10000, totalCost: 20.0, resetDate: "2026-05-01T00:00:00.000Z" },
+      tokenAllowanceBonus: 0,
+    });
+    mockGetUserSubscriptionType.mockResolvedValue("Basic");
+    mockGetSubscriptionTypeConfig.mockResolvedValue({
+      name: "Basic",
+      allowedPages: ["*"],
+      allowedSkills: ["*"],
+      monthlyTokenAllowance: 100000,
+      monthlyCostAllowance: 20,
+    });
+
+    const result = await checkTokenUsage("u1");
+    expect(result.allowed).toBe(false);
     expect(result.costPercentUsed).toBe(100);
     // token dimension alone would have allowed the request
     expect(result.percentUsed).toBe(10);
   });
 
-  it("blocks purely on cost when token allowance is unlimited (Fable rollout scenario)", async () => {
+  it("does NOT block purely on cost by default even when token allowance is unlimited (Fable rollout scenario)", async () => {
     mockGetUserById.mockResolvedValue({
       userId: "u1",
       email: "a@b.com",
@@ -324,13 +353,58 @@ describe("checkTokenUsage - cost-based limit", () => {
     });
 
     const result = await checkTokenUsage("u1");
-    expect(result.allowed).toBe(false);
+    expect(result.allowed).toBe(true);
     expect(result.effectiveAllowance).toBeNull();
     expect(result.percentUsed).toBe(0);
     expect(result.costPercentUsed).toBe(110);
   });
 
-  it("warns at 80% of the cost allowance", async () => {
+  it("blocks purely on cost when ENFORCE_COST_CAP=true and token allowance is unlimited", async () => {
+    process.env.ENFORCE_COST_CAP = "true";
+    mockGetUserById.mockResolvedValue({
+      userId: "u1",
+      email: "a@b.com",
+      tokenUsage: { month: currentMonth(), totalTokens: 5_000_000, totalCost: 55.0, resetDate: "2026-05-01T00:00:00.000Z" },
+      tokenAllowanceBonus: 0,
+    });
+    mockGetUserSubscriptionType.mockResolvedValue("Enterprise");
+    mockGetSubscriptionTypeConfig.mockResolvedValue({
+      name: "Enterprise",
+      allowedPages: ["*"],
+      allowedSkills: ["*"],
+      monthlyCostAllowance: 50,
+    });
+
+    const result = await checkTokenUsage("u1");
+    expect(result.allowed).toBe(false);
+    expect(result.effectiveAllowance).toBeNull();
+    expect(result.costPercentUsed).toBe(110);
+  });
+
+  it("does NOT surface a cost warning by default (observe-only), even above 80%", async () => {
+    mockGetUserById.mockResolvedValue({
+      userId: "u1",
+      email: "a@b.com",
+      tokenUsage: { month: currentMonth(), totalTokens: 1000, totalCost: 16.0, resetDate: "2026-05-01T00:00:00.000Z" },
+      tokenAllowanceBonus: 0,
+    });
+    mockGetUserSubscriptionType.mockResolvedValue("Basic");
+    mockGetSubscriptionTypeConfig.mockResolvedValue({
+      name: "Basic",
+      allowedPages: ["*"],
+      allowedSkills: ["*"],
+      monthlyTokenAllowance: 100000,
+      monthlyCostAllowance: 20,
+    });
+
+    const result = await checkTokenUsage("u1");
+    expect(result.allowed).toBe(true);
+    expect(result.warning).toBe(false);
+    expect(result.costPercentUsed).toBe(80);
+  });
+
+  it("surfaces a cost warning at 80% when ENFORCE_COST_CAP=true", async () => {
+    process.env.ENFORCE_COST_CAP = "true";
     mockGetUserById.mockResolvedValue({
       userId: "u1",
       email: "a@b.com",
