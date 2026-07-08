@@ -1,4 +1,4 @@
-import { getLinkedInCredentials, getLinkedInAdsSecrets, getMetaCredentials, getGmailCredentials, getYouTubeCredentials, getFathomCredentials, getClickUpCredentials, getHubSpotCredentials, getAttioCredentials, getGoogleAdsCredentials } from '../utils/secretsManager';
+import { getLinkedInCredentials, getLinkedInAdsSecrets, getMetaCredentials, getGmailCredentials, getYouTubeCredentials, getFathomCredentials, getClickUpCredentials, getHubSpotCredentials, getAttioCredentials, getGoogleAdsCredentials, getTwitterCredentials } from '../utils/secretsManager';
 import { MetaConfig } from '../types/meta';
 
 // Graph API version for Auth/Token exchange - decoupled from SDK version
@@ -180,6 +180,33 @@ export const INTEGRATION_CONFIG = {
     // ClickUp OAuth grants access to all workspaces the user has access to;
     // no explicit scopes are required in the authorization request.
     scopes: [] as string[],
+  },
+
+  twitter: {
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/twitter/callback`,
+    // offline.access is required to receive a refresh_token (access tokens expire ~2h).
+    // dm.read / dm.write require Elevated access in Twitter Developer Portal.
+    // follows.read/write required for follow/unfollow/list-followers/list-following actions.
+    // like.read/write required for like-tweet/unlike-tweet actions.
+    // bookmark.read/write required for bookmark/get-bookmarks actions.
+    scopes: [
+      'tweet.read',
+      'tweet.write',
+      'users.read',
+      'follows.read',
+      'follows.write',
+      'like.read',
+      'like.write',
+      'bookmark.read',
+      'bookmark.write',
+      'dm.read',
+      'dm.write',
+      'block.read',
+      'block.write',
+      'mute.read',
+      'mute.write',
+      'offline.access',
+    ],
   },
 
   linkedinAds: {
@@ -631,3 +658,4 @@ export async function getAttioConfig(): Promise<AttioOAuthConfig> {
   attioConfigCacheExpiresAt = Date.now() + ATTIO_CONFIG_CACHE_TTL_MS;
   return cachedAttioConfig;
 }
+
