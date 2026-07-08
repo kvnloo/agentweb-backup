@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  checks: read
   pull-requests: write
   id-token: write
 
@@ -162,10 +163,48 @@ jobs:
               );
             }
 
+  greptile-review:
+    name: Require Greptile Review
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for Greptile review check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          for attempt in {1..60}; do
+            check_json="$(gh api "repos/${REPO}/commits/${SHA}/check-runs?check_name=Greptile%20Review" --jq '.check_runs[0] // empty')"
+
+            if [ -n "$check_json" ]; then
+              status="$(printf '%s' "$check_json" | jq -r '.status')"
+              conclusion="$(printf '%s' "$check_json" | jq -r '.conclusion // ""')"
+              echo "Greptile Review status=${status} conclusion=${conclusion:-pending} attempt=${attempt}"
+
+              if [ "$status" = "completed" ]; then
+                if [ "$conclusion" = "success" ]; then
+                  exit 0
+                fi
+                echo "Greptile Review completed with conclusion=${conclusion}"
+                exit 1
+              fi
+            else
+              echo "Waiting for Greptile Review check attempt=${attempt}"
+            fi
+
+            sleep 20
+          done
+
+          echo "Greptile Review did not complete within 20 minutes."
+          exit 1
+
   backend-staging-deploy:
     name: Backend deploy to staging (after tests pass)
-    needs: [detect-changes, backend-tests-a, backend-tests-b]
-    if: needs.detect-changes.outputs.backend == 'true' && needs.backend-tests-a.result == 'success' && needs.backend-tests-b.result == 'success'
+    needs: [detect-changes, backend-tests-a, backend-tests-b, greptile-review]
+    if: needs.detect-changes.outputs.backend == 'true' && needs.backend-tests-a.result == 'success' && needs.backend-tests-b.result == 'success' && needs.greptile-review.result == 'success'
     runs-on: ubuntu-latest
     environment: staging
     steps:
