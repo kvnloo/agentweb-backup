@@ -120,6 +120,63 @@ describe('fileUserIssue — bug (private own-card + one canonical listing affect
   });
 });
 
+describe('fileUserIssue — bug priority mapping (ENG-231: stated priority becomes the Linear field, blended with the funnel tier)', () => {
+  const realFlag = process.env.FEATUREBASE_INTAKE;
+  beforeEach(() => {
+    process.env.FEATUREBASE_INTAKE = 'true';
+    linear.listOpenBugCanonicals.mockResolvedValue([]);
+    dedup.findDuplicate.mockResolvedValue(null);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
+    fb.createTicket.mockResolvedValue({ id: 'tk', number: 7, url: 'https://fb/t/7' });
+  });
+  afterEach(() => {
+    process.env.FEATUREBASE_INTAKE = realFlag;
+    jest.clearAllMocks();
+  });
+
+  it('stated High -> priority field 2, still Todo + default assignee (no-rot defaults hold)', async () => {
+    await fileUserIssue({ type: 'bug', title: 'crash', description: 'd', userEmail: 'u@e.com', priority: 'High' });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({
+      priority: 2,
+      stateName: 'Todo',
+      assigneeId: expect.any(String),
+    }));
+  });
+
+  it('stated Urgent -> priority field 1', async () => {
+    await fileUserIssue({ type: 'bug', title: 'down', description: 'd', userEmail: 'u@e.com', priority: 'Urgent' });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({ priority: 1 }));
+  });
+
+  it('stated Low never downgrades below the funnel-tier default (unknown funnel -> Medium 3)', async () => {
+    await fileUserIssue({ type: 'bug', title: 'nit', description: 'd', userEmail: 'u@e.com', priority: 'low' });
+    expect(linear.createInternalLinearIssue.mock.calls[0][0].priority).toBe(3);
+  });
+
+  it('funnel tier wins upward over a weaker stated priority (Retention + stated Medium -> Urgent 1)', async () => {
+    await fileUserIssue({ type: 'bug', title: 'crash', description: 'd', userEmail: 'u@e.com', priority: 'Medium', funnelStatus: 'paid_retention_handoff' });
+    expect(linear.createInternalLinearIssue.mock.calls[0][0].priority).toBe(1);
+  });
+
+  it('no stated priority -> funnel default (Medium 3), never "No priority"', async () => {
+    await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'u@e.com' });
+    expect(linear.createInternalLinearIssue.mock.calls[0][0].priority).toBe(3);
+  });
+
+  it('unrecognized priority text -> funnel default (Medium 3), does not crash', async () => {
+    await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'u@e.com', priority: 'ASAP!!' });
+    expect(linear.createInternalLinearIssue.mock.calls[0][0].priority).toBe(3);
+  });
+
+  it('grouped onto an existing canonical -> no new issue; the blended priority feeds the raise-only triage upgrade', async () => {
+    linear.listOpenBugCanonicals.mockResolvedValue([{ identifier: 'ENG-5', issueId: 'uuid-5', title: 'crash', description: 'x' }]);
+    dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-5', title: 'crash', description: 'x' });
+    await fileUserIssue({ type: 'bug', title: 'crash', description: 'd', userEmail: 'u@e.com', priority: 'High' });
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(linear.raiseIssueTriage).toHaveBeenCalledWith('uuid-5', expect.objectContaining({ priority: 2 }));
+  });
+});
+
 describe('intakeService.notifyCanonicalResolved (resolve bridge)', () => {
   const { notifyCanonicalResolved } = require('../services/intakeService');
   afterEach(() => jest.clearAllMocks());

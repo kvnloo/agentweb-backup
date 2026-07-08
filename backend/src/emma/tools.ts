@@ -478,6 +478,191 @@ For target person identification (send-invite, send-message, get-profile, update
 });
 
 emmaToolRegistry.register({
+  name: 'twitter_manage_post',
+  definition: {
+    name: 'twitter_manage_post',
+    description: `Manage X (Twitter) tweet interactions. ⚠️ NEVER use this tool to post a single new tweet — use post_on_connected_account for that. This tool is for: multi-tweet threads (2+ tweets), replies, quote-tweets, deletes, likes, retweets, and analytics. NOTE: X's public API does not support editing tweets — there is no edit action; to fix a mistake, delete_tweet and post a new one.
+
+To find the account_id, call list_connected_accounts(platform='twitter'). account_id is optional when the user has exactly one X account connected.
+
+Actions:
+- reply: Reply to an existing tweet. Requires text and in_reply_to_tweet_id.
+- post_thread: Post a NEW chain of 2 or more tweets in sequence. Requires tweets array with MINIMUM 2 entries — if you only have 1 tweet, use post_on_connected_account instead. Each entry auto-trimmed to 280 chars.
+- quote_tweet: Quote-tweet a tweet with added commentary. Requires text and tweet_id.
+- delete_tweet: Delete a tweet you authored. Requires tweet_id. CRITICAL: Always get explicit user approval before deleting.
+- like: Like a tweet. Requires tweet_id.
+- unlike: Remove a like from a tweet. Requires tweet_id.
+- retweet: Retweet a tweet. Requires tweet_id.
+- unretweet: Undo a retweet. Requires tweet_id.
+- get_tweet_metrics: Fetch public engagement metrics (retweets, replies, likes, quotes, impressions, bookmarks) for one or more tweets. Requires tweet_ids array.
+- list_replies: List replies to a tweet (searches last 7 days). Requires tweet_id. Optional max_results (default 10, max 100).
+- get_retweeters: List users who retweeted a tweet. Requires tweet_id.
+- get_liking_users: List users who liked a tweet. Requires tweet_id.
+- get_quote_tweets: List quote tweets of a tweet. Requires tweet_id. Optional max_results.
+
+For CRM logging of sent tweets, optionally pass list_id, lead_id and lead_email.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: [
+            'reply', 'post_thread', 'quote_tweet',
+            'delete_tweet',
+            'like', 'unlike', 'retweet', 'unretweet',
+            'get_tweet_metrics', 'list_replies',
+            'get_retweeters', 'get_liking_users', 'get_quote_tweets',
+          ],
+          description: 'The X post action to perform.'
+        },
+        account_id: {
+          type: 'string',
+          description: "The connected X account ID. Optional when the user has exactly one X account connected. Obtain via list_connected_accounts(platform='twitter')."
+        },
+        text: {
+          type: 'string',
+          description: 'Tweet text. Required for reply, quote_tweet. Auto-trimmed to 280 chars on a word boundary.'
+        },
+        tweet_id: {
+          type: 'string',
+          description: 'Tweet ID. Required for delete_tweet, like, unlike, retweet, unretweet, quote_tweet, list_replies, get_retweeters, get_liking_users, get_quote_tweets.'
+        },
+        in_reply_to_tweet_id: {
+          type: 'string',
+          description: 'ID of the tweet being replied to. Required for reply.'
+        },
+        tweets: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of tweet texts for post_thread, posted as a chained thread in order.'
+        },
+        max_results: {
+          type: 'number',
+          description: 'Maximum results to return. Optional for list_replies and get_quote_tweets (default 10, max 100).'
+        },
+        tweet_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of tweet IDs to fetch metrics for. Required for get_tweet_metrics.'
+        },
+        list_id: {
+          type: 'string',
+          description: 'CRM lead list ID. Optional — provide with lead_id and lead_email to log the sent tweet to CRM history.'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'CRM lead ID. Optional — provide with list_id and lead_email for CRM logging.'
+        },
+        lead_email: {
+          type: 'string',
+          description: 'CRM lead email. Optional — provide with list_id and lead_id for CRM logging.'
+        }
+      },
+      required: ['action']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) {
+      throw new Error("Missing user context");
+    }
+    return await agentModeService.twitterManagePost(context.userId, args);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'twitter_outreach',
+  definition: {
+    name: 'twitter_outreach',
+    description: `Manage X (Twitter) people and outreach interactions using a connected X account. Use this for profile lookup, follows, DMs, user search, bookmarks, and account management (block/mute).
+
+To find the account_id, call list_connected_accounts(platform='twitter'). account_id is optional when the user has exactly one X account connected.
+
+Actions:
+- get_profile: Get an X user's public profile by handle. Requires handle.
+- follow: Follow a user by handle. Requires handle. CRITICAL: Always get explicit user approval before following.
+- unfollow: Unfollow a user by handle. Requires handle. CRITICAL: Always get explicit user approval before unfollowing.
+- list_followers: List followers of the connected account (or another user if handle is provided).
+- list_following: List accounts the connected account follows (or another user if handle is provided).
+- search_tweets: Search recent tweets by query. Requires query. Optional max_results (default 10, max 100).
+- get_user_tweets: Get recent tweets by a user. Requires handle. Optional max_results (default 10, max 100).
+- send_dm: Send a direct message. Requires handle and text. DM text over 10000 chars is auto-trimmed. CRITICAL: Always get explicit user approval before sending.
+- list_dms: List recent DM events for the connected account.
+- get_dm_conversation: Get DM history with a specific user. Requires handle.
+- bookmark: Bookmark a tweet. Requires tweet_id.
+- get_bookmarks: Retrieve the authenticated user's bookmarked tweets.
+- block: Block a user by handle. Requires handle. CRITICAL: Always get explicit user approval before blocking.
+- unblock: Unblock a user by handle. Requires handle. CRITICAL: Always get explicit user approval before unblocking.
+- mute: Mute a user by handle. Requires handle. CRITICAL: Always get explicit user approval before muting.
+- unmute: Unmute a user by handle. Requires handle. CRITICAL: Always get explicit user approval before unmuting.
+
+For CRM logging of sent DMs, optionally pass list_id, lead_id and lead_email.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: [
+            'get_profile', 'follow', 'unfollow', 'list_followers', 'list_following',
+            'search_tweets', 'get_user_tweets',
+            'send_dm', 'list_dms', 'get_dm_conversation',
+            'bookmark', 'get_bookmarks',
+            'block', 'unblock', 'mute', 'unmute',
+          ],
+          description: 'The X outreach action to perform.'
+        },
+        account_id: {
+          type: 'string',
+          description: "The connected X account ID. Optional when the user has exactly one X account connected. Obtain via list_connected_accounts(platform='twitter')."
+        },
+        text: {
+          type: 'string',
+          description: 'DM text. Required for send_dm. Auto-trimmed to 10000 chars on a word boundary.'
+        },
+        handle: {
+          type: 'string',
+          description: 'The @handle to look up or act on. Required for get_profile, follow, unfollow, send_dm, get_dm_conversation, get_user_tweets, block, unblock, mute, unmute. Optional for list_followers and list_following (defaults to own account).'
+        },
+        recipient_handle: {
+          type: 'string',
+          description: 'Alias for handle. Use when the context makes "recipient" clearer (e.g., send_dm).'
+        },
+        query: {
+          type: 'string',
+          description: 'Search query string. Required for search_tweets.'
+        },
+        tweet_id: {
+          type: 'string',
+          description: 'Tweet ID. Required for bookmark.'
+        },
+        max_results: {
+          type: 'number',
+          description: 'Maximum results to return. Optional for search_tweets and get_user_tweets (default 10, max 100).'
+        },
+        list_id: {
+          type: 'string',
+          description: 'CRM lead list ID. Optional — provide with lead_id and lead_email to log the sent DM to CRM history.'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'CRM lead ID. Optional — provide with list_id and lead_email for CRM logging.'
+        },
+        lead_email: {
+          type: 'string',
+          description: 'CRM lead email. Optional — provide with list_id and lead_id for CRM logging.'
+        }
+      },
+      required: ['action']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) {
+      throw new Error("Missing user context");
+    }
+    return await agentModeService.twitterOutreach(context.userId, args);
+  }
+});
+
+emmaToolRegistry.register({
   name: 'list_meta_ads_campaigns',
   definition: {
     name: 'list_meta_ads_campaigns',
@@ -3753,11 +3938,12 @@ emmaToolRegistry.register({
   name: 'post_on_connected_account',
   definition: {
     name: 'post_on_connected_account',
-    description: 'Create a post on a connected social media account. Supports LinkedIn, Instagram, and YouTube. For YouTube: this UPLOADS a video — you MUST provide a video URL in media_urls. The content becomes the video title (first 100 chars) and description. CRITICAL: Always review the post content with the user and get explicit approval before publishing to social media. IMPORTANT: The content parameter must contain the COMPLETE, FULL post text exactly as approved by the user. Never truncate, abbreviate, summarize, or use placeholders like "..." in the content.',
+    description: 'Create a post on a connected social media account. Supports LinkedIn, Instagram, YouTube, and X (Twitter). This is the ONLY tool for posting a new standalone tweet on X/Twitter — do NOT use twitter_manage_post for this. For YouTube: this UPLOADS a video — you MUST provide a video URL in media_urls. The content becomes the video title (first 100 chars) and description. For X (Twitter): content is trimmed to 280 characters on a word boundary. Provide either account_id OR platform — the tool auto-resolves to the matching account. CRITICAL: Always review the post content with the user and get explicit approval before publishing to social media. IMPORTANT: The content parameter must contain the COMPLETE, FULL post text exactly as approved by the user. Never truncate, abbreviate, summarize, or use placeholders like "..." in the content.',
     inputSchema: {
       type: 'object',
       properties: {
-        account_id: { type: 'string', description: 'The connected account ID' },
+        account_id: { type: 'string', description: 'The connected account ID. Optional — provide either account_id or platform, not both. Use account_id when the user has multiple accounts on the same platform.' },
+        platform: { type: 'string', enum: ['twitter', 'linkedin', 'instagram', 'youtube'], description: 'Platform to post on. Optional — use instead of account_id when the user has one account per platform. E.g. platform="twitter" to post a tweet.' },
         content: { type: 'string', description: 'The COMPLETE post text content. MUST include the full, untruncated text exactly as approved by the user. Do NOT abbreviate, summarize, or omit any part of the content. Include all paragraphs, hashtags, emojis, and formatting. Length limits depend on the specific platform. CRITICAL FOR LINKEDIN: LinkedIn does NOT render markdown. Never use **bold**, *italic*, - bullets, [links](url), or # headings — they appear as raw text. Use LinkedIn-native plain text: line breaks, unicode bullets (•), emojis for emphasis, and full URLs (LinkedIn auto-links them).' },
         media_urls: {
           type: 'array',
@@ -3765,11 +3951,11 @@ emmaToolRegistry.register({
           description: 'Optional URLs of images/videos to attach. REQUIRED for YouTube — must be a direct video file URL (e.g. .mp4). The video will be downloaded and uploaded to YouTube.'
         }
       },
-      required: ['account_id', 'content']
+      required: ['content']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls);
+    return await agentModeService.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform);
   }
 });
 
@@ -6918,6 +7104,9 @@ emmaToolRegistry.register({
             userName: user.displayName || user.email,
             reportedByAdmin: isDelegatedAdmin && adminEmail ? adminEmail : undefined,
             sessionId: context?.sessionId,
+            // Same value that lands as "Priority:" text in issueContext — the intake service
+            // maps it onto the Linear priority field so text and board agree (ENG-231).
+            priority: issue.priority,
             // Linear-side triage enrichment (ENG-187): stage labels + priority/state/assignee defaults.
             funnelStatus: user.funnelStatus,
             // External MCP clients (Claude Code etc.) are tagged distinctly so benchmark
@@ -8156,7 +8345,7 @@ emmaToolRegistry.register({
         },
         content: {
           type: 'string',
-          description: 'Content in markdown format. Write full markdown (# Heading 1, ## Heading 2, **bold**, *italic*, - bullet lists, 1. numbered lists, | tables |, ```code blocks```, > blockquotes, [text](url) links). Markdown is automatically converted to rich Google Docs formatting — do NOT flatten to plain text.',
+          description: 'Content in markdown format. Write full markdown (# Heading 1, ## Heading 2, **bold**, *italic*, - bullet lists, 1. numbered lists, | tables |, ```code blocks```, > blockquotes, [text](url) links). Markdown is automatically converted to rich Google Docs formatting — do NOT flatten to plain text. To style just one word/phrase without affecting the rest of the document (not the document-wide accent/font from style_options), use an inline style span: [text]{attr=value;flag;...}. Supported: color=blue or color=#ff0000 (text color), font=Verdana (font family — letters/spaces only, e.g. "Times New Roman"), underline (flag, no value), italic (flag), bold (flag). Combine multiple in one span with semicolons, e.g. [Phase 1]{color=yellow;font=Verdana;italic;underline}. Only use this when the user explicitly asks for specific word/line formatting, not proactively. This composes with heading markdown: writing "# [test 2]{color=blue}" makes that one heading big+bold (from the # itself) AND blue, without recoloring any other heading in the document — do NOT treat "make it a heading" and "color it" as mutually exclusive options; combine them in a single line for a "big, bold, and [color]" request on one specific item.',
         },
         folder_id: {
           type: 'string',
@@ -8214,7 +8403,7 @@ emmaToolRegistry.register({
   name: 'update_google_doc',
   definition: {
     name: 'update_google_doc',
-    description: 'Replace the entire content of an existing Google Doc with rich formatting. Content is written in markdown and automatically converted to rich Google Docs formatting — write full markdown, do NOT flatten to plain text. Use this to write revised content back to a Doc after the team has left comments and the user has approved edits. Accepts a Doc URL or file ID. BEHAVIOR: Just do it when the user has clearly asked for an update. Only ask for clarification if multiple Docs are in context and it\'s genuinely ambiguous which one to update.',
+    description: 'Replace the entire content of an existing Google Doc with rich formatting. Content is written in markdown and automatically converted to rich Google Docs formatting — write full markdown, do NOT flatten to plain text. Use this to write revised content back to a Doc after the team has left comments and the user has approved edits. Accepts a Doc URL or file ID. BEHAVIOR: this REPLACES THE WHOLE DOCUMENT. On the FIRST update_google_doc call in a conversation, warn the user first (e.g. "this will replace the entire doc\'s content — the previous version stays recoverable via File → Version History if needed. Want me to go ahead?") and wait for explicit confirmation before calling this tool — do NOT call it on the first ask. For any SUBSEQUENT update_google_doc call later in the SAME conversation (i.e. you already asked and the user confirmed once before), do not ask again — just call it directly, but still briefly mention afterward that the previous version is recoverable via File → Version History, every time. STYLING: unlike create_google_doc, an update defaults to leaving the doc\'s existing visual decoration alone (headings/bullets/tables still render properly, just without imposed colors/fonts) — only pass plain=false or style_options when the user explicitly asks for the doc to be restyled/colorized.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -8224,7 +8413,7 @@ emmaToolRegistry.register({
         },
         content: {
           type: 'string',
-          description: 'New content in markdown format (replaces all existing content). Write full markdown — it is automatically converted to rich Google Docs formatting. Do NOT flatten to plain text.',
+          description: 'New content in markdown format (replaces all existing content). Write full markdown — it is automatically converted to rich Google Docs formatting. Do NOT flatten to plain text. To style just one word/phrase without affecting the rest of the document (not the document-wide accent/font from style_options), use an inline style span: [text]{attr=value;flag;...}. Supported: color=blue or color=#ff0000 (text color), font=Verdana (font family — letters/spaces only, e.g. "Times New Roman"), underline (flag, no value), italic (flag), bold (flag). Combine multiple in one span with semicolons, e.g. [Phase 1]{color=yellow;font=Verdana;italic;underline}. Only use this when the user explicitly asks for specific word/line formatting, not proactively. This composes with heading markdown: writing "# [test 2]{color=blue}" makes that one heading big+bold (from the # itself) AND blue, without recoloring any other heading in the document — do NOT treat "make it a heading" and "color it" as mutually exclusive options; combine them in a single line for a "big, bold, and [color]" request on one specific item.',
         },
         plain: {
           type: 'boolean',
@@ -8247,7 +8436,9 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
-    const style = args.plain === true ? 'plain' : 'styled';
+    // Unlike create (styled by default), an update defaults to leaving the doc's existing
+    // look alone — only restyle when the user explicitly asked (plain: false) or gave style_options.
+    const style = args.plain === true ? 'plain' : (args.plain === false || args.style_options) ? 'styled' : 'plain';
     const so = args.style_options;
     const styleOptions = so ? { primaryColor: so.primary_color, fontFamily: so.font_family, fontSize: so.font_size, lineHeight: so.line_height, compact: so.compact } : undefined;
     return agentModeService.updateGoogleDoc(args.url_or_id, args.content, context.userId, style, styleOptions);

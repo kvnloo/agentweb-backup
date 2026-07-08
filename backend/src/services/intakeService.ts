@@ -87,7 +87,18 @@ export interface FileUserIssueParams {
   /** Tags + context for the Notion path (flag off). */
   notionTags?: string[];
   notionContext?: Record<string, any>;
+  /**
+   * Reporter-stated priority (Urgent | High | Medium | Low, case-insensitive). Mapped onto the
+   * Linear priority FIELD so the description text and the board never disagree (ENG-231). Blended
+   * with the funnel-tier default: the more severe of the two wins, so a stated High/Urgent
+   * upgrades the tier and a stated Low never downgrades it.
+   */
+  priority?: string;
 }
+
+// Reporter-stated priority text -> Linear enum (1=Urgent, 2=High, 3=Medium, 4=Low). Unknown or
+// absent text contributes nothing — the funnel-tier default (ENG-187) then decides alone.
+const LINEAR_PRIORITY: Record<string, number> = { urgent: 1, high: 2, medium: 3, low: 4 };
 
 export interface FiledUserResult {
   pageId: string;       // Featurebase post id (or Notion pageId when the flag is off)
@@ -184,7 +195,10 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   // ("Status: <stage>" + coarse bucket) and sets the priority default. Linear-only — the stage
   // never reaches the Featurebase ticket or any reporter-facing surface.
   const stageTags = getUserFunnelStatusIssueTags(p.funnelStatus);
-  const priority = bugPriorityForFunnel(p.funnelStatus);
+  // Priority = the more severe of the funnel-tier default (ENG-187) and the reporter's stated
+  // priority (ENG-231): a stated High/Urgent upgrades the tier; a stated Low never downgrades it.
+  const stated = p.priority ? LINEAR_PRIORITY[p.priority.toLowerCase()] : undefined;
+  const priority = stated ? Math.min(bugPriorityForFunnel(p.funnelStatus), stated) : bugPriorityForFunnel(p.funnelStatus);
 
   // 1. The reporter's OWN private card. Body = their words (what THEY see). Propagates on failure.
   const ticket = await createTicket({ title: p.title, content: p.description, authorEmail: p.userEmail, authorName: p.userName });

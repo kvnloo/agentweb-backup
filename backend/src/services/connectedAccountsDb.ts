@@ -238,7 +238,20 @@ export interface GoogleDriveConfig extends BaseOAuthConfig {
   granted_scopes: string[];
 }
 
-export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig; // | TwitterConfig
+/**
+ * Twitter/X Configuration (official X API v2, OAuth2 Authorization Code + PKCE).
+ * Unlike LinkedIn outreach (Unipile sentinel token), X stores real per-user
+ * OAuth2 tokens and refreshes them server-side via the refresh_token.
+ */
+export interface TwitterXConfig extends BaseOAuthConfig {
+  account_type: 'personal';
+  twitter_user_id: string; // X numeric user id (used as DM participant id)
+  username: string;        // X handle without leading @
+  refresh_token: string;   // required — offline.access grants this; needed to refresh ~2h access tokens
+  needs_reconnect?: boolean; // set when token refresh fails (revoked/expired refresh token); cleared on reconnect
+}
+
+export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig;
 
 /**
  * Per-connection engagement memory: a persona profile generated from LinkedIn data

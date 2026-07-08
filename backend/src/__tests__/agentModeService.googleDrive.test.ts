@@ -1141,4 +1141,112 @@ describe('AgentModeService - Google Drive methods', () => {
       expect(mockDriveFiles.update).not.toHaveBeenCalled();
     });
   });
+
+  describe('inline style span — [text]{attr=value;flag;...}', () => {
+    it('renders a named color as a <span> around just that text', async () => {
+      await service.updateGoogleDoc('doc-id', '[Emma tested works]{color=blue} and the rest is untouched', USER_ID);
+      const html = mockDriveFiles.update.mock.calls[0][0].media?.body as string;
+      expect(html).toContain('<span style="color:blue">Emma tested works</span>');
+      expect(html).toContain('and the rest is untouched');
+    });
+
+    it('renders a hex color', async () => {
+      await service.updateGoogleDoc('doc-id', '[alert text]{color=#ff0000}', USER_ID);
+      const html = mockDriveFiles.update.mock.calls[0][0].media?.body as string;
+      expect(html).toContain('<span style="color:#ff0000">alert text</span>');
+    });
+
+    it('does not match and falls through to escaped literal text when the color value is empty', async () => {
+      await service.updateGoogleDoc('doc-id', '[text]{color=}', USER_ID);
+      const html = mockDriveFiles.update.mock.calls[0][0].media?.body as string;
+      expect(html).not.toContain('<span');
+      expect(html).toContain('[text]{color=}');
+    });
+
+    it('does not match and falls through to escaped literal text when malformed (missing closing brace)', async () => {
+      await service.updateGoogleDoc('doc-id', '[text]{color=blue', USER_ID);
+      const html = mockDriveFiles.update.mock.calls[0][0].media?.body as string;
+      expect(html).not.toContain('<span');
+      expect(html).toContain('[text]{color=blue');
+    });
+
+    it('rejects CSS/attribute injection attempts in the color value — only hex or plain color-name characters match', async () => {
+      await service.updateGoogleDoc(
+        'doc-id',
+        '[text]{color=red" onmouseover="alert(1)}',
+        USER_ID,
+      );
+      const html = mockDriveFiles.update.mock.calls[0][0].media?.body as string;
+      // The malformed value must not match the color-span pattern at all — it should
+      // fall through to plain escaped text, not produce a real <span> with a broken-out attribute.
+      expect(html).not.toContain('<span');
+      expect(html).toContain('&quot; onmouseover=&quot;');
+    });
+
+    it('works inside a heading — colors just the heading text, the <h1> tag itself already provides big+bold', async () => {
+      // Real user scenario: "make the heading 'test 2' big, bold, and blue" — big/bold come
+      // from the heading tag itself; only the color needs the inline span, and it must not
+      // recolor the document-wide heading accent (style_options.primary_color) to do it.
+      await service.updateGoogleDoc('doc-id', '# [test 2]{color=blue}\n\nRest of the doc unaffected.', USER_ID);
+      const html = mockDriveFiles.update.mock.calls[0][0].media?.body as string;
+      expect(html).toContain('<h1><span style="color:blue">test 2</span></h1>');
+    });
+
+    it('renders an underline flag alone', async () => {
+      await service.updateGoogleDoc('doc-id', '[text]{underline}', USER_ID);
+      const html = mockDriveFiles.update.mock.calls[0][0].media?.body as string;
+      expect(html).toContain('<span style="text-decoration:underline">text</span>');
+    });
+
+    it('renders an italic flag alone', async () => {
+      await service.updateGoogleDoc('doc-id', '[text]{italic}', USER_ID);
+      const html = mockDriveFiles.update.mock.calls[0][0].media?.body as string;
+      expect(html).toContain('<span style="font-style:italic">text</span>');
+    });
+
+    it('renders a bold flag alone', async () => {
+      await service.updateGoogleDoc('doc-id', '[text]{bold}', USER_ID);
+      const html = mockDriveFiles.update.mock.calls[0][0].media?.body as string;
+      expect(html).toContain('<span style="font-weight:700">text</span>');
+    });
+
+    it('renders a font-family attribute alone', async () => {
+      await service.updateGoogleDoc('doc-id', '[text]{font=Verdana}', USER_ID);
+      const html = mockDriveFiles.update.mock.calls[0][0].media?.body as string;
+      expect(html).toContain('<span style="font-family:Verdana">text</span>');
+    });
+
+    it('combines color, font, italic, and underline in one span — the real "italic, underline, Verdana, yellow" ask', async () => {
+      await service.updateGoogleDoc(
+        'doc-id',
+        '[Phase 1: Legal Document Updates]{color=yellow;font=Verdana;italic;underline}',
+        USER_ID,
+      );
+      const html = mockDriveFiles.update.mock.calls[0][0].media?.body as string;
+      expect(html).toContain(
+        '<span style="color:yellow;font-family:Verdana;font-style:italic;text-decoration:underline">Phase 1: Legal Document Updates</span>',
+      );
+    });
+
+    it('silently ignores an unrecognized attribute name while still applying the valid ones in the same span', async () => {
+      await service.updateGoogleDoc('doc-id', '[text]{font=Verdana;bogus=xyz}', USER_ID);
+      const html = mockDriveFiles.update.mock.calls[0][0].media?.body as string;
+      expect(html).toContain('<span style="font-family:Verdana">text</span>');
+      expect(html).not.toContain('bogus');
+    });
+
+    it('falls through to escaped literal text when no attribute in the braces is recognized at all', async () => {
+      await service.updateGoogleDoc('doc-id', '[text]{bogus=xyz}', USER_ID);
+      const html = mockDriveFiles.update.mock.calls[0][0].media?.body as string;
+      expect(html).not.toContain('<span');
+      expect(html).toContain('[text]{bogus=xyz}');
+    });
+
+    it('rejects a font-value injection attempt using only otherwise-allowed characters', async () => {
+      await service.updateGoogleDoc('doc-id', '[text]{font=Verdana;javascript=alert}', USER_ID);
+      const html = mockDriveFiles.update.mock.calls[0][0].media?.body as string;
+      expect(html).toContain('<span style="font-family:Verdana">text</span>');
+      expect(html).not.toContain('javascript=alert');
+    });
+  });
 });

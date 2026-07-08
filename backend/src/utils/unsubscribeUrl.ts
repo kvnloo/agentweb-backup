@@ -11,6 +11,7 @@
  */
 
 import { createHmac, timingSafeEqual } from 'crypto';
+import { getJwtSecret } from '../config/jwt';
 
 interface SignParams {
   baseUrl: string;
@@ -26,14 +27,6 @@ interface VerifyParams {
   sig: string;
 }
 
-function getSecret(): string {
-  const secret = process.env.JWT_SECRET;
-  if (!secret) {
-    throw new Error('JWT_SECRET is not configured — cannot sign/verify unsubscribe URLs');
-  }
-  return secret;
-}
-
 function normaliseEmail(email: string): string {
   return (email || '').trim().toLowerCase();
 }
@@ -43,7 +36,7 @@ function computeSignature(listId: string, leadId: string, email: string): string
   // case/whitespace differences between sign-time and verify-time don't
   // produce false negatives.
   const message = `${listId}:${leadId}:${normaliseEmail(email)}`;
-  return createHmac('sha256', getSecret()).update(message).digest('hex');
+  return createHmac('sha256', getJwtSecret()).update(message).digest('hex');
 }
 
 /**
