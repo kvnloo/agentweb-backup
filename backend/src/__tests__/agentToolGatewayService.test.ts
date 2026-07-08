@@ -1005,13 +1005,19 @@ describe('agentToolGatewayService', () => {
       }
     });
 
-    it('rejects LinkedIn send-invite notes over the conservative 200 character agent limit before dispatch', () => {
+    // ENG-243: an over-limit send-invite note must NOT be hard-rejected at the
+    // gateway. The send path (sendInvitation) resolves the account-tier limit
+    // (200 free / 300 Premium) and auto-trims the note on a word boundary, so a
+    // send never fails on length. Pre-rejecting here instead produced repeated
+    // invalid_args failures that tripped the anti-loop breaker and sent 0 invites.
+    it('does not reject LinkedIn send-invite notes over 200 chars — the tier-aware send path trims them', () => {
+      const overLimitNote = 'x'.repeat(201);
       const result = validateAndRepairToolArgs({
         toolName: 'linkedin_outreach',
         args: {
           action: 'send-invite',
           profile_url: 'https://www.linkedin.com/in/example/',
-          message: 'x'.repeat(201),
+          message: overLimitNote,
         },
         inputSchema: {
           type: 'object',
@@ -1025,17 +1031,12 @@ describe('agentToolGatewayService', () => {
         effect: 'external_send',
       });
 
-      expect(result.status).toBe('invalid');
-      if (result.status === 'invalid') {
-        expect(result.issues).toEqual(expect.arrayContaining([
-          expect.objectContaining({
-            code: 'invalid_args',
-            path: '$.message',
-          }),
-        ]));
-        expect(result.modelMessage).toContain('200 characters or fewer');
-        expect(result.modelMessage).toContain('201');
-      }
+      expect(result.status).toBe('valid');
+      // The note is passed through untouched so the tier-aware send path can trim
+      // it to the correct per-account limit (a free-tier gateway guess would
+      // needlessly clip a Premium account's 300-char allowance).
+      expect((result.args as Record<string, unknown>).message).toBe(overLimitNote);
+      expect(result.issues).toEqual([]);
     });
 
     it('allows LinkedIn send-message bodies over 200 characters because the invite-note limit is action-specific', () => {
