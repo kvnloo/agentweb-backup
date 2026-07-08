@@ -166,6 +166,7 @@ jobs:
   greptile-review:
     name: Require Greptile Review
     needs: detect-changes
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
       - name: Wait for Greptile review check
@@ -204,7 +205,7 @@ jobs:
   backend-staging-deploy:
     name: Backend deploy to staging (after tests pass)
     needs: [detect-changes, backend-tests-a, backend-tests-b, greptile-review]
-    if: needs.detect-changes.outputs.backend == 'true' && needs.backend-tests-a.result == 'success' && needs.backend-tests-b.result == 'success' && needs.greptile-review.result == 'success'
+    if: github.event.pull_request.draft == false && needs.detect-changes.outputs.backend == 'true' && needs.backend-tests-a.result == 'success' && needs.backend-tests-b.result == 'success' && needs.greptile-review.result == 'success'
     runs-on: ubuntu-latest
     environment: staging
     steps:

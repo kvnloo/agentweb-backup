@@ -1,6 +1,5 @@
 {
   "triggerOnUpdates": true,
-  "triggerOnDrafts": true,
   "statusCheck": true,
   "fixWithAI": true
 }
