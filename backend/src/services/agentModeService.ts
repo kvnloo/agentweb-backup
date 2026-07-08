@@ -7632,7 +7632,7 @@ export class AgentModeService {
   }
 
   // Update user's market strategy
-  public async updateMarketStrategy(updateData: any, userId: string): Promise<any> {
+  public async updateMarketStrategy(updateData: any, userId: string, opts: { replace?: boolean } = {}): Promise<any> {
     try {
       const { userDb, orgDb } = await import('./db');
       const { canEditItem } = await import('./orgShareService');
@@ -7672,8 +7672,12 @@ export class AgentModeService {
       // Extract market strategy fields from updateData
       const { businessOverview, competitors, icp, ...otherFields } = updateData;
 
-      // Merge competitors by name - preserve existing entries, update or add new ones
-      let mergedCompetitors = [...(existingMarketStrategy?.competitors || [])];
+      // Merge competitors by name - preserve existing entries, update or add new ones.
+      // When opts.replace is set and a competitors array is provided, the provided
+      // list REPLACES the existing one wholesale (used by regenerate_market_strategy
+      // after the user has explicitly confirmed the regeneration). ENG-44.
+      const replaceCompetitors = opts.replace === true && competitors !== undefined && Array.isArray(competitors);
+      let mergedCompetitors = replaceCompetitors ? [] : [...(existingMarketStrategy?.competitors || [])];
       if (competitors !== undefined && Array.isArray(competitors)) {
         competitors.forEach(newCompetitor => {
           const existingIndex = mergedCompetitors.findIndex(existing =>
@@ -7692,8 +7696,10 @@ export class AgentModeService {
         });
       }
 
-      // Merge ICPs by title - preserve existing entries, update or add new ones
-      let mergedICP = [...(existingMarketStrategy?.icp || [])];
+      // Merge ICPs by title - preserve existing entries, update or add new ones.
+      // When opts.replace is set and an icp array is provided, REPLACE wholesale. ENG-44.
+      const replaceIcp = opts.replace === true && icp !== undefined && Array.isArray(icp);
+      let mergedICP = replaceIcp ? [] : [...(existingMarketStrategy?.icp || [])];
       if (icp !== undefined && Array.isArray(icp)) {
         icp.forEach(newICP => {
           const existingIndex = mergedICP.findIndex(existing =>
@@ -11365,8 +11371,8 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         existingBrand = initialBrandGuidelines;
       }
 
-      // Extract brandData and brandAssets from updateData
-      const { brandData, brandAssets, ...otherFields } = updateData;
+      // Extract brandData, brandAssets, and optional market-strategy refresh from updateData
+      const { brandData, brandAssets, refreshMarketStrategy, ...otherFields } = updateData;
 
       // Merge with existing brandData - only update provided fields
       const updatedBrandData = {
@@ -11490,6 +11496,10 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         await userDb.updateUser(userId, { brandGuidelines: updatedGuidelines });
       }
 
+      const marketStrategyRefresh = refreshMarketStrategy === true
+        ? await this.regenerateMarketStrategy(userId)
+        : undefined;
+
       // Onboarding v2 Phase 1: flip brand-build status to ready if we were
       // building. Best-effort; wrapped in try/catch so metrics failures don't
       // break the tool-call response path.
@@ -11520,11 +11530,23 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
 
       return {
         success: true,
-        message: 'Brand guidelines updated successfully',
+        message: marketStrategyRefresh?.success
+          ? 'Brand guidelines and market strategy updated successfully'
+          : 'Brand guidelines updated successfully',
         updatedFields,
         brandData: updatedBrandData,
         attachments: updatedAttachments,
         updatedAssets: updatedAssets, // Only the assets that were actually updated
+        ...(marketStrategyRefresh
+          ? {
+            marketStrategyRefresh: {
+              success: marketStrategyRefresh.success,
+              replaced: marketStrategyRefresh.replaced,
+              generated: marketStrategyRefresh.generated,
+              ...(marketStrategyRefresh.error ? { error: marketStrategyRefresh.error } : {}),
+            }
+          }
+          : {}),
         formattedContent
       };
     } catch (error) {
@@ -11533,6 +11555,100 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         success: false,
         message: 'Failed to update brand guidelines',
         error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Read the user's effective market strategy (org-level if the user belongs to
+   * an org, otherwise personal). Shared by the brand re-setup offer and the
+   * regenerate flow so both report the same "what exists today" counts. (ENG-44)
+   */
+  private async getExistingMarketStrategy(user: any): Promise<any> {
+    if (user?.orgId) {
+      const { orgDb } = await import('./db');
+      const org = await orgDb.getOrgById(user.orgId);
+      if (org && org.marketStrategy) return org.marketStrategy;
+    }
+    return user?.marketStrategy;
+  }
+
+  /**
+   * Regenerate the user's market strategy (ICPs + competitors) from their CURRENT
+   * brand guidelines, then REPLACE the existing ICPs/competitors (business overview
+   * is preserved). Composes the same generators the onboarding pipeline uses, so
+   * there is no new generation logic here. Destructive by design — the caller
+   * (Emma) must have explicit user confirmation before invoking. Returns the
+   * before/after counts. (ENG-44)
+   */
+  public async regenerateMarketStrategy(
+    userId: string,
+    deps: {
+      llm?: any;
+      webSearchFn?: any;
+    } = {},
+  ): Promise<any> {
+    try {
+      const { userDb } = await import('./db');
+      const {
+        extractIcpBrandContext,
+        generateIcpsForUser,
+        mapIcpResultToMarketStrategy,
+      } = await import('./onboardingIcpService');
+      const {
+        generateCompetitorStrategyForUser,
+        mapCompetitorResultToMarketStrategy,
+      } = await import('./onboardingCompetitorService');
+
+      const user: any = await userDb.getUserById(userId);
+      if (!user) {
+        return { success: false, message: 'User not found', error: 'User not found' };
+      }
+
+      const brand = extractIcpBrandContext(user);
+      if (!brand.companyName && !brand.companyUrl) {
+        return {
+          success: false,
+          message:
+            'There are no brand guidelines to base a market strategy on yet. Set up the brand first, then regenerate the market strategy.',
+          error: 'Missing brand context',
+        };
+      }
+
+      // Count what we are about to replace (org-aware) BEFORE regenerating.
+      const existing = await this.getExistingMarketStrategy(user);
+      const replaced = {
+        competitors: Array.isArray(existing?.competitors) ? existing.competitors.length : 0,
+        icps: Array.isArray(existing?.icp) ? existing.icp.length : 0,
+      };
+
+      // Generate ICPs first, then competitors (competitors need the ICPs as input).
+      const personas = await generateIcpsForUser(brand, { llm: deps.llm }, userId);
+      let competitorResult: any = { per_icp: [] };
+      if (Array.isArray(personas) && personas.length > 0) {
+        competitorResult = await generateCompetitorStrategyForUser(brand, personas, deps);
+      }
+
+      const icp = mapIcpResultToMarketStrategy(personas);
+      const competitors = mapCompetitorResultToMarketStrategy(competitorResult);
+
+      // Persist via updateMarketStrategy with replace:true so org-vs-user routing,
+      // permission checks, and businessOverview preservation are all reused.
+      const writeResult = await this.updateMarketStrategy({ icp, competitors }, userId, { replace: true });
+      if (!writeResult.success) return writeResult;
+
+      return {
+        success: true,
+        message: `Market strategy regenerated to match the current brand. Replaced ${replaced.competitors} competitor(s) and ${replaced.icps} ICP(s) with ${competitors.length} new competitor(s) and ${icp.length} new ICP(s).`,
+        replaced,
+        generated: { competitors: competitors.length, icps: icp.length },
+      };
+    } catch (error) {
+      console.error('AgentMode: Error regenerating market strategy:', error);
+      return {
+        success: false,
+        message: 'Failed to regenerate market strategy',
+        error: error instanceof Error ? error.message : 'Unknown error',
       };
     }
   }
