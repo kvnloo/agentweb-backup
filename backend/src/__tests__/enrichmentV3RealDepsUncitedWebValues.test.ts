@@ -113,6 +113,32 @@ describe('classifyWebValues', () => {
     expect(r.arr?.grounding).toBe('grounded');
   });
 
+  it('KEEPS an unsourced aliased training-memory value as ai-knowledge when the model affirms (Meta = Facebook)', () => {
+    // No source URL and not grounded → the ai-knowledge branch decides keep-vs-drop.
+    // The token match is alias-blind (meta ≠ facebook), so before the fix this fell
+    // through to DROP even though __entity_matches_lead__=true. The ai-knowledge
+    // branch must honor the alias affirm too, consistent with the wrong-entity guard
+    // (ENG-122: don't lose confirmed training-memory data).
+    const source = 'Facebook is a social media company headquartered in Menlo Park, California.';
+    const r = classifyWebValues(
+      { funding_stage: fv('Series F') }, // no quote, no url, value not in source → memory
+      { source, leadCompany: 'Meta', claimedCompany: 'Facebook', claimedMatchesLead: true },
+    );
+    expect(r.funding_stage?.grounding).toBe('ai-knowledge');
+    expect(r.funding_stage?.value).toBe('Series F');
+  });
+
+  it('DROPS an unsourced aliased value when the model does NOT affirm (no ai-knowledge rescue)', () => {
+    // Same shape as above but without the affirm: token mismatch + no source + not
+    // grounded → wrong entity, dropped. Proves the rescue keys on the model signal.
+    const source = 'Facebook is a social media company headquartered in Menlo Park, California.';
+    const r = classifyWebValues(
+      { funding_stage: fv('Series F') },
+      { source, leadCompany: 'Meta', claimedCompany: 'Facebook' }, // no claimedMatchesLead
+    );
+    expect(r.funding_stage).toBeUndefined();
+  });
+
   it('DROPS a wrong-entity value when the model confirms a different company (__entity_matches_lead__ false)', () => {
     const source = 'Quill Meetings today announced $6.5 million in seed funding.';
     const r = classifyWebValues(
