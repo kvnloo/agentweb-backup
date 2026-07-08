@@ -199,6 +199,42 @@ describe('AgentModeController - landing-page timeout returns still-building (fla
     expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
   });
 
+  it('does NOT re-attach a completion hook when the in-flight build is already awaitingReconnect', async () => {
+    // Race guard: a prior timeout already bound a completion hook to build B (so its
+    // record comes back with awaitingReconnect: true). A second, unrelated generation in
+    // the same session that also times out must NOT re-attach — its genPromise resolves
+    // with different content and would win the exactly-once claimCompletion race,
+    // delivering the wrong content and dropping B's real link. Skipping the re-attach is
+    // observable here as markAwaitingReconnect NOT being called this time around.
+    mockWorkerService.runInWorker.mockRejectedValueOnce(timeoutError());
+    mockFindInFlight.mockResolvedValue({
+      id: 'page-in-flight',
+      userId: mockUserId,
+      originatingSessionId: mockSessionId,
+      status: 'generating',
+      name: 'Pulseboard',
+      createdAt: '2024-01-01T00:00:00Z',
+      awaitingReconnect: true, // a hook is already bound from the first timeout
+    } as any);
+
+    const res = makeRes();
+    await agentModeController.generateResponse(makeReq(mockSessionId, 'Now generate an image'), res);
+
+    // The user is still told it's building (the build genuinely is) — not hit with a 504.
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ stillBuilding: true, content: expect.stringContaining('still building') })
+    );
+    expect(res.status).not.toHaveBeenCalledWith(504);
+
+    // But the hook is NOT re-bound: no second markAwaitingReconnect, and the build is
+    // left running (not cancelled) so the original hook can still deliver B's real link.
+    expect(mockMarkAwaitingReconnect).not.toHaveBeenCalled();
+    expect(mockRequestCancel).not.toHaveBeenCalled();
+    expect(mockWorkerService.cancelSession).not.toHaveBeenCalled();
+
+    expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+  });
+
   it('still hard-fails (504) + cancels the orphan when NO landing build is in flight', async () => {
     mockWorkerService.runInWorker.mockRejectedValueOnce(timeoutError());
     mockFindInFlight.mockResolvedValue(null);
