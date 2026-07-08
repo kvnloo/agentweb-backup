@@ -646,16 +646,33 @@ router.get("/users", async (req, res) => {
     const users = await userDb.getAllUsers(hideBotLike);
     const sanitized = users.map(compactAdminUserForList);
 
-    // Batch-fetch org name + owner + analytics-sharing flag for users in an org
+    // Batch-fetch org name + owner + analytics-sharing flag for users in an org.
+    // Also capture the owner's subscription tier so org members can inherit it
+    // for display (ENG-237): a member's own subscriptionType is not updated when
+    // the org owner upgrades, so showing it raw renders paid members as "Free".
+    const subscriptionByUserId = new Map<string, string | undefined>(
+      users.map((u: any) => [u.userId, u.subscriptionType])
+    );
     const orgIds = [...new Set(sanitized.filter((u: any) => u.orgId).map((u: any) => u.orgId as string))];
-    const orgMap: Record<string, { name: string; ownerUserId: string; shareAnalyticsWithOrg: boolean }> = {};
+    const orgMap: Record<string, { name: string; ownerUserId: string; shareAnalyticsWithOrg: boolean; ownerSubscriptionType?: string }> = {};
     await Promise.all(
       orgIds.map(async (orgId) => {
         const org = await orgDb.getOrgById(orgId).catch(() => null);
-        if (org) orgMap[orgId] = {
+        if (!org) return;
+        // Prefer the owner already loaded in the user list; fall back to a direct
+        // fetch if the owner was filtered out (e.g. bot-like hiding).
+        let ownerSubscriptionType: string | undefined;
+        if (subscriptionByUserId.has(org.ownerUserId)) {
+          ownerSubscriptionType = subscriptionByUserId.get(org.ownerUserId) ?? undefined;
+        } else {
+          const owner = await userDb.getUserById(org.ownerUserId).catch(() => null);
+          ownerSubscriptionType = owner?.subscriptionType ?? undefined;
+        }
+        orgMap[orgId] = {
           name: org.name,
           ownerUserId: org.ownerUserId,
           shareAnalyticsWithOrg: !!(org.shareSettings?.analytics?.enabled ?? org.shareAnalyticsWithOrg),
+          ownerSubscriptionType,
         };
       })
     );
@@ -665,6 +682,15 @@ router.get("/users", async (req, res) => {
         user.orgName = orgInfo.name;
         user.isOrgOwner = orgInfo.ownerUserId === user.userId;
         user.orgShareAnalyticsWithOrg = orgInfo.shareAnalyticsWithOrg;
+        // Members inherit the org owner's tier. Only override when the owner is on
+        // a real (truthy, non-"Free") tier so we never downgrade a member.
+        if (
+          !user.isOrgOwner &&
+          orgInfo.ownerSubscriptionType &&
+          orgInfo.ownerSubscriptionType !== "Free"
+        ) {
+          user.subscriptionType = orgInfo.ownerSubscriptionType;
+        }
       }
     }
 
