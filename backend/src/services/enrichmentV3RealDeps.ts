@@ -576,7 +576,14 @@ export function classifyWebValues(
       grounding = 'grounded';
     } else if (typeof entry.sourceUrl === 'string' && entry.sourceUrl.trim()) {
       grounding = 'web-unverified';
-    } else if (companyNameMatches(opts.leadCompany, opts.claimedCompany)) {
+    } else if (
+      companyNameMatches(opts.leadCompany, opts.claimedCompany) ||
+      opts.claimedMatchesLead === true
+    ) {
+      // Training-memory value (no source URL) whose company is confirmed — by the
+      // token match OR the model's alias-aware affirm. Keep it, badged
+      // ai-knowledge, rather than drop (ENG-122: don't lose training-memory data;
+      // and stay alias-consistent with the wrong-entity guard, e.g. "Meta"="Facebook").
       grounding = 'ai-knowledge';
     } else {
       console.warn(
