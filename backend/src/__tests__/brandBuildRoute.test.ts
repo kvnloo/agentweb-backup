@@ -147,6 +147,45 @@ describe("GET /api/onboarding/brand-build/status", () => {
     expect(res.body.status.inFlight).toBe(false);
   });
 
+  it("auto-fails a build stuck in 'building' past the hard timeout and returns a retryable failed snapshot", async () => {
+    // Orphaned background job (deploy/crash) — brandBuildStatus never left
+    // 'building'. Started long ago so it is well past the hard watchdog wall.
+    userDb.getUserById
+      .mockResolvedValueOnce({
+        userId: "user-1",
+        brandBuildStatus: "building",
+        brandBuildStartedAt: "2020-01-01T00:00:00.000Z",
+      })
+      .mockResolvedValueOnce({
+        userId: "user-1",
+        brandBuildStatus: "failed",
+        brandBuildError: "Brand build timed out",
+      });
+    userDb.updateUser.mockResolvedValue({ userId: "user-1" });
+    const spy = jest.spyOn(console, "log").mockImplementation(() => {});
+    const res = await request(app).get("/api/onboarding/brand-build/status");
+    expect(res.status).toBe(200);
+    expect(userDb.updateUser).toHaveBeenCalledWith(
+      "user-1",
+      expect.objectContaining({ brandBuildStatus: "failed" })
+    );
+    expect(res.body.status.brandBuildStatus).toBe("failed");
+    spy.mockRestore();
+  });
+
+  it("does NOT auto-fail a build that is still within budget", async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      brandBuildStatus: "building",
+      brandBuildStartedAt: new Date().toISOString(), // just started
+    });
+    const res = await request(app).get("/api/onboarding/brand-build/status");
+    expect(res.status).toBe(200);
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+    expect(res.body.status.brandBuildStatus).toBe("building");
+    expect(res.body.status.inFlight).toBe(true);
+  });
+
   it("404s when the user record is missing", async () => {
     userDb.getUserById.mockResolvedValue(null);
     const res = await request(app).get("/api/onboarding/brand-build/status");
