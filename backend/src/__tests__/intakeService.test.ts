@@ -17,16 +17,19 @@ jest.mock('../services/linearService', () => ({
   listOpenBugCanonicals: jest.fn().mockResolvedValue([]),
   createInternalLinearIssue: jest.fn(),
   addIssueComment: jest.fn(),
+  raiseIssueTriage: jest.fn(),
   listOpenIssuesByLabel: jest.fn(),
   getIssueComments: jest.fn(),
 }));
 jest.mock('../services/resendService', () => ({ resendService: { sendSystemEmail: jest.fn() } }));
+jest.mock('../services/shipNotifyService', () => ({ notifyReporterShipped: jest.fn().mockResolvedValue('sent') }));
 
 const notion = require('../services/notionService');
 const dedup = require('../services/dedupService');
 const fb = require('../services/featurebaseService');
 const linear = require('../services/linearService');
 const resend = require('../services/resendService').resendService;
+const shipNotify = require('../services/shipNotifyService');
 
 describe('fileUserIssue — flag off', () => {
   const realFlag = process.env.FEATUREBASE_INTAKE;
@@ -117,6 +120,63 @@ describe('fileUserIssue — bug (private own-card + one canonical listing affect
   });
 });
 
+describe('fileUserIssue — bug priority mapping (ENG-231: stated priority becomes the Linear field, blended with the funnel tier)', () => {
+  const realFlag = process.env.FEATUREBASE_INTAKE;
+  beforeEach(() => {
+    process.env.FEATUREBASE_INTAKE = 'true';
+    linear.listOpenBugCanonicals.mockResolvedValue([]);
+    dedup.findDuplicate.mockResolvedValue(null);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
+    fb.createTicket.mockResolvedValue({ id: 'tk', number: 7, url: 'https://fb/t/7' });
+  });
+  afterEach(() => {
+    process.env.FEATUREBASE_INTAKE = realFlag;
+    jest.clearAllMocks();
+  });
+
+  it('stated High -> priority field 2, still Todo + default assignee (no-rot defaults hold)', async () => {
+    await fileUserIssue({ type: 'bug', title: 'crash', description: 'd', userEmail: 'u@e.com', priority: 'High' });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({
+      priority: 2,
+      stateName: 'Todo',
+      assigneeId: expect.any(String),
+    }));
+  });
+
+  it('stated Urgent -> priority field 1', async () => {
+    await fileUserIssue({ type: 'bug', title: 'down', description: 'd', userEmail: 'u@e.com', priority: 'Urgent' });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({ priority: 1 }));
+  });
+
+  it('stated Low never downgrades below the funnel-tier default (unknown funnel -> Medium 3)', async () => {
+    await fileUserIssue({ type: 'bug', title: 'nit', description: 'd', userEmail: 'u@e.com', priority: 'low' });
+    expect(linear.createInternalLinearIssue.mock.calls[0][0].priority).toBe(3);
+  });
+
+  it('funnel tier wins upward over a weaker stated priority (Retention + stated Medium -> Urgent 1)', async () => {
+    await fileUserIssue({ type: 'bug', title: 'crash', description: 'd', userEmail: 'u@e.com', priority: 'Medium', funnelStatus: 'paid_retention_handoff' });
+    expect(linear.createInternalLinearIssue.mock.calls[0][0].priority).toBe(1);
+  });
+
+  it('no stated priority -> funnel default (Medium 3), never "No priority"', async () => {
+    await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'u@e.com' });
+    expect(linear.createInternalLinearIssue.mock.calls[0][0].priority).toBe(3);
+  });
+
+  it('unrecognized priority text -> funnel default (Medium 3), does not crash', async () => {
+    await fileUserIssue({ type: 'bug', title: 'x', description: 'd', userEmail: 'u@e.com', priority: 'ASAP!!' });
+    expect(linear.createInternalLinearIssue.mock.calls[0][0].priority).toBe(3);
+  });
+
+  it('grouped onto an existing canonical -> no new issue; the blended priority feeds the raise-only triage upgrade', async () => {
+    linear.listOpenBugCanonicals.mockResolvedValue([{ identifier: 'ENG-5', issueId: 'uuid-5', title: 'crash', description: 'x' }]);
+    dedup.findDuplicate.mockResolvedValue({ ref: 'ENG-5', title: 'crash', description: 'x' });
+    await fileUserIssue({ type: 'bug', title: 'crash', description: 'd', userEmail: 'u@e.com', priority: 'High' });
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(linear.raiseIssueTriage).toHaveBeenCalledWith('uuid-5', expect.objectContaining({ priority: 2 }));
+  });
+});
+
 describe('intakeService.notifyCanonicalResolved (resolve bridge)', () => {
   const { notifyCanonicalResolved } = require('../services/intakeService');
   afterEach(() => jest.clearAllMocks());
@@ -166,6 +226,41 @@ describe('intakeService.notifyCanonicalResolved (resolve bridge)', () => {
     const r = await notifyCanonicalResolved('issue-uuid');
     expect(r.ticketNumbers).toEqual([11]); // 10 failed, 11 succeeded
     expect(fb.patchTicketStatus).toHaveBeenCalledWith(11, 'status-completed');
+  });
+
+  it('pings each reporter on Slack beside the email (kind bug, canonical id as the idempotency key)', async () => {
+    linear.getIssueComments.mockResolvedValue([
+      '[reporter-ticket #10 a@e.com] a',
+      '[reporter-ticket #11 b@e.com] b',
+    ]);
+    await notifyCanonicalResolved('issue-uuid', 'Save button crashes');
+    expect(shipNotify.notifyReporterShipped).toHaveBeenCalledWith(
+      expect.objectContaining({ email: 'a@e.com', itemId: 'issue-uuid', title: 'Save button crashes', kind: 'bug' }),
+    );
+    expect(shipNotify.notifyReporterShipped).toHaveBeenCalledWith(
+      expect.objectContaining({ email: 'b@e.com', kind: 'bug' }),
+    );
+    // Both notified: the EMAIL is still sent to each — Slack is additive, not a replacement.
+    expect(resend.sendSystemEmail).toHaveBeenCalledTimes(2);
+  });
+
+  it('Slack notifier blowing up does not block the email or the card flip', async () => {
+    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #10 a@e.com] a']);
+    // Pin the email mock: an earlier test installs a persistent per-address rejection
+    // via mockImplementation, which jest.clearAllMocks() does not remove.
+    resend.sendSystemEmail.mockImplementation(() => Promise.resolve());
+    shipNotify.notifyReporterShipped.mockRejectedValueOnce(new Error('slack down'));
+    const r = await notifyCanonicalResolved('issue-uuid', 'T');
+    expect(r.ticketNumbers).toEqual([10]);
+    expect(resend.sendSystemEmail).toHaveBeenCalledWith(expect.objectContaining({ to: 'a@e.com' }));
+    expect(fb.patchTicketStatus).toHaveBeenCalledWith(10, 'status-completed');
+  });
+
+  it('email failure does not suppress the Slack ping (channels are independent)', async () => {
+    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #10 a@e.com] a']);
+    resend.sendSystemEmail.mockRejectedValueOnce(new Error('resend down'));
+    await notifyCanonicalResolved('issue-uuid', 'T');
+    expect(shipNotify.notifyReporterShipped).toHaveBeenCalledWith(expect.objectContaining({ email: 'a@e.com' }));
   });
 });
 

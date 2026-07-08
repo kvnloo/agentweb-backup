@@ -231,7 +231,7 @@ export async function fetchSearchConsoleMetrics(userId: string, timeframe: strin
 
   const resolved = resolvedConfig ?? (await resolveAnalyticsConfig(user));
   if (!resolved.seoDomains || resolved.seoDomains.length === 0) {
-    return { message: "Google Search Console is not configured. Use the search_user_guide tool to find setup instructions and share them with the user." };
+    return { message: "Google Search Console is not configured. This is a self-serve setup, not a product bug — do not file a product issue. Guide the user to connect it in Settings → Analytics & SEO (/settings/analytics-seo): (1) in Google Search Console, open Settings → Users and permissions and add the AgentWeb service account email (shown on that page) with \"Full\" permission; (2) back in AgentWeb, add their domain (e.g. example.com, or https://example.com/ for a URL-prefix property) under \"SEO Domains\" and save. (If they belong to an organization and can't see that page, their org owner or an analytics editor must set it up.) You can use the search_user_guide tool for more detail." };
   }
 
   const accessToken = await getGoogleSearchConsoleAccessToken();
@@ -487,7 +487,7 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
   const resolved = resolvedConfig ?? (await resolveAnalyticsConfig(user));
   const gaProperties = resolved.properties;
   if (gaProperties.length === 0) {
-    return { message: "Google Analytics (GA4) is not configured. Use the search_user_guide tool to find setup instructions and share them with the user." };
+    return { message: "Google Analytics (GA4) is not configured. This is a self-serve setup, not a product bug — do not file a product issue. Guide the user to connect it in Settings → Analytics & SEO (/settings/analytics-seo): (1) in GA4, open Admin → Property Access Management and grant the AgentWeb service account email (shown on that page) \"Viewer\" access; (2) back in AgentWeb, add their numeric GA4 Property ID (e.g. 123456789) under \"Google Analytics\" and save, using \"Test\" to verify access. (If they belong to an organization and can't see that page, their org owner or an analytics editor must set it up.) You can use the search_user_guide tool for more detail." };
   }
 
   // Filter to a specific property if requested
@@ -626,27 +626,6 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
         ...(dimensionFilter && { dimensionFilter }),
       });
 
-      // Fetch traffic sources
-      const [trafficSourcesResponse] = await gaClient.runReport({
-        property: `properties/${propertyId}`,
-        dateRanges: [{ startDate: startDateStr, endDate: endDateStr }],
-        dimensions: [
-          { name: "sessionSource" },
-          { name: "sessionMedium" },
-        ],
-        metrics: [
-          { name: "sessions" },
-          { name: "activeUsers" },
-          { name: "screenPageViews" },
-          { name: "averageSessionDuration" },
-        ],
-        orderBys: [
-          { metric: { metricName: "sessions" }, desc: true },
-        ],
-        limit: 50,
-        ...(dimensionFilter && { dimensionFilter }),
-      });
-
       // Process overall metrics
       let totalSessions = 0;
       let totalUsers = 0;
@@ -686,7 +665,7 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
       }
       dailyData.sort((a, b) => a.date.localeCompare(b.date));
 
-      // Process traffic sources
+      // Fetch traffic sources and conversion breakdown in parallel
       interface TrafficSource {
         source: string;
         medium: string;
@@ -694,23 +673,100 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
         users: number;
         pageViews: number;
         avgSessionDuration: number;
+        conversions: number;
       }
 
-      const trafficSources: TrafficSource[] = [];
-      if (trafficSourcesResponse.rows) {
-        trafficSourcesResponse.rows.forEach((row) => {
-          const dimensions = row.dimensionValues || [];
-          const metrics = row.metricValues || [];
-          trafficSources.push({
-            source: dimensions[0]?.value || "(direct)",
-            medium: dimensions[1]?.value || "(none)",
-            sessions: parseInt(metrics[0]?.value || "0"),
-            users: parseInt(metrics[1]?.value || "0"),
-            pageViews: parseInt(metrics[2]?.value || "0"),
-            avgSessionDuration: parseFloat(metrics[3]?.value || "0"),
-          });
-        });
+      interface ConversionBySource {
+        source: string;
+        medium: string;
+        eventName: string;
+        conversions: number;
       }
+
+      const [trafficSources, conversionsBySource] = await Promise.all([
+        (async (): Promise<TrafficSource[]> => {
+          try {
+            const [trafficSourcesResponse] = await gaClient.runReport({
+              property: `properties/${propertyId}`,
+              dateRanges: [{ startDate: startDateStr, endDate: endDateStr }],
+              dimensions: [
+                { name: "sessionSource" },
+                { name: "sessionMedium" },
+              ],
+              metrics: [
+                { name: "sessions" },
+                { name: "activeUsers" },
+                { name: "screenPageViews" },
+                { name: "averageSessionDuration" },
+                { name: "conversions" },
+              ],
+              orderBys: [{ metric: { metricName: "sessions" }, desc: true }],
+              limit: 50,
+              ...(dimensionFilter && { dimensionFilter }),
+            });
+
+            const result: TrafficSource[] = [];
+            if (trafficSourcesResponse.rows) {
+              trafficSourcesResponse.rows.forEach((row) => {
+                const dimensions = row.dimensionValues || [];
+                const metrics = row.metricValues || [];
+                result.push({
+                  source: dimensions[0]?.value || "(direct)",
+                  medium: dimensions[1]?.value || "(none)",
+                  sessions: parseInt(metrics[0]?.value || "0"),
+                  users: parseInt(metrics[1]?.value || "0"),
+                  pageViews: parseInt(metrics[2]?.value || "0"),
+                  avgSessionDuration: parseFloat(metrics[3]?.value || "0"),
+                  conversions: parseInt(metrics[4]?.value || "0"),
+                });
+              });
+            }
+            return result;
+          } catch (trafficError: any) {
+            console.warn(`Error fetching traffic sources for property ${propertyId}:`, trafficError.message);
+            return [];
+          }
+        })(),
+
+        (async (): Promise<ConversionBySource[]> => {
+          try {
+            const [convBySourceResponse] = await gaClient.runReport({
+              property: `properties/${propertyId}`,
+              dateRanges: [{ startDate: startDateStr, endDate: endDateStr }],
+              dimensions: [
+                { name: "sessionSource" },
+                { name: "sessionMedium" },
+                { name: "eventName" },
+              ],
+              metrics: [{ name: "conversions" }],
+              orderBys: [{ metric: { metricName: "conversions" }, desc: true }],
+              limit: 100,
+              ...(dimensionFilter && { dimensionFilter }),
+            });
+
+            const result: ConversionBySource[] = [];
+            if (convBySourceResponse.rows) {
+              convBySourceResponse.rows.forEach((row) => {
+                const dimensions = row.dimensionValues || [];
+                const metrics = row.metricValues || [];
+                const conversions = parseInt(metrics[0]?.value || "0");
+                if (conversions > 0) {
+                  result.push({
+                    source: dimensions[0]?.value || "(direct)",
+                    medium: dimensions[1]?.value || "(none)",
+                    eventName: dimensions[2]?.value || "",
+                    conversions,
+                  });
+                }
+              });
+            }
+            return result;
+          } catch (convError: any) {
+            console.warn(`Error fetching conversions by source for property ${propertyId}:`, convError.message);
+            return [];
+          }
+        })(),
+      ]);
 
       return {
         propertyId,
@@ -722,6 +778,7 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
         bounceRate,
         dailyData,
         trafficSources: trafficSources.sort((a, b) => b.sessions - a.sessions).slice(0, 20),
+        conversionsBySource,
         topPagesByEngagement,
         dateRange: { startDate: startDateStr, endDate: endDateStr },
       };

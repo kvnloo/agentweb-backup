@@ -4,7 +4,7 @@ import { userDb, User } from './db';
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive';
 
 /**
  * Base OAuth configuration shared across all platforms
@@ -230,7 +230,28 @@ export interface GoogleAdsConfig extends BaseOAuthConfig {
   login_customer_id?: string;
 }
 
-export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig; // | TwitterConfig
+export interface GoogleDriveConfig extends BaseOAuthConfig {
+  account_type: 'oauth';
+  email: string;
+  display_name?: string;
+  picture_url?: string;
+  granted_scopes: string[];
+}
+
+/**
+ * Twitter/X Configuration (official X API v2, OAuth2 Authorization Code + PKCE).
+ * Unlike LinkedIn outreach (Unipile sentinel token), X stores real per-user
+ * OAuth2 tokens and refreshes them server-side via the refresh_token.
+ */
+export interface TwitterXConfig extends BaseOAuthConfig {
+  account_type: 'personal';
+  twitter_user_id: string; // X numeric user id (used as DM participant id)
+  username: string;        // X handle without leading @
+  refresh_token: string;   // required — offline.access grants this; needed to refresh ~2h access tokens
+  needs_reconnect?: boolean; // set when token refresh fails (revoked/expired refresh token); cleared on reconnect
+}
+
+export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig;
 
 /**
  * Per-connection engagement memory: a persona profile generated from LinkedIn data

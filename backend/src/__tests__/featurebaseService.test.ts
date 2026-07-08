@@ -1,12 +1,17 @@
+import jwt from 'jsonwebtoken';
 import {
+  signFeaturebaseIdentityJwt,
+  _resetCredentialsCache,
   addVoter,
   createPost,
   listOpenPosts,
+  findPostByTitle,
   addComment,
   getDefaultBoardId,
   _resetBoardCache,
   getCustomerTicketCategoryId,
   createTicket,
+  mdToFeaturebaseHtml,
   patchTicketStatus,
   getTicketStatusId,
   _resetTicketCategoryCache,
@@ -73,7 +78,9 @@ describe('featurebaseService', () => {
       expect(r).toEqual({ id: 'hex1', number: 12, url: 'https://fb/t/12' });
       const postCall = (global.fetch as jest.Mock).mock.calls.find((c) => String(c[0]).endsWith('/tickets'));
       const body = JSON.parse(postCall[1].body);
-      expect(body).toMatchObject({ ticketCategoryId: 'cat-bug', title: 't', content: 'd', author: { email: 'u@e.com', name: 'U' } });
+      expect(body).toMatchObject({ ticketCategoryId: 'cat-bug', title: 't', author: { email: 'u@e.com', name: 'U' } });
+      // Featurebase content is HTML — the reporter's markdown/plaintext is converted before send.
+      expect(body.content).toBe('<p>d</p>');
     });
 
     it('throws when the API does not return id+number', async () => {
@@ -105,6 +112,39 @@ describe('featurebaseService', () => {
     });
   });
 
+  describe('mdToFeaturebaseHtml', () => {
+    it('returns a synchronous string (no Promise)', () => {
+      const out = mdToFeaturebaseHtml('hello');
+      expect(typeof out).toBe('string');
+      expect(out).toBe('<p>hello</p>');
+    });
+
+    it('renders markdown headings, paragraphs, and lists as HTML block tags', () => {
+      const out = mdToFeaturebaseHtml('## Part 1\n\nIntro text.\n\n- a\n- b\n\n1. first\n2. second');
+      expect(out).toContain('<h2>Part 1</h2>');
+      expect(out).toContain('<p>Intro text.</p>');
+      expect(out).toContain('<ul>');
+      expect(out).toContain('<li>a</li>');
+      expect(out).toContain('<ol>');
+      expect(out).toContain('<li>first</li>');
+    });
+
+    it('turns blank-line-separated plaintext into separate paragraphs (the un-blobbed shape)', () => {
+      const out = mdToFeaturebaseHtml('Para one.\n\nPara two.');
+      expect((out.match(/<p>/g) || []).length).toBe(2);
+    });
+
+    it('preserves a single newline as a <br> (breaks:true — line breaks are intentional)', () => {
+      const out = mdToFeaturebaseHtml('line a\nline b');
+      expect(out).toContain('<br>');
+    });
+
+    it('returns empty string for empty/whitespace input', () => {
+      expect(mdToFeaturebaseHtml('')).toBe('');
+      expect(mdToFeaturebaseHtml('   \n  ')).toBe('');
+    });
+  });
+
   describe('createPost', () => {
     it('creates a post with integrations.linear:true + author, returns id + url', async () => {
       (global.fetch as any) = routed([{ id: 'board1', name: 'Feature Request' }], { id: 'post1', postUrl: 'https://fb/p/x' });
@@ -114,11 +154,26 @@ describe('featurebaseService', () => {
       const body = JSON.parse(postCall[1].body);
       expect(body).toMatchObject({
         title: 't',
-        content: 'd',
         boardId: 'board1',
         author: { email: 'u@e.com', name: 'U' },
         integrations: { linear: true },
       });
+      // Featurebase content is HTML — a bare description is wrapped in a block tag, not sent raw.
+      expect(body.content).toBe('<p>d</p>');
+    });
+
+    it('converts a markdown description into HTML block tags so structure survives the Linear push', async () => {
+      (global.fetch as any) = routed([{ id: 'board1', name: 'Feature Request' }], { id: 'post1', postUrl: 'https://fb/p/x' });
+      const md = '## Heading\n\nA paragraph.\n\n- one\n- two';
+      await createPost({ title: 't', description: md, authorEmail: 'u@e.com' });
+      const postCall = (global.fetch as jest.Mock).mock.calls.find((c) => String(c[0]).endsWith('/posts'));
+      const body = JSON.parse(postCall[1].body);
+      expect(body.content).toContain('<h2>Heading</h2>');
+      expect(body.content).toContain('<p>A paragraph.</p>');
+      expect(body.content).toContain('<li>one</li>');
+      expect(body.content).toContain('<li>two</li>');
+      // No bare newline-separated blob: the two list items are wrapped, not run together.
+      expect(body.content).not.toContain('- one');
     });
 
     it('throws when the API does not return a post id', async () => {
@@ -138,6 +193,55 @@ describe('featurebaseService', () => {
       });
       const posts = await listOpenPosts(10);
       expect(posts).toEqual([{ id: 'p1', title: 'Open one', description: 'desc1', url: 'u1' }]);
+    });
+  });
+
+  // ENG-187 contract #4 — the FB->Linear sync copies the post title onto the Linear issue, so the
+  // synced issue's title is the join key back to its post (and its author). Ambiguity must resolve
+  // to null: attributing the WRONG author's funnel stage is worse than no attribution.
+  describe('findPostByTitle', () => {
+    it('returns the unique exact-title match with its author email (fuzzy hits ignored)', async () => {
+      (global.fetch as any) = jest.fn(() => jsonRes({ data: [
+        { id: 'p1', title: 'Dark mode', author: { email: 'a@e.com' } },
+        { id: 'p2', title: 'Dark mode for emails', author: { email: 'b@e.com' } },
+      ] }));
+      const r = await findPostByTitle('Dark mode');
+      expect(r).toEqual({ id: 'p1', authorEmail: 'a@e.com' });
+      const url = String((global.fetch as jest.Mock).mock.calls[0][0]);
+      expect(url).toContain('/posts?q=Dark%20mode');
+    });
+
+    it('matches case/whitespace-insensitively (title may be normalized in transit)', async () => {
+      (global.fetch as any) = jest.fn(() => jsonRes({ data: [{ id: 'p1', title: '  Dark   Mode ', author: { email: 'a@e.com' } }] }));
+      const r = await findPostByTitle('dark mode');
+      expect(r).toEqual({ id: 'p1', authorEmail: 'a@e.com' });
+    });
+
+    it('falls back to getPost when the search result omits the author', async () => {
+      (global.fetch as any) = jest.fn((url: any) => String(url).includes('/posts/p1')
+        ? jsonRes({ id: 'p1', title: 'Dark mode', author: { email: 'a@e.com' } })
+        : jsonRes({ data: [{ id: 'p1', title: 'Dark mode' }] }));
+      const r = await findPostByTitle('Dark mode');
+      expect(r).toEqual({ id: 'p1', authorEmail: 'a@e.com' });
+    });
+
+    it('returns null on ZERO exact matches', async () => {
+      (global.fetch as any) = jest.fn(() => jsonRes({ data: [{ id: 'p2', title: 'Dark mode for emails', author: { email: 'b@e.com' } }] }));
+      expect(await findPostByTitle('Dark mode')).toBeNull();
+    });
+
+    it('returns null on MULTIPLE exact matches (never guess between two authors)', async () => {
+      (global.fetch as any) = jest.fn(() => jsonRes({ data: [
+        { id: 'p1', title: 'Dark mode', author: { email: 'a@e.com' } },
+        { id: 'p3', title: 'dark mode', author: { email: 'c@e.com' } },
+      ] }));
+      expect(await findPostByTitle('Dark mode')).toBeNull();
+    });
+
+    it('returns null for a blank title without calling the API', async () => {
+      (global.fetch as any) = jest.fn();
+      expect(await findPostByTitle('  ')).toBeNull();
+      expect(global.fetch).not.toHaveBeenCalled();
     });
   });
 
@@ -174,5 +278,40 @@ describe('featurebaseService', () => {
       (global.fetch as any) = jest.fn(() => jsonRes({ message: 'bad' }, false, 400));
       await expect(addVoter('p', 'u@e.com')).rejects.toThrow(/Featurebase API error 400/);
     });
+  });
+});
+
+describe('signFeaturebaseIdentityJwt', () => {
+  const { getSecret } = require('../utils/secretsManager');
+  beforeEach(() => { _resetCredentialsCache(); });
+
+  it('signs an HS256 JWT carrying userId+email+name that verifies with the ssoSecret', async () => {
+    (getSecret as jest.Mock).mockResolvedValueOnce(JSON.stringify({ apiKey: 'sk', appId: 'app123', ssoSecret: 'sso-xyz' }));
+    const token = await signFeaturebaseIdentityJwt({ userId: 'u1', email: 'u@e.com', name: 'Test User' });
+    const decoded: any = jwt.verify(token, 'sso-xyz');
+    expect(decoded.userId).toBe('u1');
+    expect(decoded.email).toBe('u@e.com');
+    expect(decoded.name).toBe('Test User');
+    expect(decoded.exp).toBeGreaterThan(decoded.iat); // short-lived
+    const header: any = (jwt.decode(token, { complete: true }) as any)?.header;
+    expect(header.alg).toBe('HS256');
+  });
+
+  it('omits name when not provided', async () => {
+    (getSecret as jest.Mock).mockResolvedValueOnce(JSON.stringify({ apiKey: 'sk', ssoSecret: 'sso-xyz' }));
+    const token = await signFeaturebaseIdentityJwt({ userId: 'u1', email: 'u@e.com' });
+    const decoded: any = jwt.verify(token, 'sso-xyz');
+    expect(decoded.name).toBeUndefined();
+  });
+
+  it('throws when ssoSecret is not configured (so the route can surface a clean 503)', async () => {
+    (getSecret as jest.Mock).mockResolvedValueOnce(JSON.stringify({ apiKey: 'sk', appId: 'app123' }));
+    await expect(signFeaturebaseIdentityJwt({ userId: 'u1', email: 'u@e.com' })).rejects.toThrow(/ssoSecret not configured/);
+  });
+
+  it('is actually signed by the ssoSecret (a different secret fails verification)', async () => {
+    (getSecret as jest.Mock).mockResolvedValueOnce(JSON.stringify({ apiKey: 'sk', ssoSecret: 'sso-xyz' }));
+    const token = await signFeaturebaseIdentityJwt({ userId: 'u1', email: 'u@e.com' });
+    expect(() => jwt.verify(token, 'WRONG-SECRET')).toThrow();
   });
 });

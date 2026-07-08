@@ -9,6 +9,7 @@ import { contactEventsDb, normalizeContactId } from '../services/contactEventsDb
 import { chatbotDb } from '../services/chatbotService';
 import { getExecutionsWithAssets } from '../routes/tasks';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
+import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
 import { enqueueAutoHumanEval } from '../services/autoHumanEvalService';
 
@@ -477,6 +478,191 @@ For target person identification (send-invite, send-message, get-profile, update
 });
 
 emmaToolRegistry.register({
+  name: 'twitter_manage_post',
+  definition: {
+    name: 'twitter_manage_post',
+    description: `Manage X (Twitter) tweet interactions. ⚠️ NEVER use this tool to post a single new tweet — use post_on_connected_account for that. This tool is for: multi-tweet threads (2+ tweets), replies, quote-tweets, deletes, likes, retweets, and analytics. NOTE: X's public API does not support editing tweets — there is no edit action; to fix a mistake, delete_tweet and post a new one.
+
+To find the account_id, call list_connected_accounts(platform='twitter'). account_id is optional when the user has exactly one X account connected.
+
+Actions:
+- reply: Reply to an existing tweet. Requires text and in_reply_to_tweet_id.
+- post_thread: Post a NEW chain of 2 or more tweets in sequence. Requires tweets array with MINIMUM 2 entries — if you only have 1 tweet, use post_on_connected_account instead. Each entry auto-trimmed to 280 chars.
+- quote_tweet: Quote-tweet a tweet with added commentary. Requires text and tweet_id.
+- delete_tweet: Delete a tweet you authored. Requires tweet_id. CRITICAL: Always get explicit user approval before deleting.
+- like: Like a tweet. Requires tweet_id.
+- unlike: Remove a like from a tweet. Requires tweet_id.
+- retweet: Retweet a tweet. Requires tweet_id.
+- unretweet: Undo a retweet. Requires tweet_id.
+- get_tweet_metrics: Fetch public engagement metrics (retweets, replies, likes, quotes, impressions, bookmarks) for one or more tweets. Requires tweet_ids array.
+- list_replies: List replies to a tweet (searches last 7 days). Requires tweet_id. Optional max_results (default 10, max 100).
+- get_retweeters: List users who retweeted a tweet. Requires tweet_id.
+- get_liking_users: List users who liked a tweet. Requires tweet_id.
+- get_quote_tweets: List quote tweets of a tweet. Requires tweet_id. Optional max_results.
+
+For CRM logging of sent tweets, optionally pass list_id, lead_id and lead_email.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: [
+            'reply', 'post_thread', 'quote_tweet',
+            'delete_tweet',
+            'like', 'unlike', 'retweet', 'unretweet',
+            'get_tweet_metrics', 'list_replies',
+            'get_retweeters', 'get_liking_users', 'get_quote_tweets',
+          ],
+          description: 'The X post action to perform.'
+        },
+        account_id: {
+          type: 'string',
+          description: "The connected X account ID. Optional when the user has exactly one X account connected. Obtain via list_connected_accounts(platform='twitter')."
+        },
+        text: {
+          type: 'string',
+          description: 'Tweet text. Required for reply, quote_tweet. Auto-trimmed to 280 chars on a word boundary.'
+        },
+        tweet_id: {
+          type: 'string',
+          description: 'Tweet ID. Required for delete_tweet, like, unlike, retweet, unretweet, quote_tweet, list_replies, get_retweeters, get_liking_users, get_quote_tweets.'
+        },
+        in_reply_to_tweet_id: {
+          type: 'string',
+          description: 'ID of the tweet being replied to. Required for reply.'
+        },
+        tweets: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of tweet texts for post_thread, posted as a chained thread in order.'
+        },
+        max_results: {
+          type: 'number',
+          description: 'Maximum results to return. Optional for list_replies and get_quote_tweets (default 10, max 100).'
+        },
+        tweet_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of tweet IDs to fetch metrics for. Required for get_tweet_metrics.'
+        },
+        list_id: {
+          type: 'string',
+          description: 'CRM lead list ID. Optional — provide with lead_id and lead_email to log the sent tweet to CRM history.'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'CRM lead ID. Optional — provide with list_id and lead_email for CRM logging.'
+        },
+        lead_email: {
+          type: 'string',
+          description: 'CRM lead email. Optional — provide with list_id and lead_id for CRM logging.'
+        }
+      },
+      required: ['action']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) {
+      throw new Error("Missing user context");
+    }
+    return await agentModeService.twitterManagePost(context.userId, args);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'twitter_outreach',
+  definition: {
+    name: 'twitter_outreach',
+    description: `Manage X (Twitter) people and outreach interactions using a connected X account. Use this for profile lookup, follows, DMs, user search, bookmarks, and account management (block/mute).
+
+To find the account_id, call list_connected_accounts(platform='twitter'). account_id is optional when the user has exactly one X account connected.
+
+Actions:
+- get_profile: Get an X user's public profile by handle. Requires handle.
+- follow: Follow a user by handle. Requires handle. CRITICAL: Always get explicit user approval before following.
+- unfollow: Unfollow a user by handle. Requires handle. CRITICAL: Always get explicit user approval before unfollowing.
+- list_followers: List followers of the connected account (or another user if handle is provided).
+- list_following: List accounts the connected account follows (or another user if handle is provided).
+- search_tweets: Search recent tweets by query. Requires query. Optional max_results (default 10, max 100).
+- get_user_tweets: Get recent tweets by a user. Requires handle. Optional max_results (default 10, max 100).
+- send_dm: Send a direct message. Requires handle and text. DM text over 10000 chars is auto-trimmed. CRITICAL: Always get explicit user approval before sending.
+- list_dms: List recent DM events for the connected account.
+- get_dm_conversation: Get DM history with a specific user. Requires handle.
+- bookmark: Bookmark a tweet. Requires tweet_id.
+- get_bookmarks: Retrieve the authenticated user's bookmarked tweets.
+- block: Block a user by handle. Requires handle. CRITICAL: Always get explicit user approval before blocking.
+- unblock: Unblock a user by handle. Requires handle. CRITICAL: Always get explicit user approval before unblocking.
+- mute: Mute a user by handle. Requires handle. CRITICAL: Always get explicit user approval before muting.
+- unmute: Unmute a user by handle. Requires handle. CRITICAL: Always get explicit user approval before unmuting.
+
+For CRM logging of sent DMs, optionally pass list_id, lead_id and lead_email.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: [
+            'get_profile', 'follow', 'unfollow', 'list_followers', 'list_following',
+            'search_tweets', 'get_user_tweets',
+            'send_dm', 'list_dms', 'get_dm_conversation',
+            'bookmark', 'get_bookmarks',
+            'block', 'unblock', 'mute', 'unmute',
+          ],
+          description: 'The X outreach action to perform.'
+        },
+        account_id: {
+          type: 'string',
+          description: "The connected X account ID. Optional when the user has exactly one X account connected. Obtain via list_connected_accounts(platform='twitter')."
+        },
+        text: {
+          type: 'string',
+          description: 'DM text. Required for send_dm. Auto-trimmed to 10000 chars on a word boundary.'
+        },
+        handle: {
+          type: 'string',
+          description: 'The @handle to look up or act on. Required for get_profile, follow, unfollow, send_dm, get_dm_conversation, get_user_tweets, block, unblock, mute, unmute. Optional for list_followers and list_following (defaults to own account).'
+        },
+        recipient_handle: {
+          type: 'string',
+          description: 'Alias for handle. Use when the context makes "recipient" clearer (e.g., send_dm).'
+        },
+        query: {
+          type: 'string',
+          description: 'Search query string. Required for search_tweets.'
+        },
+        tweet_id: {
+          type: 'string',
+          description: 'Tweet ID. Required for bookmark.'
+        },
+        max_results: {
+          type: 'number',
+          description: 'Maximum results to return. Optional for search_tweets and get_user_tweets (default 10, max 100).'
+        },
+        list_id: {
+          type: 'string',
+          description: 'CRM lead list ID. Optional — provide with lead_id and lead_email to log the sent DM to CRM history.'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'CRM lead ID. Optional — provide with list_id and lead_email for CRM logging.'
+        },
+        lead_email: {
+          type: 'string',
+          description: 'CRM lead email. Optional — provide with list_id and lead_id for CRM logging.'
+        }
+      },
+      required: ['action']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) {
+      throw new Error("Missing user context");
+    }
+    return await agentModeService.twitterOutreach(context.userId, args);
+  }
+});
+
+emmaToolRegistry.register({
   name: 'list_meta_ads_campaigns',
   definition: {
     name: 'list_meta_ads_campaigns',
@@ -900,13 +1086,20 @@ emmaToolRegistry.register({
           default: '7d'
         },
         campaign_ids: {
-          type: 'array',
+          // Union type so the static schema accepts exactly the shapes execute()
+          // normalizes (array preferred; legacy single string also accepted).
+          // minItems only fires for arrays, so a string id is not rejected.
+          type: ['array', 'string'],
           items: { type: 'string' },
           minItems: 1,
-          description: 'Required list of campaign IDs to filter metrics by. Use list_meta_ads_campaigns to get available campaign IDs (works even without a connected Meta account).'
+          description: 'List of campaign IDs to filter metrics by (array preferred; a single campaign id string is also accepted). Use list_meta_ads_campaigns to get available campaign IDs (works even without a connected Meta account).'
+        },
+        campaign_id: {
+          // Legacy single-id alias. execute() normalizes this into campaign_ids.
+          type: 'string',
+          description: 'Legacy alias for a single campaign id. Prefer campaign_ids. Provide at least one of campaign_ids or campaign_id.'
         }
-      },
-      required: ['campaign_ids']
+      }
     }
   },
   execute: async (args, context) => {
@@ -986,7 +1179,7 @@ ENTITY HIERARCHY: Ad Account → Campaign Group → Campaign → Creative
     sender is auto-resolved from the connected account — do NOT ask the user for it.
 
   CONVERSATION AD (branching message, campaign type: SPONSORED_INMAILS):
-    CONVERSATION_AD/CREATE (name) → CONVERSATION_AD/CREATE_CONTENT (×N message nodes with buttons) → CONVERSATION_AD/SET_FIRST_CONTENT → CREATIVE/CREATE (inmail_content_urn=conversation_ad_urn, campaign_id)
+    CONVERSATION_AD/CREATE (name, optional — becomes the ad's headline text; omit to let LinkedIn use the first message as the headline) → CONVERSATION_AD/CREATE_CONTENT (×N message nodes with buttons) → CONVERSATION_AD/SET_FIRST_CONTENT → CREATIVE/CREATE (inmail_content_urn=conversation_ad_urn, campaign_id)
     Each button can link to another message node (SEND_MESSAGE action) or a URL (OPEN_URL action).
 
   JOBS AD (campaign type: DYNAMIC, campaign format: JOBS):
@@ -1035,7 +1228,7 @@ REQUIRED PARAMS PER ENTITY + ACTION:
   MEDIA UPLOAD_DOCUMENT: document_url (public URL to PDF/PPT/DOC). Returns document_urn.
   INMAIL CREATE_CONTENT: name, subject, htmlBody, callToActionText (max 20 chars), callToActionLandingPageUrl. Optional: salutationText, senderName, senderTitle, senderCompany. (sender auto-resolved — do NOT pass it)
   INMAIL SEND_TEST: inmail_content_urn, recipient_email
-  CONVERSATION_AD CREATE: name
+  CONVERSATION_AD CREATE: none required. Optional: name (becomes the ad's headlineText — LinkedIn has no "name" field on this resource, so it is mapped for you)
   CONVERSATION_AD CREATE_CONTENT: conversation_ad_urn, body (message text), buttons (array of { text, action: OPEN_URL|SEND_MESSAGE, url? }). Optional: subject, footer.
   CONVERSATION_AD SET_FIRST_CONTENT: conversation_ad_urn, first_content_urn
 
@@ -1065,7 +1258,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
           description: 'Action-specific parameters. See tool description for required fields per entity + action.',
           properties: {
             // Campaign Group / Campaign common
-            name: { type: 'string', description: 'Entity name.' },
+            name: { type: 'string', description: 'Entity name (internal label). Exception: for CONVERSATION_AD CREATE it becomes the member-visible headline text shown in LinkedIn inboxes — write headline copy, not an internal label.' },
             status: { type: 'string', enum: ['ACTIVE', 'PAUSED', 'ARCHIVED', 'DRAFT', 'CANCELED', 'COMPLETED'], description: 'Entity status.' },
             campaign_group_id: { type: 'string', description: 'Campaign Group numeric ID. Used for CAMPAIGN LIST.' },
             campaignGroup: { type: 'string', description: 'Campaign Group URN (urn:li:sponsoredCampaignGroup:ID). Required for CAMPAIGN CREATE.' },
@@ -3766,11 +3959,12 @@ emmaToolRegistry.register({
   name: 'post_on_connected_account',
   definition: {
     name: 'post_on_connected_account',
-    description: 'Create a post on a connected social media account. Supports LinkedIn, Instagram, and YouTube. For YouTube: this UPLOADS a video — you MUST provide a video URL in media_urls. The content becomes the video title (first 100 chars) and description. CRITICAL: Always review the post content with the user and get explicit approval before publishing to social media. IMPORTANT: The content parameter must contain the COMPLETE, FULL post text exactly as approved by the user. Never truncate, abbreviate, summarize, or use placeholders like "..." in the content.',
+    description: 'Create a post on a connected social media account. Supports LinkedIn, Instagram, YouTube, and X (Twitter). This is the ONLY tool for posting a new standalone tweet on X/Twitter — do NOT use twitter_manage_post for this. For YouTube: this UPLOADS a video — you MUST provide a video URL in media_urls. The content becomes the video title (first 100 chars) and description. For X (Twitter): content is trimmed to 280 characters on a word boundary. Provide either account_id OR platform — the tool auto-resolves to the matching account. CRITICAL: Always review the post content with the user and get explicit approval before publishing to social media. IMPORTANT: The content parameter must contain the COMPLETE, FULL post text exactly as approved by the user. Never truncate, abbreviate, summarize, or use placeholders like "..." in the content.',
     inputSchema: {
       type: 'object',
       properties: {
-        account_id: { type: 'string', description: 'The connected account ID' },
+        account_id: { type: 'string', description: 'The connected account ID. Optional — provide either account_id or platform, not both. Use account_id when the user has multiple accounts on the same platform.' },
+        platform: { type: 'string', enum: ['twitter', 'linkedin', 'instagram', 'youtube'], description: 'Platform to post on. Optional — use instead of account_id when the user has one account per platform. E.g. platform="twitter" to post a tweet.' },
         content: { type: 'string', description: 'The COMPLETE post text content. MUST include the full, untruncated text exactly as approved by the user. Do NOT abbreviate, summarize, or omit any part of the content. Include all paragraphs, hashtags, emojis, and formatting. Length limits depend on the specific platform. CRITICAL FOR LINKEDIN: LinkedIn does NOT render markdown. Never use **bold**, *italic*, - bullets, [links](url), or # headings — they appear as raw text. Use LinkedIn-native plain text: line breaks, unicode bullets (•), emojis for emphasis, and full URLs (LinkedIn auto-links them).' },
         media_urls: {
           type: 'array',
@@ -3778,11 +3972,11 @@ emmaToolRegistry.register({
           description: 'Optional URLs of images/videos to attach. REQUIRED for YouTube — must be a direct video file URL (e.g. .mp4). The video will be downloaded and uploaded to YouTube.'
         }
       },
-      required: ['account_id', 'content']
+      required: ['content']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls);
+    return await agentModeService.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform);
   }
 });
 
@@ -4517,6 +4711,9 @@ emmaToolRegistry.register({
         ctaUrl: args.cta_url,
         audioUrl: args.audio_url,
         audioVolume: args.audio_volume,
+        // Runtime budget (not a model arg): the run's media-gen deadline, so a long render
+        // hands off before the run's hard wall-clock timeout instead of being killed (ENG-123).
+        renderDeadlineMs: context?.renderDeadlineMs,
       },
       args.clip_duration_seconds,
       args.target_duration_seconds,
@@ -4891,7 +5088,7 @@ emmaToolRegistry.register({
   name: "list_knowledge_base_files",
   definition: {
     name: "list_knowledge_base_files",
-    description: 'List available knowledge base files for the current user, including private/public task KBs, Google Drive shared folders, ClickUp docs, and Foreplay boards. Google Drive entries have identifiers starting with "gdrive:". ClickUp doc entries start with "clickup:" and include a docId field — use docId as parent_doc_id in write_clickup_doc to nest content inside that doc. ClickUp folder entries start with "clickup-folder:" (these are task-hierarchy folders, for reference only — not writable doc parents). Use modified_after/modified_before to filter by date (ISO format, e.g. "2026-04-15") — this is the most efficient way to find recent files. Use limit/offset to paginate through large folders (default limit is 100). Use kb_type to narrow to a specific source ("google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"). Returns file names, identifiers, sizes, types, and last modified timestamps. IMPORTANT: Use this tool (not search_knowledge_base) when you need to browse or list files by name or date.',
+    description: 'List available knowledge base files for the current user, including private/public task KBs, Google Drive shared folders, ClickUp docs, and Foreplay boards. Google Drive entries have identifiers starting with "gdrive:". ClickUp doc entries start with "clickup:" and include a docId field — use docId as parent_doc_id in write_clickup_doc to nest content inside that doc. ClickUp folder entries start with "clickup-folder:" (these are task-hierarchy folders, for reference only — not writable doc parents). Use modified_after/modified_before to filter by date (ISO format, e.g. "2026-04-15") — this is the most efficient way to find recent files. Use limit/offset to paginate through large folders (default limit is 100). Use kb_type to narrow to a specific source ("google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"). Returns file names, identifiers, sizes, types, and last modified timestamps. IMPORTANT: Use this tool (not search_knowledge_base) when you need to browse or list files by name or date. NOTE: the Google Drive entries here are READ-ONLY shared folders — CREATING or EDITING Google Docs/Sheets is a SEPARATE capability; discover and install the skill that provides Google Docs/Sheets create/edit tools via list_available_skills.',
     inputSchema: {
       type: "object",
       properties: {
@@ -6053,7 +6250,7 @@ emmaToolRegistry.register({
   name: 'get_website_analytics',
   definition: {
     name: 'get_website_analytics',
-    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources, top pages by engagement, and daily trends. If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
+    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources (with conversion counts per source/medium), key-event/conversion breakdown by traffic source and event name (conversionsBySource), top pages by engagement, and daily trends. Use conversionsBySource for UTM-source-level attribution of form fills and other conversion events. If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -6848,6 +7045,8 @@ emmaToolRegistry.register({
     // Fetch once before the loop to avoid N DynamoDB reads for a batch of issues
     const { settingsService } = await import('../services/settingsService');
     const productIssueEmails = await settingsService.getJsonArraySetting('product_issue_emails', ['founders@agentweb.pro']);
+    const funnelStatusLabel = getUserFunnelStatusLabel(user.funnelStatus);
+    const funnelStatusTags = getUserFunnelStatusIssueTags(user.funnelStatus);
 
     for (const rawIssue of args.issues) {
       // Gemini may serialize array items as JSON strings instead of objects — normalize
@@ -6861,6 +7060,9 @@ emmaToolRegistry.register({
           'Page URL': issue.pageUrl || 'N/A',
           'Session ID': context?.sessionId || 'N/A',
         };
+        if (funnelStatusLabel) {
+          issueContext['User Status'] = funnelStatusLabel;
+        }
 
         const attachmentUrls = Array.isArray(issue.attachment_urls)
           ? issue.attachment_urls.filter((u: unknown): u is string => typeof u === 'string' && /^https?:\/\//.test(u))
@@ -6913,19 +7115,33 @@ emmaToolRegistry.register({
         // which records the issue as failed — we do NOT silently reroute to another tracker.
         const itemType: 'feature_request' | 'bug' = issue.type === 'feature_request' ? 'feature_request' : 'bug';
         const { fileUserIssue } = await import('../services/intakeService');
-        const filed = await fileUserIssue({
-          type: itemType,
-          title: issue.title,
-          description,
-          userEmail: user.email,
-          userName: user.displayName || user.email,
-          reportedByAdmin: isDelegatedAdmin && adminEmail ? adminEmail : undefined,
-          sessionId: context?.sessionId,
-          // External MCP clients (Claude Code etc.) are tagged distinctly so benchmark
-          // filters on Customer Reported stay clean (used on the flag-off Notion path).
-          notionTags: [context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported'],
-          notionContext: issueContext,
-        });
+        const INTAKE_TIMEOUT_MS = 30_000;
+        const filed = await Promise.race([
+          fileUserIssue({
+            type: itemType,
+            title: issue.title,
+            description,
+            userEmail: user.email,
+            userName: user.displayName || user.email,
+            reportedByAdmin: isDelegatedAdmin && adminEmail ? adminEmail : undefined,
+            sessionId: context?.sessionId,
+            // Same value that lands as "Priority:" text in issueContext — the intake service
+            // maps it onto the Linear priority field so text and board agree (ENG-231).
+            priority: issue.priority,
+            // Linear-side triage enrichment (ENG-187): stage labels + priority/state/assignee defaults.
+            funnelStatus: user.funnelStatus,
+            // External MCP clients (Claude Code etc.) are tagged distinctly so benchmark
+            // filters on Customer Reported stay clean (used on the flag-off Notion path).
+            notionTags: [
+              context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported',
+              ...funnelStatusTags,
+            ],
+            notionContext: issueContext,
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('Issue filing timed out after 30s')), INTAKE_TIMEOUT_MS)
+          ),
+        ]);
         const result = { pageId: filed.pageId, url: filed.trackerUrl, tracker: filed.tracker, deduped: filed.deduped, userUrl: filed.userUrl };
 
         // Never email the customer — internal team + admin (if known) only.
@@ -6934,7 +7150,8 @@ emmaToolRegistry.register({
           : [...productIssueEmails];
 
         const priorityColor = (issue.priority || 'Medium') === 'High' ? '#dc2626' : (issue.priority || 'Medium') === 'Low' ? '#6b7280' : '#d97706';
-        await resendService.sendEmail({
+        // Fire-and-forget — internal notification email; must not block the user-facing response
+        resendService.sendEmail({
           from: `${RESEND_SYSTEM_NAME} Support <${RESEND_SYSTEM_EMAIL}>`,
           to: emailRecipients,
           subject: `[Issue] ${issue.title} — reported by ${user.email}`,
@@ -6950,6 +7167,7 @@ emmaToolRegistry.register({
                   <td style="padding: 6px 0; color: #666; width: 140px; vertical-align: top;"><strong>Reported by</strong></td>
                   <td style="padding: 6px 0;"><a href="mailto:${user.email}" style="color: #4F46E5;">${user.displayName || user.email}</a> (${user.email})</td>
                 </tr>
+                ${funnelStatusLabel ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>User status</strong></td><td style="padding: 6px 0;">${funnelStatusLabel}</td></tr>` : ''}
                 ${isDelegatedAdmin && adminEmail ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Via delegation</strong></td><td style="padding: 6px 0;">${adminEmail}</td></tr>` : ''}
                 ${result.pageId ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Issue ID</strong></td><td style="padding: 6px 0; font-family: monospace;">AGW-${result.pageId}</td></tr>` : ''}
                 ${result.url ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>${result.tracker}</strong></td><td style="padding: 6px 0;"><a href="${result.url}" style="color: #4F46E5; font-weight: 600;">→ Open in ${result.tracker}</a></td></tr>` : ''}
@@ -6967,7 +7185,7 @@ emmaToolRegistry.register({
             </div>
           `,
           replyTo: user.email,
-        });
+        }).catch((e: any) => console.warn('[report_product_issues] notification email failed (non-critical):', e?.message));
 
         results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}`, deduped: result.deduped === true, url: result.url || undefined, trackingUrl: result.userUrl || undefined });
       } catch (err: any) {
@@ -8049,5 +8267,268 @@ TYPICAL WORKFLOW:
     const userId = context?.userId;
     if (!userId) return { success: false, error: 'Authentication required: no user context.' };
     return agentModeService.handleHubspotApi(userId, args);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'read_google_doc',
+  definition: {
+    name: 'read_google_doc',
+    description: 'Read a Google Doc or Google Sheet by URL or file ID, including all inline comments and replies. If the user has connected Google Drive in Settings → Connected Accounts, uses their credentials (works for internal Workspace files). Otherwise falls back to the service account (file must be shared with the SA). Use this to ingest a specific Doc or Sheet that is NOT inside a registered Drive folder.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url_or_id: {
+          type: 'string',
+          description: 'Google Doc/Sheet URL (e.g. https://docs.google.com/document/d/FILE_ID/edit) or raw file ID',
+        },
+      },
+      required: ['url_or_id'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    const fileId = (args.url_or_id as string).match(/\/d\/([a-zA-Z0-9_-]+)/)?.[1] ?? args.url_or_id.trim();
+    return agentModeService.readGoogleFileById(fileId, context.userId);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'google_drive',
+  definition: {
+    name: 'google_drive',
+    description: 'Google Drive utility actions. Use action="search" when user refers to a file/folder by name or wants to browse/find something — search immediately, do NOT ask the user for a URL. Use action="list" to list contents of a folder — use folder_url_or_id="root" when user asks to browse their Drive or list folders without specifying a location. Use action="create_folder" when the user asks to create a folder — just do it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['search', 'list', 'create_folder'],
+          description: '"search" — find files/folders by name. "list" — list contents of a folder (use "root" for root Drive). "create_folder" — create a new Drive folder.',
+        },
+        // search params
+        query: {
+          type: 'string',
+          description: '[search] Name or partial name to search for.',
+        },
+        type: {
+          type: 'string',
+          enum: ['folder', 'file', 'any'],
+          description: '[search] Filter: "folder", "file", or "any" (default).',
+        },
+        // list params
+        folder_url_or_id: {
+          type: 'string',
+          description: '[list] Google Drive folder URL, folder ID, or "root" to list the root Drive.',
+        },
+        // create_folder params
+        name: {
+          type: 'string',
+          description: '[create_folder] Name of the folder to create.',
+        },
+        parent_folder_id: {
+          type: 'string',
+          description: '[create_folder] Optional parent folder ID. Omit to create in Drive root.',
+        },
+      },
+      required: ['action'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    if (args.action === 'search') {
+      if (!args.query) return { success: false, message: 'query is required for action=search' };
+      return agentModeService.searchGoogleDrive(args.query, context.userId, args.type);
+    }
+    if (args.action === 'list') {
+      if (!args.folder_url_or_id) return { success: false, message: 'folder_url_or_id is required for action=list' };
+      return agentModeService.listGoogleDriveFolder(args.folder_url_or_id, context.userId);
+    }
+    if (args.action === 'create_folder') {
+      if (!args.name) return { success: false, message: 'name is required for action=create_folder' };
+      return agentModeService.createGoogleDriveFolder(args.name, context.userId, args.parent_folder_id);
+    }
+    return { success: false, message: `Unknown action: ${args.action}` };
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'create_google_doc',
+  definition: {
+    name: 'create_google_doc',
+    description: 'Create a new Google Doc with rich formatting. Requires the user to have connected Google Drive in Settings → Connected Accounts. The Doc is created in the user\'s own Drive (or a specific folder if folder_id is provided) and optionally shared with additional emails. Returns the Doc URL. Content is written in markdown and automatically converted to rich Google Docs formatting (headings, bold, italic, bullet lists, numbered lists, tables, code blocks, blockquotes, etc.) — write full markdown, do NOT flatten to plain text. BEHAVIOR: Just do it — do NOT present options or ask the user to choose a format. Make the best judgment call from context and create the doc immediately. If the user names a destination folder by name (e.g. "Emma Test folder"), use google_drive action=search first to find its ID — do NOT ask the user for the URL. Images and logos cannot be embedded inline via the API — include them as clickable links in the doc content instead. Docs are styled by default — set plain=true only if the user explicitly wants a simple/minimal doc with no formatting. Use style_options.primary_color to apply brand colors or a color the user requested.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: {
+          type: 'string',
+          description: 'Title of the Google Doc',
+        },
+        content: {
+          type: 'string',
+          description: 'Content in markdown format. Write full markdown (# Heading 1, ## Heading 2, **bold**, *italic*, - bullet lists, 1. numbered lists, | tables |, ```code blocks```, > blockquotes, [text](url) links). Markdown is automatically converted to rich Google Docs formatting — do NOT flatten to plain text. To style just one word/phrase without affecting the rest of the document (not the document-wide accent/font from style_options), use an inline style span: [text]{attr=value;flag;...}. Supported: color=blue or color=#ff0000 (text color), font=Verdana (font family — letters/spaces only, e.g. "Times New Roman"), underline (flag, no value), italic (flag), bold (flag). Combine multiple in one span with semicolons, e.g. [Phase 1]{color=yellow;font=Verdana;italic;underline}. Only use this when the user explicitly asks for specific word/line formatting, not proactively. This composes with heading markdown: writing "# [test 2]{color=blue}" makes that one heading big+bold (from the # itself) AND blue, without recoloring any other heading in the document — do NOT treat "make it a heading" and "color it" as mutually exclusive options; combine them in a single line for a "big, bold, and [color]" request on one specific item.',
+        },
+        folder_id: {
+          type: 'string',
+          description: 'Optional: Google Drive folder ID to create the Doc in. If omitted, creates in the user\'s root Drive or first connected folder. Get folder IDs from list_knowledge_base_files (gdrive: identifiers).',
+        },
+        share_with_emails: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional: additional email addresses to share the Doc with (writer access). The calling user is always shared automatically.',
+        },
+        plain: {
+          type: 'boolean',
+          description: 'Set true ONLY if the user explicitly asks for a plain/simple/minimal doc or quick note with no formatting. Omit (or false) for everything else.',
+        },
+        style_options: {
+          type: 'object',
+          description: 'Visual customizations. Only set what the user asked for — everything else uses sensible defaults (Arial 14px, blue accent). Set primary_color if you know the brand or the user specified a color. Set font_family or font_size only if the user asks.',
+          properties: {
+            primary_color: {
+              type: 'string',
+              description: 'Hex accent color for headings and table headers. Derive from brand colors or user request (e.g. brand pink → "#e6518d", "use purple" → "#7C3AED"). Default: #1a73e8.',
+            },
+            font_family: {
+              type: 'string',
+              description: 'Body font. Examples: "Georgia, serif" (editorial), "Times New Roman, serif" (formal), "Trebuchet MS, sans-serif" (modern), "Courier New, monospace" (technical). Default: "Arial, sans-serif".',
+            },
+            font_size: {
+              type: 'number',
+              description: 'Base body font size in px. Heading sizes scale proportionally. Use 12 for compact, 16-18 for larger. Default: 14.',
+            },
+            line_height: {
+              type: 'number',
+              description: 'Line spacing multiplier. 1.4 = tight, 1.7 = default, 2.0 = spacious.',
+            },
+            compact: {
+              type: 'boolean',
+              description: 'Reduce table cell padding and element spacing. Default: false.',
+            },
+          },
+        },
+      },
+      required: ['title', 'content'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    const style = args.plain === true ? 'plain' : 'styled';
+    const so = args.style_options;
+    const styleOptions = so ? { primaryColor: so.primary_color, fontFamily: so.font_family, fontSize: so.font_size, lineHeight: so.line_height, compact: so.compact } : undefined;
+    return agentModeService.createGoogleDoc(args.title, args.content, context.userId, args.folder_id, args.share_with_emails, style, styleOptions);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'update_google_doc',
+  definition: {
+    name: 'update_google_doc',
+    description: 'Replace the entire content of an existing Google Doc with rich formatting. Content is written in markdown and automatically converted to rich Google Docs formatting — write full markdown, do NOT flatten to plain text. Use this to write revised content back to a Doc after the team has left comments and the user has approved edits. Accepts a Doc URL or file ID. BEHAVIOR: this REPLACES THE WHOLE DOCUMENT. On the FIRST update_google_doc call in a conversation, warn the user first (e.g. "this will replace the entire doc\'s content — the previous version stays recoverable via File → Version History if needed. Want me to go ahead?") and wait for explicit confirmation before calling this tool — do NOT call it on the first ask. For any SUBSEQUENT update_google_doc call later in the SAME conversation (i.e. you already asked and the user confirmed once before), do not ask again — just call it directly, but still briefly mention afterward that the previous version is recoverable via File → Version History, every time. STYLING: unlike create_google_doc, an update defaults to leaving the doc\'s existing visual decoration alone (headings/bullets/tables still render properly, just without imposed colors/fonts) — only pass plain=false or style_options when the user explicitly asks for the doc to be restyled/colorized.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url_or_id: {
+          type: 'string',
+          description: 'Google Doc URL or file ID',
+        },
+        content: {
+          type: 'string',
+          description: 'New content in markdown format (replaces all existing content). Write full markdown — it is automatically converted to rich Google Docs formatting. Do NOT flatten to plain text. To style just one word/phrase without affecting the rest of the document (not the document-wide accent/font from style_options), use an inline style span: [text]{attr=value;flag;...}. Supported: color=blue or color=#ff0000 (text color), font=Verdana (font family — letters/spaces only, e.g. "Times New Roman"), underline (flag, no value), italic (flag), bold (flag). Combine multiple in one span with semicolons, e.g. [Phase 1]{color=yellow;font=Verdana;italic;underline}. Only use this when the user explicitly asks for specific word/line formatting, not proactively. This composes with heading markdown: writing "# [test 2]{color=blue}" makes that one heading big+bold (from the # itself) AND blue, without recoloring any other heading in the document — do NOT treat "make it a heading" and "color it" as mutually exclusive options; combine them in a single line for a "big, bold, and [color]" request on one specific item.',
+        },
+        plain: {
+          type: 'boolean',
+          description: 'Set true ONLY if the original doc was plain or user wants no formatting.',
+        },
+        style_options: {
+          type: 'object',
+          description: 'Visual customizations. Match what was used when the doc was originally created, or apply any new style the user requests.',
+          properties: {
+            primary_color: { type: 'string', description: 'Hex accent color.' },
+            font_family: { type: 'string', description: 'Body font family.' },
+            font_size: { type: 'number', description: 'Base font size in px.' },
+            line_height: { type: 'number', description: 'Line spacing multiplier.' },
+            compact: { type: 'boolean', description: 'Tighter table/element spacing.' },
+          },
+        },
+      },
+      required: ['url_or_id', 'content'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    // Unlike create (styled by default), an update defaults to leaving the doc's existing
+    // look alone — only restyle when the user explicitly asked (plain: false) or gave style_options.
+    const style = args.plain === true ? 'plain' : (args.plain === false || args.style_options) ? 'styled' : 'plain';
+    const so = args.style_options;
+    const styleOptions = so ? { primaryColor: so.primary_color, fontFamily: so.font_family, fontSize: so.font_size, lineHeight: so.line_height, compact: so.compact } : undefined;
+    return agentModeService.updateGoogleDoc(args.url_or_id, args.content, context.userId, style, styleOptions);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'create_google_sheet',
+  definition: {
+    name: 'create_google_sheet',
+    description: 'Create a new Google Sheet with structured data. Requires the user to have connected Google Drive in Settings → Connected Accounts. The Sheet is created in the user\'s own Drive and optionally shared with additional emails. Data is a 2D array (rows × columns). Use this to deliver tabular output as a native Google Sheet. IMPORTANT: Before calling this tool, always ask the user two things and wait for explicit answers: (1) "Should I go ahead and create this Google Sheet titled X?" (2) "Where should I put it — your root Drive, or a specific folder? If a folder, please share the folder ID or URL."',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: {
+          type: 'string',
+          description: 'Title of the Google Sheet',
+        },
+        data: {
+          type: 'array',
+          items: { type: 'array', items: { type: 'string' } },
+          description: 'Rows of data. First row is typically headers. Example: [["Name","Email","Score"],["Alice","a@co.com","90"]]',
+        },
+        folder_id: {
+          type: 'string',
+          description: 'Optional: Google Drive folder ID to create the Sheet in. If omitted, creates in the user\'s root Drive or first connected folder.',
+        },
+        share_with_emails: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional: additional emails to share with (writer access).',
+        },
+      },
+      required: ['title', 'data'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    return agentModeService.createGoogleSheet(args.title, args.data, context.userId, args.folder_id, args.share_with_emails);
+  },
+});
+
+emmaToolRegistry.register({
+  name: 'update_google_sheet',
+  definition: {
+    name: 'update_google_sheet',
+    description: 'Write data into a range of an existing Google Sheet. Use this to update specific cells or add new rows to a Sheet. Existing data outside the range is preserved. IMPORTANT: Before calling this tool, always confirm with the user — e.g. "Should I update [Sheet title/URL] range X with the new data?" — and wait for explicit approval. If multiple Sheets are in the conversation context and the user says "update the sheet" without specifying which one, ask them to clarify before proceeding.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url_or_id: {
+          type: 'string',
+          description: 'Google Sheet URL or file ID',
+        },
+        range: {
+          type: 'string',
+          description: 'A1 notation range to write into, e.g. "Sheet1!A1" or "Sheet1!B2:D10"',
+        },
+        data: {
+          type: 'array',
+          items: { type: 'array', items: { type: 'string' } },
+          description: 'Rows of data to write into the range',
+        },
+      },
+      required: ['url_or_id', 'range', 'data'],
+    },
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) return { success: false, message: 'Authentication required' };
+    return agentModeService.updateGoogleSheet(args.url_or_id, args.range, args.data, context.userId);
   },
 });

@@ -1,7 +1,11 @@
 import app from './app';
+import { isCronEnabled, disableCron } from './utils/instanceState';
+import { cronJobRegistry } from './utils/cronJobRegistry';
+import { DRAIN_CEILING_MS } from './utils/shutdownConstants';
 import { agentModeService } from './services/agentModeService';
 import { generateMarketingResponseWorkerService } from './services/generateMarketingResponseWorkerService';
 import dotenv from 'dotenv';
+import { getJwtSecret, assertJwtSecretAtBoot } from './config/jwt';
 import bcrypt from 'bcryptjs';
 import http from 'http';
 import { Server, Socket } from 'socket.io';
@@ -19,6 +23,10 @@ import {
 } from './services/liveVoiceService';
 
 dotenv.config();
+
+// Fail fast at boot (before binding the port) if the JWT secret is missing, rather than
+// letting tokens be signed/verified with a fallback secret or erroring on first request.
+assertJwtSecretAtBoot();
 
 const port = process.env.PORT || 3001;
 const server = http.createServer(app);
@@ -74,7 +82,7 @@ io.use(async (socket, next) => {
 
   if (token) {
     try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key') as {
+      const decoded = jwt.verify(token, getJwtSecret()) as {
         userId?: string;
         sv?: number;
         delegateAccess?: unknown;
@@ -133,7 +141,7 @@ io.on('connection', (socket: Socket) => {
   try {
     const token = socket.handshake.auth.token;
     if (token) {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as { userId: string };
+      const decoded = jwt.verify(token, getJwtSecret()) as { userId: string };
       if (decoded.userId) {
         socket.join(`user:${decoded.userId}`);
       }
@@ -171,7 +179,7 @@ io.on('connection', (socket: Socket) => {
     }
     const token = socket.handshake.auth.token;
     if (!token) throw new Error('No auth token');
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as {
+    const decoded = jwt.verify(token, getJwtSecret()) as {
       userId: string;
       delegateAccess?: { targetUserId: string };
     };
@@ -234,7 +242,7 @@ io.on('connection', (socket: Socket) => {
         throw new Error('No authentication token provided');
       }
 
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as { userId: string; isAdmin?: boolean; delegateAccess?: { adminUserId: string; adminEmail: string; targetUserId: string; targetEmail: string } };
+      const decoded = jwt.verify(token, getJwtSecret()) as { userId: string; isAdmin?: boolean; delegateAccess?: { adminUserId: string; adminEmail: string; targetUserId: string; targetEmail: string } };
       const userId = decoded.delegateAccess?.targetUserId || decoded.userId;
       const isDelegatedAdmin = !!decoded.delegateAccess || decoded.isAdmin === true;
 
@@ -331,7 +339,20 @@ process.on('unhandledRejection', (reason: unknown, promise: Promise<unknown>) =>
 const gracefulShutdown = async (signal: string) => {
   console.log(`\n${signal} received. Shutting down gracefully...`);
 
-  // Stop the proactive MCP OAuth refresh scheduler
+  // Register force-exit FIRST so it's always set, even if an await below hangs.
+  // Force-exit buffer = drain ceiling + 3 min.
+  // EB Timeout: 900 s (15 min) sits above this so EB never force-kills first.
+  setTimeout(() => {
+    console.error('[gracefulShutdown] Force-exiting after drain ceiling');
+    process.exit(1);
+  }, DRAIN_CEILING_MS + 3 * 60 * 1000).unref();
+
+  // 1. Disable cron immediately — agent-engine's next /run-scheduled-chats call
+  //    gets 503 and reroutes to the new instance within one 5-second poll cycle.
+  //    All setInterval/setTimeout workers skip their next tick.
+  disableCron();
+
+  // 2. Stop the proactive MCP OAuth refresh scheduler
   try {
     const { stopMcpOAuthRefreshScheduler } = await import('./mcp/client/mcpOAuthRefreshService');
     stopMcpOAuthRefreshScheduler();
@@ -339,13 +360,16 @@ const gracefulShutdown = async (signal: string) => {
     // ignore — scheduler may not have started
   }
 
-  // Shutdown Agent Mode services (closes MCP clients)
-  await agentModeService.shutdown();
+  // 3. Stop accepting new HTTP connections
+  server.close((err) => {
+    if (err) {
+      console.error('Error closing HTTP server:', err);
+    } else {
+      console.log('HTTP server closed');
+    }
+  });
 
-  // Shutdown worker service
-  await generateMarketingResponseWorkerService.shutdown();
-
-  // Close Socket.IO connections
+  // 4. Disconnect all Socket.IO clients (they auto-reconnect to the new instance)
   io.close((err) => {
     if (err) {
       console.error('Error closing Socket.IO:', err);
@@ -354,23 +378,26 @@ const gracefulShutdown = async (signal: string) => {
     }
   });
 
-  // Close HTTP server (stops accepting new connections)
-  server.close((err) => {
-    if (err) {
-      console.error('Error closing HTTP server:', err);
-    } else {
-      console.log('HTTP server closed');
-    }
+  // 5. Drain the LLM worker (scheduled chats / EMMA runs) and every other
+  //    in-flight cron job (LinkedIn sync, drip worker, meta token refresh,
+  //    etc. — see cronJobRegistry) concurrently, up to the same ceiling, so
+  //    the total wait is the max of the two rather than their sum.
+  const [, cronDrain] = await Promise.all([
+    generateMarketingResponseWorkerService.shutdown(),
+    cronJobRegistry.drain(),
+  ]);
+  if (!cronDrain.drained) {
+    console.warn(
+      `[gracefulShutdown] Cron drain ceiling reached — ${cronDrain.stuckCount} job(s) still in-flight:`,
+      cronDrain.stuckJobs
+    );
+  }
 
-    // Exit after cleanup
-    process.exit(0);
-  });
+  // 6. Close parent MCP clients after the drain (child has its own MCP instance)
+  await agentModeService.shutdown();
 
-  // Force exit if graceful shutdown takes too long
-  setTimeout(() => {
-    console.error('Forcing shutdown after timeout');
-    process.exit(1);
-  }, 5000);
+  // 7. Clean exit
+  process.exit(0);
 };
 
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
@@ -498,15 +525,20 @@ createTestAccount().then(async () => {
         // Pass callback: when scanner schedules an action within 30 min, register a direct setTimeout
         const scanner = new SocialEngagementScanner((delayMs) => {
           setTimeout(() => {
-            executor.processQueue().catch(e => console.error('[SocialEngagement] Direct executor error:', e));
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('SocialEngagementExecutor.processQueue', executor.processQueue())
+              .catch(e => console.error('[SocialEngagement] Direct executor error:', e));
           }, delayMs);
         });
 
         console.log('[SocialEngagement] Scanner initialized — running first pass...');
-        scanner.runScanner().catch(e => console.error('[SocialEngagement] Scanner error:', e));
+        cronJobRegistry.track('SocialEngagementScanner', scanner.runScanner())
+          .catch(e => console.error('[SocialEngagement] Scanner error:', e));
 
         setInterval(() => {
-          scanner.runScanner().catch(e => console.error('[SocialEngagement] Scanner error:', e));
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('SocialEngagementScanner', scanner.runScanner())
+            .catch(e => console.error('[SocialEngagement] Scanner error:', e));
         }, SCANNER_INTERVAL_MS);
 
       } catch (error) {
@@ -529,9 +561,13 @@ createTestAccount().then(async () => {
 
         console.log(`[ActivationCron] Initialized — first run at 08:00 UTC (in ${Math.round(msUntilNextRun / 60000)} min)`);
         setTimeout(() => {
-          runActivationAnalysis().catch(e => console.error('[ActivationCron] Error:', e));
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('ActivationCron', runActivationAnalysis())
+            .catch(e => console.error('[ActivationCron] Error:', e));
           setInterval(() => {
-            runActivationAnalysis().catch(e => console.error('[ActivationCron] Error:', e));
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('ActivationCron', runActivationAnalysis())
+              .catch(e => console.error('[ActivationCron] Error:', e));
           }, ACTIVATION_INTERVAL_MS);
         }, msUntilNextRun);
       } catch (error) {
@@ -543,9 +579,12 @@ createTestAccount().then(async () => {
       try {
         const { processDueEnrollments } = await import('./services/dripSequenceWorker');
         const DRIP_INTERVAL_MS = 5 * 60 * 1000;
-        processDueEnrollments().catch(e => console.error('[dripWorker] Error on first run:', e));
+        cronJobRegistry.track('dripWorker', processDueEnrollments())
+          .catch(e => console.error('[dripWorker] Error on first run:', e));
         setInterval(() => {
-          processDueEnrollments().catch(e => console.error('[dripWorker] Error:', e));
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('dripWorker', processDueEnrollments())
+            .catch(e => console.error('[dripWorker] Error:', e));
         }, DRIP_INTERVAL_MS);
         console.log('[dripWorker] Initialized — running every 5 minutes');
       } catch (error) {
@@ -567,9 +606,12 @@ createTestAccount().then(async () => {
       try {
         const { runLinkedInConnectionSync } = await import('./cron/linkedInConnectionSyncCron');
         const LI_CONN_INTERVAL_MS = 10 * 60 * 1000;
-        runLinkedInConnectionSync().catch(e => console.error('[linkedInConnectionSync] Error on first run:', e));
+        cronJobRegistry.track('linkedInConnectionSync', runLinkedInConnectionSync())
+          .catch(e => console.error('[linkedInConnectionSync] Error on first run:', e));
         setInterval(() => {
-          runLinkedInConnectionSync().catch(e => console.error('[linkedInConnectionSync] Error:', e));
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('linkedInConnectionSync', runLinkedInConnectionSync())
+            .catch(e => console.error('[linkedInConnectionSync] Error:', e));
         }, LI_CONN_INTERVAL_MS);
         console.log('[linkedInConnectionSync] Initialized — running every 10 minutes');
       } catch (error) {
@@ -584,9 +626,12 @@ createTestAccount().then(async () => {
       try {
         const { runMetaTokenRefresh } = await import('./cron/metaTokenRefreshCron');
         const META_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
-        runMetaTokenRefresh().catch(e => console.error('[metaTokenRefreshCron] Error on first run:', e));
+        cronJobRegistry.track('metaTokenRefreshCron', runMetaTokenRefresh())
+          .catch(e => console.error('[metaTokenRefreshCron] Error on first run:', e));
         setInterval(() => {
-          runMetaTokenRefresh().catch(e => console.error('[metaTokenRefreshCron] Error:', e));
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('metaTokenRefreshCron', runMetaTokenRefresh())
+            .catch(e => console.error('[metaTokenRefreshCron] Error:', e));
         }, META_REFRESH_INTERVAL_MS);
         console.log('[metaTokenRefreshCron] Initialized — running every 12 hours');
       } catch (error) {
@@ -617,9 +662,13 @@ createTestAccount().then(async () => {
 
           console.log(`[OnboardingLoop] Initialized — first run at 15:00 UTC (in ${Math.round(msUntilLoop / 60000)} min)`);
           setTimeout(() => {
-            runOnboardingLoop().catch(e => console.error('[OnboardingLoop] Error:', e));
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('OnboardingLoop', runOnboardingLoop())
+              .catch(e => console.error('[OnboardingLoop] Error:', e));
             setInterval(() => {
-              runOnboardingLoop().catch(e => console.error('[OnboardingLoop] Error:', e));
+              if (!isCronEnabled()) return;
+              cronJobRegistry.track('OnboardingLoop', runOnboardingLoop())
+                .catch(e => console.error('[OnboardingLoop] Error:', e));
             }, LOOP_INTERVAL_MS);
           }, msUntilLoop);
         } catch (error) {
@@ -632,9 +681,12 @@ createTestAccount().then(async () => {
           const { runOnboardingLoopWatchdog } = await import('./cron/onboardingLoopWatchdog');
 
           console.log('[OnboardingWatchdog] Initialized — running hourly');
-          runOnboardingLoopWatchdog().catch(e => console.error('[OnboardingWatchdog] Error on first run:', e));
+          cronJobRegistry.track('OnboardingWatchdog', runOnboardingLoopWatchdog())
+            .catch(e => console.error('[OnboardingWatchdog] Error on first run:', e));
           setInterval(() => {
-            runOnboardingLoopWatchdog().catch(e => console.error('[OnboardingWatchdog] Error:', e));
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('OnboardingWatchdog', runOnboardingLoopWatchdog())
+              .catch(e => console.error('[OnboardingWatchdog] Error:', e));
           }, WATCHDOG_INTERVAL_MS);
         } catch (error) {
           console.error('[OnboardingWatchdog] Failed to initialize:', error);
@@ -665,9 +717,13 @@ createTestAccount().then(async () => {
             `[AiEvalLoop] Initialized — first run at 16:00 UTC (in ${Math.round(msUntilAiEval / 60000)} min)`,
           );
           setTimeout(() => {
-            runAiEvalLoopOnce().catch(e => console.error('[AiEvalLoop] Error:', e));
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('AiEvalLoop', runAiEvalLoopOnce())
+              .catch(e => console.error('[AiEvalLoop] Error:', e));
             setInterval(() => {
-              runAiEvalLoopOnce().catch(e => console.error('[AiEvalLoop] Error:', e));
+              if (!isCronEnabled()) return;
+              cronJobRegistry.track('AiEvalLoop', runAiEvalLoopOnce())
+                .catch(e => console.error('[AiEvalLoop] Error:', e));
             }, AI_EVAL_LOOP_INTERVAL_MS);
           }, msUntilAiEval);
         } catch (error) {
@@ -699,9 +755,13 @@ createTestAccount().then(async () => {
             `[AiReadinessLoop] Initialized — first run at 16:30 UTC (in ${Math.round(msUntilReadiness / 60000)} min)`,
           );
           setTimeout(() => {
-            runAiReadinessLoopOnce().catch(e => console.error('[AiReadinessLoop] Error:', e));
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('AiReadinessLoop', runAiReadinessLoopOnce())
+              .catch(e => console.error('[AiReadinessLoop] Error:', e));
             setInterval(() => {
-              runAiReadinessLoopOnce().catch(e => console.error('[AiReadinessLoop] Error:', e));
+              if (!isCronEnabled()) return;
+              cronJobRegistry.track('AiReadinessLoop', runAiReadinessLoopOnce())
+                .catch(e => console.error('[AiReadinessLoop] Error:', e));
             }, AI_READINESS_LOOP_INTERVAL_MS);
           }, msUntilReadiness);
         } catch (error) {
@@ -732,9 +792,13 @@ createTestAccount().then(async () => {
             `[OnboardingLoopV2] Initialized — first run at 17:00 UTC (in ${Math.round(msUntilObV2 / 60000)} min)`,
           );
           setTimeout(() => {
-            runOnboardingLoopV2Once().catch(e => console.error('[OnboardingLoopV2] Error:', e));
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('OnboardingLoopV2', runOnboardingLoopV2Once())
+              .catch(e => console.error('[OnboardingLoopV2] Error:', e));
             setInterval(() => {
-              runOnboardingLoopV2Once().catch(e => console.error('[OnboardingLoopV2] Error:', e));
+              if (!isCronEnabled()) return;
+              cronJobRegistry.track('OnboardingLoopV2', runOnboardingLoopV2Once())
+                .catch(e => console.error('[OnboardingLoopV2] Error:', e));
             }, ONBOARDING_V2_INTERVAL_MS);
           }, msUntilObV2);
         } catch (error) {
@@ -768,9 +832,13 @@ createTestAccount().then(async () => {
             `[AgentModeLoop] Initialized — first run at 17:30 UTC (in ${Math.round(msUntilAgentMode / 60000)} min)`,
           );
           setTimeout(() => {
-            runAgentModeLoopOnce().catch(e => console.error('[AgentModeLoop] Error:', e));
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('AgentModeLoop', runAgentModeLoopOnce())
+              .catch(e => console.error('[AgentModeLoop] Error:', e));
             setInterval(() => {
-              runAgentModeLoopOnce().catch(e => console.error('[AgentModeLoop] Error:', e));
+              if (!isCronEnabled()) return;
+              cronJobRegistry.track('AgentModeLoop', runAgentModeLoopOnce())
+                .catch(e => console.error('[AgentModeLoop] Error:', e));
             }, AGENT_MODE_INTERVAL_MS);
           }, msUntilAgentMode);
         } catch (error) {
@@ -802,9 +870,13 @@ createTestAccount().then(async () => {
             `[AgentReliabilitySnapshot] Initialized — first run at 17:45 UTC (in ${Math.round(msUntilSnapshot / 60000)} min)`,
           );
           setTimeout(() => {
-            runAgentReliabilitySnapshot().catch(e => console.error('[AgentReliabilitySnapshot] Error:', e));
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('AgentReliabilitySnapshot', runAgentReliabilitySnapshot())
+              .catch(e => console.error('[AgentReliabilitySnapshot] Error:', e));
             setInterval(() => {
-              runAgentReliabilitySnapshot().catch(e => console.error('[AgentReliabilitySnapshot] Error:', e));
+              if (!isCronEnabled()) return;
+              cronJobRegistry.track('AgentReliabilitySnapshot', runAgentReliabilitySnapshot())
+                .catch(e => console.error('[AgentReliabilitySnapshot] Error:', e));
             }, SNAPSHOT_INTERVAL_MS);
           }, msUntilSnapshot);
         } catch (error) {
@@ -835,9 +907,13 @@ createTestAccount().then(async () => {
             `[LoopAttribution] Initialized — first run at 18:00 UTC (in ${Math.round(msUntilAttribution / 60000)} min)`,
           );
           setTimeout(() => {
-            runLoopAttributionOnce().catch(e => console.error('[LoopAttribution] Error:', e));
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('LoopAttribution', runLoopAttributionOnce())
+              .catch(e => console.error('[LoopAttribution] Error:', e));
             setInterval(() => {
-              runLoopAttributionOnce().catch(e => console.error('[LoopAttribution] Error:', e));
+              if (!isCronEnabled()) return;
+              cronJobRegistry.track('LoopAttribution', runLoopAttributionOnce())
+                .catch(e => console.error('[LoopAttribution] Error:', e));
             }, LOOP_ATTRIBUTION_INTERVAL_MS);
           }, msUntilAttribution);
         } catch (error) {

@@ -18,7 +18,9 @@
  */
 import AWS from "aws-sdk";
 import type { GeneratedLandingPage } from "./v0Service";
-import { deliverCompletion, deliverStuckFailure } from "./durableLandingService";
+import { deliverCompletion, deliverStuckFailure, STUCK_CEILING_MS } from "./durableLandingService";
+import { isCronEnabled } from "../utils/instanceState";
+import { cronJobRegistry } from "../utils/cronJobRegistry";
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || "us-west-2",
@@ -27,9 +29,6 @@ const dynamodb = new AWS.DynamoDB.DocumentClient({
 
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 const TABLE_NAME = `${TABLE_PREFIX}AW-LandingPages`;
-
-/** A build still in this state past the ceiling is considered dead. */
-const STUCK_CEILING_MS = 30 * 60 * 1000;
 
 function isStuck(page: GeneratedLandingPage, nowMs: number): boolean {
   if (page.status !== "generating" && page.status !== "deploying") return false;
@@ -89,7 +88,8 @@ export function startDurableLandingPoller(intervalMs = 5 * 60 * 1000): void {
   if (process.env.DURABLE_LANDING_GENERATION !== "true") return;
   if (pollerHandle) return;
   pollerHandle = setInterval(() => {
-    runDurableLandingPollerOnce().catch((err) =>
+    if (!isCronEnabled()) return;
+    cronJobRegistry.track("durableLandingPoller", runDurableLandingPollerOnce()).catch((err) =>
       console.error("[DURABLE LANDING POLLER] sweep failed:", err)
     );
   }, intervalMs);

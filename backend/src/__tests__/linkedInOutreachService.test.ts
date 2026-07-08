@@ -39,6 +39,10 @@ describe('LinkedInOutreachService', () => {
     linkedInOutreachService.cachedApiKey = null;
     // @ts-ignore
     linkedInOutreachService.client = null;
+    // Reset the per-account invitation cooldown breaker so tests don't leak state
+    // (the service is a module singleton shared across tests).
+    // @ts-ignore
+    linkedInOutreachService.invitationCooldownUntil = new Map();
 
     mockGetUnipileCredentials.mockResolvedValue({
       dsn: 'api.unipile.com',
@@ -369,6 +373,104 @@ describe('LinkedInOutreachService', () => {
       expect(msg.startsWith(sent.message)).toBe(true);
       expect(sent.message.endsWith(' ')).toBe(false);
     });
+
+    // ─── Account-level invitation cooldown breaker (ENG-126) ──────────────────
+    describe('account-level "Cannot resend yet" cooldown breaker', () => {
+      // Shape a Unipile rejection the way handleError expects (body.title becomes
+      // the normalized message when no body.message is present).
+      function cannotResendYetError() {
+        return Object.assign(new Error('UnsuccessfulRequestError'), {
+          body: {
+            status: 422,
+            type: 'errors/cannot_resend_yet',
+            title: 'Cannot resend yet',
+          },
+        });
+      }
+
+      it('short-circuits the NEXT invite to any recipient after a "Cannot resend yet" — no second Unipile call', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(cannotResendYetError());
+
+        // First send hits the cap and rejects.
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false)
+        ).rejects.toThrow(/cannot resend yet/i);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+
+        // Second send is a DIFFERENT, fresh recipient — must be short-circuited by
+        // the breaker: no new sendInvitation call, no profile-fetch round-trip.
+        const requestCallsBefore = (mockUnipileClient.request.send as jest.Mock).mock.calls.length;
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-2', false)
+        ).rejects.toThrow(/cannot resend yet/i);
+
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1); // still 1
+        expect((mockUnipileClient.request.send as jest.Mock).mock.calls.length).toBe(requestCallsBefore);
+      });
+
+      it('does NOT arm the account-wide breaker on a per-recipient "Should delay new invitation" rejection', async () => {
+        const perRecipient = Object.assign(new Error('UnsuccessfulRequestError'), {
+          body: {
+            status: 422,
+            type: 'errors/already_invited_recently',
+            title: 'Should delay new invitation to this recipient',
+          },
+        });
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(perRecipient);
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false)
+        ).rejects.toThrow(/should delay new invitation/i);
+
+        // A different recipient must still be attempted (breaker not armed).
+        await linkedInOutreachService.sendInvitation('acct-A', 'recipient-2', false);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(2);
+      });
+
+      it('scopes the breaker per account — a throttled account does not block a different one', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(cannotResendYetError());
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false)
+        ).rejects.toThrow(/cannot resend yet/i);
+
+        // acct-B is untouched — its invite must go through to Unipile.
+        await linkedInOutreachService.sendInvitation('acct-B', 'recipient-1', false);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(2);
+      });
+
+      it('self-heals: a fresh invite is attempted again once the cooldown window elapses', async () => {
+        // Arm an ALREADY-EXPIRED cooldown for the account, then confirm the next
+        // send clears it and actually calls Unipile.
+        // @ts-ignore private map
+        linkedInOutreachService.invitationCooldownUntil.set('acct-A', Date.now() - 1);
+
+        await linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+        // @ts-ignore private map — the stale entry was removed.
+        expect(linkedInOutreachService.invitationCooldownUntil.has('acct-A')).toBe(false);
+      });
+
+      it('a successful send clears a previously armed breaker for that account', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock)
+          .mockRejectedValueOnce(cannotResendYetError()) // first: hit the cap
+          .mockResolvedValue({ id: 'invitation-id' });     // later: succeeds
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false)
+        ).rejects.toThrow(/cannot resend yet/i);
+        // @ts-ignore private map — breaker armed.
+        expect(linkedInOutreachService.invitationCooldownUntil.has('acct-A')).toBe(true);
+
+        // Simulate the window elapsing so the next call proceeds and succeeds.
+        // @ts-ignore private map
+        linkedInOutreachService.invitationCooldownUntil.set('acct-A', Date.now() - 1);
+        await linkedInOutreachService.sendInvitation('acct-A', 'recipient-2', false);
+
+        // @ts-ignore private map — success cleared the breaker.
+        expect(linkedInOutreachService.invitationCooldownUntil.has('acct-A')).toBe(false);
+      });
+    });
   });
 
   describe('sendMessage', () => {
@@ -603,6 +705,38 @@ describe('LinkedInOutreachService', () => {
       await expect(
         linkedInOutreachService.searchPeople('account-123', { keywords: '' })
       ).rejects.toThrow('Bad search request');
+    });
+
+    // Regression: the unipile-node-sdk's RequestSender calls response.blob() (not
+    // response.json()) whenever Unipile's error response isn't application/json —
+    // e.g. a dead LinkedIn session surfaced as a plain-text/HTML body. Its
+    // UnsuccessfulRequestError.message is always ''. Before this fix, that combo
+    // fell through every extraction branch in handleError() and collapsed to the
+    // generic "Unknown error", which is exactly what was observed in production
+    // for session-drop failures ("Unknown error" with no actionable detail).
+    it('surfaces the raw response text instead of "Unknown error" when Unipile returns a non-JSON error body', async () => {
+      const blobBody = new Blob(['No client session'], { type: 'text/plain' });
+      const apiError = Object.assign(new Error(''), { body: blobBody });
+      (mockUnipileClient.request.send as jest.Mock).mockRejectedValueOnce(apiError);
+
+      const thrown = await linkedInOutreachService
+        .searchPeople('account-123', { keywords: 'cto' })
+        .catch((e) => e);
+
+      expect(thrown.message).toBe('No client session');
+      expect(thrown.message).not.toBe('Unknown error');
+    });
+
+    it('falls back to "Unknown error" when the non-JSON error body is empty', async () => {
+      const blobBody = new Blob([''], { type: 'text/plain' });
+      const apiError = Object.assign(new Error(''), { body: blobBody });
+      (mockUnipileClient.request.send as jest.Mock).mockRejectedValueOnce(apiError);
+
+      const thrown = await linkedInOutreachService
+        .searchPeople('account-123', { keywords: 'cto' })
+        .catch((e) => e);
+
+      expect(thrown.message).toBe('Unknown error');
     });
 
     // ─── Stage 2: ID-based filters + auto-resolve free-text via UnipileSearchParamService
@@ -948,6 +1082,102 @@ describe('LinkedInOutreachService', () => {
     });
   });
 
+  describe('profile lookup timeout + retry (ENG-144)', () => {
+    const TIMEOUT_MS = 30_000;
+    const hang = () => new Promise(() => {}); // never resolves — simulates a stuck Unipile session
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('times out a hung profile lookup instead of blocking indefinitely, and retries once', async () => {
+      jest.useFakeTimers();
+      const profile = { provider_id: 'john-doe', first_name: 'John' };
+      // First call hangs (stuck session), second call (the automatic retry) succeeds.
+      (mockUnipileClient.request.send as jest.Mock)
+        .mockImplementationOnce(() => hang())
+        .mockResolvedValueOnce(profile);
+
+      const resultPromise = linkedInOutreachService.getProfile('john-doe', 'account-123');
+      // Advance past the first internal timeout so the retry fires.
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+
+      await expect(resultPromise).resolves.toEqual(profile);
+      expect(mockUnipileClient.request.send).toHaveBeenCalledTimes(2);
+    });
+
+    it('rejects with a TIMEOUT_ERROR classification when both the initial call and the retry hang', async () => {
+      jest.useFakeTimers();
+      (mockUnipileClient.request.send as jest.Mock).mockImplementation(() => hang());
+
+      const resultPromise = linkedInOutreachService.getProfile('john-doe', 'account-123');
+      const assertion = expect(resultPromise).rejects.toMatchObject({
+        structuredError: { classification: 'TIMEOUT_ERROR' },
+      });
+      // Two timeouts: the initial lookup and its single retry.
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+      await assertion;
+      expect(mockUnipileClient.request.send).toHaveBeenCalledTimes(2);
+    });
+
+    it('does NOT retry on a real (non-timeout) API error — surfaces it immediately', async () => {
+      const apiError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 404, title: 'Profile not found' },
+      });
+      (mockUnipileClient.request.send as jest.Mock).mockRejectedValueOnce(apiError);
+
+      await expect(
+        linkedInOutreachService.getProfile('nonexistent', 'account-123')
+      ).rejects.toThrow('Profile not found');
+      expect(mockUnipileClient.request.send).toHaveBeenCalledTimes(1);
+    });
+
+    it('emits greppable CloudWatch markers (PROFILE_LOOKUP_TIMEOUT per attempt + PROFILE_LOOKUP_FAILED_TIMEOUT) so a future hang is diagnosable by time window', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      jest.useFakeTimers();
+      (mockUnipileClient.request.send as jest.Mock).mockImplementation(() => hang());
+
+      const resultPromise = linkedInOutreachService.getProfile('john-doe', 'account-123');
+      const captured = resultPromise.catch(() => {}); // swallow the eventual rejection
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1); // attempt 1 times out
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1); // retry times out
+      await captured;
+
+      const lines = warnSpy.mock.calls.map((c) => `${c[0]} ${c[1] ?? ''}`);
+      // One per-attempt timeout marker for each of the 2 attempts…
+      expect(lines.filter((l) => l.includes('PROFILE_LOOKUP_TIMEOUT'))).toHaveLength(2);
+      // …plus a single terminal marker naming the identifier + account for grepping.
+      const terminal = lines.find((l) => l.includes('PROFILE_LOOKUP_FAILED_TIMEOUT'));
+      expect(terminal).toBeDefined();
+      expect(terminal).toContain('john-doe');
+      expect(terminal).toContain('account-123');
+
+      warnSpy.mockRestore();
+    });
+
+    it('surfaced timeout error is classified as a retryable "timeout" by the agent error pipeline', async () => {
+      // Guards the cross-module contract: the timeout message emitted here must
+      // match toolErrorClassifier's timeout regex so the agent tells the model
+      // "retry once, then stop" instead of hanging. If the message ever changes
+      // and stops matching, this fails loudly.
+      const { classifyToolErrorClass } = require('../utils/toolErrorClassifier');
+      const { isRetryableErrorClass } = require('../services/agentMode/core/errorRetryability');
+      jest.useFakeTimers();
+      (mockUnipileClient.request.send as jest.Mock).mockImplementation(() => hang());
+
+      const resultPromise = linkedInOutreachService.getProfile('john-doe', 'account-123');
+      const captured = resultPromise.catch((e: any) => e);
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+      const err = await captured;
+
+      const cls = classifyToolErrorClass(err);
+      expect(cls).toBe('timeout');
+      expect(isRetryableErrorClass(cls)).toBe(true);
+    });
+  });
+
   describe('listConnections', () => {
     it('should return connections list', async () => {
       const mockRelations = {
@@ -1110,6 +1340,40 @@ describe('LinkedInOutreachService', () => {
     });
   });
 
+  describe('isAccountConnected timeout guard (ENG-144)', () => {
+    const CHECK_MS = 15_000;
+    const hang = () => new Promise(() => {}); // never resolves — stuck upstream
+
+    beforeEach(() => {
+      // @ts-ignore private cache — clear so the live probe actually runs
+      linkedInOutreachService.connectedStatusCache = new Map();
+    });
+    afterEach(() => jest.useRealTimers());
+
+    it('treats a hung account probe as NOT connected instead of blocking the caller', async () => {
+      jest.useFakeTimers();
+      (mockUnipileClient.account.getOne as jest.Mock).mockImplementation(() => hang());
+
+      const settled = linkedInOutreachService.isAccountConnected('acct-hang').then((v) => ({ v }));
+      await jest.advanceTimersByTimeAsync(CHECK_MS + 1);
+
+      expect(await settled).toEqual({ v: false });
+    });
+
+    it('treats a hung self-profile probe as NOT connected', async () => {
+      jest.useFakeTimers();
+      (mockUnipileClient.account.getOne as jest.Mock).mockResolvedValue({
+        connection_params: { im: { publicIdentifier: 'me' } },
+      });
+      (mockUnipileClient.request.send as jest.Mock).mockImplementation(() => hang());
+
+      const settled = linkedInOutreachService.isAccountConnected('acct-hang-2').then((v) => ({ v }));
+      await jest.advanceTimersByTimeAsync(CHECK_MS + 1);
+
+      expect(await settled).toEqual({ v: false });
+    });
+  });
+
   describe('resolveAccountId', () => {
     const mockGetAccountsByUserId = jest.fn();
     const mockGetSetting = jest.fn();
@@ -1124,14 +1388,64 @@ describe('LinkedInOutreachService', () => {
       }));
     });
 
-    it('returns user account_id when user has a connected unipile account', async () => {
+    it('returns user account_id when user has a live connected unipile account', async () => {
       mockGetAccountsByUserId.mockResolvedValue([
         { platform: 'unipile', account_id: 'user-acct-123' },
       ]);
+      const liveSpy = jest.spyOn(linkedInOutreachService, 'isAccountConnected').mockResolvedValue(true);
 
       const result = await linkedInOutreachService.resolveAccountId('user-1');
 
       expect(result).toBe('user-acct-123');
+      liveSpy.mockRestore();
+    });
+
+    it('skips a dead own account and returns the next LIVE own account (no site-wide fallback)', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'own-dead' },
+        { platform: 'unipile', account_id: 'own-live' },
+      ]);
+      const liveSpy = jest
+        .spyOn(linkedInOutreachService, 'isAccountConnected')
+        .mockImplementation(async (id: string) => id === 'own-live');
+
+      const result = await linkedInOutreachService.resolveAccountId('user-1');
+
+      expect(result).toBe('own-live');
+      // Never consulted site-wide settings because a live own account existed.
+      expect(mockGetSetting).not.toHaveBeenCalled();
+      liveSpy.mockRestore();
+    });
+
+    it('falls back to a site-wide account ONLY after every own account is dead', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'own-dead-1' },
+        { platform: 'unipile', account_id: 'own-dead-2' },
+      ]);
+      mockGetSetting.mockResolvedValue({
+        settingValue: JSON.stringify([{ account_id: 'site-live', enabled: true }]),
+      });
+      const liveSpy = jest
+        .spyOn(linkedInOutreachService, 'isAccountConnected')
+        .mockImplementation(async (id: string) => id === 'site-live');
+
+      const result = await linkedInOutreachService.resolveAccountId('user-1');
+
+      expect(result).toBe('site-live');
+      liveSpy.mockRestore();
+    });
+
+    it('returns null when the user has own accounts but ALL of them (and no site-wide) are dead', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'own-dead-1' },
+      ]);
+      mockGetSetting.mockResolvedValue(null);
+      const liveSpy = jest.spyOn(linkedInOutreachService, 'isAccountConnected').mockResolvedValue(false);
+
+      const result = await linkedInOutreachService.resolveAccountId('user-1');
+
+      expect(result).toBeNull();
+      liveSpy.mockRestore();
     });
 
     it('returns site-wide account_id when user has no account but site-wide accounts are configured', async () => {

@@ -1,3 +1,69 @@
+## "Priority: High" in text but priority field unset — root cause + fix (2026-07-07, ENG-231)
+
+Argusoft reported auto-generated Linear bugs whose descriptions say "Priority: High" while the actual Linear priority field is None and the issue sits in Backlog unassigned — invisible to priority-sorted triage. 11 live issues had this shape (ENG-167/189/190/191/197/200/201/202/203/209/213; hand-backfilled 2026-07-07).
+
+### Root cause (adversarially verified)
+`createInternalLinearIssue` (linearService) set only teamId/title/description/labelIds + stateId=Backlog — never `priority`/`assigneeId`. Emma's `report_product_issues` accepts a `priority: High|Medium|Low` param but only rendered it as description text via `issueContext['Priority']` → `contextLines()`. The legacy Notion path (`createOncallItem`) set an Owner + Move-to-Current-Sprint, so the Linear migration had silently regressed triage visibility.
+
+### Fix
+`FileUserIssueParams.priority` (text) is now mapped onto the Linear priority field in `fileBugReport` (urgent=1/high=2/medium=3/low=4; absent/unknown → Medium — bugs never arrive "No priority" per the board doc). High+ additionally lands `startInTodo` + default bug assignee (Harshit, env override `LINEAR_BUG_DEFAULT_ASSIGNEE_ID`). `getTeamMeta` resolves `todoStateId`; `createInternalLinearIssue` gained optional `priority`/`assigneeId`/`startInTodo`.
+
+### Assumptions to validate
+- Dup-grouped High re-reports do NOT escalate the existing canonical's priority/state (kept out of scope; the reporter-count modifier in the board doc may want this later).
+- `fileAutoIssue` (telemetry/oncall) still files unset-priority Backlog items by design — no text/field mismatch there, but they remain triage-invisible until ENG-187-style intake rules cover them.
+
+## Featurebase feature requests land as run-on blobs in Linear — root cause + fix (2026-07-06)
+
+Customer feature requests filed via Emma's `report_product_issues` were showing up in Linear as one giant run-on paragraph (reported on ENG-204). Chased it to ground truth.
+
+### Root cause (NOT Emma's output)
+Emma authors reasonable paragraph structure — the stored Featurebase post for ENG-204 had 39 newlines. Featurebase's `content` field is **HTML** (their docs: "content should be formatted as HTML"; it entity-encodes `&`/`<`/`>`). We send Emma's markdown/plaintext with raw `\n` and **no block tags**, so Featurebase renders `\n` as line breaks on its own board (nl2br) but its native `integrations.linear:true` push treats `\n` as insignificant HTML whitespace and collapses the whole body into one paragraph. Inline markers (`**bold**`, `##`) survive; all vertical structure dies.
+
+Proof: FB-pushed issues (ENG-204; ENG-166 `"## The ask When a customer…"` — heading newline collapsed) are blobs, while issues our own code creates via `linearService.createInternalLinearIssue` (bugs ENG-151, autos ENG-205) preserve `\n\n` + `* ` bullets. The Linear API faithfully returns `\n`, so the flattening is genuinely in Featurebase's push. Editing an existing FB post's content does NOT re-sync to Linear.
+
+### Fix
+`featurebaseService.mdToFeaturebaseHtml()` converts the intake layer's markdown/plaintext to HTML block tags, applied at both send sites (`createPost`, `createTicket`). Hand-rolled (not `marked`) because the backend is CommonJS and marked is ESM-only — a static import risks ERR_REQUIRE_ESM breaking all intake; the converter also HTML-escapes input so raw user text can't inject markup. Native `integrations.linear:true` sync is left intact (it's load-bearing for the resolve→notify-upvoters flow).
+
+### Assumption — VERIFIED live
+That Featurebase's create-time Linear push preserves HTML block structure. Confirmed via a hidden (`inReview:true`) test post → pushed Linear issue: `<p>` → `\n\n` paragraphs, `<ul><li>` → `* ` markdown bullets. Headings lose their `#` and `<strong>` is dropped (cosmetic), but the vertical structure that caused the blob is fully preserved. Test artifacts cleaned up (FB post deleted; Linear ENG-216 canceled).
+
+## Truthfulness bundle — finalize guard + instructive-error retryability (2026-07-02)
+
+Built the ENG-143/135/124 truthfulness bundle from the EMMA-HARNESS-PARITY-PLAN "Build-Now Design" (PR-T1 + the ENG-124 retry-spiral half). Generalizes the shipped ENG-104 single-tool pattern into ONE enforcement seam at the loop edge.
+
+### What shipped
+1. **`services/agentMode/core/finalizeGuard.ts`** (PURE, ports-injected, same style as `toolDispatch.ts`). Runs after the final assistant message, before emit/persist, behind **`AGENT_FINALIZE_GUARD` (env, DEFAULT OFF — A-or-B migration flag, not an on-error fallback)**. Flow: lexicon prefilter for 6 high-harm completed-action claim classes (email_sent, task_created_or_updated, post_published, schedule_created, crm_saved, asset_generated) → ONLY on hit, one structured-output judge call via the existing `callLLM` → deterministic match against successful ledger entries (`status==='success' && !toolResultError(result)`; asset claims via `mediaGenProducedAsset` — the xCures 76×-images check generalized) → mismatch → ONE corrective turn → re-check → still mismatched → VISIBLE appended correction + `claim_mismatch` verdict reason (`computeRunVerdict` → degraded → 17:30 UTC cluster cron sees the class). Judge failure = deliver unchanged + loud `agent_claim_check_error` event (documented best-effort; blocking delivery on a judge outage would be failing badly). Never a silent rewrite.
+2. **`services/agentMode/core/errorRetryability.ts`** — every model-visible tool error at the dispatch boundary now carries `[Retryable: yes/no — <next step>]` derived from `toolErrorClassifier` classes (rate_limit/timeout/network/upstream_5xx → yes; auth/upstream_rejected/invalid_args/tool_unavailable/invalid_output/policy_blocked → no + stop signal). Non-retryable classes **fast-trip the per-run breaker at 2 identical failures instead of 3** (`agentToolGatewayService`). empty_result/not_found deliberately NOT fast-tripped (same error text across different legitimate args).
+
+### Assumptions to validate
+- The lexicon prefilter windows (120 chars, completion verbs) are tuned on synthetic examples, not a prod claim corpus — expect some false negatives; the judge bill is bounded by prefilter hits.
+- Claim-class → tool-name matchers are name-pattern based (e.g. `/^send_.*email/`); new tools with unusual names need a matcher touch. One seam to update.
+- The ON-path characterization pins the corrective-turn transcript with the run's own `llmModel` as judge. If a cheaper judge model is wanted (DIAGNOSIS_MODEL), that's a one-line port change — deliberately not done to keep the flip decision (and prompt lane) with Harsha.
+- Fast-trip threshold 2 changes when `AgentToolRepeatedFailureError` fires for terminal classes — reliability tightening (fewer wasted identical retries), verified against the June retry-spiral shape in gateway tests.
+
+### Follow-up work on this branch (Manan, 2026-07-02/03)
+- Closed two coverage gaps the ticket's own examples exposed: added a 7th claim class `settings_saved` (backed by `save_memory`/`save_org_memory`/`update_brand_guidelines`/`update_market_strategy`), and widened the `task_created_or_updated` lexicon to catch "landed"/"now in" phrasing (the literal "landed in ClickUp" example).
+- Wired `claim_mismatch` verdicts into `AgentFailureRuleSet` so the 17:30 UTC cron actually clusters them — previously computed but never consumed by the policy layer.
+- Found and fixed a footgun: `AGENT_FINALIZE_GUARD=true` alone gives zero telemetry without `AGENT_RUNTIME_SPINE_ENABLED` also set (the recorder is a no-op otherwise) — `checkFinalizeGuardMisconfiguration()` now warns loudly at boot.
+- Added `AGENT_FINALIZE_GUARD_SHADOW` (detect + telemetry only, never rewrites the message) so real judge precision/recall data can be collected from production traffic with zero user-facing risk, ahead of the Okareo claim-faithfulness check this PR already flagged as unvalidated.
+- Switched the judge call to a cheap/fast model (`gemini-3.1-flash-lite`, same as `triageSlackMessage`) instead of the run's own model — the corrective-turn call stays on the real model.
+- Added a loose (keyword-only) matcher tier: a strict-matcher miss with a loose match on a real successful tool call is now treated as ambiguous (logged, not corrected) rather than confidently unbacked, to avoid false-correcting a true claim on a matcher coverage gap. Caught and fixed a self-introduced regression while building this (the asset_generated loose matcher initially also matched known `MEDIA_GEN_TOOLS`, which would have broken the xCures confirmation-gate-pause case) before it shipped.
+- Live-tested on env1 (both flags on): confirmed `agent_run_verdict` events write correctly end-to-end; could not force a genuine judge mismatch through manual chat probing (Opus 4.8 self-corrected both attempts) — judge accuracy on adversarial/real traffic remains unvalidated, same gap this PR already called out.
+
+## Slack ship-notify: Featurebase webhook → customer channel ping (2026-07-02, ENG-170)
+
+Added `shipNotifyService` + `POST /api/integrations/featurebase/webhook`: when a reported item ships, ping the reporter in their own Slack channel — additive to the email paths (bug resolve-bridge Resend email; Featurebase-native upvoter email for feature requests). Channel = first of the existing personal → org → org-owner resolution (`getEffectiveAllowedChannels`, moved from `emma/slackMessageTools` into `slackService`). Idempotency = atomic per-item claim (`settingsService.claimSetMember`, DynamoDB string-set ADD with UPDATED_OLD — no read-modify-write) taken BEFORE the send; a failed send releases the claim so Featurebase's delivery retry re-attempts. The webhook 200s immediately and fans out detached (a slow fan-out must not trip Featurebase's delivery timeout → concurrent retry → duplicate pings). Post titles are user-generated → Slack control chars (`&<>`) escaped and non-plain-http(s) URLs dropped, so a public post title can't smuggle `<!channel>` or disguised links into customers' channels. Endpoint is dark until `FEATUREBASE_WEBHOOK_SECRET` is set; signature = HMAC-SHA256 over `${timestamp}.${rawBody}` (headers `X-Webhook-Signature` hex + `X-Webhook-Timestamp`, ±300s).
+
+**Assumptions — VALIDATED LIVE 2026-07-02 (full E2E on test env, real Featurebase deliveries):**
+- ~~`changes[].field === "status"`~~ **WRONG — caught live.** Status transitions arrive as DOTTED entries (`status.id`, `status.name`, `status.type`), never a bare `status`. Fixed in commit `e2067f84` (filter accepts both). This was the one silent-drop bug; a hand-written payload test would have locked it in — the live capture caught it.
+- `data.item.postUrl` and `data.item.author.email` ARE present on `post.updated` (captured payload) — the `GET /v2/posts/{id}` fallback is rare-path as designed.
+- Featurebase webhook `timeoutMs` is **5000ms** (from the webhook object) — the immediate-200 + detached fan-out design is mandatory, not optional.
+- E2E proof (Linear ENG-174 → FB post flip → webhook → Slack): ping delivered to the mapped channel in ~4s; `<!channel>` injection probe in the title arrived ESCAPED (no broadcast); re-completing the item did NOT re-ping (atomic claim held); unsigned requests 401; endpoint dark without the secret.
+- Ops finding: `SLACK_BOT_TOKEN` in the `agentweb/test-env` backend-env secret is STALE (`invalid_auth`) — E2E used the prod token. Refresh the secret so future test envs have working Slack.
+- Voter list is fetched single-page (limit 100, warn on `nextCursor`) — fine at current board size.
+
+Rollout: create webhook in Featurebase Settings → Advanced → Webhooks (topic `post.updated`, nova version) pointing at prod, set `FEATUREBASE_WEBHOOK_SECRET` (value in the Featurebase dashboard per-webhook), redeploy. Kill switch: unset the env var (endpoint goes dark again). Per-user opt-out: `slackShipNotifyDisabled` on AW-Users.
+
 ## Prod outage: partner-portal "Failed to load users" — full disk + nginx PrivateTmp trap (2026-06-26)
 
 Three stacked failures, only the last self-inflicted by the attempted fixes:

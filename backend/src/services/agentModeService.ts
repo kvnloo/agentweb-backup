@@ -11,7 +11,8 @@ import { rankMemoriesByRelevance } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { computeTermination } from './agentMode/core/agentStep';
-import { executePreparedTools } from './agentMode/core/toolDispatch';
+import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
+import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
@@ -60,22 +61,12 @@ const MAX_TOOL_CONTENT_SIZE = 300_000;
 // get compressed to a 200-char preview. Storing them in S3 lets the LLM call search_tool_response
 // to retrieve specific fields from the original payload without needing the full text in context.
 
-/**
- * Extracts the string content from a tool result for LLM consumption and S3 storage.
- *
- * Tools registered via mcpToolRegistry use jsonResult() which wraps their output in the MCP
- * format: { content: [{ type: 'text', text: '<actual JSON>' }] }. If we store the entire
- * wrapper via JSON.stringify(), the inner JSON becomes double-escaped in S3: field names like
- * "sessionId" are stored as \"sessionId\", causing search_tool_response to return 0 matches.
- *
- * Priority: formattedContent > content[0].text (MCP inner text) > JSON.stringify fallback.
- */
-export function extractToolContent(result: any): string {
-  if (typeof result === 'string') return result;
-  if (result?.formattedContent) return result.formattedContent;
-  if (result?.content?.[0]?.text) return result.content[0].text;
-  return JSON.stringify(result);
-}
+// extractToolContent now lives in ../utils/extractToolContent (pure, monolith-free)
+// so the tool-output contract validator and the toolDispatch unit suite can wire
+// the REAL extractor without loading this 24k-line service. Re-exported here so
+// existing `from '../services/agentModeService'` importers are unaffected.
+export { extractToolContent } from '../utils/extractToolContent';
+import { extractToolContent } from '../utils/extractToolContent';
 
 /**
  * Normalize a video timecode to a numeric number of seconds.
@@ -115,10 +106,11 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
 const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
+import { twitterService } from './twitterService';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
 import { HubSpotService } from './hubspotService';
-import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString } from '../utils/s3Utils';
+import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
 import {
@@ -130,6 +122,9 @@ import {
   validateAndRepairToolArgs,
 } from './agentToolGatewayService';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
+import { validateToolOutputContract } from '../utils/toolOutputContract';
+import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
 
 type MetaApiResult = {
   success: boolean;
@@ -175,48 +170,88 @@ function recordAgentModeToolTelemetry(
   runId: string,
   sessionId: string,
   iteration: number,
-  toolResults: Array<{ status: 'success' | 'error'; toolCall: any; functionArgs?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>,
+  toolResults: Array<{ status: 'success' | 'error' | 'deferred'; toolCall: any; functionArgs?: any; result?: any; error?: any; duration: number; policyDecision?: AgentToolPolicyDecision }>,
+  budgetContext?: { mediaAssetsProducedThisRun?: number; mediaGenerationDeadlineMs?: number },
 ): void {
   const recorder = getAgentRunRecorderSafe();
   if (!recorder || toolResults.length === 0) return;
 
-  void (async () => {
-    try {
-      const toolNames = toolResults.map(r => r.toolCall?.function?.name ?? 'unknown');
-      // PR #1818 follow-up: contract-layer activity as countable telemetry so
-      // the enforcement decision has data (args_repaired / schema-error rates).
-      const argsRepairedCount = toolResults.filter(
-        (r) => r.policyDecision?.flags?.some((flag) => flag.code === 'args_repaired'),
-      ).length;
-      const schemaErrorCount = toolResults.filter(
-        (r) => r.status === 'error' && classifyToolErrorClass(r.error) === 'invalid_args',
-      ).length;
-      await recorder.decision(runId, {
-        iteration,
-        toolNames,
-        sessionId,
-        toolArgKeys: summarizeToolArgKeys(toolResults),
-        toolArgsPreview: summarizeToolArgs(toolResults),
-        decisionExplanation: summarizeToolDecision(toolResults),
-        explanationSource: 'deterministic_tool_summary',
-        toolPolicyFlags: summarizeAgentToolPolicyFlags(toolResults.map((r) => r.policyDecision)),
-        toolPolicySummary: summarizeAgentToolPolicyModes(toolResults.map((r) => r.policyDecision)),
-        argsRepairedCount,
-        schemaErrorCount,
-      });
-      for (const r of toolResults) {
-        const toolName = r.toolCall?.function?.name ?? 'unknown';
-        await recorder.toolInvoked(runId, { toolName, iteration, sessionId });
-        if (r.status === 'success') {
-          await recorder.toolSucceeded(runId, { toolName, durationMs: r.duration, sessionId });
-        } else {
-          await recorder.toolFailed(runId, { toolName, error: r.error, durationMs: r.duration, sessionId, args: r.functionArgs });
-        }
+  // ENG-102: enqueue the per-tool records SYNCHRONOUSLY (no detached `void
+  // (async)` wrapper). The recorder's internal write chain serializes them in
+  // call order, so they always precede the terminal run record enqueued after
+  // the loop — and the terminal record's flush implies these are durably
+  // written before the worker exits. Still non-blocking from the caller's view:
+  // the recorder methods return immediately and the chain settles in the
+  // background (drained at run end). Only the synchronous summary computation is
+  // wrapped in try/catch — telemetry must never break the chat hot path.
+  try {
+    const toolNames = toolResults.map(r => r.toolCall?.function?.name ?? 'unknown');
+    // PR #1818 follow-up: contract-layer activity as countable telemetry so
+    // the enforcement decision has data (args_repaired / schema-error rates).
+    const argsRepairedCount = toolResults.filter(
+      (r) => r.policyDecision?.flags?.some((flag) => flag.code === 'args_repaired'),
+    ).length;
+    const schemaErrorCount = toolResults.filter(
+      (r) => r.status === 'error' && classifyToolErrorClass(r.error) === 'invalid_args',
+    ).length;
+    void recorder.decision(runId, {
+      iteration,
+      toolNames,
+      sessionId,
+      toolArgKeys: summarizeToolArgKeys(toolResults),
+      toolArgsPreview: summarizeToolArgs(toolResults),
+      decisionExplanation: summarizeToolDecision(toolResults),
+      explanationSource: 'deterministic_tool_summary',
+      toolPolicyFlags: summarizeAgentToolPolicyFlags(toolResults.map((r) => r.policyDecision)),
+      toolPolicySummary: summarizeAgentToolPolicyModes(toolResults.map((r) => r.policyDecision)),
+      argsRepairedCount,
+      schemaErrorCount,
+    });
+    for (const r of toolResults) {
+      const toolName = r.toolCall?.function?.name ?? 'unknown';
+      if (r.status === 'deferred') {
+        // ENG-103: a deferred call never executed → record it as its own class,
+        // NOT as toolInvoked (keeps the reliability denominator clean) and NOT
+        // as a failure (it carries no error signal).
+        void recorder.toolDeferred(runId, {
+          toolName,
+          reason: 'media_generation_time_budget',
+          iteration,
+          sessionId,
+          ...(budgetContext?.mediaAssetsProducedThisRun != null
+            ? { mediaAssetsProducedThisRun: budgetContext.mediaAssetsProducedThisRun }
+            : {}),
+          ...(budgetContext?.mediaGenerationDeadlineMs != null
+            ? { deadlineMs: budgetContext.mediaGenerationDeadlineMs }
+            : {}),
+        });
+        continue;
       }
-    } catch (err) {
-      console.error('[agent-mode] tool telemetry failed (swallowed):', err);
+      void recorder.toolInvoked(runId, { toolName, iteration, sessionId });
+      if (r.status === 'success') {
+        void recorder.toolSucceeded(runId, { toolName, durationMs: r.duration, sessionId });
+        // ENG-104: a success that returned an explicitly partial result (e.g.
+        // get_meta_ads_metrics with an errored breakdown section) is still a
+        // success, but its degradation is recorded as its own class so a section
+        // silently going dark is visible in telemetry instead of hiding behind
+        // success:true. Emitted only when the result is flagged partialFailure —
+        // the all-success path emits nothing (behavior-preserving).
+        const partial = buildToolPartialFailureTelemetry(toolName, r.result);
+        if (partial) {
+          void recorder.toolPartialFailure(runId, {
+            toolName: partial.toolName,
+            unavailableSections: partial.unavailableSections,
+            iteration,
+            sessionId,
+          });
+        }
+      } else {
+        void recorder.toolFailed(runId, { toolName, error: r.error, durationMs: r.duration, sessionId, args: r.functionArgs });
+      }
     }
-  })();
+  } catch (err) {
+    console.error('[agent-mode] tool telemetry failed (swallowed):', err);
+  }
 }
 
 
@@ -231,11 +266,29 @@ function recordAgentModeRunStarted(
 
 function recordAgentModeRunCompleted(
   runId: string,
-  info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
+  info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string; claimMismatch?: boolean },
 ): void {
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runCompleted(runId, info);
+}
+
+/**
+ * The finalize guard's claim check itself failed (judge/correction LLM call
+ * errored, ENG-143). LOUD by contract: the guard delivers the chat unchanged on
+ * judge failure — this signal (console + durable agent_claim_check_error event)
+ * is the only trace that a truthfulness check was skipped. Best-effort: must
+ * never throw into the chat hot path.
+ */
+function recordAgentModeClaimCheckError(runId: string, sessionId: string, error: unknown): void {
+  console.error('[agent-mode] finalize-guard claim check FAILED (message delivered unchanged):', {
+    runId,
+    sessionId,
+    error: error instanceof Error ? error.message : String(error),
+  });
+  const recorder = getAgentRunRecorderSafe();
+  if (!recorder) return;
+  void recorder.claimCheckError(runId, { error, sessionId });
 }
 
 function recordAgentModeRunFailed(
@@ -245,6 +298,62 @@ function recordAgentModeRunFailed(
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runFailed(runId, info);
+}
+
+/**
+ * Record same-turn duplicate tool-call suppression (ENG-108) as a structured,
+ * observability-only signal — SEPARATE from success/failure telemetry (a
+ * suppressed duplicate is neither). Best-effort: never throws into the chat hot
+ * path.
+ */
+function recordAgentModeDuplicateSuppression(
+  runId: string,
+  sessionId: string,
+  iteration: number,
+  entries: Array<{ toolCall: any; functionArgs: any; duplicateOfId: string }>,
+): void {
+  if (entries.length === 0) return;
+  try {
+    for (const entry of entries) {
+      console.warn('[agent-mode] duplicate tool call suppressed', {
+        runId,
+        sessionId,
+        iteration,
+        toolName: entry.toolCall?.function?.name ?? 'unknown',
+        duplicateOfId: entry.duplicateOfId,
+      });
+    }
+  } catch (err) {
+    console.error('[agent-mode] duplicate-suppression telemetry failed (swallowed):', err);
+  }
+}
+
+/**
+ * Record a model fallback (ENG-46) as a structured, greppable, observability-only
+ * signal. When a request pins a model id that is no longer served (e.g. a stale
+ * post-deploy smoke-test config or a retired DB default), `resolveGenerationModel`
+ * substitutes the default so the request still completes — but that substitution
+ * MUST be visible to ops, not silently buried, otherwise a stale config keeps
+ * shipping the wrong model unnoticed. The stable `[agent-mode] model fallback`
+ * tag is what log dashboards/alerts key on. Best-effort: never throws into the
+ * chat hot path.
+ */
+function recordAgentModeModelFallback(
+  runId: string,
+  sessionId: string,
+  requestedModel: string,
+  resolvedModel: string,
+): void {
+  try {
+    console.warn('[agent-mode] model fallback', {
+      runId,
+      sessionId,
+      requestedModel: requestedModel || '(none)',
+      resolvedModel,
+    });
+  } catch (err) {
+    console.error('[agent-mode] model-fallback telemetry failed (swallowed):', err);
+  }
 }
 
 function countFailedToolCalls(toolCalls: any[]): number {
@@ -357,6 +466,25 @@ function getAgentRunRecorderSafe() {
   }
 }
 
+/**
+ * Drain the recorder's pending writes before worker/IPC teardown (ENG-102) so
+ * per-tool + terminal telemetry are durably written before the worker process
+ * exits — bounded by a timeout (mirroring the 5s generateSuggestedReplies guard)
+ * so it can never hang the response. No-op when the runtime spine is disabled.
+ */
+async function flushAgentRunRecorderSafe(timeoutMs = 5000): Promise<void> {
+  const recorder = getAgentRunRecorderSafe();
+  if (!recorder) return;
+  try {
+    await Promise.race([
+      recorder.flush(),
+      new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+    ]);
+  } catch {
+    // best-effort — telemetry drain must never break the chat turn
+  }
+}
+
 function buildAgentRuntimeRunId(sessionId: string): string {
   const randomSuffix = Math.random().toString(36).slice(2, 8);
   return `${sessionId}:run:${Date.now().toString(36)}:${randomSuffix}`;
@@ -457,6 +585,11 @@ interface LLMCallOptions {
 // Diagnosis agent configuration
 const DIAGNOSIS_MODEL = 'gemini-3.1-flash-lite';
 const DIAGNOSIS_TIMEOUT_MS = 10_000;
+
+// Finalize-guard judge model (ENG-143): a bounded claim-extraction
+// classification, not conversational generation, so it deliberately does NOT
+// reuse the run's own (often pricier) llmModel — see judgeFinalizeClaims.
+const FINALIZE_GUARD_JUDGE_MODEL = DIAGNOSIS_MODEL;
 
 // Markers used by perform_data_analysis to capture files the Gemini code-execution
 // sandbox produces. The sandbox filesystem is discarded after execution and Gemini
@@ -1001,25 +1134,31 @@ export class AgentModeService {
         function: {
           name: 'wait_seconds',
           description: 'Wait for a specified number of seconds before continuing. Use this when you need to pause before checking a result — for example, waiting for a post to propagate, an email to arrive, a page to update, or any async operation to complete. When used in a batch with other tool calls, the entire batch executes sequentially so the wait happens in order.',
-          parameters: {
-            type: 'object',
-            properties: {
-              seconds: {
-                type: 'number',
-                description: 'Number of seconds to wait (max 300)'
-              },
-              reason: {
-                type: 'string',
-                description: 'Brief explanation of what you are waiting for (shown to the user)'
-              }
-            },
-            required: ['seconds', 'reason']
-          }
+          parameters: WAIT_SECONDS_PARAMETERS
         }
       },
-      execute: async (args: any, _context: any) => {
-        const seconds = Math.min(Math.max(1, Math.round(args.seconds)), 300);
-        await new Promise(resolve => setTimeout(resolve, seconds * 1000));
+      execute: async (args: any, context: any) => {
+        // Cap the sleep to the run's remaining wall-clock budget so a long wait can't
+        // be guillotined mid-sleep by the generation timeout and logged as a spurious
+        // wait_seconds failure (ENG-124). runBudgetDeadlineMs is threaded in from the
+        // dispatcher; when absent (e.g. budget disabled) the wait is unchanged.
+        const { seconds, requestedSeconds, deadlineReached } = computeWaitSeconds({
+          requestedSeconds: args.seconds,
+          deadlineMs: context?.runBudgetDeadlineMs,
+        });
+        if (seconds > 0) {
+          await new Promise(resolve => setTimeout(resolve, seconds * 1000));
+        }
+        if (deadlineReached) {
+          return {
+            waited_seconds: seconds,
+            reason: args.reason || 'Waiting before continuing',
+            deadlineReached: true,
+            message: seconds > 0
+              ? `Waited ${seconds} seconds (shortened from ${requestedSeconds}s — this response is approaching its time limit). Do NOT wait again; check the result now. If it is still pending, tell the user it is still processing and to check back shortly rather than waiting further.`
+              : `Did not wait — this response is at its time limit. Do NOT wait again; check the result now. If it is still pending, tell the user it is still processing and to check back shortly rather than waiting further.`,
+          };
+        }
         return { waited_seconds: seconds, reason: args.reason, message: `Waited ${seconds} seconds.` };
       }
     });
@@ -2031,7 +2170,7 @@ export class AgentModeService {
     // Azure OpenAI enforces a 128-tool limit per request
     // supportsVision flags below were verified empirically against the describe_image
     // path (probe against a real image). All GPT-5 deployments handle vision.
-    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true },
     'gpt-5.4-nano': { client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
@@ -2069,7 +2208,7 @@ export class AgentModeService {
   }
   /**
    * Make an LLM call with the specified model and parameters
-   * @param model - The model to use (e.g., 'gpt-5.1', 'gemini-3-pro-preview')
+   * @param model - The model to use (e.g., 'gpt-5.5', 'gemini-3-pro-preview')
    * @param messages - Array of chat messages
    * @param options - Optional parameters for the LLM call
    * @returns The LLM response
@@ -2087,6 +2226,50 @@ export class AgentModeService {
       return LEGACY_MODEL_ALIASES[model] as T;
     }
     return model;
+  }
+
+  /**
+   * Resolve the model id for a generation request up front: normalize legacy
+   * ids, then validate against the allow-list. A model that is no longer served
+   * (e.g. a stale default or smoke-test config pinned to a removed id like
+   * 'gpt-5.1') would otherwise throw an opaque "Invalid model" deep inside
+   * callLLM, which the outer handler surfaces to the user as "Unknown Error"
+   * (ENG-46). Instead, fall back to the configured default model so the request
+   * still completes, and report whether a fallback happened so callers can log
+   * it / expose it via telemetry.
+   */
+  public resolveGenerationModel(model: string): { model: string; fellBack: boolean; requestedModel: string } {
+    const normalized = this.normalizeModelId(model);
+    // Use hasOwnProperty so inherited Object.prototype keys (e.g. 'constructor',
+    // 'toString') can't masquerade as valid allow-list entries.
+    if (normalized && Object.prototype.hasOwnProperty.call(this.llmModels, normalized)) {
+      return { model: normalized, fellBack: false, requestedModel: model };
+    }
+    const fallbackModel = this.resolveFallbackModel();
+    console.warn(
+      `AgentMode: Requested model '${model ?? '(none)'}' is not in the allow-list; falling back to default '${fallbackModel}'.`
+    );
+    return { model: fallbackModel, fellBack: true, requestedModel: model };
+  }
+
+  /**
+   * Resolve the model to fall back to when a requested id is unavailable.
+   * Normally this is the configured default_model, but if that itself has been
+   * removed from the allow-list (e.g. a stale AZURE_OPENAI_DEPLOYMENT_AGENT_MODE
+   * env override pinning a retired deployment) returning it would just re-throw
+   * "Invalid model" inside callLLM. Guard against that by validating the default
+   * and falling back to a known-good served model otherwise (ENG-46).
+   */
+  private resolveFallbackModel(): string {
+    if (Object.prototype.hasOwnProperty.call(this.llmModels, this.default_model)) {
+      return this.default_model;
+    }
+    const knownGoodModel = Object.keys(this.llmModels)[0];
+    console.warn(
+      `AgentMode: Configured default model '${this.default_model}' is not in the allow-list; ` +
+      `falling back to known-good model '${knownGoodModel}'.`
+    );
+    return knownGoodModel;
   }
 
   async callLLM(
@@ -2395,10 +2578,21 @@ export class AgentModeService {
       sessionType: isInteractiveShare ? 'interactive_share' : 'regular',
     });
     try {
-      // Map legacy/renamed model ids forward (e.g. old sessions persisted the
-      // pre-rename "claude-opus-4-8") so metadata, pricing, and routing all use
-      // the canonical registry key.
-      llmModel = this.normalizeModelId(llmModel);
+      // Resolve the model up front: map legacy/renamed ids forward (e.g. old
+      // sessions persisted the pre-rename "claude-opus-4-8") AND validate against
+      // the allow-list. A removed/stale id (e.g. a smoke-test config pinned to
+      // 'gpt-5.1') would otherwise throw an opaque "Invalid model" deep inside
+      // callLLM and surface to the user as "Unknown Error" (ENG-46); instead fall
+      // back to the default model so the request still completes.
+      const requestedLlmModel = llmModel;
+      const modelResolution = this.resolveGenerationModel(llmModel);
+      llmModel = modelResolution.model;
+      if (modelResolution.fellBack) {
+        // Surface the substitution as a structured, alertable telemetry signal so
+        // a stale model id (smoke-test / DB default) is caught in dashboards rather
+        // than silently masked (ENG-46).
+        recordAgentModeModelFallback(agentRuntimeRunId, sessionId, requestedLlmModel, llmModel);
+      }
       // Track backup model usage
       const originalLlmModel = llmModel;
       let backupModelUsed = false;
@@ -3017,8 +3211,18 @@ export class AgentModeService {
             executeAgentToolThroughGateway,
             executePreparedAgentTool: (toolInput: any) => this.executePreparedAgentTool(toolInput),
             toolResultError,
+            // ENG-105: validate tool output against the minimum-output contract so
+            // an empty/undefined/invalid "success" becomes a structured tool
+            // failure (errorClass invalid_output) instead of feeding garbage to
+            // the model and counting as success.
+            validateToolOutput: (result: any) => validateToolOutputContract(result, extractToolContent),
             recordToolTelemetry: (telemetryToolResults) =>
-              recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults as any),
+              recordAgentModeToolTelemetry(agentRuntimeRunId, sessionId, iteration, telemetryToolResults as any, {
+                mediaAssetsProducedThisRun,
+                mediaGenerationDeadlineMs,
+              }),
+            recordDuplicateSuppression: (entries) =>
+              recordAgentModeDuplicateSuppression(agentRuntimeRunId, sessionId, iteration, entries),
             extractMinimalToolResult: (result: any, toolName: string) => this.extractMinimalToolResult(result, toolName),
             extractToolContent,
             formatToolError: (toolName: string, errorMessage: string) => this.formatToolError(toolName, errorMessage),
@@ -3153,6 +3357,103 @@ export class AgentModeService {
         }
       }
 
+      // Finalize guard (ENG-143/135/124): claimed-vs-executed truthfulness check at
+      // the loop edge, AFTER the final message and BEFORE emit/persist.
+      // Two independent flags, most-enforcing wins:
+      //   AGENT_FINALIZE_GUARD=true        → 'enforce': detect AND rewrite the message.
+      //   AGENT_FINALIZE_GUARD_SHADOW=true → 'shadow': detect + telemetry only, the
+      //     message the user sees is NEVER touched. Lets Harsha collect real
+      //     judge precision/recall data on production traffic (the Okareo
+      //     claim-faithfulness gap) with zero user-facing risk before deciding
+      //     on enforcement.
+      // Both default OFF — with neither set this block is inert and the
+      // characterization harness is byte-identical.
+      // NO-FALLBACK compliance: in enforce mode the guard never silently rewrites
+      // the message — a mismatch produces either the model's own corrective
+      // restatement or a VISIBLE appended correction; a judge/guard failure
+      // delivers the text unchanged plus a loud claim_check_error signal
+      // (documented best-effort — blocking chat delivery on a judge outage would
+      // be failing badly).
+      let finalizeClaimMismatch = false;
+      const finalizeGuardMode: 'enforce' | 'shadow' | null =
+        process.env.AGENT_FINALIZE_GUARD === 'true'
+          ? 'enforce'
+          : process.env.AGENT_FINALIZE_GUARD_SHADOW === 'true'
+            ? 'shadow'
+            : null;
+      if (finalizeGuardMode && content && !wasCancelled && !mockMode) {
+        try {
+          const finalizeLedger: FinalizeLedgerEntry[] = toolCalls.map((tc: any): FinalizeLedgerEntry => ({
+            toolName: tc.name,
+            // A suppressed same-turn duplicate (duplicateOf) and a budget-deferred
+            // media call never EXECUTED — neither may back a claim on its own (the
+            // original executed call has its own ledger entry), so both map to
+            // 'deferred' (non-backing) rather than 'success'.
+            status: tc.error !== undefined
+              ? 'error'
+              : (tc.duplicateOf || (tc.result && (tc.result as any).deferred === true) ? 'deferred' : 'success'),
+            result: tc.result,
+          }));
+          const guardOutcome = await runFinalizeGuard({
+            finalText: content,
+            ledger: finalizeLedger,
+            ports: {
+              judgeExtractClaims: (text, candidateClasses) =>
+                this.judgeFinalizeClaims(text, candidateClasses),
+              requestCorrection: ({ finalText, systemNote }) =>
+                this.requestFinalizeCorrection(finalText, systemNote, llmModel),
+              toolResultError,
+              mediaGenProducedAsset,
+              recordClaimCheckError: (err) => recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, err),
+            },
+          });
+          finalizeClaimMismatch = guardOutcome.claimMismatch;
+          // Ambiguous claims never change finalText (by design — see
+          // finalizeGuard.ts), so without this they'd be invisible even though
+          // the whole point of the confidence tier is to surface them for
+          // review instead of silently risking a false correction.
+          if (guardOutcome.ambiguousClaimClasses.length > 0) {
+            console.warn(`AgentMode: finalize guard found AMBIGUOUS (uncorrected) claim(s) in session ${sessionId} — possible matcher coverage gap`, {
+              ambiguousClaimClasses: guardOutcome.ambiguousClaimClasses,
+            });
+          }
+          if (guardOutcome.finalText !== content) {
+            if (finalizeGuardMode === 'shadow') {
+              // Shadow mode: log what WOULD have changed, but the user-visible
+              // message and the persisted transcript are left untouched.
+              console.warn(`AgentMode: finalize guard SHADOW ${guardOutcome.action} in session ${sessionId} (message NOT modified)`, {
+                claimClasses: guardOutcome.mismatchedClaimClasses,
+              });
+            } else {
+              console.warn(`AgentMode: finalize guard ${guardOutcome.action} in session ${sessionId}`, {
+                claimClasses: guardOutcome.mismatchedClaimClasses,
+              });
+              content = guardOutcome.finalText;
+              // Keep the persisted transcript consistent with what the user sees:
+              // correct the LAST assistant message in place (same message count) and
+              // stamp guard metadata so the correction is auditable in the session.
+              for (let i = messages.length - 1; i >= 0; i--) {
+                if ((messages[i] as any).role === 'assistant') {
+                  (messages[i] as any).content = content;
+                  (messages[i] as any).metadata = {
+                    ...(messages[i] as any).metadata,
+                    finalizeGuard: {
+                      action: guardOutcome.action,
+                      claimClasses: guardOutcome.mismatchedClaimClasses,
+                    },
+                  };
+                  break;
+                }
+              }
+            }
+          }
+        } catch (guardError) {
+          // Guard is advisory — a guard bug must never block delivery. Loud, not
+          // silent: recorded as claim_check_error (same contract as judge failure).
+          recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, guardError);
+        }
+      }
+
       // Attach timing metadata, memory usage, and tool calls to the last assistant message
       if (messages.length > 0) {
         const lastAssistantIdx = messages.length - 1 - [...messages].reverse().findIndex((m: any) => m.role === 'assistant');
@@ -3192,7 +3493,14 @@ export class AgentModeService {
         toolCalls: toolCalls.length,
         failedToolCalls: countFailedToolCalls(toolCalls),
         maxSameToolFailures: maxSameToolFailureCount(toolCalls),
+        // ENG-143: an unresolved claim mismatch grades the run degraded
+        // (claim_mismatch verdict reason) so the 17:30 UTC cluster cron sees it.
+        ...(finalizeClaimMismatch ? { claimMismatch: true } : {}),
       });
+      // ENG-102: drain telemetry before the worker reports success to the parent
+      // process (fire-and-forget would race with IPC teardown — same treatment
+      // the suggested-replies tail work already gets). Bounded, so never hangs.
+      await flushAgentRunRecorderSafe();
       return {
         content,
         toolCalls,
@@ -3258,6 +3566,8 @@ export class AgentModeService {
         failedToolCalls: countFailedToolCalls(_toolCallsForTelemetry),
         maxSameToolFailures: maxSameToolFailureCount(_toolCallsForTelemetry),
       });
+      // ENG-102: drain telemetry before the error propagates / worker tears down.
+      await flushAgentRunRecorderSafe();
       throw wrappedError;
     }
   }
@@ -3742,17 +4052,21 @@ export class AgentModeService {
       completed: '✅',
       failed: '❌'
     };
-    let statusesContent = '';
+    // Only inject a task-status context message when there ARE task statuses to
+    // report. Previously an empty session pushed an assistant message reading
+    // "📋 Task Status: No tasks have been run in this session yet." right before
+    // the user's message. On a terse confirmation (e.g. "go with defaults") the
+    // model could parrot that injected assistant turn verbatim instead of
+    // proceeding with the actual work (ENG-129). The empty-status note conveys
+    // nothing the model needs, so skip it entirely.
     if (currentTaskStatuses && currentTaskStatuses.length > 0) {
-      statusesContent += 'Current Task Statuses:\n';
+      let statusesContent = 'Current Task Statuses:\n';
       currentTaskStatuses.forEach(task => {
         const emoji = statusEmoji[task.status] || '⏳';
         statusesContent += `${emoji} ${task.taskName} (${task.status}) - Task ID: ${task.taskId}, Execution ID: ${task.executionId}\n`;
       });
-    } else {
-      statusesContent = '📋 **Task Status**: No tasks have been run in this session yet.';
+      messages.push({ role: 'assistant', content: statusesContent });
     }
-    messages.push({ role: 'assistant', content: statusesContent });
 
     // Insert work plan status as an assistant message if exists. Pass the set of
     // images already generated this session (scanned from full history, not the
@@ -3869,6 +4183,13 @@ export class AgentModeService {
     'you_search_web',         // Explicit You.com web search
     'you_search_news',        // Explicit You.com news search
 
+    // Basic file reading — always available so an attached file (text, PDF,
+    // CSV, docx, etc.) can be read immediately without first installing a
+    // skill. Being gated behind __other_skills__ produced a transient
+    // "read_file_content unavailable/failed" until the user manually installed
+    // other_skills (ENG-152).
+    'read_file_content',
+
     // Work Plans (Emma's execution planning system)
     'create_work_plan',
     'modify_work_plan',
@@ -3976,6 +4297,12 @@ export class AgentModeService {
     // this, users with a configured sender but no connected Gmail still cannot send
     // a one-off email from chat (the reported bug).
     'send_email_from_sender',
+    // Basic file reading. Force-merged because the prod `foundation_tools`
+    // AW-Settings override omits DEFAULT-only additions — without this, an
+    // attached file cannot be read until the user manually installs
+    // other_skills, producing the transient "read_file_content
+    // unavailable/failed" failure (ENG-152).
+    'read_file_content',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
@@ -3983,6 +4310,20 @@ export class AgentModeService {
   // Subset of foundation tools that must execute for real in mock/benchmark mode
   // because they modify session state (no external side effects).
   private static readonly MOCK_BYPASS_TOOLS = new Set(['install_skills']);
+
+  // ENG-43: Research / external-lookup tools whose TIMEOUTS should degrade
+  // gracefully (partial results + per-entity decomposition + provider fallback)
+  // rather than abandoning the goal. See formatToolError.
+  private static readonly RESEARCH_LOOKUP_TOOLS = new Set([
+    'you_search_web',
+    'you_search_news',
+    'google_search_web',
+    'perform_deep_research',
+    // ENG-43 (session 74bb2c5d): LinkedIn public-profile lookups (Unipile get-profile)
+    // that time out must degrade through the same branch — keep partial results, retry
+    // once, and fall back to a public web-search provider — instead of abandoning the goal.
+    'linkedin_outreach',
+  ]);
 
   /**
    * Get tools that are not associated with any published skill.
@@ -5678,11 +6019,22 @@ export class AgentModeService {
     socketEmit?: any;
     screenshotUrl?: string;
     isDelegatedAccess?: boolean;
+    renderDeadlineMs?: number;
+    runBudgetDeadlineMs?: number;
   }): Promise<any> {
     const toolOptions: Record<string, any> = {};
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
     if (input.screenshotUrl) toolOptions.screenshotUrl = input.screenshotUrl;
     if (input.isDelegatedAccess) toolOptions.isDelegatedAccess = true;
+    // Thread the run's media-gen deadline into the tool context ONLY for compose_video —
+    // the sole tool that consumes it (to hand off before the run's hard wall-clock timeout,
+    // ENG-123). Scoping it here keeps every other tool's context unchanged.
+    if (input.renderDeadlineMs != null && input.toolName === 'compose_video') {
+      toolOptions.renderDeadlineMs = input.renderDeadlineMs;
+    }
+    // Run wall-clock budget deadline (epoch ms) — used by wait_seconds to cap its
+    // sleep so it can't be killed mid-wait by the generation timeout (ENG-124).
+    if (input.runBudgetDeadlineMs != null) toolOptions.runBudgetDeadlineMs = input.runBudgetDeadlineMs;
 
     return this.executeTool(
       input.llmModel,
@@ -12641,6 +12993,83 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
   }
 
   /**
+   * Finalize-guard judge (ENG-143): ONE structured-output claim-extraction call
+   * through the existing callLLM machinery. Extracts the completed-action claims
+   * the final reply makes, restricted to the prefiltered candidate classes.
+   * THROWS on any judge failure (no content / unparseable output / transport
+   * error) — the guard then delivers the message unchanged and records a loud
+   * claim_check_error (see core/finalizeGuard.ts).
+   *
+   * Deliberately uses FINALIZE_GUARD_JUDGE_MODEL (the same cheap/fast model as
+   * triageSlackMessage) instead of the run's own llmModel: this is a bounded
+   * classification task, not conversational generation, and every flagged
+   * reply pays for this call, so keeping it cheap directly reduces the
+   * guard's latency/cost footprint at scale (PR #2005 left this as a
+   * deliberate one-line follow-up rather than reusing the run's often-pricier
+   * model for every judge call).
+   */
+  private async judgeFinalizeClaims(
+    finalText: string,
+    candidateClasses: readonly ClaimClass[],
+  ): Promise<JudgedClaim[]> {
+    const response = await this.callLLM(FINALIZE_GUARD_JUDGE_MODEL, [
+      {
+        role: 'user',
+        content:
+          'You are auditing an AI assistant\'s reply for COMPLETED-ACTION claims — statements that an action already happened '
+          + '(not offers, plans, or suggestions). The possible claim classes are: '
+          + `${CLAIM_CLASSES.join(', ')}. Candidate classes detected in this reply: ${candidateClasses.join(', ')}.\n\n`
+          + 'Return ONLY a JSON array, one element per claimed completed action, each shaped '
+          + '{"claimClass":"<class>","statement":"<short quote from the reply>"}. '
+          + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
+          + finalText,
+      },
+    ], { max_completion_tokens: 500, temperature: 0 });
+
+    const text = (response as any)?.choices?.[0]?.message?.content;
+    if (typeof text !== 'string' || !text.trim()) {
+      throw new Error('finalize-guard judge returned no content');
+    }
+    const match = text.match(/\[[\s\S]*\]/);
+    if (!match) {
+      throw new Error(`finalize-guard judge returned unparseable output: ${text.slice(0, 200)}`);
+    }
+    const parsed = JSON.parse(match[0]); // throws on invalid JSON → judge_error path
+    if (!Array.isArray(parsed)) {
+      throw new Error('finalize-guard judge output is not an array');
+    }
+    return (parsed as any[]).filter((c) => c && typeof c.claimClass === 'string');
+  }
+
+  /**
+   * Finalize-guard corrective turn (ENG-143): ONE model call asking for the
+   * truthful restatement of a reply whose claims the run ledger does not back.
+   * THROWS on failure — the guard then appends the visible correction instead
+   * (never delivers the unbacked claim silently).
+   */
+  private async requestFinalizeCorrection(
+    finalText: string,
+    systemNote: string,
+    llmModel: string,
+  ): Promise<string> {
+    const response = await this.callLLM(llmModel, [
+      {
+        role: 'user',
+        content:
+          `[SYSTEM NOTE] ${systemNote}\n\nPrevious reply:\n${finalText}\n\n`
+          + 'Rewrite the reply now. Keep everything that is accurate, but only claim actions the run log confirms succeeded, '
+          + 'clearly state what was NOT completed, and tell the user what to do next. Reply ONLY with the corrected message text.',
+      },
+    ], { temperature: 0 });
+
+    const text = (response as any)?.choices?.[0]?.message?.content;
+    if (typeof text !== 'string' || !text.trim()) {
+      throw new Error('finalize-guard correction returned no content');
+    }
+    return text.trim();
+  }
+
+  /**
    * Triage a Slack message to determine if it requires handling (e.g. a client question).
    * Uses gemini-3.1-flash-lite for fast, low-cost classification.
    * Returns true if the message needs to be handled, false otherwise.
@@ -14567,17 +14996,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         console.error('AgentMode: Campaign-level Insights API Error:', campaignInsightsData.error);
         throw new Error(`Campaign-level Insights API Error: ${campaignInsightsData.error.message}`);
       }
-      if (insightsDemographicsData.error) {
-        console.error('AgentMode: Demographics Insights API Error:', insightsDemographicsData.error);
-        // Don't throw; proceed without demographics
-      }
-      if (insightsPlacementData.error) {
-        console.error('AgentMode: Placement Insights API Error:', insightsPlacementData.error);
-        // Don't throw; proceed without placements
-      }
-      if (insightsDeviceData.error) {
-        console.error('AgentMode: Device Insights API Error:', insightsDeviceData.error);
-        // Don't throw; proceed without devices
+      // ENG-104: breakdown endpoints are NON-fatal (we proceed without them), but
+      // a missing/errored breakdown must be distinguishable from an empty-but-OK
+      // one. Summarize the three raw responses into an explicit per-section status
+      // and surface partial failures in ONE structured warning (telemetry-visible)
+      // instead of three scattered console.errors.
+      const breakdownStatus = summarizeBreakdownSections({
+        demographics: insightsDemographicsData,
+        placement: insightsPlacementData,
+        device: insightsDeviceData,
+      });
+      if (breakdownStatus.partialFailure) {
+        console.warn('AgentMode: get_meta_ads_metrics partial breakdown failure', {
+          tool: 'get_meta_ads_metrics',
+          unavailableSections: breakdownStatus.unavailableSections,
+          sectionErrors: breakdownStatus.sectionErrors,
+        });
       }
 
       // Process the data using simplified logic (filtering is now done at API level)
@@ -14621,11 +15055,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       const result = {
         success: true,
-        message: `Meta ads metrics loaded for ${timeframe} timeframe`,
+        message: breakdownStatus.partialFailure
+          ? `Meta ads metrics loaded for ${timeframe} timeframe (some breakdown sections unavailable: ${breakdownStatus.unavailableSections.join(', ')})`
+          : `Meta ads metrics loaded for ${timeframe} timeframe`,
         timeframe,
         attributionWindow: { start: sinceStr, end: untilStr, days: attributionDays },
         campaignSummary,
-        formattedContent
+        formattedContent,
+        // ENG-104: which breakdown sections are complete vs unavailable, so a
+        // partial result is explicit in the tool result (and flows into the tool
+        // telemetry that captures the tool output) rather than looking fully ok.
+        sections: breakdownStatus.sections,
+        partialFailure: breakdownStatus.partialFailure,
+        unavailableSections: breakdownStatus.unavailableSections,
       };
 
       return result;
@@ -16173,6 +16615,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // Helper to format tool error for LLM feedback
   private formatToolError(toolName: string, errorMessage: string): string {
     const safeMessage = typeof errorMessage === 'string' ? errorMessage : 'Unknown error';
+    console.error(`[AgentMode] Tool failed: ${toolName} — ${safeMessage}`);
+    // ENG-43: Research / external-lookup tools (web/news search, deep research)
+    // that TIME OUT must degrade gracefully instead of abandoning the goal with a
+    // blanket "ask the user to retry". A heavy multi-entity research query (e.g.
+    // "research 3 people + their overlaps") or a slow public-profile lookup should
+    // fall back to: keep whatever partial results were already gathered, decompose
+    // the request into one focused sub-query per entity, and switch to an alternate
+    // search provider — NOT surface a bare retry prompt. This is checked BEFORE the
+    // generic connection-timeout "stop" branch so these tools degrade rather than halt.
+    const isResearchLookupTool =
+      AgentModeService.RESEARCH_LOOKUP_TOOLS.has(toolName) ||
+      Array.from(AgentModeService.RESEARCH_LOOKUP_TOOLS).some((name) => toolName.endsWith(`_${name}`));
+    const isTimeoutOrTransient =
+      /timed out|timeout|ETIMEDOUT|ESOCKETTIMEDOUT|ECONNRESET|ECONNABORTED|socket hang up|deadline exceeded|processing timeout|temporarily unavailable|\b(408|429|500|502|503|504)\b|gateway time-?out/i.test(
+        safeMessage
+      );
+    if (isResearchLookupTool && isTimeoutOrTransient) {
+      return `⚠️ Research/Lookup Timeout: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: Do NOT abandon the goal or simply ask the user to retry. Degrade gracefully instead:\n1. KEEP any partial results you already gathered for earlier entities/queries and present them, clearly noting which parts are still pending and offering to continue.\n2. If the request covers multiple entities or topics, decompose it into one focused sub-query per entity and call the search tool separately for each, rather than one heavy combined query.\n3. Narrow or simplify the query, then retry it once.\n4. If this provider keeps timing out, fall back to an alternate search provider (e.g. switch between you_search_web and google_search_web) to gather what you can.\nOnly tell the user the lookup failed AFTER you have returned every partial result you were able to collect.`;
+    }
     // Connection-level failures (timeouts, circuit open) require a different instruction:
     // tell the LLM to stop retrying and surface the error to the user instead of
     // spinning through other variants of the same tool.
@@ -16212,23 +16673,68 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
       return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: Use the exact parameter names from the schema: "title" (string, document title) and "content_draft" (string, the full content). Both are required. Retry immediately with the correct parameters.`;
     }
+    // manage_scheduled_chat validation errors — guide LLM to the exact fix instead of a generic retry
+    if (toolName === 'manage_scheduled_chat') {
+      if (safeMessage.includes('Missing required fields')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: For action "create", schedule_name, starting_message, and schedule_frequency are all required. For action "update", these three fall back to the schedule's existing values if omitted, but at least one must resolve to a non-empty value. Add the missing field(s) named above and retry immediately.`;
+      }
+      if (safeMessage.includes('frequencyIntervalDays')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: When schedule_frequency is "every_n_days", frequency_interval_days is required and must be a positive integer. Add it and retry immediately.`;
+      }
+      if (safeMessage.includes('runCount')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: run_count must be either -1 (unlimited) or a positive integer. Correct the value and retry immediately.`;
+      }
+      if (safeMessage.includes('Scheduled chat not found')) {
+        return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The schedule_id doesn't exist or doesn't belong to this user. Call list_scheduled_chats to get a valid schedule_id before retrying update/toggle/delete.`;
+      }
+    }
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
   }
 
   // Knowledge base search functionality
   // Helper: get an authenticated Google Drive client using the service account
   private async getGoogleDriveClient() {
+    const { getSecret } = await import('../utils/secretsManager');
     const environment = process.env.NODE_ENV || 'development';
-    const secretName = environment === 'production'
-      ? 'prod/AgentWeb/Google/Share'
-      : 'dev/AgentWeb/Google/Share';
-    const secretString = await getSecret(secretName);
-    const credentials = JSON.parse(secretString);
+    const secretName = environment === 'production' ? 'prod/AgentWeb/Google/Share' : 'dev/AgentWeb/Google/Share';
+    const credentials = JSON.parse(await getSecret(secretName));
     const auth = new google.auth.GoogleAuth({
       credentials,
       scopes: ['https://www.googleapis.com/auth/drive.readonly'],
     });
     return google.drive({ version: 'v3', auth });
+  }
+
+  private extractGoogleFileId(urlOrId: string): string {
+    const match = urlOrId.match(/\/d\/([a-zA-Z0-9_-]+)/);
+    return match ? match[1] : urlOrId.trim();
+  }
+
+  private async fetchDriveFileComments(drive: any, fileId: string): Promise<string> {
+    try {
+      const resp = await drive.comments.list({
+        fileId,
+        fields: 'comments(content,quotedFileContent,author,replies,resolved,createdTime)',
+        includeDeleted: false,
+        pageSize: 100,
+      });
+      const comments: any[] = resp.data.comments || [];
+      if (comments.length === 0) return '';
+      const lines: string[] = ['\n\n--- COMMENTS & FEEDBACK ---'];
+      for (const c of comments) {
+        const author = c.author?.displayName || 'Unknown';
+        const quote = c.quotedFileContent?.value ? ` [on: "${c.quotedFileContent.value}"]` : '';
+        const resolved = c.resolved ? ' [resolved]' : '';
+        lines.push(`\n[${author}]${quote}${resolved}: ${c.content}`);
+        for (const reply of (c.replies || [])) {
+          const rAuthor = reply.author?.displayName || 'Unknown';
+          lines.push(`  ↳ [${rAuthor}]: ${reply.content}`);
+        }
+      }
+      return lines.join('\n');
+    } catch {
+      return '';
+    }
   }
 
   // Helper: get Google Drive shared folders for a caller.
@@ -16938,9 +17444,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       ].filter(Boolean) as string[];
 
       if (knowledgeBases.length === 0) {
+        // ENG-173: an explicit Google Drive query (kb_type=google-drive) that returns
+        // empty reflects only the READ-ONLY shared-folder path (service account) — it
+        // says nothing about Docs/Sheets CREATE/EDIT, a separate OAuth-backed skill.
+        // Point the model to the catalog so empty doesn't read as "Docs unavailable".
+        // Scoped to the explicit drive query: an unfiltered/other empty gets the plain
+        // message (this path lists all sources, and nudging Docs there is off-topic).
+        const message = options?.kb_type === 'google-drive'
+          ? 'No Google Drive shared folders found here — this lists only READ-ONLY shared folders (surfaced via the service account). Creating and editing Google Docs & Sheets is a SEPARATE capability — call list_available_skills to find and install the skill that provides Google Docs / Sheets create/edit tools.'
+          : 'No knowledge bases found';
         return {
           success: true,
-          message: 'No knowledge bases found',
+          message,
           knowledge_bases: [],
           totalKnowledgeBases: 0,
           totalFiles: 0,
@@ -17090,6 +17605,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
       return lines.join('\n\n');
+    } else if (['docx', 'doc'].includes(extension) ||
+      mimeType.includes('wordprocessingml') || mimeType.includes('msword')) {
+      try {
+        const mammoth = require('mammoth');
+        const result = await mammoth.extractRawText({ buffer: content });
+        return result.value || '';
+      } catch {
+        return content.toString('utf-8');
+      }
     } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) ||
       mimeType.startsWith('text/') ||
       mimeType.startsWith('application/vnd.google-apps.')) {
@@ -17104,6 +17628,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Handle Google Drive shared folder files (identifier starts with "gdrive:")
     if (kbIdentifier.startsWith('gdrive:')) {
       return await this.readGoogleDriveSharedFile(kbIdentifier, fileName, userId);
+    }
+
+    // Handle direct Google Doc/Sheet by ID
+    if (kbIdentifier.startsWith('gdoc:') || kbIdentifier.startsWith('gsheet:')) {
+      const fileId = kbIdentifier.replace(/^g(doc|sheet):/, '');
+      return await this.readGoogleFileById(fileId, userId);
     }
 
     // Handle ClickUp tasks (identifier starts with "clickup-tasks:")
@@ -17282,12 +17812,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       const file = files[0];
-      const contentStr = await this.readGoogleDriveFileContent(drive, file.id!, file.name || fileName, file.mimeType || '');
+      const isGoogleDoc = file.mimeType === 'application/vnd.google-apps.document' || file.mimeType === 'application/vnd.google-apps.spreadsheet';
+      const [contentStr, commentsStr] = await Promise.all([
+        this.readGoogleDriveFileContent(drive, file.id!, file.name || fileName, file.mimeType || ''),
+        isGoogleDoc ? this.fetchDriveFileComments(drive, file.id!) : Promise.resolve(''),
+      ]);
 
       const maxContentLength = 1_000_000;
-      const truncated = contentStr.length > maxContentLength
-        ? contentStr.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
-        : contentStr;
+      const combined = contentStr + commentsStr;
+      const truncated = combined.length > maxContentLength
+        ? combined.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
+        : combined;
 
       return {
         success: true,
@@ -17457,6 +17992,1091 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         success: false,
         message: `Failed to create ClickUp document "${name}": ${error instanceof Error ? error.message : 'Unknown error'}`
       };
+    }
+  }
+
+  // Read a Google Doc or Sheet directly by file ID.
+  // Tries user OAuth first (works for internal Workspace files); falls back to service account.
+  public async readGoogleFileById(fileId: string, userId: string): Promise<any> {
+    let drive: any;
+    let usingOAuth = false;
+    try {
+      const oauthClient = await this.getGoogleDriveOAuthClient(userId);
+      drive = google.drive({ version: 'v3', auth: oauthClient });
+      usingOAuth = true;
+    } catch (e) {
+      console.error('[AgentMode] getGoogleDriveOAuthClient failed, falling back to SA:', e);
+      drive = await this.getGoogleDriveClient();
+    }
+
+    const readWithDrive = async (driveClient: any) => {
+      const meta = await driveClient.files.get({ fileId, fields: 'id,name,mimeType,modifiedTime' });
+      const { name, mimeType, modifiedTime } = meta.data;
+      const isGoogleNative =
+        mimeType === 'application/vnd.google-apps.document' ||
+        mimeType === 'application/vnd.google-apps.spreadsheet';
+      const [contentStr, commentsStr] = await Promise.all([
+        this.readGoogleDriveFileContent(driveClient, fileId, name || fileId, mimeType || ''),
+        isGoogleNative ? this.fetchDriveFileComments(driveClient, fileId) : Promise.resolve(''),
+      ]);
+      const combined = contentStr + commentsStr;
+      const maxLen = 1_000_000;
+      return {
+        success: true,
+        message: `Successfully read Google file "${name}"`,
+        file_id: fileId,
+        file_name: name,
+        content: combined.length > maxLen ? combined.substring(0, maxLen) + '\n\n[Content truncated]' : combined,
+        size: contentStr.length,
+        type: mimeType,
+        modifiedTime,
+      };
+    };
+
+    try {
+      return await readWithDrive(drive);
+    } catch (oauthErr: any) {
+      // OAuth drive.file scope can't access files it didn't create — retry with SA
+      if (usingOAuth && (oauthErr?.code === 403 || oauthErr?.status === 403 || oauthErr?.code === 401 || oauthErr?.status === 401)) {
+        try {
+          const saDrive = await this.getGoogleDriveClient();
+          return await readWithDrive(saDrive);
+        } catch (saErr: any) {
+          const is404 = saErr?.code === 404 || saErr?.status === 404;
+          const msg = is404
+            ? `File not found or not accessible. Share the file with the service account, or connect Google Drive in Settings for files you own.`
+            : `Failed to read file: ${saErr instanceof Error ? saErr.message : 'Unknown error'}`;
+          return { success: false, message: msg };
+        }
+      }
+      const is404 = oauthErr?.code === 404 || oauthErr?.status === 404;
+      const msg = is404
+        ? `File not found or you don't have access (fileId: ${fileId}).`
+        : `Failed to read file: ${oauthErr instanceof Error ? oauthErr.message : 'Unknown error'}`;
+      return { success: false, message: msg };
+    }
+  }
+
+  // ── Google Drive OAuth helpers (user-authenticated, write-capable) ──────────
+
+  private async getGoogleDriveOAuthClient(userId: string) {
+    const { getAccountByPlatform } = await import('../services/connectedAccountsDb');
+    const account = await getAccountByPlatform(userId, 'google_drive');
+    if (!account) {
+      throw new Error('Google Drive not connected. Connect Google Drive in Settings → Connected Accounts.');
+    }
+    const cfg = account.config as any;
+    const { getGoogleDriveConfig } = await import('../config/integrations');
+    const driveConfig = await getGoogleDriveConfig();
+    const { OAuth2Client } = await import('google-auth-library');
+    const client = new OAuth2Client(driveConfig.clientId, driveConfig.clientSecret);
+    client.setCredentials({
+      access_token: cfg.access_token,
+      refresh_token: cfg.refresh_token,
+      expiry_date: cfg.token_expires_at,
+    });
+    // Persist refreshed tokens back to DB — use updateAccountTokens to preserve all other account fields
+    client.on('tokens', async (tokens) => {
+      try {
+        const { updateAccountTokens } = await import('../services/connectedAccountsDb');
+        await updateAccountTokens(userId, 'google_drive', {
+          access_token: tokens.access_token ?? cfg.access_token,
+          refresh_token: tokens.refresh_token ?? cfg.refresh_token,
+          token_expires_at: tokens.expiry_date ?? cfg.token_expires_at,
+        }, cfg.email);
+      } catch { /* best effort */ }
+    });
+    return client;
+  }
+
+  public async listGoogleDriveFolder(folderIdOrUrl: string, userId: string): Promise<any> {
+    try {
+      const auth = await this.getGoogleDriveOAuthClient(userId);
+      const drive = google.drive({ version: 'v3', auth });
+
+      const folderIdFromUrl = folderIdOrUrl.match(/\/folders\/([a-zA-Z0-9_-]+)/)?.[1];
+      const rawId = folderIdOrUrl.trim();
+      const folderId = folderIdFromUrl ?? (/^[a-zA-Z0-9_-]+$/.test(rawId) ? rawId : null);
+      if (!folderId) {
+        return { success: false, message: 'Invalid folder ID or URL. Please provide a valid Google Drive folder URL or folder ID.' };
+      }
+
+      const resp = await drive.files.list({
+        q: `'${folderId}' in parents and trashed = false`,
+        fields: 'files(id,name,mimeType,modifiedTime,webViewLink),nextPageToken',
+        orderBy: 'name',
+        pageSize: 100,
+      });
+
+      const files = resp.data.files || [];
+      const hasMore = !!resp.data.nextPageToken;
+
+      if (files.length === 0) {
+        return { success: true, message: 'Folder is empty.', files: [] };
+      }
+
+      const formatted = files.map(f => ({
+        id: f.id,
+        name: f.name,
+        type: f.mimeType,
+        url: f.webViewLink,
+        modified: f.modifiedTime,
+      }));
+
+      return {
+        success: true,
+        message: `Found ${files.length} item(s) in folder.${hasMore ? ' (Showing first 100 — folder has more items.)' : ''}`,
+        folder_id: folderId,
+        files: formatted,
+      };
+    } catch (err: any) {
+      const code = err?.code || err?.status;
+      if (code === 403 || code === 401) {
+        return { success: false, message: 'Google Drive access denied. Your Google Drive connection may have expired — reconnect in Settings → Connected Accounts.' };
+      }
+      if (code === 404) {
+        return { success: false, message: 'Folder not found. Check the URL or ID and try again.' };
+      }
+      return { success: false, message: err?.message || 'Failed to list folder contents' };
+    }
+  }
+
+  public async createGoogleDriveFolder(name: string, userId: string, parentFolderId?: string): Promise<any> {
+    try {
+      const auth = await this.getGoogleDriveOAuthClient(userId);
+      const drive = google.drive({ version: 'v3', auth });
+
+      const requestBody: any = { name, mimeType: 'application/vnd.google-apps.folder' };
+      if (parentFolderId) requestBody.parents = [parentFolderId];
+
+      const resp = await drive.files.create({ requestBody, fields: 'id,name,webViewLink' });
+      const folderId = resp.data.id!;
+      const folderUrl = resp.data.webViewLink || `https://drive.google.com/drive/folders/${folderId}`;
+
+      return { success: true, folder_id: folderId, folder_url: folderUrl, name: resp.data.name };
+    } catch (err: any) {
+      const code = err?.code || err?.status;
+      if (code === 403 || code === 401) {
+        return { success: false, message: 'Cannot create folder in that location — Emma does not have access to the specified parent folder.' };
+      }
+      if (code === 404) {
+        return { success: false, message: 'Parent folder not found. Check the folder ID and try again.' };
+      }
+      return { success: false, message: err?.message || 'Failed to create Google Drive folder' };
+    }
+  }
+
+  public async searchGoogleDrive(query: string, userId: string, type?: string): Promise<any> {
+    try {
+      const auth = await this.getGoogleDriveOAuthClient(userId);
+      const drive = google.drive({ version: 'v3', auth });
+
+      const namePart = `name contains '${query.replace(/'/g, "\\'")}'`;
+      const typePart = type === 'folder'
+        ? ` and mimeType = 'application/vnd.google-apps.folder'`
+        : type === 'file'
+        ? ` and mimeType != 'application/vnd.google-apps.folder'`
+        : '';
+      const q = `${namePart}${typePart} and trashed = false`;
+
+      const resp = await drive.files.list({
+        q,
+        fields: 'files(id,name,mimeType,webViewLink,parents)',
+        orderBy: 'modifiedTime desc',
+        pageSize: 20,
+      });
+
+      const files = resp.data.files || [];
+      if (files.length === 0) {
+        return { success: true, message: `No items found matching "${query}".`, results: [] };
+      }
+
+      const results = files.map(f => ({
+        id: f.id,
+        name: f.name,
+        type: f.mimeType === 'application/vnd.google-apps.folder' ? 'folder' : f.mimeType,
+        url: f.webViewLink,
+        parent_folder_ids: f.parents,
+      }));
+
+      return { success: true, message: `Found ${results.length} item(s) matching "${query}".`, results };
+    } catch (err: any) {
+      const code = err?.code || err?.status;
+      if (code === 403 || code === 401) {
+        return { success: false, message: 'Google Drive access denied. Ensure Drive is connected in Settings → Connected Accounts.' };
+      }
+      return { success: false, message: err?.message || 'Failed to search Google Drive' };
+    }
+  }
+
+  // ── Markdown → HTML (for Google Drive HTML import) ───────────────────────
+
+  static readonly DEFAULT_STYLE_OPTIONS = {
+    primaryColor: '#1a73e8',
+    fontFamily: 'Arial, sans-serif',
+    fontSize: 14,
+    lineHeight: 1.7,
+    compact: false,
+  };
+
+  private static escapeHtml(s: string): string {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  /** Convert inline markdown to HTML string. */
+  private static inlineToHtml(text: string): string {
+    let result = '';
+    let remaining = text;
+    while (remaining.length > 0) {
+      let m = remaining.match(/^\*{3}(.+?)\*{3}/s) ?? remaining.match(/^_{3}(.+?)_{3}/s);
+      if (m) { result += `<strong><em>${AgentModeService.escapeHtml(m[1])}</em></strong>`; remaining = remaining.slice(m[0].length); continue; }
+      m = remaining.match(/^\*{2}(.+?)\*{2}/s) ?? remaining.match(/^_{2}(.+?)_{2}/s);
+      if (m) { result += `<strong>${AgentModeService.escapeHtml(m[1])}</strong>`; remaining = remaining.slice(m[0].length); continue; }
+      m = remaining.match(/^\*([^*\n]+?)\*/s) ?? remaining.match(/^_([^_\n]+?)_/s);
+      if (m) { result += `<em>${AgentModeService.escapeHtml(m[1])}</em>`; remaining = remaining.slice(m[0].length); continue; }
+      m = remaining.match(/^`([^`\n]+)`/s);
+      if (m) { result += `<code style="background-color:#f1f3f4;padding:1px 5px;border-radius:3px;font-family:Courier New,monospace;font-size:90%;text-decoration:none">${AgentModeService.escapeHtml(m[1])}</code>`; remaining = remaining.slice(m[0].length); continue; }
+      m = remaining.match(/^\[([^\]]+)\]\(([^)]+)\)/);
+      if (m) { result += `<a href="${AgentModeService.escapeHtml(m[2])}">${AgentModeService.escapeHtml(m[1])}</a>`; remaining = remaining.slice(m[0].length); continue; }
+      // Inline style span for a single word/phrase — [text]{color=blue}, [text]{underline},
+      // [text]{color=yellow;font=Verdana;italic;underline}, etc. The attribute-string charset is
+      // restricted to letters/digits/#/=/;/space — no quotes, parens, or angle brackets can ever
+      // appear, so a malformed/hostile value can never break out of the style attribute. Each
+      // ';'-separated segment is checked against a fixed whitelist (color, font, bold, italic,
+      // underline); unrecognized segments are silently ignored rather than rejecting the whole
+      // span. If nothing recognized survives, this doesn't match at all — falls through to plain
+      // escaped text below, preserving the original literal text (including the brackets).
+      m = remaining.match(/^\[([^\]]+)\]\{([a-zA-Z0-9#=; ]+)\}/);
+      if (m) {
+        const decls: string[] = [];
+        for (const rawSeg of m[2].split(';')) {
+          const seg = rawSeg.trim();
+          if (!seg) continue;
+          if (seg === 'underline') { decls.push('text-decoration:underline'); continue; }
+          if (seg === 'italic') { decls.push('font-style:italic'); continue; }
+          if (seg === 'bold') { decls.push('font-weight:700'); continue; }
+          let am = seg.match(/^color=(#[0-9a-fA-F]{3,8}|[a-zA-Z]+)$/);
+          if (am) { decls.push(`color:${am[1]}`); continue; }
+          am = seg.match(/^font=([a-zA-Z ]+)$/);
+          if (am) { decls.push(`font-family:${am[1]}`); continue; }
+          // Unrecognized attribute name/value — ignore silently, do not fail the whole span.
+        }
+        if (decls.length > 0) {
+          result += `<span style="${decls.join(';')}">${AgentModeService.escapeHtml(m[1])}</span>`;
+          remaining = remaining.slice(m[0].length);
+          continue;
+        }
+        // Nothing recognized — fall through to ordinary text below (do not consume the match).
+      }
+      m = remaining.match(/^<[^>]+>/);
+      if (m) { remaining = remaining.slice(m[0].length); continue; }
+      result += AgentModeService.escapeHtml(remaining[0]);
+      remaining = remaining.slice(1);
+    }
+    return result;
+  }
+
+  /** Convert markdown to an HTML string for Google Drive HTML import.
+   *  style='plain'  → bare semantic HTML; Google Docs applies its own default styling (default)
+   *  style='styled' → inline CSS with colors, table headers, and spacing derived from styleOptions
+   */
+  static markdownToHtml(
+    markdown: string,
+    style: 'plain' | 'styled' = 'plain',
+    styleOptions: {
+      primaryColor?: string;
+      fontFamily?: string;
+      fontSize?: number;
+      lineHeight?: number;
+      compact?: boolean;
+    } = {},
+  ): string {
+    if (!markdown?.trim()) return '';
+    const tokens = AgentModeService.lexMarkdown(markdown);
+    const styled = style === 'styled';
+
+    // Resolve options with defaults
+    const d = AgentModeService.DEFAULT_STYLE_OPTIONS;
+    const pc  = styleOptions.primaryColor ?? d.primaryColor;
+    const ff  = styleOptions.fontFamily   ?? d.fontFamily;
+    const fs  = styleOptions.fontSize     ?? d.fontSize;
+    const lh  = styleOptions.lineHeight   ?? d.lineHeight;
+    const compact = styleOptions.compact  ?? d.compact;
+
+    // Proportional heading sizes
+    const h1fs = Math.round(fs * 1.86);
+    const h2fs = Math.round(fs * 1.29);
+    const h3fs = fs;
+
+    // Cell padding
+    const thPad = compact ? '5px 8px' : '8px 12px';
+    const tdPad = compact ? '4px 8px' : '6px 12px';
+
+    // Style tokens — empty strings when plain so attrs are omitted cleanly
+    const bodyAttr   = styled ? ` style="font-family:${ff};font-size:${fs}px;color:#202124;line-height:${lh}"` : '';
+    const hStyles: Record<number, string> = styled ? {
+      1: ` style="font-size:${h1fs}px;font-weight:700;color:${pc};margin-top:12px;margin-bottom:4px;text-decoration:none"`,
+      2: ` style="font-size:${h2fs}px;font-weight:600;color:${pc};margin-top:18px;margin-bottom:6px;text-decoration:none"`,
+      3: ` style="font-size:${h3fs}px;font-weight:700;color:#3c4043;margin-top:14px;margin-bottom:4px;text-decoration:none"`,
+    } : {};
+    const pAttr      = styled ? ` style="margin:6px 0;line-height:${lh}"` : '';
+    const ulAttr     = styled ? ` style="margin:6px 0;padding-left:22px;line-height:${lh}"` : '';
+    const liAttr     = styled ? ' style="margin:3px 0"' : '';
+    const bqAttr     = styled ? ` style="border-left:3px solid ${pc};margin:12px 0;padding:6px 14px;background-color:#f8f9fa;color:#5f6368;font-style:italic"` : '';
+    const preAttr    = styled ? ` style="background-color:#f8f9fa;border:1px solid #e8eaed;border-radius:4px;padding:14px;margin:10px 0;font-family:Courier New,monospace;font-size:${Math.round(fs * 0.93)}px;overflow-x:auto"` : '';
+    const codeAttr   = styled ? ` style="font-family:Courier New,monospace;font-size:${Math.round(fs * 0.93)}px"` : '';
+    const tableAttr  = styled ? ` style="border-collapse:collapse;width:100%;margin:10px 0;font-size:${fs}px"` : '';
+    const thAttr     = styled ? ` style="padding:${thPad};text-align:left;background-color:${pc};color:#ffffff;font-weight:600;white-space:nowrap"` : '';
+    const hrAttr     = styled ? ' style="border:none;border-top:1px solid #d1d5db;margin:16px 0"' : '';
+
+    const tdStyle = (ri: number) => styled
+      ? ` style="padding:${tdPad};border-bottom:1px solid #e8eaed;vertical-align:top;background-color:${ri % 2 === 0 ? '#ffffff' : '#f8f9fa'}"`
+      : '';
+
+    const parts: string[] = [
+      '<!DOCTYPE html>',
+      '<html>',
+      '<head><meta charset="utf-8"></head>',
+      `<body${bodyAttr}>`,
+    ];
+
+    for (const tok of tokens) {
+      switch (tok.type) {
+        case 'heading': {
+          const level = Math.min(tok.depth ?? 1, 6);
+          const hAttr = hStyles[level] ?? (styled ? ' style="font-weight:700"' : '');
+          parts.push(`<h${level}${hAttr}>${AgentModeService.inlineToHtml(tok.text ?? '')}</h${level}>`);
+          break;
+        }
+        case 'paragraph':
+          parts.push(`<p${pAttr}>${AgentModeService.inlineToHtml(tok.text ?? '')}</p>`);
+          break;
+        case 'list': {
+          const tag = tok.ordered ? 'ol' : 'ul';
+          parts.push(`<${tag}${ulAttr}>`);
+          for (const item of tok.items ?? []) {
+            parts.push(`<li${liAttr}>${AgentModeService.inlineToHtml(item.text)}`);
+            if (item.nestedItems?.length) {
+              const ntag = item.nestedItems[0].ordered ? 'ol' : 'ul';
+              parts.push(`<${ntag}${ulAttr}>`);
+              for (const n of item.nestedItems) {
+                parts.push(`<li${liAttr}>${AgentModeService.inlineToHtml(n.text)}</li>`);
+              }
+              parts.push(`</${ntag}>`);
+            }
+            parts.push(`</li>`);
+          }
+          parts.push(`</${tag}>`);
+          break;
+        }
+        case 'blockquote':
+          parts.push(`<blockquote${bqAttr}><p style="margin:0">${AgentModeService.inlineToHtml(tok.text ?? '')}</p></blockquote>`);
+          break;
+        case 'code': {
+          const codeHtml = (tok.codeLines ?? []).map(l => AgentModeService.escapeHtml(l)).join('\n');
+          parts.push(`<pre${preAttr}><code${codeAttr}>${codeHtml}</code></pre>`);
+          break;
+        }
+        case 'table': {
+          parts.push(`<table${tableAttr}>`);
+          if (tok.headerCells?.length) {
+            parts.push('<thead><tr>');
+            for (const cell of tok.headerCells) {
+              parts.push(`<th${thAttr}>${AgentModeService.inlineToHtml(cell)}</th>`);
+            }
+            parts.push('</tr></thead>');
+          }
+          if (tok.dataRows?.length) {
+            parts.push('<tbody>');
+            tok.dataRows.forEach((row, ri) => {
+              parts.push(`<tr>`);
+              for (const cell of row) {
+                parts.push(`<td${tdStyle(ri)}>${AgentModeService.inlineToHtml(cell)}</td>`);
+              }
+              parts.push('</tr>');
+            });
+            parts.push('</tbody>');
+          }
+          parts.push('</table>');
+          break;
+        }
+        case 'hr':
+          parts.push(`<hr${hrAttr}>`);
+          break;
+        case 'space':
+          break;
+      }
+    }
+
+    parts.push('</body></html>');
+    return parts.join('\n');
+  }
+
+  // ── Markdown → Google Docs API batchUpdate requests ──────────────────────
+  // Kept for updateGoogleDoc (batchUpdate on existing docs).
+  // Self-contained tokenizer (no external dep) handles Emma's markdown output.
+
+  /** Parse inline markdown into styled runs. Handles bold, italic, code, links. */
+  private static parseInlineRuns(text: string): Array<{ text: string; bold: boolean; italic: boolean; monospace: boolean; url?: string }> {
+    type Run = { text: string; bold: boolean; italic: boolean; monospace: boolean; url?: string };
+    const runs: Run[] = [];
+    let remaining = text;
+
+    while (remaining.length > 0) {
+      // Bold+italic: ***text*** or ___text___
+      let m = remaining.match(/^\*{3}(.+?)\*{3}/s) ?? remaining.match(/^_{3}(.+?)_{3}/s);
+      if (m) {
+        runs.push({ text: m[1], bold: true, italic: true, monospace: false });
+        remaining = remaining.slice(m[0].length);
+        continue;
+      }
+      // Bold: **text** or __text__
+      m = remaining.match(/^\*{2}(.+?)\*{2}/s) ?? remaining.match(/^_{2}(.+?)_{2}/s);
+      if (m) {
+        runs.push({ text: m[1], bold: true, italic: false, monospace: false });
+        remaining = remaining.slice(m[0].length);
+        continue;
+      }
+      // Italic: *text* or _text_  (single, not preceded by same char)
+      m = remaining.match(/^\*([^*\n]+?)\*/s) ?? remaining.match(/^_([^_\n]+?)_/s);
+      if (m) {
+        runs.push({ text: m[1], bold: false, italic: true, monospace: false });
+        remaining = remaining.slice(m[0].length);
+        continue;
+      }
+      // Inline code: `text`
+      m = remaining.match(/^`([^`\n]+)`/s);
+      if (m) {
+        runs.push({ text: m[1], bold: false, italic: false, monospace: true });
+        remaining = remaining.slice(m[0].length);
+        continue;
+      }
+      // Link: [text](url) — emit as clickable hyperlink run
+      m = remaining.match(/^\[([^\]]+)\]\(([^)]+)\)/);
+      if (m) {
+        runs.push({ text: m[1], bold: false, italic: false, monospace: false, url: m[2] });
+        remaining = remaining.slice(m[0].length);
+        continue;
+      }
+      // Strip HTML tags
+      m = remaining.match(/^<[^>]+>/);
+      if (m) { remaining = remaining.slice(m[0].length); continue; }
+
+      // Regular character — accumulate into last run if same style
+      const last = runs[runs.length - 1];
+      if (last && !last.bold && !last.italic && !last.monospace) {
+        last.text += remaining[0];
+      } else {
+        runs.push({ text: remaining[0], bold: false, italic: false, monospace: false });
+      }
+      remaining = remaining.slice(1);
+    }
+
+    return runs.filter(r => r.text.length > 0);
+  }
+
+  /** Lex markdown into block tokens. Handles all common block types. */
+  private static lexMarkdown(markdown: string): Array<{
+    type: 'heading' | 'paragraph' | 'list' | 'blockquote' | 'code' | 'table' | 'hr' | 'space';
+    depth?: number;
+    text?: string;
+    ordered?: boolean;
+    items?: Array<{ text: string; nestedItems?: Array<{ text: string; ordered: boolean }> }>;
+    codeLines?: string[];
+    headerCells?: string[];
+    dataRows?: string[][];
+  }> {
+    type Block = ReturnType<typeof AgentModeService.lexMarkdown>[number];
+    const blocks: Block[] = [];
+    const lines = markdown.split('\n');
+    let i = 0;
+
+    while (i < lines.length) {
+      const line = lines[i];
+      const trimmed = line.trim();
+
+      // Code fence (``` or ~~~)
+      if (/^(`{3,}|~{3,})/.test(trimmed)) {
+        const fence = trimmed.match(/^(`{3,}|~{3,})/)![1];
+        const codeLines: string[] = [];
+        i++;
+        while (i < lines.length && !lines[i].trim().startsWith(fence)) {
+          codeLines.push(lines[i]);
+          i++;
+        }
+        i++; // skip closing fence
+        blocks.push({ type: 'code', codeLines });
+        continue;
+      }
+
+      // Indented code block (4 spaces or tab)
+      if (/^(    |\t)/.test(line) && trimmed) {
+        const codeLines: string[] = [];
+        while (i < lines.length && (/^(    |\t)/.test(lines[i]) || !lines[i].trim())) {
+          codeLines.push(lines[i].replace(/^(    |\t)/, ''));
+          i++;
+        }
+        blocks.push({ type: 'code', codeLines: codeLines.filter(l => l.trim()) });
+        continue;
+      }
+
+      // Blank line
+      if (!trimmed) {
+        blocks.push({ type: 'space' });
+        i++;
+        continue;
+      }
+
+      // HR: --- or *** or ___
+      if (/^(-{3,}|_{3,}|\*{3,})\s*$/.test(trimmed)) {
+        blocks.push({ type: 'hr' });
+        i++;
+        continue;
+      }
+
+      // Heading
+      const headingMatch = trimmed.match(/^(#{1,6})\s+(.+?)(?:\s+#+\s*)?$/);
+      if (headingMatch) {
+        blocks.push({ type: 'heading', depth: headingMatch[1].length, text: headingMatch[2].trim() });
+        i++;
+        continue;
+      }
+
+      // Blockquote
+      if (trimmed.startsWith('>')) {
+        const bqLines: string[] = [];
+        while (i < lines.length && lines[i].trim().startsWith('>')) {
+          bqLines.push(lines[i].replace(/^[ \t]*>\s?/, ''));
+          i++;
+        }
+        blocks.push({ type: 'blockquote', text: bqLines.join(' ').trim() });
+        continue;
+      }
+
+      // List (unordered: - * +, or ordered: 1.)
+      const ulStart = /^[-*+]\s+/.test(trimmed);
+      const olStart = /^\d+[.)]\s+/.test(trimmed);
+      if (ulStart || olStart) {
+        const ordered = olStart;
+        const items: Array<{ text: string; nestedItems?: Array<{ text: string; ordered: boolean }> }> = [];
+
+        while (i < lines.length) {
+          const cur = lines[i];
+          const curTrimmed = cur.trim();
+          if (!curTrimmed) { i++; break; } // blank line ends list
+
+          // Nested item (2+ spaces indent)
+          const nestedUL = cur.match(/^ {2,}[-*+]\s+(.+)/);
+          const nestedOL = cur.match(/^ {2,}\d+[.)]\s+(.+)/);
+          if ((nestedUL ?? nestedOL) && items.length > 0) {
+            const nestedText = (nestedUL ?? nestedOL)![1];
+            const last = items[items.length - 1];
+            last.nestedItems = last.nestedItems ?? [];
+            last.nestedItems.push({ text: nestedText, ordered: !!nestedOL });
+            i++;
+            continue;
+          }
+
+          // Top-level item
+          const ulItem = curTrimmed.match(/^[-*+]\s+(.+)/);
+          const olItem = curTrimmed.match(/^\d+[.)]\s+(.+)/);
+          if (ulItem ?? olItem) {
+            items.push({ text: (ulItem ?? olItem)![1] });
+            i++;
+            continue;
+          }
+
+          // Continuation line (indented, no marker)
+          if (cur.startsWith('  ') && items.length > 0) {
+            items[items.length - 1].text += ' ' + curTrimmed;
+            i++;
+            continue;
+          }
+
+          break;
+        }
+
+        if (items.length) blocks.push({ type: 'list', ordered, items });
+        continue;
+      }
+
+      // Table: header row contains | and next non-blank line is separator (|---|)
+      if (trimmed.includes('|')) {
+        const nextLine = lines[i + 1]?.trim() ?? '';
+        if (/^\|?[-|: ]+\|[-|: ]+\|?$/.test(nextLine) || /^[-|: ]+\|[-|: ]+/.test(nextLine)) {
+          const headerCells = trimmed.replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+          i += 2; // skip header + separator
+          const dataRows: string[][] = [];
+          while (i < lines.length && lines[i].trim().includes('|') && lines[i].trim()) {
+            const cells = lines[i].trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+            dataRows.push(cells);
+            i++;
+          }
+          blocks.push({ type: 'table', headerCells, dataRows });
+          continue;
+        }
+      }
+
+      // Paragraph (collect until blank line or block-level element)
+      const paraLines: string[] = [];
+      while (i < lines.length) {
+        const cur = lines[i];
+        const curTrimmed = cur.trim();
+        if (!curTrimmed) break;
+        if (/^#{1,6}\s/.test(curTrimmed)) break;
+        if (/^(-{3,}|_{3,}|\*{3,})\s*$/.test(curTrimmed)) break;
+        if (/^[-*+]\s/.test(curTrimmed) || /^\d+[.)]\s/.test(curTrimmed)) break;
+        if (curTrimmed.startsWith('>')) break;
+        if (/^(`{3,}|~{3,})/.test(curTrimmed)) break;
+        if (/^(    |\t)/.test(cur)) break;
+        paraLines.push(curTrimmed);
+        i++;
+      }
+      if (paraLines.length) {
+        blocks.push({ type: 'paragraph', text: paraLines.join(' ') });
+      }
+    }
+
+    return blocks;
+  }
+
+  /** Convert block tokens → DocBlocks with inline runs and style metadata. */
+  private static buildDocBlocks(tokens: ReturnType<typeof AgentModeService.lexMarkdown>): Array<{
+    text: string;
+    runs: Array<{ text: string; bold: boolean; italic: boolean; monospace: boolean; url?: string }>;
+    namedStyleType?: string;
+    isBullet?: boolean;
+    isOrderedBullet?: boolean;
+    bulletNestLevel?: number;
+    isBlockquote?: boolean;
+    isCode?: boolean;
+    isBlank?: boolean;
+  }> {
+    type DocBlock = ReturnType<typeof AgentModeService.buildDocBlocks>[number];
+    const blocks: DocBlock[] = [];
+
+    for (const tok of tokens) {
+      switch (tok.type) {
+        case 'heading': {
+          const level = Math.min(tok.depth ?? 1, 3);
+          const runs = AgentModeService.parseInlineRuns(tok.text ?? '');
+          blocks.push({ text: runs.map(r => r.text).join(''), runs, namedStyleType: `HEADING_${level}` });
+          break;
+        }
+        case 'paragraph': {
+          const runs = AgentModeService.parseInlineRuns(tok.text ?? '');
+          blocks.push({ text: runs.map(r => r.text).join(''), runs });
+          break;
+        }
+        case 'list': {
+          for (const item of tok.items ?? []) {
+            const runs = AgentModeService.parseInlineRuns(item.text);
+            blocks.push({
+              text: runs.map(r => r.text).join(''),
+              runs,
+              isBullet: !tok.ordered,
+              isOrderedBullet: !!tok.ordered,
+              bulletNestLevel: 0,
+            });
+            for (const nested of item.nestedItems ?? []) {
+              const nRuns = AgentModeService.parseInlineRuns(nested.text);
+              blocks.push({
+                text: nRuns.map(r => r.text).join(''),
+                runs: nRuns,
+                isBullet: !nested.ordered,
+                isOrderedBullet: nested.ordered,
+                bulletNestLevel: 1,
+              });
+            }
+          }
+          break;
+        }
+        case 'blockquote': {
+          const runs = AgentModeService.parseInlineRuns(tok.text ?? '');
+          if (runs.length) blocks.push({ text: runs.map(r => r.text).join(''), runs, isBlockquote: true });
+          break;
+        }
+        case 'code': {
+          for (const codeLine of tok.codeLines ?? []) {
+            blocks.push({
+              text: codeLine,
+              runs: [{ text: codeLine, bold: false, italic: false, monospace: true }],
+              isCode: true,
+            });
+          }
+          break;
+        }
+        case 'table': {
+          type Run = { text: string; bold: boolean; italic: boolean; monospace: boolean; url?: string };
+          const sep: Run = { text: ' | ', bold: false, italic: false, monospace: false };
+          if (tok.headerCells?.length) {
+            const headerRuns: Run[] = [];
+            tok.headerCells.forEach((cell, ci) => {
+              if (ci > 0) headerRuns.push({ ...sep, bold: true });
+              AgentModeService.parseInlineRuns(cell).forEach(r => headerRuns.push({ ...r, bold: true }));
+            });
+            blocks.push({ text: headerRuns.map(r => r.text).join(''), runs: headerRuns });
+          }
+          for (const row of tok.dataRows ?? []) {
+            const rowRuns: Run[] = [];
+            row.forEach((cell, ci) => {
+              if (ci > 0) rowRuns.push(sep);
+              rowRuns.push(...AgentModeService.parseInlineRuns(cell));
+            });
+            blocks.push({ text: rowRuns.map(r => r.text).join(''), runs: rowRuns });
+          }
+          break;
+        }
+        case 'hr': {
+          const hrText = '─────────────────────────────────────────';
+          blocks.push({ text: hrText, runs: [{ text: hrText, bold: false, italic: false, monospace: false }] });
+          break;
+        }
+        case 'space':
+          blocks.push({ text: '', runs: [], isBlank: true });
+          break;
+      }
+    }
+
+    return blocks;
+  }
+
+  /**
+   * Convert markdown to Google Docs API batchUpdate requests.
+   * Returns [] when content is blank (caller can skip batchUpdate).
+   */
+  static markdownToDocsRequests(markdown: string, insertIndex = 1): any[] {
+    if (!markdown?.trim()) return [];
+
+    const rawBlocks = AgentModeService.buildDocBlocks(AgentModeService.lexMarkdown(markdown));
+
+    // Strip leading/trailing blank lines
+    while (rawBlocks.length && rawBlocks[0].isBlank) rawBlocks.shift();
+    while (rawBlocks.length && rawBlocks[rawBlocks.length - 1].isBlank) rawBlocks.pop();
+
+    if (rawBlocks.length === 0) return [];
+
+    type Meta = { startIndex: number; endIndex: number; block: (typeof rawBlocks)[number] };
+    const blockMeta: Meta[] = [];
+    let pos = insertIndex;
+    let fullText = '';
+
+    for (const block of rawBlocks) {
+      const lineText = block.text + '\n';
+      blockMeta.push({ startIndex: pos, endIndex: pos + lineText.length, block });
+      fullText += lineText;
+      pos += lineText.length;
+    }
+
+    const requests: any[] = [];
+
+    // 1. Single insertText for all content
+    requests.push({ insertText: { location: { index: insertIndex }, text: fullText } });
+
+    // 2. Heading paragraph styles
+    for (const { startIndex, endIndex, block } of blockMeta) {
+      if (block.namedStyleType) {
+        requests.push({
+          updateParagraphStyle: {
+            range: { startIndex, endIndex },
+            paragraphStyle: { namedStyleType: block.namedStyleType },
+            fields: 'namedStyleType',
+          },
+        });
+      }
+    }
+
+    // 3. Blockquote: indent + italic
+    for (const { startIndex, endIndex, block } of blockMeta) {
+      if (!block.isBlockquote) continue;
+      requests.push({
+        updateParagraphStyle: {
+          range: { startIndex, endIndex },
+          paragraphStyle: { indentStart: { magnitude: 36, unit: 'PT' } },
+          fields: 'indentStart',
+        },
+      });
+      requests.push({
+        updateTextStyle: {
+          range: { startIndex, endIndex: endIndex - 1 },
+          textStyle: { italic: true },
+          fields: 'italic',
+        },
+      });
+    }
+
+    // 4. Code block: Courier New per non-empty line
+    for (const { startIndex, endIndex, block } of blockMeta) {
+      if (!block.isCode) continue;
+      if (startIndex < endIndex - 1) {
+        requests.push({
+          updateTextStyle: {
+            range: { startIndex, endIndex: endIndex - 1 },
+            textStyle: { weightedFontFamily: { fontFamily: 'Courier New', weight: 400 } },
+            fields: 'weightedFontFamily',
+          },
+        });
+      }
+    }
+
+    // 5. Inline text styles (bold, italic, monospace) per run
+    for (const { startIndex, block } of blockMeta) {
+      if (block.isBlockquote || block.isCode || block.isBlank) continue;
+      let offset = startIndex;
+      for (const run of block.runs) {
+        const runStart = offset;
+        const runEnd = offset + run.text.length;
+        offset = runEnd;
+        if (runStart >= runEnd) continue;
+        const textStyle: any = {};
+        const fields: string[] = [];
+        if (run.bold) { textStyle.bold = true; fields.push('bold'); }
+        if (run.italic) { textStyle.italic = true; fields.push('italic'); }
+        if (run.monospace) {
+          textStyle.weightedFontFamily = { fontFamily: 'Courier New', weight: 400 };
+          fields.push('weightedFontFamily');
+        }
+        if ((run as any).url) {
+          textStyle.link = { url: (run as any).url };
+          fields.push('link');
+        }
+        if (!fields.length) continue;
+        requests.push({
+          updateTextStyle: {
+            range: { startIndex: runStart, endIndex: runEnd },
+            textStyle,
+            fields: fields.join(','),
+          },
+        });
+      }
+    }
+
+    // 6. Bullet/numbered lists — group consecutive bullet blocks
+    {
+      let i = 0;
+      while (i < blockMeta.length) {
+        const { block: b } = blockMeta[i];
+        if (!b.isBullet && !b.isOrderedBullet) { i++; continue; }
+        const isOrdered = !!b.isOrderedBullet;
+        let j = i;
+        while (
+          j + 1 < blockMeta.length &&
+          (blockMeta[j + 1].block.isBullet || blockMeta[j + 1].block.isOrderedBullet)
+        ) j++;
+
+        requests.push({
+          createParagraphBullets: {
+            range: { startIndex: blockMeta[i].startIndex, endIndex: blockMeta[j].endIndex - 1 },
+            bulletPreset: isOrdered ? 'NUMBERED_DECIMAL_ALPHA_ROMAN_SEQUENCE' : 'BULLET_DISC_CIRCLE_SQUARE',
+          },
+        });
+
+        // Indent nested items visually
+        for (let k = i; k <= j; k++) {
+          if ((blockMeta[k].block.bulletNestLevel ?? 0) > 0) {
+            requests.push({
+              updateParagraphStyle: {
+                range: { startIndex: blockMeta[k].startIndex, endIndex: blockMeta[k].endIndex },
+                paragraphStyle: {
+                  indentStart: { magnitude: 36, unit: 'PT' },
+                  indentFirstLine: { magnitude: 36, unit: 'PT' },
+                },
+                fields: 'indentStart,indentFirstLine',
+              },
+            });
+          }
+        }
+
+        i = j + 1;
+      }
+    }
+
+    return requests;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+
+  public async createGoogleDoc(title: string, content: string, userId: string, folderId?: string, shareWithEmails?: string[], style: 'plain' | 'styled' = 'plain', styleOptions?: { primaryColor?: string; fontFamily?: string; fontSize?: number; lineHeight?: number; compact?: boolean }): Promise<any> {
+    let docId: string | undefined;
+    let drive: any;
+    try {
+      const auth = await this.getGoogleDriveOAuthClient(userId);
+      drive = google.drive({ version: 'v3', auth });
+
+      const htmlBody = content ? AgentModeService.markdownToHtml(content, style, styleOptions) : undefined;
+      const createResp = await drive.files.create({
+        requestBody: {
+          name: title,
+          mimeType: 'application/vnd.google-apps.document',
+          ...(folderId ? { parents: [folderId] } : {}),
+        },
+        ...(htmlBody ? { media: { mimeType: 'text/html', body: htmlBody } } : {}),
+        fields: 'id,name,webViewLink',
+      });
+      docId = createResp.data.id!;
+      const docUrl = createResp.data.webViewLink || `https://docs.google.com/document/d/${docId}/edit`;
+
+      const emailsToShare = [...new Set(shareWithEmails || [])];
+      for (const email of emailsToShare) {
+        try {
+          await drive.permissions.create({
+            fileId: docId,
+            sendNotificationEmail: true,
+            requestBody: { type: 'user', role: 'writer', emailAddress: email },
+          });
+        } catch (permErr) {
+          console.log(`AgentMode: Could not share Doc ${docId} with ${email}:`, permErr);
+        }
+      }
+
+      return {
+        success: true,
+        message: emailsToShare.length ? `Created Google Doc "${title}" and shared with ${emailsToShare.join(', ')}` : `Created Google Doc "${title}"`,
+        doc_id: docId,
+        url: docUrl,
+        title,
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error creating Google Doc:', error);
+      const code = error?.code || error?.status;
+      if (code === 403 || code === 401) {
+        return { success: false, message: 'Cannot create Doc in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.' };
+      }
+      if (code === 404) {
+        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.' };
+      }
+      return { success: false, message: `Failed to create Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}` };
+    }
+  }
+
+  public async updateGoogleDoc(fileIdOrUrl: string, content: string, userId: string, style: 'plain' | 'styled' = 'plain', styleOptions?: { primaryColor?: string; fontFamily?: string; fontSize?: number; lineHeight?: number; compact?: boolean }): Promise<any> {
+    try {
+      const auth = await this.getGoogleDriveOAuthClient(userId);
+      const drive = google.drive({ version: 'v3', auth });
+      const fileId = this.extractGoogleFileId(fileIdOrUrl);
+
+      if (content) {
+        const htmlBody = AgentModeService.markdownToHtml(content, style, styleOptions);
+        await drive.files.update({
+          fileId,
+          media: { mimeType: 'text/html', body: htmlBody },
+        });
+      }
+
+      return {
+        success: true,
+        message: `Updated Google Doc (id: ${fileId})`,
+        doc_id: fileId,
+        url: `https://docs.google.com/document/d/${fileId}/edit`,
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error updating Google Doc:', error);
+      const code = error?.code || error?.status;
+      if (code === 403 || code === 401) {
+        return { success: false, message: 'Cannot update this Google Doc — you may not have edit access to it, or it may have been deleted.' };
+      }
+      if (code === 404) {
+        return { success: false, message: 'Google Doc not found. Check the URL or ID and try again.' };
+      }
+      return { success: false, message: `Failed to update Google Doc: ${error instanceof Error ? error.message : 'Unknown error'}` };
+    }
+  }
+
+  public async createGoogleSheet(title: string, data: string[][], userId: string, folderId?: string, shareWithEmails?: string[]): Promise<any> {
+    let sheetId: string | undefined;
+    let drive: any;
+    try {
+      const auth = await this.getGoogleDriveOAuthClient(userId);
+      drive = google.drive({ version: 'v3', auth });
+      const sheets = google.sheets({ version: 'v4', auth });
+
+      const createResp = await drive.files.create({
+        requestBody: {
+          name: title,
+          mimeType: 'application/vnd.google-apps.spreadsheet',
+          ...(folderId ? { parents: [folderId] } : {}),
+        },
+        fields: 'id,name,webViewLink',
+      });
+      sheetId = createResp.data.id!;
+      const sheetUrl = createResp.data.webViewLink || `https://docs.google.com/spreadsheets/d/${sheetId}/edit`;
+
+      if (data && data.length > 0) {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: sheetId,
+          range: 'Sheet1!A1',
+          valueInputOption: 'RAW',
+          requestBody: { values: data },
+        });
+      }
+
+      const emailsToShare = [...new Set(shareWithEmails || [])];
+      for (const email of emailsToShare) {
+        try {
+          await drive.permissions.create({
+            fileId: sheetId,
+            sendNotificationEmail: true,
+            requestBody: { type: 'user', role: 'writer', emailAddress: email },
+          });
+        } catch (permErr) {
+          console.log(`AgentMode: Could not share Sheet ${sheetId} with ${email}:`, permErr);
+        }
+      }
+
+      return {
+        success: true,
+        message: emailsToShare.length ? `Created Google Sheet "${title}" and shared with ${emailsToShare.join(', ')}` : `Created Google Sheet "${title}"`,
+        sheet_id: sheetId,
+        url: sheetUrl,
+        title,
+      };
+    } catch (error: any) {
+      if (sheetId && drive) {
+        try { await drive.files.delete({ fileId: sheetId }); } catch {}
+      }
+      console.error('AgentMode: Error creating Google Sheet:', error);
+      const code = error?.code || error?.status;
+      if (code === 403 || code === 401) {
+        return { success: false, message: 'Cannot create Sheet in that folder — Emma does not have access to it. Try without a folder_id to create in root Drive.' };
+      }
+      if (code === 404) {
+        return { success: false, message: 'Folder not found. Check the folder ID or omit it to create in root Drive.' };
+      }
+      return { success: false, message: `Failed to create Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}` };
+    }
+  }
+
+  public async updateGoogleSheet(fileIdOrUrl: string, range: string, data: string[][], userId: string): Promise<any> {
+    try {
+      const auth = await this.getGoogleDriveOAuthClient(userId);
+      const sheets = google.sheets({ version: 'v4', auth });
+      const fileId = this.extractGoogleFileId(fileIdOrUrl);
+
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: fileId,
+        range,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values: data },
+      });
+
+      return {
+        success: true,
+        message: `Updated Google Sheet (id: ${fileId}) range ${range}`,
+        sheet_id: fileId,
+        url: `https://docs.google.com/spreadsheets/d/${fileId}/edit`,
+        range,
+        rows_written: data.length,
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error updating Google Sheet:', error);
+      const code = error?.code || error?.status;
+      if (code === 403 || code === 401) {
+        return { success: false, message: 'Cannot update this Google Sheet — it was not created by Emma. Emma can only edit Sheets she created.' };
+      }
+      if (code === 404) {
+        return { success: false, message: 'Google Sheet not found. Check the URL or ID and try again.' };
+      }
+      return { success: false, message: `Failed to update Google Sheet: ${error instanceof Error ? error.message : 'Unknown error'}` };
     }
   }
 
@@ -18416,30 +20036,64 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
-      // Fetch the file content
-      const response = await axios.get(normalizedFileUrl, {
-        timeout: 30000,
-        responseType: 'arraybuffer',
-        headers: {
-          'User-Agent': 'AgentWeb-Backend/1.0',
-        },
-      });
+      // Fetch the file content — S3 objects are private, use SDK directly for our bucket
+      let buffer: Buffer;
+      let contentType: string;
 
-      const buffer = Buffer.from(response.data as ArrayBuffer);
-      const contentType = response.headers['content-type'] || '';
+      const s3Key = extractS3KeyFromUrl(normalizedFileUrl);
+      if (s3Key) {
+        // Private bucket object — stream via SDK (same pattern as filesController)
+        const stream = getS3ObjectStream(s3Key);
+        const chunks: Buffer[] = [];
+        for await (const chunk of stream) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        buffer = Buffer.concat(chunks);
+        try {
+          const meta = await getS3ObjectMetadata(s3Key);
+          contentType = meta.ContentType || '';
+        } catch {
+          contentType = '';
+        }
+        console.log(`AgentMode: Fetched S3 file via SDK, size: ${buffer.length} bytes, type: ${contentType}`);
+      } else {
+        // Google Drive / Docs links require the user's OAuth token — unauthenticated
+        // fetches return 401 for Workspace-restricted orgs. Tell the user to upload instead.
+        const urlHost = new URL(normalizedFileUrl).hostname.toLowerCase();
+        if (urlHost === 'drive.google.com' || urlHost === 'docs.google.com') {
+          return {
+            success: false,
+            message: 'Google Drive and Docs links cannot be read directly — your organization may have restricted sharing. Please download the file and upload it using the attachment button in the chat instead.',
+            error: 'Google Drive links require authenticated access'
+          };
+        }
 
-      console.log(`AgentMode: Successfully fetched file, size: ${buffer.length} bytes, type: ${contentType}`);
+        // External URL — plain fetch
+        const response = await axios.get(normalizedFileUrl, {
+          timeout: 30000,
+          responseType: 'arraybuffer',
+          headers: { 'User-Agent': 'AgentWeb-Backend/1.0' },
+        });
+        buffer = Buffer.from(response.data as ArrayBuffer);
+        contentType = response.headers['content-type'] || '';
+        console.log(`AgentMode: Fetched external file, size: ${buffer.length} bytes, type: ${contentType}`);
+      }
 
       // Process content based on file type
       let extractedContent = '';
       let fileType = 'unknown';
 
+      const PDF_PARSE_TIMEOUT_MS = 60000;
       if (extension === 'pdf' || contentType.includes('application/pdf')) {
         // Handle PDF files
         try {
-          // Use require for dynamic loading to avoid TypeScript module resolution issues
           const pdfParse = require('pdf-parse');
-          const pdfData: PDFData = await pdfParse(buffer, { pagerender: pdfPageRender });
+          const pdfData: PDFData = await Promise.race([
+            pdfParse(buffer, { pagerender: pdfPageRender }),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error('PDF parse timed out')), PDF_PARSE_TIMEOUT_MS)
+            ),
+          ]);
           extractedContent = pdfData.text;
           fileType = 'pdf';
           console.log(`AgentMode: Successfully parsed PDF, extracted ${extractedContent.length} characters`);
@@ -18447,7 +20101,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           console.error('AgentMode: Error parsing PDF:', pdfError);
           return {
             success: false,
-            message: 'Failed to parse PDF file. The file may be corrupted or password-protected.',
+            message: 'Failed to parse PDF file. The file may be corrupted, password-protected, or too complex.',
             error: pdfError instanceof Error ? pdfError.message : 'PDF parsing failed'
           };
         }
@@ -18524,6 +20178,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
 
+      // Truncate to avoid overwhelming the LLM context window
+      const MAX_CONTENT_LENGTH = 100_000;
+      let truncated = false;
+      if (extractedContent.length > MAX_CONTENT_LENGTH) {
+        extractedContent = extractedContent.slice(0, MAX_CONTENT_LENGTH);
+        truncated = true;
+        console.log(`AgentMode: Content truncated to ${MAX_CONTENT_LENGTH} characters`);
+      }
+
       const contentHash = createHash('sha256').update(extractedContent).digest('hex');
       console.log(`AgentMode: Computed content hash: ${contentHash}`);
 
@@ -18534,8 +20197,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         file_type: fileType,
         file_size: buffer.length,
         content_length: extractedContent.length,
+        truncated,
         file_url: normalizedFileUrl,
-        message: `Successfully read ${fileType} file content (${extractedContent.length} characters)`
+        message: `Successfully read ${fileType} file content (${extractedContent.length} characters${truncated ? ' — content was truncated, call again with a byte-range if you need more' : ''})`
       };
 
     } catch (error: any) {
@@ -19014,21 +20678,46 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         logoUrl: composeParams.logoUrl,
         ctaText: composeParams.ctaText,
         ctaUrl: composeParams.ctaUrl,
+        // Forward the optional voiceover track so a spot composed via compose_video is
+        // never shipped silent (ENG-123). remotionService.compose + the BrandedVideo
+        // composition both support an audio overlay; omitting these here dropped it.
+        audioUrl: composeParams.audioUrl,
+        audioVolume: composeParams.audioVolume,
         clipUrl: clipUrls[0],
         extraClipUrls: clipUrls.slice(1),
         clipDurationSeconds: clipDurationSeconds ?? 8,
         targetDurationSeconds,
         clipDurationsSeconds,
+        // Run's remaining media-gen budget (epoch ms), threaded from the tool context, so a
+        // long render on a revision pass hands off instead of blocking until the run's hard
+        // wall-clock timeout kills it with no asset (ENG-123).
+        renderDeadlineMs: composeParams.renderDeadlineMs,
         filename,
         userId,
       });
 
+      // Regression tripwire (ENG-123): a spot must never silently ship without a voiceover.
+      // Surface a soft warning when composed with no audio track — catches revision passes
+      // where the agent recomposes and forgets to re-attach the VO. Not a hard failure:
+      // silent b-roll stitching is still valid.
+      const voiceoverWarning = !composeParams.audioUrl
+        ? 'Composed with no voiceover track. If this is an ad spot, generate one with generate_voiceover and pass audio_url so it is not shipped silent.'
+        : undefined;
+
       if (composeResult.success && composeResult.videoUrl) {
+        const stillProcessing = composeResult.status === 'processing';
+        // Combine any composition-layer advisory (e.g. duration clamp) with the voiceover
+        // tripwire so the user sees every relevant note, not just one.
+        const warning = [composeResult.warning, voiceoverWarning].filter(Boolean).join(' ') || undefined;
         return {
           success: true,
-          message: `✅ ${clipUrls.length} clip(s) composed into branded video!`,
+          message: stillProcessing
+            ? (composeResult.message ?? `🎬 ${clipUrls.length} clip(s) are still finalizing — the video will be ready at this link shortly.`)
+            : `✅ ${clipUrls.length} clip(s) composed into branded video!`,
           videoUrl: composeResult.videoUrl,
           filename: composeResult.filename ?? filename,
+          ...(stillProcessing && { status: 'processing' as const }),
+          ...(warning && { warning }),
         };
       }
 
@@ -21418,6 +23107,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
       if (!llmModel) {
         llmModel = await this.getDefaultModel();
+      } else {
+        // ENG-46 sibling path: this method is reached with the SESSION's model
+        // (emma create_html_from_template tool / route), so a stale/removed id
+        // (e.g. gpt-5.1) would otherwise throw an opaque "Invalid model" inside
+        // callLLM here too. Resolve it up front so template substitution falls
+        // back to a served model instead of failing.
+        const templateModelResolution = this.resolveGenerationModel(llmModel);
+        if (templateModelResolution.fellBack) {
+          recordAgentModeModelFallback('create-html-from-template', sessionId || '', llmModel, templateModelResolution.model);
+        }
+        llmModel = templateModelResolution.model;
       }
       // Validate that all required variables are provided
       const templateVariables = template.variables || [];
@@ -23701,6 +25401,23 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         accounts = accounts.filter(acc => acc.platform === platform);
       }
 
+      // Unipile-managed (LinkedIn Outreach) accounts are saved with
+      // token_expires_at = Number.MAX_SAFE_INTEGER (see linkedInOutreachAuth.ts)
+      // since Unipile — not us — owns the session lifecycle. isTokenValid() only
+      // performs a live API check for platform === 'linkedin'; for 'unipile' it
+      // falls through to the timestamp-only check, which never expires and so
+      // always reports is_active: true even after the underlying LinkedIn
+      // session has died on Unipile's side (checkpoint, remote logout, etc).
+      // Use the real Unipile connectivity check instead — the same one already
+      // used by GET /api/oauth/connected-accounts (routes/connectedAccounts.ts)
+      // — so this tool doesn't report a dead account as active.
+      const unipileAccountIds = accounts
+        .filter(acc => acc.platform === 'unipile')
+        .map(acc => acc.account_id);
+      const unipileStatusMap = unipileAccountIds.length > 0
+        ? await linkedInOutreachService.getStatusesForAccounts(unipileAccountIds)
+        : new Map<string, string>();
+
       return {
         success: true,
         message: `Found ${accounts.length} connected account(s)`,
@@ -23709,7 +25426,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           platform: acc.platform,
           account_name: acc.account_name,
           account_type: acc.config.account_type,
-          is_active: await isTokenValid(acc),
+          is_active: acc.platform === 'unipile'
+            ? unipileStatusMap.get(acc.account_id) === 'OK'
+            : await isTokenValid(acc),
           ...(acc.platform === 'google_ads' && (acc.config as { customer_id?: string })?.customer_id
             ? {
                 customer_id: (acc.config as { customer_id: string }).customer_id,
@@ -23729,70 +25448,87 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   // Post on connected account helper
-  async postOnConnectedAccount(userId: string, accountId: string, content: string, mediaUrls: string[] = []): Promise<any> {
+  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string): Promise<any> {
     console.log('[AgentMode] postOnConnectedAccount called:', {
       userId,
       accountId,
+      platform,
       contentLength: content?.length || 0,
       mediaUrlCount: mediaUrls?.length || 0
     });
 
     try {
-      const { getAccountById, isTokenValid } = await import('./connectedAccountsDb');
+      const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
-      try {
-        console.log('[AgentMode] Looking up account:', accountId);
-        const account = await getAccountById(accountId, userId);
-        console.log('[AgentMode] Account lookup result:', account ? {
-          found: true,
-          platform: account.platform,
-          accountType: account.config?.account_type,
-          accountName: account.account_name
-        } : { found: false });
+      // Fetch all accessible accounts (own + org-shared) once, so org-shared accounts
+      // are visible for both the auto-resolve path and explicit accountId lookups.
+      // getAccountById(accountId, userId) only searches the caller's own DynamoDB record,
+      // which returns null for accounts owned by an org member — use this instead.
+      const allAccounts = await getAccountsWithOwnerIncludingOrgShared(userId);
+      const socialAccounts = allAccounts.filter((a: any) =>
+        ['twitter', 'linkedin', 'instagram', 'youtube'].includes(a.platform)
+      );
 
-        if (!account) {
-          console.log('[AgentMode] Account not found, returning error');
-          return {
-            success: false,
-            message: 'Account not found or access denied'
-          };
+      let account: any;
+
+      if (!accountId) {
+        // Narrow by platform hint when provided
+        const candidates = platform
+          ? socialAccounts.filter((a: any) => a.platform === platform)
+          : socialAccounts;
+        if (candidates.length === 0) {
+          const msg = platform
+            ? `No ${platform} account connected. Connect one in Settings → Connected Accounts.`
+            : 'No social media accounts connected. Connect an account in Settings → Connected Accounts.';
+          return { success: false, message: msg };
         }
-
-        // NOTE: Skipping isTokenValid check here because the adapter's getValidToken()
-        // method will automatically refresh expired tokens. The adapter handles token
-        // refresh internally before making API calls.
-        console.log('[AgentMode] Getting adapter for platform:', account.platform);
-        const adapter = socialPlatformService.getAdapter(account.platform);
-        console.log('[AgentMode] Calling adapter.createPost (adapter will handle token refresh if needed)...');
-        const result = await adapter.createPost(account, content, mediaUrls, userId);
-
-        return {
-          success: true,
-          message: result.message,
-          post_id: result.postId,
-          post_url: result.postUrl
-        };
-      } catch (error: any) {
-        // Handle specific error messages
-        let message = error.message;
-        if (message.includes('access token expired')) {
-          message = 'Account token expired. Please reconnect the account in Settings.';
+        if (candidates.length > 1) {
+          const names = candidates.map((a: any) => a.account_id).join(', ');
+          const platformHint = platform ? `platform="${platform}"` : '';
+          return { success: false, message: `Multiple ${platform ?? 'social'} accounts connected. Call list_connected_accounts(${platformHint}) to see account names, ask the user which one to use, then re-call with account_id. Connected IDs: ${names}` };
         }
-
-        return {
-          success: false,
-          message: `Failed to post: ${message}`
-        };
+        account = candidates[0];
+        accountId = account.account_id;
+        console.log('[AgentMode] Auto-resolved account_id:', accountId);
+      } else {
+        account = socialAccounts.find((a: any) => a.account_id === accountId);
       }
 
-    } catch (error) {
-      console.error('AgentMode: Error posting on account:', error);
+      console.log('[AgentMode] Account lookup result:', account ? {
+        found: true,
+        platform: account.platform,
+        accountType: account.config?.account_type,
+        accountName: account.account_name
+      } : { found: false });
+
+      if (!account) {
+        console.log('[AgentMode] Account not found, returning error');
+        return { success: false, message: 'Account not found or access denied' };
+      }
+
+      // account.userId is the token owner (equals userId for own accounts,
+      // the org member's userId for org-shared accounts).
+      const ownerUserId: string = (account as any).userId || userId;
+
+      // The adapter handles token refresh internally before making API calls.
+      console.log('[AgentMode] Getting adapter for platform:', account.platform);
+      const adapter = socialPlatformService.getAdapter(account.platform);
+      console.log('[AgentMode] Calling adapter.createPost (adapter will handle token refresh if needed)...');
+      const result = await adapter.createPost(account, content, mediaUrls, ownerUserId);
+
       return {
-        success: false,
-        message: 'Failed to create post',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        success: true,
+        message: result.message,
+        post_id: result.postId,
+        post_url: result.postUrl
       };
+    } catch (error: any) {
+      const message = error?.message?.includes('access token expired')
+        ? 'Account token expired. Please reconnect the account in Settings.'
+        : (error?.message ?? 'Unknown error');
+      console.error('AgentMode: Error posting on account:', error);
+      return { success: false, message: `Failed to post: ${message}` };
     }
   }
 
@@ -24708,11 +26444,398 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         };
       }
 
+      // Account-level invitation throttle (ENG-126). Once a LinkedIn account hits
+      // its invitation cap — a weekly limit that is far lower on non-Premium
+      // accounts and shrinks as the pending-invitation backlog grows — Unipile
+      // returns "Cannot resend yet" for send-invite on EVERY recipient, including
+      // brand-new ones. Surfaced verbatim, that phrase reads like a per-recipient
+      // cooldown, so the agent moves on to the next recipient and repeats, burning
+      // attempt after attempt (10+ in the reported session) and reporting nothing
+      // useful. Re-label it as the account-wide throttle it is so the agent stops
+      // and reports proactively. The raw phrase is preserved in the body so the
+      // error classifier still buckets this as an upstream_rejected business rule.
+      if (action === 'send-invite' && /cannot resend yet/i.test(errorMessage)) {
+        return {
+          success: false,
+          message: 'LinkedIn invitation limit reached',
+          error: [
+            "LinkedIn rejected this invitation with 'Cannot resend yet'. This is an ACCOUNT-LEVEL invitation cooldown/throttle, NOT a per-recipient one — LinkedIn caps how many pending invitations an account may have (the cap is much lower on non-Premium accounts), so it applies to every recipient equally.",
+            '',
+            'DO NOT keep trying other recipients — every send-invite will fail the same way until the cooldown lifts. Stop sending invitations now and report to the user that their LinkedIn account has hit its invitation limit and has a large pending-invitation backlog.',
+            '',
+            'To free up capacity the user can withdraw old unanswered invitations (use list-sent-invitations to see the backlog, then cancel-invitation on the stale ones) or wait a few days before the next outreach run. Prefer queueing these invites for a later run over retrying now.',
+          ].join('\n'),
+          accountThrottled: true,
+        };
+      }
+
       return {
         success: false,
         message: 'LinkedIn outreach action failed',
         error: errorMessage
       };
+    }
+  }
+
+  // --- Twitter / X ---
+
+  /**
+   * Dispatch Twitter/X interaction actions for Emma via the official X API.
+   * Posting a single tweet is handled by post_on_connected_account (TwitterAdapter).
+   * This method covers all other interactions: reply, thread, edit, delete, like,
+   * retweet, follow, DMs, search, bookmarks, and profile lookup.
+   *
+   * Every action requires an account owned by the caller or shared with their org.
+   * The owner's userId is passed to twitterService so refreshed OAuth tokens are
+   * written back to the owner's record. When list_id/lead_id/lead_email are
+   * supplied, sent tweets and DMs are logged to AW-EmailEvents for CRM parity.
+   */
+  async twitterManagePost(userId: string, args: any): Promise<any> {
+    let { account_id } = args;
+    const action = (args.action as string)?.replace(/_/g, '-');
+    const { text, in_reply_to_tweet_id, tweet_id, tweet_ids, handle, recipient_handle, tweets, list_id, lead_id, lead_email, query, max_results } = args;
+    console.log(`[AgentMode] twitterManagePost called: action=${action}, account_id=${account_id}`);
+
+    const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+    const twitterAccounts = (await getAccountsWithOwnerIncludingOrgShared(userId))
+      .filter((a: any) => a.platform === 'twitter');
+
+    if (twitterAccounts.length === 0) {
+      return {
+        success: false,
+        error: 'No X (Twitter) account is connected. Connect your X account in Settings → Connected Accounts.',
+      };
+    }
+
+    let account: any;
+    if (account_id) {
+      account = twitterAccounts.find((a: any) => a.account_id === account_id);
+      if (!account) {
+        return { success: false, error: `X account ${account_id} is not connected to your profile.` };
+      }
+    } else if (twitterAccounts.length === 1) {
+      account = twitterAccounts[0];
+    } else {
+      return {
+        success: false,
+        error: 'Multiple X accounts are connected — specify account_id. Use list_connected_accounts(platform="twitter").',
+      };
+    }
+
+    const ownerUserId = account.userId;
+    account_id = account.account_id;
+
+    // Best-effort CRM logging — never fails the action.
+    const logCrm = async (
+      eventType: 'twitter.tweet.sent' | 'twitter.dm.sent',
+      messageProviderId: string,
+      bodyText: string
+    ): Promise<void> => {
+      if (!list_id || !lead_id || !lead_email) return;
+      try {
+        const { emailEventsDb } = await import('./emailEventsDb');
+        await emailEventsDb.addTwitterMessageEvent({
+          eventId: `twitter_${eventType.includes('dm') ? 'dm' : 'tweet'}_${messageProviderId}`,
+          emailDomain: `twitter-${list_id}`,
+          leadEmail: lead_email,
+          eventType,
+          text: bodyText ?? null,
+          timestamp: new Date().toISOString(),
+          senderId: account_id,
+          messageProviderId,
+        });
+      } catch (e) {
+        console.error('[AgentMode] twitterManagePost CRM logging failed (non-fatal):', e);
+      }
+    };
+
+    try {
+      switch (action) {
+        case 'reply': {
+          if (!text) throw new Error('text is required for reply');
+          if (!in_reply_to_tweet_id) throw new Error('in_reply_to_tweet_id is required for reply');
+          const result = await twitterService.postTweet(ownerUserId, account_id, text, {
+            inReplyToTweetId: in_reply_to_tweet_id,
+          });
+          await logCrm('twitter.tweet.sent', result.id, result.text);
+          return { success: true, data: result };
+        }
+
+        case 'post-thread': {
+          if (!Array.isArray(tweets) || tweets.length === 0) {
+            throw new Error('tweets (non-empty array of strings) is required for post-thread');
+          }
+          if (tweets.length < 2) {
+            throw new Error('post_thread requires at least 2 tweets. To post a single tweet, use post_on_connected_account instead.');
+          }
+          const result = await twitterService.postThread(ownerUserId, account_id, tweets);
+          if (result[0]) await logCrm('twitter.tweet.sent', result[0].id, result[0].text);
+          return { success: true, data: result };
+        }
+
+        case 'quote-tweet': {
+          if (!text) throw new Error('text is required for quote_tweet');
+          if (!tweet_id) throw new Error('tweet_id is required for quote_tweet');
+          const result = await twitterService.quoteTweet(ownerUserId, account_id, text, tweet_id);
+          await logCrm('twitter.tweet.sent', result.id, result.text);
+          return { success: true, data: result };
+        }
+
+        case 'delete-tweet': {
+          if (!tweet_id) throw new Error('tweet_id is required for delete-tweet');
+          const result = await twitterService.deleteTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'like': {
+          if (!tweet_id) throw new Error('tweet_id is required for like');
+          const result = await twitterService.likeTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'unlike': {
+          if (!tweet_id) throw new Error('tweet_id is required for unlike');
+          const result = await twitterService.unlikeTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'retweet': {
+          if (!tweet_id) throw new Error('tweet_id is required for retweet');
+          const result = await twitterService.retweetTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'unretweet': {
+          if (!tweet_id) throw new Error('tweet_id is required for unretweet');
+          const result = await twitterService.unretweetTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-tweet-metrics': {
+          if (!tweet_ids?.length) throw new Error('tweet_ids is required for get_tweet_metrics');
+          const result = await twitterService.getTweetMetrics(ownerUserId, account_id, tweet_ids);
+          return { success: true, data: result };
+        }
+
+        case 'list-replies': {
+          if (!tweet_id) throw new Error('tweet_id is required for list_replies');
+          const result = await twitterService.listReplies(ownerUserId, account_id, tweet_id, max_results);
+          return { success: true, data: result };
+        }
+
+        case 'get-retweeters': {
+          if (!tweet_id) throw new Error('tweet_id is required for get_retweeters');
+          const result = await twitterService.getRetweeters(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-liking-users': {
+          if (!tweet_id) throw new Error('tweet_id is required for get_liking_users');
+          const result = await twitterService.getLikingUsers(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-quote-tweets': {
+          if (!tweet_id) throw new Error('tweet_id is required for get_quote_tweets');
+          const result = await twitterService.getQuoteTweets(ownerUserId, account_id, tweet_id, max_results);
+          return { success: true, data: result };
+        }
+
+        default: {
+          const validActions = [
+            'reply', 'post-thread', 'quote-tweet',
+            'delete-tweet',
+            'like', 'unlike', 'retweet', 'unretweet',
+            'list-replies', 'get-tweet-metrics',
+            'get-retweeters', 'get-liking-users', 'get-quote-tweets',
+          ];
+          throw new Error(`Unsupported twitter_manage_post action: "${action}". Valid actions are: ${validActions.join(', ')}`);
+        }
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      console.error('AgentMode: twitter_manage_post failed:', errorMessage);
+      return { success: false, message: 'Twitter action failed', error: errorMessage };
+    }
+  }
+
+  async twitterOutreach(userId: string, args: any): Promise<any> {
+    let { account_id } = args;
+    const action = (args.action as string)?.replace(/_/g, '-');
+    const { text, handle, recipient_handle, query, max_results, tweet_id, list_id, lead_id, lead_email } = args;
+    console.log(`[AgentMode] twitterOutreach called: action=${action}, account_id=${account_id}`);
+
+    const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+    const twitterAccounts = (await getAccountsWithOwnerIncludingOrgShared(userId))
+      .filter((a: any) => a.platform === 'twitter');
+
+    if (twitterAccounts.length === 0) {
+      return {
+        success: false,
+        error: 'No X (Twitter) account is connected. Connect your X account in Settings → Connected Accounts.',
+      };
+    }
+
+    let account: any;
+    if (account_id) {
+      account = twitterAccounts.find((a: any) => a.account_id === account_id);
+      if (!account) {
+        return { success: false, error: `X account ${account_id} is not connected to your profile.` };
+      }
+    } else if (twitterAccounts.length === 1) {
+      account = twitterAccounts[0];
+    } else {
+      return {
+        success: false,
+        error: 'Multiple X accounts are connected — specify account_id. Use list_connected_accounts(platform="twitter").',
+      };
+    }
+
+    const ownerUserId = account.userId;
+    account_id = account.account_id;
+
+    const logCrm = async (messageProviderId: string, bodyText: string): Promise<void> => {
+      if (!list_id || !lead_id || !lead_email) return;
+      try {
+        const { emailEventsDb } = await import('./emailEventsDb');
+        await emailEventsDb.addTwitterMessageEvent({
+          eventId: `twitter_dm_${messageProviderId}`,
+          emailDomain: `twitter-${list_id}`,
+          leadEmail: lead_email,
+          eventType: 'twitter.dm.sent',
+          text: bodyText ?? null,
+          timestamp: new Date().toISOString(),
+          senderId: account_id,
+          messageProviderId,
+        });
+      } catch (e) {
+        console.error('[AgentMode] twitterOutreach CRM logging failed (non-fatal):', e);
+      }
+    };
+
+    try {
+      switch (action) {
+        case 'get-profile': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for get_profile');
+          const result = await twitterService.getProfile(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'follow': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for follow');
+          const result = await twitterService.followUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'unfollow': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for unfollow');
+          const result = await twitterService.unfollowUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'list-followers': {
+          const target = handle || recipient_handle;
+          const result = await twitterService.listFollowers(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'list-following': {
+          const target = handle || recipient_handle;
+          const result = await twitterService.listFollowing(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'search-tweets': {
+          if (!query) throw new Error('query is required for search_tweets');
+          const result = await twitterService.searchTweets(ownerUserId, account_id, query, max_results);
+          return { success: true, data: result };
+        }
+
+        case 'get-user-tweets': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for get_user_tweets');
+          const result = await twitterService.getUserTweets(ownerUserId, account_id, target, max_results);
+          return { success: true, data: result };
+        }
+
+        case 'send-dm': {
+          const target = recipient_handle || handle;
+          if (!target) throw new Error('handle is required for send_dm');
+          if (!text) throw new Error('text is required for send_dm');
+          const result = await twitterService.sendDm(ownerUserId, account_id, target, text);
+          await logCrm(result?.dm_event_id || `${account_id}_dm`, text);
+          return { success: true, data: result };
+        }
+
+        case 'list-dms': {
+          const result = await twitterService.listDms(ownerUserId, account_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-dm-conversation': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for get_dm_conversation');
+          const result = await twitterService.getDmConversation(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'bookmark': {
+          if (!tweet_id) throw new Error('tweet_id is required for bookmark');
+          const result = await twitterService.bookmarkTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-bookmarks': {
+          const result = await twitterService.getBookmarks(ownerUserId, account_id);
+          return { success: true, data: result };
+        }
+
+        case 'block': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for block');
+          const result = await twitterService.blockUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'unblock': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for unblock');
+          const result = await twitterService.unblockUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'mute': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for mute');
+          const result = await twitterService.muteUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'unmute': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for unmute');
+          const result = await twitterService.unmuteUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        default: {
+          const validActions = [
+            'get-profile', 'follow', 'unfollow', 'list-followers', 'list-following',
+            'search-tweets', 'get-user-tweets',
+            'send-dm', 'list-dms', 'get-dm-conversation',
+            'bookmark', 'get-bookmarks',
+            'block', 'unblock', 'mute', 'unmute',
+          ];
+          throw new Error(`Unsupported twitter_outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
+        }
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      console.error('AgentMode: twitter_outreach failed:', errorMessage);
+      return { success: false, message: 'Twitter outreach action failed', error: errorMessage };
     }
   }
 
@@ -25048,7 +27171,6 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       case 'CONVERSATION_AD': {
         if (action === 'CREATE') {
-          if (!params.name) throw new Error('CONVERSATION_AD CREATE requires name');
           const result = await linkedInAdsService.createConversationAd(accessToken, accountId, params);
           if (!result.success) throw new Error(result.error || 'Failed to create conversation ad');
           const conversationAdUrn = result.data?.id;

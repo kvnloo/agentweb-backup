@@ -18,6 +18,16 @@ import {
   type ExecutePreparedToolsInput,
   type ToolDispatchPorts,
 } from '../toolDispatch';
+// ENG-105 wiring: the REAL output-contract validator + the REAL extractToolContent
+// (now a monolith-free util) + the REAL error classifier, so this suite proves the
+// production port — not a hand-copied mirror — downgrades empty output and tags it
+// invalid_output.
+import {
+  validateToolOutputContract,
+  ToolOutputContractError,
+} from '../../../../utils/toolOutputContract';
+import { extractToolContent } from '../../../../utils/extractToolContent';
+import { classifyToolErrorClass } from '../../../../utils/toolErrorClassifier';
 
 /** Build a model tool_call in the shape the loop emits. */
 function toolCall(id: string, name: string, args: string) {
@@ -145,9 +155,37 @@ describe('executePreparedTools', () => {
     expect(input.toolCallsLedger[0]).toMatchObject({ name: 'read_brand_guidelines' });
     expect(input.toolCallsLedger[0].error).toBeUndefined();
     expect(input.toolCallsLedger[1]).toMatchObject({ name: 'read_market_strategy', error: 'boom' });
-    expect(input.messages[1].content).toBe('ERR: boom');
+    // ENG-124: every executed-tool error now carries an explicit retryability
+    // verdict line appended to the formatted error the model sees.
+    expect(input.messages[1].content).toContain('ERR: boom');
+    expect(input.messages[1].content).toContain('Retryable: no');
     expect(result.pendingCounterUpdates).toEqual({ read_brand_guidelines: 1 });
     expect(result.failedCounterUpdates).toEqual({ read_market_strategy: 1 });
+  });
+
+  it('marks a transient (rate-limit) tool error as retryable in the model-visible content (ENG-124)', async () => {
+    const ports = makePorts({
+      executePreparedAgentTool: async () => {
+        throw new Error('429 too many requests — rate limit exceeded');
+      },
+    });
+    const input = makeInput([toolCall('a', 'you_search_web', '{}')], ports);
+    await executePreparedTools(input);
+
+    expect(input.messages[0].content).toContain('Retryable: yes');
+  });
+
+  it('marks an auth tool error as NOT retryable and tells the model to stop (ENG-124)', async () => {
+    const ports = makePorts({
+      executePreparedAgentTool: async () => {
+        throw new Error('Unauthorized: invalid api key');
+      },
+    });
+    const input = makeInput([toolCall('a', 'send_email', '{}')], ports);
+    await executePreparedTools(input);
+
+    expect(input.messages[0].content).toContain('Retryable: no');
+    expect(input.messages[0].content).toContain('Do NOT retry');
   });
 
   it('downgrades a success result that toolResultError flags as an error', async () => {
@@ -163,7 +201,8 @@ describe('executePreparedTools', () => {
     // not an Error instance). The tool message content uses String(error).
     expect(input.toolCallsLedger[0].error).toBe('Unknown error');
     expect(input.toolCallsLedger[0].result).toEqual({ bad: true });
-    expect(input.messages[0].content).toBe('ERR: flagged error');
+    expect(input.messages[0].content).toContain('ERR: flagged error');
+    expect(input.messages[0].content).toContain('Retryable:');
     expect(result.failedCounterUpdates).toEqual({ read_brand_guidelines: 1 });
     expect(result.pendingCounterUpdates).toEqual({});
   });
@@ -415,6 +454,25 @@ describe('executePreparedTools', () => {
       expect(executed).toEqual(['read_brand_guidelines']);
     });
 
+    it('forwards a deferred call to telemetry as a deferred result (ENG-103)', async () => {
+      const { ports } = mediaPorts();
+      const recordToolTelemetry = jest.fn();
+      const input = makeInput(
+        [toolCall('a', 'generate_image', '{"prompt":"x"}')],
+        { ...ports, recordToolTelemetry },
+        { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 2 },
+      );
+      await executePreparedTools(input);
+
+      // The deferred result is now PASSED to telemetry (no longer filtered out),
+      // tagged status:'deferred' so the recorder routes it to toolDeferred — not
+      // success/failure.
+      expect(recordToolTelemetry).toHaveBeenCalledTimes(1);
+      const forwarded = recordToolTelemetry.mock.calls[0][0];
+      expect(forwarded).toHaveLength(1);
+      expect(forwarded[0]).toMatchObject({ status: 'deferred', toolCall: expect.objectContaining({ id: 'a' }) });
+    });
+
     it('a deferred call that did not run does not count as a produced asset', async () => {
       // Over budget with an asset already produced: a soft {success:false} would never
       // be reached because we defer BEFORE executing. Proves deferral short-circuits.
@@ -427,6 +485,104 @@ describe('executePreparedTools', () => {
       const result = await executePreparedTools(input);
       expect(result.mediaAssetsProduced).toBe(0);
       expect(result.mediaBudgetDeferred).toBe(true);
+    });
+  });
+
+  describe('same-turn duplicate dedupe (ENG-108)', () => {
+    it('collapses two identical calls: executes once, answers BOTH tool_call_ids, no failure', async () => {
+      const ports = makePorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'create_lead', '{"email":"x@y.com"}'),
+          toolCall('b', 'create_lead', '{"email":"x@y.com"}'),
+        ],
+        ports,
+      );
+      const result = await executePreparedTools(input);
+
+      // The tool executed exactly once.
+      expect((ports as any).__execOrder).toEqual(['create_lead']);
+      // Every emitted tool_call_id is answered, with the real result before the
+      // duplicate's "use that result" note.
+      expect(input.messages.map((m: any) => m.tool_call_id)).toEqual(['a', 'b']);
+      expect(input.messages[0].content).toBe('{"success":true,"echo":"create_lead"}');
+      expect(input.messages[1].content).toContain('was already handled by tool_call_id a');
+      // The duplicate is neither a success counter nor a failed counter increment.
+      expect(result.pendingCounterUpdates).toEqual({ create_lead: 1 });
+      expect(result.failedCounterUpdates).toEqual({});
+      // The duplicate ledger entry references the call that IS handled and has no error.
+      const dupEntry = input.toolCallsLedger.find((t: any) => t.id === 'b');
+      expect(dupEntry.duplicateOf).toBe('a');
+      expect(dupEntry.error).toBeUndefined();
+    });
+
+    it('treats arg-order differences as the same call (stable key)', async () => {
+      const ports = makePorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'create_lead', '{"a":1,"b":2}'),
+          toolCall('b', 'create_lead', '{"b":2,"a":1}'),
+        ],
+        ports,
+      );
+      await executePreparedTools(input);
+      expect((ports as any).__execOrder).toEqual(['create_lead']);
+    });
+
+    it('does NOT collapse distinct args — both execute, both ids answered', async () => {
+      const ports = makePorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'create_lead', '{"email":"x@y.com"}'),
+          toolCall('b', 'create_lead', '{"email":"z@y.com"}'),
+        ],
+        ports,
+      );
+      const result = await executePreparedTools(input);
+
+      expect((ports as any).__execOrder).toEqual(['create_lead', 'create_lead']);
+      expect(input.messages.map((m: any) => m.tool_call_id).sort()).toEqual(['a', 'b']);
+      expect(result.pendingCounterUpdates).toEqual({ create_lead: 2 });
+    });
+
+    it('does NOT collapse identical calls for a non-dedupable tool (wait_seconds)', async () => {
+      const ports = makePorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'wait_seconds', '{"seconds":1}'),
+          toolCall('b', 'wait_seconds', '{"seconds":1}'),
+        ],
+        ports,
+      );
+      await executePreparedTools(input);
+      // Both identical wait_seconds calls execute (exempt set honored).
+      expect((ports as any).__execOrder).toEqual(['wait_seconds', 'wait_seconds']);
+    });
+
+    it('records suppression separately and keeps duplicates OUT of success/failure telemetry', async () => {
+      const recordDuplicateSuppression = jest.fn();
+      const recordToolTelemetry = jest.fn();
+      const ports = makePorts({ recordDuplicateSuppression, recordToolTelemetry });
+      const input = makeInput(
+        [
+          toolCall('a', 'create_lead', '{"email":"x@y.com"}'),
+          toolCall('b', 'create_lead', '{"email":"x@y.com"}'),
+        ],
+        ports,
+      );
+      await executePreparedTools(input);
+
+      // Suppression recorded once with the suppressed entry.
+      expect(recordDuplicateSuppression).toHaveBeenCalledTimes(1);
+      const suppressed = recordDuplicateSuppression.mock.calls[0][0];
+      expect(suppressed).toHaveLength(1);
+      expect(suppressed[0]).toMatchObject({ duplicateOfId: 'a', toolCall: expect.objectContaining({ id: 'b' }) });
+
+      // The suppressed duplicate must NOT appear in the success/failure telemetry.
+      const telemetered = recordToolTelemetry.mock.calls[0][0];
+      const telemeteredIds = telemetered.map((r: any) => r.toolCall?.id);
+      expect(telemeteredIds).not.toContain('b');
+      expect(telemeteredIds).toContain('a');
     });
   });
 
@@ -489,6 +645,99 @@ describe('executePreparedTools', () => {
       // Two generate_image calls, but only one produced an asset.
       expect(result.pendingCounterUpdates).toEqual({ generate_image: 1 });
       expect(result.mediaAssetsProduced).toBe(1);
+    });
+  });
+
+  // ── ENG-105: the REAL validateToolOutput port, end-to-end through dispatch ──────
+  // The isolated toolOutputContract.test.ts proves the validator in a vacuum (with a
+  // mirror extractor). This wires the ACTUAL production port — the real
+  // validateToolOutputContract composed with the real extractToolContent — into
+  // executePreparedTools, the same composition agentModeService does, and proves a
+  // tool that returns WITHOUT throwing but yields no usable output is downgraded to a
+  // structured failure (failed-counter incremented, telemetry errorClass
+  // invalid_output via the real classifier) instead of a silent success.
+  describe('ENG-105: real validateToolOutput port wiring', () => {
+    /** makePorts + the production validateToolOutput composition, returning a tool result. */
+    function portsWithRealValidator(
+      toolReturns: unknown,
+      recordToolTelemetry = jest.fn(),
+    ) {
+      return makePorts({
+        // The real production wiring: validateToolOutputContract(result, extractToolContent).
+        validateToolOutput: (result: any) => validateToolOutputContract(result, extractToolContent),
+        // Real extractor on the content path so the wired composition is genuine.
+        extractToolContent,
+        executePreparedAgentTool: async () => toolReturns,
+        recordToolTelemetry,
+      });
+    }
+
+    // Every output that the contract must reject, with the value the tool "successfully" returns.
+    const invalidCases: Array<[string, unknown]> = [
+      ['undefined', undefined],
+      ['an empty string', ''],
+      ["the literal string 'undefined'", 'undefined'],
+      ['an empty content array', { content: [] }],
+    ];
+
+    it.each(invalidCases)(
+      'downgrades a success that extracts to %s -> failure + errorClass invalid_output',
+      async (_label, toolReturns) => {
+        const recordToolTelemetry = jest.fn();
+        const ports = portsWithRealValidator(toolReturns, recordToolTelemetry);
+        const input = makeInput([toolCall('a', 'fetch_thing', '{}')], ports);
+
+        const result = await executePreparedTools(input);
+
+        // Downgraded to a failure: failed counter incremented, no pending counter.
+        expect(result.failedCounterUpdates).toEqual({ fetch_thing: 1 });
+        expect(result.pendingCounterUpdates).toEqual({});
+
+        // The failure is the structured ToolOutputContractError, and the REAL classifier
+        // tags it invalid_output (distinct from execution failures).
+        const telemetered = recordToolTelemetry.mock.calls[0][0];
+        const entry = telemetered.find((r: any) => r.toolCall?.id === 'a');
+        expect(entry.status).toBe('error');
+        expect(entry.error).toBeInstanceOf(ToolOutputContractError);
+        expect(classifyToolErrorClass(entry.error)).toBe('invalid_output');
+
+        // The model sees a structured tool error, not the garbage output.
+        expect(input.toolCallsLedger[0].name).toBe('fetch_thing');
+        expect(input.messages[0]).toMatchObject({ role: 'tool', name: 'fetch_thing' });
+      },
+    );
+
+    it('passes a VALID string result through unchanged — success, no downgrade', async () => {
+      const recordToolTelemetry = jest.fn();
+      const ports = portsWithRealValidator('GTM Plan: step 1, step 2, step 3', recordToolTelemetry);
+      const input = makeInput([toolCall('a', 'fetch_thing', '{}')], ports);
+
+      const result = await executePreparedTools(input);
+
+      expect(result.pendingCounterUpdates).toEqual({ fetch_thing: 1 });
+      expect(result.failedCounterUpdates).toEqual({});
+      const telemetered = recordToolTelemetry.mock.calls[0][0];
+      const entry = telemetered.find((r: any) => r.toolCall?.id === 'a');
+      expect(entry.status).toBe('success');
+      expect(input.messages[0].content).toContain('GTM Plan: step 1');
+    });
+
+    it('passes an image-only content array through unchanged — non-text payload is NOT empty output', async () => {
+      // The false-positive the reviewer flagged: an image-only success must survive.
+      const recordToolTelemetry = jest.fn();
+      const imageResult = {
+        content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KG...' } }],
+      };
+      const ports = portsWithRealValidator(imageResult, recordToolTelemetry);
+      const input = makeInput([toolCall('a', 'generate_diagram', '{}')], ports);
+
+      const result = await executePreparedTools(input);
+
+      expect(result.pendingCounterUpdates).toEqual({ generate_diagram: 1 });
+      expect(result.failedCounterUpdates).toEqual({});
+      const telemetered = recordToolTelemetry.mock.calls[0][0];
+      const entry = telemetered.find((r: any) => r.toolCall?.id === 'a');
+      expect(entry.status).toBe('success');
     });
   });
 });

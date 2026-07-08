@@ -129,6 +129,56 @@ export async function getSubscriptionTypeConfig(
 
 
 /**
+ * ENG-173 publish guardrail: determine whether a skill is reachable by any user.
+ *
+ * A published skill is invisible to a non-wildcard user unless its skillId appears
+ * in that user's subscription tier's `allowedSkills` — so a skill published without
+ * being added to any tier's allow-list is entitled to nobody. This reads the same
+ * `subscription_types` setting the runtime filter uses and reports which tiers (if any)
+ * allow the skill. Fails OPEN (reachable=true) when no tier config exists, mirroring
+ * getAllowedSkills' default-allow behavior so absent config never raises a false alarm.
+ */
+export async function findTiersAllowingSkill(
+  skillId: string
+): Promise<{ reachable: boolean; allowingTiers: string[]; totalTiers: number }> {
+  try {
+    const setting = await settingsService.getSetting("subscription_types");
+    if (!setting) {
+      return { reachable: true, allowingTiers: [], totalTiers: 0 };
+    }
+
+    let tiers: SubscriptionType[] = [];
+    try {
+      tiers = JSON.parse(setting.settingValue);
+    } catch (error) {
+      console.error("Error parsing subscription types:", error);
+      return { reachable: true, allowingTiers: [], totalTiers: 0 };
+    }
+
+    if (tiers.length === 0) {
+      return { reachable: true, allowingTiers: [], totalTiers: 0 };
+    }
+
+    const allowingTiers = tiers
+      .filter((tier: any) => {
+        // Backward compat: a tier without allowedSkills is treated as wildcard.
+        const allowedSkills: string[] = tier.allowedSkills || ["*"];
+        return allowedSkills.includes("*") || allowedSkills.includes(skillId);
+      })
+      .map((tier: any) => tier.name);
+
+    return {
+      reachable: allowingTiers.length > 0,
+      allowingTiers,
+      totalTiers: tiers.length,
+    };
+  } catch (error) {
+    console.error("Error checking tiers for skill:", error);
+    return { reachable: true, allowingTiers: [], totalTiers: 0 };
+  }
+}
+
+/**
  * Get all available function calls from agent mode service
  */
 export async function getAllAvailableFunctionCalls(): Promise<string[]> {
@@ -258,7 +308,7 @@ export async function getPublicAllowedSkills(): Promise<string[]> {
  * "instagram" is a separate UI entry even though it uses the "meta" OAuth flow.
  */
 export function getAllAvailableConnectedAccounts(): string[] {
-  return ['linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom', 'instagram', 'hubspot', 'attio', 'google_ads'];
+  return ['linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom', 'instagram', 'twitter', 'hubspot', 'attio', 'google_ads', 'google_drive'];
 }
 
 /**
