@@ -319,6 +319,8 @@ export interface OpenIssue {
   identifier: string;
   issueId: string;
   title: string;
+  /** Issue body — carries the structured Session/Schedule IDs the auto-issue dedup gate matches on. */
+  description: string;
 }
 
 /** List OPEN issues carrying a given label (used for auto-issue dedup). Open-only. */
@@ -333,11 +335,65 @@ export async function listOpenIssuesByLabel(labelName: string, limit = 50): Prom
           state: { type: { nin: ["completed", "canceled"] } },
           labels: { name: { eq: $label } }
         }
-      ) { nodes { id identifier title } }
+      ) { nodes { id identifier title description } }
     }`,
     { team: TEAM_KEY, label: labelName, limit },
   );
-  return (data?.issues?.nodes || []).map((n: any) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '' }));
+  return (data?.issues?.nodes || []).map((n: any) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }));
+}
+
+/**
+ * List recently RESOLVED (completed/canceled) private bug canonicals — the reopen candidates for a
+ * regression / failed-retest report (ENG-240 contract #3). A new customer report that matches one of
+ * these must REOPEN the existing ticket, not file a brand-new canonical for a bug we already tracked.
+ * Same label pair as `listOpenBugCanonicals` (Bug + Customer Reported), ordered most-recently-updated
+ * first so freshly-closed tickets are the top candidates.
+ */
+export async function listRecentlyResolvedBugCanonicals(limit = 30): Promise<OpenCanonical[]> {
+  const data = await linearGraphQL(
+    `query($team: String!, $bug: String!, $cust: String!, $limit: Int!) {
+      issues(
+        first: $limit,
+        orderBy: updatedAt,
+        filter: {
+          team: { key: { eq: $team } },
+          state: { type: { in: ["completed", "canceled"] } },
+          and: [
+            { labels: { name: { eq: $bug } } },
+            { labels: { name: { eq: $cust } } }
+          ]
+        }
+      ) {
+        nodes { id identifier title description }
+      }
+    }`,
+    { team: TEAM_KEY, bug: 'Bug', cust: 'Customer Reported', limit },
+  );
+  const nodes: any[] = data?.issues?.nodes || [];
+  return nodes.map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }));
+}
+
+/**
+ * Reopen a resolved Linear issue by moving it to a live workflow state (default "Todo"). Used by the
+ * reopen-not-refile path (ENG-240 contract #3) when a regression / failed-retest report matches a Done
+ * canonical. An unknown state name throws (no silent no-op) so a reopen never quietly leaves the issue
+ * closed.
+ */
+export async function reopenIssue(issueId: string, stateName = 'Todo'): Promise<void> {
+  const meta = await getTeamMeta();
+  const stateId = meta.stateIds[stateName.toLowerCase()];
+  if (!stateId) {
+    throw new Error(`Linear reopen: state "${stateName}" not found in team ${TEAM_KEY}`);
+  }
+  const res = await linearGraphQL(
+    `mutation($id: String!, $stateId: String!) {
+      issueUpdate(id: $id, input: { stateId: $stateId }) { success }
+    }`,
+    { id: issueId, stateId },
+  );
+  if (!res?.issueUpdate?.success) {
+    throw new Error('Linear reopen (issueUpdate) failed');
+  }
 }
 
 export interface EngineeringBugStats {

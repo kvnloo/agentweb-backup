@@ -1580,25 +1580,13 @@ export async function runScheduledChat(
       }
     }
 
-    // Send oncall alert and Notion ticket if scheduled chat failed validation (not for test runs)
+    // Send oncall alert and Notion ticket if scheduled chat failed validation (not for test runs).
+    // Single-writer (ENG-240): file the tracked issue FIRST, THEN alert. The oncall path also files an
+    // issue, but by then it dedups onto this one via the shared Schedule/Session idempotency key — so
+    // the event yields exactly ONE issue, with the oncall alert landing as an occurrence comment
+    // instead of a second, near-identical twin.
     if (!finalResult.passed && !isTest) {
-      sendAgentModeOncallAlert({
-        subject: `Scheduled Chat Failed: ${schedule.scheduleName}`,
-        message: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
-        sessionId,
-        context: {
-          'Schedule ID': schedule.scheduleId,
-          'Schedule Name': schedule.scheduleName,
-          'User ID': userId,
-          'Attempts': finalResult.attempt,
-          'Execution Time (ms)': finalResult.executionTime,
-          'Function Call Misses': finalResult.functionCallMisses.join(', ') || 'none',
-          'Function Call Matches': finalResult.functionCallMatches.join(', ') || 'none',
-          'Keyword Misses': finalResult.keywordMisses.join(', ') || 'none',
-          'Timestamp': finalResult.createdAt
-        }
-      }).catch(err => console.error('Failed to send oncall alert for scheduled chat failure:', err));
-      fileAutoIssue({
+      void fileAutoIssue({
         title: `Scheduled Chat Failed: ${schedule.scheduleName}`,
         description: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
         source: 'Scheduled chat (validation)',
@@ -1610,7 +1598,25 @@ export async function runScheduledChat(
           'Session ID': sessionId,
           'Attempts': finalResult.attempt,
         }
-      }).catch(err => console.error('Failed to file scheduled-chat-failure issue:', err));
+      })
+        .catch(err => console.error('Failed to file scheduled-chat-failure issue:', err))
+        .then(() => sendAgentModeOncallAlert({
+          subject: `Scheduled Chat Failed: ${schedule.scheduleName}`,
+          message: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
+          sessionId,
+          context: {
+            'Schedule ID': schedule.scheduleId,
+            'Schedule Name': schedule.scheduleName,
+            'User ID': userId,
+            'Attempts': finalResult.attempt,
+            'Execution Time (ms)': finalResult.executionTime,
+            'Function Call Misses': finalResult.functionCallMisses.join(', ') || 'none',
+            'Function Call Matches': finalResult.functionCallMatches.join(', ') || 'none',
+            'Keyword Misses': finalResult.keywordMisses.join(', ') || 'none',
+            'Timestamp': finalResult.createdAt
+          }
+        }))
+        .catch(err => console.error('Failed to send oncall alert for scheduled chat failure:', err));
     }
 
     // Also sync Research Reports execution for email campaigns
@@ -1769,31 +1775,13 @@ export async function runScheduledChat(
       // Continue even if saving fails - we still want to return the result
     }
 
-    // Send oncall alert and Notion ticket for scheduled chat exception (always, including test runs)
+    // Send oncall alert and Notion ticket for scheduled chat exception (always, including test runs).
+    // Single-writer (ENG-240): file the tracked issue FIRST, THEN alert, so the oncall path's own
+    // filing dedups onto this issue via the shared Schedule/Session idempotency key. A zero-output run
+    // used to trip BOTH filers and land two identical Linear issues <1s apart; now it lands one issue
+    // plus an occurrence comment.
     const originalMessage = (error as any)?.originalMessage;
-    sendAgentModeOncallAlert({
-      subject: zeroAssistantOutput
-        ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
-        : `Scheduled Chat Error: ${schedule.scheduleName}`,
-      message: zeroAssistantOutput
-        ? `Scheduled chat "${schedule.scheduleName}" terminated with zero assistant messages.${zeroAssistantRequeuedAt ? ` It was requeued for ${zeroAssistantRequeuedAt}.` : ''}\n\nError: ${errorMessage}`
-        : `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
-      sessionId: sessionId || undefined,
-      context: {
-        'Schedule ID': schedule.scheduleId,
-        'Schedule Name': schedule.scheduleName,
-        'User ID': userId,
-        'Is Test Run': isTest ? 'Yes' : 'No',
-        'Zero Assistant Output': zeroAssistantOutput ? 'Yes' : 'No',
-        ...(zeroAssistantRequeuedAt ? { 'Requeued At': zeroAssistantRequeuedAt } : {}),
-        'Error Message': errorMessage,
-        ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
-        'Error Stack': error instanceof Error ? (error.stack || 'No stack trace') : 'N/A',
-        'Execution Time (ms)': errorResult.executionTime,
-        'Timestamp': errorResult.createdAt
-      }
-    }).catch(err => console.error('Failed to send oncall alert for scheduled chat error:', err));
-    fileAutoIssue({
+    void fileAutoIssue({
       title: zeroAssistantOutput
         ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
         : `Scheduled Chat Error: ${schedule.scheduleName}`,
@@ -1813,7 +1801,31 @@ export async function runScheduledChat(
         'Error Message': errorMessage,
         ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
       }
-    }).catch(err => console.error('Failed to file scheduled-chat-error issue:', err));
+    })
+      .catch(err => console.error('Failed to file scheduled-chat-error issue:', err))
+      .then(() => sendAgentModeOncallAlert({
+        subject: zeroAssistantOutput
+          ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
+          : `Scheduled Chat Error: ${schedule.scheduleName}`,
+        message: zeroAssistantOutput
+          ? `Scheduled chat "${schedule.scheduleName}" terminated with zero assistant messages.${zeroAssistantRequeuedAt ? ` It was requeued for ${zeroAssistantRequeuedAt}.` : ''}\n\nError: ${errorMessage}`
+          : `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
+        sessionId: sessionId || undefined,
+        context: {
+          'Schedule ID': schedule.scheduleId,
+          'Schedule Name': schedule.scheduleName,
+          'User ID': userId,
+          'Is Test Run': isTest ? 'Yes' : 'No',
+          'Zero Assistant Output': zeroAssistantOutput ? 'Yes' : 'No',
+          ...(zeroAssistantRequeuedAt ? { 'Requeued At': zeroAssistantRequeuedAt } : {}),
+          'Error Message': errorMessage,
+          ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
+          'Error Stack': error instanceof Error ? (error.stack || 'No stack trace') : 'N/A',
+          'Execution Time (ms)': errorResult.executionTime,
+          'Timestamp': errorResult.createdAt
+        }
+      }))
+      .catch(err => console.error('Failed to send oncall alert for scheduled chat error:', err));
 
     // Return error result for error reporting
     return errorResult;
