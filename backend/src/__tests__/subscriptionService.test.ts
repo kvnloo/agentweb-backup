@@ -10,6 +10,7 @@ import {
   getAllowedPages,
   filterFunctionCalls,
   getAllAvailableSkills,
+  getAllAvailableConnectedAccounts,
   getAllowedSkills,
   getPublicAllowedSkills,
   resolveSkillsToToolNames,
@@ -443,5 +444,21 @@ describe('subscriptionService', () => {
       { type: 'plain', other: true },
       { type: 'function', function: { name: undefined as any } },
     ]);
+  });
+});
+
+describe('getAllAvailableConnectedAccounts', () => {
+  it('includes twitter as a gateable platform', () => {
+    expect(getAllAvailableConnectedAccounts()).toContain('twitter');
+  });
+
+  it('includes all known connectable platforms', () => {
+    const accounts = getAllAvailableConnectedAccounts();
+    for (const platform of [
+      'linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom',
+      'instagram', 'twitter', 'hubspot', 'attio', 'google_ads', 'google_drive',
+    ]) {
+      expect(accounts).toContain(platform);
+    }
   });
 });
