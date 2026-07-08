@@ -87,6 +87,12 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         const isDisconnected = liveStatus === false;
         status = isDisconnected ? 'disconnected' : 'active';
         expiryMessage = isDisconnected ? 'Disconnected — please reconnect' : 'Connected';
+      } else if (acc.platform === 'twitter' && (acc.config as any).needs_reconnect) {
+        // Refresh token was revoked or permanently expired on X's side — the user
+        // must re-authorise via OAuth. Treat as disconnected so the UI shows the
+        // reconnect prompt instead of a misleading "Connected" badge.
+        status = 'disconnected';
+        expiryMessage = 'Reconnect required — X revoked the token';
       } else {
         // Accounts with a refresh token (e.g. Gmail) auto-renew — don't show the
         // short-lived access token expiry; just show them as permanently connected.
