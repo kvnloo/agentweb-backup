@@ -59,6 +59,7 @@ const AVAILABLE_CONNECTED_ACCOUNTS = [
   { id: 'unipile', label: 'LinkedIn Outreach' },
   { id: 'meta', label: 'Meta Marketing' },
   { id: 'instagram', label: 'Instagram Business' },
+  { id: 'twitter', label: 'Twitter/X' },
   { id: 'gmail', label: 'Gmail' },
   { id: 'youtube', label: 'YouTube' },
   { id: 'fathom', label: 'Fathom' },
