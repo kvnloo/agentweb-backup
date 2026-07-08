@@ -15,9 +15,11 @@ jest.mock('../services/featurebaseService', () => ({
 }));
 jest.mock('../services/linearService', () => ({
   listOpenBugCanonicals: jest.fn().mockResolvedValue([]),
+  listRecentlyResolvedBugCanonicals: jest.fn().mockResolvedValue([]),
   createInternalLinearIssue: jest.fn(),
   addIssueComment: jest.fn(),
   raiseIssueTriage: jest.fn(),
+  reopenIssue: jest.fn(),
   listOpenIssuesByLabel: jest.fn(),
   getIssueComments: jest.fn(),
 }));
@@ -295,5 +297,164 @@ describe('intakeService.fileAutoIssue', () => {
     const r = await fileAutoIssue({ title: 'new auto', description: 'd', source: 'Scheduled chat', extraLabels: ['Scheduled Chat'] });
     expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({ labelNames: ['Auto', 'Scheduled Chat'] }));
     expect(r).toMatchObject({ deduped: false, tracker: 'Linear' });
+  });
+});
+
+describe('intakeService.fileAutoIssue — idempotency-key dedup (ENG-240)', () => {
+  const realFlag = process.env.FEATUREBASE_INTAKE;
+  beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; });
+  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+
+  // AC #1: a zero-output run trips BOTH the scheduled-chat filer and the oncall alert. They carry the
+  // same Schedule ID; the second (oncall) must land on the first's issue, not create a twin — even
+  // though the oncall alert's title differs ("Oncall alert" wording vs the scheduled-chat title).
+  it('second filer sharing the Schedule ID groups onto the first issue despite a different title', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-145', issueId: 'uuid-145', title: 'Scheduled Chat Zero Assistant Output: WACAP', description: 'Error: x\n- Schedule ID: sched-wacap\n- Session ID: sess-1' },
+    ]);
+    const r = await fileAutoIssue({
+      title: 'Oncall: WACAP zero output', // deliberately different wording from the existing issue
+      description: 'd',
+      source: 'Oncall alert',
+      notionContext: { 'Schedule ID': 'sched-wacap', 'Session ID': 'sess-1' },
+    });
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-145', expect.stringContaining('Recurred on'));
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ pageId: 'ENG-145', deduped: true, tracker: 'Linear' });
+  });
+
+  // AC #2: a SECOND failure of the same schedule (new session, so a different Session ID) while the
+  // issue is open must group by Schedule ID — zero new issues, one occurrence comment.
+  it('a later failure of the same schedule (new session) groups by Schedule ID', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-180', issueId: 'uuid-180', title: 'Scheduled Chat Error: xCures', description: 'Error\n- Schedule ID: sched-xcures\n- Session ID: 64ebbde3' },
+    ]);
+    const r = await fileAutoIssue({
+      title: 'Scheduled Chat Error: xCures',
+      description: 'd',
+      source: 'Scheduled chat (error)',
+      notionContext: { 'Schedule ID': 'sched-xcures', 'Session ID': 'new-session-abc' },
+    });
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ deduped: true });
+  });
+
+  // Root cause 2: a second analyzer re-files the SAME failing session days later (different title, no
+  // Schedule ID in context) — it must still match on the Session ID printed in the existing body.
+  it('re-file of the same session by a second analyzer groups on the Session ID', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-180', issueId: 'uuid-180', title: 'Scheduled Chat Zero Assistant Output: xCures', description: 'body\n- Session ID: 64ebbde3\n- Schedule ID: sched-xcures' },
+    ]);
+    const r = await fileAutoIssue({
+      title: 'Scheduled run crashed with no assistant response (xCures)',
+      description: 'systemic pattern report',
+      source: 'Daily audit',
+      notionContext: { 'Session ID': '64ebbde3' },
+    });
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ pageId: 'ENG-180', deduped: true });
+  });
+
+  // Placeholder ids ("N/A") must never collide across unrelated events.
+  it('a placeholder Session ID does not falsely match another placeholder issue', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-9', issueId: 'uuid-9', title: 'Some other error', description: 'body\n- Session ID: N/A' },
+    ]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-10', url: 'u' });
+    const r = await fileAutoIssue({
+      title: 'A totally different error',
+      description: 'd',
+      source: 'Scheduled chat (error)',
+      notionContext: { 'Session ID': 'N/A', 'Schedule ID': 'sched-unique-xyz' },
+    });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalled();
+    expect(r).toMatchObject({ deduped: false });
+  });
+
+  // AC #4: replaying the six evidence events (3 distinct schedules, each filed by two paths, plus a
+  // late re-file) yields 3 issues, not 9. Models the gate against a live in-memory Auto-issue store.
+  it('replaying the Jul 1-6 evidence sequence yields 3 issues, not 9', async () => {
+    const store: any[] = [];
+    let seq = 0;
+    linear.listOpenIssuesByLabel.mockImplementation(async () => store.slice());
+    linear.createInternalLinearIssue.mockImplementation(async (input: any) => {
+      seq += 1;
+      const identifier = `ENG-${100 + seq}`;
+      store.push({ identifier, issueId: `uuid-${seq}`, title: input.title, description: input.description });
+      return { identifier, url: `u/${identifier}`, id: `uuid-${seq}` };
+    });
+    linear.addIssueComment.mockResolvedValue(undefined);
+
+    // Each schedule's failure event fires twice (scheduled-chat filer + oncall) and once more via a
+    // late daily-audit re-file that only knows the Session ID.
+    const schedules = [
+      { name: 'WACAP', scheduleId: 'sched-wacap', sessionId: 'sess-wacap' },
+      { name: 'xCures', scheduleId: 'sched-xcures', sessionId: 'sess-xcures' },
+      { name: 'Token Usage', scheduleId: 'sched-token', sessionId: 'sess-token' },
+    ];
+    for (const s of schedules) {
+      // scheduled-chat filer
+      await fileAutoIssue({ title: `Scheduled Chat Zero Assistant Output: ${s.name}`, description: 'err', source: 'Scheduled chat (error)', notionContext: { 'Schedule ID': s.scheduleId, 'Session ID': s.sessionId } });
+      // oncall alert (different wording, same event)
+      await fileAutoIssue({ title: `Oncall: ${s.name} down`, description: 'err', source: 'Oncall alert', notionContext: { 'Schedule ID': s.scheduleId, 'Session ID': s.sessionId } });
+      // daily audit re-file days later (only the Session ID)
+      await fileAutoIssue({ title: `Scheduled run crashed (${s.name})`, description: 'audit', source: 'Daily audit', notionContext: { 'Session ID': s.sessionId } });
+    }
+
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(3);
+    expect(store).toHaveLength(3);
+  });
+});
+
+describe('intakeService.fileBugReport — reopen, not refile (ENG-240 contract #3)', () => {
+  const realFlag = process.env.FEATUREBASE_INTAKE;
+  beforeEach(() => {
+    process.env.FEATUREBASE_INTAKE = 'true';
+    linear.listOpenBugCanonicals.mockResolvedValue([]);
+    linear.listRecentlyResolvedBugCanonicals.mockResolvedValue([]);
+    fb.createTicket.mockResolvedValue({ id: 'tk', number: 58, url: 'https://fb/t/58' });
+  });
+  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+
+  it('a regression report referencing a resolved canonical REOPENS it instead of filing a new one', async () => {
+    // No OPEN canonical, but the report names AGW-58 and a recently-RESOLVED canonical matches.
+    linear.listRecentlyResolvedBugCanonicals.mockResolvedValue([
+      { identifier: 'ENG-179', issueId: 'uuid-179', title: 'Google Ads connection fails after OAuth', description: 'old report' },
+    ]);
+    // First dedup pass (OPEN canonicals, empty) -> no match; second pass (RESOLVED set) -> match.
+    dedup.findDuplicate
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ ref: 'ENG-179', title: 'Google Ads connection fails after OAuth', description: 'old report' });
+    const r = await fileUserIssue({
+      type: 'bug',
+      title: 'FOLLOW-UP / REGRESSION on AGW-58',
+      description: 'Marked resolved but Google Ads connection still fails after OAuth',
+      userEmail: 'u@e.com',
+    });
+    expect(linear.reopenIssue).toHaveBeenCalledWith('uuid-179', 'Todo');
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-179', expect.stringContaining('Reopened by a new report'));
+    expect(r).toMatchObject({ deduped: true });
+  });
+
+  it('a report that names no canonical never queries the resolved set (fresh bug -> new canonical)', async () => {
+    dedup.findDuplicate.mockResolvedValue(null);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
+    await fileUserIssue({ type: 'bug', title: 'Save button crashes', description: 'clicking save throws', userEmail: 'u@e.com' });
+    expect(linear.listRecentlyResolvedBugCanonicals).not.toHaveBeenCalled();
+    expect(linear.reopenIssue).not.toHaveBeenCalled();
+    expect(linear.createInternalLinearIssue).toHaveBeenCalled();
+  });
+
+  it('references a canonical but no resolved match -> files a fresh canonical (no reopen)', async () => {
+    dedup.findDuplicate.mockResolvedValue(null); // neither open nor resolved matches
+    linear.listRecentlyResolvedBugCanonicals.mockResolvedValue([
+      { identifier: 'ENG-500', issueId: 'uuid-500', title: 'unrelated', description: 'x' },
+    ]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
+    const r = await fileUserIssue({ type: 'bug', title: 'New unrelated bug (mentions ENG-500 loosely)', description: 'd', userEmail: 'u@e.com' });
+    expect(linear.reopenIssue).not.toHaveBeenCalled();
+    expect(linear.createInternalLinearIssue).toHaveBeenCalled();
+    expect(r).toMatchObject({ deduped: false });
   });
 });
