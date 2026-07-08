@@ -6918,6 +6918,9 @@ emmaToolRegistry.register({
             userName: user.displayName || user.email,
             reportedByAdmin: isDelegatedAdmin && adminEmail ? adminEmail : undefined,
             sessionId: context?.sessionId,
+            // Same value that lands as "Priority:" text in issueContext — the intake service
+            // maps it onto the Linear priority field so text and board agree (ENG-231).
+            priority: issue.priority,
             // Linear-side triage enrichment (ENG-187): stage labels + priority/state/assignee defaults.
             funnelStatus: user.funnelStatus,
             // External MCP clients (Claude Code etc.) are tagged distinctly so benchmark
