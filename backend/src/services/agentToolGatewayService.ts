@@ -945,21 +945,14 @@ function isNonEmptyString(value: unknown): boolean {
 }
 
 function validateSemanticToolContract(toolName: string, args: Record<string, unknown>): AgentToolContractIssue[] {
-  if (toolName === 'linkedin_outreach') {
-    if (args.action !== 'send-invite') return [];
-    if (typeof args.message !== 'string') return [];
-
-    const conservativeInviteLimit = 200;
-    if (args.message.length <= conservativeInviteLimit) return [];
-
-    return [{
-      code: 'invalid_args',
-      path: '$.message',
-      message:
-        `LinkedIn send-invite notes must be ${conservativeInviteLimit} characters or fewer for Agent Mode. ` +
-        `This note is ${args.message.length} characters. Rewrite it as a complete shorter note before retrying.`,
-    }];
-  }
+  // ENG-243: intentionally NO length gate on linkedin_outreach send-invite notes.
+  // The send path (LinkedInOutreachService.sendInvitation) resolves the account's
+  // tier limit (200 free / 300 Premium) and auto-trims the note on a word boundary,
+  // so a send never fails on length. Hard-rejecting an over-limit note here instead
+  // produced repeated invalid_args failures (a fast-trip error class) that tripped
+  // the anti-loop breaker after 2 attempts and sent 0 invites — and it contradicts
+  // the tool description, which promises the backend auto-trims. The gateway cannot
+  // know the account tier synchronously, so trimming is deferred to that send path.
 
   // ENG-106: the send_email_from_sender schema can only mark `to`/`subject`
   // required — the body is a 3-way alternative (html OR text OR body) the
