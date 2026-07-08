@@ -563,8 +563,18 @@ export class LinkedInOutreachService {
     profileUrlOrId: string,
     isUrl: boolean,
     message?: string,
-    maxChars: number = LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS
+    maxChars: number = LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS,
+    opts?: { onNoteQuota?: 'send_without_note' | 'skip' }
   ): Promise<any> {
+    // Policy for when LinkedIn rejects the personalized note because the account's
+    // monthly note quota is spent (ENG-213). The service is a pure mechanism — the
+    // caller decides. 'send_without_note' drops the note and sends anyway (legacy
+    // behavior; kept as the default so existing callers are unaffected). 'skip'
+    // HOLDS the invite: it throws a typed `noteQuotaExceeded` signal WITHOUT sending,
+    // so the caller can ask the customer (CRM dialog / Emma) or defer the lead
+    // instead of silently downgrading a note the customer deliberately wrote.
+    const onNoteQuota: 'send_without_note' | 'skip' = opts?.onNoteQuota ?? 'send_without_note';
+
     // Account-level cooldown breaker: if a prior send already hit LinkedIn's
     // invitation cap, skip the network round-trip entirely and fail fast with the
     // same signal, so callers (agent-mode, CRM) stop burning attempts recipient
@@ -605,12 +615,17 @@ export class LinkedInOutreachService {
       const provider_id = await this.checkIsNotAlreadyConnected(account_id, resolvedTarget);
       this.log(`Sending invitation`, { account_id, provider_id });
       const client = await this.getClient();
-      const res = await this.sendInvitationRequest(client, account_id, provider_id, outgoingMessage);
+      const res = await this.sendInvitationRequest(client, account_id, provider_id, outgoingMessage, onNoteQuota);
       this.log(`Invitation sent successfully`, { account_id, provider_id });
       // A successful send proves the account is not capped — clear any stale breaker.
       this.invitationCooldownUntil.delete(account_id);
       return res;
     } catch (error: any) {
+      // A note-quota HOLD (onNoteQuota:'skip') is an intentional, already-classified
+      // signal — surface it verbatim so callers can gate on `noteQuotaExceeded`.
+      // Running it through handleError would re-classify it as a generic validation
+      // error and strip the flag.
+      if (error?.noteQuotaExceeded) throw error;
       // handleError always throws; inspect the normalized message it produces so
       // an account-level "Cannot resend yet" arms the breaker for future calls.
       // Per-recipient rejections (e.g. "Should delay new invitation") do not match
@@ -631,28 +646,48 @@ export class LinkedInOutreachService {
   }
 
   /**
-   * Send the invite to Unipile, transparently retrying WITHOUT the personalized
-   * note if LinkedIn rejects the note-bearing invite with a generic
-   * "Invalid parameters" (ENG-213). Free LinkedIn accounts may only attach a note
-   * to ~5 invitations per month, but can still send ~150 note-less invites per
-   * week; once the monthly note quota is spent, LinkedIn rejects every note-bearing
-   * invite with that generic validation error even though the recipient/provider_id
-   * are perfectly valid. Dropping the note lets the connection request still go out
-   * instead of failing the whole outreach. A note-less invite that STILL fails, or
-   * any non-note rejection (bad provider_id, already-invited, account cap), bubbles
-   * up unchanged for the caller/handleError to classify.
+   * Send the invite to Unipile. Free LinkedIn accounts may only attach a note to ~5
+   * invitations per month, but can still send ~150 note-less invites per week; once
+   * the monthly note quota is spent, LinkedIn rejects every note-bearing invite with
+   * a generic "Invalid parameters" even though the recipient/provider_id are perfectly
+   * valid (ENG-213). What we do about that is the CALLER's policy, via `onNoteQuota`:
+   *   - 'send_without_note': transparently resend WITHOUT the note so the connection
+   *     request still goes out, tagging the result `note_dropped` so callers report it.
+   *   - 'skip': do NOT send — throw a typed `noteQuotaExceeded` signal so the caller
+   *     can ask the customer or hold the lead instead of silently dropping the note.
+   * Any non-note rejection (bad provider_id, already-invited, account cap) bubbles up
+   * unchanged for the caller/handleError to classify, regardless of `onNoteQuota`.
    */
   private async sendInvitationRequest(
     client: UnipileClient,
     account_id: string,
     provider_id: string,
     message: string | undefined,
+    onNoteQuota: 'send_without_note' | 'skip',
   ): Promise<any> {
     try {
       return await client.users.sendInvitation({ account_id, provider_id, message });
     } catch (error: any) {
       const hadNote = typeof message === 'string' && message.length > 0;
       if (hadNote && LinkedInOutreachService.isInviteNoteRejection(error)) {
+        if (onNoteQuota === 'skip') {
+          // Hold: the note quota is spent and the caller has NOT authorized a note-less
+          // send. Do not downgrade silently — surface a typed signal so the caller can
+          // ask the customer (or defer the lead). The invite is NOT sent.
+          this.warn('INVITE_NOTE_QUOTA_HELD', { account_id, provider_id });
+          const held: any = new Error(
+            'LinkedIn note quota reached — the personalized note could not be attached. ' +
+            'The invitation was held (not sent) so the note is not silently dropped.'
+          );
+          held.noteQuotaExceeded = true;
+          held.structuredError = {
+            message: held.message,
+            classification: 'NOTE_QUOTA_EXCEEDED',
+            status: 422,
+            noteQuotaExceeded: true,
+          };
+          throw held;
+        }
         this.warn('INVITE_NOTE_REJECTED_RETRY_WITHOUT_NOTE', { account_id, provider_id });
         const res = await client.users.sendInvitation({ account_id, provider_id, message: undefined });
         // Signal to callers that the note was dropped — the invite still went out,
