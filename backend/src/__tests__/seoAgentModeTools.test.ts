@@ -150,6 +150,10 @@ describe('SEO Agent Mode Tools', () => {
       // & SEO) so the agent guides the user to connect rather than filing a bug.
       expect(result.message).toContain('/settings/analytics-seo');
       expect(result.message).toContain('do not file a product issue');
+      // GSC-accurate grant steps (distinct from GA4): Search Console uses
+      // "Users and permissions" + "Full", not GA4's "Property Access Management"/"Viewer".
+      expect(result.message).toContain('Users and permissions');
+      expect(result.message).toContain('Full');
     });
 
     it('should return helpful message when user has no seoDomains field', async () => {
@@ -305,6 +309,10 @@ describe('SEO Agent Mode Tools', () => {
       // treating a missing connection as a product bug.
       expect(result.message).toContain('/settings/analytics-seo');
       expect(result.message).toContain('do not file a product issue');
+      // GA4-accurate grant steps (distinct from GSC): GA4 uses "Property Access
+      // Management" + "Viewer", and the identifier is a numeric Property ID.
+      expect(result.message).toContain('Property Access Management');
+      expect(result.message).toContain('Viewer');
     });
 
     it('should return error when user not found', async () => {
