@@ -339,3 +339,63 @@ export async function listOpenIssuesByLabel(labelName: string, limit = 50): Prom
   );
   return (data?.issues?.nodes || []).map((n: any) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '' }));
 }
+
+export interface EngineeringBugStats {
+  netOpenBugs: number;
+  opened7d: number;
+  closed7d: number;
+}
+
+/**
+ * Read-only Engineering bug scoreboard counts. This deliberately does not use
+ * Featurebase/customer-report specific labels: the scoreboard wants all open
+ * ENG bugs, plus 7d bug inflow/outflow.
+ */
+export async function getEngineeringBugStats(startDate: string, endDate: string): Promise<EngineeringBugStats> {
+  const data = await linearGraphQL(
+    `query($team: String!, $bug: String!, $start: DateTime!, $end: DateTime!) {
+      open: issues(
+        first: 1,
+        filter: {
+          team: { key: { eq: $team } },
+          labels: { name: { eq: $bug } },
+          state: { type: { nin: ["completed", "canceled"] } }
+        }
+      ) {
+        totalCount
+      }
+      opened: issues(
+        first: 1,
+        filter: {
+          team: { key: { eq: $team } },
+          labels: { name: { eq: $bug } },
+          createdAt: { gte: $start, lt: $end }
+        }
+      ) {
+        totalCount
+      }
+      closed: issues(
+        first: 1,
+        filter: {
+          team: { key: { eq: $team } },
+          labels: { name: { eq: $bug } },
+          completedAt: { gte: $start, lt: $end }
+        }
+      ) {
+        totalCount
+      }
+    }`,
+    {
+      team: TEAM_KEY,
+      bug: 'Bug',
+      start: `${startDate}T00:00:00.000Z`,
+      end: `${endDate}T00:00:00.000Z`,
+    },
+  );
+
+  return {
+    netOpenBugs: Number(data?.open?.totalCount ?? 0),
+    opened7d: Number(data?.opened?.totalCount ?? 0),
+    closed7d: Number(data?.closed?.totalCount ?? 0),
+  };
+}
