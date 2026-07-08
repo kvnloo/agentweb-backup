@@ -13,6 +13,14 @@ describe('AgentMode system prompt - skill resolution policy', () => {
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('distinct from the SEO/GEO tools');
   });
 
+  it('forbids fabricating files/links and requires installing the missing skill instead of guessing', () => {
+    // Regression guard for ENG-245: the agent HALLUCINATED that it had found a Google Drive
+    // document and FABRICATED fake links before ever calling a real Drive tool, then only
+    // installed the correct skill after the user called it out.
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('Never claim a file, document, or record was found — and never emit any link or URL — unless it came from an actual tool result');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('install the skill first (per the Page & Feature Tool Reference) or state the limitation — never fabricate');
+  });
+
   it('routes "Google Drive" phrasing to the real Drive tools, not the knowledge-base tools', () => {
     // Regression guard for a bug where Emma repeatedly called list_knowledge_base_files /
     // search_knowledge_base for "in my Google Drive" requests, and claimed zero folders
