@@ -1,7 +1,9 @@
 import {
   WeaveClient,
   WeaveApiError,
+  DynamoScoreboardSnapshotStore,
   buildEngineeringScoreboardMessage,
+  getWeaveSecretName,
   runEngineeringScoreboardLoopOnce,
   type EngineeringScoreboardDeps,
   type EngineeringScoreboardSnapshot,
@@ -185,6 +187,59 @@ describe('engineering scoreboard backend loop', () => {
       message: 'unknown metric type: bugs_introduced',
       status: 400,
     });
+  });
+
+  it('accepts generic value fields from Weave metric rows', async () => {
+    const fetchImpl = jest.fn().mockResolvedValue({
+      ok: true,
+      text: jest.fn().mockResolvedValue(JSON.stringify([{ date: '2026-07-08', value: 0.23 }])),
+    });
+    const client = new WeaveClient('test-key', 'https://weave.test/api/v1', fetchImpl as unknown as typeof fetch);
+
+    await expect(
+      client.getMetricSeries('bug_ratio', { start: '2026-07-01', end: '2026-07-08' }),
+    ).resolves.toEqual([{ date: '2026-07-08', group: undefined, value: 0.23 }]);
+  });
+
+  it('uses a non-production Weave secret fallback outside production', () => {
+    expect(getWeaveSecretName({ NODE_ENV: 'production' })).toBe('prod/AgentWeb/Weave');
+    expect(getWeaveSecretName({ NODE_ENV: 'test' })).toBe('dev/AgentWeb/Weave');
+    expect(getWeaveSecretName({ WEAVE_SECRET_NAME: 'custom/Weave' })).toBe('custom/Weave');
+  });
+
+  it('sorts all persisted snapshots before slicing to the requested recent window', async () => {
+    const items = Array.from({ length: 9 }, (_, index) => {
+      const day = String(index + 1).padStart(2, '0');
+      return {
+        snapshotDate: `2026-07-${day}`,
+        netOpenBugs: index,
+        opened7d: 1,
+        closed7d: 2,
+        bugRatioLastWeek: 0.1,
+        prsLastWeek: 10,
+        createdAt: `2026-07-${day}T12:00:00.000Z`,
+      };
+    });
+    const query = jest.fn().mockResolvedValue({ items });
+    const store = new DynamoScoreboardSnapshotStore({
+      query,
+      putItem: jest.fn(),
+      getItem: jest.fn(),
+    });
+
+    const snapshots = await store.listRecentSnapshots(8);
+
+    expect(query).toHaveBeenCalledWith(expect.not.objectContaining({ limit: expect.anything() }));
+    expect(snapshots.map((snapshot) => snapshot.createdAt)).toEqual([
+      '2026-07-09T12:00:00.000Z',
+      '2026-07-08T12:00:00.000Z',
+      '2026-07-07T12:00:00.000Z',
+      '2026-07-06T12:00:00.000Z',
+      '2026-07-05T12:00:00.000Z',
+      '2026-07-04T12:00:00.000Z',
+      '2026-07-03T12:00:00.000Z',
+      '2026-07-02T12:00:00.000Z',
+    ]);
   });
 
   it('renders prior-snapshot trend without requiring in-memory state', () => {

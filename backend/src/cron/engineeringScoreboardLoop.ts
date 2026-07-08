@@ -178,7 +178,7 @@ export class WeaveClient implements WeaveClientLike {
     return rows.map((row: Record<string, unknown>) => ({
       date: String(row.date ?? ''),
       group: optionalString(row.group ?? row.account ?? row.account_id ?? row.accountId),
-      value: Number(row[metric]),
+      value: Number(row[metric] ?? row.value),
     })).filter((point) => point.date && Number.isFinite(point.value));
   }
 
@@ -361,7 +361,7 @@ async function createProductionEngineeringScoreboardDeps(): Promise<EngineeringS
   };
 }
 
-class DynamoScoreboardSnapshotStore implements SnapshotStore {
+export class DynamoScoreboardSnapshotStore implements SnapshotStore {
   constructor(private readonly dynamo: DynamoPort) {}
 
   async listRecentSnapshots(limit: number): Promise<EngineeringScoreboardSnapshot[]> {
@@ -369,7 +369,6 @@ class DynamoScoreboardSnapshotStore implements SnapshotStore {
       tableName: LOOP_EVENTS_TABLE,
       keyConditionExpression: 'loopId = :loopId',
       expressionAttributeValues: { ':loopId': SCOREBOARD_LOOP_ID },
-      limit,
     });
     return result.items
       .map((item) => snapshotFromItem(item))
@@ -411,7 +410,7 @@ function snapshotFromItem(item: Record<string, unknown>): EngineeringScoreboardS
 
 async function getWeaveApiKey(env: Record<string, string | undefined>): Promise<string> {
   if (env.WEAVE_API_KEY?.trim()) return env.WEAVE_API_KEY.trim();
-  const secretName = env.WEAVE_SECRET_NAME || (env.NODE_ENV === 'production' ? 'prod/AgentWeb/Weave' : 'prod/AgentWeb/Weave');
+  const secretName = getWeaveSecretName(env);
   const secret = await getSecret(secretName);
   const parsed = parseJson(secret);
   const key = typeof parsed === 'object' && parsed !== null
@@ -419,6 +418,10 @@ async function getWeaveApiKey(env: Record<string, string | undefined>): Promise<
     : secret;
   if (!key.trim()) throw new ScoreboardRunError('config', `Weave API key missing in ${secretName}`);
   return key.trim();
+}
+
+export function getWeaveSecretName(env: Record<string, string | undefined>): string {
+  return env.WEAVE_SECRET_NAME || (env.NODE_ENV === 'production' ? 'prod/AgentWeb/Weave' : 'dev/AgentWeb/Weave');
 }
 
 function parseEngineerConfig(raw: string | undefined): EngineerConfig[] {
