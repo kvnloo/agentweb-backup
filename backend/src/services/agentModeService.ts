@@ -26022,7 +26022,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   async linkedinOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
-    const { profile_url, provider_id, message } = args;
+    const { profile_url, provider_id, message, on_note_quota } = args;
     console.log(`[AgentMode] linkedinOutreach called: action=${action}, account_id=${account_id}`);
 
     // Write actions must use an account that is either owned by the calling user or
@@ -26177,8 +26177,34 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
           // Premium accounts allow 300-char invites; free accounts 200.
           const inviteCharLimit = await linkedInOutreachService.getInviteCharLimitForAccount(userId, account_id);
-          const inviteResult = await linkedInOutreachService.sendInvitation(account_id, target, isUrl, message, inviteCharLimit);
-          return { success: true, data: inviteResult };
+          // Note-quota policy (ENG-213). Default to 'skip' — HOLD rather than silently
+          // drop a note the customer wrote. Only send note-less when the customer has
+          // explicitly authorized it via on_note_quota='send_without_note'.
+          const onNoteQuota: 'send_without_note' | 'skip' =
+            on_note_quota === 'send_without_note' ? 'send_without_note' : 'skip';
+          try {
+            const inviteResult = await linkedInOutreachService.sendInvitation(
+              account_id, target, isUrl, message, inviteCharLimit, { onNoteQuota },
+            );
+            return { success: true, data: inviteResult };
+          } catch (inviteErr: any) {
+            if (inviteErr?.noteQuotaExceeded) {
+              // Decision gate — do NOT decide for the customer. Ask them, then re-call
+              // send-invite with on_note_quota. In a scheduled run there is no one to
+              // answer, so the agent stops here and the invite is simply left un-sent
+              // (the lead stays eligible); the customer resolves it by reopening the chat.
+              return {
+                success: false,
+                requiresDecision: true,
+                noteQuotaExceeded: true,
+                error:
+                  `This LinkedIn account's monthly quota for personalized invitation notes is spent, so the note "${message}" cannot be attached. ` +
+                  `Do NOT decide on your own — ask the user whether to send the connection request WITHOUT the note or skip this person. ` +
+                  `Then re-call send-invite with the same target plus on_note_quota="send_without_note" to send note-less, or leave it un-sent if they choose to skip.`,
+              };
+            }
+            throw inviteErr;
+          }
         }
 
         case 'send-message': {
