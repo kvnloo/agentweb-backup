@@ -688,16 +688,30 @@ const INCOMPLETE_WORK_PATTERNS: RegExp[] = [
   /\bhave\s*not\s+yet\s+(?:processed|completed|finished|researched)\b/i,
   /\b(?:remaining|other)\s+(?:events|leads|items|entities)\b[^.]*\b(?:were|was)?\s*not\s+(?:processed|completed|finished|researched|done)\b/i,
   /\bi\s+will\s+continue\b[^.]*\b(?:later|remaining|next)\b/i,
-  // Step-budget truncation apology (ENG-244): a long data-gathering scheduled run
-  // exhausted its iteration budget and emitted this instead of the deliverable.
-  // Treat it as unfinished work so the completion gate runs a synthesis/output
-  // continuation turn — otherwise the run finishes with no report produced.
-  /\breached the maximum number of (?:processing )?steps\b/i,
 ];
 
 export function scheduledRunSignalsIncompleteWork(content: string): boolean {
   if (!content || typeof content !== 'string') return false;
   return INCOMPLETE_WORK_PATTERNS.some((re) => re.test(content));
+}
+
+// Whole-response completion-gate check for scheduled runs. A turn signals
+// unfinished work if EITHER:
+//   (a) the run was truncated because it exhausted its step budget
+//       (truncatedByStepBudget) — the ENG-244 root cause. This is a
+//       deterministic STATE flag set by generateSessionResponse whenever the
+//       tool loop hits maxIterations, so it fires whether the final content is
+//       the canned "reached the maximum steps" apology OR the model's own
+//       partial text (the model usually complies with the "wrap up" nudge and
+//       writes non-report text, so text-pattern matching alone misses it); or
+//   (b) the final text explicitly admits it left work unfinished
+//       (scheduledRunSignalsIncompleteWork).
+export function scheduledRunSignalsIncompleteResponse(response: {
+  content?: string;
+  truncatedByStepBudget?: boolean;
+}): boolean {
+  if (response?.truncatedByStepBudget === true) return true;
+  return scheduledRunSignalsIncompleteWork(response?.content || '');
 }
 
 // Common function to run verified chat with work plan, keywords, and function call verification
@@ -895,7 +909,7 @@ export async function runVerifiedChat(
         if (
           completionGateContinuationsUsed < completionGateMaxContinuations &&
           attempt < maxAttempts &&
-          scheduledRunSignalsIncompleteWork(continuationResponse.content || '')
+          scheduledRunSignalsIncompleteResponse(continuationResponse)
         ) {
           completionGateContinuationsUsed++;
           completionGateContinue = true;
@@ -1043,7 +1057,7 @@ export async function runVerifiedChat(
         completionGate &&
         completionGateContinuationsUsed < completionGateMaxContinuations &&
         attempt < maxAttempts &&
-        scheduledRunSignalsIncompleteWork(response.content || '')
+        scheduledRunSignalsIncompleteResponse(response)
       ) {
         completionGateContinuationsUsed++;
         console.log(
@@ -1959,6 +1973,10 @@ export async function generateSessionResponse(
   backupModelUsed?: boolean;
   originalModel?: string;
   backupModel?: string;
+  // ENG-244: true when the underlying run exhausted its step budget (maxIterations)
+  // and was truncated before emitting the final deliverable. The scheduled-run
+  // completion gate uses this flag (not response text) to force a synthesis turn.
+  truncatedByStepBudget?: boolean;
 }> {
   // Clear any stale cancel from a previous request on this session
   clearCancel(sessionId);
