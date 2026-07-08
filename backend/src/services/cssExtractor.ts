@@ -315,6 +315,15 @@ async function extractWithPuppeteer(
     await page.setUserAgent(
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     );
+    // Onboarding brand-build must reflect the CURRENT site, not a stale copy.
+    // Disable the browser HTTP cache and send no-cache request headers so an
+    // intermediary/CDN can't return an old version (see the onboarding stale-
+    // scrape reports).
+    await page.setCacheEnabled(false);
+    await page.setExtraHTTPHeaders({
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache',
+    });
 
     await page.goto(url.toString(), {
       waitUntil: 'networkidle2',
@@ -569,7 +578,12 @@ async function extractWithJSDOM(
     try {
       const response = await axios.get(url.toString(), {
         timeout: 30000,
-        headers: { 'User-Agent': 'AgentWeb-CSS-Extractor/1.0' },
+        headers: {
+          'User-Agent': 'AgentWeb-CSS-Extractor/1.0',
+          // Brand-build must scrape the CURRENT site — never a stale/CDN copy.
+          'Cache-Control': 'no-cache',
+          Pragma: 'no-cache',
+        },
         responseType: 'text',
       });
       htmlContent = String(response.data);
