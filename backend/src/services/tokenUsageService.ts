@@ -121,18 +121,31 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
     billingUserId
   );
 
-  // Two independent limits: token-count and dollar cost. A user is blocked when
-  // EITHER is exhausted. The cost limit is what makes higher-cost models (e.g.
-  // Fable) safe to enable — a token-count cap alone can't bound dollar spend.
+  // Two independent limits: token-count and dollar cost. The cost dimension is
+  // what will eventually make higher-cost models (e.g. Fable) safe to enable — a
+  // token-count cap alone can't bound dollar spend.
+  //
+  // Cost enforcement is OFF by default (observe-only): we accumulate and surface
+  // per-user cost so we can gather real spend data before deciding to gate on it,
+  // but we do NOT block users on cost yet. Token-count remains the only hard gate.
+  // The dollar figure is not yet trustworthy enough to block paying users on —
+  // un-priced models (e.g. Fable) fall back to default pricing until ENG-207
+  // (model pricing & normalization) lands. Flip ENFORCE_COST_CAP=true to enable
+  // the cost cap once pricing is accurate; the enforcement path stays tested below.
+  const enforceCostCap = process.env.ENFORCE_COST_CAP === "true";
+
   const tokenPercentUsed = computePercentUsed(usage.totalTokens, effectiveAllowance);
   const costPercentUsed = computePercentUsed(usage.totalCost, costAllowance);
 
   const tokenAllowed = effectiveAllowance === null || tokenPercentUsed < 100;
   const costAllowed = costAllowance === null || costPercentUsed < 100;
-  const allowed = tokenAllowed && costAllowed;
+  const allowed = tokenAllowed && (enforceCostCap ? costAllowed : true);
 
   const tokenWarning = effectiveAllowance !== null && tokenPercentUsed >= 80 && tokenPercentUsed < 100;
-  const costWarning = costAllowance !== null && costPercentUsed >= 80 && costPercentUsed < 100;
+  // Only surface a cost warning to users when the cost cap is actually enforced —
+  // otherwise we'd nag about a limit that can't block them.
+  const costWarning =
+    enforceCostCap && costAllowance !== null && costPercentUsed >= 80 && costPercentUsed < 100;
 
   return {
     allowed,
