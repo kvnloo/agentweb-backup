@@ -93,7 +93,7 @@ export const INTEGRATION_CONFIG = {
     revokeUrl: 'https://oauth2.googleapis.com/revoke',
     profileUrl: 'https://www.googleapis.com/oauth2/v2/userinfo',
     scopes: [
-      'https://www.googleapis.com/auth/drive.file',
+      'https://www.googleapis.com/auth/drive',
       'https://www.googleapis.com/auth/documents',
       'https://www.googleapis.com/auth/spreadsheets',
       'https://www.googleapis.com/auth/userinfo.email',
