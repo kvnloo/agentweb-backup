@@ -542,9 +542,11 @@ describe('LinkedInOutreachService', () => {
         expect((mockUnipileClient.users.sendInvitation as jest.Mock).mock.calls[0][0]).toEqual(
           expect.objectContaining({ message: 'Hi there — would love to connect!' })
         );
-        // Retry dropped the note.
+        // Retry dropped the note — and carries the canonical provider_id resolved by
+        // the connection-check profile fetch (the mock returns 'provider-id'), not the
+        // raw slug, since the invite endpoint only accepts the canonical URN (ENG-213).
         expect((mockUnipileClient.users.sendInvitation as jest.Mock).mock.calls[1][0]).toEqual(
-          expect.objectContaining({ account_id: 'acct-A', provider_id: 'recipient-1', message: undefined })
+          expect.objectContaining({ account_id: 'acct-A', provider_id: 'provider-id', message: undefined })
         );
         expect(result).toEqual(expect.objectContaining({ note_dropped: true }));
       });
