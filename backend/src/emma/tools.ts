@@ -8159,7 +8159,7 @@ emmaToolRegistry.register({
         },
         content: {
           type: 'string',
-          description: 'Content in markdown format. Write full markdown (# Heading 1, ## Heading 2, **bold**, *italic*, - bullet lists, 1. numbered lists, | tables |, ```code blocks```, > blockquotes, [text](url) links). Markdown is automatically converted to rich Google Docs formatting — do NOT flatten to plain text.',
+          description: 'Content in markdown format. Write full markdown (# Heading 1, ## Heading 2, **bold**, *italic*, - bullet lists, 1. numbered lists, | tables |, ```code blocks```, > blockquotes, [text](url) links). Markdown is automatically converted to rich Google Docs formatting — do NOT flatten to plain text. To style just one word/phrase without affecting the rest of the document (not the document-wide accent/font from style_options), use an inline style span: [text]{attr=value;flag;...}. Supported: color=blue or color=#ff0000 (text color), font=Verdana (font family — letters/spaces only, e.g. "Times New Roman"), underline (flag, no value), italic (flag), bold (flag). Combine multiple in one span with semicolons, e.g. [Phase 1]{color=yellow;font=Verdana;italic;underline}. Only use this when the user explicitly asks for specific word/line formatting, not proactively. This composes with heading markdown: writing "# [test 2]{color=blue}" makes that one heading big+bold (from the # itself) AND blue, without recoloring any other heading in the document — do NOT treat "make it a heading" and "color it" as mutually exclusive options; combine them in a single line for a "big, bold, and [color]" request on one specific item.',
         },
         folder_id: {
           type: 'string',
@@ -8217,7 +8217,7 @@ emmaToolRegistry.register({
   name: 'update_google_doc',
   definition: {
     name: 'update_google_doc',
-    description: 'Replace the entire content of an existing Google Doc with rich formatting. Content is written in markdown and automatically converted to rich Google Docs formatting — write full markdown, do NOT flatten to plain text. Use this to write revised content back to a Doc after the team has left comments and the user has approved edits. Accepts a Doc URL or file ID. BEHAVIOR: Just do it when the user has clearly asked for an update. Only ask for clarification if multiple Docs are in context and it\'s genuinely ambiguous which one to update.',
+    description: 'Replace the entire content of an existing Google Doc with rich formatting. Content is written in markdown and automatically converted to rich Google Docs formatting — write full markdown, do NOT flatten to plain text. Use this to write revised content back to a Doc after the team has left comments and the user has approved edits. Accepts a Doc URL or file ID. BEHAVIOR: this REPLACES THE WHOLE DOCUMENT. On the FIRST update_google_doc call in a conversation, warn the user first (e.g. "this will replace the entire doc\'s content — the previous version stays recoverable via File → Version History if needed. Want me to go ahead?") and wait for explicit confirmation before calling this tool — do NOT call it on the first ask. For any SUBSEQUENT update_google_doc call later in the SAME conversation (i.e. you already asked and the user confirmed once before), do not ask again — just call it directly, but still briefly mention afterward that the previous version is recoverable via File → Version History, every time. STYLING: unlike create_google_doc, an update defaults to leaving the doc\'s existing visual decoration alone (headings/bullets/tables still render properly, just without imposed colors/fonts) — only pass plain=false or style_options when the user explicitly asks for the doc to be restyled/colorized.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -8227,7 +8227,7 @@ emmaToolRegistry.register({
         },
         content: {
           type: 'string',
-          description: 'New content in markdown format (replaces all existing content). Write full markdown — it is automatically converted to rich Google Docs formatting. Do NOT flatten to plain text.',
+          description: 'New content in markdown format (replaces all existing content). Write full markdown — it is automatically converted to rich Google Docs formatting. Do NOT flatten to plain text. To style just one word/phrase without affecting the rest of the document (not the document-wide accent/font from style_options), use an inline style span: [text]{attr=value;flag;...}. Supported: color=blue or color=#ff0000 (text color), font=Verdana (font family — letters/spaces only, e.g. "Times New Roman"), underline (flag, no value), italic (flag), bold (flag). Combine multiple in one span with semicolons, e.g. [Phase 1]{color=yellow;font=Verdana;italic;underline}. Only use this when the user explicitly asks for specific word/line formatting, not proactively. This composes with heading markdown: writing "# [test 2]{color=blue}" makes that one heading big+bold (from the # itself) AND blue, without recoloring any other heading in the document — do NOT treat "make it a heading" and "color it" as mutually exclusive options; combine them in a single line for a "big, bold, and [color]" request on one specific item.',
         },
         plain: {
           type: 'boolean',
@@ -8250,7 +8250,9 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
-    const style = args.plain === true ? 'plain' : 'styled';
+    // Unlike create (styled by default), an update defaults to leaving the doc's existing
+    // look alone — only restyle when the user explicitly asked (plain: false) or gave style_options.
+    const style = args.plain === true ? 'plain' : (args.plain === false || args.style_options) ? 'styled' : 'plain';
     const so = args.style_options;
     const styleOptions = so ? { primaryColor: so.primary_color, fontFamily: so.font_family, fontSize: so.font_size, lineHeight: so.line_height, compact: so.compact } : undefined;
     return agentModeService.updateGoogleDoc(args.url_or_id, args.content, context.userId, style, styleOptions);

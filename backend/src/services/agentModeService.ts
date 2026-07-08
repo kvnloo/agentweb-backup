@@ -18121,6 +18121,36 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (m) { result += `<code style="background-color:#f1f3f4;padding:1px 5px;border-radius:3px;font-family:Courier New,monospace;font-size:90%;text-decoration:none">${AgentModeService.escapeHtml(m[1])}</code>`; remaining = remaining.slice(m[0].length); continue; }
       m = remaining.match(/^\[([^\]]+)\]\(([^)]+)\)/);
       if (m) { result += `<a href="${AgentModeService.escapeHtml(m[2])}">${AgentModeService.escapeHtml(m[1])}</a>`; remaining = remaining.slice(m[0].length); continue; }
+      // Inline style span for a single word/phrase — [text]{color=blue}, [text]{underline},
+      // [text]{color=yellow;font=Verdana;italic;underline}, etc. The attribute-string charset is
+      // restricted to letters/digits/#/=/;/space — no quotes, parens, or angle brackets can ever
+      // appear, so a malformed/hostile value can never break out of the style attribute. Each
+      // ';'-separated segment is checked against a fixed whitelist (color, font, bold, italic,
+      // underline); unrecognized segments are silently ignored rather than rejecting the whole
+      // span. If nothing recognized survives, this doesn't match at all — falls through to plain
+      // escaped text below, preserving the original literal text (including the brackets).
+      m = remaining.match(/^\[([^\]]+)\]\{([a-zA-Z0-9#=; ]+)\}/);
+      if (m) {
+        const decls: string[] = [];
+        for (const rawSeg of m[2].split(';')) {
+          const seg = rawSeg.trim();
+          if (!seg) continue;
+          if (seg === 'underline') { decls.push('text-decoration:underline'); continue; }
+          if (seg === 'italic') { decls.push('font-style:italic'); continue; }
+          if (seg === 'bold') { decls.push('font-weight:700'); continue; }
+          let am = seg.match(/^color=(#[0-9a-fA-F]{3,8}|[a-zA-Z]+)$/);
+          if (am) { decls.push(`color:${am[1]}`); continue; }
+          am = seg.match(/^font=([a-zA-Z ]+)$/);
+          if (am) { decls.push(`font-family:${am[1]}`); continue; }
+          // Unrecognized attribute name/value — ignore silently, do not fail the whole span.
+        }
+        if (decls.length > 0) {
+          result += `<span style="${decls.join(';')}">${AgentModeService.escapeHtml(m[1])}</span>`;
+          remaining = remaining.slice(m[0].length);
+          continue;
+        }
+        // Nothing recognized — fall through to ordinary text below (do not consume the match).
+      }
       m = remaining.match(/^<[^>]+>/);
       if (m) { remaining = remaining.slice(m[0].length); continue; }
       result += AgentModeService.escapeHtml(remaining[0]);

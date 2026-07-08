@@ -19,6 +19,12 @@ import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { requestCancel } from '../utils/sseProgress';
 
+jest.mock('../services/durableLandingService', () => ({
+  findInFlightJobForSession: jest.fn().mockResolvedValue(null),
+  markAwaitingReconnect: jest.fn().mockResolvedValue(undefined),
+  claimCompletion: jest.fn().mockResolvedValue(false),
+}));
+
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     getChatSession: jest.fn(),
