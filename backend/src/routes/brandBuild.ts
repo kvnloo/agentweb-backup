@@ -22,6 +22,7 @@ import express from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb } from "../services/db";
 import {
+  buildAutoFailPatchIfStuck,
   buildFailedPatch,
   buildStartPatch,
   logCompletionMetric,
@@ -148,6 +149,20 @@ router.get("/brand-build/status", authenticateToken, async (req, res) => {
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
+
+    // Watchdog: a build orphaned by a lost fire-and-forget job (deploy /
+    // instance recycle / crash) stays `building` forever, leaving the UI on an
+    // infinite spinner. On read, force-fail any build past the hard wall so the
+    // user gets a visible error + retry instead of a silent stuck state, and so
+    // long-stuck users (the `brand_submitted` cohort) are reset on next poll.
+    const autoFail = buildAutoFailPatchIfStuck(user as any);
+    if (autoFail) {
+      await userDb.updateUser(userId, autoFail as any);
+      logCompletionMetric(userId, "failed", autoFail.brandBuildDurationMs ?? 0);
+      const refreshed = await userDb.getUserById(userId);
+      return res.json({ status: snapshot(refreshed || (autoFail as any)) });
+    }
+
     return res.json({ status: snapshot(user) });
   } catch (err) {
     console.error("[brandBuild] status failed", err);
