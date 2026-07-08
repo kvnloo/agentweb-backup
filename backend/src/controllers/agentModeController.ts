@@ -688,6 +688,11 @@ const INCOMPLETE_WORK_PATTERNS: RegExp[] = [
   /\bhave\s*not\s+yet\s+(?:processed|completed|finished|researched)\b/i,
   /\b(?:remaining|other)\s+(?:events|leads|items|entities)\b[^.]*\b(?:were|was)?\s*not\s+(?:processed|completed|finished|researched|done)\b/i,
   /\bi\s+will\s+continue\b[^.]*\b(?:later|remaining|next)\b/i,
+  // Step-budget truncation apology (ENG-244): a long data-gathering scheduled run
+  // exhausted its iteration budget and emitted this instead of the deliverable.
+  // Treat it as unfinished work so the completion gate runs a synthesis/output
+  // continuation turn — otherwise the run finishes with no report produced.
+  /\breached the maximum number of (?:processing )?steps\b/i,
 ];
 
 export function scheduledRunSignalsIncompleteWork(content: string): boolean {
