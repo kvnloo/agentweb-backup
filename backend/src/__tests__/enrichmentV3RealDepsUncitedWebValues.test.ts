@@ -214,6 +214,36 @@ describe('classifyWebValues', () => {
     expect(r.companyLinkedin?.grounding).toBeUndefined();
   });
 
+  it('DROPS a company-level LinkedIn URL when the model named no company (fail-closed)', () => {
+    // The wrong-entity guard is fail-OPEN: tokenMismatch requires a claimedCompany,
+    // so an omitted __entity_company__ meant "not contradicted" → kept. That is how
+    // a "Slashy" lead kept company/joinslash on a live run. A company LinkedIn URL
+    // has no grounding backstop, so it must be positively confirmed, not merely
+    // un-contradicted.
+    const r = classifyWebValues(
+      { company_linkedin_url: fv('https://www.linkedin.com/company/joinslash') },
+      { source: SOURCE, leadCompany: 'Slashy' }, // claimedCompany undefined
+    );
+    expect(r.company_linkedin_url).toBeUndefined();
+  });
+
+  it('KEEPS a company-level LinkedIn URL when the model affirms the lead company without naming it', () => {
+    // An affirm alone is positive confirmation, even with no __entity_company__.
+    const r = classifyWebValues(
+      { companyLinkedin: fv('https://www.linkedin.com/company/slash') },
+      { source: SOURCE, leadCompany: 'Slash', claimedMatchesLead: true },
+    );
+    expect(r.companyLinkedin?.value).toBe('https://www.linkedin.com/company/slash');
+  });
+
+  it('does not apply the fail-closed company check to PERSON-level linkedin (no company claimed)', () => {
+    const r = classifyWebValues(
+      { linkedin_url: fv('https://www.linkedin.com/in/sam-k') },
+      { source: SOURCE, leadCompany: 'Slashy' }, // claimedCompany undefined
+    );
+    expect(r.linkedin_url?.value).toBe('https://www.linkedin.com/in/sam-k');
+  });
+
   it('KEEPS a PERSON-level linkedin URL even when the source describes a different company', () => {
     // Person identity is verified separately (rejectHallucinatedLinkedInUrls +
     // identity resolution); the company mismatch must not strip the person's URL.
