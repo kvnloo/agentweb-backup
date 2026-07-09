@@ -1,4 +1,6 @@
 import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { isFastTripErrorClass } from './agentMode/core/errorRetryability';
 
 export type AgentToolEffect =
   | 'read'
@@ -138,7 +140,15 @@ export class AgentToolBudgetExceededError extends Error {
 // retrying linkedin_outreach 15 times in 16s against the same two errors — the
 // model gets no signal to stop, so the gateway provides one. Counts are keyed
 // by (runId, toolName, error head); a success for the tool clears its counts.
+//
+// ENG-124: NON-retryable error classes (auth / upstream_rejected / invalid_args /
+// tool_unavailable / invalid_output — see core/errorRetryability.ts) trip one
+// attempt earlier (threshold 2): for those classes an identical retry is
+// KNOWN-pointless, so a second identical failure is already a spiral. The class
+// is derived from the stored error head via the same classifier the telemetry
+// uses, so breaker accounting and error taxonomy stay in lockstep.
 const REPEATED_FAILURE_THRESHOLD = 3;
+const NON_RETRYABLE_FAILURE_THRESHOLD = 2;
 const EXPENSIVE_MEDIA_FAILURE_BUDGET = 2;
 const MAX_TRACKED_RUNS = 500;
 const ERROR_KEY_LENGTH = 80;
@@ -172,13 +182,24 @@ function getRunCounts(runId: string): Map<string, number> {
   return counts;
 }
 
+/** Breaker threshold for one (tool, error-head) key: non-retryable classes trip
+ * at 2 (identical retry is known-pointless), transient/unknown classes at 3.
+ * Classified from the stored error head — same classifier as the telemetry. */
+function failureThresholdFor(errorMessageHead: string): number {
+  return isFastTripErrorClass(classifyToolErrorClass(errorMessageHead))
+    ? NON_RETRYABLE_FAILURE_THRESHOLD
+    : REPEATED_FAILURE_THRESHOLD;
+}
+
 function findTrippedFailure(runId: string, toolName: string): { count: number; errorMessage: string } | null {
   const counts = runFailureCounts.get(runId);
   if (!counts) return null;
   const prefix = `${toolName}\0`;
   for (const [key, count] of counts) {
-    if (count >= REPEATED_FAILURE_THRESHOLD && key.startsWith(prefix)) {
-      return { count, errorMessage: key.slice(prefix.length) };
+    if (!key.startsWith(prefix)) continue;
+    const errorMessage = key.slice(prefix.length);
+    if (count >= failureThresholdFor(errorMessage)) {
+      return { count, errorMessage };
     }
   }
   return null;
@@ -470,6 +491,12 @@ export function validateAndRepairToolArgs(
     if (coerced.changed) {
       repairedArgs[name] = coerced.value;
       repairs.push(`${name}:scalar_coerce`);
+      continue;
+    }
+    const container = coerceJsonContainerForSchema(repairedArgs[name], propSchema);
+    if (container.changed) {
+      repairedArgs[name] = container.value;
+      repairs.push(`${name}:json_parse`);
     }
   }
 
@@ -841,6 +868,52 @@ function coerceScalarForSchema(value: unknown, schema: any): { changed: boolean;
     if (lower === 'false') return { changed: true, value: false };
   }
 
+  return { changed: false, value };
+}
+
+/**
+ * Coerce a stringified JSON array/object to its parsed value when the schema
+ * expects an `array` or `object` (and does NOT also accept `string`). LLMs
+ * frequently double-encode a nested container argument — emitting
+ * `files: "[{...}]"` instead of `files: [{...}]` — which the type validator then
+ * hard-rejected with "Expected array." (ENG-127). Parse a string that cleanly
+ * round-trips to the expected container type so the call succeeds instead of
+ * bouncing back to the model.
+ *
+ * Behavior-preserving: returns `changed: false` for non-string inputs, for
+ * schemas that also accept `string`, for strings that don't look like / parse as
+ * JSON, and for parsed values whose type doesn't match the expected container —
+ * so a genuinely wrong value still surfaces as a type_mismatch issue downstream.
+ */
+function coerceJsonContainerForSchema(value: unknown, schema: any): { changed: boolean; value: unknown } {
+  if (typeof value !== 'string') return { changed: false, value };
+  const expected = schema?.type;
+  if (!expected) return { changed: false, value };
+  const expectedTypes = Array.isArray(expected) ? expected : [expected];
+
+  // If the schema accepts a string, the string is already valid — never coerce.
+  if (expectedTypes.includes('string')) return { changed: false, value };
+
+  const wantsArray = expectedTypes.includes('array');
+  const wantsObject = expectedTypes.includes('object');
+  if (!wantsArray && !wantsObject) return { changed: false, value };
+
+  const trimmed = value.trim();
+  const firstChar = trimmed[0];
+  // Only attempt a parse for values that actually look like a JSON container.
+  if (firstChar !== '[' && firstChar !== '{') return { changed: false, value };
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return { changed: false, value };
+  }
+
+  if (wantsArray && Array.isArray(parsed)) return { changed: true, value: parsed };
+  if (wantsObject && Boolean(parsed) && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    return { changed: true, value: parsed };
+  }
   return { changed: false, value };
 }
 

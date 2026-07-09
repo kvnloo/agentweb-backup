@@ -1,6 +1,20 @@
 import { Request, Response } from "express";
 import { skillService } from "../services/skillService";
 import { userDb } from "../services/db";
+import { findTiersAllowingSkill } from "../services/subscriptionService";
+
+// ENG-173: a published skill that is in no subscription tier's allowedSkills is
+// invisible to every non-wildcard user (list_available_skills filters it out), so the
+// tools it bundles are undiscoverable — the exact failure that produced a false
+// "capability missing" report. Warn the publishing admin without mutating entitlement.
+async function entitlementWarnings(skill: any): Promise<string[] | undefined> {
+  if (!skill || !skill.isPublished || !skill.skillId) return undefined;
+  const { reachable } = await findTiersAllowingSkill(skill.skillId);
+  if (reachable) return undefined;
+  return [
+    `Skill "${skill.name ?? skill.skillId}" is published but not in any subscription tier's allowedSkills — it will be invisible to all non-wildcard users, and its tools undiscoverable to the agent. Add it to the relevant tiers in Admin → Subscriptions.`,
+  ];
+}
 
 export const createSkill = async (req: Request, res: Response) => {
   try {
@@ -18,7 +32,8 @@ export const createSkill = async (req: Request, res: Response) => {
           isPublished
     );
 
-    res.status(201).json(skill);
+    const warnings = await entitlementWarnings(skill);
+    res.status(201).json(warnings ? { ...skill, warnings } : skill);
   } catch (error) {
     console.error("Error creating skill:", error);
     res.status(500).json({ message: "Failed to create skill" });
@@ -89,7 +104,8 @@ export const updateSkill = async (req: Request, res: Response) => {
     };
     await skillService.updateSkill(updatedSkill);
 
-    res.status(200).json(updatedSkill);
+    const warnings = await entitlementWarnings(updatedSkill);
+    res.status(200).json(warnings ? { ...updatedSkill, warnings } : updatedSkill);
   } catch (error) {
     console.error("Error updating skill:", error);
     res.status(500).json({ message: "Failed to update skill" });

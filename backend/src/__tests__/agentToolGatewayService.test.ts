@@ -348,6 +348,141 @@ describe('agentToolGatewayService', () => {
       });
     });
 
+    describe('container coercion (stringified array/object repair)', () => {
+      // Mirrors read_knowledge_base_files (ENG-127): the model double-encodes the
+      // required `files` array as a JSON string, and the type validator hard-rejected
+      // it with "Expected array." even though the decoded value is a valid array.
+      const readKnowledgeBaseFilesSchema = {
+        type: 'object',
+        properties: {
+          files: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                kb_identifier: { type: 'string' },
+                file_name: { type: 'string' },
+              },
+              required: ['kb_identifier', 'file_name'],
+            },
+          },
+        },
+        required: ['files'],
+      };
+
+      it('coerces a stringified array of objects for read_knowledge_base_files (repro: ENG-127)', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'read_knowledge_base_files',
+          args: { files: '[{"kb_identifier":"task123","file_name":"knowledge-base.txt"}]' },
+          inputSchema: readKnowledgeBaseFilesSchema,
+          effect: 'read',
+        });
+
+        expect(result.status).toBe('repaired');
+        expect(result.args).toEqual({
+          files: [{ kb_identifier: 'task123', file_name: 'knowledge-base.txt' }],
+        });
+        expect(result.repairs).toEqual(expect.arrayContaining(['files:json_parse']));
+      });
+
+      it('coerces a stringified array of plain string identifiers', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'some_tool',
+          args: { ids: '["a","b","c"]' },
+          inputSchema: {
+            type: 'object',
+            properties: { ids: { type: 'array', items: { type: 'string' } } },
+            required: ['ids'],
+          },
+          effect: 'read',
+        });
+        expect(result.status).toBe('repaired');
+        expect(result.args).toEqual({ ids: ['a', 'b', 'c'] });
+        expect(result.repairs).toEqual(expect.arrayContaining(['ids:json_parse']));
+      });
+
+      it('coerces a stringified object when the schema expects an object', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'some_tool',
+          args: { config: '{"enabled":true,"limit":5}' },
+          inputSchema: {
+            type: 'object',
+            properties: { config: { type: 'object' } },
+            required: ['config'],
+          },
+          effect: 'read',
+        });
+        expect(result.status).toBe('repaired');
+        expect(result.args).toEqual({ config: { enabled: true, limit: 5 } });
+        expect(result.repairs).toEqual(expect.arrayContaining(['config:json_parse']));
+      });
+
+      it('leaves an already-valid array unchanged (behavior-preserving)', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'read_knowledge_base_files',
+          args: { files: [{ kb_identifier: 'task123', file_name: 'knowledge-base.txt' }] },
+          inputSchema: readKnowledgeBaseFilesSchema,
+          effect: 'read',
+        });
+        expect(result.status).toBe('valid');
+        expect(result.repairs).toEqual([]);
+      });
+
+      it('does NOT coerce when the schema also accepts string', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'some_tool',
+          args: { val: '["a"]' },
+          inputSchema: {
+            type: 'object',
+            properties: { val: { type: ['string', 'array'] } },
+            required: [],
+          },
+          effect: 'read',
+        });
+        expect(result.status).toBe('valid');
+        expect(result.args).toEqual({ val: '["a"]' });
+      });
+
+      it('still rejects a non-JSON string as a type mismatch (no silent pass)', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'read_knowledge_base_files',
+          args: { files: 'knowledge-base.txt' },
+          inputSchema: readKnowledgeBaseFilesSchema,
+          effect: 'read',
+        });
+        expect(result.status).toBe('invalid');
+        if (result.status === 'invalid') {
+          expect(result.issues.map((i) => i.code)).toContain('type_mismatch');
+        }
+      });
+
+      it('does NOT coerce a stringified object when the schema expects an array', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'read_knowledge_base_files',
+          args: { files: '{"kb_identifier":"task123"}' },
+          inputSchema: readKnowledgeBaseFilesSchema,
+          effect: 'read',
+        });
+        expect(result.status).toBe('invalid');
+        if (result.status === 'invalid') {
+          expect(result.issues.map((i) => i.code)).toContain('type_mismatch');
+        }
+      });
+
+      it('rejects a container-looking but malformed JSON string as a type mismatch (JSON.parse throws)', () => {
+        const result = validateAndRepairToolArgs({
+          toolName: 'read_knowledge_base_files',
+          args: { files: '[{' },
+          inputSchema: readKnowledgeBaseFilesSchema,
+          effect: 'read',
+        });
+        expect(result.status).toBe('invalid');
+        if (result.status === 'invalid') {
+          expect(result.issues.map((i) => i.code)).toContain('type_mismatch');
+        }
+      });
+    });
+
     it('repairs low-risk url alias drift before execution', () => {
       const result = validateAndRepairToolArgs({
         toolName: 'read_file_content',
@@ -1109,8 +1244,47 @@ describe('agentToolGatewayService', () => {
       expect(execute).not.toHaveBeenCalled();
     });
 
+    it('trips after TWO identical NON-retryable failures (ENG-124 — retrying is known-pointless)', async () => {
+      // 'Unauthorized: invalid api key' classifies as auth → fast-trip threshold 2.
+      await failNTimes('run-nr', 'send_email', 'Unauthorized: invalid api key', 2);
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'send_email',
+        args: { to: 'x@example.com' },
+        runId: 'run-nr',
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+        expect((outcome.error as Error).message).toContain('send_email');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('still allows a third attempt after two identical RETRYABLE failures (transient classes keep threshold 3)', async () => {
+      // 'temporary network glitch, please retry' has no transient-class marker beyond
+      // network → classifies as network → retryable → threshold stays 3.
+      await failNTimes('run-r', 'you_search_web', 'network error, please retry', 2);
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'you_search_web',
+        args: { query: 'retry me' },
+        runId: 'run-r',
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
     it('resets the failure count when the tool succeeds', async () => {
-      await failNTimes('run-b', 'linkedin_outreach', 'Invitation message is too long', 2);
+      // Retryable-class message (timeout) so the fast-trip threshold does not
+      // apply — this test pins reset-on-success, not the threshold.
+      await failNTimes('run-b', 'linkedin_outreach', 'request timed out, please retry', 2);
 
       const success = await executeAgentToolThroughGateway({
         toolName: 'linkedin_outreach',
@@ -1120,7 +1294,7 @@ describe('agentToolGatewayService', () => {
       });
       expect(success.status).toBe('success');
 
-      await failNTimes('run-b', 'linkedin_outreach', 'Invitation message is too long', 2);
+      await failNTimes('run-b', 'linkedin_outreach', 'request timed out, please retry', 2);
 
       const execute = jest.fn().mockResolvedValue({ ok: true });
       const outcome = await executeAgentToolThroughGateway({
@@ -1291,15 +1465,17 @@ describe('agentToolGatewayService', () => {
     });
 
     it('does NOT clear prior thrown-error counts when a structured failure resolves', async () => {
-      // Two thrown failures with the same message...
-      await failNTimes('run-mixed', 'getMetaAdsMetrics', 'Invalid parameters', 2);
+      // Two thrown failures with the same message... ('Metric window mismatch' has no
+      // semantic class → legacy 'Error' → default threshold 3, so the third call below
+      // is not yet blocked and can demonstrate the no-clear accounting.)
+      await failNTimes('run-mixed', 'getMetaAdsMetrics', 'Metric window mismatch', 2);
       // ...then a resolved structured failure carrying the SAME reason. Before the
       // fix this cleared the two thrown counts; now it adds a third on the same key.
       const resolved = await executeAgentToolThroughGateway({
         toolName: 'getMetaAdsMetrics',
         args: {},
         runId: 'run-mixed',
-        execute: () => Promise.resolve({ success: false, error: 'Invalid parameters' }),
+        execute: () => Promise.resolve({ success: false, error: 'Metric window mismatch' }),
       });
       expect(resolved.status).toBe('success');
 

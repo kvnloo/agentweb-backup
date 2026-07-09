@@ -11,7 +11,8 @@ import { rankMemoriesByRelevance } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { computeTermination } from './agentMode/core/agentStep';
-import { executePreparedTools } from './agentMode/core/toolDispatch';
+import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
+import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
@@ -105,6 +106,7 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
 const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
+import { twitterService } from './twitterService';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
 import { HubSpotService } from './hubspotService';
@@ -122,6 +124,7 @@ import {
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
 import { validateToolOutputContract } from '../utils/toolOutputContract';
+import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
 
 type MetaApiResult = {
   success: boolean;
@@ -263,11 +266,29 @@ function recordAgentModeRunStarted(
 
 function recordAgentModeRunCompleted(
   runId: string,
-  info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
+  info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string; claimMismatch?: boolean },
 ): void {
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runCompleted(runId, info);
+}
+
+/**
+ * The finalize guard's claim check itself failed (judge/correction LLM call
+ * errored, ENG-143). LOUD by contract: the guard delivers the chat unchanged on
+ * judge failure — this signal (console + durable agent_claim_check_error event)
+ * is the only trace that a truthfulness check was skipped. Best-effort: must
+ * never throw into the chat hot path.
+ */
+function recordAgentModeClaimCheckError(runId: string, sessionId: string, error: unknown): void {
+  console.error('[agent-mode] finalize-guard claim check FAILED (message delivered unchanged):', {
+    runId,
+    sessionId,
+    error: error instanceof Error ? error.message : String(error),
+  });
+  const recorder = getAgentRunRecorderSafe();
+  if (!recorder) return;
+  void recorder.claimCheckError(runId, { error, sessionId });
 }
 
 function recordAgentModeRunFailed(
@@ -304,6 +325,34 @@ function recordAgentModeDuplicateSuppression(
     }
   } catch (err) {
     console.error('[agent-mode] duplicate-suppression telemetry failed (swallowed):', err);
+  }
+}
+
+/**
+ * Record a model fallback (ENG-46) as a structured, greppable, observability-only
+ * signal. When a request pins a model id that is no longer served (e.g. a stale
+ * post-deploy smoke-test config or a retired DB default), `resolveGenerationModel`
+ * substitutes the default so the request still completes — but that substitution
+ * MUST be visible to ops, not silently buried, otherwise a stale config keeps
+ * shipping the wrong model unnoticed. The stable `[agent-mode] model fallback`
+ * tag is what log dashboards/alerts key on. Best-effort: never throws into the
+ * chat hot path.
+ */
+function recordAgentModeModelFallback(
+  runId: string,
+  sessionId: string,
+  requestedModel: string,
+  resolvedModel: string,
+): void {
+  try {
+    console.warn('[agent-mode] model fallback', {
+      runId,
+      sessionId,
+      requestedModel: requestedModel || '(none)',
+      resolvedModel,
+    });
+  } catch (err) {
+    console.error('[agent-mode] model-fallback telemetry failed (swallowed):', err);
   }
 }
 
@@ -536,6 +585,11 @@ interface LLMCallOptions {
 // Diagnosis agent configuration
 const DIAGNOSIS_MODEL = 'gemini-3.1-flash-lite';
 const DIAGNOSIS_TIMEOUT_MS = 10_000;
+
+// Finalize-guard judge model (ENG-143): a bounded claim-extraction
+// classification, not conversational generation, so it deliberately does NOT
+// reuse the run's own (often pricier) llmModel — see judgeFinalizeClaims.
+const FINALIZE_GUARD_JUDGE_MODEL = DIAGNOSIS_MODEL;
 
 // Markers used by perform_data_analysis to capture files the Gemini code-execution
 // sandbox produces. The sandbox filesystem is discarded after execution and Gemini
@@ -1080,25 +1134,31 @@ export class AgentModeService {
         function: {
           name: 'wait_seconds',
           description: 'Wait for a specified number of seconds before continuing. Use this when you need to pause before checking a result — for example, waiting for a post to propagate, an email to arrive, a page to update, or any async operation to complete. When used in a batch with other tool calls, the entire batch executes sequentially so the wait happens in order.',
-          parameters: {
-            type: 'object',
-            properties: {
-              seconds: {
-                type: 'number',
-                description: 'Number of seconds to wait (max 300)'
-              },
-              reason: {
-                type: 'string',
-                description: 'Brief explanation of what you are waiting for (shown to the user)'
-              }
-            },
-            required: ['seconds', 'reason']
-          }
+          parameters: WAIT_SECONDS_PARAMETERS
         }
       },
-      execute: async (args: any, _context: any) => {
-        const seconds = Math.min(Math.max(1, Math.round(args.seconds)), 300);
-        await new Promise(resolve => setTimeout(resolve, seconds * 1000));
+      execute: async (args: any, context: any) => {
+        // Cap the sleep to the run's remaining wall-clock budget so a long wait can't
+        // be guillotined mid-sleep by the generation timeout and logged as a spurious
+        // wait_seconds failure (ENG-124). runBudgetDeadlineMs is threaded in from the
+        // dispatcher; when absent (e.g. budget disabled) the wait is unchanged.
+        const { seconds, requestedSeconds, deadlineReached } = computeWaitSeconds({
+          requestedSeconds: args.seconds,
+          deadlineMs: context?.runBudgetDeadlineMs,
+        });
+        if (seconds > 0) {
+          await new Promise(resolve => setTimeout(resolve, seconds * 1000));
+        }
+        if (deadlineReached) {
+          return {
+            waited_seconds: seconds,
+            reason: args.reason || 'Waiting before continuing',
+            deadlineReached: true,
+            message: seconds > 0
+              ? `Waited ${seconds} seconds (shortened from ${requestedSeconds}s — this response is approaching its time limit). Do NOT wait again; check the result now. If it is still pending, tell the user it is still processing and to check back shortly rather than waiting further.`
+              : `Did not wait — this response is at its time limit. Do NOT wait again; check the result now. If it is still pending, tell the user it is still processing and to check back shortly rather than waiting further.`,
+          };
+        }
         return { waited_seconds: seconds, reason: args.reason, message: `Waited ${seconds} seconds.` };
       }
     });
@@ -2110,7 +2170,7 @@ export class AgentModeService {
     // Azure OpenAI enforces a 128-tool limit per request
     // supportsVision flags below were verified empirically against the describe_image
     // path (probe against a real image). All GPT-5 deployments handle vision.
-    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true, maxTools: 128, supportsVision: true },
+    'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     'gpt-5.2-chat': { client: this.getAzureOpenAIClient('gpt-5.2-chat'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     'gpt-5.4': { client: this.getAzureOpenAIClient('gpt-5.4'), supportsTemperature: true, maxTools: 128, supportsVision: true },
     'gpt-5.4-nano': { client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
@@ -2148,7 +2208,7 @@ export class AgentModeService {
   }
   /**
    * Make an LLM call with the specified model and parameters
-   * @param model - The model to use (e.g., 'gpt-5.1', 'gemini-3-pro-preview')
+   * @param model - The model to use (e.g., 'gpt-5.5', 'gemini-3-pro-preview')
    * @param messages - Array of chat messages
    * @param options - Optional parameters for the LLM call
    * @returns The LLM response
@@ -2166,6 +2226,50 @@ export class AgentModeService {
       return LEGACY_MODEL_ALIASES[model] as T;
     }
     return model;
+  }
+
+  /**
+   * Resolve the model id for a generation request up front: normalize legacy
+   * ids, then validate against the allow-list. A model that is no longer served
+   * (e.g. a stale default or smoke-test config pinned to a removed id like
+   * 'gpt-5.1') would otherwise throw an opaque "Invalid model" deep inside
+   * callLLM, which the outer handler surfaces to the user as "Unknown Error"
+   * (ENG-46). Instead, fall back to the configured default model so the request
+   * still completes, and report whether a fallback happened so callers can log
+   * it / expose it via telemetry.
+   */
+  public resolveGenerationModel(model: string): { model: string; fellBack: boolean; requestedModel: string } {
+    const normalized = this.normalizeModelId(model);
+    // Use hasOwnProperty so inherited Object.prototype keys (e.g. 'constructor',
+    // 'toString') can't masquerade as valid allow-list entries.
+    if (normalized && Object.prototype.hasOwnProperty.call(this.llmModels, normalized)) {
+      return { model: normalized, fellBack: false, requestedModel: model };
+    }
+    const fallbackModel = this.resolveFallbackModel();
+    console.warn(
+      `AgentMode: Requested model '${model ?? '(none)'}' is not in the allow-list; falling back to default '${fallbackModel}'.`
+    );
+    return { model: fallbackModel, fellBack: true, requestedModel: model };
+  }
+
+  /**
+   * Resolve the model to fall back to when a requested id is unavailable.
+   * Normally this is the configured default_model, but if that itself has been
+   * removed from the allow-list (e.g. a stale AZURE_OPENAI_DEPLOYMENT_AGENT_MODE
+   * env override pinning a retired deployment) returning it would just re-throw
+   * "Invalid model" inside callLLM. Guard against that by validating the default
+   * and falling back to a known-good served model otherwise (ENG-46).
+   */
+  private resolveFallbackModel(): string {
+    if (Object.prototype.hasOwnProperty.call(this.llmModels, this.default_model)) {
+      return this.default_model;
+    }
+    const knownGoodModel = Object.keys(this.llmModels)[0];
+    console.warn(
+      `AgentMode: Configured default model '${this.default_model}' is not in the allow-list; ` +
+      `falling back to known-good model '${knownGoodModel}'.`
+    );
+    return knownGoodModel;
   }
 
   async callLLM(
@@ -2474,10 +2578,21 @@ export class AgentModeService {
       sessionType: isInteractiveShare ? 'interactive_share' : 'regular',
     });
     try {
-      // Map legacy/renamed model ids forward (e.g. old sessions persisted the
-      // pre-rename "claude-opus-4-8") so metadata, pricing, and routing all use
-      // the canonical registry key.
-      llmModel = this.normalizeModelId(llmModel);
+      // Resolve the model up front: map legacy/renamed ids forward (e.g. old
+      // sessions persisted the pre-rename "claude-opus-4-8") AND validate against
+      // the allow-list. A removed/stale id (e.g. a smoke-test config pinned to
+      // 'gpt-5.1') would otherwise throw an opaque "Invalid model" deep inside
+      // callLLM and surface to the user as "Unknown Error" (ENG-46); instead fall
+      // back to the default model so the request still completes.
+      const requestedLlmModel = llmModel;
+      const modelResolution = this.resolveGenerationModel(llmModel);
+      llmModel = modelResolution.model;
+      if (modelResolution.fellBack) {
+        // Surface the substitution as a structured, alertable telemetry signal so
+        // a stale model id (smoke-test / DB default) is caught in dashboards rather
+        // than silently masked (ENG-46).
+        recordAgentModeModelFallback(agentRuntimeRunId, sessionId, requestedLlmModel, llmModel);
+      }
       // Track backup model usage
       const originalLlmModel = llmModel;
       let backupModelUsed = false;
@@ -3242,6 +3357,103 @@ export class AgentModeService {
         }
       }
 
+      // Finalize guard (ENG-143/135/124): claimed-vs-executed truthfulness check at
+      // the loop edge, AFTER the final message and BEFORE emit/persist.
+      // Two independent flags, most-enforcing wins:
+      //   AGENT_FINALIZE_GUARD=true        → 'enforce': detect AND rewrite the message.
+      //   AGENT_FINALIZE_GUARD_SHADOW=true → 'shadow': detect + telemetry only, the
+      //     message the user sees is NEVER touched. Lets Harsha collect real
+      //     judge precision/recall data on production traffic (the Okareo
+      //     claim-faithfulness gap) with zero user-facing risk before deciding
+      //     on enforcement.
+      // Both default OFF — with neither set this block is inert and the
+      // characterization harness is byte-identical.
+      // NO-FALLBACK compliance: in enforce mode the guard never silently rewrites
+      // the message — a mismatch produces either the model's own corrective
+      // restatement or a VISIBLE appended correction; a judge/guard failure
+      // delivers the text unchanged plus a loud claim_check_error signal
+      // (documented best-effort — blocking chat delivery on a judge outage would
+      // be failing badly).
+      let finalizeClaimMismatch = false;
+      const finalizeGuardMode: 'enforce' | 'shadow' | null =
+        process.env.AGENT_FINALIZE_GUARD === 'true'
+          ? 'enforce'
+          : process.env.AGENT_FINALIZE_GUARD_SHADOW === 'true'
+            ? 'shadow'
+            : null;
+      if (finalizeGuardMode && content && !wasCancelled && !mockMode) {
+        try {
+          const finalizeLedger: FinalizeLedgerEntry[] = toolCalls.map((tc: any): FinalizeLedgerEntry => ({
+            toolName: tc.name,
+            // A suppressed same-turn duplicate (duplicateOf) and a budget-deferred
+            // media call never EXECUTED — neither may back a claim on its own (the
+            // original executed call has its own ledger entry), so both map to
+            // 'deferred' (non-backing) rather than 'success'.
+            status: tc.error !== undefined
+              ? 'error'
+              : (tc.duplicateOf || (tc.result && (tc.result as any).deferred === true) ? 'deferred' : 'success'),
+            result: tc.result,
+          }));
+          const guardOutcome = await runFinalizeGuard({
+            finalText: content,
+            ledger: finalizeLedger,
+            ports: {
+              judgeExtractClaims: (text, candidateClasses) =>
+                this.judgeFinalizeClaims(text, candidateClasses),
+              requestCorrection: ({ finalText, systemNote }) =>
+                this.requestFinalizeCorrection(finalText, systemNote, llmModel),
+              toolResultError,
+              mediaGenProducedAsset,
+              recordClaimCheckError: (err) => recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, err),
+            },
+          });
+          finalizeClaimMismatch = guardOutcome.claimMismatch;
+          // Ambiguous claims never change finalText (by design — see
+          // finalizeGuard.ts), so without this they'd be invisible even though
+          // the whole point of the confidence tier is to surface them for
+          // review instead of silently risking a false correction.
+          if (guardOutcome.ambiguousClaimClasses.length > 0) {
+            console.warn(`AgentMode: finalize guard found AMBIGUOUS (uncorrected) claim(s) in session ${sessionId} — possible matcher coverage gap`, {
+              ambiguousClaimClasses: guardOutcome.ambiguousClaimClasses,
+            });
+          }
+          if (guardOutcome.finalText !== content) {
+            if (finalizeGuardMode === 'shadow') {
+              // Shadow mode: log what WOULD have changed, but the user-visible
+              // message and the persisted transcript are left untouched.
+              console.warn(`AgentMode: finalize guard SHADOW ${guardOutcome.action} in session ${sessionId} (message NOT modified)`, {
+                claimClasses: guardOutcome.mismatchedClaimClasses,
+              });
+            } else {
+              console.warn(`AgentMode: finalize guard ${guardOutcome.action} in session ${sessionId}`, {
+                claimClasses: guardOutcome.mismatchedClaimClasses,
+              });
+              content = guardOutcome.finalText;
+              // Keep the persisted transcript consistent with what the user sees:
+              // correct the LAST assistant message in place (same message count) and
+              // stamp guard metadata so the correction is auditable in the session.
+              for (let i = messages.length - 1; i >= 0; i--) {
+                if ((messages[i] as any).role === 'assistant') {
+                  (messages[i] as any).content = content;
+                  (messages[i] as any).metadata = {
+                    ...(messages[i] as any).metadata,
+                    finalizeGuard: {
+                      action: guardOutcome.action,
+                      claimClasses: guardOutcome.mismatchedClaimClasses,
+                    },
+                  };
+                  break;
+                }
+              }
+            }
+          }
+        } catch (guardError) {
+          // Guard is advisory — a guard bug must never block delivery. Loud, not
+          // silent: recorded as claim_check_error (same contract as judge failure).
+          recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, guardError);
+        }
+      }
+
       // Attach timing metadata, memory usage, and tool calls to the last assistant message
       if (messages.length > 0) {
         const lastAssistantIdx = messages.length - 1 - [...messages].reverse().findIndex((m: any) => m.role === 'assistant');
@@ -3281,6 +3493,9 @@ export class AgentModeService {
         toolCalls: toolCalls.length,
         failedToolCalls: countFailedToolCalls(toolCalls),
         maxSameToolFailures: maxSameToolFailureCount(toolCalls),
+        // ENG-143: an unresolved claim mismatch grades the run degraded
+        // (claim_mismatch verdict reason) so the 17:30 UTC cluster cron sees it.
+        ...(finalizeClaimMismatch ? { claimMismatch: true } : {}),
       });
       // ENG-102: drain telemetry before the worker reports success to the parent
       // process (fire-and-forget would race with IPC teardown — same treatment
@@ -3837,17 +4052,21 @@ export class AgentModeService {
       completed: '✅',
       failed: '❌'
     };
-    let statusesContent = '';
+    // Only inject a task-status context message when there ARE task statuses to
+    // report. Previously an empty session pushed an assistant message reading
+    // "📋 Task Status: No tasks have been run in this session yet." right before
+    // the user's message. On a terse confirmation (e.g. "go with defaults") the
+    // model could parrot that injected assistant turn verbatim instead of
+    // proceeding with the actual work (ENG-129). The empty-status note conveys
+    // nothing the model needs, so skip it entirely.
     if (currentTaskStatuses && currentTaskStatuses.length > 0) {
-      statusesContent += 'Current Task Statuses:\n';
+      let statusesContent = 'Current Task Statuses:\n';
       currentTaskStatuses.forEach(task => {
         const emoji = statusEmoji[task.status] || '⏳';
         statusesContent += `${emoji} ${task.taskName} (${task.status}) - Task ID: ${task.taskId}, Execution ID: ${task.executionId}\n`;
       });
-    } else {
-      statusesContent = '📋 **Task Status**: No tasks have been run in this session yet.';
+      messages.push({ role: 'assistant', content: statusesContent });
     }
-    messages.push({ role: 'assistant', content: statusesContent });
 
     // Insert work plan status as an assistant message if exists. Pass the set of
     // images already generated this session (scanned from full history, not the
@@ -3964,6 +4183,13 @@ export class AgentModeService {
     'you_search_web',         // Explicit You.com web search
     'you_search_news',        // Explicit You.com news search
 
+    // Basic file reading — always available so an attached file (text, PDF,
+    // CSV, docx, etc.) can be read immediately without first installing a
+    // skill. Being gated behind __other_skills__ produced a transient
+    // "read_file_content unavailable/failed" until the user manually installed
+    // other_skills (ENG-152).
+    'read_file_content',
+
     // Work Plans (Emma's execution planning system)
     'create_work_plan',
     'modify_work_plan',
@@ -4071,6 +4297,12 @@ export class AgentModeService {
     // this, users with a configured sender but no connected Gmail still cannot send
     // a one-off email from chat (the reported bug).
     'send_email_from_sender',
+    // Basic file reading. Force-merged because the prod `foundation_tools`
+    // AW-Settings override omits DEFAULT-only additions — without this, an
+    // attached file cannot be read until the user manually installs
+    // other_skills, producing the transient "read_file_content
+    // unavailable/failed" failure (ENG-152).
+    'read_file_content',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
@@ -4078,6 +4310,20 @@ export class AgentModeService {
   // Subset of foundation tools that must execute for real in mock/benchmark mode
   // because they modify session state (no external side effects).
   private static readonly MOCK_BYPASS_TOOLS = new Set(['install_skills']);
+
+  // ENG-43: Research / external-lookup tools whose TIMEOUTS should degrade
+  // gracefully (partial results + per-entity decomposition + provider fallback)
+  // rather than abandoning the goal. See formatToolError.
+  private static readonly RESEARCH_LOOKUP_TOOLS = new Set([
+    'you_search_web',
+    'you_search_news',
+    'google_search_web',
+    'perform_deep_research',
+    // ENG-43 (session 74bb2c5d): LinkedIn public-profile lookups (Unipile get-profile)
+    // that time out must degrade through the same branch — keep partial results, retry
+    // once, and fall back to a public web-search provider — instead of abandoning the goal.
+    'linkedin_outreach',
+  ]);
 
   /**
    * Get tools that are not associated with any published skill.
@@ -5773,11 +6019,22 @@ export class AgentModeService {
     socketEmit?: any;
     screenshotUrl?: string;
     isDelegatedAccess?: boolean;
+    renderDeadlineMs?: number;
+    runBudgetDeadlineMs?: number;
   }): Promise<any> {
     const toolOptions: Record<string, any> = {};
     if (input.socketEmit) toolOptions.socketEmit = input.socketEmit;
     if (input.screenshotUrl) toolOptions.screenshotUrl = input.screenshotUrl;
     if (input.isDelegatedAccess) toolOptions.isDelegatedAccess = true;
+    // Thread the run's media-gen deadline into the tool context ONLY for compose_video —
+    // the sole tool that consumes it (to hand off before the run's hard wall-clock timeout,
+    // ENG-123). Scoping it here keeps every other tool's context unchanged.
+    if (input.renderDeadlineMs != null && input.toolName === 'compose_video') {
+      toolOptions.renderDeadlineMs = input.renderDeadlineMs;
+    }
+    // Run wall-clock budget deadline (epoch ms) — used by wait_seconds to cap its
+    // sleep so it can't be killed mid-wait by the generation timeout (ENG-124).
+    if (input.runBudgetDeadlineMs != null) toolOptions.runBudgetDeadlineMs = input.runBudgetDeadlineMs;
 
     return this.executeTool(
       input.llmModel,
@@ -7375,7 +7632,7 @@ export class AgentModeService {
   }
 
   // Update user's market strategy
-  public async updateMarketStrategy(updateData: any, userId: string): Promise<any> {
+  public async updateMarketStrategy(updateData: any, userId: string, opts: { replace?: boolean } = {}): Promise<any> {
     try {
       const { userDb, orgDb } = await import('./db');
       const { canEditItem } = await import('./orgShareService');
@@ -7415,8 +7672,12 @@ export class AgentModeService {
       // Extract market strategy fields from updateData
       const { businessOverview, competitors, icp, ...otherFields } = updateData;
 
-      // Merge competitors by name - preserve existing entries, update or add new ones
-      let mergedCompetitors = [...(existingMarketStrategy?.competitors || [])];
+      // Merge competitors by name - preserve existing entries, update or add new ones.
+      // When opts.replace is set and a competitors array is provided, the provided
+      // list REPLACES the existing one wholesale (used by regenerate_market_strategy
+      // after the user has explicitly confirmed the regeneration). ENG-44.
+      const replaceCompetitors = opts.replace === true && competitors !== undefined && Array.isArray(competitors);
+      let mergedCompetitors = replaceCompetitors ? [] : [...(existingMarketStrategy?.competitors || [])];
       if (competitors !== undefined && Array.isArray(competitors)) {
         competitors.forEach(newCompetitor => {
           const existingIndex = mergedCompetitors.findIndex(existing =>
@@ -7435,8 +7696,10 @@ export class AgentModeService {
         });
       }
 
-      // Merge ICPs by title - preserve existing entries, update or add new ones
-      let mergedICP = [...(existingMarketStrategy?.icp || [])];
+      // Merge ICPs by title - preserve existing entries, update or add new ones.
+      // When opts.replace is set and an icp array is provided, REPLACE wholesale. ENG-44.
+      const replaceIcp = opts.replace === true && icp !== undefined && Array.isArray(icp);
+      let mergedICP = replaceIcp ? [] : [...(existingMarketStrategy?.icp || [])];
       if (icp !== undefined && Array.isArray(icp)) {
         icp.forEach(newICP => {
           const existingIndex = mergedICP.findIndex(existing =>
@@ -11108,8 +11371,8 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         existingBrand = initialBrandGuidelines;
       }
 
-      // Extract brandData and brandAssets from updateData
-      const { brandData, brandAssets, ...otherFields } = updateData;
+      // Extract brandData, brandAssets, and optional market-strategy refresh from updateData
+      const { brandData, brandAssets, refreshMarketStrategy, ...otherFields } = updateData;
 
       // Merge with existing brandData - only update provided fields
       const updatedBrandData = {
@@ -11233,6 +11496,10 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         await userDb.updateUser(userId, { brandGuidelines: updatedGuidelines });
       }
 
+      const marketStrategyRefresh = refreshMarketStrategy === true
+        ? await this.regenerateMarketStrategy(userId)
+        : undefined;
+
       // Onboarding v2 Phase 1: flip brand-build status to ready if we were
       // building. Best-effort; wrapped in try/catch so metrics failures don't
       // break the tool-call response path.
@@ -11263,11 +11530,23 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
 
       return {
         success: true,
-        message: 'Brand guidelines updated successfully',
+        message: marketStrategyRefresh?.success
+          ? 'Brand guidelines and market strategy updated successfully'
+          : 'Brand guidelines updated successfully',
         updatedFields,
         brandData: updatedBrandData,
         attachments: updatedAttachments,
         updatedAssets: updatedAssets, // Only the assets that were actually updated
+        ...(marketStrategyRefresh
+          ? {
+            marketStrategyRefresh: {
+              success: marketStrategyRefresh.success,
+              replaced: marketStrategyRefresh.replaced,
+              generated: marketStrategyRefresh.generated,
+              ...(marketStrategyRefresh.error ? { error: marketStrategyRefresh.error } : {}),
+            }
+          }
+          : {}),
         formattedContent
       };
     } catch (error) {
@@ -11276,6 +11555,100 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         success: false,
         message: 'Failed to update brand guidelines',
         error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Read the user's effective market strategy (org-level if the user belongs to
+   * an org, otherwise personal). Shared by the brand re-setup offer and the
+   * regenerate flow so both report the same "what exists today" counts. (ENG-44)
+   */
+  private async getExistingMarketStrategy(user: any): Promise<any> {
+    if (user?.orgId) {
+      const { orgDb } = await import('./db');
+      const org = await orgDb.getOrgById(user.orgId);
+      if (org && org.marketStrategy) return org.marketStrategy;
+    }
+    return user?.marketStrategy;
+  }
+
+  /**
+   * Regenerate the user's market strategy (ICPs + competitors) from their CURRENT
+   * brand guidelines, then REPLACE the existing ICPs/competitors (business overview
+   * is preserved). Composes the same generators the onboarding pipeline uses, so
+   * there is no new generation logic here. Destructive by design — the caller
+   * (Emma) must have explicit user confirmation before invoking. Returns the
+   * before/after counts. (ENG-44)
+   */
+  public async regenerateMarketStrategy(
+    userId: string,
+    deps: {
+      llm?: any;
+      webSearchFn?: any;
+    } = {},
+  ): Promise<any> {
+    try {
+      const { userDb } = await import('./db');
+      const {
+        extractIcpBrandContext,
+        generateIcpsForUser,
+        mapIcpResultToMarketStrategy,
+      } = await import('./onboardingIcpService');
+      const {
+        generateCompetitorStrategyForUser,
+        mapCompetitorResultToMarketStrategy,
+      } = await import('./onboardingCompetitorService');
+
+      const user: any = await userDb.getUserById(userId);
+      if (!user) {
+        return { success: false, message: 'User not found', error: 'User not found' };
+      }
+
+      const brand = extractIcpBrandContext(user);
+      if (!brand.companyName && !brand.companyUrl) {
+        return {
+          success: false,
+          message:
+            'There are no brand guidelines to base a market strategy on yet. Set up the brand first, then regenerate the market strategy.',
+          error: 'Missing brand context',
+        };
+      }
+
+      // Count what we are about to replace (org-aware) BEFORE regenerating.
+      const existing = await this.getExistingMarketStrategy(user);
+      const replaced = {
+        competitors: Array.isArray(existing?.competitors) ? existing.competitors.length : 0,
+        icps: Array.isArray(existing?.icp) ? existing.icp.length : 0,
+      };
+
+      // Generate ICPs first, then competitors (competitors need the ICPs as input).
+      const personas = await generateIcpsForUser(brand, { llm: deps.llm }, userId);
+      let competitorResult: any = { per_icp: [] };
+      if (Array.isArray(personas) && personas.length > 0) {
+        competitorResult = await generateCompetitorStrategyForUser(brand, personas, deps);
+      }
+
+      const icp = mapIcpResultToMarketStrategy(personas);
+      const competitors = mapCompetitorResultToMarketStrategy(competitorResult);
+
+      // Persist via updateMarketStrategy with replace:true so org-vs-user routing,
+      // permission checks, and businessOverview preservation are all reused.
+      const writeResult = await this.updateMarketStrategy({ icp, competitors }, userId, { replace: true });
+      if (!writeResult.success) return writeResult;
+
+      return {
+        success: true,
+        message: `Market strategy regenerated to match the current brand. Replaced ${replaced.competitors} competitor(s) and ${replaced.icps} ICP(s) with ${competitors.length} new competitor(s) and ${icp.length} new ICP(s).`,
+        replaced,
+        generated: { competitors: competitors.length, icps: icp.length },
+      };
+    } catch (error) {
+      console.error('AgentMode: Error regenerating market strategy:', error);
+      return {
+        success: false,
+        message: 'Failed to regenerate market strategy',
+        error: error instanceof Error ? error.message : 'Unknown error',
       };
     }
   }
@@ -12617,6 +12990,83 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
       console.error('AgentMode: generateSuggestedReplies failed:', error);
       return null;
     }
+  }
+
+  /**
+   * Finalize-guard judge (ENG-143): ONE structured-output claim-extraction call
+   * through the existing callLLM machinery. Extracts the completed-action claims
+   * the final reply makes, restricted to the prefiltered candidate classes.
+   * THROWS on any judge failure (no content / unparseable output / transport
+   * error) — the guard then delivers the message unchanged and records a loud
+   * claim_check_error (see core/finalizeGuard.ts).
+   *
+   * Deliberately uses FINALIZE_GUARD_JUDGE_MODEL (the same cheap/fast model as
+   * triageSlackMessage) instead of the run's own llmModel: this is a bounded
+   * classification task, not conversational generation, and every flagged
+   * reply pays for this call, so keeping it cheap directly reduces the
+   * guard's latency/cost footprint at scale (PR #2005 left this as a
+   * deliberate one-line follow-up rather than reusing the run's often-pricier
+   * model for every judge call).
+   */
+  private async judgeFinalizeClaims(
+    finalText: string,
+    candidateClasses: readonly ClaimClass[],
+  ): Promise<JudgedClaim[]> {
+    const response = await this.callLLM(FINALIZE_GUARD_JUDGE_MODEL, [
+      {
+        role: 'user',
+        content:
+          'You are auditing an AI assistant\'s reply for COMPLETED-ACTION claims — statements that an action already happened '
+          + '(not offers, plans, or suggestions). The possible claim classes are: '
+          + `${CLAIM_CLASSES.join(', ')}. Candidate classes detected in this reply: ${candidateClasses.join(', ')}.\n\n`
+          + 'Return ONLY a JSON array, one element per claimed completed action, each shaped '
+          + '{"claimClass":"<class>","statement":"<short quote from the reply>"}. '
+          + 'Return [] if the reply claims no completed action.\n\nReply to audit:\n'
+          + finalText,
+      },
+    ], { max_completion_tokens: 500, temperature: 0 });
+
+    const text = (response as any)?.choices?.[0]?.message?.content;
+    if (typeof text !== 'string' || !text.trim()) {
+      throw new Error('finalize-guard judge returned no content');
+    }
+    const match = text.match(/\[[\s\S]*\]/);
+    if (!match) {
+      throw new Error(`finalize-guard judge returned unparseable output: ${text.slice(0, 200)}`);
+    }
+    const parsed = JSON.parse(match[0]); // throws on invalid JSON → judge_error path
+    if (!Array.isArray(parsed)) {
+      throw new Error('finalize-guard judge output is not an array');
+    }
+    return (parsed as any[]).filter((c) => c && typeof c.claimClass === 'string');
+  }
+
+  /**
+   * Finalize-guard corrective turn (ENG-143): ONE model call asking for the
+   * truthful restatement of a reply whose claims the run ledger does not back.
+   * THROWS on failure — the guard then appends the visible correction instead
+   * (never delivers the unbacked claim silently).
+   */
+  private async requestFinalizeCorrection(
+    finalText: string,
+    systemNote: string,
+    llmModel: string,
+  ): Promise<string> {
+    const response = await this.callLLM(llmModel, [
+      {
+        role: 'user',
+        content:
+          `[SYSTEM NOTE] ${systemNote}\n\nPrevious reply:\n${finalText}\n\n`
+          + 'Rewrite the reply now. Keep everything that is accurate, but only claim actions the run log confirms succeeded, '
+          + 'clearly state what was NOT completed, and tell the user what to do next. Reply ONLY with the corrected message text.',
+      },
+    ], { temperature: 0 });
+
+    const text = (response as any)?.choices?.[0]?.message?.content;
+    if (typeof text !== 'string' || !text.trim()) {
+      throw new Error('finalize-guard correction returned no content');
+    }
+    return text.trim();
   }
 
   /**
@@ -16166,6 +16616,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   private formatToolError(toolName: string, errorMessage: string): string {
     const safeMessage = typeof errorMessage === 'string' ? errorMessage : 'Unknown error';
     console.error(`[AgentMode] Tool failed: ${toolName} — ${safeMessage}`);
+    // ENG-43: Research / external-lookup tools (web/news search, deep research)
+    // that TIME OUT must degrade gracefully instead of abandoning the goal with a
+    // blanket "ask the user to retry". A heavy multi-entity research query (e.g.
+    // "research 3 people + their overlaps") or a slow public-profile lookup should
+    // fall back to: keep whatever partial results were already gathered, decompose
+    // the request into one focused sub-query per entity, and switch to an alternate
+    // search provider — NOT surface a bare retry prompt. This is checked BEFORE the
+    // generic connection-timeout "stop" branch so these tools degrade rather than halt.
+    const isResearchLookupTool =
+      AgentModeService.RESEARCH_LOOKUP_TOOLS.has(toolName) ||
+      Array.from(AgentModeService.RESEARCH_LOOKUP_TOOLS).some((name) => toolName.endsWith(`_${name}`));
+    const isTimeoutOrTransient =
+      /timed out|timeout|ETIMEDOUT|ESOCKETTIMEDOUT|ECONNRESET|ECONNABORTED|socket hang up|deadline exceeded|processing timeout|temporarily unavailable|\b(408|429|500|502|503|504)\b|gateway time-?out/i.test(
+        safeMessage
+      );
+    if (isResearchLookupTool && isTimeoutOrTransient) {
+      return `⚠️ Research/Lookup Timeout: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: Do NOT abandon the goal or simply ask the user to retry. Degrade gracefully instead:\n1. KEEP any partial results you already gathered for earlier entities/queries and present them, clearly noting which parts are still pending and offering to continue.\n2. If the request covers multiple entities or topics, decompose it into one focused sub-query per entity and call the search tool separately for each, rather than one heavy combined query.\n3. Narrow or simplify the query, then retry it once.\n4. If this provider keeps timing out, fall back to an alternate search provider (e.g. switch between you_search_web and google_search_web) to gather what you can.\nOnly tell the user the lookup failed AFTER you have returned every partial result you were able to collect.`;
+    }
     // Connection-level failures (timeouts, circuit open) require a different instruction:
     // tell the LLM to stop retrying and surface the error to the user instead of
     // spinning through other variants of the same tool.
@@ -16976,9 +17444,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       ].filter(Boolean) as string[];
 
       if (knowledgeBases.length === 0) {
+        // ENG-173: an explicit Google Drive query (kb_type=google-drive) that returns
+        // empty reflects only the READ-ONLY shared-folder path (service account) — it
+        // says nothing about Docs/Sheets CREATE/EDIT, a separate OAuth-backed skill.
+        // Point the model to the catalog so empty doesn't read as "Docs unavailable".
+        // Scoped to the explicit drive query: an unfiltered/other empty gets the plain
+        // message (this path lists all sources, and nudging Docs there is off-topic).
+        const message = options?.kb_type === 'google-drive'
+          ? 'No Google Drive shared folders found here — this lists only READ-ONLY shared folders (surfaced via the service account). Creating and editing Google Docs & Sheets is a SEPARATE capability — call list_available_skills to find and install the skill that provides Google Docs / Sheets create/edit tools.'
+          : 'No knowledge bases found';
         return {
           success: true,
-          message: 'No knowledge bases found',
+          message,
           knowledge_bases: [],
           totalKnowledgeBases: 0,
           totalFiles: 0,
@@ -17761,6 +18238,36 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (m) { result += `<code style="background-color:#f1f3f4;padding:1px 5px;border-radius:3px;font-family:Courier New,monospace;font-size:90%;text-decoration:none">${AgentModeService.escapeHtml(m[1])}</code>`; remaining = remaining.slice(m[0].length); continue; }
       m = remaining.match(/^\[([^\]]+)\]\(([^)]+)\)/);
       if (m) { result += `<a href="${AgentModeService.escapeHtml(m[2])}">${AgentModeService.escapeHtml(m[1])}</a>`; remaining = remaining.slice(m[0].length); continue; }
+      // Inline style span for a single word/phrase — [text]{color=blue}, [text]{underline},
+      // [text]{color=yellow;font=Verdana;italic;underline}, etc. The attribute-string charset is
+      // restricted to letters/digits/#/=/;/space — no quotes, parens, or angle brackets can ever
+      // appear, so a malformed/hostile value can never break out of the style attribute. Each
+      // ';'-separated segment is checked against a fixed whitelist (color, font, bold, italic,
+      // underline); unrecognized segments are silently ignored rather than rejecting the whole
+      // span. If nothing recognized survives, this doesn't match at all — falls through to plain
+      // escaped text below, preserving the original literal text (including the brackets).
+      m = remaining.match(/^\[([^\]]+)\]\{([a-zA-Z0-9#=; ]+)\}/);
+      if (m) {
+        const decls: string[] = [];
+        for (const rawSeg of m[2].split(';')) {
+          const seg = rawSeg.trim();
+          if (!seg) continue;
+          if (seg === 'underline') { decls.push('text-decoration:underline'); continue; }
+          if (seg === 'italic') { decls.push('font-style:italic'); continue; }
+          if (seg === 'bold') { decls.push('font-weight:700'); continue; }
+          let am = seg.match(/^color=(#[0-9a-fA-F]{3,8}|[a-zA-Z]+)$/);
+          if (am) { decls.push(`color:${am[1]}`); continue; }
+          am = seg.match(/^font=([a-zA-Z ]+)$/);
+          if (am) { decls.push(`font-family:${am[1]}`); continue; }
+          // Unrecognized attribute name/value — ignore silently, do not fail the whole span.
+        }
+        if (decls.length > 0) {
+          result += `<span style="${decls.join(';')}">${AgentModeService.escapeHtml(m[1])}</span>`;
+          remaining = remaining.slice(m[0].length);
+          continue;
+        }
+        // Nothing recognized — fall through to ordinary text below (do not consume the match).
+      }
       m = remaining.match(/^<[^>]+>/);
       if (m) { remaining = remaining.slice(m[0].length); continue; }
       result += AgentModeService.escapeHtml(remaining[0]);
@@ -20171,21 +20678,46 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         logoUrl: composeParams.logoUrl,
         ctaText: composeParams.ctaText,
         ctaUrl: composeParams.ctaUrl,
+        // Forward the optional voiceover track so a spot composed via compose_video is
+        // never shipped silent (ENG-123). remotionService.compose + the BrandedVideo
+        // composition both support an audio overlay; omitting these here dropped it.
+        audioUrl: composeParams.audioUrl,
+        audioVolume: composeParams.audioVolume,
         clipUrl: clipUrls[0],
         extraClipUrls: clipUrls.slice(1),
         clipDurationSeconds: clipDurationSeconds ?? 8,
         targetDurationSeconds,
         clipDurationsSeconds,
+        // Run's remaining media-gen budget (epoch ms), threaded from the tool context, so a
+        // long render on a revision pass hands off instead of blocking until the run's hard
+        // wall-clock timeout kills it with no asset (ENG-123).
+        renderDeadlineMs: composeParams.renderDeadlineMs,
         filename,
         userId,
       });
 
+      // Regression tripwire (ENG-123): a spot must never silently ship without a voiceover.
+      // Surface a soft warning when composed with no audio track — catches revision passes
+      // where the agent recomposes and forgets to re-attach the VO. Not a hard failure:
+      // silent b-roll stitching is still valid.
+      const voiceoverWarning = !composeParams.audioUrl
+        ? 'Composed with no voiceover track. If this is an ad spot, generate one with generate_voiceover and pass audio_url so it is not shipped silent.'
+        : undefined;
+
       if (composeResult.success && composeResult.videoUrl) {
+        const stillProcessing = composeResult.status === 'processing';
+        // Combine any composition-layer advisory (e.g. duration clamp) with the voiceover
+        // tripwire so the user sees every relevant note, not just one.
+        const warning = [composeResult.warning, voiceoverWarning].filter(Boolean).join(' ') || undefined;
         return {
           success: true,
-          message: `✅ ${clipUrls.length} clip(s) composed into branded video!`,
+          message: stillProcessing
+            ? (composeResult.message ?? `🎬 ${clipUrls.length} clip(s) are still finalizing — the video will be ready at this link shortly.`)
+            : `✅ ${clipUrls.length} clip(s) composed into branded video!`,
           videoUrl: composeResult.videoUrl,
           filename: composeResult.filename ?? filename,
+          ...(stillProcessing && { status: 'processing' as const }),
+          ...(warning && { warning }),
         };
       }
 
@@ -22575,6 +23107,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
       if (!llmModel) {
         llmModel = await this.getDefaultModel();
+      } else {
+        // ENG-46 sibling path: this method is reached with the SESSION's model
+        // (emma create_html_from_template tool / route), so a stale/removed id
+        // (e.g. gpt-5.1) would otherwise throw an opaque "Invalid model" inside
+        // callLLM here too. Resolve it up front so template substitution falls
+        // back to a served model instead of failing.
+        const templateModelResolution = this.resolveGenerationModel(llmModel);
+        if (templateModelResolution.fellBack) {
+          recordAgentModeModelFallback('create-html-from-template', sessionId || '', llmModel, templateModelResolution.model);
+        }
+        llmModel = templateModelResolution.model;
       }
       // Validate that all required variables are provided
       const templateVariables = template.variables || [];
@@ -24905,70 +25448,87 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   // Post on connected account helper
-  async postOnConnectedAccount(userId: string, accountId: string, content: string, mediaUrls: string[] = []): Promise<any> {
+  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string): Promise<any> {
     console.log('[AgentMode] postOnConnectedAccount called:', {
       userId,
       accountId,
+      platform,
       contentLength: content?.length || 0,
       mediaUrlCount: mediaUrls?.length || 0
     });
 
     try {
-      const { getAccountById, isTokenValid } = await import('./connectedAccountsDb');
+      const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
-      try {
-        console.log('[AgentMode] Looking up account:', accountId);
-        const account = await getAccountById(accountId, userId);
-        console.log('[AgentMode] Account lookup result:', account ? {
-          found: true,
-          platform: account.platform,
-          accountType: account.config?.account_type,
-          accountName: account.account_name
-        } : { found: false });
+      // Fetch all accessible accounts (own + org-shared) once, so org-shared accounts
+      // are visible for both the auto-resolve path and explicit accountId lookups.
+      // getAccountById(accountId, userId) only searches the caller's own DynamoDB record,
+      // which returns null for accounts owned by an org member — use this instead.
+      const allAccounts = await getAccountsWithOwnerIncludingOrgShared(userId);
+      const socialAccounts = allAccounts.filter((a: any) =>
+        ['twitter', 'linkedin', 'instagram', 'youtube'].includes(a.platform)
+      );
 
-        if (!account) {
-          console.log('[AgentMode] Account not found, returning error');
-          return {
-            success: false,
-            message: 'Account not found or access denied'
-          };
+      let account: any;
+
+      if (!accountId) {
+        // Narrow by platform hint when provided
+        const candidates = platform
+          ? socialAccounts.filter((a: any) => a.platform === platform)
+          : socialAccounts;
+        if (candidates.length === 0) {
+          const msg = platform
+            ? `No ${platform} account connected. Connect one in Settings → Connected Accounts.`
+            : 'No social media accounts connected. Connect an account in Settings → Connected Accounts.';
+          return { success: false, message: msg };
         }
-
-        // NOTE: Skipping isTokenValid check here because the adapter's getValidToken()
-        // method will automatically refresh expired tokens. The adapter handles token
-        // refresh internally before making API calls.
-        console.log('[AgentMode] Getting adapter for platform:', account.platform);
-        const adapter = socialPlatformService.getAdapter(account.platform);
-        console.log('[AgentMode] Calling adapter.createPost (adapter will handle token refresh if needed)...');
-        const result = await adapter.createPost(account, content, mediaUrls, userId);
-
-        return {
-          success: true,
-          message: result.message,
-          post_id: result.postId,
-          post_url: result.postUrl
-        };
-      } catch (error: any) {
-        // Handle specific error messages
-        let message = error.message;
-        if (message.includes('access token expired')) {
-          message = 'Account token expired. Please reconnect the account in Settings.';
+        if (candidates.length > 1) {
+          const names = candidates.map((a: any) => a.account_id).join(', ');
+          const platformHint = platform ? `platform="${platform}"` : '';
+          return { success: false, message: `Multiple ${platform ?? 'social'} accounts connected. Call list_connected_accounts(${platformHint}) to see account names, ask the user which one to use, then re-call with account_id. Connected IDs: ${names}` };
         }
-
-        return {
-          success: false,
-          message: `Failed to post: ${message}`
-        };
+        account = candidates[0];
+        accountId = account.account_id;
+        console.log('[AgentMode] Auto-resolved account_id:', accountId);
+      } else {
+        account = socialAccounts.find((a: any) => a.account_id === accountId);
       }
 
-    } catch (error) {
-      console.error('AgentMode: Error posting on account:', error);
+      console.log('[AgentMode] Account lookup result:', account ? {
+        found: true,
+        platform: account.platform,
+        accountType: account.config?.account_type,
+        accountName: account.account_name
+      } : { found: false });
+
+      if (!account) {
+        console.log('[AgentMode] Account not found, returning error');
+        return { success: false, message: 'Account not found or access denied' };
+      }
+
+      // account.userId is the token owner (equals userId for own accounts,
+      // the org member's userId for org-shared accounts).
+      const ownerUserId: string = (account as any).userId || userId;
+
+      // The adapter handles token refresh internally before making API calls.
+      console.log('[AgentMode] Getting adapter for platform:', account.platform);
+      const adapter = socialPlatformService.getAdapter(account.platform);
+      console.log('[AgentMode] Calling adapter.createPost (adapter will handle token refresh if needed)...');
+      const result = await adapter.createPost(account, content, mediaUrls, ownerUserId);
+
       return {
-        success: false,
-        message: 'Failed to create post',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        success: true,
+        message: result.message,
+        post_id: result.postId,
+        post_url: result.postUrl
       };
+    } catch (error: any) {
+      const message = error?.message?.includes('access token expired')
+        ? 'Account token expired. Please reconnect the account in Settings.'
+        : (error?.message ?? 'Unknown error');
+      console.error('AgentMode: Error posting on account:', error);
+      return { success: false, message: `Failed to post: ${message}` };
     }
   }
 
@@ -25462,7 +26022,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   async linkedinOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
-    const { profile_url, provider_id, message } = args;
+    const { profile_url, provider_id, message, on_note_quota } = args;
     console.log(`[AgentMode] linkedinOutreach called: action=${action}, account_id=${account_id}`);
 
     // Write actions must use an account that is either owned by the calling user or
@@ -25617,8 +26177,34 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
           // Premium accounts allow 300-char invites; free accounts 200.
           const inviteCharLimit = await linkedInOutreachService.getInviteCharLimitForAccount(userId, account_id);
-          const inviteResult = await linkedInOutreachService.sendInvitation(account_id, target, isUrl, message, inviteCharLimit);
-          return { success: true, data: inviteResult };
+          // Note-quota policy (ENG-213). Default to 'skip' — HOLD rather than silently
+          // drop a note the customer wrote. Only send note-less when the customer has
+          // explicitly authorized it via on_note_quota='send_without_note'.
+          const onNoteQuota: 'send_without_note' | 'skip' =
+            on_note_quota === 'send_without_note' ? 'send_without_note' : 'skip';
+          try {
+            const inviteResult = await linkedInOutreachService.sendInvitation(
+              account_id, target, isUrl, message, inviteCharLimit, { onNoteQuota },
+            );
+            return { success: true, data: inviteResult };
+          } catch (inviteErr: any) {
+            if (inviteErr?.noteQuotaExceeded) {
+              // Decision gate — do NOT decide for the customer. Ask them, then re-call
+              // send-invite with on_note_quota. In a scheduled run there is no one to
+              // answer, so the agent stops here and the invite is simply left un-sent
+              // (the lead stays eligible); the customer resolves it by reopening the chat.
+              return {
+                success: false,
+                requiresDecision: true,
+                noteQuotaExceeded: true,
+                error:
+                  `This LinkedIn account's monthly quota for personalized invitation notes is spent, so the note "${message}" cannot be attached. ` +
+                  `Do NOT decide on your own — ask the user whether to send the connection request WITHOUT the note or skip this person. ` +
+                  `Then re-call send-invite with the same target plus on_note_quota="send_without_note" to send note-less, or leave it un-sent if they choose to skip.`,
+              };
+            }
+            throw inviteErr;
+          }
         }
 
         case 'send-message': {
@@ -25884,11 +26470,398 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         };
       }
 
+      // Account-level invitation throttle (ENG-126). Once a LinkedIn account hits
+      // its invitation cap — a weekly limit that is far lower on non-Premium
+      // accounts and shrinks as the pending-invitation backlog grows — Unipile
+      // returns "Cannot resend yet" for send-invite on EVERY recipient, including
+      // brand-new ones. Surfaced verbatim, that phrase reads like a per-recipient
+      // cooldown, so the agent moves on to the next recipient and repeats, burning
+      // attempt after attempt (10+ in the reported session) and reporting nothing
+      // useful. Re-label it as the account-wide throttle it is so the agent stops
+      // and reports proactively. The raw phrase is preserved in the body so the
+      // error classifier still buckets this as an upstream_rejected business rule.
+      if (action === 'send-invite' && /cannot resend yet/i.test(errorMessage)) {
+        return {
+          success: false,
+          message: 'LinkedIn invitation limit reached',
+          error: [
+            "LinkedIn rejected this invitation with 'Cannot resend yet'. This is an ACCOUNT-LEVEL invitation cooldown/throttle, NOT a per-recipient one — LinkedIn caps how many pending invitations an account may have (the cap is much lower on non-Premium accounts), so it applies to every recipient equally.",
+            '',
+            'DO NOT keep trying other recipients — every send-invite will fail the same way until the cooldown lifts. Stop sending invitations now and report to the user that their LinkedIn account has hit its invitation limit and has a large pending-invitation backlog.',
+            '',
+            'To free up capacity the user can withdraw old unanswered invitations (use list-sent-invitations to see the backlog, then cancel-invitation on the stale ones) or wait a few days before the next outreach run. Prefer queueing these invites for a later run over retrying now.',
+          ].join('\n'),
+          accountThrottled: true,
+        };
+      }
+
       return {
         success: false,
         message: 'LinkedIn outreach action failed',
         error: errorMessage
       };
+    }
+  }
+
+  // --- Twitter / X ---
+
+  /**
+   * Dispatch Twitter/X interaction actions for Emma via the official X API.
+   * Posting a single tweet is handled by post_on_connected_account (TwitterAdapter).
+   * This method covers all other interactions: reply, thread, edit, delete, like,
+   * retweet, follow, DMs, search, bookmarks, and profile lookup.
+   *
+   * Every action requires an account owned by the caller or shared with their org.
+   * The owner's userId is passed to twitterService so refreshed OAuth tokens are
+   * written back to the owner's record. When list_id/lead_id/lead_email are
+   * supplied, sent tweets and DMs are logged to AW-EmailEvents for CRM parity.
+   */
+  async twitterManagePost(userId: string, args: any): Promise<any> {
+    let { account_id } = args;
+    const action = (args.action as string)?.replace(/_/g, '-');
+    const { text, in_reply_to_tweet_id, tweet_id, tweet_ids, handle, recipient_handle, tweets, list_id, lead_id, lead_email, query, max_results } = args;
+    console.log(`[AgentMode] twitterManagePost called: action=${action}, account_id=${account_id}`);
+
+    const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+    const twitterAccounts = (await getAccountsWithOwnerIncludingOrgShared(userId))
+      .filter((a: any) => a.platform === 'twitter');
+
+    if (twitterAccounts.length === 0) {
+      return {
+        success: false,
+        error: 'No X (Twitter) account is connected. Connect your X account in Settings → Connected Accounts.',
+      };
+    }
+
+    let account: any;
+    if (account_id) {
+      account = twitterAccounts.find((a: any) => a.account_id === account_id);
+      if (!account) {
+        return { success: false, error: `X account ${account_id} is not connected to your profile.` };
+      }
+    } else if (twitterAccounts.length === 1) {
+      account = twitterAccounts[0];
+    } else {
+      return {
+        success: false,
+        error: 'Multiple X accounts are connected — specify account_id. Use list_connected_accounts(platform="twitter").',
+      };
+    }
+
+    const ownerUserId = account.userId;
+    account_id = account.account_id;
+
+    // Best-effort CRM logging — never fails the action.
+    const logCrm = async (
+      eventType: 'twitter.tweet.sent' | 'twitter.dm.sent',
+      messageProviderId: string,
+      bodyText: string
+    ): Promise<void> => {
+      if (!list_id || !lead_id || !lead_email) return;
+      try {
+        const { emailEventsDb } = await import('./emailEventsDb');
+        await emailEventsDb.addTwitterMessageEvent({
+          eventId: `twitter_${eventType.includes('dm') ? 'dm' : 'tweet'}_${messageProviderId}`,
+          emailDomain: `twitter-${list_id}`,
+          leadEmail: lead_email,
+          eventType,
+          text: bodyText ?? null,
+          timestamp: new Date().toISOString(),
+          senderId: account_id,
+          messageProviderId,
+        });
+      } catch (e) {
+        console.error('[AgentMode] twitterManagePost CRM logging failed (non-fatal):', e);
+      }
+    };
+
+    try {
+      switch (action) {
+        case 'reply': {
+          if (!text) throw new Error('text is required for reply');
+          if (!in_reply_to_tweet_id) throw new Error('in_reply_to_tweet_id is required for reply');
+          const result = await twitterService.postTweet(ownerUserId, account_id, text, {
+            inReplyToTweetId: in_reply_to_tweet_id,
+          });
+          await logCrm('twitter.tweet.sent', result.id, result.text);
+          return { success: true, data: result };
+        }
+
+        case 'post-thread': {
+          if (!Array.isArray(tweets) || tweets.length === 0) {
+            throw new Error('tweets (non-empty array of strings) is required for post-thread');
+          }
+          if (tweets.length < 2) {
+            throw new Error('post_thread requires at least 2 tweets. To post a single tweet, use post_on_connected_account instead.');
+          }
+          const result = await twitterService.postThread(ownerUserId, account_id, tweets);
+          if (result[0]) await logCrm('twitter.tweet.sent', result[0].id, result[0].text);
+          return { success: true, data: result };
+        }
+
+        case 'quote-tweet': {
+          if (!text) throw new Error('text is required for quote_tweet');
+          if (!tweet_id) throw new Error('tweet_id is required for quote_tweet');
+          const result = await twitterService.quoteTweet(ownerUserId, account_id, text, tweet_id);
+          await logCrm('twitter.tweet.sent', result.id, result.text);
+          return { success: true, data: result };
+        }
+
+        case 'delete-tweet': {
+          if (!tweet_id) throw new Error('tweet_id is required for delete-tweet');
+          const result = await twitterService.deleteTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'like': {
+          if (!tweet_id) throw new Error('tweet_id is required for like');
+          const result = await twitterService.likeTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'unlike': {
+          if (!tweet_id) throw new Error('tweet_id is required for unlike');
+          const result = await twitterService.unlikeTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'retweet': {
+          if (!tweet_id) throw new Error('tweet_id is required for retweet');
+          const result = await twitterService.retweetTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'unretweet': {
+          if (!tweet_id) throw new Error('tweet_id is required for unretweet');
+          const result = await twitterService.unretweetTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-tweet-metrics': {
+          if (!tweet_ids?.length) throw new Error('tweet_ids is required for get_tweet_metrics');
+          const result = await twitterService.getTweetMetrics(ownerUserId, account_id, tweet_ids);
+          return { success: true, data: result };
+        }
+
+        case 'list-replies': {
+          if (!tweet_id) throw new Error('tweet_id is required for list_replies');
+          const result = await twitterService.listReplies(ownerUserId, account_id, tweet_id, max_results);
+          return { success: true, data: result };
+        }
+
+        case 'get-retweeters': {
+          if (!tweet_id) throw new Error('tweet_id is required for get_retweeters');
+          const result = await twitterService.getRetweeters(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-liking-users': {
+          if (!tweet_id) throw new Error('tweet_id is required for get_liking_users');
+          const result = await twitterService.getLikingUsers(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-quote-tweets': {
+          if (!tweet_id) throw new Error('tweet_id is required for get_quote_tweets');
+          const result = await twitterService.getQuoteTweets(ownerUserId, account_id, tweet_id, max_results);
+          return { success: true, data: result };
+        }
+
+        default: {
+          const validActions = [
+            'reply', 'post-thread', 'quote-tweet',
+            'delete-tweet',
+            'like', 'unlike', 'retweet', 'unretweet',
+            'list-replies', 'get-tweet-metrics',
+            'get-retweeters', 'get-liking-users', 'get-quote-tweets',
+          ];
+          throw new Error(`Unsupported twitter_manage_post action: "${action}". Valid actions are: ${validActions.join(', ')}`);
+        }
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      console.error('AgentMode: twitter_manage_post failed:', errorMessage);
+      return { success: false, message: 'Twitter action failed', error: errorMessage };
+    }
+  }
+
+  async twitterOutreach(userId: string, args: any): Promise<any> {
+    let { account_id } = args;
+    const action = (args.action as string)?.replace(/_/g, '-');
+    const { text, handle, recipient_handle, query, max_results, tweet_id, list_id, lead_id, lead_email } = args;
+    console.log(`[AgentMode] twitterOutreach called: action=${action}, account_id=${account_id}`);
+
+    const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+    const twitterAccounts = (await getAccountsWithOwnerIncludingOrgShared(userId))
+      .filter((a: any) => a.platform === 'twitter');
+
+    if (twitterAccounts.length === 0) {
+      return {
+        success: false,
+        error: 'No X (Twitter) account is connected. Connect your X account in Settings → Connected Accounts.',
+      };
+    }
+
+    let account: any;
+    if (account_id) {
+      account = twitterAccounts.find((a: any) => a.account_id === account_id);
+      if (!account) {
+        return { success: false, error: `X account ${account_id} is not connected to your profile.` };
+      }
+    } else if (twitterAccounts.length === 1) {
+      account = twitterAccounts[0];
+    } else {
+      return {
+        success: false,
+        error: 'Multiple X accounts are connected — specify account_id. Use list_connected_accounts(platform="twitter").',
+      };
+    }
+
+    const ownerUserId = account.userId;
+    account_id = account.account_id;
+
+    const logCrm = async (messageProviderId: string, bodyText: string): Promise<void> => {
+      if (!list_id || !lead_id || !lead_email) return;
+      try {
+        const { emailEventsDb } = await import('./emailEventsDb');
+        await emailEventsDb.addTwitterMessageEvent({
+          eventId: `twitter_dm_${messageProviderId}`,
+          emailDomain: `twitter-${list_id}`,
+          leadEmail: lead_email,
+          eventType: 'twitter.dm.sent',
+          text: bodyText ?? null,
+          timestamp: new Date().toISOString(),
+          senderId: account_id,
+          messageProviderId,
+        });
+      } catch (e) {
+        console.error('[AgentMode] twitterOutreach CRM logging failed (non-fatal):', e);
+      }
+    };
+
+    try {
+      switch (action) {
+        case 'get-profile': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for get_profile');
+          const result = await twitterService.getProfile(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'follow': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for follow');
+          const result = await twitterService.followUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'unfollow': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for unfollow');
+          const result = await twitterService.unfollowUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'list-followers': {
+          const target = handle || recipient_handle;
+          const result = await twitterService.listFollowers(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'list-following': {
+          const target = handle || recipient_handle;
+          const result = await twitterService.listFollowing(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'search-tweets': {
+          if (!query) throw new Error('query is required for search_tweets');
+          const result = await twitterService.searchTweets(ownerUserId, account_id, query, max_results);
+          return { success: true, data: result };
+        }
+
+        case 'get-user-tweets': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for get_user_tweets');
+          const result = await twitterService.getUserTweets(ownerUserId, account_id, target, max_results);
+          return { success: true, data: result };
+        }
+
+        case 'send-dm': {
+          const target = recipient_handle || handle;
+          if (!target) throw new Error('handle is required for send_dm');
+          if (!text) throw new Error('text is required for send_dm');
+          const result = await twitterService.sendDm(ownerUserId, account_id, target, text);
+          await logCrm(result?.dm_event_id || `${account_id}_dm`, text);
+          return { success: true, data: result };
+        }
+
+        case 'list-dms': {
+          const result = await twitterService.listDms(ownerUserId, account_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-dm-conversation': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for get_dm_conversation');
+          const result = await twitterService.getDmConversation(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'bookmark': {
+          if (!tweet_id) throw new Error('tweet_id is required for bookmark');
+          const result = await twitterService.bookmarkTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-bookmarks': {
+          const result = await twitterService.getBookmarks(ownerUserId, account_id);
+          return { success: true, data: result };
+        }
+
+        case 'block': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for block');
+          const result = await twitterService.blockUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'unblock': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for unblock');
+          const result = await twitterService.unblockUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'mute': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for mute');
+          const result = await twitterService.muteUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'unmute': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for unmute');
+          const result = await twitterService.unmuteUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        default: {
+          const validActions = [
+            'get-profile', 'follow', 'unfollow', 'list-followers', 'list-following',
+            'search-tweets', 'get-user-tweets',
+            'send-dm', 'list-dms', 'get-dm-conversation',
+            'bookmark', 'get-bookmarks',
+            'block', 'unblock', 'mute', 'unmute',
+          ];
+          throw new Error(`Unsupported twitter_outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
+        }
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      console.error('AgentMode: twitter_outreach failed:', errorMessage);
+      return { success: false, message: 'Twitter outreach action failed', error: errorMessage };
     }
   }
 
@@ -26224,7 +27197,6 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       case 'CONVERSATION_AD': {
         if (action === 'CREATE') {
-          if (!params.name) throw new Error('CONVERSATION_AD CREATE requires name');
           const result = await linkedInAdsService.createConversationAd(accessToken, accountId, params);
           if (!result.success) throw new Error(result.error || 'Failed to create conversation ad');
           const conversationAdUrn = result.data?.id;

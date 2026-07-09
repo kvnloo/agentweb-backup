@@ -765,7 +765,63 @@ describe('AgentModeService - LinkedIn Outreach', () => {
         'provider-abc',
         false,
         'Hi, let us connect!',
-        200
+        200,
+        { onNoteQuota: 'skip' }
+      );
+    });
+
+    // ENG-213: default policy is to HOLD (not silently drop the note) when the
+    // account's monthly personalized-note quota is spent.
+    it("defaults onNoteQuota to 'skip' (hold) when on_note_quota is not provided", async () => {
+      mockSendInvitation.mockResolvedValue({ id: 'invite-123' });
+      mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+
+      await service.linkedinOutreach('user-1', {
+        action: 'send-invite',
+        account_id: 'test-account-id',
+        provider_id: 'provider-abc',
+        message: 'Hi, let us connect!',
+      });
+
+      expect(mockSendInvitation).toHaveBeenCalledWith(
+        'test-account-id', 'provider-abc', false, 'Hi, let us connect!', 200, { onNoteQuota: 'skip' },
+      );
+    });
+
+    it('returns a requiresDecision gate (does not decide) when the note quota is held', async () => {
+      mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+      const held: any = new Error('LinkedIn note quota reached — the personalized note could not be attached.');
+      held.noteQuotaExceeded = true;
+      mockSendInvitation.mockRejectedValue(held);
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'send-invite',
+        account_id: 'test-account-id',
+        provider_id: 'provider-abc',
+        message: 'A deliberately personalised note',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.requiresDecision).toBe(true);
+      expect(result.noteQuotaExceeded).toBe(true);
+      expect(result.error).toMatch(/without the note|skip/i);
+    });
+
+    it("re-call with on_note_quota='send_without_note' authorizes a note-less send", async () => {
+      mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+      mockSendInvitation.mockResolvedValue({ id: 'invite-123', note_dropped: true });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'send-invite',
+        account_id: 'test-account-id',
+        provider_id: 'provider-abc',
+        message: 'A personalised note',
+        on_note_quota: 'send_without_note',
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockSendInvitation).toHaveBeenCalledWith(
+        'test-account-id', 'provider-abc', false, 'A personalised note', 200, { onNoteQuota: 'send_without_note' },
       );
     });
 
@@ -784,6 +840,63 @@ describe('AgentModeService - LinkedIn Outreach', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('too long');
+    });
+
+    // ENG-126: LinkedIn returns "Cannot resend yet" for send-invite on EVERY
+    // recipient — even fresh ones — once the account hits its invitation cap.
+    // Surfaced verbatim, this reads like a per-recipient cooldown, so the agent
+    // moves to the next recipient and repeats, burning 10+ attempts per session.
+    // The handler must flag it as the account-level throttle it is and tell the
+    // agent to stop and report proactively.
+    describe('account-level invitation cooldown ("Cannot resend yet")', () => {
+      function makeCooldownError() {
+        const err = new Error('Cannot resend yet');
+        (err as any).structuredError = {
+          message: 'Cannot resend yet',
+          status: 422,
+          classification: 'VALIDATION_ERROR',
+        };
+        return err;
+      }
+
+      it('flags an account-level throttle instead of surfacing the raw per-recipient error', async () => {
+        mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+        mockSendInvitation.mockRejectedValue(makeCooldownError());
+
+        const result = await service.linkedinOutreach('user-1', {
+          action: 'send-invite',
+          account_id: 'test-account-id',
+          provider_id: 'provider-abc',
+          message: 'Hi, let us connect!',
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.accountThrottled).toBe(true);
+        // Names it as account-level, not per-recipient.
+        expect(result.error.toLowerCase()).toContain('account-level');
+        // Tells the agent to stop hammering other recipients.
+        expect(result.error.toLowerCase()).toContain('do not keep trying');
+        // Preserves the raw provider phrase so the error classifier still
+        // buckets this as an upstream_rejected LinkedIn business rule.
+        expect(result.error).toContain('Cannot resend yet');
+      });
+
+      it('does NOT treat "Cannot resend yet" on non-invite actions as an account throttle', async () => {
+        // A send-message cooldown is a different code path — the throttle guidance
+        // is specific to send-invite and must not leak onto other actions.
+        mockSendMessage.mockRejectedValue(makeCooldownError());
+
+        const result = await service.linkedinOutreach('user-1', {
+          action: 'send-message',
+          account_id: 'test-account-id',
+          provider_id: 'provider-abc',
+          message: 'Hello!',
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.accountThrottled).toBeUndefined();
+        expect(result.error).toBe('Cannot resend yet');
+      });
     });
   });
 

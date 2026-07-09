@@ -168,6 +168,101 @@ async function getCurrentCommitSha(context: CodingAgentContext): Promise<string 
   }
 }
 
+/**
+ * Extract a human-readable detail from a failed GitHub API (axios) call so the
+ * caller sees the actual validation message (e.g. "Reference does not exist")
+ * instead of a bare "Request failed with status code 422". Exported for tests.
+ */
+export function _describeGithubError(error: any, action: string): string {
+  const status = error?.response?.status;
+  const data = error?.response?.data;
+  const parts: string[] = [];
+  if (data && typeof data === 'object') {
+    if (data.message) parts.push(String(data.message));
+    if (Array.isArray(data.errors)) {
+      for (const e of data.errors) {
+        const piece = e?.message || e?.code || (typeof e === 'string' ? e : '');
+        if (piece) parts.push(String(piece));
+      }
+    }
+    if (parts.length === 0) {
+      try { parts.push(JSON.stringify(data)); } catch { /* ignore un-serializable body */ }
+    }
+  } else if (typeof data === 'string' && data.trim()) {
+    parts.push(data.trim());
+  }
+  if (parts.length === 0 && error?.message) parts.push(String(error.message));
+  const detail = parts.join('; ') || 'unknown error';
+  return `failed to ${action}${status ? ` (HTTP ${status})` : ''}: ${detail}`;
+}
+
+/**
+ * GitHub reports a missing git ref as EITHER 404 OR 422 "Reference does not
+ * exist", depending on the endpoint: the "Update a reference" endpoint
+ * (PATCH .../git/refs/heads/<branch>) returns 422 for an absent ref, not 404.
+ * Both mean the branch is absent and should be created. Exported for tests.
+ */
+export function _isMissingGithubRefError(error: any): boolean {
+  const status = error?.response?.status;
+  if (status === 404) return true;
+  if (status === 422) {
+    const data = error?.response?.data;
+    const haystack = [
+      data?.message,
+      ...(Array.isArray(data?.errors) ? data.errors.map((e: any) => e?.message || e?.code) : []),
+    ]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+    return haystack.includes('does not exist') || haystack.includes('not found');
+  }
+  return false;
+}
+
+/**
+ * How many commits the reusable preview branch is ahead of main — i.e. how many
+ * unpublished coding_agent edits currently sit on draft/agentweb-preview. Uses
+ * GitHub's compare API (base...head). Returns 0 ONLY when the branch is absent
+ * (404) or is genuinely identical to / behind main — the cases where resetting
+ * the branch to main loses nothing. A positive result means "there is unpublished
+ * work here, do not reset."
+ *
+ * On any OTHER error (5xx / timeout / rate-limit / unparseable body) we fail
+ * CLOSED: return a positive count so the caller skips the reset (ENG-176). A
+ * transient compare failure must never be read as "0 ahead → safe to force-reset",
+ * because that would silently discard genuine unpublished edits — the exact
+ * clobber this guard exists to prevent. At worst the new edit builds on a slightly
+ * stale branch, which is recoverable; a destroyed edit is not. Exported for tests.
+ */
+export async function _previewBranchCommitsAheadOfMain(
+  repoBase: string,
+  headers: Record<string, string>,
+): Promise<number> {
+  try {
+    const res = await axios.get<any>(
+      `${repoBase}/compare/main...${encodeURIComponent(LANDING_PAGE_PREVIEW_BRANCH)}`,
+      { headers, timeout: GITHUB_API_TIMEOUT_MS },
+    );
+    const aheadBy = res?.data?.ahead_by;
+    return typeof aheadBy === 'number' && aheadBy > 0 ? aheadBy : 0;
+  } catch (error) {
+    // 404 = preview branch doesn't exist yet → nothing unpublished, reset/create
+    // as usual (fail open — creating a fresh branch loses nothing).
+    if (_isMissingGithubRefError(error)) {
+      return 0;
+    }
+    // Any other error (5xx / timeout / rate-limit) → fail CLOSED: treat the branch
+    // as ahead so the caller skips the reset and layers on top, rather than
+    // force-resetting to main and destroying unpublished work on a transient hiccup.
+    console.warn(
+      '[CODING AGENT] Could not compare preview branch to main; assuming unpublished ' +
+        'commits exist and skipping reset to avoid clobbering them (ENG-176):',
+      error instanceof Error ? error.message : error,
+    );
+    return 1;
+  }
+}
+
 async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Promise<void> {
   if (context.draftBranch !== LANDING_PAGE_PREVIEW_BRANCH) return;
 
@@ -190,13 +285,35 @@ async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Pr
     Accept: 'application/vnd.github.v3+json',
   };
 
-  const mainRef = await axios.get<any>(`${repoBase}/git/ref/heads/main`, {
-    headers,
-    timeout: GITHUB_API_TIMEOUT_MS,
-  });
-  const mainSha = mainRef.data?.object?.sha;
+  let mainSha: string | undefined;
+  try {
+    const mainRef = await axios.get<any>(`${repoBase}/git/ref/heads/main`, {
+      headers,
+      timeout: GITHUB_API_TIMEOUT_MS,
+    });
+    mainSha = mainRef.data?.object?.sha;
+  } catch (error) {
+    throw new Error(`Cannot prepare preview branch: ${_describeGithubError(error, 'read the repo main branch')}`);
+  }
   if (!mainSha) {
     throw new Error('Cannot prepare preview branch: main SHA not found');
+  }
+
+  // ENG-176: If the reusable preview branch already carries commits that are not
+  // yet on main, those are UNPUBLISHED edits from an earlier coding_agent run on
+  // this page. Force-resetting the branch to main here would silently discard
+  // them, so a later sequential edit on the same page clobbers the earlier one
+  // (e.g. the first-added book card disappears after publish). In that case we
+  // must layer the new edit on top of the existing preview branch instead of
+  // resetting. We only reset when the branch is absent or fully published
+  // (not ahead of main) — the case the reusable branch was designed for.
+  const aheadBy = await _previewBranchCommitsAheadOfMain(repoBase, headers);
+  if (aheadBy > 0) {
+    console.log(
+      `[CODING AGENT] ${LANDING_PAGE_PREVIEW_BRANCH} has ${aheadBy} unpublished commit(s) ahead of main; ` +
+        `layering new edit on top instead of resetting (ENG-176)`,
+    );
+    return;
   }
 
   try {
@@ -206,15 +323,29 @@ async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Pr
       { headers, timeout: GITHUB_API_TIMEOUT_MS },
     );
     console.log(`[CODING AGENT] Reset ${LANDING_PAGE_PREVIEW_BRANCH} to main (${mainSha.substring(0, 7)})`);
+    return;
   } catch (error: any) {
-    if (error.response?.status !== 404) throw error;
+    // The preview branch doesn't exist yet — create it below. GitHub's "Update
+    // a reference" API reports a missing ref as EITHER 404 OR 422 "Reference
+    // does not exist", so both mean "branch absent" and must fall through to
+    // creation. Previously only 404 fell through, so the common 422 case
+    // rethrew a bare "Request failed with status code 422" and blocked EVERY
+    // coding_agent edit on otherwise-healthy pages whose draft branch had never
+    // been created (ENG-159).
+    if (!_isMissingGithubRefError(error)) {
+      throw new Error(`Cannot prepare preview branch: ${_describeGithubError(error, 'reset the preview branch')}`);
+    }
+  }
 
+  try {
     await axios.post(
       `${repoBase}/git/refs`,
       { ref: `refs/heads/${LANDING_PAGE_PREVIEW_BRANCH}`, sha: mainSha },
       { headers, timeout: GITHUB_API_TIMEOUT_MS },
     );
     console.log(`[CODING AGENT] Created ${LANDING_PAGE_PREVIEW_BRANCH} from main (${mainSha.substring(0, 7)})`);
+  } catch (error) {
+    throw new Error(`Cannot prepare preview branch: ${_describeGithubError(error, 'create the preview branch')}`);
   }
 }
 

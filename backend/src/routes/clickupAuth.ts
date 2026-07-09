@@ -8,6 +8,7 @@ import { encryptPassword } from '../utils/crypto';
 import { getAccessToken, getWorkspaces, listDocs, listTasks } from '../services/clickupService';
 import { getClickUpConfig } from '../config/integrations';
 import { canEditItem } from '../services/orgShareService';
+import { getJwtSecret } from '../config/jwt';
 
 const router = express.Router();
 
@@ -22,23 +23,18 @@ const STATE_EXPIRATION = '15m';
 const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000;
 const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000;
 
-const STATE_SECRET = process.env.JWT_SECRET;
-if (!STATE_SECRET) {
-  throw new Error('JWT_SECRET environment variable must be set for OAuth state verification');
-}
-
 interface StatePayload { userId: string; nonce: string; frontendUrl?: string; }
 
 const generateState = (userId: string, frontendUrl?: string): string => {
   const nonce = crypto.randomBytes(16).toString('hex');
   const payload: StatePayload = { userId, nonce };
   if (frontendUrl) payload.frontendUrl = frontendUrl;
-  return jwt.sign(payload, STATE_SECRET, { expiresIn: STATE_EXPIRATION });
+  return jwt.sign(payload, getJwtSecret(), { expiresIn: STATE_EXPIRATION });
 };
 
 const verifyState = (state: string, userId: string): StatePayload | null => {
   try {
-    const decoded = jwt.verify(state, STATE_SECRET) as StatePayload;
+    const decoded = jwt.verify(state, getJwtSecret()) as StatePayload;
     if (decoded.userId !== userId) return null;
     return decoded;
   } catch {
