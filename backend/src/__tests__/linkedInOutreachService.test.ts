@@ -77,7 +77,10 @@ describe('LinkedInOutreachService', () => {
         getAllMessagesFromChat: jest.fn().mockResolvedValue({ items: [] }),
       },
       request: {
-        send: jest.fn().mockResolvedValue({ provider_id: 'provider-123' })
+        // Default profile lookup echoes back the same id the caller passed, so
+        // canonicalisation is a no-op in the baseline tests. Tests that exercise a
+        // public-identifier → URN resolution override this per-call.
+        send: jest.fn().mockResolvedValue({ provider_id: 'provider-id' })
       },
       account: {
         getOne: jest.fn().mockResolvedValue({ status: 'CONNECTED' }),
@@ -127,6 +130,44 @@ describe('LinkedInOutreachService', () => {
         account_id: 'account-id',
         provider_id: 'provider-id',
         message: customMessage
+      });
+    });
+
+    it('resolves a public-identifier target to the canonical provider_id before inviting', async () => {
+      // ENG-213: the agent passed a public identifier (vanity slug) as provider_id.
+      // Unipile's invite endpoint requires the canonical member URN — a public
+      // identifier is rejected with a generic "Invalid parameters". The profile
+      // lookup accepts either form and reveals the canonical provider_id, so the
+      // invite must be sent with that resolved id, not the raw slug.
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
+        network_distance: 'SECOND_DEGREE',
+        public_identifier: 'william-kwak',
+        provider_id: 'ACoAABcanonicalURN',
+      });
+
+      await linkedInOutreachService.sendInvitation('account-id', 'william-kwak', false, 'Hi William');
+
+      expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledWith({
+        account_id: 'account-id',
+        provider_id: 'ACoAABcanonicalURN',
+        message: 'Hi William',
+      });
+    });
+
+    it('falls back to the passed provider_id when the profile lookup reveals no canonical id', async () => {
+      // If the connection-check profile fetch returns no provider_id we must still
+      // attempt the invite with what the caller gave us (resilient fallback), never
+      // send an undefined provider_id.
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
+        network_distance: 'SECOND_DEGREE',
+      });
+
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, 'Hello');
+
+      expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledWith({
+        account_id: 'account-id',
+        provider_id: 'provider-id',
+        message: 'Hello',
       });
     });
 
@@ -469,6 +510,184 @@ describe('LinkedInOutreachService', () => {
 
         // @ts-ignore private map — success cleared the breaker.
         expect(linkedInOutreachService.invitationCooldownUntil.has('acct-A')).toBe(false);
+      });
+    });
+
+    describe('note-quota "Invalid parameters" fallback (ENG-213)', () => {
+      // Free LinkedIn accounts may only attach a note to ~5 invitations per month,
+      // but can send ~150 note-less invites per week. Once the note quota is spent,
+      // LinkedIn rejects every note-bearing invite with a generic "Invalid parameters"
+      // (422) even though the provider_id/recipient are perfectly valid.
+      function invalidParametersError() {
+        return Object.assign(new Error('UnsuccessfulRequestError'), {
+          body: {
+            status: 422,
+            type: 'errors/invalid_parameters',
+            title: 'Invalid parameters',
+          },
+        });
+      }
+
+      it('retries WITHOUT the note when a note-bearing invite is rejected with "Invalid parameters", and succeeds', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock)
+          .mockRejectedValueOnce(invalidParametersError()) // note-bearing invite rejected
+          .mockResolvedValueOnce({ id: 'invitation-id' });  // note-less retry succeeds
+
+        const result = await linkedInOutreachService.sendInvitation(
+          'acct-A', 'recipient-1', false, 'Hi there — would love to connect!'
+        );
+
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(2);
+        // First attempt carried the note.
+        expect((mockUnipileClient.users.sendInvitation as jest.Mock).mock.calls[0][0]).toEqual(
+          expect.objectContaining({ message: 'Hi there — would love to connect!' })
+        );
+        // Retry dropped the note — and carries the canonical provider_id resolved by
+        // the connection-check profile fetch (the mock returns 'provider-id'), not the
+        // raw slug, since the invite endpoint only accepts the canonical URN (ENG-213).
+        expect((mockUnipileClient.users.sendInvitation as jest.Mock).mock.calls[1][0]).toEqual(
+          expect.objectContaining({ account_id: 'acct-A', provider_id: 'provider-id', message: undefined })
+        );
+        expect(result).toEqual(expect.objectContaining({ note_dropped: true }));
+      });
+
+      it('does NOT retry when there was no note — a bare invite rejected with "Invalid parameters" bubbles up', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(invalidParametersError());
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false)
+        ).rejects.toThrow(/invalid parameters/i);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+      });
+
+      it('surfaces the error when the note-less retry ALSO fails (e.g. genuinely invalid provider_id)', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock)
+          .mockRejectedValueOnce(invalidParametersError())  // note-bearing attempt
+          .mockRejectedValueOnce(invalidParametersError()); // note-less retry also fails
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false, 'Let us connect!')
+        ).rejects.toThrow(/invalid parameters/i);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(2);
+      });
+
+      it('does NOT retry note-less on "Cannot resend yet" — that cap is not fixed by dropping the note', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(
+          Object.assign(new Error('UnsuccessfulRequestError'), {
+            body: { status: 422, type: 'errors/cannot_resend_yet', title: 'Cannot resend yet' },
+          })
+        );
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false, 'A personalised note')
+        ).rejects.toThrow(/cannot resend yet/i);
+        // Only the single note-bearing attempt — no note-less retry.
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+        // The account-wide cooldown breaker is still armed.
+        // @ts-ignore private map
+        expect(linkedInOutreachService.invitationCooldownUntil.has('acct-A')).toBe(true);
+      });
+
+      it('does NOT retry note-less on a per-recipient "Should delay new invitation" rejection', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(
+          Object.assign(new Error('UnsuccessfulRequestError'), {
+            body: { status: 422, type: 'errors/already_invited_recently', title: 'Should delay new invitation to this recipient' },
+          })
+        );
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false, 'A personalised note')
+        ).rejects.toThrow(/should delay new invitation/i);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+      });
+
+      it('does NOT retry note-less when the rejection text contains BOTH "Invalid parameters" and an exclusion phrase — the exclusion wins', async () => {
+        // If LinkedIn's body pairs the generic "Invalid parameters" wording with a
+        // cap/duplicate signal, dropping the note cannot fix it: the exclusion branch
+        // must suppress the note-less retry (proving the exclusion regex is decisive,
+        // not incidental). Without the exclusion this would fall through and retry.
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(
+          Object.assign(new Error('UnsuccessfulRequestError'), {
+            body: { status: 422, type: 'errors/cannot_resend_yet', title: 'Invalid parameters — cannot resend yet' },
+          })
+        );
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false, 'A personalised note')
+        ).rejects.toThrow(/cannot resend yet/i);
+        // Single note-bearing attempt only — the exclusion suppressed the note-less retry.
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+        // And the account-wide cooldown breaker armed off the "cannot resend yet" phrase.
+        // @ts-ignore private map
+        expect(linkedInOutreachService.invitationCooldownUntil.has('acct-A')).toBe(true);
+      });
+    });
+
+    describe('note-quota policy via opts.onNoteQuota (ENG-213 hold-vs-drop)', () => {
+      // The service is a pure mechanism: the CALLER decides what to do when the
+      // monthly note quota is spent. `send_without_note` keeps the legacy behavior
+      // (drop the note, send anyway); `skip` holds the invite — it throws a typed
+      // `noteQuotaExceeded` signal WITHOUT sending, so the caller can ask the user
+      // or defer the lead rather than silently downgrading a deliberate note.
+      function invalidParametersError() {
+        return Object.assign(new Error('UnsuccessfulRequestError'), {
+          body: { status: 422, type: 'errors/invalid_parameters', title: 'Invalid parameters' },
+        });
+      }
+
+      it("onNoteQuota:'skip' does NOT send a note-less invite — it throws a typed noteQuotaExceeded signal", async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(invalidParametersError());
+
+        const thrown = await linkedInOutreachService.sendInvitation(
+          'acct-A', 'recipient-1', false, 'A deliberately personalised note', 200, { onNoteQuota: 'skip' }
+        ).catch((e: any) => e);
+
+        expect(thrown?.noteQuotaExceeded).toBe(true);
+        expect(thrown?.structuredError?.classification).toBe('NOTE_QUOTA_EXCEEDED');
+        // Only the note-bearing attempt happened — NO second, note-less send.
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+      });
+
+      it("onNoteQuota:'send_without_note' drops the note and sends (legacy behavior, now explicit)", async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock)
+          .mockRejectedValueOnce(invalidParametersError())
+          .mockResolvedValueOnce({ id: 'invitation-id' });
+
+        const result = await linkedInOutreachService.sendInvitation(
+          'acct-A', 'recipient-1', false, 'A personalised note', 200, { onNoteQuota: 'send_without_note' }
+        );
+
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(2);
+        expect(result).toEqual(expect.objectContaining({ note_dropped: true }));
+      });
+
+      it("defaults to legacy send_without_note when opts is omitted (back-compat)", async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock)
+          .mockRejectedValueOnce(invalidParametersError())
+          .mockResolvedValueOnce({ id: 'invitation-id' });
+
+        const result = await linkedInOutreachService.sendInvitation(
+          'acct-A', 'recipient-1', false, 'A personalised note'
+        );
+
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(2);
+        expect(result).toEqual(expect.objectContaining({ note_dropped: true }));
+      });
+
+      it("onNoteQuota:'skip' still lets a cap/duplicate signal bubble unchanged (not treated as a note-quota hold)", async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(
+          Object.assign(new Error('UnsuccessfulRequestError'), {
+            body: { status: 422, type: 'errors/cannot_resend_yet', title: 'Cannot resend yet' },
+          })
+        );
+
+        const thrown = await linkedInOutreachService.sendInvitation(
+          'acct-A', 'recipient-1', false, 'A personalised note', 200, { onNoteQuota: 'skip' }
+        ).catch((e: any) => e);
+
+        expect(thrown?.noteQuotaExceeded).toBeFalsy();
+        expect(thrown?.message).toMatch(/cannot resend yet/i);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
       });
     });
   });
@@ -1082,6 +1301,102 @@ describe('LinkedInOutreachService', () => {
     });
   });
 
+  describe('profile lookup timeout + retry (ENG-144)', () => {
+    const TIMEOUT_MS = 30_000;
+    const hang = () => new Promise(() => {}); // never resolves — simulates a stuck Unipile session
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('times out a hung profile lookup instead of blocking indefinitely, and retries once', async () => {
+      jest.useFakeTimers();
+      const profile = { provider_id: 'john-doe', first_name: 'John' };
+      // First call hangs (stuck session), second call (the automatic retry) succeeds.
+      (mockUnipileClient.request.send as jest.Mock)
+        .mockImplementationOnce(() => hang())
+        .mockResolvedValueOnce(profile);
+
+      const resultPromise = linkedInOutreachService.getProfile('john-doe', 'account-123');
+      // Advance past the first internal timeout so the retry fires.
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+
+      await expect(resultPromise).resolves.toEqual(profile);
+      expect(mockUnipileClient.request.send).toHaveBeenCalledTimes(2);
+    });
+
+    it('rejects with a TIMEOUT_ERROR classification when both the initial call and the retry hang', async () => {
+      jest.useFakeTimers();
+      (mockUnipileClient.request.send as jest.Mock).mockImplementation(() => hang());
+
+      const resultPromise = linkedInOutreachService.getProfile('john-doe', 'account-123');
+      const assertion = expect(resultPromise).rejects.toMatchObject({
+        structuredError: { classification: 'TIMEOUT_ERROR' },
+      });
+      // Two timeouts: the initial lookup and its single retry.
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+      await assertion;
+      expect(mockUnipileClient.request.send).toHaveBeenCalledTimes(2);
+    });
+
+    it('does NOT retry on a real (non-timeout) API error — surfaces it immediately', async () => {
+      const apiError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 404, title: 'Profile not found' },
+      });
+      (mockUnipileClient.request.send as jest.Mock).mockRejectedValueOnce(apiError);
+
+      await expect(
+        linkedInOutreachService.getProfile('nonexistent', 'account-123')
+      ).rejects.toThrow('Profile not found');
+      expect(mockUnipileClient.request.send).toHaveBeenCalledTimes(1);
+    });
+
+    it('emits greppable CloudWatch markers (PROFILE_LOOKUP_TIMEOUT per attempt + PROFILE_LOOKUP_FAILED_TIMEOUT) so a future hang is diagnosable by time window', async () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      jest.useFakeTimers();
+      (mockUnipileClient.request.send as jest.Mock).mockImplementation(() => hang());
+
+      const resultPromise = linkedInOutreachService.getProfile('john-doe', 'account-123');
+      const captured = resultPromise.catch(() => {}); // swallow the eventual rejection
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1); // attempt 1 times out
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1); // retry times out
+      await captured;
+
+      const lines = warnSpy.mock.calls.map((c) => `${c[0]} ${c[1] ?? ''}`);
+      // One per-attempt timeout marker for each of the 2 attempts…
+      expect(lines.filter((l) => l.includes('PROFILE_LOOKUP_TIMEOUT'))).toHaveLength(2);
+      // …plus a single terminal marker naming the identifier + account for grepping.
+      const terminal = lines.find((l) => l.includes('PROFILE_LOOKUP_FAILED_TIMEOUT'));
+      expect(terminal).toBeDefined();
+      expect(terminal).toContain('john-doe');
+      expect(terminal).toContain('account-123');
+
+      warnSpy.mockRestore();
+    });
+
+    it('surfaced timeout error is classified as a retryable "timeout" by the agent error pipeline', async () => {
+      // Guards the cross-module contract: the timeout message emitted here must
+      // match toolErrorClassifier's timeout regex so the agent tells the model
+      // "retry once, then stop" instead of hanging. If the message ever changes
+      // and stops matching, this fails loudly.
+      const { classifyToolErrorClass } = require('../utils/toolErrorClassifier');
+      const { isRetryableErrorClass } = require('../services/agentMode/core/errorRetryability');
+      jest.useFakeTimers();
+      (mockUnipileClient.request.send as jest.Mock).mockImplementation(() => hang());
+
+      const resultPromise = linkedInOutreachService.getProfile('john-doe', 'account-123');
+      const captured = resultPromise.catch((e: any) => e);
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+      await jest.advanceTimersByTimeAsync(TIMEOUT_MS + 1);
+      const err = await captured;
+
+      const cls = classifyToolErrorClass(err);
+      expect(cls).toBe('timeout');
+      expect(isRetryableErrorClass(cls)).toBe(true);
+    });
+  });
+
   describe('listConnections', () => {
     it('should return connections list', async () => {
       const mockRelations = {
@@ -1244,6 +1559,40 @@ describe('LinkedInOutreachService', () => {
     });
   });
 
+  describe('isAccountConnected timeout guard (ENG-144)', () => {
+    const CHECK_MS = 15_000;
+    const hang = () => new Promise(() => {}); // never resolves — stuck upstream
+
+    beforeEach(() => {
+      // @ts-ignore private cache — clear so the live probe actually runs
+      linkedInOutreachService.connectedStatusCache = new Map();
+    });
+    afterEach(() => jest.useRealTimers());
+
+    it('treats a hung account probe as NOT connected instead of blocking the caller', async () => {
+      jest.useFakeTimers();
+      (mockUnipileClient.account.getOne as jest.Mock).mockImplementation(() => hang());
+
+      const settled = linkedInOutreachService.isAccountConnected('acct-hang').then((v) => ({ v }));
+      await jest.advanceTimersByTimeAsync(CHECK_MS + 1);
+
+      expect(await settled).toEqual({ v: false });
+    });
+
+    it('treats a hung self-profile probe as NOT connected', async () => {
+      jest.useFakeTimers();
+      (mockUnipileClient.account.getOne as jest.Mock).mockResolvedValue({
+        connection_params: { im: { publicIdentifier: 'me' } },
+      });
+      (mockUnipileClient.request.send as jest.Mock).mockImplementation(() => hang());
+
+      const settled = linkedInOutreachService.isAccountConnected('acct-hang-2').then((v) => ({ v }));
+      await jest.advanceTimersByTimeAsync(CHECK_MS + 1);
+
+      expect(await settled).toEqual({ v: false });
+    });
+  });
+
   describe('resolveAccountId', () => {
     const mockGetAccountsByUserId = jest.fn();
     const mockGetSetting = jest.fn();
@@ -1258,14 +1607,64 @@ describe('LinkedInOutreachService', () => {
       }));
     });
 
-    it('returns user account_id when user has a connected unipile account', async () => {
+    it('returns user account_id when user has a live connected unipile account', async () => {
       mockGetAccountsByUserId.mockResolvedValue([
         { platform: 'unipile', account_id: 'user-acct-123' },
       ]);
+      const liveSpy = jest.spyOn(linkedInOutreachService, 'isAccountConnected').mockResolvedValue(true);
 
       const result = await linkedInOutreachService.resolveAccountId('user-1');
 
       expect(result).toBe('user-acct-123');
+      liveSpy.mockRestore();
+    });
+
+    it('skips a dead own account and returns the next LIVE own account (no site-wide fallback)', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'own-dead' },
+        { platform: 'unipile', account_id: 'own-live' },
+      ]);
+      const liveSpy = jest
+        .spyOn(linkedInOutreachService, 'isAccountConnected')
+        .mockImplementation(async (id: string) => id === 'own-live');
+
+      const result = await linkedInOutreachService.resolveAccountId('user-1');
+
+      expect(result).toBe('own-live');
+      // Never consulted site-wide settings because a live own account existed.
+      expect(mockGetSetting).not.toHaveBeenCalled();
+      liveSpy.mockRestore();
+    });
+
+    it('falls back to a site-wide account ONLY after every own account is dead', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'own-dead-1' },
+        { platform: 'unipile', account_id: 'own-dead-2' },
+      ]);
+      mockGetSetting.mockResolvedValue({
+        settingValue: JSON.stringify([{ account_id: 'site-live', enabled: true }]),
+      });
+      const liveSpy = jest
+        .spyOn(linkedInOutreachService, 'isAccountConnected')
+        .mockImplementation(async (id: string) => id === 'site-live');
+
+      const result = await linkedInOutreachService.resolveAccountId('user-1');
+
+      expect(result).toBe('site-live');
+      liveSpy.mockRestore();
+    });
+
+    it('returns null when the user has own accounts but ALL of them (and no site-wide) are dead', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'own-dead-1' },
+      ]);
+      mockGetSetting.mockResolvedValue(null);
+      const liveSpy = jest.spyOn(linkedInOutreachService, 'isAccountConnected').mockResolvedValue(false);
+
+      const result = await linkedInOutreachService.resolveAccountId('user-1');
+
+      expect(result).toBeNull();
+      liveSpy.mockRestore();
     });
 
     it('returns site-wide account_id when user has no account but site-wide accounts are configured', async () => {

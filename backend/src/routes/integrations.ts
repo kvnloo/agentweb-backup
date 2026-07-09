@@ -4,12 +4,13 @@ import crypto from 'crypto';
 const router = express.Router();
 
 /**
- * Linear webhook -> resolve bridge.
+ * Linear webhook — two jobs:
  *
- * Fires the customer-facing resolve bridge (intakeService.notifyCanonicalResolved: Resend email to
- * every reporter whose private Featurebase card is grouped onto the canonical, Featurebase card flip
- * to Completed, Slack ship ping) ONLY when a bug-canonical Linear issue TRANSITIONS INTO the Done
- * state. Two guards make this precise (ENG-222):
+ * 1. Resolve bridge: fires the customer-facing resolve bridge
+ *    (intakeService.notifyCanonicalResolved: Resend email to every reporter whose private
+ *    Featurebase card is grouped onto the canonical, Featurebase card flip to Completed, Slack ship
+ *    ping) ONLY when a bug-canonical Linear issue TRANSITIONS INTO the Done state. Two guards make
+ *    this precise (ENG-222):
  *
  *  1. Gate by the Done state ID (`LINEAR_DONE_STATE_ID`), not by state category. The board runs
  *     Merged -> Verifying -> Done and all three are completed-type; only Done is customer-communicable,
@@ -21,9 +22,16 @@ const router = express.Router();
  *     `stateId` there; a title/label edit on an already-Done issue (or an `action:'create'`) has no
  *     `stateId` in `updatedFrom` and must fire nothing (the email + card flip are not deduped).
  *
+ * 2. FB-synced issue enrichment (ENG-187 contract #4): feature requests become Linear issues via
+ *    Featurebase's own FB->Linear sync (never via this repo), marked with the "Featurebase" label.
+ *    On their creation event we enrich them with the reporter's funnel-stage labels + "Needs PM"
+ *    and settle them in Backlog (intakeService.enrichFeaturebaseSyncedIssue). Issues created by
+ *    our own code (bug canonicals, Auto issues) never carry that label and are untouched.
+ *
  * Mounted with express.raw() in app.ts (BEFORE express.json) so req.body is the raw Buffer —
  * required to verify Linear's HMAC-SHA256 `linear-signature` over the exact payload bytes.
- * Set LINEAR_WEBHOOK_SECRET to enforce the signature (skipped only if unset, e.g. local).
+ * Set LINEAR_WEBHOOK_SECRET to enforce the signature (skipped only if unset, e.g. local);
+ * verification runs before ANY event handling, both jobs included.
  */
 router.post('/linear/webhook', async (req, res) => {
   try {
@@ -39,18 +47,17 @@ router.post('/linear/webhook', async (req, res) => {
       if (!ok) return res.status(401).json({ error: 'invalid signature' });
     }
 
-    // Fail loud on missing config: without the Done-state ID we cannot safely gate customer comms,
-    // so refuse to fire (rather than silently emailing on any completed-type state). Returned 200 so
-    // Linear does not retry-storm; the distinct log line is the loud signal.
+    const payload = JSON.parse(raw.toString('utf8'));
+
+    // Fail loud on missing config for issue updates: without the Done-state ID we cannot safely
+    // decide whether customer comms should fire. Creation-only enrichment below does not need it.
     const doneStateId = process.env.LINEAR_DONE_STATE_ID || '';
-    if (!doneStateId) {
+    if (payload?.type === 'Issue' && payload?.action === 'update' && payload?.data?.id && !doneStateId) {
       console.error(
         '[linear-webhook] LINEAR_DONE_STATE_ID is not set — refusing to fire resolve bridge (config missing)',
       );
       return res.status(200).json({ ok: false, error: 'LINEAR_DONE_STATE_ID not configured' });
     }
-
-    const payload = JSON.parse(raw.toString('utf8'));
 
     // Only an `update` whose new state IS the Done state AND whose `updatedFrom` shows the state
     // actually changed (from something other than Done) counts as a transition into Done.
@@ -69,6 +76,26 @@ router.post('/linear/webhook', async (req, res) => {
       const { notifyCanonicalResolved } = await import('../services/intakeService');
       const r = await notifyCanonicalResolved(payload.data.id, payload.data.title || undefined);
       return res.json({ ok: true, notified: r.ticketNumbers.length, ticketNumbers: r.ticketNumbers });
+    }
+
+    // FB-synced issue creation -> funnel enrichment (ENG-187 contract #4). Creation-only: the
+    // "Featurebase" label is the sync's marker, and our own issueCreate calls never attach it
+    // (see linearService.createInternalLinearIssue), so everything else falls through untouched.
+    const created = payload?.type === 'Issue' && payload?.action === 'create' && payload?.data?.id;
+    if (created) {
+      const labels = payload?.data?.labels;
+      if (!Array.isArray(labels)) {
+        // Contract-drift guard: Linear's Issue payloads carry an expanded `labels` array today
+        // (same expansion the resolve bridge relies on for `data.state`). If that ever changes,
+        // FB-synced issues would silently stop enriching — make it loud instead.
+        if (Array.isArray(payload?.data?.labelIds) && payload.data.labelIds.length > 0) {
+          console.error(`[linear-webhook] issue ${payload.data.id} created with labelIds but NO expanded labels array — cannot detect a Featurebase-synced issue; enrichment skipped. Did Linear's payload contract drift?`);
+        }
+      } else if (labels.some((l: any) => l?.name === 'Featurebase')) {
+        const { enrichFeaturebaseSyncedIssue } = await import('../services/intakeService');
+        const r = await enrichFeaturebaseSyncedIssue({ issueId: payload.data.id, title: payload.data.title || '' });
+        return res.json({ ok: true, enriched: true, labels: r.labelNames });
+      }
     }
     return res.json({ ok: true, notified: 0 });
   } catch (e) {

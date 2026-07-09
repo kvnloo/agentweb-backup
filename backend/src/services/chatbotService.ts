@@ -4343,6 +4343,7 @@ export async function generateChatResponse(
     const PAGE_INVALIDATION_MAP: Record<string, string[]> = {
       'update_brand_guidelines': ['brand-guidelines'],
       'update_market_strategy': ['market-strategy'],
+      'regenerate_market_strategy': ['market-strategy', 'brand-guidelines'],
       'update_gtm_plan': ['gtm-plan'],
       'add_gtm_phase': ['gtm-plan'],
       'add_gtm_work_items': ['gtm-plan'],

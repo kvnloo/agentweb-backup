@@ -156,6 +156,22 @@ interface UserNote {
   authorEmail: string;
 }
 
+const FUNNEL_STATUS_OPTIONS = [
+  { value: "", label: "Unset" },
+  { value: "follow_up", label: "Follow-up" },
+  { value: "call_booking", label: "Call Booking" },
+  { value: "sales_conversation", label: "Sales Conversation" },
+  { value: "design_trial", label: "Design Trial" },
+  { value: "trial_agreed", label: "Trial Agreed" },
+  { value: "account_setup", label: "Account Setup" },
+  { value: "activation", label: "Activation" },
+  { value: "evaluation_period", label: "Evaluation Period" },
+  { value: "decision_day", label: "Decision Day" },
+  { value: "payment_conversion", label: "Payment Conversion" },
+  { value: "paid_retention_handoff", label: "Paid / Retention Handoff" },
+  { value: "parked", label: "Parked" },
+] as const;
+
 // Define ChatSession interface for the frontend, including portalType
 interface AdminChatSession {
   sessionId: string;
@@ -229,6 +245,7 @@ interface User {
   lastLoginTime?: string;
   lastActiveAt?: string;
   displayName?: string;
+  funnelStatus?: string | null;
   supportNote?: string;
   role?: "partner" | "customer" | "free" | "contractor"; // For single role from API
   roles?: ("partner" | "customer" | "free" | "contractor")[];
@@ -804,6 +821,7 @@ export default function AdminDashboard() {
   const [editingSupportNoteUserId, setEditingSupportNoteUserId] = useState<string | null>(null);
   const [currentSupportNoteText, setCurrentSupportNoteText] = useState("");
   const [supportNoteEditLoading, setSupportNoteEditLoading] = useState(false);
+  const [funnelStatusSavingUserId, setFunnelStatusSavingUserId] = useState<string | null>(null);
   const [userNotesMap, setUserNotesMap] = useState<Record<string, UserNote[]>>({});
   const [userNotesLoading, setUserNotesLoading] = useState<Record<string, boolean>>({});
   const [newNoteText, setNewNoteText] = useState<Record<string, string>>({});
@@ -2159,6 +2177,33 @@ export default function AdminDashboard() {
     } catch (error: any) {
       console.error("Error deleting user note:", error);
       setError(error.response?.data?.message || "Failed to delete note");
+    }
+  };
+
+  const handleSaveFunnelStatus = async (userId: string, funnelStatus: string) => {
+    try {
+      setFunnelStatusSavingUserId(userId);
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${userId}/funnel-status`),
+        { funnelStatus: funnelStatus || null },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      if (response.status === 200) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === userId
+              ? { ...user, funnelStatus: response.data.funnelStatus ?? null }
+              : user
+          )
+        );
+        setSuccess("Funnel status updated successfully!");
+      }
+    } catch (error: any) {
+      console.error("Error updating funnel status:", error);
+      setError(error.response?.data?.message || "Failed to update funnel status");
+    } finally {
+      setFunnelStatusSavingUserId(null);
     }
   };
 
@@ -4140,6 +4185,9 @@ export default function AdminDashboard() {
                   </TableCell>
                   <TableCell>Payment</TableCell>
                   <TableCell>
+                    <UserSortLabel property="funnelStatus" label="Funnel Status" />
+                  </TableCell>
+                  <TableCell>
                     <UserSortLabel property="createdAt" label="Created" />
                   </TableCell>
                   <TableCell>
@@ -4155,7 +4203,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={9} align="center">
+                    <TableCell colSpan={10} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -4259,6 +4307,22 @@ export default function AdminDashboard() {
                           )}
                           </Box>
                         </TableCell>
+                        <TableCell onClick={(e) => e.stopPropagation()}>
+                          <FormControl size="small" sx={{ minWidth: 160 }}>
+                            <Select
+                              value={FUNNEL_STATUS_OPTIONS.some((option) => option.value === (user.funnelStatus || "")) ? (user.funnelStatus || "") : ""}
+                              onChange={(e) => handleSaveFunnelStatus(user.userId, e.target.value)}
+                              disabled={funnelStatusSavingUserId === user.userId}
+                              displayEmpty
+                            >
+                              {FUNNEL_STATUS_OPTIONS.map((option) => (
+                                <MenuItem key={option.value || "unset"} value={option.value}>
+                                  {option.label}
+                                </MenuItem>
+                              ))}
+                            </Select>
+                          </FormControl>
+                        </TableCell>
                         <TableCell>
                           <Typography variant="body2" color="text.secondary">
                             {user.createdAt ? format(new Date(user.createdAt), "MMM d, yyyy") : "—"}
@@ -4300,7 +4364,7 @@ export default function AdminDashboard() {
                       </TableRow>
                       {/* Expandable detail row */}
                       <TableRow>
-                        <TableCell colSpan={9} sx={{ py: 0, borderBottom: isExpanded ? undefined : "none" }}>
+                        <TableCell colSpan={10} sx={{ py: 0, borderBottom: isExpanded ? undefined : "none" }}>
                           <Collapse in={isExpanded} timeout="auto" unmountOnExit>
                             <Box sx={{ py: 2, px: 1 }}>
                               <Grid container spacing={2}>

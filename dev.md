@@ -12,6 +12,30 @@ If `LINEAR_DONE_STATE_ID` is unset the handler refuses to fire (logs a distinct 
 ### Tests
 `backend/src/__tests__/integrations.linearWebhook.test.ts` (new — the route had zero tests): Merged/Verifying → 0 comms, already-Done edit → nothing, transition into Done → fires once, non-Done completed ID → nothing, missing config → loud no-op, signature enforcement. The Linear-side fix (git-automation merge→Merged, states created) shipped 2026-07-07; this is the code-side hardening (ENG-222).
 
+## "Priority: High" in text but priority field unset — root cause + fix (2026-07-07, ENG-231)
+
+Argusoft reported auto-generated Linear bugs whose descriptions say "Priority: High" while the actual Linear priority field is None and the issue sits in Backlog unassigned — invisible to priority-sorted triage. 11 live issues had this shape (ENG-167/189/190/191/197/200/201/202/203/209/213; hand-backfilled 2026-07-07).
+
+### Root cause (adversarially verified)
+`createInternalLinearIssue` (linearService) set only teamId/title/description/labelIds + stateId=Backlog — never `priority`/`assigneeId`. Emma's `report_product_issues` accepts a `priority: High|Medium|Low` param but only rendered it as description text via `issueContext['Priority']` → `contextLines()`. The legacy Notion path (`createOncallItem`) set an Owner + Move-to-Current-Sprint, so the Linear migration had silently regressed triage visibility.
+
+### Fix
+`FileUserIssueParams.priority` (text) is now mapped onto the Linear priority field in `fileBugReport` (urgent=1/high=2/medium=3/low=4; absent/unknown → Medium — bugs never arrive "No priority" per the board doc). High+ additionally lands `startInTodo` + default bug assignee (Harshit, env override `LINEAR_BUG_DEFAULT_ASSIGNEE_ID`). `getTeamMeta` resolves `todoStateId`; `createInternalLinearIssue` gained optional `priority`/`assigneeId`/`startInTodo`.
+
+### Assumptions to validate
+- Dup-grouped High re-reports do NOT escalate the existing canonical's priority/state (kept out of scope; the reporter-count modifier in the board doc may want this later).
+- `fileAutoIssue` (telemetry/oncall) still files unset-priority Backlog items by design — no text/field mismatch there, but they remain triage-invisible until ENG-187-style intake rules cover them.
+
+## LinkedIn send-invite returns "Invalid parameters" for a valid <200-char note — root cause + fix (2026-07-07)
+
+Scheduled LinkedIn outreach (ENG-213; reported by info@pmps.ai, session 3cac962b, and hit live on Hannah K's account NN-72jZtRD6nQSzEeK6n1g) kept failing send-invite with a generic `Invalid parameters`. The note-length red herring threw the first triage: the very first attempt failed correctly on a 203-char note (over LinkedIn's 200 limit), but after both notes were trimmed to 194 and 197 chars send-invite *still* returned `Invalid parameters` — for provider_id-based calls AND a profile_url-based call. search-people, get-profile, and list-sent-invitations all worked in the same session, so the fault was isolated to the invite endpoint, not auth or the note.
+
+### Root cause (identifier form, not note length)
+The agent passed a **public-identifier slug** (e.g. `william-kwak`, `leah-marcus-bab4981a0`) as `provider_id`. Unipile's profile-lookup endpoints accept *either* the slug or the canonical member URN, so `get-profile` and `search-people` worked fine — but Unipile's **invite** endpoint accepts **only** the canonical `provider_id` (member URN) and rejects a slug with the generic, undifferentiated `Invalid parameters`. Our send path (`LinkedInOutreachService.sendInvitation`) resolved the input via `resolveProviderId` (which for a slug just forwards the slug through) and sent that raw value straight to `client.users.sendInvitation`, so any slug-based invite was rejected regardless of note length.
+
+### Fix
+`checkIsNotAlreadyConnected` — the connection-check profile fetch we already perform before every invite — now **returns** the canonical `provider_id` revealed by the live profile lookup, and `sendInvitation` sends *that* rather than whatever identifier the caller passed. When the lookup fails or reveals no `provider_id`, it falls back to the passed identifier so a transient lookup failure never blocks (or breaks) the invite. No extra API call: we reuse the profile fetch that was already happening for the already-connected guard. Covered by the send-invite canonical-resolution test in `backend/src/__tests__/`.
+
 ## Featurebase feature requests land as run-on blobs in Linear — root cause + fix (2026-07-06)
 
 Customer feature requests filed via Emma's `report_product_issues` were showing up in Linear as one giant run-on paragraph (reported on ENG-204). Chased it to ground truth.
@@ -4187,15 +4211,12 @@ Processing batch: 13 schedules (Total scanned: 89)
 Processing batch: 19 schedules (Total scanned: 108)
   ✓ Updated 40 schedules, cleaned 2179 runResults entries so far...
 
-==================================================
 Repair process completed!
-==================================================
 Total schedules scanned: 108
 Total schedules updated: 43
 Total schedules skipped: 65 (no runResults or already cleaned)
 Total runResults entries cleaned: 2179
 Total errors: 0
-==================================================
 
 ✅ Repair completed successfully!
 
