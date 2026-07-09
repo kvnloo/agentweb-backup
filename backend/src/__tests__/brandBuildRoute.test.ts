@@ -56,7 +56,11 @@ describe("POST /api/onboarding/brand-build/start", () => {
         brandBuildStatus: "building",
         brandBuildStartedAt: "2026-04-24T12:00:00.000Z",
       });
-    const res = await request(app).post("/api/onboarding/brand-build/start");
+    // A real start supplies a website URL — without one the build is
+    // dead-on-arrival (see the needsUrl guard tests below).
+    const res = await request(app)
+      .post("/api/onboarding/brand-build/start")
+      .send({ companyUrl: "https://example.com" });
     expect(res.status).toBe(200);
     expect(userDb.updateUser).toHaveBeenCalledWith(
       "user-1",
@@ -120,10 +124,75 @@ describe("POST /api/onboarding/brand-build/start", () => {
     userDb.getUserById.mockResolvedValueOnce({ userId: "user-1" });
     userDb.updateUser.mockRejectedValue(new Error("dynamo down"));
     const spy = jest.spyOn(console, "error").mockImplementation(() => {});
-    const res = await request(app).post("/api/onboarding/brand-build/start");
+    const res = await request(app)
+      .post("/api/onboarding/brand-build/start")
+      .send({ companyUrl: "https://example.com" });
     expect(res.status).toBe(500);
     expect(res.body.message).toMatch(/Failed to start/);
     spy.mockRestore();
+  });
+
+  // ── ENG-238 root-cause guard: never start a build with no resolvable URL ──
+  // The dominant failure class (≈77% of brand-build failures in prod) was the
+  // FE POSTing /start with an empty companyUrl for a user who had no URL on
+  // their record. The build flipped to `building`, then the trigger's
+  // pickCompanyUrl returned null and it immediately failed with
+  // "no companyUrl on User record" — a dead-on-arrival build that surfaced as
+  // a failure metric and left the user stuck at `brand_submitted`.
+  it("does not start a build when no URL is resolvable, returning a needsUrl snapshot", async () => {
+    userDb.getUserById.mockResolvedValue({ userId: "user-1" });
+    const res = await request(app).post("/api/onboarding/brand-build/start");
+    expect(res.status).toBe(200);
+    // Must NOT flip to building or fire the (doomed) trigger.
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+    expect(res.body.status.needsUrl).toBe(true);
+    expect(res.body.status.brandBuildStatus).toBeUndefined();
+    expect(res.body.status.inFlight).toBe(false);
+  });
+
+  it("persists supplied name/goal but does not start a build when the URL is missing", async () => {
+    userDb.getUserById.mockResolvedValue({ userId: "user-1" });
+    userDb.updateUser.mockResolvedValue({ userId: "user-1" });
+    const res = await request(app)
+      .post("/api/onboarding/brand-build/start")
+      .send({ companyName: "Acme", goal: "paid_ads" });
+    expect(res.status).toBe(200);
+    // Only the input fields are persisted — never a building status flip.
+    expect(userDb.updateUser).toHaveBeenCalledWith(
+      "user-1",
+      expect.objectContaining({ companyName: "Acme", goal: "paid_ads" })
+    );
+    const writeArg = userDb.updateUser.mock.calls[0][1];
+    expect(writeArg).not.toHaveProperty("brandBuildStatus");
+    expect(res.body.status.needsUrl).toBe(true);
+  });
+
+  it("starts a build using a URL already persisted on the User record even when the body URL is empty", async () => {
+    userDb.updateUser.mockResolvedValue({ userId: "user-1" });
+    // The guard resolves the URL from the FIRST read (the `existing` fetch),
+    // which carries the persisted productDomain. The fallback reads (used by
+    // the fire-and-forget trigger microtask) intentionally omit the URL so the
+    // background trigger fast-fails at pickCompanyUrl instead of launching a
+    // real scrape — keeping this unit test hermetic, exactly like the
+    // "writes a building patch" case above.
+    userDb.getUserById
+      .mockResolvedValueOnce({
+        userId: "user-1",
+        productDomain: "https://saved.com",
+      })
+      .mockResolvedValue({
+        userId: "user-1",
+        brandBuildStatus: "building",
+        brandBuildStartedAt: "2026-04-24T12:00:00.000Z",
+      });
+    const res = await request(app).post("/api/onboarding/brand-build/start");
+    expect(res.status).toBe(200);
+    expect(userDb.updateUser).toHaveBeenCalledWith(
+      "user-1",
+      expect.objectContaining({ brandBuildStatus: "building" })
+    );
+    expect(res.body.status.brandBuildStatus).toBe("building");
+    expect(res.body.status.needsUrl).toBeUndefined();
   });
 });
 
