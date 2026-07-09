@@ -319,6 +319,33 @@ describe('apiTools', () => {
     });
   });
 
+  // ─── Emma delegation capability discovery (ENG-257) ──────────────────
+  // External MCP clients (e.g. Claude) only see these tool descriptions —
+  // there is no Meta/ads tool in the external set. If the delegation tools
+  // don't advertise Emma's Meta/social-ads capability, the client hallucinates
+  // that "Emma cannot connect to Meta" and refuses instead of delegating.
+  describe('emma delegation capability discovery', () => {
+    const getDesc = (name: string) => {
+      const def = mcpToolRegistry.getToolDefinitions().find((d: any) => d.name === name);
+      expect(def).toBeDefined();
+      return def!.description as string;
+    };
+
+    it('emma_send_message description advertises Meta/paid-ads capability so clients delegate instead of denying it', () => {
+      const desc = getDesc('emma_send_message').toLowerCase();
+      expect(desc).toContain('meta');
+      expect(desc).toContain('ad'); // "ads" / "ad campaigns"
+      // Must instruct the client to delegate rather than assume it's unsupported
+      expect(desc).toContain('delegate');
+    });
+
+    it('emma_create_session description signals Emma is a full GTM agent to delegate marketing work to', () => {
+      const desc = getDesc('emma_create_session').toLowerCase();
+      expect(desc).toContain('gtm');
+      expect(desc).toContain('emma');
+    });
+  });
+
   describe('enable_lead_list_public_access', () => {
     it('should call the dedicated public-access endpoint with { enabled: true }', async () => {
       mockMcpFetch.mockResolvedValue({ success: true, publicAccessEnabled: true });
