@@ -40,6 +40,17 @@ import { getUnipileProfileService } from './unipileProfileServiceFactory';
 // `crmEnrichmentService.ts:260-261`). Overridable via env for cost tuning.
 const EXTRACT_MODEL      = process.env.CRM_ENRICH_V3_EXTRACT_MODEL      || 'gpt-5-chat-2';
 const CRITIC_MODEL       = process.env.CRM_ENRICH_V3_CRITIC_MODEL       || 'gpt-5-chat-2';
+// The default deployment (gpt-5-chat-2) rejects ANY non-default temperature with
+// a 400 `unsupported_value` — "Only the default (1) value is supported" — and the
+// critic's catch swallowed it, so the critic never ran at all. `null` omits the
+// parameter. Point CRM_ENRICH_V3_CRITIC_MODEL at a deployment that accepts a
+// custom temperature and set CRM_ENRICH_V3_CRITIC_TEMPERATURE=0 for a
+// deterministic judge.
+const CRITIC_TEMPERATURE: number | null =
+  process.env.CRM_ENRICH_V3_CRITIC_TEMPERATURE !== undefined &&
+  process.env.CRM_ENRICH_V3_CRITIC_TEMPERATURE !== ''
+    ? Number(process.env.CRM_ENRICH_V3_CRITIC_TEMPERATURE)
+    : null;
 // Model used for Tier 4 web extraction — must support web search tool.
 // Set to a Gemini model (e.g. "gemini-2.0-flash") for Google Search grounding,
 // or an Azure deployment of gpt-4o-search-preview for OpenAI web_search_preview.
@@ -842,7 +853,7 @@ async function runCriticReal(input: {
     `Return ONLY JSON like {"field_a": "supported", "field_b": "contradicted"}.`;
 
   try {
-    const llm = createLLMService(CRITIC_MODEL, 0.0);
+    const llm = createLLMService(CRITIC_MODEL, CRITIC_TEMPERATURE);
     const parsed = await llm.generateJSONContent<Record<string, string>>(systemPrompt, userPrompt, 'json', undefined, { userId, feature: 'enrichment' });
     const verdicts: Record<string, any> = {};
     for (const claim of claims) {
@@ -853,7 +864,13 @@ async function runCriticReal(input: {
     }
     return { verdicts };
   } catch (err) {
-    console.warn('[v3 deps] critic failed:', (err as Error).message);
+    // Loud on purpose. This returns empty verdicts, which means every web-tier
+    // value sails through unchecked — the enrichment still reports ok=true. A
+    // 400 here went unnoticed long enough that the critic never ran once.
+    console.error(
+      `[v3 deps] CRITIC DISABLED — no verdicts, every web value passes unchecked. model=${CRITIC_MODEL} ` +
+      `temperature=${CRITIC_TEMPERATURE ?? 'default'}: ${(err as Error).message}`,
+    );
     return { verdicts: {} };
   }
 }
