@@ -408,6 +408,10 @@ $('searchClear').onclick = () => { S.search = ''; $('search').value = ''; $('sea
 // ---------- selection / detail ----------
 async function select(id) {
   S.sel = id; S.curBubble = null; S.stick = true;
+  document.title = id + ' · Autofix Chat'; // show the issue key in the browser tab
+  // Remember the open issue in the URL hash so a refresh (or a shared link) lands right back on it.
+  if (location.hash.slice(1) !== id) history.replaceState(null, '', '#' + id);
+
   clearBars();
   lastIssuesJson = ''; renderIssues();
   $('empty').style.display = 'none';
@@ -416,8 +420,16 @@ async function select(id) {
   $('chat').innerHTML = '';
   if (S.es) { S.es.close(); S.es = null; }
   try {
-    const d = await (await fetch(`/api/issues/${id}`)).json();
+    const res = await fetch(`/api/issues/${id}`);
     if (S.sel !== id) return;
+    if (!res.ok) { // stale hash (e.g. a bookmarked issue no longer tracked here) — fall back to the list
+      S.sel = null; document.title = 'Autofix Chat';
+      if (location.hash.slice(1) === id) history.replaceState(null, '', location.pathname + location.search);
+      $('empty').style.display = ''; $('hdr').style.display = 'none'; $('chat').style.display = 'none'; $('composer').style.display = 'none';
+      lastIssuesJson = ''; renderIssues();
+      return;
+    }
+    const d = await res.json();
     S.detail = d;
     renderHeader(d); renderAll(d);
     setBusy(!!d.busy);
@@ -1372,6 +1384,11 @@ document.addEventListener('keydown', (ev) => {
 // ---------- boot ----------
 loadIssues();
 setInterval(loadIssues, 30000);
+// Restore the issue named in the URL hash (a refresh, a bookmark, or a shared link), and follow
+// later hash changes (back/forward, manual edits). select() no-ops when it's already the open one.
+const hashId = () => decodeURIComponent(location.hash.replace(/^#/, '')).trim();
+if (hashId()) select(hashId());
+window.addEventListener('hashchange', () => { const id = hashId(); if (id && id !== S.sel) select(id); });
 </script>
 </body>
 </html>
