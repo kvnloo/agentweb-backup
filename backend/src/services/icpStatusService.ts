@@ -28,6 +28,8 @@
  * service tightens this at the LLM-output boundary.
  */
 
+import { randomUUID } from "crypto";
+
 export type ICPStatus = "idle" | "running" | "ready" | "failed";
 
 /**
@@ -47,6 +49,15 @@ export const ICP_PERSONA_FIELD_NAMES = [
 export type ICPPersonaField = (typeof ICP_PERSONA_FIELD_NAMES)[number];
 
 export interface ICPPersona {
+  /**
+   * Stable, server-minted identity for this persona card. Personas used to be
+   * addressed positionally (`icp-<index>`), but `/icp/delete-one` splices the
+   * array and the FE does not refetch, so the browser's indices silently drift
+   * off the stored ones — deleting one card made the next edit or regeneration
+   * hit its neighbour. Optional because records written before this existed
+   * carry no id; `GET /icp/status` backfills them.
+   */
+  id?: string;
   name: string;
   pain: string;
   desire: string;
@@ -92,6 +103,22 @@ const MAX_NAME_LEN = 200;
 const MAX_TEXT_LEN = 1000;
 const MAX_BRIEF_LEN = 2000;
 const MAX_ERROR_LEN = 512;
+const MAX_ID_LEN = 64;
+
+/** Shape of a server-minted persona id. Distinguishes it from `icp-<index>`. */
+export const MINTED_ICP_ID_RE = /^icp_[A-Za-z0-9_-]+$/;
+
+/**
+ * Assign a stable id to every persona that lacks one, leaving existing ids
+ * untouched. `mint` is injectable so tests can assert deterministically.
+ */
+export function ensurePersonaIds(
+  personas: ICPPersona[],
+  mint: () => string = () => `icp_${randomUUID()}`,
+): ICPPersona[] {
+  if (!Array.isArray(personas)) return [];
+  return personas.map((p) => (p?.id ? p : { ...p, id: mint() }));
+}
 
 /**
  * Compute a patch that marks ICP generation as just-started. Idempotent:
@@ -226,6 +253,7 @@ export function sanitizeICPPersonas(raw: unknown): ICPPersona[] {
       continue;
     }
     const persona: ICPPersona = {
+      ...(typeof v.id === "string" && v.id ? { id: v.id.slice(0, MAX_ID_LEN) } : {}),
       name: v.name.slice(0, MAX_NAME_LEN),
       pain: v.pain.slice(0, MAX_TEXT_LEN),
       desire: v.desire.slice(0, MAX_TEXT_LEN),

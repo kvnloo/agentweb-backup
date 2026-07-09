@@ -33,6 +33,7 @@ import {
   icpStartPatch,
   ICPPersona,
   ICP_PERSONA_FIELD_NAMES,
+  ensurePersonaIds,
   MAX_ICP_PERSONAS,
   sanitizeICPPersonas,
 } from "./icpStatusService";
@@ -413,7 +414,7 @@ export async function generateIcpsForUser(
   }
   // Use the same sanitiser the route layer uses on /complete bodies — keeps
   // the persistence shape consistent regardless of which path wrote it.
-  return sanitizeICPPersonas(raw.icps).slice(0, MAX_ICP_PERSONAS);
+  return ensurePersonaIds(sanitizeICPPersonas(raw.icps).slice(0, MAX_ICP_PERSONAS));
 }
 
 /**
@@ -452,9 +453,12 @@ function hasAnchor(persona: ICPPersona | undefined): boolean {
  * output (no drift across repeated regenerations).
  */
 function applyAnchor(fresh: ICPPersona, previous: ICPPersona): ICPPersona {
-  if (!hasAnchor(previous)) return fresh;
+  // Same card, new content: the FE's per-card spinner and removed-set are
+  // keyed on this id, so it must survive a regeneration.
+  const carried: ICPPersona = previous.id ? { ...fresh, id: previous.id } : fresh;
+  if (!hasAnchor(previous)) return carried;
   const intent = previous.userIntent!;
-  const merged: ICPPersona = { ...fresh, userIntent: intent };
+  const merged: ICPPersona = { ...carried, userIntent: intent };
   for (const field of ICP_PERSONA_FIELD_NAMES) {
     const anchored = intent[field];
     if (typeof anchored === "string") merged[field] = anchored;
@@ -755,7 +759,9 @@ export async function triggerIcpDiscoveryForUser(
     const existing: ICPPersona[] = Array.isArray((current as any)?.icpResult)
       ? ((current as any).icpResult as ICPPersona[])
       : [];
-    const personas = mergePreservingAnchoredPersonas(existing, generated);
+    const personas = ensurePersonaIds(
+      mergePreservingAnchoredPersonas(existing, generated),
+    );
     const patch = icpReadyPatch((current as any) || {}, personas);
     if (!patch) {
       // User no longer in `running` (UI navigated away or watchdog flipped).
