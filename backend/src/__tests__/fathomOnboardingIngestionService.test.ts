@@ -127,6 +127,34 @@ describe('fathomOnboardingIngestionService', () => {
     );
   });
 
+  it('uses the derived recording id to fetch Fathom text when only a recording URL is provided', async () => {
+    const getRecording = jest.fn(async () => ({
+      title: 'Acme sales call',
+      default_summary: { short_hand_bullet: 'Acme needs more qualified demos.' },
+      action_items: [{ text: 'Send onboarding plan.' }],
+    }));
+    const getTranscript = jest.fn(async () => [
+      { speaker: 'Jane', text: 'We need LinkedIn and email follow-up.' },
+    ]);
+    const FathomApiService = jest.fn().mockImplementation(() => ({ getRecording, getTranscript }));
+    const deps = makeDeps({
+      getFathomAccessToken: jest.fn(async () => 'fathom-token'),
+      FathomApiService,
+    });
+
+    const result = await ingestFathomOnboardingRecording({
+      recordingUrl: 'https://fathom.video/calls/123?timestamp=60',
+      fathomUserId: 'review-owner',
+      reviewOwnerUserId: 'review-owner',
+    }, deps as any);
+
+    expect(result.recordingId).toBe('123');
+    expect(FathomApiService).toHaveBeenCalledWith('fathom-token');
+    expect(getRecording).toHaveBeenCalledWith('123');
+    expect(getTranscript).toHaveBeenCalledWith('123');
+    expect(deps.llm.generateJsonRobust.mock.calls[0][1]).toContain('Acme sales call');
+  });
+
   it('matches cautiously by exact contact email before domain', async () => {
     const deps = makeDeps();
 

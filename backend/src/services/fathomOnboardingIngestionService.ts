@@ -334,7 +334,7 @@ export async function ingestFathomOnboardingRecording(
     throw new Error('reviewOwnerUserId is required.');
   }
 
-  const sourceText = await loadRecordingText(input, deps);
+  const sourceText = await loadRecordingText({ ...input, recordingId }, deps);
   if (!input.extractedContext && !sourceText) {
     throw new Error('meetingText, transcriptText, extractedContext, or fetchable Fathom recording text is required.');
   }
