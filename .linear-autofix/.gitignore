@@ -9,3 +9,6 @@ chat/chat-state.json
 chat/chat.log*
 chat/server.pid
 chat/locks/
+.credcheck.stamp
+.env.bak.*
+state.json.bak.*
