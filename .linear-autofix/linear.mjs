@@ -14,18 +14,42 @@ const ISSUE_FIELDS = `
   comments { nodes { id body createdAt user { name } } }
 `;
 
-async function gql(query, variables = {}) {
-  const key = process.env.LINEAR_API_KEY;
-  if (!key) throw new Error('LINEAR_API_KEY is not set');
+// When set (via useAssigneeLinearKey), ATTRIBUTED mutations — card status changes, comments, labels —
+// run as the issue assignee's own Linear key so the board credits them, not a shared bot. READS always
+// use the default LINEAR_API_KEY (the poller must see every assignee's issues).
+let attributionKey = null;
+const mutKey = () => attributionKey || process.env.LINEAR_API_KEY;
+
+async function gql(query, variables = {}, key) {
+  const auth = key || process.env.LINEAR_API_KEY;
+  if (!auth) throw new Error('LINEAR_API_KEY is not set');
   const res = await fetch(ENDPOINT, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: key },
+    headers: { 'Content-Type': 'application/json', Authorization: auth },
     body: JSON.stringify({ query, variables }),
   });
   const json = await res.json();
   if (json.errors) throw new Error('Linear API error: ' + JSON.stringify(json.errors));
   return json.data;
 }
+
+// Install the issue assignee's Linear API key so subsequent attributed mutations (status/comments/
+// labels) are performed AS the assignee — mirrors the per-person GitHub tokens. config.assigneeLinearKeyEnv
+// maps a Linear email to the ENV-VAR NAME holding that person's key. Reads are unaffected. Falls back to
+// the default key (returns null) when disabled / no mapping / the env var is empty. Per-issue processes only.
+export function useAssigneeLinearKey(assignee, log = () => {}) {
+  attributionKey = null;
+  if (config.statusAsAssignee === false || !assignee) { log('Status attribution: using the default Linear key.'); return null; }
+  const email = (assignee.email || '').trim();
+  const map = config.assigneeLinearKeyEnv || {};
+  const envName = email ? (map[email] || map[email.toLowerCase()]) : null;
+  const key = envName ? (process.env[envName] || '').trim() : '';
+  if (key) log(`Status attribution: card status/comments/labels will be set as the assignee (${email}) via their Linear key.`);
+  else log(`Status attribution: no Linear key configured for ${email || 'assignee'} — using the default Linear key.`);
+  attributionKey = key || null;
+  return attributionKey;
+}
+export function clearAssigneeLinearKey() { attributionKey = null; }
 
 // Accepts a human identifier ("LIN-123") or a raw issue UUID.
 export async function resolveIssue(ref) {
@@ -65,10 +89,29 @@ export async function listNewBugs() {
     : data.issues.nodes;
 }
 
+// Issues a human explicitly tagged with `forceLabel` (e.g. "autofix") to demand an immediate fix,
+// in a not-yet-started state. poll.mjs runs these ahead of the queue and bypasses the WIP cap.
+// Same team/assignee scoping as listNewBugs; the bug label is NOT required (the force label is the signal).
+export async function listForcedBugs() {
+  if (!config.forceLabel) return [];
+  const filter = {
+    labels: { name: { eqIgnoreCase: config.forceLabel } }, // forgiving on case: "autofix" / "Autofix" / "AutoFix"
+    state: { type: { in: config.pickupStateTypes } },
+  };
+  if (config.teamKey) filter.team = { key: { eq: config.teamKey } };
+  if (config.assigneeEmails?.length) filter.assignee = { email: { in: config.assigneeEmails } };
+  const data = await gql(
+    `query($filter: IssueFilter!){ issues(filter:$filter, first:50){ nodes{ ${ISSUE_FIELDS} } } }`,
+    { filter },
+  );
+  return data.issues.nodes;
+}
+
 export async function addComment(issueId, body) {
   const data = await gql(
     `mutation($input: CommentCreateInput!){ commentCreate(input:$input){ success } }`,
     { input: { issueId, body } },
+    mutKey(), // posted as the assignee when their Linear key is installed
   );
   return data.commentCreate.success;
 }
@@ -87,6 +130,7 @@ export async function moveIssue(issueId, stateId) {
   const data = await gql(
     `mutation($id:String!,$input:IssueUpdateInput!){ issueUpdate(id:$id, input:$input){ success } }`,
     { id: issueId, input: { stateId } },
+    mutKey(), // the status change is attributed to the assignee when their Linear key is installed
   );
   return data.issueUpdate.success;
 }
@@ -160,6 +204,7 @@ export async function setAutofixLabel(issue, name) {
     const created = await gql(
       `mutation($input: IssueLabelCreateInput!){ issueLabelCreate(input:$input){ issueLabel{ id name } } }`,
       { input: { name, teamId, color: AUTOFIX_LABEL_COLORS[name] || '#57606A' } },
+      mutKey(),
     );
     label = created.issueLabelCreate.issueLabel;
   }
@@ -169,5 +214,6 @@ export async function setAutofixLabel(issue, name) {
   await gql(
     `mutation($id:String!,$input:IssueUpdateInput!){ issueUpdate(id:$id, input:$input){ success } }`,
     { id: issue.id, input: { labelIds: [...keep, label.id] } },
+    mutKey(), // label change attributed to the assignee when their Linear key is installed
   );
 }
