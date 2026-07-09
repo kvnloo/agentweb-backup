@@ -19,9 +19,9 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { config } from '../config.mjs';
 import { resolveIssue } from '../linear.mjs';
-import { gitIdentityEnv, resolveAssigneeGhToken } from '../git-identity.mjs';
+import { gitIdentityEnv, resolveAssigneeGhToken, resolveAssigneeIdentity } from '../git-identity.mjs';
 import {
-  assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, countCommits, ensureProxy,
+  assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, unpushedRepos, countCommits, ensureProxy,
   headShas, resetTo,
 } from '../autofix.mjs';
 
@@ -38,6 +38,20 @@ const uiPath = path.join(__dirname, 'ui.html');
 const worktreesDir = path.resolve(agentRoot, config.worktreesDir);
 const CHAT = config.chat || {};
 const log = (...a) => console.log('[chat]', ...a);
+
+// Token/cost telemetry. One greppable `STATS` line per turn to the chat log so a Claude session on
+// the box can answer "what did this chat/issue cost?" from the logs. Aggregate tokens + total cost
+// (across the main model AND any background/subagent models) + turns + duration.
+const muTokens = (x) => (x ? (x.inputTokens || 0) + (x.outputTokens || 0) + (x.cacheReadInputTokens || 0) + (x.cacheCreationInputTokens || 0) : 0);
+function logTurnStats(kind, identifier, cap, result, sessionCostTotal) {
+  if (!result) return;
+  const u = result.usage || {};
+  const inT = u.input_tokens || 0, outT = u.output_tokens || 0, cr = u.cache_read_input_tokens || 0, cc = u.cache_creation_input_tokens || 0;
+  const mu = result.modelUsage || {};
+  const model = Object.keys(mu).sort((a, b) => muTokens(mu[b]) - muTokens(mu[a]))[0] || '?'; // primary (most-tokens) model
+  const cost = result.total_cost_usd || 0;
+  log(`STATS ${kind} ${identifier} cap=${cap} model=${model} in=${inT} out=${outT} cache_read=${cr} cache_creation=${cc} context=${inT + cr + cc} cost=$${cost.toFixed(4)} turns=${result.num_turns ?? '?'} dur=${result.duration_ms ? Math.round(result.duration_ms / 1000) + 's' : '?'}${sessionCostTotal != null ? ` | issue_session_total_cost=$${Number(sessionCostTotal).toFixed(4)}` : ''}`);
+}
 
 const fixEnabled = () => process.env.AUTOFIX_RUN_ENABLED === '1';
 const loadState = () => { try { return JSON.parse(readFileSync(statePath, 'utf8')); } catch { return {}; } };
@@ -109,6 +123,21 @@ async function fetchLinear(identifier) {
       comments: (issue.comments?.nodes || []).map((c) => ({ author: c.user?.name || 'someone', body: c.body, at: c.createdAt })),
     };
   } catch { return null; }
+}
+
+// Attribution for a full-mode turn's commits/PRs/merges. Prefer the CURRENT Linear assignee, so a
+// reassignment takes effect on the very next turn (history is untouched — only future actions switch).
+// Falls back to what the pipeline stored on the state entry if Linear is unreachable.
+async function attributionFor(identifier, entry) {
+  try {
+    const issue = await Promise.race([
+      resolveIssue(identifier),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000)),
+    ]);
+    const a = issue?.assignee;
+    if (a?.email) return { idEnv: gitIdentityEnv(resolveAssigneeIdentity(a)), email: a.email, who: `${a.email} (live)` };
+  } catch { /* Linear unreachable — fall back to the pipeline-stored assignee below */ }
+  return { idEnv: entry?.assignee ? gitIdentityEnv(entry.assignee) : {}, email: entry?.assigneeEmail || null, who: `${entry?.assigneeEmail || 'none'} (stored)` };
 }
 
 // One conversation per issue — no user-facing mode. Capability is decided per turn by the
@@ -379,6 +408,34 @@ async function claudeApiText(userMessage, model, timeoutMs, maxTokens = 600) {
   finally { clearTimeout(timer); }
 }
 
+// Account-level usage/rate-limit stats for the logged-in Claude subscription — the same data
+// `claude`'s /usage screen shows. GET /api/oauth/usage with the OAuth token. Cached briefly so
+// reopening /status doesn't hammer it. Returns { ok, usage } or { ok:false, error }.
+let usageCache = { at: 0, data: null };
+async function fetchOauthUsage() {
+  if (usageCache.data && Date.now() - usageCache.at < 5000) return usageCache.data;
+  const token = oauthToken();
+  if (!token) return { ok: false, error: 'not logged in (no valid OAuth token)' };
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 6000);
+  try {
+    const r = await fetch('https://api.anthropic.com/api/oauth/usage', {
+      headers: {
+        authorization: `Bearer ${token}`,
+        'anthropic-beta': 'oauth-2025-04-20',
+        'content-type': 'application/json',
+      },
+      signal: ac.signal,
+    });
+    if (!r.ok) return { ok: false, error: `usage fetch failed (HTTP ${r.status})` };
+    const usage = await r.json();
+    const data = { ok: true, usage };
+    usageCache = { at: Date.now(), data };
+    return data;
+  } catch (e) { return { ok: false, error: String(e.name === 'AbortError' ? 'timed out' : (e.message || e)) }; }
+  finally { clearTimeout(timer); }
+}
+
 // Self-heal fallback: if the direct API fails (usually an expired OAuth token that nothing has
 // refreshed yet), run the CLI once. It's slow (~7s) but it refreshes ~/.claude/.credentials.json as
 // a side effect, so the very next call goes back to the fast API path. Keeps voice fully dynamic.
@@ -455,8 +512,11 @@ function preamble(cap) {
   const rules = cap === 'full'
     ? 'If the developer asks for changes: apply them on the current branch with a minimal diff, follow the '
       + 'repo conventions (CLAUDE.md), verify your work yourself (run `npx tsc` in the changed packages and '
-      + 'targeted tests where they exist), and COMMIT the result. Never push and never open PRs — the '
-      + 'orchestrator pushes after you finish.'
+      + 'targeted tests where they exist), and COMMIT the result — commit everything so the working tree is '
+      + "clean. Your commits are pushed to the issue's open PR AUTOMATICALLY the moment this turn ends, so do "
+      + 'NOT run `git push` or open PRs yourself. When the developer asks you to "push", that just means: make '
+      + 'sure every change is committed — the push then happens on its own. Never re-apply or re-commit changes '
+      + 'that are already committed (that would create duplicate commits).'
     : 'This session is READ-ONLY: do not modify, commit, or push anything — read code/logs and answer.';
   return `${base}${rules}\n\nDeveloper's message: `;
 }
@@ -469,6 +529,12 @@ function historyBlock(msgs) {
   if (!kept.length) return '';
   const body = kept.map((mm) => `${mm.role === 'user' ? 'Developer' : 'You'}: ${mm.text}`).join('\n\n');
   return `\nConversation so far (context — continue from here, do not repeat it):\n${body}\n`;
+}
+
+// Injected into the first fresh turn after a /compact. The big session was dropped; this concise
+// summary stands in for the whole prior conversation so the agent continues seamlessly.
+function compactBlock(summary) {
+  return `\nSummary of the earlier conversation (it was compacted to save context — treat it as your memory of everything so far and continue from here):\n${summary}\n`;
 }
 
 function freshPrompt(cap, identifier, entry, linear, cwd, message, history = '') {
@@ -643,6 +709,7 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
     const histText = edit ? historyBlock(edit.retained) : '';
     let resumeSid;
     let prompt;
+    let usedCompact = false;
     if (edit) {
       resumeSid = edit.forkSid || null;
       prompt = resumeSid ? message : freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, message, histText);
@@ -651,6 +718,12 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
       resumeSid = (sameCwd && cs0.sessions?.chat) || null;
       if (resumeSid) {
         prompt = message;
+      } else if (cs0.compactSummary) {
+        // Post-compact: there's no chat session to resume (compaction dropped it on purpose). Start
+        // fresh seeded with the compaction summary instead of the pipeline session — that big
+        // transcript is exactly the context we just compacted away.
+        usedCompact = true;
+        prompt = freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, message, compactBlock(cs0.compactSummary));
       } else if (cwd !== agentRoot && pipelineSessionId(entry)) {
         resumeSid = pipelineSessionId(entry);
         prompt = preamble(cap) + message;
@@ -669,20 +742,23 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
         sid: resumeSid || null, tLines, ...(headBefore ? { headBefore } : {}),
       });
       cs.messages = cs.messages.slice(-500);
+      if (usedCompact) delete cs.compactSummary; // one-shot: baked into this fresh session's first prompt
       return cs;
     });
 
     const preCommits = cap === 'full' ? countCommits(detectChangedRepos(cwd)) : 0;
-    // Full-mode turns can commit to the open PR, and may open a NEW PR if asked. Attribute both to
+    // Full-mode turns can commit to the open PR, and may open/merge a PR if asked. Attribute both to
     // the issue's assignee, exactly like the pipeline: GIT_* gives commits the assignee's identity,
-    // and GH_TOKEN makes any `gh pr create` the agent runs open the PR as the assignee (falling back
-    // to the box `gh` account when no token is configured). Both are resolved from what the pipeline
-    // stored on the state entry — the git identity for commits, and the raw Linear email to key the
-    // PR-token map — so no extra Linear call. Read-only turns never write, so they keep the plain env.
+    // and GH_TOKEN makes any `gh pr create`/`gh pr merge` the agent runs act as the assignee (falling
+    // back to the box `gh` account when no token is configured). We resolve the CURRENT Linear assignee
+    // so a reassignment takes effect on the next turn, falling back to the pipeline-stored one if Linear
+    // is down. Read-only turns never write, so they keep the plain env.
+    const attr = cap === 'full' ? await attributionFor(identifier, entry) : null;
+    if (attr) log(`turn ${turnId} (${identifier}): attributing commits/PRs to ${attr.who}`);
     const turnEnv = (() => {
       if (cap !== 'full') return process.env;
-      const idEnv = entry?.assignee ? gitIdentityEnv(entry.assignee) : {};
-      const ghToken = entry?.assigneeEmail ? resolveAssigneeGhToken({ email: entry.assigneeEmail }) : null;
+      const idEnv = attr.idEnv || {};
+      const ghToken = attr.email ? resolveAssigneeGhToken({ email: attr.email }) : null;
       if (!Object.keys(idEnv).length && !ghToken) return process.env;
       return { ...process.env, ...idEnv, ...(ghToken ? { GH_TOKEN: ghToken } : {}) };
     })();
@@ -719,14 +795,21 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
     let fix = null;
     if (cap === 'full' && cwd !== agentRoot) {
       const changed = detectChangedRepos(cwd);
-      const committed = countCommits(changed) > preCommits;
-      let failed = [];
-      if (committed) {
-        emit({ type: 'status', text: 'Pushing to the open PR(s)…' });
-        failed = pushChanged(changed);
+      const newThisTurn = countCommits(changed) > preCommits;
+      // Push whatever is unpushed — commits made THIS turn AND any a prior turn committed but never
+      // pushed (e.g. a push that lost a race, or a turn that made no *new* commit and so used to
+      // skip the push). The chat server is the ONLY thing that pushes chat commits — nothing picks
+      // them up later — so we flush them here instead of stranding them "waiting for the orchestrator".
+      const pending = changed.length ? unpushedRepos(changed) : [];
+      if (pending.length || newThisTurn) {
+        let failed = [];
+        if (pending.length) {
+          emit({ type: 'status', text: 'Pushing to the open PR(s)…' });
+          failed = pushChanged(pending);
+        }
+        fix = { committed: true, newThisTurn, pushedOk: failed.length === 0, failedRepos: failed, prs: entry.prs || [] };
+        emit({ type: 'fix_summary', ...fix });
       }
-      fix = { committed, pushedOk: committed && failed.length === 0, failedRepos: failed, prs: entry.prs || [] };
-      if (committed) emit({ type: 'fix_summary', ...fix });
     }
 
     if (out.timedOut) emit({ type: 'error', error: `timed out after ${Math.round(m.timeoutMs / 60000)} min (killed)` });
@@ -741,8 +824,28 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
         tools: out.tools.slice(0, 50),
         ...(fix?.committed ? { fix } : {}),
       });
+      // Snapshot context/cost from the CLI result so /status and /context have real data. The last
+      // turn's (input + cache_read + cache_creation) ≈ the current context size; cost accumulates.
+      const u = out.result?.usage, mu = out.result?.modelUsage;
+      // An Opus turn still makes tiny background haiku calls (title/summary) and may spawn subagents on
+      // other models, so modelUsage has several keys. Pick the PRIMARY one — the model that did the most
+      // work (the user-facing agent) — not just the first key, so /status shows the real model and the
+      // context window is sized to it.
+      const muTot = (x) => (x ? (x.inputTokens || 0) + (x.outputTokens || 0) + (x.cacheReadInputTokens || 0) + (x.cacheCreationInputTokens || 0) : 0);
+      const mk = mu ? Object.keys(mu).sort((a, b) => muTot(mu[b]) - muTot(mu[a]))[0] : null;
+      if (u || mk) {
+        cs.usage = {
+          contextUsed: u ? ((u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0)) : (cs.usage?.contextUsed ?? null),
+          contextWindow: mk ? mu[mk].contextWindow : (cs.usage?.contextWindow ?? null),
+          model: mk || cs.usage?.model || null,
+          turns: out.result?.num_turns ?? null,
+          at: new Date().toISOString(),
+        };
+        cs.costTotal = (cs.costTotal || 0) + (out.result?.total_cost_usd || 0);
+      }
       return cs;
     });
+    logTurnStats('chat-turn', identifier, cap, out.result, loadChatState()[identifier]?.costTotal);
   } catch (e) {
     log(`turn ${turnId} (${identifier}) crashed:`, e);
     emit({ type: 'error', error: String(e.message || e) });
@@ -776,6 +879,144 @@ function startTurn(identifier, body) {
   activeTurns.set(identifier, { child: null, cap, turnId, startedAt: new Date().toISOString(), lockPath });
   runTurn(identifier, found.entry, cap, message, turnId, lockPath);
   return { code: 202, body: { turnId, cap } };
+}
+
+// "Merge PR(s)" button. Runs on the issue's own chat session (full context, and the merge log stays
+// in the conversation). Two phases: prep (ready + sync + fix CI + wait green, but DON'T merge, end
+// with a MERGE_READY / MERGE_BLOCKED marker) and, after the developer confirms, merge. The message
+// self-authorizes the gh actions, overriding the standard "don't push/merge" note in the session.
+const MERGE_PREP_MSG = [
+  '**Merge PR(s) — preparation.** Get every open PR on this issue ready to merge, but DO NOT merge yet.',
+  '',
+  'For each open PR on this issue (list them with `gh pr list --state open` in each repo):',
+  '1. If it is a draft, mark it ready: `gh pr ready <n>`.',
+  '2. Sync its branch with the base branch: `gh pr update-branch <n>` (or merge the latest base in), resolving any conflicts.',
+  '3. Check CI: `gh pr checks <n>`. If any check is failing, read the failing logs (`gh run view <run-id> --log-failed`), fix the code, and commit — your commit auto-pushes. Repeat until every check passes.',
+  '4. Wait for all checks to go green (`gh pr checks <n> --watch`).',
+  '',
+  'If the PRs depend on each other, handle them in the right order. You ARE authorized to run `gh pr ready`, `gh pr update-branch`, `gh pr checks`, and to commit for this task — this overrides the earlier note about not pushing. But do NOT run `gh pr merge` in this step.',
+  '',
+  'When ALL open PRs are green and mergeable, end your reply with a line containing only `MERGE_READY`.',
+  'If any PR cannot be made mergeable, end your reply with `MERGE_BLOCKED: <short reason>`.',
+].join('\n');
+const MERGE_DO_MSG = [
+  '**Merge PR(s) — confirmed by the developer.** Merge the PR(s) you just prepared.',
+  'For each PR, run `gh pr merge <n> --merge` (do NOT use `--delete-branch`). You are authorized to merge for this task.',
+  'If a merge is blocked, say why. Report the final state of each PR.',
+].join('\n');
+function startMergeTurn(identifier, body) {
+  const found = findEntry(identifier);
+  if (!found) return { code: 404, error: `no autofix record for ${identifier}` };
+  if (activeTurns.has(identifier)) return { code: 409, error: 'a turn is already running for this issue' };
+  if (capabilityOf(found.entry).level !== 'full') return { code: 400, error: 'merging requires a full-access session' };
+  if (!(found.entry.prs || []).filter(Boolean).length) return { code: 400, error: 'this issue has no PRs to merge' };
+  const lockPath = acquireFixLock(identifier);
+  if (!lockPath) return { code: 409, error: 'another fix run holds the lock for this issue' };
+  const message = body?.confirm ? MERGE_DO_MSG : MERGE_PREP_MSG;
+  const turnId = `t${Date.now()}-${++turnSeq}`;
+  activeTurns.set(identifier, { child: null, cap: 'full', turnId, startedAt: new Date().toISOString(), lockPath });
+  runTurn(identifier, found.entry, 'full', message, turnId, lockPath);
+  return { code: 202, body: { turnId, cap: 'full' } };
+}
+
+// "/compact" — summarize the conversation and drop the big session so future turns run on a tiny
+// context. We resume the live session (native full memory) and ask for a thorough hand-off summary,
+// then abandon that session: the summary is stashed as `compactSummary`, injected into the next
+// fresh turn (see runTurn's session strategy). cs.messages keeps a `compact` marker for the UI.
+const COMPACT_MSG = (extra) => [
+  'This conversation is being COMPACTED to free up the context window.',
+  'Write a thorough hand-off summary of everything that matters so that YOU — resumed later in a FRESH session with no memory of this transcript — can seamlessly keep helping the developer.',
+  '',
+  'Cover, with specifics (identifiers, file paths, commands, branch/PR names — never be vague):',
+  '- What the developer is trying to accomplish, and any explicit constraints or preferences they stated.',
+  '- Key decisions made and why.',
+  '- Current state: what has been changed/committed, branch and PR/CI status, what is verified vs still pending.',
+  '- What is left to do next.',
+  '- Any gotchas, dead-ends, or context worth carrying forward.',
+  extra ? `\nThe developer specifically asked you to focus the summary on: ${extra}` : '',
+  '',
+  'Output ONLY the summary as markdown prose. Do NOT run tools, take any action, or ask questions.',
+].filter(Boolean).join('\n');
+
+function startCompactTurn(identifier, body) {
+  const found = findEntry(identifier);
+  if (!found) return { code: 404, error: `no autofix record for ${identifier}` };
+  if (activeTurns.has(identifier)) return { code: 409, error: 'a turn is already running for this issue' };
+  const cs = loadChatState()[identifier] || {};
+  const hasHistory = !!(cs.sessions?.chat) || !!pipelineSessionId(found.entry) || (cs.messages || []).some((x) => x.text);
+  if (!hasHistory) return { code: 400, error: 'nothing to compact yet — send a message first' };
+  const cap = capabilityOf(found.entry).level;
+  // Take the lock even read-only: compaction rewrites session state and prunes forks, so gc must not
+  // race it (same rationale as edit/delete).
+  const lockPath = acquireFixLock(identifier);
+  if (!lockPath) return { code: 409, error: 'another operation holds the lock for this issue' };
+  const instructions = String(body?.instructions || '').trim().slice(0, 2000);
+  const turnId = `t${Date.now()}-${++turnSeq}`;
+  activeTurns.set(identifier, { child: null, cap, turnId, startedAt: new Date().toISOString(), lockPath });
+  runCompactTurn(identifier, found.entry, cap, turnId, lockPath, instructions);
+  return { code: 202, body: { turnId, cap } };
+}
+
+async function runCompactTurn(identifier, entry, cap, turnId, lockPath, instructions) {
+  const emit = (e) => broadcast(identifier, { turnId, ...e });
+  const m = CHAT[cap] || {};
+  let tee = null;
+  try {
+    emit({ type: 'turn_start', cap, compact: true });
+    emit({ type: 'status', text: 'Summarizing the conversation…' });
+
+    const loc = resolveCwd(identifier, entry, emit);
+    if (loc.error) { emit({ type: 'error', error: loc.error }); return; }
+    const cwd = loc.cwd;
+
+    const cs0 = loadChatState()[identifier] || {};
+    const sameCwd = !cs0.cwd || cs0.cwd === cwd;
+    const sid = (sameCwd && cs0.sessions?.chat) || pipelineSessionId(entry) || null;
+    // With a live session, resume it for native full context; otherwise summarize the display
+    // transcript we have (fresh turn with the messages re-injected as text).
+    const prompt = sid
+      ? COMPACT_MSG(instructions)
+      : freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, COMPACT_MSG(instructions), historyBlock(cs0.messages));
+
+    mkdirSync(path.join(logsDir, identifier), { recursive: true });
+    tee = createWriteStream(path.join(logsDir, identifier, `compact-${Date.now()}.txt`));
+    tee.write(`# compact turn ${turnId} cap=${cap} resume=${sid || 'none'} cwd=${cwd}\n${prompt}\n---\n`);
+    const onEvent = (e) => { tee.write(JSON.stringify(e) + '\n'); if (e.type === 'result' && e.isError) return; emit(e); };
+    const register = (child) => { const t = activeTurns.get(identifier); if (t) t.child = child; };
+
+    const out = await runClaudeStream(chatArgs(cap, sid), prompt, cwd, m.timeoutMs, onEvent, register);
+    if (aborted(identifier, turnId)) return;
+    if (out.timedOut) { emit({ type: 'error', error: `compaction timed out after ${Math.round(m.timeoutMs / 60000)} min (killed)` }); return; }
+
+    const summary = (out.texts.join('\n\n').trim()) || String(out.result?.result || '').trim();
+    if (!summary) { emit({ type: 'error', error: `compaction produced no summary${out.stderr ? `: ${out.stderr.slice(-200)}` : ''}` }); return; }
+
+    updateChatState(identifier, (cs) => {
+      // Abandon the chat session + its forks — the whole point is to stop resuming that big
+      // transcript. The next turn starts fresh, seeded with `compactSummary` (see runTurn).
+      pruneForks(cwd, cs.forks || [], null);
+      delete cs.sessions.chat;
+      cs.forks = [];
+      cs.compactSummary = summary;
+      cs.messages.push({ role: 'compact', text: summary, at: new Date().toISOString() });
+      cs.messages = cs.messages.slice(-500);
+      // Reflect the freed context immediately so /context isn't stuck showing the pre-compact size:
+      // the next turn carries roughly just the summary (~4 chars/token) plus a base for prompt+tools.
+      if (cs.usage) cs.usage = { ...cs.usage, contextUsed: Math.round(summary.length / 4) + 3000, at: new Date().toISOString() };
+      cs.costTotal = (cs.costTotal || 0) + (out.result?.total_cost_usd || 0);
+      return cs;
+    });
+    logTurnStats('compact', identifier, cap, out.result, loadChatState()[identifier]?.costTotal);
+    emit({ type: 'compacted', summary, turns: out.result?.num_turns, ms: out.result?.duration_ms });
+  } catch (e) {
+    log(`compact ${turnId} (${identifier}) crashed:`, e);
+    emit({ type: 'error', error: String(e.message || e) });
+  } finally {
+    try { tee?.end(); } catch { /* best-effort */ }
+    if (lockPath) { try { unlinkSync(lockPath); } catch { /* already gone */ } }
+    activeTurns.delete(identifier);
+    emit({ type: 'done' });
+  }
 }
 
 // Edit a previously-sent user message and re-run from there: drop that message + everything below
@@ -906,8 +1147,9 @@ async function route(req, res) {
     return;
   }
   if (req.method === 'GET' && p === '/api/issues') { json(res, 200, { fixEnabled: fixEnabled(), issues: listIssues() }); return; }
+  if (req.method === 'GET' && p === '/api/usage') { json(res, 200, await fetchOauthUsage()); return; }
 
-  const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat|\/preview)?$/);
+  const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat\/merge|\/chat\/compact|\/chat|\/preview)?$/);
   if (!m) { json(res, 404, { error: 'not found' }); return; }
   const identifier = m[1].toUpperCase();
   const sub = m[2] || '';
@@ -928,6 +1170,8 @@ async function route(req, res) {
       pipeline: buildPipeline(identifier, found.entry),
       linear: await fetchLinear(identifier),
       chat: { sessions: cs.sessions || {}, messages: cs.messages || [] },
+      usage: cs.usage || null, costTotal: cs.costTotal || 0, fixEnabled: fixEnabled(),
+      models: { full: CHAT.full?.model || null, readOnly: CHAT.readOnly?.model || null },
     });
     return;
   }
@@ -949,6 +1193,16 @@ async function route(req, res) {
   if (req.method === 'POST' && sub === '/chat/polish') {
     const r = await polishVoice(identifier, await readBody(req));
     json(res, r.code, r.body);
+    return;
+  }
+  if (req.method === 'POST' && sub === '/chat/merge') {
+    const r = startMergeTurn(identifier, await readBody(req));
+    json(res, r.code, r.body || { error: r.error });
+    return;
+  }
+  if (req.method === 'POST' && sub === '/chat/compact') {
+    const r = startCompactTurn(identifier, await readBody(req));
+    json(res, r.code, r.body || { error: r.error });
     return;
   }
   if (req.method === 'POST' && sub === '/chat/abort') {
@@ -988,4 +1242,7 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
 server.listen(CHAT.port || 8790, CHAT.bind || '127.0.0.1', () => {
   log(`listening on http://${CHAT.bind || '127.0.0.1'}:${CHAT.port || 8790} (fix ${fixEnabled() ? 'ENABLED' : 'disabled'})`);
   log(`tunnel: ssh -L ${CHAT.port || 8790}:localhost:${CHAT.port || 8790} ec2-user@<ip>`);
+  // Verify the per-assignee GitHub tokens + Linear keys map to the right owner on boot (non-blocking;
+  // logs to chat.log). Catches a swapped/expired credential before it silently mis-attributes.
+  try { spawn('node', [path.join(BASE, 'check-creds.mjs')], { stdio: 'inherit' }); } catch { /* best-effort */ }
 });
