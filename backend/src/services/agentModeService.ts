@@ -11112,6 +11112,25 @@ ${emailDraftFormat === 'text'
         response_format: { type: 'json_object' }
       });
 
+      // Shadow-meter this direct Azure completion (bypasses callLLM). Fail-open.
+      try {
+        const u: any = (completion as any)?.usage;
+        if (u) {
+          void recordUsage({
+            userId,
+            sessionId,
+            model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
+            provider: 'azure-openai',
+            feature: 'email_draft',
+            inputTokens: u.prompt_tokens || 0,
+            outputTokens: u.completion_tokens || 0,
+            cacheReadTokens: u.prompt_tokens_details?.cached_tokens || 0,
+          });
+        }
+      } catch {
+        // Metering must never break email drafting.
+      }
+
       const responseContent = completion.choices[0].message.content;
       if (!responseContent) {
         throw new Error('No content generated from LLM');
@@ -11212,6 +11231,24 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         max_tokens: 2048,
       } as any);
 
+      // Shadow-meter this direct Gemini completion (bypasses callLLM). Fail-open.
+      try {
+        const u: any = (messageCompletion as any)?.usage;
+        if (u) {
+          void recordUsage({
+            userId,
+            sessionId,
+            model: 'gemini-3.5-flash',
+            provider: 'gemini',
+            feature: 'invite_message',
+            inputTokens: u.prompt_tokens || 0,
+            outputTokens: u.completion_tokens || 0,
+          });
+        }
+      } catch {
+        // Metering must never break invite drafting.
+      }
+
       const messageResponseContent = messageCompletion.choices[0].message.content;
       if (!messageResponseContent) {
         throw new Error('No message content generated from LLM');
@@ -11246,7 +11283,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         // guarantee — same trimInviteMessage() the inline send path uses, kept consistent.
         if (noteText.length > inviteCharLimit) {
           const { shortenInviteNoteToLimit } = await import('./inviteNoteShortener');
-          noteText = await shortenInviteNoteToLimit(geminiClient, noteText, inviteCharLimit, 2);
+          noteText = await shortenInviteNoteToLimit(geminiClient, noteText, inviteCharLimit, 2, userId, sessionId);
         }
         messageDraft = {
           content: LinkedInOutreachService.trimInviteMessage(noteText, inviteCharLimit),
@@ -26915,7 +26952,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (llmTitles.length > 0) {
         try {
           const llmClient = await this.getClientForModel('gemini-2.5-flash');
-          const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, llmClient);
+          const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, llmClient, userId);
           for (let k = 0; k < llmIndices.length; k++) {
             const v = results[k];
             if (v && v !== 'NONE') leads[llmIndices[k]].company = v;
@@ -27850,6 +27887,7 @@ function parseCompanyFromTitle(title: any): string | null {
 async function batchParseCompaniesFromTitlesWithLLM(
   titles: string[],
   llmClient: any,
+  userId?: string,
 ): Promise<string[]> {
   if (!Array.isArray(titles) || titles.length === 0) return [];
   if (!llmClient?.chat?.completions?.create) return titles.map(() => 'NONE');
@@ -27878,6 +27916,24 @@ async function batchParseCompaniesFromTitlesWithLLM(
       max_completion_tokens: Math.max(500, titles.length * 30),
       temperature: 0.1,
     });
+    // Shadow-meter this direct Gemini completion (bypasses callLLM). Fail-open.
+    // Tokens are recorded even though gemini-2.5-flash may be unpriced (cost 0
+    // until a price row exists) — token visibility is still worth having.
+    try {
+      const u: any = (completion as any)?.usage;
+      if (u) {
+        void recordUsage({
+          userId,
+          model: 'gemini-2.5-flash',
+          provider: 'gemini',
+          feature: 'title_company_parse',
+          inputTokens: u.prompt_tokens || 0,
+          outputTokens: u.completion_tokens || 0,
+        });
+      }
+    } catch {
+      // Metering must never break title parsing.
+    }
     const raw = String(completion?.choices?.[0]?.message?.content ?? '').trim();
     // Gemini Flash often adds preamble / postamble / markdown fences despite
     // explicit instructions. Locate the widest `[ ... ]` substring instead of

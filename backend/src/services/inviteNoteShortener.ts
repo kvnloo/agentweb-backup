@@ -12,6 +12,8 @@
  * looped on over-limit notes in a real session, so it stays pure deterministic trim.
  */
 
+import { recordUsage } from './usageRecorderService';
+
 /** Extract the note text from a Gemini JSON-ish response, tolerating markdown fences. */
 function extractContent(raw: string): string {
   if (!raw) return '';
@@ -58,6 +60,8 @@ export async function shortenInviteNoteToLimit(
   note: string,
   limit: number,
   attempts: number = 2,
+  userId?: string,
+  sessionId?: string,
 ): Promise<string> {
   let best = note;
   if (best.length <= limit) return best;
@@ -76,6 +80,24 @@ ${best}`;
         temperature: 0.4,
         max_tokens: 2048,
       });
+      // Shadow-meter this direct Gemini completion (bypasses callLLM). Fail-open.
+      try {
+        const u: any = (completion as any)?.usage;
+        if (u) {
+          void recordUsage({
+            userId,
+            sessionId,
+            model: 'gemini-3.5-flash',
+            provider: 'gemini',
+            feature: 'invite_note_shorten',
+            inputTokens: u.prompt_tokens || 0,
+            outputTokens: u.completion_tokens || 0,
+          });
+        }
+      } catch {
+        // Metering must never break note shortening.
+      }
+
       const candidate = extractContent(completion?.choices?.[0]?.message?.content || '');
       // Only accept a candidate that actually moves us forward (shorter than best).
       if (candidate && candidate.length < best.length) best = candidate;

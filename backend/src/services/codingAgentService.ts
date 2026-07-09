@@ -13,6 +13,7 @@ import axios from 'axios';
 import { mcpFetch } from '../mcp/server/httpClient';
 import { agentModeService } from './agentModeService';
 import { getGitHubOrgToken, getSecret } from '../utils/secretsManager';
+import { recordUsage } from './usageRecorderService';
 import { getLandingPageById, getLandingPagesByOwner, canUserEditLandingPage, GeneratedLandingPage } from './v0Service';
 import { AcceptanceCheck, AcceptanceStatus, AcceptanceVerificationResult, verifyAcceptanceChecks } from './codingAgentAcceptance';
 import {
@@ -1918,6 +1919,28 @@ async function runCodingAgentInternal(
       // Report this turn's token usage if a consumer is listening (eval harness).
       if (context.onUsage && response.usage) {
         context.onUsage(response.usage as any);
+      }
+
+      // Shadow-meter every turn's spend. The coding loop can run many high-cost
+      // Bedrock/Claude iterations, so leaving it unmetered was the biggest hole in
+      // per-user cost data. Fire-and-forget + fail-open: never blocks/slows the run.
+      try {
+        const u: any = response.usage;
+        if (u) {
+          void recordUsage({
+            userId: context.userId,
+            sessionId: context.sessionId,
+            model,
+            provider: model.startsWith('claude-') ? 'vertex' : 'bedrock',
+            feature: 'coding_agent',
+            inputTokens: u.input_tokens || 0,
+            outputTokens: u.output_tokens || 0,
+            cacheReadTokens: u.cache_read_input_tokens || 0,
+            cacheWriteTokens: u.cache_creation_input_tokens || 0,
+          });
+        }
+      } catch {
+        // Metering must never break the coding loop.
       }
 
       // Add assistant message to history
