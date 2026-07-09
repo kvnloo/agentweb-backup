@@ -11586,12 +11586,14 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
     deps: {
       llm?: any;
       webSearchFn?: any;
+      loadStrategicContext?: (userId: string) => Promise<string | null>;
     } = {},
   ): Promise<any> {
     try {
       const { userDb } = await import('./db');
       const {
         extractIcpBrandContext,
+        applyOnboardingStrategicContext,
         generateIcpsForUser,
         mapIcpResultToMarketStrategy,
       } = await import('./onboardingIcpService');
@@ -11621,6 +11623,15 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         competitors: Array.isArray(existing?.competitors) ? existing.competitors.length : 0,
         icps: Array.isArray(existing?.icp) ? existing.icp.length : 0,
       };
+
+      // Load the user's edited onboarding source material into `brand` so a
+      // re-run reflects their updated inputs. Without this the ICPs are
+      // regenerated from the (unchanged) brand fields only and come back
+      // identical to the original set, making the source-material edit appear
+      // ignored (ENG-255). Mirrors the onboarding per-step path
+      // (`triggerIcpDiscoveryForUser`). Mutates `brand` in place, so the
+      // competitor step below sees the same context.
+      await applyOnboardingStrategicContext(userId, brand, deps.loadStrategicContext);
 
       // Generate ICPs first, then competitors (competitors need the ICPs as input).
       const personas = await generateIcpsForUser(brand, { llm: deps.llm }, userId);

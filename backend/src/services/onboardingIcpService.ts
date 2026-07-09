@@ -303,6 +303,37 @@ export async function loadOnboardingStrategicContextForUser(
 }
 
 /**
+ * Load the user's onboarding strategic context (their uploaded / edited source
+ * material) into `brand.strategicContext` when it isn't already populated.
+ * Mutates `brand` in place so callers that reuse the same object for downstream
+ * steps (e.g. competitor generation) also see the loaded material.
+ *
+ * Every path that regenerates ICPs from the user's inputs MUST call this before
+ * generating — both the onboarding per-step path (`triggerIcpDiscoveryForUser`)
+ * and Emma's "re-setup / refresh market strategy" path
+ * (`regenerateMarketStrategy` in agentModeService). Skipping the load makes an
+ * edit to the source material a silent no-op, so the regenerated ICPs come back
+ * identical to the original set (ENG-255).
+ *
+ * Best-effort: `loadOnboardingStrategicContextForUser` already swallows its own
+ * errors and returns null, so a KB read failure leaves `brand` untouched rather
+ * than throwing.
+ */
+export async function applyOnboardingStrategicContext(
+  userId: string,
+  brand: IcpBrandContext,
+  loadStrategicContext: (
+    userId: string,
+  ) => Promise<string | null> = loadOnboardingStrategicContextForUser,
+): Promise<void> {
+  if (brand.strategicContext) return;
+  const loadedContext = await loadStrategicContext(userId);
+  if (loadedContext) {
+    brand.strategicContext = loadedContext.slice(0, MAX_STRATEGIC_CONTEXT_CHARS);
+  }
+}
+
+/**
  * Inverse of `mapMarketIcpToResult` in `onboardingBrandBuildService.ts`.
  * Mirrors the v2 onboarding ICP result back to `User.marketStrategy.icp[]`
  * shape so the rest of the product (Agent Mode, chatbot, etc.) sees the
@@ -432,12 +463,7 @@ export async function triggerIcpDiscoveryForUser(
   const user = await userDb.getUserById(userId);
   if (!user) return;
   const brand = extractIcpBrandContext(user as any);
-  if (!brand.strategicContext) {
-    const loadedContext = await (deps.loadStrategicContext ?? loadOnboardingStrategicContextForUser)(userId);
-    if (loadedContext) {
-      brand.strategicContext = loadedContext.slice(0, MAX_STRATEGIC_CONTEXT_CHARS);
-    }
-  }
+  await applyOnboardingStrategicContext(userId, brand, deps.loadStrategicContext);
   try {
     const personas = await generateIcpsForUser(brand, deps, userId);
     const current = await userDb.getUserById(userId);
