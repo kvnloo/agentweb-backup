@@ -677,14 +677,46 @@ export async function regenerateSingleIcpForUser(
     const currentList: ICPPersona[] = Array.isArray(current.icpResult)
       ? [...current.icpResult]
       : [...personas];
-    if (index < currentList.length) currentList[index] = fresh;
+
+    // Re-resolve the target by its stable id, NOT by the index we started with.
+    // A concurrent /icp/delete-one during the ~20s LLM call shifts every later
+    // persona down a slot, so the original index now names a different card —
+    // splicing there would overwrite a persona the user never touched.
+    // (Records predating stable ids fall back to the bounded index.)
+    const spliceAt = target.id
+      ? currentList.findIndex((p) => p?.id === target.id)
+      : index < currentList.length
+        ? index
+        : -1;
+
+    if (spliceAt < 0) {
+      // The card was deleted while we were regenerating it. Nothing to write —
+      // but the status must still leave `running`, or the FE spins until it
+      // times out.
+      console.warn("[onboardingIcpService] regenerated persona no longer exists", {
+        userId,
+        icpId: target.id,
+      });
+      const gonePatch = icpReadyPatch(current, currentList);
+      if (gonePatch) await userDb.updateUser(userId, gonePatch as any);
+      return;
+    }
+
+    currentList[spliceAt] = fresh;
 
     const patch = icpReadyPatch(current, currentList);
-    if (!patch) return; // no longer running — a newer run owns this record
-    await userDb.updateUser(userId, patch as any);
+    if (patch) {
+      await userDb.updateUser(userId, patch as any);
+    } else {
+      // Not `running` any more: a concurrently-started regeneration of another
+      // card already completed and flipped the record to `ready`. Persist the
+      // persona anyway — dropping it loses the card the user asked for and
+      // leaves its spinner stuck. Status belongs to whoever owns it now.
+      await userDb.updateUser(userId, { icpResult: sanitizeICPPersonas(currentList) } as any);
+    }
     await mirrorIcpsToMarketStrategy(userId, currentList);
 
-    await regenerateCompetitorEntry(userId, current, brand, fresh, index, deps);
+    await regenerateCompetitorEntry(userId, current, brand, fresh, spliceAt, deps);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const current = await userDb.getUserById(userId);

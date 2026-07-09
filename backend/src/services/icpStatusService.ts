@@ -105,6 +105,15 @@ const MAX_BRIEF_LEN = 2000;
 const MAX_ERROR_LEN = 512;
 const MAX_ID_LEN = 64;
 
+/** Per-field caps, so an anchor can never outrun the field it anchors. */
+const PERSONA_FIELD_MAX_LEN: Record<ICPPersonaField, number> = {
+  name: MAX_NAME_LEN,
+  pain: MAX_TEXT_LEN,
+  desire: MAX_TEXT_LEN,
+  objection: MAX_TEXT_LEN,
+  meta_targeting_brief: MAX_BRIEF_LEN,
+};
+
 /** Shape of a server-minted persona id. Distinguishes it from `icp-<index>`. */
 export const MINTED_ICP_ID_RE = /^icp_[A-Za-z0-9_-]+$/;
 
@@ -225,7 +234,11 @@ export function sanitizeUserIntent(
   for (const field of ICP_PERSONA_FIELD_NAMES) {
     const value = src[field];
     if (typeof value === "string" && value.length > 0) {
-      out[field] = value.slice(0, MAX_BRIEF_LEN);
+      // Bound each anchor by the SAME cap as the field it anchors. A shared cap
+      // lets the anchor keep text that `sanitizeICPPersonas` truncates off the
+      // visible field — and since the anchor drives every later regeneration,
+      // the two would diverge further each time.
+      out[field] = value.slice(0, PERSONA_FIELD_MAX_LEN[field]);
     }
   }
   return Object.keys(out).length > 0 ? out : undefined;
