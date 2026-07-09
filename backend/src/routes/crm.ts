@@ -4480,7 +4480,7 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId, leadId } = req.params;
-    const { message, accountId: requestedAccountId } = req.body;
+    const { message, accountId: requestedAccountId, on_note_quota: onNoteQuotaDecision } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -4516,7 +4516,34 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     const note = message && typeof message === 'string' && message.trim() ? message.trim() : undefined;
     // Premium accounts allow 300-char invites; free accounts 200. Resolve per-account.
     const inviteCharLimit = await linkedInOutreachService.getInviteCharLimitForAccount(userId, accountId);
-    await linkedInOutreachService.sendInvitation(accountId, leadLinkedIn, true, note, inviteCharLimit);
+
+    // Note-quota policy (ENG-213). By default we HOLD rather than silently drop a note
+    // the customer deliberately wrote: if the monthly note quota is spent, the service
+    // throws `noteQuotaExceeded` and we return a decision gate so the UI can ask
+    // "send without note / cancel". The customer's answer comes back as
+    // `on_note_quota: 'send_without_note'`, which authorizes the note-less send.
+    const onNoteQuota: 'send_without_note' | 'skip' =
+      onNoteQuotaDecision === 'send_without_note' ? 'send_without_note' : 'skip';
+
+    let inviteResult: any;
+    try {
+      inviteResult = await linkedInOutreachService.sendInvitation(
+        accountId, leadLinkedIn, true, note, inviteCharLimit, { onNoteQuota },
+      );
+    } catch (inviteErr: any) {
+      if (inviteErr?.noteQuotaExceeded) {
+        // Held — nothing was sent and the lead is NOT marked invited. Ask the customer.
+        return res.json({
+          success: false,
+          noteQuotaExceeded: true,
+          message: inviteErr.message || 'LinkedIn note quota reached — the personalized note could not be attached.',
+        });
+      }
+      throw inviteErr;
+    }
+    // When the customer authorized a note-less send, the note was NOT delivered — don't
+    // record it as sent, or the cache/UI would falsely imply the personalization went out.
+    const noteDropped = !!(inviteResult && (inviteResult as any).note_dropped);
 
     const sentAt = new Date().toISOString();
     await crmDb.updateLead(listId, leadId, { linkedInInviteSentAt: sentAt });
@@ -4535,7 +4562,7 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
         publicProfileUrl: normalized,
         invitationId: '',
         invitedUserName: [lead.firstName, lead.lastName].filter(Boolean).join(' ') || '',
-        invitationText: note ?? '',
+        invitationText: noteDropped ? '' : (note ?? ''),
         sentAt,
         syncedAt: sentAt,
       });
@@ -4543,7 +4570,7 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
       console.warn('Failed to cache sent invitation (non-fatal):', cacheErr);
     }
 
-    return res.json({ success: true, linkedInInviteSentAt: sentAt });
+    return res.json({ success: true, linkedInInviteSentAt: sentAt, noteDropped });
   } catch (error: any) {
     console.error('Error sending LinkedIn invite:', error);
     return res.status(500).json({ message: error.message || 'Failed to send LinkedIn invite' });

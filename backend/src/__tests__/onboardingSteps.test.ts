@@ -31,6 +31,12 @@ jest.mock("../services/onboardingIcpService", () => {
       const { icpStartPatch } = require("../services/icpStatusService");
       await userDb.updateUser(userId, icpStartPatch());
     }),
+    // ENG-255: /icp/regenerate-one must regenerate ONE persona, not the set.
+    regenerateSingleIcpForUser: jest.fn(async (userId: string) => {
+      const { userDb } = require("../services/db");
+      const { icpStartPatch } = require("../services/icpStatusService");
+      await userDb.updateUser(userId, icpStartPatch());
+    }),
   };
 });
 
@@ -725,5 +731,86 @@ describe("/icp/start and /competitor/start delegate to onboarding services", () 
     expect(res.status).toBe(200);
     expect(startCompetitorStrategyForUser).toHaveBeenCalledTimes(1);
     expect(startCompetitorStrategyForUser).toHaveBeenCalledWith("user-1");
+  });
+});
+
+// ─────────────────────────────── ENG-255 ───────────────────────────────
+//
+// "Regenerate this one" used to regenerate all five personas and destroy any
+// hand-edited text, because the route validated `icpId` and then discarded it
+// in favour of the set-level `startIcpDiscoveryForUser`.
+
+describe("POST /api/onboarding/icp/regenerate-one", () => {
+  const {
+    regenerateSingleIcpForUser,
+    startIcpDiscoveryForUser,
+  } = require("../services/onboardingIcpService");
+
+  beforeEach(() => jest.clearAllMocks());
+
+  it("regenerates only the requested persona, not the whole set", async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      icpStatus: "ready",
+      icpResult: goodPersonas,
+    });
+
+    const res = await request(app)
+      .post("/api/onboarding/icp/regenerate-one")
+      .send({ icpId: "icp-1" });
+
+    expect(res.status).toBe(200);
+    expect(regenerateSingleIcpForUser).toHaveBeenCalledTimes(1);
+    expect(regenerateSingleIcpForUser).toHaveBeenCalledWith("user-1", 1);
+    expect(startIcpDiscoveryForUser).not.toHaveBeenCalled();
+  });
+
+  it("400s on a malformed icpId without regenerating anything", async () => {
+    const res = await request(app)
+      .post("/api/onboarding/icp/regenerate-one")
+      .send({ icpId: "not-an-icp-id" });
+
+    expect(res.status).toBe(400);
+    expect(regenerateSingleIcpForUser).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/onboarding/icp/edit-one records the user's words as an anchor", () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it("stores the patched fields in userIntent so regeneration can honour them", async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      icpResult: goodPersonas.map((p) => ({ ...p })),
+    });
+
+    const res = await request(app)
+      .post("/api/onboarding/icp/edit-one")
+      .send({ icpId: "icp-0", patch: { name: "patients and healthcare professionals." } });
+
+    expect(res.status).toBe(200);
+    const written = userDb.updateUser.mock.calls.at(-1)![1].icpResult;
+    expect(written[0].name).toBe("patients and healthcare professionals.");
+    expect(written[0].userIntent).toEqual({
+      name: "patients and healthcare professionals.",
+    });
+    // Untouched fields are not anchored — regeneration is free to rewrite them.
+    expect(written[0].userIntent.pain).toBeUndefined();
+  });
+
+  it("merges a second edit into the existing anchor", async () => {
+    const seeded = goodPersonas.map((p) => ({ ...p }));
+    (seeded[0] as any).userIntent = { name: "first edit" };
+    userDb.getUserById.mockResolvedValue({ userId: "user-1", icpResult: seeded });
+
+    await request(app)
+      .post("/api/onboarding/icp/edit-one")
+      .send({ icpId: "icp-0", patch: { pain: "second edit" } });
+
+    const written = userDb.updateUser.mock.calls.at(-1)![1].icpResult;
+    expect(written[0].userIntent).toEqual({
+      name: "first edit",
+      pain: "second edit",
+    });
   });
 });
