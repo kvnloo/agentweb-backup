@@ -165,7 +165,7 @@ mcpToolRegistry.register({
   name: 'emma_create_session',
   definition: {
     name: 'emma_create_session',
-    description: 'Create a new Emma chat session.',
+    description: 'Create a new Emma chat session. Emma is a full GTM (go-to-market) automation agent — the entry point for delegating any marketing/growth task to her via emma_send_message. Emma has deeper, connected access than these MCP tools expose directly, including Meta (Facebook/Instagram) Ads, other paid social ads, CRM/lead engagement, social posting, content, landing pages, and multi-step work plans. Do NOT assume a capability (e.g. Meta / paid ads) is unavailable before creating a session and delegating the request to Emma.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -184,7 +184,7 @@ mcpToolRegistry.register({
   name: 'emma_send_message',
   definition: {
     name: 'emma_send_message',
-    description: 'Send a message to an Emma chat session and get a response.',
+    description: 'Send a message to an Emma chat session and get a response. Delegate the user\'s actual marketing/growth request here in natural language and Emma executes it end to end. Emma CAN connect to and operate Meta (Facebook/Instagram) Ads — create, launch, and manage paid ad campaigns and other social ads — as well as CRM/lead engagement, social posting, content creation, landing pages, and multi-step work plans. When a user asks to create or manage a Meta / paid-ads / social-ads campaign, delegate it by messaging Emma (e.g. "kick off a work plan for a B2B social ads campaign") rather than replying that the capability is unsupported.',
     inputSchema: {
       type: 'object',
       properties: {
