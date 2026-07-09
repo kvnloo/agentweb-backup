@@ -152,7 +152,7 @@ describe('fathomOnboardingIngestionService', () => {
     expect(FathomApiService).toHaveBeenCalledWith('fathom-token');
     expect(getRecording).toHaveBeenCalledWith('123');
     expect(getTranscript).toHaveBeenCalledWith('123');
-    expect(deps.llm.generateJsonRobust.mock.calls[0][1]).toContain('Acme sales call');
+    expect((deps.llm.generateJsonRobust as jest.Mock).mock.calls[0][1]).toContain('Acme sales call');
   });
 
   it('matches cautiously by exact contact email before domain', async () => {
