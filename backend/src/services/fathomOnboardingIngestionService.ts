@@ -7,6 +7,15 @@ type Confidence = 'manual' | 'high' | 'medium' | 'low';
 type MatchStatus = 'matched' | 'needs_review';
 type IngestionStatus = 'needs_review' | 'reviewed' | 'failed';
 type ExtractionState = 'auto_extracted' | 'human_reviewed';
+type AutomationMode = 'manual' | 'auto_draft';
+type FathomCallClassification = 'onboarding' | 'prospect' | 'customer' | 'internal' | 'personal' | 'ignore' | 'unknown';
+type FathomAutomationState =
+  | 'manual_review'
+  | 'ignored'
+  | 'review_only'
+  | 'matched_existing'
+  | 'draft_account_created'
+  | 'failed';
 
 export interface FathomOnboardingSourceReference {
   label: string;
@@ -15,6 +24,9 @@ export interface FathomOnboardingSourceReference {
 }
 
 export interface FathomOnboardingContext {
+  callClassification?: FathomCallClassification | null;
+  classificationConfidence?: number | null;
+  classificationReason?: string | null;
   companyName?: string | null;
   primaryContactName?: string | null;
   primaryContactEmail?: string | null;
@@ -34,6 +46,7 @@ export interface FathomOnboardingContext {
   stakeholders?: string[];
   trialOrPaymentStage?: string | null;
   followUpCommitments?: string[];
+  featureRequestDrafts?: string[];
   confidenceByField?: Record<string, number>;
   sourceReferences?: FathomOnboardingSourceReference[];
 }
@@ -48,6 +61,11 @@ export interface FathomOnboardingIngestion {
   targetLead?: Record<string, any> | null;
   matchReason?: string;
   matchConfidence?: Confidence;
+  automationState?: FathomAutomationState;
+  draftUserId?: string | null;
+  draftEmail?: string | null;
+  safetyFlags?: string[];
+  featureRequestDrafts?: string[];
   memoryIds: string[];
   orgMemoryIds: string[];
   reviewOwnerUserId: string;
@@ -71,13 +89,15 @@ interface IngestInput {
   reviewOwnerUserId: string;
   targetUserId?: string;
   reviewed?: boolean;
+  automationMode?: AutomationMode;
+  allowDraftAccountCreation?: boolean;
   meetingText?: string;
   transcriptText?: string;
   extractedContext?: FathomOnboardingContext;
 }
 
 interface IngestDeps {
-  userDb: Pick<typeof userDb, 'getUserById' | 'getUserByEmail' | 'getUsersByEmailDomain' | 'updateUser'>;
+  userDb: Pick<typeof userDb, 'getUserById' | 'getUserByEmail' | 'getUsersByEmailDomain' | 'updateUser' | 'createFathomDraftUser'>;
   crmDb: Pick<typeof crmDb, 'findLeadsByEmail'>;
   accountMemoryDb: Pick<typeof accountMemoryDb, 'addMemory'>;
   orgMemoryDb: Pick<typeof orgMemoryDb, 'addMemory'>;
@@ -88,6 +108,8 @@ interface IngestDeps {
 }
 
 const MAX_INGESTIONS_PER_USER = 25;
+const AUTOMATION_CONFIDENCE_THRESHOLD = 0.75;
+const ACTIONABLE_CALL_CLASSIFICATIONS = new Set<FathomCallClassification>(['onboarding', 'prospect']);
 
 const defaultDeps = (): IngestDeps => ({
   userDb,
@@ -145,9 +167,32 @@ function normalizeEmail(value?: string | null): string | null {
   return email && email.includes('@') ? email : null;
 }
 
+function normalizeClassification(value?: string | null): FathomCallClassification {
+  const normalized = clean(value).toLowerCase();
+  if (
+    normalized === 'onboarding' ||
+    normalized === 'prospect' ||
+    normalized === 'customer' ||
+    normalized === 'internal' ||
+    normalized === 'personal' ||
+    normalized === 'ignore'
+  ) {
+    return normalized;
+  }
+  return 'unknown';
+}
+
+function normalizeConfidence(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  return Math.max(0, Math.min(1, value));
+}
+
 function normalizeContext(input: FathomOnboardingContext, recordingUrl?: string): FathomOnboardingContext {
   return {
     ...input,
+    callClassification: normalizeClassification(input.callClassification),
+    classificationConfidence: normalizeConfidence(input.classificationConfidence),
+    classificationReason: clean(input.classificationReason) || null,
     companyName: clean(input.companyName) || null,
     primaryContactName: clean(input.primaryContactName) || null,
     primaryContactEmail: normalizeEmail(input.primaryContactEmail),
@@ -167,6 +212,7 @@ function normalizeContext(input: FathomOnboardingContext, recordingUrl?: string)
     stakeholders: compact(input.stakeholders),
     trialOrPaymentStage: clean(input.trialOrPaymentStage) || null,
     followUpCommitments: compact(input.followUpCommitments),
+    featureRequestDrafts: compact(input.featureRequestDrafts),
     confidenceByField: input.confidenceByField ?? {},
     sourceReferences: input.sourceReferences?.length
       ? input.sourceReferences
@@ -184,15 +230,19 @@ export async function extractFathomOnboardingContext(
   const systemPrompt =
     'Extract onboarding context from a sales, prospect, or onboarding call. ' +
     'Return only JSON. Separate facts from speculation. Use null or [] when a field is missing. ' +
-    'Do not invent contact emails, websites, budgets, or timelines.';
+    'Classify whether this is an onboarding, prospect, customer, internal, personal, ignore, or unknown call. ' +
+    'Do not invent contact emails, websites, budgets, timelines, or feature requests.';
   const userPrompt = `Source Fathom URL: ${recordingUrl || 'unknown'}\n\n` +
-    'Return this shape: {"companyName":string|null,"primaryContactName":string|null,' +
+    'Return this shape: {"callClassification":"onboarding"|"prospect"|"customer"|"internal"|"personal"|"ignore"|"unknown",' +
+    '"classificationConfidence":number,"classificationReason":string|null,' +
+    '"companyName":string|null,"primaryContactName":string|null,' +
     '"primaryContactEmail":string|null,"website":string|null,"productCategory":string|null,' +
     '"icp":string|null,"primaryGtmGoal":string|null,"relevantChannels":string[],' +
     '"winMetric":string|null,"urgency":string|null,"setupBlockers":string[],' +
     '"productFitNotes":string[],"featureGapsOrRisks":string[],"suggestedFirstWinPath":string|null,' +
     '"competitorsOrToolsMentioned":string[],"budgetOrPricingSensitivity":string|null,' +
     '"stakeholders":string[],"trialOrPaymentStage":string|null,"followUpCommitments":string[],' +
+    '"featureRequestDrafts":string[],' +
     '"confidenceByField":Record<string,number>,"sourceReferences":[{"label":string,"url":string,"timestampSeconds"?:number}]}\n\n' +
     sourceText.slice(0, 60000);
 
@@ -236,6 +286,74 @@ export async function matchFathomOnboardingTarget(
   }
 
   return { status: 'needs_review', confidence: 'low', reason: 'manual_review_required', userId: null, lead: null };
+}
+
+function buildAutomationSafetyFlags(context: FathomOnboardingContext): string[] {
+  const flags: string[] = [];
+  const classification = normalizeClassification(context.callClassification);
+  const confidence = normalizeConfidence(context.classificationConfidence) ?? 0;
+
+  if (!ACTIONABLE_CALL_CLASSIFICATIONS.has(classification)) {
+    flags.push(`non_actionable_call:${classification}`);
+  }
+  if (confidence < AUTOMATION_CONFIDENCE_THRESHOLD) {
+    flags.push('low_classification_confidence');
+  }
+  if (!context.companyName && !context.website) {
+    flags.push('missing_company_identity');
+  }
+  if (!context.primaryContactEmail && !context.primaryContactName) {
+    flags.push('missing_primary_contact');
+  }
+  return flags;
+}
+
+function sanitizeRecordingKey(recordingId: string): string {
+  return recordingId.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64) || 'unknown';
+}
+
+function buildDraftAccountIdentity(recordingId: string): { userId: string; email: string } {
+  const key = sanitizeRecordingKey(recordingId);
+  return {
+    userId: `fathom-draft-${key}`,
+    email: `fathom+${key}@agentweb.internal`,
+  };
+}
+
+async function createOrReuseDraftAccount(
+  recordingId: string,
+  context: FathomOnboardingContext,
+  input: IngestInput,
+  deps: IngestDeps,
+): Promise<{ userId: string; email: string }> {
+  const identity = buildDraftAccountIdentity(recordingId);
+  const existing = await deps.userDb.getUserByEmail(identity.email);
+  if (existing?.userId) {
+    return { userId: existing.userId, email: identity.email };
+  }
+
+  const created = await deps.userDb.createFathomDraftUser({
+    email: identity.email,
+    userId: identity.userId,
+    displayName: context.primaryContactName || context.companyName || `Fathom draft ${recordingId}`,
+    companyName: context.companyName || undefined,
+    reviewOwnerUserId: input.reviewOwnerUserId,
+    sourceRecordingId: recordingId,
+    sourceRecordingUrl: input.recordingUrl,
+    sourceContactEmail: context.primaryContactEmail || undefined,
+    sourceContactName: context.primaryContactName || undefined,
+    sourceWebsite: context.website || undefined,
+  } as any);
+
+  if (!created?.userId) {
+    const retry = await deps.userDb.getUserByEmail(identity.email);
+    if (retry?.userId) {
+      return { userId: retry.userId, email: identity.email };
+    }
+    throw new Error(`Failed to create Fathom draft account for recording ${recordingId}.`);
+  }
+
+  return { userId: created.userId, email: identity.email };
 }
 
 export function buildFathomOnboardingMemoryContent(
@@ -350,6 +468,34 @@ export async function ingestFathomOnboardingRecording(
     ? { status: 'matched', confidence: 'manual', reason: 'manual_target_user', userId: input.targetUserId, lead: null }
     : await matchFathomOnboardingTarget(context, deps);
 
+  const automationMode: AutomationMode = input.automationMode || 'manual';
+  const safetyFlags = automationMode === 'auto_draft' ? buildAutomationSafetyFlags(context) : [];
+  const canCreateDraft =
+    automationMode === 'auto_draft' &&
+    input.allowDraftAccountCreation === true &&
+    !target.userId &&
+    safetyFlags.length === 0;
+  let draftUserId: string | null = null;
+  let draftEmail: string | null = null;
+  let automationState: FathomAutomationState | undefined;
+
+  if (automationMode === 'auto_draft') {
+    if (target.userId) {
+      automationState = 'matched_existing';
+    } else if (canCreateDraft) {
+      const draft = await createOrReuseDraftAccount(recordingId, context, input, deps);
+      draftUserId = draft.userId;
+      draftEmail = draft.email;
+      target.userId = draft.userId;
+      target.reason = 'fathom_auto_draft_account';
+      target.confidence = 'medium';
+      automationState = 'draft_account_created';
+    } else {
+      const classification = normalizeClassification(context.callClassification);
+      automationState = ACTIONABLE_CALL_CLASSIFICATIONS.has(classification) ? 'review_only' : 'ignored';
+    }
+  }
+
   const ledgerUserId = target.userId || input.reviewOwnerUserId;
   const ledgerUser = await deps.userDb.getUserById(ledgerUserId);
   if (!ledgerUser) {
@@ -393,6 +539,11 @@ export async function ingestFathomOnboardingRecording(
     targetLead: target.lead,
     matchReason: target.reason,
     matchConfidence: target.confidence,
+    automationState: automationState || (automationMode === 'manual' ? 'manual_review' : undefined),
+    draftUserId,
+    draftEmail,
+    safetyFlags,
+    featureRequestDrafts: context.featureRequestDrafts || [],
     memoryIds,
     orgMemoryIds,
     reviewOwnerUserId: input.reviewOwnerUserId,

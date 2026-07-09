@@ -74,6 +74,45 @@ describe('fathomOnboardingAdminRoutes', () => {
     expect(ingestFathomOnboardingRecording).not.toHaveBeenCalled();
   });
 
+  it('runs automation mode through the admin auto-ingest endpoint without accepting a target user', async () => {
+    (ingestFathomOnboardingRecording as jest.Mock).mockResolvedValue({
+      recordingId: 'auto-1',
+      status: 'needs_review',
+      automationState: 'draft_account_created',
+      draftUserId: 'fathom-draft-auto-1',
+      draftEmail: 'fathom+auto-1@agentweb.internal',
+      context: { companyName: 'Auto Co' },
+    });
+
+    const res = await request(app)
+      .post('/api/admin/fathom-onboarding/auto-ingest')
+      .send({
+        recordingId: 'auto-1',
+        recordingUrl: 'https://fathom.video/calls/auto-1',
+        targetUserId: 'attacker-supplied-target',
+        extractedContext: {
+          callClassification: 'prospect',
+          classificationConfidence: 0.9,
+          companyName: 'Auto Co',
+          website: 'https://auto.co',
+          primaryContactEmail: 'buyer@auto.co',
+        },
+      })
+      .expect(200);
+
+    expect(res.body.automationState).toBe('draft_account_created');
+    expect(ingestFathomOnboardingRecording).toHaveBeenCalledWith(expect.objectContaining({
+      recordingId: 'auto-1',
+      reviewOwnerUserId: 'admin-user',
+      automationMode: 'auto_draft',
+      allowDraftAccountCreation: true,
+      reviewed: false,
+    }));
+    expect(ingestFathomOnboardingRecording).toHaveBeenCalledWith(expect.not.objectContaining({
+      targetUserId: 'attacker-supplied-target',
+    }));
+  });
+
   it('surfaces a target user ingestion ledger for review UI', async () => {
     (userDb.getUserById as jest.Mock).mockResolvedValue({
       userId: 'target-user',
