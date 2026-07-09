@@ -568,13 +568,23 @@ export function classifyWebValues(
     // Person-level LinkedIn identifies the person, not the company, and is
     // verified separately — it stays exempt from this check.
     if (/linkedin/i.test(field)) {
-      if (/company/i.test(field) && wrongEntity) {
-        console.warn(
-          `[v3 deps] Dropped company LinkedIn URL "${entry.value}" for field "${field}" ` +
-          `— source describes "${opts.claimedCompany}" ≠ lead company "${opts.leadCompany ?? ''}" ` +
-          `(wrong-entity guard)`,
+      if (/company/i.test(field)) {
+        // Fail CLOSED. The wrong-entity guard above is fail-OPEN: tokenMismatch
+        // needs a claimedCompany, so an omitted __entity_company__ reads as "not
+        // contradicted" and the value survives. That is how a "Slashy" lead kept
+        // company/joinslash on a live run. A company LinkedIn URL asserts the
+        // lead's identity and has no grounding backstop, so keep it only when the
+        // source company is POSITIVELY confirmed — by the token match, or by the
+        // model's alias-aware affirm (which rescues "Meta" ← company/facebook).
+        const companyConfirmed =
+          (!!opts.claimedCompany && companyNameMatches(opts.leadCompany, opts.claimedCompany)) ||
+          opts.claimedMatchesLead === true;
+        console.log(
+          `[v3 deps] company LinkedIn "${entry.value}" field="${field}" ` +
+          `lead="${opts.leadCompany ?? ''}" claimed="${opts.claimedCompany ?? '∅'}" ` +
+          `matchesLead=${opts.claimedMatchesLead ?? '∅'} → ${companyConfirmed ? 'KEEP' : 'DROP'}`,
         );
-        continue;
+        if (!companyConfirmed) continue;
       }
       result[field] = entry;
       continue;
