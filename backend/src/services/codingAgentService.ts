@@ -13,7 +13,7 @@ import axios from 'axios';
 import { mcpFetch } from '../mcp/server/httpClient';
 import { agentModeService } from './agentModeService';
 import { getGitHubOrgToken, getSecret } from '../utils/secretsManager';
-import { recordUsage } from './usageRecorderService';
+import { recordUsage, computeCostMicroUsd } from './usageRecorderService';
 import { getLandingPageById, getLandingPagesByOwner, canUserEditLandingPage, GeneratedLandingPage } from './v0Service';
 import { AcceptanceCheck, AcceptanceStatus, AcceptanceVerificationResult, verifyAcceptanceChecks } from './codingAgentAcceptance';
 import {
@@ -90,6 +90,29 @@ export interface CodingAgentResult {
   baseCommitSha?: string;
   latestCommitSha?: string;
   editedFiles?: string[];
+  /**
+   * Summed token usage across this run's self-contained LLM loop, so the caller
+   * can charge it to the per-user token/cost cap (ENG-200). The coding agent's
+   * turns are invisible to the parent agent-mode meter, so without this its spend
+   * never counts. Omitted when the run made no priced LLM call. costUsd is priced
+   * via the same source as the shadow meter (llmPricing), in USD.
+   */
+  usageTotals?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    totalTokens: number;
+    costUsd: number;
+  };
+}
+
+/** Mutable per-run token accumulator, filled by the loop, read once at result time. */
+interface CodingAgentUsageAccumulator {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
 }
 
 interface SearchReplaceEdit {
@@ -1845,7 +1868,8 @@ async function runCodingAgentInternal(
   taskDescription: string,
   context: CodingAgentContext,
   maxIterations: number,
-  model: string
+  model: string,
+  usageAcc: CodingAgentUsageAccumulator
 ): Promise<CodingAgentResult> {
 
   const client = await getClientForModel(model);
@@ -1927,6 +1951,12 @@ async function runCodingAgentInternal(
       try {
         const u: any = response.usage;
         if (u) {
+          // Accumulate for the per-user cap (charged once by the caller from
+          // result.usageTotals). Same numbers the shadow meter records below.
+          usageAcc.inputTokens += u.input_tokens || 0;
+          usageAcc.outputTokens += u.output_tokens || 0;
+          usageAcc.cacheReadTokens += u.cache_read_input_tokens || 0;
+          usageAcc.cacheWriteTokens += u.cache_creation_input_tokens || 0;
           void recordUsage({
             userId: context.userId,
             sessionId: context.sessionId,
@@ -2089,12 +2119,47 @@ export async function runCodingAgent(
     abortSignal: abortController.signal,
   };
 
-  const withRun = (result: CodingAgentResult, state?: CodingAgentRunState): CodingAgentResult => ({
-    ...result,
-    runId: run.runId,
-    state: state || result.state,
-    branch: result.branch ?? context.draftBranch,
-  });
+  // Filled by runCodingAgentInternal's loop; read once here to charge the caller.
+  const usageAcc: CodingAgentUsageAccumulator = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+  };
+
+  const withRun = (result: CodingAgentResult, state?: CodingAgentRunState): CodingAgentResult => {
+    const totalTokens =
+      usageAcc.inputTokens + usageAcc.outputTokens + usageAcc.cacheReadTokens + usageAcc.cacheWriteTokens;
+    // `model` is only accessed here (in the totalTokens > 0 branch), which cannot
+    // be reached until the loop has run — i.e. after model resolution below — so
+    // there is no temporal-dead-zone hazard on the early-return paths (auth denial,
+    // preview-branch reset failure) where no LLM call was made.
+    const usageTotals =
+      totalTokens > 0
+        ? {
+            inputTokens: usageAcc.inputTokens,
+            outputTokens: usageAcc.outputTokens,
+            cacheReadTokens: usageAcc.cacheReadTokens,
+            cacheWriteTokens: usageAcc.cacheWriteTokens,
+            totalTokens,
+            costUsd:
+              computeCostMicroUsd(
+                model,
+                usageAcc.inputTokens,
+                usageAcc.outputTokens,
+                usageAcc.cacheReadTokens,
+                usageAcc.cacheWriteTokens
+              ) / 1e6,
+          }
+        : undefined;
+    return {
+      ...result,
+      runId: run.runId,
+      state: state || result.state,
+      branch: result.branch ?? context.draftBranch,
+      usageTotals: result.usageTotals ?? usageTotals,
+    };
+  };
 
   // Preflight authorization. The page may be org-visible (so the agent could
   // see and select it) yet not editable by this caller — a plain member can
@@ -2182,7 +2247,7 @@ export async function runCodingAgent(
   let rawResult: CodingAgentResult;
   try {
     rawResult = await Promise.race<CodingAgentResult>([
-      runCodingAgentInternal(taskDescription, runContext, maxIterations, model).catch((error) => {
+      runCodingAgentInternal(taskDescription, runContext, maxIterations, model, usageAcc).catch((error) => {
         if (is403Error(error)) {
           return {
             success: false,

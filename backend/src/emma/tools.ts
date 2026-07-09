@@ -7,6 +7,7 @@ import { getAccountSummary } from '../services/accountSummaryService';
 import { dealDb, DealAuthError, DealNotFoundError, DEAL_STAGES, type DealStage } from '../services/dealDb';
 import { contactEventsDb, normalizeContactId } from '../services/contactEventsDb';
 import { chatbotDb } from '../services/chatbotService';
+import { incrementUserTokenUsage } from '../services/tokenUsageService';
 import { getExecutionsWithAssets } from '../routes/tasks';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
@@ -6505,6 +6506,18 @@ emmaToolRegistry.register({
         acceptanceChecks: Array.isArray(args.acceptance_checks) ? args.acceptance_checks : undefined,
       }
     );
+
+    // Charge the coding agent's own LLM turns to the caller's monthly usage. This
+    // loop makes its own (often high-cost) LLM calls that the parent agent-mode
+    // meter never sees, so without this its spend escapes the per-user token/cost
+    // cap (ENG-200). Fire-and-forget + fail-open: never block/fail the tool result.
+    if (result.usageTotals && context?.userId) {
+      const { totalTokens, costUsd } = result.usageTotals;
+      incrementUserTokenUsage(context.userId, totalTokens, costUsd).catch((err: unknown) =>
+        console.error('coding_agent: failed to record per-user usage:', err)
+      );
+    }
+
     if (result.success) {
       return {
         success: true,
