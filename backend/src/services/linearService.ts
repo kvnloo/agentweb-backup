@@ -384,6 +384,16 @@ export async function getEngineeringBugStats(startDate: string, endDate: string)
       ) {
         totalCount
       }
+      canceled: issues(
+        first: 1,
+        filter: {
+          team: { key: { eq: $team } },
+          labels: { name: { eq: $bug } },
+          canceledAt: { gte: $start, lt: $end }
+        }
+      ) {
+        totalCount
+      }
     }`,
     {
       team: TEAM_KEY,
@@ -396,6 +406,6 @@ export async function getEngineeringBugStats(startDate: string, endDate: string)
   return {
     netOpenBugs: Number(data?.open?.totalCount ?? 0),
     opened7d: Number(data?.opened?.totalCount ?? 0),
-    closed7d: Number(data?.closed?.totalCount ?? 0),
+    closed7d: Number(data?.closed?.totalCount ?? 0) + Number(data?.canceled?.totalCount ?? 0),
   };
 }

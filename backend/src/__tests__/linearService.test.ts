@@ -1,4 +1,11 @@
-import { addIssueComment, createInternalLinearIssue, listOpenIssuesByLabel, raiseIssueTriage, _resetLinearTeamCache } from '../services/linearService';
+import {
+  addIssueComment,
+  createInternalLinearIssue,
+  getEngineeringBugStats,
+  listOpenIssuesByLabel,
+  raiseIssueTriage,
+  _resetLinearTeamCache,
+} from '../services/linearService';
 
 jest.mock('../utils/secretsManager', () => ({
   getSecret: jest.fn().mockResolvedValue(JSON.stringify({ apiKey: 'lin_api_test' })),
@@ -243,6 +250,31 @@ describe('linearService.addIssueComment', () => {
   it('throws when commentCreate fails', async () => {
     (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { commentCreate: { success: false } } }) } as any));
     await expect(addIssueComment('uuid-1', 'x')).rejects.toThrow(/commentCreate failed/);
+  });
+});
+
+describe('linearService.getEngineeringBugStats', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  it('counts canceled bugs in 7-day closed outflow so net-open changes reconcile', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({
+        data: {
+          open: { totalCount: 8 },
+          opened: { totalCount: 3 },
+          closed: { totalCount: 4 },
+          canceled: { totalCount: 2 },
+        },
+      }),
+    } as any));
+
+    const stats = await getEngineeringBugStats('2026-07-01', '2026-07-08');
+
+    expect(stats).toEqual({ netOpenBugs: 8, opened7d: 3, closed7d: 6 });
+    const body = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body);
+    expect(body.query).toContain('canceledAt: { gte: $start, lt: $end }');
   });
 });
 

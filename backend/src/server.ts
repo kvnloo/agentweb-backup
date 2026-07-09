@@ -893,32 +893,31 @@ createTestAccount().then(async () => {
       // snapshot for restart-safe trend rendering.
       if (process.env.ENGINEERING_SCOREBOARD_LOOP_ENABLED === 'true') {
         try {
-          const SCOREBOARD_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
           const { runEngineeringScoreboardLoopOnce } = await import('./cron/engineeringScoreboardLoop');
 
-          const nowForScoreboard = new Date();
-          const nextScoreboardRun = new Date(nowForScoreboard);
-          nextScoreboardRun.setUTCHours(9, 0, 0, 0);
-          const daysUntilMonday = (1 - nextScoreboardRun.getUTCDay() + 7) % 7;
-          nextScoreboardRun.setUTCDate(nextScoreboardRun.getUTCDate() + daysUntilMonday);
-          if (nextScoreboardRun <= nowForScoreboard) {
-            nextScoreboardRun.setUTCDate(nextScoreboardRun.getUTCDate() + 7);
-          }
-          const msUntilScoreboard = nextScoreboardRun.getTime() - nowForScoreboard.getTime();
+          const scheduleNextEngineeringScoreboardRun = () => {
+            const nowForScoreboard = new Date();
+            const nextScoreboardRun = new Date(nowForScoreboard);
+            nextScoreboardRun.setUTCHours(9, 0, 0, 0);
+            const daysUntilMonday = (1 - nextScoreboardRun.getUTCDay() + 7) % 7;
+            nextScoreboardRun.setUTCDate(nextScoreboardRun.getUTCDate() + daysUntilMonday);
+            if (nextScoreboardRun <= nowForScoreboard) {
+              nextScoreboardRun.setUTCDate(nextScoreboardRun.getUTCDate() + 7);
+            }
+            const msUntilScoreboard = nextScoreboardRun.getTime() - nowForScoreboard.getTime();
 
-          console.log(
-            `[EngineeringScoreboard] Initialized — first run Monday 09:00 UTC (in ${Math.round(msUntilScoreboard / 60000)} min)`,
-          );
-          setTimeout(() => {
-            if (!isCronEnabled()) return;
-            cronJobRegistry.track('EngineeringScoreboard', runEngineeringScoreboardLoopOnce())
-              .catch(e => console.error('[EngineeringScoreboard] Error:', e));
-            setInterval(() => {
+            console.log(
+              `[EngineeringScoreboard] Next run Monday 09:00 UTC (in ${Math.round(msUntilScoreboard / 60000)} min)`,
+            );
+            setTimeout(() => {
+              scheduleNextEngineeringScoreboardRun();
               if (!isCronEnabled()) return;
               cronJobRegistry.track('EngineeringScoreboard', runEngineeringScoreboardLoopOnce())
                 .catch(e => console.error('[EngineeringScoreboard] Error:', e));
-            }, SCOREBOARD_INTERVAL_MS);
-          }, msUntilScoreboard);
+            }, msUntilScoreboard);
+          };
+
+          scheduleNextEngineeringScoreboardRun();
         } catch (error) {
           console.error('[EngineeringScoreboard] Failed to initialize:', error);
         }
