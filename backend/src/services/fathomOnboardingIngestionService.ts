@@ -284,6 +284,14 @@ function mergeLedger(
   return [merged, ...withoutCurrent].slice(0, MAX_INGESTIONS_PER_USER);
 }
 
+function removeLedgerRecording(
+  existing: FathomOnboardingIngestion[] | undefined,
+  recording: Pick<FathomOnboardingIngestion, 'recordingId' | 'recordingUrl'>,
+): FathomOnboardingIngestion[] {
+  const prior = Array.isArray(existing) ? existing : [];
+  return prior.filter((item) => !sameLedgerRecording(item, recording));
+}
+
 async function loadRecordingText(input: IngestInput, deps: IngestDeps): Promise<string> {
   const provided = [input.meetingText, input.transcriptText].map(clean).filter(Boolean).join('\n\n');
   if (provided) return provided;
@@ -386,6 +394,15 @@ export async function ingestFathomOnboardingRecording(
 
   const ledger = mergeLedger(existing, next);
   await deps.userDb.updateUser(ledgerUserId, { fathomOnboardingIngestions: ledger } as any);
+
+  if (reviewed && target.userId && input.reviewOwnerUserId !== ledgerUserId) {
+    const reviewOwner = await deps.userDb.getUserById(input.reviewOwnerUserId);
+    const reviewOwnerExisting = (reviewOwner as any)?.fathomOnboardingIngestions as FathomOnboardingIngestion[] | undefined;
+    const reviewOwnerLedger = removeLedgerRecording(reviewOwnerExisting, next);
+    if (reviewOwnerLedger.length !== (Array.isArray(reviewOwnerExisting) ? reviewOwnerExisting.length : 0)) {
+      await deps.userDb.updateUser(input.reviewOwnerUserId, { fathomOnboardingIngestions: reviewOwnerLedger } as any);
+    }
+  }
 
   return { ...next, target, memoryIds, orgMemoryIds };
 }

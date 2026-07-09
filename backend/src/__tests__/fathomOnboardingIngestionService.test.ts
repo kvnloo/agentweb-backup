@@ -296,6 +296,77 @@ describe('fathomOnboardingIngestionService', () => {
     });
   });
 
+  it('removes the stale review-owner queue entry when an ambiguous recording is promoted to a target user', async () => {
+    const deps = makeDeps();
+    deps.userDb.getUserById.mockImplementation(async (userId: string): Promise<any> => ({
+      userId,
+      email: userId === 'target-user' ? 'owner@acme.ai' : 'harsha@agentweb.pro',
+      emailDomain: userId === 'target-user' ? 'acme.ai' : 'agentweb.pro',
+      orgId: userId === 'target-user' ? 'org-1' : undefined,
+      fathomOnboardingIngestions: userId === 'review-owner'
+        ? [
+          {
+            recordingId: '123',
+            recordingUrl: 'https://fathom.video/calls/123',
+            status: 'needs_review',
+            extractionState: 'auto_extracted',
+            context: baseContext,
+            memoryIds: [],
+            orgMemoryIds: [],
+            createdAt: '2026-07-08T19:00:00.000Z',
+            updatedAt: '2026-07-08T19:00:00.000Z',
+          },
+          {
+            recordingId: 'keep-me',
+            recordingUrl: 'https://fathom.video/calls/keep-me',
+            status: 'needs_review',
+            extractionState: 'auto_extracted',
+            context: baseContext,
+            memoryIds: [],
+            orgMemoryIds: [],
+            createdAt: '2026-07-08T19:10:00.000Z',
+            updatedAt: '2026-07-08T19:10:00.000Z',
+          },
+        ]
+        : [],
+    }));
+
+    const result = await ingestFathomOnboardingRecording({
+      recordingId: '123',
+      recordingUrl: 'https://fathom.video/calls/123',
+      reviewOwnerUserId: 'review-owner',
+      targetUserId: 'target-user',
+      reviewed: true,
+      extractedContext: baseContext,
+    }, deps as any);
+
+    expect(result.status).toBe('reviewed');
+    expect(deps.userDb.updateUser).toHaveBeenNthCalledWith(
+      1,
+      'target-user',
+      expect.objectContaining({
+        fathomOnboardingIngestions: [
+          expect.objectContaining({
+            recordingId: '123',
+            status: 'reviewed',
+          }),
+        ],
+      }),
+    );
+    expect(deps.userDb.updateUser).toHaveBeenNthCalledWith(
+      2,
+      'review-owner',
+      expect.objectContaining({
+        fathomOnboardingIngestions: [
+          expect.objectContaining({
+            recordingId: 'keep-me',
+            status: 'needs_review',
+          }),
+        ],
+      }),
+    );
+  });
+
   it('rejects empty source input before calling the LLM or storing an all-null context', async () => {
     const deps = makeDeps();
 
