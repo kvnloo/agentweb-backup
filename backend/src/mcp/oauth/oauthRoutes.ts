@@ -12,6 +12,12 @@
 import express, { Request, Response, NextFunction } from 'express';
 import { mcpOAuthService } from './oauthService';
 import { authenticateToken, getUserFromToken } from '../../middleware/auth';
+import {
+  classifyMcpClient,
+  recordMcpOAuthAuthorized,
+  recordMcpOAuthStarted,
+  recordMcpOAuthTokenIssued,
+} from '../../services/mcpUsageEventsService';
 
 /**
  * Middleware: accept the user's JWT either from the Authorization header
@@ -42,7 +48,7 @@ export function setupMcpOAuth(app: express.Express) {
   // ─── Well-Known Metadata (RFC 8414) ─────────────────────────────────────
 
   app.get('/.well-known/oauth-authorization-server', (_req: Request, res: Response) => {
-    const baseUrl = process.env.BACKEND_URL || 'https://api.agentweb.pro';
+    const baseUrl = getBackendUrl();
 
     res.setHeader('Cache-Control', 'public, max-age=3600');
     res.json({
@@ -58,6 +64,22 @@ export function setupMcpOAuth(app: express.Express) {
       service_documentation: `${baseUrl}/docs/agent-api`,
     });
   });
+
+  const protectedResourceMetadata = (_req: Request, res: Response) => {
+    const baseUrl = getBackendUrl();
+
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.json({
+      resource: `${baseUrl}/mcp`,
+      authorization_servers: [baseUrl],
+      bearer_methods_supported: ['header'],
+      scopes_supported: ['mcp:tools'],
+      resource_documentation: `${baseUrl}/skill.md`,
+    });
+  };
+
+  app.get('/.well-known/oauth-protected-resource', protectedResourceMetadata);
+  app.get('/.well-known/oauth-protected-resource/mcp', protectedResourceMetadata);
 
   // ─── Dynamic Client Registration (RFC 7591) ────────────────────────────
   // Body parser is applied globally in app.ts (express.json + urlencoded)
@@ -138,6 +160,14 @@ export function setupMcpOAuth(app: express.Express) {
     }
 
     const actualRedirectUri = redirect_uri || client.redirectUris[0];
+    recordMcpOAuthStarted({
+      clientId: client_id,
+      clientName: client.clientName,
+      clientType: classifyMcpClient({ clientName: client.clientName, userAgent: req.get('user-agent'), redirectUri: actualRedirectUri }),
+      redirectUri: actualRedirectUri,
+      scope: scope || 'mcp:tools',
+      userAgent: req.get('user-agent'),
+    }).catch((error) => console.error('[MCP-OAuth] Failed to record OAuth start:', error));
 
     // Local-dev auto-approve: skip the consent page and issue a code directly.
     // Gated behind an explicit opt-in flag (NOT NODE_ENV) so a forgotten staging
@@ -173,6 +203,10 @@ export function setupMcpOAuth(app: express.Express) {
     if (state) consentUrl.searchParams.set('state', state);
     consentUrl.searchParams.set('code_challenge', code_challenge);
     consentUrl.searchParams.set('code_challenge_method', code_challenge_method || 'S256');
+    consentUrl.searchParams.set('source', 'mcp');
+    consentUrl.searchParams.set('utm_source', 'mcp');
+    consentUrl.searchParams.set('utm_medium', classifyMcpClient({ clientName: client.clientName, userAgent: req.get('user-agent'), redirectUri: actualRedirectUri }));
+    consentUrl.searchParams.set('mcp_client_id', client_id);
 
     return res.redirect(302, consentUrl.toString());
   });
@@ -216,6 +250,14 @@ export function setupMcpOAuth(app: express.Express) {
       codeChallenge: code_challenge,
       codeChallengeMethod: code_challenge_method || 'S256',
     });
+    recordMcpOAuthAuthorized({
+      userId,
+      clientId: client_id,
+      clientName: client.clientName,
+      clientType: classifyMcpClient({ clientName: client.clientName, redirectUri: redirect_uri }),
+      redirectUri: redirect_uri,
+      scope: scope || 'mcp:tools',
+    }).catch((error) => console.error('[MCP-OAuth] Failed to record OAuth authorization:', error));
 
     const redirectUrl = new URL(redirect_uri);
     redirectUrl.searchParams.set('code', code);
@@ -293,6 +335,14 @@ async function handleAuthorizationCodeGrant(req: Request, res: Response) {
     userId: codeRecord.userId,
     scope: codeRecord.scope,
   });
+  recordMcpOAuthTokenIssued({
+    userId: codeRecord.userId,
+    clientId: codeRecord.clientId,
+    clientName: client?.clientName,
+    clientType: classifyMcpClient({ clientName: client?.clientName, redirectUri: codeRecord.redirectUri }),
+    redirectUri: codeRecord.redirectUri,
+    scope: codeRecord.scope,
+  }).catch((error) => console.error('[MCP-OAuth] Failed to record OAuth token issue:', error));
 
   return res.json({
     access_token: tokens.accessToken,
@@ -346,4 +396,8 @@ function extractClientSecret(req: Request): string | undefined {
   }
   // client_secret_post (body)
   return req.body.client_secret;
+}
+
+function getBackendUrl(): string {
+  return process.env.BACKEND_URL || 'https://api.agentweb.pro';
 }

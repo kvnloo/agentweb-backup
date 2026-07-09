@@ -78,7 +78,7 @@ jest.mock('../mcp/server/mcpServerCore', () => ({
   }
 }));
 
-import { setupMcpServer } from '../mcp/server/mcpServer';
+import { buildMcpAuthChallenge, setupMcpServer } from '../mcp/server/mcpServer';
 import { mcpToolRegistry } from '../mcp/server/registry';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -106,6 +106,15 @@ describe('MCP Server', () => {
       setupMcpServer(app);
     });
 
+    it('builds the MCP OAuth protected-resource challenge', () => {
+      expect(buildMcpAuthChallenge('https://api.agentweb.pro')).toBe(
+        'Bearer resource_metadata="https://api.agentweb.pro/.well-known/oauth-protected-resource/mcp", scope="mcp:tools"'
+      );
+      expect(buildMcpAuthChallenge('https://api.agentweb.pro', 'invalid_token')).toBe(
+        'Bearer resource_metadata="https://api.agentweb.pro/.well-known/oauth-protected-resource/mcp", scope="mcp:tools", error="invalid_token"'
+      );
+    });
+
     it('should reject request when no auth token is provided', async () => {
       const response = await request(app)
         .post('/mcp')
@@ -115,6 +124,7 @@ describe('MCP Server', () => {
       expect(response.body.error).toContain('Missing access token');
       expect(response.body.hint).toBeDefined();
       expect(response.body.setup).toContain('skill.md');
+      expect(response.headers['www-authenticate']).toContain('/.well-known/oauth-protected-resource/mcp');
     });
 
     it('should reject request without Authorization header even with MCP_ACCESS_TOKEN set', async () => {
@@ -146,6 +156,7 @@ describe('MCP Server', () => {
       expect(response.status).toBe(401);
       expect(response.body.error).toContain('Invalid access token');
       expect(response.body.setup).toContain('skill.md');
+      expect(response.headers['www-authenticate']).toContain('error="invalid_token"');
     });
 
     it('should accept request with valid Bearer token', async () => {
