@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { config } from '../config.mjs';
 import { resolveIssue } from '../linear.mjs';
-import { gitIdentityEnv, resolveAssigneeGhToken, resolveAssigneeIdentity } from '../git-identity.mjs';
+import { gitIdentityEnv, resolveAssigneeGhToken, resolveAssigneeIdentity, applyWorktreeIdentity } from '../git-identity.mjs';
 import {
   assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, unpushedRepos, countCommits, ensureProxy,
   headShas, resetTo, ensureOpenPrs,
@@ -159,9 +159,9 @@ async function attributionFor(identifier, entry) {
       new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000)),
     ]);
     const a = issue?.assignee;
-    if (a?.email) return { idEnv: gitIdentityEnv(resolveAssigneeIdentity(a)), email: a.email, who: `${a.email} (live)` };
+    if (a?.email) { const identity = resolveAssigneeIdentity(a); return { idEnv: gitIdentityEnv(identity), identity, email: a.email, who: `${a.email} (live)` }; }
   } catch { /* Linear unreachable — fall back to the pipeline-stored assignee below */ }
-  return { idEnv: entry?.assignee ? gitIdentityEnv(entry.assignee) : {}, email: entry?.assigneeEmail || null, who: `${entry?.assigneeEmail || 'none'} (stored)` };
+  return { idEnv: entry?.assignee ? gitIdentityEnv(entry.assignee) : {}, identity: entry?.assignee || null, email: entry?.assigneeEmail || null, who: `${entry?.assigneeEmail || 'none'} (stored)` };
 }
 
 // One conversation per issue — no user-facing mode. Capability is decided per turn by the
@@ -779,6 +779,10 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
     // is down. Read-only turns never write, so they keep the plain env.
     const attr = cap === 'full' ? await attributionFor(identifier, entry) : null;
     if (attr) log(`turn ${turnId} (${identifier}): attributing commits/PRs to ${attr.who}`);
+    // Persist the CURRENT assignee's identity into each worktree's git config before the agent runs.
+    // Doing it every full turn is what makes a reassignment take effect — the new assignee's name/email
+    // overwrite the old in config.worktree, so this turn's (and any later manual) commits go by them.
+    if (cap === 'full' && cwd !== agentRoot && attr?.identity) applyWorktreeIdentity(cwd, attr.identity, (msg) => log(`turn ${turnId} (${identifier}): ${msg}`));
     const turnEnv = (() => {
       if (cap !== 'full') return process.env;
       const idEnv = attr.idEnv || {};

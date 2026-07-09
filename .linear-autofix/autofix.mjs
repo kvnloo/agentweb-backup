@@ -12,7 +12,7 @@ import net from 'node:net';
 import path from 'node:path';
 import { config } from './config.mjs';
 import { resolveIssue, addComment, findStateId, moveIssue, setAutofixLabel, uploadFile, useAssigneeLinearKey } from './linear.mjs';
-import { applyAssigneeIdentity, resolveAssigneeGhToken } from './git-identity.mjs';
+import { applyAssigneeIdentity, applyWorktreeIdentity, resolveAssigneeGhToken } from './git-identity.mjs';
 import { findSessionId, fetchItem, summarizeSession } from './tools/session.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -281,6 +281,9 @@ async function main() {
     return;
   }
   log(`Workspace ready at ${WT} on ${branch} (${config.repos.map((r) => r.key).join(', ')})`);
+  // Also persist the assignee's identity into each worktree's own git config (not just the GIT_* env),
+  // so a manual commit made in the worktree is attributed to them too, not to the box default.
+  applyWorktreeIdentity(WT, identity, log);
   prepareWorktreeDeps(WT);
 
   // Build the fixer prompt.

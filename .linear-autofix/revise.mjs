@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { config } from './config.mjs';
 import { resolveIssue, addComment, useAssigneeLinearKey } from './linear.mjs';
-import { applyAssigneeIdentity } from './git-identity.mjs';
+import { applyAssigneeIdentity, applyWorktreeIdentity } from './git-identity.mjs';
 import {
   fillTemplate, extractJson, claudeArgs, runClaude, setStageLogDir, kebab,
   assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, countCommits, runChecks,
@@ -47,7 +47,7 @@ async function main() {
   const issue = await resolveIssue(ref);
   const id = issue.identifier;
   // Attribute the revision's commits to the issue's assignee, same as the original fix.
-  applyAssigneeIdentity(issue, log);
+  const identity = applyAssigneeIdentity(issue, log);
   useAssigneeLinearKey(issue.assignee, log); // and its Linear comments/status changes
 
   const entry = loadState()[issue.id];
@@ -72,6 +72,7 @@ async function main() {
     }
   }
   prepareWorktreeDeps(WT);
+  applyWorktreeIdentity(WT, identity, log); // persist the assignee identity in each worktree's git config
   setStageLogDir(id);
 
   const requests = pending

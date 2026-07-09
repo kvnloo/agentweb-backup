@@ -7,6 +7,8 @@
 // write to the shared repo config and silently change their own identity). Env vars affect
 // only the commits made by processes we spawn, and touch no config file.
 import { config } from './config.mjs';
+import { spawnSync } from 'child_process';
+import path from 'path';
 
 // Resolve a Linear assignee to the git { name, email } their commits should carry:
 //   1. an explicit per-person override in config.assigneeGitIdentity (keyed by Linear email), else
@@ -59,6 +61,37 @@ export function resolveAssigneeGhToken(assignee) {
   if (!envName) return null;
   const token = (process.env[envName] || '').trim();
   return token || null;
+}
+
+// Persist an identity as the LOCAL git config of ONE linked worktree, so every commit made in it —
+// our spawned agent AND a human who SSHes in to commit by hand — is authored by the assignee even
+// without the GIT_* env, and so re-applying with a new identity is how a reassignment changes who
+// future commits go by. We MUST use per-worktree config, not plain `git config --local`: the autofix
+// worktrees are LINKED worktrees of the developer's real repos, which share one $GIT_DIR/config — a
+// `--local` set there would rewrite the developer's own identity and let concurrent worktrees (one
+// per assignee) clobber each other. `extensions.worktreeConfig` + `--worktree` writes to that
+// worktree's private config.worktree instead, fully isolated (verified: the main checkout stays
+// untouched). Idempotent — safe to call every turn. Returns true on success.
+export function setWorktreeIdentity(wt, identity, log = () => {}) {
+  if (!identity?.name || !identity?.email) return false;
+  const cfg = (...args) => spawnSync('git', ['-C', wt, 'config', ...args], { encoding: 'utf8' });
+  const en = cfg('extensions.worktreeConfig', 'true'); // enable per-worktree config (idempotent)
+  if (en.status !== 0) { log(`worktree identity: could not enable worktreeConfig in ${wt}: ${(en.stderr || '').trim()}`); return false; }
+  const n = cfg('--worktree', 'user.name', identity.name);
+  const e = cfg('--worktree', 'user.email', identity.email);
+  if (n.status !== 0 || e.status !== 0) { log(`worktree identity: could not set user.* in ${wt}: ${((n.stderr || '') + (e.stderr || '')).trim()}`); return false; }
+  return true;
+}
+
+// Apply the identity to EVERY repo of an assembled workspace (main + each nested repo), mirroring
+// how config.repos are mounted under the workspace root WT. No-op when there's no usable identity
+// (unassigned issue) — those keep git's default so nothing is falsely attributed.
+export function applyWorktreeIdentity(WT, identity, log = () => {}) {
+  if (!identity?.name || !identity?.email) return;
+  for (const repo of config.repos) {
+    const wt = repo.mount === '.' ? WT : path.join(WT, repo.mount);
+    if (setWorktreeIdentity(wt, identity, log)) log(`Commit identity for ${repo.key} worktree set to ${identity.name} <${identity.email}>.`);
+  }
 }
 
 // For the per-issue processes (autofix.mjs, revise.mjs): set the assignee's identity on
