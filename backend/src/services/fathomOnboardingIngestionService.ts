@@ -292,6 +292,11 @@ function removeLedgerRecording(
   return prior.filter((item) => !sameLedgerRecording(item, recording));
 }
 
+function formatTranscriptSpeaker(speaker: any): string {
+  if (typeof speaker === 'string') return clean(speaker) || 'Speaker';
+  return clean(speaker?.display_name || speaker?.name || speaker?.email) || 'Speaker';
+}
+
 async function loadRecordingText(input: IngestInput, deps: IngestDeps): Promise<string> {
   const provided = [input.meetingText, input.transcriptText].map(clean).filter(Boolean).join('\n\n');
   if (provided) return provided;
@@ -301,24 +306,22 @@ async function loadRecordingText(input: IngestInput, deps: IngestDeps): Promise<
   if (!token) throw new Error('No Fathom account connected for recording fetch.');
 
   const api = new deps.FathomApiService!(token);
-  const [recording, transcript] = await Promise.all([
-    api.getRecording(String(input.recordingId)).catch(() => null),
+  const [summaryResponse, transcript] = await Promise.all([
+    api.getRecordingSummary(String(input.recordingId)).catch(() => null),
     api.getTranscript(String(input.recordingId)).catch(() => []),
   ]);
 
-  const summary = [
-    recording?.title,
-    recording?.default_summary?.short_hand_bullet,
-    typeof recording?.default_summary === 'string' ? recording.default_summary : null,
-    Array.isArray(recording?.action_items)
-      ? recording.action_items.map((item: any) => item.text || item.title || item).join('\n')
-      : null,
+  const summaryBody = summaryResponse?.summary;
+  const summaryText = [
+    summaryBody?.markdown_formatted,
+    summaryBody?.short_hand_bullet,
+    typeof summaryBody === 'string' ? summaryBody : null,
   ].map(clean).filter(Boolean).join('\n\n');
   const transcriptText = transcript
-    .map((turn: any) => `${turn.speaker || 'Speaker'}: ${turn.text || ''}`.trim())
+    .map((turn: any) => `${formatTranscriptSpeaker(turn.speaker)}: ${turn.text || ''}`.trim())
     .filter(Boolean)
     .join('\n');
-  return [summary, transcriptText].filter(Boolean).join('\n\n');
+  return [summaryText, transcriptText].filter(Boolean).join('\n\n');
 }
 
 export async function ingestFathomOnboardingRecording(

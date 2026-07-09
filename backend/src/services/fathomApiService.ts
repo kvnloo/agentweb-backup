@@ -93,8 +93,8 @@ export class FathomApiService {
     }
   }
 
-  async getRecording(recordingId: string): Promise<any> {
-    const response = await fetch(`${FATHOM_API_BASE}/recordings/${encodeURIComponent(recordingId)}`, {
+  async getRecordingSummary(recordingId: string): Promise<any> {
+    const response = await fetch(`${FATHOM_API_BASE}/recordings/${encodeURIComponent(recordingId)}/summary`, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${this.apiKey}`,
@@ -103,7 +103,7 @@ export class FathomApiService {
     });
 
     if (!response.ok) {
-      throw new Error(`Failed to fetch Fathom recording ${recordingId}: ${response.status}`);
+      throw new Error(`Failed to fetch Fathom recording summary ${recordingId}: ${response.status}`);
     }
 
     return response.json();
