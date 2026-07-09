@@ -98,6 +98,37 @@ router.post("/brand-build/start", authenticateToken, async (req, res) => {
       return res.json({ status: snapshot(refreshed || existing || {}) });
     }
 
+    // ENG-238 root-cause guard. Do NOT start a build when no website URL is
+    // resolvable. The dominant brand-build failure class (~77% of failures in
+    // prod telemetry) was a `/start` fired with an empty companyUrl for a user
+    // who had no URL on their record: the status flipped to `building`, the
+    // background trigger's pickCompanyUrl returned null, and it immediately
+    // failed with "no companyUrl on User record" — a dead-on-arrival build
+    // that surfaced as a failure metric and stranded the user at
+    // `brand_submitted`. Resolve the effective URL from the same sources the
+    // trigger uses (body → productDomain → brandGuidelines.brandData.domain →
+    // companyUrl). If none is resolvable, persist any supplied name/goal so
+    // nothing is lost, skip both the status flip and the trigger, and return a
+    // `needsUrl` snapshot so the UI routes to the "no website" path.
+    const ex = existing as any;
+    const effectiveUrl =
+      (typeof body.companyUrl === "string" && body.companyUrl.trim()) ||
+      (typeof ex?.productDomain === "string" && ex.productDomain.trim()) ||
+      (typeof ex?.brandGuidelines?.brandData?.domain === "string" &&
+        ex.brandGuidelines.brandData.domain.trim()) ||
+      (typeof ex?.companyUrl === "string" && ex.companyUrl.trim()) ||
+      "";
+
+    if (!effectiveUrl) {
+      if (Object.keys(inputPatch).length > 0) {
+        await userDb.updateUser(userId, inputPatch as any);
+      }
+      const refreshed = await userDb.getUserById(userId);
+      return res.json({
+        status: { ...snapshot(refreshed || existing || {}), needsUrl: true },
+      });
+    }
+
     const patch: Record<string, unknown> = {
       ...buildStartPatch(),
       ...inputPatch,

@@ -36,6 +36,13 @@ export interface StatusSnapshot extends BrandBuildStatusFields {
   /** True when the last started build is still in flight (status=building). */
   inFlight: boolean;
   /**
+   * True when `/start` was called but no website URL could be resolved for the
+   * user, so no build was started (see ENG-238). The UI should route the user
+   * to the "no website" collaborative path instead of showing a spinner —
+   * starting a build with no URL is dead-on-arrival and immediately fails.
+   */
+  needsUrl?: boolean;
+  /**
    * True when a previously-started build has exceeded the timeout budget
    * (90s target from the task body). The caller should trip the status to
    * `failed` on the next write and surface the graceful-fallback UX.
