@@ -22,7 +22,7 @@ import { resolveIssue } from '../linear.mjs';
 import { gitIdentityEnv, resolveAssigneeGhToken, resolveAssigneeIdentity } from '../git-identity.mjs';
 import {
   assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, unpushedRepos, countCommits, ensureProxy,
-  headShas, resetTo,
+  headShas, resetTo, ensureOpenPrs,
 } from '../autofix.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -62,6 +62,30 @@ function updateChatState(identifier, fn) {
   s[identifier] = fn(s[identifier] || { identifier, cwd: null, sessions: {}, messages: [] });
   writeFileSync(chatStatePath, JSON.stringify(s, null, 2));
   return s[identifier];
+}
+
+// Read-modify-write state.json against a FRESH read so a concurrent autofix/gc write can't be
+// clobbered by a stale in-memory copy (same discipline as autofix's updateState). We only ever
+// touch a single field, so we merge into the existing entry rather than replacing it.
+function updateIssueEntry(identifier, fn) {
+  const s = loadState();
+  const hit = Object.entries(s).find(([, e]) => (e.identifier || '').toUpperCase() === identifier.toUpperCase());
+  if (!hit) return null;
+  const [uuid, entry] = hit;
+  s[uuid] = fn({ ...entry });
+  writeFileSync(statePath, JSON.stringify(s, null, 2));
+  return s[uuid];
+}
+
+// Merge freshly-detected PRs into the stored list, keyed by repo, keeping any that still have a URL.
+// A repo already present is updated in place; a repo touched for the first time is appended.
+function mergePrs(existing, detected) {
+  const byRepo = new Map((existing || []).filter((p) => p && p.repo).map((p) => [p.repo, p]));
+  for (const d of detected || []) {
+    if (!d || !d.repo || !d.url) continue;
+    byRepo.set(d.repo, { ...(byRepo.get(d.repo) || {}), repo: d.repo, url: d.url });
+  }
+  return [...byRepo.values()];
 }
 
 // ---------------------------------------------------------------------------
@@ -801,12 +825,31 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
       // skip the push). The chat server is the ONLY thing that pushes chat commits — nothing picks
       // them up later — so we flush them here instead of stranding them "waiting for the orchestrator".
       const pending = changed.length ? unpushedRepos(changed) : [];
+      let failed = [];
+      if (pending.length) {
+        emit({ type: 'status', text: 'Pushing to the open PR(s)…' });
+        failed = pushChanged(pending);
+      }
+      // Make sure EVERY repo with commits on the branch has an open PR and is recorded in state.
+      // A turn can add commits to a repo the pipeline never opened a PR for (e.g. the developer asks
+      // for a customer-portal change on a main-only issue) — without this, the branch would be pushed
+      // but no PR opened and the UI would keep showing only PR(main). We reconcile on any turn where
+      // the branch has commits (not just ones that pushed something), so an issue left in the old
+      // broken state self-heals on the next full turn. Best-effort — a create failure just omits that
+      // repo's link this turn. The UI re-reads state on `done`, so persisting is what updates it.
+      if (changed.length) {
+        try {
+          const linear = await fetchLinear(identifier);
+          const title = linear?.title || entry.title || identifier;
+          const detected = ensureOpenPrs(changed, title, `Auto-fix for ${identifier}: ${title}`, attr?.email ? { email: attr.email } : entry.assignee);
+          const merged = mergePrs(entry.prs || [], detected);
+          if (JSON.stringify(merged) !== JSON.stringify(entry.prs || [])) {
+            const saved = updateIssueEntry(identifier, (e) => ({ ...e, prs: merged }));
+            if (saved) { entry.prs = merged; log(`turn ${turnId} (${identifier}): PRs now ${merged.map((p) => p.repo).join(', ')}`); }
+          }
+        } catch (e) { log(`turn ${turnId} (${identifier}): PR reconcile failed:`, e.message || e); }
+      }
       if (pending.length || newThisTurn) {
-        let failed = [];
-        if (pending.length) {
-          emit({ type: 'status', text: 'Pushing to the open PR(s)…' });
-          failed = pushChanged(pending);
-        }
         fix = { committed: true, newThisTurn, pushedOk: failed.length === 0, failedRepos: failed, prs: entry.prs || [] };
         emit({ type: 'fix_summary', ...fix });
       }

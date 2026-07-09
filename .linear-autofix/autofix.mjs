@@ -725,20 +725,33 @@ export function computeTriage({ review, verify, checks, reviewEnabled }) {
 // assignee upstream via GIT_* env either way.
 function openPrs(changed, title, body, assignee) {
   const ghToken = resolveAssigneeGhToken(assignee);
-  const prEnv = ghToken ? { ...process.env, GH_TOKEN: ghToken } : process.env;
   log(ghToken
     ? `PR authorship: opening the draft PR(s) as the assignee (${assignee?.email || 'assignee'}) via their configured GitHub token.`
     : 'PR authorship: no assignee GitHub token configured — opening the draft PR(s) as the box `gh` account.');
+  return ensureOpenPrs(changed, title, body, assignee);
+}
+
+// Push each changed repo and make sure it has an open PR: detect an existing one first (idempotent
+// across turns) and only `gh pr create` a draft when none exists. Returns { repo, pushed, url } per
+// changed repo. Shared by the pipeline's initial PR open AND the chat server, where a full-mode turn
+// can add commits to a repo that had no PR yet (e.g. the developer asks for a customer-portal change
+// on a main-only issue) — that new PR must be discovered and surfaced, not just the branch pushed.
+export function ensureOpenPrs(changed, title, body, assignee) {
+  const ghToken = resolveAssigneeGhToken(assignee);
+  const prEnv = ghToken ? { ...process.env, GH_TOKEN: ghToken } : process.env;
   const out = [];
   for (const c of changed) {
     const push = gitIn(c.wt, ['push', '-u', 'origin', 'HEAD']);
-    if (push.status !== 0) { log(`Push failed for ${c.repo}: ${push.stderr}`); out.push({ repo: c.repo, pushed: false, url: null }); continue; }
-    const stat = (gitIn(c.wt, ['diff', '--stat', `origin/${c.base}...HEAD`]).stdout || '').trim();
-    const repoBody = `${body}\n\n**Files changed in \`${c.repo}\`:**\n\`\`\`\n${stat}\n\`\`\``;
-    const create = spawnSync('gh', ['pr', 'create', '--draft', '--base', c.base, '--title', title, '--body', repoBody], { cwd: c.wt, encoding: 'utf8', env: prEnv });
-    if (create.status !== 0 && !/already exists/i.test(create.stderr || '')) log(`gh pr create warning for ${c.repo}: ${create.stderr}`);
-    // `gh pr create` prints the new PR URL to stdout; fall back to `gh pr view` (e.g. PR existed).
-    const url = (create.status === 0 && (create.stdout || '').trim()) || prFromWorktree(c.wt) || null;
+    if (push.status !== 0) { log(`Push failed for ${c.repo}: ${push.stderr}`); out.push({ repo: c.repo, pushed: false, url: prFromWorktree(c.wt) }); continue; }
+    let url = prFromWorktree(c.wt); // reuse an already-open PR rather than creating a duplicate
+    if (!url && title) {
+      const stat = (gitIn(c.wt, ['diff', '--stat', `origin/${c.base}...HEAD`]).stdout || '').trim();
+      const repoBody = `${body}\n\n**Files changed in \`${c.repo}\`:**\n\`\`\`\n${stat}\n\`\`\``;
+      const create = spawnSync('gh', ['pr', 'create', '--draft', '--base', c.base, '--title', title, '--body', repoBody], { cwd: c.wt, encoding: 'utf8', env: prEnv });
+      if (create.status !== 0 && !/already exists/i.test(create.stderr || '')) log(`gh pr create warning for ${c.repo}: ${create.stderr}`);
+      // `gh pr create` prints the new PR URL to stdout; fall back to `gh pr view` (e.g. a race created it).
+      url = (create.status === 0 && (create.stdout || '').trim()) || prFromWorktree(c.wt) || null;
+    }
     out.push({ repo: c.repo, pushed: true, url });
   }
   return out;
