@@ -1,3 +1,17 @@
+## Linear webhook fired customer comms too early / repeatedly — root cause + fix (2026-07-07)
+
+The Linear→customer-comms bridge (`POST /api/integrations/linear/webhook`, `backend/src/routes/integrations.ts`) was firing the full resolve bridge (`notifyCanonicalResolved`: Resend "Resolved" email to every reporter + Featurebase card flip to Completed + Slack ship ping) on the wrong events. Surfaced during the 2026-07-07 merged≠done investigation; the premature-email proof is ENG-173 (an xCures reporter was emailed 2.9s after PR merge, pre-deploy).
+
+### Two root causes
+1. **Gated on state CATEGORY, not the Done state.** The predicate was `data.state.type === 'completed'`. The board now runs Merged → Verifying → Done and all three are completed-type in Linear, but only **Done** is customer-communicable — so a move into Merged or Verifying emailed reporters. Fix: gate by the Done **state ID** (`LINEAR_DONE_STATE_ID`, ENG Done = `b36918be-3026-4a37-b788-47eef453a581`), not by name — a rename would silently kill or misroute the bridge.
+2. **Not transition-detecting.** It fired on EVERY Issue `update` while the issue sat in a completed state (a later title/label edit on an already-Done bug re-emailed every reporter — the Slack ping is deduped via `claimSetMember`, but the email + card re-flip are not) and also on `action:'create'`. Fix: use the webhook's `updatedFrom.stateId` (Linear puts the prior value of each changed field there) to fire only on an ACTUAL transition into Done — `updatedFrom` must carry a `stateId` key whose value ≠ Done.
+
+### Fail-loud config guard
+If `LINEAR_DONE_STATE_ID` is unset the handler refuses to fire (logs a distinct `[linear-webhook] LINEAR_DONE_STATE_ID is not set …` line, returns 200 `ok:false`) rather than reverting to firing on any completed state — not silently open, not silently closed. 200 is kept so Linear doesn't retry-storm.
+
+### Tests
+`backend/src/__tests__/integrations.linearWebhook.test.ts` (new — the route had zero tests): Merged/Verifying → 0 comms, already-Done edit → nothing, transition into Done → fires once, non-Done completed ID → nothing, missing config → loud no-op, signature enforcement. The Linear-side fix (git-automation merge→Merged, states created) shipped 2026-07-07; this is the code-side hardening (ENG-222).
+
 ## "Priority: High" in text but priority field unset — root cause + fix (2026-07-07, ENG-231)
 
 Argusoft reported auto-generated Linear bugs whose descriptions say "Priority: High" while the actual Linear priority field is None and the issue sits in Backlog unassigned — invisible to priority-sorted triage. 11 live issues had this shape (ENG-167/189/190/191/197/200/201/202/203/209/213; hand-backfilled 2026-07-07).
@@ -11,6 +25,7 @@ Argusoft reported auto-generated Linear bugs whose descriptions say "Priority: H
 ### Assumptions to validate
 - Dup-grouped High re-reports do NOT escalate the existing canonical's priority/state (kept out of scope; the reporter-count modifier in the board doc may want this later).
 - `fileAutoIssue` (telemetry/oncall) still files unset-priority Backlog items by design — no text/field mismatch there, but they remain triage-invisible until ENG-187-style intake rules cover them.
+
 ## LinkedIn send-invite returns "Invalid parameters" for a valid <200-char note — root cause + fix (2026-07-07)
 
 Scheduled LinkedIn outreach (ENG-213; reported by info@pmps.ai, session 3cac962b, and hit live on Hannah K's account NN-72jZtRD6nQSzEeK6n1g) kept failing send-invite with a generic `Invalid parameters`. The note-length red herring threw the first triage: the very first attempt failed correctly on a 203-char note (over LinkedIn's 200 limit), but after both notes were trimmed to 194 and 197 chars send-invite *still* returned `Invalid parameters` — for provider_id-based calls AND a profile_url-based call. search-people, get-profile, and list-sent-invitations all worked in the same session, so the fault was isolated to the invite endpoint, not auth or the note.
