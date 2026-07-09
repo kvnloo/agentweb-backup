@@ -127,9 +127,20 @@
   .fixcard.failed { border-left-color: var(--red); }
   .fixcard a { color: var(--accent); }
   .turnmeta { color: var(--dim); font-size: 11px; align-self: flex-start; padding: 0 6px; }
+  .ctxwarn { align-self: flex-start; max-width: 780px; margin: 2px 0 4px; padding: 8px 12px; font-size: 12px; color: var(--amber); background: rgba(217,164,65,.08); border: 1px solid rgba(217,164,65,.35); border-radius: 8px; }
+  .ctxwarn .cw-go { color: var(--amber); cursor: pointer; text-decoration: underline; font-weight: 600; }
+  .compactcard { align-self: stretch; margin: 8px 0; }
+  .compactcard .ch { display: flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; color: var(--dim); font-size: 11px; }
+  .compactcard .cl { flex: 1; height: 1px; background: var(--border); }
+  .compactcard .cn { white-space: nowrap; letter-spacing: .3px; }
+  .compactcard .ct { white-space: nowrap; color: var(--dim); opacity: .8; }
+  .compactcard .cx-toggle { white-space: nowrap; color: var(--accent); }
+  .compactcard:hover .cx-toggle { text-decoration: underline; }
+  .compactcard .cx { display: none; margin-top: 10px; padding: 10px 14px; border: 1px solid var(--border); border-left: 3px solid var(--accent); background: var(--panel2); border-radius: 8px; font-size: 13px; color: var(--text); }
+  .compactcard.open .cx { display: block; }
 
   /* Composer */
-  #composer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 20px; }
+  #composer { border-top: 1px solid var(--border); background: var(--panel); padding: 12px 20px; position: relative; }
   #composer .row { display: flex; gap: 10px; align-items: flex-end; }
   #input { flex: 1; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font: inherit; resize: none; min-height: 42px; max-height: 160px; }
   #input:focus { outline: 1px solid var(--accent); }
@@ -144,6 +155,55 @@
   #voice { display: none; align-items: center; gap: 9px; padding: 8px 20px; color: var(--red); font-size: 12px; border-top: 1px solid var(--border); background: var(--panel); }
   #voice .mic { width: 9px; height: 9px; border-radius: 50%; background: var(--red); animation: pulse 1.1s infinite; }
   #input.recording { outline: 1px solid var(--red); }
+  /* Esc-Esc "jump to a previous message" picker (Claude Code style) */
+  #picker { position: absolute; inset: 0; z-index: 20; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,.45); }
+  #picker:focus { outline: none; }
+  #picker .pbox { width: min(640px, 88%); max-height: 70%; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 10px 34px rgba(0,0,0,.55); display: flex; flex-direction: column; overflow: hidden; }
+  #picker .phead { padding: 11px 15px; border-bottom: 1px solid var(--border); font-size: 13px; font-weight: 600; display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+  #picker .phead span { color: var(--dim); font-size: 11px; font-weight: 400; white-space: nowrap; }
+  #picker .plist { overflow-y: auto; padding: 6px; }
+  #picker .prow { display: flex; gap: 10px; align-items: baseline; padding: 8px 10px; border-radius: 8px; cursor: pointer; }
+  #picker .prow .pt { color: var(--dim); font-size: 10px; white-space: nowrap; min-width: 54px; }
+  #picker .prow .px { color: var(--text); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #picker .prow.sel { background: var(--user); }
+  #picker .pempty { padding: 16px; color: var(--dim); font-size: 12px; text-align: center; }
+  /* Slash-command autocomplete menu (above the composer) */
+  #slashmenu { position: absolute; left: 20px; right: 20px; bottom: 100%; margin-bottom: 8px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.5); overflow: hidden; display: none; z-index: 8; }
+  #slashmenu .srow { display: flex; gap: 10px; align-items: baseline; padding: 8px 12px; cursor: pointer; }
+  #slashmenu .srow.sel { background: var(--user); }
+  #slashmenu .srow .sn { color: var(--accent); font-weight: 600; font-size: 13px; min-width: 92px; }
+  #slashmenu .srow .sd { color: var(--dim); font-size: 12px; }
+  /* /status & /context overlay (Esc dismisses) */
+  #cmd { position: absolute; inset: 0; z-index: 20; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,.5); }
+  #cmd:focus { outline: none; }
+  #cmd .cbox { width: min(680px, 90%); max-height: 78%; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 10px 34px rgba(0,0,0,.55); display: flex; flex-direction: column; overflow: hidden; }
+  #cmd .chead { padding: 12px 16px; border-bottom: 1px solid var(--border); font-size: 14px; font-weight: 600; display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+  #cmd .chead span { color: var(--dim); font-size: 11px; font-weight: 400; white-space: nowrap; }
+  #cmd .cbody { overflow-y: auto; padding: 14px 16px; font-size: 13px; }
+  #cmd .krow { display: flex; gap: 12px; padding: 4px 0; }
+  #cmd .krow .k { color: var(--dim); min-width: 132px; flex-shrink: 0; }
+  #cmd .krow .v { color: var(--text); overflow-wrap: anywhere; }
+  #cmd .cgrid { display: grid; grid-template-columns: repeat(20, 1fr); gap: 3px; margin: 14px 0 10px; }
+  #cmd .cgrid i { aspect-ratio: 1; border-radius: 2px; background: var(--border); }
+  #cmd .cgrid i.used { background: var(--accent); }
+  #cmd .clegend { display: flex; gap: 18px; flex-wrap: wrap; }
+  #cmd .clegend .ci { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text); }
+  #cmd .clegend .sw { width: 11px; height: 11px; border-radius: 2px; }
+  #cmd .cnote { color: var(--dim); font-size: 11px; margin-top: 12px; }
+  #cmd .pempty { padding: 8px 0; color: var(--dim); font-size: 12px; }
+  #cmd .mrow { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }
+  #cmd .csub { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--dim); margin: 16px 0 8px; }
+  #cmd .csub:first-child { margin-top: 0; }
+  #cmd .usagewrap { display: flex; flex-direction: column; gap: 14px; margin-bottom: 4px; }
+  #cmd .ubar .ubl { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--text); margin-bottom: 5px; }
+  #cmd .ubar .ubp { color: var(--dim); font-variant-numeric: tabular-nums; }
+  #cmd .utrack { height: 8px; border-radius: 5px; background: var(--border); overflow: hidden; }
+  #cmd .ufill { display: block; height: 100%; border-radius: 5px; background: var(--accent); transition: width .3s; }
+  #cmd .ufill.warn { background: var(--amber); }
+  #cmd .ufill.crit { background: var(--red); }
+  #cmd .ubar .ubr { font-size: 11px; color: var(--dim); margin-top: 4px; }
+  #h-preview { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  #merge-btn { margin-left: auto; }
 </style>
 </head>
 <body>
@@ -295,7 +355,12 @@ function stampTime(bubbleEl, iso) {
   bubbleEl.appendChild(ts); // bottom-right corner of the bubble (absolute)
 }
 
-const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true };
+const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true, picker: null, lastEsc: 0, slash: null, cmd: null, mergePhase: null, lastResult: '', compacting: false, lastSent: '', escArmed: 0, escText: '' };
+const COMMANDS = [
+  { name: '/status', desc: 'Session & fix status' },
+  { name: '/context', desc: 'Context window usage' },
+  { name: '/compact', desc: 'Summarize & compact the conversation' },
+];
 
 // ---------- voice (push-to-talk): hold space to dictate via the browser's Web Speech API ----------
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -305,7 +370,7 @@ const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 // their gap is far larger. RELEASE_MS is the tiny grace period after a keyup before we treat the key
 // as truly released (must outlast the auto-repeat keyup→keydown gap).
 const HOLD_MS = 300, REPEAT_GAP = 12, RELEASE_MS = 20, VOICE_LANG = 'en-US';
-const V = { supported: !!SR, denied: false, pressActive: false, recording: false, holdTimer: null, releaseTimer: null, spaceUpTs: -1e9, interveningKey: true, rec: null, before: '', after: '', spaceAt: 0, snapshot: '', awaitingFinal: false, finalTimer: null };
+const V = { supported: !!SR, denied: false, pressActive: false, recording: false, holdTimer: null, releaseTimer: null, spaceUpTs: -1e9, interveningKey: true, rec: null, before: '', after: '', spaceAt: 0, awaitingFinal: false, finalTimer: null };
 
 // ---------- sidebar ----------
 let lastIssuesJson = '';
@@ -377,22 +442,46 @@ function renderHeader(d) {
 
 // ---------- preview ----------
 function renderPreviewBar() {
-  const p = S.detail?.preview;
   const el = $('h-preview');
-  if (!p) { el.innerHTML = ''; return; }
-  if (p.busy) {
-    el.innerHTML = '<button class="btn" disabled>⏳ preview working…</button>';
-  } else if (p.running && p.urls) {
-    el.innerHTML = `<button class="btn on" id="pv-btn">■ Disable preview</button>
-      <span>live:</span>
-      <a href="${esc(p.urls.customer)}" target="_blank">Customer ↗</a>
-      <a href="${esc(p.urls.partner)}" target="_blank">Partner ↗</a>
-      <a href="${esc(p.urls.api)}" target="_blank">API ↗</a>`;
-    $('pv-btn').onclick = () => previewAction('down');
-  } else {
-    el.innerHTML = '<button class="btn" id="pv-btn">▶ Enable preview</button>';
-    $('pv-btn').onclick = () => previewAction('up');
+  const p = S.detail?.preview;
+  let pv = '', pvAction = null;
+  if (p) {
+    if (p.busy) pv = '<button class="btn" disabled>⏳ preview working…</button>';
+    else if (p.running && p.urls) {
+      pv = `<button class="btn on" id="pv-btn">■ Disable preview</button><span>live:</span>`
+        + `<a href="${esc(p.urls.customer)}" target="_blank">Customer ↗</a>`
+        + `<a href="${esc(p.urls.partner)}" target="_blank">Partner ↗</a>`
+        + `<a href="${esc(p.urls.api)}" target="_blank">API ↗</a>`;
+      pvAction = 'down';
+    } else { pv = '<button class="btn" id="pv-btn">▶ Enable preview</button>'; pvAction = 'up'; }
   }
+  // Merge button (right side) — only for a full-access session that has open PR(s).
+  const prCount = (S.detail?.entry?.prs || []).filter(Boolean).length;
+  const canMerge = prCount > 0 && S.detail?.capability?.level === 'full';
+  const mg = canMerge ? `<button class="btn" id="merge-btn"${S.busy || S.mergePhase ? ' disabled' : ''}>⛙ Merge PR${prCount > 1 ? 's' : ''}</button>` : '';
+  el.innerHTML = pv + mg;
+  if ($('pv-btn')) $('pv-btn').onclick = () => previewAction(pvAction);
+  if ($('merge-btn')) $('merge-btn').onclick = startMerge;
+}
+async function mergePost(confirm) {
+  const r = await fetch(`/api/issues/${S.sel}/chat/merge`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ confirm }),
+  });
+  if (!r.ok) { const e = await r.json().catch(() => ({})); addSys('⚠ ' + (e.error || `merge request failed (${r.status})`), 'err'); S.mergePhase = null; renderPreviewBar(); }
+}
+function startMerge() {
+  if (S.busy || S.mergePhase) return;
+  S.mergePhase = 'prep'; renderPreviewBar();
+  addSys('⛙ Preparing PR(s) for merge — syncing with the base, fixing CI, and waiting for green…', 'sys');
+  mergePost(false);
+}
+function openMergeConfirm() {
+  const n = (S.detail?.entry?.prs || []).filter(Boolean).length;
+  const body = `<div class="pempty" style="color:var(--text);font-size:13px">All checks passed. Merge ${n} PR${n > 1 ? 's' : ''} now? This runs <code>gh pr merge --merge</code> on ${n > 1 ? 'each PR' : 'the PR'}.</div>`
+    + `<div class="mrow"><button class="btn" id="mc-cancel">Cancel</button><button class="btn on" id="mc-go">Confirm merge</button></div>`;
+  openCmd('Ready to merge', body);
+  $('mc-cancel').onclick = () => { closeCmd(); };
+  $('mc-go').onclick = () => { closeCmd(); S.mergePhase = 'merge'; renderPreviewBar(); mergePost(true); };
 }
 async function previewAction(action) {
   const r = await fetch(`/api/issues/${S.sel}/preview`, {
@@ -506,6 +595,20 @@ function addText(bubble, text) {
   bubble._run.innerHTML = md(bubble._runRaw);
   scroll();
 }
+// A compaction boundary: everything above it was summarized and dropped from the agent's context.
+// Collapsed by default (just the divider); click to read the summary the agent will carry forward.
+function addCompactCard(m) {
+  const el = document.createElement('div');
+  el.className = 'compactcard';
+  el.innerHTML = `<div class="ch"><span class="cl"></span><span class="cn">✦ Conversation compacted</span>`
+    + `${m.at ? `<span class="ct">${esc(fmtTime(m.at))}</span>` : ''}<span class="cx-toggle">show summary ▾</span><span class="cl"></span></div>`
+    + `<div class="cx">${md(m.text || '')}</div>`;
+  el.querySelector('.ch').onclick = () => {
+    el.classList.toggle('open');
+    el.querySelector('.cx-toggle').textContent = el.classList.contains('open') ? 'hide summary ▴' : 'show summary ▾';
+  };
+  chatEl().appendChild(el); scroll();
+}
 function addFixCard(fix) {
   const el = document.createElement('div');
   el.className = 'fixcard ' + (fix.pushedOk ? '' : 'failed');
@@ -515,10 +618,34 @@ function addFixCard(fix) {
     : `❌ Committed but push failed: ${esc((fix.failedRepos || []).join(', '))} ${prs}`;
   chatEl().appendChild(el); scroll();
 }
+// When the session's context fills past this fraction of the window, every fresh agent reply ends
+// with a nudge to /compact. Threshold is relative to the actual window (200k or the 1M beta), so it
+// fires at ~800k on a 1M window.
+const CTX_WARN_FRAC = 0.8;
+function ctxWarnInfo() {
+  const u = S.detail?.usage;
+  if (!u || !u.contextUsed || !u.contextWindow) return null;
+  const frac = u.contextUsed / u.contextWindow;
+  if (frac < CTX_WARN_FRAC) return null;
+  return { used: u.contextUsed, win: u.contextWindow, pct: Math.round(frac * 100) };
+}
+// Nudge the reader to compact, placed right after the latest agent message. `/compact` is clickable.
+function appendCtxWarn(afterEl) {
+  if (!afterEl || S.busy || S.compacting) return; // don't nag mid-turn or while already compacting
+  const info = ctxWarnInfo();
+  if (!info) return;
+  const el = document.createElement('div');
+  el.className = 'ctxwarn';
+  el.innerHTML = `⚠ This conversation is getting large — ${info.pct}% of the context window (${fmtTok(info.used)} / ${fmtTok(info.win)} tokens). Run <b class="cw-go">/compact</b> to summarize it and free up context.`;
+  el.querySelector('.cw-go').onclick = () => startCompact('');
+  afterEl.insertAdjacentElement('afterend', el);
+}
 function renderAll(d) {
   chatEl().innerHTML = '';
   renderPipeline(d);
+  let lastAsst = null;
   (d.chat?.messages || []).forEach((m, i) => {
+    if (m.role === 'compact') { addCompactCard(m); return; }
     if (m.role === 'user') { const el = addUser(m.text, i); if (m.at) el.title = fmtAt(m.at); stampTime(el, m.at); }
     else {
       const b = newAssistant();
@@ -527,8 +654,10 @@ function renderAll(d) {
       addText(b, m.text || '');
       if (m.fix) addFixCard(m.fix);
       stampTime(b, m.at);
+      lastAsst = b;
     }
   });
+  appendCtxWarn(lastAsst); // end the newest agent reply with a compact nudge when context is high
   scrollBottom();
 }
 
@@ -572,7 +701,8 @@ function openEvents(id) {
 function handleEvent(e) {
   switch (e.type) {
     case 'turn_start': {
-      S.curBubble = null; setBusy(true);
+      S.curBubble = null; S.lastResult = ''; setBusy(true);
+      if (e.compact) { S.compacting = true; setThinking('Summarizing the conversation…'); break; } // no user bubble for /compact
       const msgs = chatEl().querySelectorAll('.msg.user');
       const last = msgs[msgs.length - 1];
       if (!last || last.dataset.text !== e.message) addUser(e.message);
@@ -580,12 +710,15 @@ function handleEvent(e) {
     }
     case 'init': break;
     case 'status': addSys('⏳ ' + e.text); break;
+    case 'compacted': break; // the persisted `compact` marker is rendered by refreshDetail on 'done'
     case 'text':
+      if (S.compacting) { setThinking('Summarizing the conversation…'); break; } // suppress the streamed summary; it lands as a compact card
       if (!S.curBubble) S.curBubble = newAssistant();
       addText(S.curBubble, e.text);
       setThinking('Claude is responding…');
       break;
     case 'tool':
+      if (S.compacting) break;
       if (!S.curBubble) S.curBubble = newAssistant();
       addTool(S.curBubble, e);
       setThinking('Working… (running tools)');
@@ -596,7 +729,7 @@ function handleEvent(e) {
       setThinking('Claude is thinking…');
       break;
     }
-    case 'result': addSys(`⏱ ${e.turns ?? '?'} turns · ${e.ms ? Math.round(e.ms/1000)+'s' : ''}`, 'turnmeta'); break;
+    case 'result': S.lastResult = e.text || ''; if (!S.compacting) addSys(`⏱ ${e.turns ?? '?'} turns · ${e.ms ? Math.round(e.ms/1000)+'s' : ''}`, 'turnmeta'); break;
     case 'fix_summary': addFixCard(e); break;
     case 'preview':
       if (S.detail) { S.detail.preview = { running: e.running, busy: e.busy, urls: e.urls }; renderPreviewBar(); }
@@ -604,7 +737,15 @@ function handleEvent(e) {
       break;
     case 'error': addSys('⚠ ' + e.error, 'err'); break;
     case 'aborted': addSys('⏹ aborted', 'err'); break;
-    case 'done': S.curBubble = null; setBusy(false); loadIssues(); refreshDetail(S.sel); break;
+    case 'done':
+      // Stamp the just-finished assistant bubble now — renderAll (which stamps from the persisted
+      // `at`) is skipped when the reader has scrolled up, so don't rely on it for the live message.
+      if (S.curBubble) stampTime(S.curBubble, new Date().toISOString());
+      S.curBubble = null; S.compacting = false; setBusy(false); loadIssues(); refreshDetail(S.sel);
+      // Merge handshake: after the prep turn, if the agent signalled it's green, ask for confirmation.
+      if (S.mergePhase === 'prep') { S.mergePhase = null; renderPreviewBar(); if (/\bMERGE_READY\b/.test(S.lastResult)) openMergeConfirm(); }
+      else if (S.mergePhase === 'merge') { S.mergePhase = null; renderPreviewBar(); }
+      break;
   }
 }
 
@@ -615,6 +756,7 @@ function setBusy(b) {
   $('send').classList.toggle('stop', b);
   if (b) setThinking('Claude is working…');
   $('thinking').style.display = b ? 'flex' : 'none';
+  if (S.detail) renderPreviewBar(); // keep the Merge button's disabled state in sync with busy
 }
 function setThinking(label) { $('thinking-label').textContent = label; }
 function updateHint() {
@@ -627,6 +769,30 @@ function updateHint() {
 }
 
 // ---------- edit & rewrite history ----------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Esc flow, step 2: an aborted-before-any-reply message comes back to the composer as a clean redo —
+// its user bubble (and the empty aborted turn) is dropped and the session rewound to before it.
+async function restoreAborted(text) {
+  $('input').value = text || ''; autosize(); $('input').focus();
+  // The abort was fired on the first Esc; wait for the turn to fully end before rewinding, or the
+  // delete would 409 against a still-active turn. If it never settles, keep the text and bail.
+  for (let i = 0; i < 30 && S.busy; i++) await sleep(100);
+  if (S.busy || !S.sel) return;
+  await refreshDetail(S.sel); // pull the persisted messages so we can find the one we just sent
+  const msgs = S.detail?.chat?.messages || [];
+  let idx = -1;
+  for (let i = msgs.length - 1; i >= 0; i--) { if (msgs[i].role === 'user') { idx = i; break; } }
+  if (idx < 0 || msgs[idx].text !== text) return; // safety: only rewind if the tail really is our message
+  const r = await fetch(`/api/issues/${S.sel}/chat/delete`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ index: idx, revert: false }),
+  });
+  if (!r.ok) { const e = await r.json().catch(() => ({})); addSys('⚠ ' + (e.error || `couldn't rewind (${r.status})`), 'err'); return; }
+  if (S.detail?.chat?.messages) S.detail.chat.messages = S.detail.chat.messages.slice(0, idx);
+  renderAll(S.detail);
+  $('input').focus();
+  refreshDetail(S.sel);
+}
 function droppedHasCommits(index) {
   return (S.detail?.chat?.messages || []).slice(index + 1).some((m) => m && m.fix);
 }
@@ -725,6 +891,7 @@ async function doEditSend(revert) {
   const index = S.editing.index;
   const message = $('input').value.trim();
   if (!message) return;
+  S.lastSent = message; // so an Esc-abort-before-any-reply can restore it (same as a fresh send)
   const backup = S.detail?.chat?.messages ? S.detail.chat.messages.slice() : null;
 
   // Rewrite the UI to the new state BEFORE sending, so the streamed turn_start (which can only
@@ -768,7 +935,9 @@ async function send() {
   }
   const message = $('input').value.trim();
   if (!message || !S.sel) return;
+  if (message[0] === '/') { hideSlash(); $('input').value = ''; autosize(); runCommand(message); return; } // slash command, not a chat message
   $('input').value = ''; autosize();
+  S.lastSent = message; // remembered so an Esc-abort-before-any-reply can put it back in the composer
   // Show the bubble immediately (like edit does) so it doesn't vanish into limbo until turn_start.
   // turn_start's dataset.text dedup then skips re-adding it.
   const bubble = addUser(message);
@@ -788,13 +957,20 @@ async function send() {
 }
 $('send').onclick = send;
 $('input').addEventListener('keydown', (ev) => {
+  if (S.slash) { // the slash-command menu owns these keys while it's open
+    if (ev.key === 'ArrowUp') { ev.preventDefault(); ev.stopPropagation(); moveSlash(-1); return; }
+    if (ev.key === 'ArrowDown') { ev.preventDefault(); ev.stopPropagation(); moveSlash(1); return; }
+    if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); hideSlash(); return; }
+    if (ev.key === 'Enter' || ev.key === 'Tab') { ev.preventDefault(); ev.stopPropagation(); runSlash(); return; }
+  }
   if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); send(); }
 });
 // Follow-new-content behaviour: track whether the user is at the bottom; hide the pill once caught up.
 $('chat').addEventListener('scroll', () => { S.stick = nearBottom(); if (S.stick) $('jumpDown').style.display = 'none'; });
 $('jumpDown').onclick = () => scrollBottom();
 function autosize() { const i = $('input'); i.style.height = 'auto'; i.style.height = Math.min(i.scrollHeight, 160) + 'px'; }
-$('input').addEventListener('input', autosize);
+$('input').addEventListener('input', () => { S.escArmed = 0; autosize(); updateSlashMenu(); }); // typing breaks the Esc burst
+$('input').addEventListener('blur', () => { if (S.slash) setTimeout(hideSlash, 120); }); // let a row mousedown fire first
 
 // ---------- voice: push-to-talk dictation ----------
 // Only intercept space when the composer is actually usable; otherwise spaces behave normally.
@@ -810,8 +986,6 @@ function startVoice() {
   voiceNote('🎤 Starting mic…'); // rec.onstart flips this to "Listening…" once audio is actually captured
   const el = $('input'), val = el.value, at = V.spaceAt;
   const hadSpace = val[at] === ' ';
-  // Snapshot = state with that throwaway space removed, for Esc-to-cancel.
-  V.snapshot = hadSpace ? (val.slice(0, at) + val.slice(at + 1)) : val;
   // Keep the tapped space as a word separator (so "hello"+dictate = "hello world"),
   // but drop it when it would just be leading whitespace in an otherwise-empty composer.
   let before = val.slice(0, at + (hadSpace ? 1 : 0));
@@ -867,14 +1041,6 @@ function endVoice() { // release: stop recognition; the transcript stays and the
   if (V.rec) { try { V.rec.stop(); } catch {} } // → final onresult, then onend → finalizeVoice
   clearTimeout(V.finalTimer);
   V.finalTimer = setTimeout(finalizeVoice, 1500); // fallback if onend never fires
-}
-function cancelVoice() { // Esc: discard and restore what was there before
-  clearTimeout(V.holdTimer); clearTimeout(V.releaseTimer); clearTimeout(V.finalTimer); V.releaseTimer = null;
-  if (!V.recording && !V.pressActive) return;
-  if (V.recording) { $('input').value = V.snapshot; autosize(); }
-  V.recording = false; V.pressActive = false; V.awaitingFinal = false; // suppress the abort's finalize
-  showVoice(false);
-  if (V.rec) { try { V.rec.abort(); } catch {} }
 }
 // Instant, zero-cost cleanup so the box looks right the moment you release.
 function heuristicClean(s) {
@@ -936,7 +1102,6 @@ if (V.supported) {
   // real typing ("and a") always has an intervening keystroke. So we require both: no intervening key
   // AND a sub-REPEAT_GAP gap. That leaves genuinely-typed spaces untouched at any typing speed.
   inp.addEventListener('keydown', (ev) => {
-    if (ev.code === 'Escape' && (V.recording || V.pressActive)) { ev.preventDefault(); cancelVoice(); return; }
     if (ev.code !== 'Space') { V.interveningKey = true; return; } // a non-space key breaks any auto-repeat run
     if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.isComposing) return;
     const isRepeat = ev.repeat || (V.pressActive && !V.interveningKey && (ev.timeStamp - V.spaceUpTs) < REPEAT_GAP);
@@ -973,6 +1138,224 @@ if (V.supported) {
     if (V.recording) endVoice(); else V.pressActive = false;
   });
 }
+
+// ---------- keyboard: Claude Code-style Esc (stop) / Esc-Esc (jump to a previous message) ----------
+function openPicker() {
+  if (S.busy || S.editing || S.deleting || !S.detail) return;
+  const items = (S.detail.chat?.messages || []).map((m, i) => ({ i, m })).filter((x) => x.m.role === 'user');
+  if (!items.length) return;
+  S.picker = { items, sel: items.length - 1 }; // default to the most recent message
+  $('input').blur();
+  buildPicker();
+}
+function buildPicker() {
+  let ov = $('picker');
+  if (!ov) {
+    ov = document.createElement('div');
+    ov.id = 'picker'; ov.tabIndex = -1;
+    ov.addEventListener('mousedown', (e) => { if (e.target === ov) closePicker(); }); // click backdrop closes
+    $('main').appendChild(ov);
+  }
+  const { items, sel } = S.picker;
+  ov.innerHTML = '<div class="pbox"><div class="phead">Jump to a previous message'
+    + '<span>↑↓ move · Enter edit · Esc cancel</span></div><div class="plist">'
+    + items.map((x, k) =>
+        `<div class="prow${k === sel ? ' sel' : ''}" data-k="${k}">`
+        + `<span class="pt">${x.m.at ? esc(fmtTime(x.m.at)) : ''}</span>`
+        + `<span class="px">${esc(String(x.m.text || '').replace(/\s+/g, ' ').slice(0, 140))}</span></div>`
+      ).join('')
+    + '</div></div>';
+  for (const row of ov.querySelectorAll('.prow')) {
+    row.onmouseenter = () => selectPicker(+row.dataset.k);
+    row.onclick = () => { selectPicker(+row.dataset.k); pickPicker(); };
+  }
+  ov.style.display = 'flex'; ov.focus();
+  scrollPickerSel();
+}
+function selectPicker(k) { if (S.picker && k !== S.picker.sel) { S.picker.sel = k; for (const r of $('picker').querySelectorAll('.prow')) r.classList.toggle('sel', +r.dataset.k === k); scrollPickerSel(); } }
+function movePicker(d) { if (!S.picker) return; const n = S.picker.items.length; selectPicker((S.picker.sel + d + n) % n); }
+function scrollPickerSel() { const r = $('picker')?.querySelector('.prow.sel'); if (r) r.scrollIntoView({ block: 'nearest' }); }
+function closePicker() { S.picker = null; const ov = $('picker'); if (ov) ov.style.display = 'none'; if (!S.busy) $('input').focus(); }
+function pickPicker() { const it = S.picker?.items[S.picker.sel]; if (!it) return; closePicker(); beginEdit(it.i, it.m.text); }
+
+// ---------- slash commands (/status /context /compact) ----------
+function updateSlashMenu() {
+  const m = /^\/(\w*)$/.exec($('input').value);
+  if (!m || S.editing || S.deleting) { hideSlash(); return; }
+  const q = m[1].toLowerCase();
+  const items = COMMANDS.filter((c) => c.name.slice(1).startsWith(q));
+  if (!items.length) { hideSlash(); return; }
+  S.slash = { items, sel: 0 };
+  renderSlash();
+}
+function renderSlash() {
+  let el = $('slashmenu');
+  if (!el) { el = document.createElement('div'); el.id = 'slashmenu'; $('composer').appendChild(el); }
+  el.innerHTML = S.slash.items.map((c, k) =>
+    `<div class="srow${k === S.slash.sel ? ' sel' : ''}" data-k="${k}"><span class="sn">${esc(c.name)}</span><span class="sd">${esc(c.desc)}</span></div>`
+  ).join('');
+  for (const row of el.querySelectorAll('.srow')) {
+    row.onmouseenter = () => { S.slash.sel = +row.dataset.k; for (const r of el.querySelectorAll('.srow')) r.classList.toggle('sel', r === row); };
+    row.onmousedown = (e) => { e.preventDefault(); S.slash.sel = +row.dataset.k; runSlash(); };
+  }
+  el.style.display = 'block';
+}
+function moveSlash(d) { if (!S.slash) return; const n = S.slash.items.length; S.slash.sel = (S.slash.sel + d + n) % n; renderSlash(); }
+function hideSlash() { S.slash = null; const el = $('slashmenu'); if (el) el.style.display = 'none'; }
+function runSlash() { const c = S.slash?.items[S.slash.sel]; if (!c) return; hideSlash(); $('input').value = ''; autosize(); runCommand(c.name); }
+function runCommand(cmd) {
+  const raw = String(cmd).trim();
+  const name = raw.split(/\s+/)[0].toLowerCase();
+  if (name === '/status') return openStatus();
+  if (name === '/context') return openContext();
+  if (name === '/compact') return startCompact(raw.slice(name.length).trim());
+  addSys('Unknown command: ' + name + ' — try /status, /context, or /compact', 'err');
+}
+// /compact — hand the whole conversation to the agent for a summary, then continue on a tiny
+// context. Streamed summary text is suppressed; the persisted `compact` marker renders on refresh.
+async function startCompact(instructions) {
+  if (!S.sel || S.busy || S.compacting) return;
+  S.compacting = true; setBusy(true);
+  addSys('✦ Compacting the conversation — summarizing so future turns run on a smaller context…', 'sys');
+  try {
+    const r = await fetch(`/api/issues/${S.sel}/chat/compact`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ instructions: instructions || '' }),
+    });
+    if (!r.ok) { const e = await r.json().catch(() => ({})); addSys('⚠ ' + (e.error || `compact failed (${r.status})`), 'err'); S.compacting = false; setBusy(false); }
+  } catch (e) { addSys('⚠ ' + String(e.message || e), 'err'); S.compacting = false; setBusy(false); }
+}
+// Shared overlay for /status and /context (Esc / backdrop-click dismiss).
+function openCmd(title, bodyHtml) {
+  let ov = $('cmd');
+  if (!ov) { ov = document.createElement('div'); ov.id = 'cmd'; ov.tabIndex = -1; ov.addEventListener('mousedown', (e) => { if (e.target === ov) closeCmd(); }); $('main').appendChild(ov); }
+  ov.innerHTML = `<div class="cbox"><div class="chead">${esc(title)}<span>Esc to close</span></div><div class="cbody">${bodyHtml}</div></div>`;
+  S.cmd = title; ov.style.display = 'flex'; $('input').blur(); ov.focus();
+}
+function closeCmd() { S.cmd = null; const ov = $('cmd'); if (ov) ov.style.display = 'none'; if (!S.busy) $('input').focus(); }
+const kRow = (k, v) => `<div class="krow"><span class="k">${esc(k)}</span><span class="v">${esc(String(v))}</span></div>`;
+// Relative reset time: "in 42m", "in 3h 10m", or "in 2d · Jul 11, 5:59 PM" for far-off resets.
+function fmtReset(iso) {
+  try {
+    const ms = new Date(iso) - new Date();
+    if (ms <= 0) return 'now';
+    const mins = Math.round(ms / 60000);
+    if (mins < 60) return `in ${mins}m`;
+    const hrs = Math.floor(mins / 60), rm = mins % 60;
+    if (hrs < 24) return `in ${hrs}h${rm ? ` ${rm}m` : ''}`;
+    const days = Math.round(hrs / 24);
+    return `in ${days}d · ${fmtTime(iso)}`;
+  } catch { return ''; }
+}
+function usageBar(label, pct, resetsAt) {
+  if (pct == null) return '';
+  const p = Math.max(0, Math.min(100, Math.round(pct)));
+  const sev = p >= 90 ? 'crit' : p >= 70 ? 'warn' : 'ok';
+  const reset = resetsAt ? `resets ${esc(fmtReset(resetsAt))}` : '';
+  return `<div class="ubar"><div class="ubl"><span>${esc(label)}</span><span class="ubp">${p}%</span></div>`
+    + `<div class="utrack"><i class="ufill ${sev}" style="width:${p}%"></i></div>`
+    + `<div class="ubr">${reset}</div></div>`;
+}
+// Account-wide usage/limits for the logged-in Claude subscription (from /api/usage → /api/oauth/usage).
+function renderUsage(r) {
+  if (!r || !r.ok) return `<div class="pempty">Usage unavailable${r && r.error ? ` — ${esc(r.error)}` : ''}.</div>`;
+  const g = r.usage || {};
+  const bars = [
+    usageBar('Current session · 5-hour limit', g.five_hour?.utilization, g.five_hour?.resets_at),
+    usageBar('This week · all models', g.seven_day?.utilization, g.seven_day?.resets_at),
+    usageBar('This week · Opus', g.seven_day_opus?.utilization, g.seven_day_opus?.resets_at),
+    usageBar('This week · Sonnet', g.seven_day_sonnet?.utilization, g.seven_day_sonnet?.resets_at),
+  ].filter(Boolean).join('');
+  const sp = g.spend || {}, ex = g.extra_usage || {};
+  const creditsOn = !!(sp.enabled || ex.is_enabled);
+  let credits;
+  if (creditsOn && ex.used_credits != null) credits = `on · ${ex.used_credits} used`;
+  else credits = creditsOn ? 'on' : 'off';
+  return `<div class="usagewrap">${bars || '<div class="pempty">No limit data.</div>'}</div>`
+    + kRow('Usage credits', credits);
+}
+async function openStatus() {
+  const d = S.detail;
+  openCmd('Status', '<div class="csub">Account usage</div><div class="pempty">Loading usage…</div>');
+  let usageHtml = '<div class="pempty">Usage unavailable.</div>';
+  try { usageHtml = renderUsage(await (await fetch('/api/usage')).json()); }
+  catch (e) { usageHtml = `<div class="pempty">Couldn't load usage — ${esc(String(e.message || e))}.</div>`; }
+  let issueHtml = '';
+  if (d) {
+    const lvl = d.capability?.level;
+    const model = (lvl && d.models ? d.models[lvl] : '') || '—';
+    const pr = (d.entry?.prs || []).map((p) => p.url).filter(Boolean);
+    issueHtml = '<div class="csub">This issue</div>' + [
+      kRow('Issue', d.identifier + (d.linear?.title ? ' — ' + d.linear.title : '')),
+      kRow('Mode', (lvl === 'full' ? 'Full access' : 'Read-only') + '  ·  ' + model),
+      kRow('Session', d.chat?.sessions?.[lvl] || '—'),
+      kRow('Branch', d.entry?.branch || '—'),
+      kRow('PR', pr.length ? pr.join('   ') : '—'),
+      kRow('Worktree', d.worktree?.exists ? 'present' : 'none'),
+      kRow('Messages', String((d.chat?.messages || []).length)),
+      kRow('Turns (last run)', d.usage?.turns != null ? String(d.usage.turns) : '—'),
+      kRow('Cost (session)', d.costTotal ? '$' + d.costTotal.toFixed(4) : '—'),
+      kRow('Fix engine', d.fixEnabled ? 'enabled' : 'disabled'),
+    ].join('');
+  }
+  // Only patch the body if the Status overlay is still the one open (user may have closed it).
+  if (S.cmd === 'Status') { const b = document.querySelector('#cmd .cbody'); if (b) b.innerHTML = '<div class="csub">Account usage</div>' + usageHtml + issueHtml; }
+}
+const fmtTok = (n) => (n >= 1e6 ? String(+(n / 1e6).toFixed(1)) + 'M' : n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n));
+function openContext() {
+  const d = S.detail; if (!d) return;
+  const u = d.usage;
+  if (!u || !u.contextUsed || !u.contextWindow) { openCmd('Context', '<div class="pempty">No context data yet — send a message in this session first, then reopen /context.</div>'); return; }
+  const used = u.contextUsed, win = u.contextWindow, free = Math.max(0, win - used);
+  const CELLS = 100, usedCells = Math.max(0, Math.min(CELLS, Math.round(used / win * CELLS)));
+  const grid = Array.from({ length: CELLS }, (_, k) => (k < usedCells ? '<i class="used"></i>' : '<i></i>')).join('');
+  const pc = (n) => (n / win * 100).toFixed(1);
+  const html = kRow('Model', u.model || '—') + kRow('Window', fmtTok(win) + ' tokens')
+    + `<div class="cgrid">${grid}</div>`
+    + '<div class="clegend">'
+    + `<div class="ci"><span class="sw" style="background:var(--accent)"></span>Used ${fmtTok(used)} (${pc(used)}%)</div>`
+    + `<div class="ci"><span class="sw" style="background:var(--border)"></span>Free ${fmtTok(free)} (${pc(free)}%)</div>`
+    + '</div>'
+    + kRow('Session cost', d.costTotal ? '$' + d.costTotal.toFixed(4) : '—')
+    + '<div class="cnote">“Used” covers the system prompt, tools, and the whole conversation together — the CLI doesn’t report them as separate categories.</div>';
+  openCmd('Context', html);
+}
+
+document.addEventListener('keydown', (ev) => {
+  if (V.recording || V.pressActive) return; // Esc stays out of voice — dictation is cleared with select-all+delete
+  if (S.cmd) { if (ev.key === 'Escape') { ev.preventDefault(); closeCmd(); } return; } // /status or /context overlay
+  if (S.picker) { // picker owns the keyboard while open
+    if (ev.key === 'Escape') { ev.preventDefault(); closePicker(); }
+    else if (ev.key === 'ArrowUp') { ev.preventDefault(); movePicker(-1); }
+    else if (ev.key === 'ArrowDown') { ev.preventDefault(); movePicker(1); }
+    else if (ev.key === 'Enter') { ev.preventDefault(); pickPicker(); }
+    return;
+  }
+  if (ev.key !== 'Escape') return;
+  if (S.editing || S.deleting) { ev.preventDefault(); clearBars(); return; } // Esc cancels an open edit/delete
+
+  // Claude-Code-style Esc burst — only while Claude hasn't put ANYTHING in the bubble yet:
+  //   1st Esc: abort the turn   2nd Esc: bring the message back to the composer (clean redo)   3rd Esc: picker.
+  // (2) Restore step — a consecutive Esc right after a no-activity abort.
+  if (S.escArmed && ev.timeStamp - S.escArmed < 600) {
+    ev.preventDefault();
+    const text = S.escText; S.escArmed = 0;
+    S.lastEsc = ev.timeStamp; // keep the burst alive so the next Esc opens the picker
+    restoreAborted(text);
+    return;
+  }
+  S.escArmed = 0; // the arm is single-use and only survives the immediately-following key
+
+  if (S.busy) { // (1) Esc stops the running turn; arm the restore iff no reply/tool has appeared yet
+    ev.preventDefault();
+    if (!S.curBubble) { S.escArmed = ev.timeStamp; S.escText = S.lastSent || ''; }
+    S.lastEsc = 0;
+    send();
+    return;
+  }
+  // (3) Idle: Esc-Esc (double within 400ms) opens the jump-to-message picker.
+  if (ev.timeStamp - S.lastEsc < 400) { S.lastEsc = 0; ev.preventDefault(); openPicker(); }
+  else S.lastEsc = ev.timeStamp;
+});
 
 // ---------- boot ----------
 loadIssues();
