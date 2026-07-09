@@ -172,4 +172,56 @@ describe('classifyWebValues', () => {
     expect(r.linkedin_url?.value).toBe('https://www.linkedin.com/in/jane-doe');
     expect(r.linkedin_url?.grounding).toBeUndefined();
   });
+
+  // ── Company-level LinkedIn URLs are wrong-entity-checked (ENG-122) ──────────
+  // A company LinkedIn URL describes the COMPANY, so a source about a different
+  // company must not supply it. Real bug: a "Slashy" lead was given
+  // linkedin.com/company/joinslash (Slash's page) because /linkedin/i fields
+  // skipped the wrong-entity guard entirely. rejectHallucinatedLinkedInUrls
+  // can't catch it either — the slug "joinslash" really is in the Slash source.
+
+  it('DROPS a company-level LinkedIn URL sourced from a wrong-entity page (Slashy lead → company/joinslash)', () => {
+    const r = classifyWebValues(
+      { companyLinkedin: fv('https://www.linkedin.com/company/joinslash') },
+      { source: SOURCE, leadCompany: 'Slashy', claimedCompany: 'Slash' },
+    );
+    expect(r.companyLinkedin).toBeUndefined();
+  });
+
+  it('DROPS a company-level LinkedIn URL when the model confirms a different company', () => {
+    const r = classifyWebValues(
+      { company_linkedin_url: fv('https://www.linkedin.com/company/quill-ai') },
+      { source: SOURCE, leadCompany: 'Quillwork AI', claimedCompany: 'Quill AI', claimedMatchesLead: false },
+    );
+    expect(r.company_linkedin_url).toBeUndefined();
+  });
+
+  it('KEEPS an aliased company LinkedIn URL when the model affirms same company (Meta = Facebook)', () => {
+    const r = classifyWebValues(
+      { company_linkedin_url: fv('https://www.linkedin.com/company/facebook') },
+      { source: SOURCE, leadCompany: 'Meta', claimedCompany: 'Facebook', claimedMatchesLead: true },
+    );
+    expect(r.company_linkedin_url?.value).toBe('https://www.linkedin.com/company/facebook');
+    expect(r.company_linkedin_url?.grounding).toBeUndefined(); // a URL never grounds against a quote
+  });
+
+  it('KEEPS a company-level LinkedIn URL when the claimed company matches the lead', () => {
+    const r = classifyWebValues(
+      { companyLinkedin: fv('https://www.linkedin.com/company/slash') },
+      { source: SOURCE, leadCompany: 'Slash', claimedCompany: 'Slash Financial' },
+    );
+    expect(r.companyLinkedin?.value).toBe('https://www.linkedin.com/company/slash');
+    expect(r.companyLinkedin?.grounding).toBeUndefined();
+  });
+
+  it('KEEPS a PERSON-level linkedin URL even when the source describes a different company', () => {
+    // Person identity is verified separately (rejectHallucinatedLinkedInUrls +
+    // identity resolution); the company mismatch must not strip the person's URL.
+    const r = classifyWebValues(
+      { linkedin_url: fv('https://www.linkedin.com/in/harsha-gaddipati') },
+      { source: SOURCE, leadCompany: 'Slashy', claimedCompany: 'Slash' },
+    );
+    expect(r.linkedin_url?.value).toBe('https://www.linkedin.com/in/harsha-gaddipati');
+    expect(r.linkedin_url?.grounding).toBeUndefined();
+  });
 });
