@@ -520,6 +520,16 @@ export const ICP_SINGLE_REGEN_SYSTEM_PROMPT = [
 export const ICP_REGEN_DISTINCT_INSTRUCTION =
   "The user rejected the persona above. Produce a meaningfully different one — a different role, a different buying motivation — not a rewording of it.";
 
+/**
+ * Sent only when regenerating a persona the user HAS edited. They invested in
+ * this card rather than rejecting it, so the run is a refinement: keep who the
+ * persona is, and move the other fields only as far as coherence with the
+ * user's own words requires. Without this (and without showing the model the
+ * card's current content) a one-field edit silently replaced the whole persona.
+ */
+export const ICP_REGEN_REFINE_INSTRUCTION =
+  "Refine this persona — keep who it is. Update the other fields only as much as coherence with the user's own words requires. Do not replace it with a different persona.";
+
 function buildSingleRegenPrompt(
   brand: IcpBrandContext,
   target: ICPPersona,
@@ -551,17 +561,24 @@ function buildSingleRegenPrompt(
 
   lines.push("");
   if (hasAnchor(target)) {
-    lines.push(
-      "The user rewrote the following field(s) of this persona themselves. Preserve their meaning exactly — you may improve the wording and framing, but do NOT change who this persona is:",
-    );
-    for (const field of ICP_PERSONA_FIELD_NAMES) {
-      const anchored = target.userIntent?.[field];
-      if (anchored) lines.push(`- ${field}: ${anchored}`);
-    }
+    // Show the card as it stands. Anchored fields already hold the user's text
+    // (`/icp/edit-one` writes both), so this doubles as the anchor. Passing
+    // only the anchored field left the model rebuilding a whole persona from
+    // one sentence, which replaced the card's identity on a one-field edit.
+    lines.push("Persona to refine:");
+    lines.push(`- name: ${target.name}`);
+    lines.push(`- pain: ${target.pain}`);
+    lines.push(`- desire: ${target.desire}`);
+    lines.push(`- objection: ${target.objection}`);
     lines.push("");
-    lines.push(
-      "Write the remaining fields so they are coherent with the user's text above.",
+    const authored = ICP_PERSONA_FIELD_NAMES.filter(
+      (field) => target.userIntent?.[field],
     );
+    lines.push(
+      `The user wrote the following field(s) themselves — keep them exactly, changing only wording that does not alter their meaning: ${authored.join(", ")}.`,
+    );
+    lines.push("");
+    lines.push(ICP_REGEN_REFINE_INSTRUCTION);
   } else {
     lines.push("Persona to replace:");
     lines.push(`- name: ${target.name}`);
