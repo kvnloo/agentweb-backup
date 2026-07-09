@@ -551,13 +551,23 @@ export function classifyWebValues(
   // Machines", a "Facebook" article for a "Meta" lead). The extraction model
   // also returns an alias-AWARE __entity_matches_lead__. So we drop only when the
   // tokens mismatch AND the model does NOT affirm it's the same company:
-  //   - tokens match                       → keep (fast path, no model reliance)
-  //   - tokens mismatch + model says true  → alias → keep
-  //   - tokens mismatch + model false/absent → wrong entity → drop
-  // Failure mode is "keep a wrong-entity value (badged)" not "lose a real one".
+  // __entity_matches_lead__ is authoritative in BOTH directions; the token match
+  // is only the fallback for when the model says nothing:
+  //   - model says false → wrong entity → drop (whatever the name says)
+  //   - model says true  → alias → keep   (rescues "Meta" ← a "Facebook" source)
+  //   - model silent     → fall back to the token match
+  // It cannot be a plain AND/OR of the two signals. A live trace showed the model
+  // echo the lead's own name into __entity_company__ ("Slashy") while answering
+  // __entity_matches_lead__=false; the parroted name satisfied the token match and
+  // silently overrode the explicit denial, so Slash's company/joinslash survived
+  // on a "Slashy" lead (ENG-122). A denial must beat a name the model may have
+  // simply repeated back to us.
   const tokenMismatch =
     !!opts.claimedCompany && !companyNameMatches(opts.leadCompany, opts.claimedCompany);
-  const wrongEntity = tokenMismatch && opts.claimedMatchesLead !== true;
+  const wrongEntity =
+    opts.claimedMatchesLead === false ? true
+      : opts.claimedMatchesLead === true ? false
+        : tokenMismatch;
   for (const [field, entry] of Object.entries(filled)) {
     // LinkedIn URLs never ground against a source quote, so they skip the
     // grounding classification below. But a COMPANY LinkedIn URL describes the
@@ -576,9 +586,13 @@ export function classifyWebValues(
         // lead's identity and has no grounding backstop, so keep it only when the
         // source company is POSITIVELY confirmed — by the token match, or by the
         // model's alias-aware affirm (which rescues "Meta" ← company/facebook).
+        // Same tri-state: an explicit denial beats an echoed name, an explicit
+        // affirm beats a token mismatch, and silence falls back to the token match
+        // (which, absent a claimedCompany, leaves the URL unconfirmed → dropped).
         const companyConfirmed =
-          (!!opts.claimedCompany && companyNameMatches(opts.leadCompany, opts.claimedCompany)) ||
-          opts.claimedMatchesLead === true;
+          opts.claimedMatchesLead === false ? false
+            : opts.claimedMatchesLead === true ? true
+              : (!!opts.claimedCompany && companyNameMatches(opts.leadCompany, opts.claimedCompany));
         console.log(
           `[v3 deps] company LinkedIn "${entry.value}" field="${field}" ` +
           `lead="${opts.leadCompany ?? ''}" claimed="${opts.claimedCompany ?? '∅'}" ` +
