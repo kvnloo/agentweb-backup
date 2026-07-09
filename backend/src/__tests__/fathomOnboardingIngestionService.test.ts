@@ -243,6 +243,84 @@ describe('fathomOnboardingIngestionService', () => {
     );
   });
 
+  it('preserves account memory in the ledger when org memory write fails', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const deps = makeDeps({
+      orgMemoryDb: {
+        addMemory: jest.fn(async () => {
+          throw new Error('org memory unavailable');
+        }),
+      },
+    });
+
+    const result = await ingestFathomOnboardingRecording({
+      recordingId: '123',
+      recordingUrl: 'https://fathom.video/calls/123',
+      reviewOwnerUserId: 'review-owner',
+      targetUserId: 'target-user',
+      reviewed: true,
+      extractedContext: baseContext,
+    }, deps as any);
+
+    expect(result.memoryIds).toEqual(['mem-1']);
+    expect(result.orgMemoryIds).toEqual([]);
+    expect(deps.userDb.updateUser).toHaveBeenCalledWith(
+      'target-user',
+      expect.objectContaining({
+        fathomOnboardingIngestions: [
+          expect.objectContaining({
+            recordingId: '123',
+            memoryIds: ['mem-1'],
+            orgMemoryIds: [],
+          }),
+        ],
+      }),
+    );
+    expect(warn).toHaveBeenCalledWith(
+      '[FathomOnboarding] Failed to write org memory; preserving account memory ledger:',
+      'org memory unavailable',
+    );
+
+    warn.mockRestore();
+  });
+
+  it('fills missing org memory on retry without duplicating account memory', async () => {
+    const deps = makeDeps();
+    deps.userDb.getUserById.mockImplementation(async (userId: string): Promise<any> => ({
+      userId,
+      email: userId === 'target-user' ? 'owner@acme.ai' : 'harsha@agentweb.pro',
+      emailDomain: userId === 'target-user' ? 'acme.ai' : 'agentweb.pro',
+      orgId: userId === 'target-user' ? 'org-1' : undefined,
+      fathomOnboardingIngestions: userId === 'target-user'
+        ? [{
+          recordingId: '123',
+          recordingUrl: 'https://fathom.video/calls/123',
+          status: 'reviewed',
+          extractionState: 'human_reviewed',
+          context: baseContext,
+          memoryIds: ['mem-existing'],
+          orgMemoryIds: [],
+          createdAt: '2026-07-08T19:00:00.000Z',
+          updatedAt: '2026-07-08T19:00:00.000Z',
+        }]
+        : [],
+    }));
+
+    const result = await ingestFathomOnboardingRecording({
+      recordingId: '123',
+      recordingUrl: 'https://fathom.video/calls/123',
+      reviewOwnerUserId: 'review-owner',
+      targetUserId: 'target-user',
+      reviewed: true,
+      extractedContext: baseContext,
+    }, deps as any);
+
+    expect(result.memoryIds).toEqual(['mem-existing']);
+    expect(result.orgMemoryIds).toEqual(['org-mem-1']);
+    expect(deps.accountMemoryDb.addMemory).not.toHaveBeenCalled();
+    expect(deps.orgMemoryDb.addMemory).toHaveBeenCalledTimes(1);
+  });
+
   it('reprocessing the same recording updates the ledger instead of duplicating memory entries', async () => {
     const deps = makeDeps();
     deps.userDb.getUserById.mockImplementation(async (userId: string): Promise<any> => ({

@@ -365,15 +365,21 @@ export async function ingestFathomOnboardingRecording(
   let memoryIds = previous?.memoryIds || [];
   let orgMemoryIds = previous?.orgMemoryIds || [];
 
-  if (reviewed && target.userId && memoryIds.length === 0) {
+  if (reviewed && target.userId) {
     const memoryContent = buildFathomOnboardingMemoryContent(context, { recordingUrl: input.recordingUrl });
-    const memory = await deps.accountMemoryDb.addMemory(target.userId, 'insight', memoryContent, undefined, undefined);
-    memoryIds = [memory.memoryId];
+    if (memoryIds.length === 0) {
+      const memory = await deps.accountMemoryDb.addMemory(target.userId, 'insight', memoryContent, undefined, undefined);
+      memoryIds = [memory.memoryId];
+    }
 
     const targetUser = target.userId === ledgerUserId ? ledgerUser : await deps.userDb.getUserById(target.userId);
-    if (targetUser?.orgId) {
-      const orgMemory = await deps.orgMemoryDb.addMemory(targetUser.orgId, 'insight', memoryContent, input.reviewOwnerUserId, undefined);
-      orgMemoryIds = [orgMemory.memoryId];
+    if (targetUser?.orgId && orgMemoryIds.length === 0) {
+      try {
+        const orgMemory = await deps.orgMemoryDb.addMemory(targetUser.orgId, 'insight', memoryContent, input.reviewOwnerUserId, undefined);
+        orgMemoryIds = [orgMemory.memoryId];
+      } catch (error: any) {
+        console.warn('[FathomOnboarding] Failed to write org memory; preserving account memory ledger:', error?.message);
+      }
     }
   }
 
