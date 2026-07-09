@@ -532,14 +532,46 @@ export function detectChangedRepos(WT) {
   return found;
 }
 
-// Push each changed repo's branch to origin (idempotent). Returns the repos whose push failed.
+// Push each changed repo's branch to origin (idempotent — a repo already up to date is a no-op).
+// On a non-fast-forward rejection (the remote branch advanced: a concurrent pipeline push, or a
+// commit added on the PR) we fetch the remote branch and REBASE our local commits on top, then
+// push as a plain fast-forward — this keeps BOTH sides' commits (no force, nothing clobbered). If
+// the rebase can't apply cleanly we abort it and report the repo as failed so a human reconciles
+// rather than silently losing work. Returns the repo keys whose push ultimately failed.
 export function pushChanged(changed) {
   const failed = [];
   for (const c of changed) {
-    const push = gitIn(c.wt, ['push', '-u', 'origin', 'HEAD']);
+    let push = gitIn(c.wt, ['push', '-u', 'origin', 'HEAD']);
+    if (push.status !== 0 && /rejected|fetch first|non-fast-forward|behind/i.test(`${push.stderr || ''}${push.stdout || ''}`)) {
+      const branch = (gitIn(c.wt, ['rev-parse', '--abbrev-ref', 'HEAD']).stdout || '').trim();
+      const fetch = branch ? gitIn(c.wt, ['fetch', 'origin', branch]) : { status: 1 };
+      if (fetch.status === 0) {
+        const rebase = gitIn(c.wt, ['rebase', 'FETCH_HEAD']);
+        if (rebase.status === 0) push = gitIn(c.wt, ['push', '-u', 'origin', 'HEAD']);
+        else { gitIn(c.wt, ['rebase', '--abort']); log(`Rebase onto origin/${branch} failed for ${c.repo} (diverged) — needs manual reconcile`); }
+      }
+    }
     if (push.status !== 0) { log(`Push failed for ${c.repo}: ${push.stderr}`); failed.push(c.repo); }
   }
   return failed;
+}
+
+// The subset of `changed` whose local branch is AHEAD of its remote branch — i.e. has commits not
+// yet pushed (a branch never pushed at all counts as unpushed). Fetches each branch first so the
+// answer stays accurate even when an earlier push failed and left the remote-tracking ref stale.
+// Lets a caller flush commits a PRIOR turn made but never pushed, not only commits from this turn.
+export function unpushedRepos(changed) {
+  const out = [];
+  for (const c of changed) {
+    const branch = (gitIn(c.wt, ['rev-parse', '--abbrev-ref', 'HEAD']).stdout || '').trim();
+    if (!branch) { out.push(c); continue; }
+    const fetch = gitIn(c.wt, ['fetch', 'origin', branch]);
+    if (fetch.status !== 0) { out.push(c); continue; } // remote branch doesn't exist yet → unpushed
+    const ahead = gitIn(c.wt, ['rev-list', '--count', 'FETCH_HEAD..HEAD']);
+    const n = ahead.status === 0 ? parseInt((ahead.stdout || '0').trim(), 10) || 0 : 0;
+    if (n > 0) out.push(c);
+  }
+  return out;
 }
 
 // Current HEAD sha per repo in a worktree, keyed by repo.key. Snapshotted before a chat turn so
