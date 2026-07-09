@@ -1,6 +1,7 @@
 import express from "express";
 import { disconnectStaleUserSockets } from "../services/sessionSockets";
 import jwt from "jsonwebtoken";
+import { getJwtSecret } from "../config/jwt";
 import bcrypt from "bcryptjs";
 import axios from "axios";
 import { authenticateToken } from "../middleware/auth";
@@ -75,6 +76,33 @@ const parseCrmSyncSetting = (rawValue?: string | null): CrmSyncSetting | null =>
 };
 
 const getCrmSyncSettingName = (source: string) => `${CRM_SYNC_SETTING_PREFIX}${source}`;
+
+const CUSTOMER_PORTAL_ROLES = new Set(["partner", "customer", "free"] as const);
+type CustomerPortalRole = "partner" | "customer" | "free";
+
+const normalizeCustomerPortalCreateRoles = (input: unknown): CustomerPortalRole[] => {
+  const requested = Array.isArray(input) ? input : ["customer"];
+  const uniqueValidRoles = Array.from(
+    new Set(
+      requested.filter((role): role is CustomerPortalRole =>
+        typeof role === "string" && CUSTOMER_PORTAL_ROLES.has(role as CustomerPortalRole)
+      )
+    )
+  );
+
+  const roles: CustomerPortalRole[] = uniqueValidRoles.length > 0 ? uniqueValidRoles : ["customer"];
+  return roles.includes("customer") ? roles : [...roles, "customer"];
+};
+
+const mergeExistingRolesForCustomerAccess = (
+  existingRoles: unknown,
+  requestedRoles: CustomerPortalRole[]
+): string[] => {
+  const existing = Array.isArray(existingRoles)
+    ? existingRoles.filter((role): role is string => typeof role === "string")
+    : [];
+  return Array.from(new Set([...existing, ...requestedRoles, "customer"]));
+};
 
 const splitName = (fullName?: string | null): { firstName?: string; lastName?: string } => {
   if (!fullName || typeof fullName !== "string") {
@@ -1583,7 +1611,7 @@ router.put("/users/:userId/password", async (req, res) => {
           isAdmin: user.isAdmin || false,
           sv: newSessionVersion,
         },
-        process.env.JWT_SECRET || "your-secret-key",
+        getJwtSecret(),
         { expiresIn: "90d" }
       );
     }
@@ -1602,7 +1630,7 @@ router.put("/users/:userId/password", async (req, res) => {
 router.post("/waitlist/:email/create-user", async (req, res) => {
   try {
     const { email } = req.params;
-    const { roles = ["customer"] } = req.body;
+    const roles = normalizeCustomerPortalCreateRoles(req.body?.roles);
 
     // Check if user already exists
     const existingUser = await userDb.getUserByEmail(email);
@@ -1630,7 +1658,7 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
 
     if (existingUser) {
       // Update existing free user with new roles and copy stripe_customer_id if missing
-      const updatedRoles = [...(existingUser.roles || []), ...roles];
+      const updatedRoles = mergeExistingRolesForCustomerAccess(existingUser.roles, roles);
       const updatePayload: any = {
         roles: updatedRoles,
         ...freeTierDefaults,
@@ -1756,7 +1784,7 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
 
     const delegateToken = jwt.sign(
       delegatePayload,
-      process.env.JWT_SECRET || "your-secret-key",
+      getJwtSecret(),
       { expiresIn: "90d" } // Delegate tokens expire in 90 days for security
     );
 

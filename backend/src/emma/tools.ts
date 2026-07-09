@@ -343,7 +343,7 @@ Actions:
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
 - list-received-invitations: (exact action string: "list-received-invitations") List pending connection requests received from others. Returns paginated results with sender info.
-- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended. IMPORTANT: the invite note limit is 200 characters on free LinkedIn accounts and 300 on Premium. Aim for 200 characters or fewer (target ~195) so the whole message — including your call-to-action — fits and reads well. The backend auto-trims an over-limit note to the account's limit on a word boundary before sending, so a send never fails on length; but a note you keep within the limit yourself stays complete and coherent. Also: do not send-invite to someone you are already connected with (network_distance FIRST_DEGREE) — use send-message instead; check with get-profile or list-connections if unsure.
+- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended. IMPORTANT: the invite note limit is 200 characters on free LinkedIn accounts and 300 on Premium. Aim for 200 characters or fewer (target ~195) so the whole message — including your call-to-action — fits and reads well. The backend auto-trims an over-limit note to the account's limit on a word boundary before sending, so a send never fails on length; but a note you keep within the limit yourself stays complete and coherent. Also: do not send-invite to someone you are already connected with (network_distance FIRST_DEGREE) — use send-message instead; check with get-profile or list-connections if unsure. NOTE-QUOTA GATE: if send-invite returns requiresDecision/noteQuotaExceeded, the account's monthly personalized-note quota is spent and the note was NOT sent — do NOT retry automatically; ask the user whether to send WITHOUT the note or skip, and only re-call with on_note_quota="send_without_note" if they agree.
 - send-message: Send a direct message. Requires profile_url or provider_id. message required. Only works for 1st-degree connections or open profiles. When sending to a CRM lead, always provide list_id and lead_id — the system enforces that update-conversation-history was called within the last 24 hours before allowing a send.
 - send-inmail: Send a LinkedIn InMail to any profile regardless of connection degree (2nd/3rd-degree connections). Requires profile_url or provider_id, message (body), and subject. Requires a LinkedIn Premium account with available InMail credits. Use this when send-message is not possible due to connection degree restrictions. list_id and lead_id are optional but recommended for CRM persistence.
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
@@ -378,6 +378,11 @@ For target person identification (send-invite, send-message, get-profile, update
         message: {
           type: 'string',
           description: 'Message content. Required for send-message and send-inmail; recommended for send-invite. For send-invite: aim for 200 characters or fewer (300 on Premium). The backend auto-trims an over-limit note on a word boundary before sending, so the send never fails on length — but a note you keep within the limit stays complete.'
+        },
+        on_note_quota: {
+          type: 'string',
+          enum: ['send_without_note'],
+          description: 'For send-invite ONLY. Leave this UNSET on the first attempt. If a send-invite comes back with requiresDecision/noteQuotaExceeded, it means this account\'s monthly quota for personalized invitation notes is spent and the note could not be attached — do NOT decide on your own: ASK the user whether to send the connection request without the note or skip the person. Only if they choose to proceed, re-call send-invite with the SAME target and on_note_quota="send_without_note" to send it note-less. If they choose to skip, do not re-call.'
         },
         subject: {
           type: 'string',
@@ -1526,7 +1531,7 @@ emmaToolRegistry.register({
   name: 'update_brand_guidelines',
   definition: {
     name: 'update_brand_guidelines',
-    description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.). NOTE: SVG files are NOT allowed for logo or secondaryLogo uploads. If the user provides an SVG file, ask them to convert it to PNG or another raster format first.',
+    description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.). NOTE: SVG files are NOT allowed for logo or secondaryLogo uploads. If the user provides an SVG file, ask them to convert it to PNG or another raster format first. RE-SETUP SCOPE: when the user asks for a broad brand re-setup or refresh (NOT a single-field edit like changing just the tagline or one color), pass refreshMarketStrategy=true so the same operation also refreshes market strategy positioning by regenerating ICPs and competitors from the updated brand. This REPLACES current ICPs and competitors while preserving the business overview. For a small single-field edit, leave refreshMarketStrategy false/omitted.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1585,6 +1590,10 @@ emmaToolRegistry.register({
               filename: { type: 'string', description: 'Original filename of the brand asset' }
             }
           }
+        },
+        refreshMarketStrategy: {
+          type: 'boolean',
+          description: 'Set true for a broad brand re-setup/refresh so ICPs and competitors are regenerated from the updated brand in the same operation. Omit or false for single-field edits and brand-only updates.'
         }
       },
       required: []
@@ -1656,6 +1665,23 @@ emmaToolRegistry.register({
   },
   execute: async (args, context) => {
     return await agentModeService.updateMarketStrategy(args, context?.userId);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'regenerate_market_strategy',
+  definition: {
+    name: 'regenerate_market_strategy',
+    description: 'Regenerate the user\'s market strategy (ideal customer profiles and competitors) from their CURRENT brand guidelines, so the strategy matches the latest brand. DESTRUCTIVE: this REPLACES the existing competitors and ICPs (the business overview is preserved). Only call this AFTER the user has explicitly confirmed they want to regenerate — if they already have competitors/ICPs, first tell them how many will be replaced and get a clear yes. Takes ~30-60s. Typically used as part of a brand re-setup when the user chose to also refresh their positioning/market strategy (option 2 of the brand re-setup scope question).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+      },
+      required: []
+    }
+  },
+  execute: async (args, context) => {
+    return await agentModeService.regenerateMarketStrategy(context?.userId);
   }
 });
 

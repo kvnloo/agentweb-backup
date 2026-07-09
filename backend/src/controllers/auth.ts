@@ -15,6 +15,7 @@ import { onUserRegistered } from "../services/contactCaptureHooks";
 import { isCompanyEmail } from "../utils/validation";
 import { isInitialPasswordExpired } from "../utils/secureRandom";
 import { AuthenticatedRequest } from "../middleware/auth";
+import { getJwtSecret } from "../config/jwt";
 
 export const register = async (req: Request, res: Response) => {
   try {
@@ -168,7 +169,7 @@ export const register = async (req: Request, res: Response) => {
     // JWT includes roles array. sv:0 — brand-new account, no password changes yet.
     const token = jwt.sign(
       { userId, email, roles: finalRoles, isAdmin: false, sv: 0 }, // Include isAdmin=false for clarity
-      process.env.JWT_SECRET || "your-secret-key",
+      getJwtSecret(),
       { expiresIn: "90d" }
     );
 
@@ -254,7 +255,7 @@ export const login = async (req: Request, res: Response) => {
     };
     const token = jwt.sign(
       jwtPayload,
-      process.env.JWT_SECRET || "your-secret-key",
+      getJwtSecret(),
       { expiresIn: "90d" }
     );
 
@@ -529,7 +530,7 @@ export const googleCallback = async (
     };
     const token = jwt.sign(
       tokenPayload,
-      process.env.JWT_SECRET || "your-secret-key",
+      getJwtSecret(),
       { expiresIn: "90d" }
     );
 
@@ -795,7 +796,7 @@ export const changePassword = async (req: Request, res: Response) => {
         isAdmin: user.isAdmin || false,
         sv: newSessionVersion,
       },
-      process.env.JWT_SECRET || "your-secret-key",
+      getJwtSecret(),
       { expiresIn: "90d" }
     );
 
