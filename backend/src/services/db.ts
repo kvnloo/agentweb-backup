@@ -156,6 +156,7 @@ export interface User {
   useCaseCategories?: string[];
   emmaHelpInterests?: string[]; // Onboarding multi-select: what user wants Emma to help with (e.g., "brand", "paid_ads", "founder_led_sales")
   emmaHelpInterestsSetAt?: string; // ISO timestamp when the user first saved their interests
+  fathomOnboardingIngestions?: Array<Record<string, unknown>>; // Review-first Fathom sales/prospect-call onboarding context ledger
   /**
    * Onboarding event log — appended to by POST /api/onboarding/events. Used
    * by the Lifecycle Drip Phase 1 feature to derive `onboardingStage`. Each

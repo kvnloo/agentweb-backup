@@ -166,4 +166,53 @@ describe('FathomApiService', () => {
       expect(result).toBeNull();
     });
   });
+
+  describe('recording content', () => {
+    it('fetches recording summary from the documented summary endpoint', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ summary: { markdown_formatted: '## Summary\nAcme needs demos.' } }),
+      });
+
+      const result = await service.getRecordingSummary('123');
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://api.fathom.ai/external/v1/recordings/123/summary',
+        expect.objectContaining({
+          method: 'GET',
+          headers: expect.objectContaining({
+            'Authorization': `Bearer ${testApiKey}`,
+          }),
+        })
+      );
+      expect(result.summary.markdown_formatted).toContain('Acme needs demos');
+    });
+
+    it('fetches recording transcript from the documented transcript endpoint', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          transcript: [
+            { speaker: { display_name: 'Jane' }, text: 'We need qualified demos.' },
+          ],
+        }),
+      });
+
+      const result = await service.getTranscript('123');
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://api.fathom.ai/external/v1/recordings/123/transcript',
+        expect.objectContaining({
+          method: 'GET',
+          headers: expect.objectContaining({
+            'Authorization': `Bearer ${testApiKey}`,
+          }),
+        })
+      );
+      expect(result).toHaveLength(1);
+      expect(result[0].text).toBe('We need qualified demos.');
+    });
+  });
 });
