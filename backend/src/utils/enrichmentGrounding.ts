@@ -64,19 +64,45 @@ function softWindowMatch(normQuote: string, normSource: string): boolean {
   return false;
 }
 
+/** True when the quote actually supports the value, rather than merely being a
+ *  real sentence from the page. A numeric value must have all of its numbers in
+ *  the quote; a short textual value must appear in it; a long one needs a 5-word
+ *  window. Without this, any genuine quote launders any answer (ENG-122). */
+function valueSupportedByQuote(
+  normValue: string,
+  valueNums: Set<string>,
+  normQuote: string,
+): boolean {
+  if (valueNums.size > 0) {
+    const quoteNums = extractNumericTokens(normQuote);
+    return [...valueNums].every(n => quoteNums.has(n));
+  }
+  if (!normValue) return false;
+  if (normValue.split(' ').length <= 8) return normQuote.includes(normValue);
+  return softWindowMatch(normValue, normQuote);
+}
+
 /**
  * Decide whether a web-tier extracted value is grounded in the fetched source.
  *
- * Grounded when ANY of:
- *  1. its supporting quote is a normalized substring of the source, or
- *  2. a 5-consecutive-word window of the quote appears in the source (V2 rule), or
- *  3. every numeric token in the value appears (format-normalized) in the source
- *     — so "$100M" grounds against a page that says "$100 million", and
- *  4. the value itself (when short, ≤ 8 words) is a normalized substring of the
- *     source — covers short firmographic values the LLM returned without a quote.
+ * Grounded when EITHER:
+ *  1. every numeric token in the value appears (format-normalized) in the source
+ *     — so "$100M" grounds against a page that says "$100 million"; or
+ *  2. the model cited a quote that is really in the source (verbatim, or via a
+ *     5-consecutive-word window for light rephrasing) AND that quote actually
+ *     supports the value; or
+ *  3. no quote was cited and the value itself (≤ 8 words) is a substring of the
+ *     source — covers short firmographic values returned without a quote.
+ *
+ * A cited quote is the model's own evidence, so it is binding: if the quote is
+ * absent from the source, or is present but says nothing about the value, the
+ * value is NOT grounded and must not fall back to a weaker rule. Facebook's
+ * funding_stage came back "Grant (prize money)" carrying the (real) quote for
+ * *total_funding*; checking only quote-in-source stamped it grounded/high and
+ * showed a wrong answer as verified fact.
  *
  * Formatting differences never cause a false "ungrounded": a correct figure with
- * a different currency/scale style still grounds via rule 3.
+ * a different currency/scale style still grounds via rule 1.
  */
 export function groundWebValue(
   value: string,
@@ -86,8 +112,9 @@ export function groundWebValue(
   const normSource = normalizeText(source);
   if (!normSource) return false;
 
-  // Rule 3 (numeric): if the value carries numbers, they must all appear in the
-  // source (in any format). This is the strongest signal for funding figures.
+  // Rule 1 (numeric): if the value carries numbers, they must all appear in the
+  // source (in any format). This is the strongest signal for funding figures and
+  // already ties the VALUE to the source, so it stands on its own.
   const valueNums = extractNumericTokens(value);
   if (valueNums.size > 0) {
     const sourceNums = extractNumericTokens(source);
@@ -95,20 +122,19 @@ export function groundWebValue(
     if (allPresent) return true;
   }
 
-  // Rules 1 & 2 (quote grounding).
+  const normValue = normalizeText(value);
+
+  // Rule 2 (quote grounding). The quote must be real AND must support the value.
   if (typeof quote === 'string' && quote.trim()) {
     const normQuote = normalizeText(quote);
-    if (normQuote && normSource.includes(normQuote)) return true;
-    if (softWindowMatch(normQuote, normSource)) return true;
+    const quoteInSource =
+      (!!normQuote && normSource.includes(normQuote)) || softWindowMatch(normQuote, normSource);
+    if (!quoteInSource) return false;
+    return valueSupportedByQuote(normValue, valueNums, normQuote);
   }
 
-  // Rule 4 (short value substring).
-  const normValue = normalizeText(value);
-  if (normValue && normValue.split(' ').length <= 8 && normSource.includes(normValue)) {
-    return true;
-  }
-
-  return false;
+  // Rule 3 (no quote cited): a short value must appear verbatim in the source.
+  return !!normValue && normValue.split(' ').length <= 8 && normSource.includes(normValue);
 }
 
 // Legal-entity suffixes stripped before comparing company names, so
