@@ -559,7 +559,23 @@ export function classifyWebValues(
     !!opts.claimedCompany && !companyNameMatches(opts.leadCompany, opts.claimedCompany);
   const wrongEntity = tokenMismatch && opts.claimedMatchesLead !== true;
   for (const [field, entry] of Object.entries(filled)) {
+    // LinkedIn URLs never ground against a source quote, so they skip the
+    // grounding classification below. But a COMPANY LinkedIn URL describes the
+    // company, so a wrong-entity source must not supply one: a "Slashy" lead
+    // was handed linkedin.com/company/joinslash — Slash's page (ENG-122).
+    // rejectHallucinatedLinkedInUrls cannot catch that, since the slug
+    // "joinslash" genuinely appears in the Slash source it was read from.
+    // Person-level LinkedIn identifies the person, not the company, and is
+    // verified separately — it stays exempt from this check.
     if (/linkedin/i.test(field)) {
+      if (/company/i.test(field) && wrongEntity) {
+        console.warn(
+          `[v3 deps] Dropped company LinkedIn URL "${entry.value}" for field "${field}" ` +
+          `— source describes "${opts.claimedCompany}" ≠ lead company "${opts.leadCompany ?? ''}" ` +
+          `(wrong-entity guard)`,
+        );
+        continue;
+      }
       result[field] = entry;
       continue;
     }
