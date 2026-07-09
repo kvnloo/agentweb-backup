@@ -39,6 +39,7 @@ jest.mock("../services/onboardingCompetitorService", () => ({
 
 import {
   ICP_REGEN_DISTINCT_INSTRUCTION,
+  ICP_REGEN_REFINE_INSTRUCTION,
   ICP_SINGLE_REGEN_SYSTEM_PROMPT,
   regenerateSingleIcpForUser,
   triggerIcpDiscoveryForUser,
@@ -295,6 +296,45 @@ describe("regenerateSingleIcpForUser — what the model is sent", () => {
     expect(llm.lastUserPrompt).not.toContain(ICP_REGEN_DISTINCT_INSTRUCTION);
   });
 
+  it("refines an edited card: the model sees its current content, not just the anchor", async () => {
+    // Without the persona's existing fields the model rebuilds an entirely new
+    // ICP from one sentence, so editing `objection` silently replaced the
+    // persona's identity. An edited card is one the user has invested in —
+    // regenerate it as a refinement, not a replacement.
+    const anchor = "We already have preferred panel vendors.";
+    const icps = FIVE.map((p, i) =>
+      i === 1
+        ? persona(1, { objection: anchor, userIntent: { objection: anchor } })
+        : { ...p },
+    );
+    userDb.getUserById.mockResolvedValue(seedUser({ icpResult: icps }));
+    const llm = new FakeLlm({ icp: REGENERATED });
+
+    await regenerateSingleIcpForUser("u1", 1, { llm });
+
+    // The card's current content is context for the refinement.
+    expect(llm.lastUserPrompt).toContain("pain1");
+    expect(llm.lastUserPrompt).toContain("desire1");
+    expect(llm.lastUserPrompt).toContain(anchor);
+    expect(llm.lastUserPrompt).toContain(ICP_REGEN_REFINE_INSTRUCTION);
+    expect(llm.lastUserPrompt).not.toContain(ICP_REGEN_DISTINCT_INSTRUCTION);
+  });
+
+  it("names which fields the user authored so the model keeps them fixed", async () => {
+    const anchor = "We already have preferred panel vendors.";
+    const icps = FIVE.map((p, i) =>
+      i === 2
+        ? persona(2, { objection: anchor, userIntent: { objection: anchor } })
+        : { ...p },
+    );
+    userDb.getUserById.mockResolvedValue(seedUser({ icpResult: icps }));
+    const llm = new FakeLlm({ icp: REGENERATED });
+
+    await regenerateSingleIcpForUser("u1", 2, { llm });
+
+    expect(llm.lastUserPrompt).toMatch(/user wrote[\s\S]*objection/i);
+  });
+
   it("asks for a distinct persona when the card was never edited", async () => {
     userDb.getUserById.mockResolvedValue(seedUser());
     const llm = new FakeLlm({ icp: REGENERATED });
@@ -302,6 +342,7 @@ describe("regenerateSingleIcpForUser — what the model is sent", () => {
     await regenerateSingleIcpForUser("u1", 1, { llm });
 
     expect(llm.lastUserPrompt).toContain(ICP_REGEN_DISTINCT_INSTRUCTION);
+    expect(llm.lastUserPrompt).not.toContain(ICP_REGEN_REFINE_INSTRUCTION);
   });
 });
 
