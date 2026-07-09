@@ -27,6 +27,7 @@ jest.mock("../services/onboardingCompetitorService", () => ({
 }));
 
 import {
+  applyOnboardingStrategicContext,
   extractIcpBrandContext,
   generateIcpsForUser,
   ICP_DISCOVERY_SYSTEM_PROMPT,
@@ -357,6 +358,39 @@ describe("onboardingIcpService", () => {
       ]);
 
       await expect(loadOnboardingStrategicContextForUser("user-1")).resolves.toBeNull();
+    });
+  });
+
+  describe("applyOnboardingStrategicContext", () => {
+    it("loads the edited source material into a brand that has no strategic context", async () => {
+      const brand: any = { companyName: "AgentCap X" };
+      await applyOnboardingStrategicContext(
+        "user-1",
+        brand,
+        async () => "Updated seed: sell supply-side first to Akash and CoreWeave.",
+      );
+      expect(brand.strategicContext).toContain("Akash");
+      expect(brand.strategicContext).toContain("CoreWeave");
+    });
+
+    it("does not overwrite strategic context the caller already resolved", async () => {
+      const brand: any = { companyName: "Acme", strategicContext: "pre-existing" };
+      const loader = jest.fn(async () => "should not be used");
+      await applyOnboardingStrategicContext("user-1", brand, loader);
+      expect(loader).not.toHaveBeenCalled();
+      expect(brand.strategicContext).toBe("pre-existing");
+    });
+
+    it("leaves the brand untouched when the loader returns null", async () => {
+      const brand: any = { companyName: "Acme" };
+      await applyOnboardingStrategicContext("user-1", brand, async () => null);
+      expect(brand.strategicContext).toBeUndefined();
+    });
+
+    it("bounds loaded context to the strategic-context char cap", async () => {
+      const brand: any = { companyName: "Acme" };
+      await applyOnboardingStrategicContext("user-1", brand, async () => "x".repeat(10_000));
+      expect(brand.strategicContext.length).toBe(6000);
     });
   });
 
