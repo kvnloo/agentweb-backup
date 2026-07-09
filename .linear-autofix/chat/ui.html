@@ -339,12 +339,12 @@ const rel = (iso) => {
 };
 
 const fmtAt = (iso) => { try { return new Date(iso).toLocaleString(); } catch { return ''; } };
-// Local-time label in the viewer's own timezone: just the time for today, else prefixed with the
-// date (so older stamps — e.g. a fix run from days ago — aren't mistaken for today).
+// Local-time label in the viewer's own timezone: always the date + time, so no stamp is ambiguous
+// about which day it belongs to (an old fix run isn't mistaken for today's).
 const fmtTime = (iso) => {
   try {
     const d = new Date(iso), t = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-    return d.toDateString() === new Date().toDateString() ? t : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ', ' + t;
+    return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ', ' + t;
   } catch { return ''; }
 };
 function stampTime(bubbleEl, iso) {
@@ -646,10 +646,9 @@ function renderAll(d) {
   let lastAsst = null;
   (d.chat?.messages || []).forEach((m, i) => {
     if (m.role === 'compact') { addCompactCard(m); return; }
-    if (m.role === 'user') { const el = addUser(m.text, i); if (m.at) el.title = fmtAt(m.at); stampTime(el, m.at); }
+    if (m.role === 'user') { const el = addUser(m.text, i); stampTime(el, m.at); }
     else {
       const b = newAssistant();
-      if (m.at) b.title = fmtAt(m.at);
       for (const t of m.tools || []) addTool(b, t);
       addText(b, m.text || '');
       if (m.fix) addFixCard(m.fix);
@@ -963,7 +962,20 @@ $('input').addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); hideSlash(); return; }
     if (ev.key === 'Enter' || ev.key === 'Tab') { ev.preventDefault(); ev.stopPropagation(); runSlash(); return; }
   }
-  if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); send(); }
+  if (ev.key === 'Enter' && !ev.shiftKey) {
+    const inp = ev.target, pos = inp.selectionStart;
+    // Trailing backslash + Enter => newline (like Claude Code): a lone '\' right before the caret is
+    // dropped and replaced by a newline instead of sending. Shift+Enter still works too.
+    if (pos === inp.selectionEnd && pos > 0 && inp.value[pos - 1] === '\\') {
+      ev.preventDefault();
+      const before = inp.value.slice(0, pos - 1), after = inp.value.slice(pos);
+      inp.value = before + '\n' + after;
+      inp.selectionStart = inp.selectionEnd = before.length + 1;
+      S.escArmed = 0; autosize(); updateSlashMenu();
+      return;
+    }
+    ev.preventDefault(); send();
+  }
 });
 // Follow-new-content behaviour: track whether the user is at the bottom; hide the pill once caught up.
 $('chat').addEventListener('scroll', () => { S.stick = nearBottom(); if (S.stick) $('jumpDown').style.display = 'none'; });
