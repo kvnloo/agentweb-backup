@@ -20,10 +20,28 @@ if ! flock -n 9; then
   exit 0
 fi
 
-# Rotate the poll log when it grows past ~5MB (keep one previous).
+# Rotate the poll log when it grows past ~5MB (keep one previous). Safe rename: no process holds it
+# open here (the previous cron cycle has exited before this one acquires the lock).
 if [ -f "$HERE/poll.log" ] && [ "$(stat -c%s "$HERE/poll.log" 2>/dev/null || echo 0)" -gt 5242880 ]; then
   mv "$HERE/poll.log" "$HERE/poll.log.1"
 fi
 
+# Rotate the chat server's log too (it now carries per-turn STATS lines). The long-running server
+# holds it open, so a rename would strand its writes on the old inode — copytruncate instead.
+# run-chat.sh opens the log with `>>` (O_APPEND), so after truncation the server's next write lands
+# at the new (zero) EOF cleanly, with no sparse file.
+CHATLOG="$HERE/chat/chat.log"
+if [ -f "$CHATLOG" ] && [ "$(stat -c%s "$CHATLOG" 2>/dev/null || echo 0)" -gt 5242880 ]; then
+  cp "$CHATLOG" "$CHATLOG.1" && : >"$CHATLOG"
+fi
+
 node "$HERE/poll.mjs" >>"$HERE/poll.log" 2>&1
 node "$HERE/gc.mjs"   >>"$HERE/poll.log" 2>&1   # remove worktrees whose issue is Done/Canceled
+
+# Verify each per-assignee GitHub token + Linear key still maps to the right person (catches a
+# swapped/expired credential before it mis-attributes). Throttled to ~hourly so we don't hammer the APIs.
+CREDMARK="$HERE/.credcheck.stamp"
+if [ ! -f "$CREDMARK" ] || [ "$(( $(date +%s) - $(stat -c %Y "$CREDMARK" 2>/dev/null || echo 0) ))" -gt 3600 ]; then
+  node "$HERE/check-creds.mjs" >>"$HERE/poll.log" 2>&1
+  touch "$CREDMARK"
+fi

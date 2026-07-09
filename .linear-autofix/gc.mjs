@@ -17,6 +17,7 @@ const statePath = path.join(__dirname, 'state.json');
 const chatStatePath = path.join(__dirname, 'chat', 'chat-state.json');
 const previewScript = path.join(__dirname, 'preview', 'preview.mjs');
 const worktreesDir = path.resolve(agentRoot, config.worktreesDir);
+const logsDir = path.join(__dirname, 'logs');
 const DONE_TYPES = config.gcDoneStateTypes || ['completed', 'canceled'];
 const log = (...a) => console.log('[gc]', ...a);
 
@@ -76,6 +77,7 @@ async function main() {
       log(`${id} is "${issue.state.name}" (${type}) → removing worktree`);
       removeWorktree(id);
       cleanChatForks(id);
+      rmSync(path.join(logsDir, id), { recursive: true, force: true }); // stage/chat tee logs for this issue
       for (const k of Object.keys(state)) if (state[k].identifier === id) delete state[k];
       removed++;
     } else {
