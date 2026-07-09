@@ -50,6 +50,42 @@ describe('groundWebValue', () => {
     expect(groundWebValue('San Francisco', undefined, SOURCE)).toBe(true);
   });
 
+  // ── The quote must support the VALUE, not merely exist in the source ────────
+  // Live bug: Facebook's funding_stage came back "Grant (prize money)" stamped
+  // grounding=grounded / confidence=high. Its quote was real and verbatim in the
+  // source — but it was the quote for *total_funding* and says nothing about a
+  // grant. The quote rule only checked quote ⊆ source, never value ⊆ quote, so a
+  // genuine quote laundered an unsupported answer into a "verified" badge.
+  const FB_SOURCE =
+    'Facebook has raised a total of $2.27B over 21 funding rounds: 3 Seed, ' +
+    '2 Early-Stage, 12 Late-Stage, 1 Grant (prize money).';
+
+  it('does NOT ground a value whose real quote does not support it (the Grant/prize-money bug)', () => {
+    expect(
+      groundWebValue(
+        'Grant (prize money)',
+        'Facebook has raised a total of $2.27B over 21 funding rounds',
+        FB_SOURCE,
+      ),
+    ).toBe(false);
+  });
+
+  it('still grounds a value its quote genuinely contains', () => {
+    expect(
+      groundWebValue('Series B', 'raised $100 million in a Series B round', SOURCE),
+    ).toBe(true);
+  });
+
+  it('still grounds a figure via the numeric rule even with a terse quote', () => {
+    expect(groundWebValue('$2.27B', 'Facebook has raised a total of $2.27B', FB_SOURCE)).toBe(true);
+  });
+
+  it('does NOT ground when the cited quote is itself absent from the source, even if the value appears there', () => {
+    // The model's own evidence is fabricated, so the value is unverified — it
+    // falls to "web-unverified" (kept + badged), not "grounded".
+    expect(groundWebValue('San Francisco', 'Slash is based out of SoMa district', SOURCE)).toBe(false);
+  });
+
   it('does NOT ground a fabricated figure that is not in the source', () => {
     // The classic ENG-122 fabrication: value + a plausible but invented quote.
     expect(groundWebValue('$100M', undefined, 'Acme makes widgets. No funding disclosed.')).toBe(false);
