@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // .linear-autofix/poll.mjs — one poll cycle:
-//   1. find new bugs and fix up to `config.maxConcurrent` of them in parallel (urgent first)
+//   1. force-fix any issue tagged `forceLabel` ("autofix") right away (bypasses the cap), then pick
+//      new bugs one-by-one up to the `maxOpenBugs` WIP cap (urgent first)
 //   2. recover issues stranded In Progress by a crashed run (one retry, then flag for a human)
 //   3. apply any pending human "revise: ..." comments to already-fixed bugs
 
@@ -9,7 +10,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { config } from './config.mjs';
-import { listNewBugs, listStaleInProgress, resolveIssue, addComment, findStateId, moveIssue } from './linear.mjs';
+import { listNewBugs, listForcedBugs, listStaleInProgress, resolveIssue, addComment, findStateId, moveIssue } from './linear.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const statePath = path.join(__dirname, 'state.json');
@@ -24,15 +25,13 @@ function runNode(script, args) {
   });
 }
 
-async function processNewBugs() {
-  const bugs = await listNewBugs();
-  // Linear priority: 1=urgent .. 4=low, 0=none — urgent first, unprioritized last.
-  const rank = (p) => (p > 0 ? p : 9);
-  bugs.sort((a, b) => rank(a.priority) - rank(b.priority));
-  log(`${new Date().toISOString()} — ${bugs.length} new bug(s)`);
-  const queue = [...bugs];
-  const width = Math.max(1, config.maxConcurrent || 1);
-  await Promise.all(Array.from({ length: Math.min(width, queue.length) }, async () => {
+// Linear priority: 1=urgent .. 4=low, 0=none — urgent first, unprioritized last.
+const byPriority = (a, b) => { const rank = (p) => (p > 0 ? p : 9); return rank(a.priority) - rank(b.priority); };
+
+// Run a set of bugs through autofix.mjs, up to `width` concurrently (default: config.maxConcurrent).
+async function runBugs(queue, width = Math.max(1, config.maxConcurrent || 1)) {
+  const lanes = Math.max(1, Math.min(width, queue.length));
+  await Promise.all(Array.from({ length: lanes }, async () => {
     while (queue.length) {
       const b = queue.shift();
       log(`-> ${b.identifier}: ${b.title}`);
@@ -40,6 +39,46 @@ async function processNewBugs() {
       if (code !== 0) console.error(`[poll] ${b.identifier} exited with ${code}`);
     }
   }));
+}
+
+async function processNewBugs() {
+  const known = new Set(Object.values(loadState()).filter((e) => e && e.identifier).map((e) => e.identifier));
+
+  // 0) Forced pickups. A human tagged these with `forceLabel` ("autofix") to demand an immediate fix —
+  //    run them right away, bypassing the WIP cap AND the one-per-cycle pacing. Skip any that already
+  //    have a state.json record: accidentally re-labelling an already-handled bug must NOT re-trigger it.
+  let forcedIds = new Set();
+  try {
+    const forced = (await listForcedBugs()).filter((b) => !known.has(b.identifier));
+    forcedIds = new Set(forced.map((b) => b.identifier));
+    if (forced.length) {
+      forced.sort(byPriority);
+      // Urgent → no concurrency cap: run ALL forced bugs at once (or `maxForcedConcurrent` if set > 0).
+      const fw = config.maxForcedConcurrent > 0 ? config.maxForcedConcurrent : forced.length;
+      log(`${new Date().toISOString()} — ${forced.length} forced bug(s) [label "${config.forceLabel}"] — fixing now (${fw} at a time), bypassing the cap`);
+      await runBugs([...forced], fw);
+    }
+  } catch (e) { console.error('[poll] forced pickup failed:', e.message); }
+
+  // 1) Normal capped picking, one-by-one under `maxOpenBugs`. EVERY state.json entry counts (the same
+  //    list the chat UI shows); a slot frees only when a human marks the issue Done/Canceled and gc.mjs
+  //    deletes its entry. Re-read state so the forced picks just made count against the cap.
+  const cap = Math.max(0, config.maxOpenBugs ?? 15);
+  const perCycle = Math.max(1, config.maxPicksPerCycle || 1);
+  const open = Object.values(loadState()).filter((e) => e && e.identifier).length;
+  const slots = Math.max(0, cap - open);
+  if (slots === 0) {
+    log(`${new Date().toISOString()} — ${open}/${cap} bug(s) already in the list; picking no new (unforced) bugs this cycle`);
+    return;
+  }
+
+  const bugs = (await listNewBugs()).filter((b) => !forcedIds.has(b.identifier)); // don't double-pick a forced one
+  bugs.sort(byPriority);
+  const take = Math.min(slots, perCycle, bugs.length);
+  log(`${new Date().toISOString()} — ${bugs.length} new bug(s); ${open}/${cap} in the list, ${slots} slot(s) free → picking ${take} this cycle`);
+  if (!take) return;
+
+  await runBugs(bugs.slice(0, take)); // highest-priority first; the rest wait for a future cycle
 }
 
 // A crashed autofix run leaves its issue In Progress with a 'started' record and no final
