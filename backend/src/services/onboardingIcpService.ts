@@ -32,6 +32,7 @@ import {
   icpReadyPatch,
   icpStartPatch,
   ICPPersona,
+  ICP_PERSONA_FIELD_NAMES,
   MAX_ICP_PERSONAS,
   sanitizeICPPersonas,
 } from "./icpStatusService";
@@ -416,6 +417,313 @@ export async function generateIcpsForUser(
 }
 
 /**
+ * Read the User record strongly-consistently when we can.
+ *
+ * `getUserById` queries the `UserIdIndex` GSI, which is eventually consistent.
+ * The FE fires `/icp/edit-one` and `/icp/regenerate-one` a second apart (see
+ * the ENG-255 access log), so a GSI read can miss the edit anchor entirely and
+ * regenerate from pre-edit text. The base table is keyed by email, so we
+ * resolve the id first, then re-read consistently. Falls back to the GSI row
+ * if the consistent read is unavailable or misses.
+ */
+async function readUserForRegeneration(userId: string): Promise<any> {
+  const viaIndex: any = await userDb.getUserById(userId);
+  const consistentRead = (userDb as any).getUserByEmailConsistent;
+  if (!viaIndex?.email || typeof consistentRead !== "function") return viaIndex;
+  try {
+    return (await consistentRead.call(userDb, viaIndex.email)) ?? viaIndex;
+  } catch {
+    return viaIndex;
+  }
+}
+
+/** True when the user has hand-written at least one field of this persona. */
+function hasAnchor(persona: ICPPersona | undefined): boolean {
+  return Boolean(
+    persona?.userIntent && Object.keys(persona.userIntent).length > 0,
+  );
+}
+
+/**
+ * Overlay the user's anchored fields back onto a freshly generated persona.
+ * The model is asked to honour them, but we do not trust it to: the anchor is
+ * the user's text and it wins. Carries the anchor forward so the next
+ * regeneration is driven from the user's words again, never from generated
+ * output (no drift across repeated regenerations).
+ */
+function applyAnchor(fresh: ICPPersona, previous: ICPPersona): ICPPersona {
+  if (!hasAnchor(previous)) return fresh;
+  const intent = previous.userIntent!;
+  const merged: ICPPersona = { ...fresh, userIntent: intent };
+  for (const field of ICP_PERSONA_FIELD_NAMES) {
+    const anchored = intent[field];
+    if (typeof anchored === "string") merged[field] = anchored;
+  }
+  return merged;
+}
+
+/**
+ * Merge a freshly generated set into the existing one, preserving every
+ * persona the user has edited. An implicit full-set run (`/icp/start`, a
+ * cascade, a brand change) must never destroy human work — the user has to
+ * ask for it explicitly via `/icp/regenerate-one` or `/icp/delete-one`.
+ *
+ * Anchored personas hold their slot; generated personas fill the rest in
+ * order. Exported for unit testing.
+ */
+export function mergePreservingAnchoredPersonas(
+  existing: ICPPersona[],
+  generated: ICPPersona[],
+): ICPPersona[] {
+  if (!Array.isArray(existing) || existing.length === 0) return generated;
+  const queue = [...generated];
+  const out: ICPPersona[] = [];
+  const slots = Math.max(existing.length, generated.length);
+  for (let i = 0; i < slots && out.length < MAX_ICP_PERSONAS; i++) {
+    const current = existing[i];
+    if (hasAnchor(current)) {
+      out.push(current);
+      continue;
+    }
+    const next = queue.shift();
+    if (next) out.push(next);
+    else if (current) out.push(current);
+  }
+  return out;
+}
+
+/**
+ * Output contract for regenerating exactly ONE persona. Deliberately separate
+ * from `ICP_DISCOVERY_SYSTEM_PROMPT`, which is verbatim prod-work-plan copy
+ * for the 5-persona set and must not be edited (see the note on that const).
+ */
+export const ICP_SINGLE_REGEN_SYSTEM_PROMPT = [
+  "You are refining ONE Ideal Customer Profile (ICP) persona within an existing set.",
+  "Return a single persona. It must not duplicate any of the other personas in the set.",
+  "",
+  "OUTPUT CONTRACT — return ONLY valid JSON matching this exact shape:",
+  "{",
+  '  "icp": { "name": "...", "pain": "...", "desire": "...", "objection": "...", "meta_targeting_brief": "..." }',
+  "}",
+  "Each field is one short sentence. The name is an evocative archetype. No markdown, no commentary.",
+].join("\n");
+
+/**
+ * Sent only when regenerating a persona the user has NOT edited — i.e. they
+ * rejected it and want something else. On an edited persona this instruction
+ * would fight the user's own words, so it is omitted.
+ */
+export const ICP_REGEN_DISTINCT_INSTRUCTION =
+  "The user rejected the persona above. Produce a meaningfully different one — a different role, a different buying motivation — not a rewording of it.";
+
+function buildSingleRegenPrompt(
+  brand: IcpBrandContext,
+  target: ICPPersona,
+  others: ICPPersona[],
+): string {
+  const lines: string[] = [
+    "Regenerate one Ideal Customer Profile (ICP) persona for:",
+    "",
+    `Company: ${brand.companyName || "(not provided)"}`,
+  ];
+  if (brand.companyUrl) lines.push(`Website: ${brand.companyUrl}`);
+  if (brand.tagline) lines.push(`Tagline: ${brand.tagline}`);
+  if (brand.valueProposition) lines.push(`Value proposition: ${brand.valueProposition}`);
+  if (brand.targetAudience) lines.push(`Target audience hint: ${brand.targetAudience}`);
+  if (brand.toneOfVoice) lines.push(`Tone of voice: ${brand.toneOfVoice}`);
+  if (brand.strategicContext) {
+    lines.push("");
+    lines.push("Strategic context from user-provided onboarding docs/notes:");
+    lines.push(brand.strategicContext);
+  }
+
+  if (others.length > 0) {
+    lines.push("");
+    lines.push(
+      "These personas already exist in the set. Do NOT produce another one like any of them:",
+    );
+    for (const o of others) lines.push(`- ${o.name}`);
+  }
+
+  lines.push("");
+  if (hasAnchor(target)) {
+    lines.push(
+      "The user rewrote the following field(s) of this persona themselves. Preserve their meaning exactly — you may improve the wording and framing, but do NOT change who this persona is:",
+    );
+    for (const field of ICP_PERSONA_FIELD_NAMES) {
+      const anchored = target.userIntent?.[field];
+      if (anchored) lines.push(`- ${field}: ${anchored}`);
+    }
+    lines.push("");
+    lines.push(
+      "Write the remaining fields so they are coherent with the user's text above.",
+    );
+  } else {
+    lines.push("Persona to replace:");
+    lines.push(`- name: ${target.name}`);
+    lines.push(`- pain: ${target.pain}`);
+    lines.push(`- desire: ${target.desire}`);
+    lines.push(`- objection: ${target.objection}`);
+    lines.push("");
+    lines.push(ICP_REGEN_DISTINCT_INSTRUCTION);
+  }
+
+  lines.push("");
+  lines.push("Return JSON matching the schema in the system prompt.");
+  return lines.join("\n");
+}
+
+/**
+ * Pure LLM call for a single persona — exported for unit-testing with an
+ * injected LLMService.
+ */
+export async function generateSingleIcpForUser(
+  brand: IcpBrandContext,
+  target: ICPPersona,
+  others: ICPPersona[],
+  deps: { llm?: { generateJsonRobust: LLMService["generateJsonRobust"] } } = {},
+  userId?: string,
+): Promise<ICPPersona> {
+  const llm = deps.llm ?? new LLMService(ICP_MODEL, ICP_TEMPERATURE, ICP_MAX_TOKENS);
+  const raw = await llm.generateJsonRobust<{ icp: unknown }>(
+    ICP_SINGLE_REGEN_SYSTEM_PROMPT,
+    buildSingleRegenPrompt(brand, target, others),
+    undefined,
+    { userId, feature: "onboarding" },
+  );
+  const [persona] = sanitizeICPPersonas([raw?.icp]);
+  if (!persona) throw new Error("LLM returned no icp");
+  return persona;
+}
+
+/**
+ * Regenerate exactly one persona, in place.
+ *
+ * `/icp/regenerate-one` previously parsed and validated its `icpId`, then
+ * discarded it and re-ran the whole set from brand context alone — replacing
+ * all five personas and destroying any the user had edited (ENG-255).
+ *
+ * Assumes `icpStatus` is already `running` (the route flips it). Validates
+ * before touching the DB so a bad index writes nothing. Persists with a
+ * read-modify-write so a concurrent `/icp/edit-one` on a different persona is
+ * not lost to the ~20s LLM round-trip.
+ */
+export async function regenerateSingleIcpForUser(
+  userId: string,
+  index: number,
+  deps: {
+    llm?: { generateJsonRobust: LLMService["generateJsonRobust"] };
+    loadStrategicContext?: (userId: string) => Promise<string | null>;
+    competitor?: {
+      generateCompetitorStrategyForUser: (
+        brand: IcpBrandContext,
+        personas: ICPPersona[],
+        deps?: unknown,
+      ) => Promise<{ per_icp: unknown[] }>;
+    };
+  } = {},
+): Promise<void> {
+  const user: any = await readUserForRegeneration(userId);
+  if (!user) throw new Error(`user ${userId} not found`);
+
+  const personas: ICPPersona[] = Array.isArray(user.icpResult) ? user.icpResult : [];
+  if (personas.length === 0) {
+    throw new Error("no ICPs to regenerate — run /icp/start first");
+  }
+  if (!Number.isInteger(index) || index < 0 || index >= personas.length) {
+    throw new Error(`icp index ${index} out of range (0..${personas.length - 1})`);
+  }
+
+  try {
+    const brand = extractIcpBrandContext(user);
+    if (!brand.strategicContext) {
+      const loaded = await (deps.loadStrategicContext ??
+        loadOnboardingStrategicContextForUser)(userId);
+      if (loaded) brand.strategicContext = loaded.slice(0, MAX_STRATEGIC_CONTEXT_CHARS);
+    }
+
+    const target = personas[index];
+    const others = personas.filter((_, i) => i !== index);
+    const fresh = applyAnchor(
+      await generateSingleIcpForUser(brand, target, others, deps, userId),
+      target,
+    );
+
+    // Re-read: the LLM call took ~20s and the user may have edited another
+    // card meanwhile. Splice into the CURRENT list, not the one we started
+    // from, or we silently revert their edit.
+    const current: any = (await readUserForRegeneration(userId)) ?? user;
+    const currentList: ICPPersona[] = Array.isArray(current.icpResult)
+      ? [...current.icpResult]
+      : [...personas];
+    if (index < currentList.length) currentList[index] = fresh;
+
+    const patch = icpReadyPatch(current, currentList);
+    if (!patch) return; // no longer running — a newer run owns this record
+    await userDb.updateUser(userId, patch as any);
+    await mirrorIcpsToMarketStrategy(userId, currentList);
+
+    await regenerateCompetitorEntry(userId, current, brand, fresh, index, deps);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const current = await userDb.getUserById(userId);
+    await userDb.updateUser(userId, icpFailedPatch((current as any) || {}, msg) as any);
+    console.error("[onboardingIcpService] single-persona regeneration failed", {
+      userId,
+      index,
+      err: msg,
+    });
+    throw err;
+  }
+}
+
+/**
+ * Competitor research is a parallel array to the ICP set (`per_icp[i]`
+ * describes `icpResult[i]`, labelled by `icp_id: persona.name`). When one
+ * persona is replaced, its entry — and only its entry — is stale.
+ *
+ * Best-effort: the personas are already persisted, so a competitor failure
+ * must not roll them back or surface as a failed ICP run.
+ */
+async function regenerateCompetitorEntry(
+  userId: string,
+  current: any,
+  brand: IcpBrandContext,
+  persona: ICPPersona,
+  index: number,
+  deps: {
+    competitor?: {
+      generateCompetitorStrategyForUser: (
+        brand: IcpBrandContext,
+        personas: ICPPersona[],
+        deps?: unknown,
+      ) => Promise<{ per_icp: unknown[] }>;
+    };
+  },
+): Promise<void> {
+  const existing = current?.competitorResult?.per_icp;
+  if (!Array.isArray(existing) || index >= existing.length) return;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const competitor =
+      deps.competitor ?? require("./onboardingCompetitorService");
+    const result = await competitor.generateCompetitorStrategyForUser(brand, [persona]);
+    const entry = result?.per_icp?.[0];
+    if (!entry) return;
+    const next = [...existing];
+    next[index] = entry;
+    await userDb.updateUser(userId, { competitorResult: { per_icp: next } } as any);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[onboardingIcpService] competitor entry refresh failed", {
+      userId,
+      index,
+      err: msg,
+    });
+  }
+}
+
+/**
  * Fire-and-forget orchestrator. Called from `/icp/start` AFTER the status
  * has been flipped to `running`. Resolves immediately — the LLM work runs
  * in the background and patches the User record on completion.
@@ -439,8 +747,15 @@ export async function triggerIcpDiscoveryForUser(
     }
   }
   try {
-    const personas = await generateIcpsForUser(brand, deps, userId);
+    const generated = await generateIcpsForUser(brand, deps, userId);
     const current = await userDb.getUserById(userId);
+    // An implicit full-set run must not destroy personas the user wrote by
+    // hand. Anchored personas hold their slot; the rest are replaced. See
+    // ENG-255 — this is the write that silently ate the user's edits.
+    const existing: ICPPersona[] = Array.isArray((current as any)?.icpResult)
+      ? ((current as any).icpResult as ICPPersona[])
+      : [];
+    const personas = mergePreservingAnchoredPersonas(existing, generated);
     const patch = icpReadyPatch((current as any) || {}, personas);
     if (!patch) {
       // User no longer in `running` (UI navigated away or watchdog flipped).

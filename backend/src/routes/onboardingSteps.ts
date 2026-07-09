@@ -33,7 +33,10 @@ import {
   logICPCompletionMetric,
   sanitizeICPPersonas,
 } from "../services/icpStatusService";
-import { startIcpDiscoveryForUser } from "../services/onboardingIcpService";
+import {
+  regenerateSingleIcpForUser,
+  startIcpDiscoveryForUser,
+} from "../services/onboardingIcpService";
 import {
   competitorStartPatch,
   competitorReadyPatch,
@@ -648,6 +651,7 @@ function parseIcpIndex(icpId: unknown): number | null {
   return n;
 }
 
+
 function sanitizePersonaPatch(raw: unknown): Record<string, string> | null {
   if (!raw || typeof raw !== "object") return null;
   const out: Record<string, string> = {};
@@ -681,8 +685,19 @@ router.post("/icp/edit-one", authenticateToken, async (req, res) => {
     if (list.length === 0 || idx >= list.length) {
       return res.status(404).json({ message: "icp not found" });
     }
+    // Record the user's own words as an anchor alongside the visible field.
+    // Every later regeneration of this persona is driven from the anchor, so
+    // it can neither be overwritten by a full-set run nor drift across
+    // repeated regenerations (ENG-255). Merged, not replaced: a second edit to
+    // a different field must not discard the first.
     const nextList = list.map((p, i) =>
-      i === idx ? { ...p, ...patchFields } : p
+      i === idx
+        ? {
+            ...p,
+            ...patchFields,
+            userIntent: { ...((p as any).userIntent ?? {}), ...patchFields },
+          }
+        : p
     );
     await userDb.updateUser(userId, {
       icpResult: nextList as Required<NonNullable<typeof user>>["icpResult"],
@@ -704,11 +719,17 @@ router.post("/icp/regenerate-one", authenticateToken, async (req, res) => {
         .status(400)
         .json({ message: "icpId is required (format: icp-N)" });
     }
-    // Re-run the orchestrator. v1 regenerates the whole ICP set rather than
-    // just the indexed persona — the LLM service is set-level. The FE
-    // optimistically renders a per-card stall, then drops it when status
-    // flips back to ready.
-    await startIcpDiscoveryForUser(userId);
+    // Regenerate ONLY the persona the user clicked. This used to call
+    // `startIcpDiscoveryForUser`, which re-ran the whole set from brand
+    // context — replacing all five cards and destroying any the user had
+    // edited, because the regeneration prompt never read `icpResult`
+    // (ENG-255). Flip to `running` here, then hand off: the LLM round-trip is
+    // ~20s and the FE polls `/icp/status` rather than holding this request
+    // open.
+    await userDb.updateUser(userId, icpStartPatch());
+    void regenerateSingleIcpForUser(userId, idx).catch((err: unknown) => {
+      console.error("[icp] regenerate-one failed", { userId, idx, err });
+    });
     // Return the running snapshot directly from the patch we just wrote.
     // Do NOT read back via getUserById — UserIdIndex is eventually
     // consistent and the stale GSI row (icpStatus='ready' + old
