@@ -11,7 +11,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import net from 'node:net';
 import path from 'node:path';
 import { config } from './config.mjs';
-import { resolveIssue, addComment, findStateId, moveIssue, setAutofixLabel, uploadFile } from './linear.mjs';
+import { resolveIssue, addComment, findStateId, moveIssue, setAutofixLabel, uploadFile, useAssigneeLinearKey } from './linear.mjs';
 import { applyAssigneeIdentity, resolveAssigneeGhToken } from './git-identity.mjs';
 import { findSessionId, fetchItem, summarizeSession } from './tools/session.mjs';
 
@@ -28,6 +28,25 @@ const reviewPromptPath = path.join(__dirname, 'review-prompt.md');
 const managerPromptPath = path.join(__dirname, 'manager-prompt.md');
 const refixPromptPath = path.join(__dirname, 'refix-prompt.md');
 const log = (...a) => console.log('[autofix]', ...a);
+
+// Token/cost telemetry: a greppable `STATS` line per pipeline stage + a per-issue TOTAL on exit, so
+// a Claude session on the box can answer "what did fixing this issue cost?" from poll.log. One
+// process per issue, so these module-level totals are per-run.
+const _stat = { id: null, cost: 0, in: 0, out: 0, cacheR: 0, cacheC: 0 };
+const _muTok = (x) => (x ? (x.inputTokens || 0) + (x.outputTokens || 0) + (x.cacheReadInputTokens || 0) + (x.cacheCreationInputTokens || 0) : 0);
+function logStageStats(stage, j) {
+  const u = j.usage || {};
+  const inT = u.input_tokens || 0, outT = u.output_tokens || 0, cr = u.cache_read_input_tokens || 0, cc = u.cache_creation_input_tokens || 0;
+  const cost = j.total_cost_usd || 0;
+  _stat.cost += cost; _stat.in += inT; _stat.out += outT; _stat.cacheR += cr; _stat.cacheC += cc;
+  const mu = j.modelUsage || {};
+  const model = Object.keys(mu).sort((a, b) => _muTok(mu[b]) - _muTok(mu[a]))[0] || '?'; // primary (most-tokens) model
+  log(`STATS stage=${stage} model=${model} in=${inT} out=${outT} cache_read=${cr} cache_creation=${cc} context=${inT + cr + cc} cost=$${cost.toFixed(4)} turns=${j.num_turns ?? '?'} dur=${j.duration_ms ? Math.round(j.duration_ms / 1000) + 's' : '?'}`);
+}
+process.on('exit', () => {
+  if (!_stat.id || (!_stat.cost && !_stat.in)) return;
+  log(`STATS issue=${_stat.id} TOTAL cost=$${_stat.cost.toFixed(4)} in=${_stat.in} out=${_stat.out} cache_read=${_stat.cacheR} cache_creation=${_stat.cacheC} context_tokens=${_stat.in + _stat.cacheR + _stat.cacheC}`);
+});
 
 // Raw per-stage transcripts + metadata (turns, duration, timedOut) — kept for debugging failed
 // runs and tuning budgets; the transcripts cost nothing (they were paid for anyway).
@@ -168,12 +187,17 @@ async function main() {
 
   const issue = await resolveIssue(ref);
   const id = issue.identifier;
+  _stat.id = id; // tag the per-issue STATS TOTAL emitted on exit
   log(`Issue ${id}: ${issue.title}`);
 
   // Attribute every commit this run makes (fixer, escalation, review re-fix, verify re-fix) to the
   // issue's Linear assignee. Set here — before any commit-making stage and before the verify-only
   // branch — so all of them inherit it via process.env.
   const identity = applyAssigneeIdentity(issue, log);
+  // Attribute the card's status changes / comments / labels this run makes to the assignee's own
+  // Linear account too (reads stay on the default key). Resolved after the default-key resolveIssue
+  // above, so we know the assignee; falls back to the default key when none is configured.
+  useAssigneeLinearKey(issue.assignee, log);
 
   // --verify-only: re-run just the deterministic gates (checks + preview + browser verify +
   // media upload) against an ALREADY-FIXED bug's branch, then re-triage. For fixes whose
@@ -435,7 +459,7 @@ export function runClaude(args, prompt, cwd, timeoutMs = config.timeoutMs, stage
         try {
           if (stageLogDir) writeFileSync(path.join(stageLogDir, `${stage}.txt`), out);
           let meta = {};
-          try { const j = JSON.parse(out); meta = { turns: j.num_turns, ms: j.duration_ms, sessionId: j.session_id }; } catch { /* not the CLI JSON envelope */ }
+          try { const j = JSON.parse(out); meta = { turns: j.num_turns, ms: j.duration_ms, sessionId: j.session_id }; logStageStats(stage, j); } catch { /* not the CLI JSON envelope */ }
           stages[stage] = { timedOut, ...meta };
         } catch { /* stage logging is best-effort */ }
       }
