@@ -188,6 +188,35 @@ router.get("/brand-build/status", authenticateToken, async (req, res) => {
     // long-stuck users (the `brand_submitted` cohort) are reset on next poll.
     const autoFail = buildAutoFailPatchIfStuck(user as any);
     if (autoFail) {
+      // `getUserById` reads the eventually-consistent UserIdIndex GSI, which
+      // can lag a just-written terminal status by ~100-1000ms (see
+      // getUserByEmailConsistent docs / the 2026-04-27 Maya regen-stuck bug).
+      // Force-failing off that stale read could clobber a build that actually
+      // just completed `ready`, flipping a success into a spurious failure the
+      // user then sees as "This step failed". Before writing, re-read the row
+      // with a strongly-consistent GetItem and re-derive the stuck check from
+      // that authoritative view. If the fresh read is no longer stuck (the
+      // build resolved), trust it and return without clobbering.
+      const authEmail = (authReq.user as any)?.email || (user as any)?.email;
+      const fresh = authEmail
+        ? await userDb.getUserByEmailConsistent(authEmail)
+        : null;
+      if (fresh) {
+        const freshAutoFail = buildAutoFailPatchIfStuck(fresh as any);
+        if (!freshAutoFail) {
+          return res.json({ status: snapshot(fresh as any) });
+        }
+        await userDb.updateUser(userId, freshAutoFail as any);
+        logCompletionMetric(
+          userId,
+          "failed",
+          freshAutoFail.brandBuildDurationMs ?? 0
+        );
+        const refreshed = await userDb.getUserById(userId);
+        return res.json({
+          status: snapshot(refreshed || (freshAutoFail as any)),
+        });
+      }
       await userDb.updateUser(userId, autoFail as any);
       logCompletionMetric(userId, "failed", autoFail.brandBuildDurationMs ?? 0);
       const refreshed = await userDb.getUserById(userId);
