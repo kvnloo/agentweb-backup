@@ -265,6 +265,64 @@ describe("regenerateSingleIcpForUser — reads the user strongly-consistently", 
   });
 });
 
+// ──────────────── the list moving under a 20s LLM call ────────────────
+
+describe("regenerateSingleIcpForUser — the persona list can move mid-flight", () => {
+  const identified = () => FIVE.map((p, i) => persona(i, { id: `icp_stable_${i}` }));
+
+  it("splices by persona id, not index, when a concurrent delete shifted the list", async () => {
+    const before = seedUser({ icpResult: identified() });
+    // While the LLM ran, /icp/delete-one removed icp_stable_0. The target the
+    // user clicked (icp_stable_3) now sits at index 2. Splicing by the ORIGINAL
+    // index 3 would overwrite icp_stable_4 — a different persona.
+    const afterDelete = seedUser({
+      icpResult: identified().filter((p: any) => p.id !== "icp_stable_0"),
+    });
+    userDb.getUserById.mockResolvedValueOnce(before).mockResolvedValue(afterDelete);
+
+    await regenerateSingleIcpForUser("u1", 3, { llm: new FakeLlm({ icp: REGENERATED }) });
+
+    const written = lastWrittenIcps()!;
+    const target = written.find((p: any) => p.id === "icp_stable_3");
+    expect(target.name).toBe(REGENERATED.name);
+    // The neighbour it would have clobbered is untouched.
+    expect(written.find((p: any) => p.id === "icp_stable_4").name).toBe("P4");
+  });
+
+  it("drops the result when the target persona was deleted mid-flight", async () => {
+    const before = seedUser({ icpResult: identified() });
+    const afterDelete = seedUser({
+      icpResult: identified().filter((p: any) => p.id !== "icp_stable_3"),
+    });
+    userDb.getUserById.mockResolvedValueOnce(before).mockResolvedValue(afterDelete);
+    const spy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    await regenerateSingleIcpForUser("u1", 3, { llm: new FakeLlm({ icp: REGENERATED }) });
+
+    const written = lastWrittenIcps()!;
+    expect(written).toHaveLength(4);
+    expect(written.some((p: any) => p.name === REGENERATED.name)).toBe(false);
+    // Status must still leave `running`, or the FE spins until it times out.
+    const statuses = userDb.updateUser.mock.calls.map((c: any[]) => c[1]?.icpStatus);
+    expect(statuses).toContain("ready");
+    spy.mockRestore();
+  });
+
+  it("still persists the regenerated persona when a newer run already flipped the status", async () => {
+    const before = seedUser({ icpResult: identified() });
+    // A second regenerate-one finished first and set the record to `ready`, so
+    // icpReadyPatch returns null. Dropping our result here loses the card the
+    // user asked for and leaves its spinner stuck.
+    const finished = seedUser({ icpResult: identified(), icpStatus: "ready" });
+    userDb.getUserById.mockResolvedValueOnce(before).mockResolvedValue(finished);
+
+    await regenerateSingleIcpForUser("u1", 1, { llm: new FakeLlm({ icp: REGENERATED }) });
+
+    const written = lastWrittenIcps()!;
+    expect(written.find((p: any) => p.id === "icp_stable_1").name).toBe(REGENERATED.name);
+  });
+});
+
 // ───────────────────────── prompt construction ─────────────────────────
 
 describe("regenerateSingleIcpForUser — what the model is sent", () => {

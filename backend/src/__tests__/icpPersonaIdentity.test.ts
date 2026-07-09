@@ -48,6 +48,7 @@ import onboardingStepsRoutes from "../routes/onboardingSteps";
 import {
   ensurePersonaIds,
   sanitizeICPPersonas,
+  sanitizeUserIntent,
 } from "../services/icpStatusService";
 
 const { userDb } = require("../services/db");
@@ -118,6 +119,21 @@ describe("persona ids survive sanitisation and are minted where missing", () => 
     const ids = out.map((p) => p.id);
     expect(new Set(ids).size).toBe(3);
     expect(ids.every((id) => typeof id === "string" && id!.length > 0)).toBe(true);
+  });
+});
+
+describe("the edit anchor is bounded by the same caps as the field it anchors", () => {
+  it("caps each anchored field at its own limit, not a shared 2000", () => {
+    const intent = sanitizeUserIntent({
+      name: "n".repeat(500),
+      pain: "p".repeat(2000),
+      meta_targeting_brief: "b".repeat(3000),
+    })!;
+    // Otherwise the anchor keeps text that sanitizeICPPersonas truncates off the
+    // visible field, and the two diverge on every later regeneration.
+    expect(intent.name!.length).toBe(200);
+    expect(intent.pain!.length).toBe(1000);
+    expect(intent.meta_targeting_brief!.length).toBe(2000);
   });
 });
 
