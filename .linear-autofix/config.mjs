@@ -4,6 +4,10 @@
 export const config = {
   // --- Linear ---
   bugLabel: 'Bug',                 // label that marks an issue as an auto-fixable bug
+  forceLabel: 'autofix',           // an explicit "do it now" label: any not-yet-picked issue carrying it
+                                   // is fixed IMMEDIATELY, bypassing the maxOpenBugs cap and the one-per-cycle
+                                   // pacing. Already-tracked issues (a state.json entry exists) are ignored,
+                                   // so accidentally re-labelling a handled bug never re-triggers it. null = off.
   teamKey: null,                   // e.g. 'ENG' to scope to one team; null = whole workspace
   pickupStateTypes: ['backlog', 'unstarted'], // issue state types the poller picks up
   assigneeEmails: [                // the poller ONLY picks up bugs assigned to these Linear users
@@ -41,6 +45,28 @@ export const config = {
     'mvarma@argusoft.com': 'GH_TOKEN_MVARMA',
     'aseth@argusoft.com':  'GH_TOKEN_ASETH',
   },
+  // The GitHub login each person's token MUST authenticate as — used by check-creds.mjs to catch a
+  // swapped or expired token (a token in the wrong env var mis-attributes PRs silently otherwise).
+  assigneeGithubLogin: {
+    'hshah@argusoft.com':  'harshit-argusoft',
+    'mvarma@argusoft.com': 'mananv-argusoft',
+    'aseth@argusoft.com':  'anurag-seth',
+  },
+  // Change the Linear card's STATUS (and post the automation's comments/labels) AS the assignee, using
+  // their own Linear API key — mirrors the per-person GitHub tokens above, so the board shows the state
+  // change coming from the assignee, not a shared bot. Keys live in .linear-autofix/.env (gitignored,
+  // sourced by run.sh); the map references each BY ENV-VAR NAME, never the literal key (this file is
+  // committed). Each key is a Linear personal API key for that member. READS always use the default
+  // LINEAR_API_KEY (the poller must see every assignee's issues) — only the attributed writes switch.
+  // If a person has no key configured (env var unset/empty) or statusAsAssignee is false, their card
+  // actions fall back to the default key — a safe no-op until the keys are added. System actions
+  // (crash-recovery notes in poll.mjs) always use the default key.
+  statusAsAssignee: true,
+  assigneeLinearKeyEnv: {
+    'hshah@argusoft.com':  'LINEAR_KEY_HSHAH',
+    'mvarma@argusoft.com': 'LINEAR_KEY_MVARMA',
+    'aseth@argusoft.com':  'LINEAR_KEY_ASETH',
+  },
 
   inProgressState: 'In Progress',  // moved here on pickup (guards against re-processing)
   reviewState: 'In Review',        // moved here ONLY when triage is green (see triageLabels)
@@ -77,11 +103,23 @@ export const config = {
   },
 
   // --- Poller ---
-  maxConcurrent: 1,                // bugs fixed in parallel per poll cycle. ONE pipeline already fans
-                                   // out hard (parallel reviewers, 4GB tsc check, preview builds,
-                                   // verify browser); 2 concurrent bugs OOM-stalled the 16GB runner on
-                                   // 2026-07-02 (load 57, sshd unresponsive). Raise only after adding
-                                   // RAM — swap alone just makes the thrash survivable.
+  maxOpenBugs: 15,                 // WIP cap: max bugs autofix keeps "in the list" (state.json entries — the
+                                   // same list the chat UI shows). At/over this, the poller picks NO new bugs.
+                                   // A slot frees when a human marks the issue Done/Canceled and gc.mjs deletes
+                                   // its entry. Prevents an unbounded pile of un-merged fixes.
+  maxPicksPerCycle: 1,             // when there's room under maxOpenBugs, how many NEW bugs to pick per poll
+                                   // cycle (every 5 min). 1 = drain the backlog one-by-one as slots free up.
+  maxForcedConcurrent: 0,          // how many `forceLabel` ("autofix") bugs run at once. 0 = unlimited (all of
+                                   // them in parallel — they're urgent). Each fix is heavy (~4GB tsc + a browser);
+                                   // the runner is now a t3.2xlarge (8 vCPU / 32GB), so a handful in parallel is
+                                   // fine — but a big burst can still exhaust RAM. Set a positive number here to
+                                   // cap parallel forced runs if the box struggles.
+  maxConcurrent: 1,                // NON-forced bugs fixed in parallel per poll cycle. ONE pipeline already fans
+                                   // out hard (parallel reviewers, 4GB tsc check, preview builds, verify browser);
+                                   // 2 concurrent bugs OOM-stalled the OLD 16GB t3.xlarge on 2026-07-02 (load 57,
+                                   // sshd unresponsive). The runner is now a t3.2xlarge (8 vCPU / 32GB), so 2–3 is
+                                   // survivable — but normal picking is gated to `maxPicksPerCycle` (1/cycle)
+                                   // anyway, so this mostly bounds the crash-recovery/backfill path.
   staleInProgressHours: 6,         // an issue autofix STARTED (recorded in state.json) still In Progress
                                    // this long with no final outcome = a crashed run; poll.mjs resets it for
                                    // ONE retry, then flags it for a human. Issues moved to In Progress by
@@ -228,7 +266,8 @@ export const config = {
       timeoutMs: 30 * 60 * 1000,     // mirrors revise — a full-access turn is an interactive revise
     },
     readOnly: {
-      model: 'sonnet',
+      model: 'opus',                 // the user-facing chat agent is ALWAYS Opus (full or read-only); it may
+                                     // still spawn subagents on cheaper models, but the main conversation is Opus.
       maxTurns: 30,
       timeoutMs: 10 * 60 * 1000,
       // Read-only enforcement: headless -p auto-denies any tool not listed here (and there is
