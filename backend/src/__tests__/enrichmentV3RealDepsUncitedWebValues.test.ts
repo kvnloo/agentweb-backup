@@ -244,6 +244,30 @@ describe('classifyWebValues', () => {
     expect(r.linkedin_url?.value).toBe('https://www.linkedin.com/in/sam-k');
   });
 
+  // ── An explicit __entity_matches_lead__=false is authoritative (ENG-122) ────
+  // Live trace: lead="Slashy" claimed="Slashy" matchesLead=false → KEEP. The model
+  // echoed the lead's own name into __entity_company__ instead of naming the source
+  // company ("Slash"), so the token match passed and silently overrode the model's
+  // explicit denial. A denial must win over a name it may simply have parroted.
+
+  it('DROPS a company LinkedIn URL when the model denies the match despite echoing the lead name', () => {
+    const r = classifyWebValues(
+      { company_linkedin_url: fv('https://www.linkedin.com/company/joinslash') },
+      { source: SOURCE, leadCompany: 'Slashy', claimedCompany: 'Slashy', claimedMatchesLead: false },
+    );
+    expect(r.company_linkedin_url).toBeUndefined();
+  });
+
+  it('DROPS a web value when the model denies the match despite echoing the lead name', () => {
+    // Same hole in the main wrong-entity guard: tokenMismatch is false because the
+    // echoed name matches, so a funding figure read off Slash's page would survive.
+    const r = classifyWebValues(
+      { funding_stage: fv('Series C', { sourceQuote: 'raised a Series C' }) },
+      { source: SOURCE, leadCompany: 'Slashy', claimedCompany: 'Slashy', claimedMatchesLead: false },
+    );
+    expect(r.funding_stage).toBeUndefined();
+  });
+
   it('KEEPS a PERSON-level linkedin URL even when the source describes a different company', () => {
     // Person identity is verified separately (rejectHallucinatedLinkedInUrls +
     // identity resolution); the company mismatch must not strip the person's URL.
