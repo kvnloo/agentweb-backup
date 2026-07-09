@@ -342,7 +342,7 @@ app.use("/api/oauth", connectedAccountsRoutes);
 app.use("/api/mcp-oauth", mcpOAuthPublicRouter);
 app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
 app.use("/api/admin/lead-magnets", authenticateToken, isAdmin, leadMagnetAdminRoutes);
-app.use("/api/admin/fathom-onboarding", fathomOnboardingAdminRoutes);
+app.use("/api/admin/fathom-onboarding", authenticateToken, isAdmin, fathomOnboardingAdminRoutes);
 app.use("/api/admin/onboarding-loop", authenticateToken, isAdmin, onboardingLoopAdminRoutes);
 app.use("/api/admin/loops", authenticateToken, isAdmin, loopHealthRoutes);
 app.use("/api/admin/agent-runs", authenticateToken, isAdmin, agentRunsRoutes);

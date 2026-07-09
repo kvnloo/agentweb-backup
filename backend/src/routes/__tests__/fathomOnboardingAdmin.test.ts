@@ -1,6 +1,8 @@
 import express from 'express';
 import request from 'supertest';
 import fathomOnboardingAdminRoutes from '../fathomOnboardingAdmin';
+import { authenticateToken } from '../../middleware/auth';
+import { isAdmin } from '../../middleware/admin';
 import { ingestFathomOnboardingRecording } from '../../services/fathomOnboardingIngestionService';
 import { userDb } from '../../services/db';
 
@@ -27,7 +29,7 @@ jest.mock('../../services/db', () => ({
 
 const app = express();
 app.use(express.json());
-app.use('/api/admin/fathom-onboarding', fathomOnboardingAdminRoutes);
+app.use('/api/admin/fathom-onboarding', authenticateToken, isAdmin, fathomOnboardingAdminRoutes);
 
 describe('fathomOnboardingAdminRoutes', () => {
   beforeEach(() => {

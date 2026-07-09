@@ -1,13 +1,8 @@
 import express from 'express';
-import { authenticateToken } from '../middleware/auth';
-import { isAdmin } from '../middleware/admin';
 import { userDb } from '../services/db';
 import { ingestFathomOnboardingRecording } from '../services/fathomOnboardingIngestionService';
 
 const router = express.Router();
-
-router.use(authenticateToken);
-router.use(isAdmin);
 
 router.post('/ingest', async (req: any, res) => {
   try {

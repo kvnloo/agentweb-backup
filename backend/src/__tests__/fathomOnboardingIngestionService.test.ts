@@ -104,6 +104,29 @@ describe('fathomOnboardingIngestionService', () => {
     expect(result.context.sourceReferences?.[0].url).toContain('fathom.video');
   });
 
+  it('derives the canonical recording id from a Fathom calls URL instead of storing the URL as the id', async () => {
+    const deps = makeDeps();
+
+    const result = await ingestFathomOnboardingRecording({
+      recordingUrl: 'https://fathom.video/calls/123?timestamp=60',
+      reviewOwnerUserId: 'review-owner',
+      extractedContext: baseContext,
+    }, deps as any);
+
+    expect(result.recordingId).toBe('123');
+    expect(deps.userDb.updateUser).toHaveBeenCalledWith(
+      'target-user',
+      expect.objectContaining({
+        fathomOnboardingIngestions: [
+          expect.objectContaining({
+            recordingId: '123',
+            recordingUrl: 'https://fathom.video/calls/123?timestamp=60',
+          }),
+        ],
+      }),
+    );
+  });
+
   it('matches cautiously by exact contact email before domain', async () => {
     const deps = makeDeps();
 
@@ -228,6 +251,61 @@ describe('fathomOnboardingIngestionService', () => {
     expect(updatedLedger).toHaveLength(1);
     expect(updatedLedger[0].createdAt).toBe('2026-07-08T19:00:00.000Z');
     expect(updatedLedger[0].updatedAt).toBe('2026-07-08T20:00:00.000Z');
+  });
+
+  it('folds legacy URL-keyed ledger entries into the canonical recording id when the same recording is reprocessed', async () => {
+    const deps = makeDeps();
+    deps.userDb.getUserById.mockImplementation(async (userId: string): Promise<any> => ({
+      userId,
+      email: userId === 'target-user' ? 'owner@acme.ai' : 'harsha@agentweb.pro',
+      emailDomain: userId === 'target-user' ? 'acme.ai' : 'agentweb.pro',
+      orgId: userId === 'target-user' ? 'org-1' : undefined,
+      fathomOnboardingIngestions: userId === 'target-user'
+        ? [{
+          recordingId: 'https://fathom.video/calls/123',
+          recordingUrl: 'https://fathom.video/calls/123',
+          status: 'reviewed',
+          extractionState: 'human_reviewed',
+          context: baseContext,
+          memoryIds: ['mem-existing'],
+          orgMemoryIds: ['org-existing'],
+          createdAt: '2026-07-08T19:00:00.000Z',
+          updatedAt: '2026-07-08T19:00:00.000Z',
+        }]
+        : [],
+    }));
+
+    const result = await ingestFathomOnboardingRecording({
+      recordingId: '123',
+      recordingUrl: 'https://fathom.video/calls/123',
+      reviewOwnerUserId: 'review-owner',
+      targetUserId: 'target-user',
+      reviewed: true,
+      extractedContext: baseContext,
+    }, deps as any);
+
+    expect(result.memoryIds).toEqual(['mem-existing']);
+    expect(deps.accountMemoryDb.addMemory).not.toHaveBeenCalled();
+    const updatedLedger = deps.userDb.updateUser.mock.calls[0][1].fathomOnboardingIngestions;
+    expect(updatedLedger).toHaveLength(1);
+    expect(updatedLedger[0]).toMatchObject({
+      recordingId: '123',
+      recordingUrl: 'https://fathom.video/calls/123',
+      memoryIds: ['mem-existing'],
+      orgMemoryIds: ['org-existing'],
+    });
+  });
+
+  it('rejects empty source input before calling the LLM or storing an all-null context', async () => {
+    const deps = makeDeps();
+
+    await expect(ingestFathomOnboardingRecording({
+      recordingId: 'missing-source',
+      reviewOwnerUserId: 'review-owner',
+    }, deps as any)).rejects.toThrow(/meetingText, transcriptText, extractedContext/);
+
+    expect(deps.llm.generateJsonRobust).not.toHaveBeenCalled();
+    expect(deps.userDb.updateUser).not.toHaveBeenCalled();
   });
 
   it('formats bounded memory content with source link and setup blockers', () => {

@@ -104,6 +104,31 @@ const clean = (value?: string | null): string => (value ?? '').trim();
 const compact = (values?: Array<string | null | undefined>): string[] =>
   (values ?? []).map((v) => clean(v)).filter(Boolean);
 
+function deriveRecordingId(input: Pick<IngestInput, 'recordingId' | 'recordingUrl'>): string {
+  const explicitId = clean(input.recordingId == null ? '' : String(input.recordingId));
+  if (explicitId) return explicitId;
+
+  const recordingUrl = clean(input.recordingUrl);
+  if (!recordingUrl) return '';
+
+  try {
+    const parsed = new URL(recordingUrl);
+    const match = parsed.pathname.match(/\/calls\/([^/?#]+)/);
+    return match?.[1] ? decodeURIComponent(match[1]) : '';
+  } catch {
+    const match = recordingUrl.match(/fathom\.video\/calls\/([^/?#]+)/);
+    return match?.[1] ? decodeURIComponent(match[1]) : '';
+  }
+}
+
+function sameLedgerRecording(
+  item: FathomOnboardingIngestion,
+  next: Pick<FathomOnboardingIngestion, 'recordingId' | 'recordingUrl'>,
+): boolean {
+  if (String(item.recordingId) === String(next.recordingId)) return true;
+  return Boolean(item.recordingUrl && next.recordingUrl && item.recordingUrl === next.recordingUrl);
+}
+
 function normalizeDomain(value?: string | null): string | null {
   const raw = clean(value).toLowerCase();
   if (!raw) return null;
@@ -247,8 +272,8 @@ function mergeLedger(
   next: FathomOnboardingIngestion,
 ): FathomOnboardingIngestion[] {
   const prior = Array.isArray(existing) ? existing : [];
-  const withoutCurrent = prior.filter((item) => String(item.recordingId) !== String(next.recordingId));
-  const previous = prior.find((item) => String(item.recordingId) === String(next.recordingId));
+  const withoutCurrent = prior.filter((item) => !sameLedgerRecording(item, next));
+  const previous = prior.find((item) => sameLedgerRecording(item, next));
   const merged = {
     ...previous,
     ...next,
@@ -293,15 +318,18 @@ export async function ingestFathomOnboardingRecording(
   injectedDeps?: Partial<IngestDeps>,
 ): Promise<FathomOnboardingIngestion & { target: MatchResult; memoryIds: string[]; orgMemoryIds: string[] }> {
   const deps: IngestDeps = { ...defaultDeps(), ...injectedDeps } as IngestDeps;
-  const recordingId = String(input.recordingId || input.recordingUrl || '').trim();
+  const recordingId = deriveRecordingId(input);
   if (!recordingId) {
-    throw new Error('recordingId or recordingUrl is required.');
+    throw new Error('recordingId or Fathom /calls/:id recordingUrl is required.');
   }
   if (!input.reviewOwnerUserId) {
     throw new Error('reviewOwnerUserId is required.');
   }
 
   const sourceText = await loadRecordingText(input, deps);
+  if (!input.extractedContext && !sourceText) {
+    throw new Error('meetingText, transcriptText, extractedContext, or fetchable Fathom recording text is required.');
+  }
   const context = normalizeContext(
     input.extractedContext || await extractFathomOnboardingContext(sourceText, input.recordingUrl, deps),
     input.recordingUrl,
@@ -318,7 +346,7 @@ export async function ingestFathomOnboardingRecording(
   }
 
   const existing = (ledgerUser as any).fathomOnboardingIngestions as FathomOnboardingIngestion[] | undefined;
-  const previous = existing?.find((item) => String(item.recordingId) === recordingId);
+  const previous = existing?.find((item) => sameLedgerRecording(item, { recordingId, recordingUrl: input.recordingUrl }));
   const reviewed = input.reviewed === true;
   const status: IngestionStatus = reviewed ? 'reviewed' : 'needs_review';
   const extractionState: ExtractionState = reviewed ? 'human_reviewed' : 'auto_extracted';
