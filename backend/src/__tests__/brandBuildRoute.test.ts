@@ -4,6 +4,7 @@ import express from "express";
 jest.mock("../services/db", () => ({
   userDb: {
     getUserById: jest.fn(),
+    getUserByEmailConsistent: jest.fn(),
     updateUser: jest.fn(),
   },
 }));
@@ -230,6 +231,13 @@ describe("GET /api/onboarding/brand-build/status", () => {
         brandBuildStatus: "failed",
         brandBuildError: "Brand build timed out",
       });
+    // Authoritative consistent re-read confirms the build is genuinely still
+    // stuck (not a stale-GSI false alarm), so the watchdog proceeds to fail it.
+    userDb.getUserByEmailConsistent.mockResolvedValue({
+      userId: "user-1",
+      brandBuildStatus: "building",
+      brandBuildStartedAt: "2020-01-01T00:00:00.000Z",
+    });
     userDb.updateUser.mockResolvedValue({ userId: "user-1" });
     const spy = jest.spyOn(console, "log").mockImplementation(() => {});
     const res = await request(app).get("/api/onboarding/brand-build/status");
@@ -240,6 +248,33 @@ describe("GET /api/onboarding/brand-build/status", () => {
     );
     expect(res.body.status.brandBuildStatus).toBe("failed");
     spy.mockRestore();
+  });
+
+  it("does NOT force-fail when a strongly-consistent re-read shows the build already completed (no clobbering a just-succeeded build)", async () => {
+    // The watchdog decides from getUserById, which reads the eventually-
+    // consistent UserIdIndex GSI and can lag a just-written `ready` by
+    // ~100-1000ms. Here the GSI still shows a long-running `building` (so the
+    // watchdog trips), but the authoritative consistent read shows the build
+    // actually finished `ready`. The route must trust the consistent read and
+    // NOT overwrite the success with a spurious `failed`.
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      brandBuildStatus: "building",
+      brandBuildStartedAt: "2020-01-01T00:00:00.000Z",
+    });
+    userDb.getUserByEmailConsistent.mockResolvedValue({
+      userId: "user-1",
+      brandBuildStatus: "ready",
+      brandBuildStartedAt: "2020-01-01T00:00:00.000Z",
+      brandBuildCompletedAt: "2020-01-01T00:04:30.000Z",
+      brandBuildDurationMs: 270_000,
+    });
+    userDb.updateUser.mockResolvedValue({ userId: "user-1" });
+    const res = await request(app).get("/api/onboarding/brand-build/status");
+    expect(res.status).toBe(200);
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+    expect(res.body.status.brandBuildStatus).toBe("ready");
+    expect(res.body.status.brandBuildDurationMs).toBe(270_000);
   });
 
   it("does NOT auto-fail a build that is still within budget", async () => {
