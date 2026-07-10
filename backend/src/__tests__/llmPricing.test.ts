@@ -102,8 +102,52 @@ describe('llmPricing', () => {
       ]) {
         expect(IMAGE_GENERATION_PRICING_USD[model]).toBeGreaterThan(0);
       }
-      expect(VIDEO_GENERATION_PRICING_USD_PER_CLIP['veo-3.1-generate-preview']).toBe(2.8);
+      expect(VIDEO_GENERATION_PRICING_USD_PER_CLIP['veo-3.1-generate-preview']).toBe(3.2);
       expect(VIDEO_GENERATION_PRICING_USD_PER_CLIP['veo-3.1-fast-generate-preview']).toBe(1.4);
+      expect(VIDEO_GENERATION_PRICING_USD_PER_CLIP['veo-3-generate-preview']).toBe(3.2);
+      expect(VIDEO_GENERATION_PRICING_USD_PER_CLIP['seedance-2.0']).toBe(0.5);
+    });
+  });
+
+  // ENG-200 pricing accuracy pass: lock the corrected/added list prices so a stale
+  // value can never silently come back. Rates verified against the official
+  // Anthropic / OpenAI / Google pricing pages (Jul 2026). in/out = USD per 1M tokens.
+  describe('ENG-200 accurate list prices', () => {
+    const expectRate = (model: string, inPerM: number, outPerM: number) => {
+      const price = MODEL_PRICING[model];
+      expect(price).toBeDefined();
+      expect(price.inPerM).toBe(inPerM);
+      expect(price.outPerM).toBe(outPerM);
+    };
+
+    it('prices Opus at the current $5/$25 tier, not the legacy $15/$75', () => {
+      expectRate('anthropic.claude-opus-4-8', 5, 25);
+      expectRate('anthropic.claude-opus-4-6-v1', 5, 25);
+    });
+
+    it('has corrected GPT rates', () => {
+      expectRate('gpt-5.2-chat', 1.75, 14);
+      expectRate('gpt-5.4', 2.5, 15);
+    });
+
+    it('has corrected Gemini rates', () => {
+      expectRate('gemini-3-flash-preview', 0.5, 3);
+      expectRate('gemini-3.1-pro-preview', 2, 12);
+      expectRate('gemini-3.1-flash-lite', 0.25, 1.5);
+      expectRate('gemini-3.5-flash', 1.5, 9);
+    });
+
+    it('prices gemini-2.5-flash (previously missing -> recorded $0)', () => {
+      expectRate('gemini-2.5-flash', 0.3, 2.5);
+    });
+
+    it('stages Fable 5 and Haiku 4.5 so higher-cost models are metered when enabled', () => {
+      expectRate('claude-fable-5', 10, 50);
+      expectRate('claude-haiku-4-5', 1, 5);
+    });
+
+    it('prices the Pro image model above the flash tier', () => {
+      expect(IMAGE_GENERATION_PRICING_USD['gemini-3-pro-image-preview']).toBe(0.134);
     });
   });
 
