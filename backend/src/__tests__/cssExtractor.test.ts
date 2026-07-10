@@ -239,6 +239,8 @@ jest.mock('@projectwallace/css-analyzer', () => ({
 // Mock puppeteer-core
 const mockPage = {
   setUserAgent: jest.fn(),
+  setCacheEnabled: jest.fn(),
+  setExtraHTTPHeaders: jest.fn(),
   goto: jest.fn(),
   evaluate: jest.fn(),
   close: jest.fn(),
@@ -332,6 +334,38 @@ describe('cssExtractor', () => {
       // Should still extract CSS via JSDOM path
       expect(result.stylesheets).toHaveLength(1);
       expect(result.stylesheets[0].content).toContain('color: #333');
+    });
+
+    it('fetches the live URL with no-cache headers on the JSDOM fallback (returns current content, not a stale copy)', async () => {
+      // Regression for the onboarding stale-scrape reports: when the browser
+      // path is unavailable and we fetch the HTML over HTTP, the request must
+      // ask origin/intermediaries for a fresh copy. Simulate a changed site by
+      // returning the CURRENT markup and assert the request opted out of caches.
+      const origImpl = (findChromeExecutable as jest.Mock).getMockImplementation();
+      (findChromeExecutable as jest.Mock).mockReturnValue(undefined);
+      const axios = require('axios');
+      (axios.get as jest.Mock).mockResolvedValueOnce({
+        data: '<html><head><style>body { color: #abcabc; }</style></head><body></body></html>',
+      });
+
+      const result = await extractCSSFromURL('https://changed-fixture.example.com');
+
+      if (origImpl) {
+        (findChromeExecutable as jest.Mock).mockImplementation(origImpl);
+      } else {
+        (findChromeExecutable as jest.Mock).mockReturnValue('/usr/bin/google-chrome');
+      }
+
+      expect(result.stylesheets[0].content).toContain('#abcabc');
+      expect(axios.get).toHaveBeenCalledWith(
+        'https://changed-fixture.example.com/',
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            'Cache-Control': 'no-cache',
+            Pragma: 'no-cache',
+          }),
+        })
+      );
     });
   });
 
@@ -480,6 +514,8 @@ describe('cssExtractor', () => {
       mockBrowser.newPage.mockResolvedValue(mockPage);
       mockBrowser.close.mockResolvedValue(undefined);
       mockPage.setUserAgent.mockResolvedValue(undefined);
+      mockPage.setCacheEnabled.mockResolvedValue(undefined);
+      mockPage.setExtraHTTPHeaders.mockResolvedValue(undefined);
       mockPage.goto.mockResolvedValue(undefined);
       mockPage.close.mockResolvedValue(undefined);
       const pMock = require('puppeteer-core');
@@ -517,6 +553,24 @@ describe('cssExtractor', () => {
         expect(tokens.typography.scale.h1).toBeDefined();
         expect(tokens.typography.scale.body).toBeDefined();
       }
+    });
+
+    it('disables the browser cache and sends no-cache headers so it scrapes the CURRENT site (no stale copy)', async () => {
+      mockPage.evaluate.mockResolvedValueOnce({
+        customProperties: {},
+        stylesheetText: 'body { color: #111; }',
+        computedElements: {},
+      });
+
+      await extractCSSFromURL('https://example.com');
+
+      // The onboarding stale-scrape reports (an old version of the site was
+      // captured) are guarded by turning off the HTTP cache and asking any
+      // intermediary not to serve a cached response.
+      expect(mockPage.setCacheEnabled).toHaveBeenCalledWith(false);
+      expect(mockPage.setExtraHTTPHeaders).toHaveBeenCalledWith(
+        expect.objectContaining({ 'Cache-Control': 'no-cache', Pragma: 'no-cache' })
+      );
     });
   });
 
