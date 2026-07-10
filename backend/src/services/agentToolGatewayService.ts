@@ -127,15 +127,24 @@ export class AgentToolRepeatedFailureError extends Error {
     // repeating the generic "offer to file a bug report" suggestion here is exactly
     // what let the model think it still needed to act on report_product_issues.
     readonly alreadyReportedThisRun: boolean = false,
+    // ENG-167 follow-up (Greptile): when the SESSION-scoped breaker trips on a brand-
+    // new run, `failureCount` is the cross-run aggregate — the tool may not have been
+    // called at all yet in this run. Saying "in this run" here is factually wrong and
+    // contradicts the model's own tool-call history, undermining trust in the stop
+    // guidance. Scope the wording to where the count actually came from.
+    readonly scope: 'run' | 'session' = 'run',
   ) {
+    const timeoutScopePhrase = scope === 'session'
+      ? `${failureCount} times across your recent turns in this chat session (not just this run)`
+      : `${failureCount} times in this run`;
     super(
       reason === 'timeout'
         ? (alreadyReportedThisRun
-          ? `Tool "${toolName}" has timed out ${failureCount} times in this run and is consistently unable to complete in time. ` +
+          ? `Tool "${toolName}" has timed out ${timeoutScopePhrase} and is consistently unable to complete in time. ` +
             'STOP retrying it — retrying will keep timing out. You already filed a bug report for this via report_product_issues ' +
-            'in this run — do NOT file another. Deliver whatever you have already produced, tell the user this step timed out and ' +
+            '— do NOT file another. Deliver whatever you have already produced, tell the user this step timed out and ' +
             'that a bug report was already filed for it, and wrap up your turn now.'
-          : `Tool "${toolName}" has timed out ${failureCount} times in this run and is consistently unable to complete in time. ` +
+          : `Tool "${toolName}" has timed out ${timeoutScopePhrase} and is consistently unable to complete in time. ` +
             'STOP retrying it — retrying will keep timing out. Deliver whatever you have already produced, tell the user this step ' +
             'timed out and could not be completed, and offer either to try a smaller/simpler version or to file a bug report on ' +
             'their behalf with report_product_issues.')
@@ -712,6 +721,7 @@ export async function executeAgentToolThroughGateway(
             trippedSession.errorMessage,
             trippedSession.reason,
             !!input.runId && hasReportedIssue(input.runId),
+            'session',
           ),
           policyDecision,
           durationMs: Math.max(0, now() - startedAt),

@@ -1210,12 +1210,19 @@ describe('agentToolGatewayService', () => {
 
     const failingExecute = (message: string) => () => Promise.reject(new Error(message));
 
-    async function failNTimes(runId: string, toolName: string, message: string, n: number): Promise<void> {
+    async function failNTimes(
+      runId: string,
+      toolName: string,
+      message: string,
+      n: number,
+      budgetScopeId?: string,
+    ): Promise<void> {
       for (let i = 0; i < n; i += 1) {
         const outcome = await executeAgentToolThroughGateway({
           toolName,
           args: { attempt: i },
           runId,
+          ...(budgetScopeId ? { budgetScopeId } : {}),
           execute: failingExecute(message),
         });
         expect(outcome.status).toBe('error');
@@ -1402,28 +1409,18 @@ describe('agentToolGatewayService', () => {
     // out spiral-wide gets caught well before the per-run breaker ever could.
     it('trips the SESSION-scoped timeout aggregate across separate runs sharing a budgetScopeId (ENG-167 cross-turn retry)', async () => {
       const sessionScope = 'session-eng167-cross-turn';
-      await failNTimes('run-turn-1', 'create_html_file', 'connection timed out after 300000ms', 1);
-      // Re-record the SAME failure into the session scope the way a real turn does
-      // (budgetScopeId passed alongside a fresh runId each turn).
-      const outcome1 = await executeAgentToolThroughGateway({
-        toolName: 'create_html_file',
-        args: { title: 'Campaign Brief' },
-        runId: 'run-turn-1',
-        budgetScopeId: sessionScope,
-        execute: () => Promise.reject(new Error('connection timed out after 300000ms')),
-      });
-      expect(outcome1.status).toBe('error');
+      // Turn 1 and turn 2 each fail exactly once, in their OWN runs — mirrors two
+      // separate user "try again" turns, each a brand-new runId.
+      await failNTimes(
+        'run-turn-1', 'create_html_file', 'connection timed out after 300000ms', 1, sessionScope,
+      );
+      await failNTimes(
+        'run-turn-2', 'create_html_file', 'The operation was aborted due to timeout', 1, sessionScope,
+      );
 
-      const outcome2 = await executeAgentToolThroughGateway({
-        toolName: 'create_html_file',
-        args: { title: 'Campaign Brief' },
-        runId: 'run-turn-2', // a brand-new run, mirroring the user's "try again"
-        budgetScopeId: sessionScope,
-        execute: () => Promise.reject(new Error('The operation was aborted due to timeout')),
-      });
-      expect(outcome2.status).toBe('error');
-
-      // Third turn, third fresh runId — session has now seen 2 timeout failures.
+      // Third turn, third fresh runId, and — critically — this run has NOT called
+      // create_html_file before. Session has now seen 2 timeout failures across
+      // turns 1 and 2 only.
       const execute = jest.fn().mockResolvedValue({ success: true });
       const outcome3 = await executeAgentToolThroughGateway({
         toolName: 'create_html_file',
@@ -1440,6 +1437,12 @@ describe('agentToolGatewayService', () => {
         expect(message).toContain('create_html_file');
         expect(message.toLowerCase()).toContain('timed out');
         expect(message.toLowerCase()).toContain('report_product_issues');
+        // Greptile ENG-167 follow-up: run-turn-3 never called create_html_file
+        // before this attempt — the message must NOT claim the failures happened
+        // "in this run" (factually wrong, contradicts the model's own tool-call
+        // history) and must instead say they came from earlier turns/session.
+        expect(message.toLowerCase()).not.toContain('in this run');
+        expect(message.toLowerCase()).toContain('session');
       }
       expect(execute).not.toHaveBeenCalled();
     });
@@ -1599,6 +1602,10 @@ describe('agentToolGatewayService', () => {
         // that's what already happened once and confused the model into thinking
         // it still needed to do something with report_product_issues.
         expect(message).not.toContain('offer either to try');
+        // Greptile ENG-167 follow-up: run-turn-4 never called create_html_file
+        // before this attempt — the 2 counted failures came from turns 1 & 2.
+        expect(message).not.toContain('in this run');
+        expect(message).toContain('session');
       }
       expect(execute).not.toHaveBeenCalled();
     });
