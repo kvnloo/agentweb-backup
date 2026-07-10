@@ -26,14 +26,20 @@ import express, { Request, Response } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb } from "../services/db";
 import {
+  ensurePersonaIds,
+  ICPPersona,
   icpStartPatch,
   icpReadyPatch,
   icpFailedPatch,
   icpSnapshot,
   logICPCompletionMetric,
+  MINTED_ICP_ID_RE,
   sanitizeICPPersonas,
 } from "../services/icpStatusService";
-import { startIcpDiscoveryForUser } from "../services/onboardingIcpService";
+import {
+  regenerateSingleIcpForUser,
+  startIcpDiscoveryForUser,
+} from "../services/onboardingIcpService";
 import {
   competitorStartPatch,
   competitorReadyPatch,
@@ -145,6 +151,27 @@ router.get("/icp/status", authenticateToken, async (req, res) => {
     if (!email) return;
     const user = await userDb.getUserByEmailConsistent(email);
     if (!user) return res.status(404).json({ message: "User not found" });
+
+    // Self-healing migration: personas persisted before stable ids existed
+    // carry none, so the FE would fall back to positional `icp-N` refs — the
+    // refs that go stale the moment a delete splices the array. Mint them on
+    // the way out and persist, so the browser holds real ids BEFORE it can
+    // mutate anything. Idempotent: only writes when something is missing.
+    // Best-effort — a failed write must not break the status poll.
+    const personas = (user as { icpResult?: ICPPersona[] }).icpResult;
+    if (Array.isArray(personas) && personas.length > 0 && personas.some((p) => !p?.id)) {
+      const withIds = ensurePersonaIds(personas);
+      const userId = (req as AuthenticatedRequest).user?.userId;
+      if (userId) {
+        try {
+          await userDb.updateUser(userId, { icpResult: withIds } as any);
+        } catch (err) {
+          console.error("[icp] persona id backfill failed", { userId, err });
+        }
+      }
+      return res.json({ status: icpSnapshot({ ...user, icpResult: withIds }) });
+    }
+
     return res.json({ status: icpSnapshot(user) });
   } catch (err) {
     console.error("[icp] status failed", err);
@@ -648,6 +675,52 @@ function parseIcpIndex(icpId: unknown): number | null {
   return n;
 }
 
+/**
+ * Resolve an `icpId` from the FE to an index into the stored persona list.
+ *
+ * Prefers the persona's stable `id`. Positional `icp-<n>` refs are still
+ * honoured for records written before ids existed — but they are exactly the
+ * refs that go stale when `/icp/delete-one` splices the array, so they are a
+ * fallback, not the contract.
+ *
+ * Returns `{ status }` rather than throwing so callers can distinguish a
+ * malformed ref (400) from one naming a persona that is gone (404).
+ */
+function resolveIcpIndex(
+  list: Array<Record<string, unknown>>,
+  icpId: unknown,
+): { index: number } | { status: 400 | 404 } {
+  if (typeof icpId !== "string" || !icpId) return { status: 400 };
+
+  const byId = list.findIndex((p) => p && (p as any).id === icpId);
+  if (byId >= 0) return { index: byId };
+
+  const positional = parseIcpIndex(icpId);
+  if (positional !== null) {
+    if (positional >= list.length) return { status: 404 };
+    return { index: positional };
+  }
+
+  // Looks like a minted id, but no persona carries it — the card was deleted
+  // or regenerated away under the caller.
+  if (MINTED_ICP_ID_RE.test(icpId)) return { status: 404 };
+  return { status: 400 };
+}
+
+/**
+ * Reject a missing/blank `icpId` before we spend a DynamoDB read on it. The
+ * id-vs-position resolution below needs the persona list, but "you sent no id
+ * at all" is a 400 regardless of what the user has stored.
+ */
+function hasIcpIdShape(icpId: unknown): icpId is string {
+  return typeof icpId === "string" && icpId.length > 0;
+}
+
+const ICP_ID_ERROR = {
+  400: { message: "icpId is required (a persona id, or the legacy icp-N form)" },
+  404: { message: "icp not found" },
+} as const;
+
 function sanitizePersonaPatch(raw: unknown): Record<string, string> | null {
   if (!raw || typeof raw !== "object") return null;
   const out: Record<string, string> = {};
@@ -666,9 +739,8 @@ router.post("/icp/edit-one", authenticateToken, async (req, res) => {
   try {
     const userId = requireUserId(req, res);
     if (!userId) return;
-    const idx = parseIcpIndex(req.body?.icpId);
-    if (idx === null) {
-      return res.status(400).json({ message: "icpId is required (format: icp-N)" });
+    if (!hasIcpIdShape(req.body?.icpId)) {
+      return res.status(400).json(ICP_ID_ERROR[400]);
     }
     const patchFields = sanitizePersonaPatch(req.body?.patch);
     if (!patchFields) {
@@ -678,11 +750,27 @@ router.post("/icp/edit-one", authenticateToken, async (req, res) => {
     }
     const user = await userDb.getUserById(userId);
     const list: Array<Record<string, string>> = user?.icpResult ?? [];
-    if (list.length === 0 || idx >= list.length) {
+    if (list.length === 0) {
       return res.status(404).json({ message: "icp not found" });
     }
+    const resolved = resolveIcpIndex(list, req.body?.icpId);
+    if ("status" in resolved) {
+      return res.status(resolved.status).json(ICP_ID_ERROR[resolved.status]);
+    }
+    const idx = resolved.index;
+    // Record the user's own words as an anchor alongside the visible field.
+    // Every later regeneration of this persona is driven from the anchor, so
+    // it can neither be overwritten by a full-set run nor drift across
+    // repeated regenerations (ENG-255). Merged, not replaced: a second edit to
+    // a different field must not discard the first.
     const nextList = list.map((p, i) =>
-      i === idx ? { ...p, ...patchFields } : p
+      i === idx
+        ? {
+            ...p,
+            ...patchFields,
+            userIntent: { ...((p as any).userIntent ?? {}), ...patchFields },
+          }
+        : p
     );
     await userDb.updateUser(userId, {
       icpResult: nextList as Required<NonNullable<typeof user>>["icpResult"],
@@ -698,17 +786,26 @@ router.post("/icp/regenerate-one", authenticateToken, async (req, res) => {
   try {
     const userId = requireUserId(req, res);
     if (!userId) return;
-    const idx = parseIcpIndex(req.body?.icpId);
-    if (idx === null) {
-      return res
-        .status(400)
-        .json({ message: "icpId is required (format: icp-N)" });
+    if (!hasIcpIdShape(req.body?.icpId)) {
+      return res.status(400).json(ICP_ID_ERROR[400]);
     }
-    // Re-run the orchestrator. v1 regenerates the whole ICP set rather than
-    // just the indexed persona — the LLM service is set-level. The FE
-    // optimistically renders a per-card stall, then drops it when status
-    // flips back to ready.
-    await startIcpDiscoveryForUser(userId);
+    const existing = await userDb.getUserById(userId);
+    const resolved = resolveIcpIndex(existing?.icpResult ?? [], req.body?.icpId);
+    if ("status" in resolved) {
+      return res.status(resolved.status).json(ICP_ID_ERROR[resolved.status]);
+    }
+    const idx = resolved.index;
+    // Regenerate ONLY the persona the user clicked. This used to call
+    // `startIcpDiscoveryForUser`, which re-ran the whole set from brand
+    // context — replacing all five cards and destroying any the user had
+    // edited, because the regeneration prompt never read `icpResult`
+    // (ENG-255). Flip to `running` here, then hand off: the LLM round-trip is
+    // ~20s and the FE polls `/icp/status` rather than holding this request
+    // open.
+    await userDb.updateUser(userId, icpStartPatch());
+    void regenerateSingleIcpForUser(userId, idx).catch((err: unknown) => {
+      console.error("[icp] regenerate-one failed", { userId, idx, err });
+    });
     // Return the running snapshot directly from the patch we just wrote.
     // Do NOT read back via getUserById — UserIdIndex is eventually
     // consistent and the stale GSI row (icpStatus='ready' + old
@@ -727,17 +824,19 @@ router.post("/icp/delete-one", authenticateToken, async (req, res) => {
   try {
     const userId = requireUserId(req, res);
     if (!userId) return;
-    const idx = parseIcpIndex(req.body?.icpId);
-    if (idx === null) {
-      return res
-        .status(400)
-        .json({ message: "icpId is required (format: icp-N)" });
+    if (!hasIcpIdShape(req.body?.icpId)) {
+      return res.status(400).json(ICP_ID_ERROR[400]);
     }
     const user = await userDb.getUserById(userId);
     const list: Array<Record<string, string>> = user?.icpResult ?? [];
-    if (list.length === 0 || idx >= list.length) {
+    if (list.length === 0) {
       return res.status(404).json({ message: "icp not found" });
     }
+    const resolved = resolveIcpIndex(list, req.body?.icpId);
+    if ("status" in resolved) {
+      return res.status(resolved.status).json(ICP_ID_ERROR[resolved.status]);
+    }
+    const idx = resolved.index;
     const nextList = list.filter((_, i) => i !== idx);
     await userDb.updateUser(userId, {
       icpResult: nextList as Required<NonNullable<typeof user>>["icpResult"],

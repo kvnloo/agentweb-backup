@@ -92,4 +92,37 @@ export class FathomApiService {
       return null; // network error or timeout — uncertain
     }
   }
+
+  async getRecordingSummary(recordingId: string): Promise<any> {
+    const response = await fetch(`${FATHOM_API_BASE}/recordings/${encodeURIComponent(recordingId)}/summary`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${this.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch Fathom recording summary ${recordingId}: ${response.status}`);
+    }
+
+    return response.json();
+  }
+
+  async getTranscript(recordingId: string): Promise<any[]> {
+    const response = await fetch(`${FATHOM_API_BASE}/recordings/${encodeURIComponent(recordingId)}/transcript`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${this.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch Fathom transcript ${recordingId}: ${response.status}`);
+    }
+
+    const data = await response.json();
+    return Array.isArray(data?.transcript) ? data.transcript : [];
+  }
 }

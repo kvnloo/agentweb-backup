@@ -34,6 +34,7 @@ jest.mock("../services/onboardingIcpService", () => {
       const { icpStartPatch } = require("../services/icpStatusService");
       await userDb.updateUser(userId, icpStartPatch());
     }),
+    regenerateSingleIcpForUser: jest.fn(async () => {}),
   };
 });
 
@@ -196,8 +197,16 @@ describe("POST /api/onboarding/icp/regenerate-one", () => {
     expect(res.status).toBe(400);
   });
 
-  it("flips icpStatus to running and triggers the orchestrator", async () => {
-    const { startIcpDiscoveryForUser } = require("../services/onboardingIcpService");
+  it("flips icpStatus to running and regenerates only the requested persona", async () => {
+    // Previously this asserted a call to `startIcpDiscoveryForUser(userId)` —
+    // i.e. that clicking "Regenerate this one" re-ran the WHOLE set. That was
+    // the ENG-255 bug, encoded as an expectation. It now regenerates the one
+    // persona identified by `icpId`.
+    const {
+      regenerateSingleIcpForUser,
+      startIcpDiscoveryForUser,
+    } = require("../services/onboardingIcpService");
+    (regenerateSingleIcpForUser as jest.Mock).mockClear();
     (startIcpDiscoveryForUser as jest.Mock).mockClear();
     userDb.getUserById.mockResolvedValue({
       userId: "user-1",
@@ -209,8 +218,10 @@ describe("POST /api/onboarding/icp/regenerate-one", () => {
       .post("/api/onboarding/icp/regenerate-one")
       .send({ icpId: "icp-1" });
     expect(res.status).toBe(200);
-    expect(startIcpDiscoveryForUser).toHaveBeenCalledTimes(1);
-    expect(startIcpDiscoveryForUser).toHaveBeenCalledWith("user-1");
+    expect(res.body.status.icpStatus).toBe("running");
+    expect(regenerateSingleIcpForUser).toHaveBeenCalledTimes(1);
+    expect(regenerateSingleIcpForUser).toHaveBeenCalledWith("user-1", 1);
+    expect(startIcpDiscoveryForUser).not.toHaveBeenCalled();
   });
 
   it("returns icpStatus='running' even when getUserById returns stale GSI data", async () => {

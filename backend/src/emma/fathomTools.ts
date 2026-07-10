@@ -11,8 +11,8 @@
 
 import axios from 'axios';
 import { emmaToolRegistry } from './registry';
-import { getAccountsByUserId, updateAccountConfig } from '../services/connectedAccountsDb';
-import { getFathomConfig } from '../config/integrations';
+import { getFathomAccessToken } from '../services/fathomTokenService';
+import { userDb } from '../services/db';
 
 const FATHOM_API_BASE = 'https://api.fathom.ai/external/v1';
 
@@ -22,53 +22,6 @@ const FATHOM_API_BASE = 'https://api.fathom.ai/external/v1';
  * and the metrics service have the same coverage.
  */
 const FATHOM_MAX_PAGES = 20;
-
-/**
- * Retrieve the Fathom access token from the user's connected accounts.
- * For OAuth accounts, automatically refreshes the token if expired.
- * Returns null if no Fathom account is connected.
- */
-async function getFathomAccessToken(userId: string): Promise<string | null> {
-  const accounts = await getAccountsByUserId(userId);
-  const fathomAccount = accounts.find(acc => acc.platform === 'fathom');
-  if (!fathomAccount) return null;
-
-  const config = fathomAccount.config as any;
-
-  // Check if token needs refresh (OAuth accounts only)
-  if (config.refresh_token && config.token_expires_at && Date.now() > config.token_expires_at - 60000) {
-    try {
-      const fathomConfig = await getFathomConfig();
-      const response = await axios.post(fathomConfig.tokenUrl, new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: config.refresh_token,
-        client_id: fathomConfig.clientId,
-        client_secret: fathomConfig.clientSecret,
-      }).toString(), {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      });
-
-      const { access_token, refresh_token, expires_in } = response.data as {
-        access_token: string;
-        refresh_token?: string;
-        expires_in: number;
-      };
-
-      await updateAccountConfig(userId, 'fathom', fathomAccount.account_id, {
-        access_token,
-        ...(refresh_token && { refresh_token }),
-        token_expires_at: Date.now() + (expires_in * 1000),
-      });
-
-      return access_token;
-    } catch (err: any) {
-      console.error('[Fathom] Token refresh failed:', err?.message);
-      // Fall through to use existing token
-    }
-  }
-
-  return config.access_token || null;
-}
 
 // ── fathom_get_meetings ──────────────────────────────────────────────────────
 
@@ -192,6 +145,48 @@ emmaToolRegistry.register({
         message: `Failed to fetch meetings from Fathom: ${error?.message || 'Unknown error'}`,
       };
     }
+  },
+});
+
+// ── fathom_get_onboarding_context ────────────────────────────────────────────
+
+emmaToolRegistry.register({
+  name: 'fathom_get_onboarding_context',
+  definition: {
+    name: 'fathom_get_onboarding_context',
+    description:
+      'Get reviewed Fathom-derived onboarding context for the current account. ' +
+      'Use this to personalize onboarding, first-win recommendations, and customer-support guidance from sales/prospect calls.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: [],
+    },
+  },
+  execute: async (_args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) {
+      return { success: false, message: 'Authentication required: no user context.' };
+    }
+
+    const user = await userDb.getUserById(userId);
+    const ingestions = Array.isArray((user as any)?.fathomOnboardingIngestions)
+      ? (user as any).fathomOnboardingIngestions
+      : [];
+    const reviewed = ingestions.filter((item: any) => item.status === 'reviewed');
+
+    return {
+      success: true,
+      count: reviewed.length,
+      contexts: reviewed.map((item: any) => ({
+        recordingId: item.recordingId,
+        recordingUrl: item.recordingUrl,
+        extractionState: item.extractionState,
+        reviewedAt: item.updatedAt,
+        matchReason: item.matchReason,
+        context: item.context,
+      })),
+    };
   },
 });
 

@@ -6,10 +6,21 @@ const router = express.Router();
 /**
  * Linear webhook — two jobs:
  *
- * 1. Resolve bridge: when a bug-canonical Linear issue transitions to a completed state, notify
- *    every reporter whose private Featurebase card is grouped onto it
- *    (intakeService.notifyCanonicalResolved reads the canonical's `[reporter-ticket #N <email>]`
- *    comments, emails each reporter, and flips their card to Completed).
+ * 1. Resolve bridge: fires the customer-facing resolve bridge
+ *    (intakeService.notifyCanonicalResolved: Resend email to every reporter whose private
+ *    Featurebase card is grouped onto the canonical, Featurebase card flip to Completed, Slack ship
+ *    ping) ONLY when a bug-canonical Linear issue TRANSITIONS INTO the Done state. Two guards make
+ *    this precise (ENG-222):
+ *
+ *  1. Gate by the Done state ID (`LINEAR_DONE_STATE_ID`), not by state category. The board runs
+ *     Merged -> Verifying -> Done and all three are completed-type; only Done is customer-communicable,
+ *     so gating on `state.type === 'completed'` would email reporters on Merged/Verifying. We match the
+ *     state ID (not name) so a rename can't silently kill or misroute the bridge — if the ID is unset
+ *     we fail loud rather than fire blindly.
+ *  2. Fire only on the transition INTO Done, not on every edit while the issue sits in Done. Linear's
+ *     `updatedFrom` carries the prior value of each changed field, so a real state change puts the old
+ *     `stateId` there; a title/label edit on an already-Done issue (or an `action:'create'`) has no
+ *     `stateId` in `updatedFrom` and must fire nothing (the email + card flip are not deduped).
  *
  * 2. FB-synced issue enrichment (ENG-187 contract #4): feature requests become Linear issues via
  *    Featurebase's own FB->Linear sync (never via this repo), marked with the "Featurebase" label.
@@ -37,13 +48,31 @@ router.post('/linear/webhook', async (req, res) => {
     }
 
     const payload = JSON.parse(raw.toString('utf8'));
-    const completed =
+
+    // Fail loud on missing config for issue updates: without the Done-state ID we cannot safely
+    // decide whether customer comms should fire. Creation-only enrichment below does not need it.
+    const doneStateId = process.env.LINEAR_DONE_STATE_ID || '';
+    if (payload?.type === 'Issue' && payload?.action === 'update' && payload?.data?.id && !doneStateId) {
+      console.error(
+        '[linear-webhook] LINEAR_DONE_STATE_ID is not set — refusing to fire resolve bridge (config missing)',
+      );
+      return res.status(200).json({ ok: false, error: 'LINEAR_DONE_STATE_ID not configured' });
+    }
+
+    // Only an `update` whose new state IS the Done state AND whose `updatedFrom` shows the state
+    // actually changed (from something other than Done) counts as a transition into Done.
+    const stateChanged =
+      payload?.updatedFrom &&
+      Object.prototype.hasOwnProperty.call(payload.updatedFrom, 'stateId');
+    const transitionedIntoDone =
       payload?.type === 'Issue' &&
-      (payload?.action === 'update' || payload?.action === 'create') &&
-      payload?.data?.state?.type === 'completed' &&
+      payload?.action === 'update' &&
+      payload?.data?.state?.id === doneStateId &&
+      stateChanged &&
+      payload.updatedFrom.stateId !== doneStateId &&
       payload?.data?.id;
 
-    if (completed) {
+    if (transitionedIntoDone) {
       const { notifyCanonicalResolved } = await import('../services/intakeService');
       const r = await notifyCanonicalResolved(payload.data.id, payload.data.title || undefined);
       return res.json({ ok: true, notified: r.ticketNumbers.length, ticketNumbers: r.ticketNumbers });
