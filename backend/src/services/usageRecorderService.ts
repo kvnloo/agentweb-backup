@@ -13,6 +13,7 @@
 
 import { getModelPrice } from "../utils/llmPricing";
 import { usageRecordDb } from "./usageRecordDb";
+import { incrementUserTokenUsage } from "./tokenUsageService";
 
 export interface RecordUsageContext {
   userId?: string;
@@ -104,6 +105,46 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
       );
     }
   }
+}
+
+/**
+ * Meter one LLM call BOTH ways for a direct-provider call site that spends a real
+ * user's tokens but bypasses callLLM (crm enrichment, growth-genius, workflow-gen,
+ * report-revision, invite-note shortening, …):
+ *   1. recordUsage()          — the shadow analytics table.
+ *   2. incrementUserTokenUsage — the enforced per-user monthly cap.
+ *
+ * Fire-and-forget + fail-open on both — metering must never fail or slow an LLM
+ * response. The cap charge is skipped when no user is attributable (a bare
+ * recordUsage under "system" still captures the platform overhead).
+ *
+ * Note: tokens feed the always-on token cap; cost feeds the cap in dollars but
+ * only blocks when ENFORCE_COST_CAP is enabled (observe-only by default).
+ */
+export function meterUserUsage(ctx: RecordUsageContext): void {
+  // Shadow analytics — records under "system" when userId is absent.
+  void recordUsage(ctx);
+
+  // Enforced per-user cap — only when a real user is attributable.
+  if (!ctx.userId) return;
+
+  const inputTokens = Math.max(0, Math.round(ctx.inputTokens || 0));
+  const outputTokens = Math.max(0, Math.round(ctx.outputTokens || 0));
+  const cacheReadTokens = Math.max(0, Math.round(ctx.cacheReadTokens || 0));
+  const cacheWriteTokens = Math.max(0, Math.round(ctx.cacheWriteTokens || 0));
+  const totalTokens = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+  const costUsd =
+    computeCostMicroUsd(ctx.model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) /
+    1e6;
+
+  if (totalTokens <= 0 && costUsd <= 0) return;
+
+  void incrementUserTokenUsage(ctx.userId, totalTokens, costUsd).catch((err: unknown) =>
+    console.error(
+      "[usageRecorder] meterUserUsage: failed to charge per-user cap:",
+      err instanceof Error ? err.message : err
+    )
+  );
 }
 
 /** Test hook: reset the error-log throttle. */
