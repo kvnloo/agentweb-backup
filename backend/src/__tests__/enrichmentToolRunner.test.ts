@@ -142,8 +142,46 @@ describe('runEmmaEnrichment', () => {
         leadId: 'slashy-1',
         enrichedFields: { industry: 'SaaS', funding_stage: 'Series C', employee_count: '50' },
         unverifiedFields: ['funding_stage'],
+        // web-sourced unverified field → "Web — unverified" provenance (legacy fallback).
+        unverifiedProvenance: { funding_stage: 'web-unverified' },
       },
     ]);
+  });
+
+  it('names ai-knowledge vs web-unverified provenance per unverified field (ENG-122)', async () => {
+    (runEnrichment as jest.Mock).mockResolvedValue({
+      runId: 'run-prov',
+      processed: 1,
+      failed: { identityResolutionFailed: 0, apolloFailed: 0, llmOrParseFailed: 0, updateFailed: 0, searchWebFailed: 0 },
+      tierFillBreakdown: {},
+      durationMs: 50,
+      preview: [
+        {
+          leadId: 'slash-1',
+          extractedFields: { hq: 'SF', funding_stage: 'Series A', total_funding: '$5M' },
+          meta: {
+            // Grounded in real source → verified, not in unverifiedFields.
+            hq: { source: 'web_search', grounding: 'grounded', confidence: 'high', enrichedAt: 'x' },
+            // From the model's training memory → ai-knowledge badge.
+            funding_stage: { source: 'web_search', grounding: 'ai-knowledge', confidence: 'low', enrichedAt: 'x' },
+            // Web source we couldn't confirm → web-unverified badge.
+            total_funding: { source: 'web_search', grounding: 'web-unverified', confidence: 'low', enrichedAt: 'x' },
+          },
+        },
+      ],
+    });
+    const summary = await runEmmaEnrichment({
+      listId: 'list-1',
+      userId: 'user-1',
+      outputFields: [{ name: 'funding_stage', instruction: 'find funding stage' }],
+      mode: 'preview',
+      leadIds: ['slash-1'],
+    });
+    expect(summary.samples?.[0].unverifiedFields.sort()).toEqual(['funding_stage', 'total_funding']);
+    expect(summary.samples?.[0].unverifiedProvenance).toEqual({
+      funding_stage: 'ai-knowledge',
+      total_funding: 'web-unverified',
+    });
   });
 
   it('treats a preview sample with no meta as fully unverified', async () => {

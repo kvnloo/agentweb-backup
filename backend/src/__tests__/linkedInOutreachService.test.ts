@@ -77,7 +77,10 @@ describe('LinkedInOutreachService', () => {
         getAllMessagesFromChat: jest.fn().mockResolvedValue({ items: [] }),
       },
       request: {
-        send: jest.fn().mockResolvedValue({ provider_id: 'provider-123' })
+        // Default profile lookup echoes back the same id the caller passed, so
+        // canonicalisation is a no-op in the baseline tests. Tests that exercise a
+        // public-identifier → URN resolution override this per-call.
+        send: jest.fn().mockResolvedValue({ provider_id: 'provider-id' })
       },
       account: {
         getOne: jest.fn().mockResolvedValue({ status: 'CONNECTED' }),
@@ -127,6 +130,44 @@ describe('LinkedInOutreachService', () => {
         account_id: 'account-id',
         provider_id: 'provider-id',
         message: customMessage
+      });
+    });
+
+    it('resolves a public-identifier target to the canonical provider_id before inviting', async () => {
+      // ENG-213: the agent passed a public identifier (vanity slug) as provider_id.
+      // Unipile's invite endpoint requires the canonical member URN — a public
+      // identifier is rejected with a generic "Invalid parameters". The profile
+      // lookup accepts either form and reveals the canonical provider_id, so the
+      // invite must be sent with that resolved id, not the raw slug.
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
+        network_distance: 'SECOND_DEGREE',
+        public_identifier: 'william-kwak',
+        provider_id: 'ACoAABcanonicalURN',
+      });
+
+      await linkedInOutreachService.sendInvitation('account-id', 'william-kwak', false, 'Hi William');
+
+      expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledWith({
+        account_id: 'account-id',
+        provider_id: 'ACoAABcanonicalURN',
+        message: 'Hi William',
+      });
+    });
+
+    it('falls back to the passed provider_id when the profile lookup reveals no canonical id', async () => {
+      // If the connection-check profile fetch returns no provider_id we must still
+      // attempt the invite with what the caller gave us (resilient fallback), never
+      // send an undefined provider_id.
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
+        network_distance: 'SECOND_DEGREE',
+      });
+
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false, 'Hello');
+
+      expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledWith({
+        account_id: 'account-id',
+        provider_id: 'provider-id',
+        message: 'Hello',
       });
     });
 
@@ -469,6 +510,184 @@ describe('LinkedInOutreachService', () => {
 
         // @ts-ignore private map — success cleared the breaker.
         expect(linkedInOutreachService.invitationCooldownUntil.has('acct-A')).toBe(false);
+      });
+    });
+
+    describe('note-quota "Invalid parameters" fallback (ENG-213)', () => {
+      // Free LinkedIn accounts may only attach a note to ~5 invitations per month,
+      // but can send ~150 note-less invites per week. Once the note quota is spent,
+      // LinkedIn rejects every note-bearing invite with a generic "Invalid parameters"
+      // (422) even though the provider_id/recipient are perfectly valid.
+      function invalidParametersError() {
+        return Object.assign(new Error('UnsuccessfulRequestError'), {
+          body: {
+            status: 422,
+            type: 'errors/invalid_parameters',
+            title: 'Invalid parameters',
+          },
+        });
+      }
+
+      it('retries WITHOUT the note when a note-bearing invite is rejected with "Invalid parameters", and succeeds', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock)
+          .mockRejectedValueOnce(invalidParametersError()) // note-bearing invite rejected
+          .mockResolvedValueOnce({ id: 'invitation-id' });  // note-less retry succeeds
+
+        const result = await linkedInOutreachService.sendInvitation(
+          'acct-A', 'recipient-1', false, 'Hi there — would love to connect!'
+        );
+
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(2);
+        // First attempt carried the note.
+        expect((mockUnipileClient.users.sendInvitation as jest.Mock).mock.calls[0][0]).toEqual(
+          expect.objectContaining({ message: 'Hi there — would love to connect!' })
+        );
+        // Retry dropped the note — and carries the canonical provider_id resolved by
+        // the connection-check profile fetch (the mock returns 'provider-id'), not the
+        // raw slug, since the invite endpoint only accepts the canonical URN (ENG-213).
+        expect((mockUnipileClient.users.sendInvitation as jest.Mock).mock.calls[1][0]).toEqual(
+          expect.objectContaining({ account_id: 'acct-A', provider_id: 'provider-id', message: undefined })
+        );
+        expect(result).toEqual(expect.objectContaining({ note_dropped: true }));
+      });
+
+      it('does NOT retry when there was no note — a bare invite rejected with "Invalid parameters" bubbles up', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(invalidParametersError());
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false)
+        ).rejects.toThrow(/invalid parameters/i);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+      });
+
+      it('surfaces the error when the note-less retry ALSO fails (e.g. genuinely invalid provider_id)', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock)
+          .mockRejectedValueOnce(invalidParametersError())  // note-bearing attempt
+          .mockRejectedValueOnce(invalidParametersError()); // note-less retry also fails
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false, 'Let us connect!')
+        ).rejects.toThrow(/invalid parameters/i);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(2);
+      });
+
+      it('does NOT retry note-less on "Cannot resend yet" — that cap is not fixed by dropping the note', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(
+          Object.assign(new Error('UnsuccessfulRequestError'), {
+            body: { status: 422, type: 'errors/cannot_resend_yet', title: 'Cannot resend yet' },
+          })
+        );
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false, 'A personalised note')
+        ).rejects.toThrow(/cannot resend yet/i);
+        // Only the single note-bearing attempt — no note-less retry.
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+        // The account-wide cooldown breaker is still armed.
+        // @ts-ignore private map
+        expect(linkedInOutreachService.invitationCooldownUntil.has('acct-A')).toBe(true);
+      });
+
+      it('does NOT retry note-less on a per-recipient "Should delay new invitation" rejection', async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(
+          Object.assign(new Error('UnsuccessfulRequestError'), {
+            body: { status: 422, type: 'errors/already_invited_recently', title: 'Should delay new invitation to this recipient' },
+          })
+        );
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false, 'A personalised note')
+        ).rejects.toThrow(/should delay new invitation/i);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+      });
+
+      it('does NOT retry note-less when the rejection text contains BOTH "Invalid parameters" and an exclusion phrase — the exclusion wins', async () => {
+        // If LinkedIn's body pairs the generic "Invalid parameters" wording with a
+        // cap/duplicate signal, dropping the note cannot fix it: the exclusion branch
+        // must suppress the note-less retry (proving the exclusion regex is decisive,
+        // not incidental). Without the exclusion this would fall through and retry.
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(
+          Object.assign(new Error('UnsuccessfulRequestError'), {
+            body: { status: 422, type: 'errors/cannot_resend_yet', title: 'Invalid parameters — cannot resend yet' },
+          })
+        );
+
+        await expect(
+          linkedInOutreachService.sendInvitation('acct-A', 'recipient-1', false, 'A personalised note')
+        ).rejects.toThrow(/cannot resend yet/i);
+        // Single note-bearing attempt only — the exclusion suppressed the note-less retry.
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+        // And the account-wide cooldown breaker armed off the "cannot resend yet" phrase.
+        // @ts-ignore private map
+        expect(linkedInOutreachService.invitationCooldownUntil.has('acct-A')).toBe(true);
+      });
+    });
+
+    describe('note-quota policy via opts.onNoteQuota (ENG-213 hold-vs-drop)', () => {
+      // The service is a pure mechanism: the CALLER decides what to do when the
+      // monthly note quota is spent. `send_without_note` keeps the legacy behavior
+      // (drop the note, send anyway); `skip` holds the invite — it throws a typed
+      // `noteQuotaExceeded` signal WITHOUT sending, so the caller can ask the user
+      // or defer the lead rather than silently downgrading a deliberate note.
+      function invalidParametersError() {
+        return Object.assign(new Error('UnsuccessfulRequestError'), {
+          body: { status: 422, type: 'errors/invalid_parameters', title: 'Invalid parameters' },
+        });
+      }
+
+      it("onNoteQuota:'skip' does NOT send a note-less invite — it throws a typed noteQuotaExceeded signal", async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(invalidParametersError());
+
+        const thrown = await linkedInOutreachService.sendInvitation(
+          'acct-A', 'recipient-1', false, 'A deliberately personalised note', 200, { onNoteQuota: 'skip' }
+        ).catch((e: any) => e);
+
+        expect(thrown?.noteQuotaExceeded).toBe(true);
+        expect(thrown?.structuredError?.classification).toBe('NOTE_QUOTA_EXCEEDED');
+        // Only the note-bearing attempt happened — NO second, note-less send.
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
+      });
+
+      it("onNoteQuota:'send_without_note' drops the note and sends (legacy behavior, now explicit)", async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock)
+          .mockRejectedValueOnce(invalidParametersError())
+          .mockResolvedValueOnce({ id: 'invitation-id' });
+
+        const result = await linkedInOutreachService.sendInvitation(
+          'acct-A', 'recipient-1', false, 'A personalised note', 200, { onNoteQuota: 'send_without_note' }
+        );
+
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(2);
+        expect(result).toEqual(expect.objectContaining({ note_dropped: true }));
+      });
+
+      it("defaults to legacy send_without_note when opts is omitted (back-compat)", async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock)
+          .mockRejectedValueOnce(invalidParametersError())
+          .mockResolvedValueOnce({ id: 'invitation-id' });
+
+        const result = await linkedInOutreachService.sendInvitation(
+          'acct-A', 'recipient-1', false, 'A personalised note'
+        );
+
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(2);
+        expect(result).toEqual(expect.objectContaining({ note_dropped: true }));
+      });
+
+      it("onNoteQuota:'skip' still lets a cap/duplicate signal bubble unchanged (not treated as a note-quota hold)", async () => {
+        (mockUnipileClient.users.sendInvitation as jest.Mock).mockRejectedValueOnce(
+          Object.assign(new Error('UnsuccessfulRequestError'), {
+            body: { status: 422, type: 'errors/cannot_resend_yet', title: 'Cannot resend yet' },
+          })
+        );
+
+        const thrown = await linkedInOutreachService.sendInvitation(
+          'acct-A', 'recipient-1', false, 'A personalised note', 200, { onNoteQuota: 'skip' }
+        ).catch((e: any) => e);
+
+        expect(thrown?.noteQuotaExceeded).toBeFalsy();
+        expect(thrown?.message).toMatch(/cannot resend yet/i);
+        expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalledTimes(1);
       });
     });
   });
