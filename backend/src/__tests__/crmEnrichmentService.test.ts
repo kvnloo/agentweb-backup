@@ -50,6 +50,10 @@ jest.mock('../services/agentModeService', () => ({
   },
 }));
 
+jest.mock('../services/usageRecorderService', () => ({
+  meterUserUsage: jest.fn(),
+}));
+
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: jest.fn(),
 }));
@@ -89,6 +93,7 @@ import { getAccountsByUserId } from '../services/connectedAccountsDb';
 import { settingsService } from '../services/settingsService';
 import { io } from '../server';
 import { CrmEnrichmentService, EnrichmentJobSpec } from '../services/crmEnrichmentService';
+import { meterUserUsage } from '../services/usageRecorderService';
 import * as apolloServiceModule from '../services/apolloService';
 import type { ApolloService } from '../services/apolloService';
 
@@ -182,6 +187,45 @@ describe('CrmEnrichmentService', () => {
       const result = await service.preview(spec);
       expect(result.totalLeads).toBe(1);
       expect(result.leadsToProcess).toBe(0);
+    });
+  });
+
+  describe('execute - per-user metering (ENG-200)', () => {
+    it('charges the extraction LLM turn to the caller (userId + token counts) via meterUserUsage', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [createLead({ leadId: 'lead1' })],
+        lastEvaluatedKey: null, hasMore: false,
+      });
+      mockAgentModeService.youSearchWeb.mockResolvedValue({
+        success: true, results: [{ title: 'Acme', snippet: 'A company' }],
+      });
+      // Extraction completion carries usage → tokens flow through to the cap.
+      // Use Once (not a persistent default): clearAllMocks does not reset mock
+      // implementations, so a sticky mockResolvedValue would leak into later tests.
+      mockGeminiCreate.mockResolvedValueOnce({
+        choices: [{ message: { content: JSON.stringify({ company_size: '500+' }) } }],
+        usage: { prompt_tokens: 300, completion_tokens: 50 },
+      });
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Determine company size',
+        outputFields: ['company_size'],
+        sources: ['web_search'],
+      };
+
+      await service.execute(spec);
+
+      expect(meterUserUsage).toHaveBeenCalledWith(expect.objectContaining({
+        userId: 'user1',
+        feature: 'crm_enrichment_extract',
+        inputTokens: 300,
+        outputTokens: 50,
+      }));
     });
   });
 

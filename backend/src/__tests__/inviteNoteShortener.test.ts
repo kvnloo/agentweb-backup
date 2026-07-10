@@ -7,9 +7,9 @@
  */
 
 import { shortenInviteNoteToLimit } from '../services/inviteNoteShortener';
-import { recordUsage } from '../services/usageRecorderService';
+import { meterUserUsage } from '../services/usageRecorderService';
 
-jest.mock('../services/usageRecorderService', () => ({ recordUsage: jest.fn() }));
+jest.mock('../services/usageRecorderService', () => ({ meterUserUsage: jest.fn() }));
 
 const makeClient = (responses: string[]) => {
   const create = jest.fn();
@@ -177,10 +177,10 @@ describe('shortenInviteNoteToLimit', () => {
   });
 });
 
-describe('shortenInviteNoteToLimit — cost shadow-metering', () => {
-  beforeEach(() => (recordUsage as jest.Mock).mockClear());
+describe('shortenInviteNoteToLimit — per-user metering', () => {
+  beforeEach(() => (meterUserUsage as jest.Mock).mockClear());
 
-  it('shadow-meters each Gemini rewrite with userId/sessionId and token counts', async () => {
+  it('meters each Gemini rewrite (shadow + per-user cap) with userId/sessionId and token counts', async () => {
     const longNote = 'x'.repeat(260);
     const shortNote = 'Fang, tight and done.';
     const create = jest.fn().mockResolvedValueOnce({
@@ -191,8 +191,8 @@ describe('shortenInviteNoteToLimit — cost shadow-metering', () => {
 
     await shortenInviteNoteToLimit(client, longNote, 200, 2, 'user-1', 'sess-1');
 
-    expect(recordUsage).toHaveBeenCalledTimes(1);
-    expect(recordUsage).toHaveBeenCalledWith(expect.objectContaining({
+    expect(meterUserUsage).toHaveBeenCalledTimes(1);
+    expect(meterUserUsage).toHaveBeenCalledWith(expect.objectContaining({
       userId: 'user-1',
       sessionId: 'sess-1',
       model: 'gemini-3.5-flash',
@@ -203,13 +203,13 @@ describe('shortenInviteNoteToLimit — cost shadow-metering', () => {
     }));
   });
 
-  it('does not meter when the response carries no usage (fail-open)', async () => {
+  it('does not meter when the response carries no usage', async () => {
     const longNote = 'x'.repeat(260);
     const shortNote = 'Fang, fits fine.';
     const { client } = makeClient([json(shortNote)]);
 
     await shortenInviteNoteToLimit(client, longNote, 200, 2, 'user-1', 'sess-1');
 
-    expect(recordUsage).not.toHaveBeenCalled();
+    expect(meterUserUsage).not.toHaveBeenCalled();
   });
 });
