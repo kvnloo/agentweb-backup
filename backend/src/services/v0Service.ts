@@ -129,8 +129,15 @@ export async function withRetry<T>(
   label: string,
   maxRetries = MAX_RETRIES,
   baseDelayMs = BASE_DELAY_MS,
-  timeoutMs = V0_ATTEMPT_TIMEOUT_MS
+  timeoutMs = V0_ATTEMPT_TIMEOUT_MS,
+  opts: { retryOnTimeout?: boolean } = {}
 ): Promise<T> {
+  // Whether to retry OUR synthetic per-attempt timeout (V0_CALL_TIMEOUT). Retrying
+  // it re-waits the full `timeoutMs` budget each time — e.g. 3 × 300s ≈ 15 min,
+  // which reproduces the hang ENG-158 set out to kill. Callers on an interactive
+  // path (chat-create) pass `false` to fail fast with a clean retry path; other
+  // callers keep the default so a genuinely transient hang still gets a retry.
+  const retryOnTimeout = opts.retryOnTimeout ?? true;
   let lastError: Error | undefined;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
@@ -142,18 +149,24 @@ export async function withRetry<T>(
       // Unwrap the full failure reason (undici hides it on `err.cause`) so both the
       // retry decision and the surfaced error see the REAL problem, not "fetch failed".
       const detail = describeError(err);
+      // Our own per-attempt timeout: we already waited the full budget. Only retry it
+      // when the caller opted in (default). 5xx/network errors below are unaffected —
+      // those recover in seconds and stay retryable regardless. (ENG-287)
+      const isOurTimeout = err.code === "V0_CALL_TIMEOUT";
       // The v0 SDK throws `Error("HTTP <status>: <body>")` on any non-2xx response.
       // Transient server-side failures (5xx) and rate limiting (429) should be
       // retried with backoff — a v0 500 is the documented symptom of a v0 outage
       // that often recovers within seconds.
       const isRetryableHttpStatus = /\bHTTP (429|408|5\d\d)\b/.test(detail);
       const isRetryable =
-        isRetryableHttpStatus ||
-        /fetch failed|ECONNREFUSED|ENOTFOUND|network error|NetworkError|ETIMEDOUT|socket hang up|Connect Timeout|timed out|UND_ERR/i.test(
-          detail
-        ) ||
-        err.code === "ECONNRESET" ||
-        err.code === "UND_ERR_HEADERS_TIMEOUT";
+        (isOurTimeout
+          ? retryOnTimeout
+          : isRetryableHttpStatus ||
+            /fetch failed|ECONNREFUSED|ENOTFOUND|network error|NetworkError|ETIMEDOUT|socket hang up|Connect Timeout|timed out|UND_ERR/i.test(
+              detail
+            ) ||
+            err.code === "ECONNRESET" ||
+            err.code === "UND_ERR_HEADERS_TIMEOUT");
 
       if (!isRetryable || attempt === maxRetries) {
         console.error(`[V0 SERVICE] ${label} failed after ${attempt} attempt(s):`, detail);
@@ -905,7 +918,11 @@ async function generateFirstPage(
       prompt: enrichedPrompt,
       create: () => withRetry(
         () => v0.chats.create({ message: enrichedPrompt }),
-        "v0 chat creation"
+        "v0 chat creation",
+        // Interactive path: fail fast on a timeout instead of re-burning 3 × 300s
+        // ≈ 15 min. 5xx/network still retry. The guard makes the user's retry clean. (ENG-287)
+        undefined, undefined, undefined,
+        { retryOnTimeout: false }
       ),
     });
 
@@ -1186,7 +1203,11 @@ async function addPageToExistingRepo(
       prompt: enrichedPrompt,
       create: () => withRetry(
         () => v0.chats.create({ message: enrichedPrompt }),
-        "v0 chat creation (additional page)"
+        "v0 chat creation (additional page)",
+        // Interactive path: fail fast on a timeout instead of re-burning 3 × 300s
+        // ≈ 15 min. 5xx/network still retry. The guard makes the user's retry clean. (ENG-287)
+        undefined, undefined, undefined,
+        { retryOnTimeout: false }
       ),
     });
 

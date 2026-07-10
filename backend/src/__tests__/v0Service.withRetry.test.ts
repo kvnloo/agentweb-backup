@@ -108,6 +108,38 @@ describe("withRetry", () => {
     expect(fn).toHaveBeenCalledTimes(1);
   });
 
+  // ENG-287: a v0 chat-create timeout (our synthetic 300s ceiling) should not be
+  // re-burned 3× — that reproduces the ~15-min hang ENG-158 set out to kill. The
+  // opt-in `retryOnTimeout: false` fails a timeout fast while keeping 5xx/network
+  // retryable. Default behaviour (timeouts retryable) is unchanged for all other callers.
+  const v0Timeout = () => {
+    const e: any = new Error("v0 chat creation (additional page) timed out after 300s");
+    e.code = "V0_CALL_TIMEOUT";
+    return e;
+  };
+
+  it("DEFAULT: a timeout is still retryable (global behaviour unchanged)", async () => {
+    const fn = jest.fn().mockRejectedValueOnce(v0Timeout()).mockResolvedValueOnce("ok");
+    const result = await withRetry(fn, "test-op", 3, FAST, NO_TIMEOUT);
+    expect(result).toBe("ok");
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  it("retryOnTimeout:false — does NOT retry a v0 timeout (fail fast)", async () => {
+    const fn = jest.fn().mockRejectedValueOnce(v0Timeout());
+    await expect(
+      withRetry(fn, "test-op", 3, FAST, NO_TIMEOUT, { retryOnTimeout: false }),
+    ).rejects.toThrow(/timed out/);
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it("retryOnTimeout:false — STILL retries a 5xx / network error", async () => {
+    const fn = jest.fn().mockRejectedValueOnce(new Error("fetch failed")).mockResolvedValueOnce("ok");
+    const result = await withRetry(fn, "test-op", 3, FAST, NO_TIMEOUT, { retryOnTimeout: false });
+    expect(result).toBe("ok");
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
   it("SUCCESS: retries on ETIMEDOUT", async () => {
     const fn = jest.fn()
       .mockRejectedValueOnce(new Error("ETIMEDOUT"))
