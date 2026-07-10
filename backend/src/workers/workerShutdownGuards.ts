@@ -30,7 +30,7 @@ export function installWorkerShutdownGuards(proc: NodeJS.Process = process): voi
 
   // If the parent process goes away (normal exit after draining, or a crash), the IPC
   // channel disconnects — exit so we never linger as an orphaned worker.
-  proc.on('disconnect', () => {
+  proc.once('disconnect', () => {
     console.log('[Worker] Parent process disconnected — exiting');
     proc.exit(0);
   });
