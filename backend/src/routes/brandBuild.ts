@@ -217,10 +217,13 @@ router.get("/brand-build/status", authenticateToken, async (req, res) => {
           status: snapshot(refreshed || (freshAutoFail as any)),
         });
       }
-      await userDb.updateUser(userId, autoFail as any);
-      logCompletionMetric(userId, "failed", autoFail.brandBuildDurationMs ?? 0);
-      const refreshed = await userDb.getUserById(userId);
-      return res.json({ status: snapshot(refreshed || (autoFail as any)) });
+      // No authoritative consistent re-read available (no email to key the
+      // strongly-consistent GetItem, or it came back empty). We deliberately do
+      // NOT force-fail off the eventually-consistent GSI read here: that could
+      // clobber a build that actually just completed `ready` (the ~100-1000ms
+      // GSI lag the guard above exists to close). Return the current view
+      // unchanged; the next poll — which carries the JWT email — resolves it.
+      return res.json({ status: snapshot(user) });
     }
 
     return res.json({ status: snapshot(user) });
