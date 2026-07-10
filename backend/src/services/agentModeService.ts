@@ -2434,15 +2434,17 @@ export class AgentModeService {
     const pricing: Record<string, [number, number]> = {
       'anthropic.claude-sonnet-4-5-20250929-v1:0': [3, 15],
       'anthropic.claude-sonnet-4-6': [3, 15],
-      'anthropic.claude-opus-4-6-v1': [15, 75],
-      'anthropic.claude-opus-4-8': [15, 75],
+      'anthropic.claude-opus-4-6-v1': [5, 25],
+      'anthropic.claude-opus-4-8': [5, 25],
       'gpt-5-chat-2': [2.5, 10],
-      'gpt-5.2-chat': [3, 12],
+      'gpt-5.2-chat': [1.75, 14],
+      'gpt-5.4': [2.5, 15],
       'gemini-3-pro-preview': [1.25, 10],
-      'gemini-3-flash-preview': [0.15, 0.6],
-      'gemini-3.1-pro-preview': [1.25, 10],
-      'gemini-3.1-flash-lite': [0.075, 0.3],
-      'gemini-3.5-flash': [0.15, 0.6],
+      'gemini-3-flash-preview': [0.5, 3],
+      'gemini-3.1-pro-preview': [2, 12],
+      'gemini-3.1-flash-lite': [0.25, 1.5],
+      'gemini-3.5-flash': [1.5, 9],
+      'gemini-2.5-flash': [0.3, 2.5],
     };
     const [inputPrice, outputPrice] = pricing[model] || [3, 15]; // Default to Sonnet pricing
     // Cache reads are 10% of input price; cache writes are 125% of input price
@@ -2458,7 +2460,7 @@ export class AgentModeService {
       'gpt-image-1': 0.04,
       'gpt-image-2': 0.04,
       'gemini-2.5-flash-image': 0.039,
-      'gemini-3-pro-image-preview': 0.039,
+      'gemini-3-pro-image-preview': 0.134,
       'gemini-3.1-flash-image': 0.039,
       'gemini-3.1-flash-image-preview': 0.039,
       'gen4_image': 0.05,
@@ -2521,12 +2523,13 @@ export class AgentModeService {
   /** Cost per video generation in USD. Veo bills per 8s clip, so longer videos cost proportionally more. */
   private estimateVideoGenerationCost(model: string, durationSeconds?: number): number {
     const pricePerClip: Record<string, number> = {
-      'veo-3.1-generate-preview': 2.80,
+      'veo-3.1-generate-preview': 3.20, // $0.40/s x 8s, audio incl. (ai.google.dev); was 2.80
       'veo-3.1-fast-generate-preview': 1.40,
+      'veo-3-generate-preview': 3.20, // $0.40/s x 8s (ai.google.dev); was unpriced
       // Higgsfield Seedance — approximate per-clip cost; adjust to match billed Higgsfield rates.
       'seedance-2.0': 0.50,
     };
-    const clipPrice = pricePerClip[model] ?? 2.80;
+    const clipPrice = pricePerClip[model] ?? 3.20;
     const VEO_MAX_SECONDS = 8;
     const clipCount = durationSeconds && durationSeconds > VEO_MAX_SECONDS
       ? Math.ceil(durationSeconds / VEO_MAX_SECONDS)
