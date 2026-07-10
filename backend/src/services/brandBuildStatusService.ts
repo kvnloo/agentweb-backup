@@ -43,9 +43,10 @@ export interface StatusSnapshot extends BrandBuildStatusFields {
    */
   needsUrl?: boolean;
   /**
-   * True when a previously-started build has exceeded the timeout budget
-   * (90s target from the task body). The caller should trip the status to
-   * `failed` on the next write and surface the graceful-fallback UX.
+   * True when a previously-started build has exceeded the UI/status timeout
+   * budget (`BRAND_BUILD_TIMEOUT_MS`, currently 300s). The caller should trip
+   * the status to `failed` on the next write and surface the graceful-fallback
+   * UX.
    */
   timedOut: boolean;
 }
