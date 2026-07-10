@@ -837,8 +837,10 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
     mkdirSync(path.join(logsDir, identifier), { recursive: true });
     tee = createWriteStream(path.join(logsDir, identifier, `chat-${Date.now()}.txt`));
     tee.write(`# turn ${turnId} cap=${cap} resume=${resumeSid || 'none'}${edit ? ' (edit)' : ''} cwd=${cwd}\n${prompt}\n---\n`);
+    let curSid = resumeSid; // the live session id, so an inline reconcile turn can resume THIS session
     const onEvent = (e) => {
       tee.write(JSON.stringify(e) + '\n');
+      if (e.type === 'init') curSid = e.sessionId;
       if (e.type === 'init') updateChatState(identifier, (cs) => {
         cs.cwd = cwd; cs.sessions.chat = e.sessionId;
         const lastUser = [...cs.messages].reverse().find((x) => x.role === 'user');
@@ -876,6 +878,21 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
       if (pending.length) {
         emit({ type: 'status', text: 'Pushing to the open PR(s)…' });
         failed = pushChanged(pending);
+        // Deterministic reconcile (inside pushChanged) already handles the common diverged-remote case
+        // losslessly. Anything still failing is a true conflict/dirty tree that needs judgment — hand it
+        // to a self-authorized agent turn on THIS session (sequential, same lock: no reentrancy), then
+        // retry the push once. The agent typically pushes itself, so the retry is usually a no-op.
+        if (failed.length && !aborted(identifier, turnId)) {
+          const stuck = pending.filter((c) => failed.includes(c.repo));
+          emit({ type: 'status', text: `Push to ${failed.join(', ')} hit a diverged remote — reconciling automatically…` });
+          const rmsg = RECONCILE_MSG(failed);
+          tee.write(`# reconcile turn (repos: ${failed.join(',')})\n${rmsg}\n---\n`);
+          try {
+            await runClaudeStream(chatArgs('full', curSid), rmsg, cwd, m.timeoutMs, onEvent, register, turnEnv);
+          } catch (e) { log(`turn ${turnId} (${identifier}): reconcile turn errored: ${e.message || e}`); }
+          failed = pushChanged(stuck); // agent likely already pushed → no-op; otherwise retry deterministically
+          if (!failed.length) log(`turn ${turnId} (${identifier}): agent reconcile cleared the push for ${stuck.map((c) => c.repo).join(', ')}`);
+        }
       }
       // Make sure EVERY repo with commits on the branch has an open PR and is recorded in state.
       // A turn can add commits to a repo the pipeline never opened a PR for (e.g. the developer asks
@@ -993,6 +1010,25 @@ function startTurn(identifier, body) {
   runTurn(identifier, found.entry, cap, message, turnId, lockPath, null, attachments);
   return { code: 202, body: { turnId, cap } };
 }
+
+// Self-authorized message for the inline reconcile turn: fired only when the deterministic reconcile
+// (reconcileWithRemote) could not resolve a diverged remote — a true conflict that needs judgment.
+// The agent already committed this turn; its job now is to reconcile the branch with the rewritten
+// remote WITHOUT losing work or force-clobbering, then push.
+const RECONCILE_MSG = (repoKeys) => [
+  '**Push reconcile — authorized.** Your changes are committed, but the automatic push to the open PR was',
+  `rejected because the remote branch diverged (it was likely rebased server-side — e.g. \`gh pr update-branch\`,`,
+  `the merge queue, or a Greptile/CI rebase) for: **${repoKeys.join(', ')}**. The deterministic auto-reconcile`,
+  "couldn't resolve it cleanly, so it left your commit exactly as-is and handed it to you.",
+  '',
+  'For each affected repo (cd into its package/worktree):',
+  '1. `git fetch origin <branch>` and inspect the divergence: `git log --oneline HEAD..FETCH_HEAD` (theirs) and `git log --oneline FETCH_HEAD..HEAD` (yours).',
+  '2. The **remote is the source of truth** for a PR branch. If your commits are already on the remote by content (check with `git cherry FETCH_HEAD HEAD <base-branch>` — `-` means already there), just fast-forward: `git reset --hard FETCH_HEAD`. Otherwise `git rebase FETCH_HEAD` (or reset to FETCH_HEAD and cherry-pick only your new commits), resolving conflicts per the repo conventions (CLAUDE.md).',
+  '3. Verify nothing was dropped (`git log` shows both sides\' work) and the tree is clean, then push: `git push`.',
+  '',
+  'You ARE authorized to run `git fetch`, `git rebase`, `git cherry-pick`, `git reset`, and `git push` for THIS reconcile — this overrides the usual do-not-push rule. But do NOT use `--force`/`--force-with-lease` (never clobber the remote), and do NOT lose any commit.',
+  'End with a line containing only `RECONCILE_DONE` if you pushed successfully, or `RECONCILE_BLOCKED: <short reason>` if a genuine conflict needs the developer to decide.',
+].join('\n');
 
 // "Merge PR(s)" button. Runs on the issue's own chat session (full context, and the merge log stays
 // in the conversation). Two phases: prep (ready + sync + fix CI + wait green, but DON'T merge, end
