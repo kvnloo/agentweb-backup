@@ -376,7 +376,7 @@ function runClaudeStream(args, prompt, cwd, timeoutMs, onEvent, register, env = 
   return new Promise((resolve) => {
     const child = spawn('claude', args, { cwd, env, detached: true });
     if (register) register(child);
-    const out = { timedOut: false, gotInit: false, result: null, texts: [], tools: [], stderr: '' };
+    const out = { timedOut: false, gotInit: false, result: null, texts: [], tools: [], blocks: [], stderr: '' };
     const timer = setTimeout(() => {
       out.timedOut = true;
       try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
@@ -390,10 +390,11 @@ function runClaudeStream(args, prompt, cwd, timeoutMs, onEvent, register, env = 
         onEvent({ type: 'init', sessionId: j.session_id });
       } else if (j.type === 'assistant') {
         for (const block of j.message?.content || []) {
-          if (block.type === 'text' && block.text) { out.texts.push(block.text); onEvent({ type: 'text', text: block.text }); }
+          if (block.type === 'text' && block.text) { out.texts.push(block.text); out.blocks.push({ t: 'text', text: block.text }); onEvent({ type: 'text', text: block.text }); }
           if (block.type === 'tool_use') {
             const input = JSON.stringify(block.input || {}).slice(0, 1500); // enough for most Bash cmds/paths to stay valid JSON for the UI formatter
             out.tools.push({ name: block.name, input });
+            out.blocks.push({ t: 'tool', id: block.id, name: block.name, input }); // chronological record for the UI accordion
             onEvent({ type: 'tool', id: block.id, name: block.name, input });
           }
         }
@@ -905,6 +906,7 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
         text: out.texts.join('\n\n').slice(0, 50000) || '(no reply)',
         turns: out.result?.num_turns, ms: out.result?.duration_ms,
         tools: out.tools.slice(0, 50),
+        blocks: out.blocks.slice(0, 400), // chronological text+tool sequence, so the UI can split final answer from working steps
         ...(fix?.committed ? { fix } : {}),
       });
       // Snapshot context/cost from the CLI result so /status and /context have real data. The last

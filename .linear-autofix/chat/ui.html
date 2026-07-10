@@ -123,6 +123,18 @@
   .tool.open .tprev { display: none; } /* hide the truncated preview once the full body is shown */
   .tool .inp { display: none; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; color: #a8b0c2; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   .tool.open .inp { display: block; }
+  /* Collapsible "work" accordion: the tool calls Claude made, folded away once the answer arrives. */
+  .work { margin: 0 0 8px; border: 1px solid var(--border); border-radius: 8px; background: rgba(0,0,0,.15); overflow: hidden; }
+  .work-head { display: flex; align-items: center; gap: 7px; padding: 5px 10px; cursor: pointer; user-select: none; font-size: 12px; color: var(--dim); }
+  .work-head:hover { color: var(--text); }
+  .work-head .wtoggle { transition: transform .12s ease; display: inline-block; }
+  .work.open .work-head .wtoggle { transform: rotate(90deg); }
+  .work-body { display: none; padding: 2px 10px 8px; }
+  .work.open .work-body { display: block; }
+  .work-body .tool { max-width: none; }
+  .work-body .textrun { color: var(--dim); font-size: 13px; margin: 6px 0; } /* intermediate thoughts, secondary to the answer */
+  /* The final response — the main answer. A subtle accent bar sets it apart from the folded work. */
+  .msg.assistant .work + .final { border-left: 2px solid var(--accent); padding-left: 11px; }
   .fixcard { border: 1px solid var(--border); border-left: 3px solid var(--green); background: var(--panel2); border-radius: 8px; padding: 10px 14px; align-self: flex-start; font-size: 13px; max-width: 780px; }
   .fixcard.failed { border-left-color: var(--red); }
   .fixcard a { color: var(--accent); }
@@ -275,7 +287,9 @@ function md(s) {
   if (jb != null) return codeBlock('json', jb);
   const lines = String(s).replace(/\r\n?/g, '\n').split('\n');
   let html = '', inCode = false, codeLang = '', code = [], list = null, para = [];
-  const flushPara = () => { if (para.length) { html += `<p>${para.join('<br>')}</p>`; para = []; } };
+  // Inline over the WHOLE paragraph (not per line), so a **bold**/`code`/link that wraps across a
+  // soft line break still matches — then turn the retained newlines into <br>.
+  const flushPara = () => { if (para.length) { html += `<p>${mdInline(para.join('\n')).replace(/\n/g, '<br>')}</p>`; para = []; } };
   const flushList = () => { if (list) { html += `</${list}>`; list = null; } };
   const isSep = (l) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/.test(l);
   const splitRow = (l) => l.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
@@ -320,7 +334,7 @@ function md(s) {
     // pretty-prints too — not just a whole-message JSON body.
     const jl = tryJsonBlock(line);
     if (jl != null) { flushPara(); flushList(); html += codeBlock('json', jl); continue; }
-    flushList(); para.push(mdInline(line));
+    flushList(); para.push(line);
   }
   if (inCode) html += codeBlock(codeLang, code.join('\n'));
   flushPara(); flushList();
@@ -562,6 +576,11 @@ function addUser(text, index) {
 function newAssistant() {
   const el = document.createElement('div');
   el.className = 'msg assistant';
+  // Everything streams into ._stream in CHRONOLOGICAL order (thoughts and tool calls interleaved,
+  // exactly as they happen). finalizeAssistant() later lifts the LAST text block out as the answer
+  // and folds the rest into the collapsible work accordion, keeping their original order.
+  el._stream = document.createElement('div'); el._stream.className = 'stream';
+  el.appendChild(el._stream);
   chatEl().appendChild(el); scroll();
   return el;
 }
@@ -591,6 +610,7 @@ function toolParts(name, raw) {
   if (pk) { const m = raw.match(new RegExp('"' + pk + '"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)')); if (m) { try { preview = JSON.parse('"' + m[1] + '"'); } catch { preview = m[1]; } } }
   return { preview, full: raw };
 }
+const streamOf = (bubble) => bubble._stream || bubble;
 function addTool(bubble, t) {
   const el = document.createElement('span');
   el.className = 'tool'; el.dataset.tid = t.id || '';
@@ -598,17 +618,45 @@ function addTool(bubble, t) {
   const prev = preview ? `<span class="tprev">${esc(preview.replace(/\s+/g, ' ').slice(0, 90))}</span>` : '';
   el.innerHTML = `<span class="st">▸</span><b>${esc(t.name)}</b>${prev}<span class="inp">${esc(full)}</span>`;
   el.onclick = () => el.classList.toggle('open');
-  bubble.appendChild(el); scroll();
+  streamOf(bubble).appendChild(el); scroll();
   bubble._run = null; // end the current text run so following text starts a fresh md() block
 }
 // Accumulate streamed text into ONE content element per run and re-render md() over the whole run,
-// so a code fence (or any multi-line construct) split across chunks renders correctly. A tool chip
-// between chunks ends the run (via addTool) so interleaving order is preserved.
+// so a code fence (or any multi-line construct) split across chunks renders correctly. A tool between
+// chunks ends the run so order is preserved; the LAST run is the final answer (see finalizeAssistant).
 function addText(bubble, text) {
-  if (!bubble._run) { bubble._run = document.createElement('div'); bubble._runRaw = ''; bubble.appendChild(bubble._run); }
+  if (!bubble._run) { bubble._run = document.createElement('div'); bubble._run.className = 'textrun'; bubble._runRaw = ''; streamOf(bubble).appendChild(bubble._run); }
   bubble._runRaw += text;
   bubble._run.innerHTML = md(bubble._runRaw);
+  bubble._lastTextRun = bubble._run; // most recent text run — becomes the user-facing final answer
   scroll();
+}
+// Once a turn ends, split the streamed content: the LAST text block is the user-facing final answer
+// (highlighted), everything before it — the thoughts and tool calls, in their original chronological
+// order — folds into the collapsible work accordion. A turn with only a final answer (no prior steps)
+// gets no accordion. Idempotent.
+function finalizeAssistant(bubble) {
+  if (!bubble || bubble._finalized) return;
+  const stream = bubble._stream; if (!stream) return;
+  bubble._finalized = true;
+  const finalRun = bubble._lastTextRun && bubble._lastTextRun.parentNode === stream ? bubble._lastTextRun : null;
+  const rest = [...stream.childNodes].filter((n) => n !== finalRun);
+  if (rest.length) {
+    const toolN = rest.filter((n) => n.classList && n.classList.contains('tool')).length;
+    const label = toolN ? `🔧 ${toolN} tool call${toolN === 1 ? '' : 's'}` : '💭 reasoning';
+    const w = document.createElement('div');
+    w.className = 'work';
+    w.innerHTML = `<div class="work-head"><span class="wtoggle">▸</span><span class="wc">${label}</span></div><div class="work-body"></div>`;
+    const body = w.querySelector('.work-body');
+    for (const n of rest) body.appendChild(n); // move (not clone) — preserves original order
+    w.querySelector('.work-head').onclick = () => w.classList.toggle('open');
+    bubble.insertBefore(w, stream);
+    bubble._work = w;
+  }
+  const fin = document.createElement('div'); fin.className = 'final';
+  if (finalRun) fin.appendChild(finalRun);
+  bubble.appendChild(fin);
+  stream.remove();
 }
 // A compaction boundary: everything above it was summarized and dropped from the agent's context.
 // Collapsed by default (just the divider); click to read the summary the agent will carry forward.
@@ -661,11 +709,16 @@ function renderAll(d) {
   let lastAsst = null;
   (d.chat?.messages || []).forEach((m, i) => {
     if (m.role === 'compact') { addCompactCard(m); return; }
-    if (m.role === 'user') { const el = addUser(m.text, i); stampTime(el, m.at); }
+    if (m.role === 'user') { const el = addUser(m.text, i, m.attachments); stampTime(el, m.at); }
     else {
       const b = newAssistant();
-      for (const t of m.tools || []) addTool(b, t);
-      addText(b, m.text || '');
+      if (Array.isArray(m.blocks) && m.blocks.length) {
+        for (const bl of m.blocks) { if (bl.t === 'tool') addTool(b, bl); else if (bl.t === 'text') addText(b, bl.text || ''); }
+      } else { // legacy messages (no ordered blocks): approximate — tools then text
+        for (const t of m.tools || []) addTool(b, t);
+        addText(b, m.text || '');
+      }
+      finalizeAssistant(b);
       if (m.fix) addFixCard(m.fix);
       stampTime(b, m.at);
       lastAsst = b;
@@ -734,7 +787,7 @@ function handleEvent(e) {
     case 'tool':
       if (S.compacting) break;
       if (!S.curBubble) S.curBubble = newAssistant();
-      addTool(S.curBubble, e);
+      addTool(S.curBubble, e); // streams inline in chronological order; folds into the accordion on 'done'
       setThinking('Working… (running tools)');
       break;
     case 'tool_result': {
