@@ -155,7 +155,12 @@ router.post(
         brandGuideUrl,
       } = req.body;
 
-      const files = req.files as { [fieldname: string]: Express.Multer.File[] };
+      // multer only populates req.files on multipart requests; a JSON save
+      // (e.g. brand edits or the onboarding manual-brand fallback) has none, so
+      // default to {} rather than dereferencing undefined below.
+      const files = (req.files ?? {}) as {
+        [fieldname: string]: Express.Multer.File[];
+      };
 
       // Reject SVG files for logo uploads - SVG can contain scripts and is not suitable for logo storage
       const SVG_MIME_TYPES = ["image/svg+xml"];
