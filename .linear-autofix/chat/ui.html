@@ -204,11 +204,13 @@
   #cmd .ubar .ubr { font-size: 11px; color: var(--dim); margin-top: 4px; }
   #h-preview { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   #merge-btn { margin-left: auto; }
+  .spin { display: inline-block; width: 11px; height: 11px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; vertical-align: -1px; margin-right: 6px; animation: spin .6s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
   <div id="side">
-    <h1>🔧 Autofix Chat</h1>
+    <h1><span>🔧 Autofix Chat</span><button id="sideToggle" title="Collapse sidebar (Ctrl+B)">‹</button></h1>
     <div class="sub"><span id="count"></span><span id="showAll">show all</span></div>
     <div id="searchWrap">
       <input id="search" type="text" placeholder="Search ID, name or summary…" autocomplete="off" spellcheck="false" />
@@ -458,7 +460,8 @@ function renderPreviewBar() {
   const p = S.detail?.preview;
   let pv = '', pvAction = null;
   if (p) {
-    if (p.busy) pv = '<button class="btn" disabled>⏳ preview working…</button>';
+    if (p.refreshing) pv = '<button class="btn" disabled><span class="spin"></span>Refreshing preview…</button>';
+    else if (p.busy) pv = '<button class="btn" disabled>⏳ preview working…</button>';
     else if (p.running && p.urls) {
       pv = `<button class="btn on" id="pv-btn">■ Disable preview</button><span>live:</span>`
         + `<a href="${esc(p.urls.customer)}" target="_blank">Customer ↗</a>`
@@ -743,16 +746,19 @@ function handleEvent(e) {
     case 'result': S.lastResult = e.text || ''; if (!S.compacting) addSys(`⏱ ${e.turns ?? '?'} turns · ${e.ms ? Math.round(e.ms/1000)+'s' : ''}`, 'turnmeta'); break;
     case 'fix_summary': addFixCard(e); break;
     case 'preview':
-      if (S.detail) { S.detail.preview = { running: e.running, busy: e.busy, urls: e.urls }; renderPreviewBar(); }
-      addSys(e.running ? '🌐 preview is up' : '⏹ preview stopped');
+      if (S.detail) { S.detail.preview = { running: e.running, busy: e.busy, urls: e.urls, refreshing: e.refreshing }; renderPreviewBar(); }
+      if (!e.refreshing) addSys(e.running ? '🌐 preview is up' : '⏹ preview stopped');
       break;
     case 'error': addSys('⚠ ' + e.error, 'err'); break;
     case 'aborted': addSys('⏹ aborted', 'err'); break;
     case 'done':
       // Stamp the just-finished assistant bubble now — renderAll (which stamps from the persisted
       // `at`) is skipped when the reader has scrolled up, so don't rely on it for the live message.
-      if (S.curBubble) stampTime(S.curBubble, new Date().toISOString());
+      if (S.curBubble) { finalizeAssistant(S.curBubble); stampTime(S.curBubble, new Date().toISOString()); } // fold thoughts+tools into the accordion; the final answer stands out
       S.curBubble = null; S.compacting = false; setBusy(false); loadIssues(); refreshDetail(S.sel);
+      // Auto-send the next queued message once the turn ends — unless it was stopped on purpose
+      // (Esc/Stop set queuePaused, so a deliberate stop doesn't fire the rest of the queue).
+      if (!S.queuePaused && S.queue.length) drainNext();
       // Merge handshake: after the prep turn, if the agent signalled it's green, ask for confirmation.
       if (S.mergePhase === 'prep') { S.mergePhase = null; renderPreviewBar(); if (/\bMERGE_READY\b/.test(S.lastResult)) openMergeConfirm(); }
       else if (S.mergePhase === 'merge') { S.mergePhase = null; renderPreviewBar(); }

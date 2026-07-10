@@ -22,8 +22,9 @@ import { resolveIssue } from '../linear.mjs';
 import { gitIdentityEnv, resolveAssigneeGhToken, resolveAssigneeIdentity, applyWorktreeIdentity } from '../git-identity.mjs';
 import {
   assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, unpushedRepos, countCommits, ensureProxy,
-  headShas, resetTo, ensureOpenPrs,
+  headShas, resetTo, ensureOpenPrs, touchedPreviewFiles,
 } from '../autofix.mjs';
+import { evictToMakeRoom } from '../preview/policy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BASE = path.resolve(__dirname, '..');            // .linear-autofix/
@@ -254,6 +255,18 @@ function previewInfo(identifier) {
   return { running: !!entry, busy: previewOps.has(identifier), urls: entry?.urls || null };
 }
 
+// Run preview.mjs <args> to completion. Resolves regardless of exit code (caller re-reads state).
+function spawnPreview(args, timeoutMs = 15 * 60 * 1000) {
+  return new Promise((resolve) => {
+    const child = spawn('node', [previewScript, ...args], { env: process.env });
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, timeoutMs);
+    child.stdout.on('data', (d) => process.stdout.write(d));
+    child.stderr.on('data', (d) => process.stderr.write(d));
+    child.on('error', () => { clearTimeout(timer); resolve(); });
+    child.on('close', () => { clearTimeout(timer); resolve(); });
+  });
+}
+
 async function runPreviewOp(identifier, entry, action) {
   const emit = (e) => broadcast(identifier, e, { buffer: false });
   try {
@@ -261,25 +274,42 @@ async function runPreviewOp(identifier, entry, action) {
       const loc = resolveCwd(identifier, entry, emit);
       if (loc.error) { emit({ type: 'error', error: loc.error }); return; }
       if (loc.cwd === agentRoot) { emit({ type: 'error', error: 'no worktree/branch to preview for this issue' }); return; }
+      // A chat-initiated preview is a user force: allow up to maxForcedPreviews, evicting the
+      // longest-idle preview(s) to make room past the cap (never this issue's own).
+      const evicted = evictToMakeRoom(identifier, config.maxForcedPreviews ?? 7, (m) => log(`preview (${identifier}): ${m}`));
+      if (evicted.length) emit({ type: 'status', text: `Preview cap reached — closed ${evicted.length} idle preview(s) (${evicted.join(', ')}) to make room.` });
       await ensureProxy();
       emit({ type: 'status', text: 'Starting preview — builds the portals once, can take a few minutes…' });
-      await new Promise((resolve) => {
-        const child = spawn('node', [previewScript, 'up', identifier, loc.cwd], { env: process.env });
-        const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 15 * 60 * 1000);
-        child.stdout.on('data', (d) => process.stdout.write(d));
-        child.stderr.on('data', (d) => process.stderr.write(d));
-        child.on('error', () => { clearTimeout(timer); resolve(); });
-        child.on('close', () => { clearTimeout(timer); resolve(); });
-      });
+      await spawnPreview(['up', identifier, loc.cwd]);
     } else {
-      await new Promise((resolve) => {
-        const child = spawn('node', [previewScript, 'down', identifier], { env: process.env });
-        child.on('error', resolve);
-        child.on('close', resolve);
-      });
+      await spawnPreview(['down', identifier]);
     }
   } catch (e) {
     emit({ type: 'error', error: `preview ${action} failed: ${String(e.message || e)}` });
+  } finally {
+    previewOps.delete(identifier);
+    emit({ type: 'preview', ...previewInfo(identifier) });
+  }
+}
+
+// Previews are built-once/static (watcher-free), so after a chat turn edits code the running preview
+// is stale. Rebuild it in place (down → up) and drive a "refreshing" loader in the UI meanwhile.
+// Fire-and-forget from the turn; guarded so it won't collide with a manual up/down already in flight.
+async function refreshPreview(identifier, entry) {
+  if (previewOps.has(identifier) || !previewInfo(identifier).running) return;
+  previewOps.add(identifier);
+  const emit = (e) => broadcast(identifier, e, { buffer: false });
+  emit({ type: 'preview', ...previewInfo(identifier), refreshing: true });
+  emit({ type: 'status', text: '🔄 You changed code — rebuilding the preview so it isn’t stale (a minute or two)…' });
+  try {
+    const loc = resolveCwd(identifier, entry, emit);
+    if (loc.error || loc.cwd === agentRoot) return;
+    await ensureProxy();
+    await spawnPreview(['down', identifier]);
+    await spawnPreview(['up', identifier, loc.cwd]);
+    emit({ type: 'status', text: '✅ Preview refreshed with your latest changes.' });
+  } catch (e) {
+    emit({ type: 'error', error: `preview refresh failed: ${String(e.message || e)}` });
   } finally {
     previewOps.delete(identifier);
     emit({ type: 'preview', ...previewInfo(identifier) });
@@ -856,6 +886,12 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
       if (pending.length || newThisTurn) {
         fix = { committed: true, newThisTurn, pushedOk: failed.length === 0, failedRepos: failed, prs: entry.prs || [] };
         emit({ type: 'fix_summary', ...fix });
+      }
+      // The agent may have edited code the preview builds. If a preview is live for this issue and the
+      // change is preview-relevant (backend/portals, not just docs), rebuild it in the background so it
+      // stops serving the pre-edit build. Fire-and-forget — drives its own preview/status events.
+      if (newThisTurn && previewInfo(identifier).running && touchedPreviewFiles(cwd, headBefore)) {
+        refreshPreview(identifier, entry);
       }
     }
 

@@ -17,6 +17,7 @@ import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { config } from '../config.mjs';
+import { evictToMakeRoom } from './policy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '../..'); // the agentweb (main) repo root
@@ -103,6 +104,13 @@ async function up(bugRaw, worktreeRaw) {
   const worktree = path.resolve(worktreeRaw);
   if (!existsSync(worktree)) { console.error(`worktree not found: ${worktree}`); process.exit(1); }
   mkdirSync(LOGS, { recursive: true });
+
+  // Universal cap backstop: every bring-up funnels through here — the chat button, the pipeline, AND
+  // the agent running this script directly via Bash — so enforce the ceiling here too. Make room
+  // within maxForcedPreviews by evicting the longest-idle preview(s) first (never this one). Skipped
+  // when re-upping an already-live preview (evictToMakeRoom excludes the target).
+  try { evictToMakeRoom(bug, config.maxForcedPreviews ?? 7, (m) => console.log(`[preview] ${m}`)); }
+  catch (e) { console.log(`[preview] cap check skipped: ${e && e.message}`); }
 
   const urls = { api: urlFor(bug, 'api'), customer: urlFor(bug, ''), partner: urlFor(bug, 'admin') };
   const ports = { api: await freePort(31100), customer: await freePort(52100), partner: await freePort(51100) };

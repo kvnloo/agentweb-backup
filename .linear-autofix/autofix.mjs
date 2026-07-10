@@ -14,6 +14,7 @@ import { config } from './config.mjs';
 import { resolveIssue, addComment, findStateId, moveIssue, setAutofixLabel, uploadFile, useAssigneeLinearKey } from './linear.mjs';
 import { applyAssigneeIdentity, applyWorktreeIdentity, resolveAssigneeGhToken } from './git-identity.mjs';
 import { findSessionId, fetchItem, summarizeSession } from './tools/session.mjs';
+import { evictPreviewsToFit } from './preview/policy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '..'); // the agentweb (main) repo root
@@ -559,6 +560,28 @@ export function detectChangedRepos(WT) {
   return found;
 }
 
+// Did the commits between `headBefore` (per-repo shas snapshotted before a chat turn) and HEAD touch
+// any file the PREVIEW actually builds — backend/, partner-portal/, or the customer-portal app? Used
+// to decide whether a live preview is now stale and needs a rebuild. Docs-only / .linear-autofix-only
+// / release-notes commits return false so we don't burn a multi-minute rebuild for nothing.
+export function touchedPreviewFiles(WT, headBefore) {
+  if (!headBefore) return false;
+  const nonBuilt = /\.(md|txt)$/i; // docs/release-notes don't change what the portals serve
+  const builtDirs = ['backend/', 'partner-portal/']; // within the MAIN repo
+  for (const repo of config.repos) {
+    const before = headBefore[repo.key];
+    if (!before) continue;
+    const files = (gitIn(wtPathOf(WT, repo), ['diff', '--name-only', `${before}..HEAD`]).stdout || '')
+      .split('\n').map((f) => f.trim()).filter(Boolean);
+    for (const f of files) {
+      if (nonBuilt.test(f)) continue;
+      if (repo.key === 'customer-portal') return true;           // the whole nested repo is a built portal
+      if (builtDirs.some((d) => f.startsWith(d))) return true;   // main repo: only backend/ or partner-portal/
+    }
+  }
+  return false;
+}
+
 // Push each changed repo's branch to origin (idempotent — a repo already up to date is a no-op).
 // On a non-fast-forward rejection (the remote branch advanced: a concurrent pipeline push, or a
 // commit added on the PR) we fetch the remote branch and REBASE our local commits on top, then
@@ -931,16 +954,9 @@ export function enforcePreviewPolicy(id, triage) {
     previewDown(id);
     return;
   }
-  try {
-    const st = JSON.parse(readFileSync(previewStatePath, 'utf8'));
-    const byAge = Object.entries(st).sort((a, b) => new Date(a[1].at) - new Date(b[1].at)).map(([k]) => k);
-    const max = config.maxKeptPreviews ?? 3;
-    while (byAge.length > max) {
-      const evict = byAge.shift();
-      log(`Kept-preview cap (${max}) reached — evicting oldest preview: ${evict}`);
-      previewDown(evict);
-    }
-  } catch { /* no preview state */ }
+  // Non-forced keep: trim the pool to the normal cap, evicting the longest-idle previews first (an
+  // actively-used one — recent URL open or chat — is never the most idle, so it survives).
+  evictPreviewsToFit(config.maxLivePreviews ?? config.maxKeptPreviews ?? 5, log);
 }
 
 async function runVerify(issue, WT) {

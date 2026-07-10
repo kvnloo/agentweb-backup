@@ -158,10 +158,14 @@ export const config = {
                                    // needs-manual-test (the ones a human actually opens); green/rework
                                    // previews tear down right after the run. gc.mjs stops kept ones once
                                    // the issue is Done/Canceled. Set false to always tear down.
-  maxKeptPreviews: 3,              // cap on simultaneously-running kept previews (oldest evicted first).
-                                   // Unbounded accumulation (~0.8GB each) crept the box into swapping,
-                                   // and swap-on-EBS I/O is what actually stalled the runner (load 26-56
-                                   // with CPU <50% = disk-wait, not compute).
+  maxLivePreviews: 5,              // normal cap on simultaneously-running previews (pipeline auto-keep and
+                                   // a plain chat "enable preview"). Unbounded accumulation (~0.8GB each)
+                                   // crept the box into swapping, and swap-on-EBS I/O is what stalled the
+                                   // runner (load 26-56 with CPU <50% = disk-wait, not compute).
+  maxForcedPreviews: 7,            // a user forcing a preview from the chat may push past maxLivePreviews to
+                                   // here. Past this, forcing one more EVICTS the longest-idle preview to
+                                   // make room (idle = URL not opened AND no chat activity for the longest).
+  maxKeptPreviews: 5,              // deprecated alias of maxLivePreviews (kept so older refs don't break).
 
   // --- Claude ---
   defaultModel: 'opus',            // the fixer model

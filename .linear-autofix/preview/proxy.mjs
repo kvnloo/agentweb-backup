@@ -9,14 +9,28 @@
 
 import http from 'node:http';
 import net from 'node:net';
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { config } from '../config.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROUTES = path.join(__dirname, 'routes.json');
+const ACCESS = path.join(__dirname, 'preview-access.json'); // bug -> last-opened ISO; the cap policy reads this
 const HEALTH = '/__preview_health__';
+
+// Record when a preview's URL was last actually opened, so the eviction policy can tell a live-but-
+// abandoned preview from one in use. Throttled per bug (a page load fires many requests) and flushed
+// to disk since the chat server / pipeline read it from a different process.
+let access = {}; try { access = JSON.parse(readFileSync(ACCESS, 'utf8')); } catch { /* none yet */ }
+const lastFlush = {};
+function noteAccess(bug) {
+  const now = Date.now();
+  if (now - (lastFlush[bug] || 0) < 20000) return; // at most once / 20s per bug
+  lastFlush[bug] = now;
+  access[bug] = new Date(now).toISOString();
+  try { writeFileSync(ACCESS, JSON.stringify(access, null, 2)); } catch { /* best effort */ }
+}
 
 // listen port -> routes.json key suffix for that portal ('' = customer/root).
 const PP = config.previewPorts || { partner: 5173, customer: 5174, api: 3001 };
@@ -46,6 +60,7 @@ function makeRequestHandler(suffix) {
     req.on('error', () => {});
     res.on('error', () => {});
     if (req.url === HEALTH) { res.writeHead(200, { 'content-type': 'text/plain' }).end('preview-proxy-ok'); return; }
+    noteAccess(keyOf(req.headers.host)); // stamp "URL opened" for the eviction policy (throttled)
     const key = keyOf(req.headers.host) + suffix;
     const port = getRoutes()[key];
     if (!port) { res.writeHead(502, { 'content-type': 'text/plain' }).end(`no preview route for "${key}"`); return; }
