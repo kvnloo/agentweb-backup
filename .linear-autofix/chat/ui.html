@@ -107,7 +107,7 @@
   .stage.open .sbody { display: block; }
   .stage .nolog { color: var(--dim); font-style: italic; }
 
-  .msg { max-width: 780px; padding: 10px 14px 21px; border-radius: 10px; white-space: pre-wrap; overflow-wrap: break-word; position: relative; }
+  .msg { max-width: 780px; min-width: 132px; padding: 10px 14px 21px; border-radius: 10px; white-space: pre-wrap; overflow-wrap: break-word; position: relative; }
   .msg.user { background: var(--user); align-self: flex-end; position: relative; padding-right: 52px; }
   /* Edit/delete icons live INSIDE the bubble's top-right (in the reserved right padding) so they
      never depend on bubble width — a wide bubble used to push a left-positioned icon over the sidebar. */
@@ -140,7 +140,7 @@
   .msg.user .atts .att { font-size: 11px; color: var(--dim); background: rgba(0,0,0,.2); border: 1px solid var(--border); border-radius: 6px; padding: 2px 7px; }
   .msg.assistant { background: var(--panel2); align-self: flex-start; }
   /* WhatsApp-style local-time stamp tucked into the bubble's bottom-right corner (no extra row). */
-  .ts-in { position: absolute; right: 12px; bottom: 5px; font-size: 10px; line-height: 1; color: var(--dim); }
+  .ts-in { position: absolute; right: 12px; bottom: 5px; font-size: 10px; line-height: 1; color: var(--dim); white-space: nowrap; }
   /* Markdown styling applies in BOTH chat bubbles (.msg) and pipeline stage bodies (.sbody),
      since both render md() output. Scoping to .msg only left stage reports with no spacing. */
   :is(.msg, .sbody) code { background: #10131a; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
