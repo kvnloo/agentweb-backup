@@ -3864,7 +3864,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
           existingStandardFields: STANDARD_FIELDS,
           existingCustomFields: Array.isArray(list.fieldNames) ? list.fieldNames as string[] : [],
           commonlyEmptyFields,
-        });
+        }, userId);
         return res.json({
           success: true,
           instruction: result.instruction,

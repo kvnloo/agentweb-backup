@@ -22,6 +22,7 @@ import { crmDb } from './db';
 import { agentModeService } from './agentModeService';
 import { FIELD_GROUPS } from './enrichmentGroups';
 import { buildFieldMappingSystemPrompt, buildFieldMappingUserPrompt } from './enrichmentPrompts';
+import { meterUserUsage } from './usageRecorderService';
 
 // ── Tier 1: hand-curated alias map ───────────────────────────────────────────
 //
@@ -239,7 +240,8 @@ function canonicalFieldDescriptions(): string {
 // ── LLM mapping ──────────────────────────────────────────────────────────────
 
 async function llmMapFieldsToCanonical(
-  unresolvedFields: string[]
+  unresolvedFields: string[],
+  userId?: string
 ): Promise<Record<string, string | null>> {
   if (unresolvedFields.length === 0) return {};
 
@@ -259,6 +261,14 @@ async function llmMapFieldsToCanonical(
         { role: 'user', content: user },
       ],
       response_format: { type: 'json_object' },
+    });
+    meterUserUsage({
+      userId,
+      model: enrichmentModel,
+      provider: enrichmentModel.startsWith('anthropic') || enrichmentModel.startsWith('claude') ? 'bedrock' : 'azure',
+      feature: 'crm_enrichment_field_alias',
+      inputTokens: (completion as any)?.usage?.prompt_tokens || 0,
+      outputTokens: (completion as any)?.usage?.completion_tokens || 0,
     });
     const raw = completion.choices?.[0]?.message?.content || '';
     const parsed = JSON.parse(raw);
@@ -305,7 +315,8 @@ export interface ResolveFieldAliasesResult {
 
 export async function resolveFieldAliases(
   listId: string,
-  outputFields: string[]
+  outputFields: string[],
+  userId?: string
 ): Promise<ResolveFieldAliasesResult> {
   const canonicalSet = canonicalFieldSet();
   const list = await crmDb.getLeadListById(listId).catch(() => null);
@@ -336,7 +347,7 @@ export async function resolveFieldAliases(
     return { effectiveMap: effective, newlyResolved: {} };
   }
 
-  const newMappings = await llmMapFieldsToCanonical(unresolved);
+  const newMappings = await llmMapFieldsToCanonical(unresolved, userId);
   const newlyResolved: Record<string, string> = {};
   for (const [f, canonical] of Object.entries(newMappings)) {
     if (canonical) {
