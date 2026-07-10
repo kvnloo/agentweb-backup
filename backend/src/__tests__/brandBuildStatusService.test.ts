@@ -68,6 +68,34 @@ describe("brandBuildStatusService", () => {
       );
       expect(patch!.brandBuildDurationMs).toBe(0);
     });
+
+    it("flips a FAILED build to ready when includeFailed is set (manual brand save)", () => {
+      // When a user supplies a brand by hand after an unscrapable-site failure,
+      // the guidelines write should complete the build so they're no longer
+      // gated on the buildingBrand screen. Only the explicit REST save opts in;
+      // the default (Emma's internal hook) still ignores non-building states.
+      const startedAt = new Date("2026-04-24T11:59:00.000Z"); // 60s before now
+      const patch = buildReadyPatch(
+        {
+          brandBuildStatus: "failed",
+          brandBuildStartedAt: startedAt.toISOString(),
+          brandBuildError: "Emma session failed: scrape unreachable",
+        },
+        now,
+        { includeFailed: true }
+      );
+      expect(patch).not.toBeNull();
+      expect(patch!.brandBuildStatus).toBe("ready");
+      expect(patch!.brandBuildError).toBeUndefined();
+      expect(patch!.brandBuildDurationMs).toBe(60_000);
+    });
+
+    it("still ignores a ready/absent build even with includeFailed set", () => {
+      expect(
+        buildReadyPatch({ brandBuildStatus: "ready" }, now, { includeFailed: true })
+      ).toBeNull();
+      expect(buildReadyPatch({}, now, { includeFailed: true })).toBeNull();
+    });
   });
 
   describe("buildFailedPatch", () => {
