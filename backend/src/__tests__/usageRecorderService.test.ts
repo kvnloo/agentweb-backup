@@ -134,6 +134,20 @@ describe('usageRecorderService', () => {
       expect(warnSpy).toHaveBeenCalledTimes(1);
     });
 
+    it('records an explicit costUsdOverride verbatim (per-generation image/video, not token-priced)', async () => {
+      // gemini image model: getModelPrice returns null → token cost would be 0.
+      await recordUsage({
+        ...baseCtx,
+        model: 'gemini-2.5-flash-image',
+        inputTokens: 0,
+        outputTokens: 0,
+        costUsdOverride: 0.039,
+      });
+      const inc = mockIncrement.mock.calls[0][0];
+      expect(inc.costMicroUsd).toBe(39000); // 0.039 USD → microdollars, not 0
+      expect(Number.isInteger(inc.costMicroUsd)).toBe(true);
+    });
+
     it('sanitizes negative / fractional token counts', async () => {
       await recordUsage({ ...baseCtx, inputTokens: -5, outputTokens: 10.6 });
       const inc = mockIncrement.mock.calls[0][0];
