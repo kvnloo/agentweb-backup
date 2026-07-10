@@ -1005,17 +1005,22 @@ const MERGE_PREP_MSG = [
   '1. If it is a draft, mark it ready: `gh pr ready <n>`.',
   '2. Sync its branch with the base branch: `gh pr update-branch <n>` (or merge the latest base in), resolving any conflicts.',
   '3. Check CI: `gh pr checks <n>`. If any check is failing, read the failing logs (`gh run view <run-id> --log-failed`), fix the code, and commit — your commit auto-pushes. Repeat until every check passes.',
-  '4. Wait for all checks to go green (`gh pr checks <n> --watch`).',
+  '4. **Greptile review is a required, merge-blocking gate.** Greptile is an automated code reviewer (a bot) that posts a review on every PR; the branch protection keeps the PR **BLOCKED until Greptile gives a passing/approving review**. Inspect it with `gh pr view <n> --json reviews,statusCheckRollup` (and `gh pr checks <n>` — Greptile may also surface as a status check). When Greptile requests changes or flags issues, read its full review, then **classify each point** so this stays autonomous:',
+  '   - **Mechanical / clear-cut fixes** (bugs it caught, missing null checks, typos, obviously-correct suggestions with no judgment call): just fix them yourself, commit (auto-pushes), and let Greptile re-review. Do NOT come back to the developer for these — keep going.',
+  '   - **Decision changes** (Greptile is questioning an approach, a product/UX/behavior choice, a tradeoff, or anything where a reasonable person could disagree and the "right" answer needs the developer): do NOT guess. Stop and surface it (see MERGE_BLOCKED below) with a crisp summary of exactly what decision is needed.',
+  '   Greptile re-reviews on each new commit; if it stalls, re-trigger it by commenting `@greptile review` on the PR. Repeat the fix→re-review loop until Greptile passes or you hit a decision change.',
+  '5. Wait for all checks AND the Greptile review to go green (`gh pr checks <n> --watch`, then re-check `gh pr view <n> --json reviewDecision,reviews`).',
   '',
-  'If the PRs depend on each other, handle them in the right order. You ARE authorized to run `gh pr ready`, `gh pr update-branch`, `gh pr checks`, and to commit for this task — this overrides the earlier note about not pushing. But do NOT run `gh pr merge` in this step.',
+  'If the PRs depend on each other, handle them in the right order. You ARE authorized to run `gh pr ready`, `gh pr update-branch`, `gh pr checks`, to comment for a Greptile re-review, and to commit for this task — this overrides the earlier note about not pushing. But do NOT run `gh pr merge` in this step. Bias toward finishing autonomously: only pull the developer in for genuine decision changes, not for anything you can correctly fix on your own.',
   '',
-  'When ALL open PRs are green and mergeable, end your reply with a line containing only `MERGE_READY`.',
-  'If any PR cannot be made mergeable, end your reply with `MERGE_BLOCKED: <short reason>`.',
+  'When ALL open PRs are green, Greptile has passed on each, and they are mergeable, end your reply with a line containing only `MERGE_READY`.',
+  'If Greptile (or anything else) surfaced a real decision change that needs the developer, end your reply with `MERGE_BLOCKED: <what decision is needed, and the options>` — summarize Greptile\'s point so the developer can decide without re-reading the PR. Also use MERGE_BLOCKED if a PR simply cannot be made mergeable.',
 ].join('\n');
 const MERGE_DO_MSG = [
   '**Merge PR(s) — confirmed by the developer.** Merge the PR(s) you just prepared.',
   'For each PR, run `gh pr merge <n> --merge` (do NOT use `--delete-branch`). You are authorized to merge for this task.',
-  'If a merge is blocked, say why. Report the final state of each PR.',
+  'If a merge is blocked by Greptile still requesting changes, check whether its remaining points are mechanical/clear-cut fixes — if so, fix them yourself, commit, wait for Greptile to re-pass, and complete the merge autonomously. Only stop and report back if it is a real decision change that needs the developer. Never bypass the block (no admin override, no `--admin`).',
+  'Report the final state of each PR.',
 ].join('\n');
 function startMergeTurn(identifier, body) {
   const found = findEntry(identifier);
