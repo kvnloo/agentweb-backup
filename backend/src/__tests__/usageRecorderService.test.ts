@@ -11,15 +11,23 @@ jest.mock('../services/usageRecordDb', () => ({
   },
 }));
 
+const mockIncrementUserTokenUsage = jest.fn();
+jest.mock('../services/tokenUsageService', () => ({
+  incrementUserTokenUsage: (...a: any[]) => mockIncrementUserTokenUsage(...a),
+}));
+
 import { usageRecordDb } from '../services/usageRecordDb';
 import {
   recordUsage,
+  meterUserUsage,
   computeCostMicroUsd,
   __resetErrorLogThrottleForTests,
 } from '../services/usageRecorderService';
 import { __resetUnknownModelWarnsForTests } from '../utils/llmPricing';
 
 const mockIncrement = usageRecordDb.incrementUsage as jest.Mock;
+
+const flush = () => new Promise((r) => setImmediate(r));
 
 const baseCtx = {
   userId: 'user-1',
@@ -37,6 +45,7 @@ describe('usageRecorderService', () => {
     __resetErrorLogThrottleForTests();
     __resetUnknownModelWarnsForTests();
     mockIncrement.mockResolvedValue(undefined);
+    mockIncrementUserTokenUsage.mockReset().mockResolvedValue(undefined);
   });
 
   describe('fail-open behavior (acceptance criterion)', () => {
@@ -149,6 +158,58 @@ describe('usageRecorderService', () => {
       const inc = mockIncrement.mock.calls[0][0];
       expect(inc.model).toBe('unknown');
       expect(inc.feature).toBe('unknown');
+    });
+  });
+
+  describe('meterUserUsage (shadow + enforced per-user cap)', () => {
+    it('records to the shadow table AND charges the per-user cap with summed tokens + dollar cost', async () => {
+      meterUserUsage({ ...baseCtx, cacheReadTokens: 100, cacheWriteTokens: 40 });
+      await flush();
+
+      // Shadow record still happens.
+      expect(mockIncrement).toHaveBeenCalledTimes(1);
+      // Cap charged: totalTokens = 1000+200+100+40 = 1340; cost = 6180 microUsd = 0.00618 USD.
+      expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(1);
+      const [userId, tokens, cost] = mockIncrementUserTokenUsage.mock.calls[0];
+      expect(userId).toBe('user-1');
+      expect(tokens).toBe(1340);
+      expect(cost).toBeCloseTo(0.00618, 8);
+    });
+
+    it('does NOT charge the cap when no user is attributable (shadow still records under system)', async () => {
+      meterUserUsage({ ...baseCtx, userId: undefined });
+      await flush();
+
+      expect(mockIncrement).toHaveBeenCalledTimes(1);
+      expect(mockIncrement.mock.calls[0][0].userId).toBe('system');
+      expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
+    });
+
+    it('charges tokens with cost 0 for an unknown model (tokens trustworthy, cost best-effort)', async () => {
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      meterUserUsage({ ...baseCtx, model: 'mystery-model-x' });
+      await flush();
+
+      const [, tokens, cost] = mockIncrementUserTokenUsage.mock.calls[0];
+      expect(tokens).toBe(1200); // 1000 + 200
+      expect(cost).toBe(0);
+    });
+
+    it('skips the cap charge entirely when there is no usage (no tokens, no cost)', async () => {
+      meterUserUsage({ ...baseCtx, inputTokens: 0, outputTokens: 0, model: 'mystery-model-x' });
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      await flush();
+
+      expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
+    });
+
+    it('never throws when the cap charge rejects (fail-open)', async () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockIncrementUserTokenUsage.mockRejectedValue(new Error('cap write failed'));
+
+      expect(() => meterUserUsage(baseCtx)).not.toThrow();
+      await flush();
+      expect(errorSpy).toHaveBeenCalled();
     });
   });
 
