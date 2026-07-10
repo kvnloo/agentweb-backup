@@ -389,6 +389,10 @@ function runClaudeStream(args, prompt, cwd, timeoutMs, onEvent, register, env = 
         out.gotInit = true;
         onEvent({ type: 'init', sessionId: j.session_id });
       } else if (j.type === 'assistant') {
+        // Each assistant message carries the usage for THAT single turn; the last one's input (+cache)
+        // ≈ the CURRENT context size. result.usage sums every internal tool-call turn, so with prompt
+        // caching it re-counts the cached context per turn and balloons — don't use it for context size.
+        if (j.message?.usage) out.lastUsage = j.message.usage;
         for (const block of j.message?.content || []) {
           if (block.type === 'text' && block.text) { out.texts.push(block.text); out.blocks.push({ t: 'text', text: block.text }); onEvent({ type: 'text', text: block.text }); }
           if (block.type === 'tool_use') {
@@ -404,7 +408,7 @@ function runClaudeStream(args, prompt, cwd, timeoutMs, onEvent, register, env = 
         }
       } else if (j.type === 'result') {
         out.result = j;
-        onEvent({ type: 'result', text: j.result || '', turns: j.num_turns, ms: j.duration_ms, sessionId: j.session_id, isError: !!j.is_error, subtype: j.subtype });
+        onEvent({ type: 'result', text: j.result || '', turns: j.num_turns, ms: j.duration_ms, cost: j.total_cost_usd, sessionId: j.session_id, isError: !!j.is_error, subtype: j.subtype });
       }
     };
     child.stdout.on('data', (d) => {
@@ -917,9 +921,11 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
         blocks: out.blocks.slice(0, 400), // chronological text+tool sequence, so the UI can split final answer from working steps
         ...(fix?.committed ? { fix } : {}),
       });
-      // Snapshot context/cost from the CLI result so /status and /context have real data. The last
-      // turn's (input + cache_read + cache_creation) ≈ the current context size; cost accumulates.
-      const u = out.result?.usage, mu = out.result?.modelUsage;
+      // Snapshot context/cost so /status and /context have real data. Context size = the LAST assistant
+      // turn's (input + cache_read + cache_creation) — NOT result.usage, which sums every internal
+      // tool-call turn and (with prompt caching re-counting the cached context each turn) balloons to
+      // many× the real window. Cost still comes from result (it legitimately accumulates).
+      const u = out.lastUsage || out.result?.usage, mu = out.result?.modelUsage;
       // An Opus turn still makes tiny background haiku calls (title/summary) and may spawn subagents on
       // other models, so modelUsage has several keys. Pick the PRIMARY one — the model that did the most
       // work (the user-facing agent) — not just the first key, so /status shows the real model and the

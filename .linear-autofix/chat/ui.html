@@ -172,6 +172,7 @@
   .fixcard.failed { border-left-color: var(--red); }
   .fixcard a { color: var(--accent); }
   .turnmeta { color: var(--dim); font-size: 11px; align-self: flex-start; padding: 0 6px; }
+  .turnmeta.heavy { color: var(--amber); font-weight: 600; }
   .ctxwarn { align-self: flex-start; max-width: 780px; margin: 2px 0 4px; padding: 8px 12px; font-size: 12px; color: var(--amber); background: rgba(217,164,65,.08); border: 1px solid rgba(217,164,65,.35); border-radius: 8px; }
   .ctxwarn .cw-go { color: var(--amber); cursor: pointer; text-decoration: underline; font-weight: 600; }
   .compactcard { align-self: stretch; margin: 8px 0; }
@@ -568,6 +569,15 @@ async function previewAction(action) {
 
 // ---------- pipeline steps ----------
 function fmtMs(ms) { if (!ms) return ''; const m = Math.round(ms / 60000); return m >= 1 ? `${m}m` : `${Math.round(ms/1000)}s`; }
+// Per-turn meta line. A turn that ran a long/expensive agent loop (many tool-call rounds, minutes,
+// or real $) is flagged as "heavy" so it stands out — separate from context-window usage, which is
+// a different metric. `turns` here is the CLI's num_turns = internal tool-call rounds for the message.
+function addTurnMeta(e) {
+  const turns = e.turns ?? 0;
+  const parts = [`${turns} turn${turns === 1 ? '' : 's'}`, fmtMs(e.ms), e.cost != null ? '$' + e.cost.toFixed(2) : ''].filter(Boolean).join(' · ');
+  const heavy = (e.cost != null && e.cost >= 1.5) || turns >= 20 || (e.ms || 0) >= 300000; // ≥$1.50, ≥20 rounds, or ≥5 min
+  addSys((heavy ? '⚠ Heavy turn — ' : '⏱ ') + parts, heavy ? 'turnmeta heavy' : 'turnmeta');
+}
 function renderPipeline(d) {
   const steps = d.pipeline || [];
   if (!steps.length) return;
@@ -852,7 +862,7 @@ function handleEvent(e) {
       setThinking('Claude is thinking…');
       break;
     }
-    case 'result': S.lastResult = e.text || ''; if (!S.compacting) addSys(`⏱ ${e.turns ?? '?'} turns · ${e.ms ? Math.round(e.ms/1000)+'s' : ''}`, 'turnmeta'); break;
+    case 'result': S.lastResult = e.text || ''; if (!S.compacting) addTurnMeta(e); break;
     case 'fix_summary': addFixCard(e); break;
     case 'preview':
       if (S.detail) { S.detail.preview = { running: e.running, busy: e.busy, urls: e.urls, refreshing: e.refreshing }; renderPreviewBar(); }
