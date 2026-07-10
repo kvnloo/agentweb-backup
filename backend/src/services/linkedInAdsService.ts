@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { INTEGRATION_CONFIG } from '../config/integrations';
+import { buildUtmSpec, mergeUtmIntoUrl } from '../utils/adUtm';
 
 const LI_API_BASE = 'https://api.linkedin.com';
 const LI_API_VERSION = INTEGRATION_CONFIG.linkedinAds.apiVersion; // e.g. '202603'
@@ -11,6 +12,65 @@ export interface LinkedInAdsApiResult {
   data?: any;
   error?: string;
   status?: number;
+}
+
+// ─── UTM tagging (ENG-239) ─────────────────────────────────────────────────────
+
+/**
+ * Resolve the campaign id/URN to stamp into `utm_campaign`, or `undefined` when
+ * no campaign is in scope at the call site.
+ *
+ * LinkedIn has no native tracking field and no click-time macros, so UTMs are
+ * literally appended to each destination URL at create time. The campaign id is
+ * required by the creative-creating endpoints (createCreative /
+ * createCreativeInline / createDynamicCreative) but NOT by the standalone
+ * content endpoints (createPost / createInMailContent /
+ * createConversationAdContent), whose content is authored before it is wired to
+ * a campaign. Those accept the campaign as an OPTIONAL param so Emma can thread
+ * it through when known; when it is absent we leave the URL untagged rather than
+ * invent a value or emit `utm_campaign=undefined`.
+ *
+ * A `urn:li:sponsoredCampaign:123` URN is reduced to its bare numeric id so the
+ * emitted `utm_campaign` reads as `123` rather than a percent-encoded URN.
+ */
+function resolveCampaignForUtm(params: Record<string, any>): string | undefined {
+  const raw = params?.campaign_id ?? params?.campaign ?? params?.campaignUrn;
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  const urnMatch = trimmed.match(/urn:li:sponsoredCampaign:(\d+)/);
+  return urnMatch ? urnMatch[1] : trimmed;
+}
+
+/**
+ * Append LinkedIn UTM params (`utm_source=linkedin`, `utm_medium=paid`,
+ * `utm_campaign=<campaign>`) to a destination URL. `utm_content` is never emitted
+ * — LinkedIn resolves no ad-id macro and the ad id does not exist at create time
+ * (buildUtmSpec drops `content` for the linkedin platform). AC4 per-key merge is
+ * handled by `mergeUtmIntoUrl`: a UTM key the user already set is preserved.
+ *
+ * Guards:
+ *  - A missing/empty URL is returned as-is (never call mergeUtmIntoUrl on it).
+ *  - No campaign in scope → returned untagged (never emit `utm_campaign=undefined`).
+ *  - A malformed user URL (which mergeUtmIntoUrl throws on) is passed through
+ *    UNTAGGED rather than throwing. Rationale: tagging is a best-effort overlay on
+ *    an Emma-orchestrated multi-step ad build; a bad landing page is user content,
+ *    and failing loud here would abort the whole ad creation (and the tagging of
+ *    sibling URLs) with our error instead of letting LinkedIn's own endpoint
+ *    surface a precise field-level validation error. Losing attribution on one
+ *    malformed URL is strictly better than aborting the campaign.
+ */
+function appendLinkedInUtm(
+  url: string | undefined,
+  campaign: string | undefined,
+): string | undefined {
+  if (!url || typeof url !== 'string') return url;
+  if (!campaign) return url;
+  try {
+    return mergeUtmIntoUrl(url, buildUtmSpec('linkedin', { campaign }));
+  } catch {
+    return url;
+  }
 }
 
 // ─── Core HTTP client ─────────────────────────────────────────────────────────
@@ -570,16 +630,22 @@ export async function createPost(
       },
     };
   } else if (params.carousel_cards && Array.isArray(params.carousel_cards)) {
+    // ENG-239: append UTMs to each card URL. campaign_id is optional here — a dark
+    // post is authored before it is wired to a campaign; untagged when absent.
+    const utmCampaign = resolveCampaignForUtm(params);
     body.content = {
       carousel: {
         cards: params.carousel_cards.map((card: any) => ({
           media: { id: card.image_urn, title: card.title || '' },
-          landingPage: card.landing_page,
+          landingPage: appendLinkedInUtm(card.landing_page, utmCampaign),
         })),
       },
     };
     // LinkedIn requires contentLandingPage for carousel posts — default to first card's landing page
-    body.contentLandingPage = params.content_landing_page || params.carousel_cards[0]?.landing_page;
+    body.contentLandingPage = appendLinkedInUtm(
+      params.content_landing_page || params.carousel_cards[0]?.landing_page,
+      utmCampaign,
+    );
   }
 
   return makeRequest('POST', '/rest/posts', accessToken, body);
@@ -665,11 +731,12 @@ export async function createCreative(
     }
   } else if (params.headline) {
     // Text ad creative (no post needed)
+    // ENG-239: campaign_id is required by this endpoint, so the URL is always tagged.
     body.content = {
       textAd: {
         headline: params.headline,
         description: params.description || '',
-        landingPage: params.landing_page,
+        landingPage: appendLinkedInUtm(params.landing_page, resolveCampaignForUtm(params)),
         ...(params.image_urn ? { image: params.image_urn } : {}),
       },
     };
@@ -725,16 +792,21 @@ export async function createCreativeInline(
   } else if (params.video_urn) {
     post.content = { media: { id: params.video_urn, title: params.title || '' } };
   } else if (params.carousel_cards && Array.isArray(params.carousel_cards)) {
+    // ENG-239: campaign_id is required by this endpoint, so the URLs are always tagged.
+    const utmCampaign = resolveCampaignForUtm(params);
     post.content = {
       carousel: {
         cards: params.carousel_cards.map((card: any) => ({
           media: { id: card.image_urn, title: card.title || '' },
-          landingPage: card.landing_page,
+          landingPage: appendLinkedInUtm(card.landing_page, utmCampaign),
         })),
       },
     };
     // LinkedIn requires contentLandingPage for carousel posts — default to first card's landing page
-    post.contentLandingPage = params.content_landing_page || params.carousel_cards[0]?.landing_page;
+    post.contentLandingPage = appendLinkedInUtm(
+      params.content_landing_page || params.carousel_cards[0]?.landing_page,
+      utmCampaign,
+    );
   }
 
   const campaignUrn = params.campaign_id.startsWith('urn:') ? params.campaign_id : `urn:li:sponsoredCampaign:${params.campaign_id}`;
@@ -973,6 +1045,10 @@ export async function createInMailContent(
     senderName?: string;
     senderTitle?: string;
     senderCompany?: string;
+    // ENG-239: optional campaign id/URN so the CTA landing page can be UTM-tagged.
+    // InMail content is authored before it is wired to a campaign; when absent the
+    // URL is left untagged rather than emitting utm_campaign=undefined.
+    campaign_id?: string;
   }
 ): Promise<LinkedInAdsApiResult> {
   if (!params.ad_account_id) return { success: false, error: 'createInMailContent requires ad_account_id' };
@@ -991,7 +1067,11 @@ export async function createInMailContent(
     subContent: {
       regular: {
         callToActionText: params.callToActionText,
-        callToActionLandingPageUrl: params.callToActionLandingPageUrl,
+        // ENG-239: tag the CTA landing page when a campaign is in scope.
+        callToActionLandingPageUrl: appendLinkedInUtm(
+          params.callToActionLandingPageUrl,
+          resolveCampaignForUtm(params),
+        ),
       },
     },
   };
@@ -1104,11 +1184,15 @@ export async function createDynamicCreative(
         error: 'SPOTLIGHT dynamic ads require logo_urn. Upload a logo first using MEDIA/UPLOAD_IMAGE and pass the returned image_urn as logo_urn.',
       };
     }
+    // ENG-239: campaign_id is required by this endpoint, so the URL is always tagged.
     body.content = {
       spotlight: {
         headline: params.headline,
         callToAction: params.call_to_action || params.callToAction,
-        landingPage: params.landing_page || params.landingPage,
+        landingPage: appendLinkedInUtm(
+          params.landing_page || params.landingPage,
+          resolveCampaignForUtm(params),
+        ),
         logo: params.logo_urn,
         ...(params.description ? { description: params.description } : {}),
         ...(params.background_image_urn ? { backgroundImage: params.background_image_urn } : {}),
@@ -1174,6 +1258,10 @@ export async function createConversationAdContent(
     return { success: false, error: 'createConversationAdContent requires buttons array (1–5 buttons)' };
   }
 
+  // ENG-239: append UTMs to each OPEN_URL button. campaign_id is optional here —
+  // conversation content is authored before it is wired to a campaign; when absent
+  // the URL is left untagged rather than emitting utm_campaign=undefined.
+  const utmCampaign = resolveCampaignForUtm(params);
   const encodedUrn = encodeURIComponent(conversationAdUrn);
   const body: Record<string, any> = {
     body: params.body,
@@ -1182,7 +1270,7 @@ export async function createConversationAdContent(
     buttons: params.buttons.map((btn: any) => ({
       text: btn.text,
       action: btn.action || 'OPEN_URL',
-      ...(btn.url ? { landingPage: btn.url } : {}),
+      ...(btn.url ? { landingPage: appendLinkedInUtm(btn.url, utmCampaign) } : {}),
     })),
   };
 

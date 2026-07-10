@@ -289,8 +289,12 @@ describe('createCreative', () => {
     expect(call.data.content.textAd).toMatchObject({
       headline: 'Click Here',
       description: 'Ad copy',
-      landingPage: 'https://example.com',
     });
+    // ENG-239: the text-ad landing page is now UTM-tagged at create time (campaign_id
+    // is in scope here). See linkedInAdsService.utm.test.ts for full coverage.
+    expect(call.data.content.textAd.landingPage).toBe(
+      'https://example.com?utm_source=linkedin&utm_medium=paid&utm_campaign=camp-1'
+    );
   });
 
   it('returns error when no creative type provided', async () => {
@@ -826,7 +830,10 @@ describe('createDynamicCreative', () => {
     const body = mockAxiosFn.mock.calls[0][0].data;
     expect(body.content.spotlight.headline).toBe('See our work');
     expect(body.content.spotlight.callToAction).toBe('Visit Now');
-    expect(body.content.spotlight.landingPage).toBe('https://example.com');
+    // ENG-239: the spotlight landing page is now UTM-tagged at create time.
+    expect(body.content.spotlight.landingPage).toBe(
+      'https://example.com?utm_source=linkedin&utm_medium=paid&utm_campaign=camp-1'
+    );
     expect(body.content.spotlight.description).toBe('Award-winning agency');
     expect(body.content.spotlight.logo).toBe('urn:li:image:logo-1');
   });
