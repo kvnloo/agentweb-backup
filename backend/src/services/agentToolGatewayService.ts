@@ -169,6 +169,46 @@ function errorHead(error: unknown): string {
   return message.slice(0, ERROR_KEY_LENGTH);
 }
 
+// ENG-182: LinkedIn per-recipient write actions carry a recipient identity in
+// their args. Keyed on (tool, error-head) alone, a terminal per-recipient refusal
+// ("Cannot resend yet" — an upstream_rejected fast-trip class, threshold 2) from
+// two DIFFERENT profiles trips the breaker for linkedin_outreach as a whole, then
+// blocks send-invite to genuinely different recipients that were never attempted.
+// Isolate the failure accounting per recipient so a "already invited" for profile
+// A does not block an invite to profile B. Every other tool (and any LinkedIn
+// action without a recipient, e.g. search-people) returns '' — a single shared
+// scope, exactly preserving the prior per-tool behavior.
+//
+// send-invite/send-message/send-inmail identify the recipient by profile_url or
+// provider_id; accept-invitation/cancel-invitation identify it by invitation_id
+// (see agentModeService.ts). Read whichever this action actually carries so every
+// allowlisted action resolves to a real per-recipient scope instead of ''.
+const LINKEDIN_RECIPIENT_ACTIONS = new Set([
+  'send-invite',
+  'send-message',
+  'send-inmail',
+  'cancel-invitation',
+  'accept-invitation',
+]);
+
+function failureScope(toolName: string, args: unknown): string {
+  if (toolName !== 'linkedin_outreach') return '';
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
+  const record = args as Record<string, unknown>;
+  const action = typeof record.action === 'string' ? record.action.toLowerCase() : '';
+  if (!LINKEDIN_RECIPIENT_ACTIONS.has(action)) return '';
+  const target = typeof record.profile_url === 'string' && record.profile_url.trim()
+    ? record.profile_url
+    : typeof record.provider_id === 'string' && record.provider_id.trim()
+    ? record.provider_id
+    : typeof record.invitation_id === 'string' && record.invitation_id.trim()
+    ? record.invitation_id
+    : '';
+  // Normalize so the same recipient with a trailing slash or query params
+  // (LinkedIn appends miniProfileUrn tracking) collapses to one scope.
+  return target.trim().toLowerCase().split('?')[0].replace(/\/+$/, '').slice(0, ERROR_KEY_LENGTH);
+}
+
 function getRunCounts(runId: string): Map<string, number> {
   let counts = runFailureCounts.get(runId);
   if (!counts) {
@@ -191,10 +231,10 @@ function failureThresholdFor(errorMessageHead: string): number {
     : REPEATED_FAILURE_THRESHOLD;
 }
 
-function findTrippedFailure(runId: string, toolName: string): { count: number; errorMessage: string } | null {
+function findTrippedFailure(runId: string, toolName: string, scope: string): { count: number; errorMessage: string } | null {
   const counts = runFailureCounts.get(runId);
   if (!counts) return null;
-  const prefix = `${toolName}\0`;
+  const prefix = `${toolName}\0${scope}\0`;
   for (const [key, count] of counts) {
     if (!key.startsWith(prefix)) continue;
     const errorMessage = key.slice(prefix.length);
@@ -227,16 +267,21 @@ function findTrippedBudget(runId: string, toolName: string): { count: number; bu
   return count >= budget ? { count, budget } : null;
 }
 
-function recordToolFailure(runId: string, toolName: string, error: unknown): void {
+function recordToolFailure(runId: string, toolName: string, args: unknown, error: unknown): void {
   const counts = getRunCounts(runId);
-  const key = `${toolName}\0${errorHead(error)}`;
+  const key = `${toolName}\0${failureScope(toolName, args)}\0${errorHead(error)}`;
   counts.set(key, (counts.get(key) ?? 0) + 1);
 }
 
-function clearToolFailures(runId: string, toolName: string): void {
+function clearToolFailures(runId: string, toolName: string, args: unknown): void {
   const counts = runFailureCounts.get(runId);
   if (!counts) return;
-  const prefix = `${toolName}\0`;
+  // ENG-182: scope the clear to the SAME recipient that succeeded. A tool-wide
+  // clear (prefix `${toolName}\0`) would let a success for recipient B wipe a
+  // tripped/pending breaker for an unrelated recipient A, re-enabling the wasted
+  // retries the per-recipient isolation exists to prevent. Non-recipient tools
+  // resolve to scope '' — prefix `${toolName}\0\0` — preserving prior behavior.
+  const prefix = `${toolName}\0${failureScope(toolName, args)}\0`;
   for (const key of counts.keys()) {
     if (key.startsWith(prefix)) counts.delete(key);
   }
@@ -586,7 +631,11 @@ export async function executeAgentToolThroughGateway(
       };
     }
 
-    const tripped = findTrippedFailure(input.runId, policyDecision.toolName);
+    const tripped = findTrippedFailure(
+      input.runId,
+      policyDecision.toolName,
+      failureScope(policyDecision.toolName, input.args),
+    );
     if (tripped) {
       return {
         status: 'error',
@@ -608,13 +657,13 @@ export async function executeAgentToolThroughGateway(
     // failure exactly like the catch path; do NOT clear prior failure counts.
     const structuredFailure = toolResultError(result);
     if (structuredFailure) {
-      if (input.runId) recordToolFailure(input.runId, policyDecision.toolName, structuredFailure);
+      if (input.runId) recordToolFailure(input.runId, policyDecision.toolName, input.args, structuredFailure);
       if (
         input.budgetScopeId
         && input.budgetScopeId !== input.runId
         && mediaFailureBudget(policyDecision.toolName) != null
       ) {
-        recordToolFailure(input.budgetScopeId, policyDecision.toolName, structuredFailure);
+        recordToolFailure(input.budgetScopeId, policyDecision.toolName, input.args, structuredFailure);
       }
       // Keep returning status:'success' with the result so the dispatcher's
       // downgrade (toolDispatch.ts) carries the structured payload to the model.
@@ -627,9 +676,9 @@ export async function executeAgentToolThroughGateway(
         durationMs: Math.max(0, now() - startedAt),
       };
     }
-    if (input.runId) clearToolFailures(input.runId, policyDecision.toolName);
+    if (input.runId) clearToolFailures(input.runId, policyDecision.toolName, input.args);
     if (input.budgetScopeId && input.budgetScopeId !== input.runId) {
-      clearToolFailures(input.budgetScopeId, policyDecision.toolName);
+      clearToolFailures(input.budgetScopeId, policyDecision.toolName, input.args);
     }
     return {
       status: 'success',
@@ -638,13 +687,13 @@ export async function executeAgentToolThroughGateway(
       durationMs: Math.max(0, now() - startedAt),
     };
   } catch (error) {
-    if (input.runId) recordToolFailure(input.runId, policyDecision.toolName, error);
+    if (input.runId) recordToolFailure(input.runId, policyDecision.toolName, input.args, error);
     if (
       input.budgetScopeId
       && input.budgetScopeId !== input.runId
       && mediaFailureBudget(policyDecision.toolName) != null
     ) {
-      recordToolFailure(input.budgetScopeId, policyDecision.toolName, error);
+      recordToolFailure(input.budgetScopeId, policyDecision.toolName, input.args, error);
     }
     return {
       status: 'error',

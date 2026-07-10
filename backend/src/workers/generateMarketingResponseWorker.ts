@@ -4,6 +4,13 @@
  */
 
 import { AgentModeService } from '../services/agentModeService';
+import { installWorkerShutdownGuards } from './workerShutdownGuards';
+
+// Survive the OS process-group/cgroup SIGTERM on deploy so an in-flight scheduled run
+// isn't aborted before the parent's drain can let it finish (ENG-201). The parent is the
+// sole authority on worker termination (SIGKILL after drain); we exit only on IPC
+// disconnect. Install before any heavy init so the guards are active immediately.
+installWorkerShutdownGuards();
 
 // Initialize the service
 const agentModeService = new AgentModeService();
