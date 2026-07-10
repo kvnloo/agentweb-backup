@@ -5,6 +5,7 @@ import { DRAIN_CEILING_MS } from './utils/shutdownConstants';
 import { agentModeService } from './services/agentModeService';
 import { generateMarketingResponseWorkerService } from './services/generateMarketingResponseWorkerService';
 import dotenv from 'dotenv';
+import { getJwtSecret, assertJwtSecretAtBoot } from './config/jwt';
 import bcrypt from 'bcryptjs';
 import http from 'http';
 import { Server, Socket } from 'socket.io';
@@ -22,6 +23,10 @@ import {
 } from './services/liveVoiceService';
 
 dotenv.config();
+
+// Fail fast at boot (before binding the port) if the JWT secret is missing, rather than
+// letting tokens be signed/verified with a fallback secret or erroring on first request.
+assertJwtSecretAtBoot();
 
 const port = process.env.PORT || 3001;
 const server = http.createServer(app);
@@ -77,7 +82,7 @@ io.use(async (socket, next) => {
 
   if (token) {
     try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key') as {
+      const decoded = jwt.verify(token, getJwtSecret()) as {
         userId?: string;
         sv?: number;
         delegateAccess?: unknown;
@@ -136,7 +141,7 @@ io.on('connection', (socket: Socket) => {
   try {
     const token = socket.handshake.auth.token;
     if (token) {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as { userId: string };
+      const decoded = jwt.verify(token, getJwtSecret()) as { userId: string };
       if (decoded.userId) {
         socket.join(`user:${decoded.userId}`);
       }
@@ -174,7 +179,7 @@ io.on('connection', (socket: Socket) => {
     }
     const token = socket.handshake.auth.token;
     if (!token) throw new Error('No auth token');
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as {
+    const decoded = jwt.verify(token, getJwtSecret()) as {
       userId: string;
       delegateAccess?: { targetUserId: string };
     };
@@ -237,7 +242,7 @@ io.on('connection', (socket: Socket) => {
         throw new Error('No authentication token provided');
       }
 
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as { userId: string; isAdmin?: boolean; delegateAccess?: { adminUserId: string; adminEmail: string; targetUserId: string; targetEmail: string } };
+      const decoded = jwt.verify(token, getJwtSecret()) as { userId: string; isAdmin?: boolean; delegateAccess?: { adminUserId: string; adminEmail: string; targetUserId: string; targetEmail: string } };
       const userId = decoded.delegateAccess?.targetUserId || decoded.userId;
       const isDelegatedAdmin = !!decoded.delegateAccess || decoded.isAdmin === true;
 
@@ -879,6 +884,45 @@ createTestAccount().then(async () => {
         }
       } else {
         console.log('[AgentReliabilitySnapshot] Disabled (set AGENT_RELIABILITY_SNAPSHOT_ENABLED=true to enable)');
+      }
+
+      // Weekly Engineering Scoreboard — read-only backend replacement for the
+      // laptop launchd job. Runs Mondays at 09:00 UTC, gated by
+      // ENGINEERING_SCOREBOARD_LOOP_ENABLED=true. It reads Linear + Weave,
+      // DMs Harsha through the existing loop Slack rail, and appends one
+      // snapshot for restart-safe trend rendering.
+      if (process.env.ENGINEERING_SCOREBOARD_LOOP_ENABLED === 'true') {
+        try {
+          const { runEngineeringScoreboardLoopOnce } = await import('./cron/engineeringScoreboardLoop');
+
+          const scheduleNextEngineeringScoreboardRun = () => {
+            const nowForScoreboard = new Date();
+            const nextScoreboardRun = new Date(nowForScoreboard);
+            nextScoreboardRun.setUTCHours(9, 0, 0, 0);
+            const daysUntilMonday = (1 - nextScoreboardRun.getUTCDay() + 7) % 7;
+            nextScoreboardRun.setUTCDate(nextScoreboardRun.getUTCDate() + daysUntilMonday);
+            if (nextScoreboardRun <= nowForScoreboard) {
+              nextScoreboardRun.setUTCDate(nextScoreboardRun.getUTCDate() + 7);
+            }
+            const msUntilScoreboard = nextScoreboardRun.getTime() - nowForScoreboard.getTime();
+
+            console.log(
+              `[EngineeringScoreboard] Next run Monday 09:00 UTC (in ${Math.round(msUntilScoreboard / 60000)} min)`,
+            );
+            setTimeout(() => {
+              scheduleNextEngineeringScoreboardRun();
+              if (!isCronEnabled()) return;
+              cronJobRegistry.track('EngineeringScoreboard', runEngineeringScoreboardLoopOnce())
+                .catch(e => console.error('[EngineeringScoreboard] Error:', e));
+            }, msUntilScoreboard);
+          };
+
+          scheduleNextEngineeringScoreboardRun();
+        } catch (error) {
+          console.error('[EngineeringScoreboard] Failed to initialize:', error);
+        }
+      } else {
+        console.log('[EngineeringScoreboard] Disabled (set ENGINEERING_SCOREBOARD_LOOP_ENABLED=true to enable)');
       }
 
       // Generic Layer-5 attribution — daily at 18:00 UTC, after the product

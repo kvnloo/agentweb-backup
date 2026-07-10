@@ -35,6 +35,18 @@ const ZERO_ASSISTANT_REQUEUE_BASE_MS = 15 * 60 * 1000;
 const ZERO_ASSISTANT_REQUEUE_MAX_MS = 2 * 60 * 60 * 1000;
 const ZERO_ASSISTANT_MAX_REQUEUES = 3;
 
+// User-facing fallback shown when a scheduled run terminates with zero assistant
+// output (crash/timeout/context-limit). A silent, empty session reads as a total
+// failure to the user (ENG-209: a 40-competitor report produced no output). This
+// guarantees the session is never left blank — the user always sees a structured
+// "job incomplete" message with a concrete next step (split into smaller batches).
+const SCHEDULED_JOB_INCOMPLETE_MESSAGE =
+  "This scheduled run stopped before it could produce a response, so no results were generated. " +
+  "Large jobs that research many items in a single run — for example, dozens of competitors in one report — " +
+  "can exceed the run's time or memory budget and end without finishing. " +
+  "The run will be retried automatically. If this keeps happening, split the request into smaller batches " +
+  "(fewer items per run) so each run can complete and report its results.";
+
 /**
  * In-memory set of session IDs that are currently generating a response.
  * Used to reject concurrent /generate requests for the same session with 409.
@@ -1631,6 +1643,27 @@ export async function runScheduledChat(
 
     let zeroAssistantRequeuedAt: string | undefined;
     if (zeroAssistantOutput) {
+      // Never leave the session silent (ENG-209). Persist a structured
+      // "job incomplete" assistant message so the user sees graceful feedback
+      // instead of an empty session. Done BEFORE requeue so the failed session
+      // is self-explanatory; the requeue (below) runs in a fresh session.
+      if (sessionId) {
+        try {
+          await chatbotDb.addMessageToSession(sessionId, {
+            role: 'assistant',
+            content: SCHEDULED_JOB_INCOMPLETE_MESSAGE,
+            timestamp: new Date().toISOString(),
+            metadata: {
+              timestamp: new Date().toISOString(),
+              isErrorMessage: true,
+              jobIncomplete: true,
+            },
+          });
+        } catch (persistError) {
+          console.error('Failed to persist job-incomplete message to session:', persistError);
+        }
+      }
+
       console.error('Scheduled chat zero-assistant-output dead-man triggered:', {
         scheduleId: schedule.scheduleId,
         scheduleName: schedule.scheduleName,
@@ -2584,12 +2617,25 @@ export const agentModeController = {
         // Don't report a false failure — tell the user it's still building and post
         // the result back to this session when it finishes. Scoped to landing builds
         // in flight; everything else re-throws to the existing error handling.
-        if (durableLanding && genErr?.isGenerationTimeout) {
+        // NOT gated on DURABLE_LANDING_GENERATION: a real v0 build routinely exceeds the
+        // run's wall-clock budget, and hard-failing it (ENG-189) is wrong regardless of
+        // the multi-site rollout flag. findInFlightJobForSession returns null when no
+        // build is in flight, so non-landing timeouts fall through to the cancel path.
+        if (genErr?.isGenerationTimeout) {
           try {
             const inFlight = await findInFlightJobForSession(session.userId, sessionId);
             if (inFlight) {
-              await markAwaitingReconnect(inFlight.id);
-              attachInProcessCompletion(genPromise, inFlight.id, session.userId, sessionId);
+              // Only bind a completion hook the first time this build's run times out.
+              // markAwaitingReconnect already ran for it, so a prior timeout attached a
+              // hook to THIS build's own genPromise. A second, unrelated generation in the
+              // same session that also times out must NOT re-attach: its genPromise resolves
+              // with different content and would win the exactly-once claimCompletion race,
+              // delivering wrong content and permanently dropping this build's real link
+              // (there is no backstop poller when DURABLE_LANDING_GENERATION is off).
+              if (!inFlight.awaitingReconnect) {
+                await markAwaitingReconnect(inFlight.id);
+                attachInProcessCompletion(genPromise, inFlight.id, session.userId, sessionId);
+              }
               markProgressComplete(sessionId);
               await chatbotDb.addMessageToSession(sessionId, {
                 role: 'assistant',
@@ -2628,6 +2674,7 @@ export const agentModeController = {
         const PAGE_INVALIDATION_MAP: Record<string, string[]> = {
           'update_brand_guidelines': ['brand-guidelines'],
           'update_market_strategy': ['market-strategy'],
+          'regenerate_market_strategy': ['market-strategy', 'brand-guidelines'],
           'update_gtm_plan': ['gtm-plan'],
           'add_gtm_phase': ['gtm-plan'],
           'add_gtm_work_items': ['gtm-plan'],

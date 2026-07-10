@@ -22,6 +22,7 @@ import express from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb } from "../services/db";
 import {
+  buildAutoFailPatchIfStuck,
   buildFailedPatch,
   buildStartPatch,
   logCompletionMetric,
@@ -97,6 +98,37 @@ router.post("/brand-build/start", authenticateToken, async (req, res) => {
       return res.json({ status: snapshot(refreshed || existing || {}) });
     }
 
+    // ENG-238 root-cause guard. Do NOT start a build when no website URL is
+    // resolvable. The dominant brand-build failure class (~77% of failures in
+    // prod telemetry) was a `/start` fired with an empty companyUrl for a user
+    // who had no URL on their record: the status flipped to `building`, the
+    // background trigger's pickCompanyUrl returned null, and it immediately
+    // failed with "no companyUrl on User record" — a dead-on-arrival build
+    // that surfaced as a failure metric and stranded the user at
+    // `brand_submitted`. Resolve the effective URL from the same sources the
+    // trigger uses (body → productDomain → brandGuidelines.brandData.domain →
+    // companyUrl). If none is resolvable, persist any supplied name/goal so
+    // nothing is lost, skip both the status flip and the trigger, and return a
+    // `needsUrl` snapshot so the UI routes to the "no website" path.
+    const ex = existing as any;
+    const effectiveUrl =
+      (typeof body.companyUrl === "string" && body.companyUrl.trim()) ||
+      (typeof ex?.productDomain === "string" && ex.productDomain.trim()) ||
+      (typeof ex?.brandGuidelines?.brandData?.domain === "string" &&
+        ex.brandGuidelines.brandData.domain.trim()) ||
+      (typeof ex?.companyUrl === "string" && ex.companyUrl.trim()) ||
+      "";
+
+    if (!effectiveUrl) {
+      if (Object.keys(inputPatch).length > 0) {
+        await userDb.updateUser(userId, inputPatch as any);
+      }
+      const refreshed = await userDb.getUserById(userId);
+      return res.json({
+        status: { ...snapshot(refreshed || existing || {}), needsUrl: true },
+      });
+    }
+
     const patch: Record<string, unknown> = {
       ...buildStartPatch(),
       ...inputPatch,
@@ -148,6 +180,52 @@ router.get("/brand-build/status", authenticateToken, async (req, res) => {
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
+
+    // Watchdog: a build orphaned by a lost fire-and-forget job (deploy /
+    // instance recycle / crash) stays `building` forever, leaving the UI on an
+    // infinite spinner. On read, force-fail any build past the hard wall so the
+    // user gets a visible error + retry instead of a silent stuck state, and so
+    // long-stuck users (the `brand_submitted` cohort) are reset on next poll.
+    const autoFail = buildAutoFailPatchIfStuck(user as any);
+    if (autoFail) {
+      // `getUserById` reads the eventually-consistent UserIdIndex GSI, which
+      // can lag a just-written terminal status by ~100-1000ms (see
+      // getUserByEmailConsistent docs / the 2026-04-27 Maya regen-stuck bug).
+      // Force-failing off that stale read could clobber a build that actually
+      // just completed `ready`, flipping a success into a spurious failure the
+      // user then sees as "This step failed". Before writing, re-read the row
+      // with a strongly-consistent GetItem and re-derive the stuck check from
+      // that authoritative view. If the fresh read is no longer stuck (the
+      // build resolved), trust it and return without clobbering.
+      const authEmail = (authReq.user as any)?.email || (user as any)?.email;
+      const fresh = authEmail
+        ? await userDb.getUserByEmailConsistent(authEmail)
+        : null;
+      if (fresh) {
+        const freshAutoFail = buildAutoFailPatchIfStuck(fresh as any);
+        if (!freshAutoFail) {
+          return res.json({ status: snapshot(fresh as any) });
+        }
+        await userDb.updateUser(userId, freshAutoFail as any);
+        logCompletionMetric(
+          userId,
+          "failed",
+          freshAutoFail.brandBuildDurationMs ?? 0
+        );
+        const refreshed = await userDb.getUserById(userId);
+        return res.json({
+          status: snapshot(refreshed || (freshAutoFail as any)),
+        });
+      }
+      // No authoritative consistent re-read available (no email to key the
+      // strongly-consistent GetItem, or it came back empty). We deliberately do
+      // NOT force-fail off the eventually-consistent GSI read here: that could
+      // clobber a build that actually just completed `ready` (the ~100-1000ms
+      // GSI lag the guard above exists to close). Return the current view
+      // unchanged; the next poll — which carries the JWT email — resolves it.
+      return res.json({ status: snapshot(user) });
+    }
+
     return res.json({ status: snapshot(user) });
   } catch (err) {
     console.error("[brandBuild] status failed", err);

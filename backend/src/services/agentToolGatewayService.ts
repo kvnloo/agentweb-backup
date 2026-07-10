@@ -223,6 +223,46 @@ function errorHead(error: unknown): string {
   return message.slice(0, ERROR_KEY_LENGTH);
 }
 
+// ENG-182: LinkedIn per-recipient write actions carry a recipient identity in
+// their args. Keyed on (tool, error-head) alone, a terminal per-recipient refusal
+// ("Cannot resend yet" — an upstream_rejected fast-trip class, threshold 2) from
+// two DIFFERENT profiles trips the breaker for linkedin_outreach as a whole, then
+// blocks send-invite to genuinely different recipients that were never attempted.
+// Isolate the failure accounting per recipient so a "already invited" for profile
+// A does not block an invite to profile B. Every other tool (and any LinkedIn
+// action without a recipient, e.g. search-people) returns '' — a single shared
+// scope, exactly preserving the prior per-tool behavior.
+//
+// send-invite/send-message/send-inmail identify the recipient by profile_url or
+// provider_id; accept-invitation/cancel-invitation identify it by invitation_id
+// (see agentModeService.ts). Read whichever this action actually carries so every
+// allowlisted action resolves to a real per-recipient scope instead of ''.
+const LINKEDIN_RECIPIENT_ACTIONS = new Set([
+  'send-invite',
+  'send-message',
+  'send-inmail',
+  'cancel-invitation',
+  'accept-invitation',
+]);
+
+function failureScope(toolName: string, args: unknown): string {
+  if (toolName !== 'linkedin_outreach') return '';
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
+  const record = args as Record<string, unknown>;
+  const action = typeof record.action === 'string' ? record.action.toLowerCase() : '';
+  if (!LINKEDIN_RECIPIENT_ACTIONS.has(action)) return '';
+  const target = typeof record.profile_url === 'string' && record.profile_url.trim()
+    ? record.profile_url
+    : typeof record.provider_id === 'string' && record.provider_id.trim()
+    ? record.provider_id
+    : typeof record.invitation_id === 'string' && record.invitation_id.trim()
+    ? record.invitation_id
+    : '';
+  // Normalize so the same recipient with a trailing slash or query params
+  // (LinkedIn appends miniProfileUrn tracking) collapses to one scope.
+  return target.trim().toLowerCase().split('?')[0].replace(/\/+$/, '').slice(0, ERROR_KEY_LENGTH);
+}
+
 function getRunCounts(runId: string): Map<string, number> {
   let counts = runFailureCounts.get(runId);
   if (!counts) {
@@ -260,12 +300,17 @@ function failureThresholdFor(errorMessageHead: string): number {
     : REPEATED_FAILURE_THRESHOLD;
 }
 
-/** Sum this tool's failures whose stored error head classifies as `timeout`,
- * regardless of the exact wording (ENG-167). Returns null when there are none. */
-function countTimeoutFailures(runId: string, toolName: string): { count: number; errorMessage: string } | null {
-  const counts = runFailureCounts.get(runId);
+/** Sum this tool's failures (within one recipient scope, ENG-182) whose stored
+ * error head classifies as `timeout`, regardless of the exact wording (ENG-167).
+ * Returns null when there are none. */
+function countTimeoutFailures(
+  id: string,
+  toolName: string,
+  scope: string,
+): { count: number; errorMessage: string } | null {
+  const counts = runFailureCounts.get(id);
   if (!counts) return null;
-  const prefix = `${toolName}\0`;
+  const prefix = `${toolName}\0${scope}\0`;
   let total = 0;
   let sampleMessage = '';
   for (const [key, count] of counts) {
@@ -281,13 +326,14 @@ function countTimeoutFailures(runId: string, toolName: string): { count: number;
 function findTrippedFailure(
   runId: string,
   toolName: string,
+  scope: string,
 ): { count: number; errorMessage: string; reason: 'repeated' | 'timeout' } | null {
   const counts = runFailureCounts.get(runId);
   if (!counts) return null;
-  const prefix = `${toolName}\0`;
+  const prefix = `${toolName}\0${scope}\0`;
   // Timeout aggregate first so a spiral of same-tool timeouts (identical OR varied
   // wording) yields the timeout-specific stop guidance instead of the generic one.
-  const timeoutAgg = countTimeoutFailures(runId, toolName);
+  const timeoutAgg = countTimeoutFailures(runId, toolName, scope);
   if (timeoutAgg && timeoutAgg.count >= TIMEOUT_FAILURE_THRESHOLD) {
     return { ...timeoutAgg, reason: 'timeout' };
   }
@@ -308,8 +354,9 @@ function findTrippedFailure(
 function findTrippedSessionTimeout(
   budgetScopeId: string,
   toolName: string,
+  scope: string,
 ): { count: number; errorMessage: string; reason: 'timeout' } | null {
-  const timeoutAgg = countTimeoutFailures(budgetScopeId, toolName);
+  const timeoutAgg = countTimeoutFailures(budgetScopeId, toolName, scope);
   if (timeoutAgg && timeoutAgg.count >= SESSION_TIMEOUT_FAILURE_THRESHOLD) {
     return { ...timeoutAgg, reason: 'timeout' };
   }
@@ -347,16 +394,21 @@ function findTrippedBudget(runId: string, toolName: string): { count: number; bu
   return count >= budget ? { count, budget } : null;
 }
 
-function recordToolFailure(runId: string, toolName: string, error: unknown): void {
+function recordToolFailure(runId: string, toolName: string, args: unknown, error: unknown): void {
   const counts = getRunCounts(runId);
-  const key = `${toolName}\0${errorHead(error)}`;
+  const key = `${toolName}\0${failureScope(toolName, args)}\0${errorHead(error)}`;
   counts.set(key, (counts.get(key) ?? 0) + 1);
 }
 
-function clearToolFailures(runId: string, toolName: string): void {
+function clearToolFailures(runId: string, toolName: string, args: unknown): void {
   const counts = runFailureCounts.get(runId);
   if (!counts) return;
-  const prefix = `${toolName}\0`;
+  // ENG-182: scope the clear to the SAME recipient that succeeded. A tool-wide
+  // clear (prefix `${toolName}\0`) would let a success for recipient B wipe a
+  // tripped/pending breaker for an unrelated recipient A, re-enabling the wasted
+  // retries the per-recipient isolation exists to prevent. Non-recipient tools
+  // resolve to scope '' — prefix `${toolName}\0\0` — preserving prior behavior.
+  const prefix = `${toolName}\0${failureScope(toolName, args)}\0`;
   for (const key of counts.keys()) {
     if (key.startsWith(prefix)) counts.delete(key);
   }
@@ -706,12 +758,14 @@ export async function executeAgentToolThroughGateway(
       };
     }
 
+    const recipientScope = failureScope(policyDecision.toolName, input.args);
+
     // Session-scoped timeout aggregate first (ENG-167 follow-up) — a tool that's
     // timed out repeatedly across earlier runs in this session should fail fast
     // here, before ever reaching the run-scoped check below (which only ever sees
     // this one run and would let a fresh runId through with a zeroed counter).
     if (input.budgetScopeId && input.budgetScopeId !== input.runId) {
-      const trippedSession = findTrippedSessionTimeout(input.budgetScopeId, policyDecision.toolName);
+      const trippedSession = findTrippedSessionTimeout(input.budgetScopeId, policyDecision.toolName, recipientScope);
       if (trippedSession) {
         return {
           status: 'error',
@@ -729,7 +783,7 @@ export async function executeAgentToolThroughGateway(
       }
     }
 
-    const tripped = findTrippedFailure(input.runId, policyDecision.toolName);
+    const tripped = findTrippedFailure(input.runId, policyDecision.toolName, recipientScope);
     if (tripped) {
       return {
         status: 'error',
@@ -757,13 +811,13 @@ export async function executeAgentToolThroughGateway(
     // failure exactly like the catch path; do NOT clear prior failure counts.
     const structuredFailure = toolResultError(result);
     if (structuredFailure) {
-      if (input.runId) recordToolFailure(input.runId, policyDecision.toolName, structuredFailure);
+      if (input.runId) recordToolFailure(input.runId, policyDecision.toolName, input.args, structuredFailure);
       if (
         input.budgetScopeId
         && input.budgetScopeId !== input.runId
         && shouldTrackInSessionScope(policyDecision.toolName, structuredFailure)
       ) {
-        recordToolFailure(input.budgetScopeId, policyDecision.toolName, structuredFailure);
+        recordToolFailure(input.budgetScopeId, policyDecision.toolName, input.args, structuredFailure);
       }
       // Keep returning status:'success' with the result so the dispatcher's
       // downgrade (toolDispatch.ts) carries the structured payload to the model.
@@ -776,9 +830,9 @@ export async function executeAgentToolThroughGateway(
         durationMs: Math.max(0, now() - startedAt),
       };
     }
-    if (input.runId) clearToolFailures(input.runId, policyDecision.toolName);
+    if (input.runId) clearToolFailures(input.runId, policyDecision.toolName, input.args);
     if (input.budgetScopeId && input.budgetScopeId !== input.runId) {
-      clearToolFailures(input.budgetScopeId, policyDecision.toolName);
+      clearToolFailures(input.budgetScopeId, policyDecision.toolName, input.args);
     }
     // ENG-167 follow-up: remember a successful report_product_issues call for the
     // rest of this run so a later timeout stop-message doesn't tell the model to
@@ -793,13 +847,13 @@ export async function executeAgentToolThroughGateway(
       durationMs: Math.max(0, now() - startedAt),
     };
   } catch (error) {
-    if (input.runId) recordToolFailure(input.runId, policyDecision.toolName, error);
+    if (input.runId) recordToolFailure(input.runId, policyDecision.toolName, input.args, error);
     if (
       input.budgetScopeId
       && input.budgetScopeId !== input.runId
       && shouldTrackInSessionScope(policyDecision.toolName, error)
     ) {
-      recordToolFailure(input.budgetScopeId, policyDecision.toolName, error);
+      recordToolFailure(input.budgetScopeId, policyDecision.toolName, input.args, error);
     }
     return {
       status: 'error',
@@ -1100,21 +1154,14 @@ function isNonEmptyString(value: unknown): boolean {
 }
 
 function validateSemanticToolContract(toolName: string, args: Record<string, unknown>): AgentToolContractIssue[] {
-  if (toolName === 'linkedin_outreach') {
-    if (args.action !== 'send-invite') return [];
-    if (typeof args.message !== 'string') return [];
-
-    const conservativeInviteLimit = 200;
-    if (args.message.length <= conservativeInviteLimit) return [];
-
-    return [{
-      code: 'invalid_args',
-      path: '$.message',
-      message:
-        `LinkedIn send-invite notes must be ${conservativeInviteLimit} characters or fewer for Agent Mode. ` +
-        `This note is ${args.message.length} characters. Rewrite it as a complete shorter note before retrying.`,
-    }];
-  }
+  // ENG-243: intentionally NO length gate on linkedin_outreach send-invite notes.
+  // The send path (LinkedInOutreachService.sendInvitation) resolves the account's
+  // tier limit (200 free / 300 Premium) and auto-trims the note on a word boundary,
+  // so a send never fails on length. Hard-rejecting an over-limit note here instead
+  // produced repeated invalid_args failures (a fast-trip error class) that tripped
+  // the anti-loop breaker after 2 attempts and sent 0 invites — and it contradicts
+  // the tool description, which promises the backend auto-trims. The gateway cannot
+  // know the account tier synchronously, so trimming is deferred to that send path.
 
   // ENG-106: the send_email_from_sender schema can only mark `to`/`subject`
   // required — the body is a 3-way alternative (html OR text OR body) the

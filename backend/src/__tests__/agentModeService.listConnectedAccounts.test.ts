@@ -131,4 +131,33 @@ describe('AgentModeService.listConnectedAccounts', () => {
     expect(unipileAccount.is_active).toBe(false);
     expect(gmailAccount.is_active).toBe(true);
   });
+
+  it('surfaces a connected google_ads account with its customer_id and currency', async () => {
+    mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
+      {
+        platform: 'google_ads',
+        account_id: '9030368888',
+        account_name: 'xCures',
+        config: {
+          account_type: 'google_ads',
+          customer_id: '9030368888',
+          currency: 'USD',
+          token_expires_at: Date.now() - 1000, // expired access token, but refresh_token present
+          refresh_token: 'refresh-token-value',
+        },
+      },
+    ]);
+    mockIsTokenValid.mockResolvedValue(true);
+
+    const result = await service.listConnectedAccounts('user-1', 'google_ads');
+
+    expect(result.success).toBe(true);
+    expect(result.accounts).toHaveLength(1);
+    expect(result.accounts[0]).toMatchObject({
+      platform: 'google_ads',
+      customer_id: '9030368888',
+      currency: 'USD',
+      is_active: true,
+    });
+  });
 });
