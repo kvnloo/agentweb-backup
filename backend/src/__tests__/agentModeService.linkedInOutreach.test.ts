@@ -765,7 +765,63 @@ describe('AgentModeService - LinkedIn Outreach', () => {
         'provider-abc',
         false,
         'Hi, let us connect!',
-        200
+        200,
+        { onNoteQuota: 'skip' }
+      );
+    });
+
+    // ENG-213: default policy is to HOLD (not silently drop the note) when the
+    // account's monthly personalized-note quota is spent.
+    it("defaults onNoteQuota to 'skip' (hold) when on_note_quota is not provided", async () => {
+      mockSendInvitation.mockResolvedValue({ id: 'invite-123' });
+      mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+
+      await service.linkedinOutreach('user-1', {
+        action: 'send-invite',
+        account_id: 'test-account-id',
+        provider_id: 'provider-abc',
+        message: 'Hi, let us connect!',
+      });
+
+      expect(mockSendInvitation).toHaveBeenCalledWith(
+        'test-account-id', 'provider-abc', false, 'Hi, let us connect!', 200, { onNoteQuota: 'skip' },
+      );
+    });
+
+    it('returns a requiresDecision gate (does not decide) when the note quota is held', async () => {
+      mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+      const held: any = new Error('LinkedIn note quota reached — the personalized note could not be attached.');
+      held.noteQuotaExceeded = true;
+      mockSendInvitation.mockRejectedValue(held);
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'send-invite',
+        account_id: 'test-account-id',
+        provider_id: 'provider-abc',
+        message: 'A deliberately personalised note',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.requiresDecision).toBe(true);
+      expect(result.noteQuotaExceeded).toBe(true);
+      expect(result.error).toMatch(/without the note|skip/i);
+    });
+
+    it("re-call with on_note_quota='send_without_note' authorizes a note-less send", async () => {
+      mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+      mockSendInvitation.mockResolvedValue({ id: 'invite-123', note_dropped: true });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'send-invite',
+        account_id: 'test-account-id',
+        provider_id: 'provider-abc',
+        message: 'A personalised note',
+        on_note_quota: 'send_without_note',
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockSendInvitation).toHaveBeenCalledWith(
+        'test-account-id', 'provider-abc', false, 'A personalised note', 200, { onNoteQuota: 'send_without_note' },
       );
     });
 
