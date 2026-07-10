@@ -1,6 +1,6 @@
 import { getAzureClient } from '../utils/llmClients';
 import { searchPlatformKnowledgeBase } from './chatbotService';
-import { meterUserUsage } from './usageRecorderService';
+import { meterUserUsage, recordUsage } from './usageRecorderService';
 
 export interface GrowthGeniusMessage {
   id: string;
@@ -90,11 +90,11 @@ Remember: You're here to help startups and businesses grow through smart marketi
     }
   }
 
-  async generateSessionTitle(userMessage: string): Promise<string> {
+  async generateSessionTitle(userMessage: string, userId?: string): Promise<string> {
     try {
       console.log('GrowthGenius: Generating session title for message:', userMessage);
 
-      const response = await this.client().chat.completions.create({
+      const response = await this.client(userId).chat.completions.create({
         model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
         messages: [
           {
@@ -104,6 +104,17 @@ Remember: You're here to help startups and businesses grow through smart marketi
           { role: 'user', content: userMessage.slice(0, 500) }
         ],
         max_completion_tokens: 20
+      });
+
+      // Burn-only: count this cheap title call in the user's burn for visibility,
+      // but do NOT deduct it from quota (the real Growth Genius turn deducts).
+      recordUsage({
+        userId,
+        model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
+        provider: 'azure',
+        feature: 'growth_genius_title',
+        inputTokens: (response as any)?.usage?.prompt_tokens || 0,
+        outputTokens: (response as any)?.usage?.completion_tokens || 0,
       });
 
       const raw = response.choices[0]?.message?.content?.trim() || '';
