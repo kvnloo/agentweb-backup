@@ -15,7 +15,7 @@ jest.mock('../services/skillService', () => ({
       skillId: 'mock-skill-id',
       name: 'Meeting Intelligence',
       description: 'test',
-      toolNames: ['fathom_get_meetings', 'fathom_get_transcript'],
+      toolNames: ['fathom_get_meetings', 'fathom_get_transcript', 'fathom_get_onboarding_context'],
       isPublished: true,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -86,10 +86,15 @@ describe('AgentModeService - Fathom Tool Access', () => {
       expect(AgentModeService.DEFAULT_FOUNDATION_TOOLS).toContain('fathom_get_transcript');
     });
 
+    it('should include fathom_get_onboarding_context in default foundation tools', () => {
+      expect(AgentModeService.DEFAULT_FOUNDATION_TOOLS).toContain('fathom_get_onboarding_context');
+    });
+
     it('should have Fathom tools in the runtime FOUNDATION_TOOLS set after reset', () => {
       const foundationTools = agentModeService.getFoundationToolNames();
       expect(foundationTools.has('fathom_get_meetings')).toBe(true);
       expect(foundationTools.has('fathom_get_transcript')).toBe(true);
+      expect(foundationTools.has('fathom_get_onboarding_context')).toBe(true);
     });
 
     it('should load Fathom tools into FOUNDATION_TOOLS on loadFoundationTools fallback', async () => {
@@ -97,6 +102,7 @@ describe('AgentModeService - Fathom Tool Access', () => {
       const tools = agentModeService.getFoundationToolNames();
       expect(tools.has('fathom_get_meetings')).toBe(true);
       expect(tools.has('fathom_get_transcript')).toBe(true);
+      expect(tools.has('fathom_get_onboarding_context')).toBe(true);
     });
   });
 
@@ -108,6 +114,7 @@ describe('AgentModeService - Fathom Tool Access', () => {
       expect(meetingSkill).toBeDefined();
       expect(meetingSkill!.toolNames).toContain('fathom_get_meetings');
       expect(meetingSkill!.toolNames).toContain('fathom_get_transcript');
+      expect(meetingSkill!.toolNames).toContain('fathom_get_onboarding_context');
       expect(meetingSkill!.category).toBe('tool_bundle');
     });
 
@@ -119,7 +126,7 @@ describe('AgentModeService - Fathom Tool Access', () => {
       expect(skillService.createSkill).toHaveBeenCalledWith(
         'Meeting Intelligence',
         expect.stringContaining('Fathom'),
-        ['fathom_get_meetings', 'fathom_get_transcript'],
+        ['fathom_get_meetings', 'fathom_get_transcript', 'fathom_get_onboarding_context'],
         undefined,
         true
       );
@@ -137,7 +144,7 @@ describe('AgentModeService - Fathom Tool Access', () => {
           skillId: 'existing-id',
           name: 'Meeting Intelligence',
           description: 'Already exists',
-          toolNames: ['fathom_get_meetings', 'fathom_get_transcript'],
+          toolNames: ['fathom_get_meetings', 'fathom_get_transcript', 'fathom_get_onboarding_context'],
           isPublished: true,
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
@@ -180,6 +187,10 @@ describe('AgentModeService - Fathom Tool Access', () => {
       const funcName2 = 'fathom_get_transcript';
       const isAllowed2 = foundationTools.has(funcName2);
       expect(isAllowed2).toBe(true);
+
+      const funcName3 = 'fathom_get_onboarding_context';
+      const isAllowed3 = foundationTools.has(funcName3);
+      expect(isAllowed3).toBe(true);
     });
   });
 });

@@ -4,13 +4,13 @@
  */
 
 import { AgentModeService } from '../services/agentModeService';
-import { installWorkerSignalGuards } from './workerSignalGuards';
+import { installWorkerShutdownGuards } from './workerShutdownGuards';
 
-// Ignore process-group SIGTERM/SIGINT so an instance-termination signal (EB
-// deploy, autoscaling replacement, health-check restart) broadcast to the whole
-// group cannot abort an in-flight run mid-execution. The parent orchestrates
-// shutdown via a graceful drain and an explicit SIGKILL (ENG-202).
-installWorkerSignalGuards();
+// Survive the OS process-group/cgroup SIGTERM on deploy so an in-flight scheduled run
+// isn't aborted before the parent's drain can let it finish (ENG-201). The parent is the
+// sole authority on worker termination (SIGKILL after drain); we exit only on IPC
+// disconnect. Install before any heavy init so the guards are active immediately.
+installWorkerShutdownGuards();
 
 // Initialize the service
 const agentModeService = new AgentModeService();

@@ -394,8 +394,8 @@ describe('Worker uncaught error requestId', () => {
     expect(workerSource).toMatch(/currentRequestId\s*=\s*requestId/);
   });
 
-  it('should wire installWorkerSignalGuards() at module load (ENG-202)', async () => {
-    // The signal guards (ignore process-group SIGTERM/SIGINT) must be installed
+  it('should wire installWorkerShutdownGuards() at module load (ENG-202)', async () => {
+    // The shutdown guards (ignore process-group SIGTERM/SIGINT) must be installed
     // when the worker module loads, not merely imported — accidental removal of
     // the call would silently reintroduce the mid-run crash on instance teardown.
     const fs = await import('fs');
@@ -405,8 +405,8 @@ describe('Worker uncaught error requestId', () => {
     );
 
     // The guards helper must be imported...
-    expect(workerSource).toMatch(/installWorkerSignalGuards/);
+    expect(workerSource).toMatch(/installWorkerShutdownGuards/);
     // ...and actually invoked at module load (not just referenced in a comment).
-    expect(workerSource).toMatch(/installWorkerSignalGuards\(\)/);
+    expect(workerSource).toMatch(/installWorkerShutdownGuards\(\)/);
   });
 });

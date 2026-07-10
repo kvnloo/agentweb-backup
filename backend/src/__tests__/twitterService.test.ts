@@ -1,0 +1,1012 @@
+/**
+ * Unit tests for TwitterService (official X API v2 via twitter-api-v2).
+ * Covers: token auto-refresh, char-limit trimming, missing/unconnected account,
+ * and happy paths for postTweet / reply / sendDm / getProfile / listDms.
+ */
+
+// ─── Mock twitter-api-v2 ──────────────────────────────────────────────────────
+const mockTweet = jest.fn();
+const mockTweets = jest.fn();
+const mockSearch = jest.fn();
+const mockQuote = jest.fn();
+const mockTweetRetweetedBy = jest.fn();
+const mockTweetLikedBy = jest.fn();
+const mockQuotes = jest.fn();
+const mockBlock = jest.fn();
+const mockUnblock = jest.fn();
+const mockMute = jest.fn();
+const mockUnmute = jest.fn();
+const mockFollow = jest.fn();
+const mockUnfollow = jest.fn();
+const mockFollowers = jest.fn();
+const mockFollowing = jest.fn();
+const mockBookmark = jest.fn();
+const mockBookmarks = jest.fn();
+const mockListDmEventsWithParticipant = jest.fn();
+const mockReply = jest.fn();
+const mockTweetThread = jest.fn();
+const mockSendDmToParticipant = jest.fn();
+const mockUserByUsername = jest.fn();
+const mockListDmEvents = jest.fn();
+const mockDeleteTweet = jest.fn();
+const mockUserTimeline = jest.fn();
+const mockRefreshOAuth2Token = jest.fn();
+
+// Records how TwitterApi was constructed so tests can assert which token was used.
+const twitterApiConstructorArgs: any[] = [];
+
+jest.mock('twitter-api-v2', () => ({
+  TwitterApi: jest.fn().mockImplementation((arg: any) => {
+    twitterApiConstructorArgs.push(arg);
+    return {
+      refreshOAuth2Token: (...a: any[]) => mockRefreshOAuth2Token(...a),
+      v2: {
+        tweet: (...a: any[]) => mockTweet(...a),
+        tweets: (...a: any[]) => mockTweets(...a),
+        search: (...a: any[]) => mockSearch(...a),
+        quote: (...a: any[]) => mockQuote(...a),
+        tweetRetweetedBy: (...a: any[]) => mockTweetRetweetedBy(...a),
+        tweetLikedBy: (...a: any[]) => mockTweetLikedBy(...a),
+        quotes: (...a: any[]) => mockQuotes(...a),
+        block: (...a: any[]) => mockBlock(...a),
+        unblock: (...a: any[]) => mockUnblock(...a),
+        mute: (...a: any[]) => mockMute(...a),
+        unmute: (...a: any[]) => mockUnmute(...a),
+        follow: (...a: any[]) => mockFollow(...a),
+        unfollow: (...a: any[]) => mockUnfollow(...a),
+        followers: (...a: any[]) => mockFollowers(...a),
+        following: (...a: any[]) => mockFollowing(...a),
+        bookmark: (...a: any[]) => mockBookmark(...a),
+        bookmarks: (...a: any[]) => mockBookmarks(...a),
+        listDmEventsWithParticipant: (...a: any[]) => mockListDmEventsWithParticipant(...a),
+        reply: (...a: any[]) => mockReply(...a),
+        tweetThread: (...a: any[]) => mockTweetThread(...a),
+        sendDmToParticipant: (...a: any[]) => mockSendDmToParticipant(...a),
+        userByUsername: (...a: any[]) => mockUserByUsername(...a),
+        listDmEvents: (...a: any[]) => mockListDmEvents(...a),
+        deleteTweet: (...a: any[]) => mockDeleteTweet(...a),
+        userTimeline: (...a: any[]) => mockUserTimeline(...a),
+      },
+    };
+  }),
+}), { virtual: true });
+
+// ─── Mock secretsManager ──────────────────────────────────────────────────────
+jest.mock('../utils/secretsManager', () => ({
+  getTwitterCredentials: jest.fn().mockResolvedValue({ clientId: 'cid', clientSecret: 'csecret' }),
+}));
+
+// ─── Mock connectedAccountsDb ─────────────────────────────────────────────────
+const mockGetAccountsByUserId = jest.fn();
+const mockUpdateAccountTokens = jest.fn();
+const mockUpdateAccountConfig = jest.fn();
+jest.mock('../services/connectedAccountsDb', () => ({
+  getAccountsByUserId: (...a: any[]) => mockGetAccountsByUserId(...a),
+  updateAccountTokens: (...a: any[]) => mockUpdateAccountTokens(...a),
+  updateAccountConfig: (...a: any[]) => mockUpdateAccountConfig(...a),
+}));
+
+import { twitterService } from '../services/twitterService';
+
+const ACCOUNT_ID = 'tw-acct-1';
+const OWNER = 'user-1';
+
+const makeAccount = (overrides: any = {}) => ({
+  platform: 'twitter',
+  account_id: ACCOUNT_ID,
+  account_name: '@handle',
+  config: {
+    account_type: 'personal',
+    twitter_user_id: '12345',
+    username: 'handle',
+    access_token: 'access-old',
+    refresh_token: 'refresh-old',
+    token_expires_at: Date.now() + 60 * 60 * 1000, // valid: 1h out
+    scopes: ['tweet.read', 'tweet.write', 'dm.read', 'dm.write', 'users.read', 'offline.access'],
+    ...overrides,
+  },
+  created_at: '2026-06-23T00:00:00.000Z',
+  updated_at: '2026-06-23T00:00:00.000Z',
+});
+
+// Convenience: build an error that looks like an X API 401 response. Mirrors the real
+// twitter-api-v2 ApiResponseError shape, which exposes the HTTP status as `.code`
+// (there is no `.statusCode` property on that class).
+const makeXAuthError = () => Object.assign(new Error('Unauthorized'), { code: 401 });
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  twitterApiConstructorArgs.length = 0;
+  mockTweet.mockResolvedValue({ data: { id: '111', text: 'hi' } });
+  mockReply.mockResolvedValue({ data: { id: '222', text: 'reply' } });
+  mockTweetThread.mockResolvedValue([{ data: { id: 't1', text: 'a' } }, { data: { id: 't2', text: 'b' } }]);
+  mockSendDmToParticipant.mockResolvedValue({ dm_conversation_id: 'c1', dm_event_id: 'e1' });
+  mockUserByUsername.mockResolvedValue({ data: { id: '999', username: 'target', name: 'Target' } });
+  mockListDmEvents.mockResolvedValue({ data: { data: [{ id: 'dm1', text: 'yo' }] } });
+  mockRefreshOAuth2Token.mockResolvedValue({ accessToken: 'access-new', refreshToken: 'refresh-new', expiresIn: 7200 });
+  mockUpdateAccountConfig.mockResolvedValue(undefined);
+  mockDeleteTweet.mockResolvedValue({ data: { deleted: true } });
+  mockUserTimeline.mockResolvedValue({ data: { data: [{ id: 'ut1', text: 'mine' }] } });
+});
+
+// ─── FAIL cases ───────────────────────────────────────────────────────────────
+
+describe('TwitterService.getClient — failure paths', () => {
+  it('throws when the user has no twitter account', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([]);
+    await expect(twitterService.getClient(OWNER, ACCOUNT_ID)).rejects.toThrow(/no.*twitter|not connected|no twitter account/i);
+  });
+
+  it('throws when the requested accountId is not found', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    await expect(twitterService.getClient(OWNER, 'does-not-exist')).rejects.toThrow();
+  });
+});
+
+describe('TwitterService.postTweet — validation', () => {
+  it('rejects empty tweet text', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    await expect(twitterService.postTweet(OWNER, ACCOUNT_ID, '   ')).rejects.toThrow(/empty|text/i);
+  });
+
+  it('trims tweet longer than 280 chars on a word boundary', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    const longText = 'word '.repeat(100).trim(); // 100 words, 599 chars
+    await twitterService.postTweet(OWNER, ACCOUNT_ID, longText);
+    const sent = mockTweet.mock.calls[0][0];
+    expect(sent.length).toBeLessThanOrEqual(280);
+    expect(sent.endsWith('word')).toBe(true); // no partial word at the end
+  });
+});
+
+describe('TwitterService.sendDm — validation', () => {
+  it('trims DM longer than 10000 chars', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    const longDm = 'a'.repeat(10050);
+    await twitterService.sendDm(OWNER, ACCOUNT_ID, 'target', longDm);
+    const [, payload] = mockSendDmToParticipant.mock.calls[0];
+    expect(payload.text.length).toBeLessThanOrEqual(10000);
+  });
+});
+
+// ─── Token refresh ────────────────────────────────────────────────────────────
+
+describe('TwitterService.getClient — token refresh', () => {
+  it('refreshes and persists when the access token is expired', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount({ token_expires_at: Date.now() - 1000 })]);
+    await twitterService.getClient(OWNER, ACCOUNT_ID);
+    expect(mockRefreshOAuth2Token).toHaveBeenCalledWith('refresh-old');
+    expect(mockUpdateAccountTokens).toHaveBeenCalledWith(
+      OWNER,
+      'twitter',
+      expect.objectContaining({ access_token: 'access-new', refresh_token: 'refresh-new' }),
+      ACCOUNT_ID
+    );
+    // The returned user client must be built with the NEW token.
+    expect(twitterApiConstructorArgs).toContain('access-new');
+  });
+
+  it('does NOT refresh when the access token is still valid', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    await twitterService.getClient(OWNER, ACCOUNT_ID);
+    expect(mockRefreshOAuth2Token).not.toHaveBeenCalled();
+    expect(mockUpdateAccountTokens).not.toHaveBeenCalled();
+    expect(twitterApiConstructorArgs).toContain('access-old');
+  });
+});
+
+// ─── Happy paths ──────────────────────────────────────────────────────────────
+
+describe('TwitterService — happy paths', () => {
+  beforeEach(() => mockGetAccountsByUserId.mockResolvedValue([makeAccount()]));
+
+  it('postTweet posts and returns the created id', async () => {
+    const res = await twitterService.postTweet(OWNER, ACCOUNT_ID, 'hello world');
+    expect(mockTweet).toHaveBeenCalledWith('hello world');
+    expect(res.id).toBe('111');
+  });
+
+  it('postTweet with inReplyToTweetId uses reply()', async () => {
+    const res = await twitterService.postTweet(OWNER, ACCOUNT_ID, 'a reply', { inReplyToTweetId: '555' });
+    expect(mockReply).toHaveBeenCalledWith('a reply', '555');
+    expect(res.id).toBe('222');
+  });
+
+  it('postThread posts the first tweet then chains replies to the previous id', async () => {
+    const res = await twitterService.postThread(OWNER, ACCOUNT_ID, ['a', 'b']);
+    expect(mockTweet).toHaveBeenCalledWith('a');         // first entry is a root tweet
+    expect(mockReply).toHaveBeenCalledWith('b', '111');  // second entry replies to the first tweet's id
+    expect(mockTweetThread).not.toHaveBeenCalled();      // must NOT use the non-idempotent whole-thread call
+    expect(res).toHaveLength(2);
+    expect(res[0].id).toBe('111');
+    expect(res[1].id).toBe('222');
+  });
+
+  it('sendDm resolves handle then sends to participant id', async () => {
+    const res = await twitterService.sendDm(OWNER, ACCOUNT_ID, '@target', 'hey');
+    expect(mockUserByUsername).toHaveBeenCalledWith('target'); // leading @ stripped
+    expect(mockSendDmToParticipant).toHaveBeenCalledWith('999', { text: 'hey' });
+    expect(res.dm_conversation_id).toBe('c1');
+  });
+
+  it('getProfile returns the resolved user data', async () => {
+    const res = await twitterService.getProfile(OWNER, ACCOUNT_ID, '@target');
+    expect(mockUserByUsername).toHaveBeenCalled();
+    expect(res.id).toBe('999');
+  });
+
+  it('getProfile requests public_metrics and bio fields so follower count is populated', async () => {
+    await twitterService.getProfile(OWNER, ACCOUNT_ID, '@target');
+    // Without user.fields, the X API returns only id/name/username — never the
+    // follower count or bio. Assert we ask for the richer fields.
+    expect(mockUserByUsername).toHaveBeenCalledWith(
+      'target',
+      expect.objectContaining({
+        'user.fields': expect.arrayContaining(['public_metrics', 'description']),
+      })
+    );
+  });
+
+  it('listDms returns dm events', async () => {
+    const res = await twitterService.listDms(OWNER, ACCOUNT_ID);
+    expect(mockListDmEvents).toHaveBeenCalled();
+    expect(Array.isArray(res)).toBe(true);
+  });
+});
+
+describe('TwitterService.isAccountConnected', () => {
+  it('true when a twitter account exists', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    await expect(twitterService.isAccountConnected(OWNER)).resolves.toBe(true);
+  });
+
+  it('false when no twitter account exists', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([]);
+    await expect(twitterService.isAccountConnected(OWNER)).resolves.toBe(false);
+  });
+});
+
+// ─── Option 1: needs_reconnect hardening ─────────────────────────────────────
+
+describe('TwitterService.getClient — needs_reconnect fast-fail', () => {
+  it('throws immediately without attempting a refresh when needs_reconnect is true', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount({ needs_reconnect: true })]);
+    await expect(twitterService.getClient(OWNER, ACCOUNT_ID)).rejects.toThrow(/reconnect/i);
+    expect(mockRefreshOAuth2Token).not.toHaveBeenCalled();
+  });
+});
+
+describe('TwitterService.getClient — marks needs_reconnect on refresh failure', () => {
+  it('sets needs_reconnect and throws a reconnect message when pre-emptive refresh fails', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ token_expires_at: Date.now() - 1000 }),
+    ]);
+    mockRefreshOAuth2Token.mockRejectedValue(new Error('invalid_grant'));
+
+    await expect(twitterService.getClient(OWNER, ACCOUNT_ID)).rejects.toThrow(/reconnect/i);
+    expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+      OWNER, 'twitter', ACCOUNT_ID, { needs_reconnect: true }
+    );
+    // Token update must NOT have been called — refresh never completed.
+    expect(mockUpdateAccountTokens).not.toHaveBeenCalled();
+  });
+
+  it('sets needs_reconnect and throws when there is no refresh_token at all', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ token_expires_at: Date.now() - 1000, refresh_token: '' }),
+    ]);
+
+    await expect(twitterService.getClient(OWNER, ACCOUNT_ID)).rejects.toThrow(/reconnect/i);
+    expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+      OWNER, 'twitter', ACCOUNT_ID, { needs_reconnect: true }
+    );
+  });
+});
+
+// ─── postThread idempotency on mid-thread 401 ────────────────────────────────
+
+describe('TwitterService.postThread — idempotent retry', () => {
+  it('does NOT re-post already-sent tweets when a later tweet hits a 401', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    // Tweet 'a' (root) succeeds once. Reply 'b' returns 401 on its first attempt,
+    // then succeeds after force-refresh. Reply 'c' succeeds. The root tweet must
+    // be posted exactly once — the 401 retry must not re-run the whole thread.
+    mockTweet.mockResolvedValue({ data: { id: '111', text: 'a' } });
+    mockReply
+      .mockRejectedValueOnce(makeXAuthError())            // 'b' first attempt: 401
+      .mockResolvedValueOnce({ data: { id: '222', text: 'b' } }) // 'b' retry after refresh
+      .mockResolvedValueOnce({ data: { id: '333', text: 'c' } }); // 'c'
+
+    const res = await twitterService.postThread(OWNER, ACCOUNT_ID, ['a', 'b', 'c']);
+
+    expect(res.map((r) => r.id)).toEqual(['111', '222', '333']);
+    // Root tweet posted exactly once — NOT duplicated by the retry.
+    expect(mockTweet).toHaveBeenCalledTimes(1);
+    expect(mockTweet).toHaveBeenCalledWith('a');
+    // Reply called 3x total: 'b' (fail) + 'b' (retry) + 'c'.
+    expect(mockReply).toHaveBeenCalledTimes(3);
+    // Only the failing tweet triggered a refresh.
+    expect(mockRefreshOAuth2Token).toHaveBeenCalledTimes(1);
+    // Chaining stays correct across the retry: 'b'→root(111), 'c'→b(222).
+    expect(mockReply).toHaveBeenNthCalledWith(1, 'b', '111');
+    expect(mockReply).toHaveBeenNthCalledWith(2, 'b', '111');
+    expect(mockReply).toHaveBeenNthCalledWith(3, 'c', '222');
+  });
+});
+
+// ─── Option 2: retry-on-401 ──────────────────────────────────────────────────
+
+describe('TwitterService — withRetryOn401 (via postTweet)', () => {
+  it('retries with a fresh token on a 401 and succeeds', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    // First call returns 401; second call (after refresh) succeeds.
+    mockTweet
+      .mockRejectedValueOnce(makeXAuthError())
+      .mockResolvedValueOnce({ data: { id: '999', text: 'retried' } });
+
+    const res = await twitterService.postTweet(OWNER, ACCOUNT_ID, 'hello');
+    expect(res.id).toBe('999');
+    // Force-refresh must have run, persisting new tokens.
+    expect(mockRefreshOAuth2Token).toHaveBeenCalledTimes(1);
+    expect(mockUpdateAccountTokens).toHaveBeenCalledWith(
+      OWNER, 'twitter',
+      expect.objectContaining({ access_token: 'access-new' }),
+      ACCOUNT_ID
+    );
+    // Two calls to v2.tweet: first fails, second (with fresh token) succeeds.
+    expect(mockTweet).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries on a real twitter-api-v2 ApiResponseError shape (code=401, no statusCode)', async () => {
+    // Regression test: the real SDK's ApiResponseError only ever sets `.code`,
+    // never `.statusCode`. Assert against that exact shape so a future edit
+    // that reverts to checking `.statusCode` fails here immediately.
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    const realShapedError = Object.assign(new Error('Unauthorized'), {
+      code: 401,
+      type: 'response',
+      data: { title: 'Unauthorized', detail: 'Invalid or expired token.' },
+    });
+    expect((realShapedError as any).statusCode).toBeUndefined();
+
+    mockTweet
+      .mockRejectedValueOnce(realShapedError)
+      .mockResolvedValueOnce({ data: { id: '999', text: 'retried' } });
+
+    const res = await twitterService.postTweet(OWNER, ACCOUNT_ID, 'hello');
+    expect(res.id).toBe('999');
+    expect(mockRefreshOAuth2Token).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT retry on non-401 errors', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockTweet.mockRejectedValue(new Error('rate limit exceeded'));
+
+    await expect(twitterService.postTweet(OWNER, ACCOUNT_ID, 'hello')).rejects.toThrow(/rate limit/i);
+    expect(mockTweet).toHaveBeenCalledTimes(1);
+    expect(mockRefreshOAuth2Token).not.toHaveBeenCalled();
+  });
+
+  it('marks needs_reconnect when force-refresh itself fails on 401', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockTweet.mockRejectedValue(makeXAuthError());
+    mockRefreshOAuth2Token.mockRejectedValue(new Error('invalid_grant'));
+
+    await expect(twitterService.postTweet(OWNER, ACCOUNT_ID, 'hello')).rejects.toThrow(/reconnect/i);
+    expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+      OWNER, 'twitter', ACCOUNT_ID, { needs_reconnect: true }
+    );
+  });
+
+  it('marks needs_reconnect when force-refresh succeeds but retry call also returns 401', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    // Both calls return 401 (X revoked the new token immediately too).
+    mockTweet.mockRejectedValue(makeXAuthError());
+
+    await expect(twitterService.postTweet(OWNER, ACCOUNT_ID, 'hello')).rejects.toThrow(/reconnect/i);
+    expect(mockRefreshOAuth2Token).toHaveBeenCalledTimes(1);
+    expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+      OWNER, 'twitter', ACCOUNT_ID, { needs_reconnect: true }
+    );
+  });
+
+  it('clears needs_reconnect flag when force-refresh succeeds', async () => {
+    // Account already flagged needs_reconnect = true but the refresh_token is still valid.
+    // This simulates a transient X-side revocation that self-healed.
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ needs_reconnect: true }),
+    ]);
+    // getClient() will fast-fail because needs_reconnect is set, so we test forceRefresh
+    // indirectly: we need to call it from a path that bypasses getClient.
+    // The most direct way is to have a valid token (not fast-failed) get a 401 mid-call,
+    // triggering forceRefresh, which then clears the flag.
+    // Arrange: token is valid (no fast-fail), but X rejects it with 401.
+    mockGetAccountsByUserId
+      .mockResolvedValueOnce([makeAccount({ needs_reconnect: false })]) // getClient succeeds
+      .mockResolvedValue([makeAccount({ needs_reconnect: true })]);    // forceRefresh re-reads — flag was set
+    mockTweet
+      .mockRejectedValueOnce(makeXAuthError())
+      .mockResolvedValueOnce({ data: { id: '321', text: 'ok' } });
+
+    await twitterService.postTweet(OWNER, ACCOUNT_ID, 'hello');
+    // forceRefresh should have cleared needs_reconnect on success.
+    expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+      OWNER, 'twitter', ACCOUNT_ID, { needs_reconnect: false }
+    );
+  });
+});
+
+// ─── delete-tweet ─────────────────────────────────────────────────────────────
+
+describe('TwitterService.deleteTweet', () => {
+  beforeEach(() => mockGetAccountsByUserId.mockResolvedValue([makeAccount()]));
+
+  it('calls deleteTweet with the correct id and returns deleted:true', async () => {
+    const res = await twitterService.deleteTweet(OWNER, ACCOUNT_ID, 'tweet-123');
+    expect(mockDeleteTweet).toHaveBeenCalledWith('tweet-123');
+    expect(res).toEqual({ deleted: true });
+  });
+
+  it('throws when tweet_id is empty', async () => {
+    await expect(twitterService.deleteTweet(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/tweet_id/i);
+    expect(mockDeleteTweet).not.toHaveBeenCalled();
+  });
+
+  it('returns deleted:false when the API returns false', async () => {
+    mockDeleteTweet.mockResolvedValueOnce({ data: { deleted: false } });
+    const res = await twitterService.deleteTweet(OWNER, ACCOUNT_ID, 'tweet-999');
+    expect(res).toEqual({ deleted: false });
+  });
+});
+
+// ─── get-tweet-metrics ────────────────────────────────────────────────────────
+
+describe('TwitterService.getTweetMetrics', () => {
+  const METRICS_RESPONSE = {
+    data: [
+      { id: 'tw1', text: 'hello', public_metrics: { retweet_count: 2, reply_count: 1, like_count: 5, quote_count: 0, impression_count: 100, bookmark_count: 3 } },
+      { id: 'tw2', text: 'world', public_metrics: { retweet_count: 0, reply_count: 0, like_count: 1, quote_count: 0, impression_count: 20, bookmark_count: 0 } },
+    ],
+  };
+
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockTweets.mockResolvedValue({ data: METRICS_RESPONSE });
+  });
+
+  it('calls client.v2.tweets with the given ids and public_metrics field', async () => {
+    await twitterService.getTweetMetrics(OWNER, ACCOUNT_ID, ['tw1', 'tw2']);
+    expect(mockTweets).toHaveBeenCalledWith(
+      ['tw1', 'tw2'],
+      expect.objectContaining({ 'tweet.fields': expect.arrayContaining(['public_metrics']) }),
+    );
+  });
+
+  it('returns an array of tweets with metrics', async () => {
+    const res = await twitterService.getTweetMetrics(OWNER, ACCOUNT_ID, ['tw1', 'tw2']);
+    expect(res).toHaveLength(2);
+    expect(res[0].public_metrics.like_count).toBe(5);
+    expect(res[1].public_metrics.impression_count).toBe(20);
+  });
+
+  it('throws when tweet_ids is empty', async () => {
+    await expect(twitterService.getTweetMetrics(OWNER, ACCOUNT_ID, [])).rejects.toThrow(/tweet_ids/i);
+    expect(mockTweets).not.toHaveBeenCalled();
+  });
+});
+
+// ─── list-replies ─────────────────────────────────────────────────────────────
+
+describe('TwitterService.listReplies', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockSearch.mockResolvedValue({
+      data: { data: [{ id: 'r1', text: 'reply one', author_id: 'u2' }] },
+    });
+  });
+
+  it('searches with conversation_id query and is:reply filter', async () => {
+    await twitterService.listReplies(OWNER, ACCOUNT_ID, 'tw99');
+    expect(mockSearch).toHaveBeenCalledWith(
+      expect.stringContaining('conversation_id:tw99'),
+      expect.any(Object),
+    );
+  });
+
+  it('returns the reply tweets', async () => {
+    const res = await twitterService.listReplies(OWNER, ACCOUNT_ID, 'tw99');
+    expect(res).toHaveLength(1);
+    expect(res[0].id).toBe('r1');
+  });
+
+  it('respects maxResults', async () => {
+    await twitterService.listReplies(OWNER, ACCOUNT_ID, 'tw99', 25);
+    expect(mockSearch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ max_results: 25 }),
+    );
+  });
+
+  it('caps maxResults at 100', async () => {
+    await twitterService.listReplies(OWNER, ACCOUNT_ID, 'tw99', 999);
+    expect(mockSearch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ max_results: 100 }),
+    );
+  });
+
+  it('throws when tweet_id is empty', async () => {
+    await expect(twitterService.listReplies(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/tweet_id/i);
+    expect(mockSearch).not.toHaveBeenCalled();
+  });
+
+  // The X recent-search endpoint rejects max_results < 10 with HTTP 400.
+  it('floors maxResults to 10 for the search endpoint', async () => {
+    await twitterService.listReplies(OWNER, ACCOUNT_ID, 'tw99', 5);
+    expect(mockSearch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ max_results: 10 }),
+    );
+  });
+});
+
+// ─── searchTweets max_results clamping ─────────────────────────────────────────
+
+describe('TwitterService.searchTweets', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockSearch.mockResolvedValue({ data: { data: [{ id: 's1', text: 'hit' }] } });
+  });
+
+  // Regression: a request for fewer than 10 results used to pass through and 400.
+  it('floors maxResults to the endpoint minimum of 10', async () => {
+    await twitterService.searchTweets(OWNER, ACCOUNT_ID, 'agentweb', 5);
+    expect(mockSearch).toHaveBeenCalledWith(
+      'agentweb',
+      expect.objectContaining({ max_results: 10 }),
+    );
+  });
+
+  it('passes valid in-range values through', async () => {
+    await twitterService.searchTweets(OWNER, ACCOUNT_ID, 'agentweb', 42);
+    expect(mockSearch).toHaveBeenCalledWith('agentweb', expect.objectContaining({ max_results: 42 }));
+  });
+
+  it('caps maxResults at 100', async () => {
+    await twitterService.searchTweets(OWNER, ACCOUNT_ID, 'agentweb', 999);
+    expect(mockSearch).toHaveBeenCalledWith('agentweb', expect.objectContaining({ max_results: 100 }));
+  });
+});
+
+// ─── getUserTweets max_results clamping ────────────────────────────────────────
+
+describe('TwitterService.getUserTweets', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+  });
+
+  // The user-timeline endpoint requires max_results between 5 and 100.
+  it('floors maxResults to the endpoint minimum of 5', async () => {
+    await twitterService.getUserTweets(OWNER, ACCOUNT_ID, '@target', 1);
+    expect(mockUserTimeline).toHaveBeenCalledWith(
+      '999',
+      expect.objectContaining({ max_results: 5 }),
+    );
+  });
+
+  it('caps maxResults at 100', async () => {
+    await twitterService.getUserTweets(OWNER, ACCOUNT_ID, '@target', 999);
+    expect(mockUserTimeline).toHaveBeenCalledWith('999', expect.objectContaining({ max_results: 100 }));
+  });
+});
+
+// ─── quote-tweet ──────────────────────────────────────────────────────────────
+
+describe('TwitterService.quoteTweet', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockQuote.mockResolvedValue({ data: { id: 'qt1', text: 'my take on this' } });
+  });
+
+  it('calls client.v2.quote with text and quoted tweet id', async () => {
+    await twitterService.quoteTweet(OWNER, ACCOUNT_ID, 'my take', 'orig-99');
+    expect(mockQuote).toHaveBeenCalledWith('my take', 'orig-99');
+  });
+
+  it('returns id and text', async () => {
+    const res = await twitterService.quoteTweet(OWNER, ACCOUNT_ID, 'my take', 'orig-99');
+    expect(res.id).toBe('qt1');
+    expect(res.text).toBe('my take on this');
+  });
+
+  it('trims text over 280 chars', async () => {
+    const long = 'word '.repeat(100);
+    await twitterService.quoteTweet(OWNER, ACCOUNT_ID, long, 'orig-99');
+    const called = mockQuote.mock.calls[0][0] as string;
+    expect(called.length).toBeLessThanOrEqual(280);
+  });
+
+  it('throws when text is empty', async () => {
+    await expect(twitterService.quoteTweet(OWNER, ACCOUNT_ID, '', 'orig-99')).rejects.toThrow(/text/i);
+  });
+
+  it('throws when quoted_tweet_id is empty', async () => {
+    await expect(twitterService.quoteTweet(OWNER, ACCOUNT_ID, 'text', '')).rejects.toThrow(/quoted_tweet_id/i);
+  });
+});
+
+// ─── get-retweeters ───────────────────────────────────────────────────────────
+
+describe('TwitterService.getRetweeters', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockTweetRetweetedBy.mockResolvedValue({ data: [{ id: 'u1', username: 'alice' }] });
+  });
+
+  it('calls tweetRetweetedBy with tweet_id', async () => {
+    await twitterService.getRetweeters(OWNER, ACCOUNT_ID, 'tw42');
+    expect(mockTweetRetweetedBy).toHaveBeenCalledWith('tw42');
+  });
+
+  it('returns array of users', async () => {
+    const res = await twitterService.getRetweeters(OWNER, ACCOUNT_ID, 'tw42');
+    expect(res).toHaveLength(1);
+    expect(res[0].username).toBe('alice');
+  });
+
+  it('throws when tweet_id is empty', async () => {
+    await expect(twitterService.getRetweeters(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/tweet_id/i);
+  });
+});
+
+// ─── get-liking-users ─────────────────────────────────────────────────────────
+
+describe('TwitterService.getLikingUsers', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockTweetLikedBy.mockResolvedValue({ data: [{ id: 'u2', username: 'bob' }] });
+  });
+
+  it('calls tweetLikedBy with tweet_id', async () => {
+    await twitterService.getLikingUsers(OWNER, ACCOUNT_ID, 'tw42');
+    expect(mockTweetLikedBy).toHaveBeenCalledWith('tw42');
+  });
+
+  it('returns array of users', async () => {
+    const res = await twitterService.getLikingUsers(OWNER, ACCOUNT_ID, 'tw42');
+    expect(res).toHaveLength(1);
+    expect(res[0].username).toBe('bob');
+  });
+
+  it('throws when tweet_id is empty', async () => {
+    await expect(twitterService.getLikingUsers(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/tweet_id/i);
+  });
+});
+
+// ─── get-quote-tweets ─────────────────────────────────────────────────────────
+
+describe('TwitterService.getQuoteTweets', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockQuotes.mockResolvedValue({ data: { data: [{ id: 'qt2', text: 'great point!' }] } });
+  });
+
+  it('calls quotes with tweet_id', async () => {
+    await twitterService.getQuoteTweets(OWNER, ACCOUNT_ID, 'tw42');
+    expect(mockQuotes).toHaveBeenCalledWith('tw42', expect.any(Object));
+  });
+
+  it('returns array of quote tweets', async () => {
+    const res = await twitterService.getQuoteTweets(OWNER, ACCOUNT_ID, 'tw42');
+    expect(res).toHaveLength(1);
+    expect(res[0].text).toBe('great point!');
+  });
+
+  it('throws when tweet_id is empty', async () => {
+    await expect(twitterService.getQuoteTweets(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/tweet_id/i);
+  });
+});
+
+// ─── block / unblock ─────────────────────────────────────────────────────────
+
+describe('TwitterService.blockUser / unblockUser', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockUserByUsername.mockResolvedValue({ data: { id: 'target-uid', username: 'target' } });
+    mockBlock.mockResolvedValue({ data: { blocking: true } });
+    mockUnblock.mockResolvedValue({ data: { blocking: false } });
+  });
+
+  it('blockUser calls block with myId and resolved targetId', async () => {
+    await twitterService.blockUser(OWNER, ACCOUNT_ID, 'target');
+    expect(mockBlock).toHaveBeenCalledWith(expect.any(String), 'target-uid');
+  });
+
+  it('blockUser returns data', async () => {
+    const res = await twitterService.blockUser(OWNER, ACCOUNT_ID, 'target');
+    expect(res.blocking).toBe(true);
+  });
+
+  it('unblockUser calls unblock with myId and resolved targetId', async () => {
+    await twitterService.unblockUser(OWNER, ACCOUNT_ID, 'target');
+    expect(mockUnblock).toHaveBeenCalledWith(expect.any(String), 'target-uid');
+  });
+
+  it('blockUser throws when handle is empty', async () => {
+    await expect(twitterService.blockUser(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/handle/i);
+  });
+
+  it('unblockUser throws when handle is empty', async () => {
+    await expect(twitterService.unblockUser(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/handle/i);
+  });
+});
+
+// ─── mute / unmute ───────────────────────────────────────────────────────────
+
+describe('TwitterService.muteUser / unmuteUser', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockUserByUsername.mockResolvedValue({ data: { id: 'target-uid', username: 'target' } });
+    mockMute.mockResolvedValue({ data: { muting: true } });
+    mockUnmute.mockResolvedValue({ data: { muting: false } });
+  });
+
+  it('muteUser calls mute with myId and resolved targetId', async () => {
+    await twitterService.muteUser(OWNER, ACCOUNT_ID, 'target');
+    expect(mockMute).toHaveBeenCalledWith(expect.any(String), 'target-uid');
+  });
+
+  it('muteUser returns data', async () => {
+    const res = await twitterService.muteUser(OWNER, ACCOUNT_ID, 'target');
+    expect(res.muting).toBe(true);
+  });
+
+  it('unmuteUser calls unmute with myId and resolved targetId', async () => {
+    await twitterService.unmuteUser(OWNER, ACCOUNT_ID, 'target');
+    expect(mockUnmute).toHaveBeenCalledWith(expect.any(String), 'target-uid');
+  });
+
+  it('muteUser throws when handle is empty', async () => {
+    await expect(twitterService.muteUser(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/handle/i);
+  });
+
+  it('unmuteUser throws when handle is empty', async () => {
+    await expect(twitterService.unmuteUser(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/handle/i);
+  });
+});
+
+// ─── follow / unfollow ────────────────────────────────────────────────────────
+
+describe('TwitterService.followUser / unfollowUser', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockUserByUsername.mockResolvedValue({ data: { id: 'target-uid', username: 'target' } });
+    mockFollow.mockResolvedValue({ data: { following: true } });
+    mockUnfollow.mockResolvedValue({ data: { following: false } });
+  });
+
+  it('followUser calls follow with myId and resolved targetId', async () => {
+    await twitterService.followUser(OWNER, ACCOUNT_ID, 'target');
+    expect(mockFollow).toHaveBeenCalledWith('12345', 'target-uid');
+  });
+
+  it('followUser returns data', async () => {
+    const res = await twitterService.followUser(OWNER, ACCOUNT_ID, 'target');
+    expect(res.following).toBe(true);
+  });
+
+  it('unfollowUser calls unfollow with myId and resolved targetId', async () => {
+    await twitterService.unfollowUser(OWNER, ACCOUNT_ID, 'target');
+    expect(mockUnfollow).toHaveBeenCalledWith('12345', 'target-uid');
+  });
+
+  it('unfollowUser returns data', async () => {
+    const res = await twitterService.unfollowUser(OWNER, ACCOUNT_ID, 'target');
+    expect(res.following).toBe(false);
+  });
+
+  it('followUser throws when handle is empty', async () => {
+    await expect(twitterService.followUser(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/handle/i);
+  });
+
+  it('unfollowUser throws when handle is empty', async () => {
+    await expect(twitterService.unfollowUser(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/handle/i);
+  });
+});
+
+// ─── listFollowers / listFollowing ────────────────────────────────────────────
+
+describe('TwitterService.listFollowers / listFollowing', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockUserByUsername.mockResolvedValue({ data: { id: 'other-uid', username: 'other' } });
+    mockFollowers.mockResolvedValue({ data: [{ id: 'f1', username: 'alice' }] });
+    mockFollowing.mockResolvedValue({ data: [{ id: 'f2', username: 'bob' }] });
+  });
+
+  it('listFollowers calls followers with own id when no handle given', async () => {
+    await twitterService.listFollowers(OWNER, ACCOUNT_ID);
+    expect(mockFollowers).toHaveBeenCalledWith('12345');
+  });
+
+  it('listFollowers calls followers with resolved targetId when handle given', async () => {
+    await twitterService.listFollowers(OWNER, ACCOUNT_ID, 'other');
+    expect(mockFollowers).toHaveBeenCalledWith('other-uid');
+  });
+
+  it('listFollowers returns array of users', async () => {
+    const res = await twitterService.listFollowers(OWNER, ACCOUNT_ID);
+    expect(res).toHaveLength(1);
+    expect(res[0].username).toBe('alice');
+  });
+
+  it('listFollowing calls following with own id when no handle given', async () => {
+    await twitterService.listFollowing(OWNER, ACCOUNT_ID);
+    expect(mockFollowing).toHaveBeenCalledWith('12345');
+  });
+
+  it('listFollowing returns array of users', async () => {
+    const res = await twitterService.listFollowing(OWNER, ACCOUNT_ID);
+    expect(res).toHaveLength(1);
+    expect(res[0].username).toBe('bob');
+  });
+});
+
+// ─── bookmarkTweet / getBookmarks ─────────────────────────────────────────────
+
+describe('TwitterService.bookmarkTweet / getBookmarks', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockBookmark.mockResolvedValue({ data: { bookmarked: true } });
+    mockBookmarks.mockResolvedValue({ data: { data: [{ id: 'bm1', text: 'saved' }] } });
+  });
+
+  it('bookmarkTweet calls bookmark with the tweet id', async () => {
+    await twitterService.bookmarkTweet(OWNER, ACCOUNT_ID, 'tw99');
+    expect(mockBookmark).toHaveBeenCalledWith('tw99');
+  });
+
+  it('bookmarkTweet returns data', async () => {
+    const res = await twitterService.bookmarkTweet(OWNER, ACCOUNT_ID, 'tw99');
+    expect(res.bookmarked).toBe(true);
+  });
+
+  it('bookmarkTweet throws when tweet_id is empty', async () => {
+    await expect(twitterService.bookmarkTweet(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/tweet_id/i);
+  });
+
+  it('getBookmarks calls bookmarks and returns the list', async () => {
+    const res = await twitterService.getBookmarks(OWNER, ACCOUNT_ID);
+    expect(mockBookmarks).toHaveBeenCalled();
+    expect(res).toHaveLength(1);
+    expect(res[0].text).toBe('saved');
+  });
+
+  it('getBookmarks returns empty array when API returns no data', async () => {
+    mockBookmarks.mockResolvedValue({ data: { data: [] } });
+    const res = await twitterService.getBookmarks(OWNER, ACCOUNT_ID);
+    expect(res).toEqual([]);
+  });
+});
+
+// ─── getDmConversation ────────────────────────────────────────────────────────
+
+describe('TwitterService.getDmConversation', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockUserByUsername.mockResolvedValue({ data: { id: 'part-uid', username: 'partner' } });
+    mockListDmEventsWithParticipant.mockResolvedValue({ data: { data: [{ id: 'dm2', text: 'hello' }] } });
+  });
+
+  it('resolves handle to participantId then calls listDmEventsWithParticipant', async () => {
+    await twitterService.getDmConversation(OWNER, ACCOUNT_ID, 'partner');
+    expect(mockUserByUsername).toHaveBeenCalledWith('partner');
+    expect(mockListDmEventsWithParticipant).toHaveBeenCalledWith('part-uid');
+  });
+
+  it('returns the dm event array', async () => {
+    const res = await twitterService.getDmConversation(OWNER, ACCOUNT_ID, 'partner');
+    expect(res).toHaveLength(1);
+    expect(res[0].text).toBe('hello');
+  });
+
+  it('throws when handle is empty', async () => {
+    await expect(twitterService.getDmConversation(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/handle/i);
+  });
+});
+
+// ─── Concurrent refresh deduplication (race condition fix) ────────────────────
+describe('TwitterService.getClient — concurrent refresh deduplication', () => {
+  it('makes only one X API refresh call when two requests race on an expired token', async () => {
+    const expiredAccount = makeAccount({ token_expires_at: Date.now() - 1000 });
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount]);
+    // Simulate a slow refresh so both concurrent calls overlap.
+    mockRefreshOAuth2Token.mockImplementation(
+      () => new Promise(resolve => setTimeout(() => resolve({ accessToken: 'access-new', refreshToken: 'refresh-new', expiresIn: 7200 }), 20))
+    );
+    mockUpdateAccountTokens.mockResolvedValue(undefined);
+
+    const [r1, r2] = await Promise.all([
+      twitterService.getClient(OWNER, ACCOUNT_ID),
+      twitterService.getClient(OWNER, ACCOUNT_ID),
+    ]);
+
+    // Only one refresh call should have been made despite two concurrent requests.
+    expect(mockRefreshOAuth2Token).toHaveBeenCalledTimes(1);
+    // Both callers should receive a valid client.
+    expect(r1).toBeDefined();
+    expect(r2).toBeDefined();
+  });
+
+  it('does not mark needs_reconnect when the second concurrent call joins an in-flight refresh', async () => {
+    const expiredAccount = makeAccount({ token_expires_at: Date.now() - 1000 });
+    mockGetAccountsByUserId.mockResolvedValue([expiredAccount]);
+    mockRefreshOAuth2Token.mockImplementation(
+      () => new Promise(resolve => setTimeout(() => resolve({ accessToken: 'access-new', refreshToken: 'refresh-new', expiresIn: 7200 }), 20))
+    );
+    mockUpdateAccountTokens.mockResolvedValue(undefined);
+
+    await Promise.all([
+      twitterService.getClient(OWNER, ACCOUNT_ID),
+      twitterService.getClient(OWNER, ACCOUNT_ID),
+    ]);
+
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalledWith(
+      expect.anything(), expect.anything(), expect.anything(),
+      expect.objectContaining({ needs_reconnect: true })
+    );
+  });
+
+  it('makes only one X API refresh call when two withRetryOn401 calls race on a 401', async () => {
+    // Both postTweet calls have a valid token initially (not expired),
+    // so getClient returns without refreshing. Then both hit a 401 mid-call
+    // and both race into forceRefresh simultaneously. The second should join
+    // the first's in-flight promise rather than calling refreshOAuth2Token again.
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockRefreshOAuth2Token.mockImplementation(
+      () => new Promise(resolve => setTimeout(() => resolve({ accessToken: 'access-new', refreshToken: 'refresh-new', expiresIn: 7200 }), 20))
+    );
+    mockUpdateAccountTokens.mockResolvedValue(undefined);
+    // First call from each postTweet returns 401; second call (after forceRefresh) succeeds.
+    let callCount = 0;
+    mockTweet.mockImplementation(() => {
+      callCount++;
+      // Calls 1 and 2 are the initial attempts (both 401); calls 3 and 4 are the retries.
+      if (callCount <= 2) return Promise.reject(makeXAuthError());
+      return Promise.resolve({ data: { id: String(callCount), text: 'retried' } });
+    });
+
+    const [r1, r2] = await Promise.all([
+      twitterService.postTweet(OWNER, ACCOUNT_ID, 'msg-1'),
+      twitterService.postTweet(OWNER, ACCOUNT_ID, 'msg-2'),
+    ]);
+
+    expect(mockRefreshOAuth2Token).toHaveBeenCalledTimes(1);
+    expect(r1).toBeDefined();
+    expect(r2).toBeDefined();
+  });
+
+  it('does not mark needs_reconnect when two concurrent forceRefresh calls share one refresh', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+    mockRefreshOAuth2Token.mockImplementation(
+      () => new Promise(resolve => setTimeout(() => resolve({ accessToken: 'access-new', refreshToken: 'refresh-new', expiresIn: 7200 }), 20))
+    );
+    mockUpdateAccountTokens.mockResolvedValue(undefined);
+    let callCount = 0;
+    mockTweet.mockImplementation(() => {
+      callCount++;
+      if (callCount <= 2) return Promise.reject(makeXAuthError());
+      return Promise.resolve({ data: { id: String(callCount), text: 'retried' } });
+    });
+
+    await Promise.all([
+      twitterService.postTweet(OWNER, ACCOUNT_ID, 'msg-1'),
+      twitterService.postTweet(OWNER, ACCOUNT_ID, 'msg-2'),
+    ]);
+
+    expect(mockUpdateAccountConfig).not.toHaveBeenCalledWith(
+      expect.anything(), expect.anything(), expect.anything(),
+      expect.objectContaining({ needs_reconnect: true })
+    );
+  });
+});

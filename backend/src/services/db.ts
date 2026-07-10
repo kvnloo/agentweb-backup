@@ -112,6 +112,7 @@ export interface User {
   lastLoginTime?: string;
   lastActiveAt?: string; // Updated when user creates a chat session (non-delegated); more accurate than lastLoginTime for DAU/WAU/MAU
   signupSource?: "password" | "oauth" | "waitlist" | "admin" | string; // How the account was created. Set at signup; do not mutate.
+  funnelStatus?: string | null; // Admin-owned business funnel status for triage/prioritization.
   supportNote?: string;
   roles?: ("partner" | "customer" | "free" | "contractor")[];
   displayName?: string;
@@ -155,6 +156,7 @@ export interface User {
   useCaseCategories?: string[];
   emmaHelpInterests?: string[]; // Onboarding multi-select: what user wants Emma to help with (e.g., "brand", "paid_ads", "founder_led_sales")
   emmaHelpInterestsSetAt?: string; // ISO timestamp when the user first saved their interests
+  fathomOnboardingIngestions?: Array<Record<string, unknown>>; // Review-first Fathom sales/prospect-call onboarding context ledger
   /**
    * Onboarding event log — appended to by POST /api/onboarding/events. Used
    * by the Lifecycle Drip Phase 1 feature to derive `onboardingStage`. Each

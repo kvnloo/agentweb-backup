@@ -316,10 +316,9 @@ export class GenerateMarketingResponseWorkerService {
     }
 
     if (this.worker && !this.worker.killed) {
-      // The worker ignores SIGTERM (installWorkerSignalGuards) so a
-      // process-group signal can't abort an in-flight run; teardown here must
-      // therefore use SIGKILL. Safe by this point — the drain above already let
-      // in-flight requests finish (or force-failed them at the ceiling).
+      // SIGKILL, not SIGTERM: the worker deliberately ignores SIGTERM so the OS
+      // process-group/cgroup SIGTERM on deploy can't abort an in-flight run before the
+      // drain above completes (ENG-201). The parent must therefore force-kill it here.
       this.worker.kill('SIGKILL');
       this.worker = null;
     }

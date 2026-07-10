@@ -117,7 +117,7 @@ function buildBrandPrompt(input: {
     `2. Call update_brand_guidelines exactly once with the full brand object: brandName, tagline, primaryColor, secondaryColor, fontFamily, toneOfVoice, brandPersonality, brandValues, keyMessages, targetAudience, valueProposition, founders, logoUrl. Ground every field in what the site actually says — do not invent.`,
     "",
     `Constraints:`,
-    `- Do NOT call update_market_strategy in this session. ICPs and competitor research are handled by separate steps after the user reviews the brand.`,
+    `- Do NOT call update_market_strategy or regenerate_market_strategy in this session, and do NOT offer to regenerate the market strategy. ICPs and competitor research are handled by separate steps after the user reviews the brand.`,
     `- Do NOT ask the user to verify anything mid-flight.`,
     `- Do NOT call any work-plan tools, do NOT create GTM plans, email campaigns, or landing pages.`,
     `- After update_brand_guidelines succeeds, reply with a single line "DONE" and stop.`,

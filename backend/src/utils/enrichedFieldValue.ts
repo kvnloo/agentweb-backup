@@ -57,6 +57,16 @@ export interface EnrichedFieldMeta {
    *  - 'high' ← supported
    */
   criticView?: 'drop' | 'low' | 'high';
+  /**
+   * Grounding classification for web-tier values (ENG-122). Distinguishes a
+   * value proven against the fetched source text from one that could not be:
+   *  - 'grounded': the value/quote was found in the real fetched source → safe to state.
+   *  - 'web-unverified': web-sourced but the quote couldn't be matched to the source → hedge.
+   *  - 'ai-knowledge': asserted from the model's training memory with no web source
+   *    (kept only when the stated company matches the lead) → hedge, distinct badge.
+   * Drives the "Web — unverified" vs "AI knowledge — unverified" UI badges.
+   */
+  grounding?: 'grounded' | 'web-unverified' | 'ai-knowledge';
   /** Normalized form of the value (e.g. enum, numeric range) when a type spec recognizes the field. */
   normalized?: string | number | { min: number; max: number } | null;
 }
@@ -84,9 +94,33 @@ export function fieldVerificationStatus(
   if (!meta) return 'unverified';
   if (meta.verifiedBy) return 'verified';
   if (meta.rejectedReason || meta.rejectedAt) return 'unverified';
-  if (meta.criticView === 'high') return 'verified';
+  // ENG-122: values that couldn't be grounded in the fetched source carry a
+  // badged-unverified state and are NEVER auto-promoted to verified.
+  if (meta.grounding === 'web-unverified' || meta.grounding === 'ai-knowledge') return 'unverified';
+  // Critic caution downgrades even a grounded value (source may describe a
+  // different entity — the Slash/Slashy case).
   if (meta.criticView === 'low' || meta.criticView === 'drop') return 'unverified';
+  // Deterministic grounding: the fact was found in the real fetched source.
+  if (meta.grounding === 'grounded') return 'verified';
+  if (meta.criticView === 'high') return 'verified';
   return meta.confidence === 'high' ? 'verified' : 'unverified';
+}
+
+/**
+ * Which "— unverified" provenance badge (if any) the UI should show for a field.
+ * Returns null when the value is verified (no caveat needed). Otherwise maps the
+ * grounding classification to the two ENG-122 badges, falling back to the web
+ * badge for legacy web-sourced values written before `grounding` existed.
+ */
+export function fieldProvenanceBadge(
+  meta: EnrichedFieldMeta | undefined,
+): null | 'web-unverified' | 'ai-knowledge' {
+  if (!meta) return null;
+  if (fieldVerificationStatus(meta) === 'verified') return null;
+  if (meta.grounding === 'ai-knowledge') return 'ai-knowledge';
+  if (meta.grounding === 'web-unverified') return 'web-unverified';
+  if (meta.source === 'web_search') return 'web-unverified';
+  return null;
 }
 
 /** Trim a quote to a reasonable size to bound row growth in DynamoDB. */

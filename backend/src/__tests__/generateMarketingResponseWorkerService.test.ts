@@ -627,9 +627,10 @@ describe('GenerateMarketingResponseWorkerService', () => {
       // Shutdown should wait for the in-flight request and then kill the worker
       await workerService.shutdown();
 
-      // Worker is killed after drain completes. Teardown uses SIGKILL, not
-      // SIGTERM, because the worker now ignores SIGTERM so a process-group
-      // termination signal cannot abort an in-flight run mid-execution (ENG-202).
+      // Worker is force-killed (SIGKILL) after drain completes. SIGTERM is
+      // intentionally ignored by the worker so the OS process-group/cgroup SIGTERM
+      // that fires on deploy cannot abort an in-flight run before the drain (ENG-201),
+      // so the parent must use SIGKILL to actually terminate it.
       expect(mockWorker.kill).toHaveBeenCalledWith('SIGKILL');
 
       // The in-flight request resolved naturally (not rejected)

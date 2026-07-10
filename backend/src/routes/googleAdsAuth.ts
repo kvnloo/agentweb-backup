@@ -7,6 +7,7 @@ import { createAccount, getAccountsByUserId } from '../services/connectedAccount
 import { googleAdsService } from '../services/googleAdsService';
 import type { GoogleAdsAccountNode, GoogleAdLeaf } from '../services/googleAdsService';
 import { authenticateToken } from '../middleware/auth';
+import { getJwtSecret } from '../config/jwt';
 
 const router = express.Router();
 
@@ -15,19 +16,14 @@ const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000;
 const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
-const STATE_SECRET = process.env.JWT_SECRET;
-if (!STATE_SECRET) {
-  throw new Error('JWT_SECRET environment variable must be set for OAuth state verification');
-}
-
 interface StatePayload { userId: string; nonce: string; }
 
 const generateState = (userId: string): string =>
-  jwt.sign({ userId, nonce: crypto.randomBytes(16).toString('hex') } as StatePayload, STATE_SECRET, { expiresIn: STATE_EXPIRATION });
+  jwt.sign({ userId, nonce: crypto.randomBytes(16).toString('hex') } as StatePayload, getJwtSecret(), { expiresIn: STATE_EXPIRATION });
 
 const verifyState = (state: string, userId: string): StatePayload | null => {
   try {
-    const decoded = jwt.verify(state, STATE_SECRET) as StatePayload;
+    const decoded = jwt.verify(state, getJwtSecret()) as StatePayload;
     return decoded.userId === userId ? decoded : null;
   } catch { return null; }
 };
