@@ -837,7 +837,10 @@ function openEvents(id) {
     if (reconnects++ > 0 && S.sel === id) {
       try {
         const d = await (await fetch(`/api/issues/${id}`)).json();
-        if (S.sel === id) { S.detail = d; renderAll(d); S.curBubble = null; setBusy(!!d.busy); }
+        // Re-render the HEADER too (not just the chat): preview events are ephemeral (buffer:false),
+        // so a preview up/down that finished during the disconnect would otherwise leave the button
+        // stuck on "preview working…". renderHeader re-syncs the preview bar from the fresh state.
+        if (S.sel === id) { S.detail = d; renderHeader(d); renderAll(d); S.curBubble = null; setBusy(!!d.busy); }
       } catch { /* retry on next reconnect */ }
     }
   };
