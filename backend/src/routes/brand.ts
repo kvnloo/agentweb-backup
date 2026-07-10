@@ -378,7 +378,13 @@ router.post(
         // pill is per-user in the onboarding flow. Best-effort; never blocks
         // the save response on a metrics write.
         try {
-          const readyPatch = buildReadyPatch(user as any);
+          // An explicit guidelines save completes the build even from a failed
+          // state — a manually-supplied brand IS ready (unblocks the
+          // unscrapable-site case where the user is otherwise gated on
+          // buildingBrand).
+          const readyPatch = buildReadyPatch(user as any, new Date(), {
+            includeFailed: true,
+          });
           if (readyPatch) {
             await userDb.updateUser(user.userId, readyPatch);
             logCompletionMetric(user.userId, "ready", readyPatch.brandBuildDurationMs ?? 0);
@@ -423,7 +429,13 @@ router.post(
       // building. Best-effort; metrics log emitted on success so the log
       // scraper can compute p50/p99.
       try {
-        const readyPatch = buildReadyPatch(user as any);
+        // An explicit guidelines save completes the build even from a failed
+        // state — a manually-supplied brand IS ready (unblocks the
+        // unscrapable-site case where the user is otherwise gated on
+        // buildingBrand).
+        const readyPatch = buildReadyPatch(user as any, new Date(), {
+          includeFailed: true,
+        });
         if (readyPatch) {
           await userDb.updateUser(user.userId, readyPatch);
           logCompletionMetric(user.userId, "ready", readyPatch.brandBuildDurationMs ?? 0);

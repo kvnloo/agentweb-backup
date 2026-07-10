@@ -101,9 +101,19 @@ export function buildStartPatch(now: Date = new Date()): BrandBuildStatusFields 
  */
 export function buildReadyPatch(
   current: BrandBuildStatusFields,
-  now: Date = new Date()
+  now: Date = new Date(),
+  opts: { includeFailed?: boolean } = {}
 ): BrandBuildStatusFields | null {
-  if (current.brandBuildStatus !== "building") {
+  const status = current.brandBuildStatus;
+  // Normally only a build still `building` can complete. The explicit REST
+  // guidelines-save opts into `includeFailed` so that when a user supplies a
+  // brand by hand after an unscrapable-site failure, the write completes the
+  // build (failed → ready) and they're no longer gated on the buildingBrand
+  // screen. Emma's internal ready-hook keeps the default (building-only).
+  const canComplete =
+    status === "building" ||
+    (status === "failed" && opts.includeFailed === true);
+  if (!canComplete) {
     return null;
   }
   const startedAt = current.brandBuildStartedAt
