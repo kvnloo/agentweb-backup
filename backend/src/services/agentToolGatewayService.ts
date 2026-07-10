@@ -111,11 +111,46 @@ export class AgentToolContractValidationError extends Error {
 }
 
 export class AgentToolRepeatedFailureError extends Error {
-  constructor(readonly toolName: string, readonly failureCount: number, readonly lastErrorMessage: string) {
+  constructor(
+    readonly toolName: string,
+    readonly failureCount: number,
+    readonly lastErrorMessage: string,
+    // ENG-167: 'timeout' surfaces a distinct, timeout-specific stop signal — a tool
+    // that keeps timing out has no arguments to "fix", so the generic repeated-error
+    // guidance is misleading and let the model keep retrying the slow tool.
+    readonly reason: 'repeated' | 'timeout' = 'repeated',
+    // ENG-167 follow-up: verified against the real session's turn-4 event timeline —
+    // the model DID call report_product_issues successfully, but nothing told it to
+    // stop there, so it immediately retried the same tool again, hung for 900s, and
+    // the user never learned the bug had already been filed. When a run has already
+    // filed a report, the stop message must say so and forbid filing a second one —
+    // repeating the generic "offer to file a bug report" suggestion here is exactly
+    // what let the model think it still needed to act on report_product_issues.
+    readonly alreadyReportedThisRun: boolean = false,
+    // ENG-167 follow-up (Greptile): when the SESSION-scoped breaker trips on a brand-
+    // new run, `failureCount` is the cross-run aggregate — the tool may not have been
+    // called at all yet in this run. Saying "in this run" here is factually wrong and
+    // contradicts the model's own tool-call history, undermining trust in the stop
+    // guidance. Scope the wording to where the count actually came from.
+    readonly scope: 'run' | 'session' = 'run',
+  ) {
+    const timeoutScopePhrase = scope === 'session'
+      ? `${failureCount} times across your recent turns in this chat session (not just this run)`
+      : `${failureCount} times in this run`;
     super(
-      `Tool "${toolName}" already failed ${failureCount} times in this run with the same error: "${lastErrorMessage}". ` +
-      'Do not retry it with the same approach. Fix the arguments to address that exact error, use a different tool, ' +
-      'or tell the user what is blocking you.',
+      reason === 'timeout'
+        ? (alreadyReportedThisRun
+          ? `Tool "${toolName}" has timed out ${timeoutScopePhrase} and is consistently unable to complete in time. ` +
+            'STOP retrying it — retrying will keep timing out. You already filed a bug report for this via report_product_issues ' +
+            '— do NOT file another. Deliver whatever you have already produced, tell the user this step timed out and ' +
+            'that a bug report was already filed for it, and wrap up your turn now.'
+          : `Tool "${toolName}" has timed out ${timeoutScopePhrase} and is consistently unable to complete in time. ` +
+            'STOP retrying it — retrying will keep timing out. Deliver whatever you have already produced, tell the user this step ' +
+            'timed out and could not be completed, and offer either to try a smaller/simpler version or to file a bug report on ' +
+            'their behalf with report_product_issues.')
+        : `Tool "${toolName}" already failed ${failureCount} times in this run with the same error: "${lastErrorMessage}". ` +
+          'Do not retry it with the same approach. Fix the arguments to address that exact error, use a different tool, ' +
+          'or tell the user what is blocking you.',
     );
     this.name = 'AgentToolRepeatedFailureError';
   }
@@ -149,6 +184,25 @@ export class AgentToolBudgetExceededError extends Error {
 // uses, so breaker accounting and error taxonomy stay in lockstep.
 const REPEATED_FAILURE_THRESHOLD = 3;
 const NON_RETRYABLE_FAILURE_THRESHOLD = 2;
+// ENG-167: timeouts are retryable per-error-head (a single timeout message trips at
+// REPEATED_FAILURE_THRESHOLD), but a heavy tool that keeps timing out reports a
+// slightly DIFFERENT message each attempt ("connection timed out after Nms", an
+// AbortError, a Bedrock "ModelTimeoutException"), so no single head ever reaches the
+// threshold and the model retried the same ~2-min tool until the run was exhausted —
+// never reaching any other tool (including report_product_issues). Aggregate timeout-
+// class failures for a tool across differing messages and trip at this count. Kept at
+// 3 so a tool that succeeds after one or two transient timeouts is never blocked.
+const TIMEOUT_FAILURE_THRESHOLD = 3;
+// ENG-167 follow-up: the run-scoped aggregate above only ever sees ONE run. Verified
+// against the actual production session that filed ENG-167 — create_html_file failed
+// 6 times total across 4 SEPARATE ~10-minute turns (the user re-sending "try again"
+// mints a brand-new runId with a zeroed counter each time), never once reaching 3
+// within a single run. The run-scoped breaker never tripped, so the user hit the
+// agentModeController.ts hard 10-minute wall-clock timeout on every turn instead.
+// Aggregate timeout-class failures by SESSION (budgetScopeId) as well, across runs,
+// and trip earlier (2, not 3) — each unit here already cost the user up to a full
+// 10-minute controller-bounded turn, so waiting for a 3rd is needlessly slow.
+const SESSION_TIMEOUT_FAILURE_THRESHOLD = 2;
 const EXPENSIVE_MEDIA_FAILURE_BUDGET = 2;
 const MAX_TRACKED_RUNS = 500;
 const ERROR_KEY_LENGTH = 80;
@@ -222,6 +276,21 @@ function getRunCounts(runId: string): Map<string, number> {
   return counts;
 }
 
+// ENG-167 follow-up: a leading NUL byte can never prefix-match a real tool name key
+// (`${toolName}\0...`), so this marker is safe to store in the SAME per-run counts
+// map without a dedicated structure/eviction policy of its own.
+const REPORTED_ISSUE_MARKER = '\0report_product_issues_filed';
+
+/** Mark that report_product_issues succeeded in this run (ENG-167 follow-up) — so a
+ * later timeout stop-message can tell the model not to file a second report. */
+function markReportedIssue(runId: string): void {
+  getRunCounts(runId).set(REPORTED_ISSUE_MARKER, 1);
+}
+
+function hasReportedIssue(runId: string): boolean {
+  return runFailureCounts.get(runId)?.has(REPORTED_ISSUE_MARKER) ?? false;
+}
+
 /** Breaker threshold for one (tool, error-head) key: non-retryable classes trip
  * at 2 (identical retry is known-pointless), transient/unknown classes at 3.
  * Classified from the stored error head — same classifier as the telemetry. */
@@ -231,18 +300,76 @@ function failureThresholdFor(errorMessageHead: string): number {
     : REPEATED_FAILURE_THRESHOLD;
 }
 
-function findTrippedFailure(runId: string, toolName: string, scope: string): { count: number; errorMessage: string } | null {
+/** Sum this tool's failures (within one recipient scope, ENG-182) whose stored
+ * error head classifies as `timeout`, regardless of the exact wording (ENG-167).
+ * Returns null when there are none. */
+function countTimeoutFailures(
+  id: string,
+  toolName: string,
+  scope: string,
+): { count: number; errorMessage: string } | null {
+  const counts = runFailureCounts.get(id);
+  if (!counts) return null;
+  const prefix = `${toolName}\0${scope}\0`;
+  let total = 0;
+  let sampleMessage = '';
+  for (const [key, count] of counts) {
+    if (!key.startsWith(prefix)) continue;
+    const errorMessage = key.slice(prefix.length);
+    if (classifyToolErrorClass(errorMessage) !== 'timeout') continue;
+    total += count;
+    if (!sampleMessage) sampleMessage = errorMessage;
+  }
+  return total > 0 ? { count: total, errorMessage: sampleMessage } : null;
+}
+
+function findTrippedFailure(
+  runId: string,
+  toolName: string,
+  scope: string,
+): { count: number; errorMessage: string; reason: 'repeated' | 'timeout' } | null {
   const counts = runFailureCounts.get(runId);
   if (!counts) return null;
   const prefix = `${toolName}\0${scope}\0`;
+  // Timeout aggregate first so a spiral of same-tool timeouts (identical OR varied
+  // wording) yields the timeout-specific stop guidance instead of the generic one.
+  const timeoutAgg = countTimeoutFailures(runId, toolName, scope);
+  if (timeoutAgg && timeoutAgg.count >= TIMEOUT_FAILURE_THRESHOLD) {
+    return { ...timeoutAgg, reason: 'timeout' };
+  }
   for (const [key, count] of counts) {
     if (!key.startsWith(prefix)) continue;
     const errorMessage = key.slice(prefix.length);
     if (count >= failureThresholdFor(errorMessage)) {
-      return { count, errorMessage };
+      return { count, errorMessage, reason: 'repeated' };
     }
   }
   return null;
+}
+
+/** Cross-run session aggregate for timeout-class failures (ENG-167 follow-up).
+ * `countTimeoutFailures` is generic over the id it's keyed by, so passing the
+ * session's budgetScopeId here reuses the exact same per-tool aggregation the
+ * run-scoped check uses — just accumulated across every run in the session. */
+function findTrippedSessionTimeout(
+  budgetScopeId: string,
+  toolName: string,
+  scope: string,
+): { count: number; errorMessage: string; reason: 'timeout' } | null {
+  const timeoutAgg = countTimeoutFailures(budgetScopeId, toolName, scope);
+  if (timeoutAgg && timeoutAgg.count >= SESSION_TIMEOUT_FAILURE_THRESHOLD) {
+    return { ...timeoutAgg, reason: 'timeout' };
+  }
+  return null;
+}
+
+/** Whether a failure for this tool should also be recorded into the session-wide
+ * (budgetScopeId) bucket, not just the per-run one. True for the pre-existing
+ * expensive-media budget tools, and now also for any timeout-class failure
+ * (ENG-167 follow-up) — a tool that's timing out is a session-wide signal, not
+ * a per-run one, since the model retries it across separate user turns/runs. */
+function shouldTrackInSessionScope(toolName: string, error: unknown): boolean {
+  return mediaFailureBudget(toolName) != null || classifyToolErrorClass(error) === 'timeout';
 }
 
 function mediaFailureBudget(toolName: string): number | null {
@@ -631,15 +758,42 @@ export async function executeAgentToolThroughGateway(
       };
     }
 
-    const tripped = findTrippedFailure(
-      input.runId,
-      policyDecision.toolName,
-      failureScope(policyDecision.toolName, input.args),
-    );
+    const recipientScope = failureScope(policyDecision.toolName, input.args);
+
+    // Session-scoped timeout aggregate first (ENG-167 follow-up) — a tool that's
+    // timed out repeatedly across earlier runs in this session should fail fast
+    // here, before ever reaching the run-scoped check below (which only ever sees
+    // this one run and would let a fresh runId through with a zeroed counter).
+    if (input.budgetScopeId && input.budgetScopeId !== input.runId) {
+      const trippedSession = findTrippedSessionTimeout(input.budgetScopeId, policyDecision.toolName, recipientScope);
+      if (trippedSession) {
+        return {
+          status: 'error',
+          error: new AgentToolRepeatedFailureError(
+            policyDecision.toolName,
+            trippedSession.count,
+            trippedSession.errorMessage,
+            trippedSession.reason,
+            !!input.runId && hasReportedIssue(input.runId),
+            'session',
+          ),
+          policyDecision,
+          durationMs: Math.max(0, now() - startedAt),
+        };
+      }
+    }
+
+    const tripped = findTrippedFailure(input.runId, policyDecision.toolName, recipientScope);
     if (tripped) {
       return {
         status: 'error',
-        error: new AgentToolRepeatedFailureError(policyDecision.toolName, tripped.count, tripped.errorMessage),
+        error: new AgentToolRepeatedFailureError(
+          policyDecision.toolName,
+          tripped.count,
+          tripped.errorMessage,
+          tripped.reason,
+          !!input.runId && hasReportedIssue(input.runId),
+        ),
         policyDecision,
         durationMs: Math.max(0, now() - startedAt),
       };
@@ -661,7 +815,7 @@ export async function executeAgentToolThroughGateway(
       if (
         input.budgetScopeId
         && input.budgetScopeId !== input.runId
-        && mediaFailureBudget(policyDecision.toolName) != null
+        && shouldTrackInSessionScope(policyDecision.toolName, structuredFailure)
       ) {
         recordToolFailure(input.budgetScopeId, policyDecision.toolName, input.args, structuredFailure);
       }
@@ -680,6 +834,12 @@ export async function executeAgentToolThroughGateway(
     if (input.budgetScopeId && input.budgetScopeId !== input.runId) {
       clearToolFailures(input.budgetScopeId, policyDecision.toolName, input.args);
     }
+    // ENG-167 follow-up: remember a successful report_product_issues call for the
+    // rest of this run so a later timeout stop-message doesn't tell the model to
+    // file a second one.
+    if (input.runId && policyDecision.toolName === 'report_product_issues') {
+      markReportedIssue(input.runId);
+    }
     return {
       status: 'success',
       result,
@@ -691,7 +851,7 @@ export async function executeAgentToolThroughGateway(
     if (
       input.budgetScopeId
       && input.budgetScopeId !== input.runId
-      && mediaFailureBudget(policyDecision.toolName) != null
+      && shouldTrackInSessionScope(policyDecision.toolName, error)
     ) {
       recordToolFailure(input.budgetScopeId, policyDecision.toolName, input.args, error);
     }
