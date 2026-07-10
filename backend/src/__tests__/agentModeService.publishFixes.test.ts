@@ -406,7 +406,9 @@ describe('Worker uncaught error requestId', () => {
 
     // The guards helper must be imported...
     expect(workerSource).toMatch(/installWorkerShutdownGuards/);
-    // ...and actually invoked at module load (not just referenced in a comment).
-    expect(workerSource).toMatch(/installWorkerShutdownGuards\(\)/);
+    // ...and actually invoked at module load on a real (non-comment) line — a
+    // commented-out `// installWorkerShutdownGuards()` must NOT satisfy the guard,
+    // since that would let a refactor silently drop the call and reintroduce the crash.
+    expect(workerSource).toMatch(/^(?!\s*\/\/).*installWorkerShutdownGuards\(\)/m);
   });
 });
