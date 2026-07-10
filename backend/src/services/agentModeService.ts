@@ -21010,7 +21010,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         prompt,
         tone,
         depth,
-        focus_areas
+        focus_areas,
+        userId
       });
 
       if (!researchResult.success || !researchResult.markdownContent) {
@@ -21118,7 +21119,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           topic: researchTopic,
           prompt: requirements || undefined,
           tone: 'professional',
-          style
+          style,
+          userId
         });
 
         if (!researchResult.success || !researchResult.markdownContent) {

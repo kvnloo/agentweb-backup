@@ -63,6 +63,11 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'gemini-3.1-flash-lite': withDerivedCache(0.075, 0.3), // ported from estimateCost
   'gemini-3.5-flash': withDerivedCache(0.15, 0.6), // ported from estimateCost
   'gemini-3.1-flash-live-preview': withDerivedCache(0.75, 4.5), // text rate per public listings (cloudprice, Jun 2026); UNVERIFIED — audio/video tokens are billed at higher live-API rates not modeled here
+  // Deep Research agents report token usage via usageMetadata; priced at Gemini
+  // Pro token rates as a best-effort estimate. UNVERIFIED — Google has not
+  // published per-token rates for the deep-research agents (ENG-207 to confirm).
+  'deep-research-preview-04-2026': withDerivedCache(1.25, 10), // UNVERIFIED
+  'deep-research-max-preview-04-2026': withDerivedCache(1.25, 10), // UNVERIFIED
 
   // ── Chatbot (Emma) Azure deployments ────────────────────────────────────────
   // NOTE: chatbotService.calculateCost() carries per-1K rates that are 10x the
