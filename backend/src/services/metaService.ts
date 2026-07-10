@@ -3,6 +3,7 @@ import axios from 'axios';
 import { MetaAdAccount, MetaPage } from '../types/meta';
 import { INTEGRATION_CONFIG } from '../config/integrations';
 import { getMetaCredentials } from '../utils/secretsManager';
+import { buildUtmSpec, utmQueryString, existingUtmKeys } from '../utils/adUtm';
 
 export interface MetaAdsCampaignParams {
   name: string;
@@ -916,6 +917,41 @@ export class MetaService {
   }
 
   /**
+   * Resolve the creative-level `url_tags` (UTM append rules) for a creative (ENG-239).
+   *
+   * An explicitly-supplied `params.url_tags` always wins and is returned verbatim —
+   * this both honours a caller who hand-authored tracking and preserves the
+   * carried-over `url_tags` on a creative swap (agentModeService's carriedUrlTags).
+   *
+   * Otherwise we auto-generate Emma's UTM set (utm_source=meta, utm_medium=paid,
+   * utm_campaign / utm_content as Meta click-time macros).
+   *
+   * AC4 trap: Meta APPENDS `url_tags` to the destination link at delivery, so if the
+   * link already carries e.g. `utm_source`, emitting it again produces a duplicate
+   * param on the click URL. We therefore omit any UTM key the reference URL already
+   * carries; if it carries them all, `utmQueryString` returns "" and we return
+   * undefined so the caller writes no `url_tags` field at all.
+   *
+   * AC4 reference URL: `url_tags` is creative-level and Meta applies it to EVERY link
+   * on the creative, but there is only one tag string. We reference `params.link_url`
+   * (the single-image/video link, and the carousel fallback link at :989). Carousels
+   * may omit the top-level link and rely on per-card `child_attachments[].link` (:992),
+   * so when `link_url` is absent we fall back to the first card's `link_url`. If no
+   * reference URL exists at all, we omit nothing and emit the full set.
+   */
+  private static resolveUrlTags(params: MetaAdsAdCreativeParams): string | undefined {
+    if (params.url_tags) {
+      return params.url_tags;
+    }
+    const spec = buildUtmSpec('meta', { campaign: '{{campaign.id}}', content: '{{ad.id}}' });
+    const referenceUrl =
+      params.link_url || params.carousel_cards?.find((c) => c.link_url)?.link_url;
+    const omit = referenceUrl ? existingUtmKeys(referenceUrl) : new Set<string>();
+    const tags = utmQueryString(spec, omit);
+    return tags || undefined;
+  }
+
+  /**
    * Create a new ad creative (Supports Image, Video, Carousel)
    */
   public async createAdCreative(adAccountId: string, accessToken: string, params: MetaAdsAdCreativeParams) {
@@ -1030,9 +1066,11 @@ export class MetaService {
         [AdCreative.Fields.name]: params.name,
         [AdCreative.Fields.object_story_spec]: objectStorySpec
       };
-      // Preserve UTM/tracking append rules so a link_url swap doesn't strip them.
-      if (params.url_tags) {
-        creativeParams.url_tags = params.url_tags;
+      // Auto-generate UTM append rules when the caller supplies none (ENG-239), and
+      // preserve an explicit value so a link_url swap doesn't strip them.
+      const urlTags = MetaService.resolveUrlTags(params);
+      if (urlTags) {
+        creativeParams.url_tags = urlTags;
       }
 
       this.log(`Creating ad creative in account: ${adAccountId}`, creativeParams);
@@ -1139,9 +1177,11 @@ export class MetaService {
       [AdCreative.Fields.object_story_spec]: objectStorySpec,
       asset_feed_spec: assetFeedSpec,
     };
-    // Preserve UTM/tracking append rules so a link_url swap doesn't strip them.
-    if (params.url_tags) {
-      creativeParams.url_tags = params.url_tags;
+    // Auto-generate UTM append rules when the caller supplies none (ENG-239), and
+    // preserve an explicit value so a link_url swap doesn't strip them.
+    const urlTags = MetaService.resolveUrlTags(params);
+    if (urlTags) {
+      creativeParams.url_tags = urlTags;
     }
 
     this.log(`Creating placement-customized ad creative in account: ${adAccountId}`, creativeParams);
