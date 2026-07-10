@@ -1,13 +1,135 @@
 import {
   _resetV0UsageGuardForTest,
+  buildV0IdempotencyKey,
+  isReservationBlocking,
   guardedV0ChatCreate,
   guardedV0CorrectionMessage,
   getV0UsageCountForScope,
+  type V0UsageRecord,
 } from '../services/v0UsageGuard';
+
+const reservedRecord = (updatedAt: string): V0UsageRecord => ({
+  idempotencyKey: 'k',
+  userId: 'u',
+  operation: 'additional_page_chat_create',
+  scopeId: 's',
+  status: 'reserved',
+  createdAt: updatedAt,
+  updatedAt,
+});
 
 describe('v0UsageGuard', () => {
   beforeEach(() => {
     _resetV0UsageGuardForTest();
+  });
+
+  describe('buildV0IdempotencyKey — prompt-independent (ENG-287)', () => {
+    // The enriched prompt is not stable between attempts (brand context varies), so
+    // keying on it means retries never dedupe. The identity of "the same generation"
+    // is (operation, user, site/scope, slug) — not the prompt text.
+    const base = {
+      userId: 'u1',
+      operation: 'additional_page_chat_create' as const,
+      scopeId: 'site_1',
+      slug: 'book-a-demo',
+    };
+
+    test('same key for the same page regardless of prompt content', () => {
+      expect(buildV0IdempotencyKey({ ...base, prompt: 'first enriched prompt' })).toBe(
+        buildV0IdempotencyKey({ ...base, prompt: 'a totally different enriched prompt' }),
+      );
+    });
+
+    test('different slug yields a different key', () => {
+      expect(buildV0IdempotencyKey({ ...base, prompt: 'p' })).not.toBe(
+        buildV0IdempotencyKey({ ...base, slug: 'other-slug', prompt: 'p' }),
+      );
+    });
+  });
+
+  describe('isReservationBlocking (ENG-287)', () => {
+    const now = Date.parse('2026-07-10T04:00:00.000Z');
+    const TTL = 20 * 60 * 1000;
+
+    test('no record does not block', () => {
+      expect(isReservationBlocking(undefined, now, TTL)).toBe(false);
+    });
+
+    test('a failed record does not block a retry', () => {
+      const rec = { ...reservedRecord('2026-07-10T03:59:00.000Z'), status: 'failed' as const };
+      expect(isReservationBlocking(rec, now, TTL)).toBe(false);
+    });
+
+    test('a succeeded record does not block (handled as reuse elsewhere)', () => {
+      const rec = { ...reservedRecord('2026-07-10T03:59:00.000Z'), status: 'succeeded' as const };
+      expect(isReservationBlocking(rec, now, TTL)).toBe(false);
+    });
+
+    test('a fresh reserved record blocks (genuine concurrent generation)', () => {
+      expect(isReservationBlocking(reservedRecord('2026-07-10T03:59:00.000Z'), now, TTL)).toBe(true);
+    });
+
+    test('a stale reserved record does not block (abandoned by a crash)', () => {
+      // 25 min old > 20 min TTL → treat as abandoned so a retry can proceed.
+      expect(isReservationBlocking(reservedRecord('2026-07-10T03:35:00.000Z'), now, TTL)).toBe(false);
+    });
+  });
+
+  test('a retry after a failed attempt proceeds (never hard-fails as "in flight")', async () => {
+    const create = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('v0 chat creation (additional page) timed out after 300s'))
+      .mockResolvedValueOnce({ id: 'chat_retry_ok' });
+
+    await expect(
+      guardedV0ChatCreate({
+        userId: 'u1',
+        operation: 'additional_page_chat_create',
+        scopeId: 'site_1',
+        slug: 'book-a-demo',
+        prompt: 'attempt one enriched',
+        create,
+      }),
+    ).rejects.toThrow(/timed out/);
+
+    // Retry — different enriched prompt, same page. Must run, not throw "in flight".
+    const second = await guardedV0ChatCreate({
+      userId: 'u1',
+      operation: 'additional_page_chat_create',
+      scopeId: 'site_1',
+      slug: 'book-a-demo',
+      prompt: 'attempt two enriched (different)',
+      create,
+    });
+
+    expect(second).toMatchObject({ id: 'chat_retry_ok' });
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  test('a genuinely in-progress generation blocks a concurrent duplicate', async () => {
+    let release!: (v: { id: string }) => void;
+    const inflight = new Promise<{ id: string }>((r) => {
+      release = r;
+    });
+    const create = jest.fn().mockReturnValueOnce(inflight).mockResolvedValue({ id: 'x' });
+
+    const args = {
+      userId: 'u1',
+      operation: 'additional_page_chat_create' as const,
+      scopeId: 'site_1',
+      slug: 'book-a-demo',
+      prompt: 'p',
+      create,
+    };
+
+    const first = guardedV0ChatCreate(args); // reserves, then awaits the hanging create
+    await Promise.resolve(); // let the reservation land before the concurrent call
+
+    await expect(guardedV0ChatCreate(args)).rejects.toThrow(/in progress/i);
+
+    release({ id: 'chat_first' });
+    await first;
+    expect(create).toHaveBeenCalledTimes(1);
   });
 
   test('reuses a completed chat for duplicate first-page idempotency key', async () => {

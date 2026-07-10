@@ -29,6 +29,33 @@ export interface V0UsageRecord {
 
 const memoryUsage = new Map<string, V0UsageRecord>();
 
+/**
+ * How long a `reserved` record is treated as a live lock. A guarded chat-create
+ * holds the reservation only while `create()` runs — at most withRetry's
+ * 3 × 300s ≈ 15 min. Past this ceiling a still-`reserved` record means the run
+ * was abandoned (process crash / deploy before the catch), so we let a new
+ * attempt reclaim it instead of blocking forever. (ENG-287)
+ */
+export const V0_RESERVATION_TTL_MS = 20 * 60 * 1000;
+
+/**
+ * Should an existing usage record block a NEW generation attempt?
+ *
+ * Only a *fresh* `reserved` record blocks — that is a genuinely in-progress run.
+ * A `failed` record must never block (retries have to be able to proceed), a
+ * `succeeded` record is handled as a reuse by the caller (not here), and a
+ * `reserved` record older than the TTL is a crash-abandoned lock we reclaim.
+ * (ENG-287)
+ */
+export function isReservationBlocking(
+  existing: V0UsageRecord | undefined,
+  nowMs: number,
+  ttlMs: number = V0_RESERVATION_TTL_MS,
+): boolean {
+  if (!existing || existing.status !== 'reserved') return false;
+  return nowMs - Date.parse(existing.updatedAt) <= ttlMs;
+}
+
 function persistenceEnabled(): boolean {
   return process.env.NODE_ENV !== 'test' || process.env.V0_USAGE_DYNAMO_TEST === 'true';
 }
@@ -49,24 +76,36 @@ export function buildV0IdempotencyKey(input: {
   prompt?: string;
   chatId?: string;
 }): string {
-  const promptHash = input.prompt ? hashV0Prompt(input.prompt) : '';
+  // The key deliberately does NOT include the prompt. The enriched prompt varies
+  // between attempts (brand context is not stable), so keying on it meant retries
+  // never deduped and each retry called v0 at full cost. "The same generation" is
+  // identified by (operation, user, scope, slug[, chatId]) — the prompt is stored
+  // on the record for observability but is not part of the identity. (ENG-287)
   return [
     input.operation,
     input.userId,
     input.scopeId,
     input.slug || '',
     input.chatId || '',
-    promptHash,
   ].join('#');
 }
 
-async function bestEffortPut(record: V0UsageRecord, condition?: string): Promise<boolean> {
+async function bestEffortPut(
+  record: V0UsageRecord,
+  opts?: {
+    condition?: string;
+    names?: Record<string, string>;
+    values?: Record<string, unknown>;
+  },
+): Promise<boolean> {
   if (!persistenceEnabled()) return true;
   try {
     await dynamodb.put({
       TableName: TABLE_NAME,
       Item: record,
-      ...(condition ? { ConditionExpression: condition } : {}),
+      ...(opts?.condition ? { ConditionExpression: opts.condition } : {}),
+      ...(opts?.names ? { ExpressionAttributeNames: opts.names } : {}),
+      ...(opts?.values ? { ExpressionAttributeValues: opts.values } : {}),
     }).promise();
     return true;
   } catch (error: any) {
@@ -74,6 +113,21 @@ async function bestEffortPut(record: V0UsageRecord, condition?: string): Promise
     console.warn('[V0_USAGE] Persistence skipped:', error?.message || error);
     return true;
   }
+}
+
+/**
+ * Reserve the key iff nothing is holding it: no record, or a `failed` record, or
+ * a `reserved` record older than the TTL (crash-abandoned). Mirrors
+ * `isReservationBlocking` on the DynamoDB side so a concurrent winner is rejected.
+ * (ENG-287)
+ */
+async function reserveInDynamo(record: V0UsageRecord, staleThresholdIso: string): Promise<boolean> {
+  return bestEffortPut(record, {
+    condition:
+      'attribute_not_exists(idempotencyKey) OR #status = :failed OR #updatedAt < :stale',
+    names: { '#status': 'status', '#updatedAt': 'updatedAt' },
+    values: { ':failed': 'failed', ':stale': staleThresholdIso },
+  });
 }
 
 async function bestEffortGet(key: string): Promise<V0UsageRecord | undefined> {
@@ -106,11 +160,14 @@ export async function guardedV0ChatCreate<T = any>(input: {
   if (existing?.chatId && existing.status === 'succeeded') {
     return { id: existing.chatId, reused: true };
   }
-  if (existing?.status === 'reserved') {
-    throw new Error('A v0 generation with the same idempotency key is already in flight.');
+  // Only a fresh reservation blocks; a failed or crash-abandoned (stale) record
+  // must let a retry through. (ENG-287)
+  const nowMs = Date.now();
+  if (isReservationBlocking(existing, nowMs)) {
+    throw new Error('A v0 generation for this page is already in progress.');
   }
 
-  const now = new Date().toISOString();
+  const now = new Date(nowMs).toISOString();
   const reserved: V0UsageRecord = {
     idempotencyKey,
     userId: input.userId,
@@ -122,11 +179,12 @@ export async function guardedV0ChatCreate<T = any>(input: {
     updatedAt: now,
   };
   memoryUsage.set(idempotencyKey, reserved);
-  const reservedInDynamo = await bestEffortPut(reserved, 'attribute_not_exists(idempotencyKey)');
+  const staleThresholdIso = new Date(nowMs - V0_RESERVATION_TTL_MS).toISOString();
+  const reservedInDynamo = await reserveInDynamo(reserved, staleThresholdIso);
   if (!reservedInDynamo) {
     const latest = await bestEffortGet(idempotencyKey);
-    if (latest?.chatId) return { id: latest.chatId, reused: true };
-    throw new Error('A v0 generation with the same idempotency key is already in flight.');
+    if (latest?.chatId && latest.status === 'succeeded') return { id: latest.chatId, reused: true };
+    throw new Error('A v0 generation for this page is already in progress.');
   }
 
   try {
@@ -170,7 +228,9 @@ export async function guardedV0CorrectionMessage<T>(input: {
     updatedAt: now,
   };
   memoryUsage.set(idempotencyKey, reserved);
-  const reservedInDynamo = await bestEffortPut(reserved, 'attribute_not_exists(idempotencyKey)');
+  const reservedInDynamo = await bestEffortPut(reserved, {
+    condition: 'attribute_not_exists(idempotencyKey)',
+  });
   if (!reservedInDynamo) return { skipped: true };
 
   try {
