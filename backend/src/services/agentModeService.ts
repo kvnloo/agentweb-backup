@@ -20082,11 +20082,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           };
         }
 
-        // External URL — plain fetch
+        // External URL — plain fetch. Send no-cache headers so scrapes (e.g.
+        // onboarding brand-build reading the user's live site) reflect the
+        // CURRENT content and never a stale CDN/intermediary copy.
         const response = await axios.get(normalizedFileUrl, {
           timeout: 30000,
           responseType: 'arraybuffer',
-          headers: { 'User-Agent': 'AgentWeb-Backend/1.0' },
+          headers: {
+            'User-Agent': 'AgentWeb-Backend/1.0',
+            'Cache-Control': 'no-cache',
+            Pragma: 'no-cache',
+          },
         });
         buffer = Buffer.from(response.data as ArrayBuffer);
         contentType = response.headers['content-type'] || '';
