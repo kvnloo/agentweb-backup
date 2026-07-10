@@ -1,5 +1,7 @@
 import {
   BRAND_BUILD_TIMEOUT_MS,
+  BRAND_BUILD_HARD_TIMEOUT_MS,
+  buildAutoFailPatchIfStuck,
   buildFailedPatch,
   buildReadyPatch,
   buildStartPatch,
@@ -65,6 +67,34 @@ describe("brandBuildStatusService", () => {
         now
       );
       expect(patch!.brandBuildDurationMs).toBe(0);
+    });
+
+    it("flips a FAILED build to ready when includeFailed is set (manual brand save)", () => {
+      // When a user supplies a brand by hand after an unscrapable-site failure,
+      // the guidelines write should complete the build so they're no longer
+      // gated on the buildingBrand screen. Only the explicit REST save opts in;
+      // the default (Emma's internal hook) still ignores non-building states.
+      const startedAt = new Date("2026-04-24T11:59:00.000Z"); // 60s before now
+      const patch = buildReadyPatch(
+        {
+          brandBuildStatus: "failed",
+          brandBuildStartedAt: startedAt.toISOString(),
+          brandBuildError: "Emma session failed: scrape unreachable",
+        },
+        now,
+        { includeFailed: true }
+      );
+      expect(patch).not.toBeNull();
+      expect(patch!.brandBuildStatus).toBe("ready");
+      expect(patch!.brandBuildError).toBeUndefined();
+      expect(patch!.brandBuildDurationMs).toBe(60_000);
+    });
+
+    it("still ignores a ready/absent build even with includeFailed set", () => {
+      expect(
+        buildReadyPatch({ brandBuildStatus: "ready" }, now, { includeFailed: true })
+      ).toBeNull();
+      expect(buildReadyPatch({}, now, { includeFailed: true })).toBeNull();
     });
   });
 
@@ -149,6 +179,95 @@ describe("brandBuildStatusService", () => {
       );
       expect(snap.inFlight).toBe(false);
       expect(snap.timedOut).toBe(false);
+    });
+  });
+
+  describe("timeout budgets", () => {
+    it("aligns the status/UI budget with the 300s server session wall (was a stale 90s)", () => {
+      // The server-side Emma brand-build session budget
+      // (onboardingBrandBuildService.BRAND_BUILD_TIMEOUT_MS) is 300s. The
+      // status-service budget used to derive `timedOut` MUST NOT be shorter,
+      // or a legitimately-in-flight build (p95 ≈ 5m) is reported as timed out
+      // while the server is still working.
+      expect(BRAND_BUILD_TIMEOUT_MS).toBe(300_000);
+    });
+
+    it("sets the hard watchdog wall above the server budget so the server's own failure wins the race", () => {
+      expect(BRAND_BUILD_HARD_TIMEOUT_MS).toBeGreaterThan(BRAND_BUILD_TIMEOUT_MS);
+    });
+  });
+
+  describe("buildAutoFailPatchIfStuck", () => {
+    it("returns null for a build that is within the hard timeout budget", () => {
+      // FAIL case: a fresh in-flight build must never be auto-failed.
+      const startedAt = new Date(now.getTime() - 10_000); // 10s ago
+      expect(
+        buildAutoFailPatchIfStuck(
+          {
+            brandBuildStatus: "building",
+            brandBuildStartedAt: startedAt.toISOString(),
+          },
+          now
+        )
+      ).toBeNull();
+    });
+
+    it("returns null for non-building statuses regardless of age", () => {
+      // A ready/failed build is already terminal — the watchdog must ignore it.
+      const veryOld = new Date(now.getTime() - 100 * BRAND_BUILD_HARD_TIMEOUT_MS);
+      expect(
+        buildAutoFailPatchIfStuck(
+          { brandBuildStatus: "ready", brandBuildStartedAt: veryOld.toISOString() },
+          now
+        )
+      ).toBeNull();
+      expect(
+        buildAutoFailPatchIfStuck(
+          { brandBuildStatus: "failed", brandBuildStartedAt: veryOld.toISOString() },
+          now
+        )
+      ).toBeNull();
+      expect(buildAutoFailPatchIfStuck({}, now)).toBeNull();
+    });
+
+    it("returns null when a building record has no valid startedAt (cannot age it)", () => {
+      expect(
+        buildAutoFailPatchIfStuck(
+          { brandBuildStatus: "building", brandBuildStartedAt: "not-a-date" },
+          now
+        )
+      ).toBeNull();
+    });
+
+    it("auto-fails a build stuck in 'building' past the hard timeout so the UI shows a retry, not a silent spinner", () => {
+      // SUCCESS case + the 70-day stuck-user case (brand_submitted): a build
+      // whose background job was lost stays 'building' forever. The watchdog
+      // must convert it to a terminal 'failed' with a user-visible message.
+      const stuck = new Date(now.getTime() - BRAND_BUILD_HARD_TIMEOUT_MS - 1);
+      const patch = buildAutoFailPatchIfStuck(
+        {
+          brandBuildStatus: "building",
+          brandBuildStartedAt: stuck.toISOString(),
+        },
+        now
+      );
+      expect(patch).not.toBeNull();
+      expect(patch!.brandBuildStatus).toBe("failed");
+      expect(patch!.brandBuildError).toMatch(/timed out/i);
+      expect(patch!.brandBuildCompletedAt).toBe("2026-04-24T12:00:00.000Z");
+    });
+
+    it("auto-fails a 70-day stuck build (matches the stuck brand_submitted users)", () => {
+      const seventyDaysAgo = new Date(now.getTime() - 70 * 24 * 60 * 60 * 1000);
+      const patch = buildAutoFailPatchIfStuck(
+        {
+          brandBuildStatus: "building",
+          brandBuildStartedAt: seventyDaysAgo.toISOString(),
+        },
+        now
+      );
+      expect(patch).not.toBeNull();
+      expect(patch!.brandBuildStatus).toBe("failed");
     });
   });
 
