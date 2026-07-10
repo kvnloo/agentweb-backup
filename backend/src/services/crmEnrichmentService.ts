@@ -2,6 +2,7 @@ import { crmDb } from './db';
 import { agentModeService } from './agentModeService';
 import { settingsService } from './settingsService';
 import { incrementExtraCostUsage } from './tokenUsageService';
+import { meterUserUsage } from './usageRecorderService';
 import { v4 as uuidv4 } from 'uuid';
 import {
   getRawDataFromCache,
@@ -955,6 +956,14 @@ export class CrmEnrichmentService {
         dataExtractionModel,
         'extractFieldsViaLLM:json',
       );
+      meterUserUsage({
+        userId: spec.userId,
+        model: dataExtractionModel,
+        provider: dataExtractionModel.startsWith('anthropic') || dataExtractionModel.startsWith('claude') ? 'bedrock' : 'azure',
+        feature: 'crm_enrichment_extract',
+        inputTokens: (completion as any)?.usage?.prompt_tokens || 0,
+        outputTokens: (completion as any)?.usage?.completion_tokens || 0,
+      });
       const raw = completion.choices?.[0]?.message?.content || '';
       console.log(`[CrmEnrichment][extractFieldsViaLLM] LLM responded in ${Date.now()-tLlm}ms rawLen=${raw.length}`);
       response = JSON.parse(raw);
@@ -976,6 +985,14 @@ export class CrmEnrichmentService {
         dataExtractionModel,
         'extractFieldsViaLLM:plain',
       );
+      meterUserUsage({
+        userId: spec.userId,
+        model: dataExtractionModel,
+        provider: dataExtractionModel.startsWith('anthropic') || dataExtractionModel.startsWith('claude') ? 'bedrock' : 'azure',
+        feature: 'crm_enrichment_extract',
+        inputTokens: (retry as any)?.usage?.prompt_tokens || 0,
+        outputTokens: (retry as any)?.usage?.completion_tokens || 0,
+      });
       const rawRetry = retry.choices?.[0]?.message?.content || '';
 
       const cleaned = rawRetry

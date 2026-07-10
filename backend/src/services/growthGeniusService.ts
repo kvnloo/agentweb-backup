@@ -1,5 +1,6 @@
 import { getAzureClient } from '../utils/llmClients';
 import { searchPlatformKnowledgeBase } from './chatbotService';
+import { meterUserUsage } from './usageRecorderService';
 
 export interface GrowthGeniusMessage {
   id: string;
@@ -166,6 +167,15 @@ Remember: You're here to help startups and businesses grow through smart marketi
         max_completion_tokens: 1500
       });
 
+      meterUserUsage({
+        userId,
+        model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
+        provider: 'azure',
+        feature: 'growth_genius',
+        inputTokens: (response as any)?.usage?.prompt_tokens || 0,
+        outputTokens: (response as any)?.usage?.completion_tokens || 0,
+      });
+
       const responseMessage = response.choices[0].message;
       console.log('GrowthGenius: Initial response received');
       
@@ -234,7 +244,16 @@ Remember: You're here to help startups and businesses grow through smart marketi
           ],
           max_completion_tokens: 1500
         });
-        
+
+        meterUserUsage({
+          userId,
+          model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
+          provider: 'azure',
+          feature: 'growth_genius',
+          inputTokens: (finalResponse as any)?.usage?.prompt_tokens || 0,
+          outputTokens: (finalResponse as any)?.usage?.completion_tokens || 0,
+        });
+
         const finalContent = finalResponse.choices[0]?.message?.content || 'Sorry, I could not generate a response.';
         console.log('GrowthGenius: Final response generated with knowledge base context');
         
