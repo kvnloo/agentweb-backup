@@ -28,6 +28,12 @@ export interface RecordUsageContext {
   cacheWriteTokens?: number;
   sessionId?: string;
   taskId?: string;
+  /**
+   * Explicit USD cost for calls that are NOT token-priced (image/video are billed
+   * per generation, so getModelPrice returns null and token-derived cost is 0).
+   * When set, it is recorded verbatim instead of computing cost from tokens.
+   */
+  costUsdOverride?: number;
 }
 
 /** Log at most one recorder failure per minute to avoid log spam on outages. */
@@ -74,13 +80,16 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
     const cacheReadTokens = Math.max(0, Math.round(ctx.cacheReadTokens || 0));
     const cacheWriteTokens = Math.max(0, Math.round(ctx.cacheWriteTokens || 0));
 
-    const costMicroUsd = computeCostMicroUsd(
-      ctx.model,
-      inputTokens,
-      outputTokens,
-      cacheReadTokens,
-      cacheWriteTokens
-    );
+    const costMicroUsd =
+      ctx.costUsdOverride != null
+        ? Math.max(0, Math.round(ctx.costUsdOverride * 1e6))
+        : computeCostMicroUsd(
+            ctx.model,
+            inputTokens,
+            outputTokens,
+            cacheReadTokens,
+            cacheWriteTokens
+          );
 
     await usageRecordDb.incrementUsage({
       userId,

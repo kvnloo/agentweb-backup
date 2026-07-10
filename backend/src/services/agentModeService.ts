@@ -20268,11 +20268,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       if (result.success && result.imageUrl) {
-        // Track generation cost (image APIs are billed per generation, not per token)
+        // Track generation cost (image APIs are billed per generation, not per token).
+        // Burn-only: record it to the user's burn for visibility, but do NOT deduct
+        // it from their quota — image/video spend is on us (ENG-200).
         const imageCost = this.estimateImageGenerationCost(imageModelUsed);
-        incrementUserTokenUsage(userId, 0, imageCost).catch((err) =>
-          console.error('AgentMode: Failed to track token usage for generateImage:', err)
-        );
+        void recordUsage({
+          userId,
+          sessionId,
+          model: imageModelUsed,
+          provider: 'google',
+          feature: 'generateImage',
+          inputTokens: 0,
+          outputTokens: 0,
+          costUsdOverride: imageCost,
+        });
         chatbotDb.addToolCostToSession(sessionId, imageCost, 'generateImage').catch((err) =>
           console.error('AgentMode: Failed to add image cost to session:', err)
         );
@@ -20411,11 +20420,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       if (result.success && result.videoUrl) {
-        // Track generation cost (video APIs are billed per 8s clip; longer videos cost more)
+        // Track generation cost (video APIs are billed per 8s clip; longer videos cost more).
+        // Burn-only: record it to the user's burn for visibility, but do NOT deduct
+        // it from their quota — image/video spend is on us (ENG-200).
         const videoCost = this.estimateVideoGenerationCost(videoModel || 'veo-3.1-generate-preview', durationSeconds);
-        incrementUserTokenUsage(userId, 0, videoCost).catch((err) =>
-          console.error('AgentMode: Failed to track token usage for generateVideo:', err)
-        );
+        void recordUsage({
+          userId,
+          sessionId,
+          model: videoModel || 'veo-3.1-generate-preview',
+          provider: 'google',
+          feature: 'generateVideo',
+          inputTokens: 0,
+          outputTokens: 0,
+          costUsdOverride: videoCost,
+        });
         chatbotDb.addToolCostToSession(sessionId, videoCost, 'generateVideo').catch((err) =>
           console.error('AgentMode: Failed to add video cost to session:', err)
         );
