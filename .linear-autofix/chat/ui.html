@@ -48,10 +48,14 @@
 
   /* Main */
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
+  #dropzone { position: absolute; inset: 0; z-index: 30; display: none; align-items: center; justify-content: center; background: rgba(10,12,18,.72); pointer-events: none; }
+  #main.dropping #dropzone { display: flex; }
+  #dropzone .dzbox { border: 2px dashed var(--accent); border-radius: 14px; padding: 22px 34px; font-size: 16px; color: var(--text); background: var(--panel); }
   /* Holds the chat scroll area + the jump pill, so the pill anchors to the BOTTOM OF THE CHAT
      (just above the thinking/composer stack) rather than a fixed distance from the window. */
   #chatwrap { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
-  #jumpDown { position: absolute; left: 50%; transform: translateX(-50%); bottom: 14px; z-index: 5; display: none; background: var(--accent); color: #0d0f13; border: 0; border-radius: 16px; padding: 6px 14px; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,.45); }
+  #jumpDown { position: absolute; left: 50%; transform: translateX(-50%); bottom: 14px; z-index: 5; opacity: 0; visibility: hidden; transition: opacity .18s ease, visibility .18s ease; background: var(--accent); color: #0d0f13; border: 0; border-radius: 16px; padding: 6px 14px; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,.45); }
+  #jumpDown.show { opacity: 1; visibility: visible; }
   #jumpDown:hover { filter: brightness(1.08); }
   #hdr { padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--panel); }
   #hdr .t { font-size: 15px; font-weight: 600; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
@@ -93,6 +97,22 @@
   #editbar button { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 3px 10px; font: inherit; font-size: 12px; cursor: pointer; }
   #editbar button:hover { border-color: var(--accent); }
   #editbar .spacer { margin-left: auto; }
+  #queuebar { margin-bottom: 8px; display: flex; flex-direction: column; gap: 6px; }
+  #queuebar .qhead { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .04em; }
+  .qrow { display: flex; align-items: center; gap: 8px; background: var(--panel2); border: 1px dashed var(--border); border-radius: 8px; padding: 6px 10px; font-size: 13px; color: var(--dim); }
+  .qrow .qn { flex: none; opacity: .7; }
+  .qrow .qtext { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .qrow .qx { flex: none; cursor: pointer; opacity: .6; padding: 0 2px; }
+  .qrow .qx:hover { opacity: 1; color: var(--text); }
+  #attach { flex: none; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 10px; width: 42px; min-height: 42px; font-size: 17px; cursor: pointer; }
+  #attach:hover { border-color: var(--accent); }
+  #attachbar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+  .attachchip { display: flex; align-items: center; gap: 6px; background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 4px 8px; font-size: 12px; color: var(--dim); max-width: 220px; }
+  .attachchip .an { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .attachchip .ax { cursor: pointer; opacity: .6; flex: none; }
+  .attachchip .ax:hover { opacity: 1; color: var(--text); }
+  .msg.user .atts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .msg.user .atts .att { font-size: 11px; color: var(--dim); background: rgba(0,0,0,.2); border: 1px solid var(--border); border-radius: 6px; padding: 2px 7px; }
   .msg.assistant { background: var(--panel2); align-self: flex-start; }
   /* WhatsApp-style local-time stamp tucked into the bubble's bottom-right corner (no extra row). */
   .ts-in { position: absolute; right: 12px; bottom: 5px; font-size: 10px; line-height: 1; color: var(--dim); }
@@ -244,11 +264,15 @@
     <div id="thinking"><span class="dots"><i></i><i></i><i></i></span><span id="thinking-label">Claude is working…</span></div>
     <div id="voice"><span class="mic"></span><span>🎤 Listening… — release space to stop · Esc to cancel</span></div>
     <div id="composer" style="display:none">
+      <div id="queuebar" style="display:none"></div>
       <div id="editbar" style="display:none"></div>
+      <div id="attachbar" style="display:none"></div>
       <div class="row">
+        <button id="attach" title="Attach images or files for the agent to read">📎</button>
         <textarea id="input" rows="1" placeholder="Ask about this fix, or tell the agent what to change…"></textarea>
         <button id="send">Send</button>
       </div>
+      <input id="fileinput" type="file" accept="image/*,.pdf,.txt,.md,.log,.json,.csv" multiple style="display:none">
       <div id="hint"></div>
     </div>
   </div>
@@ -371,7 +395,7 @@ function stampTime(bubbleEl, iso) {
   bubbleEl.appendChild(ts); // bottom-right corner of the bubble (absolute)
 }
 
-const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true, picker: null, lastEsc: 0, slash: null, cmd: null, mergePhase: null, lastResult: '', compacting: false, lastSent: '', escArmed: 0, escText: '' };
+const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true, picker: null, lastEsc: 0, slash: null, cmd: null, mergePhase: null, lastResult: '', compacting: false, lastSent: '', escArmed: 0, escText: '', queue: [], queuePaused: false, attachments: [] };
 const COMMANDS = [
   { name: '/status', desc: 'Session & fix status' },
   { name: '/context', desc: 'Context window usage' },
@@ -424,6 +448,8 @@ $('searchClear').onclick = () => { S.search = ''; $('search').value = ''; $('sea
 // ---------- selection / detail ----------
 async function select(id) {
   S.sel = id; S.curBubble = null; S.stick = true;
+  S.queue = []; S.queuePaused = false; renderQueue(); // queued messages belong to the previously open issue
+  S.attachments = []; renderAttachments();
   document.title = id + ' · Autofix Chat'; // show the issue key in the browser tab
   // Remember the open issue in the URL hash so a refresh (or a shared link) lands right back on it.
   if (location.hash.slice(1) !== id) history.replaceState(null, '', '#' + id);
@@ -988,13 +1014,12 @@ async function doEditSend(revert) {
   }
 }
 
+// The composer's primary action (Enter, or the Send button when idle). While a turn is running this
+// no longer interrupts it — it QUEUES the message to auto-send when the turn finishes. Stopping is
+// done with Esc or the Stop button (which the Send button becomes while busy).
 async function send() {
   if (V.recording) return; // mid-dictation (space held): don't send a partial transcript — release first
-  if (S.busy) { // Stop
-    await fetch(`/api/issues/${S.sel}/chat/abort`, { method: 'POST' });
-    return;
-  }
-  if (S.deleting) return; // a delete confirmation is open — use its buttons, don't send a new message
+  if (S.deleting) return;  // a delete confirmation is open — use its buttons, don't send a new message
   if (S.editing) {
     const message = $('input').value.trim();
     if (!message) return;
@@ -1004,28 +1029,117 @@ async function send() {
     return;
   }
   const message = $('input').value.trim();
-  if (!message || !S.sel) return;
-  if (message[0] === '/') { hideSlash(); $('input').value = ''; autosize(); runCommand(message); return; } // slash command, not a chat message
+  const atts = S.attachments;
+  if (!message && !atts.length) { if (!S.busy && S.queue.length) drainNext(); return; } // empty Enter resumes a paused queue
+  if (!S.sel) return;
+  if (message[0] === '/' && !atts.length) { hideSlash(); $('input').value = ''; autosize(); runCommand(message); return; } // slash command
+  S.attachments = []; renderAttachments(); // consume the composer's attachments for this send
+  if (S.busy) { queueMessage(message, atts); return; } // a turn is running — queue it instead of interrupting
   $('input').value = ''; autosize();
+  sendMessage(message, atts);
+}
+// POST one chat message (with any attachments) and go busy. Used for a fresh send AND queue drains.
+async function sendMessage(message, atts = []) {
   S.lastSent = message; // remembered so an Esc-abort-before-any-reply can put it back in the composer
+  let uploaded = [];
+  if (atts && atts.length) { setBusy(true); setThinking('Uploading attachment(s)…'); uploaded = await uploadAttachments(atts); }
   // Show the bubble immediately (like edit does) so it doesn't vanish into limbo until turn_start.
   // turn_start's dataset.text dedup then skips re-adding it.
-  const bubble = addUser(message);
+  const bubble = addUser(message, null, uploaded.map((u) => u.name));
   stampTime(bubble, new Date().toISOString()); // show a time right away; renderAll re-stamps from the persisted `at`
   setBusy(true);
   const r = await fetch(`/api/issues/${S.sel}/chat`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, attachments: uploaded }),
   });
   if (!r.ok) {
     const err = await r.json().catch(() => ({}));
     addSys('⚠ ' + (err.error || `request failed (${r.status})`), 'err');
     bubble.remove();
-    $('input').value = message; autosize();
+    if (!S.queue.length) { $('input').value = message; autosize(); }
     setBusy(false);
   }
 }
-$('send').onclick = send;
+// Upload each picked file to the issue's attachment store; returns [{name, path}] the agent can Read.
+async function uploadAttachments(files) {
+  const out = [];
+  for (const f of files) {
+    try {
+      const r = await fetch(`/api/issues/${S.sel}/attach?name=${encodeURIComponent(f.name)}`, { method: 'POST', body: f });
+      if (r.ok) out.push(await r.json());
+      else { const e = await r.json().catch(() => ({})); addSys(`⚠ could not attach ${f.name}${e.error ? ': ' + e.error : ''}`, 'err'); }
+    } catch { addSys(`⚠ upload failed: ${f.name}`, 'err'); }
+  }
+  return out;
+}
+// The composer's staged attachments (File objects not yet sent), shown as removable chips.
+function renderAttachments() {
+  const bar = $('attachbar'); if (!bar) return;
+  if (!S.attachments.length) { bar.style.display = 'none'; bar.innerHTML = ''; return; }
+  bar.style.display = 'flex';
+  bar.innerHTML = S.attachments.map((f, i) =>
+    `<span class="attachchip"><span class="an">📎 ${esc(f.name)}</span><span class="ax" data-i="${i}" title="Remove">✕</span></span>`).join('');
+  for (const x of bar.querySelectorAll('.ax')) x.onclick = () => { S.attachments.splice(+x.dataset.i, 1); renderAttachments(); };
+}
+// ---- outgoing message queue (send while a turn is running) ----
+// Queued messages live in a tray above the composer (not in the chat flow), so ordering stays right:
+// each one becomes a real user bubble only when it's actually sent. Each carries its own attachments.
+function queueMessage(text, atts = []) {
+  S.queue.push({ text, attachments: atts });
+  S.queuePaused = false; // a fresh queue action resumes auto-draining
+  $('input').value = ''; autosize(); hideSlash();
+  renderQueue();
+}
+function renderQueue() {
+  const bar = $('queuebar');
+  if (!bar) return;
+  if (!S.queue.length) { bar.style.display = 'none'; bar.innerHTML = ''; return; }
+  bar.style.display = '';
+  const head = `<div class="qhead">${S.queue.length} queued · send${S.queue.length > 1 ? 's' : ''} when the current turn finishes${S.queuePaused ? ' (paused — press Enter to resume)' : ''}</div>`;
+  bar.innerHTML = head + S.queue.map((q, i) => {
+    const clip = q.attachments?.length ? ` <span class="qn">📎${q.attachments.length}</span>` : '';
+    return `<div class="qrow"><span class="qn">⏳</span><span class="qtext">${esc(q.text || '(attachment)')}</span>${clip}<span class="qx" data-i="${i}" title="Remove from queue">✕</span></div>`;
+  }).join('');
+  for (const x of bar.querySelectorAll('.qx')) x.onclick = () => { S.queue.splice(+x.dataset.i, 1); renderQueue(); };
+}
+function drainNext() {
+  const item = S.queue.shift();
+  if (item == null) return;
+  S.queuePaused = false;
+  renderQueue();
+  sendMessage(item.text, item.attachments);
+}
+// Explicit STOP of the running turn (Stop button / Esc). Keeps any queued messages but pauses
+// auto-draining, so a deliberate stop doesn't immediately fire the next queued one.
+async function stopTurn() {
+  if (!S.busy) return;
+  S.queuePaused = true; renderQueue();
+  await fetch(`/api/issues/${S.sel}/chat/abort`, { method: 'POST' });
+}
+$('send').onclick = () => { if (S.busy) stopTurn(); else send(); };
+$('attach').onclick = () => $('fileinput').click();
+$('fileinput').onchange = (ev) => { for (const f of ev.target.files) S.attachments.push(f); ev.target.value = ''; renderAttachments(); };
+// Drag & drop files anywhere over the chat panel to stage them as attachments (same as the 📎 picker).
+(() => {
+  const main = $('main');
+  const isFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
+  let depth = 0;
+  main.addEventListener('dragenter', (e) => { if (!isFiles(e) || !S.sel) return; e.preventDefault(); depth++; main.classList.add('dropping'); });
+  main.addEventListener('dragover', (e) => { if (!isFiles(e) || !S.sel) return; e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+  main.addEventListener('dragleave', (e) => { if (!isFiles(e)) return; depth = Math.max(0, depth - 1); if (!depth) main.classList.remove('dropping'); });
+  main.addEventListener('drop', (e) => {
+    if (!isFiles(e)) return;
+    e.preventDefault(); depth = 0; main.classList.remove('dropping');
+    if (!S.sel) return;
+    const files = [...(e.dataTransfer?.files || [])];
+    if (!files.length) return;
+    for (const f of files) S.attachments.push(f);
+    renderAttachments(); $('input').focus();
+  });
+  // Block the browser's default "open the dropped file" when a file lands anywhere else in the window.
+  window.addEventListener('dragover', (e) => { if (isFiles(e)) e.preventDefault(); });
+  window.addEventListener('drop', (e) => { if (isFiles(e)) e.preventDefault(); });
+})();
 $('input').addEventListener('keydown', (ev) => {
   if (S.slash) { // the slash-command menu owns these keys while it's open
     if (ev.key === 'ArrowUp') { ev.preventDefault(); ev.stopPropagation(); moveSlash(-1); return; }
@@ -1413,6 +1527,15 @@ document.addEventListener('keydown', (ev) => {
     else if (ev.key === 'Enter') { ev.preventDefault(); pickPicker(); }
     return;
   }
+  // Press '/' anywhere to jump into the composer (like Google/YouTube search). Skip when already
+  // typing in a field or holding a modifier; the '/' isn't inserted, just focus. Modals returned above.
+  if (ev.key === '/' && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+    const ae = document.activeElement;
+    const typing = ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable);
+    const composer = $('composer');
+    if (!typing && S.sel && composer && composer.style.display !== 'none') { ev.preventDefault(); $('input').focus(); return; }
+  }
+
   if (ev.key !== 'Escape') return;
   if (S.editing || S.deleting) { ev.preventDefault(); clearBars(); return; } // Esc cancels an open edit/delete
 
@@ -1432,7 +1555,7 @@ document.addEventListener('keydown', (ev) => {
     ev.preventDefault();
     if (!S.curBubble) { S.escArmed = ev.timeStamp; S.escText = S.lastSent || ''; }
     S.lastEsc = 0;
-    send();
+    stopTurn();
     return;
   }
   // (3) Idle: Esc-Esc (double within 400ms) opens the jump-to-message picker.

@@ -708,7 +708,7 @@ function resolveCwd(identifier, entry, emit) {
   return { cwd: agentRoot };
 }
 
-async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit = null) {
+async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit = null, attachments = []) {
   const emit = (e) => broadcast(identifier, { turnId, ...e });
   const m = CHAT[cap] || {};
   let tee = null;
@@ -762,28 +762,35 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
     // session -> the pipeline's session -> fresh with context.
     const cs0 = loadChatState()[identifier] || {};
     const histText = edit ? historyBlock(edit.retained) : '';
+    // Attachments are already saved on disk; tell the agent to open them with its Read tool (which
+    // renders images). This rides along in the PROMPT only — the stored/displayed message stays clean.
+    const attachNote = attachments.length
+      ? `\n\n[The developer attached ${attachments.length} file${attachments.length === 1 ? '' : 's'}. View ${attachments.length === 1 ? 'it' : 'each'} with the Read tool (images render visually):]\n`
+        + attachments.map((a) => `- ${a.path}`).join('\n')
+      : '';
+    const promptMsg = (message || '(see the attached file(s))') + attachNote;
     let resumeSid;
     let prompt;
     let usedCompact = false;
     if (edit) {
       resumeSid = edit.forkSid || null;
-      prompt = resumeSid ? message : freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, message, histText);
+      prompt = resumeSid ? promptMsg : freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, promptMsg, histText);
     } else {
       const sameCwd = !cs0.cwd || cs0.cwd === cwd;
       resumeSid = (sameCwd && cs0.sessions?.chat) || null;
       if (resumeSid) {
-        prompt = message;
+        prompt = promptMsg;
       } else if (cs0.compactSummary) {
         // Post-compact: there's no chat session to resume (compaction dropped it on purpose). Start
         // fresh seeded with the compaction summary instead of the pipeline session — that big
         // transcript is exactly the context we just compacted away.
         usedCompact = true;
-        prompt = freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, message, compactBlock(cs0.compactSummary));
+        prompt = freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, promptMsg, compactBlock(cs0.compactSummary));
       } else if (cwd !== agentRoot && pipelineSessionId(entry)) {
         resumeSid = pipelineSessionId(entry);
-        prompt = preamble(cap) + message;
+        prompt = preamble(cap) + promptMsg;
       } else {
-        prompt = freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, message);
+        prompt = freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, promptMsg);
       }
     }
 
@@ -795,6 +802,7 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
       cs.messages.push({
         role: 'user', cap, text: message, at: new Date().toISOString(),
         sid: resumeSid || null, tLines, ...(headBefore ? { headBefore } : {}),
+        ...(attachments.length ? { attachments: attachments.map((a) => a.name) } : {}),
       });
       cs.messages = cs.messages.slice(-500);
       if (usedCompact) delete cs.compactSummary; // one-shot: baked into this fresh session's first prompt
@@ -948,9 +956,23 @@ function aborted(identifier, turnId) {
   return !t || t.turnId !== turnId || t.abortedAt;
 }
 
+// Keep only attachments that were actually uploaded to THIS issue's attachment dir — a client can't
+// hand us an arbitrary path for the agent to read (it has filesystem access, so this matters).
+function validateAttachments(identifier, list) {
+  if (!Array.isArray(list)) return [];
+  const dir = path.join(logsDir, identifier, 'attachments') + path.sep;
+  const out = [];
+  for (const a of list) {
+    const p = a && typeof a.path === 'string' ? path.resolve(a.path) : null;
+    if (!p || !p.startsWith(dir) || !existsSync(p)) continue;
+    out.push({ name: safeName(a.name || path.basename(p)), path: p });
+  }
+  return out.slice(0, 10);
+}
 function startTurn(identifier, body) {
   const message = String(body?.message || '').trim();
-  if (!message) return { code: 400, error: 'message must be non-empty' };
+  const attachments = validateAttachments(identifier, body?.attachments);
+  if (!message && !attachments.length) return { code: 400, error: 'message must be non-empty' };
   const found = findEntry(identifier);
   if (!found) return { code: 404, error: `no autofix record for ${identifier}` };
   if (activeTurns.has(identifier)) return { code: 409, error: 'a turn is already running for this issue' };
@@ -962,7 +984,7 @@ function startTurn(identifier, body) {
 
   const turnId = `t${Date.now()}-${++turnSeq}`;
   activeTurns.set(identifier, { child: null, cap, turnId, startedAt: new Date().toISOString(), lockPath });
-  runTurn(identifier, found.entry, cap, message, turnId, lockPath);
+  runTurn(identifier, found.entry, cap, message, turnId, lockPath, null, attachments);
   return { code: 202, body: { turnId, cap } };
 }
 
@@ -1214,6 +1236,17 @@ function readBody(req) {
     req.on('error', reject);
   });
 }
+// Raw binary body (for file uploads) buffered to a size cap. JSON's 1MB limit is too small for media.
+function readRawBody(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = []; let len = 0;
+    req.on('data', (d) => { len += d.length; if (len > maxBytes) { reject(new Error(`file exceeds ${Math.round(maxBytes / 1048576)}MB limit`)); req.destroy(); return; } chunks.push(d); });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+// A safe on-disk basename: strip directory separators and anything odd so an upload can't escape its dir.
+const safeName = (s) => (String(s || 'file').replace(/[^\w.\- ]+/g, '_').replace(/^\.+/, '_').slice(0, 120) || 'file');
 
 const json = (res, code, obj) => { res.writeHead(code, { 'content-type': 'application/json' }).end(JSON.stringify(obj)); };
 
@@ -1234,7 +1267,7 @@ async function route(req, res) {
   if (req.method === 'GET' && p === '/api/issues') { json(res, 200, { fixEnabled: fixEnabled(), issues: listIssues() }); return; }
   if (req.method === 'GET' && p === '/api/usage') { json(res, 200, await fetchOauthUsage()); return; }
 
-  const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat\/merge|\/chat\/compact|\/chat|\/preview)?$/);
+  const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/attach|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat\/merge|\/chat\/compact|\/chat|\/preview)?$/);
   if (!m) { json(res, 404, { error: 'not found' }); return; }
   const identifier = m[1].toUpperCase();
   const sub = m[2] || '';
@@ -1258,6 +1291,20 @@ async function route(req, res) {
       usage: cs.usage || null, costTotal: cs.costTotal || 0, fixEnabled: fixEnabled(),
       models: { full: CHAT.full?.model || null, readOnly: CHAT.readOnly?.model || null },
     });
+    return;
+  }
+  if (req.method === 'POST' && sub === '/attach') {
+    if (!findEntry(identifier)) { json(res, 404, { error: `no autofix record for ${identifier}` }); return; }
+    const name = safeName(u.searchParams.get('name'));
+    try {
+      const buf = await readRawBody(req, 20 * 1024 * 1024); // 20MB/file
+      if (!buf.length) { json(res, 400, { error: 'empty file' }); return; }
+      const dir = path.join(logsDir, identifier, 'attachments');
+      mkdirSync(dir, { recursive: true });
+      const fp = path.join(dir, `${Date.now()}-${name}`);
+      writeFileSync(fp, buf);
+      json(res, 200, { path: fp, name });
+    } catch (e) { json(res, 413, { error: String(e.message || e) }); }
     return;
   }
   if (req.method === 'POST' && sub === '/chat') {
