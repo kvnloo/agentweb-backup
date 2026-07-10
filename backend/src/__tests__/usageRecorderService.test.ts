@@ -242,6 +242,14 @@ describe('usageRecorderService', () => {
       ).toBe(Math.round(1000 * 1.5 + 1000 * 18.75));
     });
 
+    it('prices the deep-research agents (so their per-run cost is counted, not 0)', () => {
+      // Priced at Gemini Pro rates: in $1.25/M, out $10/M.
+      expect(computeCostMicroUsd('deep-research-preview-04-2026', 1_000_000, 100_000)).toBe(
+        1_250_000 + 1_000_000
+      );
+      expect(computeCostMicroUsd('deep-research-max-preview-04-2026', 1_000_000, 0)).toBe(1_250_000);
+    });
+
     it('returns 0 for unknown models', () => {
       jest.spyOn(console, 'warn').mockImplementation(() => {});
       expect(computeCostMicroUsd('nope-model', 1_000_000, 1_000_000)).toBe(0);
