@@ -33,6 +33,11 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { recordUsage } from './usageRecorderService';
+import {
+  getModelPrice,
+  IMAGE_GENERATION_PRICING_USD,
+  VIDEO_GENERATION_PRICING_USD_PER_CLIP,
+} from '../utils/llmPricing';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
 import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmMutationEvents';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
@@ -2430,43 +2435,21 @@ export class AgentModeService {
    * Prices are per 1M tokens (input/output).
    */
   private estimateCost(model: string, inputTokens: number, outputTokens: number, cacheReadTokens: number = 0, cacheWriteTokens: number = 0): number {
-    // Pricing per 1M tokens: [input, output]
-    const pricing: Record<string, [number, number]> = {
-      'anthropic.claude-sonnet-4-5-20250929-v1:0': [3, 15],
-      'anthropic.claude-sonnet-4-6': [3, 15],
-      'anthropic.claude-opus-4-6-v1': [5, 25],
-      'anthropic.claude-opus-4-8': [5, 25],
-      'gpt-5-chat-2': [2.5, 10],
-      'gpt-5.2-chat': [1.75, 14],
-      'gpt-5.4': [2.5, 15],
-      'gemini-3-pro-preview': [1.25, 10],
-      'gemini-3-flash-preview': [0.5, 3],
-      'gemini-3.1-pro-preview': [2, 12],
-      'gemini-3.1-flash-lite': [0.25, 1.5],
-      'gemini-3.5-flash': [1.5, 9],
-      'gemini-2.5-flash': [0.3, 2.5],
-    };
-    const [inputPrice, outputPrice] = pricing[model] || [3, 15]; // Default to Sonnet pricing
-    // Cache reads are 10% of input price; cache writes are 125% of input price
-    const cacheReadPrice = inputPrice * 0.1;
-    const cacheWritePrice = inputPrice * 1.25;
+    // Single source of truth for rates: llmPricing.MODEL_PRICING (via getModelPrice).
+    // Unknown models fall back to Sonnet pricing here, preserving long-standing behavior.
+    const price = getModelPrice(model);
+    const inputPrice = price?.inPerM ?? 3;
+    const outputPrice = price?.outPerM ?? 15;
+    // Cache reads are 10% of input price; cache writes are 125% of input price.
+    const cacheReadPrice = price?.cacheReadPerM ?? inputPrice * 0.1;
+    const cacheWritePrice = price?.cacheWritePerM ?? inputPrice * 1.25;
     return (inputTokens * inputPrice + outputTokens * outputPrice
       + cacheReadTokens * cacheReadPrice + cacheWriteTokens * cacheWritePrice) / 1_000_000;
   }
 
-  /** Cost per image generation in USD (fixed per-generation pricing). */
+  /** Cost per image generation in USD (fixed per-generation pricing, sourced from llmPricing). */
   private estimateImageGenerationCost(model: string): number {
-    const pricing: Record<string, number> = {
-      'gpt-image-1': 0.04,
-      'gpt-image-2': 0.04,
-      'gemini-2.5-flash-image': 0.039,
-      'gemini-3-pro-image-preview': 0.134,
-      'gemini-3.1-flash-image': 0.039,
-      'gemini-3.1-flash-image-preview': 0.039,
-      'gen4_image': 0.05,
-      'gemini_2.5_flash': 0.04,
-    };
-    return pricing[model] ?? 0.04;
+    return IMAGE_GENERATION_PRICING_USD[model] ?? 0.04;
   }
 
   private isRetryableMediaToolError(error: unknown): boolean {
@@ -2522,14 +2505,8 @@ export class AgentModeService {
 
   /** Cost per video generation in USD. Veo bills per 8s clip, so longer videos cost proportionally more. */
   private estimateVideoGenerationCost(model: string, durationSeconds?: number): number {
-    const pricePerClip: Record<string, number> = {
-      'veo-3.1-generate-preview': 3.20, // $0.40/s x 8s, audio incl. (ai.google.dev); was 2.80
-      'veo-3.1-fast-generate-preview': 1.40,
-      'veo-3-generate-preview': 3.20, // $0.40/s x 8s (ai.google.dev); was unpriced
-      // Higgsfield Seedance — approximate per-clip cost; adjust to match billed Higgsfield rates.
-      'seedance-2.0': 0.50,
-    };
-    const clipPrice = pricePerClip[model] ?? 3.20;
+    // Per-clip rates sourced from llmPricing (single source of truth).
+    const clipPrice = VIDEO_GENERATION_PRICING_USD_PER_CLIP[model] ?? 3.20;
     const VEO_MAX_SECONDS = 8;
     const clipCount = durationSeconds && durationSeconds > VEO_MAX_SECONDS
       ? Math.ceil(durationSeconds / VEO_MAX_SECONDS)

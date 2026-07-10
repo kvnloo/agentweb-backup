@@ -33,24 +33,6 @@ function parseLlmModelsRegistryKeys(): string[] {
   return keys;
 }
 
-function parseEstimateCostPricing(): Record<string, [number, number]> {
-  const srcPath = path.join(__dirname, '..', 'services', 'agentModeService.ts');
-  const src = fs.readFileSync(srcPath, 'utf8');
-  const blockMatch = src.match(
-    /const pricing: Record<string, \[number, number\]> = \{([\s\S]*?)\n {4}\};/
-  );
-  if (!blockMatch) {
-    throw new Error('Could not locate the estimateCost pricing map in agentModeService.ts');
-  }
-  const entries: Record<string, [number, number]> = {};
-  for (const m of blockMatch[1].matchAll(
-    /'([^']+)':\s*\[([\d.]+),\s*([\d.]+)\]/g
-  )) {
-    entries[m[1]] = [parseFloat(m[2]), parseFloat(m[3])];
-  }
-  return entries;
-}
-
 describe('llmPricing', () => {
   beforeEach(() => {
     __resetUnknownModelWarnsForTests();
@@ -65,17 +47,6 @@ describe('llmPricing', () => {
 
       const missing = registryKeys.filter((model) => !MODEL_PRICING[model]);
       expect(missing).toEqual([]);
-    });
-
-    it('matches the prices ported from agentModeService.estimateCost()', () => {
-      const ported = parseEstimateCostPricing();
-      expect(Object.keys(ported).length).toBeGreaterThanOrEqual(11);
-      for (const [model, [inPerM, outPerM]] of Object.entries(ported)) {
-        const price = MODEL_PRICING[model];
-        expect(price).toBeDefined();
-        expect(price.inPerM).toBe(inPerM);
-        expect(price.outPerM).toBe(outPerM);
-      }
     });
 
     it('covers the chatbot + embedding models from the provider report', () => {
