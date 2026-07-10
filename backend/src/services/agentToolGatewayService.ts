@@ -201,7 +201,7 @@ function failureScope(toolName: string, args: unknown): string {
     ? record.profile_url
     : typeof record.provider_id === 'string' && record.provider_id.trim()
     ? record.provider_id
-    : typeof record.invitation_id === 'string'
+    : typeof record.invitation_id === 'string' && record.invitation_id.trim()
     ? record.invitation_id
     : '';
   // Normalize so the same recipient with a trailing slash or query params
