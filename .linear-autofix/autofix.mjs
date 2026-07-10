@@ -582,26 +582,65 @@ export function touchedPreviewFiles(WT, headBefore) {
   return false;
 }
 
+// Reconcile a diverged PR branch with its remote WITHOUT force-pushing or losing work. For a PR
+// branch the REMOTE is the source of truth — it can be rewritten server-side (`gh pr update-branch`
+// rebases the branch, Greptile/merge-queue may too), which leaves our local worktree with the same
+// commits at different SHAs on an older base. A plain `git rebase FETCH_HEAD` then tries to replay
+// ALL of that stale base and conflicts. Instead we adopt the remote tip and re-apply only our
+// GENUINELY-NEW commits (ones whose patch-id isn't already on the remote) on top.
+//
+// Safety: never runs on a dirty worktree; snapshots the original HEAD and restores it exactly if a
+// cherry-pick conflicts. So it can only ever (a) fast-forward to a remote that already contains our
+// work, or (b) cleanly replay new commits — it can never drop a commit or force-clobber the remote.
+// Returns { ok, needPush?, reason? }.
+export function reconcileWithRemote(wt, branch, base, logFn = log) {
+  if ((gitIn(wt, ['status', '--porcelain']).stdout || '').trim()) return { ok: false, reason: 'dirty-worktree' };
+  const orig = (gitIn(wt, ['rev-parse', 'HEAD']).stdout || '').trim();
+  if (!orig) return { ok: false, reason: 'no-head' };
+  // Fresh remote refs: the branch tip we diverged from, and the base branch (to tell OUR commits
+  // apart from base history that merely drifted). Capture each SHA right after its fetch.
+  if (gitIn(wt, ['fetch', 'origin', branch]).status !== 0) return { ok: false, reason: 'fetch-branch-failed' };
+  const remote = (gitIn(wt, ['rev-parse', 'FETCH_HEAD']).stdout || '').trim();
+  if (gitIn(wt, ['fetch', 'origin', base]).status !== 0) return { ok: false, reason: 'fetch-base-failed' };
+  const baseSha = (gitIn(wt, ['rev-parse', 'FETCH_HEAD']).stdout || '').trim();
+  if (!remote || !baseSha) return { ok: false, reason: 'missing-refs' };
+  // Our own commits since base (baseSha..HEAD), each tagged by whether an equivalent (same patch-id)
+  // already exists on the remote tip: `-` = already there (remote rebased them in), `+` = new.
+  const cherry = gitIn(wt, ['cherry', remote, 'HEAD', baseSha]);
+  if (cherry.status !== 0) return { ok: false, reason: 'cherry-failed' };
+  // `git cherry` prints oldest→newest — the order cherry-pick needs.
+  const news = (cherry.stdout || '').split('\n').filter((l) => l.startsWith('+ ')).map((l) => l.slice(2).trim());
+  // Adopt the remote tip (it already contains every `-` commit). Guarded: worktree is clean.
+  if (gitIn(wt, ['reset', '--hard', remote]).status !== 0) return { ok: false, reason: 'reset-failed' };
+  if (!news.length) return { ok: true, needPush: false }; // remote already had all our work — nothing to push
+  for (const sha of news) {
+    if (gitIn(wt, ['cherry-pick', sha]).status !== 0) {
+      gitIn(wt, ['cherry-pick', '--abort']);
+      gitIn(wt, ['reset', '--hard', orig]); // restore EXACTLY — no work lost, remote untouched
+      return { ok: false, reason: 'cherry-pick-conflict' };
+    }
+  }
+  return { ok: true, needPush: true };
+}
+
 // Push each changed repo's branch to origin (idempotent — a repo already up to date is a no-op).
-// On a non-fast-forward rejection (the remote branch advanced: a concurrent pipeline push, or a
-// commit added on the PR) we fetch the remote branch and REBASE our local commits on top, then
-// push as a plain fast-forward — this keeps BOTH sides' commits (no force, nothing clobbered). If
-// the rebase can't apply cleanly we abort it and report the repo as failed so a human reconciles
-// rather than silently losing work. Returns the repo keys whose push ultimately failed.
+// On a non-fast-forward rejection (the remote branch advanced OR was rebased server-side) we hand off
+// to reconcileWithRemote, which losslessly adopts the remote tip and replays only our new commits,
+// then push again. If it can't reconcile cleanly (true conflict / dirty tree) we report the repo as
+// failed so the caller can escalate (agent-driven reconcile) rather than silently losing work.
+// Returns the repo keys whose push ultimately failed.
 export function pushChanged(changed) {
   const failed = [];
   for (const c of changed) {
     let push = gitIn(c.wt, ['push', '-u', 'origin', 'HEAD']);
     if (push.status !== 0 && /rejected|fetch first|non-fast-forward|behind/i.test(`${push.stderr || ''}${push.stdout || ''}`)) {
       const branch = (gitIn(c.wt, ['rev-parse', '--abbrev-ref', 'HEAD']).stdout || '').trim();
-      const fetch = branch ? gitIn(c.wt, ['fetch', 'origin', branch]) : { status: 1 };
-      if (fetch.status === 0) {
-        const rebase = gitIn(c.wt, ['rebase', 'FETCH_HEAD']);
-        if (rebase.status === 0) push = gitIn(c.wt, ['push', '-u', 'origin', 'HEAD']);
-        else { gitIn(c.wt, ['rebase', '--abort']); log(`Rebase onto origin/${branch} failed for ${c.repo} (diverged) — needs manual reconcile`); }
-      }
+      const rec = branch ? reconcileWithRemote(c.wt, branch, c.base, log) : { ok: false, reason: 'no-branch' };
+      if (rec.ok && rec.needPush) push = gitIn(c.wt, ['push', '-u', 'origin', 'HEAD']);
+      else if (rec.ok) { push = { status: 0 }; log(`${c.repo}: remote had rebased in our commits — fast-forwarded local, nothing to push`); }
+      else log(`Reconcile with origin/${branch} failed for ${c.repo} (${rec.reason}) — needs agent/manual reconcile`);
     }
-    if (push.status !== 0) { log(`Push failed for ${c.repo}: ${push.stderr}`); failed.push(c.repo); }
+    if (push.status !== 0) { log(`Push failed for ${c.repo}: ${push.stderr || `reconcile ${push.reason || ''}`}`); failed.push(c.repo); }
   }
   return failed;
 }
