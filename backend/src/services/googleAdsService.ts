@@ -2,6 +2,7 @@ import axios from 'axios';
 import { getGoogleAdsCredentials } from '../utils/secretsManager';
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
+import { buildUtmSpec, existingUtmKeys, mergeUtmIntoUrl, utmQueryString } from '../utils/adUtm';
 
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
 const TOKEN_REFRESH_URL = 'https://oauth2.googleapis.com/token';
@@ -810,6 +811,27 @@ export class GoogleAdsService {
 
   // ── Ads ──────────────────────────────────────────────────────────────────
 
+  /**
+   * ENG-239 — the Google `final_url_suffix` Emma stamps on an ad so leads from it
+   * reach the CRM with attribution. Returns `undefined` when nothing should be
+   * written (so the caller omits the field rather than sending an empty one).
+   *
+   * `final_url_suffix` is a native field on the `Ad` (`ad_group_ad.ad.final_url_suffix`),
+   * appended to the destination URL by Google at click time and shown in the ad's
+   * URL options — which is what makes AC1 ("verifiable in the platform's ad
+   * settings") hold literally. The generated value uses ValueTrack macros
+   * (`{campaignid}`, `{creative}`) that reach the API un-encoded and resolve per
+   * click. An explicit caller-supplied suffix wins verbatim; otherwise any UTM key
+   * the user already put on `finalUrl` is omitted (AC4), and when every key is
+   * already present `utmQueryString` returns "" → we return `undefined`.
+   */
+  private buildAdFinalUrlSuffix(opts: { finalUrl?: string; explicitSuffix?: string }): string | undefined {
+    if (opts.explicitSuffix) return opts.explicitSuffix;
+    if (!opts.finalUrl) return undefined;
+    const spec = buildUtmSpec('google', { campaign: '{campaignid}', content: '{creative}' });
+    return utmQueryString(spec, existingUtmKeys(opts.finalUrl)) || undefined;
+  }
+
   async listAds(userId: string, customerId: string, adGroupResourceName: string): Promise<any[]> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const results = await this.search(customerId, accessToken,
@@ -834,6 +856,8 @@ export class GoogleAdsService {
     descriptions: string[];
     finalUrl: string;
     imageAssetResourceNames?: string[];
+    /** ENG-239: explicit UTM/tracking suffix; wins over the auto-generated one. */
+    finalUrlSuffix?: string;
   }): Promise<{ resourceName: string }> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
 
@@ -861,11 +885,17 @@ export class GoogleAdsService {
       throw new Error(`Unsupported ad type "${params.type}". Use RESPONSIVE_SEARCH_AD or RESPONSIVE_DISPLAY_AD.`);
     }
 
+    const finalUrlSuffix = this.buildAdFinalUrlSuffix({ finalUrl: params.finalUrl, explicitSuffix: params.finalUrlSuffix });
+
     const data = await this.mutate(customerId, accessToken, 'adGroupAds', [{
       create: {
         adGroup: params.adGroupResourceName,
         status: 'ENABLED',
-        ad: { ...adContent, finalUrls: [params.finalUrl] },
+        ad: {
+          ...adContent,
+          finalUrls: [params.finalUrl],
+          ...(finalUrlSuffix ? { finalUrlSuffix } : {}),
+        },
       },
     }], loginCustomerId);
     return { resourceName: data.results[0].resourceName };
@@ -873,11 +903,20 @@ export class GoogleAdsService {
 
   async updateAd(userId: string, customerId: string, adGroupAdResourceName: string, params: {
     status?: 'ENABLED' | 'PAUSED';
+    /** ENG-239: destination URL — used to omit UTM keys it already carries (AC4). */
+    finalUrl?: string;
+    /** ENG-239: explicit UTM/tracking suffix; wins over the auto-generated one. */
+    finalUrlSuffix?: string;
   }): Promise<boolean> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const updateMask: string[] = [];
     const update: any = { resourceName: adGroupAdResourceName };
     if (params.status) { update.status = params.status; updateMask.push('status'); }
+    // ENG-239: keep/gain the ad's UTM suffix on edit. The field lives on the ad
+    // (ad_group_ad.ad.final_url_suffix), so it nests under `update.ad` with the
+    // matching field-mask path.
+    const finalUrlSuffix = this.buildAdFinalUrlSuffix({ finalUrl: params.finalUrl, explicitSuffix: params.finalUrlSuffix });
+    if (finalUrlSuffix) { update.ad = { finalUrlSuffix }; updateMask.push('ad.final_url_suffix'); }
     if (updateMask.length === 0) return false;
     await this.mutate(customerId, accessToken, 'adGroupAds', [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
     return true;
@@ -1032,6 +1071,16 @@ export class GoogleAdsService {
     addImageAssets(params.logoAssets, 'LOGO');
     if (params.videoAssets) addImageAssets(params.videoAssets, 'YOUTUBE_VIDEO');
 
+    // ENG-239: PMax asset groups have no `final_url_suffix` field (unlike Ad and
+    // Campaign), so the per-asset-group way to tag the destination is to merge the
+    // UTMs straight into `final_urls`. `mergeUtmIntoUrl` is per-key, so a UTM the
+    // user already set is left untouched (AC4); ValueTrack macros pass through
+    // un-encoded and resolve at click time.
+    const finalUrlWithUtm = mergeUtmIntoUrl(
+      params.finalUrl,
+      buildUtmSpec('google', { campaign: '{campaignid}', content: '{creative}' }),
+    );
+
     const assetGroupOp = {
       assetGroupOperation: {
         create: {
@@ -1039,7 +1088,7 @@ export class GoogleAdsService {
           name: params.name,
           campaign: params.campaignResourceName,
           status: 'PAUSED',
-          finalUrls: [params.finalUrl],
+          finalUrls: [finalUrlWithUtm],
         },
       },
     };

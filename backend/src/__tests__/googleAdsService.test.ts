@@ -1111,7 +1111,11 @@ describe('createAssetGroup', () => {
     // Asset group is after text assets (index 3)
     expect(body.mutateOperations[3].assetGroupOperation.create.name).toBe('My Asset Group');
     expect(body.mutateOperations[3].assetGroupOperation.create.campaign).toBe('customers/123/campaigns/1');
-    expect(body.mutateOperations[3].assetGroupOperation.create.finalUrls[0]).toBe('https://example.com');
+    // ENG-239: asset_group has no final_url_suffix field, so Emma merges the UTMs
+    // straight into final_urls (ValueTrack macros pass through un-encoded).
+    expect(body.mutateOperations[3].assetGroupOperation.create.finalUrls[0]).toBe(
+      'https://example.com?utm_source=google&utm_medium=paid&utm_campaign={campaignid}&utm_content={creative}',
+    );
   });
 
   it('retries without LOGO links on BRAND_ASSETS_NOT_LINKED_AT_CAMPAIGN_LEVEL error', async () => {
