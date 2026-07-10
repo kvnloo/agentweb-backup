@@ -1325,6 +1325,193 @@ describe('agentToolGatewayService', () => {
       expect(execute).toHaveBeenCalledTimes(1);
     });
 
+    it('ENG-182: a per-recipient LinkedIn refusal does not block invites to other recipients', async () => {
+      const runId = 'run-eng182';
+      // Two DIFFERENT profiles each hit LinkedIn's terminal "Cannot resend yet"
+      // (upstream_rejected → fast-trip threshold 2). Keyed on the error text alone
+      // these two identical refusals would trip the breaker for the whole tool.
+      for (const profile of [
+        'https://www.linkedin.com/in/chang-liu/',
+        'https://www.linkedin.com/in/liang-guo/',
+      ]) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'linkedin_outreach',
+          args: { action: 'send-invite', profile_url: profile },
+          runId,
+          execute: failingExecute('Cannot resend yet'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      // A genuinely different recipient, never individually attempted, must still run.
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: 'https://www.linkedin.com/in/mei-chen/' },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('ENG-182: still trips the breaker when the SAME LinkedIn recipient refuses repeatedly', async () => {
+      const runId = 'run-eng182-same';
+      const profile = 'https://www.linkedin.com/in/chang-liu/';
+      for (let i = 0; i < 2; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'linkedin_outreach',
+          args: { action: 'send-invite', profile_url: profile },
+          runId,
+          execute: failingExecute('Cannot resend yet'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: profile },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('ENG-182: collapses query/trailing-slash variants of one recipient into a single scope', async () => {
+      const runId = 'run-eng182-norm';
+      // Same profile, two URL shapes LinkedIn hands back (trailing slash + tracking query).
+      for (const profile of [
+        'https://www.linkedin.com/in/chang-liu/',
+        'https://www.linkedin.com/in/chang-liu?miniProfileUrn=urn%3Ali%3Aabc',
+      ]) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'linkedin_outreach',
+          args: { action: 'send-invite', profile_url: profile },
+          runId,
+          execute: failingExecute('Cannot resend yet'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: 'https://www.linkedin.com/in/chang-liu' },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('ENG-182: a success for one recipient does NOT reset a pending breaker for another (per-recipient clear)', async () => {
+      const runId = 'run-eng182-clear';
+      const alice = 'https://www.linkedin.com/in/alice/';
+      const bob = 'https://www.linkedin.com/in/bob/';
+
+      // Alice refuses once — below the fast-trip threshold of 2 for "Cannot resend yet".
+      const firstAlice = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: alice },
+        runId,
+        execute: failingExecute('Cannot resend yet'),
+      });
+      expect(firstAlice.status).toBe('error');
+
+      // Bob succeeds. A tool-wide clear would wipe Alice's pending count here; the
+      // per-recipient clear must leave it intact.
+      const bobSuccess = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: bob },
+        runId,
+        execute: () => Promise.resolve({ success: true }),
+      });
+      expect(bobSuccess.status).toBe('success');
+
+      // Alice refuses a second time — now at the original threshold (2), so she trips.
+      const secondAlice = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: alice },
+        runId,
+        execute: failingExecute('Cannot resend yet'),
+      });
+      expect(secondAlice.status).toBe('error');
+
+      // The next Alice call is blocked without executing — Bob's success did not
+      // reset her counter. If the clear were tool-wide, this would run and succeed.
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: alice },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('ENG-182: scopes the breaker per provider_id when no profile_url is present', async () => {
+      const runId = 'run-eng182-provider';
+      // Live send-invite calls often carry provider_id instead of profile_url.
+      for (const providerId of ['ACoAA-alice', 'ACoAA-bob']) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'linkedin_outreach',
+          args: { action: 'send-invite', provider_id: providerId },
+          runId,
+          execute: failingExecute('Cannot resend yet'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      // A third, distinct provider_id is not cross-blocked by the other two.
+      const carol = jest.fn().mockResolvedValue({ success: true });
+      const carolOutcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', provider_id: 'ACoAA-carol' },
+        runId,
+        execute: carol,
+      });
+      expect(carolOutcome.status).toBe('success');
+      expect(carol).toHaveBeenCalledTimes(1);
+
+      // A second refusal for the SAME provider_id reaches threshold 2 and trips it.
+      const secondAlice = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', provider_id: 'ACoAA-alice' },
+        runId,
+        execute: failingExecute('Cannot resend yet'),
+      });
+      expect(secondAlice.status).toBe('error');
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', provider_id: 'ACoAA-alice' },
+        runId,
+        execute,
+      });
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
     it('blocks expensive media tools after two failures even when the error messages differ', async () => {
       await failNTimes('run-media', 'generate_image', 'Safety filter rejected image prompt', 1);
       await failNTimes('run-media', 'generate_image', 'Google image generation timed out after 10 minutes', 1);
