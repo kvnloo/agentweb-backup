@@ -26,10 +26,22 @@
   #side h1 { font-size: 15px; padding: 14px 16px 6px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   #sideToggle, #sideOpen { background: var(--panel2); color: var(--dim); border: 1px solid var(--border); border-radius: 7px; cursor: pointer; font-size: 15px; line-height: 1; padding: 4px 9px; }
   #sideToggle:hover, #sideOpen:hover { border-color: var(--accent); color: var(--text); }
-  body.side-collapsed #side { display: none; }
+  /* Fully hidden (Alt+Enter): the whole sidebar is gone, a floating ☰ reopens it. */
+  body.side-hidden #side { display: none; }
   #sideOpen { display: none; position: absolute; top: 12px; left: 12px; z-index: 15; }
-  body.side-collapsed #sideOpen { display: block; }
-  body.side-collapsed #hdr { padding-left: 58px; }
+  body.side-hidden #sideOpen { display: block; }
+  body.side-hidden #hdr { padding-left: 58px; }
+  /* Rail (Ctrl+B / the ‹ button): a thin column showing just clickable issue keys. The hide rules use
+     #side so they beat the ID-specificity base styles (e.g. `#side .sub`). */
+  body.side-rail #side { width: 74px; min-width: 74px; }
+  body.side-rail #side h1 { justify-content: center; padding: 12px 4px; }
+  body.side-rail #side h1 > span, body.side-rail #side .sub, body.side-rail #side #searchWrap { display: none; }
+  body.side-rail #side #issues { padding: 2px 0; }
+  body.side-rail #side .issue { padding: 9px 6px; margin: 0; border-radius: 0; text-align: center; border-left: 2px solid transparent; }
+  body.side-rail #side .issue.sel { border-left-color: var(--accent); }
+  body.side-rail #side .issue .row1 { justify-content: center; gap: 0; margin: 0; }
+  body.side-rail #side .issue .badge, body.side-rail #side .issue .time, body.side-rail #side .issue .busydot, body.side-rail #side .issue .summ { display: none; }
+  body.side-rail #side .issue .id { font-size: 11.5px; font-weight: 600; white-space: nowrap; }
   #side .sub { padding: 0 16px 10px; color: var(--dim); font-size: 12px; display: flex; justify-content: space-between; align-items: center; }
   #showAll { color: var(--accent); cursor: pointer; user-select: none; }
   #searchWrap { padding: 0 12px 10px; position: relative; }
@@ -256,7 +268,7 @@
 </head>
 <body>
   <div id="side">
-    <h1><span>🔧 Autofix Chat</span><button id="sideToggle" title="Collapse sidebar (Ctrl+B)">‹</button></h1>
+    <h1><span>🔧 Autofix Chat</span><button id="sideToggle" title="Collapse to rail (Ctrl+B)">‹</button></h1>
     <div class="sub"><span id="count"></span><span id="showAll">show all</span></div>
     <div id="searchWrap">
       <input id="search" type="text" placeholder="Search ID, name or summary…" autocomplete="off" spellcheck="false" />
@@ -265,7 +277,7 @@
     <div id="issues"></div>
   </div>
   <div id="main">
-    <button id="sideOpen" title="Show sidebar (Ctrl+B)">☰</button>
+    <button id="sideOpen" title="Show sidebar (Alt+Enter)">☰</button>
     <div id="dropzone"><div class="dzbox">📎 Drop files to attach</div></div>
     <div id="hdr" style="display:none">
       <div class="t"><span id="h-id"></span><span id="h-badges"></span></div>
@@ -1567,10 +1579,9 @@ function openContext() {
 
 document.addEventListener('keydown', (ev) => {
   if (V.recording || V.pressActive) return; // Esc stays out of voice — dictation is cleared with select-all+delete
-  // Ctrl/Cmd+B or Alt+Enter toggles the sidebar.
-  if (((ev.key === 'b' || ev.key === 'B') && (ev.ctrlKey || ev.metaKey)) || (ev.key === 'Enter' && ev.altKey)) {
-    ev.preventDefault(); setSidebar(!document.body.classList.contains('side-collapsed')); return;
-  }
+  // Ctrl/Cmd+B collapses to the thin rail (and back); Alt+Enter hides the whole sidebar (and back).
+  if ((ev.key === 'b' || ev.key === 'B') && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); toggleRail(); return; }
+  if (ev.key === 'Enter' && ev.altKey) { ev.preventDefault(); toggleHidden(); return; }
   // Ctrl/Cmd+Down jumps to the latest message (the "New messages" pill's shortcut).
   if (ev.key === 'ArrowDown' && (ev.ctrlKey || ev.metaKey)) { if (S.sel) { ev.preventDefault(); scrollBottom(); } return; }
   // Ctrl/Cmd+O toggles the "work" accordion of the bubble in focus — the one under the pointer — or,
@@ -1627,13 +1638,20 @@ document.addEventListener('keydown', (ev) => {
 });
 
 // ---------- sidebar collapse ----------
-function setSidebar(collapsed) {
-  document.body.classList.toggle('side-collapsed', collapsed);
-  try { localStorage.setItem('sideCollapsed', collapsed ? '1' : '0'); } catch { /* private mode */ }
+// Three states: 'full' (normal), 'rail' (thin column of clickable issue keys), 'hidden' (gone).
+const sideState = () => document.body.classList.contains('side-hidden') ? 'hidden' : document.body.classList.contains('side-rail') ? 'rail' : 'full';
+function setSide(state) {
+  document.body.classList.toggle('side-rail', state === 'rail');
+  document.body.classList.toggle('side-hidden', state === 'hidden');
+  $('sideToggle').textContent = state === 'rail' ? '›' : '‹';
+  $('sideToggle').title = state === 'rail' ? 'Expand sidebar (Ctrl+B)' : 'Collapse to rail (Ctrl+B)';
+  try { localStorage.setItem('sideState', state); } catch { /* private mode */ }
 }
-$('sideToggle').onclick = () => setSidebar(true);
-$('sideOpen').onclick = () => setSidebar(false);
-try { if (localStorage.getItem('sideCollapsed') === '1') setSidebar(true); } catch { /* ignore */ }
+const toggleRail = () => setSide(sideState() === 'rail' ? 'full' : 'rail'); // ‹ button + Ctrl+B: full <-> rail
+const toggleHidden = () => setSide(sideState() === 'hidden' ? 'full' : 'hidden'); // Alt+Enter: hide/show whole thing
+$('sideToggle').onclick = toggleRail;
+$('sideOpen').onclick = () => setSide('full');
+try { const st = localStorage.getItem('sideState'); if (st === 'rail' || st === 'hidden') setSide(st); } catch { /* ignore */ }
 
 // ---------- boot ----------
 loadIssues();
