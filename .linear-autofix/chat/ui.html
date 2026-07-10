@@ -468,6 +468,9 @@ function renderIssues() {
       <div class="summ">${esc(i.summary || i.title || i.branch || '')}</div>
     </div>`).join('') || `<div style="padding:16px;color:var(--dim)">${empty}</div>`;
   for (const el of $('issues').children) el.onclick = () => el.dataset.id && select(el.dataset.id);
+  // Bring the open issue into view once (on open/refresh) — but not on every background poll, which
+  // would yank the scroll if the user scrolled the list. The flag is set by select() and cleared here.
+  if (S.scrollToSel) { const sel = $('issues').querySelector('.issue.sel'); if (sel) { sel.scrollIntoView({ block: 'nearest' }); S.scrollToSel = false; } }
 }
 $('showAll').onclick = () => { S.showAll = !S.showAll; lastIssuesJson = ''; renderIssues(); };
 $('search').addEventListener('input', (ev) => { S.search = ev.target.value; lastIssuesJson = ''; renderIssues(); });
@@ -476,6 +479,7 @@ $('searchClear').onclick = () => { S.search = ''; $('search').value = ''; $('sea
 // ---------- selection / detail ----------
 async function select(id) {
   S.sel = id; S.curBubble = null; S.stick = true;
+  S.scrollToSel = true; // scroll the sidebar list to this issue once it's rendered (open/refresh)
   S.queue = []; S.queuePaused = false; renderQueue(); // queued messages belong to the previously open issue
   S.attachments = []; renderAttachments();
   document.title = id + ' · Autofix Chat'; // show the issue key in the browser tab
