@@ -13,6 +13,9 @@ jest.mock("../middleware/auth", () => ({
   authenticateToken: (req: any, _res: any, next: any) => {
     if (req.headers["x-no-auth"] === "1") {
       req.user = undefined;
+    } else if (req.headers["x-no-email"] === "1") {
+      // Authenticated but the JWT carried no email (degenerate token).
+      req.user = { userId: "user-1", isAdmin: false };
     } else {
       req.user = { userId: "user-1", email: "test@example.com", isAdmin: false };
     }
@@ -275,6 +278,28 @@ describe("GET /api/onboarding/brand-build/status", () => {
     expect(userDb.updateUser).not.toHaveBeenCalled();
     expect(res.body.status.brandBuildStatus).toBe("ready");
     expect(res.body.status.brandBuildDurationMs).toBe(270_000);
+  });
+
+  it("does NOT force-fail a stuck build when no email is available for the consistent re-read (no clobber off the stale GSI read)", async () => {
+    // Degenerate case: the JWT carried no email and the GSI-read user record
+    // has none either, so we can't do the strongly-consistent GetItem that
+    // guards against clobbering a just-completed `ready` build. Rather than
+    // force-fail off the eventually-consistent read, the watchdog must skip the
+    // write and return the current view — the next (email-bearing) poll fails
+    // it authoritatively if it really is stuck.
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      brandBuildStatus: "building",
+      brandBuildStartedAt: "2020-01-01T00:00:00.000Z", // well past the wall
+      // note: no email on the record either
+    });
+    const res = await request(app)
+      .get("/api/onboarding/brand-build/status")
+      .set("x-no-email", "1");
+    expect(res.status).toBe(200);
+    expect(userDb.getUserByEmailConsistent).not.toHaveBeenCalled();
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+    expect(res.body.status.brandBuildStatus).toBe("building");
   });
 
   it("does NOT auto-fail a build that is still within budget", async () => {
