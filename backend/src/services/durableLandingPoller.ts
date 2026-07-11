@@ -37,6 +37,77 @@ function isStuck(page: GeneratedLandingPage, nowMs: number): boolean {
 }
 
 /**
+ * Universal janitor: mark ANY abandoned in-flight build failed, not just
+ * agent-session (`awaitingReconnect`) ones. Portal-initiated builds have no session
+ * to deliver to, so before this sweep a crash/redeploy mid-build left them
+ * `generating` forever — an eternal yellow card with no action button, and (until
+ * the reuse age-ceiling in findReusablePageForRoute) a record that swallowed every
+ * future build of its route. Staleness is judged on updatedAt: a build that
+ * progressed recently is alive even if it started long ago. The conditional update
+ * only fires if the record hasn't moved since the scan, so a live build that
+ * progresses mid-sweep is untouched.
+ */
+export async function sweepAbandonedBuilds(
+  nowMs: number = new Date().getTime()
+): Promise<{ scanned: number; failed: number }> {
+  const result = await dynamodb
+    .scan({
+      TableName: TABLE_NAME,
+      FilterExpression:
+        "(#status = :generating OR #status = :deploying) AND (attribute_not_exists(archived) OR archived = :false)",
+      ExpressionAttributeNames: { "#status": "status" },
+      ExpressionAttributeValues: {
+        ":generating": "generating",
+        ":deploying": "deploying",
+        ":false": false,
+      },
+    })
+    .promise();
+
+  const pages = (result.Items || []) as GeneratedLandingPage[];
+  let failed = 0;
+
+  for (const page of pages) {
+    // Agent-session builds are handled by the awaitingReconnect sweep, which also
+    // delivers the failure message back to the user's session.
+    if ((page as any).awaitingReconnect) continue;
+    const lastMoved = new Date(page.updatedAt || page.createdAt || 0).getTime();
+    if (!Number.isFinite(lastMoved) || nowMs - lastMoved <= STUCK_CEILING_MS) continue;
+
+    try {
+      await dynamodb
+        .update({
+          TableName: TABLE_NAME,
+          Key: { id: page.id },
+          UpdateExpression:
+            "SET #status = :failed, errorMessage = :error, updatedAt = :now",
+          ConditionExpression: "#status = :oldStatus AND updatedAt = :oldUpdatedAt",
+          ExpressionAttributeNames: { "#status": "status" },
+          ExpressionAttributeValues: {
+            ":failed": "failed",
+            ":error":
+              `Build abandoned in '${page.status}' — the server restarted or the build crashed mid-run. ` +
+              "Retry the generation; abandoned attempts never block a retry.",
+            ":now": new Date(nowMs).toISOString(),
+            ":oldStatus": page.status,
+            ":oldUpdatedAt": page.updatedAt,
+          },
+        })
+        .promise();
+      failed++;
+      console.log(
+        `[DURABLE LANDING POLLER] marked abandoned build failed: ${page.id} (${page.slug || page.name || "?"}, stuck in ${page.status})`
+      );
+    } catch (err: any) {
+      if (err?.code === "ConditionalCheckFailedException") continue; // build moved — it's alive
+      console.error(`[DURABLE LANDING POLLER] failed to sweep page ${page.id}: ${err?.message}`);
+    }
+  }
+
+  return { scanned: pages.length, failed };
+}
+
+/**
  * Run one poller sweep. Returns counts for logging/metrics. `nowMs` is injectable
  * for tests. Best-effort per record: one bad record never aborts the sweep.
  */
@@ -81,19 +152,25 @@ export async function runDurableLandingPollerOnce(
 let pollerHandle: NodeJS.Timeout | undefined;
 
 /**
- * Start the poller on an interval (default 5 min). No-op if the durable-execution
- * flag is off, or if already started. Registered from server.ts after boot.
+ * Start the poller on an interval (default 5 min). Registered from server.ts after
+ * boot. Unlike the original durable-execution bolt-on, this is NOT gated on
+ * DURABLE_LANDING_GENERATION: the abandoned-build janitor must run for portal
+ * builds too, or a crash mid-build leaves records `generating` forever (ENG-287
+ * hygiene). The awaitingReconnect delivery sweep no-ops when the flag has never
+ * minted such records.
  */
 export function startDurableLandingPoller(intervalMs = 5 * 60 * 1000): void {
-  if (process.env.DURABLE_LANDING_GENERATION !== "true") return;
   if (pollerHandle) return;
   pollerHandle = setInterval(() => {
     if (!isCronEnabled()) return;
     cronJobRegistry.track("durableLandingPoller", runDurableLandingPollerOnce()).catch((err) =>
       console.error("[DURABLE LANDING POLLER] sweep failed:", err)
     );
+    cronJobRegistry.track("landingBuildJanitor", sweepAbandonedBuilds()).catch((err) =>
+      console.error("[DURABLE LANDING POLLER] janitor sweep failed:", err)
+    );
   }, intervalMs);
   // Don't keep the event loop alive solely for the poller.
   if (typeof pollerHandle.unref === "function") pollerHandle.unref();
-  console.log("[DURABLE LANDING POLLER] started");
+  console.log("[DURABLE LANDING POLLER] started (reconnect delivery + abandoned-build janitor)");
 }
