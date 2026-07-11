@@ -63,9 +63,14 @@ console.log('pickResumeBase');
   const r2 = pickResumeBase({ sessions: {}, compactSummary: 'x'.repeat(400) }, opt());
   ok(r2.kind === 'compact' && r2.tokens === Math.round(400 / 4) + 3000, `compact seed sized from summary (got ${r2.tokens})`);
 
-  // no chat, no compact, pipeline session available (and in a worktree) → resume the pipeline session
+  // DEFAULT (resumePipeline off): a first chat turn does NOT resume the 300-400k fixer transcript —
+  // it seeds a fresh curated context instead. This is the whole point of the context-curation change.
   const r3 = pickResumeBase({ sessions: {} }, opt({ pipelineSid: 'FIX' }));
-  ok(r3.kind === 'session' && r3.sid === 'FIX', 'pipeline session resumed when nothing else');
+  ok(r3.kind === 'fresh', 'default: pipeline session NOT resumed (curated fresh context)');
+
+  // opt-in (resumePipeline true) restores the old resume-the-fixer behavior
+  const r3b = pickResumeBase({ sessions: {} }, opt({ pipelineSid: 'FIX', resumePipeline: true }));
+  ok(r3b.kind === 'session' && r3b.sid === 'FIX', 'resumePipeline=true resumes the pipeline session');
 
   // nothing at all → fresh
   const r4 = pickResumeBase({ sessions: {} }, opt());
@@ -75,9 +80,13 @@ console.log('pickResumeBase');
   const r5 = pickResumeBase({ sessions: { chat: 'S1' }, cwd: '/other' }, opt());
   ok(r5.kind !== 'session' || r5.sid !== 'S1', 'chat session from a different cwd is not reused');
 
-  // a pipeline session is NOT resumed when the turn would run at agentRoot (read-only main checkout)
-  const r6 = pickResumeBase({ sessions: {} }, { cwd: ROOT, agentRoot: ROOT, pipelineSid: 'FIX' });
+  // even with resumePipeline on, a pipeline session is NOT resumed at agentRoot (read-only main checkout)
+  const r6 = pickResumeBase({ sessions: {} }, { cwd: ROOT, agentRoot: ROOT, pipelineSid: 'FIX', resumePipeline: true });
   ok(r6.kind === 'fresh', 'pipeline session not used at agentRoot');
+
+  // an existing chat session is always continued, regardless of the flag
+  const r7 = pickResumeBase({ sessions: { chat: 'C1' }, cwd: WT }, opt({ pipelineSid: 'FIX' }));
+  ok(r7.kind === 'session' && r7.sid === 'C1', 'existing chat session is continued (not the pipeline)');
 }
 
 console.log(`\n${fail === 0 ? '✅ ALL PASSED' : '❌ FAILURES'} — ${pass} passed, ${fail} failed`);
