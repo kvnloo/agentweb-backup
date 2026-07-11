@@ -22,7 +22,7 @@ import { resolveIssue } from '../linear.mjs';
 import { gitIdentityEnv, resolveAssigneeGhToken, resolveAssigneeIdentity, applyWorktreeIdentity } from '../git-identity.mjs';
 import {
   assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, unpushedRepos, countCommits, ensureProxy,
-  headShas, resetTo, ensureOpenPrs, touchedPreviewFiles,
+  headShas, resetTo, ensureOpenPrs, touchedPreviewFiles, commitsDropped,
 } from '../autofix.mjs';
 import { evictToMakeRoom } from '../preview/policy.mjs';
 
@@ -859,13 +859,23 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
     // retained conversation when this is an edit — the fork we tried to resume is abandoned).
     if (resumeSid && !out.gotInit && !out.timedOut && !aborted(identifier, turnId)) {
       emit({ type: 'status', text: 'Previous session unavailable — starting a fresh one with re-injected context…' });
-      updateChatState(identifier, (cs) => { delete cs.sessions.chat; return cs; });
+      // #17: this turn's user message was stamped with the now-dead resumeSid + its tLines. The turn
+      // actually continues in a FRESH session, so clear those — the fresh session's init repopulates
+      // sid (the init handler only fills a falsy sid), and tLines=0 makes a later edit fork from the
+      // fresh session's start rather than the abandoned transcript (which never saw this exchange).
+      updateChatState(identifier, (cs) => {
+        delete cs.sessions.chat;
+        const lastUser = [...cs.messages].reverse().find((x) => x.role === 'user');
+        if (lastUser) { lastUser.sid = null; lastUser.tLines = 0; }
+        return cs;
+      });
       prompt = freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, message, histText);
       tee.write(`# retry fresh\n${prompt}\n---\n`);
       out = await runClaudeStream(chatArgs(cap, null), prompt, cwd, m.timeoutMs, onEvent, register, turnEnv);
     }
 
     let fix = null;
+    let reconcileOut = null; // the inline reconcile turn's stream, so its narration is persisted too (#9)
     if (cap === 'full' && cwd !== agentRoot) {
       const changed = detectChangedRepos(cwd);
       const newThisTurn = countCommits(changed) > preCommits;
@@ -884,13 +894,24 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
         // retry the push once. The agent typically pushes itself, so the retry is usually a no-op.
         if (failed.length && !aborted(identifier, turnId)) {
           const stuck = pending.filter((c) => failed.includes(c.repo));
+          const preHeads = headShas(cwd); // snapshot our commits BEFORE the agent touches the branch (#8)
           emit({ type: 'status', text: `Push to ${failed.join(', ')} hit a diverged remote — reconciling automatically…` });
           const rmsg = RECONCILE_MSG(failed);
           tee.write(`# reconcile turn (repos: ${failed.join(',')})\n${rmsg}\n---\n`);
           try {
-            await runClaudeStream(chatArgs('full', curSid), rmsg, cwd, m.timeoutMs, onEvent, register, turnEnv);
+            reconcileOut = await runClaudeStream(chatArgs('full', curSid), rmsg, cwd, m.timeoutMs, onEvent, register, turnEnv);
           } catch (e) { log(`turn ${turnId} (${identifier}): reconcile turn errored: ${e.message || e}`); }
           failed = pushChanged(stuck); // agent likely already pushed → no-op; otherwise retry deterministically
+          // #8: an agent that adopted the remote tip could have DROPPED our commit, which pushChanged
+          // would then report as a no-op "success". Verify our pre-reconcile commits survived on the
+          // remote; if any vanished, report the repo failed instead of falsely claiming pushedOk.
+          for (const c of stuck) {
+            if (failed.includes(c.repo)) continue;
+            if (commitsDropped(c.wt, c.base, preHeads[c.repo])) {
+              log(`turn ${turnId} (${identifier}): reconcile DROPPED commit(s) in ${c.repo} — reporting push failed`);
+              failed.push(c.repo);
+            }
+          }
           if (!failed.length) log(`turn ${turnId} (${identifier}): agent reconcile cleared the push for ${stuck.map((c) => c.repo).join(', ')}`);
         }
       }
@@ -905,11 +926,19 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
         try {
           const linear = await fetchLinear(identifier);
           const title = linear?.title || entry.title || identifier;
-          const detected = ensureOpenPrs(changed, title, `Auto-fix for ${identifier}: ${title}`, attr?.email ? { email: attr.email } : entry.assignee);
-          const merged = mergePrs(entry.prs || [], detected);
-          if (JSON.stringify(merged) !== JSON.stringify(entry.prs || [])) {
-            const saved = updateIssueEntry(identifier, (e) => ({ ...e, prs: merged }));
-            if (saved) { entry.prs = merged; log(`turn ${turnId} (${identifier}): PRs now ${merged.map((p) => p.repo).join(', ')}`); }
+          // Pass the LINEAR email for PR-token lookup (assigneeGhTokenEnv is keyed by Linear email).
+          // Never fall back to entry.assignee here: that's the git IDENTITY, whose email may be an
+          // overridden commit/noreply email that mis-keys the token map. No Linear email → null →
+          // the PR opens as the box account (the safe default), not the wrong person.
+          const detected = ensureOpenPrs(changed, title, `Auto-fix for ${identifier}: ${title}`, attr?.email ? { email: attr.email } : null);
+          // Merge INSIDE the updater against the FRESH on-disk prs — not the stale in-memory entry.prs
+          // captured at turn start. Otherwise a PR another writer (pipeline/gc) added mid-turn, absent
+          // from our stale base and from `detected`, would be silently dropped despite the fresh read.
+          const before = JSON.stringify(entry.prs || []);
+          const saved = updateIssueEntry(identifier, (e) => ({ ...e, prs: mergePrs(e.prs || [], detected) }));
+          if (saved && JSON.stringify(saved.prs || []) !== before) {
+            entry.prs = saved.prs;
+            log(`turn ${turnId} (${identifier}): PRs now ${(saved.prs || []).map((p) => p.repo).join(', ')}`);
           }
         } catch (e) { log(`turn ${turnId} (${identifier}): PR reconcile failed:`, e.message || e); }
       }
@@ -938,6 +967,18 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
         blocks: out.blocks.slice(0, 400), // chronological text+tool sequence, so the UI can split final answer from working steps
         ...(fix?.committed ? { fix } : {}),
       });
+      // #9: the inline reconcile turn ran on this same turn but AFTER the main reply. Persist its
+      // narration/marker as its own assistant message so a reload shows what was done to the branch
+      // (otherwise the reconcile work vanishes from the stored transcript, though it really happened).
+      if (reconcileOut && (reconcileOut.texts.length || reconcileOut.blocks.length)) {
+        cs.messages.push({
+          role: 'assistant', cap, at: new Date().toISOString(),
+          text: reconcileOut.texts.join('\n\n').slice(0, 50000) || '(reconciled the branch)',
+          turns: reconcileOut.result?.num_turns, ms: reconcileOut.result?.duration_ms,
+          tools: reconcileOut.tools.slice(0, 50),
+          blocks: reconcileOut.blocks.slice(0, 400),
+        });
+      }
       // Snapshot context/cost so /status and /context have real data. Context size = the LAST assistant
       // turn's (input + cache_read + cache_creation) — NOT result.usage, which sums every internal
       // tool-call turn and (with prompt caching re-counting the cached context each turn) balloons to
