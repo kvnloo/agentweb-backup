@@ -21,6 +21,7 @@ import { config } from '../config.mjs';
 import { resolveIssue } from '../linear.mjs';
 import { gitIdentityEnv, resolveAssigneeGhToken, resolveAssigneeIdentity, applyWorktreeIdentity } from '../git-identity.mjs';
 import { acquireLock, releaseLock } from '../lock.mjs';
+import { transcriptContextUsed, pickResumeBase } from './context-usage.mjs';
 import {
   assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, unpushedRepos, countCommits, ensureProxy,
   headShas, resetTo, ensureOpenPrs, touchedPreviewFiles, commitsDropped,
@@ -666,6 +667,27 @@ function pipelineSessionId(entry) {
   return null;
 }
 
+// The REAL context the next turn will resume (drives /context). We resolve the same base runTurn
+// would pick, then read its actual size from the transcript — so /context reflects what `claude -p`
+// truly reloads (e.g. a 397k Opus session), not the optimistic post-compact display value. Also fixes
+// "No context data yet" on a live session whose cs.usage was cleared: the number is read from disk,
+// not from the last turn's snapshot. Side-effect-free (never rebuilds a worktree) so it's safe in a GET.
+function resumeContext(identifier, entry, cs) {
+  const WT = path.join(worktreesDir, identifier);
+  const cwd = cs.cwd || (existsSync(WT) ? WT : agentRoot);
+  const base = pickResumeBase(cs, { cwd, agentRoot, pipelineSid: pipelineSessionId(entry) });
+  if (base.kind === 'fresh') return null;
+  if (base.kind === 'compact') {
+    return { contextUsed: base.tokens, contextWindow: cs.usage?.contextWindow || 200000, model: cs.usage?.model || null };
+  }
+  const t = transcriptContextUsed(sessionFile(cwd, base.sid));
+  if (!t) return null;
+  // The per-message transcript usage carries no window size; infer the 1M beta when the live context
+  // already exceeds the 200k default, else keep whatever the last snapshot recorded (default 200k).
+  const win = cs.usage?.contextWindow || (t.contextUsed > 200000 ? 1000000 : 200000);
+  return { contextUsed: t.contextUsed, contextWindow: win, model: t.model || cs.usage?.model || null };
+}
+
 // ---------------------------------------------------------------------------
 // Session transcripts on disk. The Claude CLI stores each session as a JSONL file at
 // ~/.claude/projects/<cwd-with-non-alnum-replaced-by-dash>/<sessionId>.jsonl and APPENDS to it
@@ -741,6 +763,10 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
   let tee = null;
   try {
     emit({ type: 'turn_start', cap, message });
+    // Warm the account-usage cache now so it's fresh by the time this turn ends and the client
+    // re-renders (it drives the ≥90% per-turn limit warning). Fire-and-forget; the turn runs for
+    // seconds regardless, so the fetch lands well before 'done'.
+    fetchOauthUsage().catch(() => { /* best-effort */ });
 
     const loc = resolveCwd(identifier, entry, emit);
     if (loc.error) { emit({ type: 'error', error: loc.error }); return; }
@@ -1406,6 +1432,12 @@ async function route(req, res) {
     if (!found) { json(res, 404, { error: `no autofix record for ${identifier}` }); return; }
     const WT = path.join(worktreesDir, identifier);
     const cs = loadChatState()[identifier] || {};
+    // Real resume-base context (overrides the last snapshot's contextUsed/window/model when available).
+    const rc = resumeContext(identifier, found.entry, cs);
+    const usage = rc ? { ...(cs.usage || {}), contextUsed: rc.contextUsed, contextWindow: rc.contextWindow, model: rc.model } : (cs.usage || null);
+    // Account limits ride along so the client can warn per-turn at ≥90% (like the context-fill nudge).
+    // Non-blocking: serve the cached value and warm it in the background when stale — never await here.
+    if (Date.now() - usageCache.at > 5000) fetchOauthUsage().catch(() => { /* best-effort warm */ });
     json(res, 200, {
       issueId: found.uuid, identifier, entry: found.entry,
       worktree: { path: WT, exists: existsSync(WT) },
@@ -1415,7 +1447,8 @@ async function route(req, res) {
       pipeline: buildPipeline(identifier, found.entry),
       linear: await fetchLinear(identifier),
       chat: { sessions: cs.sessions || {}, messages: cs.messages || [] },
-      usage: cs.usage || null, costTotal: cs.costTotal || 0, fixEnabled: fixEnabled(),
+      usage, costTotal: cs.costTotal || 0, fixEnabled: fixEnabled(),
+      accountUsage: usageCache.data?.ok ? usageCache.data.usage : null,
       models: { full: CHAT.full?.model || null, readOnly: CHAT.readOnly?.model || null },
     });
     return;

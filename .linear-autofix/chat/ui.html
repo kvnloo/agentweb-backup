@@ -187,6 +187,7 @@
   .turnmeta.heavy { color: var(--amber); font-weight: 600; }
   .ctxwarn { align-self: flex-start; max-width: 780px; margin: 2px 0 4px; padding: 8px 12px; font-size: 12px; color: var(--amber); background: rgba(217,164,65,.08); border: 1px solid rgba(217,164,65,.35); border-radius: 8px; }
   .ctxwarn .cw-go { color: var(--amber); cursor: pointer; text-decoration: underline; font-weight: 600; }
+  .ctxwarn.limitwarn { color: var(--red); background: rgba(229,101,94,.08); border-color: rgba(229,101,94,.4); }
   .compactcard { align-self: stretch; margin: 8px 0; }
   .compactcard .ch { display: flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; color: var(--dim); font-size: 11px; }
   .compactcard .cl { flex: 1; height: 1px; background: var(--border); }
@@ -785,6 +786,37 @@ function appendCtxWarn(afterEl) {
   el.querySelector('.cw-go').onclick = () => startCompact('');
   afterEl.insertAdjacentElement('afterend', el);
 }
+// Account-limit warning: unlike the context nudge above (per-conversation), this watches the whole
+// Claude subscription. At ≥90% on any limit (5-hour session or a weekly bucket) each agent reply ends
+// with a heads-up — because a session can sit at 40% context yet still burn the account fast (cold
+// resumes re-bill a big transcript every turn), so the context bar alone won't warn you.
+const LIMIT_WARN_PCT = 90;
+const LIMIT_BUCKETS = [
+  { k: 'five_hour', label: '5-hour session' },
+  { k: 'seven_day', label: 'weekly (all models)' },
+  { k: 'seven_day_opus', label: 'weekly Opus' },
+  { k: 'seven_day_sonnet', label: 'weekly Sonnet' },
+];
+function limitWarnInfo() {
+  const g = S.detail?.accountUsage;
+  if (!g) return null;
+  const hit = LIMIT_BUCKETS
+    .map((b) => ({ ...b, u: g[b.k] }))
+    .filter((x) => x.u && typeof x.u.utilization === 'number' && x.u.utilization >= LIMIT_WARN_PCT)
+    .sort((a, b) => b.u.utilization - a.u.utilization);
+  return hit[0] || null; // surface the single most-depleted limit
+}
+function appendLimitWarn(afterEl) {
+  if (!afterEl || S.busy || S.compacting) return;
+  const info = limitWarnInfo();
+  if (!info) return;
+  const pct = Math.max(0, Math.min(100, Math.round(info.u.utilization)));
+  const reset = info.u.resets_at ? ` — resets ${fmtReset(info.u.resets_at)}` : '';
+  const el = document.createElement('div');
+  el.className = 'ctxwarn limitwarn';
+  el.innerHTML = `⚠ Your Claude ${esc(info.label)} usage is at <b>${pct}%</b>${esc(reset)}. Turns may start failing once it reaches 100%.`;
+  afterEl.insertAdjacentElement('afterend', el);
+}
 function renderAll(d) {
   chatEl().innerHTML = '';
   renderPipeline(d);
@@ -806,7 +838,8 @@ function renderAll(d) {
       lastAsst = b;
     }
   });
-  appendCtxWarn(lastAsst); // end the newest agent reply with a compact nudge when context is high
+  appendCtxWarn(lastAsst);   // end the newest agent reply with a compact nudge when context is high
+  appendLimitWarn(lastAsst); // …and an account-limit heads-up when any subscription limit is ≥90%
   scrollBottom();
 }
 
