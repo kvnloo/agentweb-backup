@@ -1143,6 +1143,16 @@ async function runCompactTurn(identifier, entry, cap, turnId, lockPath, instruct
     if (aborted(identifier, turnId)) return;
     if (out.timedOut) { emit({ type: 'error', error: `compaction timed out after ${Math.round(m.timeoutMs / 60000)} min (killed)` }); return; }
 
+    // If the CLI turn errored (usage/session-limit hit, API error, dead resume), its "result" text is
+    // the ERROR message, not a summary. Storing it and dropping the live session would DESTROY the
+    // conversation (exactly the "You've hit your session limit" corruption). Bail without touching any
+    // state — the session stays resumable so the developer can just retry once the limit resets.
+    if (out.result?.is_error || (sid && !out.gotInit)) {
+      const why = String(out.result?.result || out.stderr || '').trim().slice(0, 300) || out.result?.subtype || 'the model turn errored';
+      emit({ type: 'error', error: `compaction failed — ${why}. Nothing was changed; your conversation is intact — retry after the limit resets.` });
+      return;
+    }
+
     const summary = (out.texts.join('\n\n').trim()) || String(out.result?.result || '').trim();
     if (!summary) { emit({ type: 'error', error: `compaction produced no summary${out.stderr ? `: ${out.stderr.slice(-200)}` : ''}` }); return; }
 
