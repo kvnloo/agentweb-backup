@@ -198,6 +198,9 @@ async function fetchAndNormalize(): Promise<V0CreditsDto> {
 // ── In-memory cache (successes only; failures always propagate) ──────────────
 
 let cache: { dto: V0CreditsDto; expiresAt: number } | null = null;
+// In-flight dedup: concurrent callers (including ?refresh=1 racing a natural
+// cache expiry) share ONE v0 fetch instead of stampeding the API.
+let inflight: Promise<V0CreditsDto> | null = null;
 
 export async function getV0Credits(options?: {
   forceRefresh?: boolean;
@@ -205,12 +208,24 @@ export async function getV0Credits(options?: {
   if (!options?.forceRefresh && cache && Date.now() < cache.expiresAt) {
     return cache.dto;
   }
-  const dto = await fetchAndNormalize();
-  cache = { dto, expiresAt: Date.now() + V0_CREDITS_CACHE_TTL_MS };
-  return dto;
+  if (inflight) {
+    // A fetch is already running — its result is as fresh as a new one would be.
+    return inflight;
+  }
+  inflight = (async () => {
+    try {
+      const dto = await fetchAndNormalize();
+      cache = { dto, expiresAt: Date.now() + V0_CREDITS_CACHE_TTL_MS };
+      return dto;
+    } finally {
+      inflight = null;
+    }
+  })();
+  return inflight;
 }
 
-/** Test-only: clear the module-level cache between test cases. */
+/** Test-only: clear the module-level cache and in-flight fetch between test cases. */
 export function __resetV0CreditsCacheForTests(): void {
   cache = null;
+  inflight = null;
 }
