@@ -613,7 +613,7 @@ export async function findReusablePageForRoute(
   const pages = await listLandingPages(userId);
   const REUSE_STATUSES = ["deployed", "generating", "deploying"];
   const match = pages.find(
-    (p) => (p.slug || buildPageSlug(p.name)) === slug && REUSE_STATUSES.includes(p.status)
+    (p) => (p.slug || (p.name ? buildPageSlug(p.name) : undefined)) === slug && REUSE_STATUSES.includes(p.status)
   );
   return match || null;
 }
@@ -713,6 +713,12 @@ export async function generateLandingPage(
     if (opts?.siteId) {
       const site = await findSiteById(opts.siteId, userId);
       if (site?.githubRepoUrl) {
+        const slug = buildPageSlug(name);
+        const reuse = await findReusablePageForRoute(userId, slug);
+        if (reuse) {
+          console.log(`[V0 SERVICE] Route /${slug} is already ${reuse.status} (${reuse.id}) — reusing, skipping duplicate build`);
+          return reuse;
+        }
         return addSubPage(
           site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
         );
@@ -733,6 +739,12 @@ export async function generateLandingPage(
     //    under it. Falls back to creating the first site if none exists yet.
     const existing = await findUserSiteRecord(userId);
     if (existing?.githubRepoUrl) {
+      const slug = buildPageSlug(name);
+      const reuse = await findReusablePageForRoute(userId, slug);
+      if (reuse) {
+        console.log(`[V0 SERVICE] Route /${slug} is already ${reuse.status} (${reuse.id}) — reusing, skipping duplicate build`);
+        return reuse;
+      }
       return addSubPage(
         existing, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
       );

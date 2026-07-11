@@ -53,7 +53,10 @@ export function isReservationBlocking(
   ttlMs: number = V0_RESERVATION_TTL_MS,
 ): boolean {
   if (!existing || existing.status !== 'reserved') return false;
-  return nowMs - Date.parse(existing.updatedAt) <= ttlMs;
+  // An unparseable timestamp yields NaN → not blocking. Failing open here costs at
+  // most one duplicate v0 call; failing closed would recreate the permanent wedge
+  // this fix exists to kill.
+  return nowMs - Date.parse(existing.updatedAt || existing.createdAt) <= ttlMs;
 }
 
 function persistenceEnabled(): boolean {
@@ -119,14 +122,15 @@ async function bestEffortPut(
  * Reserve the key iff nothing is holding it: no record, or a `failed` record, or
  * a `reserved` record older than the TTL (crash-abandoned). Mirrors
  * `isReservationBlocking` on the DynamoDB side so a concurrent winner is rejected.
- * (ENG-287)
+ * The stale clause is scoped to `reserved` so a `succeeded` record is never
+ * clobbered — reuse of an old succeeded chat must survive this put. (ENG-287)
  */
 async function reserveInDynamo(record: V0UsageRecord, staleThresholdIso: string): Promise<boolean> {
   return bestEffortPut(record, {
     condition:
-      'attribute_not_exists(idempotencyKey) OR #status = :failed OR #updatedAt < :stale',
+      'attribute_not_exists(idempotencyKey) OR #status = :failed OR (#status = :reserved AND #updatedAt < :stale)',
     names: { '#status': 'status', '#updatedAt': 'updatedAt' },
-    values: { ':failed': 'failed', ':stale': staleThresholdIso },
+    values: { ':failed': 'failed', ':reserved': 'reserved', ':stale': staleThresholdIso },
   });
 }
 
@@ -182,7 +186,11 @@ export async function guardedV0ChatCreate<T = any>(input: {
   const staleThresholdIso = new Date(nowMs - V0_RESERVATION_TTL_MS).toISOString();
   const reservedInDynamo = await reserveInDynamo(reserved, staleThresholdIso);
   if (!reservedInDynamo) {
+    // Lost the race to another instance — resync the local Map with the winner's
+    // record so this instance's pre-check stops trusting its own stale reservation.
     const latest = await bestEffortGet(idempotencyKey);
+    if (latest) memoryUsage.set(idempotencyKey, latest);
+    else memoryUsage.delete(idempotencyKey);
     if (latest?.chatId && latest.status === 'succeeded') return { id: latest.chatId, reused: true };
     throw new Error('A v0 generation for this page is already in progress.');
   }
