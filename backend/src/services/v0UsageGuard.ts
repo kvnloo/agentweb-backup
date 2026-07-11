@@ -145,6 +145,47 @@ async function bestEffortGet(key: string): Promise<V0UsageRecord | undefined> {
   }
 }
 
+/**
+ * Drop the usage records tied to a landing page when the page is deleted/archived.
+ * Without this, the prompt-independent key makes a `succeeded` record permanent: a
+ * user who deletes a page and regenerates the same slug would get the OLD chat back
+ * as `reused` forever, silently ignoring their new prompt. Best-effort — a cleanup
+ * failure must never block the delete itself. (ENG-287 review follow-up)
+ */
+export async function clearV0UsageForPage(input: {
+  userId: string;
+  pageId: string;
+  siteId?: string;
+  slug?: string;
+}): Promise<void> {
+  const keys = [
+    buildV0IdempotencyKey({
+      userId: input.userId,
+      operation: 'first_page_chat_create',
+      scopeId: input.pageId,
+    }),
+  ];
+  if (input.siteId && input.slug) {
+    keys.push(
+      buildV0IdempotencyKey({
+        userId: input.userId,
+        operation: 'additional_page_chat_create',
+        scopeId: input.siteId,
+        slug: input.slug,
+      }),
+    );
+  }
+  for (const key of keys) {
+    memoryUsage.delete(key);
+    if (!persistenceEnabled()) continue;
+    try {
+      await dynamodb.delete({ TableName: TABLE_NAME, Key: { idempotencyKey: key } }).promise();
+    } catch (error: any) {
+      console.warn('[V0_USAGE] Cleanup skipped for', key, ':', error?.message || error);
+    }
+  }
+}
+
 async function save(record: V0UsageRecord): Promise<void> {
   record.updatedAt = new Date().toISOString();
   memoryUsage.set(record.idempotencyKey, record);
@@ -223,8 +264,15 @@ export async function guardedV0CorrectionMessage<T>(input: {
   if (existing?.status === 'succeeded' || existing?.status === 'skipped') {
     return { skipped: true };
   }
+  // A failed or crash-abandoned correction must not skip forever — the validation
+  // retry loop depends on being able to send a second correction. Same reclaim
+  // semantics as chat-create. (ENG-287 review follow-up)
+  const nowMs = Date.now();
+  if (isReservationBlocking(existing, nowMs)) {
+    return { skipped: true };
+  }
 
-  const now = new Date().toISOString();
+  const now = new Date(nowMs).toISOString();
   const reserved: V0UsageRecord = {
     idempotencyKey,
     userId: input.userId,
@@ -236,9 +284,10 @@ export async function guardedV0CorrectionMessage<T>(input: {
     updatedAt: now,
   };
   memoryUsage.set(idempotencyKey, reserved);
-  const reservedInDynamo = await bestEffortPut(reserved, {
-    condition: 'attribute_not_exists(idempotencyKey)',
-  });
+  const reservedInDynamo = await reserveInDynamo(
+    reserved,
+    new Date(nowMs - V0_RESERVATION_TTL_MS).toISOString(),
+  );
   if (!reservedInDynamo) return { skipped: true };
 
   try {
