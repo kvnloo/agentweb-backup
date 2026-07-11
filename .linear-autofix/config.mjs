@@ -166,6 +166,9 @@ export const config = {
                                    // here. Past this, forcing one more EVICTS the longest-idle preview to
                                    // make room (idle = URL not opened AND no chat activity for the longest).
   maxKeptPreviews: 5,              // deprecated alias of maxLivePreviews (kept so older refs don't break).
+  previewIdleHours: 24,            // gc.mjs stops any preview untouched this long — same "last hit" signal
+                                   // as the cap eviction (URL last opened, bring-up time, or chat activity),
+                                   // so an actively-used preview is never reaped. Set 0 to disable.
 
   // --- Claude ---
   defaultModel: 'opus',            // the fixer model

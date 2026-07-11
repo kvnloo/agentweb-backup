@@ -11,6 +11,7 @@ import path from 'node:path';
 import { config } from './config.mjs';
 import { resolveIssue } from './linear.mjs';
 import { lockActive } from './lock.mjs';
+import { evictIdlePreviews } from './preview/policy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '..');
@@ -57,6 +58,16 @@ function removeWorktree(id) {
 
 async function main() {
   if (!process.env.LINEAR_API_KEY) { console.error('[gc] LINEAR_API_KEY not set'); process.exit(2); }
+
+  // Reap previews untouched for previewIdleHours (default 24h), independent of worktree state — a
+  // long-abandoned preview holds ~0.8GB even while its issue is still open. Uses the same last-hit
+  // signal as the cap eviction, so an actively-used preview is never stopped. Local JSON only.
+  const idleHours = config.previewIdleHours ?? 0;
+  if (idleHours > 0) {
+    try { evictIdlePreviews(idleHours * 3600 * 1000, log); }
+    catch (e) { log(`idle-preview reap failed: ${e.message}`); }
+  }
+
   if (!existsSync(worktreesDir)) { log('no worktrees dir; nothing to do'); return; }
   const dirs = readdirSync(worktreesDir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
   if (!dirs.length) { log('no worktrees'); return; }

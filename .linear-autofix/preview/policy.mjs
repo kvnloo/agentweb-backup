@@ -57,6 +57,31 @@ export function evictToMakeRoom(identifier, cap, log = () => {}) {
   return evicted;
 }
 
+// Previews whose most-recent activity (lastHit — the SAME signal the cap eviction uses) is at least
+// `maxIdleMs` old, oldest-idle first. Pure: no teardown, `now`/state injectable for tests. A preview
+// with a recent URL open or chat message has a recent lastHit and is never returned.
+export function idlePreviews(maxIdleMs, now = Date.now(), state = readJson(STATE), access = readJson(ACCESS), chat = readJson(CHAT_STATE)) {
+  return Object.keys(state)
+    .map((b) => ({ b, hit: lastHit(b, state, access, chat) }))
+    .filter(({ hit }) => now - hit >= maxIdleMs)
+    .sort((a, z) => a.hit - z.hit);
+}
+
+// Stop every preview untouched for longer than `maxIdleMs` (default 24h via config.previewIdleHours).
+// Called from gc.mjs on its 5-minute sweep. Returns the evicted bug ids.
+export function evictIdlePreviews(maxIdleMs, log = () => {}) {
+  const idle = idlePreviews(maxIdleMs);
+  const evicted = [];
+  const hrs = Math.round(maxIdleMs / 3600000);
+  for (const { b, hit } of idle) {
+    const ago = hit ? `${Math.round((Date.now() - hit) / 3600000)}h ago` : 'never';
+    log(`preview idle > ${hrs}h: stopping ${b} (last hit ${ago})`);
+    spawnSync('node', [PREVIEW, 'down', b], { stdio: 'inherit' });
+    evicted.push(b);
+  }
+  return evicted;
+}
+
 // Evict longest-idle previews (oldest last-hit first) until at most `cap` remain. Returns the bug ids
 // evicted. `log` receives a human line per eviction.
 export function evictPreviewsToFit(cap, log = () => {}) {
