@@ -258,15 +258,20 @@ export const config = {
 
   // --- Chat UI (chat/server.mjs) ---
   // A local web UI to chat about any issue the machine is handling. ONE conversation per issue
-  // (no mode toggle) — opening it shows every pipeline step that ran, and the first message
-  // RESUMES the pipeline's own Claude session (per-stage session_ids in state.json), so the
-  // agent natively remembers making the fix. Capability follows the environment: on the runner
-  // (AUTOFIX_RUN_ENABLED=1, pipeline not mid-run, fix branch exists) the chat has FULL access
-  // and new commits auto-push to the open PR; anywhere else it is READ-ONLY. Binds localhost
-  // only — reach it via `ssh -L 8790:localhost:8790 ec2-user@<ip>`; SSH is the auth.
+  // (no mode toggle) — opening it shows every pipeline step that ran. The first message seeds a
+  // fresh session with a CURATED context (issue + fix diff + pipeline verdicts + on-demand access to
+  // the code and the raw stage transcripts), rather than reloading the fixer's 300-400k-token
+  // transcript on every turn — same knowledge, a fraction of the tokens, less context noise.
+  // Capability follows the environment: on the runner (AUTOFIX_RUN_ENABLED=1, pipeline not mid-run,
+  // fix branch exists) the chat has FULL access and new commits auto-push to the open PR; anywhere
+  // else it is READ-ONLY. Binds localhost only — reach it via `ssh -L 8790:localhost:8790 ec2-user@<ip>`.
   chat: {
     port: 8790,
     bind: '127.0.0.1',               // NEVER 0.0.0.0 — no auth layer; SSH tunnel only
+    resumePipelineSession: false,    // default: curated fresh context (above). Set true to instead RESUME
+                                     // the fixer's own Claude session on the first turn for raw native
+                                     // memory — costs ~380k tokens of low-signal transcript reloaded every
+                                     // turn (the reason /compact felt like a no-op). Reversible A/B knob.
     full: {
       model: 'opus',
       maxTurns: 100,

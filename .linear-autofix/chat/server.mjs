@@ -646,7 +646,11 @@ Open PRs:
 ${prs}
 
 Pipeline stages that ran: ${stages}
-Raw stage transcripts are in ${path.join(logsDir, identifier)}/<stage>.txt — each is a JSON envelope whose .result field is that agent's final report. Read them if asked about pipeline behavior.
+
+You have EVERYTHING you need on demand — nothing about the fix is hidden from you:
+- The fix itself is the committed change on this branch: run \`git show\`/\`git diff\` (against the base branch) to see exactly what you changed.
+- Your full original fix run — every step of your reasoning — is saved at ${path.join(logsDir, identifier)}/fixer.txt (and <stage>.txt for each other stage: each is a JSON envelope whose .result field is that agent's final report). Read fixer.txt if you need to recall precisely WHY you made a change.
+- The whole codebase is in this workspace: read any file rather than assuming. Prefer reading the real code/diff/transcript over guessing.
 ${history}
 ${preamble(cap)}${message}`;
 }
@@ -675,7 +679,7 @@ function pipelineSessionId(entry) {
 function resumeContext(identifier, entry, cs) {
   const WT = path.join(worktreesDir, identifier);
   const cwd = cs.cwd || (existsSync(WT) ? WT : agentRoot);
-  const base = pickResumeBase(cs, { cwd, agentRoot, pipelineSid: pipelineSessionId(entry) });
+  const base = pickResumeBase(cs, { cwd, agentRoot, pipelineSid: pipelineSessionId(entry), resumePipeline: CHAT.resumePipelineSession });
   if (base.kind === 'fresh') return null;
   if (base.kind === 'compact') {
     return { contextUsed: base.tokens, contextWindow: cs.usage?.contextWindow || 200000, model: cs.usage?.model || null };
@@ -843,10 +847,13 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
         // transcript is exactly the context we just compacted away.
         usedCompact = true;
         prompt = freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, promptMsg, compactBlock(cs0.compactSummary));
-      } else if (cwd !== agentRoot && pipelineSessionId(entry)) {
+      } else if (CHAT.resumePipelineSession && cwd !== agentRoot && pipelineSessionId(entry)) {
+        // Opt-in legacy path: resume the fixer's own (300-400k-token) transcript for raw native memory.
         resumeSid = pipelineSessionId(entry);
         prompt = preamble(cap) + promptMsg;
       } else {
+        // Default: seed a fresh session with a curated context (issue + fix diff + verdicts + on-demand
+        // access to the code and the raw stage transcripts) instead of reloading the giant fixer session.
         prompt = freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, promptMsg);
       }
     }

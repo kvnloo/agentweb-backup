@@ -33,13 +33,18 @@ export function transcriptContextUsed(filePath) {
 
 // Which base the NEXT non-edit turn resumes — a faithful mirror of the session-selection ladder in
 // runTurn (server.mjs): stored chat session (same cwd) → compaction summary (fresh + seed) → the
-// pipeline's own session (only in a worktree, never at agentRoot) → fresh. Pure: the caller resolves
-// cwd/agentRoot and the pipeline session id and passes them in.
-export function pickResumeBase(cs, { cwd, agentRoot, pipelineSid = null }) {
+// pipeline's own session → fresh. Pure: the caller resolves cwd/agentRoot and the pipeline session id.
+//
+// `resumePipeline` gates whether the FIRST chat turn resumes the pipeline's (fixer) transcript. It is
+// OFF by default: that transcript is 300-400k tokens of mostly low-signal exploration, so instead the
+// first turn seeds a fresh curated context (issue + diff + verdicts + on-demand code/transcript access)
+// — the same knowledge at a fraction of the tokens. Set config.chat.resumePipelineSession=true to
+// restore the old resume-the-fixer behavior. Once a chat session exists it's always continued (chatSid).
+export function pickResumeBase(cs, { cwd, agentRoot, pipelineSid = null, resumePipeline = false }) {
   const sameCwd = !cs.cwd || cs.cwd === cwd;
   const chatSid = (sameCwd && cs.sessions?.chat) || null;
   if (chatSid) return { kind: 'session', sid: chatSid };
   if (cs.compactSummary) return { kind: 'compact', tokens: Math.round(cs.compactSummary.length / 4) + 3000 };
-  if (cwd !== agentRoot && pipelineSid) return { kind: 'session', sid: pipelineSid };
+  if (resumePipeline && cwd !== agentRoot && pipelineSid) return { kind: 'session', sid: pipelineSid };
   return { kind: 'fresh' };
 }
