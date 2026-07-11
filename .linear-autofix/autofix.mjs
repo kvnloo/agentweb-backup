@@ -15,6 +15,7 @@ import { resolveIssue, addComment, findStateId, moveIssue, setAutofixLabel, uplo
 import { applyAssigneeIdentity, applyWorktreeIdentity, resolveAssigneeGhToken } from './git-identity.mjs';
 import { findSessionId, fetchItem, summarizeSession } from './tools/session.mjs';
 import { evictPreviewsToFit } from './preview/policy.mjs';
+import { acquireLock, releaseLock } from './lock.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '..'); // the agentweb (main) repo root
@@ -190,6 +191,13 @@ async function main() {
   const id = issue.identifier;
   _stat.id = id; // tag the per-issue STATS TOTAL emitted on exit
   log(`Issue ${id}: ${issue.title}`);
+
+  // Cross-process mutual exclusion: never run a fix while a chat turn / revision / another fix is
+  // already touching this issue's worktree. Non-blocking — if the lock is held, skip and let the
+  // poller retry next cycle. Released on exit; a crash leaves a lock the self-healing reclaim clears.
+  const lockPath = acquireLock(id);
+  if (!lockPath) { log(`Another operation holds the lock for ${id} — skipping this run.`); return; }
+  process.once('exit', () => releaseLock(lockPath));
 
   // Attribute every commit this run makes (fixer, escalation, review re-fix, verify re-fix) to the
   // issue's Linear assignee. Set here — before any commit-making stage and before the verify-only

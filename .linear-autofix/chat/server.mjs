@@ -20,6 +20,7 @@ import path from 'node:path';
 import { config } from '../config.mjs';
 import { resolveIssue } from '../linear.mjs';
 import { gitIdentityEnv, resolveAssigneeGhToken, resolveAssigneeIdentity, applyWorktreeIdentity } from '../git-identity.mjs';
+import { acquireLock, releaseLock } from '../lock.mjs';
 import {
   assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, unpushedRepos, countCommits, ensureProxy,
   headShas, resetTo, ensureOpenPrs, touchedPreviewFiles, commitsDropped,
@@ -34,7 +35,6 @@ const logsDir = path.join(BASE, 'logs');
 const previewScript = path.join(BASE, 'preview', 'preview.mjs');
 const previewStatePath = path.join(BASE, 'preview', 'preview-state.json');
 const chatStatePath = path.join(__dirname, 'chat-state.json');
-const locksDir = path.join(__dirname, 'locks');
 const uiPath = path.join(__dirname, 'ui.html');
 const worktreesDir = path.resolve(agentRoot, config.worktreesDir);
 const CHAT = config.chat || {};
@@ -298,6 +298,11 @@ async function runPreviewOp(identifier, entry, action) {
 async function refreshPreview(identifier, entry) {
   if (previewOps.has(identifier) || !previewInfo(identifier).running) return;
   previewOps.add(identifier);
+  // #11: this background rebuild outlives the chat turn that spawned it (the turn's fix-lock is
+  // released before this finishes). Hold a separate `<id>.preview.lock` — acquired SYNCHRONOUSLY here,
+  // before the first await, so there's no window where the turn's lock is gone but this isn't yet —
+  // so gc won't delete the worktree mid-rebuild. Different file from the fix-lock: no mutual exclusion.
+  const previewLock = acquireLock(identifier, { suffix: 'preview' });
   const emit = (e) => broadcast(identifier, e, { buffer: false });
   emit({ type: 'preview', ...previewInfo(identifier), refreshing: true });
   emit({ type: 'status', text: '🔄 You changed code — rebuilding the preview so it isn’t stale (a minute or two)…' });
@@ -311,6 +316,7 @@ async function refreshPreview(identifier, entry) {
   } catch (e) {
     emit({ type: 'error', error: `preview refresh failed: ${String(e.message || e)}` });
   } finally {
+    releaseLock(previewLock);
     previewOps.delete(identifier);
     emit({ type: 'preview', ...previewInfo(identifier) });
   }
@@ -687,14 +693,10 @@ function pruneForks(cwd, forks, keepSid) {
   }
 }
 
-function acquireFixLock(identifier) {
-  mkdirSync(locksDir, { recursive: true });
-  const lockPath = path.join(locksDir, `${identifier}.lock`);
-  const staleMs = (CHAT.fix?.timeoutMs || 30 * 60 * 1000) + 5 * 60 * 1000;
-  try { if (Date.now() - statSync(lockPath).mtimeMs > staleMs) unlinkSync(lockPath); } catch { /* no lock */ }
-  try { writeFileSync(lockPath, String(process.pid), { flag: 'wx' }); return lockPath; }
-  catch { return null; }
-}
+// Delegates to the shared self-healing lock (lock.mjs) so the chat server, the poller (autofix/
+// revise), gc, and preview rebuilds all mutually exclude on the SAME lock, with PID-liveness + stale
+// reclaim (a crashed holder never wedges the issue; a healthy long op is never stolen).
+function acquireFixLock(identifier) { return acquireLock(identifier); }
 
 // Resolve where the turn runs. Missing worktree + known branch -> rebuild it (bounded, rare —
 // accepted as a blocking call; the status event flushes first). No branch at all -> the main
@@ -1043,8 +1045,11 @@ function startTurn(identifier, body) {
 
   // No user-facing mode: the environment decides what this turn may do.
   const cap = capabilityOf(found.entry).level;
-  const lockPath = cap === 'full' ? acquireFixLock(identifier) : null;
-  if (cap === 'full' && !lockPath) return { code: 409, error: 'another fix run holds the lock for this issue' };
+  // Acquire the lock for READ-ONLY turns too (#2): a read-only agent reads the worktree, so gc must
+  // not delete it and the poller must not rewrite it mid-turn. Turns are already serialized per issue
+  // by activeTurns above, so this only adds cross-process protection.
+  const lockPath = acquireFixLock(identifier);
+  if (!lockPath) return { code: 409, error: 'another operation holds the lock for this issue' };
 
   const turnId = `t${Date.now()}-${++turnSeq}`;
   activeTurns.set(identifier, { child: null, cap, turnId, startedAt: new Date().toISOString(), lockPath });

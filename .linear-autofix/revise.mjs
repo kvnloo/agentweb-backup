@@ -17,6 +17,7 @@ import {
   fillTemplate, extractJson, claudeArgs, runClaude, setStageLogDir, kebab,
   assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, countCommits, runChecks,
 } from './autofix.mjs';
+import { acquireLock, releaseLock } from './lock.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '..');
@@ -46,6 +47,14 @@ async function main() {
 
   const issue = await resolveIssue(ref);
   const id = issue.identifier;
+
+  // Cross-process mutual exclusion: never revise while a chat turn / fix / another revision is already
+  // touching this worktree. Non-blocking — skip if held; the poller retries next cycle. Released on
+  // exit; a crash leaves a lock the self-healing reclaim clears.
+  const lockPath = acquireLock(id);
+  if (!lockPath) { log(`Another operation holds the lock for ${id} — skipping this revision.`); return; }
+  process.once('exit', () => releaseLock(lockPath));
+
   // Attribute the revision's commits to the issue's assignee, same as the original fix.
   const identity = applyAssigneeIdentity(issue, log);
   useAssigneeLinearKey(issue.assignee, log); // and its Linear comments/status changes

@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { config } from './config.mjs';
 import { resolveIssue } from './linear.mjs';
+import { lockActive } from './lock.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '..');
@@ -67,10 +68,12 @@ async function main() {
     try { issue = await resolveIssue(id); }
     catch (e) { log(`skip ${id} (could not resolve: ${e.message})`); continue; }
     const type = issue.state?.type;
-    // A chat Fix turn may be mid-flight in this worktree (chat/server.mjs holds a marker file
-    // for the turn's duration) — removing it under the agent corrupts the run. Next gc gets it.
-    if (existsSync(path.join(__dirname, 'chat', 'locks', `${id}.lock`))) {
-      log(`skip ${id} (chat fix turn in progress)`);
+    // Something may be mid-flight in this worktree — a chat turn (full OR read-only), a poller
+    // fix/revision, or a background preview rebuild all hold a self-healing lock for their duration.
+    // Removing the worktree under any of them corrupts it. lockActive() ignores a dead holder's stale
+    // lock (so a crashed run can't wedge gc forever) and also covers the `<id>.preview.lock`.
+    if (lockActive(id)) {
+      log(`skip ${id} (an operation is active in this worktree)`);
       continue;
     }
     if (DONE_TYPES.includes(type)) {
