@@ -318,15 +318,16 @@ async function main() {
   // Push the committed fix to the remote NOW (durability): otherwise a crash/timeout during the
   // long review + verify gates would strand the committed work with no push and no PR.
   let review = null;
+  let pushFailed = []; // repos whose fix never reached the remote — must block a green/mergeable verdict
   if (changed.length > 0) {
-    pushChanged(changed);
+    pushFailed = pushChanged(changed);
 
     // --- Code review gate: experts -> manager -> re-fix (BEFORE the PR and BEFORE browser verify) ---
     if (config.review?.enabled) {
       try { review = await runReview(issue, WT, changed, branch, sessionContext); }
       catch (e) { log('Review error:', e.message); }
       changed = detectChangedRepos(WT); // a re-fix may have added commits (or reverted to none)
-      pushChanged(changed); // durability: re-fix/rework commits shouldn't be stranded by a crash in verify
+      pushFailed = pushChanged(changed); // durability: re-fix/rework commits shouldn't be stranded by a crash in verify
     }
   }
 
@@ -351,10 +352,16 @@ async function main() {
       await runClaude(claudeArgs({ model: config.review?.refixModel || config.opusModel, maxTurns: config.review?.maxTurns || 60 }), rp, WT, config.review?.timeoutMs || 20 * 60 * 1000, 'verify-refix');
       changed = detectChangedRepos(WT);
       if (countCommits(changed) > before) {
-        pushChanged(changed);
+        pushFailed = pushChanged(changed);
         checks = runChecks(WT, changed);
-        try { const v2 = await runVerify(issue, WT); if (v2) verify = { ...v2, attempt: 2 }; }
-        catch (e) { log('Re-verify error:', e.message); }
+        // Only let the re-verify REPLACE the verdict when it is CONCLUSIVE. An env_down/inconclusive
+        // re-verify must not erase the original not_fixed — doing so silently downgrades triage from
+        // rework to manual (or green), advertising a still-broken fix as ready.
+        try {
+          const v2 = await runVerify(issue, WT);
+          if (v2 && (v2.verdict === 'verified' || v2.verdict === 'not_fixed')) verify = { ...v2, attempt: 2 };
+          else if (v2) log(`Re-verify inconclusive (${v2.verdict}) — keeping the not_fixed verdict.`);
+        } catch (e) { log('Re-verify error:', e.message); }
       } else {
         log('Re-fix made no new commit — keeping the not_fixed verdict.');
       }
@@ -362,7 +369,13 @@ async function main() {
 
     // --- Triage: the one signal that tells a human what to do with this bug ---
     // green  → skim & merge; manual → run the manual steps first; rework → human takes over.
-    const triage = computeTriage({ review, verify, checks, reviewEnabled: !!config.review?.enabled });
+    let triage = computeTriage({ review, verify, checks, reviewEnabled: !!config.review?.enabled });
+    // A fix that never reached the remote is NOT mergeable — never advertise it green / move it to
+    // In Review. Downgrade to manual so a human re-pushes; the fix comment already flags the failure.
+    if (pushFailed.length && triage === 'green') {
+      log(`Push to ${pushFailed.join(', ')} failed — downgrading triage green → manual (fix is not on the remote).`);
+      triage = 'manual';
+    }
     log(`Triage: ${triage}`);
     enforcePreviewPolicy(id, triage);
 
@@ -400,10 +413,13 @@ async function main() {
 
     // --- Label + comments back on Linear: fix -> verification (tests + review) -> manual guide ---
     try { await setAutofixLabel(issue, config.triageLabels?.[triage]); } catch (e) { log('Warn: could not set triage label:', e.message); }
-    await addComment(issue.id, fixCommentBody(prs, marker, { triage }));
+    // Each comment is best-effort: a transient Linear failure here must NOT abort the run before the
+    // green→In-Review move and updateState below (that would strand the issue In Progress with a
+    // recorded fix, forcing the 6h stale sweep to re-run the whole pipeline).
     const verification = [testReportBody(marker, verify, checks), reviewReportBody(review)].filter(Boolean).join('\n\n---\n\n');
-    await addComment(issue.id, verification);
-    await addComment(issue.id, manualTestBody(marker, manualOpts));
+    try { await addComment(issue.id, fixCommentBody(prs, marker, { triage })); } catch (e) { log('Warn: fix comment failed:', e.message); }
+    try { await addComment(issue.id, verification); } catch (e) { log('Warn: verification comment failed:', e.message); }
+    try { await addComment(issue.id, manualTestBody(marker, manualOpts)); } catch (e) { log('Warn: manual-test comment failed:', e.message); }
 
     if (verify) {
       for (const p of prs) if (p.url) spawnSync('gh', ['pr', 'comment', p.url, '--body', verifyBody(verify)], { encoding: 'utf8' });
@@ -623,6 +639,24 @@ export function reconcileWithRemote(wt, branch, base, logFn = log) {
   return { ok: true, needPush: true };
 }
 
+// Safety check for an agent-driven reconcile: did it silently DROP our work? Given the branch HEAD as
+// it was BEFORE the reconcile (`preHead`), returns true if any commit that existed on preHead (since
+// `base`) has NO patch-id equivalent on the current remote tip — i.e. the reconcile adopted the remote
+// and left our commit behind (which a plain re-push would then report as a no-op "success"). Returns
+// false when it can't verify (fetch fails) so it never false-alarms.
+export function commitsDropped(wt, base, preHead) {
+  const branch = (gitIn(wt, ['rev-parse', '--abbrev-ref', 'HEAD']).stdout || '').trim();
+  if (!branch || !preHead) return false;
+  if (gitIn(wt, ['fetch', 'origin', branch]).status !== 0) return false;
+  const remote = (gitIn(wt, ['rev-parse', 'FETCH_HEAD']).stdout || '').trim();
+  if (gitIn(wt, ['fetch', 'origin', base]).status !== 0) return false;
+  const baseSha = (gitIn(wt, ['rev-parse', 'FETCH_HEAD']).stdout || '').trim();
+  if (!remote || !baseSha) return false;
+  const cherry = gitIn(wt, ['cherry', remote, preHead, baseSha]); // baseSha..preHead vs remote, by patch-id
+  if (cherry.status !== 0) return false;
+  return (cherry.stdout || '').split('\n').some((l) => l.startsWith('+ ')); // '+' = our commit missing from remote
+}
+
 // Push each changed repo's branch to origin (idempotent — a repo already up to date is a no-op).
 // On a non-fast-forward rejection (the remote branch advanced OR was rebased server-side) we hand off
 // to reconcileWithRemote, which losslessly adopts the remote tip and replays only our new commits,
@@ -684,6 +718,22 @@ export function resetTo(WT, shas) {
     const wt = wtPathOf(WT, repo);
     const cur = (gitIn(wt, ['rev-parse', 'HEAD']).stdout || '').trim();
     if (cur === sha) continue;
+    // Guard against clobbering a server-side-rewritten remote. `--force-with-lease` alone compares
+    // against the LOCAL remote-tracking ref, which may be stale — so if Greptile / the merge queue /
+    // `gh pr update-branch` rebased or amended the branch since our last fetch, a bare lease would
+    // still pass and the force-push would DESTROY those commits. Fetch the real tip first and only
+    // proceed when everything on the remote is already in our local history; otherwise refuse.
+    const branch = (gitIn(wt, ['rev-parse', '--abbrev-ref', 'HEAD']).stdout || '').trim();
+    if (branch) {
+      const fetch = gitIn(wt, ['fetch', 'origin', branch]);
+      if (fetch.status === 0) {
+        const remoteTip = (gitIn(wt, ['rev-parse', 'FETCH_HEAD']).stdout || '').trim();
+        if (remoteTip && gitIn(wt, ['merge-base', '--is-ancestor', remoteTip, cur]).status !== 0) {
+          log(`Refusing revert for ${repo.key}: origin/${branch} has commits not in the local branch (rewritten server-side) — reconcile manually.`);
+          failed.push(repo.key); continue;
+        }
+      }
+    }
     if (gitIn(wt, ['reset', '--hard', sha]).status !== 0) { failed.push(repo.key); continue; }
     const push = gitIn(wt, ['push', '--force-with-lease', 'origin', 'HEAD']);
     if (push.status !== 0) { log(`Force-push failed for ${repo.key}: ${push.stderr}`); failed.push(repo.key); }
@@ -1091,6 +1141,12 @@ async function verifyOnlyRun(issue) {
       verify.screenshotUrls = media.shots;
       verify.videoUrls = media.videos;
     } catch (e) { log('Verify media upload error:', e.message); }
+  }
+  // A verify-only re-run that comes back inconclusive (env_down / no verdict) must not discard the
+  // fix's ORIGINAL conclusive verification evidence — prefer the prior verdict over a flaky env.
+  if ((!verify || verify.verdict === 'env_down') && entry.verify && entry.verify.verdict !== 'env_down') {
+    log(`Re-verify inconclusive (${verify?.verdict || 'none'}) — keeping prior verdict ${entry.verify.verdict}.`);
+    verify = entry.verify;
   }
 
   const triage = computeTriage({ review: entry.review, verify, checks, reviewEnabled: !!config.review?.enabled });
