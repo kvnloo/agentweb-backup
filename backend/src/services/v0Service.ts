@@ -164,9 +164,14 @@ async function waitForCompletedV0Version(
 
     const version = chat?.latestVersion;
     if (version?.status === "failed") {
-      throw new Error(
+      // Typed so callers can distinguish "this chat is a dead end" (clear the
+      // idempotency identity — a retry must mint a FRESH chat, not reuse this one)
+      // from a transient/poll-budget failure (where reusing the chat is free and right).
+      const failedErr: any = new Error(
         `v0 reported the generation as failed (version ${version.id}). Retry the generation — failed attempts do not block retries.`
       );
+      failedErr.code = "V0_VERSION_FAILED";
+      throw failedErr;
     }
     if (version?.id && version.status !== "pending") {
       console.log(`[V0 SERVICE] ${label}: version ${version.id} ready (poll attempt ${pollAttempt + 1})`);
@@ -1052,6 +1057,14 @@ async function generateFirstPage(
   } catch (error: any) {
     console.error("[V0 SERVICE] Generation failed:", error);
 
+    if (error?.code === "V0_VERSION_FAILED") {
+      // v0 marked this chat's generation failed — the chat is a dead end. Free the
+      // idempotency identity so a retry mints a fresh chat instead of reusing it
+      // and failing instantly again. Best-effort; the failed-status write below is
+      // the critical step.
+      await clearV0UsageForPage({ userId, pageId: id });
+    }
+
     await dynamodb
       .update({
         TableName: TABLE_NAME,
@@ -1490,6 +1503,17 @@ async function addPageToExistingRepo(
     return deployedSubPage;
   } catch (error: any) {
     console.error("[V0 SERVICE] Failed to add page to repo:", error);
+
+    if (error?.code === "V0_VERSION_FAILED") {
+      // Dead-end chat (see generateFirstPage catch) — free the route identity so the
+      // retry creates a fresh chat rather than reusing the one v0 marked failed.
+      await clearV0UsageForPage({
+        userId,
+        pageId: id,
+        siteId: existingPage.siteId ?? existingPage.id,
+        slug,
+      });
+    }
 
     await dynamodb
       .update({
