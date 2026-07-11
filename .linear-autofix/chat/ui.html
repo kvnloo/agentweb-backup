@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Autofix Chat</title>
+<title>Autofix</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔧</text></svg>">
 <style>
   :root {
@@ -24,8 +24,15 @@
   /* Sidebar */
   #side { width: 290px; min-width: 290px; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
   #side h1 { font-size: 15px; padding: 14px 16px 6px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-  #sideToggle, #sideOpen { background: var(--panel2); color: var(--dim); border: 1px solid var(--border); border-radius: 7px; cursor: pointer; font-size: 15px; line-height: 1; padding: 4px 9px; }
-  #sideToggle:hover, #sideOpen:hover { border-color: var(--accent); color: var(--text); }
+  #side h1 > span:first-child { margin-right: auto; } /* title left, control buttons clustered right */
+  #sideToggle, #sideOpen, #sidePosToggle { background: var(--panel2); color: var(--dim); border: 1px solid var(--border); border-radius: 7px; cursor: pointer; font-size: 15px; line-height: 1; padding: 4px 9px; }
+  #sideToggle:hover, #sideOpen:hover, #sidePosToggle:hover { border-color: var(--accent); color: var(--text); }
+  /* Move the whole sidebar to the right (persisted). row-reverse flips the two flex children; the
+     side border and the floating ☰ reopener move with it so the layout stays consistent. */
+  body.side-right { flex-direction: row-reverse; }
+  body.side-right #side { border-right: none; border-left: 1px solid var(--border); }
+  body.side-right #sideOpen { left: auto; right: 12px; }
+  body.side-right.side-hidden #hdr { padding-left: 14px; padding-right: 58px; }
   /* Fully hidden (Alt+Enter): the whole sidebar is gone, a floating ☰ reopens it. */
   body.side-hidden #side { display: none; }
   #sideOpen { display: none; position: absolute; top: 12px; left: 12px; z-index: 15; }
@@ -35,7 +42,7 @@
      #side so they beat the ID-specificity base styles (e.g. `#side .sub`). */
   body.side-rail #side { width: 74px; min-width: 74px; }
   body.side-rail #side h1 { justify-content: center; padding: 12px 4px; }
-  body.side-rail #side h1 > span, body.side-rail #side .sub, body.side-rail #side #searchWrap { display: none; }
+  body.side-rail #side h1 > span, body.side-rail #side .sub, body.side-rail #side #searchWrap, body.side-rail #sidePosToggle { display: none; }
   body.side-rail #side #issues { padding: 2px 0; }
   body.side-rail #side .issue { padding: 9px 6px; margin: 0; border-radius: 0; text-align: center; border-left: 2px solid transparent; }
   body.side-rail #side .issue.sel { border-left-color: var(--accent); }
@@ -50,7 +57,7 @@
   #searchClear { position: absolute; right: 20px; top: 50%; transform: translateY(-50%); color: var(--dim); cursor: pointer; font-size: 14px; line-height: 1; display: none; user-select: none; }
   #searchClear:hover { color: var(--text); }
   #issues { overflow-y: auto; flex: 1; }
-  .issue { padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer; }
+  .issue { display: block; padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer; color: inherit; text-decoration: none; } /* an <a> so Ctrl/⌘/middle-click opens the issue in a new tab */
   .issue:hover { background: var(--panel2); }
   .issue.sel { background: var(--panel2); border-left: 3px solid var(--accent); padding-left: 11px; }
   .issue .row1 { display: flex; align-items: center; gap: 8px; }
@@ -269,7 +276,7 @@
 </head>
 <body>
   <div id="side">
-    <h1><span>🔧 Autofix Chat</span><button id="sideToggle" title="Collapse to rail (Ctrl+B)">‹</button></h1>
+    <h1><span>🔧 Autofix</span><button id="sidePosToggle" title="Move sidebar to the other side">⇄</button><button id="sideToggle" title="Collapse to rail (Ctrl+B)">‹</button></h1>
     <div class="sub"><span id="count"></span><span id="showAll">show all</span></div>
     <div id="searchWrap">
       <input id="search" type="text" placeholder="Search ID, name or summary…" autocomplete="off" spellcheck="false" />
@@ -463,12 +470,18 @@ function renderIssues() {
   $('searchClear').style.display = S.search ? 'block' : 'none';
   const empty = q ? `No issues match “${esc(S.search.trim())}”.` : 'Nothing active on this machine.';
   $('issues').innerHTML = list.map((i) => `
-    <div class="issue ${i.identifier === S.sel ? 'sel' : ''}" data-id="${i.identifier}">
+    <a class="issue ${i.identifier === S.sel ? 'sel' : ''}" data-id="${i.identifier}" href="#${encodeURIComponent(i.identifier)}">
       <div class="row1"><span class="id">${esc(i.identifier)}</span>${badge(i.outcome)}
         ${i.chat.busy ? '<span class="busydot"></span>' : ''}<span class="time">${rel(i.at)}</span></div>
       <div class="summ">${esc(i.summary || i.title || i.branch || '')}</div>
-    </div>`).join('') || `<div style="padding:16px;color:var(--dim)">${empty}</div>`;
-  for (const el of $('issues').children) el.onclick = () => el.dataset.id && select(el.dataset.id);
+    </a>`).join('') || `<div style="padding:16px;color:var(--dim)">${empty}</div>`;
+  // Plain left-click = in-app select. Ctrl/⌘/Shift/middle-click fall through to the <a href="#ID">
+  // so the browser opens the issue in a new tab/window (the hash boots straight to it).
+  for (const el of $('issues').children) el.onclick = (ev) => {
+    if (ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.button === 1) return;
+    ev.preventDefault();
+    if (el.dataset.id) select(el.dataset.id);
+  };
   // Bring the open issue into view once (on open/refresh) — but not on every background poll, which
   // would yank the scroll if the user scrolled the list. The flag is set by select() and cleared here.
   if (S.scrollToSel) { const sel = $('issues').querySelector('.issue.sel'); if (sel) { sel.scrollIntoView({ block: 'nearest' }); S.scrollToSel = false; } }
@@ -483,7 +496,7 @@ async function select(id) {
   S.scrollToSel = true; // scroll the sidebar list to this issue once it's rendered (open/refresh)
   S.queue = []; S.queuePaused = false; renderQueue(); // queued messages belong to the previously open issue
   S.attachments = []; renderAttachments();
-  document.title = id + ' · Autofix Chat'; // show the issue key in the browser tab
+  document.title = id + ' · Autofix'; // show the issue key in the browser tab
   // Remember the open issue in the URL hash so a refresh (or a shared link) lands right back on it.
   if (location.hash.slice(1) !== id) history.replaceState(null, '', '#' + id);
 
@@ -498,7 +511,7 @@ async function select(id) {
     const res = await fetch(`/api/issues/${id}`);
     if (S.sel !== id) return;
     if (!res.ok) { // stale hash (e.g. a bookmarked issue no longer tracked here) — fall back to the list
-      S.sel = null; document.title = 'Autofix Chat';
+      S.sel = null; document.title = 'Autofix';
       if (location.hash.slice(1) === id) history.replaceState(null, '', location.pathname + location.search);
       $('empty').style.display = ''; $('hdr').style.display = 'none'; $('chat').style.display = 'none'; $('composer').style.display = 'none';
       lastIssuesJson = ''; renderIssues();
@@ -1697,6 +1710,16 @@ const toggleHidden = () => setSide(sideState() === 'hidden' ? 'full' : 'hidden')
 $('sideToggle').onclick = toggleRail;
 $('sideOpen').onclick = () => setSide('full');
 try { const st = localStorage.getItem('sideState'); if (st === 'rail' || st === 'hidden') setSide(st); } catch { /* ignore */ }
+
+// ---------- sidebar side (left / right), remembered across sessions ----------
+function setSidePos(pos) {
+  const right = pos === 'right';
+  document.body.classList.toggle('side-right', right);
+  $('sidePosToggle').title = right ? 'Move sidebar to the left' : 'Move sidebar to the right';
+  try { localStorage.setItem('sidePos', right ? 'right' : 'left'); } catch { /* private mode */ }
+}
+$('sidePosToggle').onclick = () => setSidePos(document.body.classList.contains('side-right') ? 'left' : 'right');
+try { if (localStorage.getItem('sidePos') === 'right') setSidePos('right'); } catch { /* ignore */ }
 
 // ---------- boot ----------
 loadIssues();
