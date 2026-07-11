@@ -91,6 +91,36 @@ describe("sweepAbandonedBuilds (universal janitor, ENG-287)", () => {
     expect(mockUpdate).not.toHaveBeenCalled();
   });
 
+  it("paginates the scan — stuck builds beyond the first 1MB page are still swept", async () => {
+    mockScan
+      .mockReturnValueOnce(
+        ok({
+          Items: [{ id: "pg1", status: "generating", updatedAt: FORTY_MIN_AGO }],
+          LastEvaluatedKey: { id: "pg1" },
+        })
+      )
+      .mockReturnValueOnce(ok({ Items: [{ id: "pg2", status: "generating", updatedAt: FORTY_MIN_AGO }] }));
+
+    const r = await sweepAbandonedBuilds(NOW);
+
+    expect(mockScan).toHaveBeenCalledTimes(2);
+    expect(mockScan.mock.calls[1][0].ExclusiveStartKey).toEqual({ id: "pg1" });
+    expect(r).toEqual({ scanned: 2, failed: 2 });
+  });
+
+  it("sweeps a legacy record with NO updatedAt via attribute_not_exists — never puts undefined in the expression", async () => {
+    mockScan.mockReturnValue(
+      ok({ Items: [{ id: "p-legacy", status: "generating", createdAt: FORTY_MIN_AGO }] })
+    );
+
+    const r = await sweepAbandonedBuilds(NOW);
+
+    expect(r).toEqual({ scanned: 1, failed: 1 });
+    const call = mockUpdate.mock.calls[0][0];
+    expect(call.ConditionExpression).toContain("attribute_not_exists(updatedAt)");
+    expect(Object.values(call.ExpressionAttributeValues)).not.toContain(undefined);
+  });
+
   it("treats a lost conditional update as 'the build moved' — counted alive, sweep continues", async () => {
     mockScan.mockReturnValue(
       ok({

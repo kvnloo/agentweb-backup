@@ -848,6 +848,29 @@ describe("v0Service - multi-site routing (DURABLE_LANDING_GENERATION=on)", () =>
     expect(put.isRootPage).toBeUndefined(); // not a new site root
   });
 
+  it("a v0-failed generation frees the route identity — retry mints a FRESH chat, never reuses the dead one", async () => {
+    mockQuery.mockReturnValue(siteRow());
+    mockChatsCreate
+      .mockResolvedValueOnce({ id: "chat_dead" })
+      .mockResolvedValueOnce({ id: "chat_fresh" });
+    // v0 marks the generation failed — the chat is a dead end.
+    mockChatsGetById.mockResolvedValue({
+      id: "c",
+      latestVersion: { id: "v_failed", status: "failed" },
+    });
+
+    const first = await generateLandingPage("user-1", "Variant", "Pricing", {});
+    expect(first.status).toBe("failed");
+    expect(first.errorMessage).toMatch(/generation as failed/);
+
+    const second = await generateLandingPage("user-1", "Variant retry", "Pricing", {});
+    expect(second.status).toBe("failed"); // v0 failed again, but critically...
+    // ...via a FRESH chat. Without clearing the identity on V0_VERSION_FAILED, the
+    // guard would return chat_dead as reused and every retry would fail instantly.
+    expect(mockChatsCreate).toHaveBeenCalledTimes(2);
+    mockChatsGetById.mockReset();
+  });
+
   it("unified default + existing site + same in-flight route → reuses instead of duplicate-building", async () => {
     const inFlightRoute = {
       id: "route-1",
