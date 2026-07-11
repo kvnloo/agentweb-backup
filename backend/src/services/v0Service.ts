@@ -10,7 +10,10 @@ import { canEditItem } from "./orgShareService";
 import { addSubdomain, generateSubdomain, listDomains, SUBDOMAIN_BASE } from "./customDomainService";
 import { settingsService } from "./settingsService";
 import { paginatedQuery } from "../utils/dynamoPagination";
-import { guardedV0ChatCreate, guardedV0CorrectionMessage } from "./v0UsageGuard";
+import { guardedV0ChatCreate, guardedV0CorrectionMessage, clearV0UsageForPage } from "./v0UsageGuard";
+// Type-only imports from durableLandingService live elsewhere; this constant import is
+// runtime-safe because durableLandingService only imports a TYPE from this module.
+import { STUCK_CEILING_MS } from "./durableLandingService";
 import { enqueueAutoHumanEval } from "./autoHumanEvalService";
 
 // Note: global fetch (undici) timeouts are managed by httpClient.ts (15 min headersTimeout/bodyTimeout).
@@ -106,12 +109,76 @@ export async function withTimeout<T>(promise: Promise<T>, ms: number, label: str
   }
 }
 
-// Poll intervals for waiting on v0 generation to complete
-let v0PollIntervalsMs = [0, 15_000, 30_000, 45_000, 60_000];
+// Poll intervals for waiting on v0 generation to complete. With chat creation in
+// async responseMode the create call returns in seconds and THIS loop absorbs the
+// real generation time — prod evidence (ENG-287, AW-V0Usage 2026-07-10) shows
+// brand-enriched generations routinely take 3–15 min, so the budget must exceed
+// that. Ramps to a steady 30s cadence, ~16 min total.
+let v0PollIntervalsMs = [0, 10_000, 15_000, 20_000, 30_000, 45_000, ...Array(28).fill(30_000)];
 
 /** Override poll intervals (for testing) */
 export function setV0PollIntervals(intervals: number[]) {
   v0PollIntervalsMs = intervals;
+}
+
+/**
+ * Poll a v0 chat until its latest version reaches a terminal state and return the
+ * completed version id.
+ *
+ * Async-mode chats expose the version immediately with `status: 'pending'` while
+ * generation runs, so readiness is the version's status — NOT its existence
+ * (grabbing a pending version downloads a half-generated page). A missing status
+ * field (older sync-mode responses) is treated as completed, preserving the
+ * pre-async behavior. A transient poll-read failure only costs that attempt — a
+ * 15-minute generation must not die because one status read timed out; the loop's
+ * budget bounds the total wait and the exit is loud.
+ */
+async function waitForCompletedV0Version(
+  v0: any,
+  chatId: string,
+  label: string
+): Promise<string> {
+  const intervals = v0PollIntervalsMs;
+  let lastReadError: string | undefined;
+  for (let pollAttempt = 0; pollAttempt < intervals.length; pollAttempt++) {
+    if (intervals[pollAttempt] > 0) {
+      console.log(
+        `[V0 SERVICE] ${label}: generation not ready yet, waiting ${intervals[pollAttempt] / 1000}s (attempt ${pollAttempt + 1}/${intervals.length})...`
+      );
+      await new Promise((resolve) => setTimeout(resolve, intervals[pollAttempt]));
+    }
+
+    let chat: any;
+    try {
+      chat = await withRetry(
+        () => v0.chats.getById({ chatId }),
+        `${label} (status poll)`,
+        undefined, undefined, undefined,
+        { retryOnTimeout: false }
+      );
+    } catch (err: any) {
+      lastReadError = describeError(err);
+      console.warn(`[V0 SERVICE] ${label}: status poll failed (${lastReadError}), continuing...`);
+      continue;
+    }
+
+    const version = chat?.latestVersion;
+    if (version?.status === "failed") {
+      throw new Error(
+        `v0 reported the generation as failed (version ${version.id}). Retry the generation — failed attempts do not block retries.`
+      );
+    }
+    if (version?.id && version.status !== "pending") {
+      console.log(`[V0 SERVICE] ${label}: version ${version.id} ready (poll attempt ${pollAttempt + 1})`);
+      return version.id;
+    }
+  }
+
+  const budgetMin = Math.round(intervals.reduce((a, b) => a + b, 0) / 60_000);
+  throw new Error(
+    `No completed version in v0 chat after ~${budgetMin} minutes of polling — v0 generation is unusually slow or stalled` +
+    (lastReadError ? ` (last poll error: ${lastReadError})` : "")
+  );
 }
 
 // Vercel deployment polling config
@@ -611,10 +678,19 @@ export async function findReusablePageForRoute(
   slug: string
 ): Promise<GeneratedLandingPage | null> {
   const pages = await listLandingPages(userId);
-  const REUSE_STATUSES = ["deployed", "generating", "deploying"];
-  const match = pages.find(
-    (p) => (p.slug || (p.name ? buildPageSlug(p.name) : undefined)) === slug && REUSE_STATUSES.includes(p.status)
-  );
+  const nowMs = Date.now();
+  const match = pages.find((p) => {
+    if ((p.slug || (p.name ? buildPageSlug(p.name) : undefined)) !== slug) return false;
+    if (p.status === "deployed") return true;
+    // In-flight records are only reusable while plausibly alive. A record stuck in
+    // generating/deploying past the stuck ceiling was abandoned by a crash/redeploy —
+    // reusing it would let one wedged record swallow every future build of this
+    // route forever (the ENG-277 wedge). The janitor will mark it failed; a fresh
+    // build must be allowed to proceed now.
+    if (p.status !== "generating" && p.status !== "deploying") return false;
+    const ageMs = nowMs - new Date(p.updatedAt || p.createdAt).getTime();
+    return Number.isFinite(ageMs) && ageMs <= STUCK_CEILING_MS;
+  });
   return match || null;
 }
 
@@ -928,8 +1004,12 @@ async function generateFirstPage(
       operation: "first_page_chat_create",
       scopeId: id,
       prompt: enrichedPrompt,
+      // responseMode async: sync mode blocks the HTTP call for the FULL generation
+      // (3–15 min in prod), guaranteeing a loss against the 300s attempt timeout and
+      // minting an orphan, credit-burning chat on every "timeout". Async returns the
+      // chatId in seconds; waitForCompletedV0Version absorbs the generation time. (ENG-287)
       create: () => withRetry(
-        () => v0.chats.create({ message: enrichedPrompt }),
+        () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" }),
         "v0 chat creation",
         // Interactive path: fail fast on a timeout instead of re-burning 3 × 300s
         // ≈ 15 min. 5xx/network still retry. The guard makes the user's retry clean. (ENG-287)
@@ -1213,8 +1293,10 @@ async function addPageToExistingRepo(
       scopeId: existingPage.siteId ?? existingPage.id,
       slug,
       prompt: enrichedPrompt,
+      // responseMode async — see the first-page call site for why sync mode cannot
+      // survive the 300s attempt timeout. (ENG-287)
       create: () => withRetry(
-        () => v0.chats.create({ message: enrichedPrompt }),
+        () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" }),
         "v0 chat creation (additional page)",
         // Interactive path: fail fast on a timeout instead of re-burning 3 × 300s
         // ≈ 15 min. 5xx/network still retry. The guard makes the user's retry clean. (ENG-287)
@@ -1241,31 +1323,9 @@ async function addPageToExistingRepo(
       })
       .promise();
 
-    // ── Step 2: Poll for v0 version completion ──
-    const V0_POLL_INTERVALS_MS = v0PollIntervalsMs;
-    let versionId: string | undefined;
-
-    for (let pollAttempt = 0; pollAttempt < V0_POLL_INTERVALS_MS.length; pollAttempt++) {
-      if (V0_POLL_INTERVALS_MS[pollAttempt] > 0) {
-        console.log(`[V0 SERVICE] v0 generation not ready yet for /${slug}, waiting ${V0_POLL_INTERVALS_MS[pollAttempt] / 1000}s (attempt ${pollAttempt + 1}/${V0_POLL_INTERVALS_MS.length})...`);
-        await new Promise(resolve => setTimeout(resolve, V0_POLL_INTERVALS_MS[pollAttempt]));
-      }
-
-      const chat = await withRetry(
-        () => v0.chats.getById({ chatId }),
-        "v0 chat fetch (additional page)"
-      );
-      versionId = chat.latestVersion?.id;
-
-      if (versionId) {
-        console.log(`[V0 SERVICE] v0 version found for /${slug}: ${versionId} (poll attempt ${pollAttempt + 1})`);
-        break;
-      }
-    }
-
-    if (!versionId) {
-      throw new Error("No version found in v0 chat after polling — generation may have failed");
-    }
+    // ── Step 2: Poll for v0 version completion (status-gated — a pending version
+    // must not be downloaded half-generated) ──
+    let versionId: string | undefined = await waitForCompletedV0Version(v0, chatId, `v0 generation for /${slug}`);
 
     // ── Step 3: Download and validate v0 output ──
     await dynamodb
@@ -1320,7 +1380,11 @@ async function addPageToExistingRepo(
                   "Output must include .tsx files with real React components using export and function/const. " +
                   `Issue: ${valErr.reason}`,
               }),
-              "v0 correction message (additional page)"
+              "v0 correction message (additional page)",
+              // A correction that outlives the attempt timeout must fail once, not be
+              // re-sent 3× — each retry could double-apply the correction at full cost. (ENG-287)
+              undefined, undefined, undefined,
+              { retryOnTimeout: false }
             ),
           });
 
@@ -1656,32 +1720,11 @@ export async function deployLandingPage(
   try {
     const v0 = await getV0Client();
 
-    // Step 1: Get the latest version from v0 chat (poll with backoff if generation is still in progress)
+    // Step 1: Wait for the latest version to complete (status-gated — async-mode
+    // chats expose a pending version immediately; downloading it would ship a
+    // half-generated page)
     console.log(`[V0 SERVICE] Step 1: Getting latest version for chat ${record.v0ChatId}`);
-    const V0_POLL_INTERVALS_MS = v0PollIntervalsMs; // total wait: up to ~2.5 min
-    let versionId: string | undefined;
-
-    for (let pollAttempt = 0; pollAttempt < V0_POLL_INTERVALS_MS.length; pollAttempt++) {
-      if (V0_POLL_INTERVALS_MS[pollAttempt] > 0) {
-        console.log(`[V0 SERVICE] v0 generation not ready yet, waiting ${V0_POLL_INTERVALS_MS[pollAttempt] / 1000}s before retry (attempt ${pollAttempt + 1}/${V0_POLL_INTERVALS_MS.length})...`);
-        await new Promise(resolve => setTimeout(resolve, V0_POLL_INTERVALS_MS[pollAttempt]));
-      }
-
-      const chat = await withRetry(
-        () => v0.chats.getById({ chatId: record.v0ChatId! }),
-        "v0 chat fetch"
-      );
-      versionId = chat.latestVersion?.id;
-
-      if (versionId) {
-        console.log(`[V0 SERVICE] v0 version found: ${versionId} (poll attempt ${pollAttempt + 1})`);
-        break;
-      }
-    }
-
-    if (!versionId) {
-      throw new Error("No version found in v0 chat after polling for ~2.5 minutes — generation may have failed");
-    }
+    let versionId: string | undefined = await waitForCompletedV0Version(v0, record.v0ChatId!, "v0 generation");
 
     // Step 2: Download + validate v0 output (with retry on bad output)
     const V0_VALIDATION_MAX_RETRIES = 2;
@@ -1725,7 +1768,11 @@ export async function deployLandingPage(
                   "Output must include .tsx files with real React components using export and function/const. " +
                   `Issue: ${valErr.reason}`,
               }),
-              "v0 correction message"
+              "v0 correction message",
+              // A correction that outlives the attempt timeout must fail once, not be
+              // re-sent 3× — each retry could double-apply the correction at full cost. (ENG-287)
+              undefined, undefined, undefined,
+              { retryOnTimeout: false }
             ),
           });
 
@@ -3073,7 +3120,13 @@ export async function iterateLandingPage(
         chatId: record.v0ChatId!,
         message,
       }),
-      "v0 chat iterate"
+      "v0 chat iterate",
+      // Interactive path: a >300s iteration fails fast with a clean retry instead of
+      // hanging ~15 min and possibly applying the message multiple times. Kept in
+      // sync responseMode deliberately — the deploy that follows reads latestVersion,
+      // and async here would let it grab the pre-iteration version. (ENG-287)
+      undefined, undefined, undefined,
+      { retryOnTimeout: false }
     );
 
     // Reset status to draft (needs re-deploy after iteration)
@@ -3383,6 +3436,16 @@ export async function deleteLandingPage(
       },
     })
     .promise();
+
+  // Free the idempotency identity so regenerating this slug creates a NEW page
+  // instead of reusing the archived page's chat forever. Best-effort — the delete
+  // above already succeeded and must not be un-done by a cleanup failure.
+  await clearV0UsageForPage({
+    userId,
+    pageId: id,
+    siteId: record.siteId,
+    slug: record.slug || (record.name ? buildPageSlug(record.name) : undefined),
+  });
 }
 
 export async function updateLandingPageGtm(
