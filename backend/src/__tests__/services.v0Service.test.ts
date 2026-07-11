@@ -684,6 +684,16 @@ describe("v0Service - findReusablePageForRoute (route-level idempotency, kills d
     expect(await findReusablePageForRoute("u1", "pricing")).toBeNull();
   });
 
+  it("does NOT reuse a same-slug page from a DIFFERENT site (cross-site collision, Greptile P1)", async () => {
+    items(page({ status: "deployed", siteId: "site-A" }));
+    expect(await findReusablePageForRoute("u1", "pricing", "site-B")).toBeNull();
+  });
+
+  it("reuses a same-slug page when it belongs to the REQUESTED site", async () => {
+    items(page({ status: "deployed", siteId: "site-A" }));
+    expect((await findReusablePageForRoute("u1", "pricing", "site-A"))?.id).toBe("p1");
+  });
+
   it("does NOT match a different route", async () => {
     items(page({ slug: "about", status: "deployed" }));
     expect(await findReusablePageForRoute("u1", "pricing")).toBeNull();

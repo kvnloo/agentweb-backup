@@ -680,11 +680,15 @@ async function getV0Client() {
  */
 export async function findReusablePageForRoute(
   userId: string,
-  slug: string
+  slug: string,
+  siteId?: string
 ): Promise<GeneratedLandingPage | null> {
   const pages = await listLandingPages(userId);
   const nowMs = Date.now();
   const match = pages.find((p) => {
+    // Routes are per-site: /book-a-demo on Site A must never satisfy a request
+    // targeting Site B (the guard key is siteId-scoped for the same reason).
+    if (siteId && p.siteId !== siteId && p.id !== siteId) return false;
     if ((p.slug || (p.name ? buildPageSlug(p.name) : undefined)) !== slug) return false;
     if (p.status === "deployed") return true;
     // In-flight records are only reusable while plausibly alive. A record stuck in
@@ -795,7 +799,7 @@ export async function generateLandingPage(
       const site = await findSiteById(opts.siteId, userId);
       if (site?.githubRepoUrl) {
         const slug = buildPageSlug(name);
-        const reuse = await findReusablePageForRoute(userId, slug);
+        const reuse = await findReusablePageForRoute(userId, slug, site.siteId ?? site.id);
         if (reuse) {
           console.log(`[V0 SERVICE] Route /${slug} is already ${reuse.status} (${reuse.id}) — reusing, skipping duplicate build`);
           return reuse;
@@ -821,7 +825,7 @@ export async function generateLandingPage(
     const existing = await findUserSiteRecord(userId);
     if (existing?.githubRepoUrl) {
       const slug = buildPageSlug(name);
-      const reuse = await findReusablePageForRoute(userId, slug);
+      const reuse = await findReusablePageForRoute(userId, slug, existing.siteId ?? existing.id);
       if (reuse) {
         console.log(`[V0 SERVICE] Route /${slug} is already ${reuse.status} (${reuse.id}) — reusing, skipping duplicate build`);
         return reuse;
