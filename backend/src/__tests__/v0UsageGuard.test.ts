@@ -5,6 +5,7 @@ import {
   guardedV0ChatCreate,
   guardedV0CorrectionMessage,
   getV0UsageCountForScope,
+  clearV0UsageForPage,
   type V0UsageRecord,
 } from '../services/v0UsageGuard';
 
@@ -253,5 +254,50 @@ describe('v0UsageGuard', () => {
     expect(first).toEqual({ ok: true });
     expect(second).toEqual({ skipped: true });
     expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  test('a FAILED correction does not skip the retry — the validation loop depends on it (ENG-287)', async () => {
+    const send = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('v0 correction message timed out after 300s'))
+      .mockResolvedValueOnce({ ok: true });
+
+    await expect(
+      guardedV0CorrectionMessage({ userId: 'user_1', scopeId: 'page_1', chatId: 'chat_1', send }),
+    ).rejects.toThrow(/timed out/);
+
+    const retry = await guardedV0CorrectionMessage({
+      userId: 'user_1',
+      scopeId: 'page_1',
+      chatId: 'chat_1',
+      send,
+    });
+
+    expect(retry).toEqual({ ok: true });
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  test('clearV0UsageForPage frees the identity — regenerating a deleted page gets a NEW chat (ENG-287)', async () => {
+    const create = jest
+      .fn()
+      .mockResolvedValueOnce({ id: 'chat_old' })
+      .mockResolvedValueOnce({ id: 'chat_new' });
+    const args = {
+      userId: 'user_1',
+      operation: 'additional_page_chat_create' as const,
+      scopeId: 'site_1',
+      slug: 'book-a-demo',
+      prompt: 'p',
+      create,
+    };
+
+    await guardedV0ChatCreate(args);
+    // Without the clear, the succeeded record is a permanent identity: the second
+    // call would return chat_old as reused and silently ignore the new prompt.
+    await clearV0UsageForPage({ userId: 'user_1', pageId: 'page_x', siteId: 'site_1', slug: 'book-a-demo' });
+    const second = await guardedV0ChatCreate(args);
+
+    expect(second).toMatchObject({ id: 'chat_new' });
+    expect(create).toHaveBeenCalledTimes(2);
   });
 });
