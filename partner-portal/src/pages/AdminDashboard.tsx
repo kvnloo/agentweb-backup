@@ -59,6 +59,7 @@ import McpServersTab from "../components/admin/McpServersTab";
 import ResultEndpointsTab from "../components/admin/ResultEndpointsTab";
 import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
 import CrmTab from "../components/admin/CrmTab";
+import V0CreditsCard from "../components/admin/V0CreditsCard";
 import RevenueTab from "../components/admin/RevenueTab";
 import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
@@ -3678,6 +3679,9 @@ export default function AdminDashboard() {
                         )}
                       </CardContent>
                     </Card>
+                  </Grid>
+                  <Grid item xs={12} md={3}>
+                    <V0CreditsCard />
                   </Grid>
                 </Grid>
 
