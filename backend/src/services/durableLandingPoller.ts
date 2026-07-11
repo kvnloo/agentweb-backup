@@ -21,6 +21,7 @@ import type { GeneratedLandingPage } from "./v0Service";
 import { deliverCompletion, deliverStuckFailure, STUCK_CEILING_MS } from "./durableLandingService";
 import { isCronEnabled } from "../utils/instanceState";
 import { cronJobRegistry } from "../utils/cronJobRegistry";
+import { paginatedScan } from "../utils/dynamoPagination";
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || "us-west-2",
@@ -50,21 +51,20 @@ function isStuck(page: GeneratedLandingPage, nowMs: number): boolean {
 export async function sweepAbandonedBuilds(
   nowMs: number = new Date().getTime()
 ): Promise<{ scanned: number; failed: number }> {
-  const result = await dynamodb
-    .scan({
-      TableName: TABLE_NAME,
-      FilterExpression:
-        "(#status = :generating OR #status = :deploying) AND (attribute_not_exists(archived) OR archived = :false)",
-      ExpressionAttributeNames: { "#status": "status" },
-      ExpressionAttributeValues: {
-        ":generating": "generating",
-        ":deploying": "deploying",
-        ":false": false,
-      },
-    })
-    .promise();
-
-  const pages = (result.Items || []) as GeneratedLandingPage[];
+  // paginatedScan: a plain Scan caps at 1 MB per call, and a sweep that silently
+  // misses the tail recreates the exact "eternal generating card" bug it exists
+  // to prevent.
+  const pages = await paginatedScan<GeneratedLandingPage>(dynamodb, {
+    TableName: TABLE_NAME,
+    FilterExpression:
+      "(#status = :generating OR #status = :deploying) AND (attribute_not_exists(archived) OR archived = :false)",
+    ExpressionAttributeNames: { "#status": "status" },
+    ExpressionAttributeValues: {
+      ":generating": "generating",
+      ":deploying": "deploying",
+      ":false": false,
+    },
+  });
   let failed = 0;
 
   for (const page of pages) {
@@ -74,6 +74,10 @@ export async function sweepAbandonedBuilds(
     const lastMoved = new Date(page.updatedAt || page.createdAt || 0).getTime();
     if (!Number.isFinite(lastMoved) || nowMs - lastMoved <= STUCK_CEILING_MS) continue;
 
+    // Legacy records may lack updatedAt entirely; `undefined` in
+    // ExpressionAttributeValues makes the SDK throw a serialization error (not a
+    // conditional failure), which would leave the record unsweepable forever.
+    const hasUpdatedAt = typeof page.updatedAt === "string" && page.updatedAt.length > 0;
     try {
       await dynamodb
         .update({
@@ -81,7 +85,9 @@ export async function sweepAbandonedBuilds(
           Key: { id: page.id },
           UpdateExpression:
             "SET #status = :failed, errorMessage = :error, updatedAt = :now",
-          ConditionExpression: "#status = :oldStatus AND updatedAt = :oldUpdatedAt",
+          ConditionExpression: hasUpdatedAt
+            ? "#status = :oldStatus AND updatedAt = :oldUpdatedAt"
+            : "#status = :oldStatus AND attribute_not_exists(updatedAt)",
           ExpressionAttributeNames: { "#status": "status" },
           ExpressionAttributeValues: {
             ":failed": "failed",
@@ -90,7 +96,7 @@ export async function sweepAbandonedBuilds(
               "Retry the generation; abandoned attempts never block a retry.",
             ":now": new Date(nowMs).toISOString(),
             ":oldStatus": page.status,
-            ":oldUpdatedAt": page.updatedAt,
+            ...(hasUpdatedAt ? { ":oldUpdatedAt": page.updatedAt } : {}),
           },
         })
         .promise();
@@ -117,16 +123,12 @@ export async function runDurableLandingPollerOnce(
   let delivered = 0;
   let failed = 0;
 
-  const result = await dynamodb
-    .scan({
-      TableName: TABLE_NAME,
-      FilterExpression:
-        "awaitingReconnect = :true AND attribute_not_exists(claimedCompletionAt) AND attribute_exists(originatingSessionId)",
-      ExpressionAttributeValues: { ":true": true },
-    })
-    .promise();
-
-  const pages = (result.Items || []) as GeneratedLandingPage[];
+  const pages = await paginatedScan<GeneratedLandingPage>(dynamodb, {
+    TableName: TABLE_NAME,
+    FilterExpression:
+      "awaitingReconnect = :true AND attribute_not_exists(claimedCompletionAt) AND attribute_exists(originatingSessionId)",
+    ExpressionAttributeValues: { ":true": true },
+  });
 
   for (const page of pages) {
     try {
