@@ -58,9 +58,30 @@ const fixEnabled = () => process.env.AUTOFIX_RUN_ENABLED === '1';
 const loadState = () => { try { return JSON.parse(readFileSync(statePath, 'utf8')); } catch { return {}; } };
 const loadChatState = () => { try { return JSON.parse(readFileSync(chatStatePath, 'utf8')); } catch { return {}; } };
 // Read-modify-write against a fresh read (same discipline as autofix's updateState).
+// Give every message a stable, monotonic `mid`. Edit/delete address a message by mid, NOT by array
+// position, because the .slice(-500) cap drops messages off the FRONT and would shift every index —
+// so a stale index could otherwise cut the conversation at the wrong message. The counter persists on
+// cs.midSeq and only ever increases, so dropped mids are never reused (no collisions).
+function ensureMids(cs) {
+  if (!cs || !Array.isArray(cs.messages)) return cs;
+  let seq = cs.midSeq || 0;
+  for (const m of cs.messages) if (m && m.mid == null) m.mid = ++seq;
+  cs.midSeq = seq;
+  return cs;
+}
+
+// Resolve the CURRENT array index of the message an edit/delete targets: prefer the stable mid, fall
+// back to a raw index for older clients. Returns -1 when the target is gone (e.g. scrolled out of the
+// 500-message window) so the caller can reject rather than cut at the wrong place.
+function resolveMsgIndex(msgs, body) {
+  if (body?.mid != null) return msgs.findIndex((m) => m && m.mid === body.mid);
+  const idx = Number.parseInt(body?.index, 10);
+  return Number.isInteger(idx) && idx >= 0 && idx < msgs.length ? idx : -1;
+}
+
 function updateChatState(identifier, fn) {
   const s = loadChatState();
-  s[identifier] = fn(s[identifier] || { identifier, cwd: null, sessions: {}, messages: [] });
+  s[identifier] = ensureMids(fn(s[identifier] || { identifier, cwd: null, sessions: {}, messages: [] }));
   writeFileSync(chatStatePath, JSON.stringify(s, null, 2));
   return s[identifier];
 }
@@ -728,11 +749,15 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
     // Edit prelude: rewrite history at edit.index. Optionally rewind the code, fork the transcript
     // at the cut point (native memory preserved; null -> fresh fallback), then drop the messages
     // from the edit point down. Mutates `edit` with forkSid + the retained conversation.
-    if (edit && edit.index != null && !edit.prepared) {
+    if (edit && (edit.index != null || edit.mid != null) && !edit.prepared) {
       const csE = loadChatState()[identifier] || {};
       const msgsE = csE.messages || [];
-      const em = msgsE[edit.index] || {};
-      edit.retained = msgsE.slice(0, edit.index);
+      // Resolve the cut point by stable mid (fall back to the raw index) against the CURRENT array,
+      // so a .slice(-500) shift between the request and here can't move it to the wrong message.
+      const byMid = edit.mid != null ? msgsE.findIndex((m) => m && m.mid === edit.mid) : -1;
+      const idx = byMid >= 0 ? byMid : edit.index;
+      const em = msgsE[idx] || {};
+      edit.retained = msgsE.slice(0, idx);
 
       if (edit.revert && cap === 'full' && em.headBefore) {
         emit({ type: 'status', text: 'Rewinding the branch to before the dropped turns…' });
@@ -755,7 +780,7 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
       edit.forkSid = forkSid;
       edit.prepared = true;
       updateChatState(identifier, (cs) => {
-        cs.messages = (cs.messages || []).slice(0, edit.index);
+        cs.messages = (cs.messages || []).slice(0, idx);
         pruneForks(cwd, prevForks, forkSid);
         if (forkSid) { cs.forks = [forkSid]; cs.sessions.chat = forkSid; }
         else { cs.forks = []; delete cs.sessions.chat; }
@@ -1234,17 +1259,16 @@ async function runCompactTurn(identifier, entry, cap, turnId, lockPath, instruct
 // it, fork the CLI session's transcript to the cut point (memory preserved), then run the edited
 // message as a new turn. `revert` additionally rewinds the branch to before the dropped turns.
 function startEditTurn(identifier, body) {
-  const index = Number.parseInt(body?.index, 10);
   const message = String(body?.message || '').trim();
   const revert = !!body?.revert;
   if (!message) return { code: 400, error: 'message must be non-empty' };
-  if (!Number.isInteger(index) || index < 0) return { code: 400, error: 'index must be a non-negative integer' };
   const found = findEntry(identifier);
   if (!found) return { code: 404, error: `no autofix record for ${identifier}` };
   if (activeTurns.has(identifier)) return { code: 409, error: 'a turn is already running for this issue' };
 
   const msgs = (loadChatState()[identifier] || {}).messages || [];
-  if (index >= msgs.length) return { code: 400, error: 'index out of range' };
+  const index = resolveMsgIndex(msgs, body); // by stable mid (index fallback) — robust to .slice(-500) shifts
+  if (index < 0) return { code: 400, error: 'that message is no longer available (it may have scrolled out of history)' };
   if (msgs[index].role !== 'user') return { code: 400, error: 'only user messages can be edited' };
 
   const cap = capabilityOf(found.entry).level;
@@ -1257,7 +1281,7 @@ function startEditTurn(identifier, body) {
 
   const turnId = `t${Date.now()}-${++turnSeq}`;
   activeTurns.set(identifier, { child: null, cap, turnId, startedAt: new Date().toISOString(), lockPath });
-  runTurn(identifier, found.entry, cap, message, turnId, lockPath, { index, revert });
+  runTurn(identifier, found.entry, cap, message, turnId, lockPath, { index, mid: msgs[index].mid, revert });
   return { code: 202, body: { turnId, cap } };
 }
 
@@ -1265,16 +1289,15 @@ function startEditTurn(identifier, body) {
 // same fork+truncate as edit, but WITHOUT re-running (no new turn). `revert` also rewinds the
 // branch. Runs synchronously (only file/git ops, no agent), under the lock so gc won't race it.
 function startDeleteHistory(identifier, body) {
-  const index = Number.parseInt(body?.index, 10);
   const revert = !!body?.revert;
-  if (!Number.isInteger(index) || index < 0) return { code: 400, error: 'index must be a non-negative integer' };
   const found = findEntry(identifier);
   if (!found) return { code: 404, error: `no autofix record for ${identifier}` };
   if (activeTurns.has(identifier)) return { code: 409, error: 'a turn is running for this issue' };
 
   const cs0 = loadChatState()[identifier] || {};
   const msgs = cs0.messages || [];
-  if (index >= msgs.length) return { code: 400, error: 'index out of range' };
+  const index = resolveMsgIndex(msgs, body); // by stable mid (index fallback) — robust to .slice(-500) shifts
+  if (index < 0) return { code: 400, error: 'that message is no longer available (it may have scrolled out of history)' };
   if (msgs[index].role !== 'user') return { code: 400, error: 'only user messages can be deleted' };
 
   const cap = capabilityOf(found.entry).level;

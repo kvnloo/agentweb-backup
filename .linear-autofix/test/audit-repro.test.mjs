@@ -79,5 +79,33 @@ console.log('#8 FIX: commitsDropped flags a reconcile that adopted the remote an
 // essentially cannot occur in the real system, so this is not treated as an actionable bug.
 void reconcileWithRemote; void spawnSync; void mkdtempSync; void writeFileSync; void rmSync; void tmpdir; void path;
 
+// ── #18 FIX: edit/delete resolve by stable mid, so a .slice(-500) front-drop can't cut at the wrong
+// message. Faithful copies of server.mjs ensureMids + resolveMsgIndex. ──
+function ensureMids(cs) {
+  let seq = cs.midSeq || 0;
+  for (const m of cs.messages) if (m && m.mid == null) m.mid = ++seq;
+  cs.midSeq = seq; return cs;
+}
+function resolveMsgIndex(msgs, body) {
+  if (body?.mid != null) return msgs.findIndex((m) => m && m.mid === body.mid);
+  const idx = Number.parseInt(body?.index, 10);
+  return Number.isInteger(idx) && idx >= 0 && idx < msgs.length ? idx : -1;
+}
+console.log('#18 FIX: edit/delete target survives a .slice(-500) index shift');
+{
+  const cs = { messages: Array.from({ length: 502 }, (_, i) => ({ role: 'user', text: `m${i}` })) };
+  ensureMids(cs);
+  const target = cs.messages[250];               // the message a user clicks edit on (index 250)
+  const clickedIndex = 250, clickedMid = target.mid;
+  cs.messages = cs.messages.slice(-500);         // cap drops the first 2 → everything shifts down by 2
+  ensureMids(cs);
+  // stale raw index now points at the WRONG message; the stable mid still finds the right one
+  ok(cs.messages[clickedIndex].text !== target.text, 'raw index now points at a different message (the bug)');
+  const byMid = resolveMsgIndex(cs.messages, { mid: clickedMid });
+  ok(byMid >= 0 && cs.messages[byMid].text === target.text, `FIX VERIFIED: mid resolves to the original message (idx ${byMid}, was ${clickedIndex})`);
+  // a target that scrolled out of the window resolves to -1 (rejected, not mis-cut)
+  ok(resolveMsgIndex(cs.messages, { mid: 1 }) === -1, 'a dropped message resolves to -1 (rejected, never mis-cut)');
+}
+
 console.log(`\n${fail === 0 ? '✅ ALL ASSERTIONS HELD' : '❌ SOME ASSERTIONS FAILED'} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

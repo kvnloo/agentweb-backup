@@ -940,7 +940,7 @@ async function restoreAborted(text) {
   if (idx < 0 || msgs[idx].text !== text) return; // safety: only rewind if the tail really is our message
   const r = await fetch(`/api/issues/${S.sel}/chat/delete`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ index: idx, revert: false }),
+    body: JSON.stringify({ index: idx, mid: msgs[idx]?.mid, revert: false }),
   });
   if (!r.ok) { const e = await r.json().catch(() => ({})); addSys('⚠ ' + (e.error || `couldn't rewind (${r.status})`), 'err'); return; }
   if (S.detail?.chat?.messages) S.detail.chat.messages = S.detail.chat.messages.slice(0, idx);
@@ -1027,9 +1027,10 @@ function renderDeleteBar() {
 async function doDelete(revert) {
   if (!S.deleting || !S.sel) return;
   const index = S.deleting.index;
+  const mid = (S.detail?.chat?.messages || [])[index]?.mid;
   const r = await fetch(`/api/issues/${S.sel}/chat/delete`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ index, revert }),
+    body: JSON.stringify({ index, mid, revert }),
   });
   if (!r.ok) {
     const err = await r.json().catch(() => ({}));
@@ -1044,6 +1045,7 @@ async function doDelete(revert) {
 async function doEditSend(revert) {
   if (!S.editing || !S.sel) return;
   const index = S.editing.index;
+  const mid = S.detail?.chat?.messages?.[index]?.mid; // capture BEFORE the optimistic mutation below
   const message = $('input').value.trim();
   if (!message) return;
   S.lastSent = message; // so an Esc-abort-before-any-reply can restore it (same as a fresh send)
@@ -1063,7 +1065,7 @@ async function doEditSend(revert) {
 
   const r = await fetch(`/api/issues/${S.sel}/chat/edit`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ index, message, revert }),
+    body: JSON.stringify({ index, mid, message, revert }),
   });
   if (!r.ok) {
     const err = await r.json().catch(() => ({}));
