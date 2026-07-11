@@ -224,8 +224,115 @@ export async function getV0Credits(options?: {
   return inflight;
 }
 
-/** Test-only: clear the module-level cache and in-flight fetch between test cases. */
+// ── Low-credit alerting ───────────────────────────────────────────────────────
+//
+// Hourly cron (see server.ts) so credits can never silently run out even if no
+// admin looks at the dashboard card. Alerts route through the backend's
+// canonical ops-alert path — emailService.sendOncallAlert (oncall email list +
+// auto-filed tracked issue via intakeService; suppressed outside production) —
+// the same transport the AgentMode context-limit alerts use.
+
+/** Re-alert at most once per level within this window (a redeploy re-alerting once is acceptable). */
+export const V0_ALERT_REALERT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+export type V0AlertTransport = (
+  subject: string,
+  message: string,
+  context?: Record<string, any>
+) => Promise<void>;
+
+/** Default transport: the existing oncall alert util. Lazy import keeps the
+ *  heavy emailService dependency graph out of this module's unit tests. */
+const defaultAlertTransport: V0AlertTransport = async (subject, message, context) => {
+  const { emailService } = await import("./emailService");
+  await emailService.sendOncallAlert(subject, message, context);
+};
+
+let lastAlerted: { level: Exclude<V0WarnLevel, "ok">; at: number } | null = null;
+
+function formatAlertMessage(dto: V0CreditsDto): { subject: string; message: string } {
+  const subject = `v0 credits ${dto.warnLevel.toUpperCase()} — $${dto.totalSpendableUsd.toFixed(2)} spendable`;
+  const message = [
+    `v0 (landing-page generation) account credits are ${dto.warnLevel.toUpperCase()}.`,
+    `Plan: ${dto.plan}`,
+    `Total spendable: $${dto.totalSpendableUsd.toFixed(2)}`,
+    `Monthly allowance: $${dto.monthly.remaining.toFixed(2)} of $${dto.monthly.total.toFixed(2)} remaining`,
+    `On-demand: $${dto.onDemand.remaining.toFixed(2)} of $${dto.onDemand.total.toFixed(2)} remaining`,
+    `Action: top up v0 credits (v0.dev → Settings → Billing) before landing-page generation starts failing.`,
+  ].join("\n");
+  return { subject, message };
+}
+
+export interface V0AlertCheckResult {
+  warnLevel: V0WarnLevel;
+  alerted: boolean;
+  recovered: boolean;
+}
+
+/**
+ * Fetch credits (respecting the cache) and alert on a warn-level transition
+ * INTO 'low' or 'critical'. Dedupe: the same level only re-alerts after
+ * V0_ALERT_REALERT_WINDOW_MS; a *different* level alerts immediately.
+ * Recovery to 'ok' resets the state and sends a one-line all-clear.
+ *
+ * Transport failures are logged (console.error) and do NOT throw out of the
+ * cron; alert state is only advanced on a successful send so the next tick
+ * retries. v0 API failures DO propagate — the cron wrapper logs them.
+ */
+export async function checkAndAlert(options?: {
+  transport?: V0AlertTransport;
+}): Promise<V0AlertCheckResult> {
+  const transport = options?.transport ?? defaultAlertTransport;
+  const dto = await getV0Credits();
+  const level = dto.warnLevel;
+
+  if (level === "ok") {
+    const recovered = lastAlerted !== null;
+    if (recovered) {
+      lastAlerted = null;
+      try {
+        await transport(
+          "v0 credits recovered",
+          `v0 credit balance is back to OK — $${dto.totalSpendableUsd.toFixed(2)} spendable (plan: ${dto.plan}).`
+        );
+      } catch (error) {
+        console.error("[v0CreditAlert] Failed to send recovery note:", error);
+      }
+    }
+    return { warnLevel: level, alerted: false, recovered };
+  }
+
+  const now = Date.now();
+  const sameLevelWithinWindow =
+    lastAlerted !== null &&
+    lastAlerted.level === level &&
+    now - lastAlerted.at < V0_ALERT_REALERT_WINDOW_MS;
+  if (sameLevelWithinWindow) {
+    return { warnLevel: level, alerted: false, recovered: false };
+  }
+
+  const { subject, message } = formatAlertMessage(dto);
+  try {
+    await transport(subject, message, {
+      Plan: dto.plan,
+      "Total spendable": `$${dto.totalSpendableUsd.toFixed(2)}`,
+      "Monthly remaining": `$${dto.monthly.remaining.toFixed(2)} / $${dto.monthly.total.toFixed(2)}`,
+      "Warn level": level,
+      "Fetched at": dto.fetchedAt,
+    });
+  } catch (error) {
+    // Logged loudly, never thrown out of the hourly cron. State is NOT
+    // advanced, so the next tick retries the alert.
+    console.error("[v0CreditAlert] Failed to send low-credit alert:", error);
+    return { warnLevel: level, alerted: false, recovered: false };
+  }
+  lastAlerted = { level, at: now };
+  return { warnLevel: level, alerted: true, recovered: false };
+}
+
+/** Test-only: clear the module-level cache, in-flight fetch, and alert state. */
 export function __resetV0CreditsCacheForTests(): void {
   cache = null;
   inflight = null;
+  lastAlerted = null;
 }
