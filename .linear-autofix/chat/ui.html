@@ -187,6 +187,10 @@
   .work-body .textrun { color: var(--dim); font-size: 13px; margin: 6px 0; } /* intermediate thoughts, secondary to the answer */
   /* The final response — the main answer. A subtle accent bar sets it apart from the folded work. */
   .msg.assistant .work + .final { border-left: 2px solid var(--accent); padding-left: 11px; }
+  /* Links inside a message body: readable accent + underline (the md renderer emits bare <a>, which
+     would otherwise fall back to the unreadable default browser blue on the dark background). */
+  .msg a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+  .msg a:hover { color: #a9caff; }
   .fixcard { border: 1px solid var(--border); border-left: 3px solid var(--green); background: var(--panel2); border-radius: 8px; padding: 10px 14px; align-self: flex-start; font-size: 13px; max-width: 780px; }
   .fixcard.failed { border-left-color: var(--red); }
   .fixcard a { color: var(--accent); }
@@ -194,7 +198,11 @@
   .turnmeta.heavy { color: var(--amber); font-weight: 600; }
   .ctxwarn { align-self: flex-start; max-width: 780px; margin: 2px 0 4px; padding: 8px 12px; font-size: 12px; color: var(--amber); background: rgba(217,164,65,.08); border: 1px solid rgba(217,164,65,.35); border-radius: 8px; }
   .ctxwarn .cw-go { color: var(--amber); cursor: pointer; text-decoration: underline; font-weight: 600; }
-  .ctxwarn.limitwarn { color: var(--red); background: rgba(229,101,94,.08); border-color: rgba(229,101,94,.4); }
+  /* Account-limit warning, color deepening with severity (all tuned for the dark background):
+     notice (session ≥75%) amber → warn (≥90%) red → crit (≥95%) deep, bold red. */
+  .ctxwarn.limitwarn.lw-notice { color: #e0a33c; background: rgba(224,138,60,.09); border-color: rgba(224,138,60,.38); }
+  .ctxwarn.limitwarn.lw-warn   { color: #e5655e; background: rgba(229,101,94,.12); border-color: rgba(229,101,94,.5); }
+  .ctxwarn.limitwarn.lw-crit   { color: #ff5a5a; background: rgba(201,42,42,.2); border-color: rgba(255,80,80,.6); font-weight: 600; }
   .compactcard { align-self: stretch; margin: 8px 0; }
   .compactcard .ch { display: flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; color: var(--dim); font-size: 11px; }
   .compactcard .cl { flex: 1; height: 1px; background: var(--border); }
@@ -803,30 +811,39 @@ function appendCtxWarn(afterEl) {
 // Claude subscription. At ≥90% on any limit (5-hour session or a weekly bucket) each agent reply ends
 // with a heads-up — because a session can sit at 40% context yet still burn the account fast (cold
 // resumes re-bill a big transcript every turn), so the context bar alone won't warn you.
-const LIMIT_WARN_PCT = 90;
+// `floor` = the lowest utilization at which THAT bucket warns. The 5-hour session warns earlier
+// (from 75%) since it's the tightest, fastest-cycling limit; weekly buckets only warn from 90%.
 const LIMIT_BUCKETS = [
-  { k: 'five_hour', label: '5-hour session' },
-  { k: 'seven_day', label: 'weekly (all models)' },
-  { k: 'seven_day_opus', label: 'weekly Opus' },
-  { k: 'seven_day_sonnet', label: 'weekly Sonnet' },
+  { k: 'five_hour', label: '5-hour session', floor: 75 },
+  { k: 'seven_day', label: 'weekly (all models)', floor: 90 },
+  { k: 'seven_day_opus', label: 'weekly Opus', floor: 90 },
+  { k: 'seven_day_sonnet', label: 'weekly Sonnet', floor: 90 },
+];
+// Severity tiers (deepest first) matched by the worst offender's utilization → drive the color depth.
+const LIMIT_TIERS = [
+  { min: 95, cls: 'lw-crit' },
+  { min: 90, cls: 'lw-warn' },
+  { min: 75, cls: 'lw-notice' },
 ];
 function limitWarnInfo() {
   const g = S.detail?.accountUsage;
   if (!g) return null;
-  const hit = LIMIT_BUCKETS
-    .map((b) => ({ ...b, u: g[b.k] }))
-    .filter((x) => x.u && typeof x.u.utilization === 'number' && x.u.utilization >= LIMIT_WARN_PCT)
-    .sort((a, b) => b.u.utilization - a.u.utilization);
-  return hit[0] || null; // surface the single most-depleted limit
+  const worst = LIMIT_BUCKETS
+    .map((b) => ({ ...b, util: g[b.k]?.utilization, resets_at: g[b.k]?.resets_at }))
+    .filter((x) => typeof x.util === 'number' && x.util >= x.floor)
+    .sort((a, b) => b.util - a.util)[0]; // the single most-depleted limit
+  if (!worst) return null;
+  const tier = LIMIT_TIERS.find((t) => worst.util >= t.min) || LIMIT_TIERS[LIMIT_TIERS.length - 1];
+  return { ...worst, tier };
 }
 function appendLimitWarn(afterEl) {
   if (!afterEl || S.busy || S.compacting) return;
   const info = limitWarnInfo();
   if (!info) return;
-  const pct = Math.max(0, Math.min(100, Math.round(info.u.utilization)));
-  const reset = info.u.resets_at ? ` — resets ${fmtReset(info.u.resets_at)}` : '';
+  const pct = Math.max(0, Math.min(100, Math.round(info.util)));
+  const reset = info.resets_at ? ` — resets ${fmtReset(info.resets_at)}` : '';
   const el = document.createElement('div');
-  el.className = 'ctxwarn limitwarn';
+  el.className = `ctxwarn limitwarn ${info.tier.cls}`;
   el.innerHTML = `⚠ Your Claude ${esc(info.label)} usage is at <b>${pct}%</b>${esc(reset)}. Turns may start failing once it reaches 100%.`;
   afterEl.insertAdjacentElement('afterend', el);
 }
