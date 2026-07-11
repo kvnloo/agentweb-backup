@@ -16,12 +16,14 @@ jest.mock('../../utils/secretsManager', () => ({
 import axios from 'axios';
 import {
   getV0Credits,
+  checkAndAlert,
   computeWarnLevel,
   __resetV0CreditsCacheForTests,
   LOW_TOTAL_SPENDABLE_USD,
   CRITICAL_TOTAL_SPENDABLE_USD,
   LOW_MONTHLY_REMAINING_FRACTION,
   V0_CREDITS_CACHE_TTL_MS,
+  V0_ALERT_REALERT_WINDOW_MS,
 } from '../v0BillingService';
 
 const mockedGet = axios.get as jest.Mock;
@@ -251,6 +253,71 @@ describe('v0BillingService', () => {
     });
   });
 
+  describe('in-flight dedup (cache stampede)', () => {
+    /** Mock every endpoint with a deferred resolver so the fetch stays in flight
+     *  until the test explicitly releases it. */
+    function mockV0ApiDeferred() {
+      const deferred: Array<{ url: string; resolve: (v: any) => void }> = [];
+      mockedGet.mockImplementation(
+        (url: string) => new Promise((resolve) => deferred.push({ url, resolve }))
+      );
+      const release = () => {
+        for (const d of deferred) {
+          if (d.url.includes('/user/billing')) {
+            d.resolve({ data: JSON.parse(JSON.stringify(BILLING_FIXTURE)) });
+          } else if (d.url.includes('/user/plan')) {
+            d.resolve({ data: JSON.parse(JSON.stringify(PLAN_FIXTURE)) });
+          } else {
+            d.resolve({ data: JSON.parse(JSON.stringify(RATE_LIMITS_FIXTURE)) });
+          }
+        }
+      };
+      return { release };
+    }
+
+    const flushMicrotasks = () => new Promise((resolve) => setImmediate(resolve));
+
+    it('two concurrent callers share ONE v0 fetch', async () => {
+      const { release } = mockV0ApiDeferred();
+
+      const p1 = getV0Credits();
+      const p2 = getV0Credits();
+      await flushMicrotasks(); // let both reach the HTTP layer
+
+      // One set of 3 endpoint requests — not 6.
+      expect(mockedGet).toHaveBeenCalledTimes(3);
+
+      release();
+      const [r1, r2] = await Promise.all([p1, p2]);
+      expect(mockedGet).toHaveBeenCalledTimes(3);
+      expect(r1).toEqual(r2);
+      expect(r1.totalSpendableUsd).toBe(12.76);
+    });
+
+    it('forceRefresh racing an in-flight fetch joins it instead of stampeding', async () => {
+      const { release } = mockV0ApiDeferred();
+
+      const natural = getV0Credits(); // e.g. dashboard load after natural expiry
+      const refresh = getV0Credits({ forceRefresh: true }); // refresh button racing it
+      await flushMicrotasks();
+
+      expect(mockedGet).toHaveBeenCalledTimes(3);
+
+      release();
+      const [r1, r2] = await Promise.all([natural, refresh]);
+      expect(r1).toEqual(r2);
+    });
+
+    it('clears the in-flight slot after failure so the next call retries', async () => {
+      mockV0Api({ failEndpoint: 'billing' });
+      await expect(getV0Credits()).rejects.toThrow();
+
+      mockV0Api();
+      const dto = await getV0Credits();
+      expect(dto.totalSpendableUsd).toBe(12.76);
+    });
+  });
+
   describe('failure handling — loud, never fabricated', () => {
     it.each(['billing', 'plan', 'rate-limits'] as const)(
       'rejects when the %s endpoint fails',
@@ -285,6 +352,134 @@ describe('v0BillingService', () => {
       mockV0Api();
 
       await expect(getV0Credits()).rejects.toThrow('secrets down');
+    });
+  });
+
+  describe('checkAndAlert — low-credit alerting', () => {
+    /** Billing fixture tuned to produce a specific warnLevel. */
+    function billingAtLevel(level: 'ok' | 'low' | 'critical') {
+      const billing = JSON.parse(JSON.stringify(BILLING_FIXTURE));
+      if (level === 'ok') {
+        billing.data.balance = { remaining: 30, total: 30 };
+        billing.data.onDemand.balance = 50; // $80 spendable
+      } else if (level === 'low') {
+        billing.data.balance = { remaining: 10, total: 30 };
+        billing.data.onDemand.balance = 5; // $15 spendable → low
+      } else {
+        billing.data.balance = { remaining: 1, total: 30 };
+        billing.data.onDemand.balance = 4; // $5 spendable → critical
+      }
+      return billing;
+    }
+
+    /** Switch the mocked v0 account to a level AND expire the credits cache. */
+    function setLevelAndExpireCache(level: 'ok' | 'low' | 'critical') {
+      mockV0Api({ billing: billingAtLevel(level) });
+      jest.setSystemTime(new Date(Date.now() + V0_CREDITS_CACHE_TTL_MS + 1));
+    }
+
+    let transport: jest.Mock;
+
+    beforeEach(() => {
+      transport = jest.fn().mockResolvedValue(undefined);
+      mockV0Api({ billing: billingAtLevel('low') });
+    });
+
+    it('fires once on transition into low, with the balances and action line', async () => {
+      const result = await checkAndAlert({ transport });
+
+      expect(result).toEqual({ warnLevel: 'low', alerted: true, recovered: false });
+      expect(transport).toHaveBeenCalledTimes(1);
+      const [subject, message] = transport.mock.calls[0];
+      expect(subject).toContain('LOW');
+      expect(subject).toContain('$15.00');
+      expect(message).toContain('Plan: v0-team');
+      expect(message).toContain('Total spendable: $15.00');
+      expect(message).toContain('Monthly allowance: $10.00 of $30.00');
+      expect(message).toContain('top up v0 credits');
+    });
+
+    it('does not re-fire for the same level within the 24h window', async () => {
+      await checkAndAlert({ transport });
+
+      // Same tick cadence as the cron: an hour later, still low.
+      jest.setSystemTime(new Date(Date.now() + 60 * 60 * 1000));
+      const second = await checkAndAlert({ transport });
+
+      expect(second).toEqual({ warnLevel: 'low', alerted: false, recovered: false });
+      expect(transport).toHaveBeenCalledTimes(1);
+    });
+
+    it('re-fires for the same level once the 24h window elapses', async () => {
+      await checkAndAlert({ transport });
+
+      jest.setSystemTime(new Date(Date.now() + V0_ALERT_REALERT_WINDOW_MS + 1));
+      const result = await checkAndAlert({ transport });
+
+      expect(result.alerted).toBe(true);
+      expect(transport).toHaveBeenCalledTimes(2);
+    });
+
+    it('fires immediately on escalation low → critical', async () => {
+      await checkAndAlert({ transport });
+
+      setLevelAndExpireCache('critical');
+      const result = await checkAndAlert({ transport });
+
+      expect(result).toEqual({ warnLevel: 'critical', alerted: true, recovered: false });
+      expect(transport).toHaveBeenCalledTimes(2);
+      expect(transport.mock.calls[1][0]).toContain('CRITICAL');
+    });
+
+    it('recovery to ok resets state (and sends an all-clear) so a later dip re-alerts', async () => {
+      await checkAndAlert({ transport });
+      expect(transport).toHaveBeenCalledTimes(1);
+
+      setLevelAndExpireCache('ok');
+      const recovery = await checkAndAlert({ transport });
+      expect(recovery).toEqual({ warnLevel: 'ok', alerted: false, recovered: true });
+      expect(transport).toHaveBeenCalledTimes(2);
+      expect(transport.mock.calls[1][0]).toContain('recovered');
+
+      // Dip again — state was reset, so it alerts immediately (no 24h suppression).
+      setLevelAndExpireCache('low');
+      const dip = await checkAndAlert({ transport });
+      expect(dip.alerted).toBe(true);
+      expect(transport).toHaveBeenCalledTimes(3);
+    });
+
+    it('stays quiet when the account is ok and nothing was previously alerted', async () => {
+      mockV0Api({ billing: billingAtLevel('ok') });
+
+      const result = await checkAndAlert({ transport });
+
+      expect(result).toEqual({ warnLevel: 'ok', alerted: false, recovered: false });
+      expect(transport).not.toHaveBeenCalled();
+    });
+
+    it('logs (console.error) and does not throw when the alert transport fails — and retries next tick', async () => {
+      const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
+      transport.mockRejectedValueOnce(new Error('slack down'));
+
+      const failed = await checkAndAlert({ transport });
+      expect(failed).toEqual({ warnLevel: 'low', alerted: false, recovered: false });
+      expect(consoleError).toHaveBeenCalledWith(
+        '[v0CreditAlert] Failed to send low-credit alert:',
+        expect.any(Error)
+      );
+
+      // State was NOT advanced — the next tick retries and succeeds.
+      const retried = await checkAndAlert({ transport });
+      expect(retried.alerted).toBe(true);
+
+      consoleError.mockRestore();
+    });
+
+    it('propagates v0 API failures to the caller (the cron wrapper logs them)', async () => {
+      mockV0Api({ failEndpoint: 'billing' });
+
+      await expect(checkAndAlert({ transport })).rejects.toThrow(/v0/i);
+      expect(transport).not.toHaveBeenCalled();
     });
   });
 });
