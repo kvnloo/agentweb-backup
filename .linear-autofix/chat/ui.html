@@ -1497,17 +1497,20 @@ function openCmd(title, bodyHtml) {
 }
 function closeCmd() { S.cmd = null; const ov = $('cmd'); if (ov) ov.style.display = 'none'; if (!S.busy) $('input').focus(); }
 const kRow = (k, v) => `<div class="krow"><span class="k">${esc(k)}</span><span class="v">${esc(String(v))}</span></div>`;
-// Relative reset time: "in 42m", "in 3h 10m", or "in 2d · Jul 11, 5:59 PM" for far-off resets.
+// Relative reset time PLUS the absolute clock time in the viewer's own timezone, so it's clear both
+// how long is left and exactly when it lands: "in 42m · Jul 11, 5:59 PM", "in 3h 10m · Jul 11, 9:10 PM",
+// "in 2d · Jul 13, 2:00 AM". fmtTime() already renders date + time in the browser's local timezone.
 function fmtReset(iso) {
   try {
     const ms = new Date(iso) - new Date();
     if (ms <= 0) return 'now';
+    const abs = fmtTime(iso); // date + time, browser-local timezone
     const mins = Math.round(ms / 60000);
-    if (mins < 60) return `in ${mins}m`;
+    if (mins < 60) return `in ${mins}m · ${abs}`;
     const hrs = Math.floor(mins / 60), rm = mins % 60;
-    if (hrs < 24) return `in ${hrs}h${rm ? ` ${rm}m` : ''}`;
+    if (hrs < 24) return `in ${hrs}h${rm ? ` ${rm}m` : ''} · ${abs}`;
     const days = Math.round(hrs / 24);
-    return `in ${days}d · ${fmtTime(iso)}`;
+    return `in ${days}d · ${abs}`;
   } catch { return ''; }
 }
 function usageBar(label, pct, resetsAt) {
