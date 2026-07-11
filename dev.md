@@ -36,6 +36,23 @@ The agent passed a **public-identifier slug** (e.g. `william-kwak`, `leah-marcus
 ### Fix
 `checkIsNotAlreadyConnected` — the connection-check profile fetch we already perform before every invite — now **returns** the canonical `provider_id` revealed by the live profile lookup, and `sendInvitation` sends *that* rather than whatever identifier the caller passed. When the lookup fails or reveals no `provider_id`, it falls back to the passed identifier so a transient lookup failure never blocks (or breaks) the invite. No extra API call: we reuse the profile fetch that was already happening for the already-connected guard. Covered by the send-invite canonical-resolution test in `backend/src/__tests__/`.
 
+## Scheduled runs crash with no assistant response — process-group SIGTERM kills the LLM worker mid-run (2026-07-07, ENG-202)
+
+Second instance of the same signature (first: the Daily Token Usage report). A scheduled chat (session `64ebbde3`, xCures Daily Site Health Check, opus-4-8) died with `messageCount=2` (only the trigger), `totalTokens`/`totalCost` null — the run crashed before persisting any assistant message. A sibling site-scan schedule (session `d7d45dea`, sonnet-4-6) completed the same class of task 5/5 in the same window, so the failure is NOT task- or model-inherent; it's an execution/infra abort.
+
+### Root cause (NOT the model path)
+`generateSessionResponse` runs the LLM turn in a **forked child** (`services/generateMarketingResponseWorkerService.ts` → `workers/generateMarketingResponseWorker.ts`). A forked child shares its parent's process group by default. When the platform terminates the instance (Elastic Beanstalk deploy, autoscaling replacement, health-check restart) it broadcasts SIGTERM to the **whole group**, so the worker received SIGTERM directly. With no handler installed, Node's default action killed it instantly, mid-run — surfacing as `Worker process exited with code null and signal SIGTERM` and zero persisted assistant messages, even though the parent's graceful drain (`shutdown()`) would gladly have waited for the in-flight request to finish. The opus-4-8 correlation is a red herring: opus turns are longer, so they're simply more likely to be in flight when a group SIGTERM lands.
+
+### Fix (shipped on main as ENG-201, PR #2038 — same root cause landed in parallel)
+The runtime fix was authored twice independently for the same worker-crash signature; ENG-201 (PR #2038 — opened ~30 min after this ENG-202 PR #2037, but reviewed and merged first) landed the runtime code, so this branch defers to its implementation and this entry documents the shared root cause plus the one net-additive guard ENG-202 adds.
+- `workers/workerShutdownGuards.ts` (`installWorkerShutdownGuards`), wired at the worker's module load (`generateMarketingResponseWorker.ts:13`). The worker now **ignores SIGTERM/SIGINT** — its lifecycle is owned entirely by the parent, which drains in-flight requests and then issues an explicit kill. Ignoring the racing group-signal lets the in-flight run complete during the drain instead of being aborted. As an orphan-safety net, the worker still exits on IPC `disconnect` (parent channel closed → no parent left to orchestrate shutdown).
+- `GenerateMarketingResponseWorkerService.shutdown()` teardown switches `SIGTERM` → `SIGKILL`, since the worker no longer honors SIGTERM. Safe by that point — the drain above already let in-flight requests finish (or force-failed them at the ceiling).
+- **ENG-202 addition:** a module-load wiring guard in `agentModeService.publishFixes.test.ts` asserting `installWorkerShutdownGuards()` is actually invoked at the top of the worker (not merely imported) — so accidental removal of the call, which would silently reintroduce this crash, fails a test.
+
+### Assumptions — VERIFIED
+- The worker is a `fork()` child sharing the parent group (confirmed in `generateMarketingResponseWorkerService.ts`), so a group SIGTERM reaches it directly — matching the `signal SIGTERM`, `code null` crash signature.
+- Ignoring SIGTERM cannot strand the worker: the parent owns kill via `shutdown()` (drain → SIGKILL), and IPC `disconnect` covers the orphaned-parent case. Pinned by `workerShutdownGuards.test.ts` (SIGTERM/SIGINT ignored, `disconnect` exits) and the `shutdown` SIGKILL assertion in `generateMarketingResponseWorkerService.test.ts`.
+
 ## Featurebase feature requests land as run-on blobs in Linear — root cause + fix (2026-07-06)
 
 Customer feature requests filed via Emma's `report_product_issues` were showing up in Linear as one giant run-on paragraph (reported on ENG-204). Chased it to ground truth.

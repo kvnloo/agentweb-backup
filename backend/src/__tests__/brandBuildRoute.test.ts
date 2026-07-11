@@ -4,6 +4,7 @@ import express from "express";
 jest.mock("../services/db", () => ({
   userDb: {
     getUserById: jest.fn(),
+    getUserByEmailConsistent: jest.fn(),
     updateUser: jest.fn(),
   },
 }));
@@ -12,6 +13,9 @@ jest.mock("../middleware/auth", () => ({
   authenticateToken: (req: any, _res: any, next: any) => {
     if (req.headers["x-no-auth"] === "1") {
       req.user = undefined;
+    } else if (req.headers["x-no-email"] === "1") {
+      // Authenticated but the JWT carried no email (degenerate token).
+      req.user = { userId: "user-1", isAdmin: false };
     } else {
       req.user = { userId: "user-1", email: "test@example.com", isAdmin: false };
     }
@@ -56,7 +60,11 @@ describe("POST /api/onboarding/brand-build/start", () => {
         brandBuildStatus: "building",
         brandBuildStartedAt: "2026-04-24T12:00:00.000Z",
       });
-    const res = await request(app).post("/api/onboarding/brand-build/start");
+    // A real start supplies a website URL — without one the build is
+    // dead-on-arrival (see the needsUrl guard tests below).
+    const res = await request(app)
+      .post("/api/onboarding/brand-build/start")
+      .send({ companyUrl: "https://example.com" });
     expect(res.status).toBe(200);
     expect(userDb.updateUser).toHaveBeenCalledWith(
       "user-1",
@@ -120,10 +128,75 @@ describe("POST /api/onboarding/brand-build/start", () => {
     userDb.getUserById.mockResolvedValueOnce({ userId: "user-1" });
     userDb.updateUser.mockRejectedValue(new Error("dynamo down"));
     const spy = jest.spyOn(console, "error").mockImplementation(() => {});
-    const res = await request(app).post("/api/onboarding/brand-build/start");
+    const res = await request(app)
+      .post("/api/onboarding/brand-build/start")
+      .send({ companyUrl: "https://example.com" });
     expect(res.status).toBe(500);
     expect(res.body.message).toMatch(/Failed to start/);
     spy.mockRestore();
+  });
+
+  // ── ENG-238 root-cause guard: never start a build with no resolvable URL ──
+  // The dominant failure class (≈77% of brand-build failures in prod) was the
+  // FE POSTing /start with an empty companyUrl for a user who had no URL on
+  // their record. The build flipped to `building`, then the trigger's
+  // pickCompanyUrl returned null and it immediately failed with
+  // "no companyUrl on User record" — a dead-on-arrival build that surfaced as
+  // a failure metric and left the user stuck at `brand_submitted`.
+  it("does not start a build when no URL is resolvable, returning a needsUrl snapshot", async () => {
+    userDb.getUserById.mockResolvedValue({ userId: "user-1" });
+    const res = await request(app).post("/api/onboarding/brand-build/start");
+    expect(res.status).toBe(200);
+    // Must NOT flip to building or fire the (doomed) trigger.
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+    expect(res.body.status.needsUrl).toBe(true);
+    expect(res.body.status.brandBuildStatus).toBeUndefined();
+    expect(res.body.status.inFlight).toBe(false);
+  });
+
+  it("persists supplied name/goal but does not start a build when the URL is missing", async () => {
+    userDb.getUserById.mockResolvedValue({ userId: "user-1" });
+    userDb.updateUser.mockResolvedValue({ userId: "user-1" });
+    const res = await request(app)
+      .post("/api/onboarding/brand-build/start")
+      .send({ companyName: "Acme", goal: "paid_ads" });
+    expect(res.status).toBe(200);
+    // Only the input fields are persisted — never a building status flip.
+    expect(userDb.updateUser).toHaveBeenCalledWith(
+      "user-1",
+      expect.objectContaining({ companyName: "Acme", goal: "paid_ads" })
+    );
+    const writeArg = userDb.updateUser.mock.calls[0][1];
+    expect(writeArg).not.toHaveProperty("brandBuildStatus");
+    expect(res.body.status.needsUrl).toBe(true);
+  });
+
+  it("starts a build using a URL already persisted on the User record even when the body URL is empty", async () => {
+    userDb.updateUser.mockResolvedValue({ userId: "user-1" });
+    // The guard resolves the URL from the FIRST read (the `existing` fetch),
+    // which carries the persisted productDomain. The fallback reads (used by
+    // the fire-and-forget trigger microtask) intentionally omit the URL so the
+    // background trigger fast-fails at pickCompanyUrl instead of launching a
+    // real scrape — keeping this unit test hermetic, exactly like the
+    // "writes a building patch" case above.
+    userDb.getUserById
+      .mockResolvedValueOnce({
+        userId: "user-1",
+        productDomain: "https://saved.com",
+      })
+      .mockResolvedValue({
+        userId: "user-1",
+        brandBuildStatus: "building",
+        brandBuildStartedAt: "2026-04-24T12:00:00.000Z",
+      });
+    const res = await request(app).post("/api/onboarding/brand-build/start");
+    expect(res.status).toBe(200);
+    expect(userDb.updateUser).toHaveBeenCalledWith(
+      "user-1",
+      expect.objectContaining({ brandBuildStatus: "building" })
+    );
+    expect(res.body.status.brandBuildStatus).toBe("building");
+    expect(res.body.status.needsUrl).toBeUndefined();
   });
 });
 
@@ -145,6 +218,101 @@ describe("GET /api/onboarding/brand-build/status", () => {
     expect(res.body.status.brandBuildStatus).toBe("ready");
     expect(res.body.status.brandBuildDurationMs).toBe(30_000);
     expect(res.body.status.inFlight).toBe(false);
+  });
+
+  it("auto-fails a build stuck in 'building' past the hard timeout and returns a retryable failed snapshot", async () => {
+    // Orphaned background job (deploy/crash) — brandBuildStatus never left
+    // 'building'. Started long ago so it is well past the hard watchdog wall.
+    userDb.getUserById
+      .mockResolvedValueOnce({
+        userId: "user-1",
+        brandBuildStatus: "building",
+        brandBuildStartedAt: "2020-01-01T00:00:00.000Z",
+      })
+      .mockResolvedValueOnce({
+        userId: "user-1",
+        brandBuildStatus: "failed",
+        brandBuildError: "Brand build timed out",
+      });
+    // Authoritative consistent re-read confirms the build is genuinely still
+    // stuck (not a stale-GSI false alarm), so the watchdog proceeds to fail it.
+    userDb.getUserByEmailConsistent.mockResolvedValue({
+      userId: "user-1",
+      brandBuildStatus: "building",
+      brandBuildStartedAt: "2020-01-01T00:00:00.000Z",
+    });
+    userDb.updateUser.mockResolvedValue({ userId: "user-1" });
+    const spy = jest.spyOn(console, "log").mockImplementation(() => {});
+    const res = await request(app).get("/api/onboarding/brand-build/status");
+    expect(res.status).toBe(200);
+    expect(userDb.updateUser).toHaveBeenCalledWith(
+      "user-1",
+      expect.objectContaining({ brandBuildStatus: "failed" })
+    );
+    expect(res.body.status.brandBuildStatus).toBe("failed");
+    spy.mockRestore();
+  });
+
+  it("does NOT force-fail when a strongly-consistent re-read shows the build already completed (no clobbering a just-succeeded build)", async () => {
+    // The watchdog decides from getUserById, which reads the eventually-
+    // consistent UserIdIndex GSI and can lag a just-written `ready` by
+    // ~100-1000ms. Here the GSI still shows a long-running `building` (so the
+    // watchdog trips), but the authoritative consistent read shows the build
+    // actually finished `ready`. The route must trust the consistent read and
+    // NOT overwrite the success with a spurious `failed`.
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      brandBuildStatus: "building",
+      brandBuildStartedAt: "2020-01-01T00:00:00.000Z",
+    });
+    userDb.getUserByEmailConsistent.mockResolvedValue({
+      userId: "user-1",
+      brandBuildStatus: "ready",
+      brandBuildStartedAt: "2020-01-01T00:00:00.000Z",
+      brandBuildCompletedAt: "2020-01-01T00:04:30.000Z",
+      brandBuildDurationMs: 270_000,
+    });
+    userDb.updateUser.mockResolvedValue({ userId: "user-1" });
+    const res = await request(app).get("/api/onboarding/brand-build/status");
+    expect(res.status).toBe(200);
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+    expect(res.body.status.brandBuildStatus).toBe("ready");
+    expect(res.body.status.brandBuildDurationMs).toBe(270_000);
+  });
+
+  it("does NOT force-fail a stuck build when no email is available for the consistent re-read (no clobber off the stale GSI read)", async () => {
+    // Degenerate case: the JWT carried no email and the GSI-read user record
+    // has none either, so we can't do the strongly-consistent GetItem that
+    // guards against clobbering a just-completed `ready` build. Rather than
+    // force-fail off the eventually-consistent read, the watchdog must skip the
+    // write and return the current view — the next (email-bearing) poll fails
+    // it authoritatively if it really is stuck.
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      brandBuildStatus: "building",
+      brandBuildStartedAt: "2020-01-01T00:00:00.000Z", // well past the wall
+      // note: no email on the record either
+    });
+    const res = await request(app)
+      .get("/api/onboarding/brand-build/status")
+      .set("x-no-email", "1");
+    expect(res.status).toBe(200);
+    expect(userDb.getUserByEmailConsistent).not.toHaveBeenCalled();
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+    expect(res.body.status.brandBuildStatus).toBe("building");
+  });
+
+  it("does NOT auto-fail a build that is still within budget", async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: "user-1",
+      brandBuildStatus: "building",
+      brandBuildStartedAt: new Date().toISOString(), // just started
+    });
+    const res = await request(app).get("/api/onboarding/brand-build/status");
+    expect(res.status).toBe(200);
+    expect(userDb.updateUser).not.toHaveBeenCalled();
+    expect(res.body.status.brandBuildStatus).toBe("building");
+    expect(res.body.status.inFlight).toBe(true);
   });
 
   it("404s when the user record is missing", async () => {

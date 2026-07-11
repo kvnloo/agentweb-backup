@@ -269,7 +269,11 @@ describe('executePreparedTools', () => {
     expect(emit).toHaveBeenCalledWith('user:user-1', 'crm:data-changed', { changed: true });
   });
 
-  it('blocks the actual overlong LinkedIn send-invite tool-call shape before gateway execution', async () => {
+  // ENG-243: an overlong send-invite note must NOT be pre-blocked here. The send
+  // path (sendInvitation) auto-trims to the account-tier limit, so the call should
+  // reach the gateway and succeed instead of failing repeatedly and tripping the
+  // anti-loop breaker (which sent 0 invites in a real scheduled session).
+  it('lets an overlong LinkedIn send-invite note reach the gateway (tier-aware send path trims it)', async () => {
     const executeAgentToolThroughGatewaySpy = jest.fn(executeAgentToolThroughGateway);
     const ports = makePorts({
       evaluateAgentToolPolicy,
@@ -299,17 +303,12 @@ describe('executePreparedTools', () => {
 
     const result = await executePreparedTools(input);
 
-    expect(executeAgentToolThroughGatewaySpy).not.toHaveBeenCalled();
-    expect(input.toolCallsLedger[0]).toMatchObject({
-      name: 'linkedin_outreach',
-      error: expect.stringContaining('200 characters or fewer'),
-    });
-    expect(input.messages[0]).toMatchObject({
-      role: 'tool',
-      name: 'linkedin_outreach',
-      content: expect.stringContaining('Rewrite it as a complete shorter note before retrying'),
-    });
-    expect(result.failedCounterUpdates).toEqual({ linkedin_outreach: 1 });
+    expect(executeAgentToolThroughGatewaySpy).toHaveBeenCalledTimes(1);
+    expect(input.toolCallsLedger[0]).toMatchObject({ name: 'linkedin_outreach' });
+    expect(input.toolCallsLedger[0].error).toBeFalsy();
+    expect(input.messages[0].content).not.toContain('200 characters or fewer');
+    expect(result.failedCounterUpdates).toEqual({});
+    expect(result.pendingCounterUpdates).toEqual({ linkedin_outreach: 1 });
   });
 
   it('blocks the third actual generate_image call shape after two failed attempts in the same session', async () => {
