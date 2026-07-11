@@ -515,6 +515,12 @@ describe("v0Service - generateLandingPage", () => {
 
     // chats.create was called (no more projects.create)
     expect(mockChatsCreate).toHaveBeenCalledTimes(1);
+    // Async responseMode: sync mode blocks the call for the full 3-15 min generation,
+    // guaranteeing a loss against the 300s attempt timeout and burning credits on an
+    // orphan chat every time. (ENG-287)
+    expect(mockChatsCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ responseMode: "async" })
+    );
     expect(result.userId).toBe("user-1");
     expect(result.id).toBe("test-uuid-1234");
   });
@@ -656,14 +662,36 @@ describe("v0Service - findReusablePageForRoute (route-level idempotency, kills d
     expect((await findReusablePageForRoute("u1", "pricing"))?.id).toBe("p1");
   });
 
-  it("reuses an in-flight build at the same route (generating/deploying)", async () => {
-    items(page({ status: "generating" }));
+  it("reuses a FRESH in-flight build at the same route (generating/deploying)", async () => {
+    items(page({ status: "generating", updatedAt: new Date().toISOString() }));
     expect((await findReusablePageForRoute("u1", "pricing"))?.status).toBe("generating");
+  });
+
+  it("does NOT reuse a STALE in-flight build — a wedged record must not hold the route hostage (ENG-277)", async () => {
+    // 31 min old > 30 min stuck ceiling → abandoned; a fresh build must proceed.
+    const stale = new Date(Date.now() - 31 * 60 * 1000).toISOString();
+    items(page({ status: "generating", updatedAt: stale }));
+    expect(await findReusablePageForRoute("u1", "pricing")).toBeNull();
+  });
+
+  it("does NOT reuse an in-flight build with no readable timestamp — fail open to a new build", async () => {
+    items(page({ status: "generating", updatedAt: undefined, createdAt: undefined }));
+    expect(await findReusablePageForRoute("u1", "pricing")).toBeNull();
   });
 
   it("does NOT reuse a FAILED page — a retry after a failure must rebuild", async () => {
     items(page({ status: "failed" }));
     expect(await findReusablePageForRoute("u1", "pricing")).toBeNull();
+  });
+
+  it("does NOT reuse a same-slug page from a DIFFERENT site (cross-site collision, Greptile P1)", async () => {
+    items(page({ status: "deployed", siteId: "site-A" }));
+    expect(await findReusablePageForRoute("u1", "pricing", "site-B")).toBeNull();
+  });
+
+  it("reuses a same-slug page when it belongs to the REQUESTED site", async () => {
+    items(page({ status: "deployed", siteId: "site-A" }));
+    expect((await findReusablePageForRoute("u1", "pricing", "site-A"))?.id).toBe("p1");
   });
 
   it("does NOT match a different route", async () => {
@@ -828,6 +856,52 @@ describe("v0Service - multi-site routing (DURABLE_LANDING_GENERATION=on)", () =>
     expect(put.githubRepoUrl).toBe("https://github.com/o/r"); // inherited the existing repo
     expect(put.siteId).toBe("site-1"); // belongs to the existing site
     expect(put.isRootPage).toBeUndefined(); // not a new site root
+  });
+
+  it("a v0-failed generation frees the route identity — retry mints a FRESH chat, never reuses the dead one", async () => {
+    mockQuery.mockReturnValue(siteRow());
+    mockChatsCreate
+      .mockResolvedValueOnce({ id: "chat_dead" })
+      .mockResolvedValueOnce({ id: "chat_fresh" });
+    // v0 marks the generation failed — the chat is a dead end.
+    mockChatsGetById.mockResolvedValue({
+      id: "c",
+      latestVersion: { id: "v_failed", status: "failed" },
+    });
+
+    const first = await generateLandingPage("user-1", "Variant", "Pricing", {});
+    expect(first.status).toBe("failed");
+    expect(first.errorMessage).toMatch(/generation as failed/);
+
+    const second = await generateLandingPage("user-1", "Variant retry", "Pricing", {});
+    expect(second.status).toBe("failed"); // v0 failed again, but critically...
+    // ...via a FRESH chat. Without clearing the identity on V0_VERSION_FAILED, the
+    // guard would return chat_dead as reused and every retry would fail instantly.
+    expect(mockChatsCreate).toHaveBeenCalledTimes(2);
+    mockChatsGetById.mockReset();
+  });
+
+  it("unified default + existing site + same in-flight route → reuses instead of duplicate-building", async () => {
+    const inFlightRoute = {
+      id: "route-1",
+      userId: "user-1",
+      name: "Pricing",
+      slug: "pricing",
+      status: "generating",
+      updatedAt: new Date().toISOString(),
+      siteId: "site-1",
+      githubRepoUrl: "https://github.com/o/r",
+      vercelProjectId: "vp1",
+    };
+    mockQuery
+      .mockReturnValueOnce(siteRow())
+      .mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [inFlightRoute] }) });
+
+    const result = await generateLandingPage("user-1", "Variant", "Pricing", {});
+
+    expect(result.id).toBe("route-1");
+    expect(mockPut).not.toHaveBeenCalled();
+    expect(mockChatsCreate).not.toHaveBeenCalled();
   });
 
   it("separate mode → creates a new site even when one exists (opt-in, costlier)", async () => {
@@ -1086,7 +1160,7 @@ describe("v0Service - deployLandingPage", () => {
     mockChatsGetById.mockResolvedValue({ id: "chat_1" }); // no latestVersion
 
     await expect(deployLandingPage("page-1", "user-1")).rejects.toThrow(
-      "No version found"
+      "No completed version"
     );
 
     // Verify it polled multiple times (5 attempts with zero-delay intervals)
@@ -1094,6 +1168,67 @@ describe("v0Service - deployLandingPage", () => {
 
     // Reset to default after test
     mockChatsGetById.mockReset();
+  });
+
+  const deployablePage = () => ({
+    promise: () =>
+      Promise.resolve({
+        Item: {
+          id: "page-1",
+          userId: "user-1",
+          status: "draft",
+          v0ProjectId: "proj_1",
+          v0ChatId: "chat_1",
+        },
+      }),
+  });
+
+  it("FAIL: version stuck 'pending' → never downloaded, throws no completed version (async gating, ENG-287)", async () => {
+    mockGet.mockReturnValueOnce(deployablePage());
+    // Async-mode chats expose the version immediately with status 'pending' — its
+    // EXISTENCE must not be treated as readiness or we ship a half-generated page.
+    mockChatsGetById.mockResolvedValue({
+      id: "chat_1",
+      latestVersion: { id: "v_pending", status: "pending" },
+    });
+
+    await expect(deployLandingPage("page-1", "user-1")).rejects.toThrow(
+      "No completed version"
+    );
+    expect(mockChatsDownloadVersion).not.toHaveBeenCalled();
+    mockChatsGetById.mockReset();
+  });
+
+  it("FAIL: version status 'failed' → fails fast with v0's verdict, never downloads (ENG-287)", async () => {
+    mockGet.mockReturnValueOnce(deployablePage());
+    mockChatsGetById.mockResolvedValue({
+      id: "chat_1",
+      latestVersion: { id: "v_failed", status: "failed" },
+    });
+
+    await expect(deployLandingPage("page-1", "user-1")).rejects.toThrow(
+      /generation as failed/
+    );
+    // Fails on the FIRST poll — no point burning the whole poll budget on a terminal state.
+    expect(mockChatsGetById).toHaveBeenCalledTimes(1);
+    expect(mockChatsDownloadVersion).not.toHaveBeenCalled();
+    mockChatsGetById.mockReset();
+  });
+
+  it("SUCCESS gate: pending → completed is waited out, and the COMPLETED version is downloaded (ENG-287)", async () => {
+    mockGet.mockReturnValueOnce(deployablePage());
+    mockChatsGetById
+      .mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "v_1", status: "pending" } })
+      .mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "v_1", status: "completed" } });
+    // End the test right after the gate: the download step rejects loudly.
+    mockChatsDownloadVersion.mockRejectedValueOnce(new Error("stop here"));
+
+    await expect(deployLandingPage("page-1", "user-1")).rejects.toThrow("stop here");
+    expect(mockChatsDownloadVersion).toHaveBeenCalledWith(
+      expect.objectContaining({ versionId: "v_1" })
+    );
+    mockChatsGetById.mockReset();
+    mockChatsDownloadVersion.mockReset();
   });
 
   it("SUCCESS: polls until version becomes available on 3rd attempt", async () => {

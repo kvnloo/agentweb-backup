@@ -1,3 +1,45 @@
+## Landing-page generation failing routinely (RankAI/Opsera/internal) — root cause + fix (2026-07-11, ENG-287/ENG-277)
+
+Matt reported the landing-page builder "keeps failing routinely" for RankAI (07-10); Opsera's urgent
+Monday case hit "another bug on the v0 side"; internal evals were rescuing Opsera-branded attempts by
+hand. Anurag's earlier fixes (ENG-135/157/158/159/160/189, merged 07-02..07-08) were real but fixed
+DIFFERENT failure modes (coding-agent 422 preview-branch, zombie durable records, opaque errors,
+model timeout). The 07-09/07-10 failures are a distinct, never-fixed mode.
+
+### Root cause (adversarially verified, prod evidence in AW-V0Usage + v0 chat list)
+1. **Sync-mode create loses a race against our own timeout.** `v0.chats.create` was called with no
+   `responseMode` → sync → the HTTP call blocks for the FULL generation. Prod generations of
+   brand-enriched prompts take 3–15 min; our per-attempt ceiling is 300s (`V0_CALL_TIMEOUT`). Every
+   slow generation = guaranteed client-side "timeout" while v0 finishes anyway → **orphan chat,
+   credits burned, user sees failure** (v0 chat list showed 4 orphan "Forge + Cursor rebrand" chats at
+   a 5-min retry cadence on 07-10; ~$39 of the $50 on-demand block burned in 10 days).
+2. **Our reliability layers amplified it**: `withRetry` re-burned the 300s timeout 3× (≈15-min hang),
+   and the idempotency guard (volatile prompt-hash key, no TTL, failed-blocks-retry) converted
+   failures into the permanent "already in flight" wedge (ENG-277, rankai-book-a-demo).
+3. **NOT credits, NOT auth** (Harsha's two hypotheses ruled out): prod key healthy (200s on
+   /user, /plan, /billing, /rate-limits; account deploy@agentweb.pro, v0-team, OWNER); balance
+   existed at failure time and creates succeeded later the same day. **BUT balance is now LOW:
+   ~$12.76 spendable, and the orphan-burn loop would exhaust it within days** — top-up is a
+   Session: Money item; the fix stops the orphan burn.
+
+### The fix (branch `defense/lander-reliability`, supersedes PR #2065)
+Merged Manan's `manan/v0-subpage-generation-timeout` + Codex's `codex/landing-page-idempotency`
+(conditions tightened: only `failed` or stale-`reserved` records are reclaimable — both originals
+could clobber a `succeeded` record), then the root-cause work: async `responseMode` on both create
+sites + `waitForCompletedV0Version` (status-gated ~16-min poll; `pending` never downloaded, `failed`
+fails fast), fail-fast on iterate/correction sends, universal abandoned-build janitor (portal builds
+included, poller unconditional), stale in-flight records excluded from route reuse, correction-guard
+reclaim, usage-identity cleanup on page delete.
+
+### Assumptions to validate
+- v0 async responseMode returns the chat id in seconds under load (observed for reads; not yet
+  measured for async creates at scale).
+- The ~16-min poll budget covers p99 generation time (evidence maxed ~15 min; janitor + retry path
+  cover the tail).
+- ENG-277's wedged prod record self-heals on next retry via failed-not-blocking + janitor (verify
+  live after deploy; a one-off data fix is the fallback).
+- Iterate/corrections stay sync deliberately (async there risks deploying the pre-iteration version;
+  needs version-id tracking — follow-up).
 ## Linear webhook fired customer comms too early / repeatedly — root cause + fix (2026-07-07)
 
 The Linear→customer-comms bridge (`POST /api/integrations/linear/webhook`, `backend/src/routes/integrations.ts`) was firing the full resolve bridge (`notifyCanonicalResolved`: Resend "Resolved" email to every reporter + Featurebase card flip to Completed + Slack ship ping) on the wrong events. Surfaced during the 2026-07-07 merged≠done investigation; the premature-email proof is ENG-173 (an xCures reporter was emailed 2.9s after PR merge, pre-deploy).
