@@ -105,6 +105,12 @@ async function up(bugRaw, worktreeRaw) {
   if (!existsSync(worktree)) { console.error(`worktree not found: ${worktree}`); process.exit(1); }
   mkdirSync(LOGS, { recursive: true });
 
+  // #14: register a placeholder entry BEFORE the cap check + build so a CONCURRENT bring-up counts
+  // this in-flight preview and doesn't also skip eviction (otherwise two both see the same pre-write
+  // count, both evict nothing, and the cap is exceeded). Overwritten with the full entry at the end;
+  // torn down by down() on failure. evictToMakeRoom excludes this bug, so its own placeholder is fine.
+  { const st0 = readJson(STATE); if (!st0[bug]) { st0[bug] = { worktree, at: new Date().toISOString(), starting: true }; writeJson(STATE, st0); } }
+
   // Universal cap backstop: every bring-up funnels through here — the chat button, the pipeline, AND
   // the agent running this script directly via Bash — so enforce the ceiling here too. Make room
   // within maxForcedPreviews by evicting the longest-idle preview(s) first (never this one). Skipped
@@ -113,8 +119,10 @@ async function up(bugRaw, worktreeRaw) {
   catch (e) { console.log(`[preview] cap check skipped: ${e && e.message}`); }
 
   const urls = { api: urlFor(bug, 'api'), customer: urlFor(bug, ''), partner: urlFor(bug, 'admin') };
-  const ports = { api: await freePort(31100), customer: await freePort(52100), partner: await freePort(51100) };
+  const ports = {};
   const procs = {};
+  const PORT_KEY = { backend: 'api', 'customer-portal': 'customer', 'partner-portal': 'partner' };
+  const PORT_BASE = { api: 31100, customer: 52100, partner: 51100 };
 
   // WATCHER-FREE by design: dev servers (ts-node-dev + Vite HMR) each hold thousands of inotify
   // watches, and kept previews accumulate until the kernel limit is hit and everything 502s
@@ -125,10 +133,12 @@ async function up(bugRaw, worktreeRaw) {
     if (!existsSync(cwd)) { console.error(`[preview] missing ${svc.dir} in worktree — skipping`); continue; }
     ensureDeps(worktree, svc);
     const env = { ...process.env };
-    const port = svc.kind === 'backend' ? ports.api : (svc.name === 'customer-portal' ? ports.customer : ports.partner);
+    const pkey = PORT_KEY[svc.name];
     const out = openSync(path.join(LOGS, `${bug}-${svc.name}.log`), 'a');
     let cmd, args;
     if (svc.kind === 'backend') {
+      // No build → allocate right before spawn (tiny reservation window).
+      ports.api = await freePort(PORT_BASE.api);
       env.PORT = String(ports.api);
       env.NODE_ENV = env.NODE_ENV || 'development';
       env.BACKEND_URL = stripSlash(urls.api);
@@ -144,18 +154,22 @@ async function up(bugRaw, worktreeRaw) {
       console.log(`[preview] building ${svc.name} (one-time, no watchers; queued on the build lock)...`);
       const b = spawnSync('flock', ['/tmp/aw-heavy-build.lock', 'npx', 'vite', 'build'], { cwd, env, stdio: ['ignore', out, out] });
       if (b.status !== 0) console.log(`[preview] WARNING: ${svc.name} build failed — check ${LOGS}/${bug}-${svc.name}.log`);
-      cmd = 'npx'; args = ['vite', 'preview', '--port', String(port), '--strictPort'];
+      // #13: allocate the port AFTER the (minutes-long) build, immediately before spawning — not
+      // up-front — so it isn't reserved-then-released across the whole build, the window during which
+      // a concurrent bring-up would grab the same port and lose the `--strictPort` race.
+      ports[pkey] = await freePort(PORT_BASE[pkey]);
+      cmd = 'npx'; args = ['vite', 'preview', '--port', String(ports[pkey]), '--strictPort'];
     }
     const child = spawn(cmd, args, { cwd, env, detached: true, stdio: ['ignore', out, out] });
     child.unref();
-    procs[svc.name] = { pid: child.pid, port };
-    console.log(`[preview] ${bug}: started ${svc.name} (pid ${child.pid}) on :${port}`);
+    procs[svc.name] = { pid: child.pid, port: ports[pkey] };
+    console.log(`[preview] ${bug}: started ${svc.name} (pid ${child.pid}) on :${ports[pkey]}`);
   }
 
   const routes = readJson(ROUTES);
-  routes[bug] = ports.customer;
-  routes[`${bug}-api`] = ports.api;
-  routes[`${bug}-admin`] = ports.partner;
+  if (ports.customer != null) routes[bug] = ports.customer;
+  if (ports.api != null) routes[`${bug}-api`] = ports.api;
+  if (ports.partner != null) routes[`${bug}-admin`] = ports.partner;
   writeJson(ROUTES, routes);
 
   const state = readJson(STATE);
@@ -206,7 +220,7 @@ function list() {
   const state = readJson(STATE);
   const keys = Object.keys(state);
   if (!keys.length) { console.log('[preview] no active previews'); return; }
-  for (const b of keys) console.log(`${b}  ${state[b].urls.customer}  (worktree: ${state[b].worktree})`);
+  for (const b of keys) console.log(`${b}  ${state[b].urls?.customer || (state[b].starting ? '(starting…)' : '(no url)')}  (worktree: ${state[b].worktree})`);
 }
 
 const [cmd, bug, wt] = process.argv.slice(2);
