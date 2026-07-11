@@ -28,6 +28,7 @@ export interface V0UsageRecord {
 }
 
 const memoryUsage = new Map<string, V0UsageRecord>();
+const RESERVED_LOCK_TTL_MS = 30 * 60 * 1000;
 
 function persistenceEnabled(): boolean {
   return process.env.NODE_ENV !== 'test' || process.env.V0_USAGE_DYNAMO_TEST === 'true';
@@ -49,24 +50,36 @@ export function buildV0IdempotencyKey(input: {
   prompt?: string;
   chatId?: string;
 }): string {
-  const promptHash = input.prompt ? hashV0Prompt(input.prompt) : '';
   return [
     input.operation,
     input.userId,
     input.scopeId,
     input.slug || '',
     input.chatId || '',
-    promptHash,
   ].join('#');
 }
 
-async function bestEffortPut(record: V0UsageRecord, condition?: string): Promise<boolean> {
+function isFreshReserved(record: V0UsageRecord, nowMs = Date.now()): boolean {
+  if (record.status !== 'reserved') return false;
+  const updatedAtMs = new Date(record.updatedAt || record.createdAt).getTime();
+  if (!Number.isFinite(updatedAtMs)) return true;
+  return nowMs - updatedAtMs < RESERVED_LOCK_TTL_MS;
+}
+
+async function bestEffortPut(
+  record: V0UsageRecord,
+  condition?: string,
+  expressionAttributeNames?: Record<string, string>,
+  expressionAttributeValues?: Record<string, any>
+): Promise<boolean> {
   if (!persistenceEnabled()) return true;
   try {
     await dynamodb.put({
       TableName: TABLE_NAME,
       Item: record,
       ...(condition ? { ConditionExpression: condition } : {}),
+      ...(expressionAttributeNames ? { ExpressionAttributeNames: expressionAttributeNames } : {}),
+      ...(expressionAttributeValues ? { ExpressionAttributeValues: expressionAttributeValues } : {}),
     }).promise();
     return true;
   } catch (error: any) {
@@ -106,11 +119,12 @@ export async function guardedV0ChatCreate<T = any>(input: {
   if (existing?.chatId && existing.status === 'succeeded') {
     return { id: existing.chatId, reused: true };
   }
-  if (existing?.status === 'reserved') {
+  if (existing && isFreshReserved(existing)) {
     throw new Error('A v0 generation with the same idempotency key is already in flight.');
   }
 
   const now = new Date().toISOString();
+  const staleBefore = new Date(Date.now() - RESERVED_LOCK_TTL_MS).toISOString();
   const reserved: V0UsageRecord = {
     idempotencyKey,
     userId: input.userId,
@@ -122,10 +136,17 @@ export async function guardedV0ChatCreate<T = any>(input: {
     updatedAt: now,
   };
   memoryUsage.set(idempotencyKey, reserved);
-  const reservedInDynamo = await bestEffortPut(reserved, 'attribute_not_exists(idempotencyKey)');
+  const reservedInDynamo = await bestEffortPut(
+    reserved,
+    'attribute_not_exists(idempotencyKey) OR #status <> :reserved OR updatedAt < :staleBefore',
+    { '#status': 'status' },
+    { ':reserved': 'reserved', ':staleBefore': staleBefore }
+  );
   if (!reservedInDynamo) {
     const latest = await bestEffortGet(idempotencyKey);
-    if (latest?.chatId) return { id: latest.chatId, reused: true };
+    if (latest) memoryUsage.set(idempotencyKey, latest);
+    else memoryUsage.delete(idempotencyKey);
+    if (latest?.chatId && latest.status === 'succeeded') return { id: latest.chatId, reused: true };
     throw new Error('A v0 generation with the same idempotency key is already in flight.');
   }
 

@@ -830,6 +830,28 @@ describe("v0Service - multi-site routing (DURABLE_LANDING_GENERATION=on)", () =>
     expect(put.isRootPage).toBeUndefined(); // not a new site root
   });
 
+  it("unified default + existing site + same in-flight route → reuses instead of duplicate-building", async () => {
+    const inFlightRoute = {
+      id: "route-1",
+      userId: "user-1",
+      name: "Pricing",
+      slug: "pricing",
+      status: "generating",
+      siteId: "site-1",
+      githubRepoUrl: "https://github.com/o/r",
+      vercelProjectId: "vp1",
+    };
+    mockQuery
+      .mockReturnValueOnce(siteRow())
+      .mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [inFlightRoute] }) });
+
+    const result = await generateLandingPage("user-1", "Variant", "Pricing", {});
+
+    expect(result.id).toBe("route-1");
+    expect(mockPut).not.toHaveBeenCalled();
+    expect(mockChatsCreate).not.toHaveBeenCalled();
+  });
+
   it("separate mode → creates a new site even when one exists (opt-in, costlier)", async () => {
     mockQuery.mockReturnValue(siteRow());
     mockChatsCreate.mockResolvedValueOnce({ id: "chat_sep" });
