@@ -61,7 +61,9 @@ export default function V0CreditsCard() {
         );
         setCredits(data);
       } catch (err: any) {
-        setCredits(null);
+        // Keep the last-known-good numbers (with their stale "Last checked"
+        // timestamp) and surface the failure alongside them — never wipe data
+        // we already have, and never fake numbers we don't.
         setError(err.response?.data?.error || "Couldn't reach v0 billing");
       } finally {
         setLoading(false);
@@ -96,6 +98,7 @@ export default function V0CreditsCard() {
         {error && (
           <Typography variant="body2" color="error" data-testid="v0-credits-error">
             {error}
+            {credits ? ' — showing last known values' : ''}
           </Typography>
         )}
         {credits && (

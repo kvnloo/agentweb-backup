@@ -112,6 +112,29 @@ describe('V0CreditsCard', () => {
     expect(screen.queryByTestId('v0-total-spendable')).not.toBeInTheDocument();
   });
 
+  it('keeps last-known-good values (with stale timestamp) when a refresh fails', async () => {
+    mockedAxiosGet.mockResolvedValueOnce({ data: CREDITS_LOW });
+
+    render(<V0CreditsCard />);
+    await waitFor(() => {
+      expect(screen.getByTestId('v0-total-spendable')).toHaveTextContent('$12.76');
+    });
+
+    mockedAxiosGet.mockRejectedValueOnce(new Error('network down'));
+    fireEvent.click(screen.getByLabelText('refresh v0 credits'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('v0-credits-error')).toBeInTheDocument();
+    });
+    // Stale numbers and their "Last checked" timestamp stay visible alongside the error.
+    expect(screen.getByTestId('v0-total-spendable')).toHaveTextContent('$12.76');
+    expect(screen.getByText('Monthly: $2.00 / $30.00')).toBeInTheDocument();
+    expect(screen.getByText(/Last checked:/)).toBeInTheDocument();
+    expect(screen.getByTestId('v0-credits-error')).toHaveTextContent(
+      "Couldn't reach v0 billing — showing last known values"
+    );
+  });
+
   it('surfaces the backend error message when the API returns one', async () => {
     mockedAxiosGet.mockRejectedValue({
       response: { data: { message: 'Failed to fetch v0 billing', error: 'v0 API request failed: GET /user/billing (HTTP 500)' } },
