@@ -173,7 +173,15 @@ async function up(bugRaw, worktreeRaw) {
   console.log(`  Partner portal:  ${urls.partner}   (${ok.partner ? 'up' : 'NOT UP'})`);
   console.log(`  Backend API:     ${urls.api}   (${ok.api ? 'up' : 'NOT UP'})`);
   console.log('');
-  if (!ok.api || !ok.customer || !ok.partner) console.log(`  Some service isn't up — check ${LOGS}/${bug}-*.log`);
+  // If the preview is fundamentally broken (backend or the main customer portal never bound — e.g. a
+  // failed build), tear it down instead of leaving a dead entry that holds a live-cap slot and serves
+  // 502s forever. A lone partner-portal miss leaves a still-usable customer+api preview standing.
+  if (!ok.api || !ok.customer) {
+    console.log(`  Preview for ${bug} did not come up (api:${ok.api ? 'up' : 'down'}, customer:${ok.customer ? 'up' : 'down'}) — tearing it down so it doesn't hold a cap slot or serve 502s. Check ${LOGS}/${bug}-*.log`);
+    down(bug);
+  } else if (!ok.partner) {
+    console.log(`  Partner portal isn't up — leaving the usable customer+api preview; check ${LOGS}/${bug}-partner-portal.log`);
+  }
 }
 
 function down(bugRaw) {
