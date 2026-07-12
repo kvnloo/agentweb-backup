@@ -203,6 +203,24 @@
   .ctxwarn.limitwarn.lw-notice { color: #e0a33c; background: rgba(224,138,60,.09); border-color: rgba(224,138,60,.38); }
   .ctxwarn.limitwarn.lw-warn   { color: #e5655e; background: rgba(229,101,94,.12); border-color: rgba(229,101,94,.5); }
   .ctxwarn.limitwarn.lw-crit   { color: #ff5a5a; background: rgba(201,42,42,.2); border-color: rgba(255,80,80,.6); font-weight: 600; }
+  /* /btw side-thread panel — an interactive mini-chat inside the shared modal. */
+  .btwwrap { display: flex; flex-direction: column; gap: 10px; }
+  .btwnote { color: var(--dim); font-size: 11.5px; }
+  .btwthread { overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding-right: 4px; min-height: 120px; max-height: 46vh; }
+  .btw-msg { max-width: 100%; padding: 7px 11px; border-radius: 8px; font-size: 13px; line-height: 1.55; }
+  .btw-u { align-self: flex-end; background: var(--user); color: var(--text); white-space: pre-wrap; }
+  .btw-b { align-self: flex-start; background: var(--panel2); border: 1px solid var(--border); color: var(--text); }
+  .btw-a a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+  .btw-a p { margin: 0 0 6px; } .btw-a p:last-child { margin-bottom: 0; }
+  .btw-a pre { background: #10131a; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; overflow-x: auto; }
+  .btw-a code { font-size: 12.5px; }
+  .btw-err { color: var(--red); }
+  .btwcompose { display: flex; gap: 8px; align-items: flex-end; }
+  .btwcompose textarea { flex: 1; resize: none; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font: inherit; font-size: 13px; line-height: 1.4; max-height: 120px; }
+  .btwcompose textarea:focus { outline: 1px solid var(--accent); }
+  .btwcompose button { background: var(--accent); color: #0d0f13; border: 0; border-radius: 8px; padding: 8px 14px; font: inherit; font-weight: 600; cursor: pointer; }
+  .btw-dots::after { content: '…'; animation: btwpulse 1.2s infinite; }
+  @keyframes btwpulse { 0%,100% { opacity: .4; } 50% { opacity: 1; } }
   .compactcard { align-self: stretch; margin: 8px 0; }
   .compactcard .ch { display: flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; color: var(--dim); font-size: 11px; }
   .compactcard .cl { flex: 1; height: 1px; background: var(--border); }
@@ -444,6 +462,7 @@ const COMMANDS = [
   { name: '/status', desc: 'Session & fix status' },
   { name: '/context', desc: 'Context window usage' },
   { name: '/compact', desc: 'Summarize & compact the conversation' },
+  { name: '/btw', desc: 'Ask a quick side question (kept out of the conversation)', needsArg: true },
 ];
 
 // ---------- voice (push-to-talk): hold space to dictate via the browser's Web Speech API ----------
@@ -1531,14 +1550,22 @@ function renderSlash() {
 }
 function moveSlash(d) { if (!S.slash) return; const n = S.slash.items.length; S.slash.sel = (S.slash.sel + d + n) % n; renderSlash(); }
 function hideSlash() { S.slash = null; const el = $('slashmenu'); if (el) el.style.display = 'none'; }
-function runSlash() { const c = S.slash?.items[S.slash.sel]; if (!c) return; hideSlash(); $('input').value = ''; autosize(); runCommand(c.name); }
+function runSlash() {
+  const c = S.slash?.items[S.slash.sel]; if (!c) return;
+  hideSlash();
+  // Commands that REQUIRE an argument (e.g. /btw <question>): prefill the input and let the user type
+  // the argument, rather than firing the command empty.
+  if (c.needsArg) { const inp = $('input'); inp.value = c.name + ' '; autosize(); inp.focus(); return; }
+  $('input').value = ''; autosize(); runCommand(c.name);
+}
 function runCommand(cmd) {
   const raw = String(cmd).trim();
   const name = raw.split(/\s+/)[0].toLowerCase();
   if (name === '/status') return openStatus();
   if (name === '/context') return openContext();
   if (name === '/compact') return startCompact(raw.slice(name.length).trim());
-  addSys('Unknown command: ' + name + ' — try /status, /context, or /compact', 'err');
+  if (name === '/btw') return openBtw(raw.slice(name.length).trim());
+  addSys('Unknown command: ' + name + ' — try /status, /context, /compact, or /btw', 'err');
 }
 // /compact — hand the whole conversation to the agent for a summary, then continue on a tiny
 // context. Streamed summary text is suppressed; the persisted `compact` marker renders on refresh.
@@ -1650,6 +1677,54 @@ function openContext() {
     + kRow('Session cost', d.costTotal ? '$' + d.costTotal.toFixed(4) : '—')
     + '<div class="cnote">“Used” covers the system prompt, tools, and the whole conversation together — the CLI doesn’t report them as separate categories.</div>';
   openCmd('Context', html);
+}
+// /btw — a "by the way" side thread: an interactive read-only mini-chat that can see the main
+// conversation (even mid-turn) but never adds to it, and remembers its own follow-ups. Opens the shared
+// modal with a thread view + a compose box; each send hits the backend and appends to the side thread.
+function openBtw(question) {
+  const id = S.sel; if (!id) return;
+  openCmd('By the way', '<div class="btwwrap">'
+    + '<div class="btwnote">A side thread — it can see the main conversation (even while the agent is working) but never adds to it. Ask follow-ups below.</div>'
+    + '<div class="btwthread" id="btwThread"></div>'
+    + '<div class="btwcompose"><textarea id="btwInput" rows="1" placeholder="Ask a side question…" autocomplete="off" spellcheck="false"></textarea><button id="btwSend">Ask</button></div>'
+    + '</div>');
+  renderBtwThread(S.detail?.btw || []);
+  const inp = document.getElementById('btwInput'), btn = document.getElementById('btwSend');
+  const submit = () => { const v = inp.value.trim(); if (!v) return; inp.value = ''; btwAutosize(inp); btwSend(v); };
+  btn.onclick = submit;
+  inp.addEventListener('input', () => btwAutosize(inp));
+  inp.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } });
+  inp.focus();
+  const q = String(question || '').trim();
+  if (q) btwSend(q); // a typed "/btw <question>" fires immediately
+}
+function btwAutosize(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 120) + 'px'; }
+function renderBtwThread(msgs) {
+  const el = document.getElementById('btwThread'); if (!el) return;
+  el.innerHTML = (msgs || []).map((m) => m.role === 'user'
+    ? `<div class="btw-msg btw-u">${esc(m.text || '')}</div>`
+    : `<div class="btw-msg btw-b btw-a">${md(m.text || '')}</div>`).join('')
+    || '<div class="pempty" style="padding:8px 2px">No side questions yet — ask one below.</div>';
+  el.scrollTop = el.scrollHeight;
+}
+async function btwSend(q) {
+  const id = S.sel; if (!id || S.btwBusy) return;
+  S.btwBusy = true;
+  const el = document.getElementById('btwThread');
+  if (el) {
+    if (el.querySelector('.pempty')) el.innerHTML = '';
+    el.insertAdjacentHTML('beforeend', `<div class="btw-msg btw-u">${esc(q)}</div><div class="btw-msg btw-b btw-a" id="btwPending"><span class="btw-dots">Thinking</span></div>`);
+    el.scrollTop = el.scrollHeight;
+  }
+  try {
+    const r = await fetch(`/api/issues/${id}/chat/btw`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ question: q }) });
+    const d = await r.json().catch(() => ({}));
+    if (S.cmd !== 'By the way') return; // user closed the panel
+    if (r.ok && Array.isArray(d.thread)) { if (S.detail) S.detail.btw = d.thread; renderBtwThread(d.thread); }
+    else { const p = document.getElementById('btwPending'); if (p) p.innerHTML = `<span class="btw-err">${esc(d.error || `failed (${r.status})`)}</span>`; }
+  } catch (e) {
+    const p = document.getElementById('btwPending'); if (p) p.innerHTML = `<span class="btw-err">${esc(String(e.message || e))}</span>`;
+  } finally { S.btwBusy = false; const i = document.getElementById('btwInput'); if (i) i.focus(); }
 }
 
 document.addEventListener('keydown', (ev) => {

@@ -1115,6 +1115,76 @@ function startTurn(identifier, body) {
   return { code: 202, body: { turnId, cap } };
 }
 
+// The main conversation as READ-ONLY context for a /btw side turn: the recent main messages plus, if a
+// main turn is streaming right now, its in-progress output — so /btw can answer questions ABOUT what the
+// main agent is currently doing. This is injected as text; the side thread never joins the main session.
+function mainConvoBlock(identifier, cs) {
+  const msgs = (cs.messages || []).filter((m) => m && m.text).slice(-12);
+  const body = msgs.map((m) => `${m.role === 'user' ? 'Developer' : 'Main agent'}: ${String(m.text).slice(0, 2000)}`).join('\n\n');
+  let block = `\n=== MAIN CONVERSATION (read-only context for you, the side thread — you can see it but must never change or add to it) ===\n${body || '(no messages yet)'}\n`;
+  if (activeTurns.has(identifier)) {
+    const live = (channelOf(identifier).turnBuffer || []).filter((e) => e.type === 'text' && e.text).map((e) => e.text).join('');
+    block += `\n[The main agent is WORKING ON A TURN RIGHT NOW.${live ? ' Its in-progress output so far:\n' + live.slice(-4000) : ''}]\n`;
+  }
+  return block;
+}
+
+// /btw — a "by the way" side thread. A PARALLEL read-only conversation that (1) runs even while the main
+// agent is mid-turn (its own `.btw` lock — never the main lock), (2) sees the main conversation + the main
+// agent's live in-progress output, and (3) remembers its OWN thread for follow-ups (a separate btw session
+// resumed each turn). It is stored under cs.btw / cs.sessions.btw — the main convo's messages and session
+// are never touched, so the side thread never pollutes the main context. Returns the answer + full thread.
+async function runBtw(identifier, question) {
+  const q = String(question || '').trim();
+  if (!q) return { code: 400, error: 'ask a question: /btw <question>' };
+  const found = findEntry(identifier);
+  if (!found) return { code: 404, error: `no autofix record for ${identifier}` };
+  // Own lock: serialize btw turns among themselves, but do NOT contend with the main turn — the whole
+  // point is to ask while the main agent is busy. Read-only, so concurrent reads of the worktree are safe.
+  const lockPath = acquireLock(identifier, { suffix: 'btw' });
+  if (!lockPath) return { code: 409, error: 'the side thread is already answering — wait a moment, then ask again' };
+  let sid = null;
+  try {
+    const cs0 = loadChatState()[identifier] || {};
+    // Read-only aside: use the worktree if it exists, else the main checkout — never REBUILD it. A
+    // rebuild is a heavy write that could race a concurrent main-turn rebuild; resolveCwd (which rebuilds)
+    // is only for real turns that hold the main lock. /btw holds only the btw lock, so it must not assemble.
+    const WT = path.join(worktreesDir, identifier);
+    const cwd = existsSync(WT) ? WT : agentRoot;
+    const btwSid = cs0.sessions?.btw || null;
+    const mainCtx = mainConvoBlock(identifier, cs0);
+    let prompt;
+    if (btwSid) {
+      // Follow-up: resume the side thread (it remembers earlier /btw Q&A); refresh it on the main convo.
+      prompt = `${mainCtx}\n[Continue our side thread. Read-only, standalone, concise. Answer the developer's follow-up.]\n\nSide question: ${q}`;
+    } else {
+      // First /btw: seed the curated issue context + the main conversation, framed as an isolated aside.
+      const framed = `[You are a "/btw" SIDE THREAD. You can read the main conversation (below) and the codebase, and you'll remember THIS side thread for the developer's follow-ups — but nothing here is added to the main conversation or its context. Read-only: change nothing. Answer concisely and standalone.]\n${mainCtx}\n\nSide question: ${q}`;
+      prompt = freshPrompt('readOnly', identifier, found.entry, await fetchLinear(identifier), cwd, framed, '');
+    }
+    const out = await runClaudeStream(chatArgs('readOnly', btwSid), prompt, cwd, CHAT.readOnly?.timeoutMs || 10 * 60 * 1000,
+      (e) => { if (e.type === 'init') sid = e.sessionId; }, null);
+    if (out.timedOut) return { code: 504, error: 'the side question timed out' };
+    const answer = (out.texts.join('\n\n').trim()) || (out.result?.result || '').trim() || '(no answer)';
+    // Persist the side thread SEPARATELY. updateChatState re-reads fresh, so a main turn that finished
+    // during our await keeps its messages — we only ever add cs.btw / cs.sessions.btw.
+    const at = new Date().toISOString();
+    const entry = updateChatState(identifier, (cs) => {
+      cs.sessions = cs.sessions || {};
+      cs.sessions.btw = sid || btwSid || cs.sessions.btw || null;
+      cs.btw = cs.btw || { messages: [] };
+      cs.btw.messages.push({ role: 'user', text: q.slice(0, 8000), at }, { role: 'assistant', text: answer.slice(0, 50000), at });
+      cs.btw.messages = cs.btw.messages.slice(-200);
+      return cs;
+    });
+    return { code: 200, body: { answer, thread: entry.btw?.messages || [] } };
+  } catch (e) {
+    return { code: 500, error: String(e?.message || e) };
+  } finally {
+    releaseLock(lockPath);
+  }
+}
+
 // Self-authorized message for the inline reconcile turn: fired only when the deterministic reconcile
 // (reconcileWithRemote) could not resolve a diverged remote — a true conflict that needs judgment.
 // The agent already committed this turn; its job now is to reconcile the branch with the rewritten
@@ -1427,7 +1497,7 @@ async function route(req, res) {
   if (req.method === 'GET' && p === '/api/issues') { json(res, 200, { fixEnabled: fixEnabled(), issues: listIssues() }); return; }
   if (req.method === 'GET' && p === '/api/usage') { json(res, 200, await fetchOauthUsage()); return; }
 
-  const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/attach|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat\/merge|\/chat\/compact|\/chat|\/preview)?$/);
+  const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/attach|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat\/merge|\/chat\/compact|\/chat\/btw|\/chat|\/preview)?$/);
   if (!m) { json(res, 404, { error: 'not found' }); return; }
   const identifier = m[1].toUpperCase();
   const sub = m[2] || '';
@@ -1454,6 +1524,7 @@ async function route(req, res) {
       pipeline: buildPipeline(identifier, found.entry),
       linear: await fetchLinear(identifier),
       chat: { sessions: cs.sessions || {}, messages: cs.messages || [] },
+      btw: cs.btw?.messages || [], // the /btw side thread (separate from the main conversation)
       usage, costTotal: cs.costTotal || 0, fixEnabled: fixEnabled(),
       accountUsage: usageCache.data?.ok ? usageCache.data.usage : null,
       models: { full: CHAT.full?.model || null, readOnly: CHAT.readOnly?.model || null },
@@ -1506,6 +1577,11 @@ async function route(req, res) {
   }
   if (req.method === 'POST' && sub === '/chat/abort') {
     const r = abortTurn(identifier);
+    json(res, r.code, r.body || { error: r.error });
+    return;
+  }
+  if (req.method === 'POST' && sub === '/chat/btw') {
+    const r = await runBtw(identifier, (await readBody(req))?.question);
     json(res, r.code, r.body || { error: r.error });
     return;
   }
