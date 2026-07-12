@@ -10,10 +10,10 @@
 // Run: chat/run-chat.sh start   (or directly: node chat/server.mjs)
 
 import http from 'node:http';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
-  readFileSync, writeFileSync, existsSync, mkdirSync, statSync, unlinkSync, createWriteStream, readdirSync,
+  readFileSync, writeFileSync, existsSync, mkdirSync, statSync, unlinkSync, rmSync, createWriteStream, readdirSync,
 } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -133,6 +133,8 @@ function listIssues() {
       return {
         issueId: uuid,
         identifier: e.identifier,
+        standalone: e.standalone || false,
+        ownerName: e.ownerName || null,
         outcome: e.outcome,
         triage: e.triage || null,
         branch: e.branch || null,
@@ -141,7 +143,7 @@ function listIssues() {
         summary: e.summary || '',
         prs: e.prs || [],
         hasWorktree,
-        active: hasWorktree || ACTIVE_OUTCOMES.includes(e.outcome),
+        active: e.standalone || hasWorktree || ACTIVE_OUTCOMES.includes(e.outcome),
         fixable: !!e.branch || hasWorktree,
         chat: {
           messages: (cs.messages || []).length,
@@ -152,6 +154,138 @@ function listIssues() {
     })
     .filter((i) => i.identifier)
     .sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')));
+}
+
+// ---------------------------------------------------------------------------
+// Standalone "scratch" chats — a conversation not tied to any ENG issue (e.g. babysitting a PR that no
+// card owns). Modeled as a normal state.json entry flagged `standalone`, so it reuses the ENTIRE chat
+// stack: its own branch + worktree (full capability), the sidebar list + breathing dot, turns, /btw.
+const repoRootOf = (repo) => path.resolve(agentRoot, repo.root);
+const wtPathOf = (WT, repo) => (repo.mount === '.' ? WT : path.join(WT, repo.mount));
+
+// Next free CHAT-<n> id (max existing + 1) — the id doubles as the branch name (lowercased).
+function nextChatId() {
+  let max = 0;
+  for (const e of Object.values(loadState())) {
+    const m = /^CHAT-(\d+)$/i.exec(e.identifier || '');
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return `CHAT-${max + 1}`;
+}
+
+// Concise title inferred from the first user message (single line, trimmed, no trailing punctuation).
+function deriveTitle(message) {
+  return String(message || '').replace(/\s+/g, ' ').trim().slice(0, 60).replace(/[.,;:!?]+$/, '') || 'New chat';
+}
+
+const firstNameOf = (name, email) => (String(name || '').trim().split(/\s+/)[0]) || String(email || '').split('@')[0] || '';
+// The configured team members (from config.assigneeGitIdentity) a standalone chat can be owned by — the
+// owner decides whose git identity, GitHub PAT, and Linear key the agent acts with.
+function chatMembers() {
+  return Object.entries(config.assigneeGitIdentity || {}).map(([email, id]) => ({ email, name: id.name, firstName: firstNameOf(id.name, email) }));
+}
+
+// Create a standalone chat, OWNED by a configured member (so the agent knows whose credentials to use).
+// Just a state entry with its own branch; the worktree is built lazily on the first turn.
+function createChat(email) {
+  const identifier = nextChatId();
+  const member = chatMembers().find((m) => m.email.toLowerCase() === String(email || '').toLowerCase()) || null;
+  const identity = member ? resolveAssigneeIdentity({ email: member.email }) : null;
+  const s = loadState();
+  s[`chat-${randomUUID()}`] = {
+    identifier, standalone: true, branch: identifier.toLowerCase(), // e.g. chat-1
+    outcome: 'chat', title: 'New chat',
+    assigneeEmail: member?.email || null, // drives GH PAT + Linear key (config maps are keyed by email)
+    assignee: identity || null,           // git commit identity (attributionFor's fallback reads this)
+    ownerName: member?.firstName || null, // shown next to the title so it's clear who's on it
+    at: new Date().toISOString(),
+  };
+  writeFileSync(statePath, JSON.stringify(s, null, 2));
+  return { code: 200, body: { identifier } };
+}
+
+// Resolve a member by email, first name, or full name (case-insensitive) — used by both the UI owner
+// picker and the agent's mid-chat [[OWNER: …]] handoff.
+function resolveMember(emailOrName) {
+  const q = String(emailOrName || '').trim().toLowerCase();
+  if (!q) return null;
+  return chatMembers().find((m) => m.email.toLowerCase() === q || m.firstName.toLowerCase() === q || m.name.toLowerCase() === q) || null;
+}
+// Change who's working on a standalone chat — updates the label AND the credentials used from the NEXT
+// turn on (git identity + GitHub PAT + Linear key all follow assigneeEmail).
+function setChatOwner(identifier, emailOrName) {
+  const member = resolveMember(emailOrName);
+  if (!member) return { code: 400, error: `unknown member "${emailOrName}" — pick one of: ${chatMembers().map((m) => m.firstName).join(', ')}` };
+  const identity = resolveAssigneeIdentity({ email: member.email });
+  const saved = updateIssueEntry(identifier, (e) => ({ ...e, assigneeEmail: member.email, assignee: identity || null, ownerName: member.firstName }));
+  if (!saved) return { code: 404, error: `no chat ${identifier}` };
+  return { code: 200, body: { ownerName: member.firstName, email: member.email } };
+}
+
+function renameChat(identifier, title) {
+  const t = String(title || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+  if (!t) return { code: 400, error: 'title must be non-empty' };
+  const saved = updateIssueEntry(identifier, (e) => ({ ...e, title: t }));
+  if (!saved) return { code: 404, error: `no chat ${identifier}` };
+  return { code: 200, body: { title: saved.title } };
+}
+
+// Tear down a standalone chat AND its repo: stop preview, remove each repo's worktree + local branch,
+// delete the state + chat-state entries. Only standalone chats can be closed this way (an ENG card's
+// workspace is owned by the pipeline/gc). Returns 409 if a turn is mid-flight.
+function closeChat(identifier) {
+  const found = findEntry(identifier);
+  if (!found) return { code: 404, error: `no chat ${identifier}` };
+  if (!found.entry.standalone) return { code: 400, error: 'only standalone chats can be closed' };
+  if (activeTurns.has(identifier)) return { code: 409, error: 'a turn is running — stop it before closing' };
+  const lockPath = acquireFixLock(identifier);
+  if (!lockPath) return { code: 409, error: 'busy — an operation holds this chat; try again in a moment' };
+  try {
+    try { spawnSync('node', [previewScript, 'down', identifier], { stdio: 'ignore' }); } catch { /* best-effort */ }
+    const WT = path.join(worktreesDir, identifier);
+    const branch = found.entry.branch;
+    for (const repo of [...config.repos].reverse()) {
+      spawnSync('git', ['-C', repoRootOf(repo), 'worktree', 'remove', '--force', wtPathOf(WT, repo)], { encoding: 'utf8' });
+      spawnSync('git', ['-C', repoRootOf(repo), 'worktree', 'prune'], { encoding: 'utf8' });
+      if (branch) spawnSync('git', ['-C', repoRootOf(repo), 'branch', '-D', branch], { encoding: 'utf8' });
+    }
+    try { rmSync(WT, { recursive: true, force: true }); } catch { /* already gone */ }
+    const s = loadState();
+    for (const [uuid, e] of Object.entries(s)) if ((e.identifier || '').toUpperCase() === identifier.toUpperCase()) delete s[uuid];
+    writeFileSync(statePath, JSON.stringify(s, null, 2));
+    const cs = loadChatState(); delete cs[identifier]; writeFileSync(chatStatePath, JSON.stringify(cs, null, 2));
+    log(`closed standalone chat ${identifier} (removed worktree + branch ${branch})`);
+    return { code: 200, body: { closed: true } };
+  } finally { releaseLock(lockPath); }
+}
+
+// GitHub PR URLs the agent surfaced this turn (from its text + tool inputs). Standalone chats DETECT
+// links the agent opened instead of auto-opening PRs — matching a normal Claude Code session.
+function detectPrUrls(out) {
+  const text = [...(out.texts || []), ...(out.blocks || []).map((b) => b.input || '')].join('\n');
+  const byUrl = new Map();
+  for (const m of text.matchAll(/https:\/\/github\.com\/[\w.-]+\/([\w.-]+)\/pull\/\d+/g)) byUrl.set(m[0], { repo: m[1], url: m[0] });
+  return [...byUrl.values()];
+}
+
+// The system framing for a standalone chat turn (first turn / fresh retry). No autofix pipeline, no
+// Linear issue — a plain full-capability coding session in a dedicated worktree.
+function standaloneChatPrompt(entry, cwd, message, history = '') {
+  return `You are a coding assistant in a STANDALONE chat — not tied to any tracked issue. It's a normal, full-capability session (like Claude Code): read/edit code, run commands, use git and \`gh\`, open and manage PRs — whatever the developer asks.
+Chat title: "${entry.title || 'New chat'}".${entry.assignee ? `\nYou are acting on behalf of ${entry.assignee.name} — git commits, GitHub PRs, and Linear actions all use their identity/credentials.` : ''}
+If the developer indicates a DIFFERENT person is now working (e.g. "this is Anurag now", "Manan here", "I'm taking over"), acknowledge it and end your reply with a line containing exactly: [[OWNER: <their first name or email>]] — from the next turn on, THEIR GitHub PAT and Linear key are used and the label updates.
+You are in a dedicated git worktree at ${cwd} on branch \`${entry.branch}\` (a fresh branch off main); the main repo is at the root and customer-portal is nested. There is NO autofix pipeline here and commits are NOT auto-pushed — push or open PRs yourself when asked (any PR you open is auto-detected and shown to the developer).
+To CLOSE this chat and delete its workspace when the developer asks, end your reply with a line containing exactly: [[CLOSE_CHAT]]
+${history}
+Developer's message: ${message}`;
+}
+
+// Fresh-turn system prompt for either flavor of chat: a standalone chat gets the plain full-capability
+// framing (no Linear fetch, no pipeline), an ENG chat gets the curated issue context. Everything else
+// (session curation, /btw, /context, editing) is identical, so standalone chats inherit it all.
+async function freshTurnPrompt(cap, identifier, entry, cwd, message, history = '') {
+  if (entry.standalone) return standaloneChatPrompt(entry, cwd, message, history);
+  return freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, message, history);
 }
 
 // Live Linear data is decoration, never a dependency: 8s cap, null on any failure (including
@@ -765,6 +899,7 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
   const emit = (e) => broadcast(identifier, { turnId, ...e });
   const m = CHAT[cap] || {};
   let tee = null;
+  let closeRequested = false; // a standalone chat can ask to close itself ([[CLOSE_CHAT]]); handled after the finally
   try {
     emit({ type: 'turn_start', cap, message });
     // Warm the account-usage cache now so it's fresh by the time this turn ends and the client
@@ -835,7 +970,7 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
     let usedCompact = false;
     if (edit) {
       resumeSid = edit.forkSid || null;
-      prompt = resumeSid ? promptMsg : freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, promptMsg, histText);
+      prompt = resumeSid ? promptMsg : await freshTurnPrompt(cap, identifier, entry, cwd, promptMsg, histText);
     } else {
       const sameCwd = !cs0.cwd || cs0.cwd === cwd;
       resumeSid = (sameCwd && cs0.sessions?.chat) || null;
@@ -846,7 +981,7 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
         // fresh seeded with the compaction summary instead of the pipeline session — that big
         // transcript is exactly the context we just compacted away.
         usedCompact = true;
-        prompt = freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, promptMsg, compactBlock(cs0.compactSummary));
+        prompt = await freshTurnPrompt(cap, identifier, entry, cwd, promptMsg, compactBlock(cs0.compactSummary));
       } else if (CHAT.resumePipelineSession && cwd !== agentRoot && pipelineSessionId(entry)) {
         // Opt-in legacy path: resume the fixer's own (300-400k-token) transcript for raw native memory.
         resumeSid = pipelineSessionId(entry);
@@ -854,7 +989,8 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
       } else {
         // Default: seed a fresh session with a curated context (issue + fix diff + verdicts + on-demand
         // access to the code and the raw stage transcripts) instead of reloading the giant fixer session.
-        prompt = freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, promptMsg);
+        // (For a standalone chat this is the plain full-capability framing — see freshTurnPrompt.)
+        prompt = await freshTurnPrompt(cap, identifier, entry, cwd, promptMsg);
       }
     }
 
@@ -890,8 +1026,12 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
       if (cap !== 'full') return process.env;
       const idEnv = attr.idEnv || {};
       const ghToken = attr.email ? resolveAssigneeGhToken({ email: attr.email }) : null;
-      if (!Object.keys(idEnv).length && !ghToken) return process.env;
-      return { ...process.env, ...idEnv, ...(ghToken ? { GH_TOKEN: ghToken } : {}) };
+      // For a standalone chat, also hand the agent its OWNER's Linear key so any Linear action it takes
+      // is attributed to that person (ENG chats already resolve this per-assignee via the pipeline).
+      const linEnv = entry.standalone && attr.email ? config.assigneeLinearKeyEnv?.[attr.email] : null;
+      const linKey = linEnv ? process.env[linEnv] : null;
+      if (!Object.keys(idEnv).length && !ghToken && !linKey) return process.env;
+      return { ...process.env, ...idEnv, ...(ghToken ? { GH_TOKEN: ghToken } : {}), ...(linKey ? { LINEAR_API_KEY: linKey } : {}) };
     })();
 
     mkdirSync(path.join(logsDir, identifier), { recursive: true });
@@ -929,14 +1069,30 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
         if (lastUser) { lastUser.sid = null; lastUser.tLines = 0; }
         return cs;
       });
-      prompt = freshPrompt(cap, identifier, entry, await fetchLinear(identifier), cwd, message, histText);
+      prompt = await freshTurnPrompt(cap, identifier, entry, cwd, message, histText);
       tee.write(`# retry fresh\n${prompt}\n---\n`);
       out = await runClaudeStream(chatArgs(cap, null), prompt, cwd, m.timeoutMs, onEvent, register, turnEnv);
     }
 
     let fix = null;
     let reconcileOut = null; // the inline reconcile turn's stream, so its narration is persisted too (#9)
-    if (cap === 'full' && cwd !== agentRoot) {
+    // Standalone chats skip the ENG auto-push/PR-open machinery entirely (they're a normal full-capability
+    // session — the agent drives its own git/gh). We only DETECT any PR the agent opened, and honor a
+    // self-close request. The `&& !entry.standalone` below keeps the whole ENG block off for them.
+    if (cap === 'full' && cwd !== agentRoot && entry.standalone) {
+      const detected = detectPrUrls(out);
+      if (detected.length) {
+        const saved = updateIssueEntry(identifier, (e) => ({ ...e, prs: mergePrs(e.prs || [], detected) }));
+        if (saved) { entry.prs = saved.prs; emit({ type: 'fix_summary', committed: false, standalone: true, pushedOk: true, failedRepos: [], prs: saved.prs }); }
+      }
+      const txt = (out.texts || []).join('\n');
+      // Mid-chat handoff: the agent emits [[OWNER: <first name or email>]] when a different person takes
+      // over. Applied now, so the NEXT turn uses THEIR git identity + GitHub PAT + Linear key.
+      const om = txt.match(/\[\[OWNER:\s*([^\]]+)\]\]/i);
+      if (om) { const r = setChatOwner(identifier, om[1].trim()); if (r.code === 200) emit({ type: 'owner_changed', ownerName: r.body.ownerName }); }
+      if (/\[\[CLOSE_CHAT\]\]/.test(txt)) closeRequested = true;
+    }
+    if (cap === 'full' && cwd !== agentRoot && !entry.standalone) {
       const changed = detectChangedRepos(cwd);
       const newThisTurn = countCommits(changed) > preCommits;
       // Push whatever is unpushed — commits made THIS turn AND any a prior turn committed but never
@@ -1072,6 +1228,12 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
     activeTurns.delete(identifier);
     emit({ type: 'done' });
   }
+  // Agent-initiated close: run AFTER the finally releases the lock + clears activeTurns (closeChat needs
+  // both free). Tears down the worktree/branch/state and tells the UI to drop the chat.
+  if (closeRequested) {
+    const r = closeChat(identifier);
+    broadcast(identifier, r.code === 200 ? { type: 'closed' } : { type: 'error', error: r.error || 'could not close the chat' });
+  }
 }
 
 // After an abort the turn record is replaced/cleared — used to suppress bogus error events.
@@ -1100,6 +1262,14 @@ function startTurn(identifier, body) {
   const found = findEntry(identifier);
   if (!found) return { code: 404, error: `no autofix record for ${identifier}` };
   if (activeTurns.has(identifier)) return { code: 409, error: 'a turn is already running for this issue' };
+
+  // Auto-title a standalone chat from its FIRST user message (only while it's still the default title,
+  // so a manual rename is never clobbered). The updated title shows in the sidebar after this turn.
+  if (found.entry.standalone && (!found.entry.title || found.entry.title === 'New chat')) {
+    const title = deriveTitle(message);
+    updateIssueEntry(identifier, (e) => ({ ...e, title }));
+    found.entry.title = title;
+  }
 
   // No user-facing mode: the environment decides what this turn may do.
   const cap = capabilityOf(found.entry).level;
@@ -1499,8 +1669,10 @@ async function route(req, res) {
   }
   if (req.method === 'GET' && p === '/api/issues') { json(res, 200, { fixEnabled: fixEnabled(), issues: listIssues() }); return; }
   if (req.method === 'GET' && p === '/api/usage') { json(res, 200, await fetchOauthUsage()); return; }
+  if (req.method === 'GET' && p === '/api/members') { json(res, 200, { members: chatMembers() }); return; }
+  if (req.method === 'POST' && p === '/api/chats') { const r = createChat((await readBody(req))?.email); json(res, r.code, r.body || { error: r.error }); return; }
 
-  const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/attach|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat\/merge|\/chat\/compact|\/chat\/btw|\/chat|\/preview)?$/);
+  const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/attach|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat\/merge|\/chat\/compact|\/chat\/btw|\/chat\/rename|\/chat\/owner|\/chat\/close|\/chat|\/preview)?$/);
   if (!m) { json(res, 404, { error: 'not found' }); return; }
   const identifier = m[1].toUpperCase();
   const sub = m[2] || '';
@@ -1585,6 +1757,21 @@ async function route(req, res) {
   }
   if (req.method === 'POST' && sub === '/chat/btw') {
     const r = await runBtw(identifier, (await readBody(req))?.question);
+    json(res, r.code, r.body || { error: r.error });
+    return;
+  }
+  if (req.method === 'POST' && sub === '/chat/rename') {
+    const r = renameChat(identifier, (await readBody(req))?.title);
+    json(res, r.code, r.body || { error: r.error });
+    return;
+  }
+  if (req.method === 'POST' && sub === '/chat/owner') {
+    const r = setChatOwner(identifier, (await readBody(req))?.email);
+    json(res, r.code, r.body || { error: r.error });
+    return;
+  }
+  if (req.method === 'POST' && sub === '/chat/close') {
+    const r = closeChat(identifier);
     json(res, r.code, r.body || { error: r.error });
     return;
   }

@@ -57,6 +57,38 @@
   #searchClear { position: absolute; right: 20px; top: 50%; transform: translateY(-50%); color: var(--dim); cursor: pointer; font-size: 14px; line-height: 1; display: none; user-select: none; }
   #searchClear:hover { color: var(--text); }
   #issues { overflow-y: auto; flex: 1; }
+  /* ＋ New chat — the primary create action for standalone chats, under the search box. */
+  #newChat { margin: 4px 14px 8px; padding: 7px 10px; display: flex; align-items: center; justify-content: center; gap: 6px; background: transparent; color: var(--accent); border: 1px dashed var(--border); border-radius: 8px; font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; }
+  #newChat:hover { border-color: var(--accent); background: rgba(110,168,254,.06); }
+  body.side-rail #newChat { margin: 4px 6px; padding: 7px 0; font-size: 0; }
+  body.side-rail #newChat::before { content: '＋'; font-size: 15px; }
+  /* Collapsible sidebar sections (Chats / Issues). */
+  .sec .sechead { display: flex; align-items: center; gap: 7px; padding: 8px 14px 5px; color: var(--dim); font-size: 10.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; cursor: pointer; user-select: none; }
+  .sec .sechead:hover { color: var(--text); }
+  .sec .secn { background: var(--panel2); color: var(--dim); border-radius: 10px; padding: 0 7px; font-size: 10px; font-weight: 600; letter-spacing: 0; }
+  .sec .secchev { margin-left: auto; transition: transform .12s ease; }
+  .sec.collapsed .secchev { transform: rotate(-90deg); }
+  .sec.collapsed .secbody { display: none; }
+  /* Indent a section's rows under its header so the grouping reads clearly. */
+  .sec .secbody .issue { padding-left: 24px; }
+  .sec .secbody .issue.sel { padding-left: 21px; } /* the 3px accent border keeps the text aligned */
+  body.side-rail .sec .sechead { justify-content: center; padding: 6px 2px; }
+  body.side-rail .sec .sechead .sect, body.side-rail .sec .secn, body.side-rail .sec .secchev { display: none; }
+  /* Standalone chat row: 💬 title + owner + relative time + breathing dot; hover reveals a ⋯ menu. */
+  .issue.chatrow .row1 { gap: 8px; }
+  .issue.chatrow .cico { flex: none; }
+  .issue.chatrow .ctitle { flex: 0 1 auto; min-width: 0; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .issue.chatrow .ctitle input { width: 100%; background: var(--panel); color: var(--text); border: 1px solid var(--accent); border-radius: 5px; padding: 1px 5px; font: inherit; font-weight: 600; }
+  .issue.chatrow .cmenu { margin-left: 4px; flex: none; color: var(--dim); cursor: pointer; opacity: 0; font-size: 16px; line-height: 1; padding: 0 3px; }
+  .issue.chatrow:hover .cmenu { opacity: 1; }
+  .issue.chatrow .cmenu:hover { color: var(--text); }
+  /* Small popover menu (chat ⋯ actions + the New-chat owner picker). */
+  .popmenu { position: fixed; z-index: 60; background: var(--panel); border: 1px solid var(--border); border-radius: 9px; box-shadow: 0 8px 24px rgba(0,0,0,.5); padding: 4px; min-width: 156px; }
+  .popmenu .pmhead { padding: 6px 12px 4px; font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--dim); }
+  .popmenu .pmi { padding: 7px 12px; font-size: 13px; color: var(--text); cursor: pointer; border-radius: 6px; white-space: nowrap; display: flex; align-items: center; gap: 8px; }
+  .popmenu .pmi:hover { background: var(--panel2); }
+  .popmenu .pmi.danger { color: var(--red); }
+  .popmenu .pmsep { height: 1px; background: var(--border); margin: 4px 6px; }
   .issue { display: block; padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer; color: inherit; text-decoration: none; } /* an <a> so Ctrl/⌘/middle-click opens the issue in a new tab */
   .issue:hover { background: var(--panel2); }
   .issue.sel { background: var(--panel2); border-left: 3px solid var(--accent); padding-left: 11px; }
@@ -315,6 +347,7 @@
       <input id="search" type="text" placeholder="Search ID, name or summary…" autocomplete="off" spellcheck="false" />
       <span id="searchClear" title="Clear">×</span>
     </div>
+    <button id="newChat" title="Start a standalone chat (not tied to any ENG card)">＋ New chat</button>
     <div id="issues"></div>
   </div>
   <div id="main">
@@ -464,7 +497,8 @@ function stampTime(bubbleEl, iso) {
   bubbleEl.appendChild(ts); // bottom-right corner of the bubble (absolute)
 }
 
-const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true, picker: null, lastEsc: 0, slash: null, cmd: null, mergePhase: null, lastResult: '', compacting: false, lastSent: '', escArmed: 0, escText: '', queue: [], queuePaused: false, attachments: [] };
+const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true, picker: null, lastEsc: 0, slash: null, cmd: null, mergePhase: null, lastResult: '', compacting: false, lastSent: '', escArmed: 0, escText: '', queue: [], queuePaused: false, attachments: [], collapsed: {} };
+try { S.collapsed = JSON.parse(localStorage.getItem('secCollapsed')) || {}; } catch { /* private mode */ }
 const COMMANDS = [
   { name: '/status', desc: 'Session & fix status' },
   { name: '/context', desc: 'Context window usage' },
@@ -493,33 +527,171 @@ async function loadIssues() {
     if (j !== lastIssuesJson) { lastIssuesJson = j; renderIssues(); }
   } catch { /* server briefly down */ }
 }
-function renderIssues() {
-  const q = S.search.trim().toLowerCase();
-  // When searching, look across ALL issues (not just the active set) so a resolved issue isn't
-  // hidden by the active-only filter — otherwise you'd get "no match" for an issue that exists.
-  let list = q ? S.issues : (S.showAll ? S.issues : S.issues.filter((i) => i.active));
-  if (q) list = list.filter((i) => `${i.identifier} ${i.summary || ''} ${i.title || ''} ${i.branch || ''}`.toLowerCase().includes(q));
-  $('count').textContent = `${list.length} issue${list.length === 1 ? '' : 's'}${q ? ' matched' : S.showAll ? '' : ' active'}`;
-  $('showAll').textContent = S.showAll ? 'active only' : 'show all';
-  $('searchClear').style.display = S.search ? 'block' : 'none';
-  const empty = q ? `No issues match “${esc(S.search.trim())}”.` : 'Nothing active on this machine.';
-  $('issues').innerHTML = list.map((i) => `
+// A standalone-chat row — same two-line shape/fonts as an ENG card: line 1 is 💬 + title + time + ⋯,
+// line 2 (the summary slot) shows who's working on it.
+function chatRow(i) {
+  return `
+    <a class="issue chatrow ${i.identifier === S.sel ? 'sel' : ''}" data-id="${i.identifier}" href="#${encodeURIComponent(i.identifier)}">
+      <div class="row1"><span class="cico">💬</span><span class="ctitle" title="Double-click to rename">${esc(i.title || 'New chat')}</span>
+        ${i.chat.busy ? '<span class="busydot"></span>' : ''}<span class="time">${rel(i.at)}</span>
+        <span class="cmenu" title="Options">⋯</span></div>
+      <div class="summ">${i.ownerName ? esc(i.ownerName) : 'standalone workspace'}</div>
+    </a>`;
+}
+// An ENG-issue row (unchanged): id + outcome badge + summary.
+function issueRow(i) {
+  return `
     <a class="issue ${i.identifier === S.sel ? 'sel' : ''}" data-id="${i.identifier}" href="#${encodeURIComponent(i.identifier)}">
       <div class="row1"><span class="id">${esc(i.identifier)}</span>${badge(i.outcome)}
         ${i.chat.busy ? '<span class="busydot"></span>' : ''}<span class="time">${rel(i.at)}</span></div>
       <div class="summ">${esc(i.summary || i.title || i.branch || '')}</div>
-    </a>`).join('') || `<div style="padding:16px;color:var(--dim)">${empty}</div>`;
-  // Plain left-click = in-app select. Ctrl/⌘/Shift/middle-click fall through to the <a href="#ID">
-  // so the browser opens the issue in a new tab/window (the hash boots straight to it).
-  for (const el of $('issues').children) el.onclick = (ev) => {
-    if (ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.button === 1) return;
-    ev.preventDefault();
-    if (el.dataset.id) select(el.dataset.id);
-  };
-  // Bring the open issue into view once (on open/refresh) — but not on every background poll, which
-  // would yank the scroll if the user scrolled the list. The flag is set by select() and cleared here.
+    </a>`;
+}
+function section(key, label, rowsHtml) {
+  if (!rowsHtml.length) return '';
+  const collapsed = S.collapsed[key] ? ' collapsed' : '';
+  return `<div class="sec${collapsed}" data-sec="${key}">`
+    + `<div class="sechead"><span class="sect">${label}</span><span class="secn">${rowsHtml.length}</span><span class="secchev">▾</span></div>`
+    + `<div class="secbody">${rowsHtml.join('')}</div></div>`;
+}
+function renderIssues() {
+  const q = S.search.trim().toLowerCase();
+  // When searching, look across ALL items (not just the active set) so a resolved one isn't hidden.
+  let list = q ? S.issues : (S.showAll ? S.issues : S.issues.filter((i) => i.active));
+  if (q) list = list.filter((i) => `${i.identifier} ${i.summary || ''} ${i.title || ''} ${i.branch || ''}`.toLowerCase().includes(q));
+  const chats = list.filter((i) => i.standalone);
+  const issues = list.filter((i) => !i.standalone);
+  $('count').textContent = `${list.length} item${list.length === 1 ? '' : 's'}${q ? ' matched' : S.showAll ? '' : ' active'}`;
+  $('showAll').textContent = S.showAll ? 'active only' : 'show all';
+  $('searchClear').style.display = S.search ? 'block' : 'none';
+  const empty = q ? `No matches for “${esc(S.search.trim())}”.` : 'Nothing yet — start a chat, or wait for issues.';
+  const html = section('chats', 'Chats', chats.map(chatRow)) + section('issues', 'Issues', issues.map(issueRow));
+  $('issues').innerHTML = html || `<div style="padding:16px;color:var(--dim)">${empty}</div>`;
+  // Collapsible sections (persisted).
+  for (const sec of $('issues').querySelectorAll('.sec')) {
+    sec.querySelector('.sechead').onclick = () => {
+      const k = sec.dataset.sec; S.collapsed[k] = !S.collapsed[k];
+      sec.classList.toggle('collapsed', S.collapsed[k]);
+      try { localStorage.setItem('secCollapsed', JSON.stringify(S.collapsed)); } catch { /* private mode */ }
+    };
+  }
+  // Row click = select in-app; Ctrl/⌘/Shift/middle-click fall through to the <a href> (new tab). The
+  // close ✕ and title double-click are handled without navigating.
+  for (const el of $('issues').querySelectorAll('.issue')) {
+    el.onclick = (ev) => {
+      if (ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.button === 1) return;
+      if (ev.target.classList.contains('cmenu')) { ev.preventDefault(); ev.stopPropagation(); return chatMenu(ev.target, el.dataset.id, el.querySelector('.ctitle')); }
+      ev.preventDefault();
+      if (el.dataset.id) select(el.dataset.id);
+    };
+    const t = el.querySelector('.ctitle');
+    if (t) t.ondblclick = (ev) => { ev.preventDefault(); ev.stopPropagation(); startRename(el.dataset.id, t); };
+  }
   if (S.scrollToSel) { const sel = $('issues').querySelector('.issue.sel'); if (sel) { sel.scrollIntoView({ block: 'nearest' }); S.scrollToSel = false; } }
 }
+// Create a standalone chat owned by `email` and open it.
+async function newChat(email) {
+  try {
+    const d = await (await fetch('/api/chats', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: email || null }) })).json();
+    if (d.identifier) { lastIssuesJson = ''; await loadIssues(); select(d.identifier); }
+    else addSys('Could not create a chat' + (d.error ? `: ${d.error}` : '') + '.', 'err');
+  } catch (e) { addSys('Could not create a chat — ' + String(e.message || e) + '.', 'err'); }
+}
+// Inline-rename a standalone chat (Enter/blur saves, Esc cancels).
+function startRename(id, titleEl) {
+  const cur = titleEl.textContent;
+  titleEl.innerHTML = `<input type="text" spellcheck="false">`;
+  const inp = titleEl.querySelector('input'); inp.value = cur; inp.focus(); inp.select();
+  inp.onclick = (e) => e.stopPropagation();
+  let done = false;
+  const finish = async (commit) => {
+    if (done) return; done = true;
+    const v = inp.value.trim();
+    if (commit && v && v !== cur) {
+      try { await fetch(`/api/issues/${id}/chat/rename`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: v }) }); } catch { /* keep old */ }
+      if (S.sel === id && S.detail?.entry) { S.detail.entry.title = v; renderHeader(S.detail); }
+    }
+    lastIssuesJson = ''; loadIssues();
+  };
+  inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); finish(true); } else if (e.key === 'Escape') { e.preventDefault(); finish(false); } };
+  inp.onblur = () => finish(true);
+}
+// Close a standalone chat + delete its workspace (with confirm).
+async function closeChatFromList(id) {
+  if (!id || !confirm('Close this chat and delete its workspace? This cannot be undone.')) return;
+  try {
+    const r = await fetch(`/api/issues/${id}/chat/close`, { method: 'POST' });
+    if (!r.ok) { const d = await r.json().catch(() => ({})); addSys('⚠ ' + (d.error || 'close failed'), 'err'); return; }
+    if (S.sel === id) deselectClosed(id);
+    lastIssuesJson = ''; loadIssues();
+  } catch (e) { addSys('⚠ ' + String(e.message || e), 'err'); }
+}
+// Reset the main view after the open chat is closed (by Delete or the agent's [[CLOSE_CHAT]]).
+function deselectClosed(id) {
+  S.sel = null; S.detail = null; document.title = 'Autofix';
+  if (location.hash.slice(1) === id) history.replaceState(null, '', location.pathname + location.search);
+  $('empty').style.display = ''; $('hdr').style.display = 'none'; $('chat').style.display = 'none'; $('composer').style.display = 'none';
+  if (S.es) { S.es.close(); S.es = null; }
+}
+// ---------- small popover menu (chat ⋯ actions + the New-chat owner picker) ----------
+function closeMenu() { if (S.menu) { S.menu.remove(); S.menu = null; document.removeEventListener('mousedown', onMenuOutside, true); } }
+function onMenuOutside(ev) { if (S.menu && !S.menu.contains(ev.target)) closeMenu(); }
+// items: [{label, onClick, danger?} | {head}| {sep}]. Anchored under `anchorEl`.
+function showMenu(anchorEl, items) {
+  closeMenu();
+  const m = document.createElement('div'); m.className = 'popmenu';
+  m.innerHTML = items.map((it, i) => it.sep ? '<div class="pmsep"></div>' : it.head ? `<div class="pmhead">${esc(it.head)}</div>` : `<div class="pmi${it.danger ? ' danger' : ''}" data-i="${i}">${esc(it.label)}</div>`).join('');
+  document.body.appendChild(m);
+  const r = anchorEl.getBoundingClientRect();
+  m.style.top = Math.min(r.bottom + 4, window.innerHeight - m.offsetHeight - 8) + 'px';
+  m.style.left = Math.min(r.left, window.innerWidth - m.offsetWidth - 8) + 'px';
+  for (const el of m.querySelectorAll('.pmi')) el.onclick = (e) => { e.stopPropagation(); const it = items[+el.dataset.i]; closeMenu(); it.onClick && it.onClick(); };
+  S.menu = m;
+  setTimeout(() => document.addEventListener('mousedown', onMenuOutside, true), 0);
+}
+// Configured team members (cached) — who a chat can be owned by.
+async function loadMembers() {
+  if (S.members) return S.members;
+  try { S.members = (await (await fetch('/api/members')).json()).members || []; } catch { S.members = []; }
+  return S.members;
+}
+// ＋ New chat → pick who's working → create + open.
+async function newChatMenu(anchorEl) {
+  const members = await loadMembers();
+  if (!members.length) return newChat(null);
+  showMenu(anchorEl, [{ head: "Who's working on this?" }, ...members.map((m) => ({ label: m.firstName, onClick: () => newChat(m.email) }))]);
+}
+// The ⋯ menu on a chat row: rename, change owner, delete.
+function chatMenu(anchorEl, id, titleEl) {
+  showMenu(anchorEl, [
+    { label: '✎  Rename', onClick: () => (titleEl ? startRename(id, titleEl) : renamePrompt(id)) },
+    { label: '↔  Change owner', onClick: () => changeOwnerMenu(anchorEl, id) },
+    { sep: true },
+    { label: '🗑  Delete chat', danger: true, onClick: () => closeChatFromList(id) },
+  ]);
+}
+async function renamePrompt(id) {
+  const cur = S.detail?.entry?.title || '';
+  const v = prompt('Rename chat', cur);
+  if (v == null) return;
+  const t = v.trim(); if (!t || t === cur) return;
+  try { await fetch(`/api/issues/${id}/chat/rename`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: t }) }); } catch { /* ignore */ }
+  if (S.sel === id && S.detail?.entry) { S.detail.entry.title = t; renderHeader(S.detail); }
+  lastIssuesJson = ''; loadIssues();
+}
+// Re-assign who's working (updates the label + which GitHub PAT / Linear key the agent uses).
+async function changeOwnerMenu(anchorEl, id) {
+  const members = await loadMembers();
+  showMenu(anchorEl, [{ head: "Who's working now?" }, ...members.map((m) => ({
+    label: m.firstName,
+    onClick: async () => {
+      try { await fetch(`/api/issues/${id}/chat/owner`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: m.email }) }); } catch { /* ignore */ }
+      if (S.sel === id && S.detail?.entry) { S.detail.entry.ownerName = m.firstName; renderHeader(S.detail); }
+      lastIssuesJson = ''; loadIssues();
+    },
+  }))]);
+}
+$('newChat').onclick = (ev) => newChatMenu(ev.currentTarget);
 $('showAll').onclick = () => { S.showAll = !S.showAll; lastIssuesJson = ''; renderIssues(); };
 $('search').addEventListener('input', (ev) => { S.search = ev.target.value; lastIssuesJson = ''; renderIssues(); });
 $('searchClear').onclick = () => { S.search = ''; $('search').value = ''; $('search').focus(); lastIssuesJson = ''; renderIssues(); };
@@ -993,6 +1165,15 @@ function handleEvent(e) {
       break;
     case 'error': addSys('⚠ ' + e.error, 'err'); break;
     case 'aborted': addSys('⏹ aborted', 'err'); break;
+    case 'closed': // the agent closed this standalone chat ([[CLOSE_CHAT]]) — drop the view + refresh the list
+      addSys('✓ Chat closed and its workspace removed.', 'sys');
+      setBusy(false); if (S.sel) deselectClosed(S.sel); lastIssuesJson = ''; loadIssues();
+      break;
+    case 'owner_changed': // the agent handed the chat to a different person ([[OWNER: …]])
+      addSys(`↔ Now working: ${e.ownerName}. Their GitHub PAT & Linear key will be used from the next turn.`, 'sys');
+      if (S.detail?.entry) { S.detail.entry.ownerName = e.ownerName; renderHeader(S.detail); }
+      lastIssuesJson = ''; loadIssues();
+      break;
     case 'done':
       // Stamp the just-finished assistant bubble now — renderAll (which stamps from the persisted
       // `at`) is skipped when the reader has scrolled up, so don't rely on it for the live message.
