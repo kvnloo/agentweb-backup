@@ -391,9 +391,9 @@ function handleEvents(identifier, req, res) {
 // prompt, SIGKILL-the-group on timeout) but parsing `--output-format stream-json` NDJSON
 // incrementally instead of buffering one JSON envelope.
 
-function chatArgs(cap, sessionId) {
+function chatArgs(cap, sessionId, modelOverride) {
   const m = CHAT[cap] || {};
-  const a = ['-p', '--output-format', 'stream-json', '--verbose', '--model', m.model, '--max-turns', String(m.maxTurns)];
+  const a = ['-p', '--output-format', 'stream-json', '--verbose', '--model', modelOverride || m.model, '--max-turns', String(m.maxTurns)];
   if (cap === 'readOnly') a.push('--allowedTools', (m.allowedTools || []).join(','));
   else a.push('--dangerously-skip-permissions');
   if (sessionId) a.push('--resume', sessionId);
@@ -1158,11 +1158,14 @@ async function runBtw(identifier, question) {
       // Follow-up: resume the side thread (it remembers earlier /btw Q&A); refresh it on the main convo.
       prompt = `${mainCtx}\n[Continue our side thread. Read-only, standalone, concise. Answer the developer's follow-up.]\n\nSide question: ${q}`;
     } else {
-      // First /btw: seed the curated issue context + the main conversation, framed as an isolated aside.
+      // First /btw: seed the curated context + the main conversation, framed as an isolated aside.
       const framed = `[You are a "/btw" SIDE THREAD. You can read the main conversation (below) and the codebase, and you'll remember THIS side thread for the developer's follow-ups — but nothing here is added to the main conversation or its context. Read-only: change nothing. Answer concisely and standalone.]\n${mainCtx}\n\nSide question: ${q}`;
-      prompt = freshPrompt('readOnly', identifier, found.entry, await fetchLinear(identifier), cwd, framed, '');
+      prompt = found.entry.standalone
+        ? `You are a READ-ONLY side thread in a standalone chat titled "${found.entry.title || 'New chat'}" (worktree ${cwd}, branch ${found.entry.branch}). Read the code and the main conversation to answer; change nothing.\n${framed}`
+        : freshPrompt('readOnly', identifier, found.entry, await fetchLinear(identifier), cwd, framed, '');
     }
-    const out = await runClaudeStream(chatArgs('readOnly', btwSid), prompt, cwd, CHAT.readOnly?.timeoutMs || 10 * 60 * 1000,
+    // Read-only tools (from the readOnly cap), but on Sonnet — a side aside doesn't need Opus.
+    const out = await runClaudeStream(chatArgs('readOnly', btwSid, CHAT.btwModel), prompt, cwd, CHAT.readOnly?.timeoutMs || 10 * 60 * 1000,
       (e) => { if (e.type === 'init') sid = e.sessionId; }, null);
     if (out.timedOut) return { code: 504, error: 'the side question timed out' };
     const answer = (out.texts.join('\n\n').trim()) || (out.result?.result || '').trim() || '(no answer)';

@@ -268,6 +268,8 @@ export const config = {
   chat: {
     port: 8790,
     bind: '127.0.0.1',               // NEVER 0.0.0.0 — no auth layer; SSH tunnel only
+    btwModel: 'sonnet',              // /btw side-thread model — a read-only aside doesn't need Opus, so it
+                                     // runs on Sonnet (cheaper) while keeping the read-only tool set.
     resumePipelineSession: false,    // default: curated fresh context (above). Set true to instead RESUME
                                      // the fixer's own Claude session on the first turn for raw native
                                      // memory — costs ~380k tokens of low-signal transcript reloaded every
