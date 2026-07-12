@@ -72,12 +72,11 @@ async function main() {
   const dirs = readdirSync(worktreesDir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
   if (!dirs.length) { log('no worktrees'); return; }
 
-  let state = {}; try { state = JSON.parse(readFileSync(statePath, 'utf8')); } catch { /* none */ }
-  let removed = 0;
+  const removedIds = [];
   for (const id of dirs) {
     let issue;
     try { issue = await resolveIssue(id); }
-    catch (e) { log(`skip ${id} (could not resolve: ${e.message})`); continue; }
+    catch (e) { log(`skip ${id} (could not resolve: ${e.message})`); continue; } // e.g. a standalone CHAT-* worktree — not a Linear issue, never reaped here
     const type = issue.state?.type;
     // Something may be mid-flight in this worktree — a chat turn (full OR read-only), a poller
     // fix/revision, or a background preview rebuild all hold a self-healing lock for their duration.
@@ -92,13 +91,17 @@ async function main() {
       removeWorktree(id);
       cleanChatForks(id);
       rmSync(path.join(logsDir, id), { recursive: true, force: true }); // stage/chat tee logs for this issue
-      for (const k of Object.keys(state)) if (state[k].identifier === id) delete state[k];
-      removed++;
+      removedIds.push(id);
     } else {
       log(`${id} still "${issue.state?.name}" (${type}) → keep`);
     }
   }
+  // Re-read state FRESH before writing so this run's slow async loop can't clobber entries the chat
+  // server added meanwhile (notably new standalone chats). Apply ONLY the deletions we actually made.
+  let state = {}; try { state = JSON.parse(readFileSync(statePath, 'utf8')); } catch { /* none */ }
+  for (const k of Object.keys(state)) if (removedIds.includes(state[k].identifier)) delete state[k];
   writeFileSync(statePath, JSON.stringify(state, null, 2));
+  const removed = removedIds.length;
   log(`done — removed ${removed} worktree(s)`);
 }
 

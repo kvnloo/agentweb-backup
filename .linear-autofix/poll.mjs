@@ -94,6 +94,7 @@ async function recoverStale() {
   catch (e) { console.error('[poll] stale sweep failed:', e.message); return; }
   if (!stale.length) return;
   const state = loadState();
+  const changed = {}; // only the entries we actually touch, so we can re-apply against a FRESH read
   for (const issue of stale) {
     const entry = state[issue.id];
     if (!entry || entry.outcome !== 'started') continue; // human-owned issue or a finished run
@@ -103,15 +104,17 @@ async function recoverStale() {
         const sid = (await findStateId(issue.team.id, 'Backlog', 'backlog')) || (await findStateId(issue.team.id, 'Todo', 'unstarted'));
         if (sid) await moveIssue(issue.id, sid);
         await addComment(issue.id, '⚠️ **Auto-fix run appears to have crashed** (the issue sat In Progress with no result). Resetting it so the poller retries once.');
-        state[issue.id] = { ...entry, outcome: 'recovered', recoveries: 1, at: new Date().toISOString() };
+        changed[issue.id] = { ...entry, outcome: 'recovered', recoveries: 1, at: new Date().toISOString() };
       } else {
         log(`${issue.identifier} crashed again after a recovery — flagging for a human`);
         await addComment(issue.id, '🔴 **Auto-fix crashed twice on this issue — needs a human.** It will not be retried automatically.');
-        state[issue.id] = { ...entry, outcome: 'recovery_failed', at: new Date().toISOString() };
+        changed[issue.id] = { ...entry, outcome: 'recovery_failed', at: new Date().toISOString() };
       }
     } catch (e) { console.error(`[poll] recovery of ${issue.identifier} failed:`, e.message); }
   }
-  saveState(state);
+  // Re-read FRESH and apply only our changes, so the await-heavy loop above can't clobber entries the
+  // chat server added meanwhile (e.g. new standalone chats).
+  if (Object.keys(changed).length) { const fresh = loadState(); Object.assign(fresh, changed); saveState(fresh); }
 }
 
 // Human feedback loop: a Linear comment starting with the trigger (default "revise:") on a
