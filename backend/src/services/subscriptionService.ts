@@ -1,5 +1,5 @@
 import { settingsService } from "./settingsService";
-import { userDb } from "./db";
+import { userDb, orgDb } from "./db";
 import { CUSTOMER_PORTAL_PAGES } from "./customerPortalPages";
 import { skillService } from "./skillService";
 
@@ -56,6 +56,21 @@ export async function getTierConfig(tierName: string): Promise<SubscriptionType 
 export async function getUserSubscriptionType(userId: string): Promise<string> {
   try {
     const user = await userDb.getUserById(userId);
+    // Org members inherit the org owner's tier dynamically — the org's effective
+    // tier is whatever the owner currently holds (orgs carry no tier field).
+    // Resolving at read time (instead of snapshotting the owner's tier onto the
+    // member on invite-accept) keeps members in sync when the owner up/downgrades
+    // and automatically revokes access the moment they leave the org (orgId/
+    // orgRole are cleared on leave/remove). This is the ENG-288 root cause: the
+    // /me endpoint already resolved a member's tier from the owner, but the
+    // member-id call sites (agent mode, Emma) read the member's own record.
+    if (user?.orgId && user.orgRole === "member" && orgDb?.getOrgById) {
+      const org = await orgDb.getOrgById(user.orgId);
+      if (org?.ownerUserId && org.ownerUserId !== userId) {
+        const owner = await userDb.getUserById(org.ownerUserId);
+        return owner?.subscriptionType || "Free";
+      }
+    }
     return user?.subscriptionType || "Free";
   } catch (error) {
     console.error("Error getting user subscription type:", error);

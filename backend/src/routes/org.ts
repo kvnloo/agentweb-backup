@@ -372,32 +372,12 @@ router.post("/accept-invite", async (req: Request, res: Response) => {
     updatedInvites.splice(inviteIndex, 1);
     await orgDb.updateOrg(orgId, { pendingInvites: updatedInvites });
 
-    // Provision the new member with the org owner's subscription tier so they
-    // inherit the org's entitlements instead of staying on their signup Free
-    // tier. Without this, gated features (e.g. Landing Pages) stay locked and
-    // org-shared assets are unreachable for the invitee even after the owner
-    // shares them — the ENG-288 "wrong tier & no shared assets" report. The
-    // owner's persisted subscriptionType/allowedPages/allowedSkills ARE the
-    // org's effective tier (orgs don't carry their own tier field).
-    const tierInheritance: {
-      subscriptionType?: string | null;
-      allowedPages?: string[];
-      allowedSkills?: string[];
-    } = {};
-    const owner = await userDb.getUserById(org.ownerUserId);
-    if (owner) {
-      tierInheritance.subscriptionType = owner.subscriptionType ?? "Free";
-      if (owner.allowedPages) tierInheritance.allowedPages = owner.allowedPages;
-      if (owner.allowedSkills) tierInheritance.allowedSkills = owner.allowedSkills;
-    }
-
-    // Add user to org and clear the pending invite stamp
-    await userDb.updateUser(userId, {
-      orgId,
-      orgRole: "member",
-      pendingOrgInvite: null,
-      ...tierInheritance,
-    });
+    // Add user to org and clear the pending invite stamp. We intentionally do
+    // NOT snapshot the owner's subscription tier onto the member here — the org's
+    // effective tier is resolved dynamically from the owner at read time
+    // (getUserSubscriptionType), which keeps members in sync with owner up/
+    // downgrades and auto-revokes entitlements when they leave. See ENG-288.
+    await userDb.updateUser(userId, { orgId, orgRole: "member", pendingOrgInvite: null });
 
     return res.json({ success: true, message: "Successfully joined the organization" });
   } catch (error) {
