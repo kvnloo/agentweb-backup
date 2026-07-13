@@ -903,6 +903,107 @@ export class GoogleAdsService {
     }));
   }
 
+  /**
+   * Read every destination the UTM audit must judge for this account (ENG-239 AC3).
+   * STRICTLY READ-ONLY.
+   *
+   * TWO resource types, because our tagger writes to two:
+   *
+   *   1. `ad_group_ad` — a normal ad. Tagged via the ad's native `final_url_suffix`
+   *      (`buildAdFinalUrlSuffix`), which Google appends to the final URL at click time.
+   *
+   *   2. `asset_group` — a Performance Max campaign. A PMax campaign has NO ad_group_ads at
+   *      all; its destinations live on `asset_group.final_urls`. Reading only ad_group_ad would
+   *      see zero ads for such a campaign and the audit would report it `tagged: true`
+   *      VACUOUSLY — a clean bill of health for a campaign we never actually looked at. That
+   *      is worse than a false "untagged": the team trusts the report and skips a client who
+   *      has no attribution at all.
+   *
+   * INHERITANCE — the thing that must not be got wrong: Google resolves `final_url_suffix`
+   * most-specific-wins (ad > ad group > campaign > account) and the winner REPLACES the
+   * others; they are NEVER concatenated. So an ad's effective suffix is its own if set, else
+   * the campaign's. Concatenating (or ignoring the campaign level) would report a properly
+   * tagged campaign as untagged — a false positive the team would act on.
+   *
+   * ASSET-GROUP SUFFIX: an asset group has NO `final_url_suffix` field of its own (that is
+   * precisely why `createAssetGroup` merges the UTMs straight into `final_urls` — see :1072).
+   * Its append field is therefore the CAMPAIGN's suffix and nothing else. Selecting
+   * `asset_group.final_url_suffix` in GAQL would not merely be wrong, it would fail the whole
+   * query and take the audit down with it.
+   *
+   * Ad-group-level suffixes are not read: `buildAdFinalUrlSuffix` only ever inherits from the
+   * campaign, so an ad-group suffix is a location our writer does not use. It could only ever
+   * make the audit MORE lenient, never produce a false "untagged".
+   *
+   * `destinationUrls` is the whole `finalUrls` array — every one of them must carry the UTMs,
+   * not just `finalUrls[0]`.
+   */
+  async listAdsForUtmAudit(
+    userId: string,
+    customerId: string,
+    campaignId?: string,
+  ): Promise<Array<{
+    adId: string;
+    campaignId: string;
+    campaignName: string;
+    destinationUrls: string[];
+    appendField?: string;
+  }>> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+
+    // Campaign ids are numeric; the guard keeps a caller-supplied value out of the GAQL text.
+    const where = campaignId && /^\d+$/.test(campaignId) ? ` WHERE campaign.id = ${campaignId}` : '';
+
+    const adQuery =
+      'SELECT campaign.id, campaign.name, campaign.final_url_suffix, ' +
+      'ad_group_ad.ad.id, ad_group_ad.ad.final_urls, ad_group_ad.ad.final_url_suffix ' +
+      'FROM ad_group_ad' + where;
+
+    // NOTE: no `asset_group.final_url_suffix` — that field does not exist on the resource.
+    const assetGroupQuery =
+      'SELECT campaign.id, campaign.name, campaign.final_url_suffix, ' +
+      'asset_group.id, asset_group.final_urls ' +
+      'FROM asset_group' + where;
+
+    const [adRows, assetGroupRows] = await Promise.all([
+      this.search(customerId, accessToken, adQuery, loginCustomerId),
+      this.search(customerId, accessToken, assetGroupQuery, loginCustomerId),
+    ]);
+
+    const urls = (value: any): string[] =>
+      (Array.isArray(value) ? value : []).filter((u: any) => typeof u === 'string' && u.trim());
+
+    const ads = adRows.map((r: any) => {
+      const ad = r.adGroupAd?.ad ?? {};
+      const campaign = r.campaign ?? {};
+      return {
+        adId: String(ad.id ?? ''),
+        campaignId: campaign.id != null ? String(campaign.id) : '',
+        campaignName: campaign.name ?? '',
+        destinationUrls: urls(ad.finalUrls),
+        // Most-specific-wins: the ad's suffix REPLACES the campaign's, never appends to it.
+        appendField: ad.finalUrlSuffix || campaign.finalUrlSuffix || undefined,
+      };
+    });
+
+    const assetGroups = assetGroupRows.map((r: any) => {
+      const assetGroup = r.assetGroup ?? {};
+      const campaign = r.campaign ?? {};
+      return {
+        // Namespaced so an asset group is never mistaken for an ad id in the report — the two
+        // are different resources and are actioned differently.
+        adId: `assetGroup/${assetGroup.id ?? ''}`,
+        campaignId: campaign.id != null ? String(campaign.id) : '',
+        campaignName: campaign.name ?? '',
+        destinationUrls: urls(assetGroup.finalUrls),
+        // Campaign level ONLY — an asset group has no suffix field of its own.
+        appendField: campaign.finalUrlSuffix || undefined,
+      };
+    });
+
+    return [...ads, ...assetGroups];
+  }
+
   async createAd(userId: string, customerId: string, params: {
     adGroupResourceName: string;
     type: 'RESPONSIVE_SEARCH_AD' | 'RESPONSIVE_DISPLAY_AD';

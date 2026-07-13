@@ -1238,6 +1238,118 @@ export class MetaService {
   }
 
   /**
+   * Every destination URL on a creative (ENG-239 AC3, read side).
+   *
+   * This is the exact mirror of `createAdCreative` / `createPlacementCustomizedCreative`'s
+   * write sites, plus `creative.link_url` (which Meta populates and Ads Manager writes
+   * directly). Read/write symmetry is the correctness bar: a location we fail to read is
+   * a healthy ad reported as "untagged", and acting on that means swapping a live creative
+   * and resetting its learning phase.
+   *
+   *   creative.link_url                                             (top-level / Ads Manager)
+   *   object_story_spec.link_data.link                              (single image; carousel fallback :1044)
+   *   object_story_spec.link_data.call_to_action.value.link         (:1058, :1071)
+   *   object_story_spec.link_data.child_attachments[].link          (carousel cards :1047)
+   *   object_story_spec.link_data.child_attachments[].call_to_action.value.link  (per-card CTA :1055)
+   *   object_story_spec.video_data.call_to_action.value.link        (:1029)
+   *   asset_feed_spec.link_urls[].website_url                       (placement-customized :1174)
+   *
+   * Deliberately NOT read: `link_data.caption`. The writer sets it to the link URL, but it is
+   * a DISPLAY field — Ads Manager routinely holds a bare domain ("example.com") there, which
+   * `readUtmKeys` cannot parse, and one unparseable URL marks the whole ad unreadable. It is
+   * never a click destination, so reading it would only manufacture noise.
+   *
+   * Returns [] when nothing is extractable. The audit classes that `unreadable` and surfaces
+   * it for a human — we never invent a placeholder URL.
+   */
+  private static extractCreativeDestinationUrls(creative: any): string[] {
+    // Graph subfields arrive as plain objects, but tolerate an SDK node wrapper.
+    const c = creative?._data ?? creative;
+    if (!c || typeof c !== 'object') return [];
+
+    const urls: string[] = [];
+    const push = (u: unknown) => {
+      if (typeof u === 'string' && u.trim()) urls.push(u.trim());
+    };
+
+    push(c.link_url);
+
+    const oss = c.object_story_spec ?? {};
+
+    const linkData = oss.link_data ?? {};
+    push(linkData.link);
+    push(linkData.call_to_action?.value?.link);
+    for (const card of Array.isArray(linkData.child_attachments) ? linkData.child_attachments : []) {
+      push(card?.link);
+      push(card?.call_to_action?.value?.link);
+    }
+
+    push(oss.video_data?.call_to_action?.value?.link);
+
+    const linkUrls = c.asset_feed_spec?.link_urls;
+    for (const entry of Array.isArray(linkUrls) ? linkUrls : []) {
+      push(entry?.website_url);
+    }
+
+    return [...new Set(urls)];
+  }
+
+  /**
+   * Read every ad's destination URLs and creative-level `url_tags` for the UTM audit
+   * (ENG-239 AC3). STRICTLY READ-ONLY.
+   *
+   * Mirrors `listAds`: same SDK edge, same `effective_status` filter, so an ad paused at
+   * campaign/adset level is audited rather than silently omitted (an omitted ad reads as a
+   * vacuously-tagged campaign — a false negative that hides missing attribution).
+   *
+   * `campaignId` scopes the read to one campaign via Meta's `filtering` param; the caller
+   * ALSO filters client-side, so a filter the API ignores can never attribute another
+   * campaign's ads to this one.
+   */
+  public async listAdsForUtmAudit(
+    adAccountId: string,
+    accessToken: string,
+    campaignId?: string,
+  ): Promise<Array<{ adId: string; campaignId: string; destinationUrls: string[]; urlTags?: string }>> {
+    try {
+      this.initApi(accessToken);
+      const account = new AdAccount(`act_${adAccountId}`);
+      const fields = [
+        'id',
+        'campaign_id',
+        'creative{id,link_url,url_tags,object_story_spec,asset_feed_spec}',
+      ];
+      const params: Record<string, any> = {
+        effective_status: [
+          'ACTIVE', 'PAUSED', 'CAMPAIGN_PAUSED', 'ADSET_PAUSED',
+          'PENDING_REVIEW', 'DISAPPROVED', 'PREAPPROVED',
+          'PENDING_BILLING_INFO', 'IN_PROCESS', 'WITH_ISSUES'
+        ],
+      };
+      if (campaignId) {
+        params.filtering = [{ field: 'campaign.id', operator: 'IN', value: [campaignId] }];
+      }
+      this.log(`Listing ads for UTM audit in account: ${adAccountId}`, { fields, campaignId });
+      const ads = await account.getAds(fields, params);
+      return ads.map((a: any) => {
+        const data = a._data ?? a;
+        const creative = data.creative;
+        const urlTags = (creative?._data ?? creative)?.url_tags;
+        return {
+          adId: String(data.id),
+          campaignId: data.campaign_id != null ? String(data.campaign_id) : '',
+          destinationUrls: MetaService.extractCreativeDestinationUrls(creative),
+          urlTags: typeof urlTags === 'string' && urlTags.trim() ? urlTags : undefined,
+        };
+      });
+    } catch (error) {
+      // handleError always throws — a failed read must never look like "no ads"
+      // (which the audit would report as a vacuously tagged, healthy account).
+      return this.handleError(error, 'listAdsForUtmAudit') as never;
+    }
+  }
+
+  /**
    * Create a new ad
    */
   public async createAd(adAccountId: string, accessToken: string, params: MetaAdsAdParams) {

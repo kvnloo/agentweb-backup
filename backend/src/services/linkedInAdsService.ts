@@ -699,6 +699,141 @@ export async function listCreatives(
   );
 }
 
+// ─── UTM audit (ENG-239 AC3, read side) ───────────────────────────────────────
+
+/**
+ * Every key `appendLinkedInUtm` writes a destination URL to, across its eight call
+ * sites. Read/write symmetry is the correctness bar for the audit: a shape we fail to
+ * read is a healthy ad reported "untagged", and acting on that means republishing a
+ * live creative.
+ *
+ *   landingPage               — carousel card (createPost, createCreativeInline),
+ *                               text ad (createCreative), spotlight (createDynamicCreative),
+ *                               conversation-ad button (createConversationAdContent)
+ *   contentLandingPage        — carousel post (createPost, createCreativeInline)
+ *   callToActionLandingPageUrl— InMail CTA (createInMailContent)
+ *
+ * The snake_case variants are the request-side param names (`card.landing_page`,
+ * `content_landing_page`); LinkedIn echoes camelCase, but reading both costs nothing and
+ * makes the read strictly a superset of the write.
+ */
+const LI_LANDING_PAGE_KEYS = new Set([
+  'landingPage',
+  'landing_page',
+  'contentLandingPage',
+  'content_landing_page',
+  'callToActionLandingPageUrl',
+  'call_to_action_landing_page_url',
+]);
+
+/**
+ * Collect landing pages from anywhere in a creative.
+ *
+ * A key-based walk rather than a list of fixed paths, deliberately: LinkedIn nests the SAME
+ * `landingPage` key differently for every ad format (content.carousel.cards[], content.textAd,
+ * content.spotlight, content.sponsoredMessageContent.buttons[], subContent.regular…), and the
+ * read-back shape does not always match the write shape. Keying on the field name makes the
+ * read total over every format — including formats added later — instead of silently missing
+ * whichever one a new writer starts using.
+ */
+function collectLandingPages(node: any, out: string[], depth = 0): void {
+  if (!node || depth > 10) return;
+  if (Array.isArray(node)) {
+    for (const item of node) collectLandingPages(item, out, depth + 1);
+    return;
+  }
+  if (typeof node !== 'object') return;
+  for (const [key, value] of Object.entries(node)) {
+    if (LI_LANDING_PAGE_KEYS.has(key)) {
+      if (typeof value === 'string' && value.trim()) out.push(value.trim());
+    } else {
+      collectLandingPages(value, out, depth + 1);
+    }
+  }
+}
+
+/** The bare numeric id in a `urn:li:sponsoredCampaign:123` URN (or the value as-is). */
+function bareCampaignId(value: unknown): string {
+  const raw = typeof value === 'string' ? value : String(value ?? '');
+  const match = raw.match(/urn:li:sponsoredCampaign:(\d+)/);
+  return match ? match[1] : raw;
+}
+
+/**
+ * Read every creative's landing pages for the UTM audit (ENG-239 AC3). STRICTLY READ-ONLY.
+ *
+ * `appendField` is always `undefined` — LinkedIn has no native tracking/append field, so the
+ * UTMs must be on the URL itself or they are not there at all. Inventing an append field here
+ * would make untagged ads look tagged.
+ *
+ * Throws on an API failure rather than returning []. An empty list is indistinguishable from
+ * "campaign has no ads", which the audit reports as vacuously tagged — a silent all-clear is
+ * the one failure mode an audit must not have.
+ *
+ * KNOWN LIMIT: a sponsored-content creative that merely references a post
+ * (`content.reference: urn:li:share:…`) carries no landing page of its own — the URL lives on
+ * the post, which this endpoint does not expand. Such ads come back with `destinationUrls: []`
+ * and the audit classes them `unreadable` (surfaced for a human), never `untagged`. That is the
+ * safe direction: it can under-report, never manufacture a false positive to act on.
+ */
+export async function listAdsForUtmAudit(
+  accessToken: string,
+  adAccountId: string,
+  campaignId?: string,
+): Promise<Array<{
+  adId: string;
+  campaignId: string;
+  campaignName: string;
+  destinationUrls: string[];
+  appendField?: string;
+}>> {
+  let campaigns: Array<{ id: string; name: string }>;
+
+  if (campaignId) {
+    campaigns = [{ id: bareCampaignId(campaignId), name: '' }];
+  } else {
+    const result = await listCampaigns(accessToken, adAccountId);
+    if (!result.success) {
+      throw new Error(`LinkedIn UTM audit: could not list campaigns — ${result.error}`);
+    }
+    campaigns = (result.data?.elements ?? []).map((c: any) => ({
+      id: bareCampaignId(c.id),
+      name: c.name ?? '',
+    }));
+  }
+
+  const ads: Array<{
+    adId: string;
+    campaignId: string;
+    campaignName: string;
+    destinationUrls: string[];
+    appendField?: string;
+  }> = [];
+
+  for (const campaign of campaigns) {
+    const result = await listCreatives(accessToken, adAccountId, campaign.id);
+    if (!result.success) {
+      throw new Error(
+        `LinkedIn UTM audit: could not list creatives for campaign ${campaign.id} — ${result.error}`,
+      );
+    }
+    for (const creative of result.data?.elements ?? []) {
+      const urls: string[] = [];
+      collectLandingPages(creative, urls);
+      ads.push({
+        adId: String(creative.id ?? ''),
+        campaignId: bareCampaignId(creative.campaign) || campaign.id,
+        campaignName: campaign.name,
+        destinationUrls: [...new Set(urls)],
+        // LinkedIn has no native append field. Never fabricate one.
+        appendField: undefined,
+      });
+    }
+  }
+
+  return ads;
+}
+
 export async function createCreative(
   accessToken: string,
   params: Record<string, any>
