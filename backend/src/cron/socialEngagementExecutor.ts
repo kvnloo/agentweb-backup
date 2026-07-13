@@ -452,7 +452,7 @@ export class SocialEngagementExecutor {
                 model: COMMENT_MODEL,
                 provider: 'gemini',
                 feature: 'social_engagement_comment',
-            }, completion, { burnOnly: true });
+            }, completion, { mode: 'burn' });
             const sanitized = sanitizeGeneratedComment(completion.choices[0]?.message?.content);
             if (sanitized) return sanitized;
             console.warn(`[Executor] Generated comment rejected by sanitizer (refusal/meta/empty), skipping comment.`);
@@ -480,7 +480,7 @@ export class SocialEngagementExecutor {
                 model: COMMENT_MODEL,
                 provider: 'gemini',
                 feature: 'social_engagement_reaction',
-            }, completion, { burnOnly: true });
+            }, completion, { mode: 'burn' });
             const raw = completion.choices[0]?.message?.content?.trim().toUpperCase() as LinkedInReaction;
             if (VALID_REACTIONS.includes(raw)) return raw;
             console.warn(`[Executor] LLM returned invalid reaction "${raw}", defaulting to LIKE`);
@@ -588,7 +588,7 @@ export class SocialEngagementExecutor {
                 model: COMMENT_MODEL,
                 provider: 'gemini',
                 feature: 'social_engagement_reply',
-            }, completion, { burnOnly: true });
+            }, completion, { mode: 'burn' });
             const sanitized = sanitizeGeneratedComment(completion.choices[0]?.message?.content);
             if (sanitized) return sanitized;
             console.warn(`[Executor] Generated reply rejected by sanitizer (refusal/meta/empty), skipping reply.`);

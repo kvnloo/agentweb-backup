@@ -156,13 +156,27 @@ export interface MeterFromResponseContext {
 }
 
 /**
+ * How a metered call is accounted:
+ *   - 'meter' (default) -> burn visibility AND the enforced per-user cap deduction.
+ *   - 'burn'            -> burn visibility ONLY (platform absorbs the cost; still
+ *                          attributed to the user, but never charges the cap).
+ *
+ * 'meter' is a SUPERSET of 'burn' — it always records the burn and then also deducts.
+ * So flipping a site from { mode: 'burn' } to the default (or { mode: 'meter' }) ADDS
+ * the deduction on top of the burn; it never loses the visibility.
+ */
+export type MeterMode = "burn" | "meter";
+
+/**
  * ONE-LINER metering hook for any direct-provider (non-factory) token-based LLM call.
  * Extracts token usage from the raw provider `response` (any of OpenAI/Azure, Anthropic
  * Messages, Bedrock Converse, or Gemini shapes) and meters it:
- *   - default            -> meterUserUsage (shadow analytics + per-user cap)
- *   - { burnOnly: true } -> recordUsage only (platform absorbs the cost; still attributed
- *                           to the user for burn visibility, but never charges the cap —
- *                           used for deep research, email drafts, session titles, etc.)
+ *   - default / { mode: 'meter' } -> shadow analytics (burn) + the per-user cap deduction
+ *   - { mode: 'burn' }            -> burn only; used for deep research, email drafts,
+ *                                    session titles, background automation, etc.
+ *
+ * Deduction only happens when a real ctx.userId is present — with no user, 'meter'
+ * degrades to a bare burn record under "system", so a site can never deduct against nobody.
  *
  * Fire-and-forget + fail-open: it never throws into, awaits, or slows the caller. When the
  * response carries no usage, the call is still recorded (with zero tokens) so call volume
@@ -172,7 +186,7 @@ export interface MeterFromResponseContext {
 export function meterUsageFromResponse(
   ctx: MeterFromResponseContext,
   response: any,
-  opts?: { burnOnly?: boolean }
+  opts?: { mode?: MeterMode }
 ): void {
   try {
     const usage =
@@ -191,7 +205,7 @@ export function meterUsageFromResponse(
       cacheReadTokens: usage.cacheReadTokens,
       cacheWriteTokens: usage.cacheWriteTokens,
     };
-    if (opts?.burnOnly) {
+    if (opts?.mode === "burn") {
       void recordUsage(meterCtx);
     } else {
       meterUserUsage(meterCtx);

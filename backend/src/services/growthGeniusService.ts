@@ -112,7 +112,7 @@ Remember: You're here to help startups and businesses grow through smart marketi
         model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
         provider: 'azure',
         feature: 'growth_genius_title',
-      }, response, { burnOnly: true });
+      }, response, { mode: 'burn' });
 
       const raw = response.choices[0]?.message?.content?.trim() || '';
       // Extract first line, strip markdown, hard-truncate to 60 chars
