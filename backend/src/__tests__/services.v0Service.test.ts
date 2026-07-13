@@ -172,8 +172,8 @@ import {
   assertNoDuplicateInjectedRoutes,
 } from "../services/v0Service";
 
-import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
-import { _resetV0UsageGuardForTest } from "../services/v0UsageGuard";
+import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord } from "../services/v0Service";
+import { _resetV0UsageGuardForTest, guardedV0ChatCreate } from "../services/v0UsageGuard";
 const { enqueueAutoHumanEval } = jest.requireMock("../services/autoHumanEvalService");
 
 async function createMinimalV0Zip(): Promise<Buffer> {
@@ -927,6 +927,139 @@ describe("v0Service - multi-site routing (DURABLE_LANDING_GENERATION=on)", () =>
 
     expect(mockPut.mock.calls[0][0].Item.originatingSessionId).toBe("sess-9");
   });
+});
+
+describe("v0Service - ENG-287 residual hardening", () => {
+  const statusesWritten = () =>
+    mockUpdate.mock.calls
+      .map((c: any) => c[0].ExpressionAttributeValues?.[":status"])
+      .filter(Boolean);
+
+  it("a first-page build stays `generating` while v0 generates — never `draft` (ENG-287 residual F3)", async () => {
+    // Async create returns a chatId in seconds and the ~16-min poll now happens inside
+    // deployLandingPage. The record used to be flipped to `draft` first, so a first-page
+    // build spent its ENTIRE generation in a status that IN_FLIGHT_STATUSES, the
+    // abandoned-build janitor, and route-reuse all ignore. Agent mode (10-min run
+    // timeout) then could not find the in-flight job, told the user it FAILED, and a
+    // retry started a duplicate build with a second repo and a second Vercel project.
+    // `draft` keeps its real meaning: "has an undeployed version ready".
+    mockQuery.mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) });
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_1" });
+    // Version is still pending on the first poll, completed on the second — i.e. the
+    // record is mid-generation, which is exactly the window that used to read `draft`.
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v1", status: "pending" } })
+      .mockResolvedValue({ latestVersion: { id: "v1", status: "completed" } });
+    mockChatsDownloadVersion.mockRejectedValue(new Error("stop here — we only care about the status window"));
+
+    await generateLandingPage("user-1", "Launch", "Acme Home", {});
+
+    expect(statusesWritten()).not.toContain("draft");
+    expect(statusesWritten()).toContain("generating");
+    mockChatsGetById.mockReset();
+    mockChatsDownloadVersion.mockReset();
+  });
+
+  it("deployLandingPage preserves error.code on rethrow — the dead-chat branch is not dead code (ENG-287 residual F4)", async () => {
+    // deployLandingPage rethrew `new Error(\`Deployment failed: ${e.message}\`)`, minting a
+    // fresh Error and destroying `.code`. waitForCompletedV0Version is only ever reached
+    // through deployLandingPage on the first-page path, so generateFirstPage's
+    // `if (error.code === "V0_VERSION_FAILED") clearV0UsageForPage(...)` could never fire.
+    mockGet.mockReturnValue({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page_1",
+            userId: "user-1",
+            status: "draft",
+            v0ChatId: "chat_dead",
+            name: "Acme",
+            prompt: "p",
+          },
+        }),
+    });
+    mockChatsGetById.mockResolvedValue({ latestVersion: { id: "v_failed", status: "failed" } });
+
+    await expect(deployLandingPage("page_1", "user-1")).rejects.toMatchObject({
+      code: "V0_VERSION_FAILED",
+    });
+    mockChatsGetById.mockReset();
+    mockGet.mockReturnValue({ promise: () => Promise.resolve({ Item: null }) });
+  });
+
+  it("a long generation heartbeats `updatedAt` so the janitor cannot mark a LIVE build failed (ENG-287 residual F5)", async () => {
+    // The poll budget bounds SLEEPS, not wall-clock: each status read was itself allowed
+    // 300s, so a slow-but-alive v0 could keep the record untouched well past the
+    // janitor's 30-min `updatedAt` ceiling. The janitor would then mark a live build
+    // failed, the user would retry, and TWO live builds would push to the same repo.
+    mockQuery.mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) });
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_1" });
+    // deployLandingPage re-reads the record — without this it throws "not found" and the
+    // poll (where the heartbeat lives) never runs.
+    mockGet.mockReturnValue({
+      promise: () =>
+        Promise.resolve({
+          Item: { id: "page_1", userId: "user-1", status: "generating", v0ChatId: "chat_1", name: "Acme Home", prompt: "p" },
+        }),
+    });
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v1", status: "pending" } })
+      .mockResolvedValueOnce({ latestVersion: { id: "v1", status: "pending" } })
+      .mockResolvedValue({ latestVersion: { id: "v1", status: "completed" } });
+    mockChatsDownloadVersion.mockRejectedValue(new Error("stop after the poll"));
+
+    await generateLandingPage("user-1", "Launch", "Acme Home", {});
+
+    // A heartbeat touches ONLY updatedAt — it must not smuggle in a status change.
+    const heartbeats = mockUpdate.mock.calls.filter(
+      (c: any) =>
+        /SET updatedAt/.test(c[0].UpdateExpression || "") &&
+        c[0].ExpressionAttributeValues?.[":status"] === undefined
+    );
+    expect(heartbeats.length).toBeGreaterThan(0);
+    mockChatsGetById.mockReset();
+    mockChatsDownloadVersion.mockReset();
+    mockGet.mockReturnValue({ promise: () => Promise.resolve({ Item: null }) });
+  });
+
+  it("deleteLandingPageByRecord frees the v0 identity — a deleted page's slug does not hijack the next generation (ENG-287 residual F1)", async () => {
+    // This is the function the DELETE route actually calls. `deleteLandingPage` — the one
+    // that DID free the identity — is imported by that route and never used, so in practice
+    // no user-initiated delete ever freed it. That only became dangerous when the fix
+    // removed the prompt from the idempotency key: a surviving `succeeded` row now silently
+    // HIJACKS the next generation of the same route. The user deletes a page, regenerates
+    // the same slug with a brand-new prompt, and gets the OLD chat back — their prompt is
+    // never sent to v0 and the identical page reappears.
+    const create = jest
+      .fn()
+      .mockResolvedValueOnce({ id: "chat_old" })
+      .mockResolvedValueOnce({ id: "chat_new" });
+    const args = {
+      userId: "user-1",
+      operation: "additional_page_chat_create" as const,
+      scopeId: "site-1",
+      slug: "pricing",
+      prompt: "the original prompt",
+      create,
+    };
+
+    await guardedV0ChatCreate(args);
+
+    await deleteLandingPageByRecord({
+      id: "page-1",
+      userId: "user-1",
+      siteId: "site-1",
+      slug: "pricing",
+      name: "Pricing",
+      status: "deployed",
+    } as any);
+
+    const afterDelete = await guardedV0ChatCreate({ ...args, prompt: "a COMPLETELY different prompt" });
+
+    expect(afterDelete).toMatchObject({ id: "chat_new" });
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
 });
 
 describe("v0Service - findSiteById (explicit site identity, replaces oldest-repo guess)", () => {
@@ -2507,6 +2640,85 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     expect(result.status).toBe("failed");
     expect(result.errorMessage).toBeDefined();
     expect(result.errorMessage).toContain("Vercel build failed");
+  });
+
+  it("a Vercel build failure FREES the route identity — the retry mints a FRESH chat, not the one whose code will not compile (ENG-287 residual F2)", async () => {
+    // The deterministic wedge. v0 emits code that does not build; the guard row is left
+    // `succeeded` (it records that the CHAT was created, not that a page shipped), so
+    // every retry reuses the same chat, re-downloads the same broken version and fails
+    // identically — forever. And because the prompt is deliberately not part of the key,
+    // retrying with a DIFFERENT prompt reuses it too. This route is unbuildable for all
+    // time, and the user has no lever. Note the Vercel-error path RETURNS rather than
+    // throws, so the catch block that frees the identity never even runs.
+    setupSiteRecordMock();
+    await setupV0Mocks(); // chat_new_page → code that fails to build
+    setupGitHubMocks();
+    setupVercelDeployErrorMock();
+
+    const first = await generateLandingPage("user-1", "Create ABM page", "ABM Startups", {});
+    expect(first.status).toBe("failed");
+    expect(first.errorMessage).toContain("Vercel build failed");
+
+    // Retry the same route — this time v0 would produce code that builds.
+    setupSiteRecordMock();
+    const zip = await createTestZip();
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_fresh" });
+    mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "version_fresh" } });
+    mockChatsDownloadVersion.mockResolvedValueOnce(zip);
+    setupGitHubMocks();
+    setupVercelDeploySuccessMock();
+
+    const second = await generateLandingPage("user-1", "Create ABM page", "ABM Startups", {});
+
+    expect(mockChatsCreate).toHaveBeenCalledTimes(2); // a FRESH chat, not chat_new_page
+    expect(second.status).toBe("deployed");
+  });
+
+  it("a budget-exhausted PENDING generation keeps the chat — the retry RESUMES it rather than paying twice (ENG-287 residual)", async () => {
+    // The other half of the reuse contract, and the reason the age ceiling is a backstop
+    // rather than the primary mechanism. A DEAD END must free the identity; a merely-SLOW
+    // v0 must not. Freeing it here would mint a second full-cost chat while the first is
+    // still generating — precisely the orphan-chat credit burn (~$39 of a $50 block in 10
+    // days) that this whole issue is about. Sub-page keys are (site, slug), so they are
+    // stable across retries and this is observable.
+    setV0PollIntervals([0, 0]); // exhaust the poll budget immediately
+    setupSiteRecordMock();
+    mockChatsCreate.mockResolvedValue({ id: "chat_slow" });
+    mockChatsGetById.mockResolvedValue({ latestVersion: { id: "v1", status: "pending" } });
+
+    const first = await generateLandingPage("user-1", "Create a page", "Slow Page", {});
+    expect(first.status).toBe("failed");
+
+    // v0 finishes in the background. The retry must pick the SAME chat back up.
+    setupSiteRecordMock();
+    const zip = await createTestZip();
+    mockChatsGetById.mockResolvedValue({ latestVersion: { id: "v1", status: "completed" } });
+    mockChatsDownloadVersion.mockResolvedValueOnce(zip);
+    setupGitHubMocks();
+    setupVercelDeploySuccessMock();
+
+    const second = await generateLandingPage("user-1", "Create a page", "Slow Page", {});
+
+    expect(mockChatsCreate).toHaveBeenCalledTimes(1); // resumed, never charged twice
+    expect(second.status).toBe("deployed");
+    setV0PollIntervals([0, 0, 0, 0, 0]);
+  });
+
+  it("a v0 zip-download timeout is NOT retried 3x — the original 15-min hang, moved to downloadVersion (ENG-287 residual)", async () => {
+    // withRetry's default retries OUR synthetic 300s ceiling three times. This call sits
+    // inside a 3-round validation loop, so the worst case was 3 x 3 x 300s = 45 min —
+    // worse than the hang that started this, and past the MCP tool's own 25-min budget.
+    setupSiteRecordMock();
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_slow" });
+    mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "version_slow" } });
+    const timeout: any = new Error("v0 zip download timed out after 300s");
+    timeout.code = "V0_CALL_TIMEOUT";
+    mockChatsDownloadVersion.mockRejectedValue(timeout);
+
+    const result = await generateLandingPage("user-1", "Create a page", "Slow Page", {});
+
+    expect(result.status).toBe("failed");
+    expect(mockChatsDownloadVersion).toHaveBeenCalledTimes(1); // fail fast, one attempt
   });
 
   it("FAIL: Vercel deployment times out → record status set to failed", async () => {
