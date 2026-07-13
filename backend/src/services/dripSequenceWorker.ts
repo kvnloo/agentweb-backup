@@ -18,6 +18,11 @@ import { crmDb, userDb } from './db';
 import { emailEventsDb } from './emailEventsDb';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { substituteVariables, injectUnsubscribeUrl, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
+import {
+  loadSenderConfig as loadCrmSenderConfig,
+  assertSenderUsableForBulkSend,
+} from './crmSenderService';
+import { CrmSender } from './crmSenderTypes';
 import { settingsService } from './settingsService';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -181,6 +186,16 @@ async function sendEmailStep(
   const unsubscribeUrl = `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe?listId=${encodeURIComponent(enrollment.listId)}&leadId=${encodeURIComponent(enrollment.leadId)}&email=${encodeURIComponent(enrollment.leadEmail)}`;
   bodyHtml = injectUnsubscribeUrl(bodyHtml, unsubscribeUrl);
 
+  // GUARD (ENG-266 Part 3): this path still sends unconditionally through Resend.
+  // A mailbox-backed sender reaching it would silently send from the wrong system,
+  // so refuse loudly. Remove once the send path routes by provider.
+  const selectedSender = senderConfig.senders.find(
+    (s) => s.id === (step.senderId ?? senderConfig.defaultSenderId),
+  );
+  if (selectedSender) {
+    assertSenderUsableForBulkSend(selectedSender);
+  }
+
   const senderEmail = resolveSenderEmail(user, senderConfig, step.senderId);
   const senderName = resolveSenderName(user, senderConfig, step.senderId);
 
@@ -335,15 +350,9 @@ function addDays(date: Date, days: number): Date {
   return result;
 }
 
-async function loadSenderConfig(userId: string): Promise<{ senders: any[]; defaultSenderId: string | null }> {
-  try {
-    const setting = await settingsService.getSetting(`crm_sender_emails_${userId}`);
-    if (!setting?.settingValue) return { senders: [], defaultSenderId: null };
-    const config = JSON.parse(setting.settingValue);
-    return { senders: config.senders ?? [], defaultSenderId: config.defaultSenderId ?? null };
-  } catch {
-    return { senders: [], defaultSenderId: null };
-  }
+async function loadSenderConfig(userId: string): Promise<{ senders: CrmSender[]; defaultSenderId: string | null }> {
+  const config = await loadCrmSenderConfig(userId);
+  return { senders: config.senders, defaultSenderId: config.defaultSenderId };
 }
 
 function resolveSenderEmail(user: any, senderConfig: { senders: any[]; defaultSenderId: string | null }, senderId?: string): string | null {

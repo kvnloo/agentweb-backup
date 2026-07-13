@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { providerLabel } from './crmSenderTypes';
 import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
@@ -7516,28 +7517,33 @@ export class AgentModeService {
   // Get CRM sender emails configuration
   public async getCrmSenders(userId: string): Promise<{
     success: boolean;
-    senders: Array<{ id: string; email: string; fromName: string; notes?: string; senderType?: 'gmail'; gmailAccountId?: string }>;
+    senders: Array<{
+      id: string;
+      email: string;
+      fromName: string;
+      notes?: string;
+      senderType?: 'gmail' | 'outlook';
+      gmailAccountId?: string;
+      senderProvider?: 'resend' | 'gmail' | 'outlook';
+      connectedAccountId?: string;
+    }>;
     defaultSenderId: string | null;
     error?: string;
   }> {
     try {
-      const { settingsService } = await import('./settingsService');
-      const settingName = `crm_sender_emails_${userId}`;
-      const setting = await settingsService.getSetting(settingName);
+      const { loadSenderConfig, serializeSender } = await import('./crmSenderService');
+      const config = await loadSenderConfig(userId);
 
-      if (!setting) {
-        return {
-          success: true,
-          senders: [],
-          defaultSenderId: null
-        };
-      }
-
-      const config = JSON.parse(setting.settingValue);
+      // Emit both shapes: legacy keys for callers that still branch on senderType,
+      // and the neutral ones for provider-aware code.
       return {
         success: true,
-        senders: config.senders || [],
-        defaultSenderId: config.defaultSenderId || null
+        senders: config.senders.map((s) => ({
+          ...serializeSender(s),
+          senderProvider: s.senderProvider,
+          connectedAccountId: s.connectedAccountId,
+        })),
+        defaultSenderId: config.defaultSenderId
       };
     } catch (error) {
       console.error('AgentMode: Error getting CRM senders:', error);
@@ -10571,21 +10577,30 @@ export class AgentModeService {
 
       let emailId: string;
 
-      if ((sender as any).senderType === 'gmail') {
-        // Send via connected Gmail account
-        const gmailAccountId = (sender as any).gmailAccountId;
-        if (!gmailAccountId) {
-          return { success: false, message: 'Gmail sender misconfigured', error: 'Gmail sender is missing gmailAccountId' };
+      // Accept both shapes — see note in sendEmailFromConfiguredSender.
+      const leadSenderProvider: string = (sender as any).senderProvider || (sender as any).senderType || 'resend';
+
+      if (leadSenderProvider !== 'resend') {
+        // Send through the customer's own connected mailbox (Gmail / Outlook)
+        const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
+        if (!connectedAccountId) {
+          return {
+            success: false,
+            message: `${providerLabel(leadSenderProvider)} sender misconfigured`,
+            error: `The ${providerLabel(leadSenderProvider)} sender is missing its connected account id`,
+          };
         }
-        const { gmailService } = await import('./gmailService');
+        const { bootstrapEmailProviders, getEmailProvider } = await import('./emailProviderService');
+        await bootstrapEmailProviders();
+        const provider = getEmailProvider(leadSenderProvider);
         const body = draft.htmlContent || draft.textContent || '';
-        const gmailResult = await gmailService.sendEmail(userId, gmailAccountId, {
+        const sendResult = await provider.sendEmail(userId, connectedAccountId, {
           to: lead.email,
           subject: draft.subject,
           body,
           isHtml: !!draft.htmlContent,
         });
-        emailId = gmailResult.messageId;
+        emailId = sendResult.messageId;
       } else {
         // Send via Resend (custom domain sender)
         const { resendService } = await import('./resendService');
@@ -10676,32 +10691,40 @@ export class AgentModeService {
       let sender: any = null;
       if (params.senderId) {
         // The model can't see internal sender IDs, so accept an id, an email
-        // address, a from-name (case-insensitive), or a sender-type keyword like
-        // "gmail" — whatever the user named ("send from my gmail sender").
+        // address, a from-name (case-insensitive), or a provider keyword like
+        // "gmail" / "outlook" — whatever the user named ("send from my outlook sender").
         const needle = params.senderId.trim().toLowerCase();
-        const wantsGmail = needle === 'gmail' || needle === 'gmail sender' || needle === 'my gmail' || needle === 'my gmail sender';
         sender = sendersResult.senders.find((s: any) =>
           s.id === params.senderId ||
           (s.email && s.email.toLowerCase() === needle) ||
           (s.fromName && s.fromName.toLowerCase() === needle)
         );
-        // Fall back to matching by sender type (e.g. the single Gmail-account sender).
-        if (!sender && wantsGmail) {
-          const gmailSenders = sendersResult.senders.filter((s: any) => s.senderType === 'gmail');
-          if (gmailSenders.length === 1) {
-            sender = gmailSenders[0];
-          } else if (gmailSenders.length > 1) {
-            const list = gmailSenders.map((s: any) => `${s.fromName} <${s.email}>`).join(', ');
-            return {
-              success: false,
-              message: 'Multiple Gmail senders',
-              error: `You have more than one Gmail sender: ${list}. Tell me which one to use by its email address.`,
-              availableSenders: gmailSenders.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: 'gmail' })),
-            };
+
+        // Fall back to matching by provider (e.g. the single connected-mailbox sender).
+        if (!sender) {
+          const wantedProvider = ['gmail', 'outlook'].find(
+            (p) => needle === p || needle === `${p} sender` || needle === `my ${p}` || needle === `my ${p} sender`,
+          );
+          if (wantedProvider) {
+            const matches = sendersResult.senders.filter(
+              (s: any) => (s.senderProvider || s.senderType) === wantedProvider,
+            );
+            if (matches.length === 1) {
+              sender = matches[0];
+            } else if (matches.length > 1) {
+              const list = matches.map((s: any) => `${s.fromName} <${s.email}>`).join(', ');
+              return {
+                success: false,
+                message: `Multiple ${wantedProvider} senders`,
+                error: `You have more than one ${wantedProvider} sender: ${list}. Tell me which one to use by its email address.`,
+                availableSenders: matches.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: wantedProvider })),
+              };
+            }
           }
         }
+
         if (!sender) {
-          const available = sendersResult.senders.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: s.senderType === 'gmail' ? 'gmail' : 'resend' }));
+          const available = sendersResult.senders.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: s.senderProvider || s.senderType || 'resend' }));
           const list = available.map((s: any) => `${s.fromName} <${s.email}> [${s.senderType}]`).join(', ');
           return {
             success: false,
@@ -10726,40 +10749,50 @@ export class AgentModeService {
 
       let emailId: string;
 
-      if ((sender as any).senderType === 'gmail') {
-        const gmailAccountId = (sender as any).gmailAccountId;
-        if (!gmailAccountId) {
-          return { success: false, message: 'Gmail sender misconfigured', error: 'Gmail sender is missing gmailAccountId' };
+      // Accept both shapes: senderProvider is the neutral field, senderType the legacy
+      // persisted key. A sender resolved outside loadSenderConfig may only carry the latter.
+      const senderProvider: string = (sender as any).senderProvider || (sender as any).senderType || 'resend';
+
+      if (senderProvider !== 'resend') {
+        const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
+        if (!connectedAccountId) {
+          return {
+            success: false,
+            message: `${providerLabel(senderProvider)} sender misconfigured`,
+            error: `The ${providerLabel(senderProvider)} sender is missing its connected account id`,
+          };
         }
-        const { gmailService } = await import('./gmailService');
+        const { bootstrapEmailProviders, getEmailProvider } = await import('./emailProviderService');
+        const label = providerLabel(senderProvider);
+        await bootstrapEmailProviders();
+        const provider = getEmailProvider(senderProvider);
         const body = htmlBody || textBody || '';
         try {
-          const gmailResult = await gmailService.sendEmail(userId, gmailAccountId, {
+          const sendResult = await provider.sendEmail(userId, connectedAccountId, {
             to,
             subject: params.subject,
             body,
             isHtml: !!htmlBody,
           });
-          emailId = gmailResult.messageId;
-        } catch (gmailErr: any) {
-          // Translate Gmail/OAuth failures into an actionable message that names
-          // the affected sender. Raw errors like "unauthorized_client" /
-          // "invalid_grant" are otherwise opaque and get mis-paraphrased by the LLM
-          // (e.g. "no Gmail account configured"). Nearly all of these are resolved
-          // by reconnecting the Gmail account in Settings → Connected Accounts.
-          const raw = gmailErr instanceof Error ? gmailErr.message : String(gmailErr);
+          emailId = sendResult.messageId;
+        } catch (providerErr: any) {
+          // Translate OAuth failures into an actionable message that names the
+          // affected sender. Raw errors like "unauthorized_client" / "invalid_grant"
+          // are otherwise opaque and get mis-paraphrased by the LLM (e.g. "no account
+          // configured"). Nearly all are resolved by reconnecting in Settings.
+          const raw = providerErr instanceof Error ? providerErr.message : String(providerErr);
           const needsReconnect = /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
           if (needsReconnect) {
             return {
               success: false,
-              message: 'Gmail sender needs reconnecting',
-              error: `Could not send from the Gmail sender ${sender.email} (${gmailAccountId}): ${raw}. Please reconnect this Gmail account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
+              message: `${label} sender needs reconnecting`,
+              error: `Could not send from the ${label} sender ${sender.email} (${connectedAccountId}): ${raw}. Please reconnect this account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
             };
           }
           return {
             success: false,
-            message: 'Gmail send failed',
-            error: `Could not send from the Gmail sender ${sender.email}: ${raw}`,
+            message: `${label} send failed`,
+            error: `Could not send from the ${label} sender ${sender.email}: ${raw}`,
           };
         }
       } else {

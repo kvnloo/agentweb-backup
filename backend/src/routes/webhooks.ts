@@ -641,13 +641,24 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
                             : null)
                           || sendersResult.senders[0];
 
-                        if (sender) {
+                        // GUARD (ENG-266 Part 3): this path sends unconditionally through
+                        // Resend. A mailbox-backed sender would silently go out from the
+                        // wrong system, so skip rather than misroute.
+                        if (sender && sender.senderProvider && sender.senderProvider !== 'resend') {
+                          console.error(
+                            `Auto send skipped: sender ${sender.id} uses a connected ${sender.senderProvider} mailbox, which this path cannot send through yet`,
+                            leadList.userId,
+                          );
+                          autoSendStatus = 'skipped_mailbox_sender_unsupported';
+                        } else if (sender) {
                           senderEmail = sender.email;
                           senderFromName = sender.fromName;
                         }
                       }
 
-                      if (!senderEmail || !senderFromName) {
+                      if (autoSendStatus === 'skipped_mailbox_sender_unsupported') {
+                        // already handled above
+                      } else if (!senderEmail || !senderFromName) {
                         console.error('Auto send skipped: no sender configured for user', leadList.userId);
                         autoSendStatus = 'skipped_no_sender';
                       } else {

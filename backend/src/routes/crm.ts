@@ -203,6 +203,14 @@ router.use(enrichSoSubRouter);
 // its own express.raw body parser before HMAC verification — keep this
 // mounted before any global JSON body parser if we add one in the future.
 import apolloSubRouter from './crmApollo';
+import {
+  loadSenderConfig,
+  serializeSender,
+  validateSender,
+  senderSettingName,
+  bulkSendGuardMessage,
+} from '../services/crmSenderService';
+import { MAILBOX_PROVIDERS } from '../services/crmSenderTypes';
 router.use(apolloSubRouter);
 
 const normalizeAlertEvents = (alertEvents: any) => {
@@ -219,20 +227,10 @@ const normalizeAlertEvents = (alertEvents: any) => {
 };
 
 const getCrmSenderIds = async (userId: string) => {
-  const settingName = `crm_sender_emails_${userId}`;
-  const setting = await settingsService.getSetting(settingName);
-  if (!setting?.settingValue) {
-    return [];
-  }
-  try {
-    const config = JSON.parse(setting.settingValue);
-    const senders = Array.isArray(config?.senders) ? config.senders : [];
-    return senders.map((sender: any) => sender.id).filter(Boolean);
-  } catch (error) {
-    console.error('Error parsing CRM sender emails:', error);
-    return [];
-  }
+  const config = await loadSenderConfig(userId);
+  return config.senders.map((sender) => sender.id).filter(Boolean);
 };
+
 
 const normalizeSenderId = (senderId: any) => {
   if (senderId === null || senderId === undefined || senderId === '') {
@@ -4872,40 +4870,44 @@ router.get('/sender-emails', async (req: Request, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const settingName = `crm_sender_emails_${userId}`;
-    const setting = await settingsService.getSetting(settingName);
-
-    // Fetch connected Gmail accounts so the frontend can offer them as sender options
-    let connectedGmailAccounts: Array<{ account_id: string; account_name: string; email: string }> = [];
+    // Connected mailboxes the frontend can offer as sender options.
+    // `connectedEmailAccounts` covers every mailbox provider; `connectedGmailAccounts`
+    // is kept so the existing portal build keeps working until it migrates.
+    let connectedEmailAccounts: Array<{ account_id: string; account_name: string; email: string; platform: string }> = [];
     try {
       const user = await userDb.getUserById(userId);
-      connectedGmailAccounts = (user?.connected_accounts || [])
-        .filter((a: any) => a.platform === 'gmail')
+      connectedEmailAccounts = (user?.connected_accounts || [])
+        .filter((a: any) => MAILBOX_PROVIDERS.includes(a.platform))
         .map((a: any) => ({
           account_id: a.account_id,
           account_name: a.account_name,
           email: a.config?.email || a.account_id,
+          platform: a.platform,
         }));
     } catch (_) {
       // Non-fatal — proceed without connected accounts
     }
+    const connectedGmailAccounts = connectedEmailAccounts
+      .filter((a) => a.platform === 'gmail')
+      .map(({ platform, ...rest }) => rest);
 
-    if (!setting) {
-      return res.json({ senders: [], defaultSenderId: null, connectedGmailAccounts });
-    }
+    const config = await loadSenderConfig(userId);
 
-    try {
-      const config = JSON.parse(setting.settingValue);
-      res.json({
-        senders: config.senders || [],
-        defaultSenderId: config.defaultSenderId || null,
-        defaultLinkedInAccountId: config.defaultLinkedInAccountId || null,
-        connectedGmailAccounts,
-      });
-    } catch (parseError) {
-      console.error('Error parsing CRM sender emails:', parseError);
-      res.json({ senders: [], defaultSenderId: null, defaultLinkedInAccountId: null, connectedGmailAccounts });
-    }
+    // Emit both shapes: the legacy keys (senderType / gmailAccountId) so the
+    // current portal keeps rendering, and the neutral ones the new UI reads.
+    const senders = config.senders.map((s) => ({
+      ...serializeSender(s),
+      senderProvider: s.senderProvider,
+      connectedAccountId: s.connectedAccountId,
+    }));
+
+    res.json({
+      senders,
+      defaultSenderId: config.defaultSenderId,
+      defaultLinkedInAccountId: config.defaultLinkedInAccountId,
+      connectedEmailAccounts,
+      connectedGmailAccounts,
+    });
   } catch (error: any) {
     console.error('Error fetching CRM sender emails:', error);
     res.status(500).json({ message: error.message || 'Failed to fetch CRM sender emails' });
@@ -4933,6 +4935,17 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'Senders must be an array' });
     }
 
+    // Mailbox senders are validated against the user's connected accounts: the
+    // provider sends as the authenticated mailbox, so a mismatched From would be
+    // silently ignored on the wire. Reject it here, where we can say so.
+    let userConnectedAccounts: any[] = [];
+    try {
+      const user = await userDb.getUserById(userId);
+      userConnectedAccounts = user?.connected_accounts || [];
+    } catch (_) {
+      // Non-fatal — validateSender will reject mailbox senders if we can't confirm the account
+    }
+
     // Validate each sender
     for (const sender of senders) {
       if (!sender.email || !sender.fromName) {
@@ -4947,12 +4960,9 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
       if (sender.notes !== undefined && typeof sender.notes !== 'string') {
         return res.status(400).json({ message: 'Notes must be a string if provided' });
       }
-      // Gmail sender validation
-      if (sender.senderType !== undefined && sender.senderType !== 'gmail') {
-        return res.status(400).json({ message: `Invalid senderType: ${sender.senderType}` });
-      }
-      if (sender.senderType === 'gmail' && !sender.gmailAccountId) {
-        return res.status(400).json({ message: 'Gmail senders must include gmailAccountId' });
+      const validation = validateSender(sender, userConnectedAccounts);
+      if (!validation.ok) {
+        return res.status(400).json({ message: validation.error });
       }
     }
 
@@ -4973,15 +4983,18 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
       }
     }
 
-    const settingName = `crm_sender_emails_${userId}`;
+    const settingName = senderSettingName(userId);
     const config: any = {
-      senders: senders.map((s: any, index: number) => ({
-        id: s.id || index.toString(),
-        email: s.email.trim(),
-        fromName: s.fromName.trim(),
-        notes: s.notes ? s.notes.trim() : undefined,
-        ...(s.senderType === 'gmail' ? { senderType: 'gmail', gmailAccountId: s.gmailAccountId } : {}),
-      })),
+      senders: senders.map((s: any, index: number) =>
+        serializeSender({
+          id: s.id || index.toString(),
+          email: s.email.trim(),
+          fromName: s.fromName.trim(),
+          notes: s.notes ? s.notes.trim() : undefined,
+          senderProvider: s.senderType ?? 'resend',
+          connectedAccountId: s.connectedAccountId ?? s.gmailAccountId,
+        }),
+      ),
       defaultSenderId: defaultSenderId || (senders.length > 0 ? senders[0].id || '0' : null),
       defaultLinkedInAccountId: defaultLinkedInAccountId || null
     };
@@ -5231,6 +5244,13 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
     }
 
     // Send email via Resend
+    // GUARD (ENG-266 Part 3): sends unconditionally through Resend — refuse a
+    // mailbox-backed sender rather than silently sending from the wrong system.
+    const mailboxGuard = await bulkSendGuardMessage(userId, senderEmail);
+    if (mailboxGuard) {
+      return res.status(400).json({ message: mailboxGuard, code: 'MAILBOX_SENDER_NOT_SUPPORTED' });
+    }
+
     const from = `${senderName} <${senderEmail}>`;
     const result = await resendService.sendEmail({
       from,
@@ -5297,6 +5317,13 @@ router.post('/lists/:listId/leads/:leadId/reply-email', async (req: Request, res
     }
 
     // Send reply email via Resend with In-Reply-To header
+    // GUARD (ENG-266 Part 3): sends unconditionally through Resend — refuse a
+    // mailbox-backed sender rather than silently sending from the wrong system.
+    const mailboxGuard = await bulkSendGuardMessage(userId, senderEmail);
+    if (mailboxGuard) {
+      return res.status(400).json({ message: mailboxGuard, code: 'MAILBOX_SENDER_NOT_SUPPORTED' });
+    }
+
     const from = `${senderName} <${senderEmail}>`;
     const result = await resendService.sendEmail({
       from,
@@ -5733,6 +5760,15 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       return res.status(400).json({ message: 'senderEmail, senderName, subject, and htmlContent are required' });
     }
 
+    // GUARD (ENG-266 Part 3): this route sends unconditionally through Resend. The
+    // composer only posts senderEmail/senderName, so resolve it back to the sender
+    // record and refuse if it is mailbox-backed — otherwise a connected Gmail/Outlook
+    // sender would silently go out via Resend from an address we don't own.
+    const guardCheck = await bulkSendGuardMessage(userId, senderEmail);
+    if (guardCheck) {
+      return res.status(400).json({ message: guardCheck, code: 'MAILBOX_SENDER_NOT_SUPPORTED' });
+    }
+
     const list = await crmDb.getLeadListById(listId);
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
@@ -5913,6 +5949,13 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
       : testBanner + testBaseHtml;
     // Wire up unsubscribe URL with the real portal domain
     const testHtml = injectUnsubscribeUrl(withBanner, testUnsubscribeUrl, unsubscribeFooterHtml);
+    // GUARD (ENG-266 Part 3): sends unconditionally through Resend — refuse a
+    // mailbox-backed sender rather than silently sending from the wrong system.
+    const mailboxGuard = await bulkSendGuardMessage(userId, senderEmail);
+    if (mailboxGuard) {
+      return res.status(400).json({ message: mailboxGuard, code: 'MAILBOX_SENDER_NOT_SUPPORTED' });
+    }
+
     const from = `${senderName} <${senderEmail}>`;
 
     let sent = 0;

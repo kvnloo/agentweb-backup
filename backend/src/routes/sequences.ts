@@ -15,6 +15,7 @@ import {
 } from '../services/dripSequenceDb';
 import { crmDb } from '../services/db';
 import { resendService } from '../services/resendService';
+import { bulkSendGuardMessage } from '../services/crmSenderService';
 import axios from 'axios';
 import { extractVariables, leadHasVariable, isSupportedVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
@@ -352,6 +353,13 @@ router.post(
     const withNormalizedUrls = normalizeYoutubeUrls(withRewrittenImages);
     // Wire up unsubscribe URL with the real portal domain
     const testHtml = injectUnsubscribeUrl(withNormalizedUrls, testUnsubscribeUrl);
+    // GUARD (ENG-266 Part 3): sends unconditionally through Resend — refuse a
+    // mailbox-backed sender rather than silently sending from the wrong system.
+    const mailboxGuard = await bulkSendGuardMessage(userId, senderEmail);
+    if (mailboxGuard) {
+      return res.status(400).json({ message: mailboxGuard, code: 'MAILBOX_SENDER_NOT_SUPPORTED' });
+    }
+
     const from = `${senderName} <${senderEmail}>`;
 
     let sent = 0;
