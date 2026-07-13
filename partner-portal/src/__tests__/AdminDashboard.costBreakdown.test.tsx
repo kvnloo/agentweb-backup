@@ -62,11 +62,15 @@ const BreakdownBody: React.FC<{ user: User; month: string; rows: UsageRow[] }> =
     m.costUsd += r.costUsd;
   });
   const modelRows = Object.values(byModel).sort((a, b) => b.costUsd - a.costUsd);
+  const earliestTracked = rows.length ? rows[0].date : null;
+  const burnLagsDeducted = modelRows.length > 0 && burn + 0.005 < deducted;
   return (
     <div>
       <div>Burned (gross) ${burn.toFixed(2)}</div>
       <div>Counted to quota ${deducted.toFixed(2)}</div>
       <div>Absorbed by platform ${absorbed.toFixed(2)}</div>
+      {modelRows.length === 0 && <div role="alert">No per-model burn has been recorded for this month yet.</div>}
+      {burnLagsDeducted && <div role="alert">Recorded burn (tracked from {earliestTracked}) is lower than the amount counted to this user's quota.</div>}
       <table>
         <tbody>
           {modelRows.map((m) => (
@@ -164,6 +168,31 @@ describe('AdminDashboard per-model burn breakdown (isolated)', () => {
     expect(screen.getByText('Burned (gross) $10.00')).toBeInTheDocument();
     expect(screen.getByText('Counted to quota $4.00')).toBeInTheDocument();
     expect(screen.getByText('Absorbed by platform $6.00')).toBeInTheDocument();
+  });
+
+  it('shows an explanatory empty-state alert (not a broken view) when no burn is recorded', () => {
+    render(<BreakdownBody user={user} month={month} rows={[]} />);
+    expect(screen.getByRole('alert')).toHaveTextContent('No per-model burn has been recorded for this month yet.');
+    // Deducted counter can still be non-zero even with empty burn.
+    expect(screen.getByText('Counted to quota $4.00')).toBeInTheDocument();
+  });
+
+  it('flags the ramp-up case where recorded burn is lower than the quota deduction', () => {
+    // burn = 1, deducted = 4 → burn lags; absorbed clamps to $0 and an alert explains it.
+    const rows: UsageRow[] = [
+      { date: '2026-07-05', model: 'gpt-5.2-chat', feature: 'agent_mode', totalTokens: 200, callCount: 1, costUsd: 1 },
+    ];
+    render(<BreakdownBody user={user} month={month} rows={rows} />);
+    expect(screen.getByRole('alert')).toHaveTextContent('tracked from 2026-07-05');
+    expect(screen.getByText('Absorbed by platform $0.00')).toBeInTheDocument();
+  });
+
+  it('does NOT flag lag when burn meets or exceeds the deduction', () => {
+    const rows: UsageRow[] = [
+      { date: '2026-07-05', model: 'gpt-5.2-chat', feature: 'agent_mode', totalTokens: 200, callCount: 1, costUsd: 5 },
+    ];
+    render(<BreakdownBody user={user} month={month} rows={rows} />);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('reads deduction from tokenUsageHistory for a past month', () => {
