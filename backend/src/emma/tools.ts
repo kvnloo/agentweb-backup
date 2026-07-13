@@ -1242,7 +1242,16 @@ REQUIRED PARAMS PER ENTITY + ACTION:
   CONVERSATION_AD CREATE_CONTENT: conversation_ad_urn, body (message text), buttons (array of { text, action: OPEN_URL|SEND_MESSAGE, url? }). Optional: subject, footer.
   CONVERSATION_AD SET_FIRST_CONTENT: conversation_ad_urn, first_content_urn
 
-POST/CREATE params: commentary (text), feed_distribution (NONE=dark post|MAIN_FEED=company page). Media: image_urn | video_urn | document_urn | article_url+article_title+article_description+thumbnail_urn | carousel_cards.
+POST/CREATE params: commentary (text), feed_distribution (NONE=dark post|MAIN_FEED=company page), campaign_id (OPTIONAL but STRONGLY RECOMMENDED — see UTM ATTRIBUTION below). Media: image_urn | video_urn | document_urn | article_url+article_title+article_description+thumbnail_urn | carousel_cards.
+
+UTM ATTRIBUTION — pass campaign_id to the CONTENT actions too:
+  POST/CREATE, INMAIL/CREATE_CONTENT and CONVERSATION_AD/CREATE_CONTENT accept an OPTIONAL campaign_id.
+  Emma stamps utm_source/utm_medium/utm_campaign onto every destination URL so leads from the ad can be
+  attributed back to it. But these three actions author content BEFORE it is attached to a campaign, so
+  without campaign_id the landing pages are left UNTAGGED and their leads arrive in the CRM with no source.
+  You almost always created the campaign first, so you HAVE the id — pass it. If you genuinely do not have
+  one yet, omit it: an untagged URL is correct, a fabricated utm_campaign is not.
+  (CREATIVE/CREATE and CREATIVE/CREATE_DYNAMIC already require campaign_id, so those tag automatically.)
 
 BUDGET FORMAT: decimal string e.g. "10.00" = $10.00 (NOT micro-currency)
 SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
@@ -1272,7 +1281,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
             status: { type: 'string', enum: ['ACTIVE', 'PAUSED', 'ARCHIVED', 'DRAFT', 'CANCELED', 'COMPLETED'], description: 'Entity status.' },
             campaign_group_id: { type: 'string', description: 'Campaign Group numeric ID. Used for CAMPAIGN LIST.' },
             campaignGroup: { type: 'string', description: 'Campaign Group URN (urn:li:sponsoredCampaignGroup:ID). Required for CAMPAIGN CREATE.' },
-            campaign_id: { type: 'string', description: 'Campaign ID. Required for CREATIVE LIST/CREATE and CAMPAIGN UPDATE.' },
+            campaign_id: { type: 'string', description: 'Campaign ID. Required for CREATIVE LIST/CREATE and CAMPAIGN UPDATE. ALSO accepted — and strongly recommended — on POST/CREATE, INMAIL/CREATE_CONTENT and CONVERSATION_AD/CREATE_CONTENT: without it those destination URLs ship with no utm_campaign and their leads cannot be attributed. Omit it only if no campaign exists yet.' },
             // Campaign
             objectiveType: { type: 'string', description: 'Campaign objective (WEBSITE_VISIT, BRAND_AWARENESS, ENGAGEMENT, VIDEO_VIEWS, LEAD_GENERATION, WEBSITE_CONVERSIONS). Omit entirely for DYNAMIC campaigns with format=JOBS.' },
             costType: { type: 'string', enum: ['CPM', 'CPC', 'CPV'], description: 'Bidding type.' },

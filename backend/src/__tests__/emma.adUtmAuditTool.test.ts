@@ -140,3 +140,43 @@ describe('ENG-239 AC3 — audit_ad_utm_coverage tool', () => {
     expect(tool.definition.description).toMatch(/read-only|never modifies|does not modify/i);
   });
 });
+
+/**
+ * ENG-239 AC1 — the last LinkedIn gap.
+ *
+ * LinkedIn's standalone-content endpoints (POST/CREATE, INMAIL/CREATE_CONTENT,
+ * CONVERSATION_AD/CREATE_CONTENT) author content BEFORE it is attached to a
+ * campaign, so `campaign_id` is not structurally in scope there and those landing
+ * pages ship UNTAGGED — the tagger correctly refuses to emit
+ * `utm_campaign=undefined`.
+ *
+ * But Emma creates the campaign before the content, so it HAS the id — it was
+ * simply never told to pass it. The plumbing already works (agentModeService
+ * spreads `...params` into createPost, and `resolveCampaignForUtm` reads
+ * `params.campaign_id`); the only thing missing was the instruction. These pin it,
+ * because a silently-dropped instruction is exactly how those 4 sites stayed
+ * untagged in the first place.
+ */
+describe('ENG-239 AC1 — LinkedIn content endpoints are told to pass campaign_id', () => {
+  const linkedInTool = () => emmaToolRegistry.getTool('call_linkedin_marketing_api')!;
+
+  it('is registered', () => {
+    expect(linkedInTool()).toBeDefined();
+  });
+
+  it('tells Emma to pass campaign_id to POST/CREATE so the landing page gets UTM-tagged', () => {
+    const desc = linkedInTool().definition.description;
+    expect(desc).toMatch(/POST\/CREATE params:[^\n]*campaign_id/i);
+  });
+
+  it('tells Emma to pass campaign_id to the InMail and Conversation content actions', () => {
+    const desc = linkedInTool().definition.description;
+    expect(desc).toMatch(/INMAIL\/CREATE_CONTENT[^\n]*campaign_id/i);
+    expect(desc).toMatch(/CONVERSATION_AD\/CREATE_CONTENT[^\n]*campaign_id/i);
+  });
+
+  it('explains WHY — without it the ad is untagged and its leads cannot be attributed', () => {
+    const desc = linkedInTool().definition.description;
+    expect(desc).toMatch(/attribut|utm/i);
+  });
+});
