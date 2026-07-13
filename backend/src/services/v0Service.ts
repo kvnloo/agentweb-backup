@@ -10,7 +10,7 @@ import { canEditItem } from "./orgShareService";
 import { addSubdomain, generateSubdomain, listDomains, SUBDOMAIN_BASE } from "./customDomainService";
 import { settingsService } from "./settingsService";
 import { paginatedQuery } from "../utils/dynamoPagination";
-import { guardedV0ChatCreate, guardedV0CorrectionMessage, clearV0UsageForPage } from "./v0UsageGuard";
+import { guardedV0ChatCreate, guardedV0CorrectionMessage, clearV0UsageForPage, hashV0Prompt } from "./v0UsageGuard";
 // Type-only imports from durableLandingService live elsewhere; this constant import is
 // runtime-safe because durableLandingService only imports a TYPE from this module.
 import { STUCK_CEILING_MS } from "./durableLandingService";
@@ -400,12 +400,29 @@ export function buildPageSlug(name: string): string {
     .replace(/^-|-$/g, "");
 }
 
+/**
+ * An iteration v0 has ACCEPTED but not yet published a version for.
+ *
+ * Recorded the moment `chats.sendMessage` returns, so a retry whose HTTP response the user
+ * lost does not re-send the same instruction — v0 would apply it TWICE ("add a testimonials
+ * section" becomes two sections, charged twice). `baseVersionId` is the chat's latest
+ * version at send time: once v0 publishes something newer, the edit has landed and the retry
+ * adopts it instead of re-sending. v0's own state is the source of truth, not our guess.
+ * (ENG-287 follow-up)
+ */
+export interface PendingIteration {
+  baseVersionId: string;
+  messageHash: string;
+  startedAt: string;
+}
+
 export interface GeneratedLandingPage {
   id: string;
   userId: string;
   name: string;
   prompt: string;
   status: "generating" | "draft" | "deploying" | "deployed" | "failed";
+  pendingIteration?: PendingIteration;
   v0ProjectId?: string;
   v0ChatId?: string;
   vercelProjectId?: string;
@@ -3479,51 +3496,119 @@ export async function iterateLandingPage(
     );
   }
 
+  const chatId = record.v0ChatId!;
+  const deadline = Date.now() + V0_GENERATION_BUDGET_MS;
+
   try {
     const v0 = await getV0Client();
 
-    await withRetry(
-      () => v0.chats.sendMessage({
-        chatId: record.v0ChatId!,
-        message,
-      }),
-      "v0 chat iterate",
-      // Interactive path: a >300s iteration fails fast with a clean retry instead of
-      // hanging ~15 min and possibly applying the message multiple times. Kept in
-      // sync responseMode deliberately — the deploy that follows reads latestVersion,
-      // and async here would let it grab the pre-iteration version. (ENG-287)
-      undefined, undefined, undefined,
-      { retryOnTimeout: false }
+    // Where the chat stands BEFORE this edit. Everything below is anchored to it: it is both
+    // the "don't hand me back the old version" guard and the "did my earlier send land?"
+    // question. (ENG-287 follow-up)
+    const baseVersionId = await waitForCompletedV0Version(
+      v0,
+      chatId,
+      "v0 iterate (base version)",
+      { deadline }
     );
 
-    // Reset status to draft (needs re-deploy after iteration)
-    const newStatus = record.status === "deployed" ? "draft" : record.status;
+    const messageHash = hashV0Prompt(message);
+    const pending = record.pendingIteration;
+    const isSameEdit = pending?.messageHash === messageHash;
 
-    await dynamodb
-      .update({
-        TableName: TABLE_NAME,
-        Key: { id },
-        UpdateExpression:
-          "SET #status = :status, iterations = :iterations, updatedAt = :updatedAt",
-        ExpressionAttributeNames: { "#status": "status" },
-        ExpressionAttributeValues: {
-          ":status": newStatus,
-          ":iterations": (record.iterations || 0) + 1,
-          ":updatedAt": new Date().toISOString(),
-        },
-      })
-      .promise();
+    if (isSameEdit && pending!.baseVersionId !== baseVersionId) {
+      // v0 has published a version SINCE we recorded the send — the edit already landed.
+      // Adopt it. Re-sending here is the double-apply bug: the user would get their
+      // instruction twice and be charged twice.
+      console.log(`[V0 SERVICE] iterate: edit already applied (${pending!.baseVersionId} → ${baseVersionId}), adopting`);
+      return await finishIteration(id, record, baseVersionId);
+    }
 
-    return {
-      ...record,
-      status: newStatus,
-      iterations: (record.iterations || 0) + 1,
-      updatedAt: new Date().toISOString(),
-    };
+    if (!isSameEdit) {
+      // responseMode async: sync mode blocks the HTTP call for the whole edit, which is the
+      // 300s race that made a slow iteration fail while v0 applied and CHARGED for it anyway
+      // — leaving the edit stranded (the record stayed `deployed`, which deployLandingPage
+      // refuses). Async returns in seconds; the version wait below absorbs the real time.
+      // Safe now only because that wait is anchored to `afterVersionId` — without it, a deploy
+      // could grab the PRE-iteration version and silently ship the page without the edit.
+      await withRetry(
+        () => v0.chats.sendMessage({ chatId, message, responseMode: "async" }),
+        "v0 chat iterate",
+        undefined, undefined, undefined,
+        { retryOnTimeout: false }
+      );
+
+      // Record it the instant v0 accepts, BEFORE the wait — if the wait dies (timeout, crash,
+      // lost response), the retry must know the message is already with v0.
+      const nowIso = new Date().toISOString();
+      await dynamodb
+        .update({
+          TableName: TABLE_NAME,
+          Key: { id },
+          UpdateExpression: "SET pendingIteration = :p, updatedAt = :now",
+          ExpressionAttributeValues: {
+            ":p": { baseVersionId, messageHash, startedAt: nowIso },
+            ":now": nowIso,
+          },
+        })
+        .promise();
+    } else {
+      console.log(`[V0 SERVICE] iterate: message already sent and still generating — resuming the wait, not re-sending`);
+    }
+
+    // Do not return until v0 publishes a version that is NOT the one we started from. This is
+    // what makes the async send safe: the deploy that follows reads the latest completed
+    // version, so returning early would ship the pre-iteration page.
+    const newVersionId = await waitForCompletedV0Version(
+      v0,
+      chatId,
+      "v0 iterate",
+      { deadline, afterVersionId: pending && isSameEdit ? pending.baseVersionId : baseVersionId }
+    );
+
+    return await finishIteration(id, record, newVersionId);
   } catch (error: any) {
     console.error("[V0 SERVICE] Iteration failed:", error);
-    throw new Error(`Iteration failed: ${error.message}`);
+    // Deliberately NOT flipping the record to `failed`: the page is still live at its URL, and
+    // `pendingIteration` is deliberately LEFT in place so the retry resumes instead of
+    // re-sending. The status is untouched for the same reason.
+    const wrapped: any = new Error(`Iteration failed: ${error.message}`);
+    if (error?.code) wrapped.code = error.code;
+    wrapped.cause = error;
+    throw wrapped;
   }
+}
+
+/** Land a completed iteration: clear the pending marker, count it, make it deployable. */
+async function finishIteration(
+  id: string,
+  record: GeneratedLandingPage,
+  versionId: string
+): Promise<GeneratedLandingPage> {
+  // `draft` == "has an undeployed version ready", which is now exactly true. It is also what
+  // makes the edit reachable: deployLandingPage accepts `draft` and refuses `deployed`, which
+  // is precisely how a timed-out iteration used to get stranded inside v0.
+  const newStatus = record.status === "deployed" ? "draft" : record.status;
+  const iterations = (record.iterations || 0) + 1;
+  const nowIso = new Date().toISOString();
+
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      UpdateExpression:
+        "SET #status = :status, iterations = :iterations, updatedAt = :updatedAt REMOVE pendingIteration",
+      ExpressionAttributeNames: { "#status": "status" },
+      ExpressionAttributeValues: {
+        ":status": newStatus,
+        ":iterations": iterations,
+        ":updatedAt": nowIso,
+      },
+    })
+    .promise();
+
+  console.log(`[V0 SERVICE] iterate: version ${versionId} ready — page is deployable`);
+  return { ...record, status: newStatus, iterations, updatedAt: nowIso, pendingIteration: undefined };
 }
 
 /**

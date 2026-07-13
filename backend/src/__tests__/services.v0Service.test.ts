@@ -173,7 +173,7 @@ import {
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord } from "../services/v0Service";
-import { _resetV0UsageGuardForTest, guardedV0ChatCreate } from "../services/v0UsageGuard";
+import { _resetV0UsageGuardForTest, guardedV0ChatCreate, hashV0Prompt } from "../services/v0UsageGuard";
 const { enqueueAutoHumanEval } = jest.requireMock("../services/autoHumanEvalService");
 
 async function createMinimalV0Zip(): Promise<Buffer> {
@@ -1752,6 +1752,9 @@ describe("v0Service - iterateLandingPage", () => {
         }),
     });
 
+    // iterate now reads the chat's current version before sending (that base version is what
+    // makes the async send safe), so the chat has to answer for sendMessage to be reached.
+    mockChatsGetById.mockResolvedValue({ latestVersion: { id: "v_base", status: "completed" } });
     mockChatsSendMessage.mockRejectedValueOnce(
       new Error("Send message failed")
     );
@@ -1759,6 +1762,7 @@ describe("v0Service - iterateLandingPage", () => {
     await expect(
       iterateLandingPage("page-1", "user-1", "change color")
     ).rejects.toThrow("Iteration failed");
+    mockChatsGetById.mockReset();
   });
 
   it("SUCCESS: deployed page → status reverts to draft, iterations +1", async () => {
@@ -1775,6 +1779,9 @@ describe("v0Service - iterateLandingPage", () => {
         }),
     });
 
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } })
+      .mockResolvedValue({ latestVersion: { id: "v_new", status: "completed" } });
     mockChatsSendMessage.mockResolvedValueOnce({});
 
     const result = await iterateLandingPage(
@@ -1785,6 +1792,149 @@ describe("v0Service - iterateLandingPage", () => {
 
     expect(result.status).toBe("draft");
     expect(result.iterations).toBe(3);
+    mockChatsGetById.mockReset();
+  });
+
+  // ── ENG-287 follow-up: iterate was the last sync v0 call behind the 300s ceiling ──
+  //
+  // A >300s iteration used to fail four ways at once: v0 applied the edit and charged for
+  // it anyway; our record never incremented and stayed `deployed`; deployLandingPage then
+  // REFUSED it ("Cannot deploy a landing page with status: deployed"), stranding the edit
+  // inside v0; and the retry re-sent the same message with no guard, so v0 applied it twice.
+  //
+  // Async was blocked because deployLandingPage reads "the latest completed version" — if
+  // iterate returned before v0 published the new one, the deploy would ship the
+  // PRE-iteration version and silently lose the user's edit. waitForCompletedV0Version's
+  // `afterVersionId` guard is what makes it safe: we do not return until v0 has published a
+  // version that is genuinely NOT the one we came in with.
+  const iterRecord = (over: Record<string, any> = {}) => ({
+    promise: () =>
+      Promise.resolve({
+        Item: {
+          id: "page-1",
+          userId: "user-1",
+          status: "deployed",
+          v0ChatId: "chat_1",
+          iterations: 0,
+          ...over,
+        },
+      }),
+  });
+
+  it("sends the iteration in ASYNC responseMode — no 300s race", async () => {
+    mockGet.mockReturnValue(iterRecord());
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } })
+      .mockResolvedValue({ latestVersion: { id: "v_new", status: "completed" } });
+    mockChatsSendMessage.mockResolvedValueOnce({});
+
+    await iterateLandingPage("page-1", "user-1", "Add testimonials");
+
+    expect(mockChatsSendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ responseMode: "async" })
+    );
+    mockChatsGetById.mockReset();
+  });
+
+  it("waits for a NEW version — a deploy can never grab the PRE-iteration version", async () => {
+    mockGet.mockReturnValue(iterRecord());
+    // v0 keeps reporting the OLD version for two polls before publishing the new one.
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } }) // base
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } }) // not yet
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } }) // not yet
+      .mockResolvedValue({ latestVersion: { id: "v_new", status: "completed" } });
+    mockChatsSendMessage.mockResolvedValueOnce({});
+
+    const result = await iterateLandingPage("page-1", "user-1", "Add testimonials");
+
+    // Only returns once v0 published something that is NOT v_base.
+    expect(result.status).toBe("draft"); // deployable — the edit is not stranded
+    expect(result.iterations).toBe(1);
+    mockChatsGetById.mockReset();
+  });
+
+  it("a retry of the SAME message while an iteration is pending does NOT re-send it (no double-apply)", async () => {
+    // The record already carries a pendingIteration from the attempt whose HTTP response the
+    // user lost. v0 accepted that message and is still working on it. Re-sending would apply
+    // the instruction twice — "add a testimonials section" becomes two sections, charged twice.
+    mockGet.mockReturnValue(
+      iterRecord({
+        pendingIteration: {
+          baseVersionId: "v_base",
+          messageHash: hashV0Prompt("Add testimonials"),
+          startedAt: new Date().toISOString(),
+        },
+      })
+    );
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } }) // unchanged → still generating
+      .mockResolvedValue({ latestVersion: { id: "v_new", status: "completed" } });
+
+    const result = await iterateLandingPage("page-1", "user-1", "Add testimonials");
+
+    expect(mockChatsSendMessage).not.toHaveBeenCalled(); // resumed, never re-sent
+    expect(result.status).toBe("draft");
+    mockChatsGetById.mockReset();
+  });
+
+  it("a retry AFTER v0 already published the edit adopts it — no re-send, no second charge", async () => {
+    mockGet.mockReturnValue(
+      iterRecord({
+        pendingIteration: {
+          baseVersionId: "v_base",
+          messageHash: hashV0Prompt("Add testimonials"),
+          startedAt: new Date().toISOString(),
+        },
+      })
+    );
+    // The version has MOVED ON from the recorded base → the earlier send landed.
+    mockChatsGetById.mockResolvedValue({ latestVersion: { id: "v_new", status: "completed" } });
+
+    const result = await iterateLandingPage("page-1", "user-1", "Add testimonials");
+
+    expect(mockChatsSendMessage).not.toHaveBeenCalled();
+    expect(result.status).toBe("draft");
+    expect(result.iterations).toBe(1);
+    mockChatsGetById.mockReset();
+  });
+
+  it("a DIFFERENT message still sends — the guard must not swallow a genuine second edit", async () => {
+    mockGet.mockReturnValue(
+      iterRecord({
+        pendingIteration: {
+          baseVersionId: "v_base",
+          messageHash: hashV0Prompt("Add testimonials"),
+          startedAt: new Date().toISOString(),
+        },
+      })
+    );
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } })
+      .mockResolvedValue({ latestVersion: { id: "v_new2", status: "completed" } });
+    mockChatsSendMessage.mockResolvedValueOnce({});
+
+    await iterateLandingPage("page-1", "user-1", "Now make the hero blue");
+
+    expect(mockChatsSendMessage).toHaveBeenCalledTimes(1);
+    mockChatsGetById.mockReset();
+  });
+
+  it("a failed iteration leaves the page's status alone — the live page must not be marked failed", async () => {
+    mockGet.mockReturnValue(iterRecord({ status: "deployed" }));
+    mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } });
+    mockChatsSendMessage.mockRejectedValueOnce(new Error("v0 is down"));
+
+    await expect(iterateLandingPage("page-1", "user-1", "Add testimonials")).rejects.toThrow(
+      /Iteration failed/
+    );
+
+    // The page is still live at its URL — nothing may flip it to `failed`.
+    const statuses = mockUpdate.mock.calls
+      .map((c: any) => c[0].ExpressionAttributeValues?.[":status"])
+      .filter(Boolean);
+    expect(statuses).not.toContain("failed");
+    mockChatsGetById.mockReset();
   });
 });
 
