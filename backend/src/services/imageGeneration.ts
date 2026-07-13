@@ -3,6 +3,7 @@ import { getSecret } from "../utils/secretsManager";
 import { uploadFileToS3 } from "../utils/s3Utils";
 import { getOpenAIClient, getGeminiClient } from "../utils/llmClients";
 import { recordUsage } from "./usageRecorderService";
+import { imageGenerationCostUsd } from "../utils/llmPricing";
 
 interface ImageGenerationResult {
   success: boolean;
@@ -481,6 +482,22 @@ export class ImageService {
         
         // If generation was successful, upload to S3
         if (result.success && result.imageUrl) {
+          // Burn-only shadow record, fired ONCE at the source so every caller (agent-mode
+          // and non-agent) is metered exactly once. Images bill per generation (not per
+          // token); attribute the dollar cost to the user's burn but never charge quota.
+          void recordUsage({
+            userId: params.userId,
+            model: modelToUse,
+            provider: modelToUse.startsWith("gpt-image")
+              ? "openai"
+              : modelToUse.startsWith("gemini-")
+              ? "gemini"
+              : "runway",
+            feature: "image_generation",
+            inputTokens: 0,
+            outputTokens: 0,
+            costUsdOverride: imageGenerationCostUsd(modelToUse),
+          });
           // Check if it's a data URL (base64) and convert to buffer
           let imageBuffer: Buffer;
           if (result.imageUrl.startsWith('data:image/')) {

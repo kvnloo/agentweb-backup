@@ -35,8 +35,8 @@ import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { recordUsage } from './usageRecorderService';
 import {
   getModelPrice,
-  IMAGE_GENERATION_PRICING_USD,
-  VIDEO_GENERATION_PRICING_USD_PER_CLIP,
+  imageGenerationCostUsd,
+  videoGenerationCostUsd,
 } from '../utils/llmPricing';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
 import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmMutationEvents';
@@ -2449,7 +2449,7 @@ export class AgentModeService {
 
   /** Cost per image generation in USD (fixed per-generation pricing, sourced from llmPricing). */
   private estimateImageGenerationCost(model: string): number {
-    return IMAGE_GENERATION_PRICING_USD[model] ?? 0.04;
+    return imageGenerationCostUsd(model);
   }
 
   private isRetryableMediaToolError(error: unknown): boolean {
@@ -2506,12 +2506,7 @@ export class AgentModeService {
   /** Cost per video generation in USD. Veo bills per 8s clip, so longer videos cost proportionally more. */
   private estimateVideoGenerationCost(model: string, durationSeconds?: number): number {
     // Per-clip rates sourced from llmPricing (single source of truth).
-    const clipPrice = VIDEO_GENERATION_PRICING_USD_PER_CLIP[model] ?? 3.20;
-    const VEO_MAX_SECONDS = 8;
-    const clipCount = durationSeconds && durationSeconds > VEO_MAX_SECONDS
-      ? Math.ceil(durationSeconds / VEO_MAX_SECONDS)
-      : 1;
-    return clipPrice * clipCount;
+    return videoGenerationCostUsd(model, durationSeconds);
   }
 
   /** Returns an onUsage callback that records LLM token usage for a named tool. */
@@ -20248,20 +20243,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       if (result.success && result.imageUrl) {
-        // Track generation cost (image APIs are billed per generation, not per token).
-        // Burn-only: record it to the user's burn for visibility, but do NOT deduct
-        // it from their quota — image/video spend is on us (ENG-200).
+        // Session cost accounting (agent-mode chat). The per-user burn shadow record is
+        // fired once at the generation SOURCE (imageService.generateImage) so every caller
+        // is metered exactly once — see llmPricing.imageGenerationCostUsd (ENG-200).
         const imageCost = this.estimateImageGenerationCost(imageModelUsed);
-        void recordUsage({
-          userId,
-          sessionId,
-          model: imageModelUsed,
-          provider: 'google',
-          feature: 'generateImage',
-          inputTokens: 0,
-          outputTokens: 0,
-          costUsdOverride: imageCost,
-        });
         chatbotDb.addToolCostToSession(sessionId, imageCost, 'generateImage').catch((err) =>
           console.error('AgentMode: Failed to add image cost to session:', err)
         );
@@ -20400,20 +20385,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       if (result.success && result.videoUrl) {
-        // Track generation cost (video APIs are billed per 8s clip; longer videos cost more).
-        // Burn-only: record it to the user's burn for visibility, but do NOT deduct
-        // it from their quota — image/video spend is on us (ENG-200).
+        // Session cost accounting (agent-mode chat). The per-user burn shadow record is
+        // fired once at the generation SOURCE (videoService.generateVideo) so every caller
+        // is metered exactly once — see llmPricing.videoGenerationCostUsd (ENG-200).
         const videoCost = this.estimateVideoGenerationCost(videoModel || 'veo-3.1-generate-preview', durationSeconds);
-        void recordUsage({
-          userId,
-          sessionId,
-          model: videoModel || 'veo-3.1-generate-preview',
-          provider: 'google',
-          feature: 'generateVideo',
-          inputTokens: 0,
-          outputTokens: 0,
-          costUsdOverride: videoCost,
-        });
         chatbotDb.addToolCostToSession(sessionId, videoCost, 'generateVideo').catch((err) =>
           console.error('AgentMode: Failed to add video cost to session:', err)
         );

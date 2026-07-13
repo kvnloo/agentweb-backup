@@ -140,6 +140,29 @@ export const VIDEO_GENERATION_PRICING_USD_PER_CLIP: Record<string, number> = {
   'seedance-2.0': 1.55,
 };
 
+/**
+ * Per-generation USD cost for an image model (billed per image, not per token).
+ * Single source of truth for image cost — used by the generation source meter and
+ * agent-mode session accounting alike.
+ */
+export function imageGenerationCostUsd(model: string): number {
+  return IMAGE_GENERATION_PRICING_USD[model] ?? 0.04;
+}
+
+/**
+ * Per-generation USD cost for a video model. Video is billed per 8s clip; a longer
+ * requested duration bills as ceil(seconds / 8) clips.
+ */
+export function videoGenerationCostUsd(model: string, durationSeconds?: number): number {
+  const clipPrice = VIDEO_GENERATION_PRICING_USD_PER_CLIP[model] ?? 3.2;
+  const VEO_MAX_SECONDS = 8;
+  const clipCount =
+    durationSeconds && durationSeconds > VEO_MAX_SECONDS
+      ? Math.ceil(durationSeconds / VEO_MAX_SECONDS)
+      : 1;
+  return clipPrice * clipCount;
+}
+
 /** Models we've already warned about this process — dedupes the unknown-model warn. */
 const warnedUnknownModels = new Set<string>();
 

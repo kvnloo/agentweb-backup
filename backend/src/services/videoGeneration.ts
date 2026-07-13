@@ -4,6 +4,8 @@ import { uploadFileToS3 } from "../utils/s3Utils";
 import { remotionService, RemotionComposeParams } from "./remotionService";
 import { imageService } from "./imageGeneration";
 import { McpClientService } from "../mcp/client/mcpClientService";
+import { recordUsage } from "./usageRecorderService";
+import { videoGenerationCostUsd } from "../utils/llmPricing";
 
 interface VideoGenerationResult {
   success: boolean;
@@ -1086,6 +1088,22 @@ export class VideoService {
             // Composition failed — log a warning but still return the raw clip
             console.warn(`VideoService: Remotion composition failed (${composeResult.error}), returning raw clip`);
           }
+        }
+
+        // Burn-only shadow record, fired ONCE per successful generation at the source so
+        // every caller is metered exactly once. The Seedance->Veo fallback re-enters
+        // generateVideo, so only the terminal successful model reaches here. Video bills per
+        // 8s clip; attribute the dollar cost to the user's burn but never charge quota.
+        if (result.success && result.videoUrl) {
+          void recordUsage({
+            userId: params.userId,
+            model: modelToUse,
+            provider: isHiggsfieldModel(modelToUse) ? "higgsfield" : "google",
+            feature: "video_generation",
+            inputTokens: 0,
+            outputTokens: 0,
+            costUsdOverride: videoGenerationCostUsd(modelToUse, requestedDuration),
+          });
         }
 
         return result;
