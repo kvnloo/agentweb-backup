@@ -38,6 +38,14 @@ export interface AttributionTouch {
 /**
  * Normalize a raw request payload into an AttributionTouch.
  * Accepts either the new `attribution` shape or the legacy flat `utm` shape.
+ *
+ * ⚠️ A returned touch does NOT mean the visit was attributed. `timestamp` is
+ * stamped unconditionally, so any payload at all — including one carrying no UTMs
+ * and no click ids — yields a truthy AttributionTouch whose `utm` is undefined.
+ * That is deliberate (a direct/organic visit is still a first touch worth
+ * recording), but it means callers must NOT treat "normalizeAttribution returned
+ * something" as "we know where this lead came from". Check `touch.utm?.source`.
+ * See LeadAttributionFields in utils/leadSchema.ts for the full warning.
  */
 export function normalizeAttribution(payload: unknown): AttributionTouch | undefined {
   if (!payload || typeof payload !== 'object') return undefined;
