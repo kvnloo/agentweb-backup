@@ -101,20 +101,24 @@ router.get('/me', authenticateToken, async (req, res) => {
         const { getUserSubscriptionType, getAllowedPages, getAllowedSkills, getHiddenPages } = await import('../services/subscriptionService');
         const { skillService } = await import('../services/skillService');
 
-        // If user is an org member, resolve subscription from the org owner
-        const subscriptionUserId = (org?.ownerUserId) || userId;
-        const subscriptionTypeName = await getUserSubscriptionType(subscriptionUserId);
+        // Resolution (including the org-owner fallback and the own-active-
+        // subscription guard) is centralized in getUserSubscriptionType and
+        // friends — call them with the caller's own userId directly rather
+        // than pre-resolving to the owner here, or a member riding their own
+        // active/trialing subscription would have it silently overridden by
+        // the owner's tier (see subscriptionService.ts's discriminator).
+        const subscriptionTypeName = await getUserSubscriptionType(userId);
 
         response.subscriptionType = subscriptionTypeName;
 
-        // Get allowed pages (expands "*" to actual list) — use org owner's if in org
-        response.allowedPages = await getAllowedPages(subscriptionUserId);
+        // Get allowed pages (expands "*" to actual list)
+        response.allowedPages = await getAllowedPages(userId);
 
-        // Get hidden pages — use org owner's if in org
-        response.hiddenPages = await getHiddenPages(subscriptionUserId);
+        // Get hidden pages
+        response.hiddenPages = await getHiddenPages(userId);
 
-        // Get allowed skills resolved to { skillId, name } for display — use org owner's if in org
-        const allowedSkillIds = await getAllowedSkills(subscriptionUserId);
+        // Get allowed skills resolved to { skillId, name } for display
+        const allowedSkillIds = await getAllowedSkills(userId);
         const publishedSkills = await skillService.getPublishedSkills();
         const isWildcard = allowedSkillIds.includes("*");
         const allowedSet = new Set(allowedSkillIds);
@@ -132,7 +136,12 @@ router.get('/me', authenticateToken, async (req, res) => {
 
         // For org members, overlay the owner's Stripe subscription status fields so
         // the customer portal displays the correct plan status, billing date, etc.
-        if (user.orgRole === 'member' && org?.ownerUserId && org.ownerUserId !== userId) {
+        // Skip the overlay for a member riding their own active/trialing subscription —
+        // showing the owner's billing/payment info would be misleading when the member
+        // is genuinely paying independently (same discriminator as getUserSubscriptionType).
+        const hasOwnActiveSubscriptionForOverlay =
+          user.subscription_status === 'active' || user.subscription_status === 'trialing';
+        if (!hasOwnActiveSubscriptionForOverlay && user.orgRole === 'member' && org?.ownerUserId && org.ownerUserId !== userId) {
           const ownerUser = await userDb.getUserById(org.ownerUserId);
           if (ownerUser) {
             response.subscription_status = ownerUser.subscription_status;
