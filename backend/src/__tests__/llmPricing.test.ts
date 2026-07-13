@@ -133,11 +133,39 @@ describe('llmPricing', () => {
     });
 
     it('derives cache prices as 10% / 125% of input price for token models', () => {
+      // Models whose provider publishes an explicit cache rate that differs from the
+      // 10%/125% convention (see the ModelPrice cache-price docs). gpt-4o's real
+      // cached-input rate is $1.25 (50% of input), not the derived 10%.
+      const explicitCacheOverrides = new Set(['gpt-4o']);
       for (const [model, price] of Object.entries(MODEL_PRICING)) {
         if (price.outPerM === 0) continue; // embeddings have no cache convention
+        if (explicitCacheOverrides.has(model)) continue;
         expect(price.cacheReadPerM).toBeCloseTo(price.inPerM * 0.1, 10);
         expect(price.cacheWritePerM).toBeCloseTo(price.inPerM * 1.25, 10);
         expect(model).toBeTruthy();
+      }
+    });
+
+    it('uses the real published cache-read rate for gpt-4o ($1.25, not the 10% default)', () => {
+      const price = getModelPrice('gpt-4o');
+      expect(price).not.toBeNull();
+      expect(price!.cacheReadPerM).toBe(1.25);
+    });
+
+    it('resolves Fable/Haiku under the Bedrock anthropic.-prefixed id, not just the bare Vertex id', () => {
+      // ENG-199 may wire Fable via Bedrock (anthropic.claude-fable-5) rather than
+      // Vertex (bare) — both ids must price identically or a rollout records $0.
+      for (const id of ['claude-fable-5', 'anthropic.claude-fable-5']) {
+        const price = getModelPrice(id);
+        expect(price).not.toBeNull();
+        expect(price!.inPerM).toBe(10);
+        expect(price!.outPerM).toBe(50);
+      }
+      for (const id of ['claude-haiku-4-5', 'anthropic.claude-haiku-4-5']) {
+        const price = getModelPrice(id);
+        expect(price).not.toBeNull();
+        expect(price!.inPerM).toBe(1);
+        expect(price!.outPerM).toBe(5);
       }
     });
 
