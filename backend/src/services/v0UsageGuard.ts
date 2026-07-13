@@ -39,6 +39,41 @@ const memoryUsage = new Map<string, V0UsageRecord>();
 export const V0_RESERVATION_TTL_MS = 20 * 60 * 1000;
 
 /**
+ * How long a `succeeded` chat may be reused before we mint a fresh one.
+ *
+ * `succeeded` records that the CHAT was created — NOT that a page was delivered. Reuse
+ * is right while v0 is merely slow: the retry resumes the same chat, catches a late
+ * completion, and is never charged twice. It is a permanent wedge once the chat is a
+ * dead end — and because the prompt is deliberately not part of the key, retrying with a
+ * DIFFERENT prompt would reuse it too. Dead ends are freed explicitly by the caller
+ * (`clearV0UsageForPage`); this ceiling is the backstop that bounds every path we did not
+ * anticipate, so "a route can never be wedged forever" is a guarantee, not a hope.
+ *
+ * Sized above two generation budgets (2 × 20 min) so a legitimate resume-after-timeout
+ * retry always lands inside it. (ENG-287 residual)
+ */
+export const V0_CHAT_REUSE_CEILING_MS = 45 * 60 * 1000;
+
+/**
+ * May we hand this existing chat back instead of paying for a new one?
+ *
+ * Only a `succeeded` record with a chatId, and only while it is younger than the reuse
+ * ceiling. Age is measured from `createdAt` (when the chat was minted), not `updatedAt`,
+ * which `save()` bumps on every write.
+ */
+export function canReuseChat(
+  existing: V0UsageRecord | undefined,
+  nowMs: number,
+  ceilingMs: number = V0_CHAT_REUSE_CEILING_MS,
+): boolean {
+  if (!existing?.chatId || existing.status !== 'succeeded') return false;
+  const ageMs = nowMs - Date.parse(existing.createdAt);
+  // An unparseable timestamp yields NaN → not reusable. Minting a fresh chat costs one
+  // duplicate v0 call; reusing an unknown-age chat risks the eternal wedge.
+  return Number.isFinite(ageMs) && ageMs <= ceilingMs;
+}
+
+/**
  * Should an existing usage record block a NEW generation attempt?
  *
  * Only a *fresh* `reserved` record blocks — that is a genuinely in-progress run.
@@ -78,18 +113,25 @@ export function buildV0IdempotencyKey(input: {
   slug?: string;
   prompt?: string;
   chatId?: string;
+  attempt?: number;
 }): string {
   // The key deliberately does NOT include the prompt. The enriched prompt varies
   // between attempts (brand context is not stable), so keying on it meant retries
   // never deduped and each retry called v0 at full cost. "The same generation" is
   // identified by (operation, user, scope, slug[, chatId]) — the prompt is stored
   // on the record for observability but is not part of the identity. (ENG-287)
+  //
+  // `attempt` discriminates the rounds of the validation-correction loop, which are
+  // genuinely DIFFERENT sends (round 2 must go out even though round 1 succeeded).
+  // It is appended only when supplied, so chat-create keys stay byte-identical to the
+  // ones already persisted in prod. (ENG-287 residual)
   return [
     input.operation,
     input.userId,
     input.scopeId,
     input.slug || '',
     input.chatId || '',
+    ...(input.attempt === undefined ? [] : [String(input.attempt)]),
   ].join('#');
 }
 
@@ -119,18 +161,32 @@ async function bestEffortPut(
 }
 
 /**
- * Reserve the key iff nothing is holding it: no record, or a `failed` record, or
- * a `reserved` record older than the TTL (crash-abandoned). Mirrors
- * `isReservationBlocking` on the DynamoDB side so a concurrent winner is rejected.
- * The stale clause is scoped to `reserved` so a `succeeded` record is never
- * clobbered — reuse of an old succeeded chat must survive this put. (ENG-287)
+ * Reserve the key iff nothing is holding it: no record, a `failed` record, a `reserved`
+ * record older than the TTL (crash-abandoned), or a `succeeded` record whose chat has
+ * aged past the reuse ceiling (see `canReuseChat`).
+ *
+ * Mirrors `isReservationBlocking` + `canReuseChat` on the DynamoDB side so a concurrent
+ * winner is rejected. A *fresh* `succeeded` record is still never clobbered — that is what
+ * keeps two concurrent generations of the same route deduped to one chat. (ENG-287)
  */
-async function reserveInDynamo(record: V0UsageRecord, staleThresholdIso: string): Promise<boolean> {
+async function reserveInDynamo(
+  record: V0UsageRecord,
+  staleThresholdIso: string,
+  chatStaleThresholdIso: string,
+): Promise<boolean> {
   return bestEffortPut(record, {
     condition:
-      'attribute_not_exists(idempotencyKey) OR #status = :failed OR (#status = :reserved AND #updatedAt < :stale)',
-    names: { '#status': 'status', '#updatedAt': 'updatedAt' },
-    values: { ':failed': 'failed', ':reserved': 'reserved', ':stale': staleThresholdIso },
+      'attribute_not_exists(idempotencyKey) OR #status = :failed' +
+      ' OR (#status = :reserved AND #updatedAt < :stale)' +
+      ' OR (#status = :succeeded AND #createdAt < :chatStale)',
+    names: { '#status': 'status', '#updatedAt': 'updatedAt', '#createdAt': 'createdAt' },
+    values: {
+      ':failed': 'failed',
+      ':reserved': 'reserved',
+      ':stale': staleThresholdIso,
+      ':succeeded': 'succeeded',
+      ':chatStale': chatStaleThresholdIso,
+    },
   });
 }
 
@@ -202,12 +258,15 @@ export async function guardedV0ChatCreate<T = any>(input: {
 }): Promise<T | { id: string; reused: true }> {
   const idempotencyKey = buildV0IdempotencyKey(input);
   const existing = memoryUsage.get(idempotencyKey) || await bestEffortGet(idempotencyKey);
-  if (existing?.chatId && existing.status === 'succeeded') {
-    return { id: existing.chatId, reused: true };
+  const nowMs = Date.now();
+  // Reuse a succeeded chat only while it is young enough to still be worth resuming.
+  // Past the ceiling it is presumed dead and we mint a fresh one rather than reusing a
+  // chat that can never deliver — the immortal-record wedge. (ENG-287 residual)
+  if (canReuseChat(existing, nowMs)) {
+    return { id: existing!.chatId!, reused: true };
   }
   // Only a fresh reservation blocks; a failed or crash-abandoned (stale) record
   // must let a retry through. (ENG-287)
-  const nowMs = Date.now();
   if (isReservationBlocking(existing, nowMs)) {
     throw new Error('A v0 generation for this page is already in progress.');
   }
@@ -225,14 +284,15 @@ export async function guardedV0ChatCreate<T = any>(input: {
   };
   memoryUsage.set(idempotencyKey, reserved);
   const staleThresholdIso = new Date(nowMs - V0_RESERVATION_TTL_MS).toISOString();
-  const reservedInDynamo = await reserveInDynamo(reserved, staleThresholdIso);
+  const chatStaleThresholdIso = new Date(nowMs - V0_CHAT_REUSE_CEILING_MS).toISOString();
+  const reservedInDynamo = await reserveInDynamo(reserved, staleThresholdIso, chatStaleThresholdIso);
   if (!reservedInDynamo) {
     // Lost the race to another instance — resync the local Map with the winner's
     // record so this instance's pre-check stops trusting its own stale reservation.
     const latest = await bestEffortGet(idempotencyKey);
     if (latest) memoryUsage.set(idempotencyKey, latest);
     else memoryUsage.delete(idempotencyKey);
-    if (latest?.chatId && latest.status === 'succeeded') return { id: latest.chatId, reused: true };
+    if (canReuseChat(latest, nowMs)) return { id: latest!.chatId!, reused: true };
     throw new Error('A v0 generation for this page is already in progress.');
   }
 
@@ -252,6 +312,15 @@ export async function guardedV0CorrectionMessage<T>(input: {
   userId: string;
   scopeId: string;
   chatId: string;
+  /**
+   * Which round of the validation-correction loop this is. Each round is a genuinely
+   * different send — round 2 must go out even though round 1 succeeded. Without this the
+   * key was (user, scope, chatId), so every round after the first returned
+   * `{skipped: true}` and the loop just re-downloaded the same broken zip: a 3-attempt
+   * self-heal that was really 1 attempt. Same value on a retry still dedupes a
+   * double-fire. (ENG-287 residual)
+   */
+  attempt?: number;
   send: () => Promise<T>;
 }): Promise<T | { skipped: true }> {
   const idempotencyKey = buildV0IdempotencyKey({
@@ -259,6 +328,7 @@ export async function guardedV0CorrectionMessage<T>(input: {
     operation: 'correction_message',
     scopeId: input.scopeId,
     chatId: input.chatId,
+    attempt: input.attempt,
   });
   const existing = memoryUsage.get(idempotencyKey) || await bestEffortGet(idempotencyKey);
   if (existing?.status === 'succeeded' || existing?.status === 'skipped') {
@@ -287,6 +357,7 @@ export async function guardedV0CorrectionMessage<T>(input: {
   const reservedInDynamo = await reserveInDynamo(
     reserved,
     new Date(nowMs - V0_RESERVATION_TTL_MS).toISOString(),
+    new Date(nowMs - V0_CHAT_REUSE_CEILING_MS).toISOString(),
   );
   if (!reservedInDynamo) return { skipped: true };
 
