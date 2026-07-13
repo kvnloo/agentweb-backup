@@ -360,6 +360,24 @@ const HelpCaption: React.FC<{ label: string; help: string }> = ({ label, help })
   </Box>
 );
 
+// Recent months (newest first) for the cost-breakdown picker, as
+// { value: "YYYY-MM", label: "Jul 2026" }. Bounded on purpose: burn data only
+// exists for the recent window (shadow-table TTL), so an open-ended date input
+// would mostly land on empty months. Uses the same UTC basis as tokenUsage.month
+// and the inline cost cells, so the default month always matches an option.
+function recentMonthOptions(count: number): Array<{ value: string; label: string }> {
+  const now = new Date();
+  const opts: Array<{ value: string; label: string }> = [];
+  for (let i = 0; i < count; i++) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+    opts.push({
+      value: d.toISOString().slice(0, 7),
+      label: d.toLocaleString("en-US", { month: "short", year: "numeric", timeZone: "UTC" }),
+    });
+  }
+  return opts;
+}
+
 // Define an interface for the task data shown in the admin tasks tab
 interface AdminTask {
   taskId: string;
@@ -6615,14 +6633,17 @@ export default function AdminDashboard() {
         <DialogTitle sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 2 }}>
           <span>LLM Cost Burn — {costBreakdownUser?.email}</span>
           <TextField
-            type="month"
+            select
             size="small"
             label="Month"
             value={costBreakdownMonth}
             onChange={(e) => setCostBreakdownMonth(e.target.value)}
-            InputLabelProps={{ shrink: true }}
             sx={{ width: 170 }}
-          />
+          >
+            {recentMonthOptions(12).map((m) => (
+              <MenuItem key={m.value} value={m.value}>{m.label}</MenuItem>
+            ))}
+          </TextField>
         </DialogTitle>
         <DialogContent dividers>
           {costBreakdownLoading ? (
