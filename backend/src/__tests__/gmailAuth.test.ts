@@ -39,6 +39,27 @@ jest.mock('../middleware/auth', () => ({
   },
 }));
 
+// OAuth token sessions are no longer held in process memory — they round-trip
+// through the settings table so /finalize and /connect can land on different
+// instances (ENG-301). Back it with an in-memory map for this route test.
+jest.mock('../services/settingsService', () => {
+  const store = new Map<string, string>();
+  return {
+    settingsService: {
+      setSetting: jest.fn(async (settingName: string, settingValue: string) => {
+        store.set(settingName, settingValue);
+      }),
+      getSetting: jest.fn(async (settingName: string) => {
+        const settingValue = store.get(settingName);
+        return settingValue ? { settingName, settingValue } : null;
+      }),
+      deleteSetting: jest.fn(async (settingName: string) => {
+        store.delete(settingName);
+      }),
+    },
+  };
+});
+
 jest.mock('axios');
 const axios = require('axios');
 
