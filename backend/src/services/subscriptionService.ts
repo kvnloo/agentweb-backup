@@ -82,6 +82,16 @@ export async function getUserSubscriptionType(userId: string): Promise<string> {
       try {
         const org = await orgDb.getOrgById(user.orgId);
         if (org?.ownerUserId && org.ownerUserId !== userId) {
+          // Reads the owner's raw stored field directly, not resolved
+          // recursively through this same function — the owner's
+          // subscriptionType is the canonical source of truth for what the
+          // org pays for (kept in sync by Stripe webhooks / admin panel
+          // writes, not by this resolution logic), and an org owner can't
+          // themselves be a member of another org (see routes/org.ts create),
+          // so there is no owner-of-owner chain to walk. A stale owner field
+          // (e.g. their own Stripe sub canceled but subscriptionType wasn't
+          // updated) would propagate as-is — an accepted limitation of the
+          // current data model, not something this function can detect.
           const owner = await userDb.getUserById(org.ownerUserId);
           return owner?.subscriptionType || "Free";
         }
