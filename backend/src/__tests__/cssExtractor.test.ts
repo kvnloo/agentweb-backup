@@ -30,6 +30,18 @@ jest.mock('color', () => {
         const b = parseInt(hex.slice(5, 7), 16);
         return (0.299 * r + 0.587 * g + 0.114 * b) / 2.55;
       },
+      saturationl: () => {
+        // HSL saturation (0-100)
+        const r = parseInt(hex.slice(1, 3), 16) / 255;
+        const g = parseInt(hex.slice(3, 5), 16) / 255;
+        const b = parseInt(hex.slice(5, 7), 16) / 255;
+        const max = Math.max(r, g, b);
+        const min = Math.min(r, g, b);
+        if (max === min) return 0;
+        const l = (max + min) / 2;
+        const d = max - min;
+        return (l > 0.5 ? d / (2 - max - min) : d / (max + min)) * 100;
+      },
     };
   };
   Color.default = Color;
@@ -243,6 +255,7 @@ const mockPage = {
   setExtraHTTPHeaders: jest.fn(),
   emulateMediaFeatures: jest.fn(),
   goto: jest.fn(),
+  reload: jest.fn(),
   evaluate: jest.fn(),
   close: jest.fn(),
 };
@@ -266,7 +279,7 @@ jest.mock('../utils/browserUtils', () => ({
 // Mock axios for JSDOM fallback path
 jest.mock('axios');
 
-import { extractCSSFromURL, analyzeDesignTokens, inferBrandTokens, DesignTokens } from '../services/cssExtractor';
+import { extractCSSFromURL, analyzeDesignTokens, inferBrandTokens, countBrandColors, DesignTokens } from '../services/cssExtractor';
 
 const { findChromeExecutable } = require('../utils/browserUtils');
 
@@ -519,6 +532,7 @@ describe('cssExtractor', () => {
       mockPage.setExtraHTTPHeaders.mockResolvedValue(undefined);
       mockPage.emulateMediaFeatures.mockResolvedValue(undefined);
       mockPage.goto.mockResolvedValue(undefined);
+      mockPage.reload.mockResolvedValue(undefined);
       mockPage.close.mockResolvedValue(undefined);
       const pMock = require('puppeteer-core');
       pMock.default.launch.mockResolvedValue(mockBrowser);
@@ -575,28 +589,100 @@ describe('cssExtractor', () => {
       );
     });
 
-    it('emulates prefers-color-scheme: dark before navigating so a dark-brand site is captured as dark (not a light default)', async () => {
+    it('captures the DARK render when it is the richer brand palette (ENG-285: rankai.ai)', async () => {
       // Regression for ENG-285: headless Chrome reports prefers-color-scheme:
-      // light by default, so sites that ship their brand's dark theme behind the
-      // OS color-scheme preference (via a CSS media query or a client script that
-      // reads it) were captured in their LIGHT variant — e.g. rankai.ai read as a
-      // near-white background when the real design is dark. Emulating a dark
-      // preference makes the extraction match what dark-mode users see.
-      mockPage.evaluate.mockResolvedValueOnce({
+      // light by default, so a site whose real design is dark (matte black with an
+      // amber glow, purple accent, indigo CTA) was captured in a near-white LIGHT
+      // variant. We now read both variants and keep dark when it is the richer
+      // (more brand-colored) render.
+      const lightRender = {
         customProperties: {},
-        stylesheetText: 'body { color: #eee; }',
-        computedElements: {},
-      });
+        stylesheetText: 'body { color: #111; background: #fafafa; }',
+        computedElements: {
+          body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: 'rgb(17, 17, 17)', backgroundColor: 'rgb(250, 250, 250)', borderColor: 'transparent' },
+        },
+      };
+      const darkRender = {
+        customProperties: {},
+        stylesheetText: 'body { color: #fff; background: #121212; }',
+        computedElements: {
+          body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: 'rgb(255, 255, 255)', backgroundColor: 'rgb(18, 18, 18)', borderColor: 'transparent' },
+          h1: { fontSize: '48px', lineHeight: '56px', fontWeight: '700', fontFamily: 'Inter', color: 'rgb(155, 130, 255)', backgroundColor: 'transparent', borderColor: 'transparent' },
+          button: { fontSize: '16px', lineHeight: '24px', fontWeight: '600', fontFamily: 'Inter', color: 'rgb(255, 255, 255)', backgroundColor: 'rgb(99, 68, 245)', borderColor: 'transparent' },
+        },
+      };
+      mockPage.evaluate
+        .mockResolvedValueOnce(lightRender)
+        .mockResolvedValueOnce(darkRender);
 
-      await extractCSSFromURL('https://example.com');
+      const result = await extractCSSFromURL('https://example.com');
 
+      // The dark preference is emulated and the page reloaded to capture it.
       expect(mockPage.emulateMediaFeatures).toHaveBeenCalledWith([
         { name: 'prefers-color-scheme', value: 'dark' },
       ]);
-      // Must be emulated BEFORE navigation so SSR/hydration observe the preference.
-      const emulateOrder = mockPage.emulateMediaFeatures.mock.invocationCallOrder[0];
-      const gotoOrder = mockPage.goto.mock.invocationCallOrder[0];
-      expect(emulateOrder).toBeLessThan(gotoOrder);
+      expect(mockPage.reload).toHaveBeenCalled();
+      // Dark is richer (purple + indigo accents) → selected.
+      expect(result.computedElements?.body?.backgroundColor).toBe('rgb(18, 18, 18)');
+    });
+
+    it('keeps the LIGHT render for a light-default site that only offers a system dark variant (vercel.com regression)', async () => {
+      // vercel.com is light by default and merely offers a near-monochrome dark
+      // variant. Forcing dark mis-captured it as rgb(0,0,0); we must keep light.
+      const lightRender = {
+        customProperties: {},
+        stylesheetText: 'body { background: #fafafa; }',
+        computedElements: {
+          body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: 'rgb(0, 0, 0)', backgroundColor: 'rgb(250, 250, 250)', borderColor: 'transparent' },
+        },
+      };
+      const darkRender = {
+        customProperties: {},
+        stylesheetText: 'body { background: #000; }',
+        computedElements: {
+          body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: 'rgb(255, 255, 255)', backgroundColor: 'rgb(0, 0, 0)', borderColor: 'transparent' },
+        },
+      };
+      mockPage.evaluate
+        .mockResolvedValueOnce(lightRender)
+        .mockResolvedValueOnce(darkRender);
+
+      const result = await extractCSSFromURL('https://example.com');
+
+      // Neither variant has saturated brand colors → tie → keep the canonical
+      // (default-served) light render.
+      expect(result.computedElements?.body?.backgroundColor).toBe('rgb(250, 250, 250)');
+    });
+
+    it('falls back to the default render when the dark reload fails', async () => {
+      const lightRender = {
+        customProperties: {},
+        stylesheetText: 'body { background: #fafafa; }',
+        computedElements: {
+          body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: 'rgb(0, 0, 0)', backgroundColor: 'rgb(250, 250, 250)', borderColor: 'transparent' },
+        },
+      };
+      mockPage.evaluate.mockResolvedValueOnce(lightRender);
+      mockPage.reload.mockRejectedValueOnce(new Error('nav timeout'));
+
+      const result = await extractCSSFromURL('https://example.com');
+
+      expect(result.computedElements?.body?.backgroundColor).toBe('rgb(250, 250, 250)');
+    });
+  });
+
+  describe('countBrandColors', () => {
+    it('counts distinct saturated brand colors and ignores neutrals/near-black/white', () => {
+      expect(countBrandColors(undefined)).toBe(0);
+      // Pure neutrals → 0
+      expect(countBrandColors({
+        body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: 'rgb(0, 0, 0)', backgroundColor: 'rgb(255, 255, 255)', borderColor: 'transparent' },
+      } as any)).toBe(0);
+      // Two distinct saturated accents → 2
+      expect(countBrandColors({
+        h1: { fontSize: '48px', lineHeight: '56px', fontWeight: '700', fontFamily: 'Inter', color: 'rgb(155, 130, 255)', backgroundColor: 'rgb(18, 18, 18)', borderColor: 'transparent' },
+        button: { fontSize: '16px', lineHeight: '24px', fontWeight: '600', fontFamily: 'Inter', color: 'rgb(255, 255, 255)', backgroundColor: 'rgb(99, 68, 245)', borderColor: 'transparent' },
+      } as any)).toBe(2);
     });
   });
 
