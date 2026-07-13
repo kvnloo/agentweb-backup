@@ -442,18 +442,20 @@ describe('Organization routes', () => {
       expect(mockUsers['user-2'].orgRole).toBe('member');
     });
 
-    it('should provision the new member with the org owner tier (ENG-288)', async () => {
+    it('should NOT snapshot the owner tier onto the member on accept (ENG-288)', async () => {
       const res = await request(app).post('/api/org/accept-invite').send({
         orgId: 'org-1',
         inviteToken: 'valid-token',
       });
       expect(res.status).toBe(200);
-      // The invited member must inherit the org owner's subscription tier and
-      // entitlements, not stay on their signup Free tier — otherwise gated
-      // features (e.g. Landing Pages) remain locked despite org sharing.
-      expect(mockUsers['user-2'].subscriptionType).toBe('Pro');
-      expect(mockUsers['user-2'].allowedPages).toEqual(['/', '/agent-mode', '/settings', '/landing-pages']);
-      expect(mockUsers['user-2'].allowedSkills).toEqual(['*']);
+      // The member's effective tier is resolved dynamically from the org owner at
+      // read time (getUserSubscriptionType), NOT persisted onto the member record.
+      // Snapshotting the owner's tier here would leave a departed/downgraded member
+      // with permanently elevated access, so accept-invite must leave the member's
+      // own subscription fields untouched.
+      expect(mockUsers['user-2'].subscriptionType).toBe('Free');
+      expect(mockUsers['user-2'].allowedPages).toEqual(['/', '/agent-mode', '/settings']);
+      expect(mockUsers['user-2'].allowedSkills).toEqual([]);
     });
   });
 

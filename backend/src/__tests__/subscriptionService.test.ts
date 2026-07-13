@@ -1,5 +1,5 @@
 import { settingsService } from '../services/settingsService';
-import { userDb } from '../services/db';
+import { userDb, orgDb } from '../services/db';
 import { CUSTOMER_PORTAL_PAGES } from '../services/customerPortalPages';
 import {
   getUserSubscriptionType,
@@ -26,6 +26,9 @@ jest.mock('../services/settingsService', () => ({
 jest.mock('../services/db', () => ({
   userDb: {
     getUserById: jest.fn(),
+  },
+  orgDb: {
+    getOrgById: jest.fn(),
   },
 }));
 
@@ -86,6 +89,30 @@ describe('subscriptionService', () => {
     mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u2' } as any);
     const t2 = await getUserSubscriptionType('u2');
     expect(t2).toBe('Free');
+  });
+
+  it('getUserSubscriptionType resolves an org member to the owner tier dynamically (ENG-288)', async () => {
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    // Member record itself carries no paid tier — it must resolve from the owner.
+    mockedUserDb.getUserById.mockImplementation(async (id: string) => {
+      if (id === 'member-1') return { userId: 'member-1', orgId: 'org-1', orgRole: 'member', subscriptionType: 'Free' } as any;
+      if (id === 'owner-1') return { userId: 'owner-1', subscriptionType: 'Pro' } as any;
+      return null as any;
+    });
+    mockedOrgDb.getOrgById.mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1' } as any);
+
+    const tier = await getUserSubscriptionType('member-1');
+    expect(tier).toBe('Pro');
+  });
+
+  it('getUserSubscriptionType returns the member own tier once they leave the org (ENG-288 revocation)', async () => {
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    // After leaving, orgId/orgRole are cleared — no org lookup, no inherited tier.
+    mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'ex-member', subscriptionType: 'Free' } as any);
+
+    const tier = await getUserSubscriptionType('ex-member');
+    expect(tier).toBe('Free');
+    expect(mockedOrgDb.getOrgById).not.toHaveBeenCalled();
   });
 
   it('getAllAvailablePages includes default pages and customer portal pages', () => {
