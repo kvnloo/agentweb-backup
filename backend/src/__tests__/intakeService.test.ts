@@ -90,8 +90,6 @@ describe('fileUserIssue — bug (private own-card + one canonical listing affect
     expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-9', expect.stringContaining('[reporter-ticket #7 u@e.com]'));
     expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-9', expect.stringContaining('Session: sess-2'));
     expect(r).toMatchObject({ pageId: '7', deduped: false, tracker: 'Featurebase', userUrl: 'https://fb/t/7' });
-    // Visible Linear confirmation (ENG-289): the canonical issue link is surfaced, not discarded.
-    expect(r.canonicalUrl).toBe('lin');
   });
 
   it('matches an existing canonical -> its OWN new card, groups onto the existing canonical, deduped=true', async () => {
@@ -104,8 +102,6 @@ describe('fileUserIssue — bug (private own-card + one canonical listing affect
     expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-5', expect.stringContaining('[reporter-ticket #8 u2@e.com]'));
     expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-5', expect.stringContaining('also on save')); // dup folds their text in
     expect(r).toMatchObject({ pageId: '8', deduped: true, tracker: 'Featurebase', userUrl: 'https://fb/t/8' });
-    // Deduped reports return the SAME canonical link (ENG-289) — built from the matched canonical's identifier.
-    expect(r.canonicalUrl).toBe('https://linear.app/emmabyaw/issue/ENG-5');
   });
 
   it('createTicket throws -> PROPAGATES (no Notion fallback)', async () => {

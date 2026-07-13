@@ -7176,7 +7176,6 @@ emmaToolRegistry.register({
                 ${isDelegatedAdmin && adminEmail ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Via delegation</strong></td><td style="padding: 6px 0;">${adminEmail}</td></tr>` : ''}
                 ${result.pageId ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Issue ID</strong></td><td style="padding: 6px 0; font-family: monospace;">AGW-${result.pageId}</td></tr>` : ''}
                 ${result.url ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>${result.tracker}</strong></td><td style="padding: 6px 0;"><a href="${result.url}" style="color: #4F46E5; font-weight: 600;">→ Open in ${result.tracker}</a></td></tr>` : ''}
-                ${filed.canonicalUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Linear canonical</strong></td><td style="padding: 6px 0;"><a href="${filed.canonicalUrl}" style="color: #4F46E5; font-weight: 600;">→ Open canonical in Linear</a></td></tr>` : ''}
                 ${issue.pageUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Page URL</strong></td><td style="padding: 6px 0;"><a href="${issue.pageUrl}" style="color: #4F46E5;">${issue.pageUrl}</a></td></tr>` : ''}
               </table>
 
