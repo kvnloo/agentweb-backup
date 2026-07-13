@@ -695,6 +695,25 @@ export function scheduledRunSignalsIncompleteWork(content: string): boolean {
   return INCOMPLETE_WORK_PATTERNS.some((re) => re.test(content));
 }
 
+// Whole-response completion-gate check for scheduled runs. A turn signals
+// unfinished work if EITHER:
+//   (a) the run was truncated because it exhausted its step budget
+//       (truncatedByStepBudget) — the ENG-244 root cause. This is a
+//       deterministic STATE flag set by generateSessionResponse whenever the
+//       tool loop hits maxIterations, so it fires whether the final content is
+//       the canned "reached the maximum steps" apology OR the model's own
+//       partial text (the model usually complies with the "wrap up" nudge and
+//       writes non-report text, so text-pattern matching alone misses it); or
+//   (b) the final text explicitly admits it left work unfinished
+//       (scheduledRunSignalsIncompleteWork).
+export function scheduledRunSignalsIncompleteResponse(response: {
+  content?: string;
+  truncatedByStepBudget?: boolean;
+}): boolean {
+  if (response?.truncatedByStepBudget === true) return true;
+  return scheduledRunSignalsIncompleteWork(response?.content || '');
+}
+
 // Common function to run verified chat with work plan, keywords, and function call verification
 // Used by both scheduled chat and verified-generate
 export async function runVerifiedChat(
@@ -854,6 +873,11 @@ export async function runVerifiedChat(
   // Set when the completion gate asks for one more continuation turn; the next
   // iteration uses a "finish the unfinished entities" continuation message.
   let completionGateContinue = false;
+  // True when that continuation was triggered because the prior turn was cut off at
+  // its step budget (truncatedByStepBudget) rather than admitting unfinished work.
+  // Lets the continuation message be tailored so a merely-truncated turn is not
+  // wrongly told it "indicated" unfinished work (ENG-244).
+  let completionGateBudgetTruncated = false;
 
   while (attempt < maxAttempts) {
     attempt++;
@@ -863,14 +887,22 @@ export async function runVerifiedChat(
       let userMessage = startingMessage;
 
       if (completionGateContinue) {
-        // Completion-gate continuation: the prior turn admitted unfinished work.
+        // Completion-gate continuation. The prior turn either admitted unfinished
+        // work OR was cut off at its step budget; tailor the message to which, so a
+        // merely-truncated turn is not falsely told it "indicated" unfinished work
+        // (which could prompt it to argue instead of synthesizing) — ENG-244.
         completionGateContinue = false;
-        userMessage =
-          'Your previous response indicated some entities/steps were not finished. ' +
-          'Complete ALL remaining per-entity work now (research, filtering, approval ' +
-          'checks, drafts) for every entity that is not finished and not genuinely ' +
-          'blocked. Do not stop early. Then produce the final consolidated report, ' +
-          'surfacing any genuinely blocked items as actionable next steps.';
+        userMessage = completionGateBudgetTruncated
+          ? 'The previous run was cut short because it exhausted its processing-step ' +
+            'budget before it could produce the final deliverable. Using the data ' +
+            'already gathered, produce the final consolidated report now. Surface any ' +
+            'entities you could not fully research as actionable next steps.'
+          : 'Your previous response indicated some entities/steps were not finished. ' +
+            'Complete ALL remaining per-entity work now (research, filtering, approval ' +
+            'checks, drafts) for every entity that is not finished and not genuinely ' +
+            'blocked. Do not stop early. Then produce the final consolidated report, ' +
+            'surfacing any genuinely blocked items as actionable next steps.';
+        completionGateBudgetTruncated = false;
         const continuationResponse = await generateSessionResponse(
           sessionId,
           userMessage,
@@ -890,10 +922,11 @@ export async function runVerifiedChat(
         if (
           completionGateContinuationsUsed < completionGateMaxContinuations &&
           attempt < maxAttempts &&
-          scheduledRunSignalsIncompleteWork(continuationResponse.content || '')
+          scheduledRunSignalsIncompleteResponse(continuationResponse)
         ) {
           completionGateContinuationsUsed++;
           completionGateContinue = true;
+          completionGateBudgetTruncated = continuationResponse.truncatedByStepBudget === true;
           await waitForVerifiedChatRetry(attempt);
           continue;
         }
@@ -1038,13 +1071,14 @@ export async function runVerifiedChat(
         completionGate &&
         completionGateContinuationsUsed < completionGateMaxContinuations &&
         attempt < maxAttempts &&
-        scheduledRunSignalsIncompleteWork(response.content || '')
+        scheduledRunSignalsIncompleteResponse(response)
       ) {
         completionGateContinuationsUsed++;
         console.log(
           `AgentMode runVerifiedChat: completion gate triggered (continuation ${completionGateContinuationsUsed}/${completionGateMaxContinuations}) — latest turn admitted unfinished work for session ${sessionId}`
         );
         completionGateContinue = true;
+        completionGateBudgetTruncated = response.truncatedByStepBudget === true;
         await waitForVerifiedChatRetry(attempt);
         continue;
       }
@@ -1954,6 +1988,10 @@ export async function generateSessionResponse(
   backupModelUsed?: boolean;
   originalModel?: string;
   backupModel?: string;
+  // ENG-244: true when the underlying run exhausted its step budget (maxIterations)
+  // and was truncated before emitting the final deliverable. The scheduled-run
+  // completion gate uses this flag (not response text) to force a synthesis turn.
+  truncatedByStepBudget?: boolean;
 }> {
   // Clear any stale cancel from a previous request on this session
   clearCancel(sessionId);

@@ -2578,7 +2578,7 @@ export class AgentModeService {
     excludeTools?: string[],
     screenshotUrl?: string,
     isDelegatedAccess: boolean = false
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string }> {
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
@@ -2858,6 +2858,13 @@ export class AgentModeService {
       const MAX_EMPTY_SYNTHESIS_RETRIES = 1;
 
       let wasCancelled = false;
+      // ENG-244: set true when the loop exits because the step budget (maxIterations)
+      // was exhausted. This is the deterministic signal a long data-gathering
+      // scheduled run was truncated before it could emit the final deliverable —
+      // regardless of whether `content` holds the canned apology or the model's own
+      // partial text. The completion gate consumes this flag directly rather than
+      // pattern-matching the response text.
+      let truncatedByStepBudget = false;
       while (iteration < maxIterations) {
         // Check for cancellation before each iteration
         if (isCancelled?.()) {
@@ -3365,6 +3372,12 @@ export class AgentModeService {
 
       if (iteration >= maxIterations) {
         console.warn('AgentMode: Reached maximum tool execution iterations');
+        // ENG-244: flag the truncation for the completion gate BEFORE any
+        // content fallback. The model often complies with the "wrap up soon"
+        // nudge and emits its own partial text, so `content` is usually
+        // non-empty here and the canned apology below never runs — the flag,
+        // not the text, is what makes truncation reliably detectable.
+        truncatedByStepBudget = true;
         if (!content) {
           content = "I've reached the maximum number of processing steps for this request. Here's what was completed so far — please review and let me know if you'd like me to continue with any remaining items.";
         }
@@ -3521,6 +3534,7 @@ export class AgentModeService {
         sources,
         responseMessages,
         ...(wasCancelled ? { cancelled: true } : {}),
+        ...(truncatedByStepBudget ? { truncatedByStepBudget: true } : {}),
         ...(backupModelUsed ? { backupModelUsed: true, originalModel: originalLlmModel, backupModel: llmModel } : {})
       };
     } catch (error: any) {
