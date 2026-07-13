@@ -349,6 +349,17 @@ interface UsageByModelDay {
   };
 }
 
+// Caption paired with a hover-help info icon. Used to explain the burn / deduction
+// cost terminology to admins in the Users tab without cluttering the layout.
+const HelpCaption: React.FC<{ label: string; help: string }> = ({ label, help }) => (
+  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+    <Typography variant="caption" color="text.secondary">{label}</Typography>
+    <Tooltip title={help} arrow>
+      <InfoIcon sx={{ fontSize: 14, color: "text.disabled", cursor: "help" }} />
+    </Tooltip>
+  </Box>
+);
+
 // Define an interface for the task data shown in the admin tasks tab
 interface AdminTask {
   taskId: string;
@@ -4830,7 +4841,10 @@ export default function AdminDashboard() {
                                 </Grid>
                                 {/* LLM Cost quota (dollar spend vs cost cap) */}
                                 <Grid item xs={6}>
-                                  <Typography variant="caption" color="text.secondary">LLM Cost</Typography>
+                                  <HelpCaption
+                                    label="LLM Cost"
+                                    help="Dollars deducted from this user's monthly cost cap so far this month, vs the cap (∞ = no cap). This is the counted/deducted figure — open the breakdown for gross burn per model, including platform-absorbed cost."
+                                  />
                                   <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
                                     {user.roles?.includes("customer") ? (() => {
                                       const currentMonth = new Date().toISOString().slice(0, 7);
@@ -6640,21 +6654,30 @@ export default function AdminDashboard() {
                 <Grid container spacing={2} sx={{ mb: 2 }}>
                   <Grid item xs={4}>
                     <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 1.5 }}>
-                      <Typography variant="caption" color="text.secondary">Burned (gross)</Typography>
+                      <HelpCaption
+                        label="Burned (gross)"
+                        help="Burn = the real dollar cost of every LLM call this user generated this month — including calls the platform absorbs. This is what it actually costs us to serve them, before any quota accounting."
+                      />
                       <Typography variant="h6" sx={{ fontVariantNumeric: "tabular-nums" }}>${burn.toFixed(2)}</Typography>
                       <Typography variant="caption" color="text.secondary">all LLM calls this user generated</Typography>
                     </Box>
                   </Grid>
                   <Grid item xs={4}>
                     <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 1.5 }}>
-                      <Typography variant="caption" color="text.secondary">Counted to quota</Typography>
+                      <HelpCaption
+                        label="Counted to quota"
+                        help="Deduction = the portion of burn charged against the user's monthly cost cap. Some calls are metered burn-only (platform-absorbed) and never deduct, so this is usually ≤ gross burn."
+                      />
                       <Typography variant="h6" sx={{ fontVariantNumeric: "tabular-nums" }}>${deducted.toFixed(2)}</Typography>
                       <Typography variant="caption" color="text.secondary">deducted from their cost cap</Typography>
                     </Box>
                   </Grid>
                   <Grid item xs={4}>
                     <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 1.5 }}>
-                      <Typography variant="caption" color="text.secondary">Absorbed by platform</Typography>
+                      <HelpCaption
+                        label="Absorbed by platform"
+                        help="Burn the platform ate — gross burn minus what was counted to quota. This is cost we generated on the user's behalf but did not charge against their cap."
+                      />
                       <Typography variant="h6" sx={{ fontVariantNumeric: "tabular-nums" }}>${absorbed.toFixed(2)}</Typography>
                       <Typography variant="caption" color="text.secondary">burn not charged to the user</Typography>
                     </Box>
