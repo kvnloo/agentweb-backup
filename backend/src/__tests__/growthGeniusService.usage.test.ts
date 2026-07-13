@@ -38,11 +38,11 @@ describe('GrowthGeniusService.generateSessionTitle — burn-only metering', () =
     const title = await growthGeniusService.generateSessionTitle('How do I scale outbound?', 'user-7');
 
     expect(title).toBe('Scaling B2B Outbound');
-    // Burn-only: passes { burnOnly: true } so the helper records but never charges the cap.
+    // Burn-only: passes { mode: 'burn' } so the helper records but never charges the cap.
     expect(mockMeterFromResponse).toHaveBeenCalledWith(
       expect.objectContaining({ userId: 'user-7', feature: 'growth_genius_title' }),
       response,
-      { burnOnly: true }
+      { mode: 'burn' }
     );
   });
 });

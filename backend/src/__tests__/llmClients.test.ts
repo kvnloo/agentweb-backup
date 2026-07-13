@@ -292,13 +292,19 @@ describe('meterUsageFromResponse', () => {
     );
   });
 
-  it('records burn-only (recordUsage, no cap charge) when burnOnly is set', () => {
-    meterUsageFromResponse(ctx, { usage: { prompt_tokens: 12, completion_tokens: 4 } }, { burnOnly: true });
+  it("records burn-only (recordUsage, no cap charge) when mode is 'burn'", () => {
+    meterUsageFromResponse(ctx, { usage: { prompt_tokens: 12, completion_tokens: 4 } }, { mode: 'burn' });
     expect(mockRecordUsage).toHaveBeenCalledTimes(1);
     expect(mockMeterUserUsage).not.toHaveBeenCalled();
     expect(mockRecordUsage).toHaveBeenCalledWith(
       expect.objectContaining({ inputTokens: 12, outputTokens: 4, feature: 'unit-test' })
     );
+  });
+
+  it("deducts (full meter) when mode is explicitly 'meter'", () => {
+    meterUsageFromResponse(ctx, { usage: { prompt_tokens: 5, completion_tokens: 2 } }, { mode: 'meter' });
+    expect(mockMeterUserUsage).toHaveBeenCalledTimes(1);
+    expect(mockRecordUsage).not.toHaveBeenCalled();
   });
 
   it('extracts the right tokens from a Gemini response shape', () => {
