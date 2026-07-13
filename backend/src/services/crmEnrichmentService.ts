@@ -2,7 +2,7 @@ import { crmDb } from './db';
 import { agentModeService } from './agentModeService';
 import { settingsService } from './settingsService';
 import { incrementExtraCostUsage } from './tokenUsageService';
-import { meterUserUsage } from './usageRecorderService';
+import { meterUsageFromResponse } from '../utils/llmClients';
 import { v4 as uuidv4 } from 'uuid';
 import {
   getRawDataFromCache,
@@ -956,14 +956,12 @@ export class CrmEnrichmentService {
         dataExtractionModel,
         'extractFieldsViaLLM:json',
       );
-      meterUserUsage({
+      meterUsageFromResponse({
         userId: spec.userId,
         model: dataExtractionModel,
         provider: dataExtractionModel.startsWith('anthropic') || dataExtractionModel.startsWith('claude') ? 'bedrock' : 'azure',
         feature: 'crm_enrichment_extract',
-        inputTokens: (completion as any)?.usage?.prompt_tokens || 0,
-        outputTokens: (completion as any)?.usage?.completion_tokens || 0,
-      });
+      }, completion);
       const raw = completion.choices?.[0]?.message?.content || '';
       console.log(`[CrmEnrichment][extractFieldsViaLLM] LLM responded in ${Date.now()-tLlm}ms rawLen=${raw.length}`);
       response = JSON.parse(raw);
@@ -985,14 +983,12 @@ export class CrmEnrichmentService {
         dataExtractionModel,
         'extractFieldsViaLLM:plain',
       );
-      meterUserUsage({
+      meterUsageFromResponse({
         userId: spec.userId,
         model: dataExtractionModel,
         provider: dataExtractionModel.startsWith('anthropic') || dataExtractionModel.startsWith('claude') ? 'bedrock' : 'azure',
         feature: 'crm_enrichment_extract',
-        inputTokens: (retry as any)?.usage?.prompt_tokens || 0,
-        outputTokens: (retry as any)?.usage?.completion_tokens || 0,
-      });
+      }, retry);
       const rawRetry = retry.choices?.[0]?.message?.content || '';
 
       const cleaned = rawRetry
@@ -1120,14 +1116,12 @@ export class CrmEnrichmentService {
         enrichConfig.dataExtractionModel,
         'criticPass',
       );
-      meterUserUsage({
+      meterUsageFromResponse({
         userId,
         model: enrichConfig.dataExtractionModel,
         provider: enrichConfig.dataExtractionModel.startsWith('anthropic') || enrichConfig.dataExtractionModel.startsWith('claude') ? 'bedrock' : 'azure',
         feature: 'crm_enrichment_critic',
-        inputTokens: (completion as any)?.usage?.prompt_tokens || 0,
-        outputTokens: (completion as any)?.usage?.completion_tokens || 0,
-      });
+      }, completion);
       const raw = completion.choices?.[0]?.message?.content || '';
       const parsed = JSON.parse(raw) as Record<string, { verdict?: string; reason?: string }>;
       for (const c of claims) {
@@ -2088,14 +2082,12 @@ export class CrmEnrichmentService {
         ],
         response_format: { type: 'json_object' },
       });
-      meterUserUsage({
+      meterUsageFromResponse({
         userId,
         model: enrichmentModel,
         provider: enrichmentModel.startsWith('anthropic') || enrichmentModel.startsWith('claude') ? 'bedrock' : 'azure',
         feature: 'crm_enrichment_suggest',
-        inputTokens: (completion as any)?.usage?.prompt_tokens || 0,
-        outputTokens: (completion as any)?.usage?.completion_tokens || 0,
-      });
+      }, completion);
       raw = completion.choices?.[0]?.message?.content || '';
     } catch (err) {
       // Retry without json_object mode
@@ -2108,14 +2100,12 @@ export class CrmEnrichmentService {
             { role: 'user', content: `${userPrompt}\n\nCRITICAL: Return ONLY a valid JSON object. No markdown, no backticks.` },
           ],
         });
-        meterUserUsage({
+        meterUsageFromResponse({
           userId,
           model: enrichmentModel,
           provider: enrichmentModel.startsWith('anthropic') || enrichmentModel.startsWith('claude') ? 'bedrock' : 'azure',
           feature: 'crm_enrichment_suggest',
-          inputTokens: (retry as any)?.usage?.prompt_tokens || 0,
-          outputTokens: (retry as any)?.usage?.completion_tokens || 0,
-        });
+        }, retry);
         raw = retry.choices?.[0]?.message?.content || '';
         raw = raw.trim().replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/, '').trim();
       } catch (retryErr) {

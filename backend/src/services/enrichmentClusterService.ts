@@ -19,7 +19,7 @@
 import { crmDb } from './db';
 import { agentModeService } from './agentModeService';
 import { buildClusterFieldsSystemPrompt, buildClusterFieldsUserPrompt } from './enrichmentPrompts';
-import { meterUserUsage } from './usageRecorderService';
+import { meterUsageFromResponse } from '../utils/llmClients';
 
 export interface FieldCluster {
   /** User-facing field names this cluster covers. */
@@ -72,14 +72,12 @@ async function llmClusterFields(
       ],
       response_format: { type: 'json_object' },
     });
-    meterUserUsage({
+    meterUsageFromResponse({
       userId,
       model: enrichmentModel,
       provider: enrichmentModel.startsWith('anthropic') || enrichmentModel.startsWith('claude') ? 'bedrock' : 'azure',
       feature: 'crm_enrichment_cluster',
-      inputTokens: (completion as any)?.usage?.prompt_tokens || 0,
-      outputTokens: (completion as any)?.usage?.completion_tokens || 0,
-    });
+    }, completion);
     const raw = completion.choices?.[0]?.message?.content || '';
     const parsed = JSON.parse(raw);
     const candidates = Array.isArray(parsed) ? parsed : (parsed?.clusters || []);

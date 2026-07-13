@@ -12,7 +12,7 @@
  * looped on over-limit notes in a real session, so it stays pure deterministic trim.
  */
 
-import { meterUserUsage } from './usageRecorderService';
+import { meterUsageFromResponse } from '../utils/llmClients';
 
 /** Extract the note text from a Gemini JSON-ish response, tolerating markdown fences. */
 function extractContent(raw: string): string {
@@ -81,18 +81,16 @@ ${best}`;
         max_tokens: 2048,
       });
       // Meter this direct Gemini completion (bypasses callLLM): shadow analytics +
-      // the per-user cap. meterUserUsage is fail-open, so no try/catch needed.
-      const u: any = (completion as any)?.usage;
-      if (u) {
-        meterUserUsage({
+      // the per-user cap. Only when usage is present, so an empty response records
+      // nothing. meterUsageFromResponse is fail-open, so no try/catch needed.
+      if ((completion as any)?.usage) {
+        meterUsageFromResponse({
           userId,
           sessionId,
           model: 'gemini-3.5-flash',
           provider: 'gemini',
           feature: 'invite_note_shorten',
-          inputTokens: u.prompt_tokens || 0,
-          outputTokens: u.completion_tokens || 0,
-        });
+        }, completion);
       }
 
       const candidate = extractContent(completion?.choices?.[0]?.message?.content || '');
