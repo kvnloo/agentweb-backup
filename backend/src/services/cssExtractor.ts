@@ -120,8 +120,107 @@ function validateURL(urlString: string): URL {
   return url;
 }
 
+// --- CSS Color 4 support -----------------------------------------------------
+// The `color` package only understands legacy notations (hex/rgb/hsl/named). It
+// throws on `oklch()` / `oklab()` / `color(srgb ...)`, which Chrome preserves
+// verbatim in computed styles and which Tailwind v4 emits for its entire palette.
+// Without this, every colour on a Tailwind v4 site is silently dropped from
+// token extraction (ENG-285: rankai.ai ships 434 oklch declarations, and its
+// computed body background reads `oklch(0.985 0 0)`).
+
+const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
+
+// Linear-light sRGB channel -> gamma-encoded sRGB (0-255)
+function linearToSrgb(c: number): number {
+  const v = c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+  return Math.round(clamp01(v) * 255);
+}
+
+const toHex = (r: number, g: number, b: number) =>
+  '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('').toLowerCase();
+
+// Oklab -> sRGB hex (Björn Ottosson's reference matrices)
+function oklabToHex(L: number, a: number, b: number): string {
+  const l_ = L + 0.3963377774 * a + 0.2158037573 * b;
+  const m_ = L - 0.1055613458 * a - 0.0638541728 * b;
+  const s_ = L - 0.0894841775 * a - 1.2914855480 * b;
+
+  const l = l_ * l_ * l_;
+  const m = m_ * m_ * m_;
+  const s = s_ * s_ * s_;
+
+  return toHex(
+    linearToSrgb(+4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
+    linearToSrgb(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+    linearToSrgb(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s)
+  );
+}
+
+// Parse a CSS Color 4 numeric component: `0.5`, `50%`, or `none`.
+function parseComponent(token: string, percentBase: number): number | null {
+  if (!token || token === 'none') return 0;
+  const m = /^([+-]?[\d.]+)(%)?$/.exec(token);
+  if (!m) return null;
+  const value = parseFloat(m[1]);
+  if (!isFinite(value)) return null;
+  return m[2] ? (value / 100) * percentBase : value;
+}
+
+// Convert modern CSS colour notations to hex. Returns null for anything it does
+// not recognise, so the caller can fall back to the legacy `color` parser.
+export function modernColorToHex(colorValue: string): string | null {
+  const input = colorValue.trim().toLowerCase();
+  const fn = /^(oklch|oklab|color)\(\s*([^)]+?)\s*\)$/.exec(input);
+  if (!fn) return null;
+
+  // Strip the optional `/ alpha` component — we only need the opaque hex.
+  const parts = fn[2].split('/')[0].trim().split(/[\s,]+/).filter(Boolean);
+
+  try {
+    if (fn[1] === 'oklch') {
+      // oklch(L C H) — L is 0..1 (or 0-100%), C is unbounded (~0..0.4), H in deg
+      const L = parseComponent(parts[0], 1);
+      const C = parseComponent(parts[1], 0.4);
+      const hRaw = parts[2];
+      if (L === null || C === null) return null;
+      const H = hRaw && hRaw !== 'none' ? parseFloat(hRaw.replace(/deg$/, '')) : 0;
+      if (!isFinite(H)) return null;
+      const rad = (H * Math.PI) / 180;
+      return oklabToHex(L, C * Math.cos(rad), C * Math.sin(rad));
+    }
+
+    if (fn[1] === 'oklab') {
+      const L = parseComponent(parts[0], 1);
+      const a = parseComponent(parts[1], 0.4);
+      const b = parseComponent(parts[2], 0.4);
+      if (L === null || a === null || b === null) return null;
+      return oklabToHex(L, a, b);
+    }
+
+    // color(srgb r g b) / color(srgb-linear r g b) — display-p3 et al. are not
+    // colourimetrically converted; treating their coordinates as sRGB is close
+    // enough for palette extraction and far better than dropping the colour.
+    const space = parts[0];
+    const [r, g, b] = [parts[1], parts[2], parts[3]].map(p => parseComponent(p, 1));
+    if (r === null || g === null || b === null) return null;
+    if (space === 'srgb-linear') {
+      return toHex(linearToSrgb(r), linearToSrgb(g), linearToSrgb(b));
+    }
+    return toHex(
+      Math.round(clamp01(r) * 255),
+      Math.round(clamp01(g) * 255),
+      Math.round(clamp01(b) * 255)
+    );
+  } catch {
+    return null;
+  }
+}
+
 // Normalize color to hex format
 function normalizeColor(colorValue: string): string | null {
+  const modern = modernColorToHex(colorValue);
+  if (modern) return modern;
+
   try {
     const color = Color(colorValue);
     return color.hex().toLowerCase();
