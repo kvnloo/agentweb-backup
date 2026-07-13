@@ -6628,6 +6628,13 @@ export default function AdminDashboard() {
               m.costUsd += r.costUsd;
             });
             const modelRows = Object.values(byModel).sort((a, b) => b.costUsd - a.costUsd);
+            // rows come back sorted by (date, model) asc, so rows[0] is the earliest
+            // burn we have on record for this window — used to signal "tracking since".
+            const earliestTracked = costBreakdownData.rows.length ? costBreakdownData.rows[0].date : null;
+            // Burn (shadow table) and the deducted counter are separate pipelines; the
+            // counter predates per-call burn tracking, so burn can legitimately read
+            // lower than what's counted to quota during the ramp-up window.
+            const burnLagsDeducted = modelRows.length > 0 && burn + 0.005 < deducted;
             return (
               <>
                 <Grid container spacing={2} sx={{ mb: 2 }}>
@@ -6654,9 +6661,23 @@ export default function AdminDashboard() {
                   </Grid>
                 </Grid>
                 {modelRows.length === 0 ? (
-                  <Typography variant="body2" color="text.secondary" sx={{ py: 2 }}>No LLM usage recorded for this month.</Typography>
+                  <Alert severity="info" sx={{ mb: 1 }}>
+                    No per-model burn has been recorded for this month yet. Burn is captured per LLM
+                    call from usage records, so an empty view means no metered calls landed in this
+                    window (or this environment hasn't generated traffic yet). The “Counted to quota”
+                    figure above comes from a separate running counter and may still be non-zero.
+                  </Alert>
                 ) : (
-                  <Table size="small">
+                  <>
+                    {burnLagsDeducted && (
+                      <Alert severity="info" sx={{ mb: 1 }}>
+                        Recorded burn{earliestTracked ? ` (tracked from ${earliestTracked})` : ""} is lower than
+                        the amount counted to this user's quota. Per-call burn tracking is newer than the quota
+                        counter, so earlier usage isn't reflected here yet; “Absorbed by platform” shows $0
+                        until burn catches up.
+                      </Alert>
+                    )}
+                    <Table size="small">
                     <TableHead>
                       <TableRow>
                         <TableCell>Model</TableCell>
@@ -6682,6 +6703,7 @@ export default function AdminDashboard() {
                       </TableRow>
                     </TableBody>
                   </Table>
+                  </>
                 )}
               </>
             );
