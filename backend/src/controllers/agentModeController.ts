@@ -873,6 +873,11 @@ export async function runVerifiedChat(
   // Set when the completion gate asks for one more continuation turn; the next
   // iteration uses a "finish the unfinished entities" continuation message.
   let completionGateContinue = false;
+  // True when that continuation was triggered because the prior turn was cut off at
+  // its step budget (truncatedByStepBudget) rather than admitting unfinished work.
+  // Lets the continuation message be tailored so a merely-truncated turn is not
+  // wrongly told it "indicated" unfinished work (ENG-244).
+  let completionGateBudgetTruncated = false;
 
   while (attempt < maxAttempts) {
     attempt++;
@@ -882,14 +887,22 @@ export async function runVerifiedChat(
       let userMessage = startingMessage;
 
       if (completionGateContinue) {
-        // Completion-gate continuation: the prior turn admitted unfinished work.
+        // Completion-gate continuation. The prior turn either admitted unfinished
+        // work OR was cut off at its step budget; tailor the message to which, so a
+        // merely-truncated turn is not falsely told it "indicated" unfinished work
+        // (which could prompt it to argue instead of synthesizing) — ENG-244.
         completionGateContinue = false;
-        userMessage =
-          'Your previous response indicated some entities/steps were not finished. ' +
-          'Complete ALL remaining per-entity work now (research, filtering, approval ' +
-          'checks, drafts) for every entity that is not finished and not genuinely ' +
-          'blocked. Do not stop early. Then produce the final consolidated report, ' +
-          'surfacing any genuinely blocked items as actionable next steps.';
+        userMessage = completionGateBudgetTruncated
+          ? 'The previous run was cut short because it exhausted its processing-step ' +
+            'budget before it could produce the final deliverable. Using the data ' +
+            'already gathered, produce the final consolidated report now. Surface any ' +
+            'entities you could not fully research as actionable next steps.'
+          : 'Your previous response indicated some entities/steps were not finished. ' +
+            'Complete ALL remaining per-entity work now (research, filtering, approval ' +
+            'checks, drafts) for every entity that is not finished and not genuinely ' +
+            'blocked. Do not stop early. Then produce the final consolidated report, ' +
+            'surfacing any genuinely blocked items as actionable next steps.';
+        completionGateBudgetTruncated = false;
         const continuationResponse = await generateSessionResponse(
           sessionId,
           userMessage,
@@ -913,6 +926,7 @@ export async function runVerifiedChat(
         ) {
           completionGateContinuationsUsed++;
           completionGateContinue = true;
+          completionGateBudgetTruncated = continuationResponse.truncatedByStepBudget === true;
           await waitForVerifiedChatRetry(attempt);
           continue;
         }
@@ -1064,6 +1078,7 @@ export async function runVerifiedChat(
           `AgentMode runVerifiedChat: completion gate triggered (continuation ${completionGateContinuationsUsed}/${completionGateMaxContinuations}) — latest turn admitted unfinished work for session ${sessionId}`
         );
         completionGateContinue = true;
+        completionGateBudgetTruncated = response.truncatedByStepBudget === true;
         await waitForVerifiedChatRetry(attempt);
         continue;
       }
