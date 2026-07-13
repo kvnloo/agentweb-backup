@@ -3,7 +3,7 @@ import axios from 'axios';
 import { MetaAdAccount, MetaPage } from '../types/meta';
 import { INTEGRATION_CONFIG } from '../config/integrations';
 import { getMetaCredentials } from '../utils/secretsManager';
-import { buildUtmSpec, utmQueryString, existingUtmKeys } from '../utils/adUtm';
+import { buildUtmSpec, readUtmKeys, utmQueryString } from '../utils/adUtm';
 
 export interface MetaAdsCampaignParams {
   name: string;
@@ -943,10 +943,29 @@ export class MetaService {
     if (params.url_tags) {
       return params.url_tags;
     }
+
+    // `url_tags` is creative-level: Meta appends the SAME string to EVERY link on the
+    // creative (the top-level link and every carousel card). So a key must be omitted
+    // if ANY of those links already carries it — emitting it would give that link the
+    // param twice, and a duplicated utm_source corrupts the very attribution this
+    // feature exists to produce. The cost is that a card the user tagged only
+    // partially may stay under-tagged; that is strictly better than a duplicate.
+    const linkUrls = [
+      params.link_url,
+      ...(params.carousel_cards?.map((c) => c.link_url) ?? []),
+    ].filter((u): u is string => Boolean(u));
+
+    const omit = new Set<string>();
+    for (const url of linkUrls) {
+      const keys = readUtmKeys(url);
+      // Unreadable link → we cannot know what it already carries, so we do not tag at
+      // all rather than risk a duplicate. Meta still rejects the bad URL with its own
+      // (precise) error; tagging must never be the thing that breaks an ad build.
+      if (!keys) return undefined;
+      for (const k of keys) omit.add(k);
+    }
+
     const spec = buildUtmSpec('meta', { campaign: '{{campaign.id}}', content: '{{ad.id}}' });
-    const referenceUrl =
-      params.link_url || params.carousel_cards?.find((c) => c.link_url)?.link_url;
-    const omit = referenceUrl ? existingUtmKeys(referenceUrl) : new Set<string>();
     const tags = utmQueryString(spec, omit);
     return tags || undefined;
   }

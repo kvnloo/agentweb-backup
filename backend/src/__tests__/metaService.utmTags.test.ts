@@ -181,3 +181,47 @@ describe('MetaService — auto-generated url_tags (ENG-239)', () => {
         expect(lastUrlTags()).toBe(FULL_TAGS);
     });
 });
+
+/**
+ * Edge cases the first pass missed. Both fail in the DANGEROUS direction — one
+ * aborts an ad build, the other corrupts attribution with a duplicate param — so
+ * they matter more than their size suggests.
+ */
+describe('MetaService — url_tags edge cases', () => {
+  it('creates the creative untagged rather than throwing when link_url is unparseable', async () => {
+    // `example.com` (no scheme) fails `new URL()`. Tagging must never be the thing
+    // that breaks an ad build: let Meta reject the bad URL with its own error.
+    const params: any = {
+      name: 'c', link_url: 'example.com', message: 'm', title: 't', image_hash: 'h', page_id: 'p',
+    };
+    const tags = (MetaService as any).resolveUrlTags(params);
+    expect(tags).toBeUndefined();
+  });
+
+  it('does not duplicate a UTM key that ANY carousel card already carries', async () => {
+    // url_tags is creative-level: Meta appends it to EVERY link on the creative. If
+    // card 2 already has utm_source and we emit one in url_tags, card 2's click URL
+    // gets utm_source twice — which corrupts the attribution this feature exists to
+    // produce. A duplicate is worse than an under-tagged card, so a key present on
+    // ANY card is omitted.
+    const params: any = {
+      name: 'c', page_id: 'p',
+      carousel_cards: [
+        { link_url: 'https://a.com/1', image_hash: 'h1' },
+        { link_url: 'https://a.com/2?utm_source=partner', image_hash: 'h2' },
+      ],
+    };
+    const tags = (MetaService as any).resolveUrlTags(params);
+    expect(tags).not.toContain('utm_source');
+    expect(tags).toContain('utm_medium=paid');
+    expect(tags).toContain('utm_campaign={{campaign.id}}');
+  });
+
+  it('skips tagging entirely when a carousel card URL is unparseable', () => {
+    const params: any = {
+      name: 'c', page_id: 'p',
+      carousel_cards: [{ link_url: 'not a url', image_hash: 'h1' }],
+    };
+    expect((MetaService as any).resolveUrlTags(params)).toBeUndefined();
+  });
+});
