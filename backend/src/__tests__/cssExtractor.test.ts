@@ -241,6 +241,7 @@ const mockPage = {
   setUserAgent: jest.fn(),
   setCacheEnabled: jest.fn(),
   setExtraHTTPHeaders: jest.fn(),
+  emulateMediaFeatures: jest.fn(),
   goto: jest.fn(),
   evaluate: jest.fn(),
   close: jest.fn(),
@@ -516,6 +517,7 @@ describe('cssExtractor', () => {
       mockPage.setUserAgent.mockResolvedValue(undefined);
       mockPage.setCacheEnabled.mockResolvedValue(undefined);
       mockPage.setExtraHTTPHeaders.mockResolvedValue(undefined);
+      mockPage.emulateMediaFeatures.mockResolvedValue(undefined);
       mockPage.goto.mockResolvedValue(undefined);
       mockPage.close.mockResolvedValue(undefined);
       const pMock = require('puppeteer-core');
@@ -571,6 +573,30 @@ describe('cssExtractor', () => {
       expect(mockPage.setExtraHTTPHeaders).toHaveBeenCalledWith(
         expect.objectContaining({ 'Cache-Control': 'no-cache', Pragma: 'no-cache' })
       );
+    });
+
+    it('emulates prefers-color-scheme: dark before navigating so a dark-brand site is captured as dark (not a light default)', async () => {
+      // Regression for ENG-285: headless Chrome reports prefers-color-scheme:
+      // light by default, so sites that ship their brand's dark theme behind the
+      // OS color-scheme preference (via a CSS media query or a client script that
+      // reads it) were captured in their LIGHT variant — e.g. rankai.ai read as a
+      // near-white background when the real design is dark. Emulating a dark
+      // preference makes the extraction match what dark-mode users see.
+      mockPage.evaluate.mockResolvedValueOnce({
+        customProperties: {},
+        stylesheetText: 'body { color: #eee; }',
+        computedElements: {},
+      });
+
+      await extractCSSFromURL('https://example.com');
+
+      expect(mockPage.emulateMediaFeatures).toHaveBeenCalledWith([
+        { name: 'prefers-color-scheme', value: 'dark' },
+      ]);
+      // Must be emulated BEFORE navigation so SSR/hydration observe the preference.
+      const emulateOrder = mockPage.emulateMediaFeatures.mock.invocationCallOrder[0];
+      const gotoOrder = mockPage.goto.mock.invocationCallOrder[0];
+      expect(emulateOrder).toBeLessThan(gotoOrder);
     });
   });
 
