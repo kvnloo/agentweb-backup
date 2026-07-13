@@ -116,6 +116,80 @@ describe('subscriptionService', () => {
     expect(mockedOrgDb.getOrgById).not.toHaveBeenCalled();
   });
 
+  it('getUserSubscriptionType lets a member own ACTIVE subscription govern instead of the owner (regression: pvandervalk@xcures.com)', async () => {
+    // A member can hold their own paid Stripe subscription independent of the
+    // org — accept-invite touches no billing state. Their own tier must win
+    // when their subscription is genuinely active, even under a different
+    // owner tier, or a self-paying member would be silently downgraded.
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    mockedUserDb.getUserById.mockImplementation(async (id: string) => {
+      if (id === 'member-active') {
+        return {
+          userId: 'member-active', orgId: 'org-1', orgRole: 'member',
+          subscriptionType: 'Pro', subscription_status: 'active',
+        } as any;
+      }
+      if (id === 'owner-1') return { userId: 'owner-1', subscriptionType: 'Managed' } as any;
+      return null as any;
+    });
+    mockedOrgDb.getOrgById.mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1' } as any);
+
+    const tier = await getUserSubscriptionType('member-active');
+    expect(tier).toBe('Pro');
+    expect(mockedOrgDb.getOrgById).not.toHaveBeenCalled();
+  });
+
+  it('getUserSubscriptionType lets a member own TRIALING subscription govern instead of the owner', async () => {
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    mockedUserDb.getUserById.mockImplementation(async (id: string) => {
+      if (id === 'member-trial') {
+        return {
+          userId: 'member-trial', orgId: 'org-1', orgRole: 'member',
+          subscriptionType: 'Starter', subscription_status: 'trialing',
+        } as any;
+      }
+      if (id === 'owner-1') return { userId: 'owner-1', subscriptionType: 'Free' } as any;
+      return null as any;
+    });
+    mockedOrgDb.getOrgById.mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1' } as any);
+
+    const tier = await getUserSubscriptionType('member-trial');
+    expect(tier).toBe('Starter');
+  });
+
+  it('getUserSubscriptionType still inherits the owner tier for a member with a CANCELED subscription (the Harsha case)', async () => {
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    mockedUserDb.getUserById.mockImplementation(async (id: string) => {
+      if (id === 'member-canceled') {
+        return {
+          userId: 'member-canceled', orgId: 'org-1', orgRole: 'member',
+          subscriptionType: 'Pro', subscription_status: 'canceled',
+        } as any;
+      }
+      if (id === 'owner-1') return { userId: 'owner-1', subscriptionType: 'Super Premium' } as any;
+      return null as any;
+    });
+    mockedOrgDb.getOrgById.mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1' } as any);
+
+    const tier = await getUserSubscriptionType('member-canceled');
+    expect(tier).toBe('Super Premium');
+  });
+
+  it('getUserSubscriptionType inherits the owner tier for a member with no subscription_status at all (fresh invite)', async () => {
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    mockedUserDb.getUserById.mockImplementation(async (id: string) => {
+      if (id === 'member-fresh') {
+        return { userId: 'member-fresh', orgId: 'org-1', orgRole: 'member', subscriptionType: 'Free' } as any;
+      }
+      if (id === 'owner-1') return { userId: 'owner-1', subscriptionType: 'Pro' } as any;
+      return null as any;
+    });
+    mockedOrgDb.getOrgById.mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1' } as any);
+
+    const tier = await getUserSubscriptionType('member-fresh');
+    expect(tier).toBe('Pro');
+  });
+
   it('getAllowedConnectedAccounts resolves an org member to the owner tier (regression: Harsha/Twitter flash-then-hide bug)', async () => {
     // Reproduces the reported symptom: member's own record is Pro (no twitter),
     // org owner is Super Premium (includes twitter). Before centralizing tier
