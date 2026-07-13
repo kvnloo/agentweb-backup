@@ -11761,9 +11761,13 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
       let darkThemeTokens: any = null;
       if (extractedCSS.themes?.hasDarkVariant && extractedCSS.themes.dark) {
         try {
+          // Analyse the dark render with ITS OWN computed styles AND stylesheets —
+          // reusing the light render's stylesheets would blend light colours into
+          // the reported dark palette (ENG-285).
           const darkCSS = {
             ...extractedCSS,
             computedElements: extractedCSS.themes.dark.computedElements,
+            stylesheets: extractedCSS.themes.dark.stylesheets,
           };
           const darkDetailed = await analyzeDesignTokens(darkCSS);
           darkThemeTokens = {

@@ -20,6 +20,10 @@ export interface ThemeRender {
   // Custom properties resolved on :root for THIS render (a themed site resolves
   // --background, --primary, etc. to different values per scheme).
   customProperties: Record<string, string>;
+  // Stylesheets synthesized for THIS render, so a consumer analysing the dark
+  // variant sees the dark render's colours rather than the light render's (the
+  // stylesheet text is captured per scheme, not shared).
+  stylesheets: ExtractedCSS['stylesheets'];
 }
 
 export interface ExtractedCSS {
@@ -248,6 +252,91 @@ function normalizeColor(colorValue: string): string | null {
   } catch (error) {
     return null;
   }
+}
+
+// Average lightness (0–100) of the parseable, opaque backgrounds sampled across a
+// render's elements. Used to distinguish a genuine dark theme — whose backgrounds
+// turn materially darker — from the incidental pixel differences a page reload
+// produces (carousels advancing, animations, lazy-loaded or A/B content). Returns
+// null when no background is parseable. Exported for testing.
+export function averageBackgroundLightness(
+  computedElements?: ComputedElementStyles
+): number | null {
+  if (!computedElements) return null;
+  const values: number[] = [];
+  for (const styles of Object.values(computedElements)) {
+    const raw = styles.backgroundColor;
+    if (!raw || raw === 'transparent' || raw === 'rgba(0, 0, 0, 0)') continue;
+    const hex = normalizeColor(raw);
+    if (!hex) continue;
+    try {
+      values.push(Color(hex).lightness());
+    } catch {
+      // Unparseable — ignore
+    }
+  }
+  if (!values.length) return null;
+  return values.reduce((sum, v) => sum + v, 0) / values.length;
+}
+
+// A genuine dark variant flips the page's backgrounds materially darker. Requiring
+// a meaningful drop in average background lightness (rather than any diff between
+// the two renders) stops a light-only site from being handed an invented dark
+// theme just because a reload produced non-deterministic content (ENG-285).
+const DARK_THEME_MIN_LIGHTNESS_DROP = 15; // on the 0–100 lightness scale
+export function isDistinctDarkTheme(
+  light?: ComputedElementStyles,
+  dark?: ComputedElementStyles
+): boolean {
+  const lightL = averageBackgroundLightness(light);
+  const darkL = averageBackgroundLightness(dark);
+  if (lightL === null || darkL === null) return false;
+  return lightL - darkL >= DARK_THEME_MIN_LIGHTNESS_DROP;
+}
+
+// Synthesize the puppeteer stylesheets (resolved CSSOM text + colour-bearing
+// custom properties) for a single render. Factored out so each colour-scheme
+// render carries its OWN stylesheets — a consumer analysing the dark variant must
+// see the dark render's colours, not the light render's.
+function buildPuppeteerStylesheets(
+  stylesheetText: string,
+  customProperties: Record<string, string>
+): ExtractedCSS['stylesheets'] {
+  // Resolve variables in the stylesheet text
+  const resolvedCSS = resolveVariables(stylesheetText, customProperties);
+
+  // Synthesize CSS from custom properties — map color-like values into parseable
+  // declarations so the regex extractor can pick them up. Categorize by name hint.
+  const customPropLines: string[] = [];
+  for (const [name, value] of Object.entries(customProperties)) {
+    const nameLower = name.toLowerCase();
+    if (nameLower.includes('background') || nameLower.includes('bg')) {
+      customPropLines.push(`.cp { background-color: ${value}; }`);
+    } else if (nameLower.includes('border')) {
+      customPropLines.push(`.cp { border-color: ${value}; }`);
+    } else if (nameLower.includes('color') || nameLower.includes('text') ||
+               nameLower.includes('primary') || nameLower.includes('secondary') ||
+               nameLower.includes('accent') || nameLower.includes('brand')) {
+      customPropLines.push(`.cp { color: ${value}; }`);
+    } else {
+      // Try to detect if value looks like a color
+      const trimmed = value.trim();
+      if (/^#[0-9a-f]{3,8}$/i.test(trimmed) || /^rgba?\(/.test(trimmed) || /^hsla?\(/.test(trimmed)) {
+        customPropLines.push(`.cp { color: ${value}; }`);
+      }
+      // Non-color values (dimensions, strings, etc.) are skipped
+    }
+  }
+  const customPropCSS = customPropLines.join('\n');
+
+  const stylesheets: ExtractedCSS['stylesheets'] = [];
+  if (resolvedCSS.trim()) {
+    stylesheets.push({ source: 'puppeteer-cssom', content: resolvedCSS, parsed: null });
+  }
+  if (customPropCSS.trim()) {
+    stylesheets.push({ source: 'puppeteer-custom-properties', content: customPropCSS, parsed: null });
+  }
+  return stylesheets;
 }
 
 // Resolve CSS variables in stylesheet text
@@ -647,17 +736,16 @@ async function extractWithPuppeteer(
     // in these sampled computed styles, so any such score is noise.
     const pageData = lightData;
 
-    // Only claim a dark variant when the site genuinely renders differently under
-    // a dark preference — a light-only site must not be given an invented theme.
-    const isDistinct = (a: typeof lightData, b: typeof lightData) =>
-      JSON.stringify(a.computedElements) !== JSON.stringify(b.computedElements) ||
-      JSON.stringify(a.customProperties) !== JSON.stringify(b.customProperties);
-
-    const hasDarkVariant = !!darkData && isDistinct(lightData, darkData);
+    // Only claim a dark variant when the site's backgrounds turn materially
+    // darker under a dark preference — a light-only site must not be handed an
+    // invented theme just because a reload produced non-deterministic content.
+    const hasDarkVariant =
+      !!darkData && isDistinctDarkTheme(lightData.computedElements, darkData.computedElements);
     const themes: ExtractedCSS['themes'] = {
       light: {
         computedElements: lightData.computedElements,
         customProperties: lightData.customProperties,
+        stylesheets: buildPuppeteerStylesheets(lightData.stylesheetText, lightData.customProperties),
       },
       hasDarkVariant,
     };
@@ -665,6 +753,7 @@ async function extractWithPuppeteer(
       themes.dark = {
         computedElements: darkData.computedElements,
         customProperties: darkData.customProperties,
+        stylesheets: buildPuppeteerStylesheets(darkData.stylesheetText, darkData.customProperties),
       };
     }
 
@@ -675,50 +764,10 @@ async function extractWithPuppeteer(
         `${dbg.sheetsCollected} collected, ${dbg.customPropsCount} custom props, ${dbg.elementsFound} elements`);
     }
 
-    // Resolve variables in the stylesheet text
-    const resolvedCSS = resolveVariables(pageData.stylesheetText, pageData.customProperties);
-
-    // Synthesize CSS from custom properties — map color-like values into parseable declarations
-    // so the regex extractor can pick them up. Also categorize by property name hints.
-    const customPropLines: string[] = [];
-    for (const [name, value] of Object.entries(pageData.customProperties as Record<string, string>)) {
-      const nameLower = name.toLowerCase();
-      // Determine context from property name
-      if (nameLower.includes('background') || nameLower.includes('bg')) {
-        customPropLines.push(`.cp { background-color: ${value}; }`);
-      } else if (nameLower.includes('border')) {
-        customPropLines.push(`.cp { border-color: ${value}; }`);
-      } else if (nameLower.includes('color') || nameLower.includes('text') ||
-                 nameLower.includes('primary') || nameLower.includes('secondary') ||
-                 nameLower.includes('accent') || nameLower.includes('brand')) {
-        customPropLines.push(`.cp { color: ${value}; }`);
-      } else {
-        // Try to detect if value looks like a color
-        const trimmed = value.trim();
-        if (/^#[0-9a-f]{3,8}$/i.test(trimmed) || /^rgba?\(/.test(trimmed) || /^hsla?\(/.test(trimmed)) {
-          customPropLines.push(`.cp { color: ${value}; }`);
-        }
-        // Non-color values (dimensions, strings, etc.) are skipped
-      }
-    }
-    const customPropCSS = customPropLines.join('\n');
-
+    // Build the DEFAULT render's stylesheets (the dark render carries its own on
+    // `themes.dark.stylesheets`).
     const html = ''; // Not needed when using puppeteer
-    const stylesheets: ExtractedCSS['stylesheets'] = [];
-    if (resolvedCSS.trim()) {
-      stylesheets.push({
-        source: 'puppeteer-cssom',
-        content: resolvedCSS,
-        parsed: null,
-      });
-    }
-    if (customPropCSS.trim()) {
-      stylesheets.push({
-        source: 'puppeteer-custom-properties',
-        content: customPropCSS,
-        parsed: null,
-      });
-    }
+    const stylesheets = buildPuppeteerStylesheets(pageData.stylesheetText, pageData.customProperties);
 
     await page.close();
 
