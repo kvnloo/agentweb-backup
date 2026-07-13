@@ -68,9 +68,9 @@ export interface IEmailService {
 
 // ── Supported email platforms ──────────────────────────────────────────────
 
-export type EmailPlatform = 'gmail'; // extended when a provider is added
+export type EmailPlatform = 'gmail' | 'outlook';
 
-export const EMAIL_PLATFORMS: EmailPlatform[] = ['gmail'];
+export const EMAIL_PLATFORMS: EmailPlatform[] = ['gmail', 'outlook'];
 
 // ── Provider registry ──────────────────────────────────────────────────────
 
@@ -127,8 +127,12 @@ let bootstrapPromise: Promise<void> | null = null;
 export async function bootstrapEmailProviders(): Promise<void> {
   if (!bootstrapPromise) {
     bootstrapPromise = (async () => {
-      const { gmailService } = await import('./gmailService');
+      const [{ gmailService }, { outlookService }] = await Promise.all([
+        import('./gmailService'),
+        import('./outlookService'),
+      ]);
       registerEmailProvider('gmail', gmailService);
+      registerEmailProvider('outlook', outlookService);
     })().catch((error) => {
       // Don't cache a failed bootstrap — let the next caller retry.
       bootstrapPromise = null;
