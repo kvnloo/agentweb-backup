@@ -1,3 +1,86 @@
+## Landing pages: the residual wedge + hang the first fix left behind (2026-07-13, ENG-287 follow-up)
+
+The 07-11 fix (PR #2066, below) correctly killed the sync-create 300s race. But the same failure
+CLASS was still reachable by other doors, and the sync→async switch introduced two regressions. An
+audit of the merged code found the following, each verified against the code and now fixed with tests.
+
+### The semantic bug underneath all of it
+A `succeeded` guard row records that the **chat was created** — NOT that a page was delivered. It was
+then reused unconditionally and forever: no TTL on `AW-V0Usage`, never clobbered, age-blind. So ANY
+post-create failure left the row behind and every retry reused the same dead chat. And because #2066
+deliberately removed the prompt from the key, retrying with a **different prompt** reused it too.
+
+### Wedges (a route that can never be built again)
+1. **Vercel build error RETURNS instead of throwing** (`addPageToExistingRepo`), so the catch that
+   frees the identity never ran. v0 emits code that will not compile → guard row stays `succeeded` →
+   every retry re-downloads the same broken version. Forever. Deterministic, and the user has no lever.
+2. **The DELETE route never freed the identity.** It calls `deleteLandingPageByRecord`;
+   `deleteLandingPage` (which did free it) is imported by that route and never used. Combined with the
+   prompt-free key, a surviving row **hijacks the next generation**: delete a page, regenerate the same
+   slug with a new prompt, get the OLD chat back — the new prompt is never sent to v0.
+3. **No backstop.** Now `V0_CHAT_REUSE_CEILING_MS` (45 min) bounds reuse even on paths nobody
+   anticipated, so "cannot wedge forever" is a guarantee rather than a hope.
+
+The fix draws the line explicitly (`isDeadEndV0Failure`): a **dead end** (v0 marked the version failed
+/ output will not validate / code will not build) frees the identity so the retry mints a fresh chat; a
+merely-**slow** generation keeps it so the retry RESUMES the same chat for free. Freeing on slowness
+would mint a second full-cost chat while the first is still generating — the exact orphan-chat credit
+burn this whole issue is about.
+
+### The original hang, still live
+`withRetry`'s default re-burns our synthetic 300s ceiling 3×. Four sites still used it —
+`downloadVersion` ×2 and the post-correction `getById` ×2 — and they sit INSIDE a 3-round validation
+loop: worst case **3 × 3 × 300s = 45 min**, worse than the 15-min hang that started this and past the
+MCP tool's own 25-min budget. Also, the "~16 min" poll budget bounded **sleeps, not wall-clock** (each
+status read was allowed 300s → a real ceiling near 3h, and the error message said 16 min). Now: an
+ABSOLUTE deadline (`V0_GENERATION_BUDGET_MS` 20 min), status polls bounded at 30s, and fail-fast at all
+four sites (5xx/network stay retryable).
+
+### Regressions introduced by the async switch
+- **First-page builds spent their whole generation in `draft`.** Async create returns in seconds and
+  the long poll moved into `deployLandingPage`, but the record was flipped to `draft` first — a status
+  `IN_FLIGHT_STATUSES`, the janitor, and route-reuse all ignore. Agent mode (10-min run timeout) could
+  not find the in-flight job, told the user it **FAILED**, and the retry built a **duplicate site**
+  (second repo, second Vercel project). That is the ENG-189 class, reopened. Now stays `generating`;
+  `deployLandingPage` accepts that status only for its own auto-deploy, so a user-initiated deploy
+  still refuses an actively-generating record.
+- **`deployLandingPage` rethrew a bare `new Error()`**, destroying `error.code`. It is the ONLY place
+  the first-page path reaches the version poll, so `generateFirstPage`'s dead-end branch was
+  unreachable **dead code** — the safety net did not exist. Code + cause now preserved.
+
+### Constants (coherent ladder)
+| constant | value | why |
+| -- | -- | -- |
+| `V0_STATUS_POLL_TIMEOUT_MS` | 30s | a status read is a cheap GET; 300s let wall-clock reach ~3h |
+| `V0_GENERATION_BUDGET_MS` | 20 min | ABSOLUTE deadline; above prod p99 (~15 min), below the janitor |
+| `V0_RESERVATION_TTL_MS` | 20 min | unchanged; `reserved` now lives seconds (async create) |
+| `STUCK_CEILING_MS` | 30 min | janitor + route reuse; above the generation budget, so a live build is never swept |
+| `V0_CHAT_REUSE_CEILING_MS` | 45 min | > 2 generation budgets, so a resume-after-timeout retry always lands inside it |
+
+### Also fixed
+- A long build **heartbeats `updatedAt`**, so the janitor cannot mark a LIVE build failed (which let a
+  retry run a second build into the same repo). This is why draft→generating and the heartbeat had to
+  land together.
+- `isStuck`/`isZombieInFlight` now measure from `updatedAt`, matching the janitor. Keyed on `createdAt`
+  they declared a long-but-progressing build dead, and `deliverStuckFailure` **burned its one-shot
+  completion claim** — so the real success could never be delivered afterwards. The page went live at a
+  URL the user was never given.
+- The **correction key gained an `attempt`** component. It was `(user, scope, chatId)`, so round 2
+  returned `{skipped:true}` and the loop re-downloaded the same broken zip: a 3-attempt self-heal that
+  was really 1. (Appended only when supplied, so chat-create keys stay byte-identical to prod rows.)
+- The post-correction version is **status-gated** rather than read raw off `latestVersion` — the exact
+  mistake `waitForCompletedV0Version` exists to prevent (shipping a half-generated page).
+
+### Still open (deliberately not in this change)
+- **`iterateLandingPage` is still sync behind the 300s ceiling.** An iteration that legitimately takes
+  >300s still fails, v0 still creates the version (credits burned), the record is not incremented, and
+  the iteration is stranded — `deployLandingPage` then refuses the page because its status is
+  `deployed`. Retrying re-sends the same message with NO idempotency guard, so v0 applies the
+  instruction twice. Going async here needs explicit version-id tracking (otherwise the deploy that
+  follows grabs the pre-iteration version). Worth its own issue.
+- `bestEffortPut` fails open on a Dynamo outage → a bounded double-spend across instances. Accepted
+  trade-off; the alternative is recreating the permanent wedge.
+
 ## Landing-page generation failing routinely (RankAI/Opsera/internal) — root cause + fix (2026-07-11, ENG-287/ENG-277)
 
 Matt reported the landing-page builder "keeps failing routinely" for RankAI (07-10); Opsera's urgent
