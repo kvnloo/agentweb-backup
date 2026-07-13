@@ -80,6 +80,25 @@ against the 25-min number.
 - The post-correction version is **status-gated** rather than read raw off `latestVersion` — the exact
   mistake `waitForCompletedV0Version` exists to prevent (shipping a half-generated page).
 
+### Sub-page builds died on `Module not found: '../components/landing/nav'` (found in manual test)
+
+Our bug, not v0's. `remapFilesForSubPage` rewrote exactly two import forms — the
+`@/components/*` alias and `./_components/*` inside component files. Plain **relative** imports were
+never touched, and v0 emits those too. They are correct at the repo root (`../components/landing/nav`
+from `app/page.tsx` = `components/landing/nav`), but we move the file to `app/<slug>/page.tsx`, where
+that same string means `app/components/landing/nav` — nonexistent — and the component itself has also
+moved into `_components/`. Wrong twice over. It looked intermittent only because it depended on
+whether v0 happened to emit alias-style or relative-style imports.
+
+Fix: resolve every relative import against the file's ORIGINAL directory and re-emit as `@/...`
+(always resolves from the repo root) BEFORE the alias pass, which then handles moved components
+uniformly. Also fixes the same latent break for `../lib/*`, `../hooks/*`, `../components/ui/*` — none
+of which move, and which nobody had hit yet.
+
+Worth noting how it surfaced: the ENG-287 fix is what let us *see* it. The Vercel build error now
+frees the route identity, so the retry minted a fresh chat. Pre-fix that route would have silently
+re-downloaded the same broken version forever.
+
 ### Caught in adversarial review of THIS change (worth knowing about)
 - **A Vercel poll `timeout` is NOT a dead end.** `pollVercelDeployment` gives up after 5 min and also
   degrades API flakiness to `timeout`. The first cut of this fix freed the identity on it — which
