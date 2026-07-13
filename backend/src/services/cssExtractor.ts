@@ -130,6 +130,36 @@ function normalizeColor(colorValue: string): string | null {
   }
 }
 
+// Count the distinct saturated (non-grayscale, non-near-black/white) colors used
+// across a page's computed elements. This is a proxy for how "brand-rich" a
+// rendered variant is: a matte-black hero with an amber glow + purple accent +
+// indigo CTA scores higher than a plain near-monochrome light layout. Used to
+// decide, when a site offers both a light and a dark render, which one better
+// represents the intended brand (see ENG-285 and the vercel.com light-default
+// regression it caused).
+export function countBrandColors(computedElements?: ComputedElementStyles): number {
+  if (!computedElements) return 0;
+  const seen = new Set<string>();
+  for (const styles of Object.values(computedElements)) {
+    for (const raw of [styles.color, styles.backgroundColor, styles.borderColor]) {
+      if (!raw || raw === 'transparent' || raw === 'rgba(0, 0, 0, 0)') continue;
+      const hex = normalizeColor(raw);
+      if (!hex) continue;
+      try {
+        const color = Color(hex);
+        // Skip near-grayscale (text/background neutrals) and near-black/near-white.
+        if (color.saturationl() < 15) continue;
+        const lightness = color.lightness();
+        if (lightness < 6 || lightness > 96) continue;
+        seen.add(hex);
+      } catch {
+        // Unparseable — ignore
+      }
+    }
+  }
+  return seen.size;
+}
+
 // Resolve CSS variables in stylesheet text
 function resolveVariables(css: string, varMap: Record<string, string>): string {
   let resolved = css;
@@ -325,27 +355,14 @@ async function extractWithPuppeteer(
       Pragma: 'no-cache',
     });
 
-    // Capture the brand's dark theme when it exists. Headless Chrome reports
-    // `prefers-color-scheme: light` by default, so sites that ship their dark
-    // design behind the OS color-scheme preference — either a CSS
-    // `@media (prefers-color-scheme: dark)` rule or a client script that reads
-    // the preference and toggles a `dark` class / `data-theme` — were captured
-    // in their LIGHT variant. That made brand extraction read the wrong theme
-    // (see ENG-285: rankai.ai is matte-black with an amber glow, but the headless
-    // read returned a near-white background). Emulating a dark preference makes
-    // the DOM/computed styles match what dark-mode users see; light-only sites
-    // are unaffected because they have no dark variant to switch to.
-    await page.emulateMediaFeatures([
-      { name: 'prefers-color-scheme', value: 'dark' },
-    ]);
-
     await page.goto(url.toString(), {
       waitUntil: 'networkidle2',
       timeout: 30000,
     });
 
-    // Extract all CSS data from the page
-    const pageData = await page.evaluate(async () => {
+    // Extract all CSS data from the page. Defined as a reusable in-page routine
+    // (no Node closures) so it can be evaluated once per color-scheme variant.
+    const extractPageData = async () => {
       // Collect CSS custom properties from :root / documentElement
       const computedStyle = getComputedStyle(document.documentElement);
       const customProperties: Record<string, string> = {};
@@ -505,7 +522,40 @@ async function extractWithPuppeteer(
           elementsFound: Object.keys(computedElements).length,
         },
       };
-    });
+    };
+
+    // The site's DEFAULT (canonical) render — headless Chrome reports
+    // `prefers-color-scheme: light`, so this is what the site serves to a
+    // light/no-preference client.
+    const lightData = await page.evaluate(extractPageData);
+
+    // Also capture the DARK render. Many brands ship their real design behind
+    // the OS color-scheme preference — a CSS `@media (prefers-color-scheme: dark)`
+    // rule or a client script that toggles a `dark` class / `data-theme`. Reload
+    // with a dark preference emulated so both CSS- and JS-driven dark themes
+    // apply (see ENG-285: rankai.ai is matte-black with an amber glow, but the
+    // default headless read returned a near-white background). This is
+    // best-effort — if the dark reload fails we fall back to the default render.
+    let darkData: Awaited<ReturnType<typeof extractPageData>> | null = null;
+    try {
+      await page.emulateMediaFeatures([
+        { name: 'prefers-color-scheme', value: 'dark' },
+      ]);
+      await page.reload({ waitUntil: 'networkidle2', timeout: 30000 });
+      darkData = await page.evaluate(extractPageData);
+    } catch (err) {
+      console.warn('Dark color-scheme capture failed; using default render:', err);
+    }
+
+    // Pick the variant that better represents the intended brand. A light-DEFAULT
+    // site that merely offers a system dark variant (e.g. vercel.com) must stay
+    // light; a site whose real design is dark (e.g. rankai.ai) must be captured
+    // dark. Use the richer accent palette as the discriminator, defaulting to the
+    // site's canonical (default-served) render on a tie so we never force dark.
+    const useDark =
+      !!darkData &&
+      countBrandColors(darkData.computedElements) > countBrandColors(lightData.computedElements);
+    const pageData = useDark && darkData ? darkData : lightData;
 
     // Log extraction debug info
     const dbg = (pageData as any).debug;
