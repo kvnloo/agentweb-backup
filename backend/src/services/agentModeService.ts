@@ -33,6 +33,7 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { recordUsage } from './usageRecorderService';
+import { meterUsageFromResponse } from '../utils/llmClients';
 import {
   getModelPrice,
   imageGenerationCostUsd,
@@ -7100,24 +7101,14 @@ export class AgentModeService {
         }
       );
 
-      // Shadow usage metering (Ship 1): direct REST call, so observe the
-      // usageMetadata off the already-resolved response. Fire-and-forget +
-      // fail-open — never awaited, never throws.
-      try {
-        const usageMetadata = (apiResponse.data as any)?.usageMetadata;
-        if (usageMetadata) {
-          void recordUsage({
-            userId,
-            model: modelName,
-            provider: 'gemini',
-            feature: 'agent_task',
-            inputTokens: usageMetadata.promptTokenCount || 0,
-            outputTokens: usageMetadata.candidatesTokenCount || 0,
-            cacheReadTokens: usageMetadata.cachedContentTokenCount || 0,
-          });
-        }
-      } catch {
-        // Metering must never break the call.
+      // Shadow usage metering (Ship 1): direct REST call — meter off the resolved
+      // response via the shared hook. Burn-only, fail-open (never awaited/throws).
+      if ((apiResponse.data as any)?.usageMetadata) {
+        meterUsageFromResponse(
+          { userId, model: modelName, provider: 'gemini', feature: 'agent_task' },
+          apiResponse.data,
+          { mode: 'burn' }
+        );
       }
 
       // Extract and format the response
@@ -11087,23 +11078,19 @@ ${emailDraftFormat === 'text'
         response_format: { type: 'json_object' }
       });
 
-      // Shadow-meter this direct Azure completion (bypasses callLLM). Fail-open.
-      try {
-        const u: any = (completion as any)?.usage;
-        if (u) {
-          void recordUsage({
+      // Shadow-meter this direct Azure completion (bypasses callLLM). Burn-only, fail-open.
+      if ((completion as any)?.usage) {
+        meterUsageFromResponse(
+          {
             userId,
             sessionId,
             model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
             provider: 'azure-openai',
             feature: 'email_draft',
-            inputTokens: u.prompt_tokens || 0,
-            outputTokens: u.completion_tokens || 0,
-            cacheReadTokens: u.prompt_tokens_details?.cached_tokens || 0,
-          });
-        }
-      } catch {
-        // Metering must never break email drafting.
+          },
+          completion,
+          { mode: 'burn' }
+        );
       }
 
       const responseContent = completion.choices[0].message.content;
@@ -11206,22 +11193,13 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         max_tokens: 2048,
       } as any);
 
-      // Shadow-meter this direct Gemini completion (bypasses callLLM). Fail-open.
-      try {
-        const u: any = (messageCompletion as any)?.usage;
-        if (u) {
-          void recordUsage({
-            userId,
-            sessionId,
-            model: 'gemini-3.5-flash',
-            provider: 'gemini',
-            feature: 'invite_message',
-            inputTokens: u.prompt_tokens || 0,
-            outputTokens: u.completion_tokens || 0,
-          });
-        }
-      } catch {
-        // Metering must never break invite drafting.
+      // Shadow-meter this direct Gemini completion (bypasses callLLM). Burn-only, fail-open.
+      if ((messageCompletion as any)?.usage) {
+        meterUsageFromResponse(
+          { userId, sessionId, model: 'gemini-3.5-flash', provider: 'gemini', feature: 'invite_message' },
+          messageCompletion,
+          { mode: 'burn' }
+        );
       }
 
       const messageResponseContent = messageCompletion.choices[0].message.content;
@@ -27891,23 +27869,15 @@ async function batchParseCompaniesFromTitlesWithLLM(
       max_completion_tokens: Math.max(500, titles.length * 30),
       temperature: 0.1,
     });
-    // Shadow-meter this direct Gemini completion (bypasses callLLM). Fail-open.
+    // Shadow-meter this direct Gemini completion (bypasses callLLM). Burn-only, fail-open.
     // Tokens are recorded even though gemini-2.5-flash may be unpriced (cost 0
     // until a price row exists) — token visibility is still worth having.
-    try {
-      const u: any = (completion as any)?.usage;
-      if (u) {
-        void recordUsage({
-          userId,
-          model: 'gemini-2.5-flash',
-          provider: 'gemini',
-          feature: 'title_company_parse',
-          inputTokens: u.prompt_tokens || 0,
-          outputTokens: u.completion_tokens || 0,
-        });
-      }
-    } catch {
-      // Metering must never break title parsing.
+    if ((completion as any)?.usage) {
+      meterUsageFromResponse(
+        { userId, model: 'gemini-2.5-flash', provider: 'gemini', feature: 'title_company_parse' },
+        completion,
+        { mode: 'burn' }
+      );
     }
     const raw = String(completion?.choices?.[0]?.message?.content ?? '').trim();
     // Gemini Flash often adds preamble / postamble / markdown fences despite
