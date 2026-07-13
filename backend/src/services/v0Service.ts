@@ -122,6 +122,60 @@ export function setV0PollIntervals(intervals: number[]) {
 }
 
 /**
+ * A status read is a cheap GET. Bounding it at the full 300s attempt ceiling meant the
+ * poll loop's real wall-clock was `sum(sleeps) + 34 × 300s ≈ 3 hours`, not the ~16 min its
+ * own error message claimed — and nothing refreshed the record while it ran, so the
+ * abandoned-build janitor (30-min `updatedAt` ceiling) would mark a LIVE build failed.
+ * (ENG-287 residual)
+ */
+const V0_STATUS_POLL_TIMEOUT_MS = 30_000;
+
+/**
+ * ABSOLUTE wall-clock budget for a generation — the sleep table alone bounds only the time
+ * we spend *sleeping*. Sits above prod p99 (~15 min) and below `STUCK_CEILING_MS` (30 min),
+ * so a build that blows this budget fails loudly on its own terms before the janitor ever
+ * has to consider it. (ENG-287 residual)
+ */
+const V0_GENERATION_BUDGET_MS = 20 * 60 * 1000;
+
+/**
+ * Is this failure a DEAD END for the v0 chat that produced it — i.e. will retrying against
+ * the same chat fail identically, forever?
+ *
+ * This is the line between the two halves of the reuse contract:
+ *  - dead end  → free the route identity so the retry mints a FRESH chat;
+ *  - anything else (slow v0, transient read, poll budget exhausted while still `pending`)
+ *    → KEEP the identity so the retry RESUMES the same chat for free. Freeing it there
+ *    would mint a second full-cost chat while the first is still generating — the exact
+ *    orphan-chat credit burn this issue is about.
+ * (ENG-287 residual)
+ */
+export function isDeadEndV0Failure(error: any): boolean {
+  return (
+    error?.code === "V0_VERSION_FAILED" ||  // v0 itself marked the version failed
+    error?.code === "VERCEL_BUILD_ERROR" || // that version's code does not compile
+    error?.code === "V0_OUTPUT_INVALID"    // v0 keeps emitting output we cannot ship
+  );
+}
+
+/** Refresh a record's `updatedAt` without touching its status — a liveness heartbeat. */
+async function touchLandingPageRecord(id: string): Promise<void> {
+  try {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "SET updatedAt = :now",
+        ExpressionAttributeValues: { ":now": new Date().toISOString() },
+      })
+      .promise();
+  } catch (err: any) {
+    // Best-effort: a missed heartbeat costs liveness, never correctness.
+    console.warn(`[V0 SERVICE] heartbeat failed for ${id}: ${err?.message}`);
+  }
+}
+
+/**
  * Poll a v0 chat until its latest version reaches a terminal state and return the
  * completed version id.
  *
@@ -136,9 +190,11 @@ export function setV0PollIntervals(intervals: number[]) {
 async function waitForCompletedV0Version(
   v0: any,
   chatId: string,
-  label: string
+  label: string,
+  opts: { heartbeat?: () => Promise<void> } = {}
 ): Promise<string> {
   const intervals = v0PollIntervalsMs;
+  const deadline = Date.now() + V0_GENERATION_BUDGET_MS;
   let lastReadError: string | undefined;
   for (let pollAttempt = 0; pollAttempt < intervals.length; pollAttempt++) {
     if (intervals[pollAttempt] > 0) {
@@ -148,12 +204,20 @@ async function waitForCompletedV0Version(
       await new Promise((resolve) => setTimeout(resolve, intervals[pollAttempt]));
     }
 
+    // Tell the world this build is alive. Without it, nothing refreshes the record for the
+    // whole generation and the janitor marks a LIVE build failed at 30 min — after which a
+    // retry runs a SECOND build against the same chat and repo. (ENG-287 residual)
+    if (opts.heartbeat) await opts.heartbeat();
+
+    // Bound the real wall-clock, not just the time spent sleeping.
+    if (Date.now() >= deadline) break;
+
     let chat: any;
     try {
       chat = await withRetry(
         () => v0.chats.getById({ chatId }),
         `${label} (status poll)`,
-        undefined, undefined, undefined,
+        undefined, undefined, V0_STATUS_POLL_TIMEOUT_MS,
         { retryOnTimeout: false }
       );
     } catch (err: any) {
@@ -179,11 +243,19 @@ async function waitForCompletedV0Version(
     }
   }
 
-  const budgetMin = Math.round(intervals.reduce((a, b) => a + b, 0) / 60_000);
-  throw new Error(
-    `No completed version in v0 chat after ~${budgetMin} minutes of polling — v0 generation is unusually slow or stalled` +
+  const budgetMin = Math.round(
+    Math.min(intervals.reduce((a, b) => a + b, 0), V0_GENERATION_BUDGET_MS) / 60_000
+  );
+  // NOT a dead end: v0 may still be generating and finish in the background. The chat is
+  // deliberately left reusable so a retry RESUMES it instead of paying for a second one.
+  // `isDeadEndV0Failure` returns false for this code — that is the whole point.
+  const timeoutErr: any = new Error(
+    `No completed version in v0 chat after ~${budgetMin} minutes — v0 is still generating or has stalled. ` +
+    `Retry: the generation resumes on the same chat and is not charged again.` +
     (lastReadError ? ` (last poll error: ${lastReadError})` : "")
   );
+  timeoutErr.code = "V0_GENERATION_TIMEOUT";
+  throw timeoutErr;
 }
 
 // Vercel deployment polling config
@@ -1035,7 +1107,14 @@ async function generateFirstPage(
     let updateExpression =
       "SET #status = :status, v0ChatId = :chatId, updatedAt = :updatedAt";
     const expressionAttributeValues: Record<string, any> = {
-      ":status": "draft",
+      // Stay `generating` — the ~16-min version poll happens inside deployLandingPage
+      // below, so flipping to `draft` here parked the record in a status that
+      // IN_FLIGHT_STATUSES, the abandoned-build janitor and route-reuse all ignore for
+      // the entire generation. Agent mode then could not find the in-flight job at its
+      // 10-min timeout, told the user it FAILED, and the retry started a duplicate build
+      // with a second repo and Vercel project. `draft` means "has an undeployed version
+      // ready", which is not true yet. (ENG-287 residual)
+      ":status": "generating",
       ":chatId": chatId,
       ":updatedAt": new Date().toISOString(),
     };
@@ -1056,16 +1135,21 @@ async function generateFirstPage(
       .promise();
 
     console.log(`[V0 SERVICE] v0 chat created (${chatId}), auto-deploying...`);
-    const deployed = await deployLandingPage(id, userId);
+    // fromGeneration: this record is legitimately still `generating` (see above) — the
+    // public deploy route must keep refusing an actively-generating record.
+    const deployed = await deployLandingPage(id, userId, { fromGeneration: true });
     return deployed;
   } catch (error: any) {
     console.error("[V0 SERVICE] Generation failed:", error);
 
-    if (error?.code === "V0_VERSION_FAILED") {
-      // v0 marked this chat's generation failed — the chat is a dead end. Free the
-      // idempotency identity so a retry mints a fresh chat instead of reusing it
-      // and failing instantly again. Best-effort; the failed-status write below is
-      // the critical step.
+    if (isDeadEndV0Failure(error)) {
+      // The chat is a dead end — v0 marked it failed, its output will not validate, or its
+      // code will not build. Retrying against it fails identically forever, and since the
+      // prompt is not part of the key, a DIFFERENT prompt would reuse it too. Free the
+      // identity so the retry mints a fresh chat. A merely-slow generation
+      // (V0_GENERATION_TIMEOUT) deliberately does NOT land here: that chat stays reusable
+      // so the retry resumes it for free. Best-effort; the failed-status write below is
+      // the critical step. (ENG-287 residual)
       await clearV0UsageForPage({ userId, pageId: id });
     }
 
@@ -1342,7 +1426,12 @@ async function addPageToExistingRepo(
 
     // ── Step 2: Poll for v0 version completion (status-gated — a pending version
     // must not be downloaded half-generated) ──
-    let versionId: string | undefined = await waitForCompletedV0Version(v0, chatId, `v0 generation for /${slug}`);
+    let versionId: string | undefined = await waitForCompletedV0Version(
+      v0,
+      chatId,
+      `v0 generation for /${slug}`,
+      { heartbeat: () => touchLandingPageRecord(id) }
+    );
 
     // ── Step 3: Download and validate v0 output ──
     await dynamodb
@@ -1371,7 +1460,13 @@ async function addPageToExistingRepo(
           format: "zip",
           includeDefaultFiles: true,
         }),
-        "v0 zip download (additional page)"
+        "v0 zip download (additional page)",
+        // Fail fast on OUR synthetic 300s ceiling. The default re-burns it 3× and this call
+        // sits inside a 3-round validation loop — worst case 3 × 3 × 300s = 45 min, worse
+        // than the hang that started this and past the MCP tool's 25-min budget. 5xx and
+        // network errors stay retryable. (ENG-287 residual)
+        undefined, undefined, undefined,
+        { retryOnTimeout: false }
       );
 
       const previewFiles = await unzipBuffer(zipBuffer);
@@ -1388,6 +1483,11 @@ async function addPageToExistingRepo(
             userId,
             scopeId: existingPage.siteId ?? existingPage.id,
             chatId,
+            // Each round of the loop is a genuinely different send. Without this the key was
+            // (user, scope, chatId), so round 2 returned {skipped:true}, the loop re-fetched
+            // the SAME version and re-downloaded the SAME broken zip — a 3-attempt self-heal
+            // that was really 1. (ENG-287 residual)
+            attempt: validationAttempt,
             send: () => withRetry(
               () => v0.chats.sendMessage({
                 chatId,
@@ -1405,14 +1505,16 @@ async function addPageToExistingRepo(
             ),
           });
 
-          await new Promise((resolve) => setTimeout(resolve, 5000));
-
-          const updatedChat = await withRetry(
-            () => v0.chats.getById({ chatId }),
-            "v0 chat re-fetch (additional page)"
+          // Status-gated, like the initial wait: reading `latestVersion.id` straight off the
+          // chat is the exact mistake waitForCompletedV0Version exists to prevent — a
+          // correction's version is `pending` for a while, and downloading it ships a
+          // half-generated page. (ENG-287 residual)
+          versionId = await waitForCompletedV0Version(
+            v0,
+            chatId,
+            `v0 correction for /${slug}`,
+            { heartbeat: () => touchLandingPageRecord(id) }
           );
-          versionId = updatedChat.latestVersion?.id;
-          if (!versionId) throw new Error("No version found after correction message");
 
           continue;
         }
@@ -1457,6 +1559,19 @@ async function addPageToExistingRepo(
     if (deploymentResult.buildStatus === "error" || deploymentResult.buildStatus === "timeout") {
       const errorMsg = `Vercel build failed for /${slug}: ${deploymentResult.buildError || "Unknown build error"}`;
       console.error(`[V0 SERVICE] ${errorMsg}`);
+
+      // This chat's code does not compile, and it will not compile next time either. Free
+      // the route identity so the retry mints a FRESH chat — otherwise every retry reuses
+      // this chat, re-downloads the same broken version and fails identically, forever.
+      // (And because the prompt is not part of the key, even a NEW prompt would reuse it.)
+      // Note this path RETURNS rather than throwing, so the catch block below never runs —
+      // which is exactly why the wedge survived the original fix. (ENG-287 residual)
+      await clearV0UsageForPage({
+        userId,
+        pageId: id,
+        siteId: existingPage.siteId ?? existingPage.id,
+        slug,
+      });
 
       await dynamodb
         .update({
@@ -1508,9 +1623,11 @@ async function addPageToExistingRepo(
   } catch (error: any) {
     console.error("[V0 SERVICE] Failed to add page to repo:", error);
 
-    if (error?.code === "V0_VERSION_FAILED") {
-      // Dead-end chat (see generateFirstPage catch) — free the route identity so the
-      // retry creates a fresh chat rather than reusing the one v0 marked failed.
+    if (isDeadEndV0Failure(error)) {
+      // Dead-end chat (see generateFirstPage catch) — free the route identity so the retry
+      // creates a fresh chat rather than reusing one that can never deliver. A merely-slow
+      // generation (V0_GENERATION_TIMEOUT) deliberately keeps its chat so the retry resumes
+      // it for free. (ENG-287 residual)
       await clearV0UsageForPage({
         userId,
         pageId: id,
@@ -1715,7 +1832,8 @@ export function remapFilesForSubPage(
  */
 export async function deployLandingPage(
   id: string,
-  userId: string
+  userId: string,
+  opts: { fromGeneration?: boolean } = {}
 ): Promise<GeneratedLandingPage> {
   const record = await getLandingPage(id, userId);
   if (!record) {
@@ -1731,7 +1849,14 @@ export async function deployLandingPage(
     );
   }
 
-  if (!["draft", "failed", "deploying"].includes(record.status)) {
+  // `generating` is accepted ONLY for generateFirstPage's own auto-deploy: that record is
+  // legitimately mid-generation and this call is the thing driving it. A user-initiated
+  // deploy of an actively-generating record must still be refused — otherwise two builds
+  // race into the same repo. (ENG-287 residual)
+  const deployableStatuses = opts.fromGeneration
+    ? ["generating", "draft", "failed", "deploying"]
+    : ["draft", "failed", "deploying"];
+  if (!deployableStatuses.includes(record.status)) {
     throw new Error(`Cannot deploy a landing page with status: ${record.status}`);
   }
 
@@ -1752,7 +1877,12 @@ export async function deployLandingPage(
     // chats expose a pending version immediately; downloading it would ship a
     // half-generated page)
     console.log(`[V0 SERVICE] Step 1: Getting latest version for chat ${record.v0ChatId}`);
-    let versionId: string | undefined = await waitForCompletedV0Version(v0, record.v0ChatId!, "v0 generation");
+    let versionId: string | undefined = await waitForCompletedV0Version(
+      v0,
+      record.v0ChatId!,
+      "v0 generation",
+      { heartbeat: () => touchLandingPageRecord(id) }
+    );
 
     // Step 2: Download + validate v0 output (with retry on bad output)
     const V0_VALIDATION_MAX_RETRIES = 2;
@@ -1768,7 +1898,11 @@ export async function deployLandingPage(
           format: "zip",
           includeDefaultFiles: true,
         }),
-        "v0 zip download"
+        "v0 zip download",
+        // Fail fast on our synthetic 300s ceiling — see the sub-page download for why the
+        // default (3× re-burn, inside a 3-round loop) is a 45-minute hang. (ENG-287 residual)
+        undefined, undefined, undefined,
+        { retryOnTimeout: false }
       );
 
       // Unzip and validate before pushing to GitHub
@@ -1787,6 +1921,9 @@ export async function deployLandingPage(
             userId,
             scopeId: record.siteId ?? record.id,
             chatId: record.v0ChatId!,
+            // Each loop round is a different send — without this discriminator round 2 was
+            // skipped and we re-downloaded the same broken zip. (ENG-287 residual)
+            attempt: validationAttempt,
             send: () => withRetry(
               () => v0.chats.sendMessage({
                 chatId: record.v0ChatId!,
@@ -1804,16 +1941,15 @@ export async function deployLandingPage(
             ),
           });
 
-          // Wait for v0 to process the correction
-          await new Promise((resolve) => setTimeout(resolve, 5000));
-
-          // Get the new version
-          const updatedChat = await withRetry(
-            () => v0.chats.getById({ chatId: record.v0ChatId! }),
-            "v0 chat re-fetch"
+          // Status-gated: a correction's version is `pending` for a while, and reading
+          // `latestVersion.id` straight off the chat downloads it half-generated — the exact
+          // mistake waitForCompletedV0Version exists to prevent. (ENG-287 residual)
+          versionId = await waitForCompletedV0Version(
+            v0,
+            record.v0ChatId!,
+            "v0 correction",
+            { heartbeat: () => touchLandingPageRecord(id) }
           );
-          versionId = updatedChat.latestVersion?.id;
-          if (!versionId) throw new Error("No version found after correction message");
 
           continue;
         }
@@ -1975,7 +2111,15 @@ export async function deployLandingPage(
       console.error("[V0 SERVICE] Failed to update DB after deploy error:", dbError);
     }
 
-    throw new Error(`Deployment failed: ${error.message}`);
+    // Re-wrapping with a bare `new Error(...)` destroyed `error.code`. deployLandingPage is
+    // the ONLY place the first-page path reaches waitForCompletedV0Version, so the lost code
+    // made generateFirstPage's dead-end branch unreachable — the safety net did not exist.
+    // Preserve the code (and the cause) so callers can still tell a dead-end chat from a
+    // slow one. (ENG-287 residual)
+    const wrapped: any = new Error(`Deployment failed: ${error.message}`);
+    if (error?.code) wrapped.code = error.code;
+    wrapped.cause = error;
+    throw wrapped;
   }
 }
 
@@ -2089,6 +2233,12 @@ export function autoFixV0Files(files: Array<{ path: string; content: Buffer }>):
 // ---------------------------------------------------------------------------
 
 export class V0OutputValidationError extends Error {
+  /**
+   * Carried as a `code` (not just a prototype) so it survives being re-wrapped across a
+   * throw boundary — `instanceof` does not, and deployLandingPage re-wraps. This is what
+   * lets `isDeadEndV0Failure` still recognise it. (ENG-287 residual)
+   */
+  readonly code = "V0_OUTPUT_INVALID";
   constructor(public readonly reason: string) {
     super(`v0 output validation failed: ${reason}`);
     this.name = "V0OutputValidationError";
@@ -3538,7 +3688,10 @@ export async function deleteLandingPage(
     userId,
     pageId: id,
     siteId: record.siteId,
-    slug: record.slug || (record.name ? buildPageSlug(record.name) : undefined),
+    // Only a REAL slug. A root page has none, and deriving one from its name could match a
+    // genuine sub-page route on the same site and free the wrong identity — that sub-page
+    // would then pay for a fresh chat on its next build. (ENG-287 residual)
+    slug: record.slug,
   });
 }
 
@@ -3746,6 +3899,23 @@ export async function deleteLandingPageByRecord(record: GeneratedLandingPage): P
       },
     })
     .promise();
+
+  // Free the v0 usage identity. This is the function the DELETE route actually calls —
+  // `deleteLandingPage` (which did clear it) is imported by that route and never used, so
+  // in practice no user-initiated delete ever freed the identity. Because the fix removed
+  // the prompt from the idempotency key, a `succeeded` row silently HIJACKS the next
+  // generation of the same route: the user deletes a page, regenerates the same slug with a
+  // brand-new prompt, and gets the OLD chat back — their prompt is never sent to v0.
+  // Best-effort: the archive above already succeeded and must not be undone by a cleanup
+  // failure. Pass the slug only when there is a real one — a root page has none, and
+  // deriving one from its name would free a SUB-page's identity that merely shares the slug.
+  // (ENG-287 residual)
+  await clearV0UsageForPage({
+    userId: record.userId,
+    pageId: record.id,
+    siteId: record.siteId,
+    slug: record.slug,
+  });
 }
 
 /**
