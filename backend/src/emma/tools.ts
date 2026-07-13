@@ -1,5 +1,8 @@
 import { agentModeService } from '../services/agentModeService';
 import { emmaToolRegistry } from './registry';
+import { auditCampaigns } from '../services/adUtmAuditService';
+import type { AdPlatform } from '../utils/adUtm';
+import { metaAdReadPort, googleAdReadPort, linkedInAdReadPort } from '../services/adUtmAuditAdapters';
 import { accountMemoryDb, orgMemoryDb, userDb } from '../services/db';
 import { crmDb } from '../services/db';
 import { askCrm, AskCrmLead } from '../services/askCrmService';
@@ -8586,5 +8589,102 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
     return agentModeService.updateGoogleSheet(args.url_or_id, args.range, args.data, context.userId);
+  },
+});
+
+/**
+ * ENG-239 AC3 — "Existing campaigns are not silently modified; a report/tool lists
+ * campaigns lacking UTMs so the team can opt in per client."
+ *
+ * This is the report. It is STRICTLY READ-ONLY: it audits through an AdReadPort that
+ * exposes no write method, so Emma cannot modify a campaign through this tool. Fixing
+ * an untagged campaign stays a deliberate, per-campaign act by a human, which is what
+ * the AC's "not silently" is protecting — on Meta, re-tagging means swapping the
+ * creative, and that resets the ad's learning phase.
+ */
+const AD_UTM_AUDIT_PORTS = Object.assign(Object.create(null), {
+  meta: metaAdReadPort,
+  google: googleAdReadPort,
+  linkedin: linkedInAdReadPort,
+}) as Record<string, typeof metaAdReadPort>;
+
+emmaToolRegistry.register({
+  name: 'audit_ad_utm_coverage',
+  definition: {
+    name: 'audit_ad_utm_coverage',
+    description:
+      "READ-ONLY. Lists which of an ad account's campaigns are missing UTM tracking on their " +
+      'destination URLs, so leads from them can be attributed back to the ad that produced them. ' +
+      'This tool NEVER modifies a campaign, ad, or URL — it only reports. Use it to decide which ' +
+      'clients to opt in to UTM tagging.\n\n' +
+      'A campaign counts as tagged only if EVERY ad under it carries utm_source, utm_medium and ' +
+      'utm_campaign (utm_content is not required — LinkedIn cannot supply it).\n\n' +
+      'Two kinds of problem are reported SEPARATELY and must not be conflated:\n' +
+      '  • untaggedAdIds  — ads definitely missing a UTM key. Safe to act on.\n' +
+      '  • unreadableAdIds — ads whose destination URL could not be read. These need a HUMAN to ' +
+      'look; do NOT assume they are untagged and do not "fix" them blindly.\n\n' +
+      "Get account_id from list_connected_accounts for the platform.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        platform: {
+          type: 'string',
+          enum: ['meta', 'google', 'linkedin'],
+          description: 'Which ad platform to audit.',
+        },
+        account_id: {
+          type: 'string',
+          description:
+            'The ad account id on that platform (Meta ad account id, Google customer id, or LinkedIn ad account id).',
+        },
+      },
+      required: ['platform', 'account_id'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) {
+      throw new Error('Missing user context');
+    }
+    const platform = String(args?.platform || '').trim();
+    const port = AD_UTM_AUDIT_PORTS[platform];
+    if (!port) {
+      throw new Error(
+        `Unsupported platform "${args?.platform}". Use one of: meta, google, linkedin.`,
+      );
+    }
+    const accountId = String(args?.account_id || '').trim();
+    if (!accountId) {
+      throw new Error('account_id is required — get it from list_connected_accounts.');
+    }
+
+    const campaigns = await auditCampaigns(
+      platform as AdPlatform,
+      context.userId,
+      accountId,
+      port,
+    );
+
+    const needingAction = campaigns.filter((c) => !c.tagged);
+    const unreadableCount = campaigns.reduce((n, c) => n + c.unreadableAdIds.length, 0);
+
+    // Say the unreadable count out loud. Silently folding it into "untagged" would send
+    // someone to swap a creative we never actually managed to read.
+    const message = needingAction.length === 0
+      ? `✅ All ${campaigns.length} campaign(s) on ${platform} carry UTM tracking. Nothing to opt in.`
+      : `${needingAction.length} of ${campaigns.length} campaign(s) on ${platform} need attention.` +
+        (unreadableCount > 0
+          ? ` ${unreadableCount} ad(s) were unreadable — their destination URL could not be parsed, so they need review by a human rather than an automatic fix.`
+          : '');
+
+    return {
+      success: true,
+      message,
+      platform,
+      accountId,
+      totalCampaigns: campaigns.length,
+      campaignsNeedingAction: needingAction.length,
+      unreadableAdCount: unreadableCount,
+      campaigns,
+    };
   },
 });
