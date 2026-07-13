@@ -1,32 +1,40 @@
 import { google } from 'googleapis';
 import { getAccountById, updateAccountTokens, GmailConfig } from './connectedAccountsDb';
 import { getGmailConfig } from '../config/integrations';
-import type { IEmailService, SendEmailParams, SentEmailResult } from './emailProviderService';
+import { EmailProviderError } from './emailProviderService';
+import type {
+  IEmailService,
+  SendEmailParams,
+  SentEmailResult,
+  EmailSummary,
+  EmailDetail,
+  EmailBatchResult,
+} from './emailProviderService';
 
 // ── Custom Errors ──────────────────────────────────────────────────────────
 
-export class GmailNotConnectedError extends Error {
+export class GmailNotConnectedError extends EmailProviderError {
   constructor() {
     super('Gmail account not connected. Please connect your Gmail account in Settings → Connected Accounts.');
     this.name = 'GmailNotConnectedError';
   }
 }
 
-export class GmailTokenRevokedError extends Error {
+export class GmailTokenRevokedError extends EmailProviderError {
   constructor(msg = 'Gmail access was revoked. Please reconnect your Gmail account in Settings → Connected Accounts.') {
     super(msg);
     this.name = 'GmailTokenRevokedError';
   }
 }
 
-export class GmailQuotaError extends Error {
+export class GmailQuotaError extends EmailProviderError {
   constructor() {
     super('Gmail quota exceeded. Please try again in a moment.');
     this.name = 'GmailQuotaError';
   }
 }
 
-export class GmailBodyTooLargeError extends Error {
+export class GmailBodyTooLargeError extends EmailProviderError {
   constructor() {
     super(
       'Email body is too large (HTML content exceeds 50KB). ' +
@@ -37,7 +45,7 @@ export class GmailBodyTooLargeError extends Error {
   }
 }
 
-export class GmailSendNotAuthorizedError extends Error {
+export class GmailSendNotAuthorizedError extends EmailProviderError {
   constructor() {
     super(
       'Gmail send permission was not granted. Please go to Settings → Connected Accounts, ' +
@@ -61,24 +69,10 @@ const BATCH_CHUNK_SIZE = 100; // Gmail batch API limit per request
 const refreshLocks = new Map<string, Promise<string>>();
 
 // ── Email result types ─────────────────────────────────────────────────────
+// These now live in emailProviderService (they are provider-neutral). Re-exported
+// here so existing importers of gmailService keep working.
 
-export interface EmailSummary {
-  id: string;
-  threadId: string;
-  subject: string;
-  from: string;
-  date: string;
-  snippet: string;
-}
-
-export interface EmailDetail extends EmailSummary {
-  to: string;
-  body: string;
-  hasAttachments: boolean;
-}
-
-// Result for each entry in a batch get — either full detail or an error
-export type EmailBatchResult = EmailDetail | { id: string; error: string };
+export type { EmailSummary, EmailDetail, EmailBatchResult } from './emailProviderService';
 
 // ── GmailService ───────────────────────────────────────────────────────────
 

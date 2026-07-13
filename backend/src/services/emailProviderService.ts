@@ -1,5 +1,44 @@
 import { getAccountById } from './connectedAccountsDb';
-import { EmailSummary, EmailDetail, EmailBatchResult } from './gmailService';
+
+// ── Shared email result types ──────────────────────────────────────────────
+// These live here, not in a provider implementation. They used to be imported
+// from gmailService, which made the provider-agnostic module depend on one
+// concrete provider — that does not survive a second provider (ENG-302).
+// gmailService re-exports them, so existing importers keep working.
+
+export interface EmailSummary {
+  id: string;
+  threadId: string;
+  subject: string;
+  from: string;
+  date: string;
+  snippet: string;
+}
+
+export interface EmailDetail extends EmailSummary {
+  to: string;
+  body: string;
+  hasAttachments: boolean;
+}
+
+/** Result for each entry in a batch get — either full detail or a per-message error. */
+export type EmailBatchResult = EmailDetail | { id: string; error: string };
+
+// ── Provider errors ────────────────────────────────────────────────────────
+
+/**
+ * Base class for every email provider's user-facing errors.
+ *
+ * Callers used to enumerate the Gmail error classes by name, which meant a second
+ * provider's errors silently fell through to the generic handler. Catch this
+ * instead — new providers are then covered for free.
+ */
+export class EmailProviderError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EmailProviderError';
+  }
+}
 
 // ── Shared send types ──────────────────────────────────────────────────────
 
@@ -29,7 +68,7 @@ export interface IEmailService {
 
 // ── Supported email platforms ──────────────────────────────────────────────
 
-export type EmailPlatform = 'gmail'; // extend as new providers are added
+export type EmailPlatform = 'gmail'; // extended when a provider is added
 
 export const EMAIL_PLATFORMS: EmailPlatform[] = ['gmail'];
 
@@ -77,13 +116,24 @@ export async function resolveEmailAccount(
 }
 
 // ── Lazy provider bootstrap ───────────────────────────────────────────────
-// Import and register Gmail provider on first use (avoids circular imports at module load)
+// Register providers on first use (avoids circular imports at module load).
+//
+// The promise is memoized rather than guarded by a boolean: the previous version
+// set `bootstrapped = true` BEFORE awaiting the dynamic import, so a second
+// concurrent caller returned immediately and then read an empty registry (ENG-300).
 
-let bootstrapped = false;
+let bootstrapPromise: Promise<void> | null = null;
 
 export async function bootstrapEmailProviders(): Promise<void> {
-  if (bootstrapped) return;
-  bootstrapped = true;
-  const { gmailService } = await import('./gmailService');
-  registerEmailProvider('gmail', gmailService);
+  if (!bootstrapPromise) {
+    bootstrapPromise = (async () => {
+      const { gmailService } = await import('./gmailService');
+      registerEmailProvider('gmail', gmailService);
+    })().catch((error) => {
+      // Don't cache a failed bootstrap — let the next caller retry.
+      bootstrapPromise = null;
+      throw error;
+    });
+  }
+  return bootstrapPromise;
 }
