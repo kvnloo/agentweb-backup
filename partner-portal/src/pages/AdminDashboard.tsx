@@ -99,6 +99,7 @@ import {
   Cancel as CancelIcon,
   Search as SearchIcon,
   Email as EmailIcon,
+  BarChart as BarChartIcon,
 } from "@mui/icons-material";
 
 interface TabPanelProps {
@@ -311,6 +312,41 @@ interface User {
   orgName?: string;
   isOrgOwner?: boolean;
   orgShareAnalyticsWithOrg?: boolean;
+}
+
+// Per-(day, model, feature) shadow-usage row returned by
+// GET /api/admin/users/:userId/usage/by-model-day (see backend adminUsage.ts).
+// costUsd here is the GROSS burn — every metered AND burn-only LLM call — not the
+// amount deducted from the user's quota.
+interface UsageByModelDayRow {
+  date: string;
+  model: string;
+  feature: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  callCount: number;
+  costMicroUsd: number;
+  costUsd: number;
+}
+
+interface UsageByModelDay {
+  userId: string;
+  start: string;
+  end: string;
+  rows: UsageByModelDayRow[];
+  totals: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    totalTokens: number;
+    callCount: number;
+    costMicroUsd: number;
+    costUsd: number;
+  };
 }
 
 // Define an interface for the task data shown in the admin tasks tab
@@ -885,6 +921,13 @@ export default function AdminDashboard() {
   const [subscriptionTypeEditLoading, setSubscriptionTypeEditLoading] = useState(false);
   const [availableSubscriptionTypes, setAvailableSubscriptionTypes] = useState<string[]>([]);
   const [subscriptionTypeAllowanceMap, setSubscriptionTypeAllowanceMap] = useState<Record<string, number | null>>({});
+  const [subscriptionTypeCostAllowanceMap, setSubscriptionTypeCostAllowanceMap] = useState<Record<string, number | null>>({});
+  // Per-user LLM cost breakdown modal (burn, from the shadow-usage table)
+  const [costBreakdownUser, setCostBreakdownUser] = useState<User | null>(null);
+  const [costBreakdownMonth, setCostBreakdownMonth] = useState<string>("");
+  const [costBreakdownData, setCostBreakdownData] = useState<UsageByModelDay | null>(null);
+  const [costBreakdownLoading, setCostBreakdownLoading] = useState(false);
+  const [costBreakdownError, setCostBreakdownError] = useState<string | null>(null);
   const [grantBonusDialogOpen, setGrantBonusDialogOpen] = useState(false);
   const [grantBonusUserId, setGrantBonusUserId] = useState<string | null>(null);
   const [grantBonusEmail, setGrantBonusEmail] = useState("");
@@ -1043,14 +1086,67 @@ export default function AdminDashboard() {
         : ['Basic'];
       setAvailableSubscriptionTypes(typeNames);
       const allowanceMap: Record<string, number | null> = {};
-      types.forEach((t: any) => { allowanceMap[t.name] = t.monthlyTokenAllowance ?? null; });
+      const costAllowanceMap: Record<string, number | null> = {};
+      types.forEach((t: any) => {
+        allowanceMap[t.name] = t.monthlyTokenAllowance ?? null;
+        costAllowanceMap[t.name] = t.monthlyCostAllowance ?? null;
+      });
       setSubscriptionTypeAllowanceMap(allowanceMap);
+      setSubscriptionTypeCostAllowanceMap(costAllowanceMap);
     } catch (error) {
       console.error('Error loading subscription types:', error);
       // Default to Basic if loading fails
       setAvailableSubscriptionTypes(['Basic']);
     }
   };
+
+  // Fetch the per-model LLM cost burn for a user over a calendar month (YYYY-MM).
+  const fetchCostBreakdown = async (userId: string, month: string) => {
+    setCostBreakdownLoading(true);
+    setCostBreakdownError(null);
+    try {
+      const start = `${month}-01`;
+      // 31 always sorts at/after the real month end; days that don't exist have no rows.
+      const end = `${month}-31`;
+      const response = await axios.get(
+        buildApiUrl(`/api/admin/users/${userId}/usage/by-model-day`),
+        { headers: { Authorization: `Bearer ${token}` }, params: { start, end } }
+      );
+      setCostBreakdownData(response.data);
+    } catch (error: any) {
+      console.error('Error loading cost breakdown:', error);
+      setCostBreakdownData(null);
+      setCostBreakdownError(error.response?.data?.message || 'Failed to load cost breakdown');
+    } finally {
+      setCostBreakdownLoading(false);
+    }
+  };
+
+  // Open the breakdown modal for a user, defaulting to the current month.
+  const openCostBreakdown = (user: User) => {
+    setCostBreakdownUser(user);
+    setCostBreakdownData(null);
+    setCostBreakdownError(null);
+    setCostBreakdownMonth(new Date().toISOString().slice(0, 7));
+  };
+
+  // Amount deducted from a user's quota for a given month (YYYY-MM). This is the
+  // "counted" cost — only metered (non-burn-only) calls — vs the gross burn shown
+  // by the breakdown endpoint. Current month comes from tokenUsage; past months
+  // from tokenUsageHistory.
+  const deductedCostForMonth = (user: User, month: string): number => {
+    if (user.tokenUsage?.month === month) return user.tokenUsage?.totalCost ?? 0;
+    const hist = user.tokenUsageHistory?.find((h) => h.month === month);
+    return hist?.totalCost ?? 0;
+  };
+
+  // (Re)load the breakdown whenever the target user or selected month changes.
+  useEffect(() => {
+    if (costBreakdownUser && costBreakdownMonth) {
+      fetchCostBreakdown(costBreakdownUser.userId, costBreakdownMonth);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [costBreakdownUser?.userId, costBreakdownMonth]);
 
   // Load waitlist data only when Waitlist tab (3) is selected
   useEffect(() => {
@@ -4732,6 +4828,28 @@ export default function AdminDashboard() {
                                     </Box>
                                   )}
                                 </Grid>
+                                {/* LLM Cost quota (dollar spend vs cost cap) */}
+                                <Grid item xs={6}>
+                                  <Typography variant="caption" color="text.secondary">LLM Cost</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
+                                    {user.roles?.includes("customer") ? (() => {
+                                      const currentMonth = new Date().toISOString().slice(0, 7);
+                                      const costUsed = user.tokenUsage?.month === currentMonth ? (user.tokenUsage?.totalCost ?? 0) : 0;
+                                      const costAllowance = subscriptionTypeCostAllowanceMap[user.subscriptionType || "Basic"] ?? null;
+                                      return (
+                                        <Typography variant="body2">
+                                          ${costUsed.toFixed(2)} / {costAllowance != null ? `$${costAllowance.toFixed(2)}` : "∞"}
+                                          <Typography component="span" variant="caption" color="text.secondary"> deducted</Typography>
+                                        </Typography>
+                                      );
+                                    })() : <Typography variant="body2" color="text.disabled">—</Typography>}
+                                    {user.roles?.includes("customer") && (
+                                      <Tooltip title="View per-model burn breakdown">
+                                        <IconButton size="small" onClick={() => openCostBreakdown(user)} color="primary"><BarChartIcon fontSize="small" /></IconButton>
+                                      </Tooltip>
+                                    )}
+                                  </Box>
+                                </Grid>
                                 {/* Extra Cost Usage (enrichment, image gen, etc.) */}
                                 {user.roles?.includes("customer") && (
                                   <Grid item xs={6}>
@@ -6475,6 +6593,104 @@ export default function AdminDashboard() {
           >
             {grantBonusLoading ? <CircularProgress size={24} /> : "Grant"}
           </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Per-user LLM cost burn breakdown */}
+      <Dialog open={!!costBreakdownUser} onClose={() => setCostBreakdownUser(null)} maxWidth="md" fullWidth>
+        <DialogTitle sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 2 }}>
+          <span>LLM Cost Burn — {costBreakdownUser?.email}</span>
+          <TextField
+            type="month"
+            size="small"
+            label="Month"
+            value={costBreakdownMonth}
+            onChange={(e) => setCostBreakdownMonth(e.target.value)}
+            InputLabelProps={{ shrink: true }}
+            sx={{ width: 170 }}
+          />
+        </DialogTitle>
+        <DialogContent dividers>
+          {costBreakdownLoading ? (
+            <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}><CircularProgress /></Box>
+          ) : costBreakdownError ? (
+            <Typography color="error" variant="body2" sx={{ py: 2 }}>{costBreakdownError}</Typography>
+          ) : costBreakdownData ? (() => {
+            const burn = costBreakdownData.totals.costUsd;
+            const deducted = costBreakdownUser ? deductedCostForMonth(costBreakdownUser, costBreakdownMonth) : 0;
+            const absorbed = Math.max(0, burn - deducted);
+            // Aggregate the per-(day, model, feature) rows up to per-model totals.
+            const byModel: Record<string, { model: string; callCount: number; totalTokens: number; costUsd: number }> = {};
+            costBreakdownData.rows.forEach((r) => {
+              const m = byModel[r.model] || (byModel[r.model] = { model: r.model, callCount: 0, totalTokens: 0, costUsd: 0 });
+              m.callCount += r.callCount;
+              m.totalTokens += r.totalTokens;
+              m.costUsd += r.costUsd;
+            });
+            const modelRows = Object.values(byModel).sort((a, b) => b.costUsd - a.costUsd);
+            return (
+              <>
+                <Grid container spacing={2} sx={{ mb: 2 }}>
+                  <Grid item xs={4}>
+                    <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 1.5 }}>
+                      <Typography variant="caption" color="text.secondary">Burned (gross)</Typography>
+                      <Typography variant="h6" sx={{ fontVariantNumeric: "tabular-nums" }}>${burn.toFixed(2)}</Typography>
+                      <Typography variant="caption" color="text.secondary">all LLM calls this user generated</Typography>
+                    </Box>
+                  </Grid>
+                  <Grid item xs={4}>
+                    <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 1.5 }}>
+                      <Typography variant="caption" color="text.secondary">Counted to quota</Typography>
+                      <Typography variant="h6" sx={{ fontVariantNumeric: "tabular-nums" }}>${deducted.toFixed(2)}</Typography>
+                      <Typography variant="caption" color="text.secondary">deducted from their cost cap</Typography>
+                    </Box>
+                  </Grid>
+                  <Grid item xs={4}>
+                    <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 1.5 }}>
+                      <Typography variant="caption" color="text.secondary">Absorbed by platform</Typography>
+                      <Typography variant="h6" sx={{ fontVariantNumeric: "tabular-nums" }}>${absorbed.toFixed(2)}</Typography>
+                      <Typography variant="caption" color="text.secondary">burn not charged to the user</Typography>
+                    </Box>
+                  </Grid>
+                </Grid>
+                {modelRows.length === 0 ? (
+                  <Typography variant="body2" color="text.secondary" sx={{ py: 2 }}>No LLM usage recorded for this month.</Typography>
+                ) : (
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Model</TableCell>
+                        <TableCell align="right">Calls</TableCell>
+                        <TableCell align="right">Tokens</TableCell>
+                        <TableCell align="right">Burn</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {modelRows.map((m) => (
+                        <TableRow key={m.model}>
+                          <TableCell>{m.model}</TableCell>
+                          <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>{m.callCount.toLocaleString()}</TableCell>
+                          <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>{m.totalTokens.toLocaleString()}</TableCell>
+                          <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>${m.costUsd.toFixed(4)}</TableCell>
+                        </TableRow>
+                      ))}
+                      <TableRow>
+                        <TableCell sx={{ fontWeight: 600 }}>Total</TableCell>
+                        <TableCell align="right" sx={{ fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>{costBreakdownData.totals.callCount.toLocaleString()}</TableCell>
+                        <TableCell align="right" sx={{ fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>{costBreakdownData.totals.totalTokens.toLocaleString()}</TableCell>
+                        <TableCell align="right" sx={{ fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>${burn.toFixed(4)}</TableCell>
+                      </TableRow>
+                    </TableBody>
+                  </Table>
+                )}
+              </>
+            );
+          })() : (
+            <Typography variant="body2" color="text.secondary" sx={{ py: 2 }}>No data.</Typography>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setCostBreakdownUser(null)}>Close</Button>
         </DialogActions>
       </Dialog>
 
