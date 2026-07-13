@@ -325,6 +325,20 @@ async function extractWithPuppeteer(
       Pragma: 'no-cache',
     });
 
+    // Capture the brand's dark theme when it exists. Headless Chrome reports
+    // `prefers-color-scheme: light` by default, so sites that ship their dark
+    // design behind the OS color-scheme preference — either a CSS
+    // `@media (prefers-color-scheme: dark)` rule or a client script that reads
+    // the preference and toggles a `dark` class / `data-theme` — were captured
+    // in their LIGHT variant. That made brand extraction read the wrong theme
+    // (see ENG-285: rankai.ai is matte-black with an amber glow, but the headless
+    // read returned a near-white background). Emulating a dark preference makes
+    // the DOM/computed styles match what dark-mode users see; light-only sites
+    // are unaffected because they have no dark variant to switch to.
+    await page.emulateMediaFeatures([
+      { name: 'prefers-color-scheme', value: 'dark' },
+    ]);
+
     await page.goto(url.toString(), {
       waitUntil: 'networkidle2',
       timeout: 30000,
