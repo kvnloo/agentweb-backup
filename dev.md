@@ -118,15 +118,39 @@ re-downloaded the same broken version forever.
   route-reuse, so the guard row is the only thing left deduping, and freeing it lets a second chat
   build into the same repo concurrently.
 
-### Still open (deliberately not in this change)
-- **`iterateLandingPage` is still sync behind the 300s ceiling.** An iteration that legitimately takes
-  >300s still fails, v0 still creates the version (credits burned), the record is not incremented, and
-  the iteration is stranded — `deployLandingPage` then refuses the page because its status is
-  `deployed`. Retrying re-sends the same message with NO idempotency guard, so v0 applies the
-  instruction twice. Going async here needs explicit version-id tracking (otherwise the deploy that
-  follows grabs the pre-iteration version). Worth its own issue.
+### iterate: the last sync v0 call (now fixed)
+
+`iterateLandingPage` was the last v0 call still sitting behind the 300s ceiling. A >300s iteration
+failed FOUR ways at once: v0 applied the edit and charged for it anyway; the record never incremented
+and stayed `deployed`; `deployLandingPage` then REFUSED it ("Cannot deploy a landing page with
+status: deployed"), stranding the edit inside v0; and the retry re-sent the same message with no
+guard, so v0 applied it TWICE.
+
+Async was blocked for a real reason: `deployLandingPage` reads "the latest completed version", so an
+iterate that returned before v0 published the new one would let the deploy ship the **pre-iteration**
+version and silently lose the user's edit — worse than failing. `waitForCompletedV0Version`'s
+`afterVersionId` guard is what unblocked it: we do not return until v0 publishes a version that is
+genuinely NOT the one we started from, so the hazard is structurally impossible.
+
+`pendingIteration {baseVersionId, messageHash}` is recorded the instant v0 ACCEPTS the send (before
+the wait). A retry of the same message resumes instead of re-sending; if v0 has since published a
+newer version, the edit landed and we adopt it. v0's own state is the source of truth, not a guess.
+
+Note what is deliberately NOT done: the status is not flipped to `generating` during an edit. The
+page is still live, and a crash mid-iterate would then let the janitor mark a LIVE page `failed`.
+
+### Still open
+- **The 15-min transport ceiling.** `mcp/server/httpClient.ts` sets a global undici
+  `headersTimeout: 15 min`, so any generation or iteration past that loses its in-band HTTP response
+  no matter what the backend budget says. The work still lands and the record is left correct
+  (deployable), so the user finishes from the portal — but the in-band call is not what delivers a
+  slow build. Removing this properly means returning 202 immediately and having the portal poll
+  (ENG-290 pattern 5) — a product change, not a bug fix.
 - `bestEffortPut` fails open on a Dynamo outage → a bounded double-spend across instances. Accepted
   trade-off; the alternative is recreating the permanent wedge.
+- The DynamoDB `ConditionExpression` in `v0UsageGuard` is only asserted as a STRING in tests (the
+  DocumentClient is mocked) — it has never executed against a real table. If its semantics are wrong,
+  the symptom is the wedge it exists to prevent. Worth one real exercise against a dev table.
 
 ## Landing-page generation failing routinely (RankAI/Opsera/internal) — root cause + fix (2026-07-11, ENG-287/ENG-277)
 
