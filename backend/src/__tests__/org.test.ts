@@ -395,6 +395,14 @@ describe('Organization routes', () => {
       };
       mockUsers['user-1'].orgId = 'org-1';
       mockUsers['user-1'].orgRole = 'owner';
+      // Owner is on a paid tier — the org's effective tier that members inherit.
+      mockUsers['user-1'].subscriptionType = 'Pro';
+      mockUsers['user-1'].allowedPages = ['/', '/agent-mode', '/settings', '/landing-pages'];
+      mockUsers['user-1'].allowedSkills = ['*'];
+      // Member starts on the default Free tier from signup.
+      mockUsers['user-2'].subscriptionType = 'Free';
+      mockUsers['user-2'].allowedPages = ['/', '/agent-mode', '/settings'];
+      mockUsers['user-2'].allowedSkills = [];
       // Switch to member user for accept
       mockUser = mockUsers['user-2'];
     });
@@ -432,6 +440,22 @@ describe('Organization routes', () => {
       expect(res.body.success).toBe(true);
       expect(mockUsers['user-2'].orgId).toBe('org-1');
       expect(mockUsers['user-2'].orgRole).toBe('member');
+    });
+
+    it('should NOT snapshot the owner tier onto the member on accept (ENG-288)', async () => {
+      const res = await request(app).post('/api/org/accept-invite').send({
+        orgId: 'org-1',
+        inviteToken: 'valid-token',
+      });
+      expect(res.status).toBe(200);
+      // The member's effective tier is resolved dynamically from the org owner at
+      // read time (getUserSubscriptionType), NOT persisted onto the member record.
+      // Snapshotting the owner's tier here would leave a departed/downgraded member
+      // with permanently elevated access, so accept-invite must leave the member's
+      // own subscription fields untouched.
+      expect(mockUsers['user-2'].subscriptionType).toBe('Free');
+      expect(mockUsers['user-2'].allowedPages).toEqual(['/', '/agent-mode', '/settings']);
+      expect(mockUsers['user-2'].allowedSkills).toEqual([]);
     });
   });
 

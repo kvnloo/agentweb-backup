@@ -7261,11 +7261,16 @@ emmaToolRegistry.register({
     if (!user) {
       return { error: 'User profile not found.' };
     }
+    // Org members inherit the owner's tier dynamically (ENG-288) — resolve
+    // through the canonical helper instead of reading the raw field, so this
+    // self-report matches what the member actually has access to.
+    const { getUserSubscriptionType } = await import('../services/subscriptionService');
+    const subscriptionType = await getUserSubscriptionType(userId);
     return {
       email: user.email,
       displayName: user.displayName || null,
       companyName: user.companyName || null,
-      subscriptionType: user.subscriptionType || null,
+      subscriptionType: subscriptionType || null,
     };
   }
 });

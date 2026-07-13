@@ -1358,31 +1358,46 @@ export class UserDB {
       return user; // Return the fetched user object if no updates are needed
     }
 
-    const updateExpressions: string[] = [];
+    const setExpressions: string[] = [];
+    const removeExpressions: string[] = [];
     const expressionAttributeNames: { [key: string]: string } = {};
     const expressionAttributeValues: { [key: string]: any } = {};
 
     Object.entries(updatableFields).forEach(([key, value]) => {
-      // Ensure value is not undefined. Allow null to explicitly remove/set a field to null.
-      if (value !== undefined) {
-        updateExpressions.push(`#${key} = :${key}`);
-        expressionAttributeNames[`#${key}`] = key;
+      if (value === undefined) return;
+      expressionAttributeNames[`#${key}`] = key;
+      if (value === null) {
+        // DynamoDB rejects SET-ing a GSI key attribute (e.g. orgId on
+        // OrgIdIndex) to NULL — it must be REMOVEd instead. Applying this to
+        // every null (not just GSI keys) keeps the semantics consistent and
+        // matches the REMOVE-on-null pattern already used in updateLead.
+        removeExpressions.push(`#${key}`);
+      } else {
+        setExpressions.push(`#${key} = :${key}`);
         expressionAttributeValues[`:${key}`] = value;
       }
     });
 
-    if (updateExpressions.length === 0) {
+    if (setExpressions.length === 0 && removeExpressions.length === 0) {
       return user;
     }
 
-    const params = {
+    const updateExpressionParts: string[] = [];
+    if (setExpressions.length > 0) updateExpressionParts.push(`SET ${setExpressions.join(", ")}`);
+    if (removeExpressions.length > 0) updateExpressionParts.push(`REMOVE ${removeExpressions.join(", ")}`);
+
+    const params: any = {
       TableName: this.tableName,
       Key: { email: user.email }, // Use email as the primary key
-      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      UpdateExpression: updateExpressionParts.join(" "),
       ExpressionAttributeNames: expressionAttributeNames,
-      ExpressionAttributeValues: expressionAttributeValues,
       ReturnValues: "ALL_NEW",
     };
+    // DynamoDB rejects an empty ExpressionAttributeValues map (e.g. when every
+    // update is a REMOVE-on-null with no SET clauses at all).
+    if (Object.keys(expressionAttributeValues).length > 0) {
+      params.ExpressionAttributeValues = expressionAttributeValues;
+    }
 
     try {
       const result = await this.docClient.update(params).promise();
