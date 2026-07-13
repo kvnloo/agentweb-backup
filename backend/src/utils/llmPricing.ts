@@ -117,10 +117,11 @@ export const VIDEO_GENERATION_PRICING_USD_PER_CLIP: Record<string, number> = {
   'veo-3.1-generate-preview': 3.2, // $0.40/s x 8s, audio incl. (ai.google.dev); was 2.8
   'veo-3.1-fast-generate-preview': 1.4, // within official fast range ($0.10-0.30/s)
   'veo-3-generate-preview': 3.2, // $0.40/s x 8s (ai.google.dev); was unpriced -> recorded $0
-  // Seedance 2.0 standard = $0.3034/s (audio incl.) via fal.ai's transparent API
-  // rate (higgsfield.ai/blog/seedance-2-0-pricing-2026); $0.3034 x 8s = $2.43/clip.
-  // Higgsfield itself bills in credits, so this is the best USD proxy, not a Higgsfield invoice rate.
-  'seedance-2.0': 2.43,
+  // Seedance 2.0: effective Higgsfield rate for a 720p 8s standard clip = $1.55
+  // (Higgsfield's own published per-clip cost, higgsfield.ai/blog/seedance-2-0-pricing-2026;
+  // cross-checked ~40 credits/clip x $0.039/credit on the Plus plan = $1.56). Our path is
+  // Higgsfield MCP, so this beats the fal.ai proxy ($2.43). Fast mode would be $1.20.
+  'seedance-2.0': 1.55,
 };
 
 /** Models we've already warned about this process — dedupes the unknown-model warn. */

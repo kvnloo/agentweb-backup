@@ -76,7 +76,7 @@ describe('llmPricing', () => {
       expect(VIDEO_GENERATION_PRICING_USD_PER_CLIP['veo-3.1-generate-preview']).toBe(3.2);
       expect(VIDEO_GENERATION_PRICING_USD_PER_CLIP['veo-3.1-fast-generate-preview']).toBe(1.4);
       expect(VIDEO_GENERATION_PRICING_USD_PER_CLIP['veo-3-generate-preview']).toBe(3.2);
-      expect(VIDEO_GENERATION_PRICING_USD_PER_CLIP['seedance-2.0']).toBe(2.43);
+      expect(VIDEO_GENERATION_PRICING_USD_PER_CLIP['seedance-2.0']).toBe(1.55);
     });
   });
 
