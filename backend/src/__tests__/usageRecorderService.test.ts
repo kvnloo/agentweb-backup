@@ -236,10 +236,10 @@ describe('usageRecorderService', () => {
     });
 
     it('prices cache reads and writes when present', () => {
-      // opus: in $15/M → cacheRead $1.5/M, cacheWrite $18.75/M
+      // opus 4.6: in $5/M → cacheRead $0.5/M (10%), cacheWrite $6.25/M (125%)
       expect(
         computeCostMicroUsd('anthropic.claude-opus-4-6-v1', 0, 0, 1000, 1000)
-      ).toBe(Math.round(1000 * 1.5 + 1000 * 18.75));
+      ).toBe(Math.round(1000 * 0.5 + 1000 * 6.25));
     });
 
     it('prices the deep-research agents (so their per-run cost is counted, not 0)', () => {
