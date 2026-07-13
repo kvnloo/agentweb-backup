@@ -4,12 +4,16 @@
  * The AC: "Existing campaigns are not silently modified; a report/tool lists
  * campaigns lacking UTMs so the team can opt in per client."
  *
- * These tests are written FIRST (CLAUDE.md Rule 2, TDD) and must fail until
- * `adUtmAuditService` exists. They pin the audit contract:
- *   - a campaign is "tagged" only if EVERY ad carries utm_source/medium/campaign,
- *     considering the union of the destination URL's query keys AND the platform
- *     append field (Meta url_tags / Google finalUrlSuffix);
+ * The contract this pins:
+ *   - an ad is tagged only if EVERY one of its destination URLs carries
+ *     utm_source/medium/campaign, counting the union of the URL's own query keys
+ *     and the platform append field (Meta url_tags / Google finalUrlSuffix), which
+ *     the platforms merge into every link at delivery;
  *   - utm_content is NOT required (LinkedIn ships without it);
+ *   - an ad whose destination we cannot READ is reported `unreadable`, never
+ *     `untagged`. That distinction matters: acting on a false "untagged" means
+ *     swapping a live Meta creative, which resets the ad's learning phase. A
+ *     wrong audit is worse than no audit;
  *   - the audit is strictly read-only — it never invokes anything but the port's
  *     two read methods.
  */
@@ -22,19 +26,19 @@ import {
 
 type Ad = {
   adId: string;
-  destinationUrl?: string;
+  destinationUrls?: string[];
   appendField?: string;
 };
 
+/** Fully tagged URL, for brevity in fixtures. */
+const TAGGED = "https://x.com/lp?utm_source=meta&utm_medium=paid&utm_campaign=1";
+
 /**
- * Build a read-only port from a fixed campaign->ads map. The read methods are
- * jest mocks so tests can assert exactly how they were called. The returned
- * object is wrapped in a Proxy that records every property access, so a test can
- * prove the audit touched nothing but the two read methods (no writes, ever).
+ * Build a read-only port from a fixed campaign->ads map. The returned object is
+ * wrapped in a Proxy recording every property access, so a test can prove the audit
+ * touched nothing but the two read methods (no writes, ever).
  */
-function makePort(
-  data: Record<string, { name: string; ads: Ad[] }>,
-): {
+function makePort(data: Record<string, { name: string; ads: Ad[] }>): {
   port: AdReadPort;
   listCampaigns: jest.Mock;
   listAdDestinations: jest.Mock;
@@ -64,11 +68,8 @@ const byId = (reports: CampaignAuditReport[]) =>
   Object.fromEntries(reports.map((r) => [r.campaignId, r]));
 
 describe("adUtmAuditService.auditCampaigns", () => {
-  // ---- Edge case 1: campaign with zero ads ----
   it("treats a campaign with zero ads as tagged (vacuous — nothing to opt in)", async () => {
-    const { port } = makePort({
-      c_empty: { name: "Empty Campaign", ads: [] },
-    });
+    const { port } = makePort({ c_empty: { name: "Empty Campaign", ads: [] } });
 
     const reports = await auditCampaigns("meta", "u1", "acct1", port);
 
@@ -79,38 +80,44 @@ describe("adUtmAuditService.auditCampaigns", () => {
       tagged: true,
       missingKeys: [],
       untaggedAdIds: [],
+      unreadableAdIds: [],
     });
   });
 
-  // ---- Edge case 2: malformed destination URL must not crash the audit ----
-  it("degrades a malformed destination URL to untagged and records the ad, without throwing", async () => {
+  it("reports a malformed destination URL as UNREADABLE, not untagged, and never throws", async () => {
+    // We cannot know what a URL we can't parse already carries. Calling it
+    // "untagged" would send the team to swap a creative that may be perfectly fine.
     const { port } = makePort({
       c_bad: {
         name: "Broken URL Campaign",
         ads: [
-          {
-            adId: "ad_ok",
-            destinationUrl:
-              "https://x.com/lp?utm_source=meta&utm_medium=paid&utm_campaign=123",
-          },
-          { adId: "ad_bad", destinationUrl: "http://[not a url" },
+          { adId: "ad_ok", destinationUrls: [TAGGED] },
+          { adId: "ad_bad", destinationUrls: ["http://[not a url"] },
         ],
       },
     });
 
     const reports = await auditCampaigns("meta", "u1", "acct1", port);
 
+    expect(reports[0].untaggedAdIds).toEqual([]);
+    expect(reports[0].unreadableAdIds).toEqual(["ad_bad"]);
+    // Nothing is *definitively* missing — we simply could not read that ad.
+    expect(reports[0].missingKeys).toEqual([]);
+    // But the campaign still needs a human, so it is not "no action needed".
     expect(reports[0].tagged).toBe(false);
-    expect(reports[0].untaggedAdIds).toEqual(["ad_bad"]);
-    // A malformed URL yields no parseable keys, so all three are reported missing.
-    expect(reports[0].missingKeys).toEqual([
-      "utm_source",
-      "utm_medium",
-      "utm_campaign",
-    ]);
   });
 
-  // ---- Edge case 3: ad tagged ONLY via the append field (url_tags / finalUrlSuffix) ----
+  it("reports an ad with no destination URL at all as unreadable", async () => {
+    const { port } = makePort({
+      c_missing: { name: "Missing URL Campaign", ads: [{ adId: "no_url" }] },
+    });
+
+    const reports = await auditCampaigns("meta", "u1", "acct1", port);
+    expect(reports[0].unreadableAdIds).toEqual(["no_url"]);
+    expect(reports[0].untaggedAdIds).toEqual([]);
+    expect(reports[0].tagged).toBe(false);
+  });
+
   it("counts an ad as tagged when the append field alone supplies the UTMs", async () => {
     const { port } = makePort({
       c_append: {
@@ -118,7 +125,7 @@ describe("adUtmAuditService.auditCampaigns", () => {
         ads: [
           {
             adId: "ad_append",
-            destinationUrl: "https://x.com/lp",
+            destinationUrls: ["https://x.com/lp"],
             appendField:
               "utm_source=google&utm_medium=paid&utm_campaign={campaignid}&utm_content={creative}",
           },
@@ -127,13 +134,10 @@ describe("adUtmAuditService.auditCampaigns", () => {
     });
 
     const reports = await auditCampaigns("google", "u1", "acct1", port);
-
     expect(reports[0].tagged).toBe(true);
     expect(reports[0].missingKeys).toEqual([]);
-    expect(reports[0].untaggedAdIds).toEqual([]);
   });
 
-  // ---- Edge case 4: union of URL keys AND append field keys ----
   it("unions the destination URL's keys with the append field's keys", async () => {
     const { port } = makePort({
       c_union: {
@@ -141,8 +145,7 @@ describe("adUtmAuditService.auditCampaigns", () => {
         ads: [
           {
             adId: "ad_union",
-            // URL carries source only; append field supplies medium + campaign.
-            destinationUrl: "https://x.com/lp?utm_source=meta",
+            destinationUrls: ["https://x.com/lp?utm_source=meta"],
             appendField: "utm_medium=paid&utm_campaign=42",
           },
         ],
@@ -153,21 +156,41 @@ describe("adUtmAuditService.auditCampaigns", () => {
     expect(reports[0].tagged).toBe(true);
   });
 
-  // ---- Happy path: every ad fully tagged via the destination URL ----
+  it("marks a carousel ad untagged when ANY one of its card URLs lacks a key", async () => {
+    // A Meta carousel has one destination URL per card. One untagged card is a hole
+    // in the attribution, so the whole ad must be flagged.
+    const { port } = makePort({
+      c_carousel: {
+        name: "Carousel Campaign",
+        ads: [
+          {
+            adId: "ad_carousel",
+            destinationUrls: [
+              TAGGED,
+              "https://x.com/card2?utm_source=meta", // missing medium + campaign
+            ],
+          },
+        ],
+      },
+    });
+
+    const reports = await auditCampaigns("meta", "u1", "acct1", port);
+    expect(reports[0].tagged).toBe(false);
+    expect(reports[0].untaggedAdIds).toEqual(["ad_carousel"]);
+    expect(reports[0].missingKeys).toEqual(["utm_medium", "utm_campaign"]);
+  });
+
   it("reports a fully tagged campaign as tagged with no missing keys", async () => {
     const { port } = makePort({
       c_good: {
         name: "Good Campaign",
         ads: [
-          {
-            adId: "a1",
-            destinationUrl:
-              "https://x.com/lp?utm_source=meta&utm_medium=paid&utm_campaign=1",
-          },
+          { adId: "a1", destinationUrls: [TAGGED] },
           {
             adId: "a2",
-            destinationUrl:
+            destinationUrls: [
               "https://x.com/lp2?utm_campaign=1&utm_medium=paid&utm_source=meta",
+            ],
           },
         ],
       },
@@ -181,10 +204,10 @@ describe("adUtmAuditService.auditCampaigns", () => {
       tagged: true,
       missingKeys: [],
       untaggedAdIds: [],
+      unreadableAdIds: [],
     });
   });
 
-  // ---- utm_content is NOT required ----
   it("does not require utm_content (LinkedIn ships without it)", async () => {
     const { port } = makePort({
       c_li: {
@@ -192,8 +215,9 @@ describe("adUtmAuditService.auditCampaigns", () => {
         ads: [
           {
             adId: "li1",
-            destinationUrl:
+            destinationUrls: [
               "https://x.com/lp?utm_source=linkedin&utm_medium=paid&utm_campaign=9",
+            ],
           },
         ],
       },
@@ -203,41 +227,14 @@ describe("adUtmAuditService.auditCampaigns", () => {
     expect(reports[0].tagged).toBe(true);
   });
 
-  // ---- Missing / undefined destination URL and no append field => untagged ----
-  it("treats an ad with a missing destination URL and no append field as untagged", async () => {
-    const { port } = makePort({
-      c_missing: {
-        name: "Missing URL Campaign",
-        ads: [{ adId: "no_url" }],
-      },
-    });
-
-    const reports = await auditCampaigns("meta", "u1", "acct1", port);
-    expect(reports[0].tagged).toBe(false);
-    expect(reports[0].untaggedAdIds).toEqual(["no_url"]);
-    expect(reports[0].missingKeys).toEqual([
-      "utm_source",
-      "utm_medium",
-      "utm_campaign",
-    ]);
-  });
-
-  // ---- Partial: one tagged ad, one missing only some keys ----
   it("aggregates missing keys and untagged ad ids across a campaign", async () => {
     const { port } = makePort({
       c_partial: {
         name: "Partial Campaign",
         ads: [
-          {
-            adId: "full",
-            destinationUrl:
-              "https://x.com/lp?utm_source=meta&utm_medium=paid&utm_campaign=7",
-          },
-          {
-            // has source only -> missing medium + campaign
-            adId: "half",
-            destinationUrl: "https://x.com/lp?utm_source=meta",
-          },
+          { adId: "full", destinationUrls: [TAGGED] },
+          // source only -> missing medium + campaign
+          { adId: "half", destinationUrls: ["https://x.com/lp?utm_source=meta"] },
         ],
       },
     });
@@ -248,20 +245,10 @@ describe("adUtmAuditService.auditCampaigns", () => {
     expect(reports[0].missingKeys).toEqual(["utm_medium", "utm_campaign"]);
   });
 
-  // ---- Multiple campaigns are each reported ----
   it("reports every campaign returned by the port", async () => {
     const { port, listAdDestinations, listCampaigns } = makePort({
-      c1: {
-        name: "One",
-        ads: [
-          {
-            adId: "x",
-            destinationUrl:
-              "https://x.com/lp?utm_source=meta&utm_medium=paid&utm_campaign=1",
-          },
-        ],
-      },
-      c2: { name: "Two", ads: [{ adId: "y", destinationUrl: "https://x.com/lp" }] },
+      c1: { name: "One", ads: [{ adId: "x", destinationUrls: [TAGGED] }] },
+      c2: { name: "Two", ads: [{ adId: "y", destinationUrls: ["https://x.com/lp"] }] },
     });
 
     const reports = await auditCampaigns("meta", "u9", "acctZ", port);
@@ -270,20 +257,16 @@ describe("adUtmAuditService.auditCampaigns", () => {
     expect(reports).toHaveLength(2);
     expect(map.c1.tagged).toBe(true);
     expect(map.c2.tagged).toBe(false);
+    expect(map.c2.untaggedAdIds).toEqual(["y"]);
 
-    // Read methods were called with the audit's userId/accountId.
     expect(listCampaigns).toHaveBeenCalledWith("u9", "acctZ");
     expect(listAdDestinations).toHaveBeenCalledWith("u9", "acctZ", "c1");
     expect(listAdDestinations).toHaveBeenCalledWith("u9", "acctZ", "c2");
   });
 
-  // ---- Read-only guarantee: no property beyond the two reads is ever touched ----
   it("is strictly read-only: touches only listCampaigns and listAdDestinations", async () => {
     const { port, accessed } = makePort({
-      c: {
-        name: "RO",
-        ads: [{ adId: "a", destinationUrl: "https://x.com/lp" }],
-      },
+      c: { name: "RO", ads: [{ adId: "a", destinationUrls: ["https://x.com/lp"] }] },
     });
 
     await auditCampaigns("meta", "u1", "acct1", port);
@@ -294,7 +277,6 @@ describe("adUtmAuditService.auditCampaigns", () => {
     expect(unexpected).toEqual([]);
   });
 
-  // ---- Error path: unsupported platform is rejected ----
   it("throws on an unsupported platform", async () => {
     const { port } = makePort({ c: { name: "x", ads: [] } });
     await expect(

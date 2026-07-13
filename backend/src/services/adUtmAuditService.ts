@@ -34,12 +34,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-import {
-  AdPlatform,
-  UTM_KEYS,
-  UtmKey,
-  existingUtmKeys,
-} from "../utils/adUtm";
+import { AdPlatform, UTM_KEYS, UtmKey, readUtmKeys } from "../utils/adUtm";
 
 /**
  * The reads the audit needs, abstracted away from any one platform. A wiring
@@ -59,8 +54,12 @@ export interface AdReadPort {
   ): Promise<
     Array<{
       adId: string;
-      /** Meta link_url / Google finalUrl / LinkedIn landingPage. */
-      destinationUrl?: string;
+      /**
+       * EVERY destination URL on the ad. A Meta carousel has one per card, so an
+       * ad is only tagged if all of them are — a single untagged card is a hole in
+       * the attribution.
+       */
+      destinationUrls?: string[];
       /** Meta url_tags / Google finalUrlSuffix; undefined elsewhere. */
       appendField?: string;
     }>
@@ -71,12 +70,19 @@ export interface AdReadPort {
 export interface CampaignAuditReport {
   campaignId: string;
   name: string;
-  /** True iff every ad under the campaign carries all REQUIRED_KEYS. */
+  /** True iff no ad needs action: none untagged, none unreadable. */
   tagged: boolean;
   /** Required keys missing from at least one ad, in canonical order. */
   missingKeys: UtmKey[];
-  /** Ad IDs that are not fully tagged (missing a required key or malformed). */
+  /** Ads DEFINITELY missing a required key. Safe to act on. */
   untaggedAdIds: string[];
+  /**
+   * Ads whose destination we could not read (no URL extracted, or an unparseable
+   * one). Deliberately NOT reported as untagged: acting on a false positive means
+   * swapping a Meta creative, which resets the ad's learning phase — so an
+   * unreadable ad is surfaced for a human to look at, never auto-fixed.
+   */
+  unreadableAdIds: string[];
 }
 
 /**
@@ -112,31 +118,37 @@ function appendFieldUtmKeys(appendField: string): Set<UtmKey> {
 }
 
 /**
- * The UTM keys effectively present on one ad — the union of its destination
- * URL's query keys and its append field's keys (platforms merge the two at
- * delivery). `malformed` is true when a present destination URL fails to parse;
- * such an ad degrades to untagged rather than crashing the whole audit.
+ * Evaluate one ad.
+ *
+ * The platforms MERGE the append field into every destination URL at delivery
+ * (Meta url_tags, Google final_url_suffix), so a key counts as present on a URL if
+ * it is on the URL OR in the append field. An ad is tagged only if EVERY one of its
+ * destination URLs ends up carrying all REQUIRED_KEYS — one untagged carousel card
+ * is a hole in the attribution.
+ *
+ * `unreadable` means we could not determine the ad's destinations at all (none
+ * extracted, or one that will not parse). That is NOT the same as "untagged": we
+ * report it separately so a human looks, because acting on a false "untagged"
+ * means swapping a live Meta creative and resetting its learning phase.
  */
-function keysForAd(ad: {
-  destinationUrl?: string;
+function evaluateAd(ad: {
+  destinationUrls?: string[];
   appendField?: string;
-}): { keys: Set<UtmKey>; malformed: boolean } {
-  const keys = new Set<UtmKey>();
-  let malformed = false;
+}): { missing: UtmKey[]; unreadable: boolean } {
+  const urls = (ad.destinationUrls ?? []).filter(Boolean);
+  const appendKeys = appendFieldUtmKeys(ad.appendField ?? "");
 
-  if (ad.destinationUrl) {
-    try {
-      for (const k of existingUtmKeys(ad.destinationUrl)) keys.add(k);
-    } catch {
-      malformed = true;
+  if (urls.length === 0) return { missing: [], unreadable: true };
+
+  const missing = new Set<UtmKey>();
+  for (const url of urls) {
+    const urlKeys = readUtmKeys(url);
+    if (!urlKeys) return { missing: [], unreadable: true };
+    for (const key of REQUIRED_KEYS) {
+      if (!urlKeys.has(key) && !appendKeys.has(key)) missing.add(key);
     }
   }
-
-  if (ad.appendField) {
-    for (const k of appendFieldUtmKeys(ad.appendField)) keys.add(k);
-  }
-
-  return { keys, malformed };
+  return { missing: REQUIRED_KEYS.filter((k) => missing.has(k)), unreadable: false };
 }
 
 /**
@@ -167,14 +179,14 @@ export async function auditCampaigns(
     const ads = await port.listAdDestinations(userId, accountId, campaign.id);
 
     const untaggedAdIds: string[] = [];
+    const unreadableAdIds: string[] = [];
     const missing = new Set<UtmKey>();
 
     for (const ad of ads) {
-      const { keys, malformed } = keysForAd(ad);
-      const missingForAd = REQUIRED_KEYS.filter((k) => !keys.has(k));
-      const adTagged = !malformed && missingForAd.length === 0;
-
-      if (!adTagged) {
+      const { missing: missingForAd, unreadable } = evaluateAd(ad);
+      if (unreadable) {
+        unreadableAdIds.push(ad.adId);
+      } else if (missingForAd.length > 0) {
         untaggedAdIds.push(ad.adId);
         for (const k of missingForAd) missing.add(k);
       }
@@ -183,10 +195,12 @@ export async function auditCampaigns(
     reports.push({
       campaignId: campaign.id,
       name: campaign.name,
-      tagged: untaggedAdIds.length === 0,
+      // "No action needed" — nothing definitively untagged AND nothing we could not read.
+      tagged: untaggedAdIds.length === 0 && unreadableAdIds.length === 0,
       // Canonical order, deterministic regardless of ad iteration order.
       missingKeys: REQUIRED_KEYS.filter((k) => missing.has(k)),
       untaggedAdIds,
+      unreadableAdIds,
     });
   }
 
