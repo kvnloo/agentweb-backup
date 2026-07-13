@@ -7042,7 +7042,15 @@ emmaToolRegistry.register({
     }
     const isDelegatedAdmin = isDelegate && !!adminEmail;
 
-    const results: Array<{ title: string; success: boolean; issueId?: string; error?: string; deduped?: boolean; url?: string; trackingUrl?: string }> = [];
+    const results: Array<{ title: string; success: boolean; issueId?: string; error?: string; deduped?: boolean; url?: string; trackingUrl?: string; canonicalUrl?: string }> = [];
+    // ENG-289 Desired behavior #1: the SUBMITTER gets the canonical Linear link — but only when they are
+    // INTERNAL (a teammate who can actually open a Linear issue): an admin, a delegated-admin session, or an
+    // @agentweb.pro reporter. External customers and ALL external-MCP callers still never receive the internal
+    // link (preserves the leak guard: the tool result is JSON.stringified to external MCP clients and preserved
+    // into Agent Mode LLM context + persisted sidebar state). The internal team email always gets it regardless.
+    const reporterIsInternal = context?.externalMcp !== true && (
+      user?.isAdmin === true || isDelegatedAdmin || /@agentweb\.pro$/i.test(user?.email || '')
+    );
     // Public, user-facing board (what the customer can actually open). Per-result `url` is the
     // internal tracker (Linear/Notion) for the team email; `trackingUrl`/`userUrl` is the user's link.
     const FEATUREBASE_BOARD_URL = 'https://agentweb.featurebase.app/';
@@ -7147,7 +7155,7 @@ emmaToolRegistry.register({
             setTimeout(() => reject(new Error('Issue filing timed out after 30s')), INTAKE_TIMEOUT_MS)
           ),
         ]);
-        const result = { pageId: filed.pageId, url: filed.trackerUrl, tracker: filed.tracker, deduped: filed.deduped, userUrl: filed.userUrl };
+        const result = { pageId: filed.pageId, url: filed.trackerUrl, tracker: filed.tracker, deduped: filed.deduped, userUrl: filed.userUrl, canonicalUrl: reporterIsInternal ? filed.canonicalUrl : undefined };
 
         // Never email the customer — internal team + admin (if known) only.
         const emailRecipients = adminEmail
@@ -7193,7 +7201,7 @@ emmaToolRegistry.register({
           replyTo: user.email,
         }).catch((e: any) => console.warn('[report_product_issues] notification email failed (non-critical):', e?.message));
 
-        results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}`, deduped: result.deduped === true, url: result.url || undefined, trackingUrl: result.userUrl || undefined });
+        results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}`, deduped: result.deduped === true, url: result.url || undefined, trackingUrl: result.userUrl || undefined, canonicalUrl: result.canonicalUrl || undefined });
       } catch (err: any) {
         results.push({ title: issue.title, success: false, error: err.message });
       }
