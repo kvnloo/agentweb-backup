@@ -2,20 +2,17 @@
  * Per-user metering for Growth Genius (ENG-200).
  *
  * growthGeniusService makes direct Azure OpenAI calls that bypass callLLM, so its
- * spend used to escape the per-user meter entirely. generateResponse must now charge
- * the caller via meterUserUsage (shadow analytics + the enforced per-user cap).
+ * spend used to escape the per-user meter entirely. It now delegates metering to
+ * meterUsageFromResponse (utils/llmClients): generateResponse charges the caller
+ * (shadow + per-user cap), while generateSessionTitle is burn-only. Token extraction
+ * itself is covered in llmClients.test.ts — here we assert the delegation + flags.
  */
 
 const mockCreate = jest.fn();
+const mockMeterFromResponse = jest.fn();
 jest.mock('../utils/llmClients', () => ({
   getAzureClient: jest.fn(() => ({ chat: { completions: { create: mockCreate } } })),
-}));
-
-const mockMeterUserUsage = jest.fn();
-const mockRecordUsage = jest.fn();
-jest.mock('../services/usageRecorderService', () => ({
-  meterUserUsage: (...a: any[]) => mockMeterUserUsage(...a),
-  recordUsage: (...a: any[]) => mockRecordUsage(...a),
+  meterUsageFromResponse: (...a: any[]) => mockMeterFromResponse(...a),
 }));
 
 // Only referenced in the tool-call branch, which these tests do not exercise.
@@ -27,63 +24,59 @@ import { growthGeniusService } from '../services/growthGeniusService';
 
 beforeEach(() => {
   mockCreate.mockReset();
-  mockMeterUserUsage.mockReset();
-  mockRecordUsage.mockReset();
+  mockMeterFromResponse.mockReset();
 });
 
 describe('GrowthGeniusService.generateSessionTitle — burn-only metering', () => {
-  it('records the title call to the user burn (recordUsage), never the quota (meterUserUsage)', async () => {
-    mockCreate.mockResolvedValueOnce({
+  it('meters the title call burn-only (never deducts the quota)', async () => {
+    const response = {
       choices: [{ message: { content: 'Scaling B2B Outbound' } }],
       usage: { prompt_tokens: 40, completion_tokens: 8 },
-    });
+    };
+    mockCreate.mockResolvedValueOnce(response);
 
     const title = await growthGeniusService.generateSessionTitle('How do I scale outbound?', 'user-7');
 
     expect(title).toBe('Scaling B2B Outbound');
-    expect(mockRecordUsage).toHaveBeenCalledWith(expect.objectContaining({
-      userId: 'user-7',
-      feature: 'growth_genius_title',
-      inputTokens: 40,
-      outputTokens: 8,
-    }));
-    expect(mockMeterUserUsage).not.toHaveBeenCalled(); // burn only — never deducts quota
+    // Burn-only: passes { burnOnly: true } so the helper records but never charges the cap.
+    expect(mockMeterFromResponse).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: 'user-7', feature: 'growth_genius_title' }),
+      response,
+      { burnOnly: true }
+    );
   });
 });
 
 describe('GrowthGeniusService.generateResponse — per-user metering', () => {
-  it('charges the initial response turn to the caller with userId and token counts', async () => {
+  it('charges the initial response turn to the caller (full meter, not burn-only)', async () => {
     // No tool_calls → returns the initial response directly (single LLM turn).
-    mockCreate.mockResolvedValueOnce({
+    const response = {
       choices: [{ message: { content: 'Here is your growth answer.', tool_calls: undefined } }],
       usage: { prompt_tokens: 800, completion_tokens: 120 },
-    });
+    };
+    mockCreate.mockResolvedValueOnce(response);
 
     const res = await growthGeniusService.generateResponse('How do I grow?', [], 'user-42');
 
     expect(res.content).toBe('Here is your growth answer.');
-    expect(mockMeterUserUsage).toHaveBeenCalledTimes(1);
-    expect(mockMeterUserUsage).toHaveBeenCalledWith(expect.objectContaining({
-      userId: 'user-42',
-      feature: 'growth_genius',
-      inputTokens: 800,
-      outputTokens: 120,
-    }));
+    expect(mockMeterFromResponse).toHaveBeenCalledTimes(1);
+    const [ctx, resp, opts] = mockMeterFromResponse.mock.calls[0];
+    expect(ctx).toEqual(expect.objectContaining({ userId: 'user-42', feature: 'growth_genius' }));
+    expect(resp).toBe(response);
+    expect(opts).toBeUndefined(); // full meter — charges the cap, not burn-only
   });
 
-  it('is fail-open — a missing usage object still meters (0 tokens) and never throws', async () => {
-    mockCreate.mockResolvedValueOnce({
-      choices: [{ message: { content: 'answer', tool_calls: undefined } }],
-    });
+  it('is fail-open — a missing usage object still delegates to the meter and never throws', async () => {
+    const response = { choices: [{ message: { content: 'answer', tool_calls: undefined } }] };
+    mockCreate.mockResolvedValueOnce(response);
 
     await expect(
       growthGeniusService.generateResponse('q', [], 'user-42')
     ).resolves.toBeDefined();
 
-    expect(mockMeterUserUsage).toHaveBeenCalledWith(expect.objectContaining({
-      userId: 'user-42',
-      inputTokens: 0,
-      outputTokens: 0,
-    }));
+    expect(mockMeterFromResponse).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: 'user-42', feature: 'growth_genius' }),
+      response
+    );
   });
 });
