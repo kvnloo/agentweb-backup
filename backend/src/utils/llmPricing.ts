@@ -35,6 +35,16 @@ function withDerivedCache(inPerM: number, outPerM: number): ModelPrice {
   };
 }
 
+// Fable 5 / Haiku 4.5 list prices, confirmed against Anthropic's official pricing
+// (Fable $10/$50, Haiku $1/$5). Defined once and registered under BOTH the bare
+// Vertex id (e.g. claude-fable-5) and the anthropic.-prefixed Bedrock id, because
+// the registry key ENG-199 uses depends on the provider it wires Fable through
+// (Vertex → bare, Bedrock → anthropic.<id>). Same object reference on both keys so
+// the two can never drift. Without the prefixed key, a Bedrock rollout would miss
+// the lookup and record $0 — the exact blind spot ENG-200 exists to close.
+const FABLE_5_PRICE = withDerivedCache(10, 50);
+const HAIKU_4_5_PRICE = withDerivedCache(1, 5);
+
 /**
  * Token-priced models. Sources:
  * - Ported from agentModeService.estimateCost() where present.
@@ -51,9 +61,12 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   // Anthropic dropped Opus to $5/$25 at the 4.5 generation; the old $15/$75 rate
   // above was stale (ported from estimateCost) and overcharged the cost cap 3x.
   // Fable 5 is ENG-200's target model — staged here so the cost cap is accurate
-  // the moment ENG-199 wires it into the registry (confirm the exact invoked id).
-  'claude-fable-5': withDerivedCache(10, 50),
-  'claude-haiku-4-5': withDerivedCache(1, 5),
+  // the moment ENG-199 wires it into the registry, under whichever provider id it
+  // ends up invoked as (Vertex bare or Bedrock anthropic.-prefixed — see above).
+  'claude-fable-5': FABLE_5_PRICE,
+  'anthropic.claude-fable-5': FABLE_5_PRICE,
+  'claude-haiku-4-5': HAIKU_4_5_PRICE,
+  'anthropic.claude-haiku-4-5': HAIKU_4_5_PRICE,
 
   // ── Azure OpenAI chat deployments ───────────────────────────────────────────
   'gpt-5-chat-2': withDerivedCache(2.5, 10), // ported from estimateCost
@@ -83,7 +96,10 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   // published Azure list prices (likely a long-standing bug). The shadow price
   // book uses the official list prices instead — the comparison endpoint is
   // expected to surface this discrepancy.
-  'gpt-4o': withDerivedCache(2.5, 10),
+  // OpenAI publishes gpt-4o cached input at $1.25/1M (50% of the $2.50 input rate),
+  // not the 10%-of-input default our convention would derive ($0.25). Override the
+  // cache-read rate with the real published number; write stays on the convention.
+  'gpt-4o': { ...withDerivedCache(2.5, 10), cacheReadPerM: 1.25 },
   'gpt-4.1': withDerivedCache(2, 8),
   'gpt-4': withDerivedCache(30, 60), // legacy default deployment name; official GPT-4 8k list price
 
