@@ -76,11 +76,34 @@ beforeEach(() => {
   // prior test can never leak into the next one's first axios call.
   mockAxiosPost.mockReset();
   mockAxiosGet.mockReset();
+  // Benign default so an unqueued call (e.g. the inherited-suffix GAQL read that
+  // createAd/updateAd now issue before mutating) never crashes. Assertions below
+  // check what we SENT, so the response body only has to be well-shaped.
+  mockAxiosPost.mockResolvedValue({ data: { results: [{ resourceName: 'default' }] } });
   service = new GoogleAdsService();
 });
 
+/**
+ * Locate the mutate POST by its body shape rather than by call index: createAd /
+ * updateAd now issue a GAQL `search` first (to read the campaign's inherited
+ * final_url_suffix — see the AC4 tests below), so the mutate is no longer call 0.
+ * `search` posts `{ query }`; `mutate` posts `{ operations }`.
+ */
+function mutateOperation(): any {
+  const call = mockAxiosPost.mock.calls.find((c: any) => c[1]?.operations);
+  if (!call) throw new Error('no mutate call was made');
+  return call[1].operations[0];
+}
+
 function adGroupAdCreate(): any {
-  return mockAxiosPost.mock.calls[0][1].operations[0].create;
+  return mutateOperation().create;
+}
+
+/** Stub the inherited-suffix GAQL read. Pass undefined for "campaign has none". */
+function mockInheritedSuffix(suffix?: string) {
+  mockAxiosPost.mockResolvedValueOnce({
+    data: { results: [{ campaign: suffix ? { finalUrlSuffix: suffix } : {} }] },
+  });
 }
 
 describe('createAd — final_url_suffix generation (AC1)', () => {
@@ -258,5 +281,93 @@ describe('createAssetGroup — asset_group has no suffix field, so UTMs merge in
     expect(create.finalUrls[0]).toBe(
       'https://example.com/?utm_source=newsletter&utm_medium=paid&utm_campaign={campaignid}&utm_content={creative}',
     );
+  });
+});
+
+/**
+ * ENG-239 AC4 at the level nobody checks — the bug this suite was extended for.
+ *
+ * Google resolves `final_url_suffix` by MOST SPECIFIC level (ad > ad group >
+ * campaign > account) and the winning level REPLACES the others outright — they
+ * are NOT concatenated. So writing an ad-level suffix silently destroys whatever
+ * the client configured at campaign level, which is the normal place to configure
+ * it. "User-provided UTMs are respected, not overwritten" has to hold there too.
+ */
+describe('createAd — inherited campaign-level final_url_suffix (AC4)', () => {
+  it("carries the campaign's own tracking params forward instead of destroying them", async () => {
+    mockInheritedSuffix('clientparam=1&partner=acme');
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/1/adGroupAds/1~1' }] } });
+
+    await service.createAd('user-123', '1234567890', {
+      adGroupResourceName: 'customers/1234567890/adGroups/55',
+      type: 'RESPONSIVE_SEARCH_AD',
+      headlines: ['h'], descriptions: ['d'],
+      finalUrl: 'https://example.com',
+    });
+
+    const suffix = adGroupAdCreate().ad.finalUrlSuffix;
+    // the client's params survive the ad-level write
+    expect(suffix).toContain('clientparam=1');
+    expect(suffix).toContain('partner=acme');
+    // and our UTMs are appended alongside them
+    expect(suffix).toContain('utm_source=google');
+    expect(suffix).toContain('utm_campaign={campaignid}');
+  });
+
+  it("does not duplicate a UTM key the campaign suffix already defines", async () => {
+    mockInheritedSuffix('utm_source=partnernetwork');
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'x' }] } });
+
+    await service.createAd('user-123', '1234567890', {
+      adGroupResourceName: 'customers/1234567890/adGroups/55',
+      type: 'RESPONSIVE_SEARCH_AD',
+      headlines: ['h'], descriptions: ['d'],
+      finalUrl: 'https://example.com',
+    });
+
+    const suffix = adGroupAdCreate().ad.finalUrlSuffix;
+    expect(suffix).toContain('utm_source=partnernetwork');
+    expect(suffix).not.toContain('utm_source=google');
+    expect(suffix).toContain('utm_medium=paid');
+  });
+
+  it('writes no suffix when the inherited-suffix read fails — never clobber what we cannot see', async () => {
+    // Fail-safe: losing attribution on one ad is recoverable; silently destroying a
+    // client's campaign-level tracking is not.
+    mockAxiosPost.mockRejectedValueOnce(new Error('transient API error'));
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'x' }] } });
+
+    await service.createAd('user-123', '1234567890', {
+      adGroupResourceName: 'customers/1234567890/adGroups/55',
+      type: 'RESPONSIVE_SEARCH_AD',
+      headlines: ['h'], descriptions: ['d'],
+      finalUrl: 'https://example.com',
+    });
+
+    expect(adGroupAdCreate().ad.finalUrlSuffix).toBeUndefined();
+  });
+});
+
+describe('createAd — malformed destination URL must not abort ad creation', () => {
+  it('creates the ad untagged rather than throwing when finalUrl is unparseable', async () => {
+    // A user typing `example.com` (no scheme) should get GOOGLE's validation error,
+    // not ours. Tagging is a best-effort overlay; it must never be the thing that
+    // breaks an ad build.
+    mockInheritedSuffix(undefined);
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'x' }] } });
+
+    await expect(
+      service.createAd('user-123', '1234567890', {
+        adGroupResourceName: 'customers/1234567890/adGroups/55',
+        type: 'RESPONSIVE_SEARCH_AD',
+        headlines: ['h'], descriptions: ['d'],
+        finalUrl: 'example.com',
+      }),
+    ).resolves.toBeDefined();
+
+    // We could not read its keys, so we add nothing and let Google judge the URL.
+    const create = adGroupAdCreate();
+    expect(create.ad.finalUrls).toEqual(['example.com']);
+    expect(create.ad.finalUrlSuffix).toBeUndefined();
   });
 });

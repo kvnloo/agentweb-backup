@@ -2,7 +2,7 @@ import axios from 'axios';
 import { getGoogleAdsCredentials } from '../utils/secretsManager';
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
-import { buildUtmSpec, existingUtmKeys, mergeUtmIntoUrl, utmQueryString } from '../utils/adUtm';
+import { buildUtmSpec, mergeUtmIntoQueryString, mergeUtmIntoUrl, readUtmKeys } from '../utils/adUtm';
 
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
 const TOKEN_REFRESH_URL = 'https://oauth2.googleapis.com/token';
@@ -825,11 +825,65 @@ export class GoogleAdsService {
    * the user already put on `finalUrl` is omitted (AC4), and when every key is
    * already present `utmQueryString` returns "" → we return `undefined`.
    */
-  private buildAdFinalUrlSuffix(opts: { finalUrl?: string; explicitSuffix?: string }): string | undefined {
+  private buildAdFinalUrlSuffix(opts: {
+    finalUrl?: string;
+    explicitSuffix?: string;
+    /** The suffix this ad would otherwise inherit from its campaign. */
+    inheritedSuffix?: string;
+  }): string | undefined {
     if (opts.explicitSuffix) return opts.explicitSuffix;
     if (!opts.finalUrl) return undefined;
+    // If we cannot read the destination URL we do not tag it: it may well already
+    // carry a utm_source (`example.com?utm_source=news` fails `new URL()` for want of
+    // a scheme), and appending a second one would corrupt the attribution. Nor do we
+    // throw — Google should reject a bad URL with its own precise error, not ours.
+    const urlKeys = readUtmKeys(opts.finalUrl);
+    if (!urlKeys) return undefined;
     const spec = buildUtmSpec('google', { campaign: '{campaignid}', content: '{creative}' });
-    return utmQueryString(spec, existingUtmKeys(opts.finalUrl)) || undefined;
+    // Carry the campaign's suffix forward — an ad-level suffix REPLACES it, so not
+    // doing so would silently destroy the client's own tracking (AC4).
+    const merged = mergeUtmIntoQueryString(opts.inheritedSuffix, spec, urlKeys);
+    return merged || undefined;
+  }
+
+  /**
+   * The `final_url_suffix` an ad in this ad group would inherit from its campaign.
+   *
+   * Google resolves the suffix by most-specific level (ad > ad group > campaign >
+   * account) and the winner REPLACES the others — they are not concatenated. So we
+   * must know what we would be replacing before we write at ad level.
+   *
+   * Returns `{ ok: false }` if the read fails. Callers then write no generated
+   * suffix at all: losing attribution on one ad is recoverable, silently destroying
+   * a client's campaign-level tracking is not.
+   */
+  private async getInheritedFinalUrlSuffix(
+    customerId: string,
+    accessToken: string,
+    adGroupResourceName: string,
+    loginCustomerId?: string,
+  ): Promise<{ ok: true; suffix?: string } | { ok: false }> {
+    try {
+      const rows = await this.search(
+        customerId,
+        accessToken,
+        `SELECT campaign.final_url_suffix FROM ad_group WHERE ad_group.resource_name = '${adGroupResourceName}'`,
+        loginCustomerId,
+      );
+      return { ok: true, suffix: rows[0]?.campaign?.finalUrlSuffix || undefined };
+    } catch (err: any) {
+      console.warn(
+        `[GoogleAds] could not read inherited final_url_suffix for ${adGroupResourceName}; skipping UTM suffix to avoid clobbering it:`,
+        err?.message || err,
+      );
+      return { ok: false };
+    }
+  }
+
+  /** The ad group a given adGroupAd belongs to: `customers/1/adGroupAds/55~9` → `customers/1/adGroups/55`. */
+  private adGroupFromAdGroupAd(adGroupAdResourceName: string): string | undefined {
+    const m = adGroupAdResourceName.match(/^customers\/(\d+)\/adGroupAds\/(\d+)~/);
+    return m ? `customers/${m[1]}/adGroups/${m[2]}` : undefined;
   }
 
   async listAds(userId: string, customerId: string, adGroupResourceName: string): Promise<any[]> {
@@ -885,7 +939,18 @@ export class GoogleAdsService {
       throw new Error(`Unsupported ad type "${params.type}". Use RESPONSIVE_SEARCH_AD or RESPONSIVE_DISPLAY_AD.`);
     }
 
-    const finalUrlSuffix = this.buildAdFinalUrlSuffix({ finalUrl: params.finalUrl, explicitSuffix: params.finalUrlSuffix });
+    // Read what this ad would inherit from its campaign BEFORE writing at ad level —
+    // an ad-level suffix replaces the campaign's outright (ENG-239 AC4).
+    const inherited = await this.getInheritedFinalUrlSuffix(
+      customerId, accessToken, params.adGroupResourceName, loginCustomerId,
+    );
+    const finalUrlSuffix = inherited.ok
+      ? this.buildAdFinalUrlSuffix({
+          finalUrl: params.finalUrl,
+          explicitSuffix: params.finalUrlSuffix,
+          inheritedSuffix: inherited.suffix,
+        })
+      : params.finalUrlSuffix; // read failed → only an explicitly-supplied suffix is safe to write
 
     const data = await this.mutate(customerId, accessToken, 'adGroupAds', [{
       create: {
@@ -915,7 +980,17 @@ export class GoogleAdsService {
     // ENG-239: keep/gain the ad's UTM suffix on edit. The field lives on the ad
     // (ad_group_ad.ad.final_url_suffix), so it nests under `update.ad` with the
     // matching field-mask path.
-    const finalUrlSuffix = this.buildAdFinalUrlSuffix({ finalUrl: params.finalUrl, explicitSuffix: params.finalUrlSuffix });
+    const adGroupResourceName = this.adGroupFromAdGroupAd(adGroupAdResourceName);
+    const inherited = adGroupResourceName
+      ? await this.getInheritedFinalUrlSuffix(customerId, accessToken, adGroupResourceName, loginCustomerId)
+      : ({ ok: true } as const);
+    const finalUrlSuffix = inherited.ok
+      ? this.buildAdFinalUrlSuffix({
+          finalUrl: params.finalUrl,
+          explicitSuffix: params.finalUrlSuffix,
+          inheritedSuffix: inherited.suffix,
+        })
+      : params.finalUrlSuffix;
     if (finalUrlSuffix) { update.ad = { finalUrlSuffix }; updateMask.push('ad.final_url_suffix'); }
     if (updateMask.length === 0) return false;
     await this.mutate(customerId, accessToken, 'adGroupAds', [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
