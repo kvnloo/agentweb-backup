@@ -47,9 +47,10 @@ jest.mock('@google/genai', () => {
 
 jest.mock('../services/usageRecorderService', () => ({
   recordUsage: jest.fn().mockResolvedValue(undefined),
+  meterUserUsage: jest.fn(),
 }));
 
-import { recordUsage } from '../services/usageRecorderService';
+import { recordUsage, meterUserUsage } from '../services/usageRecorderService';
 import {
   getOpenAIClient,
   getAzureClient,
@@ -59,10 +60,14 @@ import {
   normalizeBedrockUsage,
   normalizeGeminiUsage,
   normalizeEmbeddingsUsage,
+  normalizeAnthropicUsage,
+  normalizeUsageFromResponse,
+  meterUsageFromResponse,
   bedrockModelIdFromArn,
 } from '../utils/llmClients';
 
 const mockRecordUsage = recordUsage as jest.Mock;
+const mockMeterUserUsage = meterUserUsage as jest.Mock;
 
 const meterCtx = { userId: 'user-1', feature: 'chat', sessionId: 'sess-1' };
 
@@ -182,6 +187,152 @@ describe('llmClients normalizers', () => {
     ).toBe('anthropic.claude-sonnet-4-6');
     expect(bedrockModelIdFromArn('anthropic.claude-opus-4-8')).toBe('anthropic.claude-opus-4-8');
     expect(bedrockModelIdFromArn(undefined)).toBe('unknown');
+  });
+});
+
+describe('normalizeAnthropicUsage', () => {
+  it('normalizes Anthropic Messages usage including cache buckets', () => {
+    expect(
+      normalizeAnthropicUsage({
+        input_tokens: 120,
+        output_tokens: 40,
+        cache_read_input_tokens: 15,
+        cache_creation_input_tokens: 7,
+      })
+    ).toEqual({ inputTokens: 120, outputTokens: 40, cacheReadTokens: 15, cacheWriteTokens: 7 });
+  });
+
+  it('coerces missing/undefined Anthropic usage to 0', () => {
+    expect(normalizeAnthropicUsage(undefined)).toEqual({
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+    });
+  });
+});
+
+describe('normalizeUsageFromResponse (shape detection)', () => {
+  it('detects the Gemini shape via usageMetadata', () => {
+    expect(
+      normalizeUsageFromResponse({
+        usageMetadata: { promptTokenCount: 9, candidatesTokenCount: 18, cachedContentTokenCount: 2 },
+      })
+    ).toEqual({ inputTokens: 9, outputTokens: 18, cacheReadTokens: 2 });
+  });
+
+  it('detects the OpenAI/Azure shape via usage.prompt_tokens', () => {
+    expect(
+      normalizeUsageFromResponse({
+        usage: { prompt_tokens: 100, completion_tokens: 25, prompt_tokens_details: { cached_tokens: 10 } },
+      })
+    ).toEqual({ inputTokens: 100, outputTokens: 25, cacheReadTokens: 10 });
+  });
+
+  it('detects the OpenAI embeddings shape (prompt_tokens, no completion)', () => {
+    expect(normalizeUsageFromResponse({ usage: { prompt_tokens: 50, total_tokens: 50 } })).toEqual({
+      inputTokens: 50,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+    });
+  });
+
+  it('detects the Anthropic Messages shape via usage.input_tokens', () => {
+    expect(
+      normalizeUsageFromResponse({ usage: { input_tokens: 11, output_tokens: 4, cache_read_input_tokens: 2 } })
+    ).toEqual({ inputTokens: 11, outputTokens: 4, cacheReadTokens: 2, cacheWriteTokens: 0 });
+  });
+
+  it('detects the Bedrock Converse shape via usage.inputTokens', () => {
+    expect(
+      normalizeUsageFromResponse({ usage: { inputTokens: 8, outputTokens: 3, cacheReadInputTokens: 1 } })
+    ).toEqual({ inputTokens: 8, outputTokens: 3, cacheReadTokens: 1, cacheWriteTokens: 0 });
+  });
+
+  it('prefers the Gemini shape when both usageMetadata and usage are present', () => {
+    // A response that carries both keys resolves as Gemini (usageMetadata checked first).
+    expect(
+      normalizeUsageFromResponse({
+        usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 6 },
+        usage: { prompt_tokens: 999, completion_tokens: 999 },
+      })
+    ).toEqual({ inputTokens: 5, outputTokens: 6, cacheReadTokens: 0 });
+  });
+
+  it('returns null for null, non-objects, and responses with no usage', () => {
+    expect(normalizeUsageFromResponse(null)).toBeNull();
+    expect(normalizeUsageFromResponse(undefined)).toBeNull();
+    expect(normalizeUsageFromResponse('nope' as any)).toBeNull();
+    expect(normalizeUsageFromResponse({ choices: [] })).toBeNull();
+    expect(normalizeUsageFromResponse({ usage: {} })).toBeNull();
+    expect(normalizeUsageFromResponse({ usageMetadata: {} })).toBeNull();
+  });
+});
+
+describe('meterUsageFromResponse', () => {
+  const ctx = { userId: 'user-9', model: 'gpt-5-chat-2', provider: 'azure', feature: 'unit-test' };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('meters a full call (shadow + cap) via meterUserUsage by default', () => {
+    meterUsageFromResponse(ctx, { usage: { prompt_tokens: 100, completion_tokens: 30 } });
+    expect(mockMeterUserUsage).toHaveBeenCalledTimes(1);
+    expect(mockRecordUsage).not.toHaveBeenCalled();
+    expect(mockMeterUserUsage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: 'user-9',
+        model: 'gpt-5-chat-2',
+        provider: 'azure',
+        feature: 'unit-test',
+        inputTokens: 100,
+        outputTokens: 30,
+      })
+    );
+  });
+
+  it('records burn-only (recordUsage, no cap charge) when burnOnly is set', () => {
+    meterUsageFromResponse(ctx, { usage: { prompt_tokens: 12, completion_tokens: 4 } }, { burnOnly: true });
+    expect(mockRecordUsage).toHaveBeenCalledTimes(1);
+    expect(mockMeterUserUsage).not.toHaveBeenCalled();
+    expect(mockRecordUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ inputTokens: 12, outputTokens: 4, feature: 'unit-test' })
+    );
+  });
+
+  it('extracts the right tokens from a Gemini response shape', () => {
+    meterUsageFromResponse(
+      { ...ctx, provider: 'gemini', model: 'gemini-3.5-flash' },
+      { usageMetadata: { promptTokenCount: 40, candidatesTokenCount: 60, cachedContentTokenCount: 5 } }
+    );
+    expect(mockMeterUserUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ inputTokens: 40, outputTokens: 60, cacheReadTokens: 5 })
+    );
+  });
+
+  it('meters zero tokens (call volume still visible) when the response carries no usage', () => {
+    meterUsageFromResponse(ctx, { choices: [{ message: { content: 'x' } }] });
+    expect(mockMeterUserUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ inputTokens: 0, outputTokens: 0 })
+    );
+  });
+
+  it('does not throw on null/garbage responses', () => {
+    expect(() => meterUsageFromResponse(ctx, null)).not.toThrow();
+    expect(() => meterUsageFromResponse(ctx, undefined)).not.toThrow();
+    expect(() => meterUsageFromResponse(ctx, 42 as any)).not.toThrow();
+    // still records the call (zero tokens) rather than dropping it silently
+    expect(mockMeterUserUsage).toHaveBeenCalled();
+  });
+
+  it('never propagates a metering error to the caller', () => {
+    mockMeterUserUsage.mockImplementationOnce(() => {
+      throw new Error('meter boom');
+    });
+    expect(() =>
+      meterUsageFromResponse(ctx, { usage: { prompt_tokens: 1, completion_tokens: 1 } })
+    ).not.toThrow();
   });
 });
 
