@@ -69,6 +69,18 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-07-11',
+    changes: [
+      'New: Ads Emma Deploys Now Tell You Which Leads They Produced',
+      '- Until now, a lead that arrived from one of your ads looked exactly like a lead that wandered in from anywhere else — so you could see that an ad spent money, but not whether it earned any',
+      '- Emma now automatically tags the destination URL of every ad it deploys on Meta, Google, and LinkedIn, so leads arriving on your landing page carry the campaign and ad that sent them, all the way through to your CRM',
+      '- If you already put your own tracking on a URL, Emma leaves it exactly as you set it and only fills in the parts you left out — your setup is never overwritten',
+      '- Existing campaigns are left completely untouched. Nothing is changed behind your back',
+      '- Ask Emma "which of my campaigns are missing UTM tracking?" and she will list them per ad account, so you can decide which ones to bring across',
+      '- She reports ads she could not read separately from ads that are genuinely untagged, so you are never sent to "fix" an ad that was fine',
+    ],
+  },
+  {
     date: '2026-07-08',
     changes: [
       'Improved: Your LinkedIn Invite Note Is Never Silently Dropped',
