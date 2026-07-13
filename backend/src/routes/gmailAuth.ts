@@ -6,12 +6,11 @@ import { getGmailConfig } from '../config/integrations';
 import { createAccount } from '../services/connectedAccountsDb';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
+import { storeTokenSession, retrieveTokenSession } from '../services/oauthTokenSessionStore';
 
 const router = express.Router();
 
 const STATE_EXPIRATION = '15m';
-const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 // ── State JWT ──────────────────────────────────────────────────────────────
@@ -34,49 +33,6 @@ const verifyState = (state: string, userId: string): StatePayload | null => {
   } catch {
     return null;
   }
-};
-
-// ── Token session store (server-side, one-time use) ────────────────────────
-
-interface TokenSession {
-  tokens: {
-    access_token: string;
-    refresh_token?: string;
-    expires_in: number;
-    granted_scopes: string[];
-  };
-  profile: {
-    email: string;
-    name: string;
-    picture?: string;
-  };
-  userId: string;
-  expires: number;
-}
-
-const tokenSessions = new Map<string, TokenSession>();
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of tokenSessions.entries()) {
-    if (now > session.expires) tokenSessions.delete(id);
-  }
-}, SESSION_CLEANUP_INTERVAL_MS).unref();
-
-const storeTokenSession = (userId: string, tokens: TokenSession['tokens'], profile: TokenSession['profile']): string => {
-  const sessionId = crypto.randomBytes(32).toString('hex');
-  tokenSessions.set(sessionId, { tokens, profile, userId, expires: Date.now() + TOKEN_SESSION_TTL_MS });
-  return sessionId;
-};
-
-const retrieveTokenSession = (sessionId: string, userId: string): Pick<TokenSession, 'tokens' | 'profile'> | null => {
-  const session = tokenSessions.get(sessionId);
-  if (!session || session.userId !== userId || Date.now() > session.expires) {
-    tokenSessions.delete(sessionId);
-    return null;
-  }
-  tokenSessions.delete(sessionId); // one-time use
-  return { tokens: session.tokens, profile: session.profile };
 };
 
 // ── GET /init — build Google authorization URL ─────────────────────────────
@@ -188,8 +144,9 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
     };
 
     // Store tokens server-side (never expose to frontend)
-    const tokenSessionId = storeTokenSession(
+    const tokenSessionId = await storeTokenSession(
       userId,
+      'gmail',
       { access_token, refresh_token, expires_in, granted_scopes: grantedScopes },
       { email, name, picture }
     );
@@ -217,7 +174,7 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     return res.status(400).json({ error: 'Missing tokenSessionId' });
   }
 
-  const session = retrieveTokenSession(tokenSessionId, userId);
+  const session = await retrieveTokenSession(tokenSessionId, userId, 'gmail');
   if (!session) {
     return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
   }
