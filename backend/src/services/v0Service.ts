@@ -1915,13 +1915,22 @@ export async function deployLandingPage(
     );
   }
 
-  // `generating` is accepted ONLY for generateFirstPage's own auto-deploy: that record is
-  // legitimately mid-generation and this call is the thing driving it. A user-initiated
-  // deploy of an actively-generating record must still be refused — otherwise two builds
-  // race into the same repo. (ENG-287 residual)
-  const deployableStatuses = opts.fromGeneration
-    ? ["generating", "draft", "failed", "deploying"]
-    : ["draft", "failed", "deploying"];
+  // `generating` is accepted in exactly two cases:
+  //  1. generateFirstPage's own auto-deploy — that record is legitimately mid-generation and
+  //     THIS call is the thing driving it;
+  //  2. the build is abandoned (no progress past the stuck ceiling), so there is no live
+  //     process to race. Without this, a crashed build would refuse a manual deploy until
+  //     the janitor flips it to `failed`, leaving the user stuck for up to 30 min.
+  // A user-initiated deploy of an ACTIVELY-generating record is still refused — otherwise
+  // two builds race commits into the same repo. The heartbeat is what keeps a live build
+  // looking live here. (ENG-287 residual)
+  const lastMovedMs = new Date(record.updatedAt || record.createdAt).getTime();
+  const abandoned =
+    Number.isFinite(lastMovedMs) && Date.now() - lastMovedMs > STUCK_CEILING_MS;
+  const deployableStatuses =
+    opts.fromGeneration || abandoned
+      ? ["generating", "draft", "failed", "deploying"]
+      : ["draft", "failed", "deploying"];
   if (!deployableStatuses.includes(record.status)) {
     throw new Error(`Cannot deploy a landing page with status: ${record.status}`);
   }

@@ -987,6 +987,56 @@ describe("v0Service - ENG-287 residual hardening", () => {
     mockGet.mockReturnValue({ promise: () => Promise.resolve({ Item: null }) });
   });
 
+  it("a user deploy is REFUSED while a build is actively generating — two builds must not race into one repo (ENG-287 residual)", async () => {
+    mockGet.mockReturnValue({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page_live",
+            userId: "user-1",
+            status: "generating",
+            v0ChatId: "chat_1",
+            name: "Acme",
+            prompt: "p",
+            updatedAt: new Date().toISOString(), // heartbeating — alive
+          },
+        }),
+    });
+
+    await expect(deployLandingPage("page_live", "user-1")).rejects.toThrow(/status: generating/);
+    mockGet.mockReturnValue({ promise: () => Promise.resolve({ Item: null }) });
+  });
+
+  it("but an ABANDONED generating build IS deployable — a crashed build must not block manual recovery for 30 min (ENG-287 residual)", async () => {
+    // The record no longer sits in `draft`, so it is now visible to the janitor (it used to
+    // be an eternal wedge). But until the janitor flips it to `failed` the user would be
+    // told "Cannot deploy a landing page with status: generating". No live process owns a
+    // build that has not moved past the stuck ceiling, so there is nothing to race.
+    const FORTY_MIN_AGO = new Date(Date.now() - 40 * 60 * 1000).toISOString();
+    mockGet.mockReturnValue({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page_dead",
+            userId: "user-1",
+            status: "generating",
+            v0ChatId: "chat_1",
+            name: "Acme",
+            prompt: "p",
+            updatedAt: FORTY_MIN_AGO, // no heartbeat for 40 min — abandoned
+          },
+        }),
+    });
+    mockChatsGetById.mockResolvedValue({ latestVersion: { id: "v1", status: "failed" } });
+
+    // Gets past the status gate and into the real deploy (which then fails on the dead chat)
+    // — the point is that it is no longer rejected out of hand.
+    await expect(deployLandingPage("page_dead", "user-1")).rejects.not.toThrow(/status: generating/);
+
+    mockChatsGetById.mockReset();
+    mockGet.mockReturnValue({ promise: () => Promise.resolve({ Item: null }) });
+  });
+
   it("a long generation heartbeats `updatedAt` so the janitor cannot mark a LIVE build failed (ENG-287 residual F5)", async () => {
     // The poll budget bounds SLEEPS, not wall-clock: each status read was itself allowed
     // 300s, so a slow-but-alive v0 could keep the record untouched well past the
