@@ -116,6 +116,21 @@ describe('subscriptionService', () => {
     expect(mockedOrgDb.getOrgById).not.toHaveBeenCalled();
   });
 
+  it('getUserSubscriptionType falls back to the member own tier when the org lookup throws, instead of hard "Free"', async () => {
+    // A transient org-lookup failure (DynamoDB throttling, network blip) must
+    // not discard the already-fetched user record and its real own tier —
+    // that would wrongly downgrade a paying member to Free for the duration
+    // of an unrelated, transient error.
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    mockedUserDb.getUserById.mockResolvedValueOnce({
+      userId: 'member-1', orgId: 'org-1', orgRole: 'member', subscriptionType: 'Pro',
+    } as any);
+    mockedOrgDb.getOrgById.mockRejectedValueOnce(new Error('ProvisionedThroughputExceededException'));
+
+    const tier = await getUserSubscriptionType('member-1');
+    expect(tier).toBe('Pro');
+  });
+
   it('getUserSubscriptionType lets a member own ACTIVE subscription govern instead of the owner (regression: pvandervalk@xcures.com)', async () => {
     // A member can hold their own paid Stripe subscription independent of the
     // org — accept-invite touches no billing state. Their own tier must win
