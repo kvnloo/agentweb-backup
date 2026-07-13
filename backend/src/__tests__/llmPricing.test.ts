@@ -14,6 +14,8 @@ import {
   IMAGE_GENERATION_PRICING_USD,
   VIDEO_GENERATION_PRICING_USD_PER_CLIP,
   getModelPrice,
+  imageGenerationCostUsd,
+  videoGenerationCostUsd,
   __resetUnknownModelWarnsForTests,
 } from '../utils/llmPricing';
 
@@ -201,6 +203,36 @@ describe('llmPricing', () => {
       expect(price).not.toBeNull();
       expect(price!.inPerM).toBe(0.13);
       expect(price!.outPerM).toBe(0);
+    });
+  });
+
+  describe('imageGenerationCostUsd', () => {
+    it('returns the per-image price for known models', () => {
+      expect(imageGenerationCostUsd('gemini-3-pro-image-preview')).toBe(0.134);
+      expect(imageGenerationCostUsd('gpt-image-1')).toBe(0.04);
+      expect(imageGenerationCostUsd('gen4_image')).toBe(0.05);
+    });
+
+    it('falls back to $0.04 for an unknown image model', () => {
+      expect(imageGenerationCostUsd('mystery-image-model')).toBe(0.04);
+    });
+  });
+
+  describe('videoGenerationCostUsd', () => {
+    it('prices a single clip (<=8s) at the per-clip rate', () => {
+      expect(videoGenerationCostUsd('veo-3.1-generate-preview', 8)).toBe(3.2);
+      expect(videoGenerationCostUsd('seedance-2.0', 5)).toBe(1.55);
+      expect(videoGenerationCostUsd('veo-3.1-generate-preview')).toBe(3.2); // undefined → 1 clip
+    });
+
+    it('bills longer durations as ceil(seconds / 8) clips', () => {
+      expect(videoGenerationCostUsd('veo-3.1-generate-preview', 16)).toBe(6.4); // 2 clips
+      expect(videoGenerationCostUsd('veo-3.1-generate-preview', 24)).toBeCloseTo(9.6, 5); // 3 clips
+      expect(videoGenerationCostUsd('veo-3.1-fast-generate-preview', 16)).toBeCloseTo(2.8, 5); // 2 × 1.40
+    });
+
+    it('falls back to $3.20/clip for an unknown video model', () => {
+      expect(videoGenerationCostUsd('mystery-video-model', 8)).toBe(3.2);
     });
   });
 });
