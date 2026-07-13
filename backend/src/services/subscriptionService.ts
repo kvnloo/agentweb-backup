@@ -64,7 +64,16 @@ export async function getUserSubscriptionType(userId: string): Promise<string> {
     // orgRole are cleared on leave/remove). This is the ENG-288 root cause: the
     // /me endpoint already resolved a member's tier from the owner, but the
     // member-id call sites (agent mode, Emma) read the member's own record.
-    if (user?.orgId && user.orgRole === "member" && orgDb?.getOrgById) {
+    // A member riding their own active/trialing Stripe subscription is not
+    // riding the org's — accepting an invite touches no billing state (see
+    // routes/org.ts accept-invite), so a member can independently pay for a
+    // tier that differs from their owner's. Only resolve to the owner when
+    // the member has no live subscription of their own; otherwise their own
+    // tier governs (matches the "active"/"trialing" = entitling convention
+    // already used throughout stripeService.ts).
+    const hasOwnActiveSubscription =
+      user?.subscription_status === "active" || user?.subscription_status === "trialing";
+    if (user?.orgId && user.orgRole === "member" && !hasOwnActiveSubscription && orgDb?.getOrgById) {
       const org = await orgDb.getOrgById(user.orgId);
       if (org?.ownerUserId && org.ownerUserId !== userId) {
         const owner = await userDb.getUserById(org.ownerUserId);
