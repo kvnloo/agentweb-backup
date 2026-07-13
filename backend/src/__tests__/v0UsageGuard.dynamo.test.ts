@@ -61,23 +61,36 @@ beforeEach(() => {
 });
 
 describe('v0UsageGuard — DynamoDB conditional reserve (cross-instance semantics)', () => {
-  test('the reserve condition only reclaims failed or STALE-reserved records — succeeded is never clobbered', async () => {
+  test('the reserve condition reclaims failed, STALE-reserved, and STALE-succeeded records — a FRESH succeeded is never clobbered', async () => {
     const create = jest.fn().mockResolvedValue({ id: 'chat_1' });
     await guardedV0ChatCreate(createArgs(create));
 
     const reservePut = mockPut.mock.calls.find((c: any) => c[0].ConditionExpression);
     expect(reservePut).toBeDefined();
-    // The stale clause MUST be scoped to status=reserved: a bare `updatedAt < :stale`
-    // would let a new reservation overwrite an old SUCCEEDED record, double-spending
-    // the generation and losing the chat-reuse identity.
+    // Each clause is scoped to a status on purpose:
+    //  - a bare `updatedAt < :stale` would overwrite a FRESH succeeded record, double-
+    //    spending the generation and losing the chat-reuse identity (that is what keeps
+    //    two concurrent builds of the same route deduped to one chat);
+    //  - but a succeeded record must NOT be immortal either, so it is reclaimable once its
+    //    chat ages past the reuse ceiling, keyed on `createdAt` (when the chat was minted).
+    //    Without that clause a dead chat wedges the route forever. (ENG-287 residual)
     expect(reservePut![0].ConditionExpression).toBe(
-      'attribute_not_exists(idempotencyKey) OR #status = :failed OR (#status = :reserved AND #updatedAt < :stale)'
+      'attribute_not_exists(idempotencyKey) OR #status = :failed' +
+      ' OR (#status = :reserved AND #updatedAt < :stale)' +
+      ' OR (#status = :succeeded AND #createdAt < :chatStale)'
     );
     expect(reservePut![0].ExpressionAttributeValues).toMatchObject({
       ':failed': 'failed',
       ':reserved': 'reserved',
+      ':succeeded': 'succeeded',
     });
     expect(typeof reservePut![0].ExpressionAttributeValues[':stale']).toBe('string');
+    expect(typeof reservePut![0].ExpressionAttributeValues[':chatStale']).toBe('string');
+    // The chat ceiling is the looser of the two — it must not expire a chat that a
+    // resume-after-timeout retry should still be reusing.
+    expect(
+      Date.parse(reservePut![0].ExpressionAttributeValues[':chatStale'])
+    ).toBeLessThan(Date.parse(reservePut![0].ExpressionAttributeValues[':stale']));
   });
 
   test('lost race + other instance SUCCEEDED → returns reused chat, no create call', async () => {
