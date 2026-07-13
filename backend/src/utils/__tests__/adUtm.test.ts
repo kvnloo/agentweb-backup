@@ -21,6 +21,9 @@ import {
   buildUtmSpec,
   existingUtmKeys,
   mergeUtmIntoUrl,
+  mergeUtmIntoQueryString,
+  readUtmKeys,
+  utmKeysInQueryString,
   utmQueryString,
 } from "../adUtm";
 
@@ -184,6 +187,98 @@ describe("mergeUtmIntoUrl", () => {
 
   it("throws on a URL it cannot parse", () => {
     expect(() => mergeUtmIntoUrl("not a url", spec)).toThrow(/invalid url/i);
+  });
+});
+
+describe("readUtmKeys", () => {
+  // An unparseable URL is NOT "a URL with no UTMs". `example.com?utm_source=news`
+  // fails `new URL()` (no scheme) yet plainly carries a utm_source — so callers must
+  // be able to tell "cannot read" apart from "read, found nothing", or they would
+  // append a duplicate and corrupt the very attribution this feature protects.
+  it("returns the keys present on a valid URL", () => {
+    expect([...readUtmKeys("https://x.com/p?utm_source=a")!]).toEqual(["utm_source"]);
+  });
+
+  it("returns an empty set for a valid URL with no UTMs", () => {
+    expect(readUtmKeys("https://x.com/p")!.size).toBe(0);
+  });
+
+  it("returns undefined (not an empty set) for a URL it cannot parse", () => {
+    expect(readUtmKeys("example.com")).toBeUndefined();
+    expect(readUtmKeys("example.com?utm_source=news")).toBeUndefined();
+    expect(readUtmKeys("not a url")).toBeUndefined();
+  });
+
+  it("returns undefined for a missing URL, and never throws", () => {
+    expect(() => readUtmKeys(undefined)).not.toThrow();
+    expect(readUtmKeys(undefined)).toBeUndefined();
+    expect(readUtmKeys("")).toBeUndefined();
+  });
+});
+
+describe("utmKeysInQueryString", () => {
+  // Used to read a platform's existing append field (Google final_url_suffix,
+  // Meta url_tags), which is a bare query string, not a URL.
+  it("finds the UTM keys in a bare query string", () => {
+    const keys = utmKeysInQueryString("utm_source=google&foo=1&utm_campaign={campaignid}");
+    expect([...keys].sort()).toEqual(["utm_campaign", "utm_source"]);
+  });
+
+  it("tolerates a leading ? or & and is case-insensitive", () => {
+    expect(utmKeysInQueryString("?UTM_Source=a").has("utm_source")).toBe(true);
+    expect(utmKeysInQueryString("&utm_medium=cpc").has("utm_medium")).toBe(true);
+  });
+
+  it("never throws on junk, and is empty for empty input", () => {
+    expect(() => utmKeysInQueryString("%%%")).not.toThrow();
+    expect(utmKeysInQueryString("").size).toBe(0);
+    expect(utmKeysInQueryString(undefined).size).toBe(0);
+  });
+});
+
+describe("mergeUtmIntoQueryString", () => {
+  // Google resolves final_url_suffix by MOST SPECIFIC level (ad > ad group >
+  // campaign > account) — an ad-level suffix REPLACES the campaign's outright.
+  // So when we write at ad level we must carry the campaign's params forward, or
+  // we silently destroy a client's own tracking (ENG-239 AC4).
+  const spec = buildUtmSpec("google", { campaign: "{campaignid}", content: "{creative}" });
+
+  it("carries the inherited params forward and appends only the missing UTM keys", () => {
+    const out = mergeUtmIntoQueryString("clientparam=1&utm_source=partner", spec);
+    // the client's own params survive, untouched and first
+    expect(out.startsWith("clientparam=1&utm_source=partner")).toBe(true);
+    // their utm_source is NOT overwritten
+    expect(out).not.toContain("utm_source=google");
+    // and the keys they did not set are added
+    expect(out).toContain("utm_medium=paid");
+    expect(out).toContain("utm_campaign={campaignid}");
+  });
+
+  it("returns just our params when there is nothing inherited", () => {
+    expect(mergeUtmIntoQueryString(undefined, spec)).toBe(
+      "utm_source=google&utm_medium=paid&utm_campaign={campaignid}&utm_content={creative}",
+    );
+  });
+
+  it("returns the inherited string unchanged when it already carries every UTM key", () => {
+    const full = "utm_source=a&utm_medium=b&utm_campaign=c&utm_content=d&utm_term=e";
+    expect(mergeUtmIntoQueryString(full, spec)).toBe(full);
+  });
+
+  it("also omits keys the caller says are already on the destination URL (AC4)", () => {
+    // The ad's final_url already carries utm_source; the campaign suffix carries a
+    // client param. Neither may be duplicated or lost.
+    const out = mergeUtmIntoQueryString(
+      "clientparam=1",
+      spec,
+      new Set(["utm_source"]),
+    );
+    expect(out).toBe("clientparam=1&utm_medium=paid&utm_campaign={campaignid}&utm_content={creative}");
+    expect(out).not.toContain("utm_source");
+  });
+
+  it("returns an empty string when there is nothing inherited and every key is omitted", () => {
+    expect(mergeUtmIntoQueryString(undefined, spec, new Set(UTM_KEYS))).toBe("");
   });
 });
 

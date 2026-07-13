@@ -129,6 +129,76 @@ export function existingUtmKeys(url: string): Set<UtmKey> {
   return present;
 }
 
+/**
+ * The UTM keys on a URL, or `undefined` if it cannot be parsed.
+ *
+ * Callers at the ad-platform boundary use this to decide whether to tag at all.
+ * Returning `undefined` (rather than an empty set) is deliberate: an unparseable
+ * URL is NOT the same as a URL with no UTMs. `example.com?utm_source=news` fails
+ * `new URL()` for want of a scheme yet plainly carries a `utm_source` — treating
+ * it as "no keys" would append a second one and corrupt the attribution we are
+ * here to protect. So: if we cannot read a URL, we do not tag it, and the ad
+ * platform surfaces its own (precise) validation error for the bad URL.
+ */
+export function readUtmKeys(url: string | undefined): Set<UtmKey> | undefined {
+  if (!url) return undefined;
+  try {
+    return existingUtmKeys(url);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The UTM keys present in a bare query string — a platform "append field" such as
+ * Google's `final_url_suffix` or Meta's `url_tags` (e.g. `utm_source=google&x=1`).
+ * Lenient: tolerates a leading `?`/`&`, matches case-insensitively, never throws.
+ */
+export function utmKeysInQueryString(qs: string | undefined): Set<UtmKey> {
+  const present = new Set<UtmKey>();
+  if (!qs) return present;
+  // URLSearchParams parses leniently and never throws — junk becomes a junk key,
+  // which simply won't match a UTM name.
+  const params = new URLSearchParams(qs.replace(/^[?&]+/, ""));
+  for (const rawKey of params.keys()) {
+    const lower = rawKey.toLowerCase() as UtmKey;
+    if ((UTM_KEYS as readonly string[]).includes(lower)) {
+      present.add(lower);
+    }
+  }
+  return present;
+}
+
+/**
+ * Merge our UTM params into an INHERITED append field, preserving it verbatim.
+ *
+ * Google resolves `final_url_suffix` by most-specific level — ad > ad group >
+ * campaign > account — and the winning level REPLACES the others outright; they
+ * are not concatenated. So writing an ad-level suffix silently destroys whatever
+ * the client configured at campaign level. To honour AC4 ("user-provided UTMs are
+ * respected, not overwritten") we must carry the inherited string forward intact
+ * and append only the UTM keys it does not already define.
+ *
+ * Non-UTM params in the inherited string (a client's own tracking, e.g.
+ * `clientparam=1`) are preserved untouched — they are exactly what would otherwise
+ * be lost.
+ */
+export function mergeUtmIntoQueryString(
+  inherited: string | undefined,
+  spec: UtmSpec,
+  alsoOmit: ReadonlySet<string> = new Set(),
+): string {
+  const base = (inherited || "").replace(/^[?&]+/, "").replace(/&+$/, "");
+  const present = utmKeysInQueryString(base);
+  const additions = specEntries(spec)
+    .filter(([key]) => !present.has(key) && !alsoOmit.has(key))
+    .map(([key, value]) => `${key}=${encodeValue(value)}`);
+
+  if (!base) return additions.join("&");
+  if (additions.length === 0) return base;
+  return `${base}&${additions.join("&")}`;
+}
+
 /** Macros pass through verbatim; real values are percent-encoded. */
 function encodeValue(value: string): string {
   return MACRO_RE.test(value) ? value : encodeURIComponent(value);
