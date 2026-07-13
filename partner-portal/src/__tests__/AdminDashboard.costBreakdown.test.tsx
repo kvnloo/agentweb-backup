@@ -1,0 +1,182 @@
+import React from 'react';
+import { render, screen } from '@testing-library/react';
+import '@testing-library/jest-dom';
+
+// These minimal components mirror the LLM-cost UI added to AdminDashboard's Users
+// tab: the inline cost quota (deducted spend vs cost cap) and the per-model burn
+// breakdown modal. They replicate the exact display/aggregation logic so the math
+// (by-model rollup, burn vs deducted vs absorbed) is covered without mounting the
+// full AdminDashboard (which requires many contexts).
+
+interface User {
+  userId: string;
+  email: string;
+  roles?: string[];
+  subscriptionType?: string;
+  tokenUsage?: { month: string; totalTokens: number; totalCost: number; resetDate: string };
+  tokenUsageHistory?: Array<{ month: string; totalTokens: number; totalCost: number }>;
+}
+
+interface UsageRow {
+  date: string;
+  model: string;
+  feature: string;
+  totalTokens: number;
+  callCount: number;
+  costUsd: number;
+}
+
+// --- Mirror of the inline "LLM Cost" quota cell ---
+const CostQuotaCell: React.FC<{ user: User; costAllowanceMap: Record<string, number | null>; currentMonth: string }> = ({
+  user,
+  costAllowanceMap,
+  currentMonth,
+}) => {
+  if (!user.roles?.includes('customer')) return <span>—</span>;
+  const costUsed = user.tokenUsage?.month === currentMonth ? user.tokenUsage?.totalCost ?? 0 : 0;
+  const costAllowance = costAllowanceMap[user.subscriptionType || 'Basic'] ?? null;
+  return (
+    <span>
+      ${costUsed.toFixed(2)} / {costAllowance != null ? `$${costAllowance.toFixed(2)}` : '∞'} deducted
+    </span>
+  );
+};
+
+// --- Mirror of the deduction lookup used by the modal header ---
+const deductedCostForMonth = (user: User, month: string): number => {
+  if (user.tokenUsage?.month === month) return user.tokenUsage?.totalCost ?? 0;
+  const hist = user.tokenUsageHistory?.find((h) => h.month === month);
+  return hist?.totalCost ?? 0;
+};
+
+// --- Mirror of the per-model burn breakdown modal body ---
+const BreakdownBody: React.FC<{ user: User; month: string; rows: UsageRow[] }> = ({ user, month, rows }) => {
+  const burn = rows.reduce((acc, r) => acc + r.costUsd, 0);
+  const deducted = deductedCostForMonth(user, month);
+  const absorbed = Math.max(0, burn - deducted);
+  const byModel: Record<string, { model: string; callCount: number; totalTokens: number; costUsd: number }> = {};
+  rows.forEach((r) => {
+    const m = byModel[r.model] || (byModel[r.model] = { model: r.model, callCount: 0, totalTokens: 0, costUsd: 0 });
+    m.callCount += r.callCount;
+    m.totalTokens += r.totalTokens;
+    m.costUsd += r.costUsd;
+  });
+  const modelRows = Object.values(byModel).sort((a, b) => b.costUsd - a.costUsd);
+  return (
+    <div>
+      <div>Burned (gross) ${burn.toFixed(2)}</div>
+      <div>Counted to quota ${deducted.toFixed(2)}</div>
+      <div>Absorbed by platform ${absorbed.toFixed(2)}</div>
+      <table>
+        <tbody>
+          {modelRows.map((m) => (
+            <tr key={m.model}>
+              <td>{m.model}</td>
+              <td>{m.callCount.toLocaleString()}</td>
+              <td>{m.totalTokens.toLocaleString()}</td>
+              <td data-testid={`burn-${m.model}`}>${m.costUsd.toFixed(4)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+};
+
+describe('AdminDashboard LLM cost quota (isolated)', () => {
+  const currentMonth = '2026-07';
+
+  it('shows dollar spend against the cost cap for a customer with a cap', () => {
+    const user: User = {
+      userId: 'u1',
+      email: 'c1@example.com',
+      roles: ['customer'],
+      subscriptionType: 'Pro',
+      tokenUsage: { month: currentMonth, totalTokens: 1000, totalCost: 3.5, resetDate: '' },
+    };
+    render(<CostQuotaCell user={user} costAllowanceMap={{ Pro: 10 }} currentMonth={currentMonth} />);
+    expect(screen.getByText('$3.50 / $10.00 deducted')).toBeInTheDocument();
+  });
+
+  it('shows ∞ when the tier has no cost cap configured', () => {
+    const user: User = {
+      userId: 'u2',
+      email: 'c2@example.com',
+      roles: ['customer'],
+      subscriptionType: 'Basic',
+      tokenUsage: { month: currentMonth, totalTokens: 1000, totalCost: 2, resetDate: '' },
+    };
+    render(<CostQuotaCell user={user} costAllowanceMap={{ Basic: null }} currentMonth={currentMonth} />);
+    expect(screen.getByText('$2.00 / ∞ deducted')).toBeInTheDocument();
+  });
+
+  it('treats a stale (previous-month) tokenUsage as $0 spent this month', () => {
+    const user: User = {
+      userId: 'u3',
+      email: 'c3@example.com',
+      roles: ['customer'],
+      subscriptionType: 'Pro',
+      tokenUsage: { month: '2026-06', totalTokens: 1000, totalCost: 9, resetDate: '' },
+    };
+    render(<CostQuotaCell user={user} costAllowanceMap={{ Pro: 10 }} currentMonth={currentMonth} />);
+    expect(screen.getByText('$0.00 / $10.00 deducted')).toBeInTheDocument();
+  });
+
+  it('renders — for non-customer users', () => {
+    const user: User = { userId: 'u4', email: 'partner@example.com', roles: ['partner'] };
+    render(<CostQuotaCell user={user} costAllowanceMap={{}} currentMonth={currentMonth} />);
+    expect(screen.getByText('—')).toBeInTheDocument();
+  });
+});
+
+describe('AdminDashboard per-model burn breakdown (isolated)', () => {
+  const month = '2026-07';
+  const user: User = {
+    userId: 'u1',
+    email: 'c1@example.com',
+    roles: ['customer'],
+    tokenUsage: { month, totalTokens: 5000, totalCost: 4, resetDate: '' },
+  };
+
+  it('rolls up per-day/feature rows into per-model totals sorted by burn desc', () => {
+    const rows: UsageRow[] = [
+      { date: '2026-07-01', model: 'claude-fable-5', feature: 'agent_mode', totalTokens: 1000, callCount: 2, costUsd: 6 },
+      { date: '2026-07-02', model: 'claude-fable-5', feature: 'chatbot', totalTokens: 500, callCount: 1, costUsd: 4 },
+      { date: '2026-07-01', model: 'gpt-5.2-chat', feature: 'agent_mode', totalTokens: 2000, callCount: 3, costUsd: 1.5 },
+    ];
+    render(<BreakdownBody user={user} month={month} rows={rows} />);
+
+    // fable aggregated: 6 + 4 = 10; sorted first (desc)
+    expect(screen.getByTestId('burn-claude-fable-5')).toHaveTextContent('$10.0000');
+    expect(screen.getByTestId('burn-gpt-5.2-chat')).toHaveTextContent('$1.5000');
+
+    const rowsRendered = screen.getAllByRole('row');
+    expect(rowsRendered[0]).toHaveTextContent('claude-fable-5');
+    expect(rowsRendered[1]).toHaveTextContent('gpt-5.2-chat');
+  });
+
+  it('shows gross burn, quota deduction, and platform-absorbed amounts distinctly', () => {
+    const rows: UsageRow[] = [
+      { date: '2026-07-01', model: 'claude-fable-5', feature: 'agent_mode', totalTokens: 1000, callCount: 2, costUsd: 10 },
+    ];
+    // burn = 10, deducted (tokenUsage.totalCost) = 4, absorbed = 6
+    render(<BreakdownBody user={user} month={month} rows={rows} />);
+    expect(screen.getByText('Burned (gross) $10.00')).toBeInTheDocument();
+    expect(screen.getByText('Counted to quota $4.00')).toBeInTheDocument();
+    expect(screen.getByText('Absorbed by platform $6.00')).toBeInTheDocument();
+  });
+
+  it('reads deduction from tokenUsageHistory for a past month', () => {
+    const histUser: User = {
+      ...user,
+      tokenUsage: { month, totalTokens: 5000, totalCost: 4, resetDate: '' },
+      tokenUsageHistory: [{ month: '2026-06', totalTokens: 3000, totalCost: 2.25 }],
+    };
+    const rows: UsageRow[] = [
+      { date: '2026-06-10', model: 'gpt-5.2-chat', feature: 'agent_mode', totalTokens: 2000, callCount: 1, costUsd: 5 },
+    ];
+    render(<BreakdownBody user={histUser} month="2026-06" rows={rows} />);
+    expect(screen.getByText('Counted to quota $2.25')).toBeInTheDocument();
+    expect(screen.getByText('Absorbed by platform $2.75')).toBeInTheDocument();
+  });
+});
