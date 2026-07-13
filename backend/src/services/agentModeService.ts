@@ -11753,11 +11753,36 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         }
       }, null, 2);
 
+      // A site may render a completely different design under a dark color-scheme
+      // preference (ENG-285: rankai.ai is matte black with a purple accent under
+      // dark, near-white under light). The tokens above describe the site's
+      // DEFAULT render; when a distinct dark render exists, analyze it too and
+      // surface both so the caller can pick the intended brand theme.
+      let darkThemeTokens: any = null;
+      if (extractedCSS.themes?.hasDarkVariant && extractedCSS.themes.dark) {
+        try {
+          const darkCSS = {
+            ...extractedCSS,
+            computedElements: extractedCSS.themes.dark.computedElements,
+          };
+          const darkDetailed = await analyzeDesignTokens(darkCSS);
+          darkThemeTokens = {
+            ...inferBrandTokens(darkDetailed),
+            backgrounds: darkDetailed.colors.backgrounds.slice(0, 3),
+            text: darkDetailed.colors.text.slice(0, 3),
+          };
+          console.log(`Dark color-scheme variant detected for ${url}; extracted its palette too.`);
+        } catch (err) {
+          console.warn('Dark-variant token analysis failed; reporting default render only:', err);
+        }
+      }
+
       // Format summary for LLM
       const formattedSummary = this.formatCSSExtractionResult({
         url,
         suggestedBrandTokens,
         detailedTokens,
+        darkThemeTokens,
         brandIdentity: {
           logoUrl: s3LogoUrl || brandIdentity.logoUrl || null,
           brandName: brandIdentity.brandName || null,
@@ -11780,6 +11805,8 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         suggestedBrandTokens: enrichedBrandTokens,
         detailedTokens,
         detailedTokensJSON, // Emma can save this to KB using update_knowledge_base_file tool
+        hasDarkVariant: !!darkThemeTokens,
+        darkThemeTokens, // null unless the site renders a distinct dark theme
         formattedContent: formattedSummary
       };
     } catch (error: any) {
@@ -11796,7 +11823,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
    * Format CSS extraction result for LLM consumption
    */
   private formatCSSExtractionResult(data: any): string {
-    const { url, suggestedBrandTokens, detailedTokens, brandIdentity } = data;
+    const { url, suggestedBrandTokens, detailedTokens, brandIdentity, darkThemeTokens } = data;
 
     let formatted = `# CSS Extraction Results\n\n`;
     formatted += `**Source:** ${url}\n\n`;
@@ -11829,6 +11856,23 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
     formatted += `### Visual Effects\n`;
     formatted += `- **Primary Shadow:** ${suggestedBrandTokens.visualEffects.primaryShadow}\n`;
     formatted += `- **Border Radius:** ${suggestedBrandTokens.visualEffects.borderRadius}\n\n`;
+
+    // Dark color-scheme variant, when the site has one. The tokens above describe
+    // what the site serves a no-preference visitor; this is what a dark-mode
+    // visitor sees. Which one is "the brand" is a judgement call, so present both
+    // rather than silently choosing (ENG-285).
+    if (darkThemeTokens) {
+      formatted += `## Dark Theme Variant Detected\n\n`;
+      formatted += `This site renders a **distinct dark theme** under \`prefers-color-scheme: dark\`. `;
+      formatted += `The tokens above are its DEFAULT (light) render; the dark render is:\n\n`;
+      formatted += `- **Primary:** ${darkThemeTokens.colors.primary}\n`;
+      formatted += `- **Secondary:** ${darkThemeTokens.colors.secondary}\n`;
+      formatted += `- **Backgrounds:** ${(darkThemeTokens.backgrounds || []).join(', ') || 'Not detected'}\n`;
+      formatted += `- **Text:** ${(darkThemeTokens.text || []).join(', ') || 'Not detected'}\n`;
+      formatted += `- **Palette:** ${darkThemeTokens.colors.palette.join(', ')}\n\n`;
+      formatted += `⚠️ Confirm with the user which theme represents their brand before applying tokens — `;
+      formatted += `a site whose design is dark still serves the light render to visitors whose OS is set to light.\n\n`;
+    }
 
     // Summary of detailed tokens
     formatted += `## Detailed Analysis\n\n`;

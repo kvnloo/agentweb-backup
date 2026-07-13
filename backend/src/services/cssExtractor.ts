@@ -11,6 +11,17 @@ export interface BrandIdentity {
   favicon: string | null;       // Favicon URL (fallback if no logo found)
 }
 
+// A single colour-scheme render of the page. A site may look completely
+// different under `prefers-color-scheme: dark` — either via a CSS media query or
+// a client script that toggles a `dark` class (ENG-285: rankai.ai does the
+// latter). We capture each render rather than guessing which one is "the brand".
+export interface ThemeRender {
+  computedElements: ComputedElementStyles;
+  // Custom properties resolved on :root for THIS render (a themed site resolves
+  // --background, --primary, etc. to different values per scheme).
+  customProperties: Record<string, string>;
+}
+
 export interface ExtractedCSS {
   url: string;
   html: string;
@@ -22,6 +33,16 @@ export interface ExtractedCSS {
   extractedAt: string;
   computedElements?: ComputedElementStyles;
   brandIdentity?: BrandIdentity;
+  // Both colour-scheme renders, when a real browser was used. `computedElements`
+  // and `stylesheets` above always describe the site's DEFAULT render (what a
+  // no-preference client is served) so existing consumers are unaffected;
+  // `themes.dark` is populated only when the site genuinely renders differently
+  // under a dark preference, letting the caller choose the intended brand theme.
+  themes?: {
+    light: ThemeRender;
+    dark?: ThemeRender;
+    hasDarkVariant: boolean;
+  };
 }
 
 export interface ComputedElementStyles {
@@ -227,36 +248,6 @@ function normalizeColor(colorValue: string): string | null {
   } catch (error) {
     return null;
   }
-}
-
-// Count the distinct saturated (non-grayscale, non-near-black/white) colors used
-// across a page's computed elements. This is a proxy for how "brand-rich" a
-// rendered variant is: a matte-black hero with an amber glow + purple accent +
-// indigo CTA scores higher than a plain near-monochrome light layout. Used to
-// decide, when a site offers both a light and a dark render, which one better
-// represents the intended brand (see ENG-285 and the vercel.com light-default
-// regression it caused).
-export function countBrandColors(computedElements?: ComputedElementStyles): number {
-  if (!computedElements) return 0;
-  const seen = new Set<string>();
-  for (const styles of Object.values(computedElements)) {
-    for (const raw of [styles.color, styles.backgroundColor, styles.borderColor]) {
-      if (!raw || raw === 'transparent' || raw === 'rgba(0, 0, 0, 0)') continue;
-      const hex = normalizeColor(raw);
-      if (!hex) continue;
-      try {
-        const color = Color(hex);
-        // Skip near-grayscale (text/background neutrals) and near-black/near-white.
-        if (color.saturationl() < 15) continue;
-        const lightness = color.lightness();
-        if (lightness < 6 || lightness > 96) continue;
-        seen.add(hex);
-      } catch {
-        // Unparseable — ignore
-      }
-    }
-  }
-  return seen.size;
 }
 
 // Resolve CSS variables in stylesheet text
@@ -632,9 +623,10 @@ async function extractWithPuppeteer(
     // the OS color-scheme preference — a CSS `@media (prefers-color-scheme: dark)`
     // rule or a client script that toggles a `dark` class / `data-theme`. Reload
     // with a dark preference emulated so both CSS- and JS-driven dark themes
-    // apply (see ENG-285: rankai.ai is matte-black with an amber glow, but the
-    // default headless read returned a near-white background). This is
-    // best-effort — if the dark reload fails we fall back to the default render.
+    // apply (see ENG-285: rankai.ai reads `localStorage.theme ?? matchMedia(dark)`
+    // and toggles a `dark` class, so only a reload under a dark preference
+    // reveals its real matte-black design). This is best-effort — if the dark
+    // reload fails we simply report no dark variant.
     let darkData: Awaited<ReturnType<typeof extractPageData>> | null = null;
     try {
       await page.emulateMediaFeatures([
@@ -646,15 +638,35 @@ async function extractWithPuppeteer(
       console.warn('Dark color-scheme capture failed; using default render:', err);
     }
 
-    // Pick the variant that better represents the intended brand. A light-DEFAULT
-    // site that merely offers a system dark variant (e.g. vercel.com) must stay
-    // light; a site whose real design is dark (e.g. rankai.ai) must be captured
-    // dark. Use the richer accent palette as the discriminator, defaulting to the
-    // site's canonical (default-served) render on a tie so we never force dark.
-    const useDark =
-      !!darkData &&
-      countBrandColors(darkData.computedElements) > countBrandColors(lightData.computedElements);
-    const pageData = useDark && darkData ? darkData : lightData;
+    // Keep the DEFAULT render as the canonical result — it is what the site
+    // actually serves a no-preference client, and existing consumers rely on it.
+    // The dark render is reported alongside it (see `themes` on ExtractedCSS) so
+    // the caller can pick the intended brand theme instead of us guessing. We do
+    // NOT try to score which render is "more brand-like": the accents a site
+    // cares about routinely live in gradients and nested spans that never surface
+    // in these sampled computed styles, so any such score is noise.
+    const pageData = lightData;
+
+    // Only claim a dark variant when the site genuinely renders differently under
+    // a dark preference — a light-only site must not be given an invented theme.
+    const isDistinct = (a: typeof lightData, b: typeof lightData) =>
+      JSON.stringify(a.computedElements) !== JSON.stringify(b.computedElements) ||
+      JSON.stringify(a.customProperties) !== JSON.stringify(b.customProperties);
+
+    const hasDarkVariant = !!darkData && isDistinct(lightData, darkData);
+    const themes: ExtractedCSS['themes'] = {
+      light: {
+        computedElements: lightData.computedElements,
+        customProperties: lightData.customProperties,
+      },
+      hasDarkVariant,
+    };
+    if (hasDarkVariant && darkData) {
+      themes.dark = {
+        computedElements: darkData.computedElements,
+        customProperties: darkData.customProperties,
+      };
+    }
 
     // Log extraction debug info
     const dbg = (pageData as any).debug;
@@ -717,6 +729,7 @@ async function extractWithPuppeteer(
       extractedAt: new Date().toISOString(),
       computedElements: pageData.computedElements,
       brandIdentity: (pageData as any).brandIdentity as BrandIdentity,
+      themes,
     };
   } finally {
     await browser.close();
