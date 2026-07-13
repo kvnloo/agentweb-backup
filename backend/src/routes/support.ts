@@ -289,6 +289,11 @@ router.post("/report-ui-bug", async (req, res) => {
     const isDelegated = authenticatedReq.delegateInfo?.isDelegated === true;
     const adminEmail: string | undefined = authenticatedReq.delegateInfo?.adminEmail;
 
+    // ENG-289 Desired behavior #1: an INTERNAL submitter (admin, delegated-admin session, or an
+    // @agentweb.pro reporter) gets the canonical Linear link back in the response; external customers
+    // still only receive their Featurebase tracking link. The internal team email always gets it.
+    const reporterIsInternal = user.isAdmin === true || isDelegated || /@agentweb\.pro$/i.test(user.email || "");
+
     const title = `${config.titlePrefix}: ${description.trim().slice(0, 80)}`;
 
     const issueContext: Record<string, any> = {
@@ -395,6 +400,9 @@ router.post("/report-ui-bug", async (req, res) => {
         : "Report submitted successfully",
       issueId,
       trackingUrl: filed.userUrl, // public link to the user's request on the feedback board
+      // Internal reporters (teammates) also get the canonical Linear link (ENG-289 #1); external
+      // customers do not — it stays an internal, eng-facing link routed to the team email only.
+      canonicalUrl: reporterIsInternal ? filed.canonicalUrl : undefined,
       deduped: filed.deduped,
     });
   } catch (error) {
