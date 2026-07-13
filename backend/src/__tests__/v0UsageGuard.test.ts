@@ -2,6 +2,7 @@ import {
   _resetV0UsageGuardForTest,
   buildV0IdempotencyKey,
   isReservationBlocking,
+  canReuseChat,
   guardedV0ChatCreate,
   guardedV0CorrectionMessage,
   getV0UsageCountForScope,
@@ -334,6 +335,26 @@ describe('v0UsageGuard', () => {
 
       expect(second).toEqual({ id: 'chat_1', reused: true });
       expect(create).toHaveBeenCalledTimes(1); // no second charge
+    });
+
+    test('canReuseChat: a succeeded row with an unreadable createdAt is not reusable (and so must be reclaimable — see the dynamo condition)', () => {
+      // Refusing to reuse an unknown-age chat is only safe because `reserveInDynamo` carries
+      // a matching `attribute_not_exists(createdAt)` clause that lets the row be RECLAIMED.
+      // Without that second half this would fail CLOSED — every attempt throwing "already in
+      // progress", forever — which is the exact eternal wedge this guard exists to kill.
+      const now = Date.parse('2026-07-10T04:00:00.000Z');
+      const row: V0UsageRecord = {
+        idempotencyKey: 'k',
+        userId: 'u',
+        operation: 'additional_page_chat_create',
+        scopeId: 's',
+        chatId: 'chat_legacy',
+        status: 'succeeded',
+        createdAt: 'not-a-date',
+        updatedAt: 'not-a-date',
+      };
+      expect(canReuseChat(row, now)).toBe(false);
+      expect(canReuseChat({ ...row, createdAt: new Date(now - 60_000).toISOString() }, now)).toBe(true);
     });
 
     test('a STALE succeeded chat is NOT reused — the retry mints a fresh chat instead of wedging forever', async () => {

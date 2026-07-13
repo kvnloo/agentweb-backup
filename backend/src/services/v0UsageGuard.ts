@@ -68,8 +68,12 @@ export function canReuseChat(
 ): boolean {
   if (!existing?.chatId || existing.status !== 'succeeded') return false;
   const ageMs = nowMs - Date.parse(existing.createdAt);
-  // An unparseable timestamp yields NaN → not reusable. Minting a fresh chat costs one
-  // duplicate v0 call; reusing an unknown-age chat risks the eternal wedge.
+  // An unparseable/missing timestamp is treated as STALE (not reusable), and
+  // `reserveInDynamo` mirrors that with an `attribute_not_exists(createdAt)` clause so the
+  // row can actually be RECLAIMED. Both halves are required: refusing to reuse it here
+  // while the conditional put has no clause that matches it would fail CLOSED — every
+  // attempt throwing "already in progress" forever, which is the eternal wedge this file
+  // exists to eliminate. Reclaiming costs at most one duplicate v0 call.
   return Number.isFinite(ageMs) && ageMs <= ceilingMs;
 }
 
@@ -178,7 +182,10 @@ async function reserveInDynamo(
     condition:
       'attribute_not_exists(idempotencyKey) OR #status = :failed' +
       ' OR (#status = :reserved AND #updatedAt < :stale)' +
-      ' OR (#status = :succeeded AND #createdAt < :chatStale)',
+      ' OR (#status = :succeeded AND #createdAt < :chatStale)' +
+      // A succeeded row with no readable createdAt is unreusable (canReuseChat says so) —
+      // it must therefore be RECLAIMABLE, or it would block every future attempt forever.
+      ' OR (#status = :succeeded AND attribute_not_exists(#createdAt))',
     names: { '#status': 'status', '#updatedAt': 'updatedAt', '#createdAt': 'createdAt' },
     values: {
       ':failed': 'failed',

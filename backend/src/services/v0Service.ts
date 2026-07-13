@@ -151,9 +151,12 @@ const V0_GENERATION_BUDGET_MS = 20 * 60 * 1000;
  * (ENG-287 residual)
  */
 export function isDeadEndV0Failure(error: any): boolean {
+  // A Vercel build ERROR is also a dead end, but that path RETURNS a failed record instead
+  // of throwing, so it frees the identity inline rather than through this predicate — there
+  // is deliberately no VERCEL_BUILD_ERROR arm here, because nothing throws one and a dead
+  // arm would imply coverage that does not exist.
   return (
-    error?.code === "V0_VERSION_FAILED" ||  // v0 itself marked the version failed
-    error?.code === "VERCEL_BUILD_ERROR" || // that version's code does not compile
+    error?.code === "V0_VERSION_FAILED" || // v0 itself marked the version failed
     error?.code === "V0_OUTPUT_INVALID"    // v0 keeps emitting output we cannot ship
   );
 }
@@ -166,13 +169,37 @@ async function touchLandingPageRecord(id: string): Promise<void> {
         TableName: TABLE_NAME,
         Key: { id },
         UpdateExpression: "SET updatedAt = :now",
+        // UpdateItem is an UPSERT. Without this, a heartbeat racing a hard delete would
+        // resurrect a stub record with no userId/status — invisible to every owner check.
+        ConditionExpression: "attribute_exists(id)",
         ExpressionAttributeValues: { ":now": new Date().toISOString() },
       })
       .promise();
   } catch (err: any) {
     // Best-effort: a missed heartbeat costs liveness, never correctness.
+    if (err?.code === "ConditionalCheckFailedException") return; // record is gone — nothing to keep alive
     console.warn(`[V0 SERVICE] heartbeat failed for ${id}: ${err?.message}`);
   }
+}
+
+/**
+ * Keep a record's `updatedAt` fresh for the WHOLE of `fn`, not just the v0 poll.
+ *
+ * The version poll is only the first phase of a build. The zip download, the correction
+ * sends, the GitHub push and the 5-min Vercel poll all follow it, each with their own
+ * multi-minute retry budgets — and none of them writes `updatedAt`. So the `deploying`
+ * phase could plausibly run past the janitor's 30-min ceiling in total silence, and the
+ * janitor would mark a LIVE build failed (after which a retry runs a SECOND build into the
+ * same repo, and `deliverStuckFailure` burns the one-shot completion claim so the real
+ * success can never be delivered). Heartbeating for the entire build closes that hole.
+ * (ENG-287 residual)
+ */
+const BUILD_HEARTBEAT_INTERVAL_MS = 60_000;
+function startBuildHeartbeat(id: string): () => void {
+  const timer = setInterval(() => { void touchLandingPageRecord(id); }, BUILD_HEARTBEAT_INTERVAL_MS);
+  // Never hold the process open just for a heartbeat.
+  if (typeof timer.unref === "function") timer.unref();
+  return () => clearInterval(timer);
 }
 
 /**
@@ -191,10 +218,25 @@ async function waitForCompletedV0Version(
   v0: any,
   chatId: string,
   label: string,
-  opts: { heartbeat?: () => Promise<void> } = {}
+  opts: {
+    heartbeat?: () => Promise<void>;
+    /**
+     * Absolute epoch-ms deadline for the WHOLE build. Passed in so the budget is spent
+     * once across the initial wait AND every correction round — computing it per call would
+     * re-arm it each time, letting one build poll 3 × 20 min and outlive both the janitor
+     * ceiling and the chat-reuse ceiling the guard depends on. (ENG-287 residual)
+     */
+    deadline?: number;
+    /**
+     * The version we already have. A correction produces a NEW version, but v0 may still be
+     * reporting the OLD (completed) one for a moment — returning it would re-download the
+     * identical broken zip and silently waste the correction round. Treat it as not-ready.
+     */
+    afterVersionId?: string;
+  } = {}
 ): Promise<string> {
   const intervals = v0PollIntervalsMs;
-  const deadline = Date.now() + V0_GENERATION_BUDGET_MS;
+  const deadline = opts.deadline ?? Date.now() + V0_GENERATION_BUDGET_MS;
   let lastReadError: string | undefined;
   for (let pollAttempt = 0; pollAttempt < intervals.length; pollAttempt++) {
     if (intervals[pollAttempt] > 0) {
@@ -238,6 +280,9 @@ async function waitForCompletedV0Version(
       throw failedErr;
     }
     if (version?.id && version.status !== "pending") {
+      // Still the version we came in with — v0 has not published the correction's new one
+      // yet. Returning it would re-download the identical zip and waste the round.
+      if (opts.afterVersionId && version.id === opts.afterVersionId) continue;
       console.log(`[V0 SERVICE] ${label}: version ${version.id} ready (poll attempt ${pollAttempt + 1})`);
       return version.id;
     }
@@ -1379,6 +1424,13 @@ async function addPageToExistingRepo(
 
   await dynamodb.put({ TableName: TABLE_NAME, Item: record }).promise();
 
+  // Covers the WHOLE build, not just the v0 poll: the zip download, the corrections, the
+  // GitHub push and the 5-min Vercel poll each carry multi-minute retry budgets and write
+  // nothing, so without this the record can go silent past the janitor's 30-min ceiling and
+  // a LIVE build gets marked failed. (ENG-287 residual)
+  const stopHeartbeat = startBuildHeartbeat(id);
+  // One budget for the whole build, shared by the initial wait and every correction round.
+  const buildDeadline = Date.now() + V0_GENERATION_BUDGET_MS;
   try {
     // ── Step 1: Call v0 to generate proper page content ──
     // If no template provided, fall back to landing-page-v2 (same behaviour as generateFirstPage)
@@ -1430,7 +1482,7 @@ async function addPageToExistingRepo(
       v0,
       chatId,
       `v0 generation for /${slug}`,
-      { heartbeat: () => touchLandingPageRecord(id) }
+      { heartbeat: () => touchLandingPageRecord(id), deadline: buildDeadline }
     );
 
     // ── Step 3: Download and validate v0 output ──
@@ -1513,7 +1565,11 @@ async function addPageToExistingRepo(
             v0,
             chatId,
             `v0 correction for /${slug}`,
-            { heartbeat: () => touchLandingPageRecord(id) }
+            {
+              heartbeat: () => touchLandingPageRecord(id),
+              deadline: buildDeadline,
+              afterVersionId: versionId, // must be the correction's NEW version, not the old one
+            }
           );
 
           continue;
@@ -1560,18 +1616,26 @@ async function addPageToExistingRepo(
       const errorMsg = `Vercel build failed for /${slug}: ${deploymentResult.buildError || "Unknown build error"}`;
       console.error(`[V0 SERVICE] ${errorMsg}`);
 
-      // This chat's code does not compile, and it will not compile next time either. Free
-      // the route identity so the retry mints a FRESH chat — otherwise every retry reuses
-      // this chat, re-downloads the same broken version and fails identically, forever.
-      // (And because the prompt is not part of the key, even a NEW prompt would reuse it.)
-      // Note this path RETURNS rather than throwing, so the catch block below never runs —
-      // which is exactly why the wedge survived the original fix. (ENG-287 residual)
-      await clearV0UsageForPage({
-        userId,
-        pageId: id,
-        siteId: existingPage.siteId ?? existingPage.id,
-        slug,
-      });
+      // ONLY a real build `error` is a dead end. `timeout` means "we stopped waiting after
+      // 5 min", NOT "this code will never compile" — a normal Next.js cold build can outrun
+      // that poll, and pollVercelDeployment also degrades API flakiness to `timeout`. Freeing
+      // the identity there would be the orphan double-spend this whole split exists to
+      // prevent: the page goes live a minute later, the user retries the `failed` card, and
+      // we mint a second full-cost chat and push a second commit to the same repo.
+      //
+      // A genuine build error IS a dead end: this chat's code does not compile and will not
+      // compile next time either, so every retry would reuse it, re-download the same broken
+      // version and fail identically, forever — and because the prompt is not part of the
+      // key, even a NEW prompt would reuse it. Cleared inline because this path RETURNS
+      // rather than throwing, so the catch below never runs. (ENG-287 residual)
+      if (deploymentResult.buildStatus === "error") {
+        await clearV0UsageForPage({
+          userId,
+          pageId: id,
+          siteId: existingPage.siteId ?? existingPage.id,
+          slug,
+        });
+      }
 
       await dynamodb
         .update({
@@ -1656,6 +1720,8 @@ async function addPageToExistingRepo(
       status: "failed",
       errorMessage: error.message || "Failed to add page to repo",
     };
+  } finally {
+    stopHeartbeat();
   }
 }
 
@@ -1870,6 +1936,11 @@ export async function deployLandingPage(
     );
   }
 
+  // Covers the whole deploy (download → corrections → GitHub push → 5-min Vercel poll), not
+  // just the v0 poll — see startBuildHeartbeat. (ENG-287 residual)
+  const stopHeartbeat = startBuildHeartbeat(id);
+  // One budget for the whole deploy, shared by the initial wait and every correction round.
+  const buildDeadline = Date.now() + V0_GENERATION_BUDGET_MS;
   try {
     const v0 = await getV0Client();
 
@@ -1881,7 +1952,7 @@ export async function deployLandingPage(
       v0,
       record.v0ChatId!,
       "v0 generation",
-      { heartbeat: () => touchLandingPageRecord(id) }
+      { heartbeat: () => touchLandingPageRecord(id), deadline: buildDeadline }
     );
 
     // Step 2: Download + validate v0 output (with retry on bad output)
@@ -1948,7 +2019,11 @@ export async function deployLandingPage(
             v0,
             record.v0ChatId!,
             "v0 correction",
-            { heartbeat: () => touchLandingPageRecord(id) }
+            {
+              heartbeat: () => touchLandingPageRecord(id),
+              deadline: buildDeadline,
+              afterVersionId: versionId, // must be the correction's NEW version, not the old one
+            }
           );
 
           continue;
@@ -2120,6 +2195,8 @@ export async function deployLandingPage(
     if (error?.code) wrapped.code = error.code;
     wrapped.cause = error;
     throw wrapped;
+  } finally {
+    stopHeartbeat();
   }
 }
 
@@ -3906,16 +3983,26 @@ export async function deleteLandingPageByRecord(record: GeneratedLandingPage): P
   // the prompt from the idempotency key, a `succeeded` row silently HIJACKS the next
   // generation of the same route: the user deletes a page, regenerates the same slug with a
   // brand-new prompt, and gets the OLD chat back — their prompt is never sent to v0.
+  //
+  // NOT for an in-flight build. Deleting the identity of a live build lets the next request
+  // for that slug mint a SECOND chat while the first is still running — two builds racing
+  // commits into the same app/<slug>/ in the same repo. The archived record is invisible to
+  // findReusablePageForRoute, so the guard row is the only thing still deduping them. Such a
+  // row is not immortal anyway: the reuse ceiling reclaims it.
+  //
   // Best-effort: the archive above already succeeded and must not be undone by a cleanup
   // failure. Pass the slug only when there is a real one — a root page has none, and
   // deriving one from its name would free a SUB-page's identity that merely shares the slug.
   // (ENG-287 residual)
-  await clearV0UsageForPage({
-    userId: record.userId,
-    pageId: record.id,
-    siteId: record.siteId,
-    slug: record.slug,
-  });
+  const inFlight = record.status === "generating" || record.status === "deploying";
+  if (!inFlight) {
+    await clearV0UsageForPage({
+      userId: record.userId,
+      pageId: record.id,
+      siteId: record.siteId,
+      slug: record.slug,
+    });
+  }
 }
 
 /**

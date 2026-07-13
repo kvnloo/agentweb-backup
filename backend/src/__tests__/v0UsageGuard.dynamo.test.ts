@@ -77,7 +77,11 @@ describe('v0UsageGuard — DynamoDB conditional reserve (cross-instance semantic
     expect(reservePut![0].ConditionExpression).toBe(
       'attribute_not_exists(idempotencyKey) OR #status = :failed' +
       ' OR (#status = :reserved AND #updatedAt < :stale)' +
-      ' OR (#status = :succeeded AND #createdAt < :chatStale)'
+      ' OR (#status = :succeeded AND #createdAt < :chatStale)' +
+      // In DynamoDB a `<` against a MISSING attribute is false, so without this clause a
+      // succeeded row with no readable createdAt — which canReuseChat also refuses to reuse —
+      // would match nothing, fail the condition on every attempt, and wedge the route forever.
+      ' OR (#status = :succeeded AND attribute_not_exists(#createdAt))'
     );
     expect(reservePut![0].ExpressionAttributeValues).toMatchObject({
       ':failed': 'failed',

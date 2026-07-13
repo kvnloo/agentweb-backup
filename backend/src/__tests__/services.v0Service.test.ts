@@ -1060,6 +1060,39 @@ describe("v0Service - ENG-287 residual hardening", () => {
     expect(create).toHaveBeenCalledTimes(2);
   });
 
+  it("deleting an IN-FLIGHT page does not free its identity — two live builds must never race into the same repo (ENG-287 residual)", async () => {
+    // The delete route does not check status. Freeing the identity of a build that is still
+    // running lets the next request for that slug mint a SECOND chat while the first is alive,
+    // and both commit into the same app/<slug>/ in the same repo. The archived record is
+    // invisible to findReusablePageForRoute, so the guard row is the only thing still deduping
+    // them. It is not immortal anyway — the reuse ceiling reclaims it.
+    const create = jest.fn().mockResolvedValue({ id: "chat_inflight" });
+    const args = {
+      userId: "user-1",
+      operation: "additional_page_chat_create" as const,
+      scopeId: "site-1",
+      slug: "about",
+      prompt: "p",
+      create,
+    };
+
+    await guardedV0ChatCreate(args);
+
+    await deleteLandingPageByRecord({
+      id: "page-2",
+      userId: "user-1",
+      siteId: "site-1",
+      slug: "about",
+      name: "About",
+      status: "generating", // still building
+    } as any);
+
+    const afterDelete = await guardedV0ChatCreate(args);
+
+    expect(afterDelete).toEqual({ id: "chat_inflight", reused: true });
+    expect(create).toHaveBeenCalledTimes(1); // no second chat, no second build
+  });
+
 });
 
 describe("v0Service - findSiteById (explicit site identity, replaces oldest-repo guess)", () => {
@@ -2653,7 +2686,16 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     setupSiteRecordMock();
     await setupV0Mocks(); // chat_new_page → code that fails to build
     setupGitHubMocks();
-    setupVercelDeployErrorMock();
+    // A REAL build error. Note setupVercelDeployErrorMock() cannot be used here: its
+    // deployment carries no meta.githubCommitSha, so pollVercelDeployment's SHA-match guard
+    // never selects it and the poll falls through to `timeout` instead — that helper does
+    // not actually exercise the build-error path.
+    mockAxiosGet.mockResolvedValueOnce({
+      data: { deployments: [{ uid: "dpl_fail", readyState: "ERROR", meta: { githubCommitSha: "commit_sha" } }] },
+    });
+    mockAxiosGet.mockResolvedValueOnce({
+      data: [{ type: "stderr", payload: { text: "Module not found: @/components/missing" } }],
+    });
 
     const first = await generateLandingPage("user-1", "Create ABM page", "ABM Startups", {});
     expect(first.status).toBe("failed");
@@ -2672,6 +2714,43 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
 
     expect(mockChatsCreate).toHaveBeenCalledTimes(2); // a FRESH chat, not chat_new_page
     expect(second.status).toBe("deployed");
+  });
+
+  it("a Vercel poll TIMEOUT keeps the chat — 'we stopped waiting' is not 'the code will never compile' (ENG-287 residual)", async () => {
+    // The dangerous half of the dead-end split. pollVercelDeployment returns `timeout` after
+    // only 5 minutes, and also degrades Vercel API flakiness to `timeout`. A normal Next.js
+    // cold build can outrun that. If we treated it as a dead end and freed the identity, the
+    // page would go LIVE a minute later while the card said `failed` — and the user's retry
+    // would mint a second full-cost chat and push a second commit to the same repo. That is
+    // precisely the orphan-chat double-spend this whole issue is about.
+    setupSiteRecordMock();
+    await setupV0Mocks(); // chat_new_page
+    setupGitHubMocks();
+    // Every Vercel poll says BUILDING → pollVercelDeployment gives up with buildStatus
+    // "timeout". Exactly vercelPollMaxAttempts (30, set in beforeEach) — queueing more would
+    // leak unconsumed mockResolvedValueOnce values into the tests that follow.
+    for (let i = 0; i < 30; i++) {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { deployments: [{ uid: "dpl_slow", readyState: "BUILDING", meta: { githubCommitSha: "commit_sha" } }] },
+      });
+    }
+
+    const first = await generateLandingPage("user-1", "Create a page", "Slow Build", {});
+    expect(first.status).toBe("failed");
+    expect(first.errorMessage).toMatch(/timed out/i);
+
+    // Retry: the chat is still good, so it must be REUSED, not re-minted.
+    setupSiteRecordMock();
+    const zip = await createTestZip();
+    mockChatsGetById.mockResolvedValue({ latestVersion: { id: "version_new", status: "completed" } });
+    mockChatsDownloadVersion.mockResolvedValueOnce(zip);
+    setupGitHubMocks();
+    setupVercelDeploySuccessMock();
+
+    await generateLandingPage("user-1", "Create a page", "Slow Build", {});
+
+    expect(mockChatsCreate).toHaveBeenCalledTimes(1); // never charged twice
+    mockChatsGetById.mockReset();
   });
 
   it("a budget-exhausted PENDING generation keeps the chat — the retry RESUMES it rather than paying twice (ENG-287 residual)", async () => {

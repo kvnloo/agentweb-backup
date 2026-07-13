@@ -52,10 +52,19 @@ four sites (5xx/network stay retryable).
 | constant | value | why |
 | -- | -- | -- |
 | `V0_STATUS_POLL_TIMEOUT_MS` | 30s | a status read is a cheap GET; 300s let wall-clock reach ~3h |
-| `V0_GENERATION_BUDGET_MS` | 20 min | ABSOLUTE deadline; above prod p99 (~15 min), below the janitor |
+| `V0_GENERATION_BUDGET_MS` | 20 min | ABSOLUTE deadline, threaded through the whole build (initial wait + every correction round) so it is spent ONCE. Computing it per call re-armed it, letting one build poll 3 × 20 min and outlive both ceilings below. |
 | `V0_RESERVATION_TTL_MS` | 20 min | unchanged; `reserved` now lives seconds (async create) |
 | `STUCK_CEILING_MS` | 30 min | janitor + route reuse; above the generation budget, so a live build is never swept |
 | `V0_CHAT_REUSE_CEILING_MS` | 45 min | > 2 generation budgets, so a resume-after-timeout retry always lands inside it |
+
+**The real transport ceiling is 15 min, not 25.** `mcp/server/httpClient.ts` installs a global undici
+dispatcher with `headersTimeout: 15 min`, and the backend sends no headers until the generation
+finishes — so `generate_landing_page`'s `timeoutMs: 25 min` can never be reached; the fetch aborts at
+15 min with `UND_ERR_HEADERS_TIMEOUT`. A generation in the 15–20 min window therefore always loses its
+MCP call even though the backend budget allows it. That is survivable — the durable/reconnect path
+(`findInFlightJobForSession`) and sub-page route-reuse both pick the build back up — but it means the
+in-band MCP call is NOT the thing that delivers a slow build, and nobody should size a constant
+against the 25-min number.
 
 ### Also fixed
 - A long build **heartbeats `updatedAt`**, so the janitor cannot mark a LIVE build failed (which let a
@@ -70,6 +79,25 @@ four sites (5xx/network stay retryable).
   was really 1. (Appended only when supplied, so chat-create keys stay byte-identical to prod rows.)
 - The post-correction version is **status-gated** rather than read raw off `latestVersion` — the exact
   mistake `waitForCompletedV0Version` exists to prevent (shipping a half-generated page).
+
+### Caught in adversarial review of THIS change (worth knowing about)
+- **A Vercel poll `timeout` is NOT a dead end.** `pollVercelDeployment` gives up after 5 min and also
+  degrades API flakiness to `timeout`. The first cut of this fix freed the identity on it — which
+  would have been the orphan double-spend it exists to prevent: a normal Next.js cold build outruns
+  the poll, the page goes live a minute later, and the user's retry mints a second full-cost chat and
+  pushes a second commit. Only `buildStatus === "error"` frees the identity.
+- **`setupVercelDeployErrorMock()` in the test suite does not test the build-error path.** Its
+  deployment carries no `meta.githubCommitSha`, so `pollVercelDeployment`'s SHA-match guard never
+  selects it and the poll falls through to `timeout`. Any test that wants a real build error must set
+  the SHA. (Pre-existing; the helper predates the SHA guard.)
+- **The guard must fail OPEN, both halves.** `canReuseChat` refuses to reuse a `succeeded` row with an
+  unreadable `createdAt` — so the reserve condition needs a matching
+  `attribute_not_exists(createdAt)` clause, because in DynamoDB a `<` against a missing attribute is
+  false. Without it the row matches nothing, the conditional put fails on every attempt, and the route
+  wedges forever: exactly the bug, reintroduced by the fix for it.
+- **Deleting an IN-FLIGHT page must not free its identity** — the archived record is invisible to
+  route-reuse, so the guard row is the only thing left deduping, and freeing it lets a second chat
+  build into the same repo concurrently.
 
 ### Still open (deliberately not in this change)
 - **`iterateLandingPage` is still sync behind the 300s ceiling.** An iteration that legitimately takes
