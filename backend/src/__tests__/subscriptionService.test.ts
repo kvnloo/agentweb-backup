@@ -11,6 +11,7 @@ import {
   filterFunctionCalls,
   getAllAvailableSkills,
   getAllAvailableConnectedAccounts,
+  getAllowedConnectedAccounts,
   getAllowedSkills,
   getPublicAllowedSkills,
   resolveSkillsToToolNames,
@@ -112,6 +113,56 @@ describe('subscriptionService', () => {
 
     const tier = await getUserSubscriptionType('ex-member');
     expect(tier).toBe('Free');
+    expect(mockedOrgDb.getOrgById).not.toHaveBeenCalled();
+  });
+
+  it('getAllowedConnectedAccounts resolves an org member to the owner tier (regression: Harsha/Twitter flash-then-hide bug)', async () => {
+    // Reproduces the reported symptom: member's own record is Pro (no twitter),
+    // org owner is Super Premium (includes twitter). Before centralizing tier
+    // resolution in getUserSubscriptionType, routes/connectedAccounts.ts called
+    // getAllowedConnectedAccounts(userId) with the member's own id directly,
+    // so Twitter was excluded from allowedConnectedAccounts even though the
+    // owner had shared/granted it — the card would flash (from the already
+    // org-aware /me response) then disappear once this endpoint's response
+    // landed with the member's own, un-inherited tier.
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    mockedUserDb.getUserById.mockImplementation(async (id: string) => {
+      if (id === 'member-harsha') {
+        return { userId: 'member-harsha', orgId: 'org-1', orgRole: 'member', subscriptionType: 'Pro' } as any;
+      }
+      if (id === 'owner-1') {
+        return { userId: 'owner-1', subscriptionType: 'Super Premium' } as any;
+      }
+      return null as any;
+    });
+    mockedOrgDb.getOrgById.mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1' } as any);
+
+    mockedSettingsService.getSetting.mockResolvedValue({
+      settingValue: JSON.stringify([
+        { name: 'Pro', allowedPages: ['/'], allowedSkills: ['*'], allowedConnectedAccounts: ['linkedin', 'gmail'] },
+        { name: 'Super Premium', allowedPages: ['/'], allowedSkills: ['*'], allowedConnectedAccounts: ['linkedin', 'gmail', 'twitter'] },
+      ]),
+    } as any);
+
+    const allowed = await getAllowedConnectedAccounts('member-harsha');
+
+    expect(allowed).toContain('twitter');
+    expect(allowed).toEqual(['linkedin', 'gmail', 'twitter']);
+  });
+
+  it('getAllowedConnectedAccounts uses the member own tier once they leave the org', async () => {
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'ex-member', subscriptionType: 'Pro' } as any);
+    mockedSettingsService.getSetting.mockResolvedValue({
+      settingValue: JSON.stringify([
+        { name: 'Pro', allowedPages: ['/'], allowedSkills: ['*'], allowedConnectedAccounts: ['linkedin', 'gmail'] },
+      ]),
+    } as any);
+
+    const allowed = await getAllowedConnectedAccounts('ex-member');
+
+    expect(allowed).toEqual(['linkedin', 'gmail']);
+    expect(allowed).not.toContain('twitter');
     expect(mockedOrgDb.getOrgById).not.toHaveBeenCalled();
   });
 
