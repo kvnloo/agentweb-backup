@@ -279,7 +279,7 @@ jest.mock('../utils/browserUtils', () => ({
 // Mock axios for JSDOM fallback path
 jest.mock('axios');
 
-import { extractCSSFromURL, analyzeDesignTokens, inferBrandTokens, modernColorToHex, DesignTokens } from '../services/cssExtractor';
+import { extractCSSFromURL, analyzeDesignTokens, inferBrandTokens, modernColorToHex, averageBackgroundLightness, isDistinctDarkTheme, DesignTokens } from '../services/cssExtractor';
 
 const { findChromeExecutable } = require('../utils/browserUtils');
 
@@ -670,6 +670,103 @@ describe('cssExtractor', () => {
       expect(result.computedElements?.body?.backgroundColor).toBe('rgb(250, 250, 250)');
       expect(result.themes?.hasDarkVariant).toBe(false);
       expect(result.themes?.dark).toBeUndefined();
+    });
+
+    it('does NOT invent a dark variant when the reload merely differs (content noise, not a darker theme)', async () => {
+      // A light-only site whose second load differs only from non-deterministic
+      // content (a carousel advanced, a banner appeared) — the backgrounds stay
+      // light. A raw diff would flag this as a dark variant; requiring the
+      // backgrounds to turn materially darker must not (ENG-285).
+      const lightRender = {
+        customProperties: {},
+        stylesheetText: 'body { background: #fafafa; }',
+        computedElements: {
+          body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: 'rgb(20, 20, 20)', backgroundColor: 'rgb(250, 250, 250)', borderColor: 'transparent' },
+        },
+      };
+      const noisyRender = {
+        customProperties: {},
+        stylesheetText: 'body { background: #f8f8f8; }',
+        computedElements: {
+          // Slightly different (a re-rendered hero) but still a light background.
+          body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: 'rgb(24, 24, 24)', backgroundColor: 'rgb(248, 248, 248)', borderColor: 'transparent' },
+        },
+      };
+      mockPage.evaluate
+        .mockResolvedValueOnce(lightRender)
+        .mockResolvedValueOnce(noisyRender);
+
+      const result = await extractCSSFromURL('https://example.com');
+
+      expect(result.themes?.hasDarkVariant).toBe(false);
+      expect(result.themes?.dark).toBeUndefined();
+    });
+
+    it('gives the dark variant its OWN stylesheets, not the light render’s', async () => {
+      // The reported dark palette must come from the dark render's stylesheets;
+      // reusing the light render's would blend light colours into it (ENG-285).
+      const lightRender = {
+        customProperties: {},
+        stylesheetText: 'body { background: oklch(0.985 0 0); }',
+        computedElements: {
+          body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: 'oklch(0.095 0 0)', backgroundColor: 'oklch(0.985 0 0)', borderColor: 'transparent' },
+        },
+      };
+      const darkRender = {
+        customProperties: {},
+        stylesheetText: 'body { background: oklch(0.175 0 0); }',
+        computedElements: {
+          body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: 'oklch(0.98 0 0)', backgroundColor: 'oklch(0.175 0 0)', borderColor: 'transparent' },
+        },
+      };
+      mockPage.evaluate
+        .mockResolvedValueOnce(lightRender)
+        .mockResolvedValueOnce(darkRender);
+
+      const result = await extractCSSFromURL('https://example.com');
+
+      const darkSheets = result.themes?.dark?.stylesheets ?? [];
+      const darkCssom = darkSheets.find(s => s.source === 'puppeteer-cssom');
+      const lightCssom = result.themes?.light.stylesheets.find(s => s.source === 'puppeteer-cssom');
+      expect(darkCssom?.content).toContain('oklch(0.175 0 0)');
+      expect(darkCssom?.content).not.toContain('oklch(0.985 0 0)');
+      expect(lightCssom?.content).toContain('oklch(0.985 0 0)');
+    });
+  });
+
+  describe('dark-variant detection helpers (ENG-285)', () => {
+    const bg = (backgroundColor: string) => ({
+      body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: '#000', backgroundColor },
+    });
+
+    it('averageBackgroundLightness averages parseable opaque backgrounds and ignores transparent/null', () => {
+      const styles = {
+        body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: '#000', backgroundColor: '#000000' },
+        nav: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: '#000', backgroundColor: '#ffffff' },
+        header: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: '#000', backgroundColor: 'transparent' },
+        main: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: '#000', backgroundColor: 'not-a-color' },
+      };
+      // Only #000000 (0) and #ffffff (100) count → average 50.
+      expect(averageBackgroundLightness(styles)).toBe(50);
+      expect(averageBackgroundLightness(undefined)).toBeNull();
+      expect(averageBackgroundLightness({})).toBeNull();
+    });
+
+    it('averageBackgroundLightness understands oklch backgrounds', () => {
+      const near = averageBackgroundLightness(bg('oklch(0.175 0 0)'));
+      expect(near).not.toBeNull();
+      expect(near as number).toBeLessThan(15); // matte black
+    });
+
+    it('isDistinctDarkTheme is true only when backgrounds turn materially darker', () => {
+      // Near-white light → matte-black dark: a genuine dark theme.
+      expect(isDistinctDarkTheme(bg('rgb(250, 250, 250)'), bg('rgb(16, 16, 16)'))).toBe(true);
+      // Both light, only a small difference: content noise, not a dark theme.
+      expect(isDistinctDarkTheme(bg('rgb(250, 250, 250)'), bg('rgb(240, 240, 240)'))).toBe(false);
+      // Identical: never a dark variant.
+      expect(isDistinctDarkTheme(bg('#eeeeee'), bg('#eeeeee'))).toBe(false);
+      // Unparseable on either side: cannot claim a dark variant.
+      expect(isDistinctDarkTheme(undefined, bg('#000000'))).toBe(false);
     });
   });
 
