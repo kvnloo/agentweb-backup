@@ -29,7 +29,33 @@ ok()   { echo "  ✅ $1"; pass=$((pass+1)); }
 bad()  { echo "  ❌ $1"; fail=$((fail+1)); }
 note() { echo "     · $1"; }
 
-jqr() { python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('$1','') if isinstance(d,dict) else '')" 2>/dev/null; }
+# Find a key ANYWHERE in the response. The generate endpoint does not always return the
+# record at the top level (it may nest it under page/landingPage/data), and a shallow
+# d.get(key) then silently yields "" — which reads as "no chat was minted" and reports a
+# false negative on the most important check in this script.
+jqr() {
+  python3 -c "
+import sys, json
+key = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print(''); raise SystemExit
+def find(o):
+    if isinstance(o, dict):
+        if key in o and o[key] not in (None, ''):
+            return o[key]
+        for v in o.values():
+            r = find(v)
+            if r: return r
+    elif isinstance(o, list):
+        for v in o:
+            r = find(v)
+            if r: return r
+    return None
+print(find(d) or '')
+" "$1" 2>/dev/null
+}
 
 gen() { # gen <prompt> <name> [siteId]
   local body
@@ -43,6 +69,19 @@ print(json.dumps(d))" "$1" "$2" "${3:-}")
 get_page() { curl -s -m 30 "$API/generated/$1" "${H[@]}"; }
 del_page() { curl -s -m 60 -X DELETE "$API/generated/$1" "${H[@]}" -o /dev/null -w '%{http_code}'; }
 
+# chat_id <response-json> <page-id> — read v0ChatId from the response, and if it is not
+# there, re-read the record. Never infer "no chat" from a parsing miss: this value decides
+# whether we report a stale-chat reuse, so a false empty is worse than a slow check.
+chat_id() {
+  local c
+  c=$(printf '%s' "$1" | jqr v0ChatId)
+  if [[ -z "$c" && -n "${2:-}" ]]; then
+    c=$(get_page "$2" | jqr v0ChatId)
+    [[ -n "$c" ]] && note "(v0ChatId absent from the POST body — read it back via GET)"
+  fi
+  printf '%s' "$c"
+}
+
 SLUG_NAME="ENG287 Smoke $(date +%H%M%S)"
 
 echo
@@ -50,14 +89,14 @@ echo "════ 1. delete + regenerate with a DIFFERENT prompt must mint a FR
 echo "  (the prompt-hijack bug: the guard key has no prompt in it, so a surviving"
 echo "   'succeeded' row would silently hand back the OLD chat)"
 r1=$(gen "a pricing page with exactly three tiers" "$SLUG_NAME")
-id1=$(echo "$r1" | jqr id); chat1=$(echo "$r1" | jqr v0ChatId)
+id1=$(echo "$r1" | jqr id); chat1=$(chat_id "$r1" "$id1")
 st1=$(echo "$r1" | jqr status)
 note "page=$id1 chat=$chat1 status=$st1"
 if [[ -z "$id1" ]]; then bad "generate #1 returned no id — check TOKEN/subscription"; echo "$r1" | head -c 400; echo; exit 1; fi
 
 code=$(del_page "$id1"); note "DELETE -> HTTP $code"
 r2=$(gen "a testimonials wall, absolutely no pricing" "$SLUG_NAME")
-id2=$(echo "$r2" | jqr id); chat2=$(echo "$r2" | jqr v0ChatId)
+id2=$(echo "$r2" | jqr id); chat2=$(chat_id "$r2" "$id2")
 note "page=$id2 chat=$chat2"
 
 if [[ -n "$chat1" && "$chat1" == "$chat2" ]]; then
@@ -74,8 +113,8 @@ CONC="ENG287 Race $(date +%H%M%S)"
 gen "a demo booking page" "$CONC" > /tmp/eng287_a.json &
 gen "a demo booking page" "$CONC" > /tmp/eng287_b.json &
 wait
-ca=$(jqr v0ChatId < /tmp/eng287_a.json); cb=$(jqr v0ChatId < /tmp/eng287_b.json)
 ia=$(jqr id < /tmp/eng287_a.json);       ib=$(jqr id < /tmp/eng287_b.json)
+ca=$(chat_id "$(cat /tmp/eng287_a.json)" "$ia"); cb=$(chat_id "$(cat /tmp/eng287_b.json)" "$ib")
 note "A: page=$ia chat=$ca"
 note "B: page=$ib chat=$cb"
 if [[ -n "$ca" && "$ca" == "$cb" ]]; then

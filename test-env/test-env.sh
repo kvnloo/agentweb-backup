@@ -57,10 +57,12 @@ err()  { echo -e "${RED}[test-env]${NC} $*" >&2; }
 # Environment name resolution
 ###############################################################################
 resolve_env_name() {
-  local aws_user folder
+  local aws_user folder local_user
   aws_user=$(aws sts get-caller-identity --query 'Arn' --output text 2>/dev/null | sed 's|.*/||')
   folder=$(basename "$REPO_ROOT")
-  echo "${aws_user}-${folder}"
+  local_user=$(whoami)
+  # Include local username so team members sharing an IAM user get distinct env names
+  echo "${local_user}-${aws_user}-${folder}"
 }
 
 state_file_for() {
@@ -623,6 +625,10 @@ _do_sync() {
 
   for target in "${targets[@]}"; do
     local src_path="$REPO_ROOT/$target/"
+    # Allow override via CUSTOMER_PORTAL_PATH in .test-env.config (for split-repo clones)
+    if [[ "$target" == "customer-portal" && -n "${CUSTOMER_PORTAL_PATH:-}" ]]; then
+      src_path="${CUSTOMER_PORTAL_PATH%/}/"
+    fi
     if [[ ! -d "$src_path" ]]; then
       warn "Directory not found: $src_path — skipping"
       continue
@@ -671,6 +677,10 @@ _do_sync_dev() {
 
   for target in "${targets[@]}"; do
     local src_path="$REPO_ROOT/$target/"
+    # Allow override via CUSTOMER_PORTAL_PATH in .test-env.config (for split-repo clones)
+    if [[ "$target" == "customer-portal" && -n "${CUSTOMER_PORTAL_PATH:-}" ]]; then
+      src_path="${CUSTOMER_PORTAL_PATH%/}/"
+    fi
     if [[ ! -d "$src_path" ]]; then
       warn "Directory not found: $src_path — skipping"
       continue

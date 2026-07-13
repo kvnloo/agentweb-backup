@@ -1810,6 +1810,9 @@ export function remapFilesForSubPage(
 
   const result: Array<{ path: string; content: Buffer }> = [];
   const componentRenames = new Map<string, string>(); // old import path → new import path
+  // Where each emitted file CAME FROM. A relative import is only meaningful against the
+  // file's original location, so resolving one after the move needs this.
+  const originalPathOf = new Map<string, string>(); // new path → original path
 
   for (const file of files) {
     // Skip config and shared files
@@ -1818,11 +1821,13 @@ export function remapFilesForSubPage(
     if (file.path === "app/page.tsx") {
       // Main page → sub-route page
       result.push({ path: `app/${slug}/page.tsx`, content: file.content });
+      originalPathOf.set(`app/${slug}/page.tsx`, file.path);
     } else if (file.path.startsWith("components/") && !file.path.startsWith("components/ui/")) {
       // Custom components → namespaced under the sub-route to avoid conflicts
       const relativeName = file.path.replace("components/", "");
       const newPath = `app/${slug}/_components/${relativeName}`;
       result.push({ path: newPath, content: file.content });
+      originalPathOf.set(newPath, file.path);
       // Track rename: @/components/foo → ./_components/foo (relative from app/<slug>/)
       const oldImport = `@/components/${relativeName.replace(/\.tsx$/, "")}`;
       const newImport = `./_components/${relativeName.replace(/\.tsx$/, "")}`;
@@ -1835,6 +1840,7 @@ export function remapFilesForSubPage(
       // Other app files (e.g. app/loading.tsx) → namespace under slug
       const relativeName = file.path.replace("app/", "");
       result.push({ path: `app/${slug}/${relativeName}`, content: file.content });
+      originalPathOf.set(`app/${slug}/${relativeName}`, file.path);
     }
     // Skip everything else (public/, lib/, etc.) — root project already has them
   }
@@ -1844,6 +1850,37 @@ export function remapFilesForSubPage(
     if (!file.path.endsWith(".tsx") && !file.path.endsWith(".ts")) continue;
     let content = file.content.toString("utf-8");
     let changed = false;
+
+    // 0. Normalize RELATIVE imports to the `@/` alias, resolved against the file's ORIGINAL
+    //    location.
+    //
+    //    v0 does not always emit the `@/` alias — it also emits plain relative paths, which
+    //    are perfectly correct at the repo root. They break the instant we move the file:
+    //    `../components/landing/nav` from `app/page.tsx` means `components/landing/nav`, but
+    //    from `app/<slug>/page.tsx` it means `app/components/landing/nav`, which does not
+    //    exist. The component has ALSO moved (to `_components/`), so the path is wrong twice
+    //    over. Observed in prod as `Module not found: '../components/landing/nav'` — a failed
+    //    Vercel build and a dead sub-page.
+    //
+    //    Resolving against the original directory and re-emitting as `@/...` (which always
+    //    resolves from the repo root) makes step 1 below handle moved components uniformly,
+    //    and fixes the same latent break for `../lib/...`, `../hooks/...` and
+    //    `../components/ui/...`, none of which move.
+    const origPath = originalPathOf.get(file.path);
+    if (origPath) {
+      const origDir = path.posix.dirname(origPath);
+      content = content.replace(
+        /(from\s+['"])(\.\.?\/[^'"]+)(['"])/g,
+        (whole, pre: string, spec: string, post: string) => {
+          const resolved = path.posix.normalize(path.posix.join(origDir, spec));
+          // Escapes the repo root — we cannot say what it points at; leave it untouched
+          // rather than emit something confidently wrong.
+          if (resolved.startsWith("..")) return whole;
+          changed = true;
+          return `${pre}@/${resolved}${post}`;
+        }
+      );
+    }
 
     // 1. Rewrite @/components/foo → ./_components/foo (absolute → relative)
     for (const [oldImport, newImport] of componentRenames) {

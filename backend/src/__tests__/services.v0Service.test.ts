@@ -2274,6 +2274,77 @@ describe("V0OutputValidationError", () => {
 // =============================================================================
 // remapFilesForSubPage
 // =============================================================================
+describe("v0Service - remapFilesForSubPage — relative imports (prod: Module not found)", () => {
+  const buf = (s: string) => Buffer.from(s);
+
+  // v0 does not always emit the `@/` alias. A plain relative import is correct at the repo
+  // root and breaks the instant we move the file into app/<slug>/ — and the component it
+  // points at has usually ALSO moved into _components/, so the path is wrong twice over.
+  // Seen in prod as `Module not found: '../components/landing/nav'`: a failed Vercel build
+  // and a dead sub-page. Only the alias form was ever rewritten.
+  it("rewrites a RELATIVE import of a MOVED component (the observed failure)", () => {
+    const out = remapFilesForSubPage(
+      [
+        { path: "app/page.tsx", content: buf(`import Nav from "../components/landing/nav";\nexport default function P(){return <Nav/>;}`) },
+        { path: "components/landing/nav.tsx", content: buf(`export default function Nav(){return <nav/>;}`) },
+      ] as any,
+      "pricing",
+    );
+    const page = out.find((f) => f.path === "app/pricing/page.tsx")!.content.toString();
+
+    expect(page).not.toContain('"../components/landing/nav"');
+    expect(page).toContain('"./_components/landing/nav"');
+    // and the component really did move there
+    expect(out.map((f) => f.path)).toContain("app/pricing/_components/landing/nav.tsx");
+  });
+
+  it("rewrites a relative import of a NON-moved file (ui/lib stay at the root) to the alias", () => {
+    const out = remapFilesForSubPage(
+      [
+        {
+          path: "app/page.tsx",
+          content: buf(`import { Button } from "../components/ui/button";\nimport { cn } from "../lib/utils";\nexport default function P(){return <Button className={cn("x")}/>;}`),
+        },
+      ] as any,
+      "demo",
+    );
+    const page = out.find((f) => f.path === "app/demo/page.tsx")!.content.toString();
+
+    // components/ui and lib/utils are deliberately NOT copied — they already exist at the
+    // repo root — so the import must resolve from the root, not from app/<slug>/.
+    expect(page).toContain('"@/components/ui/button"');
+    expect(page).toContain('"@/lib/utils"');
+    expect(page).not.toContain('"../components/ui/button"');
+    expect(page).not.toContain('"../lib/utils"');
+  });
+
+  it("a component importing a SIBLING relatively still resolves after both move", () => {
+    const out = remapFilesForSubPage(
+      [
+        { path: "app/page.tsx", content: buf(`import Hero from "@/components/hero";\nexport default function P(){return <Hero/>;}`) },
+        { path: "components/hero.tsx", content: buf(`import Badge from "./badge";\nexport default function Hero(){return <Badge/>;}`) },
+        { path: "components/badge.tsx", content: buf(`export default function Badge(){return <b/>;}`) },
+      ] as any,
+      "about",
+    );
+    const hero = out.find((f) => f.path === "app/about/_components/hero.tsx")!.content.toString();
+
+    // ./badge → resolved to components/badge → @/components/badge → moved → ./_components/badge
+    // → and finally collapsed to ./badge, because hero and badge are siblings again.
+    expect(hero).toContain('"./badge"');
+    expect(hero).not.toContain("_components/badge");
+  });
+
+  it("leaves an import that escapes the repo root alone rather than emitting something wrong", () => {
+    const out = remapFilesForSubPage(
+      [{ path: "app/page.tsx", content: buf(`import x from "../../outside/thing";\nexport default function P(){return <x/>;}`) }] as any,
+      "edge",
+    );
+    const page = out.find((f) => f.path === "app/edge/page.tsx")!.content.toString();
+    expect(page).toContain('"../../outside/thing"');
+  });
+});
+
 describe("v0Service - remapFilesForSubPage", () => {
   const buf = (s: string) => Buffer.from(s);
 
