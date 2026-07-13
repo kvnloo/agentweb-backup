@@ -177,12 +177,75 @@ if [[ -n "$lid" ]]; then
 fi
 
 echo
+echo "════ 6. a SUB-PAGE builds and its route goes live (relative-import fix) ════"
+note "(remapFilesForSubPage only rewrote '@/components/*'. v0 also emits RELATIVE imports,"
+note " which are correct at the repo root and break the moment the page moves into"
+note " app/<slug>/. Seen in prod as: Module not found: '../components/landing/nav')"
+site=$(curl -s -m 30 "$API/site" "${H[@]}" | jqr siteId)
+[[ -z "$site" ]] && site=$(curl -s -m 30 "$API/site" "${H[@]}" | jqr id)
+note "site=$site"
+SUB="ENG287 Sub $(date +%H%M%S)"
+rsub=$(gen "a features page with a hero, a nav bar and a feature grid" "$SUB" "$site")
+sid=$(echo "$rsub" | jqr id)
+sstatus=$(get_page "$sid" | jqr status)
+serr=$(get_page "$sid" | jqr errorMessage)
+surl=$(get_page "$sid" | jqr deployedUrl)
+note "page=$sid status=$sstatus"
+if echo "$serr" | grep -qi "Module not found"; then
+  bad "sub-page died on a Module not found — the import remap is still broken: $serr"
+elif [[ "$sstatus" == "deployed" ]]; then
+  ok "sub-page deployed ($surl)"
+  if [[ -n "$surl" ]]; then
+    hc=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$surl")
+    [[ "$hc" == "200" ]] && ok "sub-page route is LIVE (HTTP 200)" || bad "sub-page URL returned HTTP $hc"
+  fi
+else
+  bad "sub-page ended in '$sstatus': ${serr:-no errorMessage}"
+fi
+
+echo
+echo "════ 7. ITERATE: an edit lands, is deployable, and is never applied twice ════"
+note "(iterate was the last sync v0 call behind the 300s ceiling. A slow edit used to fail"
+note " while v0 applied it anyway — stranded, because the record stayed 'deployed', which"
+note " deploy refuses — and the retry re-sent it, so v0 applied the instruction TWICE)"
+target="$sid"
+[[ "$sstatus" != "deployed" ]] && target="$lid"
+if [[ -n "$target" ]]; then
+  before=$(get_page "$target" | jqr iterations); before=${before:-0}
+  it=$(curl -s -m 1500 -X POST "$API/generated/$target/iterate" "${H[@]}" \
+        -d '{"message":"Add a section with the exact heading ENG287_ITERATION_MARKER"}')
+  after=$(get_page "$target" | jqr iterations)
+  st=$(get_page "$target" | jqr status)
+  pend=$(get_page "$target" | jqr pendingIteration)
+  note "iterations $before -> ${after:-?}   status=$st"
+  if [[ "$st" == "draft" ]]; then
+    ok "edit landed and the page is DEPLOYABLE (status=draft) — not stranded"
+  else
+    bad "after an iteration the status is '$st' — deploy refuses anything but draft/failed, so the edit is stranded"
+  fi
+  [[ -z "$pend" ]] && ok "pendingIteration cleared (the edit completed cleanly)" \
+                   || note "pendingIteration still set — a retry will RESUME it, not re-send (that is the anti-double-apply guard)"
+  # deploy it and confirm the marker actually shipped (proves we did NOT deploy the
+  # pre-iteration version — the exact hazard that kept iterate synchronous)
+  curl -s -m 900 -X POST "$API/generated/$target/deploy" "${H[@]}" -o /dev/null
+  url=$(get_page "$target" | jqr deployedUrl)
+  if [[ -n "$url" ]]; then
+    if curl -s -m 25 "$url" | grep -q "ENG287_ITERATION_MARKER"; then
+      ok "the deployed page contains the edit — the PRE-iteration version was not shipped"
+    else
+      bad "the marker is NOT on the live page — the deploy grabbed the pre-iteration version"
+    fi
+  fi
+fi
+
+echo
 echo "──────────────────────────────────────────────────────────────"
 echo "  passed: $pass   failed: $fail"
 echo
 echo "  STILL DO BY HAND (no API can prove these):"
 echo "   • open the v0 dashboard chat list — the chat count must equal the number of"
 echo "     pages you MEANT to build. One extra chat per RETRY = the orphan credit burn."
+echo "     For test 7, ONE extra version on the chat — not two (a double-applied edit)."
 echo "   • confirm the regenerated page in test 1 actually shows TESTIMONIALS, not pricing."
 echo "   • scan Dev-AW-V0Usage: one 'succeeded' row per route (not per attempt), no"
 echo "     prompt hash in the key, nothing left 'reserved' after a build ends."
