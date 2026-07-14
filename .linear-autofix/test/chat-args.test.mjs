@@ -1,0 +1,87 @@
+// Tests for chatArgs — the CLI-arg builder every chat/compact/btw turn is spawned with.
+// server.mjs has no exports, so (per this repo's convention, cf. audit-repro.test.mjs) we keep a
+// FAITHFUL COPY of chatArgs here and assert its contract. The one that matters most: EVERY chat turn
+// denies the reference-heavy skills (config.chat.skillDenylist) via `Skill(<name>)`, so a heavyweight
+// skill (e.g. claude-api ~194k tokens) can never auto-load into the resumed session and get re-billed
+// on every turn — the bug that silently defeated /compact on ENG-200 — WHILE every other skill stays
+// available (the agent is not dumbed down). Run: node test/chat-args.test.mjs
+let pass = 0, fail = 0;
+const ok = (c, m) => { if (c) { pass++; console.log(`  ✅ ${m}`); } else { fail++; console.log(`  ❌ ${m}`); } };
+
+// ── Faithful copy of chat/server.mjs chatArgs + the relevant CHAT config (keep in sync) ──
+const CHAT = {
+  full: { model: 'opus', maxTurns: 100 },
+  readOnly: { model: 'opus', maxTurns: 30, allowedTools: ['Read', 'Grep', 'Bash(git log:*)'] },
+  skillDenylist: ['claude-api', 'deep-research'],
+  capabilityPrompt: 'Linear access: ... (persistent capability text)',
+};
+function chatArgs(cap, sessionId, modelOverride) {
+  const m = CHAT[cap] || {};
+  const a = ['-p', '--output-format', 'stream-json', '--verbose', '--model', modelOverride || m.model, '--max-turns', String(m.maxTurns)];
+  if (cap === 'readOnly') a.push('--allowedTools', (m.allowedTools || []).join(','));
+  else {
+    a.push('--dangerously-skip-permissions');
+    if (CHAT.capabilityPrompt) a.push('--append-system-prompt', CHAT.capabilityPrompt);
+  }
+  const denied = (CHAT.skillDenylist || []).map((s) => `Skill(${s})`);
+  if (denied.length) a.push('--disallowedTools', ...denied);
+  if (sessionId) a.push('--resume', sessionId);
+  return a;
+}
+// helper: is the persistent capability appended to the system prompt (survives /compact)?
+const hasCapability = (a) => { const i = a.indexOf('--append-system-prompt'); return i >= 0 && a[i + 1] === CHAT.capabilityPrompt; };
+
+// helper: are all denylisted skills passed as `Skill(<name>)` after a --disallowedTools flag?
+const deniesSkills = (a, names) => {
+  const i = a.indexOf('--disallowedTools');
+  if (i < 0) return false;
+  return names.every((n) => a.includes(`Skill(${n})`));
+};
+// helper: is a specific skill NOT denied (so it stays usable)?
+const allows = (a, name) => !a.includes(`Skill(${name})`);
+
+console.log('chatArgs — heavyweight skills denied, the rest kept');
+{
+  // happy path: full cap, resumed session — the exact config a normal chat turn uses
+  const full = chatArgs('full', 'sess-123');
+  ok(deniesSkills(full, ['claude-api', 'deep-research']), 'full cap denies the heavyweight reference skills');
+  ok(allows(full, 'code-review') && allows(full, 'verify') && allows(full, 'simplify'), 'small workflow skills stay usable — code-review/verify/simplify (not dumbed down)');
+  ok(full.includes('--dangerously-skip-permissions'), 'full cap still has skip-permissions (unchanged)');
+  ok(hasCapability(full), 'full cap appends the persistent capability to the system prompt (survives /compact)');
+  ok(full.includes('--resume') && full[full.indexOf('--resume') + 1] === 'sess-123', 'resume sid still passed');
+
+  // the denials come as separate values under ONE --disallowedTools, and --resume stays last
+  ok(full.filter((x) => x === '--disallowedTools').length === 1, 'a single --disallowedTools flag carries all denials');
+  ok(full.indexOf('--disallowedTools') < full.indexOf('--resume'), 'denials precede --resume');
+
+  // read-only cap (also what /btw uses): allowlisted, and STILL denies the heavyweight skills
+  const ro = chatArgs('readOnly', 'sess-9');
+  ok(deniesSkills(ro, ['claude-api', 'deep-research']), 'readOnly cap denies the heavyweight skills too');
+  ok(ro.includes('--allowedTools'), 'readOnly cap keeps its allowedTools guard');
+  ok(!ro.includes('--dangerously-skip-permissions'), 'readOnly cap never gets skip-permissions');
+  ok(!ro.includes('--append-system-prompt'), 'readOnly cap gets NO capability prompt (its Bash is git-only — cannot curl)');
+
+  // btw-style: readOnly cap + a model override (Sonnet) — still denies, and honors the override
+  const btw = chatArgs('readOnly', 'btw-sid', 'sonnet');
+  ok(deniesSkills(btw, ['claude-api', 'deep-research']), 'btw (readOnly + override) denies the heavyweight skills');
+  ok(btw[btw.indexOf('--model') + 1] === 'sonnet', 'model override is honored');
+
+  // boundary: no sessionId (fresh/first turn or post-compact seed) — still denies, no --resume
+  const fresh = chatArgs('full', null);
+  ok(deniesSkills(fresh, ['claude-api', 'deep-research']), 'fresh turn (no sid) still denies the heavyweight skills');
+  ok(!fresh.includes('--resume'), 'no --resume when sessionId is null');
+
+  // boundary: unknown/empty cap must not crash and must STILL deny (fail-safe default)
+  const unknown = chatArgs('bogus', 'x');
+  ok(deniesSkills(unknown, ['claude-api', 'deep-research']), 'unknown cap still denies the heavyweight skills (fail-safe)');
+
+  // boundary: empty denylist → no --disallowedTools flag at all (clean no-op, no crash)
+  const saved = CHAT.skillDenylist;
+  CHAT.skillDenylist = [];
+  const none = chatArgs('full', 's');
+  ok(!none.includes('--disallowedTools'), 'empty denylist emits no --disallowedTools flag');
+  CHAT.skillDenylist = saved;
+}
+
+console.log(fail ? `\n❌ ${fail} FAILED — ${pass} passed, ${fail} failed` : `\n✅ ALL PASSED — ${pass} passed, 0 failed`);
+process.exit(fail ? 1 : 0);
