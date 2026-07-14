@@ -437,6 +437,29 @@ describe('intakeService.fileBugReport — reopen, not refile (ENG-240 contract #
     expect(r).toMatchObject({ deduped: true });
   });
 
+  it('a FAILED reopen still groups the reporter but never stamps the misleading "Reopened" banner', async () => {
+    // Same regression match, but the reopen state change throws (best-effort, swallowed). The report
+    // must still fold onto the canonical (deduped, no new issue) WITHOUT claiming a reopen that the
+    // ticket — still sitting in Done — never actually got.
+    linear.listRecentlyResolvedBugCanonicals.mockResolvedValue([
+      { identifier: 'ENG-179', issueId: 'uuid-179', title: 'Google Ads connection fails after OAuth', description: 'old report' },
+    ]);
+    dedup.findDuplicate
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ ref: 'ENG-179', title: 'Google Ads connection fails after OAuth', description: 'old report' });
+    linear.reopenIssue.mockRejectedValueOnce(new Error('state "Todo" not found'));
+    const r = await fileUserIssue({
+      type: 'bug',
+      title: 'FOLLOW-UP / REGRESSION on AGW-58',
+      description: 'still failing after OAuth',
+      userEmail: 'u@e.com',
+    });
+    expect(linear.reopenIssue).toHaveBeenCalledWith('uuid-179', 'Todo');
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-179', expect.not.stringContaining('Reopened by a new report'));
+    expect(r).toMatchObject({ deduped: true });
+  });
+
   it('a report that names no canonical never queries the resolved set (fresh bug -> new canonical)', async () => {
     dedup.findDuplicate.mockResolvedValue(null);
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'lin', id: 'uuid-9' });
