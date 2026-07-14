@@ -16,6 +16,11 @@ export interface TokenUsageStatus {
   costUsed: number; // USD spent this month
   costAllowance: number | null; // null = unlimited
   costPercentUsed: number; // 0-100+, 0 if unlimited (cost dimension)
+  // Whether the cost cap is the ENFORCED gate right now (ENFORCE_COST_CAP). While
+  // false the dollar figures are observe-only — we're gathering spend data to
+  // decide the cost quota. UIs use this to know when a real cost denominator
+  // exists: the customer-facing meter only surfaces cost once this is true.
+  costEnforced: boolean;
 }
 
 /**
@@ -161,6 +166,7 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
     costUsed: usage.totalCost,
     costAllowance,
     costPercentUsed: costAllowance === null ? 0 : costPercentUsed,
+    costEnforced: enforceCostCap,
   };
 }
 
