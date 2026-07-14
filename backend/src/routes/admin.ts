@@ -4613,6 +4613,9 @@ router.get("/subscription-types", async (req, res) => {
         allowedSkills: normalizedSkills,
         allowedConnectedAccounts: normalizedConnectedAccounts,
         ...(type.monthlyTokenAllowance != null ? { monthlyTokenAllowance: type.monthlyTokenAllowance } : {}),
+        // ENG-200 per-user cost cap: round-trip it so the Users-tab "LLM Cost $X / $cap"
+        // display can show the cap. Absent = unlimited.
+        ...(type.monthlyCostAllowance != null ? { monthlyCostAllowance: type.monthlyCostAllowance } : {}),
       };
     }));
 
@@ -4682,6 +4685,13 @@ router.post("/subscription-types", async (req, res) => {
         ? Number(type.monthlyTokenAllowance)
         : null;
 
+      // Parse monthlyCostAllowance (ENG-200 per-user cost cap; null = unlimited).
+      // Must persist symmetric with the token allowance, else any tier edit via the
+      // admin UI silently drops a cost cap set out-of-band.
+      const parsedCostAllowance = type.monthlyCostAllowance != null
+        ? Number(type.monthlyCostAllowance)
+        : null;
+
       // Pass through hiddenPages as-is; validate it's an array of strings
       const hiddenPages: string[] = Array.isArray(type.hiddenPages)
         ? type.hiddenPages.filter((p: any) => typeof p === 'string')
@@ -4694,6 +4704,7 @@ router.post("/subscription-types", async (req, res) => {
         allowedSkills: normalizedSkills,
         allowedConnectedAccounts: normalizedConnectedAccounts,
         ...(parsedAllowance != null && !isNaN(parsedAllowance) ? { monthlyTokenAllowance: parsedAllowance } : {}),
+        ...(parsedCostAllowance != null && !isNaN(parsedCostAllowance) ? { monthlyCostAllowance: parsedCostAllowance } : {}),
       };
     }));
 
