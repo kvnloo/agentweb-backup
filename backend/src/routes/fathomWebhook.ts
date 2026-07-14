@@ -10,6 +10,7 @@
 
 import express from 'express';
 import { processActionItems, MeetingData } from '../services/meetingIntakeService';
+import { ingestFathomOnboardingRecording } from '../services/fathomOnboardingIngestionService';
 
 const router = express.Router();
 
@@ -54,6 +55,49 @@ router.post('/', async (req: express.Request, res: express.Response) => {
 
   try {
     const result = await processActionItems(meetingData);
+    let onboardingAutomation: { status: string; recordingId?: string; automationState?: string } = { status: 'disabled' };
+
+    if (process.env.FATHOM_ONBOARDING_AUTOMATION_ENABLED === 'true') {
+      const reviewOwnerUserId = process.env.FATHOM_ONBOARDING_REVIEW_OWNER_USER_ID;
+      const recordingId = data?.recording_id || data?.recording?.id || meeting?.recording_id || meeting?.recordingId;
+
+      if (!reviewOwnerUserId || !recordingId) {
+        onboardingAutomation = { status: 'skipped_missing_config_or_recording' };
+      } else {
+        try {
+          const recordingUrl =
+            data?.recording_url ||
+            data?.recording?.url ||
+            meeting?.recording_url ||
+            meeting?.recordingUrl ||
+            `https://fathom.video/calls/${recordingId}`;
+          const meetingText = [
+            `Meeting title: ${meeting.title}`,
+            participants.length ? `Participants: ${participants.join(', ')}` : null,
+            actionItems.length ? `Action items: ${actionItems.join('; ')}` : null,
+          ].filter(Boolean).join('\n');
+          const ingestion = await ingestFathomOnboardingRecording({
+            recordingId,
+            recordingUrl,
+            fathomUserId: process.env.FATHOM_ONBOARDING_FATHOM_USER_ID || reviewOwnerUserId,
+            reviewOwnerUserId,
+            automationMode: 'auto_draft',
+            allowDraftAccountCreation: true,
+            reviewed: false,
+            meetingText,
+          });
+
+          onboardingAutomation = {
+            status: 'processed',
+            recordingId: ingestion.recordingId,
+            automationState: ingestion.automationState,
+          };
+        } catch (error: any) {
+          console.error('[Fathom Webhook] Onboarding automation failed:', error?.message);
+          onboardingAutomation = { status: 'failed' };
+        }
+      }
+    }
 
     console.log(
       `[Fathom Webhook] Processed meeting "${meeting.title}": ` +
@@ -65,6 +109,7 @@ router.post('/', async (req: express.Request, res: express.Response) => {
       message: `Meeting "${meeting.title}" processed: ${result.created.length} tasks created, ${result.skipped.length} skipped.`,
       created: result.created.length,
       skipped: result.skipped.length,
+      onboardingAutomation,
     });
   } catch (error: any) {
     console.error('[Fathom Webhook] Failed to process meeting:', error?.message);

@@ -5,6 +5,9 @@ import {
 } from '../services/fathomOnboardingIngestionService';
 
 const baseContext = {
+  callClassification: 'prospect' as const,
+  classificationConfidence: 0.92,
+  classificationReason: 'The call is about evaluating AgentWeb for a GTM rollout.',
   companyName: 'Acme AI',
   primaryContactName: 'Jane Buyer',
   primaryContactEmail: 'jane@acme.ai',
@@ -65,6 +68,16 @@ const makeDeps = (overrides: Record<string, any> = {}) => {
         : []
     )),
     updateUser: jest.fn(async (_userId: string, updates: Record<string, any>) => updates),
+    createFathomDraftUser: jest.fn(async (input: Record<string, any>) => ({
+      userId: input.userId,
+      email: input.email,
+      isActive: false,
+      signupSource: 'fathom_auto_onboarding_draft',
+      fathomDraftAccount: true,
+      fathomDraftStatus: 'needs_review',
+      roles: ['customer'],
+      ...input,
+    })),
   };
 
   return {
@@ -179,6 +192,7 @@ describe('fathomOnboardingIngestionService', () => {
         getUserByEmail: jest.fn(async () => null),
         getUsersByEmailDomain: jest.fn(async () => []),
         updateUser: jest.fn(async (_userId: string, updates: Record<string, any>) => updates),
+        createFathomDraftUser: jest.fn(),
       },
     });
 
@@ -200,6 +214,204 @@ describe('fathomOnboardingIngestionService', () => {
         ],
       }),
     );
+  });
+
+  it('ignores personal or internal calls instead of creating random users', async () => {
+    const deps = makeDeps({
+      userDb: {
+        getUserById: jest.fn(async () => ({ userId: 'review-owner', email: 'harsha@agentweb.pro', fathomOnboardingIngestions: [] })),
+        getUserByEmail: jest.fn(async () => null),
+        getUsersByEmailDomain: jest.fn(async () => []),
+        updateUser: jest.fn(async (_userId: string, updates: Record<string, any>) => updates),
+        createFathomDraftUser: jest.fn(),
+      },
+    });
+
+    const result = await ingestFathomOnboardingRecording({
+      recordingId: 'friend-call-1',
+      recordingUrl: 'https://fathom.video/calls/friend-call-1',
+      reviewOwnerUserId: 'review-owner',
+      automationMode: 'auto_draft',
+      allowDraftAccountCreation: true,
+      extractedContext: {
+        ...baseContext,
+        callClassification: 'personal',
+        classificationConfidence: 0.96,
+        classificationReason: 'Casual personal call, not a prospect or onboarding meeting.',
+        companyName: 'Weekend Plans',
+        primaryContactEmail: null,
+        website: null,
+      },
+    }, deps as any);
+
+    expect(result.automationState).toBe('ignored');
+    expect(result.safetyFlags).toContain('non_actionable_call:personal');
+    expect(result.targetUserId).toBeNull();
+    expect(deps.userDb.createFathomDraftUser).not.toHaveBeenCalled();
+    expect(deps.accountMemoryDb.addMemory).not.toHaveBeenCalled();
+  });
+
+  it('keeps low-confidence or poorly extracted calls review-only', async () => {
+    const deps = makeDeps({
+      userDb: {
+        getUserById: jest.fn(async () => ({ userId: 'review-owner', email: 'harsha@agentweb.pro', fathomOnboardingIngestions: [] })),
+        getUserByEmail: jest.fn(async () => null),
+        getUsersByEmailDomain: jest.fn(async () => []),
+        updateUser: jest.fn(async (_userId: string, updates: Record<string, any>) => updates),
+        createFathomDraftUser: jest.fn(),
+      },
+    });
+
+    const result = await ingestFathomOnboardingRecording({
+      recordingId: 'bad-extract-1',
+      recordingUrl: 'https://fathom.video/calls/bad-extract-1',
+      reviewOwnerUserId: 'review-owner',
+      automationMode: 'auto_draft',
+      allowDraftAccountCreation: true,
+      extractedContext: {
+        ...baseContext,
+        callClassification: 'prospect',
+        classificationConfidence: 0.51,
+        companyName: null,
+        primaryContactEmail: null,
+        primaryContactName: null,
+        website: null,
+      },
+    }, deps as any);
+
+    expect(result.automationState).toBe('review_only');
+    expect(result.safetyFlags).toEqual(expect.arrayContaining([
+      'low_classification_confidence',
+      'missing_company_identity',
+      'missing_primary_contact',
+    ]));
+    expect(deps.userDb.createFathomDraftUser).not.toHaveBeenCalled();
+  });
+
+  it('creates a disabled internal draft account for a high-confidence new prospect', async () => {
+    const deps = makeDeps({
+      userDb: {
+        getUserById: jest.fn(async (userId: string) => ({
+          userId,
+          email: userId === 'fathom-draft-new-prospect-1' ? 'fathom+new-prospect-1@agentweb.internal' : 'harsha@agentweb.pro',
+          isActive: false,
+          fathomOnboardingIngestions: [],
+        })),
+        getUserByEmail: jest.fn(async () => null),
+        getUsersByEmailDomain: jest.fn(async () => []),
+        updateUser: jest.fn(async (_userId: string, updates: Record<string, any>) => updates),
+        createFathomDraftUser: jest.fn(async (input: Record<string, any>) => ({
+          userId: input.userId,
+          email: input.email,
+          isActive: false,
+          signupSource: 'fathom_auto_onboarding_draft',
+          fathomDraftAccount: true,
+          fathomDraftStatus: 'needs_review',
+        })),
+      },
+    });
+
+    const result = await ingestFathomOnboardingRecording({
+      recordingId: 'new-prospect-1',
+      recordingUrl: 'https://fathom.video/calls/new-prospect-1',
+      reviewOwnerUserId: 'review-owner',
+      automationMode: 'auto_draft',
+      allowDraftAccountCreation: true,
+      extractedContext: {
+        ...baseContext,
+        primaryContactEmail: 'buyer@newco.com',
+        website: 'https://newco.com',
+        companyName: 'NewCo',
+        featureRequestDrafts: ['Needs an onboarding summary review screen before account activation.'],
+      },
+    }, deps as any);
+
+    expect(result.automationState).toBe('draft_account_created');
+    expect(result.draftUserId).toBe('fathom-draft-new-prospect-1');
+    expect(result.draftEmail).toBe('fathom+new-prospect-1@agentweb.internal');
+    expect(result.status).toBe('needs_review');
+    expect(result.memoryIds).toEqual([]);
+    expect(result.featureRequestDrafts).toEqual(['Needs an onboarding summary review screen before account activation.']);
+    expect(deps.userDb.createFathomDraftUser).toHaveBeenCalledWith(expect.objectContaining({
+      email: 'fathom+new-prospect-1@agentweb.internal',
+      userId: 'fathom-draft-new-prospect-1',
+      reviewOwnerUserId: 'review-owner',
+      sourceContactEmail: 'buyer@newco.com',
+    }));
+    expect(deps.accountMemoryDb.addMemory).not.toHaveBeenCalled();
+  });
+
+  it('reuses the deterministic draft account on duplicate webhook retries', async () => {
+    const deps = makeDeps({
+      userDb: {
+        getUserById: jest.fn(async (userId: string) => ({
+          userId,
+          email: userId === 'fathom-draft-dupe-1' ? 'fathom+dupe-1@agentweb.internal' : 'harsha@agentweb.pro',
+          fathomOnboardingIngestions: userId === 'fathom-draft-dupe-1'
+            ? [{
+              recordingId: 'dupe-1',
+              recordingUrl: 'https://fathom.video/calls/dupe-1',
+              status: 'needs_review',
+              extractionState: 'auto_extracted',
+              context: baseContext,
+              automationState: 'draft_account_created',
+              draftUserId: 'fathom-draft-dupe-1',
+              draftEmail: 'fathom+dupe-1@agentweb.internal',
+              memoryIds: [],
+              orgMemoryIds: [],
+              createdAt: '2026-07-08T19:00:00.000Z',
+              updatedAt: '2026-07-08T19:00:00.000Z',
+            }]
+            : [],
+        })),
+        getUserByEmail: jest.fn(async (email: string) => (
+          email === 'fathom+dupe-1@agentweb.internal'
+            ? { userId: 'fathom-draft-dupe-1', email, isActive: false, fathomDraftAccount: true }
+            : null
+        )),
+        getUsersByEmailDomain: jest.fn(async () => []),
+        updateUser: jest.fn(async (_userId: string, updates: Record<string, any>) => updates),
+        createFathomDraftUser: jest.fn(),
+      },
+    });
+
+    const result = await ingestFathomOnboardingRecording({
+      recordingId: 'dupe-1',
+      recordingUrl: 'https://fathom.video/calls/dupe-1',
+      reviewOwnerUserId: 'review-owner',
+      automationMode: 'auto_draft',
+      allowDraftAccountCreation: true,
+      extractedContext: {
+        ...baseContext,
+        primaryContactEmail: 'buyer@dupe.com',
+        website: 'https://dupe.com',
+        companyName: 'Dupe Co',
+      },
+    }, deps as any);
+
+    expect(result.draftUserId).toBe('fathom-draft-dupe-1');
+    expect(deps.userDb.createFathomDraftUser).not.toHaveBeenCalled();
+    const updatedLedger = deps.userDb.updateUser.mock.calls[0][1].fathomOnboardingIngestions;
+    expect(updatedLedger).toHaveLength(1);
+    expect(updatedLedger[0].createdAt).toBe('2026-07-08T19:00:00.000Z');
+  });
+
+  it('routes existing account matches to review without creating another user', async () => {
+    const deps = makeDeps();
+
+    const result = await ingestFathomOnboardingRecording({
+      recordingId: 'existing-1',
+      recordingUrl: 'https://fathom.video/calls/existing-1',
+      reviewOwnerUserId: 'review-owner',
+      automationMode: 'auto_draft',
+      allowDraftAccountCreation: true,
+      extractedContext: baseContext,
+    }, deps as any);
+
+    expect(result.automationState).toBe('matched_existing');
+    expect(result.targetUserId).toBe('target-user');
+    expect(deps.userDb.createFathomDraftUser).not.toHaveBeenCalled();
+    expect(deps.accountMemoryDb.addMemory).not.toHaveBeenCalled();
   });
 
   it('persists reviewed context to account and org memory and keeps auto-extracted vs reviewed state visible', async () => {

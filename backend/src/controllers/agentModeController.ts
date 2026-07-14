@@ -688,6 +688,9 @@ const INCOMPLETE_WORK_PATTERNS: RegExp[] = [
   /\bhave\s*not\s+yet\s+(?:processed|completed|finished|researched)\b/i,
   /\b(?:remaining|other)\s+(?:events|leads|items|entities)\b[^.]*\b(?:were|was)?\s*not\s+(?:processed|completed|finished|researched|done)\b/i,
   /\bi\s+will\s+continue\b[^.]*\b(?:later|remaining|next)\b/i,
+  /\bi(?:\s+will|'ll|’ll)\s+(?:continue|proceed|move on|start|begin|work on)\b[^.]*\b(?:remaining|next|rest|step\s*\d+|phase|workflow)\b/i,
+  /\b(?:i|we)\s+(?:skipped|omitted)\b[^.]*\b(?:remaining|other|rest|events|leads|items|entities|steps?|workflow)\b/i,
+  /\b(?:i|we)\s+left\b[^.]*\b(?:remaining|other|rest|events|leads|items|entities|steps?|workflow)\b[^.]*\b(?:unfinished|incomplete|undone|unprocessed|unresearched)\b/i,
 ];
 
 export function scheduledRunSignalsIncompleteWork(content: string): boolean {
