@@ -3,7 +3,23 @@ import { getSecret } from '../utils/secretsManager';
 import axios from 'axios';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 
-interface SendEmailParams {
+/**
+ * Parameters for a Resend send.
+ *
+ * Deliberately NOT the same shape as emailProviderService's SendEmailParams, and no longer
+ * sharing its name (ENG-302). The difference is real, not cosmetic:
+ *
+ *  - Resend needs an explicit `from` — it relays on our behalf and we choose the identity.
+ *    A mailbox provider (Gmail/Graph) has no `from`: it stamps the authenticated mailbox,
+ *    so anything we passed would be silently ignored on the wire.
+ *  - Resend carries `html` AND `text` (the multipart alternative); IEmailService collapses
+ *    to a single `body` + `isHtml`.
+ *  - `inReplyTo` here is an RFC Message-ID, and `replyTo` is an address. IEmailService's
+ *    `replyToMessageId` is a provider-native message handle. Three different concepts.
+ *
+ * A helper that unifies these (ENG-266 Part 3) must reconcile all three, not just widen a type.
+ */
+interface ResendSendParams {
   from: string;
   to: string | string[];
   subject: string;
@@ -16,7 +32,7 @@ interface SendEmailParams {
 
 interface QueuedEmailSend {
   id: number;
-  params: SendEmailParams;
+  params: ResendSendParams;
   resolve: (value: any | null) => void;
 }
 
@@ -168,7 +184,7 @@ class ResendService {
     }
   }
 
-  private enqueueSend(params: SendEmailParams): Promise<any | null> {
+  private enqueueSend(params: ResendSendParams): Promise<any | null> {
     return new Promise((resolve) => {
       const queueItem: QueuedEmailSend = {
         id: ++this.queueItemId,
@@ -190,7 +206,7 @@ class ResendService {
     cc,
     inReplyTo,
     replyTo
-  }: SendEmailParams) {
+  }: ResendSendParams) {
     await this.initializeResend();
 
     if (!this.resend) {
@@ -259,7 +275,7 @@ class ResendService {
     return result;
   }
 
-  async sendEmail(params: SendEmailParams) {
+  async sendEmail(params: ResendSendParams) {
     return this.enqueueSend(params);
   }
 

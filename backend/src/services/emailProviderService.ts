@@ -42,13 +42,24 @@ export class EmailProviderError extends Error {
 
 // ── Shared send types ──────────────────────────────────────────────────────
 
+/**
+ * Parameters for sending through a customer's connected mailbox (Gmail / Outlook).
+ *
+ * Note what is NOT here: there is no `from`. The provider sends as the authenticated
+ * mailbox, so a caller-supplied From would be silently discarded on the wire — which is
+ * why a mailbox sender's address is validated at save time instead (crmSenderService).
+ *
+ * resendService has its own, deliberately different `ResendSendParams` (ENG-302): Resend
+ * relays on our behalf and therefore DOES need an explicit `from`, carries `html` and
+ * `text` separately, and means something different by "reply to".
+ */
 export interface SendEmailParams {
   to: string | string[];
   subject: string;
   body: string;
   cc?: string | string[];
   bcc?: string | string[];
-  replyToMessageId?: string; // message ID to reply to (sets thread + headers)
+  replyToMessageId?: string; // provider-native message handle (NOT an RFC Message-ID)
   isHtml?: boolean;          // true = text/html body, false (default) = text/plain
 }
 
