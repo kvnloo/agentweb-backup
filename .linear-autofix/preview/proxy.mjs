@@ -9,14 +9,37 @@
 
 import http from 'node:http';
 import net from 'node:net';
-import { readFileSync, writeFileSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, statSync, existsSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { config } from '../config.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROUTES = path.join(__dirname, 'routes.json');
-const ACCESS = path.join(__dirname, 'preview-access.json'); // bug -> last-opened ISO; the cap policy reads this
+
+// Resolve the CANONICAL main-repo preview dir, NOT this script's own dir. routes.json is written by
+// preview.mjs running in the MAIN checkout; if the proxy is launched from a git-worktree copy of the
+// repo it would read that worktree's stale routes.json and 502 every preview registered afterwards — a
+// real incident (proxy started from autofix-worktrees/ENG-200/.linear-autofix served only eng-200).
+// git's common dir points at the main checkout from any worktree; fall back to __dirname when we're not
+// in a worktree or git is unavailable.
+function canonicalPreviewDir() {
+  try {
+    const r = spawnSync('git', ['-C', __dirname, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { encoding: 'utf8' });
+    if (r.status === 0) {
+      const mainRoot = path.dirname(r.stdout.trim());        // <main-repo>/.git -> <main-repo>
+      const dir = path.join(mainRoot, '.linear-autofix', 'preview');
+      if (dir !== __dirname && existsSync(path.join(dir, 'proxy.mjs'))) {
+        console.log(`[preview-proxy] launched from a worktree — using canonical routes at ${dir}`);
+        return dir;
+      }
+    }
+  } catch { /* git missing / not a repo — fall back below */ }
+  return __dirname;
+}
+const PREVIEW_DIR = canonicalPreviewDir();
+const ROUTES = path.join(PREVIEW_DIR, 'routes.json');
+const ACCESS = path.join(PREVIEW_DIR, 'preview-access.json'); // bug -> last-opened ISO; the cap policy reads this
 const HEALTH = '/__preview_health__';
 
 // Record when a preview's URL was last actually opened, so the eviction policy can tell a live-but-
