@@ -22,6 +22,7 @@ import {
   postLoopDigest,
   type LoopDigestTemplate,
 } from '../../core/digest/loopDigest';
+import { claimLoopDailyDigestPost } from '../../core/digest/dailyDigestClaim';
 import { createInstanceRunner } from '../../core/instanceRunner';
 import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
 import { CooldownRuleSet } from '../../core/policy/cooldownRuleSet';
@@ -68,7 +69,15 @@ const runner = createInstanceRunner({
   manifest: () => onboardingManifest,
   onRunComplete: async ({ result, drained, ports, manifest }) => {
     if (drained === null) return;
-    await postLoopDigest(result, ports.slack, manifest.approval.slackUserId, onboardingDigestTemplate, undefined);
+    await postLoopDigest(result, ports.slack, manifest.approval.slackUserId, onboardingDigestTemplate, undefined, {
+      claimDailyDigest: (digestDate, slackUserId, runId) =>
+        claimLoopDailyDigestPost(ports.dynamo, {
+          loopId: ONBOARDING_LOOP_ID,
+          digestDate,
+          slackUserId,
+          runId,
+        }),
+    });
   },
 });
 
@@ -95,6 +104,8 @@ const onboardingDigestTemplate: LoopDigestTemplate = {
   counts: (result) =>
     `Users/events scanned: ${result.eventsScanned}  |  Findings: ${result.proposals.length}`,
   emptyBody: () => [`_No onboarding events in the window — too thin to judge._`],
-  quietBody: () => [`_Funnel looks healthy — no issues surfaced._`],
+  quietBody: () => [
+    `_No analyst proposal fired this window. Check the reliability heartbeat before treating onboarding as clear._`,
+  ],
   findingsBody: analystFindingsBody,
 };
