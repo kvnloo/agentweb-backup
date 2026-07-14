@@ -270,6 +270,33 @@ export const config = {
     bind: '127.0.0.1',               // NEVER 0.0.0.0 — no auth layer; SSH tunnel only
     btwModel: 'sonnet',              // /btw side-thread model — a read-only aside doesn't need Opus, so it
                                      // runs on Sonnet (cheaper) while keeping the read-only tool set.
+    // Skills that must NEVER auto-load into a chat session. A chat turn resumes the WHOLE session every
+    // time, so a heavyweight *reference* skill baked into the session is re-billed on every later turn.
+    // claude-api is the proven offender: a ~194k-token API/pricing manual that AUTO-triggers on any
+    // model/cost-themed issue (e.g. ENG-200) → fires almost every turn, silently defeating /compact (it
+    // re-inflates ~30 min later) and burning the 5hr limit ~3x fast. And it's redundant here: this repo's
+    // real model IDs + pricing live in code (config.mjs modelPricing, agentModeService.ts llmModels).
+    // Each name becomes `--disallowedTools Skill(<name>)` — a SURGICAL deny: the agent keeps Opus, every
+    // tool (incl. the WebSearch/WebFetch *tools* — untouched, so it can still look things up on the web),
+    // and every other skill (code-review, verify, simplify, …). Not dumbed down; it just can't drag a
+    // manual (or a report-writing harness) into a re-billed session.
+    // deep-research is here by the owner's choice: it's a heavy multi-agent report-writing harness that's
+    // never wanted mid bug-fix, so denying it removes a bloat risk with zero cost (plain web search/fetch
+    // remain available as tools). It differs from claude-api in that it only fires when explicitly asked.
+    skillDenylist: ['claude-api', 'deep-research'],
+    // Persistent capability the agent must KEEP knowing about across the whole conversation — passed via
+    // `--append-system-prompt` on every full-access turn (see chatArgs), so it lives in the system prompt,
+    // NOT the transcript. That's deliberate: a one-off hint in the conversation would be summarized away by
+    // /compact, but this is re-applied on every turn (fresh, resumed, AND post-compact), so no number of
+    // compacts can strip it. Self-gating on the env var so it's accurate whether or not a key is present.
+    capabilityPrompt:
+      'Linear access: on this (full-access) turn you have a shell, and when the issue\'s assignee has a ' +
+      'configured key the LINEAR_API_KEY env var is set to THAT assignee\'s key. Whenever it is set you CAN ' +
+      'read the live Linear board yourself — never claim you lack Linear access. Query the GraphQL API ' +
+      '(POST https://api.linear.app/graphql with header "Authorization: $LINEAR_API_KEY") to fetch an issue ' +
+      'and its status/assignee/description and its related & linked issues, or use the repo helpers in ' +
+      '.linear-autofix/linear.mjs (e.g. resolveIssue). Only if LINEAR_API_KEY is unset does the assignee ' +
+      'have no key configured — then, and only then, say Linear is unavailable.',
     resumePipelineSession: false,    // default: curated fresh context (above). Set true to instead RESUME
                                      // the fixer's own Claude session on the first turn for raw native
                                      // memory — costs ~380k tokens of low-signal transcript reloaded every

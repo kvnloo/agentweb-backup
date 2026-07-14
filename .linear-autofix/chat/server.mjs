@@ -565,7 +565,21 @@ function chatArgs(cap, sessionId, modelOverride) {
   const m = CHAT[cap] || {};
   const a = ['-p', '--output-format', 'stream-json', '--verbose', '--model', modelOverride || m.model, '--max-turns', String(m.maxTurns)];
   if (cap === 'readOnly') a.push('--allowedTools', (m.allowedTools || []).join(','));
-  else a.push('--dangerously-skip-permissions');
+  else {
+    a.push('--dangerously-skip-permissions');
+    // Persistent capabilities (e.g. "you can read Linear via LINEAR_API_KEY") go in the SYSTEM prompt, not
+    // the conversation — so no number of /compact passes can summarize them away. Full-access only: read-only
+    // turns can't run curl/node anyway (their Bash allowlist is git-only). Constant text → prompt cache stays
+    // warm across turns.
+    if (CHAT.capabilityPrompt) a.push('--append-system-prompt', CHAT.capabilityPrompt);
+  }
+  // Deny only the reference-heavy skills (config.chat.skillDenylist) so they can't auto-load into a
+  // chat session and get re-billed on every resumed turn — the bug that silently defeated /compact on
+  // ENG-200 (claude-api ~194k tokens). Per-skill `Skill(<name>)` denials leave every other skill usable,
+  // so the agent keeps full capability. Verified: Skill(claude-api) blocks its 194k body while
+  // code-review/verify/simplify/… stay available. See the skillDenylist comment in config.mjs.
+  const denied = (CHAT.skillDenylist || []).map((s) => `Skill(${s})`);
+  if (denied.length) a.push('--disallowedTools', ...denied);
   if (sessionId) a.push('--resume', sessionId);
   return a;
 }
