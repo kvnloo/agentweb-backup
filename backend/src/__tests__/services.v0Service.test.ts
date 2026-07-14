@@ -154,6 +154,7 @@ import {
   BrandContext,
   remapFilesForSubPage,
   repairSubPageImports,
+  repairPoisonedSubPagesInRepo,
   ensurePageMetadataTitle,
   buildPageSlug,
   autoFixV0Files,
@@ -2599,6 +2600,83 @@ describe("v0Service - repairSubPageImports", () => {
 });
 
 // =============================================================================
+// repairPoisonedSubPagesInRepo — the wiring that heals a live repo
+// =============================================================================
+// Adding a page to a poisoned site is exactly when we can heal it: we are already
+// listing the repo and pushing a commit. The repairs ride along in the SAME commit as
+// the new page, so one Vercel build validates both.
+describe("v0Service - repairPoisonedSubPagesInRepo", () => {
+  const tree = (paths: string[]) => ({ data: { tree: paths.map((p) => ({ path: p, type: "blob" })) } });
+  const blob = (s: string) => ({ data: { content: Buffer.from(s).toString("base64"), encoding: "base64" } });
+
+  beforeEach(() => {
+    mockAxiosGet.mockReset();
+  });
+
+  // A mockImplementation outlives the test that set it — reset, or it hijacks every
+  // axios.get in the suites that follow.
+  afterEach(() => {
+    mockAxiosGet.mockReset();
+  });
+
+  it("returns a repaired sibling page that would otherwise brick the whole site build", async () => {
+    mockAxiosGet.mockImplementation((url: string) => {
+      const u = String(url);
+      if (u.includes("/git/trees/")) {
+        return Promise.resolve(
+          tree([
+            "app/page.tsx",
+            "app/eng287-race/page.tsx",
+            "app/eng287-race/_components/landing/nav.tsx",
+          ]),
+        );
+      }
+      if (u.includes("/contents/app/eng287-race/page.tsx")) {
+        return Promise.resolve(blob(`import Nav from "../components/landing/nav";\n`));
+      }
+      return Promise.resolve(blob(`export default function C(){return null;}\n`));
+    });
+
+    const out = await repairPoisonedSubPagesInRepo("o/r", {}, new Set());
+
+    const page = out.find((f) => f.path === "app/eng287-race/page.tsx");
+    expect(page).toBeDefined();
+    expect(page!.content!.toString()).toContain('"@/app/eng287-race/_components/landing/nav"');
+  });
+
+  it("returns nothing for a healthy repo — no commit, no rebuild", async () => {
+    mockAxiosGet.mockImplementation((url: string) => {
+      const u = String(url);
+      if (u.includes("/git/trees/")) {
+        return Promise.resolve(tree(["app/ok/page.tsx", "app/ok/_components/hero.tsx"]));
+      }
+      return Promise.resolve(blob(`import Hero from "./_components/hero";\n`));
+    });
+
+    expect(await repairPoisonedSubPagesInRepo("o/r", {}, new Set())).toEqual([]);
+  });
+
+  it("skips files the caller is already committing — the new page is correct by construction", async () => {
+    mockAxiosGet.mockImplementation((url: string) => {
+      const u = String(url);
+      if (u.includes("/git/trees/")) {
+        return Promise.resolve(tree(["app/brand-new/page.tsx", "app/brand-new/_components/x.tsx"]));
+      }
+      return Promise.resolve(blob(`import X from "../components/x";\n`));
+    });
+
+    // The page being added this run is already remapped correctly — re-reading and
+    // "repairing" the stale copy in the repo would clobber it.
+    const out = await repairPoisonedSubPagesInRepo(
+      "o/r",
+      {},
+      new Set(["app/brand-new/page.tsx", "app/brand-new/_components/x.tsx"]),
+    );
+    expect(out).toEqual([]);
+  });
+});
+
+// =============================================================================
 // deleteLandingPageByRecord — remove the WHOLE page directory from the repo
 // =============================================================================
 // removePageFromGitHub deleted exactly one file: app/<slug>/page.tsx. But the remap
@@ -2629,6 +2707,14 @@ describe("v0Service - deleteLandingPageByRecord removes the whole page directory
     );
     mockAxiosPost.mockResolvedValue({ data: { sha: "new-sha" } });
     mockAxiosPatch.mockResolvedValue({ data: {} });
+  });
+
+  // These mockImplementation/mockResolvedValue defaults persist — clear them, or they
+  // hijack axios for every suite that runs after this one.
+  afterEach(() => {
+    mockAxiosGet.mockReset();
+    mockAxiosPost.mockReset();
+    mockAxiosPatch.mockReset();
   });
 
   const deletedPaths = () => {
@@ -3017,8 +3103,11 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     return zipBuffer;
   };
 
-  // Setup: mock GitHub API (ref, blob, tree, commit, patch)
+  // Setup: mock GitHub API (repair scan, ref, blob, tree, commit, patch)
   const setupGitHubMocks = () => {
+    // GET git/trees/main?recursive=1 — the poisoned-import repair scan runs first.
+    // An empty tree means a healthy repo: nothing to scan, nothing to repair, no extra reads.
+    mockAxiosGet.mockResolvedValueOnce({ data: { tree: [] } });
     // GET ref/heads/main
     mockAxiosGet.mockResolvedValueOnce({
       data: { object: { sha: "abc123" } },
@@ -3346,8 +3435,10 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     );
 
     expect(result.status).toBe("deployed");
-    // At least 2 Vercel polling calls after the GitHub GET ref call
-    expect(mockAxiosGet).toHaveBeenCalledTimes(3); // 1 GitHub ref + 2 Vercel polls
+    // 1 repair-scan tree listing + 1 GitHub ref + 2 Vercel polls.
+    // The tree listing is the whole cost of the poisoned-import scan on a healthy repo:
+    // an empty/clean tree yields no candidates, so no file contents are ever read.
+    expect(mockAxiosGet).toHaveBeenCalledTimes(4);
   });
 
   it("SUCCESS: sub-page deployedUrl uses customDomainUrl as base when existingPage has one", async () => {
