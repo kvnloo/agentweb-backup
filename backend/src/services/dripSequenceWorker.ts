@@ -318,7 +318,7 @@ async function checkExitConditions(
       // count — better to keep sending than to silently kill a live sequence.
       const enrolledAt = new Date(enrollment.enrolledAt).getTime();
       const wanted = exitConditions.onEmailEngagement;
-      const engaged = events.some((e: any) => {
+      const trigger = events.find((e: any) => {
         const at = e.createdAt ? new Date(e.createdAt).getTime() : NaN;
         if (!Number.isFinite(at) || at <= enrolledAt) return false;
 
@@ -330,8 +330,17 @@ async function checkExitConditions(
         return false;
       });
 
-      if (engaged) {
-        console.log(`[dripWorker] Enrollment ${enrollment.enrollmentId} exited: lead ${enrollment.leadEmail} engaged`);
+      if (trigger) {
+        // Name the exact event that caused this. These exits have never fired before (the
+        // query was dead), so the first time this ships, enrollments whose leads had already
+        // engaged will exit — correctly, but suddenly. When someone asks "why did my
+        // sequence stop?", this line is the answer.
+        console.log(
+          `[dripWorker] Enrollment ${enrollment.enrollmentId} exited: engagement — ` +
+          `lead ${enrollment.leadEmail} triggered "${(trigger as any).eventType}" ` +
+          `at ${(trigger as any).createdAt} (enrolled ${enrollment.enrolledAt}; ` +
+          `sequence exits on: ${wanted.join(', ')})`,
+        );
         return 'engagement';
       }
     }
