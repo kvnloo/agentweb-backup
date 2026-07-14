@@ -17,7 +17,7 @@ services:
 
   ngrok:
     image: ngrok/ngrok:latest
-    command: http backend:3001
+    command: http backend:3001 --url=${NGROK_DOMAIN}
     environment:
       - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
     ports:
