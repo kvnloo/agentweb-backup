@@ -12,7 +12,7 @@
  * breaking change for historical queries:
  *   timeout | auth | rate_limit | invalid_args | not_found | network |
  *   upstream_5xx | policy_blocked | repeated_failure |
- *   tool_unavailable | upstream_rejected | empty_result
+ *   tool_unavailable | upstream_rejected | empty_result | invalid_output
  *
  * The three trailing classes were added 2026-06-14 after a 7-day production
  * sweep of Dev-AW-LoopEvents `agent_tool_failed` events: re-classifying the
@@ -46,6 +46,10 @@ const GATEWAY_NAME_CLASSES: Record<string, string> = {
   AgentToolPolicyBlockedError: 'policy_blocked',
   AgentToolRepeatedFailureError: 'repeated_failure',
   AgentToolContractValidationError: 'invalid_args',
+  // A tool returned without throwing but produced no usable output (ENG-105).
+  // Distinct from an execution failure so telemetry can separate "tool ran and
+  // gave us nothing" from "tool errored".
+  ToolOutputContractError: 'invalid_output',
   TimeoutError: 'timeout',
   AbortError: 'timeout',
 };
@@ -82,7 +86,7 @@ function classFromMessage(message: string): string | null {
   // contract layer rejects before execution) plus classic validation phrasing.
   if (/arguments failed schema validation|has the wrong type|missing required (argument|variable)|invalid parameters?|invalid argument|validation (failed|error)|(is|are) required|must be|is too long|too long \(|is too short/.test(m)) return 'invalid_args';
 
-  if (/unauthorized|forbidden|invalid (access |api )?token|invalid api key|authentication|missing credentials|not authorized|do not have permission|permission to|no secrets configured|not a member of channel|account connected|account not configured/.test(m)) return 'auth';
+  if (/unauthorized|forbidden|invalid (access |api )?token|invalid api key|authentication|missing credentials|not authorized|do not have permission|permission to|no secrets configured|not a member of channel|account connected|account not configured|not configured to access/.test(m)) return 'auth';
   if (/enotfound|econnrefused|econnreset|eai_again|socket hang up|network error|fetch failed/.test(m)) return 'network';
   if (/does not exist|not found/.test(m)) return 'not_found';
   if (/internal server error|bad gateway|service unavailable|upstream/.test(m)) return 'upstream_5xx';

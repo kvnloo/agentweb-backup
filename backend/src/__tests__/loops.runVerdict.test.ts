@@ -75,6 +75,20 @@ describe('computeRunVerdict', () => {
     expect(v.verdict).toBe('degraded');
     expect(v.reasons).toContain('repeated_tool_failures');
   });
+
+  it('flags degraded on an unresolved finalize-guard claim mismatch (ENG-143)', () => {
+    // Zero tool failures — the run "worked" — but the final message claimed an
+    // action the ledger does not back. That is user-facing degradation and must
+    // reach the 17:30 UTC failure-cluster cron via the verdict reasons.
+    const v = computeRunVerdict({ failed: false, toolCalls: 2, failedToolCalls: 0, claimMismatch: true });
+    expect(v.verdict).toBe('degraded');
+    expect(v.reasons).toContain('claim_mismatch');
+  });
+
+  it('claimMismatch absent/false leaves the verdict unchanged', () => {
+    expect(computeRunVerdict({ failed: false, toolCalls: 2, failedToolCalls: 0, claimMismatch: false }).verdict).toBe('ok');
+    expect(computeRunVerdict({ failed: false, toolCalls: 2, failedToolCalls: 0 }).verdict).toBe('ok');
+  });
 });
 
 describe('AgentRunRecorder verdict emission', () => {
@@ -110,6 +124,31 @@ describe('AgentRunRecorder verdict emission', () => {
 
     const verdictPut = puts.map((p) => p.item as any).find((i) => i.eventType === EVT_RUN_VERDICT);
     expect(verdictPut.dimensions.verdict).toBe('failed');
+  });
+
+  it('threads claimMismatch through runCompleted into a degraded verdict with claim_mismatch reason', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    await rec.runCompleted('run-4', { toolCalls: 2, failedToolCalls: 0, sessionId: 's4', claimMismatch: true });
+
+    const verdictPut = puts.map((p) => p.item as any).find((i) => i.eventType === EVT_RUN_VERDICT);
+    expect(verdictPut.dimensions.verdict).toBe('degraded');
+    expect(String(verdictPut.dimensions.reasons)).toContain('claim_mismatch');
+  });
+
+  it('emits a loud agent_claim_check_error event when the finalize-guard judge fails', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    await rec.claimCheckError('run-5', { sessionId: 's5', error: new Error('judge unavailable: 503 service unavailable') });
+
+    const item = puts.map((p) => p.item as any).find((i) => i.eventType === 'agent_claim_check_error');
+    expect(item).toBeDefined();
+    expect(item.subjectId).toBe('run-5');
+    expect(item.dimensions.sessionId).toBe('s5');
+    expect(item.dimensions.errorMessage).toContain('judge unavailable');
+    expect(item.dimensions.errorClass).toBe('upstream_5xx');
   });
 });
 

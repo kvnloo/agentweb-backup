@@ -168,6 +168,8 @@ import {
   recordLandingPagePublish,
   markLandingPagePublishReverted,
   triggerVercelDeployment,
+  injectLeadCaptureAttribution,
+  assertNoDuplicateInjectedRoutes,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
@@ -268,6 +270,181 @@ describe("v0Service - buildBrandEnrichedPrompt", () => {
     expect(result).not.toContain("Brand Guidelines:");
     expect(result).toContain("production-ready landing page");
   });
+
+  it("SUCCESS: with leadListId, instructs v0 to build only the form and NOT create the capture route", () => {
+    const result = buildBrandEnrichedPrompt("Build page", {}, "list_abc123");
+
+    expect(result).toContain("/api/capture");
+    expect(result).toContain("Do NOT create app/api/capture/route.ts");
+    // Relative fetch path required — no hardcoded backend host in the prompt's capture instructions
+    expect(result).toMatch(/fetch\('\/api\/capture'/);
+  });
+
+  it("FAIL: without leadListId, no lead capture instructions are included", () => {
+    const result = buildBrandEnrichedPrompt("Build page", {});
+
+    expect(result).not.toContain("LEAD CAPTURE FORM");
+    expect(result).not.toContain("/api/capture");
+    expect(result).not.toContain("app/api/capture/route.ts");
+  });
+});
+
+// =============================================================================
+// injectLeadCaptureAttribution
+// =============================================================================
+describe("v0Service - injectLeadCaptureAttribution", () => {
+  const file = (path: string, content = "// v0 generated") => ({ path, content: Buffer.from(content) });
+
+  it("SUCCESS: injects middleware.ts and app/api/capture/route.ts with the list id and forward URL", () => {
+    const result = injectLeadCaptureAttribution([file("app/page.tsx")], "list_xyz");
+
+    const middleware = result.find((f) => f.path === "middleware.ts");
+    const route = result.find((f) => f.path === "app/api/capture/route.ts");
+
+    expect(middleware).toBeDefined();
+    expect(middleware!.content.toString()).toContain("aw_first_touch");
+    expect(middleware!.content.toString()).toContain("60 * 60 * 24 * 90");
+
+    expect(route).toBeDefined();
+    const routeSrc = route!.content.toString();
+    expect(routeSrc).toContain('const LIST_ID = "list_xyz"');
+    expect(routeSrc).toContain("/api/webhooks/forward-lead");
+    expect(routeSrc).toContain('from "next/headers"');
+    expect(routeSrc).toContain("aw_first_touch");
+  });
+
+  it("FAIL: v0-generated app/api/capture/route.ts is replaced, not duplicated", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("app/api/capture/route.ts", "// v0's own capture route"), file("app/page.tsx")],
+      "list_xyz"
+    );
+
+    const captureRoutes = result.filter((f) => f.path === "app/api/capture/route.ts");
+    expect(captureRoutes).toHaveLength(1);
+    expect(captureRoutes[0].content.toString()).not.toContain("v0's own capture route");
+  });
+
+  it("FAIL: route-group variant of v0's capture route is also dropped", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("app/(frontend)/api/capture/route.ts", "// v0 route-group capture"), file("app/page.tsx")],
+      "list_xyz"
+    );
+
+    expect(result.some((f) => f.path === "app/(frontend)/api/capture/route.ts")).toBe(false);
+    const captureRoutes = result.filter((f) => f.path === "app/api/capture/route.ts");
+    expect(captureRoutes).toHaveLength(1);
+  });
+
+  it("FAIL: v0-generated middleware.ts is replaced, not duplicated", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("middleware.ts", "// v0's own middleware"), file("app/page.tsx")],
+      "list_xyz"
+    );
+
+    const middlewares = result.filter((f) => f.path === "middleware.ts");
+    expect(middlewares).toHaveLength(1);
+    expect(middlewares[0].content.toString()).not.toContain("v0's own middleware");
+  });
+
+  it("SUCCESS: unrelated files are left untouched", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("app/page.tsx", "// page"), file("lib/utils.ts", "// utils")],
+      "list_xyz"
+    );
+
+    expect(result.find((f) => f.path === "app/page.tsx")!.content.toString()).toBe("// page");
+    expect(result.find((f) => f.path === "lib/utils.ts")!.content.toString()).toBe("// utils");
+  });
+
+  it("FAIL: src/app capture route variant is dropped, not duplicated", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("src/app/api/capture/route.ts", "// v0 src/app capture"), file("app/page.tsx")],
+      "list_xyz"
+    );
+
+    expect(result.some((f) => f.path === "src/app/api/capture/route.ts")).toBe(false);
+    const captureRoutes = result.filter((f) => f.path === "app/api/capture/route.ts");
+    expect(captureRoutes).toHaveLength(1);
+  });
+
+  it("FAIL: nested/multiple route-group capture variant is dropped, not duplicated", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("src/app/(marketing)/(v2)/api/capture/route.tsx", "// v0 nested"), file("app/page.tsx")],
+      "list_xyz"
+    );
+
+    expect(result.some((f) => f.path.includes("(marketing)"))).toBe(false);
+    const captureRoutes = result.filter((f) => f.path === "app/api/capture/route.ts");
+    expect(captureRoutes).toHaveLength(1);
+  });
+
+  it("FAIL: src/middleware.ts variant is replaced, not duplicated", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("src/middleware.ts", "// v0's own src middleware"), file("app/page.tsx")],
+      "list_xyz"
+    );
+
+    expect(result.some((f) => f.path === "src/middleware.ts")).toBe(false);
+    const middlewares = result.filter((f) => f.path === "middleware.ts");
+    expect(middlewares).toHaveLength(1);
+    expect(middlewares[0].content.toString()).not.toContain("v0's own src middleware");
+  });
+
+  it("SUCCESS: a non-root helper file literally named middleware.ts is left alone (not a real Next.js middleware)", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("components/middleware.ts", "// unrelated helper, not Next middleware"), file("app/page.tsx")],
+      "list_xyz"
+    );
+
+    const helper = result.find((f) => f.path === "components/middleware.ts");
+    expect(helper).toBeDefined();
+    expect(helper!.content.toString()).toBe("// unrelated helper, not Next middleware");
+  });
+
+  it("SUCCESS: injectLeadCaptureAttribution never trips the duplicate guard on the normal path", () => {
+    const files = [file("app/page.tsx"), file("app/api/capture/route.ts", "// v0's own"), file("middleware.ts", "// v0's own")];
+    expect(() => injectLeadCaptureAttribution(files, "list_xyz")).not.toThrow();
+  });
+});
+
+// =============================================================================
+// assertNoDuplicateInjectedRoutes
+// =============================================================================
+describe("v0Service - assertNoDuplicateInjectedRoutes", () => {
+  const file = (path: string, content = "x") => ({ path, content: Buffer.from(content) });
+
+  it("SUCCESS: does not throw with exactly one capture route and one middleware", () => {
+    expect(() =>
+      assertNoDuplicateInjectedRoutes([file("app/api/capture/route.ts"), file("middleware.ts"), file("app/page.tsx")])
+    ).not.toThrow();
+  });
+
+  it("SUCCESS: does not throw with neither file present", () => {
+    expect(() => assertNoDuplicateInjectedRoutes([file("app/page.tsx")])).not.toThrow();
+  });
+
+  it("FAIL: throws when two capture routes are present", () => {
+    expect(() =>
+      assertNoDuplicateInjectedRoutes([file("app/api/capture/route.ts"), file("app/api/capture/route.ts")])
+    ).toThrow(/duplicate route/);
+  });
+
+  it("FAIL: throws when two middleware files are present", () => {
+    expect(() => assertNoDuplicateInjectedRoutes([file("middleware.ts"), file("middleware.ts")])).toThrow(
+      /duplicate route/
+    );
+  });
+
+  it("FAIL: throws when both are duplicated, reporting both counts", () => {
+    expect(() =>
+      assertNoDuplicateInjectedRoutes([
+        file("app/api/capture/route.ts"),
+        file("app/api/capture/route.ts"),
+        file("middleware.ts"),
+        file("middleware.ts"),
+      ])
+    ).toThrow(/capture routes: 2, middleware: 2/);
+  });
 });
 
 // =============================================================================
@@ -338,6 +515,12 @@ describe("v0Service - generateLandingPage", () => {
 
     // chats.create was called (no more projects.create)
     expect(mockChatsCreate).toHaveBeenCalledTimes(1);
+    // Async responseMode: sync mode blocks the call for the full 3-15 min generation,
+    // guaranteeing a loss against the 300s attempt timeout and burning credits on an
+    // orphan chat every time. (ENG-287)
+    expect(mockChatsCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ responseMode: "async" })
+    );
     expect(result.userId).toBe("user-1");
     expect(result.id).toBe("test-uuid-1234");
   });
@@ -479,14 +662,36 @@ describe("v0Service - findReusablePageForRoute (route-level idempotency, kills d
     expect((await findReusablePageForRoute("u1", "pricing"))?.id).toBe("p1");
   });
 
-  it("reuses an in-flight build at the same route (generating/deploying)", async () => {
-    items(page({ status: "generating" }));
+  it("reuses a FRESH in-flight build at the same route (generating/deploying)", async () => {
+    items(page({ status: "generating", updatedAt: new Date().toISOString() }));
     expect((await findReusablePageForRoute("u1", "pricing"))?.status).toBe("generating");
+  });
+
+  it("does NOT reuse a STALE in-flight build — a wedged record must not hold the route hostage (ENG-277)", async () => {
+    // 31 min old > 30 min stuck ceiling → abandoned; a fresh build must proceed.
+    const stale = new Date(Date.now() - 31 * 60 * 1000).toISOString();
+    items(page({ status: "generating", updatedAt: stale }));
+    expect(await findReusablePageForRoute("u1", "pricing")).toBeNull();
+  });
+
+  it("does NOT reuse an in-flight build with no readable timestamp — fail open to a new build", async () => {
+    items(page({ status: "generating", updatedAt: undefined, createdAt: undefined }));
+    expect(await findReusablePageForRoute("u1", "pricing")).toBeNull();
   });
 
   it("does NOT reuse a FAILED page — a retry after a failure must rebuild", async () => {
     items(page({ status: "failed" }));
     expect(await findReusablePageForRoute("u1", "pricing")).toBeNull();
+  });
+
+  it("does NOT reuse a same-slug page from a DIFFERENT site (cross-site collision, Greptile P1)", async () => {
+    items(page({ status: "deployed", siteId: "site-A" }));
+    expect(await findReusablePageForRoute("u1", "pricing", "site-B")).toBeNull();
+  });
+
+  it("reuses a same-slug page when it belongs to the REQUESTED site", async () => {
+    items(page({ status: "deployed", siteId: "site-A" }));
+    expect((await findReusablePageForRoute("u1", "pricing", "site-A"))?.id).toBe("p1");
   });
 
   it("does NOT match a different route", async () => {
@@ -651,6 +856,52 @@ describe("v0Service - multi-site routing (DURABLE_LANDING_GENERATION=on)", () =>
     expect(put.githubRepoUrl).toBe("https://github.com/o/r"); // inherited the existing repo
     expect(put.siteId).toBe("site-1"); // belongs to the existing site
     expect(put.isRootPage).toBeUndefined(); // not a new site root
+  });
+
+  it("a v0-failed generation frees the route identity — retry mints a FRESH chat, never reuses the dead one", async () => {
+    mockQuery.mockReturnValue(siteRow());
+    mockChatsCreate
+      .mockResolvedValueOnce({ id: "chat_dead" })
+      .mockResolvedValueOnce({ id: "chat_fresh" });
+    // v0 marks the generation failed — the chat is a dead end.
+    mockChatsGetById.mockResolvedValue({
+      id: "c",
+      latestVersion: { id: "v_failed", status: "failed" },
+    });
+
+    const first = await generateLandingPage("user-1", "Variant", "Pricing", {});
+    expect(first.status).toBe("failed");
+    expect(first.errorMessage).toMatch(/generation as failed/);
+
+    const second = await generateLandingPage("user-1", "Variant retry", "Pricing", {});
+    expect(second.status).toBe("failed"); // v0 failed again, but critically...
+    // ...via a FRESH chat. Without clearing the identity on V0_VERSION_FAILED, the
+    // guard would return chat_dead as reused and every retry would fail instantly.
+    expect(mockChatsCreate).toHaveBeenCalledTimes(2);
+    mockChatsGetById.mockReset();
+  });
+
+  it("unified default + existing site + same in-flight route → reuses instead of duplicate-building", async () => {
+    const inFlightRoute = {
+      id: "route-1",
+      userId: "user-1",
+      name: "Pricing",
+      slug: "pricing",
+      status: "generating",
+      updatedAt: new Date().toISOString(),
+      siteId: "site-1",
+      githubRepoUrl: "https://github.com/o/r",
+      vercelProjectId: "vp1",
+    };
+    mockQuery
+      .mockReturnValueOnce(siteRow())
+      .mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [inFlightRoute] }) });
+
+    const result = await generateLandingPage("user-1", "Variant", "Pricing", {});
+
+    expect(result.id).toBe("route-1");
+    expect(mockPut).not.toHaveBeenCalled();
+    expect(mockChatsCreate).not.toHaveBeenCalled();
   });
 
   it("separate mode → creates a new site even when one exists (opt-in, costlier)", async () => {
@@ -909,7 +1160,7 @@ describe("v0Service - deployLandingPage", () => {
     mockChatsGetById.mockResolvedValue({ id: "chat_1" }); // no latestVersion
 
     await expect(deployLandingPage("page-1", "user-1")).rejects.toThrow(
-      "No version found"
+      "No completed version"
     );
 
     // Verify it polled multiple times (5 attempts with zero-delay intervals)
@@ -917,6 +1168,67 @@ describe("v0Service - deployLandingPage", () => {
 
     // Reset to default after test
     mockChatsGetById.mockReset();
+  });
+
+  const deployablePage = () => ({
+    promise: () =>
+      Promise.resolve({
+        Item: {
+          id: "page-1",
+          userId: "user-1",
+          status: "draft",
+          v0ProjectId: "proj_1",
+          v0ChatId: "chat_1",
+        },
+      }),
+  });
+
+  it("FAIL: version stuck 'pending' → never downloaded, throws no completed version (async gating, ENG-287)", async () => {
+    mockGet.mockReturnValueOnce(deployablePage());
+    // Async-mode chats expose the version immediately with status 'pending' — its
+    // EXISTENCE must not be treated as readiness or we ship a half-generated page.
+    mockChatsGetById.mockResolvedValue({
+      id: "chat_1",
+      latestVersion: { id: "v_pending", status: "pending" },
+    });
+
+    await expect(deployLandingPage("page-1", "user-1")).rejects.toThrow(
+      "No completed version"
+    );
+    expect(mockChatsDownloadVersion).not.toHaveBeenCalled();
+    mockChatsGetById.mockReset();
+  });
+
+  it("FAIL: version status 'failed' → fails fast with v0's verdict, never downloads (ENG-287)", async () => {
+    mockGet.mockReturnValueOnce(deployablePage());
+    mockChatsGetById.mockResolvedValue({
+      id: "chat_1",
+      latestVersion: { id: "v_failed", status: "failed" },
+    });
+
+    await expect(deployLandingPage("page-1", "user-1")).rejects.toThrow(
+      /generation as failed/
+    );
+    // Fails on the FIRST poll — no point burning the whole poll budget on a terminal state.
+    expect(mockChatsGetById).toHaveBeenCalledTimes(1);
+    expect(mockChatsDownloadVersion).not.toHaveBeenCalled();
+    mockChatsGetById.mockReset();
+  });
+
+  it("SUCCESS gate: pending → completed is waited out, and the COMPLETED version is downloaded (ENG-287)", async () => {
+    mockGet.mockReturnValueOnce(deployablePage());
+    mockChatsGetById
+      .mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "v_1", status: "pending" } })
+      .mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "v_1", status: "completed" } });
+    // End the test right after the gate: the download step rejects loudly.
+    mockChatsDownloadVersion.mockRejectedValueOnce(new Error("stop here"));
+
+    await expect(deployLandingPage("page-1", "user-1")).rejects.toThrow("stop here");
+    expect(mockChatsDownloadVersion).toHaveBeenCalledWith(
+      expect.objectContaining({ versionId: "v_1" })
+    );
+    mockChatsGetById.mockReset();
+    mockChatsDownloadVersion.mockReset();
   });
 
   it("SUCCESS: polls until version becomes available on 3rd attempt", async () => {

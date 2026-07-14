@@ -286,12 +286,28 @@ export function setupMcpServer(app: express.Express) {
         });
         return;
       } else {
-        // No session ID AND not an initialization request — actually a bad request.
-        res.status(400).json({
+        // No session ID AND not an initialization request.
+        // This happens when a client's session was evicted (cleanupStaleSessions /
+        // server restart / multi-instance deploy with no shared session store) and its
+        // transport has since dropped or never re-set the mcp-session-id header, so the
+        // next non-initialize call arrives bare.
+        //
+        // Return 404 / -32001 (matching the unknown-session branch above), NOT 400 /
+        // -32000. The MCP SDK's StreamableHTTPClientTransport treats 404 as "session
+        // expired" and transparently re-runs the initialize handshake, then retries the
+        // call with a fresh session; it treats 400 as terminal and forces a manual
+        // reconnect. Returning the terminal 400 here was the root cause of
+        // emma_create_session (and every subsequent tool call) permanently failing with
+        // -32000 'Bad Request: No valid session ID provided' until a manual reconnect.
+        // This reuses the same recovery contract established in commit 9799b23b for the
+        // unknown-session path (MCP spec / SDK status-code semantics: 404 = recoverable
+        // session-expired, mirrored by the Claude Code MCP transport handling).
+        console.log('[MCP-SERVER-DEBUG] No session ID on non-init request — returning 404 so client auto-reinitializes');
+        res.status(404).json({
           jsonrpc: '2.0',
           error: {
-            code: -32000,
-            message: 'Bad Request: No valid session ID provided'
+            code: -32001,
+            message: 'Session not found. Please reinitialize.'
           },
           id: null
         });

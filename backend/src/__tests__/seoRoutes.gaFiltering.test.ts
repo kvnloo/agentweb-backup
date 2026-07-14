@@ -135,11 +135,13 @@ describe('SEO Routes - GA Domain Filtering', () => {
                 { value: '80' },  // sessions
                 { value: '40' },  // activeUsers
                 { value: '150' }, // screenPageViews
-                { value: '100' }  // avgSessionDuration
+                { value: '100' }, // avgSessionDuration
+                { value: '5' }    // conversions
               ]
             }
           ]
-        }]);
+        }])
+        .mockResolvedValueOnce([{ rows: [] }]); // conversionsBySource
 
       // Mock Search Console API
       global.fetch = jest.fn()
@@ -215,7 +217,7 @@ describe('SEO Routes - GA Domain Filtering', () => {
       expect(response.body.gaMetrics.sessions).toBe(100);
 
       // Verify that dimension filter was applied to all GA API calls
-      expect(mockRunReport).toHaveBeenCalledTimes(4);
+      expect(mockRunReport).toHaveBeenCalledTimes(5);
 
       // Check first call (overall metrics) has dimension filter
       const firstCall = mockRunReport.mock.calls[0][0];

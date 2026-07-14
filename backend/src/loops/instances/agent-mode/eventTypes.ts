@@ -44,6 +44,18 @@ export const EVT_TOOL_INVOKED = 'agent_tool_invoked';
 export const EVT_TOOL_SUCCEEDED = 'agent_tool_succeeded';
 /** A tool call threw / errored — the signal the policy groups by tool. */
 export const EVT_TOOL_FAILED = 'agent_tool_failed';
+/** A tool call was skipped without executing — neither success nor failure.
+ * Today this is media-gen calls deferred by the per-run time budget. Recorded
+ * as its own class so deferred/skipped is accounted separately from success and
+ * failure and never pollutes the reliability ratio or the failure policy. */
+export const EVT_TOOL_DEFERRED = 'agent_tool_deferred';
+/** A tool call SUCCEEDED but returned an explicitly partial result — some
+ * sub-sections of its output were unavailable (e.g. get_meta_ads_metrics where a
+ * breakdown endpoint errored while the core metrics came back). The call is still
+ * a success (it is NOT a failure and must not pollute the failure ratio), but the
+ * partial degradation is recorded as its own class so a section silently going
+ * dark is visible to telemetry instead of hiding behind success:true (ENG-104). */
+export const EVT_TOOL_PARTIAL_FAILURE = 'agent_tool_partial_failure';
 /** The run finished and produced a final answer. */
 export const EVT_RUN_COMPLETED = 'agent_run_completed';
 /** The run aborted with an unrecovered error. */
@@ -53,6 +65,11 @@ export const EVT_RUN_FAILED = 'agent_run_failed';
  * still complete, and only a durable event lets the loop's sensor learn from
  * degraded runs (the inspector's read-time flags are invisible to the policy). */
 export const EVT_RUN_VERDICT = 'agent_run_verdict';
+/** The finalize guard's claim check itself failed (judge/correction call error,
+ * ENG-143). LOUD by design: the guard delivers the chat unchanged on judge
+ * failure (never blocks delivery), so this event is the only trace that a
+ * truthfulness check was skipped — silence here would hide a dark guard. */
+export const EVT_CLAIM_CHECK_ERROR = 'agent_claim_check_error';
 
 export const AGENT_MODE_EVENT_TYPES = [
   EVT_RUN_STARTED,
@@ -60,7 +77,10 @@ export const AGENT_MODE_EVENT_TYPES = [
   EVT_TOOL_INVOKED,
   EVT_TOOL_SUCCEEDED,
   EVT_TOOL_FAILED,
+  EVT_TOOL_DEFERRED,
+  EVT_TOOL_PARTIAL_FAILURE,
   EVT_RUN_COMPLETED,
   EVT_RUN_FAILED,
   EVT_RUN_VERDICT,
+  EVT_CLAIM_CHECK_ERROR,
 ] as const;

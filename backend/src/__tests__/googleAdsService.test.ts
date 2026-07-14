@@ -803,6 +803,23 @@ describe('updateCampaign', () => {
     expect(body.operations[0].update.status).toBe('PAUSED');
     expect(body.operations[0].updateMask).toContain('status');
   });
+
+  it('sends mutate request with update and updateMask for final_url_suffix change', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    const didUpdate = await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+      finalUrlSuffix: 'utm_source=google&utm_medium=cpc',
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.finalUrlSuffix).toBe('utm_source=google&utm_medium=cpc');
+    expect(body.operations[0].updateMask).toContain('final_url_suffix');
+    expect(didUpdate).toBe(true);
+  });
+
+  it('returns false and makes no API call when no recognized fields are provided', async () => {
+    const didUpdate = await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {});
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+    expect(didUpdate).toBe(false);
+  });
 });
 
 describe('updateAdGroup', () => {

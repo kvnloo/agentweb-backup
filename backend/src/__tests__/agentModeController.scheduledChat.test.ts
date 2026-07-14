@@ -183,6 +183,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     // Setup default mocks
     mockChatbotDb.createChatSession.mockResolvedValue(mockSession);
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
+    // Reset persist implementation each test (clearAllMocks does not reset implementations)
+    mockChatbotDb.addMessageToSession.mockResolvedValue(undefined as any);
     (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
     mockChatbotDb.updateSessionLlmModel.mockResolvedValue(mockSession);
     mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
@@ -527,6 +529,116 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       const retryAt = new Date(nextRunTime as string).getTime();
       expect(retryAt).toBeGreaterThanOrEqual(beforeRun + 14 * 60 * 1000);
       expect(retryAt).toBeLessThanOrEqual(Date.now() + 16 * 60 * 1000);
+    });
+
+    it('should persist a structured incomplete-job assistant message so the session is never left silent after zero assistant output', async () => {
+      // Reproduces ENG-209: a large scheduled research job (e.g. 40-competitor
+      // report) crashes/times out and the run produces zero assistant output.
+      // The session must NOT be left blank — the user should see a graceful
+      // "job incomplete" message rather than an empty session.
+      const simpleSchedule = {
+        ...baseSchedule,
+        keywords: [],
+        requiredFunctionCalls: [],
+        zeroAssistantRetryCount: 0,
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: '',
+        toolCalls: [],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      await runScheduledChat(simpleSchedule, mockUserId, false);
+
+      const fallbackCall = mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call: any[]) => call[1]?.metadata?.jobIncomplete === true
+      );
+      expect(fallbackCall).toBeDefined();
+      expect(fallbackCall![0]).toBe('test-session-123');
+      expect(fallbackCall![1]).toEqual(
+        expect.objectContaining({
+          role: 'assistant',
+          content: expect.any(String),
+          metadata: expect.objectContaining({
+            isErrorMessage: true,
+            jobIncomplete: true,
+          }),
+        })
+      );
+      expect(fallbackCall![1].content.length).toBeGreaterThan(0);
+    });
+
+    it('should still requeue after zero assistant output even when persisting the job-incomplete message fails', async () => {
+      // The job-incomplete persist runs inside a try/catch (ENG-209): if DynamoDB
+      // rejects, the error must be swallowed so the requeue still proceeds and the
+      // run does not crash.
+      const simpleSchedule = {
+        ...baseSchedule,
+        keywords: [],
+        requiredFunctionCalls: [],
+        zeroAssistantRetryCount: 0,
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: '',
+        toolCalls: [],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+      mockChatbotDb.addMessageToSession.mockRejectedValue(new Error('DynamoDB write failed'));
+
+      const result = await runScheduledChat(simpleSchedule, mockUserId, false);
+
+      // Run still completes gracefully despite the persist failure
+      expect(result).toEqual(expect.objectContaining({ status: 'failure', passed: false }));
+
+      // The persist was attempted...
+      const fallbackCall = mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call: any[]) => call[1]?.metadata?.jobIncomplete === true
+      );
+      expect(fallbackCall).toBeDefined();
+
+      // ...but the requeue still fired even though the persist rejected
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        simpleSchedule.scheduleId,
+        expect.objectContaining({
+          status: 'active',
+          zeroAssistantRetryCount: 1,
+          nextRunTime: expect.any(String),
+        })
+      );
+    });
+
+    it('should skip the job-incomplete persist and not crash when no session was created', async () => {
+      // The persist block is guarded by `if (sessionId)`; when session creation
+      // yields a falsy sessionId the persist must be skipped without throwing.
+      const simpleSchedule = {
+        ...baseSchedule,
+        keywords: [],
+        requiredFunctionCalls: [],
+        zeroAssistantRetryCount: 0,
+      };
+      mockChatbotDb.createChatSession.mockResolvedValue({ ...mockSession, sessionId: '' });
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: '',
+        toolCalls: [],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      const result = await runScheduledChat(simpleSchedule, mockUserId, false);
+
+      // No throw — returns a graceful failure result
+      expect(result).toEqual(expect.objectContaining({ status: 'failure', passed: false }));
+
+      // The job-incomplete message must NOT be persisted when there is no session
+      const fallbackCall = mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call: any[]) => call[1]?.metadata?.jobIncomplete === true
+      );
+      expect(fallbackCall).toBeUndefined();
     });
 
     it('should reset zero assistant retry tracking after a successful production run', async () => {
@@ -2380,6 +2492,31 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
             error: 'runCount must be -1 (unlimited) or a positive integer',
           })
         );
+      });
+
+      it('should list the missing field names when a required field resolves to empty', async () => {
+        // baseSchedule (default mock) has no `frequency`, so omitting scheduleFrequency
+        // in the request leaves effectiveScheduleFrequency undefined.
+        const mockReq = {
+          user: { userId: mockUserId },
+          params: { scheduleId: mockScheduleId },
+          body: {
+            scheduleName: 'Updated Schedule',
+            startingMessage: 'Updated message',
+          },
+        } as unknown as Request;
+
+        const mockRes = {
+          json: jest.fn(),
+          status: jest.fn().mockReturnThis(),
+        } as unknown as Response;
+
+        await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+        expect(mockRes.status).toHaveBeenCalledWith(400);
+        expect(mockRes.json).toHaveBeenCalledWith({
+          error: 'Missing required fields: scheduleFrequency',
+        });
       });
 
       it('should reject updating schedule without email notifications (no variables)', async () => {

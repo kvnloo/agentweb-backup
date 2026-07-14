@@ -1,6 +1,8 @@
 name: Deploy
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       environment:
@@ -10,9 +12,10 @@ on:
         type: choice
         options:
           - prod
-  schedule:
-    # Run at 2:00 AM UTC (6:00 PM PST) every day
-    - cron: '0 2 * * *'
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -31,17 +34,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 100
+          fetch-depth: 0
 
-      - name: Check changes (scheduled)
-        if: github.event_name == 'schedule'
+      - name: Check changes (push)
+        if: github.event_name == 'push'
         id: filter
-        run: |
-          BASE=$(git rev-parse HEAD~10 2>/dev/null || git rev-list --max-parents=0 HEAD)
-          BACKEND=$(git diff --name-only "$BASE" HEAD -- backend/ | head -1)
-          PARTNER=$(git diff --name-only "$BASE" HEAD -- partner-portal/ | head -1)
-          echo "backend=$( [ -n \"$BACKEND\" ] && echo true || echo false )" >> $GITHUB_OUTPUT
-          echo "partner=$( [ -n \"$PARTNER\" ] && echo true || echo false )" >> $GITHUB_OUTPUT
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            backend:
+              - 'backend/**'
+            partner:
+              - 'partner-portal/**'
 
       - name: Deploy all (manual trigger)
         if: github.event_name == 'workflow_dispatch'
@@ -80,9 +84,7 @@ jobs:
         id: pr-num
         run: |
           SHORT_SHA=$(git rev-parse --short HEAD)
-          if [ "${{ github.event_name }}" == "schedule" ]; then
-            SUFFIX="scheduled-${SHORT_SHA}"
-          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             SUFFIX="manual-${SHORT_SHA}"
           else
             PR_NUM=$(git log -1 --pretty=%s | grep -oP '#\K[0-9]+' || echo "${SHORT_SHA}")
@@ -135,13 +137,34 @@ jobs:
             --environment-name ${{ vars.EB_BACKEND_ENVIRONMENT_NAME }} \
             --version-label "$VERSION_LABEL" || echo "⚠️  Environment update failed (may be updating), but AWS deployment likely succeeded"
 
+      - name: Wait for backend environment to be ready
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          ENV_NAME="${{ vars.EB_BACKEND_ENVIRONMENT_NAME }}"
+          for attempt in {1..180}; do
+            STATUS=$(aws elasticbeanstalk describe-environments \
+              --environment-names "$ENV_NAME" \
+              --query 'Environments[0].Status' --output text)
+            HEALTH=$(aws elasticbeanstalk describe-environments \
+              --environment-names "$ENV_NAME" \
+              --query 'Environments[0].Health' --output text)
+            echo "Status=$STATUS Health=$HEALTH attempt=$attempt"
+            if [ "$STATUS" = "Ready" ] && [ "$HEALTH" != "Grey" ]; then
+              echo "Environment is ready"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "❌ Environment did not become ready within 45 minutes"
+          exit 1
+
       - name: Backend Deployment Status
         run: |
           DATE=$(date +%Y%m%d)
           PR_NUM=${{ steps.pr-num.outputs.pr_num }}
-          echo "🚀 Backend deployment initiated successfully!"
-          echo "📊 Check deployment status: https://${{ env.AWS_REGION }}.console.aws.amazon.com/elasticbeanstalk/home?region=${{ env.AWS_REGION }}#/environments"
-          echo "✅ Deployed: backend-${DATE}-pr${PR_NUM}"
+          echo "Backend deployment complete!"
+          echo "Deployed: backend-${DATE}-pr${PR_NUM}"
 
       # Artifact upload removed to save GitHub storage quota
       # Build artifacts are already uploaded to S3 for deployment
@@ -168,9 +191,7 @@ jobs:
         id: pr-num
         run: |
           SHORT_SHA=$(git rev-parse --short HEAD)
-          if [ "${{ github.event_name }}" == "schedule" ]; then
-            SUFFIX="scheduled-${SHORT_SHA}"
-          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             SUFFIX="manual-${SHORT_SHA}"
           else
             PR_NUM=$(git log -1 --pretty=%s | grep -oP '#\K[0-9]+' || echo "${SHORT_SHA}")
@@ -233,13 +254,34 @@ jobs:
             --environment-name ${{ vars.EB_PARTNER_ENVIRONMENT_NAME }} \
             --version-label "$VERSION_LABEL" || echo "⚠️  Environment update failed (may be updating), but AWS deployment likely succeeded"
 
+      - name: Wait for partner environment to be ready
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          ENV_NAME="${{ vars.EB_PARTNER_ENVIRONMENT_NAME }}"
+          for attempt in {1..80}; do
+            STATUS=$(aws elasticbeanstalk describe-environments \
+              --environment-names "$ENV_NAME" \
+              --query 'Environments[0].Status' --output text)
+            HEALTH=$(aws elasticbeanstalk describe-environments \
+              --environment-names "$ENV_NAME" \
+              --query 'Environments[0].Health' --output text)
+            echo "Status=$STATUS Health=$HEALTH attempt=$attempt"
+            if [ "$STATUS" = "Ready" ] && [ "$HEALTH" != "Grey" ]; then
+              echo "Environment is ready"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "❌ Environment did not become ready within 20 minutes"
+          exit 1
+
       - name: Partner Portal Deployment Status
         run: |
           DATE=$(date +%Y%m%d)
           PR_NUM=${{ steps.pr-num.outputs.pr_num }}
-          echo "🚀 Partner portal deployment initiated successfully!"
-          echo "📊 Check deployment status: https://${{ env.AWS_REGION }}.console.aws.amazon.com/elasticbeanstalk/home?region=${{ env.AWS_REGION }}#/environments"
-          echo "✅ Deployed: partner-${DATE}-pr${PR_NUM}"
+          echo "Partner portal deployment complete!"
+          echo "Deployed: partner-${DATE}-pr${PR_NUM}"
 
       # Artifact upload removed to save GitHub storage quota
       # Build artifacts are already uploaded to S3 for deployment

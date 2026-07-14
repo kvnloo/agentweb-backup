@@ -61,6 +61,14 @@ describe('AgentModeService - Knowledge Base Files', () => {
         expect(tool?.function?.description).toContain('List available knowledge base files');
       });
 
+      // ENG-173: description must clarify the Drive entries here are read-only and
+      // that creating/editing Docs is a separate skill discoverable via list_available_skills.
+      it('should note that Google Docs create/edit is a separate skill', () => {
+        const tools = agentModeService.getAvailableTools();
+        const tool = tools.find((t: any) => t.function?.name === 'list_knowledge_base_files');
+        expect(tool?.function?.description).toContain('list_available_skills');
+      });
+
       it('should have no required parameters', () => {
         const tools = agentModeService.getAvailableTools();
         const tool = tools.find((t: any) => t.function?.name === 'list_knowledge_base_files');
@@ -76,11 +84,71 @@ describe('AgentModeService - Knowledge Base Files', () => {
         const result = await (agentModeService as any).listKnowledgeBaseFiles('user-123');
 
         expect(result.success).toBe(true);
-        expect(result.message).toBe('No knowledge bases found');
+        expect(result.message).toContain('No knowledge bases found');
         expect(result.knowledge_bases).toEqual([]);
         expect(result.totalFiles).toBe(0);
         expect(result.totalKnowledgeBases).toBe(0);
         expect(mockedTaskDb.getTasksWithKnowledgeBase).toHaveBeenCalledWith('user-123');
+      });
+
+      // ENG-173: an explicit Google Drive query returning empty must NOT read as
+      // "Google Docs creation is unavailable" — route the model to the separate
+      // Drive/Docs skill via list_available_skills. Scoped to kb_type=google-drive so
+      // generic listings aren't spammed with an off-topic Docs nudge.
+      it('should append Google Docs capability guidance on empty result when kb_type=google-drive', async () => {
+        mockedTaskDb.getTasksWithKnowledgeBase.mockResolvedValue([]);
+        mockedTaskDb.getAllPublicKnowledgeBaseTasks.mockResolvedValue([]);
+
+        const result = await (agentModeService as any).listKnowledgeBaseFiles('user-123', { kb_type: 'google-drive' });
+
+        expect(result.success).toBe(true);
+        expect(result.message).toContain('list_available_skills');
+        expect(result.message.toLowerCase()).toContain('separate');
+      });
+
+      it('should NOT append Docs guidance on an unfiltered empty result (avoids off-topic nudging)', async () => {
+        mockedTaskDb.getTasksWithKnowledgeBase.mockResolvedValue([]);
+        mockedTaskDb.getAllPublicKnowledgeBaseTasks.mockResolvedValue([]);
+
+        const result = await (agentModeService as any).listKnowledgeBaseFiles('user-123');
+
+        expect(result.success).toBe(true);
+        expect(result.message).toBe('No knowledge bases found');
+        expect(result.message).not.toContain('list_available_skills');
+      });
+
+      it('should NOT append Google Docs guidance on empty result for a non-Drive kb_type', async () => {
+        mockedTaskDb.getTasksWithKnowledgeBase.mockResolvedValue([]);
+        mockedTaskDb.getAllPublicKnowledgeBaseTasks.mockResolvedValue([]);
+
+        const result = await (agentModeService as any).listKnowledgeBaseFiles('user-123', { kb_type: 'private' });
+
+        expect(result.success).toBe(true);
+        expect(result.message).toBe('No knowledge bases found');
+        expect(result.message).not.toContain('list_available_skills');
+      });
+
+      // ENG-173: a populated result (generic listing) must NOT carry the Docs nudge —
+      // it only fired in off-topic cases (Docs wasn't the subject). Signal ~0, noise high.
+      it('should NOT append Docs guidance to a populated listing with no Google Drive folder', async () => {
+        mockedTaskDb.getTasksWithKnowledgeBase.mockResolvedValue([
+          {
+            taskId: 'task-1',
+            name: 'Task 1',
+            knowledgeBaseSize: 1024,
+            knowledgeBaseType: 'private',
+            knowledgeBaseUpdatedAt: '2024-01-01T00:00:00Z',
+            knowledgeBase: 'https://example.com/knowledge-base.txt',
+            knowledgeBaseFiles: []
+          }
+        ] as any);
+        mockedTaskDb.getAllPublicKnowledgeBaseTasks.mockResolvedValue([]);
+
+        const result = await (agentModeService as any).listKnowledgeBaseFiles('user-123');
+
+        expect(result.success).toBe(true);
+        expect(result.totalKnowledgeBases).toBeGreaterThan(0);
+        expect(result.message).not.toContain('list_available_skills');
       });
 
       it('should return list of knowledge bases with files', async () => {

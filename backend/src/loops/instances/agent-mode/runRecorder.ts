@@ -25,6 +25,7 @@
 
 import type { DynamoPort } from '../../core/ports';
 import type { ClockPort } from '../../core/ports';
+import type { LoggerPort } from '../../core/ports';
 import type { EventDimensions, NormalizedEvent } from '../../core/types';
 import { asSubjectId } from '../../core/types';
 import { eventToItem, LOOP_EVENTS_TABLE } from '../../core/sensors/eventTableEventSource';
@@ -32,13 +33,16 @@ import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
 import { classifyToolFailureType } from '../../../utils/toolFailureType';
 import { AGENT_MODE_LOOP_ID } from './eventTypes';
 import {
+  EVT_CLAIM_CHECK_ERROR,
   EVT_DECISION,
   EVT_RUN_COMPLETED,
   EVT_RUN_FAILED,
   EVT_RUN_STARTED,
   EVT_RUN_VERDICT,
+  EVT_TOOL_DEFERRED,
   EVT_TOOL_FAILED,
   EVT_TOOL_INVOKED,
+  EVT_TOOL_PARTIAL_FAILURE,
   EVT_TOOL_SUCCEEDED,
 } from './eventTypes';
 
@@ -53,6 +57,10 @@ export interface RunVerdictInput {
   /** Highest per-tool failure count in the run — catches retry spirals that a
    * low overall ratio hides (e.g. one tool retried 15× in a 100-call run). */
   maxSameToolFailures?: number;
+  /** The finalize guard found the final message claiming a completed action the
+   * tool ledger does not back, and the corrective turn did not resolve it
+   * (ENG-143). User-facing degradation even with zero tool failures. */
+  claimMismatch?: boolean;
 }
 
 /**
@@ -74,16 +82,54 @@ export function computeRunVerdict(input: RunVerdictInput): {
     reasons.push('high_failure_ratio');
   }
   if ((input.maxSameToolFailures ?? 0) >= 3) reasons.push('repeated_tool_failures');
+  if (input.claimMismatch) reasons.push('claim_mismatch');
 
   return reasons.length > 0 ? { verdict: 'degraded', reasons } : { verdict: 'ok', reasons: [] };
 }
 
 export class AgentRunRecorder {
+  /**
+   * Monotonic write chain (ENG-102). Every emit is appended SYNCHRONOUSLY onto
+   * this chain, so call-order == write-order for one recorder: a terminal run
+   * record (runCompleted/runFailed) enqueued after the per-tool records can
+   * never have its Dynamo put start before the tool puts complete. Without this,
+   * the per-tool telemetry and the terminal record were independent detached
+   * promises and the terminal put could (and did) land first, and unflushed
+   * writes were silently lost when the worker process exited.
+   */
+  private writeChain: Promise<void> = Promise.resolve();
+
+  /** Count of Dynamo write failures surfaced this process (ENG-102) — exposed so
+   * callers/metrics can observe persistence failures instead of them being
+   * console-only. */
+  public writeFailures = 0;
+
   constructor(
     private readonly dynamo: DynamoPort,
     private readonly clock: ClockPort,
     private readonly tableName: string = LOOP_EVENTS_TABLE,
+    private readonly logger?: LoggerPort,
   ) {}
+
+  /**
+   * Append a write segment onto the monotonic chain. Returns the segment so the
+   * caller MAY await its own write, while the chain itself is kept alive with a
+   * swallowing `.catch` so one failed write never breaks ordering for the next.
+   */
+  private enqueue(fn: () => Promise<void>): Promise<void> {
+    const segment = this.writeChain.then(fn);
+    this.writeChain = segment.catch(() => {});
+    return segment;
+  }
+
+  /**
+   * Resolve once every write enqueued so far has settled. Callers drain this
+   * before worker/IPC teardown so no telemetry is lost on process exit — the
+   * terminal run record's flush implies all per-tool records are durably written.
+   */
+  flush(): Promise<void> {
+    return this.writeChain;
+  }
 
   async runStarted(
     runId: string,
@@ -160,26 +206,97 @@ export class AgentRunRecorder {
     });
   }
 
+  /**
+   * A tool call was DEFERRED — skipped without executing (ENG-103). Recorded as
+   * its own event class (not toolInvoked/succeeded/failed) so deferred calls are
+   * accounted separately from success and failure and never touch the
+   * reliability ratio or the failure-cluster policy. Carries the tool name, a
+   * reason/category, and the budget/defer context.
+   */
+  async toolDeferred(
+    runId: string,
+    info: {
+      toolName: string;
+      reason: string;
+      iteration?: number;
+      sessionId?: string;
+      mediaAssetsProducedThisRun?: number;
+      deadlineMs?: number;
+    },
+  ): Promise<void> {
+    await this.emit(runId, EVT_TOOL_DEFERRED, cleanDims(info));
+  }
+
+  /**
+   * A tool call SUCCEEDED but with a partial result — some sub-sections of its
+   * output were unavailable (ENG-104). Recorded as its OWN event class, NOT as
+   * toolFailed: the call did not error, so it must not enter the failure ratio or
+   * the failure-cluster policy. It also is NOT toolDeferred (the call DID execute).
+   * The unavailable sections are stored as a comma-joined string + a numeric count
+   * so a section silently going dark is queryable in Dev-AW-LoopEvents.
+   */
+  async toolPartialFailure(
+    runId: string,
+    info: {
+      toolName: string;
+      unavailableSections: string[];
+      iteration?: number;
+      sessionId?: string;
+    },
+  ): Promise<void> {
+    await this.emit(runId, EVT_TOOL_PARTIAL_FAILURE, cleanDims({
+      toolName: info.toolName,
+      unavailableSections: info.unavailableSections.join(','),
+      unavailableCount: info.unavailableSections.length,
+      iteration: info.iteration,
+      sessionId: info.sessionId,
+    }));
+  }
+
   async runCompleted(
     runId: string,
-    info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string } = {},
+    info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string; claimMismatch?: boolean } = {},
   ): Promise<void> {
-    await this.emit(runId, EVT_RUN_COMPLETED, cleanDims(info));
-    await this.emitVerdict(runId, false, info);
+    // Enqueue BOTH the terminal record and its verdict SYNCHRONOUSLY (no await
+    // between) so they are both on the write chain before this method yields —
+    // otherwise a flush() captured right after a fire-and-forget runCompleted
+    // could miss the not-yet-enqueued verdict (ENG-102). Order is still
+    // completed → verdict because emit() enqueues in call order.
+    const completed = this.emit(runId, EVT_RUN_COMPLETED, cleanDims(info));
+    const verdict = this.emitVerdict(runId, false, info);
+    await Promise.all([completed, verdict]);
   }
 
   async runFailed(
     runId: string,
     info: { error: unknown; toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
   ): Promise<void> {
-    await this.emit(runId, EVT_RUN_FAILED, {
+    const failed = this.emit(runId, EVT_RUN_FAILED, {
       ...(info.toolCalls != null ? { toolCalls: info.toolCalls } : {}),
       ...(info.failedToolCalls != null ? { failedToolCalls: info.failedToolCalls } : {}),
       ...(info.sessionId ? { sessionId: info.sessionId } : {}),
       errorClass: errorClassOf(info.error),
       errorMessage: errorMessageOf(info.error),
     });
-    await this.emitVerdict(runId, true, info);
+    const verdict = this.emitVerdict(runId, true, info);
+    await Promise.all([failed, verdict]);
+  }
+
+  /**
+   * The finalize guard's claim check itself failed (judge/correction LLM call
+   * errored, ENG-143). Emitted LOUDLY as its own event class: on judge failure
+   * the guard delivers the chat unchanged, so this event is the only durable
+   * trace that a truthfulness check was skipped for the run.
+   */
+  async claimCheckError(
+    runId: string,
+    info: { error: unknown; sessionId?: string },
+  ): Promise<void> {
+    await this.emit(runId, EVT_CLAIM_CHECK_ERROR, {
+      ...(info.sessionId ? { sessionId: info.sessionId } : {}),
+      errorClass: errorClassOf(info.error),
+      errorMessage: errorMessageOf(info.error),
+    });
   }
 
   /** Durable outcome verdict alongside the terminal event — the loop's sensor
@@ -187,13 +304,14 @@ export class AgentRunRecorder {
   private async emitVerdict(
     runId: string,
     failed: boolean,
-    info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
+    info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string; claimMismatch?: boolean },
   ): Promise<void> {
     const { verdict, reasons } = computeRunVerdict({
       failed,
       toolCalls: info.toolCalls ?? 0,
       failedToolCalls: info.failedToolCalls ?? 0,
       maxSameToolFailures: info.maxSameToolFailures,
+      claimMismatch: info.claimMismatch,
     });
     await this.emit(runId, EVT_RUN_VERDICT, {
       verdict,
@@ -205,15 +323,19 @@ export class AgentRunRecorder {
     });
   }
 
-  /** Build + put one event row. Swallows errors — telemetry must never break
-   * the caller's hot path. */
-  private async emit(runId: string, eventType: string, dimensions: EventDimensions): Promise<void> {
-    try {
+  /** Build + put one event row through the serialized write chain. Swallows its
+   * own write errors — telemetry must never break the caller's hot path — but
+   * surfaces them as a structured logger signal + writeFailures counter rather
+   * than console-only (ENG-102). The timestamp is captured synchronously at
+   * enqueue time so the event's ts reflects when it happened, not when written. */
+  private emit(runId: string, eventType: string, dimensions: EventDimensions): Promise<void> {
+    const ts = this.clock.now();
+    return this.enqueue(async () => {
       recorderSeq++;
       const event: NormalizedEvent = {
         subjectId: asSubjectId(runId),
         eventType,
-        ts: this.clock.now(),
+        ts,
         dimensions,
       };
       const item = eventToItem(AGENT_MODE_LOOP_ID, event);
@@ -223,10 +345,21 @@ export class AgentRunRecorder {
         ...item,
         tsSession: `${item.tsSession as string}#${recorderSeq}`,
       };
-      await this.dynamo.putItem(this.tableName, disambiguated);
-    } catch (err) {
-      console.error('[agent-mode-recorder] failed to record event (swallowed):', eventType, err);
-    }
+      try {
+        await this.dynamo.putItem(this.tableName, disambiguated);
+      } catch (err) {
+        this.writeFailures++;
+        if (this.logger) {
+          this.logger.log('error', 'agent_recorder_write_failed', {
+            eventType,
+            runId,
+            errorClass: classifyToolErrorClass(err),
+          });
+        } else {
+          console.error('[agent-mode-recorder] failed to record event (swallowed):', eventType, err);
+        }
+      }
+    });
   }
 }
 

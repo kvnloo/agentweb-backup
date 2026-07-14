@@ -1228,9 +1228,20 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const creative = new AdCreative(creativeId);
+      // object_story_spec must be expanded with explicit subfields — the Graph API only returns
+      // image_hash when it is named directly; requesting the bare "object_story_spec" field
+      // silently drops image_hash and returns only the hosted "picture" URL. Copy/reuse flows
+      // (COPY_AD) that read the hash back to attach it to a new creative would otherwise always
+      // fall back to re-uploading that low-res preview URL, which Meta's AdCreative create
+      // endpoint rejects (error code 100, subcode 1487390).
+      const objectStorySpecField =
+        'object_story_spec{page_id,' +
+        'link_data{link,message,caption,name,image_hash,picture,call_to_action,' +
+        'child_attachments{link,image_hash,picture,name,description,video_id,call_to_action}},' +
+        'video_data{video_id,image_hash,image_url,title,message,call_to_action}}';
       const fields = [
         'id', 'name', 'body', 'title', 'image_url', 'thumbnail_url',
-        'object_type', 'link_url', 'object_story_spec', 'asset_feed_spec', 'url_tags'
+        'object_type', 'link_url', objectStorySpecField, 'asset_feed_spec', 'url_tags'
       ];
       this.log(`Fetching ad creative: ${creativeId}`);
       const result = await creative.get(fields);

@@ -9,6 +9,7 @@ import { userDb } from "../../services/db";
 import { decryptPassword } from "../../utils/crypto";
 import { internalMcpServers } from "./mcp_config";
 import { McpOAuthClientProvider, getServerConfig } from "./mcpOAuthClientProvider";
+import { buildMcpToolTelemetry } from "./mcpToolTelemetry";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -586,7 +587,16 @@ export class McpClientService {
                   const sessionClient = await this.getSessionClient(serverName, context.sessionId, context.userId);
                   const clientTransport = (sessionClient as any)._transport;
                   const mcpSessionId = clientTransport?.sessionId || 'NO_SESSION_ID';
-                  console.log(`[MCP-DEBUG] Calling tool ${originalToolName} on server ${serverName}, MCP session: ${mcpSessionId}, chat sessionId: ${context.sessionId}${attempt > 1 ? ` (retry ${attempt - 1}/${BROWSER_TOOL_MAX_RETRIES})` : ''}`);
+                  console.log(JSON.stringify(buildMcpToolTelemetry({
+                    serverName,
+                    toolName: exposedToolName,
+                    transport: transportType,
+                    chatSessionId: context.sessionId,
+                    mcpSessionId,
+                    attempt,
+                    maxAttempts,
+                    phase: 'call',
+                  })));
                   const result = await sessionClient.callTool({
                     name: originalToolName,
                     arguments: toolArgs
@@ -611,10 +621,28 @@ export class McpClientService {
                     }
                   }
                   if (attempt < maxAttempts) {
-                    console.warn(`[MCP-RETRY] Browser tool "${exposedToolName}" failed on attempt ${attempt}/${maxAttempts}, retrying in ${BROWSER_TOOL_RETRY_DELAY_MS}ms:`, error);
+                    console.warn(JSON.stringify(buildMcpToolTelemetry({
+                      serverName,
+                      toolName: exposedToolName,
+                      transport: transportType,
+                      chatSessionId: context.sessionId,
+                      attempt,
+                      maxAttempts,
+                      phase: 'retry',
+                      error,
+                    })));
                     await sleep(BROWSER_TOOL_RETRY_DELAY_MS);
                   } else {
-                    console.error(`[MCP Tool Execution Error (${exposedToolName}):`, error);
+                    console.error(JSON.stringify(buildMcpToolTelemetry({
+                      serverName,
+                      toolName: exposedToolName,
+                      transport: transportType,
+                      chatSessionId: context.sessionId,
+                      attempt,
+                      maxAttempts,
+                      phase: 'final_failure',
+                      error,
+                    })));
                   }
                 }
               }
@@ -1150,10 +1178,19 @@ export class McpClientService {
               // This ensures each chat session has its own isolated MCP connection
               const sessionClient = await this.getSessionClient(name, context.sessionId, context.userId);
 
-              // Log MCP tool call with session info
+              // Log MCP tool call with structured reliability telemetry (ENG-107)
               const clientTransport = (sessionClient as any)._transport;
               const mcpSessionId = clientTransport?.sessionId || 'NO_SESSION_ID';
-              console.log(`[MCP-DEBUG] Calling tool ${originalToolName} on server ${name}, MCP session: ${mcpSessionId}, chat sessionId: ${context.sessionId}${attempt > 1 ? ` (retry ${attempt - 1}/${BROWSER_TOOL_MAX_RETRIES})` : ''}`);
+              console.log(JSON.stringify(buildMcpToolTelemetry({
+                serverName: name,
+                toolName: exposedToolName,
+                transport: transportType,
+                chatSessionId: context.sessionId,
+                mcpSessionId,
+                attempt,
+                maxAttempts,
+                phase: 'call',
+              })));
 
               const result = await sessionClient.callTool({
                 name: originalToolName, // Use ORIGINAL (unprefixed) name for execution
@@ -1189,10 +1226,28 @@ export class McpClientService {
                 }
               }
               if (attempt < maxAttempts) {
-                console.warn(`[MCP-RETRY] Browser tool "${exposedToolName}" failed on attempt ${attempt}/${maxAttempts}, retrying in ${BROWSER_TOOL_RETRY_DELAY_MS}ms:`, error);
+                console.warn(JSON.stringify(buildMcpToolTelemetry({
+                  serverName: name,
+                  toolName: exposedToolName,
+                  transport: transportType,
+                  chatSessionId: context.sessionId,
+                  attempt,
+                  maxAttempts,
+                  phase: 'retry',
+                  error,
+                })));
                 await sleep(BROWSER_TOOL_RETRY_DELAY_MS);
               } else {
-                console.error(`[MCP Tool Execution Error (${exposedToolName}):`, error);
+                console.error(JSON.stringify(buildMcpToolTelemetry({
+                  serverName: name,
+                  toolName: exposedToolName,
+                  transport: transportType,
+                  chatSessionId: context.sessionId,
+                  attempt,
+                  maxAttempts,
+                  phase: 'final_failure',
+                  error,
+                })));
               }
             }
           }
