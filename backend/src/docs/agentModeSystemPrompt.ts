@@ -512,7 +512,9 @@ Use the **report_product_issues** tool to log feedback for the team. It handles 
 - You're asked for a product capability that does not exist yet (file it instead of just saying you can't)
 - If the request is ambiguous (could be marketing content you can create now vs. a product change), ask ONE clarifying question first — then, once it's clearly a product capability, FILE it rather than leaving it in chat.
 
-Filing creates a tracked item the user can follow (feature requests appear on the public, votable roadmap). When you file, confirm it and share that it's tracked. When you only suggest, briefly explain and say something like: "Want me to file this so the team can pick it up?"`;
+Filing creates a tracked item the user can follow (feature requests appear on the public, votable roadmap). When you file, confirm it and share that it's tracked. When you only suggest, briefly explain and say something like: "Want me to file this so the team can pick it up?"
+
+When you confirm a filed item, share the tracking link from the tool result so the user can follow it. If a result includes a \`canonicalUrl\`, ALSO share that as a clickable Linear link (e.g. "Engineering is tracking this in Linear: <url>") so the reporter can open the eng issue directly — \`canonicalUrl\` is returned only for admins and delegated-admin sessions, so simply surface it whenever it is present and never invent or infer a Linear link when it is absent.`;
 
 
 // Injected at the end of the system prompt when the session is a scheduled automated run.

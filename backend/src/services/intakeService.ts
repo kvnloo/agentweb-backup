@@ -24,6 +24,7 @@
 import { getUserFunnelStatusIssueTags, getUserFunnelStatusCoarseTag } from '../utils/userFunnelStatus';
 
 const FEATUREBASE_BOARD_URL = 'https://agentweb.featurebase.app/';
+const LINEAR_ISSUE_BASE = 'https://linear.app/emmabyaw/issue';
 
 function intakeEnabled(): boolean {
   return process.env.FEATUREBASE_INTAKE === 'true';
@@ -104,6 +105,13 @@ export interface FiledUserResult {
   pageId: string;       // Featurebase post id (or Notion pageId when the flag is off)
   trackerUrl: string;   // internal tracker link (Featurebase post / Notion page)
   userUrl?: string;     // public, user-facing Featurebase post link
+  /**
+   * Internal Linear canonical issue link (bugs only) — the single ticket eng works, whether this
+   * report created it or deduped onto an existing one. Surfaced so the team gets a VISIBLE Linear
+   * confirmation/link instead of only the reporter's private Featurebase card (ENG-289). Never
+   * shown to the customer — it is an internal, eng-facing link for the notification email.
+   */
+  canonicalUrl?: string;
   deduped: boolean;
   tracker: 'Featurebase' | 'Notion';
 }
@@ -212,8 +220,13 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   );
 
   let canonicalUuid = '';
+  let canonicalUrl = '';
   if (dup) {
-    canonicalUuid = byRef.get(dup.ref)!.issueId;
+    const matched = byRef.get(dup.ref)!;
+    canonicalUuid = matched.issueId;
+    // A deduped report returns the SAME canonical link (ENG-289). listOpenBugCanonicals gives us
+    // the identifier (e.g. ENG-42) but not the url, so build it from the stable issue-URL base.
+    canonicalUrl = `${LINEAR_ISSUE_BASE}/${matched.identifier}`;
     // Dedup triage upgrade (ENG-187): a higher-tier reporter hitting an existing canonical unions
     // its stage labels in and raises the priority — never lowers it (raise-only by contract of
     // raiseIssueTriage). Best-effort: a failed upgrade must not block the filing.
@@ -246,6 +259,9 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
       assigneeId: BUG_DEFAULT_ASSIGNEE_ID,
     });
     canonicalUuid = li.id || '';
+    // Capture the canonical link (ENG-289) — createInternalLinearIssue returns it; fall back to
+    // building from the identifier if the url is ever absent.
+    canonicalUrl = li.url || (li.identifier ? `${LINEAR_ISSUE_BASE}/${li.identifier}` : '');
   }
 
   // 3. Record this reporter on the canonical (best-effort). `[reporter-ticket #N]` is the contract
@@ -265,6 +281,7 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
     pageId: String(ticket.number),
     trackerUrl: ticket.url || FEATUREBASE_BOARD_URL,
     userUrl: ticket.url || FEATUREBASE_BOARD_URL, // the reporter's OWN private card
+    canonicalUrl: canonicalUrl || undefined,      // internal Linear canonical (ENG-289)
     deduped: !!dup,
     tracker: 'Featurebase',
   };
@@ -344,8 +361,6 @@ export interface FiledAutoResult {
   deduped: boolean;
   tracker: 'Linear' | 'Notion';
 }
-
-const LINEAR_ISSUE_BASE = 'https://linear.app/emmabyaw/issue';
 
 /**
  * File an auto-identified issue. Callers should treat this as best-effort and wrap it
