@@ -11,6 +11,21 @@ export interface BrandIdentity {
   favicon: string | null;       // Favicon URL (fallback if no logo found)
 }
 
+// A single colour-scheme render of the page. A site may look completely
+// different under `prefers-color-scheme: dark` — either via a CSS media query or
+// a client script that toggles a `dark` class (ENG-285: rankai.ai does the
+// latter). We capture each render rather than guessing which one is "the brand".
+export interface ThemeRender {
+  computedElements: ComputedElementStyles;
+  // Custom properties resolved on :root for THIS render (a themed site resolves
+  // --background, --primary, etc. to different values per scheme).
+  customProperties: Record<string, string>;
+  // Stylesheets synthesized for THIS render, so a consumer analysing the dark
+  // variant sees the dark render's colours rather than the light render's (the
+  // stylesheet text is captured per scheme, not shared).
+  stylesheets: ExtractedCSS['stylesheets'];
+}
+
 export interface ExtractedCSS {
   url: string;
   html: string;
@@ -22,6 +37,16 @@ export interface ExtractedCSS {
   extractedAt: string;
   computedElements?: ComputedElementStyles;
   brandIdentity?: BrandIdentity;
+  // Both colour-scheme renders, when a real browser was used. `computedElements`
+  // and `stylesheets` above always describe the site's DEFAULT render (what a
+  // no-preference client is served) so existing consumers are unaffected;
+  // `themes.dark` is populated only when the site genuinely renders differently
+  // under a dark preference, letting the caller choose the intended brand theme.
+  themes?: {
+    light: ThemeRender;
+    dark?: ThemeRender;
+    hasDarkVariant: boolean;
+  };
 }
 
 export interface ComputedElementStyles {
@@ -120,14 +145,198 @@ function validateURL(urlString: string): URL {
   return url;
 }
 
+// --- CSS Color 4 support -----------------------------------------------------
+// The `color` package only understands legacy notations (hex/rgb/hsl/named). It
+// throws on `oklch()` / `oklab()` / `color(srgb ...)`, which Chrome preserves
+// verbatim in computed styles and which Tailwind v4 emits for its entire palette.
+// Without this, every colour on a Tailwind v4 site is silently dropped from
+// token extraction (ENG-285: rankai.ai ships 434 oklch declarations, and its
+// computed body background reads `oklch(0.985 0 0)`).
+
+const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
+
+// Linear-light sRGB channel -> gamma-encoded sRGB (0-255)
+function linearToSrgb(c: number): number {
+  const v = c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+  return Math.round(clamp01(v) * 255);
+}
+
+const toHex = (r: number, g: number, b: number) =>
+  '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('').toLowerCase();
+
+// Oklab -> sRGB hex (Björn Ottosson's reference matrices)
+function oklabToHex(L: number, a: number, b: number): string {
+  const l_ = L + 0.3963377774 * a + 0.2158037573 * b;
+  const m_ = L - 0.1055613458 * a - 0.0638541728 * b;
+  const s_ = L - 0.0894841775 * a - 1.2914855480 * b;
+
+  const l = l_ * l_ * l_;
+  const m = m_ * m_ * m_;
+  const s = s_ * s_ * s_;
+
+  return toHex(
+    linearToSrgb(+4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
+    linearToSrgb(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+    linearToSrgb(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s)
+  );
+}
+
+// Parse a CSS Color 4 numeric component: `0.5`, `50%`, or `none`.
+function parseComponent(token: string, percentBase: number): number | null {
+  if (!token || token === 'none') return 0;
+  const m = /^([+-]?[\d.]+)(%)?$/.exec(token);
+  if (!m) return null;
+  const value = parseFloat(m[1]);
+  if (!isFinite(value)) return null;
+  return m[2] ? (value / 100) * percentBase : value;
+}
+
+// Convert modern CSS colour notations to hex. Returns null for anything it does
+// not recognise, so the caller can fall back to the legacy `color` parser.
+export function modernColorToHex(colorValue: string): string | null {
+  const input = colorValue.trim().toLowerCase();
+  const fn = /^(oklch|oklab|color)\(\s*([^)]+?)\s*\)$/.exec(input);
+  if (!fn) return null;
+
+  // Strip the optional `/ alpha` component — we only need the opaque hex.
+  const parts = fn[2].split('/')[0].trim().split(/[\s,]+/).filter(Boolean);
+
+  try {
+    if (fn[1] === 'oklch') {
+      // oklch(L C H) — L is 0..1 (or 0-100%), C is unbounded (~0..0.4), H in deg
+      const L = parseComponent(parts[0], 1);
+      const C = parseComponent(parts[1], 0.4);
+      const hRaw = parts[2];
+      if (L === null || C === null) return null;
+      const H = hRaw && hRaw !== 'none' ? parseFloat(hRaw.replace(/deg$/, '')) : 0;
+      if (!isFinite(H)) return null;
+      const rad = (H * Math.PI) / 180;
+      return oklabToHex(L, C * Math.cos(rad), C * Math.sin(rad));
+    }
+
+    if (fn[1] === 'oklab') {
+      const L = parseComponent(parts[0], 1);
+      const a = parseComponent(parts[1], 0.4);
+      const b = parseComponent(parts[2], 0.4);
+      if (L === null || a === null || b === null) return null;
+      return oklabToHex(L, a, b);
+    }
+
+    // color(srgb r g b) / color(srgb-linear r g b) — display-p3 et al. are not
+    // colourimetrically converted; treating their coordinates as sRGB is close
+    // enough for palette extraction and far better than dropping the colour.
+    const space = parts[0];
+    const [r, g, b] = [parts[1], parts[2], parts[3]].map(p => parseComponent(p, 1));
+    if (r === null || g === null || b === null) return null;
+    if (space === 'srgb-linear') {
+      return toHex(linearToSrgb(r), linearToSrgb(g), linearToSrgb(b));
+    }
+    return toHex(
+      Math.round(clamp01(r) * 255),
+      Math.round(clamp01(g) * 255),
+      Math.round(clamp01(b) * 255)
+    );
+  } catch {
+    return null;
+  }
+}
+
 // Normalize color to hex format
 function normalizeColor(colorValue: string): string | null {
+  const modern = modernColorToHex(colorValue);
+  if (modern) return modern;
+
   try {
     const color = Color(colorValue);
     return color.hex().toLowerCase();
   } catch (error) {
     return null;
   }
+}
+
+// Average lightness (0–100) of the parseable, opaque backgrounds sampled across a
+// render's elements. Used to distinguish a genuine dark theme — whose backgrounds
+// turn materially darker — from the incidental pixel differences a page reload
+// produces (carousels advancing, animations, lazy-loaded or A/B content). Returns
+// null when no background is parseable. Exported for testing.
+export function averageBackgroundLightness(
+  computedElements?: ComputedElementStyles
+): number | null {
+  if (!computedElements) return null;
+  const values: number[] = [];
+  for (const styles of Object.values(computedElements)) {
+    const raw = styles.backgroundColor;
+    if (!raw || raw === 'transparent' || raw === 'rgba(0, 0, 0, 0)') continue;
+    const hex = normalizeColor(raw);
+    if (!hex) continue;
+    try {
+      values.push(Color(hex).lightness());
+    } catch {
+      // Unparseable — ignore
+    }
+  }
+  if (!values.length) return null;
+  return values.reduce((sum, v) => sum + v, 0) / values.length;
+}
+
+// A genuine dark variant flips the page's backgrounds materially darker. Requiring
+// a meaningful drop in average background lightness (rather than any diff between
+// the two renders) stops a light-only site from being handed an invented dark
+// theme just because a reload produced non-deterministic content (ENG-285).
+const DARK_THEME_MIN_LIGHTNESS_DROP = 15; // on the 0–100 lightness scale
+export function isDistinctDarkTheme(
+  light?: ComputedElementStyles,
+  dark?: ComputedElementStyles
+): boolean {
+  const lightL = averageBackgroundLightness(light);
+  const darkL = averageBackgroundLightness(dark);
+  if (lightL === null || darkL === null) return false;
+  return lightL - darkL >= DARK_THEME_MIN_LIGHTNESS_DROP;
+}
+
+// Synthesize the puppeteer stylesheets (resolved CSSOM text + colour-bearing
+// custom properties) for a single render. Factored out so each colour-scheme
+// render carries its OWN stylesheets — a consumer analysing the dark variant must
+// see the dark render's colours, not the light render's.
+function buildPuppeteerStylesheets(
+  stylesheetText: string,
+  customProperties: Record<string, string>
+): ExtractedCSS['stylesheets'] {
+  // Resolve variables in the stylesheet text
+  const resolvedCSS = resolveVariables(stylesheetText, customProperties);
+
+  // Synthesize CSS from custom properties — map color-like values into parseable
+  // declarations so the regex extractor can pick them up. Categorize by name hint.
+  const customPropLines: string[] = [];
+  for (const [name, value] of Object.entries(customProperties)) {
+    const nameLower = name.toLowerCase();
+    if (nameLower.includes('background') || nameLower.includes('bg')) {
+      customPropLines.push(`.cp { background-color: ${value}; }`);
+    } else if (nameLower.includes('border')) {
+      customPropLines.push(`.cp { border-color: ${value}; }`);
+    } else if (nameLower.includes('color') || nameLower.includes('text') ||
+               nameLower.includes('primary') || nameLower.includes('secondary') ||
+               nameLower.includes('accent') || nameLower.includes('brand')) {
+      customPropLines.push(`.cp { color: ${value}; }`);
+    } else {
+      // Try to detect if value looks like a color
+      const trimmed = value.trim();
+      if (/^#[0-9a-f]{3,8}$/i.test(trimmed) || /^rgba?\(/.test(trimmed) || /^hsla?\(/.test(trimmed)) {
+        customPropLines.push(`.cp { color: ${value}; }`);
+      }
+      // Non-color values (dimensions, strings, etc.) are skipped
+    }
+  }
+  const customPropCSS = customPropLines.join('\n');
+
+  const stylesheets: ExtractedCSS['stylesheets'] = [];
+  if (resolvedCSS.trim()) {
+    stylesheets.push({ source: 'puppeteer-cssom', content: resolvedCSS, parsed: null });
+  }
+  if (customPropCSS.trim()) {
+    stylesheets.push({ source: 'puppeteer-custom-properties', content: customPropCSS, parsed: null });
+  }
+  return stylesheets;
 }
 
 // Resolve CSS variables in stylesheet text
@@ -330,8 +539,9 @@ async function extractWithPuppeteer(
       timeout: 30000,
     });
 
-    // Extract all CSS data from the page
-    const pageData = await page.evaluate(async () => {
+    // Extract all CSS data from the page. Defined as a reusable in-page routine
+    // (no Node closures) so it can be evaluated once per color-scheme variant.
+    const extractPageData = async () => {
       // Collect CSS custom properties from :root / documentElement
       const computedStyle = getComputedStyle(document.documentElement);
       const customProperties: Record<string, string> = {};
@@ -491,7 +701,61 @@ async function extractWithPuppeteer(
           elementsFound: Object.keys(computedElements).length,
         },
       };
-    });
+    };
+
+    // The site's DEFAULT (canonical) render — headless Chrome reports
+    // `prefers-color-scheme: light`, so this is what the site serves to a
+    // light/no-preference client.
+    const lightData = await page.evaluate(extractPageData);
+
+    // Also capture the DARK render. Many brands ship their real design behind
+    // the OS color-scheme preference — a CSS `@media (prefers-color-scheme: dark)`
+    // rule or a client script that toggles a `dark` class / `data-theme`. Reload
+    // with a dark preference emulated so both CSS- and JS-driven dark themes
+    // apply (see ENG-285: rankai.ai reads `localStorage.theme ?? matchMedia(dark)`
+    // and toggles a `dark` class, so only a reload under a dark preference
+    // reveals its real matte-black design). This is best-effort — if the dark
+    // reload fails we simply report no dark variant.
+    let darkData: Awaited<ReturnType<typeof extractPageData>> | null = null;
+    try {
+      await page.emulateMediaFeatures([
+        { name: 'prefers-color-scheme', value: 'dark' },
+      ]);
+      await page.reload({ waitUntil: 'networkidle2', timeout: 30000 });
+      darkData = await page.evaluate(extractPageData);
+    } catch (err) {
+      console.warn('Dark color-scheme capture failed; using default render:', err);
+    }
+
+    // Keep the DEFAULT render as the canonical result — it is what the site
+    // actually serves a no-preference client, and existing consumers rely on it.
+    // The dark render is reported alongside it (see `themes` on ExtractedCSS) so
+    // the caller can pick the intended brand theme instead of us guessing. We do
+    // NOT try to score which render is "more brand-like": the accents a site
+    // cares about routinely live in gradients and nested spans that never surface
+    // in these sampled computed styles, so any such score is noise.
+    const pageData = lightData;
+
+    // Only claim a dark variant when the site's backgrounds turn materially
+    // darker under a dark preference — a light-only site must not be handed an
+    // invented theme just because a reload produced non-deterministic content.
+    const hasDarkVariant =
+      !!darkData && isDistinctDarkTheme(lightData.computedElements, darkData.computedElements);
+    const themes: ExtractedCSS['themes'] = {
+      light: {
+        computedElements: lightData.computedElements,
+        customProperties: lightData.customProperties,
+        stylesheets: buildPuppeteerStylesheets(lightData.stylesheetText, lightData.customProperties),
+      },
+      hasDarkVariant,
+    };
+    if (hasDarkVariant && darkData) {
+      themes.dark = {
+        computedElements: darkData.computedElements,
+        customProperties: darkData.customProperties,
+        stylesheets: buildPuppeteerStylesheets(darkData.stylesheetText, darkData.customProperties),
+      };
+    }
 
     // Log extraction debug info
     const dbg = (pageData as any).debug;
@@ -500,50 +764,10 @@ async function extractWithPuppeteer(
         `${dbg.sheetsCollected} collected, ${dbg.customPropsCount} custom props, ${dbg.elementsFound} elements`);
     }
 
-    // Resolve variables in the stylesheet text
-    const resolvedCSS = resolveVariables(pageData.stylesheetText, pageData.customProperties);
-
-    // Synthesize CSS from custom properties — map color-like values into parseable declarations
-    // so the regex extractor can pick them up. Also categorize by property name hints.
-    const customPropLines: string[] = [];
-    for (const [name, value] of Object.entries(pageData.customProperties as Record<string, string>)) {
-      const nameLower = name.toLowerCase();
-      // Determine context from property name
-      if (nameLower.includes('background') || nameLower.includes('bg')) {
-        customPropLines.push(`.cp { background-color: ${value}; }`);
-      } else if (nameLower.includes('border')) {
-        customPropLines.push(`.cp { border-color: ${value}; }`);
-      } else if (nameLower.includes('color') || nameLower.includes('text') ||
-                 nameLower.includes('primary') || nameLower.includes('secondary') ||
-                 nameLower.includes('accent') || nameLower.includes('brand')) {
-        customPropLines.push(`.cp { color: ${value}; }`);
-      } else {
-        // Try to detect if value looks like a color
-        const trimmed = value.trim();
-        if (/^#[0-9a-f]{3,8}$/i.test(trimmed) || /^rgba?\(/.test(trimmed) || /^hsla?\(/.test(trimmed)) {
-          customPropLines.push(`.cp { color: ${value}; }`);
-        }
-        // Non-color values (dimensions, strings, etc.) are skipped
-      }
-    }
-    const customPropCSS = customPropLines.join('\n');
-
+    // Build the DEFAULT render's stylesheets (the dark render carries its own on
+    // `themes.dark.stylesheets`).
     const html = ''; // Not needed when using puppeteer
-    const stylesheets: ExtractedCSS['stylesheets'] = [];
-    if (resolvedCSS.trim()) {
-      stylesheets.push({
-        source: 'puppeteer-cssom',
-        content: resolvedCSS,
-        parsed: null,
-      });
-    }
-    if (customPropCSS.trim()) {
-      stylesheets.push({
-        source: 'puppeteer-custom-properties',
-        content: customPropCSS,
-        parsed: null,
-      });
-    }
+    const stylesheets = buildPuppeteerStylesheets(pageData.stylesheetText, pageData.customProperties);
 
     await page.close();
 
@@ -554,6 +778,7 @@ async function extractWithPuppeteer(
       extractedAt: new Date().toISOString(),
       computedElements: pageData.computedElements,
       brandIdentity: (pageData as any).brandIdentity as BrandIdentity,
+      themes,
     };
   } finally {
     await browser.close();

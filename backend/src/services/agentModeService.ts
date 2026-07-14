@@ -2578,7 +2578,7 @@ export class AgentModeService {
     excludeTools?: string[],
     screenshotUrl?: string,
     isDelegatedAccess: boolean = false
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string }> {
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
@@ -2858,6 +2858,13 @@ export class AgentModeService {
       const MAX_EMPTY_SYNTHESIS_RETRIES = 1;
 
       let wasCancelled = false;
+      // ENG-244: set true when the loop exits because the step budget (maxIterations)
+      // was exhausted. This is the deterministic signal a long data-gathering
+      // scheduled run was truncated before it could emit the final deliverable —
+      // regardless of whether `content` holds the canned apology or the model's own
+      // partial text. The completion gate consumes this flag directly rather than
+      // pattern-matching the response text.
+      let truncatedByStepBudget = false;
       while (iteration < maxIterations) {
         // Check for cancellation before each iteration
         if (isCancelled?.()) {
@@ -3365,6 +3372,12 @@ export class AgentModeService {
 
       if (iteration >= maxIterations) {
         console.warn('AgentMode: Reached maximum tool execution iterations');
+        // ENG-244: flag the truncation for the completion gate BEFORE any
+        // content fallback. The model often complies with the "wrap up soon"
+        // nudge and emits its own partial text, so `content` is usually
+        // non-empty here and the canned apology below never runs — the flag,
+        // not the text, is what makes truncation reliably detectable.
+        truncatedByStepBudget = true;
         if (!content) {
           content = "I've reached the maximum number of processing steps for this request. Here's what was completed so far — please review and let me know if you'd like me to continue with any remaining items.";
         }
@@ -3521,6 +3534,7 @@ export class AgentModeService {
         sources,
         responseMessages,
         ...(wasCancelled ? { cancelled: true } : {}),
+        ...(truncatedByStepBudget ? { truncatedByStepBudget: true } : {}),
         ...(backupModelUsed ? { backupModelUsed: true, originalModel: originalLlmModel, backupModel: llmModel } : {})
       };
     } catch (error: any) {
@@ -11753,11 +11767,40 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         }
       }, null, 2);
 
+      // A site may render a completely different design under a dark color-scheme
+      // preference (ENG-285: rankai.ai is matte black with a purple accent under
+      // dark, near-white under light). The tokens above describe the site's
+      // DEFAULT render; when a distinct dark render exists, analyze it too and
+      // surface both so the caller can pick the intended brand theme.
+      let darkThemeTokens: any = null;
+      if (extractedCSS.themes?.hasDarkVariant && extractedCSS.themes.dark) {
+        try {
+          // Analyse the dark render with ITS OWN computed styles AND stylesheets —
+          // reusing the light render's stylesheets would blend light colours into
+          // the reported dark palette (ENG-285).
+          const darkCSS = {
+            ...extractedCSS,
+            computedElements: extractedCSS.themes.dark.computedElements,
+            stylesheets: extractedCSS.themes.dark.stylesheets,
+          };
+          const darkDetailed = await analyzeDesignTokens(darkCSS);
+          darkThemeTokens = {
+            ...inferBrandTokens(darkDetailed),
+            backgrounds: darkDetailed.colors.backgrounds.slice(0, 3),
+            text: darkDetailed.colors.text.slice(0, 3),
+          };
+          console.log(`Dark color-scheme variant detected for ${url}; extracted its palette too.`);
+        } catch (err) {
+          console.warn('Dark-variant token analysis failed; reporting default render only:', err);
+        }
+      }
+
       // Format summary for LLM
       const formattedSummary = this.formatCSSExtractionResult({
         url,
         suggestedBrandTokens,
         detailedTokens,
+        darkThemeTokens,
         brandIdentity: {
           logoUrl: s3LogoUrl || brandIdentity.logoUrl || null,
           brandName: brandIdentity.brandName || null,
@@ -11780,6 +11823,8 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         suggestedBrandTokens: enrichedBrandTokens,
         detailedTokens,
         detailedTokensJSON, // Emma can save this to KB using update_knowledge_base_file tool
+        hasDarkVariant: !!darkThemeTokens,
+        darkThemeTokens, // null unless the site renders a distinct dark theme
         formattedContent: formattedSummary
       };
     } catch (error: any) {
@@ -11796,7 +11841,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
    * Format CSS extraction result for LLM consumption
    */
   private formatCSSExtractionResult(data: any): string {
-    const { url, suggestedBrandTokens, detailedTokens, brandIdentity } = data;
+    const { url, suggestedBrandTokens, detailedTokens, brandIdentity, darkThemeTokens } = data;
 
     let formatted = `# CSS Extraction Results\n\n`;
     formatted += `**Source:** ${url}\n\n`;
@@ -11829,6 +11874,23 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
     formatted += `### Visual Effects\n`;
     formatted += `- **Primary Shadow:** ${suggestedBrandTokens.visualEffects.primaryShadow}\n`;
     formatted += `- **Border Radius:** ${suggestedBrandTokens.visualEffects.borderRadius}\n\n`;
+
+    // Dark color-scheme variant, when the site has one. The tokens above describe
+    // what the site serves a no-preference visitor; this is what a dark-mode
+    // visitor sees. Which one is "the brand" is a judgement call, so present both
+    // rather than silently choosing (ENG-285).
+    if (darkThemeTokens) {
+      formatted += `## Dark Theme Variant Detected\n\n`;
+      formatted += `This site renders a **distinct dark theme** under \`prefers-color-scheme: dark\`. `;
+      formatted += `The tokens above are its DEFAULT (light) render; the dark render is:\n\n`;
+      formatted += `- **Primary:** ${darkThemeTokens.colors.primary}\n`;
+      formatted += `- **Secondary:** ${darkThemeTokens.colors.secondary}\n`;
+      formatted += `- **Backgrounds:** ${(darkThemeTokens.backgrounds || []).join(', ') || 'Not detected'}\n`;
+      formatted += `- **Text:** ${(darkThemeTokens.text || []).join(', ') || 'Not detected'}\n`;
+      formatted += `- **Palette:** ${darkThemeTokens.colors.palette.join(', ')}\n\n`;
+      formatted += `⚠️ Confirm with the user which theme represents their brand before applying tokens — `;
+      formatted += `a site whose design is dark still serves the light render to visitors whose OS is set to light.\n\n`;
+    }
 
     // Summary of detailed tokens
     formatted += `## Detailed Analysis\n\n`;
@@ -27730,14 +27792,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for UPDATE action' };
-          await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
+          const didUpdate = await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
             name: args.name,
             status: args.status,
             biddingStrategy: args.bidding_strategy,
             biddingStrategyTarget: args.bidding_strategy_target,
             cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
             budgetResourceName: args.budget_resource_name,
+            finalUrlSuffix: args.final_url_suffix,
           });
+          if (!didUpdate) return { success: false, error: 'This tool does not support updating the field(s) requested for CAMPAIGN — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Campaign updated' };
         }
       }
@@ -27780,7 +27844,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.ad_group_resource_name) return { success: false, error: 'ad_group_resource_name is required for UPDATE action' };
-          await googleAdsService.updateAdGroup(userId, customer_id, args.ad_group_resource_name, {
+          const didUpdateAdGroup = await googleAdsService.updateAdGroup(userId, customer_id, args.ad_group_resource_name, {
             name: args.name,
             status: args.status,
             cpcBidMicros: args.cpc_bid_micros,
@@ -27788,6 +27852,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             targetCpaMicros: args.target_cpa_micros,
             targetRoas: args.target_roas,
           });
+          if (!didUpdateAdGroup) return { success: false, error: 'This tool does not support updating the field(s) requested for AD_GROUP — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Ad group updated' };
         }
         if (action === 'REMOVE') {
@@ -27820,10 +27885,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.criterion_resource_name) return { success: false, error: 'criterion_resource_name is required for KEYWORD UPDATE' };
-          await googleAdsService.updateKeyword(userId, customer_id, args.criterion_resource_name, {
+          const didUpdateKeyword = await googleAdsService.updateKeyword(userId, customer_id, args.criterion_resource_name, {
             status: args.status,
             cpcBidMicros: args.cpc_bid_micros,
           });
+          if (!didUpdateKeyword) return { success: false, error: 'This tool does not support updating the field(s) requested for KEYWORD — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Keyword updated' };
         }
         if (action === 'REMOVE') {
@@ -27864,9 +27930,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD UPDATE' };
-          await googleAdsService.updateAd(userId, customer_id, args.ad_resource_name, {
+          const didUpdateAd = await googleAdsService.updateAd(userId, customer_id, args.ad_resource_name, {
             status: args.status,
           });
+          if (!didUpdateAd) return { success: false, error: 'This tool does not support updating the field(s) requested for AD — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Ad updated' };
         }
         if (action === 'REMOVE') {

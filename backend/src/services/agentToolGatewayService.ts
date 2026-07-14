@@ -233,14 +233,26 @@ function errorHead(error: unknown): string {
 // action without a recipient, e.g. search-people) returns '' — a single shared
 // scope, exactly preserving the prior per-tool behavior.
 //
-// send-invite/send-message/send-inmail identify the recipient by profile_url or
-// provider_id; accept-invitation/cancel-invitation identify it by invitation_id
-// (see agentModeService.ts). Read whichever this action actually carries so every
-// allowlisted action resolves to a real per-recipient scope instead of ''.
+// send-invite/send-message/send-inmail/get-profile/update-conversation-history
+// identify the recipient by profile_url or provider_id; accept-invitation/
+// cancel-invitation identify it by invitation_id (see agentModeService.ts). Read
+// whichever this action actually carries so every allowlisted action resolves to
+// a real per-recipient scope instead of ''.
+//
+// ENG-313: get-profile must be scoped too. When the model first calls get-profile
+// with only keywords (no profile_url/provider_id) it fails "Either profile_url or
+// provider_id is required" — an invalid_args fast-trip (threshold 2). Without a
+// recipient scope those two arg-less failures shared scope '' with a LATER,
+// corrected call that finally passed a valid profile_url, so the breaker blocked
+// the corrected call. Scoping get-profile by its target means the arg-less
+// failures (scope '') and the corrected call (scope = the profile URL) land in
+// different buckets, so a materially different, now-valid attempt is not blocked.
 const LINKEDIN_RECIPIENT_ACTIONS = new Set([
   'send-invite',
   'send-message',
   'send-inmail',
+  'get-profile',
+  'update-conversation-history',
   'cancel-invitation',
   'accept-invitation',
 ]);

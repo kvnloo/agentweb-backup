@@ -1,5 +1,5 @@
 import { settingsService } from "./settingsService";
-import { userDb } from "./db";
+import { userDb, orgDb } from "./db";
 import { CUSTOMER_PORTAL_PAGES } from "./customerPortalPages";
 import { skillService } from "./skillService";
 
@@ -56,6 +56,49 @@ export async function getTierConfig(tierName: string): Promise<SubscriptionType 
 export async function getUserSubscriptionType(userId: string): Promise<string> {
   try {
     const user = await userDb.getUserById(userId);
+    // Org members inherit the org owner's tier dynamically — the org's effective
+    // tier is whatever the owner currently holds (orgs carry no tier field).
+    // Resolving at read time (instead of snapshotting the owner's tier onto the
+    // member on invite-accept) keeps members in sync when the owner up/downgrades
+    // and automatically revokes access the moment they leave the org (orgId/
+    // orgRole are cleared on leave/remove). This is the ENG-288 root cause: the
+    // /me endpoint already resolved a member's tier from the owner, but the
+    // member-id call sites (agent mode, Emma) read the member's own record.
+    // A member riding their own active/trialing Stripe subscription is not
+    // riding the org's — accepting an invite touches no billing state (see
+    // routes/org.ts accept-invite), so a member can independently pay for a
+    // tier that differs from their owner's. Only resolve to the owner when
+    // the member has no live subscription of their own; otherwise their own
+    // tier governs (matches the "active"/"trialing" = entitling convention
+    // already used throughout stripeService.ts).
+    const hasOwnActiveSubscription =
+      user?.subscription_status === "active" || user?.subscription_status === "trialing";
+    if (user?.orgId && user.orgRole === "member" && !hasOwnActiveSubscription && orgDb?.getOrgById) {
+      // Isolated from the outer catch: a transient failure resolving the org
+      // (network blip, throttling) must fall back to the user's own already-
+      // fetched tier, not the hard "Free" default — we have real user data in
+      // hand at this point, discarding it on an unrelated lookup failure would
+      // wrongly downgrade a paying member for the duration of the blip.
+      try {
+        const org = await orgDb.getOrgById(user.orgId);
+        if (org?.ownerUserId && org.ownerUserId !== userId) {
+          // Reads the owner's raw stored field directly, not resolved
+          // recursively through this same function — the owner's
+          // subscriptionType is the canonical source of truth for what the
+          // org pays for (kept in sync by Stripe webhooks / admin panel
+          // writes, not by this resolution logic), and an org owner can't
+          // themselves be a member of another org (see routes/org.ts create),
+          // so there is no owner-of-owner chain to walk. A stale owner field
+          // (e.g. their own Stripe sub canceled but subscriptionType wasn't
+          // updated) would propagate as-is — an accepted limitation of the
+          // current data model, not something this function can detect.
+          const owner = await userDb.getUserById(org.ownerUserId);
+          return owner?.subscriptionType || "Free";
+        }
+      } catch (orgLookupError) {
+        console.error("Error resolving org owner for subscription type:", orgLookupError);
+      }
+    }
     return user?.subscriptionType || "Free";
   } catch (error) {
     console.error("Error getting user subscription type:", error);

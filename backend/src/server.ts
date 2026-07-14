@@ -600,6 +600,24 @@ createTestAccount().then(async () => {
         console.error('[durableLandingPoller] Failed to initialize:', error);
       }
 
+      // v0 Credit Alert — hourly low-credit check on the v0 (landing-page
+      // generation) account. Fires an oncall alert on warn-level transitions
+      // into low/critical so credits can never silently run out again.
+      try {
+        const { checkAndAlert } = await import('./services/v0BillingService');
+        const V0_CREDIT_ALERT_INTERVAL_MS = 60 * 60 * 1000;
+        cronJobRegistry.track('v0CreditAlert', checkAndAlert())
+          .catch(e => console.error('[v0CreditAlert] Error on first run:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('v0CreditAlert', checkAndAlert())
+            .catch(e => console.error('[v0CreditAlert] Error:', e));
+        }, V0_CREDIT_ALERT_INTERVAL_MS);
+        console.log('[v0CreditAlert] Initialized — running hourly');
+      } catch (error) {
+        console.error('[v0CreditAlert] Failed to initialize:', error);
+      }
+
       // LinkedIn Connection Sync — runs every 10 minutes
       // Polls Unipile for accepted connections, upserts into AW-UnipileConnections cache,
       // and activates any awaiting_connection drip enrollments.
