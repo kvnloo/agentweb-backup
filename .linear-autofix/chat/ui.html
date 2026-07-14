@@ -185,6 +185,8 @@
   .msg.assistant { background: var(--panel2); align-self: flex-start; }
   /* WhatsApp-style local-time stamp tucked into the bubble's bottom-right corner (no extra row). */
   .ts-in { position: absolute; right: 12px; bottom: 5px; font-size: 10px; line-height: 1; color: var(--dim); white-space: nowrap; }
+  /* Per-turn token totals, bottom-LEFT of the bubble — opposite the timestamp, in the same reserved strip. */
+  .stats-in { position: absolute; left: 12px; bottom: 5px; font-size: 10px; line-height: 1; color: var(--dim); white-space: nowrap; max-width: 55%; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
   /* Markdown styling applies in BOTH chat bubbles (.msg) and pipeline stage bodies (.sbody),
      since both render md() output. Scoping to .msg only left stage reports with no spacing. */
   :is(.msg, .sbody) code { background: #10131a; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
@@ -489,15 +491,29 @@ const fmtTime = (iso) => {
     return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ', ' + t;
   } catch { return ''; }
 };
-function stampTime(bubbleEl, iso) {
+function stampTime(bubbleEl, iso, durMs) {
   if (!bubbleEl || !iso) return;
   const ts = document.createElement('span');
   ts.className = 'ts-in';
-  ts.textContent = fmtTime(iso); ts.title = fmtAt(iso); // full date on hover
+  const dur = durMs != null ? fmtMs(durMs) : ''; // how long the turn took, shown just left of the time
+  ts.textContent = (dur ? dur + ' · ' : '') + fmtTime(iso);
+  ts.title = (dur ? `Turn took ${dur} · ` : '') + fmtAt(iso); // full date + duration on hover
   bubbleEl.appendChild(ts); // bottom-right corner of the bubble (absolute)
 }
+// Per-turn tokens in the bubble's bottom-LEFT corner (opposite the timestamp). `↑` = input processed
+// this turn (fresh + cache read + cache write), `↓` = output generated. Hover shows the full breakdown.
+function stampStats(bubbleEl, tok, cost) {
+  if (!bubbleEl || !tok || (!tok.in && !tok.out)) return;
+  const el = document.createElement('span');
+  el.className = 'stats-in';
+  const dollars = cost != null ? ` · $${cost.toFixed(2)}` : ''; // anchors the big token count to real limit impact
+  el.textContent = `↑ ${fmtTok(tok.in)}  ↓ ${fmtTok(tok.out)}${dollars}`;
+  const k = (n) => (n || 0).toLocaleString();
+  el.title = `Tokens this turn — input ${k(tok.in)} (fresh ${k(tok.fresh)}, cache read ${k(tok.cacheRead)}, cache write ${k(tok.cacheWrite)}) · output ${k(tok.out)}${cost != null ? ` · cost $${cost.toFixed(2)}` : ''}`;
+  bubbleEl.appendChild(el);
+}
 
-const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true, picker: null, lastEsc: 0, slash: null, cmd: null, mergePhase: null, lastResult: '', compacting: false, lastSent: '', escArmed: 0, escText: '', queue: [], queuePaused: false, attachments: [], collapsed: {} };
+const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true, picker: null, lastEsc: 0, slash: null, cmd: null, mergePhase: null, lastResult: '', lastTokens: null, lastCost: null, lastMs: null, compacting: false, lastSent: '', escArmed: 0, escText: '', queue: [], queuePaused: false, attachments: [], collapsed: {} };
 try { S.collapsed = JSON.parse(localStorage.getItem('secCollapsed')) || {}; } catch { /* private mode */ }
 const COMMANDS = [
   { name: '/status', desc: 'Session & fix status' },
@@ -1077,7 +1093,8 @@ function renderAll(d) {
       }
       finalizeAssistant(b);
       if (m.fix) addFixCard(m.fix);
-      stampTime(b, m.at);
+      stampTime(b, m.at, m.ms);
+      stampStats(b, m.tokens, m.cost);
       lastAsst = b;
     }
   });
@@ -1129,7 +1146,7 @@ function openEvents(id) {
 function handleEvent(e) {
   switch (e.type) {
     case 'turn_start': {
-      S.curBubble = null; S.lastResult = ''; setBusy(true);
+      S.curBubble = null; S.lastResult = ''; S.lastTokens = null; S.lastCost = null; S.lastMs = null; setBusy(true);
       if (e.compact) { S.compacting = true; setThinking('Summarizing the conversation…'); break; } // no user bubble for /compact
       const msgs = chatEl().querySelectorAll('.msg.user');
       const last = msgs[msgs.length - 1];
@@ -1157,7 +1174,7 @@ function handleEvent(e) {
       setThinking('Claude is thinking…');
       break;
     }
-    case 'result': S.lastResult = e.text || ''; if (!S.compacting) addTurnMeta(e); break;
+    case 'result': S.lastResult = e.text || ''; S.lastTokens = e.tokens || null; S.lastCost = e.cost ?? null; S.lastMs = e.ms ?? null; if (!S.compacting) addTurnMeta(e); break;
     case 'fix_summary': addFixCard(e); break;
     case 'preview':
       if (S.detail) { S.detail.preview = { running: e.running, busy: e.busy, urls: e.urls, refreshing: e.refreshing }; renderPreviewBar(); }
@@ -1177,7 +1194,7 @@ function handleEvent(e) {
     case 'done':
       // Stamp the just-finished assistant bubble now — renderAll (which stamps from the persisted
       // `at`) is skipped when the reader has scrolled up, so don't rely on it for the live message.
-      if (S.curBubble) { finalizeAssistant(S.curBubble); stampTime(S.curBubble, new Date().toISOString()); } // fold thoughts+tools into the accordion; the final answer stands out
+      if (S.curBubble) { finalizeAssistant(S.curBubble); stampTime(S.curBubble, new Date().toISOString(), S.lastMs); stampStats(S.curBubble, S.lastTokens, S.lastCost); } // fold thoughts+tools into the accordion; the final answer stands out, tokens+$ bottom-left, duration+time bottom-right
       S.curBubble = null; S.compacting = false; setBusy(false); loadIssues(); refreshDetail(S.sel);
       // Auto-send the next queued message once the turn ends — unless it was stopped on purpose
       // (Esc/Stop set queuePaused, so a deliberate stop doesn't fire the rest of the queue).

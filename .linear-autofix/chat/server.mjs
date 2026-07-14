@@ -55,6 +55,16 @@ function logTurnStats(kind, identifier, cap, result, sessionCostTotal) {
   log(`STATS ${kind} ${identifier} cap=${cap} model=${model} in=${inT} out=${outT} cache_read=${cr} cache_creation=${cc} context=${inT + cr + cc} cost=$${cost.toFixed(4)} turns=${result.num_turns ?? '?'} dur=${result.duration_ms ? Math.round(result.duration_ms / 1000) + 's' : '?'}${sessionCostTotal != null ? ` | issue_session_total_cost=$${Number(sessionCostTotal).toFixed(4)}` : ''}`);
 }
 
+// Per-turn token totals for the chat bubble footer. Sums the turn's usage the same way the STATS line
+// does (across every internal tool-call step), so `in` reflects ALL input the turn processed — fresh +
+// cache-read + cache-write — and `out` the generated tokens. The breakdown fields feed the hover tooltip.
+// Returns null when there's no usage (nothing to show).
+const turnTokens = (u) => {
+  if (!u) return null;
+  const fresh = u.input_tokens || 0, cacheRead = u.cache_read_input_tokens || 0, cacheWrite = u.cache_creation_input_tokens || 0, out = u.output_tokens || 0;
+  return { in: fresh + cacheRead + cacheWrite, out, fresh, cacheRead, cacheWrite };
+};
+
 const fixEnabled = () => process.env.AUTOFIX_RUN_ENABLED === '1';
 const loadState = () => { try { return JSON.parse(readFileSync(statePath, 'utf8')); } catch { return {}; } };
 const loadChatState = () => { try { return JSON.parse(readFileSync(chatStatePath, 'utf8')); } catch { return {}; } };
@@ -570,7 +580,7 @@ function runClaudeStream(args, prompt, cwd, timeoutMs, onEvent, register, env = 
         }
       } else if (j.type === 'result') {
         out.result = j;
-        onEvent({ type: 'result', text: j.result || '', turns: j.num_turns, ms: j.duration_ms, cost: j.total_cost_usd, sessionId: j.session_id, isError: !!j.is_error, subtype: j.subtype });
+        onEvent({ type: 'result', text: j.result || '', turns: j.num_turns, ms: j.duration_ms, cost: j.total_cost_usd, tokens: turnTokens(j.usage), sessionId: j.session_id, isError: !!j.is_error, subtype: j.subtype });
       }
     };
     child.stdout.on('data', (d) => {
@@ -1179,6 +1189,8 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
         role: 'assistant', cap, at: new Date().toISOString(),
         text: out.texts.join('\n\n').slice(0, 50000) || '(no reply)',
         turns: out.result?.num_turns, ms: out.result?.duration_ms,
+        cost: out.result?.total_cost_usd ?? null, // per-turn $ for the bubble footer (survives reload)
+        tokens: turnTokens(out.result?.usage), // per-turn token totals for the bubble footer (survives reload)
         tools: out.tools.slice(0, 50),
         blocks: out.blocks.slice(0, 400), // chronological text+tool sequence, so the UI can split final answer from working steps
         ...(fix?.committed ? { fix } : {}),
