@@ -786,6 +786,33 @@ describe('updateCampaign — TARGET_IMPRESSION_SHARE', () => {
   });
 });
 
+describe('updateCampaign — TARGET_SPEND (Maximize Clicks)', () => {
+  it('switches to TARGET_SPEND with a cpc bid ceiling', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    const didUpdate = await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+      biddingStrategy: 'TARGET_SPEND',
+      cpcBidCeilingMicros: 9_000_000,
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    const update = body.operations[0].update;
+    expect(update.targetSpend.cpcBidCeilingMicros).toBe('9000000');
+    expect(body.operations[0].updateMask).toContain('target_spend.cpc_bid_ceiling_micros');
+    expect(didUpdate).toBe(true);
+  });
+
+  it('switches to TARGET_SPEND with no ceiling by masking the target_spend field', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    const didUpdate = await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+      biddingStrategy: 'TARGET_SPEND',
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    const update = body.operations[0].update;
+    expect(update.targetSpend).toEqual({});
+    expect(body.operations[0].updateMask).toContain('target_spend');
+    expect(didUpdate).toBe(true);
+  });
+});
+
 describe('updateCampaign', () => {
   it('sends mutate request with update and updateMask for name change', async () => {
     mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
