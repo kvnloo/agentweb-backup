@@ -88,6 +88,31 @@ describe('ENG-308 — one middleware, both jobs', () => {
       expect(src).toMatch(/api/);
     });
 
+    it('EXCLUDES only "api/" — a page route merely STARTING with "api" must still work', () => {
+      // The two middlewares this replaces did NOT agree here: the capture one excluded
+      // `api` (no slash), the subdomain one excluded `api/`. Unifying on the former
+      // would strip the middleware from routes like /api-docs, /apis, /api-integration
+      // — which are entirely plausible B2B landing pages — and those pages would lose
+      // their SUBDOMAIN REWRITE, i.e. visibly break for the customer. Only `/api/*`
+      // may be excluded.
+      const matcher = src.match(/matcher:\s*\[\s*"([^"]+)"/)?.[1];
+      expect(matcher).toBeDefined();
+      const re = new RegExp(`^${matcher}$`);
+
+      // must NOT match (the capture route must never be rewritten)
+      expect(re.test('/api/capture')).toBe(false);
+      expect(re.test('/api/anything')).toBe(false);
+
+      // MUST still match (real page routes that merely begin with the letters "api")
+      expect(re.test('/api-docs')).toBe(true);
+      expect(re.test('/apis')).toBe(true);
+      expect(re.test('/api-integration')).toBe(true);
+
+      // and the ordinary cases
+      expect(re.test('/')).toBe(true);
+      expect(re.test('/pricing')).toBe(true);
+    });
+
     it('is first-touch: an existing cookie is never overwritten', () => {
       expect(src).toMatch(/cookies\.get\(COOKIE\)/);
     });

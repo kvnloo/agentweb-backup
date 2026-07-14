@@ -2235,8 +2235,13 @@ export function assertNoDuplicateInjectedRoutes(files: Array<{ path: string; con
  *  - The cookie is set on the SAME response we return, on BOTH paths. Early-returning
  *    the rewrite would skip capture for exactly the pages a customer cared enough
  *    about to give a domain to.
- *  - The `matcher` must keep excluding `/api/*`. The capture route lives at
- *    `app/api/capture/route.ts` and READS this cookie; it must not be rewritten.
+ *  - The `matcher` must exclude `api/` — WITH the trailing slash. The capture route
+ *    lives at `app/api/capture/route.ts` and READS this cookie, so it must never be
+ *    rewritten. But excluding a bare `api` (no slash) would also strip the middleware
+ *    from ordinary page routes that merely begin with those letters — `/api-docs`,
+ *    `/apis`, `/api-integration` — and those pages would lose their SUBDOMAIN REWRITE,
+ *    i.e. visibly break for the customer. The two middlewares this replaces disagreed
+ *    on exactly this; the slash-ful form is the correct one.
  *
  * It imports `./domainMap`, so every writer must also emit a `domainMap.ts`.
  */
@@ -2288,7 +2293,7 @@ export function middleware(req: NextRequest) {
   return res;
 }
 
-export const config = { matcher: ["/((?!api|_next/static|_next/image|favicon.ico).*)"] };
+export const config = { matcher: ["/((?!api\\/|_next\\/static|_next\\/image|favicon\\.ico).*)"] };
 `;
 }
 
