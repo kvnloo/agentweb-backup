@@ -21,14 +21,43 @@ This guide is designed for **AI agents** connecting via Model Context Protocol (
 
 **Endpoint:** `https://api.agentweb.pro/mcp`
 **Transport:** Streamable HTTP (MCP 2024-11-05)
-**Auth:** Bearer token via `Authorization` header
+**Auth:** OAuth browser sign-in from your MCP client, or API-key bearer auth
 
-**Getting an API Key:**
+**Claude.ai / Claude Desktop / Claude account connector:**
+1. Open Claude settings > Connectors.
+2. Add a custom web connector.
+3. Use remote MCP server URL `https://api.agentweb.pro/mcp`.
+4. Click Connect and complete AgentWeb OAuth.
+
+This account-level connector is the preferred Claude path when you want the same Emma connection available across Claude surfaces.
+
+**Claude Code:**
+```bash
+claude mcp add --scope user --transport http emma https://api.agentweb.pro/mcp
+claude mcp list
+```
+
+The first Emma tool call opens the AgentWeb consent flow. After approval, the MCP client stores and refreshes OAuth tokens automatically. If you already connected Emma from claude.ai as an account-level connector, enable that connector in Claude Code rather than creating a duplicate direct connection.
+
+**Codex:**
+Add this to `~/.codex/config.toml`:
+```toml
+[mcp_servers.emma]
+url = "https://api.agentweb.pro/mcp"
+```
+
+Then authenticate:
+```bash
+codex mcp login emma
+codex mcp list
+```
+
+**API-Key Fallback:**
 1. Log in at `https://start.agentweb.pro`
 2. Navigate to Settings > API Keys
 3. Generate an MCP access token (starts with `aw_`)
 
-**MCP Client Configuration:**
+**Manual MCP Client Configuration:**
 ```json
 {
   "mcpServers": {
