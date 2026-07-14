@@ -1365,8 +1365,12 @@ export async function downloadSlackFile(urlPrivate: string): Promise<Buffer> {
   });
 
   const buffer = Buffer.from(response.data);
-  const prefix = buffer.slice(0, 20).toString('utf8');
-  if (prefix.trimStart().startsWith('<!') || prefix.trimStart().toLowerCase().startsWith('<html')) {
+  // Slack serves an HTML sign-in/error page (not the file bytes) when the bot can't
+  // access the file. Detect a real HTML document specifically — matching a bare "<!"
+  // prefix wrongly rejected valid SVG/XML uploads that legitimately begin with
+  // "<!DOCTYPE svg", "<!--", or "<!ENTITY" (ENG-323), leaving the attachment empty.
+  const prefix = buffer.slice(0, 64).toString('utf8').trimStart().toLowerCase();
+  if (prefix.startsWith('<!doctype html') || prefix.startsWith('<html')) {
     throw new Error(`Slack file download returned HTML for URL: ${urlPrivate}`);
   }
   return buffer;
