@@ -1252,21 +1252,57 @@ describe('agentToolGatewayService', () => {
       expect(execute).not.toHaveBeenCalled();
     });
 
-    it('does NOT lock out a multi-target tool after two execution-time invalid_args failures (ENG-197)', async () => {
-      // ENG-197: in a LinkedIn send-invite batch, two over-limit notes to two
+    // Helper: an execution-time send-invite failure to a specific profile. Uses
+    // real send-invite args so the per-recipient breaker scope (failureScope,
+    // ENG-182) keys each failure by its own profile_url — exactly like production.
+    const failSendInvite = (runId: string, profileUrl: string, message = 'Invalid parameters') =>
+      executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: profileUrl, message: 'a note' },
+        runId,
+        execute: failingExecute(message),
+      });
+
+    it('does NOT lock out other profiles after two DISTINCT-profile send-invite failures (ENG-197 reporter scenario)', async () => {
+      // ENG-197 reporter scenario: a send-invite batch where two invites to two
       // DIFFERENT profiles each came back from upstream as the generic
-      // 'Invalid parameters' (classified invalid_args). That is argument-specific
-      // — a corrected note, or an invite to an entirely different profile, must
-      // still be allowed to run. Execution-time invalid_args recurs across
-      // legitimately different arguments (like empty_result / not_found), so it
-      // must keep the default threshold (3), not the fast-trip threshold (2).
-      await failNTimes('run-eng197', 'linkedin_outreach', 'Invalid parameters', 2);
+      // 'Invalid parameters' (classified invalid_args). Every subsequent invite —
+      // to yet another vetted profile — must still send. On current main this is
+      // guaranteed by the per-recipient breaker scope (ENG-182): each profile_url
+      // is its own failure scope, so distinct-profile failures never aggregate to
+      // trip the run-level breaker. This test goes red if that scoping regresses
+      // (and the invalid_args threshold — ENG-197 — also regresses to 2).
+      expect((await failSendInvite('run-eng197-batch', 'https://linkedin.com/in/lead-one')).status).toBe('error');
+      expect((await failSendInvite('run-eng197-batch', 'https://linkedin.com/in/lead-two')).status).toBe('error');
 
       const execute = jest.fn().mockResolvedValue({ ok: true });
       const outcome = await executeAgentToolThroughGateway({
         toolName: 'linkedin_outreach',
-        args: { action: 'send-invite', profile_url: 'https://linkedin.com/in/vetted-lead', message: 'a correctly trimmed note' },
-        runId: 'run-eng197',
+        args: { action: 'send-invite', profile_url: 'https://linkedin.com/in/lead-three', message: 'a correctly trimmed note' },
+        runId: 'run-eng197-batch',
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('lets a corrected note to the SAME profile send after two invalid_args failures — threshold 3, not fast-trip 2 (ENG-197)', async () => {
+      // Isolates the one-line change (invalid_args OUT of FAST_TRIP_ERROR_CLASSES):
+      // every call here targets the SAME profile, so the per-recipient scope does
+      // NOT separate them — only the threshold protects the third attempt. With
+      // invalid_args kept at the DEFAULT threshold (3), two failures on one
+      // recipient do not lock it out, so a corrected third attempt still sends.
+      // Reverting the change (invalid_args fast-trips at 2) turns this red.
+      const sameProfile = 'https://linkedin.com/in/same-lead';
+      expect((await failSendInvite('run-eng197-same', sameProfile)).status).toBe('error');
+      expect((await failSendInvite('run-eng197-same', sameProfile)).status).toBe('error');
+
+      const execute = jest.fn().mockResolvedValue({ ok: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: sameProfile, message: 'a corrected note' },
+        runId: 'run-eng197-same',
         execute,
       });
 
