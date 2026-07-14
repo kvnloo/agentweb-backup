@@ -188,6 +188,41 @@ describe('llmPricing', () => {
       }
     });
 
+    // ENG-207: Azure/OpenAI return a dated snapshot or rolling-alias `response.model`
+    // (e.g. "gpt-4.1-2025-04-14", "gpt-chat-latest") even when we call a deployment
+    // named for the canonical model. Without normalization these meter at $0 — the
+    // exact blind spot ENG-200 exists to close.
+    it('normalizes a dated snapshot suffix to the canonical model price', () => {
+      const base = getModelPrice('gpt-4.1');
+      const dated = getModelPrice('gpt-4.1-2025-04-14');
+      expect(base).not.toBeNull();
+      expect(dated).not.toBeNull();
+      expect(dated!.inPerM).toBe(base!.inPerM);
+      expect(dated!.outPerM).toBe(base!.outPerM);
+    });
+
+    it('resolves the gpt-chat-latest rolling alias to gpt-5-chat-2 pricing', () => {
+      const alias = getModelPrice('gpt-chat-latest');
+      const canonical = getModelPrice('gpt-5-chat-2');
+      expect(alias).not.toBeNull();
+      expect(canonical).not.toBeNull();
+      expect(alias!.inPerM).toBe(canonical!.inPerM);
+      expect(alias!.outPerM).toBe(canonical!.outPerM);
+    });
+
+    it('handles a missing/empty model id without throwing (recordUsage passes undefined)', () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      expect(getModelPrice(undefined as any)).toBeNull();
+      expect(getModelPrice('' as any)).toBeNull();
+      warnSpy.mockRestore();
+    });
+
+    it('still returns null for an unknown model with a date suffix (no false match)', () => {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      expect(getModelPrice('totally-made-up-model-2025-04-14')).toBeNull();
+      warnSpy.mockRestore();
+    });
+
     it('returns null for an unknown model — NEVER another model price', () => {
       const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
       expect(getModelPrice('totally-made-up-model')).toBeNull();
