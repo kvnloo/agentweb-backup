@@ -133,7 +133,9 @@ export class AgentRunRecorder {
 
   async runStarted(
     runId: string,
-    info: { llmModel?: string; sessionType?: string; userId?: string; sessionId?: string } = {},
+    /** `traceId` is the OTel bridge (ENG-141): the active trace id, so a run in
+     * Dev-AW-LoopEvents can be joined to its Langfuse/Okareo trace by ID. */
+    info: { llmModel?: string; sessionType?: string; userId?: string; sessionId?: string; traceId?: string } = {},
   ): Promise<void> {
     await this.emit(runId, EVT_RUN_STARTED, cleanDims(info));
   }
