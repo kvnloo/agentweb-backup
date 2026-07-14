@@ -933,12 +933,15 @@ export async function runVerifiedChat(
             'blocked. Do not stop early. Then produce the final consolidated report, ' +
             'surfacing any genuinely blocked items as actionable next steps.';
         completionGateBudgetTruncated = false;
-        const continuationResponse = await generateSessionResponse(
-          sessionId,
-          userMessage,
-          userId,
-          defaultModel,
-          []
+        const continuationResponse = await withGenerationTimeout(
+          generateSessionResponse(
+            sessionId,
+            userMessage,
+            userId,
+            defaultModel,
+            []
+          ),
+          sessionId
         );
         if (continuationResponse.content) {
           allContent += (allContent ? '\n\n' : '') + continuationResponse.content;
@@ -1023,12 +1026,20 @@ export async function runVerifiedChat(
       // Only pass attachments on the first attempt to avoid duplicating them
       const attachmentsForThisAttempt = attempt === 1 ? attachmentsArray : [];
       console.log(`AgentMode runVerifiedChat: Attempt ${attempt}, passing ${attachmentsForThisAttempt.length} attachments to generateSessionResponse`);
-      const response = await generateSessionResponse(
-        sessionId,
-        userMessage,
-        userId,
-        defaultModel,
-        attachmentsForThisAttempt
+      // Wall-clock timeout so a hung generation (stuck LLM stream, never-resolving
+      // upstream) can't silently hang the whole scheduled run forever with no assistant
+      // output, no persisted error, and no requeue (ENG-304). On timeout this rejects
+      // and is handled in the catch below, which cancels the orphaned worker run and
+      // rethrows so runScheduledChat's dead-man path persists the error and requeues.
+      const response = await withGenerationTimeout(
+        generateSessionResponse(
+          sessionId,
+          userMessage,
+          userId,
+          defaultModel,
+          attachmentsForThisAttempt
+        ),
+        sessionId
       );
 
       if (!hasAssistantOutput(response)) {
@@ -1145,6 +1156,16 @@ export async function runVerifiedChat(
 
     } catch (error) {
       console.error(`Run verified chat attempt ${attempt} failed:`, error);
+      if ((error as any)?.isGenerationTimeout) {
+        // Wall-clock timeout: the generation hung. Mirror the interactive path — cancel the
+        // orphaned worker run so it stops burning compute and can't later write to the
+        // abandoned session — then rethrow so runScheduledChat persists the error and
+        // requeues the run instead of hanging forever with no assistant output (ENG-304).
+        console.error(`AgentMode runVerifiedChat: generation timed out for session ${sessionId} — cancelling orphaned worker run`);
+        requestCancel(sessionId);
+        generateMarketingResponseWorkerService.cancelSession(sessionId);
+        throw error;
+      }
       if (isZeroAssistantOutputError(error)) {
         if (attempt === maxAttempts) {
           throw error;
