@@ -2722,6 +2722,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         costUsed: 0,
         costAllowance: null,
         costPercentUsed: 0,
+        costEnforced: false,
       });
 
       const scheduleWithEmails = {
@@ -2756,6 +2757,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         costUsed: 0,
         costAllowance: null,
         costPercentUsed: 0,
+        costEnforced: false,
       });
 
       const scheduleNoEmails = {
@@ -2788,6 +2790,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         costUsed: 0,
         costAllowance: null,
         costPercentUsed: 0,
+        costEnforced: false,
       });
 
       const scheduleWithEmails = { ...baseSchedule, requiredFunctionCalls: [], emailNotifications: ['owner@example.com'] };
@@ -2812,6 +2815,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         costUsed: 42.5,
         costAllowance: 40,
         costPercentUsed: 106,
+        costEnforced: true,
       });
 
       const scheduleWithEmails = {

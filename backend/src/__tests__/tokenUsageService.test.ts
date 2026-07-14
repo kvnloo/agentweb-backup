@@ -310,6 +310,8 @@ describe("checkTokenUsage - cost tracking (observe-only by default)", () => {
     expect(result.costAllowance).toBe(20);
     expect(result.costPercentUsed).toBe(100);
     expect(result.percentUsed).toBe(10);
+    // Observe-only: no decided/enforced cost quota yet → UIs keep the cost figure hidden.
+    expect(result.costEnforced).toBe(false);
   });
 
   it("blocks on cost when ENFORCE_COST_CAP=true even though tokens are under limit", async () => {
@@ -334,6 +336,8 @@ describe("checkTokenUsage - cost tracking (observe-only by default)", () => {
     expect(result.costPercentUsed).toBe(100);
     // token dimension alone would have allowed the request
     expect(result.percentUsed).toBe(10);
+    // Cost cap is the enforced gate → a real cost quota exists → UIs may surface it.
+    expect(result.costEnforced).toBe(true);
   });
 
   it("does NOT block purely on cost by default even when token allowance is unlimited (Fable rollout scenario)", async () => {
