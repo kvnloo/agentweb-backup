@@ -7231,7 +7231,9 @@ emmaToolRegistry.register({
     // Admins / delegated-admin sessions also get the canonical Linear link in chat (ENG-289) so they can
     // track the eng issue directly. `canonicalUrl` is only populated on results[] for internal reporters
     // (gated by reporterIsInternal above), so this stays empty for external customers + external-MCP callers.
-    const linearLinks = results.filter(r => r.success && r.canonicalUrl).map(r => r.canonicalUrl);
+    const linearLinks = results
+      .map(r => (r.success ? r.canonicalUrl : undefined))
+      .filter((u): u is string => !!u);
     if (linearLinks.length === 1) summary += ` Engineering is tracking this in Linear: ${linearLinks[0]}`;
     else if (linearLinks.length > 1) summary += ` Engineering is tracking these in Linear: ${linearLinks.join(', ')}`;
 
