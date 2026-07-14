@@ -3926,3 +3926,167 @@ export async function updateSubdomainMiddleware(
     { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
   );
 }
+
+/**
+ * Read a file from a repo's `main`, or `null` if it does not exist.
+ * Any status other than 404 is a real failure and is rethrown.
+ */
+async function readRepoFile(
+  repoFullName: string,
+  path: string,
+  ghHeaders: Record<string, string>
+): Promise<string | null> {
+  try {
+    const res = await axios.get<any>(
+      `https://api.github.com/repos/${repoFullName}/contents/${path}?ref=main`,
+      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+    );
+    const data = res.data;
+    if (!data || typeof data.content !== "string") return null;
+    return Buffer.from(data.content, "base64").toString("utf-8");
+  } catch (err: any) {
+    if (err?.response?.status === 404) return null;
+    throw err;
+  }
+}
+
+/**
+ * Push the lead-capture files into an EXISTING landing-page repo. ENG-310.
+ *
+ * Generation injects `middleware.ts` / `domainMap.ts` / `app/api/capture/route.ts` into
+ * every new site, but attaching a lead list to an ALREADY-GENERATED page used to write
+ * DynamoDB and nothing else: the repo was never touched, so a deployed site whose pages
+ * all carried a `leadListId` still 404'd on `/api/capture`. The record claimed a lead
+ * list that meant nothing. This is the missing half — same blob → tree → commit → ref
+ * push as {@link updateSubdomainMiddleware}, and the push is what makes Vercel redeploy.
+ *
+ * Two things it is careful about, both of which cost a customer real money if got wrong:
+ *
+ *  - It does NOT touch `domainMap.ts` when the repo already has one. That file holds the
+ *    live host → path map for any subdomain the customer has attached; overwriting it
+ *    with `{}` would break their routing — ENG-308's bug with the roles reversed. It is
+ *    only written (empty) when ABSENT, because the middleware imports it and the Vercel
+ *    build fails outright without it.
+ *
+ *  - It is idempotent. If the repo already has byte-for-byte what we would write, it
+ *    makes no commit at all: a pointless commit is a pointless redeploy of a live site.
+ *
+ * It never throws. The caller has already committed the DynamoDB write by the time this
+ * runs, and a GitHub hiccup must not unwind that — the result says what happened and the
+ * caller decides how to surface it.
+ *
+ * @param repoFullName e.g. "AgentWebPro/lp-product-abc12345"
+ * @param listByPath page path -> lead list id, for EVERY page of the site (the capture
+ *   route is repo-level while the lead list is per-page). May be empty.
+ */
+export async function syncLeadCaptureFilesToRepo(
+  repoFullName: string,
+  listByPath: Record<string, string>
+): Promise<{ committed: boolean; reason?: string }> {
+  try {
+    const { token: ghToken } = await getGitHubOrgToken();
+    const ghHeaders = {
+      Authorization: `Bearer ${ghToken}`,
+      Accept: "application/vnd.github.v3+json",
+    };
+
+    const middlewareContent = buildLandingPageMiddleware();
+    const captureRouteContent = buildCaptureRoute(listByPath);
+
+    const [existingMiddleware, existingCaptureRoute, existingDomainMap] = await Promise.all([
+      readRepoFile(repoFullName, "middleware.ts", ghHeaders),
+      readRepoFile(repoFullName, "app/api/capture/route.ts", ghHeaders),
+      readRepoFile(repoFullName, "domainMap.ts", ghHeaders),
+    ]);
+
+    // Only write domainMap.ts if the repo has none. If it exists it may carry a real
+    // subdomain map — clobbering it with {} would break the customer's routing.
+    const needsDomainMap = existingDomainMap === null;
+
+    if (
+      !needsDomainMap &&
+      existingMiddleware === middlewareContent &&
+      existingCaptureRoute === captureRouteContent
+    ) {
+      console.log(
+        `[V0 SERVICE] Lead-capture files already up to date in ${repoFullName} — skipping commit (no redeploy)`
+      );
+      return { committed: false, reason: "up-to-date" };
+    }
+
+    const filesToCommit: Array<{ path: string; content: string }> = [
+      { path: "middleware.ts", content: middlewareContent },
+      { path: "app/api/capture/route.ts", content: captureRouteContent },
+    ];
+    if (needsDomainMap) {
+      // Pre-ENG-308 repo: the middleware imports ./domainMap, so it MUST exist or the
+      // Vercel build fails. Empty is correct here — no subdomain has ever been attached.
+      filesToCommit.push({ path: "domainMap.ts", content: buildDomainMapFile({}) });
+    }
+
+    const refRes = await axios.get<any>(
+      `https://api.github.com/repos/${repoFullName}/git/ref/heads/main`,
+      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+    );
+    const latestCommitSha = refRes.data.object.sha;
+
+    const treeItems = await Promise.all(
+      filesToCommit.map(async (file) => {
+        const blobRes = await axios.post<any>(
+          `https://api.github.com/repos/${repoFullName}/git/blobs`,
+          { content: Buffer.from(file.content).toString("base64"), encoding: "base64" },
+          { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+        );
+        return {
+          path: file.path,
+          mode: "100644" as const,
+          type: "blob" as const,
+          sha: blobRes.data.sha,
+        };
+      })
+    );
+
+    const treeRes = await axios.post<any>(
+      `https://api.github.com/repos/${repoFullName}/git/trees`,
+      { base_tree: latestCommitSha, tree: treeItems },
+      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+    );
+
+    const commitRes = await axios.post<any>(
+      `https://api.github.com/repos/${repoFullName}/git/commits`,
+      {
+        message: "chore: sync lead-capture route and middleware",
+        tree: treeRes.data.sha,
+        parents: [latestCommitSha],
+      },
+      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+    );
+
+    await axios.patch<any>(
+      `https://api.github.com/repos/${repoFullName}/git/refs/heads/main`,
+      { sha: commitRes.data.sha },
+      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+    );
+
+    const wired = Object.entries(listByPath);
+    console.log(
+      `[V0 SERVICE] Synced lead-capture files to ${repoFullName} (${filesToCommit
+        .map((f) => f.path)
+        .join(", ")}); ${
+        wired.length
+          ? wired.map(([p, l]) => `${p} -> ${l}`).join(", ")
+          : "NO page of this site has a lead list — its forms will fail loudly"
+      }`
+    );
+    return { committed: true };
+  } catch (err: any) {
+    const reason = err?.response?.data?.message || err?.message || String(err);
+    console.error(
+      `[V0 SERVICE] FAILED to sync lead-capture files to ${repoFullName}: ${reason}. ` +
+        `The lead list is wired in DynamoDB but this repo's /api/capture route is STALE — ` +
+        `leads submitted from this site will not be filed correctly until this is retried.`,
+      err?.response?.status ? `(HTTP ${err.response.status})` : ""
+    );
+    return { committed: false, reason };
+  }
+}
