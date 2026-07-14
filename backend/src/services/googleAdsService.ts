@@ -492,15 +492,11 @@ export class GoogleAdsService {
         update.manualCpc = { enhancedCpcEnabled: false };
         updateMask.push('manual_cpc.enhanced_cpc_enabled');
       } else if (params.biddingStrategy === 'TARGET_SPEND') {
-        // Maximize Clicks. cpc_bid_ceiling_micros is optional; when omitted, mask the
-        // whole target_spend message so the campaign still switches to this strategy.
-        if (params.cpcBidCeilingMicros !== undefined) {
-          update.targetSpend = { cpcBidCeilingMicros: String(params.cpcBidCeilingMicros) };
-          updateMask.push('target_spend.cpc_bid_ceiling_micros');
-        } else {
-          update.targetSpend = {};
-          updateMask.push('target_spend');
-        }
+        // Maximize Clicks. cpc_bid_ceiling_micros is optional; default it to 0 (uncapped)
+        // when omitted and always mask the leaf path, so the campaign switches strategy.
+        // Masking the bare parent 'target_spend' path risks FieldMaskError.FIELD_HAS_SUBFIELDS.
+        update.targetSpend = { cpcBidCeilingMicros: String(params.cpcBidCeilingMicros ?? 0) };
+        updateMask.push('target_spend.cpc_bid_ceiling_micros');
       } else {
         throw new Error(`Unsupported bidding_strategy '${params.biddingStrategy}' for CAMPAIGN UPDATE. Supported values: MAXIMIZE_CONVERSIONS, MAXIMIZE_CONVERSION_VALUE, TARGET_CPA, TARGET_ROAS, TARGET_IMPRESSION_SHARE, TARGET_SPEND, MANUAL_CPC.`);
       }
