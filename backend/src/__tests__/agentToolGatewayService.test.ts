@@ -1820,6 +1820,64 @@ describe('agentToolGatewayService', () => {
       expect(execute).not.toHaveBeenCalled();
     });
 
+    it('ENG-313: a corrected get-profile with a valid profile_url runs after two argument-less failures', async () => {
+      const runId = 'run-eng313';
+      // The model twice calls get-profile with only keywords (no profile_url /
+      // provider_id), so it fails "Either profile_url or provider_id is required"
+      // — an invalid_args class (fast-trip threshold 2) with an empty recipient
+      // scope. Two of these must NOT block a later, corrected call that finally
+      // carries a real profile_url — that is a materially different, now-valid
+      // attempt, not a spiral.
+      for (let i = 0; i < 2; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'linkedin_outreach',
+          args: { action: 'get-profile', keywords: 'nalin pradeep' },
+          runId,
+          execute: failingExecute('Either profile_url or provider_id is required for get-profile'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'get-profile', profile_url: 'https://www.linkedin.com/in/nalinpradeep/' },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('ENG-313: still trips when the SAME get-profile recipient fails repeatedly', async () => {
+      const runId = 'run-eng313-same';
+      const profile = 'https://www.linkedin.com/in/nalinpradeep/';
+      for (let i = 0; i < 2; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'linkedin_outreach',
+          args: { action: 'get-profile', profile_url: profile },
+          runId,
+          execute: failingExecute('Invalid parameters'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'get-profile', profile_url: profile },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
     it('blocks expensive media tools after two failures even when the error messages differ', async () => {
       await failNTimes('run-media', 'generate_image', 'Safety filter rejected image prompt', 1);
       await failNTimes('run-media', 'generate_image', 'Google image generation timed out after 10 minutes', 1);
