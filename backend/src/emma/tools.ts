@@ -8028,7 +8028,7 @@ emmaToolRegistry.register({
 
 ACTION MATRIX:
   BUDGET      → LIST, CREATE (name, amount_micros, explicitly_shared?), UPDATE (budget_resource_name, amount_micros), REMOVE (budget_resource_name; must not be attached to any campaign)
-  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy?, bidding_strategy_target?, budget_resource_name?), REMOVE (campaign_resource_name)
+  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?), REMOVE (campaign_resource_name)
               For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
   AD_GROUP    → LIST (campaign_resource_name)
                CREATE (name, campaign_resource_name, type [SEARCH_STANDARD|DISPLAY_STANDARD], cpc_bid_micros?)
@@ -8059,6 +8059,7 @@ ACTION MATRIX:
         cpc_bid_ceiling_micros: { type: 'number', description: 'Max CPC bid ceiling in micros for TARGET_IMPRESSION_SHARE campaigns. Default 100000000 (≈100 currency units). Pass a lower value to cap spend per click.' },
         location_target_ids: { type: 'array', items: { type: 'number' }, description: 'From LOCATION SEARCH.' },
         campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE and AD_GROUP LIST.' },
+        final_url_suffix: { type: 'string', description: 'Campaign-level Final URL suffix (query params appended to all final URLs, e.g. "utm_source=google&utm_medium=cpc"). For CAMPAIGN UPDATE only.' },
         ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD LIST/ADD/ADD_NEGATIVE/REMOVE, AD LIST/CREATE, AD_GROUP UPDATE.' },
         ad_resource_name: { type: 'string', description: 'AdGroupAd resource name. Required for AD UPDATE/REMOVE. Obtain from AD LIST.' },
         brand_business_name: { type: 'string', description: 'Business name for PMax brand guidelines. Required for PERFORMANCE_MAX CAMPAIGN CREATE when brand guidelines are enforced.' },

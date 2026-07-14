@@ -27792,14 +27792,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for UPDATE action' };
-          await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
+          const didUpdate = await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
             name: args.name,
             status: args.status,
             biddingStrategy: args.bidding_strategy,
             biddingStrategyTarget: args.bidding_strategy_target,
             cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
             budgetResourceName: args.budget_resource_name,
+            finalUrlSuffix: args.final_url_suffix,
           });
+          if (!didUpdate) return { success: false, error: 'This tool does not support updating the field(s) requested for CAMPAIGN — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Campaign updated' };
         }
       }
@@ -27842,7 +27844,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.ad_group_resource_name) return { success: false, error: 'ad_group_resource_name is required for UPDATE action' };
-          await googleAdsService.updateAdGroup(userId, customer_id, args.ad_group_resource_name, {
+          const didUpdateAdGroup = await googleAdsService.updateAdGroup(userId, customer_id, args.ad_group_resource_name, {
             name: args.name,
             status: args.status,
             cpcBidMicros: args.cpc_bid_micros,
@@ -27850,6 +27852,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             targetCpaMicros: args.target_cpa_micros,
             targetRoas: args.target_roas,
           });
+          if (!didUpdateAdGroup) return { success: false, error: 'This tool does not support updating the field(s) requested for AD_GROUP — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Ad group updated' };
         }
         if (action === 'REMOVE') {
@@ -27882,10 +27885,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.criterion_resource_name) return { success: false, error: 'criterion_resource_name is required for KEYWORD UPDATE' };
-          await googleAdsService.updateKeyword(userId, customer_id, args.criterion_resource_name, {
+          const didUpdateKeyword = await googleAdsService.updateKeyword(userId, customer_id, args.criterion_resource_name, {
             status: args.status,
             cpcBidMicros: args.cpc_bid_micros,
           });
+          if (!didUpdateKeyword) return { success: false, error: 'This tool does not support updating the field(s) requested for KEYWORD — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Keyword updated' };
         }
         if (action === 'REMOVE') {
@@ -27926,9 +27930,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD UPDATE' };
-          await googleAdsService.updateAd(userId, customer_id, args.ad_resource_name, {
+          const didUpdateAd = await googleAdsService.updateAd(userId, customer_id, args.ad_resource_name, {
             status: args.status,
           });
+          if (!didUpdateAd) return { success: false, error: 'This tool does not support updating the field(s) requested for AD — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Ad updated' };
         }
         if (action === 'REMOVE') {
