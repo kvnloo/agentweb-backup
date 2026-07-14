@@ -331,15 +331,32 @@ async function checkExitConditions(
       });
 
       if (trigger) {
-        // Name the exact event that caused this. These exits have never fired before (the
-        // query was dead), so the first time this ships, enrollments whose leads had already
-        // engaged will exit — correctly, but suddenly. When someone asks "why did my
-        // sequence stop?", this line is the answer.
+        // Name the exact event that caused this, and carry the two fields that would expose
+        // a false positive.
+        //
+        // Opens and clicks can be machine-generated: corporate link scanners (Microsoft Safe
+        // Links, Proofpoint, Mimecast) click every link on delivery, and Apple Mail
+        // pre-fetches tracking pixels. Neither is visible in today's traffic — sampled prod
+        // clicks sit 18s–250s after send, and the dominant open user-agent is Gmail's image
+        // proxy, which represents a REAL human open. But cold outreach into corporate M365
+        // tenants is exactly the workload that produces scanner engagement, and we do not
+        // have any of that yet.
+        //
+        // So instead of guessing at a filter we cannot calibrate, log the evidence. A
+        // scanner shows up here as a sub-second gap and a datacenter user-agent. If that
+        // starts appearing, we will know rather than infer. Tracked separately.
+        const t = trigger as any;
+        const detail = t.data?.click || t.data?.open || {};
+        const sentAt = t.data?.created_at ? new Date(String(t.data.created_at).replace(' ', 'T')).getTime() : NaN;
+        const eventAt = new Date(t.createdAt).getTime();
+        const gapSeconds = Number.isFinite(sentAt) ? Math.round((eventAt - sentAt) / 1000) : null;
+
         console.log(
           `[dripWorker] Enrollment ${enrollment.enrollmentId} exited: engagement — ` +
-          `lead ${enrollment.leadEmail} triggered "${(trigger as any).eventType}" ` +
-          `at ${(trigger as any).createdAt} (enrolled ${enrollment.enrolledAt}; ` +
-          `sequence exits on: ${wanted.join(', ')})`,
+          `lead ${enrollment.leadEmail} triggered "${t.eventType}" at ${t.createdAt} ` +
+          `(enrolled ${enrollment.enrolledAt}; sequence exits on: ${wanted.join(', ')}; ` +
+          `gapFromSend=${gapSeconds === null ? 'unknown' : `${gapSeconds}s`}; ` +
+          `userAgent=${detail.userAgent || 'n/a'})`,
         );
         return 'engagement';
       }
