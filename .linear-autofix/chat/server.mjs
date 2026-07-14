@@ -331,6 +331,32 @@ async function attributionFor(identifier, entry) {
   return { idEnv: entry?.assignee ? gitIdentityEnv(entry.assignee) : {}, identity: entry?.assignee || null, email: entry?.assigneeEmail || null, who: `${entry?.assigneeEmail || 'none'} (stored)` };
 }
 
+// The chat agent must touch Linear as the issue's ASSIGNEE — never via the shared/global LINEAR_API_KEY
+// the server itself runs on (that key is one person's, doubling as the poller's, so every agent would
+// otherwise act as them). Resolve the assignee's OWN key; if they have none configured, the agent gets
+// no Linear key at all rather than silently borrowing the shared one.
+const assigneeLinearKey = (email) => {
+  const ev = email ? config.assigneeLinearKeyEnv?.[email] : null;
+  return (ev && process.env[ev]) || null;
+};
+// Build the environment a chat-agent subprocess runs with. ALWAYS scopes Linear to the assignee (strips
+// the shared global key, substitutes the assignee's own or none). `attr` set (full turns) additionally
+// carries the assignee's git identity + GH token so commits/PRs are attributed to them; null (read-only,
+// /btw, compact) still gets the Linear scoping. Server-side Linear reads are unaffected — they use the
+// server's own env, not this.
+function agentEnv(entry, attr) {
+  const email = attr?.email || entry?.assigneeEmail || entry?.assignee?.email || null;
+  const env = { ...process.env };
+  const linKey = assigneeLinearKey(email);
+  if (linKey) env.LINEAR_API_KEY = linKey; else delete env.LINEAR_API_KEY;
+  if (attr) {
+    Object.assign(env, attr.idEnv || {});
+    const ghToken = attr.email ? resolveAssigneeGhToken({ email: attr.email }) : null;
+    if (ghToken) env.GH_TOKEN = ghToken;
+  }
+  return env;
+}
+
 // One conversation per issue — no user-facing mode. Capability is decided per turn by the
 // environment: full access only where a fix run would also be allowed to push.
 function capabilityOf(entry) {
@@ -1032,17 +1058,11 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
     // Doing it every full turn is what makes a reassignment take effect — the new assignee's name/email
     // overwrite the old in config.worktree, so this turn's (and any later manual) commits go by them.
     if (cap === 'full' && cwd !== agentRoot && attr?.identity) applyWorktreeIdentity(cwd, attr.identity, (msg) => log(`turn ${turnId} (${identifier}): ${msg}`));
-    const turnEnv = (() => {
-      if (cap !== 'full') return process.env;
-      const idEnv = attr.idEnv || {};
-      const ghToken = attr.email ? resolveAssigneeGhToken({ email: attr.email }) : null;
-      // For a standalone chat, also hand the agent its OWNER's Linear key so any Linear action it takes
-      // is attributed to that person (ENG chats already resolve this per-assignee via the pipeline).
-      const linEnv = entry.standalone && attr.email ? config.assigneeLinearKeyEnv?.[attr.email] : null;
-      const linKey = linEnv ? process.env[linEnv] : null;
-      if (!Object.keys(idEnv).length && !ghToken && !linKey) return process.env;
-      return { ...process.env, ...idEnv, ...(ghToken ? { GH_TOKEN: ghToken } : {}), ...(linKey ? { LINEAR_API_KEY: linKey } : {}) };
-    })();
+    // Scope Linear to the assignee for EVERY turn (and, on full turns, attribute commits/PRs to them).
+    // attr is the live-resolved assignee on full turns, null on read-only — either way agentEnv strips
+    // the shared global LINEAR_API_KEY and substitutes the assignee's own (or none). This is what makes
+    // an ENG card's agent act as its assignee (e.g. ENG-200 → Manan), not as the shared key's owner.
+    const turnEnv = agentEnv(entry, cap === 'full' ? attr : null);
 
     mkdirSync(path.join(logsDir, identifier), { recursive: true });
     tee = createWriteStream(path.join(logsDir, identifier, `chat-${Date.now()}.txt`));
@@ -1348,7 +1368,7 @@ async function runBtw(identifier, question) {
     }
     // Read-only tools (from the readOnly cap), but on Sonnet — a side aside doesn't need Opus.
     const out = await runClaudeStream(chatArgs('readOnly', btwSid, CHAT.btwModel), prompt, cwd, CHAT.readOnly?.timeoutMs || 10 * 60 * 1000,
-      (e) => { if (e.type === 'init') sid = e.sessionId; }, null);
+      (e) => { if (e.type === 'init') sid = e.sessionId; }, null, agentEnv(found.entry, null));
     if (out.timedOut) return { code: 504, error: 'the side question timed out' };
     const answer = (out.texts.join('\n\n').trim()) || (out.result?.result || '').trim() || '(no answer)';
     // Persist the side thread SEPARATELY. updateChatState re-reads fresh, so a main turn that finished
@@ -1498,7 +1518,7 @@ async function runCompactTurn(identifier, entry, cap, turnId, lockPath, instruct
     const onEvent = (e) => { tee.write(JSON.stringify(e) + '\n'); if (e.type === 'result' && e.isError) return; emit(e); };
     const register = (child) => { const t = activeTurns.get(identifier); if (t) t.child = child; };
 
-    const out = await runClaudeStream(chatArgs(cap, sid), prompt, cwd, m.timeoutMs, onEvent, register);
+    const out = await runClaudeStream(chatArgs(cap, sid), prompt, cwd, m.timeoutMs, onEvent, register, agentEnv(entry, null));
     if (aborted(identifier, turnId)) return;
     if (out.timedOut) { emit({ type: 'error', error: `compaction timed out after ${Math.round(m.timeoutMs / 60000)} min (killed)` }); return; }
 
