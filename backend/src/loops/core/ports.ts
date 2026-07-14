@@ -64,6 +64,11 @@ export interface DynamoQueryResult {
 
 export interface DynamoPort {
   putItem(tableName: string, item: DynamoAttributeMap): Promise<void>;
+  putItemIfAbsent?(
+    tableName: string,
+    item: DynamoAttributeMap,
+    keyAttributes: readonly string[],
+  ): Promise<boolean>;
   getItem(tableName: string, key: DynamoAttributeMap): Promise<DynamoAttributeMap | null>;
   query(params: DynamoQueryParams): Promise<DynamoQueryResult>;
 }
