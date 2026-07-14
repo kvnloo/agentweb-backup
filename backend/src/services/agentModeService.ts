@@ -10551,8 +10551,16 @@ export class AgentModeService {
       }
 
       // Resolve sender: lead → list → account default → first available
-      // Use the list owner's sender config so org members can send using the owner's senders
-      const sendersResult = await this.getCrmSenders(list.userId || userId);
+      // Use the list owner's sender config so org members can send using the owner's senders.
+      //
+      // The owner's id is load-bearing beyond just reading the config: a mailbox sender's
+      // connected account lives on the OWNER's record, so the provider must be called with
+      // the owner's userId — otherwise getAccountById(accountId, actorUserId) finds nothing
+      // and the send fails with "account not connected" for a sender the UI happily offered.
+      // It also matters on the write side: a refreshed (and for Outlook, rotated) token must
+      // be persisted back onto the owner's account. See ENG-299.
+      const senderOwnerUserId = list.userId || userId;
+      const sendersResult = await this.getCrmSenders(senderOwnerUserId);
       if (!sendersResult.success || sendersResult.senders.length === 0) {
         return { success: false, message: 'No senders configured', error: 'No sender email is configured for this lead list. To set one up, select the lead list and click "Senders".' };
       }
@@ -10594,7 +10602,9 @@ export class AgentModeService {
         await bootstrapEmailProviders();
         const provider = getEmailProvider(leadSenderProvider);
         const body = draft.htmlContent || draft.textContent || '';
-        const sendResult = await provider.sendEmail(userId, connectedAccountId, {
+        // senderOwnerUserId, not userId: the connected account belongs to whoever owns the
+        // sender config, and a refreshed/rotated token must be written back to them (ENG-299).
+        const sendResult = await provider.sendEmail(senderOwnerUserId, connectedAccountId, {
           to: lead.email,
           subject: draft.subject,
           body,
