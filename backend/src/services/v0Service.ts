@@ -1945,6 +1945,108 @@ export function remapFilesForSubPage(
   return result;
 }
 
+/** Extensions Next/TS will try when an import omits one. */
+const MODULE_EXTENSIONS = [".tsx", ".ts", ".jsx", ".js"];
+
+/** Does `target` (repo-root-relative, extensionless) name a file that actually exists? */
+function moduleExists(target: string, existingPaths: Set<string>): boolean {
+  if (existingPaths.has(target)) return true;
+  for (const ext of MODULE_EXTENSIONS) {
+    if (existingPaths.has(`${target}${ext}`)) return true;
+    if (existingPaths.has(`${target}/index${ext}`)) return true;
+  }
+  return false;
+}
+
+/**
+ * Invert remapFilesForSubPage: where did this committed file live when v0 emitted it?
+ * A relative import is only meaningful against the file's ORIGINAL directory, so healing
+ * one after the fact requires undoing the move.
+ *
+ * Returns null for anything that was never moved (the root page, layout, etc.) — those
+ * files' relative imports are correct and must not be touched.
+ */
+function originalPathOfSubPageFile(filePath: string): { slug: string; original: string } | null {
+  const m = filePath.match(/^app\/([^/]+)\/(.+)$/);
+  if (!m) return null; // app/page.tsx, app/layout.tsx — never moved
+  const [, slug, rest] = m;
+  if (rest.startsWith("_components/")) {
+    // app/<slug>/_components/x.tsx  ←  components/x.tsx
+    return { slug, original: `components/${rest.slice("_components/".length)}` };
+  }
+  // app/<slug>/page.tsx ← app/page.tsx;  app/<slug>/loading.tsx ← app/loading.tsx
+  return { slug, original: `app/${rest}` };
+}
+
+/**
+ * Repair sub-page files already committed to a repo by the PRE-FIX remap, which moved files
+ * without rewriting their plain relative imports.
+ *
+ * Why this exists at all: `next build` type-checks the whole project, so a SINGLE page with an
+ * unresolvable import fails the deployment for EVERY page on the site. A site poisoned while
+ * that bug was live is permanently undeployable — regenerating cannot save it, because the
+ * broken file is still in the repo. remapFilesForSubPage stops new poisoning; this undoes the
+ * damage already done.
+ *
+ * The invariant that makes it safe to rewrite files we did not generate this run:
+ *
+ *   ONLY rewrite an import that does not CURRENTLY resolve.
+ *
+ * A healthy repo is untouched. A broken one can only move toward compiling — we never
+ * "fix" something that already works, and when no file in the repo could satisfy an import we
+ * leave it alone rather than emit a confident guess. It follows that the pass is idempotent.
+ *
+ * Pure: `existingPaths` is the repo's file list, so this is fully testable without GitHub.
+ * Returns ONLY the files whose content changed.
+ */
+export function repairSubPageImports(
+  files: Array<{ path: string; content: string }>,
+  existingPaths: Set<string>,
+): Array<{ path: string; content: string }> {
+  const repaired: Array<{ path: string; content: string }> = [];
+
+  for (const file of files) {
+    if (!file.path.endsWith(".tsx") && !file.path.endsWith(".ts")) continue;
+    const origin = originalPathOfSubPageFile(file.path);
+    if (!origin) continue; // never moved → its relative imports were always correct
+
+    const { slug, original } = origin;
+    const currentDir = path.posix.dirname(file.path);
+    const originalDir = path.posix.dirname(original);
+    let changed = false;
+
+    const content = file.content.replace(
+      /(from\s+['"])(\.\.?\/[^'"]+)(['"])/g,
+      (whole, pre: string, spec: string, post: string) => {
+        // Already resolves from where the file sits now? Then it is not broken — hands off.
+        const asWritten = path.posix.normalize(path.posix.join(currentDir, spec));
+        if (moduleExists(asWritten, existingPaths)) return whole;
+
+        // Broken. Read it the way v0 meant it — against the file's ORIGINAL directory.
+        const intended = path.posix.normalize(path.posix.join(originalDir, spec));
+        if (intended.startsWith("..")) return whole; // escapes the repo root — unknowable
+
+        // The remap relocates components/* (but not components/ui/*) into the page's
+        // _components/. Look there first, then at the untouched root.
+        const candidates: string[] = [];
+        if (intended.startsWith("components/") && !intended.startsWith("components/ui/")) {
+          candidates.push(`app/${slug}/_components/${intended.slice("components/".length)}`);
+        }
+        candidates.push(intended);
+
+        const target = candidates.find((c) => moduleExists(c, existingPaths));
+        if (!target) return whole; // nothing in the repo satisfies it — do not guess
+
+        changed = true;
+        return `${pre}@/${target}${post}`;
+      },
+    );
+
+    if (changed) repaired.push({ path: file.path, content });
+  }
+
+  return repaired;
+}
 
 /**
  * Deploy a generated landing page: download from v0 → create GitHub repo → connect to Vercel.
