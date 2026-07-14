@@ -7043,14 +7043,12 @@ emmaToolRegistry.register({
     const isDelegatedAdmin = isDelegate && !!adminEmail;
 
     const results: Array<{ title: string; success: boolean; issueId?: string; error?: string; deduped?: boolean; url?: string; trackingUrl?: string; canonicalUrl?: string }> = [];
-    // ENG-289 Desired behavior #1: the SUBMITTER gets the canonical Linear link — but only when they are
-    // INTERNAL (a teammate who can actually open a Linear issue): an admin, a delegated-admin session, or an
-    // @agentweb.pro reporter. External customers and ALL external-MCP callers still never receive the internal
-    // link (preserves the leak guard: the tool result is JSON.stringified to external MCP clients and preserved
-    // into Agent Mode LLM context + persisted sidebar state). The internal team email always gets it regardless.
-    const reporterIsInternal = context?.externalMcp !== true && (
-      user?.isAdmin === true || isDelegatedAdmin || /@agentweb\.pro$/i.test(user?.email || '')
-    );
+    // ENG-289: the reporting admin gets the canonical Linear link back in chat — but ONLY when they are
+    // an admin or in a delegated-admin session (someone who can actually open a Linear issue). External
+    // customers and ALL external-MCP callers never receive the internal link (preserves the leak guard:
+    // the tool result is JSON.stringified to external MCP clients and preserved into Agent Mode LLM context
+    // + persisted sidebar state). The internal team notification email always gets it regardless.
+    const reporterIsInternal = context?.externalMcp !== true && (user?.isAdmin === true || isDelegatedAdmin);
     // Public, user-facing board (what the customer can actually open). Per-result `url` is the
     // internal tracker (Linear/Notion) for the team email; `trackingUrl`/`userUrl` is the user's link.
     const FEATUREBASE_BOARD_URL = 'https://agentweb.featurebase.app/';
@@ -7229,6 +7227,13 @@ emmaToolRegistry.register({
     } else {
       summary = `All ${successCount} issue(s) have been reported and tracked. The engineering team has been notified.${linkLine}`;
     }
+
+    // Admins / delegated-admin sessions also get the canonical Linear link in chat (ENG-289) so they can
+    // track the eng issue directly. `canonicalUrl` is only populated on results[] for internal reporters
+    // (gated by reporterIsInternal above), so this stays empty for external customers + external-MCP callers.
+    const linearLinks = results.filter(r => r.success && r.canonicalUrl).map(r => r.canonicalUrl);
+    if (linearLinks.length === 1) summary += ` Engineering is tracking this in Linear: ${linearLinks[0]}`;
+    else if (linearLinks.length > 1) summary += ` Engineering is tracking these in Linear: ${linearLinks.join(', ')}`;
 
     return {
       success: failCount === 0,
