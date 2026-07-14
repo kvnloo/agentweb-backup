@@ -24,12 +24,18 @@ jest.mock('../services/meetingIntakeService', () => ({
   },
 }));
 
+jest.mock('../services/fathomOnboardingIngestionService', () => ({
+  ingestFathomOnboardingRecording: jest.fn(),
+}));
+
 import express from 'express';
 import request from 'supertest';
 import { processActionItems } from '../services/meetingIntakeService';
+import { ingestFathomOnboardingRecording } from '../services/fathomOnboardingIngestionService';
 import fathomWebhookRouter from '../routes/fathomWebhook';
 
 const mockedProcessActionItems = processActionItems as jest.MockedFunction<typeof processActionItems>;
+const mockedIngestFathomOnboardingRecording = ingestFathomOnboardingRecording as jest.MockedFunction<typeof ingestFathomOnboardingRecording>;
 
 // Create a minimal Express app for testing
 const app = express();
@@ -39,6 +45,9 @@ app.use('/api/webhooks/fathom', fathomWebhookRouter);
 describe('POST /api/webhooks/fathom', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    delete process.env.FATHOM_ONBOARDING_AUTOMATION_ENABLED;
+    delete process.env.FATHOM_ONBOARDING_REVIEW_OWNER_USER_ID;
+    delete process.env.FATHOM_ONBOARDING_FATHOM_USER_ID;
   });
 
   const validPayload = {
@@ -80,7 +89,9 @@ describe('POST /api/webhooks/fathom', () => {
 
     expect(res.body.success).toBe(true);
     expect(res.body.message).toContain('processed');
+    expect(res.body.onboardingAutomation).toEqual({ status: 'disabled' });
     expect(mockedProcessActionItems).toHaveBeenCalledTimes(1);
+    expect(mockedIngestFathomOnboardingRecording).not.toHaveBeenCalled();
     expect(mockedProcessActionItems).toHaveBeenCalledWith(
       expect.objectContaining({
         meetingTitle: 'Sprint Planning',
@@ -145,6 +156,83 @@ describe('POST /api/webhooks/fathom', () => {
       .expect(200);
 
     expect(res.body.success).toBe(true);
+  });
+
+  it('runs Fathom onboarding automation only when explicitly enabled and configured', async () => {
+    process.env.FATHOM_ONBOARDING_AUTOMATION_ENABLED = 'true';
+    process.env.FATHOM_ONBOARDING_REVIEW_OWNER_USER_ID = 'harsha-user';
+    process.env.FATHOM_ONBOARDING_FATHOM_USER_ID = 'harsha-fathom-user';
+    mockedProcessActionItems.mockResolvedValue({
+      meetingTitle: 'Prospect Onboarding',
+      processedAt: '2026-03-16T10:00:00Z',
+      created: [],
+      skipped: [],
+    });
+    mockedIngestFathomOnboardingRecording.mockResolvedValue({
+      recordingId: '101',
+      status: 'needs_review',
+      extractionState: 'auto_extracted',
+      context: { companyName: 'Prospect Co' },
+      automationState: 'draft_account_created',
+      draftUserId: 'fathom-draft-101',
+      draftEmail: 'fathom+101@agentweb.internal',
+      memoryIds: [],
+      orgMemoryIds: [],
+      reviewOwnerUserId: 'harsha-user',
+      createdAt: '2026-03-16T10:00:00Z',
+      updatedAt: '2026-03-16T10:00:00Z',
+      target: { status: 'matched', confidence: 'medium', reason: 'fathom_auto_draft_account', userId: 'fathom-draft-101', lead: null },
+    } as any);
+
+    const res = await request(app)
+      .post('/api/webhooks/fathom')
+      .send({
+        ...validPayload,
+        data: {
+          ...validPayload.data,
+          recording_url: 'https://fathom.video/calls/101',
+          meeting: {
+            ...validPayload.data.meeting,
+            title: 'Prospect Onboarding',
+          },
+        },
+      })
+      .expect(200);
+
+    expect(res.body.onboardingAutomation).toEqual({
+      status: 'processed',
+      recordingId: '101',
+      automationState: 'draft_account_created',
+    });
+    expect(mockedIngestFathomOnboardingRecording).toHaveBeenCalledWith(expect.objectContaining({
+      recordingId: 101,
+      recordingUrl: 'https://fathom.video/calls/101',
+      fathomUserId: 'harsha-fathom-user',
+      reviewOwnerUserId: 'harsha-user',
+      automationMode: 'auto_draft',
+      allowDraftAccountCreation: true,
+      reviewed: false,
+    }));
+  });
+
+  it('does not fail the webhook when onboarding automation cannot run', async () => {
+    process.env.FATHOM_ONBOARDING_AUTOMATION_ENABLED = 'true';
+    process.env.FATHOM_ONBOARDING_REVIEW_OWNER_USER_ID = 'harsha-user';
+    mockedProcessActionItems.mockResolvedValue({
+      meetingTitle: 'Prospect Onboarding',
+      processedAt: '2026-03-16T10:00:00Z',
+      created: [],
+      skipped: [],
+    });
+    mockedIngestFathomOnboardingRecording.mockRejectedValue(new Error('LLM extraction unavailable'));
+
+    const res = await request(app)
+      .post('/api/webhooks/fathom')
+      .send(validPayload)
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.onboardingAutomation).toEqual({ status: 'failed' });
   });
 
   it('returns 500 when processActionItems throws', async () => {
