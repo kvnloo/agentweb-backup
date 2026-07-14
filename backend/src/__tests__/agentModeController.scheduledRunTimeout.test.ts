@@ -116,6 +116,32 @@ describe('runVerifiedChat wall-clock timeout (ENG-304)', () => {
     await expectation;
   });
 
+  it('fails fast on timeout without retrying, even when maxAttempts allows more attempts', async () => {
+    // Regression guard for the exact ENG-304 class: a hung generation must NOT be retried up
+    // to maxAttempts (20 in prod ≈ 200min of stacked hangs). It must throw on the first
+    // timeout. runInWorker never settles, so the only way past the first attempt is if the
+    // timeout were (incorrectly) treated as a transient/retryable error.
+    mockWorkerService.runInWorker.mockReturnValue(new Promise(() => {}) as any);
+
+    const promise = runVerifiedChat({
+      sessionId: 'session-1',
+      userId: 'user-1',
+      startingMessage: 'Produce the daily report.',
+      keywords: [],
+      requiredFunctions: [],
+      maxAttempts: 5,
+    });
+    const expectation = expect(promise).rejects.toThrow(/timed out/i);
+
+    // Advance past the wall-clock timeout ONCE — enough for exactly one attempt to time out.
+    await jest.advanceTimersByTimeAsync(GENERATION_TIMEOUT_MS + 1000);
+    await expectation;
+
+    // The generation was attempted exactly once: no second attempt was spun up after the
+    // timeout. If a regression made the timeout retryable, this would be >= 2.
+    expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+  });
+
   it('cancels the orphaned worker run when the generation times out', async () => {
     const requestCancelSpy = jest.spyOn(sseProgress, 'requestCancel');
     mockWorkerService.runInWorker.mockReturnValue(new Promise(() => {}) as any);
