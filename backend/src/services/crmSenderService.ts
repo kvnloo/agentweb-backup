@@ -174,24 +174,36 @@ export function assertSenderUsableForBulkSend(sender: CrmSender): void {
 export async function bulkSendGuardMessage(
   userId: string,
   senderEmail: string,
+  senderId?: string,
 ): Promise<string | null> {
-  const needle = String(senderEmail || '').toLowerCase();
   const config = await loadSenderConfig(userId);
 
+  // Preferred path: the caller told us WHICH sender. No ambiguity — resolve it exactly.
+  if (senderId) {
+    const sender = config.senders.find((s) => s.id === senderId);
+    if (!sender) {
+      return null; // unknown id — the route's own validation owns this case
+    }
+    try {
+      assertSenderUsableForBulkSend(sender);
+      return null;
+    } catch (error: any) {
+      return error.message;
+    }
+  }
+
+  // Fallback: older clients post only the address. One address can legitimately have BOTH
+  // a mailbox sender and a custom-domain sender on it (a Google Workspace address whose
+  // domain is also verified in Resend), and from the address alone we cannot tell which the
+  // user picked. Refusing would break a configuration that works today, so only refuse when
+  // EVERY sender on that address is mailbox-backed — i.e. when there is no way this send
+  // could have gone via Resend anyway.
+  const needle = String(senderEmail || '').toLowerCase();
   const matches = config.senders.filter((s) => s.email?.toLowerCase() === needle);
 
   if (matches.length === 0) {
-    // Not a configured sender (e.g. an ad-hoc custom-domain address) — leave the
-    // existing behaviour untouched.
-    return null;
+    return null; // not a configured sender (e.g. an ad-hoc address) — leave behaviour alone
   }
-
-  // A single address can legitimately have BOTH a mailbox sender and a custom-domain
-  // sender configured on it (e.g. a Google Workspace address whose domain is also
-  // verified in Resend). The composer only posts the address, so we cannot tell which
-  // one the user picked — and refusing would break a configuration that works today.
-  // Give them the benefit of the doubt: only refuse when EVERY sender on this address
-  // is mailbox-backed, i.e. when there is no way this send could have gone via Resend.
   if (matches.some((s) => !isMailboxSender(s))) {
     return null;
   }

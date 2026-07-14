@@ -287,6 +287,32 @@ describe('bulkSendGuardMessage — must not block a legitimate custom-domain sen
     ]);
     expect(await bulkSendGuardMessage('u1', 'Habeb@Baldwin.COM')).toMatch(/gmail/i);
   });
+
+  // The real fix for the ambiguity: the composer now posts senderId, so the guard resolves
+  // the exact sender the user picked instead of guessing from the address.
+  describe('when senderId is supplied, resolve it EXACTLY — no guessing', () => {
+    const ambiguous = () =>
+      senders([
+        { id: 'mailbox', email: 'habeb@baldwin.com', fromName: 'H', senderType: 'outlook', connectedAccountId: 'o1' },
+        { id: 'domain', email: 'habeb@baldwin.com', fromName: 'H (domain)' },
+      ]);
+
+    it('BLOCKS the mailbox sender even though the address also has a resend sender', async () => {
+      ambiguous();
+      const msg = await bulkSendGuardMessage('u1', 'habeb@baldwin.com', 'mailbox');
+      expect(msg).toMatch(/outlook/i);
+    });
+
+    it('ALLOWS the resend sender even though the address also has a mailbox sender', async () => {
+      ambiguous();
+      expect(await bulkSendGuardMessage('u1', 'habeb@baldwin.com', 'domain')).toBeNull();
+    });
+
+    it('falls back to the address when the id is unknown', async () => {
+      ambiguous();
+      expect(await bulkSendGuardMessage('u1', 'habeb@baldwin.com', 'no-such-id')).toBeNull();
+    });
+  });
 });
 
 describe('loadSenderConfig — the single loader every reader must use', () => {

@@ -5750,7 +5750,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { socketId, senderEmail, senderName, subject, htmlContent, textContent, leadIds, unsubscribeFooterHtml, includeUndeliverable, includeUndeliverableEmails } = req.body;
+    const { socketId, senderId, senderEmail, senderName, subject, htmlContent, textContent, leadIds, unsubscribeFooterHtml, includeUndeliverable, includeUndeliverableEmails } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -5764,7 +5764,10 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     // composer only posts senderEmail/senderName, so resolve it back to the sender
     // record and refuse if it is mailbox-backed — otherwise a connected Gmail/Outlook
     // sender would silently go out via Resend from an address we don't own.
-    const guardCheck = await bulkSendGuardMessage(userId, senderEmail);
+    // senderId is preferred and unambiguous. senderEmail is the legacy fallback: one address
+    // can have both a mailbox and a custom-domain sender, and the address alone cannot tell
+    // them apart.
+    const guardCheck = await bulkSendGuardMessage(userId, senderEmail, senderId);
     if (guardCheck) {
       return res.status(400).json({ message: guardCheck, code: 'MAILBOX_SENDER_NOT_SUPPORTED' });
     }
