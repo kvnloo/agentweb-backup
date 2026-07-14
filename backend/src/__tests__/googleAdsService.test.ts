@@ -800,16 +800,27 @@ describe('updateCampaign — TARGET_SPEND (Maximize Clicks)', () => {
     expect(didUpdate).toBe(true);
   });
 
-  it('switches to TARGET_SPEND with no ceiling by masking the target_spend field', async () => {
+  it('switches to TARGET_SPEND with no ceiling by defaulting to an uncapped leaf mask', async () => {
     mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
     const didUpdate = await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
       biddingStrategy: 'TARGET_SPEND',
     });
     const body = mockAxiosPost.mock.calls[0][1];
     const update = body.operations[0].update;
-    expect(update.targetSpend).toEqual({});
-    expect(body.operations[0].updateMask).toContain('target_spend');
+    expect(update.targetSpend.cpcBidCeilingMicros).toBe('0');
+    expect(body.operations[0].updateMask).toContain('target_spend.cpc_bid_ceiling_micros');
+    // Must never emit the bare parent mask path (FieldMaskError.FIELD_HAS_SUBFIELDS).
+    expect(body.operations[0].updateMask.split(',')).not.toContain('target_spend');
     expect(didUpdate).toBe(true);
+  });
+
+  it('rejects an unrecognized bidding_strategy without mutating anything', async () => {
+    await expect(
+      service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+        biddingStrategy: 'NOT_A_REAL_STRATEGY',
+      }),
+    ).rejects.toThrow('Unsupported bidding_strategy');
+    expect(mockAxiosPost).not.toHaveBeenCalled();
   });
 });
 
