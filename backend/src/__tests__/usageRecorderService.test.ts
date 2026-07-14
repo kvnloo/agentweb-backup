@@ -243,11 +243,11 @@ describe('usageRecorderService', () => {
     });
 
     it('prices the deep-research agents (so their per-run cost is counted, not 0)', () => {
-      // Priced at Gemini Pro rates: in $1.25/M, out $10/M.
+      // ENG-207: verified — Deep Research runs on Gemini 3.1 Pro rates: in $2/M, out $12/M.
       expect(computeCostMicroUsd('deep-research-preview-04-2026', 1_000_000, 100_000)).toBe(
-        1_250_000 + 1_000_000
+        2_000_000 + 1_200_000
       );
-      expect(computeCostMicroUsd('deep-research-max-preview-04-2026', 1_000_000, 0)).toBe(1_250_000);
+      expect(computeCostMicroUsd('deep-research-max-preview-04-2026', 1_000_000, 0)).toBe(2_000_000);
     });
 
     it('returns 0 for unknown models', () => {

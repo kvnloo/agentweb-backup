@@ -122,6 +122,23 @@ describe('llmPricing', () => {
     it('prices the Pro image model above the flash tier', () => {
       expect(IMAGE_GENERATION_PRICING_USD['gemini-3-pro-image-preview']).toBe(0.134);
     });
+
+    // ENG-207: previously UNVERIFIED rows, now confirmed against published rates.
+    it('prices gpt-5.5 at the confirmed $5/$30 with a real $0.50/1M cache-read', () => {
+      expectRate('gpt-5.5', 5, 30);
+      // withDerivedCache leaves cacheRead to the inPerM*0.1 convention, which
+      // equals the published $0.50/1M cached rate — so no override is needed.
+      expect(MODEL_PRICING['gpt-5.5'].cacheReadPerM ?? MODEL_PRICING['gpt-5.5'].inPerM * 0.1).toBeCloseTo(0.5, 6);
+    });
+
+    it('prices gemini-3.1-flash-live-preview at the confirmed $0.75/$4.50 text rate', () => {
+      expectRate('gemini-3.1-flash-live-preview', 0.75, 4.5);
+    });
+
+    it('prices the Deep Research agents at Gemini 3.1 Pro rates ($2/$12), not the old estimate', () => {
+      expectRate('deep-research-preview-04-2026', 2, 12);
+      expectRate('deep-research-max-preview-04-2026', 2, 12);
+    });
   });
 
   describe('getModelPrice', () => {
