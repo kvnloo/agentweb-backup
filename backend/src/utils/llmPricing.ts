@@ -168,6 +168,36 @@ export function videoGenerationCostUsd(model: string, durationSeconds?: number):
 const warnedUnknownModels = new Set<string>();
 
 /**
+ * Rolling-alias model ids that providers return in `response.model` but that are
+ * NOT literal registry keys. Azure/OpenAI report a rolling alias for some
+ * deployments (e.g. the gpt-5-chat-2 deployment reports "gpt-chat-latest"), so
+ * without this map that usage meters at $0. Map alias → canonical registry key.
+ */
+const MODEL_ID_ALIASES: Record<string, string> = {
+  'gpt-chat-latest': 'gpt-5-chat-2',
+};
+
+/** Trailing dated-snapshot suffix, e.g. "-2025-04-14" on "gpt-4.1-2025-04-14". */
+const DATE_SNAPSHOT_SUFFIX = /-\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Collapse a provider-returned model id to its canonical pricing key. Handles the
+ * two ways Azure/OpenAI `response.model` drifts from the deployment/registry name:
+ * a rolling alias (MODEL_ID_ALIASES) or a dated snapshot suffix
+ * ("gpt-4.1-2025-04-14" → "gpt-4.1"). Returns the input unchanged when neither
+ * applies — so an unknown model stays unknown (never a false price match).
+ */
+function canonicalModelId(model: string): string {
+  // Defensive: recordUsage may call getModelPrice with a missing/empty model
+  // (typed string, but undefined at runtime) — return it unchanged, never throw.
+  if (typeof model !== 'string' || !model) return model;
+  if (MODEL_ID_ALIASES[model]) return MODEL_ID_ALIASES[model];
+  const stripped = model.replace(DATE_SNAPSHOT_SUFFIX, '');
+  if (stripped !== model && MODEL_ID_ALIASES[stripped]) return MODEL_ID_ALIASES[stripped];
+  return stripped;
+}
+
+/**
  * Look up the token price for a model.
  *
  * Returns null for unknown models and emits a single console.warn per model per
@@ -177,6 +207,17 @@ const warnedUnknownModels = new Set<string>();
 export function getModelPrice(model: string): ModelPrice | null {
   const price = MODEL_PRICING[model];
   if (price) return price;
+
+  // Normalize provider-returned `response.model` drift (rolling aliases + dated
+  // snapshot suffixes) to the canonical registry key before giving up. This is
+  // not "substitute another model's price" — it resolves the SAME model reported
+  // under a non-canonical id (e.g. "gpt-4.1-2025-04-14" → "gpt-4.1"), which would
+  // otherwise meter at $0.
+  const canonical = canonicalModelId(model);
+  if (canonical !== model) {
+    const canonicalPrice = MODEL_PRICING[canonical];
+    if (canonicalPrice) return canonicalPrice;
+  }
 
   // Image and video models are intentionally NOT token-priced — they are billed
   // per-image / per-clip via IMAGE_GENERATION_PRICING_USD and
