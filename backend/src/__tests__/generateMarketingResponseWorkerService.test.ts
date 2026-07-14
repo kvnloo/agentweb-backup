@@ -116,7 +116,7 @@ describe('GenerateMarketingResponseWorkerService', () => {
     messageContent: 'Test message',
     sessionHistory: [],
     userId: 'test-user-id',
-    llmModel: 'gpt-5.1',
+    llmModel: 'gpt-5.5',
     sessionId: 'test-session-id',
     mockMode: false
   };
@@ -607,26 +607,51 @@ describe('GenerateMarketingResponseWorkerService', () => {
   });
 
   describe('shutdown', () => {
-    it('should kill the worker process and reject pending requests', async () => {
+    it('should drain in-flight requests before killing the worker', async () => {
       // Start a request
       const promise = workerService.runInWorker(mockParams);
 
       // Wait for worker initialization
       await waitForAsync();
 
-      // Shutdown before completing the request
+      // Simulate the in-flight request completing while shutdown is draining
+      const requestId = (workerService as any).pendingRequests.keys().next().value;
+      setTimeout(() => {
+        // Resolve the in-flight request via the message handler (simulates worker responding)
+        const handler = messageHandlers.get('default');
+        if (handler) {
+          handler({ type: 'success', requestId, result: { content: 'done', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] } });
+        }
+      }, 100);
+
+      // Shutdown should wait for the in-flight request and then kill the worker
       await workerService.shutdown();
 
-      // Verify worker was killed
-      expect(mockWorker.kill).toHaveBeenCalledWith('SIGTERM');
+      // Worker is force-killed (SIGKILL) after drain completes. SIGTERM is
+      // intentionally ignored by the worker so the OS process-group/cgroup SIGTERM
+      // that fires on deploy cannot abort an in-flight run before the drain (ENG-201),
+      // so the parent must use SIGKILL to actually terminate it.
+      expect(mockWorker.kill).toHaveBeenCalledWith('SIGKILL');
 
-      // Verify pending request was rejected
-      await expect(promise).rejects.toThrow('Worker shutdown');
+      // The in-flight request resolved naturally (not rejected)
+      await expect(promise).resolves.toMatchObject({ content: 'done' });
     });
 
     it('should handle shutdown when no worker is running', async () => {
       // Should not throw
       await expect(workerService.shutdown()).resolves.not.toThrow();
+    });
+
+    it('should block new runInWorker calls once draining', async () => {
+      // Start the drain (no pending requests, completes immediately)
+      const shutdownPromise = workerService.shutdown();
+
+      // New requests should be rejected immediately
+      await expect(
+        workerService.runInWorker(mockParams)
+      ).rejects.toThrow('draining');
+
+      await shutdownPromise;
     });
   });
 });

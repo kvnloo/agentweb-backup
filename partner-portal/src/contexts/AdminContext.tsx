@@ -27,6 +27,7 @@ interface User {
   lastLoginTime?: string;
   lastActiveAt?: string;
   displayName?: string;
+  funnelStatus?: string | null;
   supportNote?: string;
   roles?: ("partner" | "customer" | "free" | "contractor")[];
   taskCount?: number;

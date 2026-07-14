@@ -59,12 +59,14 @@ const AVAILABLE_CONNECTED_ACCOUNTS = [
   { id: 'unipile', label: 'LinkedIn Outreach' },
   { id: 'meta', label: 'Meta Marketing' },
   { id: 'instagram', label: 'Instagram Business' },
+  { id: 'twitter', label: 'Twitter/X' },
   { id: 'gmail', label: 'Gmail' },
   { id: 'youtube', label: 'YouTube' },
   { id: 'fathom', label: 'Fathom' },
   { id: 'hubspot', label: 'HubSpot' },
   { id: 'attio', label: 'Attio' },
   { id: 'google_ads', label: 'Google Ads' },
+  { id: 'google_drive', label: 'Google Drive' },
 ];
 
 interface AvailableSkill {

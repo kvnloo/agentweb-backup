@@ -592,6 +592,66 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
     }, 15000); // Longer timeout for multiple retries
   });
 
+  describe('Partial breakdown failure (ENG-104)', () => {
+    const mockUser = {
+      id: 'user123',
+      adAccount: '123456789',
+      connected_accounts: [
+        {
+          platform: 'meta',
+          account_id: '123456789',
+          account_name: 'Test Business',
+          config: { account_type: 'ad_account', access_token: 'mock-access-token', ad_account_id: '123456789' },
+        },
+      ],
+    };
+
+    it('returns success:true with partialFailure metadata when a breakdown endpoint fails', async () => {
+      const { userDb } = await import('../services/db');
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      // Demographics breakdown returns a Graph API error; all other endpoints succeed.
+      global.fetch = jest.fn().mockImplementation((url: string) => {
+        if (url.includes('breakdowns=age,gender')) {
+          return Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve({ error: { message: 'Unsupported get request', code: 100 } }),
+          });
+        }
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ data: [] }) });
+      }) as jest.Mock;
+
+      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
+
+      // The overall tool call still succeeds (partial, not fatal)...
+      expect(result.success).toBe(true);
+      // ...but the partial failure is now telemetry-visible in the tool result.
+      expect(result.partialFailure).toBe(true);
+      expect(result.sections.demographics).toBe('unavailable');
+      expect(result.sections.placement).toBe('ok');
+      expect(result.sections.device).toBe('ok');
+      expect(result.unavailableSections).toEqual(['demographics']);
+      expect(result.message).toContain('demographics');
+    });
+
+    it('returns partialFailure:false and clean sections on the all-success path (behavior-preserving)', async () => {
+      const { userDb } = await import('../services/db');
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      global.fetch = jest.fn().mockImplementation(() =>
+        Promise.resolve({ ok: true, json: () => Promise.resolve({ data: [] }) }),
+      ) as jest.Mock;
+
+      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
+
+      expect(result.success).toBe(true);
+      expect(result.partialFailure).toBe(false);
+      expect(result.sections).toEqual({ demographics: 'ok', placement: 'ok', device: 'ok' });
+      expect(result.unavailableSections).toEqual([]);
+      expect(result.message).toBe('Meta ads metrics loaded for 7d timeframe');
+    });
+  });
+
   describe('Integration - Date, Parameters, and Retry', () => {
     it('should use correct dates and parameters even after retry', async () => {
       const mockUser = {

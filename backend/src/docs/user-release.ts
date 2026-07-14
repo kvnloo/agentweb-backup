@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-26
+// Last updated: 2026-06-30
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,36 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-07-08',
+    changes: [
+      'Improved: Your LinkedIn Invite Note Is Never Silently Dropped',
+      '- Free LinkedIn accounts can only attach a personalized note to a limited number of invitations each month. Once that monthly note allowance is used up, LinkedIn rejects any invite that carries a note',
+      '- Previously, when this happened, the connection request was quietly sent WITHOUT your note — so a message you deliberately wrote to get the recipient\'s attention could go missing without you knowing',
+      '- Now it is your call: if the note can\'t be attached, the invite is held and you are asked whether to send the connection request without the note or skip it — both when you send from the CRM and when you ask Emma to send invites in chat',
+      '- If you choose to send without the note, we tell you plainly that it went out as a plain connection request, so what you see always matches what was actually sent',
+      '- For scheduled outreach, affected invites are paused instead of being sent noteless; open the run\'s chat from your email to decide what to do',
+    ],
+  },
+  {
+    date: '2026-07-06',
+    changes: [
+      'Fixed: Emma No Longer Says She "Can\'t" Create Google Docs',
+      '- Previously, if you had connected Google Drive but had not shared any folder with AgentWeb, Emma could wrongly conclude she was unable to create Google Docs or Sheets — even though that capability was available',
+      '- Emma now correctly recognizes that creating and editing Google Docs and Sheets is a separate capability from browsing shared Drive folders, so she no longer turns down a request she can actually fulfill',
+    ],
+  },
+  {
+    date: '2026-06-30',
+    changes: [
+      'New: Emma Can Now Create and Edit Google Docs, Sheets, and Folders in Your Drive',
+      '- Connect your Google Drive under Settings → Accounts and Emma can create Google Docs, Google Sheets, and folders directly in your Drive from chat — just ask her',
+      '- Emma confirms the file name and asks where you want it placed (your root Drive or a specific folder) before doing anything',
+      '- She can also update Docs and Sheets she created, list the contents of a folder, and create nested folders — all from a single conversation',
+      '- Files Emma creates are owned by your Google account and live in your Drive like any normal file, even after the session ends',
+      '- To let Emma read files you already have in your Drive (documents you wrote, files shared by teammates), share those folders with AgentWeb via Brand → Knowledge Base → Google Drive',
+    ],
+  },
   {
     date: '2026-06-26',
     changes: [

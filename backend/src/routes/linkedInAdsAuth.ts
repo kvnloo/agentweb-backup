@@ -6,6 +6,7 @@ import { getLinkedInAdsConfig } from '../config/integrations';
 import { createAccount } from '../services/connectedAccountsDb';
 import { listAdAccounts } from '../services/linkedInAdsService';
 import { authenticateToken } from '../middleware/auth';
+import { getJwtSecret } from '../config/jwt';
 
 const router = express.Router();
 
@@ -14,11 +15,6 @@ const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
-const STATE_SECRET = process.env.JWT_SECRET;
-if (!STATE_SECRET) {
-  throw new Error('JWT_SECRET environment variable must be set for OAuth state verification');
-}
-
 interface StatePayload {
   userId: string;
   nonce: string;
@@ -26,7 +22,7 @@ interface StatePayload {
 
 const generateState = (userId: string): string => {
   const nonce = crypto.randomBytes(16).toString('hex');
-  return jwt.sign({ userId, nonce } as StatePayload, STATE_SECRET, { expiresIn: STATE_EXPIRATION });
+  return jwt.sign({ userId, nonce } as StatePayload, getJwtSecret(), { expiresIn: STATE_EXPIRATION });
 };
 
 const buildOAuthUrl = (
@@ -45,7 +41,7 @@ const buildOAuthUrl = (
 
 const verifyState = (state: string, userId: string): StatePayload | null => {
   try {
-    const decoded = jwt.verify(state, STATE_SECRET) as StatePayload;
+    const decoded = jwt.verify(state, getJwtSecret()) as StatePayload;
     if (decoded.userId !== userId) return null;
     return decoded;
   } catch {

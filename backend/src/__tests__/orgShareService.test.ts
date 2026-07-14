@@ -182,13 +182,16 @@ describe("canEditItem", () => {
 });
 
 describe("feature defaults (single source of truth)", () => {
-  it("skills and workPlans default to enabled; others default to disabled", () => {
+  it("every shareable feature is shared by default", () => {
+    // An org is a company. The point of putting a team in one is that they can see each
+    // other's work. Defaulting these to private meant a new team saw an empty product
+    // until someone found the settings page — and most never did.
     expect(defaultEnabledFor("skills")).toBe(true);
     expect(defaultEnabledFor("workPlans")).toBe(true);
-    expect(defaultEnabledFor("knowledgeBase")).toBe(false);
-    expect(defaultEnabledFor("htmlTemplates")).toBe(false);
-    expect(defaultEnabledFor("landingPages")).toBe(false);
-    expect(defaultEnabledFor("analytics")).toBe(false);
+    expect(defaultEnabledFor("knowledgeBase")).toBe(true);
+    expect(defaultEnabledFor("htmlTemplates")).toBe(true);
+    expect(defaultEnabledFor("landingPages")).toBe(true);
+    expect(defaultEnabledFor("analytics")).toBe(true);
   });
 
   it("always-on features report enabled by default", () => {
@@ -200,10 +203,10 @@ describe("feature defaults (single source of truth)", () => {
     const s = defaultShareSettings();
     expect(s.skills).toEqual({ enabled: true, editors: [] });
     expect(s.workPlans).toEqual({ enabled: true, editors: [] });
-    expect(s.knowledgeBase).toEqual({ enabled: false, editors: [] });
-    expect(s.htmlTemplates).toEqual({ enabled: false, editors: [] });
-    expect(s.landingPages).toEqual({ enabled: false, editors: [] });
-    expect(s.analytics).toEqual({ enabled: false, editors: [] });
+    expect(s.knowledgeBase).toEqual({ enabled: true, editors: [] });
+    expect(s.htmlTemplates).toEqual({ enabled: true, editors: [] });
+    expect(s.landingPages).toEqual({ enabled: true, editors: [] });
+    expect(s.analytics).toEqual({ enabled: true, editors: [] });
     expect(s.brandGuidelines).toEqual({ editors: [] });
     expect(s.marketingStrategy).toEqual({ editors: [] });
   });
@@ -227,9 +230,29 @@ describe("absent-config fallback (org never had shareSettings written)", () => {
     expect(isFeatureEffectivelyEnabled(member, orgNoSettings, "workPlans")).toBe(true);
   });
 
-  it("plain member does NOT see default-off features when org has no shareSettings", () => {
-    expect(isFeatureEffectivelyEnabled(member, orgNoSettings, "knowledgeBase")).toBe(false);
-    expect(canViewItem(item, member, orgNoSettings, ownerOrgId, "landingPages")).toBe(false);
+  it("a member of an org that never configured sharing now SEES shared features", () => {
+    // This is the change: an org that never expressed a preference gets the new default.
+    expect(isFeatureEffectivelyEnabled(member, orgNoSettings, "knowledgeBase")).toBe(true);
+    expect(canViewItem(item, member, orgNoSettings, ownerOrgId, "landingPages")).toBe(true);
+  });
+
+  it("SAFETY: an org that explicitly turned a feature OFF keeps it off", () => {
+    // The whole reason flipping the default is safe for existing orgs. The gate prefers an
+    // explicit value over the default, so a deliberate opt-out is never trampled. If this
+    // ever breaks, the default flip silently overrides real customer choices.
+    const orgOptedOut = {
+      orgId: "org-A", ownerUserId: "u-admin", name: "A",
+      shareSettings: {
+        knowledgeBase: { enabled: false, editors: [] },
+        htmlTemplates: { enabled: false, editors: [] },
+        landingPages: { enabled: false, editors: [] },
+        analytics: { enabled: false, editors: [] },
+      },
+    } as unknown as Organization;
+    expect(isFeatureEffectivelyEnabled(member, orgOptedOut, "knowledgeBase")).toBe(false);
+    expect(isFeatureEffectivelyEnabled(member, orgOptedOut, "htmlTemplates")).toBe(false);
+    expect(isFeatureEffectivelyEnabled(member, orgOptedOut, "analytics")).toBe(false);
+    expect(canViewItem(item, member, orgOptedOut, ownerOrgId, "landingPages")).toBe(false);
   });
 
   it("falls back to the skills default when shareSettings exists but omits skills", () => {

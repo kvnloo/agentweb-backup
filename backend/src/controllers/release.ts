@@ -8,6 +8,15 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2026-07-06",
+    changes: [
+      "Publish Guardrail for Skills Not Entitled to Any Tier",
+      "- When you publish a skill that is not in any subscription tier's allowed-skills list, Skill Management now shows a warning — a published-but-unentitled skill is invisible to all non-wildcard users and its tools are undiscoverable to Emma",
+      "- The warning is advisory only: publishing still succeeds, and it points you to Admin → Subscriptions to add the skill to the relevant tiers",
+      "- This closes a silent gap where a newly published skill (for example, Google Drive Management) could reach nobody until it was manually added to the tier allow-lists",
+    ],
+  },
+  {
     date: "2026-06-22",
     changes: [
       "Gemini 3.1 Flash Image Model Migrated to GA Endpoint",

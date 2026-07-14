@@ -5,8 +5,11 @@
  * Covers both admin (unrestricted) and regular-user (channel-scoped) paths.
  */
 
-// Mock slackService before any imports
+// Mock slackService before any imports. The channel resolution helpers
+// (getUserAllowedChannels/getEffectiveAllowedChannels) stay REAL — these tests
+// exercise the personal → org → org-owner fallback through the tools.
 jest.mock('../services/slackService', () => ({
+  ...jest.requireActual('../services/slackService'),
   getSlackChannels: jest.fn(),
   getSlackChannelInfo: jest.fn(),
   getRecentChannelMessages: jest.fn(),

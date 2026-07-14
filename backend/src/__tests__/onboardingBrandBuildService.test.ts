@@ -178,6 +178,49 @@ describe("onboardingBrandBuildService", () => {
       expect(lastCall[1].brandBuildError).toMatch(/Bedrock 503/);
     });
 
+    it("force-fails a HUNG session at its own timeout wall — never leaves it 'building' past budget (watchdog-safety invariant)", async () => {
+      // This is the invariant that makes the status-read watchdog
+      // (BRAND_BUILD_HARD_TIMEOUT_MS = 330s) safe: the orchestrator's own
+      // withTimeout wall (BRAND_BUILD_TIMEOUT_MS = 300s) fires FIRST, so a
+      // live build that "would have succeeded" can never still be 'building'
+      // when the 330s watchdog runs. If Emma's session hangs forever, the
+      // orchestrator flips the record to 'failed' at the wall — the watchdog
+      // at 330s only ever catches genuinely-orphaned builds (process crash /
+      // deploy recycle) where this code path never got to run.
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          productDomain: "https://acme.com",
+          brandBuildStatus: "building",
+          brandBuildStartedAt: new Date().toISOString(),
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          productDomain: "https://acme.com",
+          brandBuildStatus: "building",
+          brandBuildStartedAt: new Date().toISOString(),
+        });
+      const createChatSession = jest
+        .fn()
+        .mockResolvedValueOnce({ sessionId: "s1" });
+      // Session never settles — simulates Emma's tool loop hanging.
+      const generateSessionResponse = jest
+        .fn()
+        .mockReturnValueOnce(new Promise<never>(() => {}));
+
+      await triggerBrandBuildForUser("u1", {
+        createChatSession,
+        generateSessionResponse,
+        timeoutMs: 20, // tiny wall so the test runs fast; real wall is 300s
+      });
+
+      const lastCall =
+        userDb.updateUser.mock.calls[userDb.updateUser.mock.calls.length - 1];
+      expect(lastCall[1].brandBuildStatus).toBe("failed");
+      expect(lastCall[1].brandBuildStatus).not.toBe("building");
+      expect(lastCall[1].brandBuildError).toMatch(/timed out/i);
+    });
+
     it("marks the build failed when Emma finishes without calling update_brand_guidelines", async () => {
       // Emma's session ran fine, but she never wrote brandGuidelines —
       // brandBuildStatus stays at 'building'. The orchestrator should

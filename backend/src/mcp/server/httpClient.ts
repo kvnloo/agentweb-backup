@@ -4,6 +4,7 @@
  */
 
 import jwt from 'jsonwebtoken';
+import { getJwtSecret } from '../../config/jwt';
 import { Agent, setGlobalDispatcher } from 'undici';
 
 // Extend Node's built-in fetch timeouts. The default undici headersTimeout (300s)
@@ -65,7 +66,7 @@ async function lookupUser(userId: string): Promise<UserRecord> {
 const SELF_CALL_TOKEN_TTL = 600; // seconds — must outlast slow operations like v0 generation
 
 export function generateSelfCallToken(user: UserRecord): string {
-  const secret = process.env.JWT_SECRET || 'your-secret-key';
+  const secret = getJwtSecret();
   return jwt.sign(
     { userId: user.userId, email: user.email, isAdmin: user.isAdmin, _svc: true },
     secret,

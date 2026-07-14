@@ -4,6 +4,7 @@ import {
   EVT_RUN_FAILED,
   EVT_RUN_STARTED,
   EVT_RUN_VERDICT,
+  EVT_TOOL_DEFERRED,
   EVT_TOOL_FAILED,
   EVT_TOOL_INVOKED,
   EVT_TOOL_SUCCEEDED,
@@ -32,7 +33,7 @@ export interface AgentRunDecisionSummary {
 
 export interface AgentRunToolOutcomeSummary {
   ts: string;
-  eventType: typeof EVT_TOOL_INVOKED | typeof EVT_TOOL_SUCCEEDED | typeof EVT_TOOL_FAILED;
+  eventType: typeof EVT_TOOL_INVOKED | typeof EVT_TOOL_SUCCEEDED | typeof EVT_TOOL_FAILED | typeof EVT_TOOL_DEFERRED;
   iteration?: number;
   toolName?: string;
   durationMs?: number;
@@ -91,6 +92,9 @@ export interface AgentRunSummary {
   status: 'running' | 'completed' | 'failed' | 'unknown';
   toolCalls: number;
   failedToolCalls: number;
+  /** Tool calls DEFERRED (skipped without executing, ENG-103) — counted
+   * separately from success/failure: NOT part of toolCalls or failedToolCalls. */
+  deferredToolCalls: number;
   durationMs?: number;
   /** Durable outcome verdict from the agent_run_verdict spine event. */
   outcomeVerdict?: 'ok' | 'degraded' | 'failed';
@@ -193,7 +197,8 @@ function buildOneRunSummary(runId: string, events: AgentRunEventRow[]): AgentRun
     .filter((e) =>
       e.eventType === EVT_TOOL_INVOKED ||
       e.eventType === EVT_TOOL_SUCCEEDED ||
-      e.eventType === EVT_TOOL_FAILED
+      e.eventType === EVT_TOOL_FAILED ||
+      e.eventType === EVT_TOOL_DEFERRED
     )
     .map((e) => ({
       ts: e.ts,
@@ -211,6 +216,9 @@ function buildOneRunSummary(runId: string, events: AgentRunEventRow[]): AgentRun
   const completedAt = terminal?.ts;
   const toolCalls = asNumber(terminal?.dimensions?.toolCalls) ?? outcomes.filter((o) => o.eventType === EVT_TOOL_INVOKED).length;
   const failedToolCalls = asNumber(terminal?.dimensions?.failedToolCalls) ?? outcomes.filter((o) => o.eventType === EVT_TOOL_FAILED).length;
+  // Deferred calls are accounted separately — never folded into toolCalls or
+  // failedToolCalls, and they never feed the run_failed/degraded verdict logic.
+  const deferredToolCalls = outcomes.filter((o) => o.eventType === EVT_TOOL_DEFERRED).length;
   const status = runFailed ? 'failed' : runCompleted ? 'completed' : runStarted ? 'running' : 'unknown';
   const durationMs = durationBetween(startedAt, completedAt);
 
@@ -225,6 +233,7 @@ function buildOneRunSummary(runId: string, events: AgentRunEventRow[]): AgentRun
     status,
     toolCalls,
     failedToolCalls,
+    deferredToolCalls,
     durationMs,
     outcomeVerdict,
     outcomeReasons,

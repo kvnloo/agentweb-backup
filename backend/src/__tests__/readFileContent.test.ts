@@ -26,9 +26,46 @@ jest.mock('aws-sdk', () => ({
   }
 }));
 
+// Mock @slack/web-api
+jest.mock('@slack/web-api', () => ({
+  WebClient: jest.fn().mockImplementation(() => ({
+    chat: { postMessage: jest.fn() }
+  }))
+}));
+
 // Mock axios
-jest.mock('axios', () => ({
-  get: jest.fn()
+jest.mock('axios', () => {
+  const mockAxios = {
+    get: jest.fn(),
+    post: jest.fn(),
+    create: jest.fn().mockReturnThis(),
+    interceptors: {
+      request: { use: jest.fn(), eject: jest.fn() },
+      response: { use: jest.fn(), eject: jest.fn() }
+    },
+    defaults: { headers: { common: {} } }
+  };
+  return {
+    __esModule: true,
+    default: mockAxios,
+    ...mockAxios
+  };
+});
+
+// Mock s3Utils
+jest.mock('../utils/s3Utils', () => ({
+  extractS3KeyFromUrl: jest.fn((url: string) => {
+    if (url.includes('agentweb-user-files.s3')) {
+      return 'test-s3-key';
+    }
+    return null;
+  }),
+  getS3ObjectStream: jest.fn(() => {
+    return (async function* () {
+      yield Buffer.from('S3 file content');
+    })();
+  }),
+  getS3ObjectMetadata: jest.fn().mockResolvedValue({ ContentType: 'text/plain' }),
 }));
 
 // Mock crypto
@@ -647,4 +684,57 @@ describe('readFileContent', () => {
       expect(rendered).toBe('');
     });
   });
+
+  describe('S3, Google Drive, and Timeout handling', () => {
+    it('should fetch files from private S3 bucket using the SDK stream', async () => {
+      const { getS3ObjectStream, getS3ObjectMetadata } = require('../utils/s3Utils');
+      const s3Url = 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/test-s3-key';
+
+      const result = await (agentModeService as any).readFileContent(s3Url);
+
+      expect(result.success).toBe(true);
+      expect(result.content).toBe('S3 file content');
+      expect(result.file_type).toBe('text');
+      expect(getS3ObjectStream).toHaveBeenCalledWith('test-s3-key');
+      expect(getS3ObjectMetadata).toHaveBeenCalledWith('test-s3-key');
+    });
+
+    it('should reject Google Drive and Docs URLs with authorization message', async () => {
+      const result = await (agentModeService as any).readFileContent('https://drive.google.com/file/d/123');
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Google Drive and Docs links cannot be read directly');
+      expect(result.error).toBe('Google Drive links require authenticated access');
+    });
+
+    it('should fail with timeout if PDF parsing exceeds limit', async () => {
+      const mockResponse = {
+        data: Buffer.from('pdf data'),
+        headers: { 'content-type': 'application/pdf' }
+      };
+      const axios = require('axios');
+      axios.get.mockResolvedValue(mockResponse);
+
+      const pdfParse = require('pdf-parse');
+      pdfParse.mockImplementation(() => new Promise(() => {}));
+
+      jest.useFakeTimers();
+      const promise = (agentModeService as any).readFileContent('https://example.com/file.pdf');
+      
+      // Flush microtasks to allow the axios promise to resolve and reach the setTimeout
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      
+      jest.advanceTimersByTime(65000);
+      
+      const result = await promise;
+      jest.useRealTimers();
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Failed to parse PDF file');
+      expect(result.error).toBe('PDF parse timed out');
+    });
+  });
 });
+

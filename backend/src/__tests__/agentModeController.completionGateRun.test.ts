@@ -165,6 +165,34 @@ describe('runScheduledChat — deterministic completion gate', () => {
     expect(result).toEqual(expect.objectContaining({ status: 'success' }));
   });
 
+  it('ENG-244: issues a continuation when the run is truncated by the step budget, even with non-report partial text', async () => {
+    let call = 0;
+    mockWorker.runInWorker.mockImplementation(() => {
+      call++;
+      // Turn 1: step budget exhausted mid-gather. The model complied with the
+      // "wrap up" nudge and wrote its own partial text (NO admission phrasing,
+      // NO canned apology), but the run set truncatedByStepBudget. Turn 2
+      // (continuation): produces the final report.
+      return Promise.resolve(
+        call === 1
+          ? { ...workerResult('Here is a partial summary gathered so far; page 4 of the S3 export is still pending.'), truncatedByStepBudget: true }
+          : workerResult('Daily User Activity Report complete. Final consolidated report below.')
+      );
+    });
+
+    const result = await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    // Gate fired off the flag → at least 2 LLM turns (no single-turn short-circuit).
+    expect(mockWorker.runInWorker.mock.calls.length).toBeGreaterThanOrEqual(2);
+    // Continuation message is tailored to the truncation cause: it tells the model it
+    // was cut off at its step budget and must NOT falsely claim it "indicated"
+    // unfinished work (Greptile ENG-244 follow-up).
+    const secondMsg = mockWorker.runInWorker.mock.calls[1][0].messageContent as string;
+    expect(secondMsg).toMatch(/exhausted its processing-step budget|cut short/i);
+    expect(secondMsg).not.toMatch(/indicated some entities\/steps were not finished/i);
+    expect(result).toEqual(expect.objectContaining({ status: 'success' }));
+  });
+
   it('does NOT issue a continuation when the first turn is already complete', async () => {
     mockWorker.runInWorker.mockResolvedValue(
       workerResult('All three events completed. Consolidated report below.')

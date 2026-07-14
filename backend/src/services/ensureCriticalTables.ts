@@ -21,6 +21,7 @@ import { LOOP_EVENTS_TABLE } from '../loops/core/sensors/eventTableEventSource';
 import { LOOP_LEARNING_TABLE } from '../loops/core/learning/dynamoLearningStore';
 import { LOOP_DISPATCHES_TABLE } from './loopDispatchTracker';
 import { ONBOARDING_METRICS_TABLE, ONBOARDING_METRICS_STEP_INDEX } from './onboardingMetricsService';
+import { CONTACT_EVENTS_TABLE, CONTACT_EVENTS_SOURCE_RECORD_INDEX } from './contactEventsDb';
 
 export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
   {
@@ -67,6 +68,28 @@ export const CRITICAL_TABLE_SPECS: AWS.DynamoDB.CreateTableInput[] = [
         KeySchema: [
           { AttributeName: 'step', KeyType: 'HASH' },
           { AttributeName: 'startedAt', KeyType: 'RANGE' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+      },
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+  },
+  {
+    TableName: CONTACT_EVENTS_TABLE,
+    AttributeDefinitions: [
+      { AttributeName: 'contactId', AttributeType: 'S' },
+      { AttributeName: 'eventTimestamp', AttributeType: 'S' },
+      { AttributeName: 'sourceRecordId', AttributeType: 'S' },
+    ],
+    KeySchema: [
+      { AttributeName: 'contactId', KeyType: 'HASH' },
+      { AttributeName: 'eventTimestamp', KeyType: 'RANGE' },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: CONTACT_EVENTS_SOURCE_RECORD_INDEX,
+        KeySchema: [
+          { AttributeName: 'sourceRecordId', KeyType: 'HASH' },
         ],
         Projection: { ProjectionType: 'ALL' },
       },

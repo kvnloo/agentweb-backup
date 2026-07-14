@@ -1,4 +1,4 @@
-import { getLinkedInCredentials, getLinkedInAdsSecrets, getMetaCredentials, getGmailCredentials, getYouTubeCredentials, getFathomCredentials, getClickUpCredentials, getHubSpotCredentials, getAttioCredentials, getGoogleAdsCredentials } from '../utils/secretsManager';
+import { getLinkedInCredentials, getLinkedInAdsSecrets, getMetaCredentials, getGmailCredentials, getYouTubeCredentials, getFathomCredentials, getClickUpCredentials, getHubSpotCredentials, getAttioCredentials, getGoogleAdsCredentials, getTwitterCredentials } from '../utils/secretsManager';
 import { MetaConfig } from '../types/meta';
 
 // Graph API version for Auth/Token exchange - decoupled from SDK version
@@ -86,6 +86,21 @@ export const INTEGRATION_CONFIG = {
     ],
   },
 
+  googleDrive: {
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/google-drive/callback`,
+    authorizationUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+    tokenUrl: 'https://oauth2.googleapis.com/token',
+    revokeUrl: 'https://oauth2.googleapis.com/revoke',
+    profileUrl: 'https://www.googleapis.com/oauth2/v2/userinfo',
+    scopes: [
+      'https://www.googleapis.com/auth/drive',
+      'https://www.googleapis.com/auth/documents',
+      'https://www.googleapis.com/auth/spreadsheets',
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/userinfo.profile',
+    ],
+  },
+
   youtube: {
     redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/youtube/callback`,
     authorizationUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
@@ -165,6 +180,33 @@ export const INTEGRATION_CONFIG = {
     // ClickUp OAuth grants access to all workspaces the user has access to;
     // no explicit scopes are required in the authorization request.
     scopes: [] as string[],
+  },
+
+  twitter: {
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/twitter/callback`,
+    // offline.access is required to receive a refresh_token (access tokens expire ~2h).
+    // dm.read / dm.write require Elevated access in Twitter Developer Portal.
+    // follows.read/write required for follow/unfollow/list-followers/list-following actions.
+    // like.read/write required for like-tweet/unlike-tweet actions.
+    // bookmark.read/write required for bookmark/get-bookmarks actions.
+    scopes: [
+      'tweet.read',
+      'tweet.write',
+      'users.read',
+      'follows.read',
+      'follows.write',
+      'like.read',
+      'like.write',
+      'bookmark.read',
+      'bookmark.write',
+      'dm.read',
+      'dm.write',
+      'block.read',
+      'block.write',
+      'mute.read',
+      'mute.write',
+      'offline.access',
+    ],
   },
 
   linkedinAds: {
@@ -324,6 +366,41 @@ export async function getGmailConfig(): Promise<GmailOAuthConfig> {
   };
   gmailConfigCacheExpiresAt = Date.now() + GMAIL_CONFIG_CACHE_TTL_MS;
   return cachedGmailConfig;
+}
+
+// Google Drive OAuth configuration
+export interface GoogleDriveOAuthConfig {
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+  scopes: string[];
+  authorizationUrl: string;
+  tokenUrl: string;
+  revokeUrl: string;
+  profileUrl: string;
+}
+
+let cachedGoogleDriveConfig: GoogleDriveOAuthConfig | null = null;
+let googleDriveConfigCacheExpiresAt = 0;
+const GOOGLE_DRIVE_CONFIG_CACHE_TTL_MS = 5 * 60 * 1000;
+
+export async function getGoogleDriveConfig(): Promise<GoogleDriveOAuthConfig> {
+  if (cachedGoogleDriveConfig && Date.now() < googleDriveConfigCacheExpiresAt) {
+    return cachedGoogleDriveConfig;
+  }
+  const credentials = await getGmailCredentials(); // reuses same Google OAuth client
+  cachedGoogleDriveConfig = {
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    redirectUri: INTEGRATION_CONFIG.googleDrive.redirectUri,
+    scopes: INTEGRATION_CONFIG.googleDrive.scopes,
+    authorizationUrl: INTEGRATION_CONFIG.googleDrive.authorizationUrl,
+    tokenUrl: INTEGRATION_CONFIG.googleDrive.tokenUrl,
+    revokeUrl: INTEGRATION_CONFIG.googleDrive.revokeUrl,
+    profileUrl: INTEGRATION_CONFIG.googleDrive.profileUrl,
+  };
+  googleDriveConfigCacheExpiresAt = Date.now() + GOOGLE_DRIVE_CONFIG_CACHE_TTL_MS;
+  return cachedGoogleDriveConfig;
 }
 
 // YouTube configuration interface
@@ -581,3 +658,4 @@ export async function getAttioConfig(): Promise<AttioOAuthConfig> {
   attioConfigCacheExpiresAt = Date.now() + ATTIO_CONFIG_CACHE_TTL_MS;
   return cachedAttioConfig;
 }
+

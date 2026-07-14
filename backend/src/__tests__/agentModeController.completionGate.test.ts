@@ -16,7 +16,10 @@
  * gate on them would loop pointlessly.
  */
 
-import { scheduledRunSignalsIncompleteWork } from '../controllers/agentModeController';
+import {
+  scheduledRunSignalsIncompleteWork,
+  scheduledRunSignalsIncompleteResponse,
+} from '../controllers/agentModeController';
 
 describe('scheduledRunSignalsIncompleteWork — completion-gate detector', () => {
   // ── Fires on genuine "I stopped short / didn't finish" admissions ───────────
@@ -35,6 +38,44 @@ describe('scheduledRunSignalsIncompleteWork — completion-gate detector', () =>
 
   it.each(incompleteAdmissions)('fires on incomplete-work admission: %s', (text) => {
     expect(scheduledRunSignalsIncompleteWork(text)).toBe(true);
+  });
+
+  // ── Step-budget truncation (ENG-244) is detected by STATE, not text ─────────
+  // When a long data-gathering scheduled run exhausts its step budget
+  // (maxIterations), it is truncated before emitting the deliverable. The model
+  // usually complies with the "wrap up soon" nudge and writes its own partial
+  // non-report text, so the truncation is NOT reliably visible in the response
+  // text — the canned apology only appears when content is empty. Detection must
+  // therefore key off the deterministic truncatedByStepBudget flag, which
+  // scheduledRunSignalsIncompleteResponse consumes.
+  const stepBudgetTexts = [
+    // Canned apology (only emitted when content was empty at maxIterations).
+    "I've reached the maximum number of processing steps for this request. Here's what was completed so far — please review and let me know if you'd like me to continue with any remaining items.",
+    // The far more common case: the model wrote non-report partial text and the
+    // apology never substituted. Text alone gives the gate nothing to match.
+    'Here is a partial summary of the user activity gathered so far. Page 4 of the S3 export is still pending.',
+  ];
+
+  it.each(stepBudgetTexts)('scheduledRunSignalsIncompleteResponse fires when truncatedByStepBudget is set, whatever the text: %s', (text) => {
+    expect(scheduledRunSignalsIncompleteResponse({ content: text, truncatedByStepBudget: true })).toBe(true);
+  });
+
+  it('scheduledRunSignalsIncompleteResponse fires on the flag even with empty content', () => {
+    expect(scheduledRunSignalsIncompleteResponse({ content: '', truncatedByStepBudget: true })).toBe(true);
+  });
+
+  it('scheduledRunSignalsIncompleteWork does NOT rely on the apology text (flag-based detection only)', () => {
+    // The non-report partial text a compliant model emits at truncation carries no
+    // admission phrasing, so the text detector correctly returns false — the flag
+    // is what makes the truncation detectable.
+    expect(scheduledRunSignalsIncompleteWork(
+      'Here is a partial summary of the user activity gathered so far. Page 4 of the S3 export is still pending.'
+    )).toBe(false);
+  });
+
+  it('scheduledRunSignalsIncompleteResponse defers to the text detector when the flag is absent', () => {
+    expect(scheduledRunSignalsIncompleteResponse({ content: 'I did not finish researching Events 2 and 3.' })).toBe(true);
+    expect(scheduledRunSignalsIncompleteResponse({ content: 'All three events completed. Consolidated report below.' })).toBe(false);
   });
 
   it('fires when the admission is embedded in a larger report', () => {
