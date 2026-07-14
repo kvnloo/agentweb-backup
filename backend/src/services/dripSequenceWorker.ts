@@ -285,16 +285,43 @@ async function checkExitConditions(
   }
 
   // Check email engagement exit
+  //
+  // This used to pass '' as the emailDomain — which is the GSI PARTITION KEY. DynamoDB
+  // rejects empty key values, and the .catch() swallowed it, so the query could never
+  // match and these exits never fired for anyone (ENG-298). It also only ever evaluated
+  // 'opened' and 'clicked': a sequence set to stop when a lead REPLIED kept on sending.
   if (exitConditions.onEmailEngagement?.length) {
-    const events = await emailEventsDb
-      .getEventsByEmailDomainAndLeadEmail('', enrollment.leadEmail)
-      .catch(() => []);
-    const engaged = events.some((e: any) => {
-      if (exitConditions.onEmailEngagement!.includes('opened') && e.eventType === 'email.opened') return true;
-      if (exitConditions.onEmailEngagement!.includes('clicked') && e.eventType === 'email.clicked') return true;
-      return false;
-    });
-    if (engaged) return 'engagement';
+    const user = await userDb.getUserById(enrollment.userId).catch(() => null);
+    const emailDomain = (user as any)?.emailDomain;
+
+    // A mailbox-only sender (Gmail/Outlook) has no Resend domain, and Resend webhooks are
+    // the only source of these events — so there is nothing to find. Skip rather than
+    // query with a key we know is invalid.
+    if (!emailDomain) {
+      console.log(
+        `[dripWorker] Skipping engagement exit check for enrollment ${enrollment.enrollmentId}: ` +
+        `user ${enrollment.userId} has no emailDomain, so no email events exist`,
+      );
+    } else {
+      const events = await emailEventsDb
+        .getEventsByEmailDomainAndLeadEmail(emailDomain, enrollment.leadEmail)
+        .catch(() => []);
+
+      const wanted = exitConditions.onEmailEngagement;
+      const engaged = events.some((e: any) => {
+        if (wanted.includes('opened') && e.eventType === 'email.opened') return true;
+        if (wanted.includes('clicked') && e.eventType === 'email.clicked') return true;
+        // An inbound reply is stored as email.received, with leadEmail set to the SENDER
+        // (i.e. the lead) — see emailEventsDb.extractLeadEmail.
+        if (wanted.includes('replied') && e.eventType === 'email.received') return true;
+        return false;
+      });
+
+      if (engaged) {
+        console.log(`[dripWorker] Enrollment ${enrollment.enrollmentId} exited: lead ${enrollment.leadEmail} engaged`);
+        return 'engagement';
+      }
+    }
   }
 
   // Check LinkedIn reply exit — fetch messages and look for inbound after enrollment
