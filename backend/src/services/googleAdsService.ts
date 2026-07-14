@@ -355,7 +355,7 @@ export class GoogleAdsService {
     name: string;
     type: 'SEARCH' | 'DISPLAY' | 'PERFORMANCE_MAX';
     budgetResourceName: string;
-    biddingStrategy: 'MAXIMIZE_CONVERSIONS' | 'TARGET_CPA' | 'TARGET_ROAS' | 'MAXIMIZE_CONVERSION_VALUE' | 'TARGET_IMPRESSION_SHARE' | 'MANUAL_CPC';
+    biddingStrategy: 'MAXIMIZE_CONVERSIONS' | 'TARGET_CPA' | 'TARGET_ROAS' | 'MAXIMIZE_CONVERSION_VALUE' | 'TARGET_IMPRESSION_SHARE' | 'TARGET_SPEND' | 'MANUAL_CPC';
     biddingStrategyTarget?: number;
     cpcBidCeilingMicros?: number;
     locationTargetIds: number[];
@@ -381,6 +381,9 @@ export class GoogleAdsService {
       cpcBidCeilingMicros: String(params.cpcBidCeilingMicros ?? 100_000_000),
     };
     else if (params.biddingStrategy === 'MANUAL_CPC') biddingField.manualCpc = { enhancedCpcEnabled: false };
+    else if (params.biddingStrategy === 'TARGET_SPEND') biddingField.targetSpend = params.cpcBidCeilingMicros !== undefined
+      ? { cpcBidCeilingMicros: String(params.cpcBidCeilingMicros) }
+      : {};
 
     const campaignCreate = {
       name: params.name,
@@ -488,6 +491,18 @@ export class GoogleAdsService {
       } else if (params.biddingStrategy === 'MANUAL_CPC') {
         update.manualCpc = { enhancedCpcEnabled: false };
         updateMask.push('manual_cpc.enhanced_cpc_enabled');
+      } else if (params.biddingStrategy === 'TARGET_SPEND') {
+        // Maximize Clicks. cpc_bid_ceiling_micros is optional; when omitted, mask the
+        // whole target_spend message so the campaign still switches to this strategy.
+        if (params.cpcBidCeilingMicros !== undefined) {
+          update.targetSpend = { cpcBidCeilingMicros: String(params.cpcBidCeilingMicros) };
+          updateMask.push('target_spend.cpc_bid_ceiling_micros');
+        } else {
+          update.targetSpend = {};
+          updateMask.push('target_spend');
+        }
+      } else {
+        throw new Error(`Unsupported bidding_strategy '${params.biddingStrategy}' for CAMPAIGN UPDATE. Supported values: MAXIMIZE_CONVERSIONS, MAXIMIZE_CONVERSION_VALUE, TARGET_CPA, TARGET_ROAS, TARGET_IMPRESSION_SHARE, TARGET_SPEND, MANUAL_CPC.`);
       }
     }
     if (updateMask.length === 0) return false;
