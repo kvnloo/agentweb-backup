@@ -1246,7 +1246,10 @@ async function generateFirstPage(
 /** A file to commit: repo-relative path + raw bytes. */
 interface RepoFileToCommit {
   path: string;
-  content: Buffer;
+  /** Omitted for a deletion — the tree entry carries `sha: null` instead of a blob. */
+  content?: Buffer;
+  /** Remove this path from the repo in the same commit. */
+  deleted?: boolean;
 }
 
 /** Whether a GitHub-push error is worth retrying (transient network/server) or a
@@ -1318,9 +1321,16 @@ export async function commitFilesToRepoMain(
 
       const treeItems = await Promise.all(
         filesToCommit.map(async (file) => {
+          // A deletion carries no blob — GitHub removes a path when its tree entry has a
+          // null sha. Routing it through here (rather than the contents API) means deletes
+          // inherit this function's rebase/idempotency retry, which matters when another
+          // page is being committed into the same repo concurrently.
+          if (file.deleted) {
+            return { path: file.path, mode: "100644" as const, type: "blob" as const, sha: null };
+          }
           const blobRes = await axios.post<any>(
             `https://api.github.com/repos/${repoFullName}/git/blobs`,
-            { content: file.content.toString("base64"), encoding: "base64" },
+            { content: file.content!.toString("base64"), encoding: "base64" },
             { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
           );
           return { path: file.path, mode: "100644" as const, type: "blob" as const, sha: blobRes.data.sha };
@@ -3922,12 +3932,32 @@ export async function canUserEditLandingPage(
 /**
  * Remove a page route file from the GitHub repo.
  */
+async function listRepoTree(
+  repoFullName: string,
+  ghHeaders: Record<string, string>
+): Promise<string[]> {
+  const res = await axios.get<any>(
+    `https://api.github.com/repos/${repoFullName}/git/trees/main?recursive=1`,
+    { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+  );
+  return (res.data?.tree ?? [])
+    .filter((e: any) => e.type === "blob")
+    .map((e: any) => e.path as string);
+}
+
+/**
+ * Remove a page's ENTIRE directory (app/<slug>/**) from the repo.
+ *
+ * This used to delete exactly one file — app/<slug>/page.tsx — and leave
+ * app/<slug>/_components/** behind. `next build` type-checks the whole project, so an
+ * orphaned component with an unresolvable import still fails the build for EVERY page on
+ * the site: "delete the broken page" did not actually unbreak the site.
+ */
 async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promise<void> {
   const match = githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
   if (!match) return;
   const [, owner, repo] = match;
-  const repoName = repo.replace(".git", "");
-  const filePath = `app/${slug}/page.tsx`;
+  const repoFullName = `${owner}/${repo.replace(".git", "")}`;
 
   const { token: ghToken } = await getGitHubOrgToken();
   const ghHeaders = {
@@ -3935,23 +3965,22 @@ async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promis
     Accept: "application/vnd.github.v3+json",
   };
 
-  // Get the file SHA (required for deletion)
-  const fileRes = await axios.get<any>(
-    `https://api.github.com/repos/${owner}/${repoName}/contents/${filePath}`,
-    { headers: ghHeaders }
+  const prefix = `app/${slug}/`;
+  const toDelete = (await listRepoTree(repoFullName, ghHeaders)).filter((p) => p.startsWith(prefix));
+
+  if (toDelete.length === 0) {
+    console.log(`[GITHUB] Nothing to remove for /${slug} in ${repoFullName}`);
+    return; // never push an empty commit — it would trigger a pointless rebuild
+  }
+
+  await commitFilesToRepoMain(
+    repoFullName,
+    ghHeaders,
+    toDelete.map((path) => ({ path, deleted: true })),
+    `Remove page /${slug}`
   );
 
-  await axios({
-    method: "DELETE",
-    url: `https://api.github.com/repos/${owner}/${repoName}/contents/${filePath}`,
-    headers: ghHeaders,
-    data: {
-      message: `Remove page /${slug}`,
-      sha: fileRes.data.sha,
-    },
-  });
-
-  console.log(`[GITHUB] Removed ${filePath} from ${owner}/${repoName}`);
+  console.log(`[GITHUB] Removed ${toDelete.length} file(s) under ${prefix} from ${repoFullName}`);
 }
 
 /**
