@@ -288,11 +288,13 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
     // Surface the reopened canonical's link too (ENG-289) — same URL base as the dup path.
     canonicalUrl = `${LINEAR_ISSUE_BASE}/${reopenTarget.identifier}`;
     grouped = true;
-    reopened = true;
     // Reopen first (Done -> Todo), then apply the same raise-only triage a fresh report would.
-    // Best-effort so a reopen/triage hiccup never blocks recording the reporter.
+    // Best-effort so a reopen/triage hiccup never blocks recording the reporter. Only flip
+    // `reopened` AFTER the state change actually lands — otherwise a swallowed reopen failure would
+    // stamp a misleading "⚠️ Reopened by a new report" comment on a ticket still sitting in Done.
     try {
       await reopenIssue(canonicalUuid, BUG_CANONICAL_STATE);
+      reopened = true;
     } catch (e) {
       console.warn('[intake] bug canonical reopen failed:', e instanceof Error ? e.message : e);
     }
