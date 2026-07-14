@@ -6472,7 +6472,7 @@ export default function AdminDashboard() {
         </DialogActions>
       </Dialog>
 
-      {/* Grant Token Bonus Dialog */}
+      {/* Delegated Customer Portal Link Dialog (popup-blocked recovery) */}
       <Dialog
         open={Boolean(delegatedPortalUrl)}
         onClose={() => setDelegatedPortalUrl(null)}
@@ -6540,6 +6540,7 @@ export default function AdminDashboard() {
         </DialogActions>
       </Dialog>
 
+      {/* Grant Bonus Tokens Dialog */}
       <Dialog open={grantBonusDialogOpen} onClose={() => setGrantBonusDialogOpen(false)}>
         <DialogTitle>Grant Bonus Tokens</DialogTitle>
         <DialogContent>
