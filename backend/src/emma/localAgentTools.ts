@@ -302,6 +302,30 @@ export function buildScopeRejectionResult(reason: string, suggestedTool: string)
   };
 }
 
+export function buildLocalAgentUnavailableResult(
+  reason: 'not_configured' | 'unreachable' | 'auth_failed' | 'bad_response',
+  message: string,
+): {
+  success: true;
+  unavailable: true;
+  reason: string;
+  message: string;
+  formattedContent: string;
+} {
+  return {
+    success: true,
+    unavailable: true,
+    reason,
+    message,
+    formattedContent:
+      `${message}\n\n` +
+      'The local browser relay is unavailable, but this is only a fallback. ' +
+      'Do not retry run_local_agent_task in this run; continue the website scan with the cloud Playwright browser tools, read_page_source, and search tools. ' +
+      'If the cloud browser can load enough page content, complete the audit from that evidence. ' +
+      'If bot protection blocks all cloud-browser evidence, report that manual browser verification is needed instead of marking the whole scan as an internal tool failure.',
+  };
+}
+
 emmaToolRegistry.register({
   name: 'run_local_agent_task',
   definition: {
@@ -366,10 +390,10 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
 
     const config = await getRelayConfig();
     if (!config) {
-      return {
-        success: false,
-        error: 'Local agent relay not configured. Store the secret at dev/AgentWeb/LocalAgentRelay (or prod/...) with {"endpoint":"https://xxx.ngrok-free.app","apiKey":"YOUR_API_KEY"}.',
-      };
+      return buildLocalAgentUnavailableResult(
+        'not_configured',
+        'Local agent relay is not configured for this environment.',
+      );
     }
 
     const timeoutSeconds = Math.min(args.timeout_seconds ?? 120, 900);
@@ -399,21 +423,33 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
     try {
       rawResponse = await httpRequest('POST', taskUrl, config.apiKey, requestBody, (timeoutSeconds + 90) * 1000);
     } catch (err: any) {
-      return { success: false, error: `Failed to reach local agent relay: ${err.message}` };
+      return buildLocalAgentUnavailableResult(
+        'unreachable',
+        `Failed to reach local agent relay: ${err.message}`,
+      );
     }
 
     if (rawResponse.status === 401) {
-      return { success: false, error: 'Local agent relay rejected the request — check the secret token.' };
+      return buildLocalAgentUnavailableResult(
+        'auth_failed',
+        'Local agent relay rejected the request.',
+      );
     }
     if (rawResponse.status !== 200) {
-      return { success: false, error: `Local agent relay returned status ${rawResponse.status}: ${rawResponse.data.slice(0, 500)}` };
+      return buildLocalAgentUnavailableResult(
+        'bad_response',
+        `Local agent relay returned status ${rawResponse.status}: ${rawResponse.data.slice(0, 200)}`,
+      );
     }
 
     let parsed: any;
     try {
       parsed = JSON.parse(rawResponse.data);
     } catch {
-      return { success: false, error: 'Invalid JSON from local agent relay.' };
+      return buildLocalAgentUnavailableResult(
+        'bad_response',
+        'Invalid JSON from local agent relay.',
+      );
     }
 
     const screenshotUrls: string[] = [];
