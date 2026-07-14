@@ -1,7 +1,9 @@
 /**
- * ENG-289 Desired behavior #1 for the in-app reporter (POST /report-ui-bug): an INTERNAL submitter
- * (admin, delegated-admin session, or @agentweb.pro reporter) gets the canonical Linear link back in
- * the response; an external customer does not. The internal team email always carries the link.
+ * ENG-289 (in-app "Report a Bug" REST route, POST /report-ui-bug): surfacing the canonical Linear
+ * link to admins is Emma-chat-only. This route must NEVER return the Linear link in its response
+ * (no frontend renders it, and we don't want it on a customer-facing surface) — regardless of
+ * whether the reporter is an admin or a delegated session. The internal team notification email,
+ * however, still carries the Linear canonical row.
  */
 import express from 'express';
 import request from 'supertest';
@@ -56,7 +58,7 @@ async function report() {
     .send({ description: 'Landing page builder keeps failing', reportType: 'bug' });
 }
 
-describe('POST /api/support/report-ui-bug — canonical link exposure (ENG-289 #1)', () => {
+describe('POST /api/support/report-ui-bug — canonical link is NOT exposed in the response (ENG-289, chat-only)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     reporterRecord = { userId: 'user-123', email: 'user@example.com', displayName: 'Test User' };
@@ -70,28 +72,23 @@ describe('POST /api/support/report-ui-bug — canonical link exposure (ENG-289 #
     expect(JSON.stringify(res.body)).not.toContain('linear.app');
   });
 
-  it('internal admin reporter: response includes the canonical Linear link', async () => {
+  it('admin reporter: response STILL omits the canonical Linear link (surfacing is chat-only)', async () => {
     reporterRecord = { userId: 'user-123', email: 'user@example.com', displayName: 'Admin', isAdmin: true };
     const res = await report();
     expect(res.status).toBe(200);
-    expect(res.body.canonicalUrl).toBe(CANON);
+    expect(res.body.canonicalUrl).toBeUndefined();
+    expect(JSON.stringify(res.body)).not.toContain('linear.app');
   });
 
-  it('@agentweb.pro reporter: response includes the canonical Linear link', async () => {
-    reporterRecord = { userId: 'user-123', email: 'harsha@agentweb.pro', displayName: 'Harsha' };
-    const res = await report();
-    expect(res.status).toBe(200);
-    expect(res.body.canonicalUrl).toBe(CANON);
-  });
-
-  it('delegated-admin session: response includes the canonical Linear link', async () => {
+  it('delegated-admin session: response STILL omits the canonical Linear link', async () => {
     delegateInfo = { isDelegated: true, adminEmail: 'harsha@agentweb.pro' };
     const res = await report();
     expect(res.status).toBe(200);
-    expect(res.body.canonicalUrl).toBe(CANON);
+    expect(res.body.canonicalUrl).toBeUndefined();
+    expect(JSON.stringify(res.body)).not.toContain('linear.app');
   });
 
-  it('always renders the canonical row in the internal team email, even for an external customer', async () => {
+  it('the internal team email still renders the Linear canonical row', async () => {
     await report();
     const html = (resendService.sendEmail as jest.Mock).mock.calls.at(-1)![0].html as string;
     expect(html).toContain(CANON);
