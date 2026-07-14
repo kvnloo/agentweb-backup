@@ -46,16 +46,60 @@ export interface OAuthProfile {
 
 interface StoredSession {
   sessionId: string; // the bearer secret /connect must present
-  userId: string;
-  provider: OAuthProvider;
   tokens: OAuthTokens;
   profile: OAuthProfile;
   expires: number;
 }
 
-/** Deterministic — one row per user per provider, overwritten on each attempt. */
+/** One row per user per provider, holding any in-flight sessions for that pair. */
+interface SessionRow {
+  userId: string;
+  provider: OAuthProvider;
+  sessions: StoredSession[];
+}
+
+/**
+ * Cap on concurrent in-flight sessions per user+provider. A user can legitimately have more
+ * than one popup open (connecting two Gmail accounts), but not twenty — this bounds the row
+ * even if something is retrying in a loop. Oldest is evicted first.
+ */
+const MAX_CONCURRENT_SESSIONS = 5;
+
+/** Deterministic — one row per user per provider. */
 const settingName = (userId: string, provider: OAuthProvider) =>
   `oauth_token_session_${provider}_${userId}`;
+
+const readRow = async (userId: string, provider: OAuthProvider): Promise<SessionRow> => {
+  const setting = await settingsService.getSetting(settingName(userId, provider));
+  if (!setting?.settingValue) {
+    return { userId, provider, sessions: [] };
+  }
+  try {
+    const row = JSON.parse(setting.settingValue) as SessionRow;
+    return {
+      userId,
+      provider,
+      sessions: Array.isArray(row?.sessions) ? row.sessions : [],
+    };
+  } catch {
+    return { userId, provider, sessions: [] };
+  }
+};
+
+const writeRow = async (row: SessionRow): Promise<void> => {
+  if (row.sessions.length === 0) {
+    await settingsService.deleteSetting(settingName(row.userId, row.provider)).catch(() => undefined);
+    return;
+  }
+  await settingsService.setSetting(
+    settingName(row.userId, row.provider),
+    JSON.stringify(row),
+    `Transient ${row.provider} OAuth token session`,
+    'system',
+  );
+};
+
+const live = (s: StoredSession, now: number) => s && s.expires > now;
 
 /** Constant-time compare so a session id cannot be recovered by timing the endpoint. */
 const secretsMatch = (a: string, b: string): boolean => {
@@ -71,68 +115,61 @@ export async function storeTokenSession(
   tokens: OAuthTokens,
   profile: OAuthProfile,
 ): Promise<string> {
+  const now = Date.now();
   const sessionId = crypto.randomBytes(32).toString('hex');
-  const session: StoredSession = {
+
+  const row = await readRow(userId, provider);
+
+  // Drop anything already expired. This is what replaces the in-memory sweeper: every
+  // write prunes, so an abandoned popup's tokens survive at most one TTL past the user's
+  // next attempt, and the row can never grow without bound.
+  row.sessions = row.sessions.filter((s) => live(s, now));
+
+  row.sessions.push({
     sessionId,
-    userId,
-    provider,
     tokens,
     profile,
-    expires: Date.now() + TOKEN_SESSION_TTL_MS,
-  };
+    expires: now + TOKEN_SESSION_TTL_MS,
+  });
 
-  // Overwrites any previous attempt by this user for this provider — which is what keeps
-  // abandoned popups from accumulating live tokens.
-  await settingsService.setSetting(
-    settingName(userId, provider),
-    JSON.stringify(session),
-    `Transient ${provider} OAuth token session`,
-    'system',
-  );
+  // Keep the most recent few — a user may have two popups open, not twenty.
+  if (row.sessions.length > MAX_CONCURRENT_SESSIONS) {
+    row.sessions = row.sessions.slice(-MAX_CONCURRENT_SESSIONS);
+  }
 
+  await writeRow(row);
   return sessionId;
 }
 
 /**
- * Retrieve and burn a session. Returns null if it is unknown, expired, or does not match
- * the presented session id — and deletes it in every one of those cases, so a guessed id
- * cannot be retried.
+ * Retrieve and burn a session. Returns null if it is unknown, expired, or does not match a
+ * live session id for this user+provider.
+ *
+ * Only the matching session is consumed — concurrent popups for the same provider do not
+ * invalidate each other. Expired siblings are pruned on the way through.
  */
 export async function retrieveTokenSession(
   sessionId: string,
   userId: string,
   provider: OAuthProvider,
 ): Promise<{ tokens: OAuthTokens; profile: OAuthProfile } | null> {
-  const name = settingName(userId, provider);
-  const setting = await settingsService.getSetting(name);
-  if (!setting?.settingValue) {
+  if (!sessionId) return null;
+
+  const now = Date.now();
+  const row = await readRow(userId, provider);
+  if (row.sessions.length === 0) return null;
+
+  const match = row.sessions.find(
+    (s) => s.sessionId && live(s, now) && secretsMatch(s.sessionId, sessionId),
+  );
+
+  // One-time use: remove the matched session, and prune expired siblings while we're here.
+  row.sessions = row.sessions.filter((s) => live(s, now) && s !== match);
+  await writeRow(row);
+
+  if (!match) {
     return null;
   }
 
-  const burn = () => settingsService.deleteSetting(name).catch(() => undefined);
-
-  let session: StoredSession;
-  try {
-    session = JSON.parse(setting.settingValue);
-  } catch {
-    await burn();
-    return null;
-  }
-
-  const valid =
-    !!sessionId &&
-    !!session.sessionId &&
-    secretsMatch(session.sessionId, sessionId) &&
-    session.userId === userId &&
-    session.provider === provider &&
-    Date.now() <= session.expires;
-
-  // One-time use: burn it whether or not it validated.
-  await burn();
-
-  if (!valid) {
-    return null;
-  }
-
-  return { tokens: session.tokens, profile: session.profile };
+  return { tokens: match.tokens, profile: match.profile };
 }

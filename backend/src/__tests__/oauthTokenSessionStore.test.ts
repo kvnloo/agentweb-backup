@@ -1,6 +1,10 @@
 import { storeTokenSession, retrieveTokenSession } from '../services/oauthTokenSessionStore';
 import { settingsService } from '../services/settingsService';
 
+// Back the settings table with an in-memory map so the read-modify-write behaviour of the
+// store is exercised for real, rather than asserted against mock call arguments.
+const table = new Map<string, string>();
+
 jest.mock('../services/settingsService', () => ({
   settingsService: {
     getSetting: jest.fn(),
@@ -16,43 +20,30 @@ const mockDelete = settingsService.deleteSetting as jest.Mock;
 const tokens = { access_token: 'a', refresh_token: 'r', expires_in: 3600, granted_scopes: ['Mail.Send'] };
 const profile = { email: 'habeb@baldwin.com', name: 'Habeb' };
 
-/** Simulate the row another instance would read back. */
-const storedRow = (over: any = {}) => ({
-  settingValue: JSON.stringify({
-    sessionId: 'the-secret',
-    userId: 'u1',
-    provider: 'outlook',
-    tokens,
-    profile,
-    expires: Date.now() + 60_000,
-    ...over,
-  }),
-});
+const rowsWithTokens = () =>
+  [...table.entries()].filter(([, v]) => v.includes('access_token'));
 
 beforeEach(() => {
   jest.clearAllMocks();
-  mockSet.mockResolvedValue(undefined);
-  mockDelete.mockResolvedValue(undefined);
-  mockGet.mockResolvedValue(null);
+  table.clear();
+  mockGet.mockImplementation(async (name: string) => {
+    const settingValue = table.get(name);
+    return settingValue ? { settingName: name, settingValue } : null;
+  });
+  mockSet.mockImplementation(async (name: string, value: string) => {
+    table.set(name, value);
+  });
+  mockDelete.mockImplementation(async (name: string) => {
+    table.delete(name);
+  });
 });
 
 describe('oauthTokenSessionStore — must survive a different instance (ENG-301)', () => {
-  it('persists the session to the shared store, not process memory', async () => {
+  it('round-trips a session through the shared store, not process memory', async () => {
     const sessionId = await storeTokenSession('u1', 'outlook', tokens, profile);
 
-    expect(sessionId).toEqual(expect.any(String));
-    expect(mockSet).toHaveBeenCalledTimes(1);
-    const [, settingValue] = mockSet.mock.calls[0];
-    const stored = JSON.parse(settingValue);
-    expect(stored.userId).toBe('u1');
-    expect(stored.provider).toBe('outlook');
-    expect(stored.tokens.access_token).toBe('a');
-  });
-
-  it('round-trips a session stored by a "different instance"', async () => {
-    mockGet.mockResolvedValue(storedRow());
-
-    const session = await retrieveTokenSession('the-secret', 'u1', 'outlook');
+    // A "different instance" reads it back purely from the table.
+    const session = await retrieveTokenSession(sessionId, 'u1', 'outlook');
     expect(session?.profile.email).toBe('habeb@baldwin.com');
     expect(session?.tokens.refresh_token).toBe('r');
   });
@@ -60,16 +51,41 @@ describe('oauthTokenSessionStore — must survive a different instance (ENG-301)
 
 // AW-Settings has no DynamoDB TTL, and the in-memory version's sweeper did not survive the
 // move. If each attempt wrote its own row, an abandoned popup would leave live access and
-// refresh tokens behind FOREVER, and every retry would add another. Keying by user+provider
-// makes the row self-overwriting, which bounds that to one stale row per provider.
+// refresh tokens behind forever, and every retry would add another.
 describe('oauthTokenSessionStore — abandoned popups must not accumulate token material', () => {
-  it('writes to a deterministic key per user+provider, so a retry OVERWRITES the previous attempt', async () => {
+  it('keeps abandoned attempts in ONE row, not one row each', async () => {
     await storeTokenSession('u1', 'outlook', tokens, profile);
     await storeTokenSession('u1', 'outlook', tokens, profile);
     await storeTokenSession('u1', 'outlook', tokens, profile);
 
-    const keys = new Set(mockSet.mock.calls.map((c) => c[0]));
-    expect(keys.size).toBe(1); // three abandoned attempts -> ONE row, not three
+    expect(rowsWithTokens()).toHaveLength(1);
+  });
+
+  it('prunes expired sessions on the next write, so tokens do not linger', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-07-13T10:00:00Z'));
+    await storeTokenSession('u1', 'outlook', tokens, profile); // abandoned
+
+    // 11 minutes later (TTL is 10), the user tries again.
+    jest.setSystemTime(new Date('2026-07-13T10:11:00Z'));
+    await storeTokenSession('u1', 'outlook', tokens, profile);
+
+    const row = JSON.parse(table.get('oauth_token_session_outlook_u1')!);
+    expect(row.sessions).toHaveLength(1); // the abandoned one is gone
+    jest.useRealTimers();
+  });
+
+  it('caps the row even if something retries in a loop', async () => {
+    for (let i = 0; i < 12; i++) await storeTokenSession('u1', 'outlook', tokens, profile);
+
+    const row = JSON.parse(table.get('oauth_token_session_outlook_u1')!);
+    expect(row.sessions.length).toBeLessThanOrEqual(5);
+  });
+
+  it('deletes the row entirely once the last session is consumed', async () => {
+    const id = await storeTokenSession('u1', 'outlook', tokens, profile);
+    await retrieveTokenSession(id, 'u1', 'outlook');
+
+    expect(table.has('oauth_token_session_outlook_u1')).toBe(false);
   });
 
   it('keeps different providers and different users in separate rows', async () => {
@@ -77,61 +93,86 @@ describe('oauthTokenSessionStore — abandoned popups must not accumulate token 
     await storeTokenSession('u1', 'gmail', tokens, profile);
     await storeTokenSession('u2', 'outlook', tokens, profile);
 
-    const keys = new Set(mockSet.mock.calls.map((c) => c[0]));
-    expect(keys.size).toBe(3);
+    expect(rowsWithTokens()).toHaveLength(3);
   });
 
   it('does not put the session id in the KEY (it is a secret, checked on read)', async () => {
     const sessionId = await storeTokenSession('u1', 'outlook', tokens, profile);
-    const [key] = mockSet.mock.calls[0];
-    expect(key).not.toContain(sessionId);
+    expect([...table.keys()].some((k) => k.includes(sessionId))).toBe(false);
+  });
+});
+
+// The previous (single-session-per-row) design broke this: a second popup overwrote the
+// first, and the first /connect then failed. A user connecting two mailboxes is legitimate.
+describe('oauthTokenSessionStore — concurrent popups must not invalidate each other', () => {
+  it('honours BOTH sessions when two popups are open for the same provider', async () => {
+    const first = await storeTokenSession('u1', 'gmail', tokens, { email: 'one@x.com', name: 'One' });
+    const second = await storeTokenSession('u1', 'gmail', tokens, { email: 'two@x.com', name: 'Two' });
+
+    // Finish them out of order, for good measure.
+    const b = await retrieveTokenSession(second, 'u1', 'gmail');
+    const a = await retrieveTokenSession(first, 'u1', 'gmail');
+
+    expect(b?.profile.email).toBe('two@x.com');
+    expect(a?.profile.email).toBe('one@x.com');
+  });
+
+  it('consuming one session does not burn its siblings', async () => {
+    const first = await storeTokenSession('u1', 'gmail', tokens, profile);
+    const second = await storeTokenSession('u1', 'gmail', tokens, profile);
+
+    await retrieveTokenSession(first, 'u1', 'gmail');
+
+    const row = JSON.parse(table.get('oauth_token_session_gmail_u1')!);
+    expect(row.sessions).toHaveLength(1);
+    expect(await retrieveTokenSession(second, 'u1', 'gmail')).not.toBeNull();
   });
 });
 
 describe('oauthTokenSessionStore — security properties', () => {
-  it('is one-time use: the row is deleted on retrieval', async () => {
-    mockGet.mockResolvedValue(storedRow());
-    await retrieveTokenSession('the-secret', 'u1', 'outlook');
-    expect(mockDelete).toHaveBeenCalledTimes(1);
+  it('is one-time use: the same session id cannot be replayed', async () => {
+    const id = await storeTokenSession('u1', 'outlook', tokens, profile);
+
+    expect(await retrieveTokenSession(id, 'u1', 'outlook')).not.toBeNull();
+    expect(await retrieveTokenSession(id, 'u1', 'outlook')).toBeNull();
   });
 
-  it('refuses a WRONG session id, and burns the row anyway', async () => {
-    mockGet.mockResolvedValue(storedRow());
+  it('refuses a WRONG session id', async () => {
+    await storeTokenSession('u1', 'outlook', tokens, profile);
     expect(await retrieveTokenSession('not-the-secret', 'u1', 'outlook')).toBeNull();
-    expect(mockDelete).toHaveBeenCalled();
   });
 
   it('refuses an empty session id', async () => {
-    mockGet.mockResolvedValue(storedRow());
+    await storeTokenSession('u1', 'outlook', tokens, profile);
     expect(await retrieveTokenSession('', 'u1', 'outlook')).toBeNull();
   });
 
-  it('refuses a session belonging to a different user', async () => {
-    mockGet.mockResolvedValue(storedRow({ userId: 'someone-else' }));
-    expect(await retrieveTokenSession('the-secret', 'u1', 'outlook')).toBeNull();
-    expect(mockDelete).toHaveBeenCalled();
+  it('refuses another user presenting a valid session id', async () => {
+    const id = await storeTokenSession('u1', 'outlook', tokens, profile);
+    expect(await retrieveTokenSession(id, 'attacker', 'outlook')).toBeNull();
   });
 
   it('refuses a session issued for a different provider', async () => {
-    mockGet.mockResolvedValue(storedRow({ provider: 'gmail' }));
-    expect(await retrieveTokenSession('the-secret', 'u1', 'outlook')).toBeNull();
+    const id = await storeTokenSession('u1', 'gmail', tokens, profile);
+    expect(await retrieveTokenSession(id, 'u1', 'outlook')).toBeNull();
   });
 
   it('refuses an expired session', async () => {
-    mockGet.mockResolvedValue(storedRow({ expires: Date.now() - 1 }));
-    expect(await retrieveTokenSession('the-secret', 'u1', 'outlook')).toBeNull();
-    expect(mockDelete).toHaveBeenCalled();
+    jest.useFakeTimers().setSystemTime(new Date('2026-07-13T10:00:00Z'));
+    const id = await storeTokenSession('u1', 'outlook', tokens, profile);
+
+    jest.setSystemTime(new Date('2026-07-13T10:11:00Z')); // TTL is 10 minutes
+    expect(await retrieveTokenSession(id, 'u1', 'outlook')).toBeNull();
+    jest.useRealTimers();
   });
 
   it('returns null for an unknown session', async () => {
-    mockGet.mockResolvedValue(null);
-    expect(await retrieveTokenSession('the-secret', 'u1', 'outlook')).toBeNull();
+    expect(await retrieveTokenSession('nope', 'u1', 'outlook')).toBeNull();
   });
 
   it('returns null rather than throwing on a corrupt row', async () => {
-    mockGet.mockResolvedValue({ settingValue: '{not json' });
-    expect(await retrieveTokenSession('the-secret', 'u1', 'outlook')).toBeNull();
-    expect(mockDelete).toHaveBeenCalled();
+    table.set('oauth_token_session_outlook_u1', '{not json');
+    expect(await retrieveTokenSession('anything', 'u1', 'outlook')).toBeNull();
   });
 
   it('issues unpredictable session ids', async () => {
