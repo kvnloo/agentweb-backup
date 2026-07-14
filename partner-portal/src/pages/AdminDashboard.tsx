@@ -3070,9 +3070,33 @@ export default function AdminDashboard() {
 
   const handleCopyDelegatedUrl = async () => {
     if (!delegatedPortalUrl) return;
+    // Prefer the async Clipboard API, but it is only exposed in secure contexts
+    // (HTTPS/localhost). On plain HTTP (e.g. preview envs) navigator.clipboard is
+    // undefined, so fall back to a temporary textarea + execCommand("copy").
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(delegatedPortalUrl);
+        setDelegatedUrlCopied(true);
+        return;
+      } catch (error) {
+        console.error("Clipboard API copy failed, falling back to execCommand:", error);
+      }
+    }
     try {
-      await navigator.clipboard.writeText(delegatedPortalUrl);
-      setDelegatedUrlCopied(true);
+      const textarea = document.createElement("textarea");
+      textarea.value = delegatedPortalUrl;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand("copy");
+      document.body.removeChild(textarea);
+      if (copied) {
+        setDelegatedUrlCopied(true);
+      } else {
+        console.error("Failed to copy delegated URL: execCommand returned false");
+      }
     } catch (error) {
       console.error("Failed to copy delegated URL:", error);
     }
