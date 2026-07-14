@@ -1624,11 +1624,33 @@ async function addPageToExistingRepo(
     // generated into the SAME repo) is rebased onto rather than rejected as a
     // non-fast-forward. Transient network/5xx failures are retried too — this
     // path was previously bare axios, the dominant source of "fetch failed".
+    // Heal sub-pages the PRE-FIX remap poisoned. `next build` type-checks the whole project,
+    // so one sibling page with an unresolvable import fails the deployment for every page —
+    // our correct new page included. Repairs ride in the SAME commit, so a single Vercel
+    // build validates both. Best-effort: a repo we cannot scan must not block the page add.
+    let repairs: RepoFileToCommit[] = [];
+    try {
+      repairs = await repairPoisonedSubPagesInRepo(
+        repoFullName,
+        ghHeaders,
+        new Set(filesToCommit.map((f) => f.path)),
+      );
+      if (repairs.length > 0) {
+        console.log(
+          `[V0 SERVICE] Repairing ${repairs.length} poisoned import(s) in ${repoFullName}: ${repairs.map((f) => f.path).join(", ")}`
+        );
+      }
+    } catch (repairErr: any) {
+      console.warn(`[V0 SERVICE] Import repair scan failed for ${repoFullName} (continuing): ${repairErr?.message}`);
+    }
+
     const { pushedCommitSha, pushTimestampMs } = await commitFilesToRepoMain(
       repoFullName,
       ghHeaders,
-      filesToCommit,
-      `Add new page: ${name} (/${slug})`
+      [...filesToCommit, ...repairs],
+      repairs.length > 0
+        ? `Add new page: ${name} (/${slug}) + repair ${repairs.length} broken import(s)`
+        : `Add new page: ${name} (/${slug})`
     );
 
     console.log(`[V0 SERVICE] Pushed ${filesToCommit.length} files for /${slug} to ${repoFullName} (${pushedCommitSha.substring(0, 7)}) — polling Vercel for build status`);
@@ -2056,6 +2078,58 @@ export function repairSubPageImports(
   }
 
   return repaired;
+}
+
+/** Upper bound on files read during a repair scan, so a huge repo can't stall a page add. */
+const REPAIR_SCAN_MAX_FILES = 200;
+
+/**
+ * Scan a repo's existing sub-pages for imports poisoned by the pre-fix remap and return the
+ * repaired files, ready to ride along in the caller's commit.
+ *
+ * Adding a page to a poisoned site is precisely when we can heal it — we are already listing
+ * the repo and pushing a commit, and a repair in that SAME commit means one Vercel build
+ * validates both. Without this, the new page is correct and the site still cannot deploy,
+ * because a sibling page's broken import fails the build for everything.
+ *
+ * `skipPaths` are the files the caller is committing this run: they are correct by
+ * construction, and re-reading the stale copies from the repo would clobber them.
+ */
+export async function repairPoisonedSubPagesInRepo(
+  repoFullName: string,
+  ghHeaders: Record<string, string>,
+  skipPaths: Set<string>,
+): Promise<RepoFileToCommit[]> {
+  const tree = await listRepoTree(repoFullName, ghHeaders);
+  const existingPaths = new Set(tree);
+
+  const candidates = tree.filter(
+    (p) => /^app\/[^/]+\/.+\.(tsx|ts)$/.test(p) && !skipPaths.has(p),
+  );
+  if (candidates.length === 0) return [];
+
+  const scanned = candidates.slice(0, REPAIR_SCAN_MAX_FILES);
+  if (scanned.length < candidates.length) {
+    console.warn(
+      `[V0 SERVICE] Import repair scanned ${scanned.length} of ${candidates.length} files in ${repoFullName} — ` +
+        `${candidates.length - scanned.length} skipped by the ${REPAIR_SCAN_MAX_FILES}-file cap`,
+    );
+  }
+
+  const files = await Promise.all(
+    scanned.map(async (p) => {
+      const res = await axios.get<any>(
+        `https://api.github.com/repos/${repoFullName}/contents/${p}`,
+        { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS },
+      );
+      return { path: p, content: Buffer.from(res.data.content, "base64").toString("utf-8") };
+    }),
+  );
+
+  return repairSubPageImports(files, existingPaths).map((f) => ({
+    path: f.path,
+    content: Buffer.from(f.content),
+  }));
 }
 
 /**
