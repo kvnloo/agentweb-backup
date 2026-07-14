@@ -49,8 +49,14 @@ const deductedCostForMonth = (user: User, month: string): number => {
   return hist?.totalCost ?? 0;
 };
 
-// --- Mirror of the per-model burn breakdown modal body ---
-const BreakdownBody: React.FC<{ user: User; month: string; rows: UsageRow[] }> = ({ user, month, rows }) => {
+// --- Mirror of the per-model burn breakdown modal body (table + bars views) ---
+const BreakdownBody: React.FC<{
+  user: User;
+  month: string;
+  rows: UsageRow[];
+  view?: 'table' | 'bars';
+  costAllowanceMap?: Record<string, number | null>;
+}> = ({ user, month, rows, view = 'table', costAllowanceMap = {} }) => {
   const burn = rows.reduce((acc, r) => acc + r.costUsd, 0);
   const deducted = deductedCostForMonth(user, month);
   const absorbed = Math.max(0, burn - deducted);
@@ -64,25 +70,51 @@ const BreakdownBody: React.FC<{ user: User; month: string; rows: UsageRow[] }> =
   const modelRows = Object.values(byModel).sort((a, b) => b.costUsd - a.costUsd);
   const earliestTracked = rows.length ? rows[0].date : null;
   const burnLagsDeducted = modelRows.length > 0 && burn + 0.005 < deducted;
+  // Overall cost quota (bars view): deducted spend vs the tier cap, colored by threshold.
+  const costAllowance = costAllowanceMap[user.subscriptionType || 'Basic'] ?? null;
+  const quotaPct = costAllowance != null && costAllowance > 0 ? (deducted / costAllowance) * 100 : null;
+  const quotaColor = quotaPct == null ? 'none' : quotaPct >= 100 ? 'over' : quotaPct >= 80 ? 'warn' : 'ok';
   return (
     <div>
       <div>Burned (gross) ${burn.toFixed(2)}</div>
       <div>Counted to quota ${deducted.toFixed(2)}</div>
       <div>Absorbed by platform ${absorbed.toFixed(2)}</div>
+      {view === 'bars' && (
+        costAllowance != null ? (
+          <div data-testid="quota-bar" data-color={quotaColor} data-pct={String(Math.min(100, Math.round(quotaPct ?? 0)))}>
+            Monthly cost quota ${deducted.toFixed(2)} / ${costAllowance.toFixed(2)} ({Math.round(quotaPct ?? 0)}%)
+          </div>
+        ) : (
+          <div role="alert">This user's tier has no cost cap (unlimited) — no quota bar.</div>
+        )
+      )}
       {modelRows.length === 0 && <div role="alert">No per-model burn has been recorded for this month yet.</div>}
       {burnLagsDeducted && <div role="alert">Recorded burn (tracked from {earliestTracked}) is lower than the amount counted to this user's quota.</div>}
-      <table>
-        <tbody>
-          {modelRows.map((m) => (
-            <tr key={m.model}>
-              <td>{m.model}</td>
-              <td>{m.callCount.toLocaleString()}</td>
-              <td>{m.totalTokens.toLocaleString()}</td>
-              <td data-testid={`burn-${m.model}`}>${m.costUsd.toFixed(4)}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      {view === 'bars' ? (
+        <div data-testid="cost-breakdown-bars">
+          {modelRows.map((m) => {
+            const share = burn > 0 ? (m.costUsd / burn) * 100 : 0;
+            return (
+              <div key={m.model} data-testid={`bar-${m.model}`} data-share={share.toFixed(1)}>
+                {m.model} ${m.costUsd.toFixed(4)} ({share.toFixed(1)}%)
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <table>
+          <tbody>
+            {modelRows.map((m) => (
+              <tr key={m.model}>
+                <td>{m.model}</td>
+                <td>{m.callCount.toLocaleString()}</td>
+                <td>{m.totalTokens.toLocaleString()}</td>
+                <td data-testid={`burn-${m.model}`}>${m.costUsd.toFixed(4)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
     </div>
   );
 };
@@ -207,5 +239,58 @@ describe('AdminDashboard per-model burn breakdown (isolated)', () => {
     render(<BreakdownBody user={histUser} month="2026-06" rows={rows} />);
     expect(screen.getByText('Counted to quota $2.25')).toBeInTheDocument();
     expect(screen.getByText('Absorbed by platform $2.75')).toBeInTheDocument();
+  });
+});
+
+describe('AdminDashboard cost breakdown — bars view (isolated)', () => {
+  const month = '2026-07';
+  const mkUser = (totalCost: number, tier = 'Starter'): User => ({
+    userId: 'u1',
+    email: 'c1@example.com',
+    roles: ['customer'],
+    subscriptionType: tier,
+    tokenUsage: { month, totalTokens: 5000, totalCost, resetDate: '' },
+  });
+  const rows: UsageRow[] = [
+    { date: '2026-07-01', model: 'claude-opus-4-8', feature: 'agent_mode', totalTokens: 1000, callCount: 2, costUsd: 9 },
+    { date: '2026-07-02', model: 'gpt-4o', feature: 'chatbot', totalTokens: 500, callCount: 1, costUsd: 1 },
+  ];
+
+  it('renders the quota bar with deducted / cap and percent', () => {
+    render(<BreakdownBody user={mkUser(300)} month={month} rows={rows} view="bars" costAllowanceMap={{ Starter: 360 }} />);
+    const bar = screen.getByTestId('quota-bar');
+    expect(bar).toHaveTextContent('Monthly cost quota $300.00 / $360.00 (83%)');
+    expect(bar).toHaveAttribute('data-pct', '83');
+  });
+
+  it('colors the quota bar green < 80%, amber 80–99%, red ≥ 100%', () => {
+    const { rerender } = render(<BreakdownBody user={mkUser(180)} month={month} rows={rows} view="bars" costAllowanceMap={{ Starter: 360 }} />);
+    expect(screen.getByTestId('quota-bar')).toHaveAttribute('data-color', 'ok'); // 50%
+    rerender(<BreakdownBody user={mkUser(324)} month={month} rows={rows} view="bars" costAllowanceMap={{ Starter: 360 }} />);
+    expect(screen.getByTestId('quota-bar')).toHaveAttribute('data-color', 'warn'); // 90%
+    rerender(<BreakdownBody user={mkUser(400)} month={month} rows={rows} view="bars" costAllowanceMap={{ Starter: 360 }} />);
+    expect(screen.getByTestId('quota-bar')).toHaveAttribute('data-color', 'over'); // 111%
+  });
+
+  it('shows an unlimited-tier notice instead of a quota bar when no cap', () => {
+    // deducted (5) <= burn (10) so the burn-lags-deducted alert doesn't also fire.
+    render(<BreakdownBody user={mkUser(5, 'Basic')} month={month} rows={rows} view="bars" costAllowanceMap={{ Basic: null }} />);
+    expect(screen.queryByTestId('quota-bar')).not.toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('no cost cap (unlimited)');
+  });
+
+  it('renders per-model bars sized by share of total burn', () => {
+    render(<BreakdownBody user={mkUser(300)} month={month} rows={rows} view="bars" costAllowanceMap={{ Starter: 360 }} />);
+    // total burn = 10 → opus 90%, gpt-4o 10%
+    expect(screen.getByTestId('bar-claude-opus-4-8')).toHaveAttribute('data-share', '90.0');
+    expect(screen.getByTestId('bar-gpt-4o')).toHaveAttribute('data-share', '10.0');
+    // bars view shows no table
+    expect(screen.queryByRole('row')).not.toBeInTheDocument();
+  });
+
+  it('table view (default) shows the table and no bars', () => {
+    render(<BreakdownBody user={mkUser(300)} month={month} rows={rows} costAllowanceMap={{ Starter: 360 }} />);
+    expect(screen.queryByTestId('cost-breakdown-bars')).not.toBeInTheDocument();
+    expect(screen.getByTestId('burn-claude-opus-4-8')).toHaveTextContent('$9.0000');
   });
 });
