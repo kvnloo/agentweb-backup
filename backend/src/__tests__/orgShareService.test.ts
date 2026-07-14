@@ -244,11 +244,13 @@ describe("absent-config fallback (org never had shareSettings written)", () => {
       orgId: "org-A", ownerUserId: "u-admin", name: "A",
       shareSettings: {
         knowledgeBase: { enabled: false, editors: [] },
+        htmlTemplates: { enabled: false, editors: [] },
         landingPages: { enabled: false, editors: [] },
         analytics: { enabled: false, editors: [] },
       },
     } as unknown as Organization;
     expect(isFeatureEffectivelyEnabled(member, orgOptedOut, "knowledgeBase")).toBe(false);
+    expect(isFeatureEffectivelyEnabled(member, orgOptedOut, "htmlTemplates")).toBe(false);
     expect(isFeatureEffectivelyEnabled(member, orgOptedOut, "analytics")).toBe(false);
     expect(canViewItem(item, member, orgOptedOut, ownerOrgId, "landingPages")).toBe(false);
   });
