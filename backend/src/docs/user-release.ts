@@ -11,12 +11,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-07-13',
     changes: [
-      'Fixed: Sequences Now Actually Stop When a Lead Engages',
-      '- If you set a sequence to stop when a lead opens, clicks, or replies, that setting has not been working. The check behind it was broken, so it never triggered — and leads who had already replied to you kept receiving the rest of the sequence',
-      '- Replying in particular was never checked at all, which is the case where it stings most: someone answers you, and the automated follow-ups keep arriving anyway',
-      '- This now works. A sequence with an engagement exit will stop for a lead as soon as they engage',
-      '- Heads-up: because this never worked before, some of your active sequences may have leads who already engaged and should have exited. Those will exit shortly after this update. That is the behavior you originally asked for — but if a sequence goes quiet, this is why',
-      '- Only engagement that happens AFTER a lead is enrolled counts. An old open or click from a previous campaign will not retroactively end a new sequence',
+      'Fixed: Sequences Now Stop When a Lead Engages',
+      '- If you set a sequence to stop once a lead opens, clicks, or replies, that setting was not being applied. The check behind it never ran, so a sequence would keep sending regardless',
+      '- Replies were not checked at all — the case where it stings most: a lead answers you, and the automated follow-ups keep arriving anyway',
+      '- All three now work, and you can choose whichever fits the campaign: stop on open, on click, or on reply',
+      '- Only engagement that happens AFTER a lead is enrolled counts, so an old open or click from an earlier campaign will not cut a new sequence short',
     ],
   },
   {
