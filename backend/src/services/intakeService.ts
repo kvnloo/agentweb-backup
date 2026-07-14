@@ -22,11 +22,41 @@
  */
 
 import { getUserFunnelStatusIssueTags, getUserFunnelStatusCoarseTag } from '../utils/userFunnelStatus';
+import type { OpenCanonical } from './linearService';
 
 const FEATUREBASE_BOARD_URL = 'https://agentweb.featurebase.app/';
+const LINEAR_ISSUE_BASE = 'https://linear.app/emmabyaw/issue';
+
+/**
+ * A report that explicitly names an existing tracked ticket — the user-facing "AGW-<n>" id or a raw
+ * Linear "ENG-<n>" identifier. It's the signal that a report is a regression / failed retest of a
+ * known bug rather than a fresh one, so we look for a resolved canonical to REOPEN (ENG-240 #3)
+ * instead of filing a duplicate.
+ */
+const REFERENCES_CANONICAL = /\b(?:AGW|ENG)-\d+\b/i;
 
 function intakeEnabled(): boolean {
   return process.env.FEATUREBASE_INTAKE === 'true';
+}
+
+/**
+ * Idempotency keys for auto-issue dedup (ENG-240): the stable identifiers of the underlying event —
+ * the failing Session ID and/or the owning Schedule ID. Two filers reacting to the SAME failure carry
+ * the same id even when their titles/sources differ, so we dedup on these instead of on wording.
+ * Placeholder values ("N/A", "unknown", empty) are dropped — they'd collide across unrelated events.
+ */
+const IDEMPOTENCY_CONTEXT_KEYS = ['Session ID', 'Schedule ID'];
+const IDEMPOTENCY_PLACEHOLDERS = new Set(['', 'n/a', 'na', 'unknown', 'none', 'null', 'undefined']);
+function idempotencyKeys(context?: Record<string, any>): string[] {
+  if (!context) return [];
+  const keys: string[] = [];
+  for (const k of IDEMPOTENCY_CONTEXT_KEYS) {
+    const v = context[k];
+    if (v === undefined || v === null) continue;
+    const s = String(v).trim();
+    if (s && !IDEMPOTENCY_PLACEHOLDERS.has(s.toLowerCase())) keys.push(s);
+  }
+  return keys;
 }
 
 function contextLines(context?: Record<string, any>): string[] {
@@ -104,6 +134,13 @@ export interface FiledUserResult {
   pageId: string;       // Featurebase post id (or Notion pageId when the flag is off)
   trackerUrl: string;   // internal tracker link (Featurebase post / Notion page)
   userUrl?: string;     // public, user-facing Featurebase post link
+  /**
+   * Internal Linear canonical issue link (bugs only) — the single ticket eng works, whether this
+   * report created it or deduped onto an existing one. Surfaced so the team gets a VISIBLE Linear
+   * confirmation/link instead of only the reporter's private Featurebase card (ENG-289). Never
+   * shown to the customer — it is an internal, eng-facing link for the notification email.
+   */
+  canonicalUrl?: string;
   deduped: boolean;
   tracker: 'Featurebase' | 'Notion';
 }
@@ -188,7 +225,7 @@ async function fileFeatureRequest(p: FileUserIssueParams): Promise<FiledUserResu
  */
 async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   const { findDuplicate, MAX_CANDIDATES } = await import('./dedupService');
-  const { listOpenBugCanonicals, createInternalLinearIssue, addIssueComment, raiseIssueTriage } = await import('./linearService');
+  const { listOpenBugCanonicals, listRecentlyResolvedBugCanonicals, createInternalLinearIssue, addIssueComment, raiseIssueTriage, reopenIssue } = await import('./linearService');
   const { createTicket } = await import('./featurebaseService');
 
   // Linear-side triage enrichment (ENG-187): the reporter's funnel stage becomes stage labels
@@ -211,9 +248,33 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
     cans.map((c) => ({ ref: c.identifier, title: c.title, description: c.description })),
   );
 
+  // Reopen, not refile (ENG-240 contract #3): when no OPEN canonical matches but the report explicitly
+  // references an existing ticket (regression / failed retest, e.g. "AGW-58" or "ENG-179"), match it
+  // against recently-RESOLVED canonicals so we reopen the one it duplicates instead of filing anew.
+  let reopenTarget: OpenCanonical | null = null;
+  if (!dup && REFERENCES_CANONICAL.test(`${p.title}\n${p.description}`)) {
+    const resolved = await listRecentlyResolvedBugCanonicals(MAX_CANDIDATES);
+    if (resolved.length) {
+      const rByRef = new Map(resolved.map((c) => [c.identifier, c]));
+      const rdup = await findDuplicate(
+        { type: 'bug', title: p.title, description: p.description },
+        resolved.map((c) => ({ ref: c.identifier, title: c.title, description: c.description })),
+      );
+      reopenTarget = rdup ? rByRef.get(rdup.ref) || null : null;
+    }
+  }
+
   let canonicalUuid = '';
+  let canonicalUrl = '';
+  let grouped = false;  // grouped onto an existing canonical (open dup OR reopened resolved one)
+  let reopened = false; // reopened a Done/canceled canonical for a regression / failed retest
   if (dup) {
-    canonicalUuid = byRef.get(dup.ref)!.issueId;
+    const matched = byRef.get(dup.ref)!;
+    canonicalUuid = matched.issueId;
+    grouped = true;
+    // A deduped report returns the SAME canonical link (ENG-289). listOpenBugCanonicals gives us
+    // the identifier (e.g. ENG-42) but not the url, so build it from the stable issue-URL base.
+    canonicalUrl = `${LINEAR_ISSUE_BASE}/${matched.identifier}`;
     // Dedup triage upgrade (ENG-187): a higher-tier reporter hitting an existing canonical unions
     // its stage labels in and raises the priority — never lowers it (raise-only by contract of
     // raiseIssueTriage). Best-effort: a failed upgrade must not block the filing.
@@ -221,6 +282,26 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
       await raiseIssueTriage(canonicalUuid, { addLabelNames: stageTags, priority });
     } catch (e) {
       console.warn('[intake] bug canonical triage upgrade failed:', e instanceof Error ? e.message : e);
+    }
+  } else if (reopenTarget) {
+    canonicalUuid = reopenTarget.issueId;
+    // Surface the reopened canonical's link too (ENG-289) — same URL base as the dup path.
+    canonicalUrl = `${LINEAR_ISSUE_BASE}/${reopenTarget.identifier}`;
+    grouped = true;
+    // Reopen first (Done -> Todo), then apply the same raise-only triage a fresh report would.
+    // Best-effort so a reopen/triage hiccup never blocks recording the reporter. Only flip
+    // `reopened` AFTER the state change actually lands — otherwise a swallowed reopen failure would
+    // stamp a misleading "⚠️ Reopened by a new report" comment on a ticket still sitting in Done.
+    try {
+      await reopenIssue(canonicalUuid, BUG_CANONICAL_STATE);
+      reopened = true;
+    } catch (e) {
+      console.warn('[intake] bug canonical reopen failed:', e instanceof Error ? e.message : e);
+    }
+    try {
+      await raiseIssueTriage(canonicalUuid, { addLabelNames: stageTags, priority });
+    } catch (e) {
+      console.warn('[intake] bug canonical reopen triage upgrade failed:', e instanceof Error ? e.message : e);
     }
   } else {
     const filedBy = p.reportedByAdmin
@@ -246,16 +327,22 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
       assigneeId: BUG_DEFAULT_ASSIGNEE_ID,
     });
     canonicalUuid = li.id || '';
+    // Capture the canonical link (ENG-289) — createInternalLinearIssue returns it; fall back to
+    // building from the identifier if the url is ever absent.
+    canonicalUrl = li.url || (li.identifier ? `${LINEAR_ISSUE_BASE}/${li.identifier}` : '');
   }
 
   // 3. Record this reporter on the canonical (best-effort). `[reporter-ticket #N]` is the contract
   //    the resolve-bridge parses to notify each card; eng also sees the affected user + session.
   if (canonicalUuid) {
     const note = [
+      ...(reopened ? ['⚠️ Reopened by a new report (regression / failed retest) — this bug is back.', ''] : []),
       `[reporter-ticket #${ticket.number} ${p.userEmail}] Affected user: ${reporterLabel(p)}${p.reportedByAdmin ? ` — via ${p.reportedByAdmin}` : ''} on ${new Date().toISOString().slice(0, 10)}.`,
       ...(p.sessionId ? [`Session: ${p.sessionId}`] : []),
-      // For the FIRST reporter the text is already in the canonical description.
-      ...(dup ? ['', 'Their report:', p.description] : []),
+      // The reopened canonical's body is the OLD report, so fold in this reporter's text too — as we
+      // do for any reporter grouped onto an existing canonical. Only the brand-new canonical already
+      // carries the text in its description.
+      ...(grouped ? ['', 'Their report:', p.description] : []),
       ...contextLines(p.notionContext),
     ].join('\n');
     try { await addIssueComment(canonicalUuid, note); } catch (e) { console.warn('[intake] bug canonical comment failed:', e instanceof Error ? e.message : e); }
@@ -265,7 +352,9 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
     pageId: String(ticket.number),
     trackerUrl: ticket.url || FEATUREBASE_BOARD_URL,
     userUrl: ticket.url || FEATUREBASE_BOARD_URL, // the reporter's OWN private card
-    deduped: !!dup,
+    canonicalUrl: canonicalUrl || undefined,      // internal Linear canonical (ENG-289)
+    deduped: grouped,
+
     tracker: 'Featurebase',
   };
 }
@@ -345,8 +434,6 @@ export interface FiledAutoResult {
   tracker: 'Linear' | 'Notion';
 }
 
-const LINEAR_ISSUE_BASE = 'https://linear.app/emmabyaw/issue';
-
 /**
  * File an auto-identified issue. Callers should treat this as best-effort and wrap it
  * (a failed self-report must not break the user's real request) — it throws on a hard
@@ -368,7 +455,15 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
   const { listOpenIssuesByLabel, addIssueComment, createInternalLinearIssue } = await import('./linearService');
   const norm = (s: string) => (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
   const open = await listOpenIssuesByLabel('Auto', 50);
-  const match = open.find((i) => norm(i.title) === norm(p.title));
+  // Dedup gate (ENG-240). One failure event must never spawn 2-3 issues, whichever filer reacts to it:
+  //  1. Idempotency key — an open Auto issue already carrying this event's Session/Schedule ID owns it.
+  //     Two filers (scheduled-chat + oncall) reacting to the same run, or a second analyzer re-filing
+  //     the same session days later, both land on that one issue as an occurrence comment.
+  //  2. Fallback — normalized-title match, for recurring auto-issues that carry no id context.
+  const idKeys = idempotencyKeys(p.notionContext);
+  const match =
+    (idKeys.length ? open.find((i) => idKeys.some((k) => (i.description || '').includes(k))) : undefined) ||
+    open.find((i) => norm(i.title) === norm(p.title));
   if (match) {
     try {
       await addIssueComment(match.issueId, [`Recurred on ${new Date().toISOString().slice(0, 10)}.`, ...contextLines(p.notionContext)].join('\n'));

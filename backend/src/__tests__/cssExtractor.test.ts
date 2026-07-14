@@ -30,6 +30,18 @@ jest.mock('color', () => {
         const b = parseInt(hex.slice(5, 7), 16);
         return (0.299 * r + 0.587 * g + 0.114 * b) / 2.55;
       },
+      saturationl: () => {
+        // HSL saturation (0-100)
+        const r = parseInt(hex.slice(1, 3), 16) / 255;
+        const g = parseInt(hex.slice(3, 5), 16) / 255;
+        const b = parseInt(hex.slice(5, 7), 16) / 255;
+        const max = Math.max(r, g, b);
+        const min = Math.min(r, g, b);
+        if (max === min) return 0;
+        const l = (max + min) / 2;
+        const d = max - min;
+        return (l > 0.5 ? d / (2 - max - min) : d / (max + min)) * 100;
+      },
     };
   };
   Color.default = Color;
@@ -241,7 +253,9 @@ const mockPage = {
   setUserAgent: jest.fn(),
   setCacheEnabled: jest.fn(),
   setExtraHTTPHeaders: jest.fn(),
+  emulateMediaFeatures: jest.fn(),
   goto: jest.fn(),
+  reload: jest.fn(),
   evaluate: jest.fn(),
   close: jest.fn(),
 };
@@ -265,7 +279,7 @@ jest.mock('../utils/browserUtils', () => ({
 // Mock axios for JSDOM fallback path
 jest.mock('axios');
 
-import { extractCSSFromURL, analyzeDesignTokens, inferBrandTokens, DesignTokens } from '../services/cssExtractor';
+import { extractCSSFromURL, analyzeDesignTokens, inferBrandTokens, modernColorToHex, averageBackgroundLightness, isDistinctDarkTheme, DesignTokens } from '../services/cssExtractor';
 
 const { findChromeExecutable } = require('../utils/browserUtils');
 
@@ -516,7 +530,9 @@ describe('cssExtractor', () => {
       mockPage.setUserAgent.mockResolvedValue(undefined);
       mockPage.setCacheEnabled.mockResolvedValue(undefined);
       mockPage.setExtraHTTPHeaders.mockResolvedValue(undefined);
+      mockPage.emulateMediaFeatures.mockResolvedValue(undefined);
       mockPage.goto.mockResolvedValue(undefined);
+      mockPage.reload.mockResolvedValue(undefined);
       mockPage.close.mockResolvedValue(undefined);
       const pMock = require('puppeteer-core');
       pMock.default.launch.mockResolvedValue(mockBrowser);
@@ -571,6 +587,222 @@ describe('cssExtractor', () => {
       expect(mockPage.setExtraHTTPHeaders).toHaveBeenCalledWith(
         expect.objectContaining({ 'Cache-Control': 'no-cache', Pragma: 'no-cache' })
       );
+    });
+
+    it('captures BOTH renders for a site with a dark variant (ENG-285: rankai.ai)', async () => {
+      // ENG-285: headless Chrome reports prefers-color-scheme: light, so a site
+      // whose real design is dark was only ever read in its near-white LIGHT
+      // variant. We now capture both and expose them, rather than guessing which
+      // one is "the brand" — the caller decides.
+      //
+      // NOTE: these are oklch values, because that is what Chrome actually returns
+      // for a Tailwind v4 site like rankai.ai. The previous implementation scored
+      // brand-richness with the `color` package, which throws on oklch, so both
+      // renders scored 0 and the light one always won.
+      const lightRender = {
+        customProperties: {},
+        stylesheetText: 'body { background: oklch(0.985 0 0); }',
+        computedElements: {
+          body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: 'oklch(0.095 0 0)', backgroundColor: 'oklch(0.985 0 0)', borderColor: 'transparent' },
+        },
+      };
+      const darkRender = {
+        customProperties: {},
+        stylesheetText: 'body { background: oklch(0.175 0 0); }',
+        computedElements: {
+          body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: 'oklch(0.98 0 0)', backgroundColor: 'oklch(0.175 0 0)', borderColor: 'transparent' },
+        },
+      };
+      mockPage.evaluate
+        .mockResolvedValueOnce(lightRender)
+        .mockResolvedValueOnce(darkRender);
+
+      const result = await extractCSSFromURL('https://example.com');
+
+      // The dark preference is emulated and the page reloaded to capture it.
+      expect(mockPage.emulateMediaFeatures).toHaveBeenCalledWith([
+        { name: 'prefers-color-scheme', value: 'dark' },
+      ]);
+      expect(mockPage.reload).toHaveBeenCalled();
+
+      // Top-level stays the site's DEFAULT (what a no-preference client is served).
+      expect(result.computedElements?.body?.backgroundColor).toBe('oklch(0.985 0 0)');
+      // ...and the dark render is preserved alongside it, for the caller to use.
+      expect(result.themes?.hasDarkVariant).toBe(true);
+      expect(result.themes?.light.computedElements.body.backgroundColor).toBe('oklch(0.985 0 0)');
+      expect(result.themes?.dark?.computedElements.body.backgroundColor).toBe('oklch(0.175 0 0)');
+    });
+
+    it('reports no dark variant when the dark render is identical to the default', async () => {
+      // A light-only site (example.com) renders the same under a dark preference.
+      // We must not invent a dark theme for it.
+      const render = {
+        customProperties: {},
+        stylesheetText: 'body { background: #eee; }',
+        computedElements: {
+          body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: 'rgb(0, 0, 0)', backgroundColor: 'rgb(238, 238, 238)', borderColor: 'transparent' },
+        },
+      };
+      mockPage.evaluate
+        .mockResolvedValueOnce(render)
+        .mockResolvedValueOnce(JSON.parse(JSON.stringify(render)));
+
+      const result = await extractCSSFromURL('https://example.com');
+
+      expect(result.computedElements?.body?.backgroundColor).toBe('rgb(238, 238, 238)');
+      expect(result.themes?.hasDarkVariant).toBe(false);
+      expect(result.themes?.dark).toBeUndefined();
+    });
+
+    it('falls back to the default render when the dark reload fails', async () => {
+      const lightRender = {
+        customProperties: {},
+        stylesheetText: 'body { background: #fafafa; }',
+        computedElements: {
+          body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: 'rgb(0, 0, 0)', backgroundColor: 'rgb(250, 250, 250)', borderColor: 'transparent' },
+        },
+      };
+      mockPage.evaluate.mockResolvedValueOnce(lightRender);
+      mockPage.reload.mockRejectedValueOnce(new Error('nav timeout'));
+
+      const result = await extractCSSFromURL('https://example.com');
+
+      expect(result.computedElements?.body?.backgroundColor).toBe('rgb(250, 250, 250)');
+      expect(result.themes?.hasDarkVariant).toBe(false);
+      expect(result.themes?.dark).toBeUndefined();
+    });
+
+    it('does NOT invent a dark variant when the reload merely differs (content noise, not a darker theme)', async () => {
+      // A light-only site whose second load differs only from non-deterministic
+      // content (a carousel advanced, a banner appeared) — the backgrounds stay
+      // light. A raw diff would flag this as a dark variant; requiring the
+      // backgrounds to turn materially darker must not (ENG-285).
+      const lightRender = {
+        customProperties: {},
+        stylesheetText: 'body { background: #fafafa; }',
+        computedElements: {
+          body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: 'rgb(20, 20, 20)', backgroundColor: 'rgb(250, 250, 250)', borderColor: 'transparent' },
+        },
+      };
+      const noisyRender = {
+        customProperties: {},
+        stylesheetText: 'body { background: #f8f8f8; }',
+        computedElements: {
+          // Slightly different (a re-rendered hero) but still a light background.
+          body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: 'rgb(24, 24, 24)', backgroundColor: 'rgb(248, 248, 248)', borderColor: 'transparent' },
+        },
+      };
+      mockPage.evaluate
+        .mockResolvedValueOnce(lightRender)
+        .mockResolvedValueOnce(noisyRender);
+
+      const result = await extractCSSFromURL('https://example.com');
+
+      expect(result.themes?.hasDarkVariant).toBe(false);
+      expect(result.themes?.dark).toBeUndefined();
+    });
+
+    it('gives the dark variant its OWN stylesheets, not the light render’s', async () => {
+      // The reported dark palette must come from the dark render's stylesheets;
+      // reusing the light render's would blend light colours into it (ENG-285).
+      const lightRender = {
+        customProperties: {},
+        stylesheetText: 'body { background: oklch(0.985 0 0); }',
+        computedElements: {
+          body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: 'oklch(0.095 0 0)', backgroundColor: 'oklch(0.985 0 0)', borderColor: 'transparent' },
+        },
+      };
+      const darkRender = {
+        customProperties: {},
+        stylesheetText: 'body { background: oklch(0.175 0 0); }',
+        computedElements: {
+          body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: 'oklch(0.98 0 0)', backgroundColor: 'oklch(0.175 0 0)', borderColor: 'transparent' },
+        },
+      };
+      mockPage.evaluate
+        .mockResolvedValueOnce(lightRender)
+        .mockResolvedValueOnce(darkRender);
+
+      const result = await extractCSSFromURL('https://example.com');
+
+      const darkSheets = result.themes?.dark?.stylesheets ?? [];
+      const darkCssom = darkSheets.find(s => s.source === 'puppeteer-cssom');
+      const lightCssom = result.themes?.light.stylesheets.find(s => s.source === 'puppeteer-cssom');
+      expect(darkCssom?.content).toContain('oklch(0.175 0 0)');
+      expect(darkCssom?.content).not.toContain('oklch(0.985 0 0)');
+      expect(lightCssom?.content).toContain('oklch(0.985 0 0)');
+    });
+  });
+
+  describe('dark-variant detection helpers (ENG-285)', () => {
+    const bg = (backgroundColor: string) => ({
+      body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: '#000', backgroundColor },
+    });
+
+    it('averageBackgroundLightness averages parseable opaque backgrounds and ignores transparent/null', () => {
+      const styles = {
+        body: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: '#000', backgroundColor: '#000000' },
+        nav: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: '#000', backgroundColor: '#ffffff' },
+        header: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: '#000', backgroundColor: 'transparent' },
+        main: { fontSize: '16px', lineHeight: '24px', fontWeight: '400', fontFamily: 'Inter', color: '#000', backgroundColor: 'not-a-color' },
+      };
+      // Only #000000 (0) and #ffffff (100) count → average 50.
+      expect(averageBackgroundLightness(styles)).toBe(50);
+      expect(averageBackgroundLightness(undefined)).toBeNull();
+      expect(averageBackgroundLightness({})).toBeNull();
+    });
+
+    it('averageBackgroundLightness understands oklch backgrounds', () => {
+      const near = averageBackgroundLightness(bg('oklch(0.175 0 0)'));
+      expect(near).not.toBeNull();
+      expect(near as number).toBeLessThan(15); // matte black
+    });
+
+    it('isDistinctDarkTheme is true only when backgrounds turn materially darker', () => {
+      // Near-white light → matte-black dark: a genuine dark theme.
+      expect(isDistinctDarkTheme(bg('rgb(250, 250, 250)'), bg('rgb(16, 16, 16)'))).toBe(true);
+      // Both light, only a small difference: content noise, not a dark theme.
+      expect(isDistinctDarkTheme(bg('rgb(250, 250, 250)'), bg('rgb(240, 240, 240)'))).toBe(false);
+      // Identical: never a dark variant.
+      expect(isDistinctDarkTheme(bg('#eeeeee'), bg('#eeeeee'))).toBe(false);
+      // Unparseable on either side: cannot claim a dark variant.
+      expect(isDistinctDarkTheme(undefined, bg('#000000'))).toBe(false);
+    });
+  });
+
+  describe('modernColorToHex — CSS Color 4 (ENG-285)', () => {
+    it('converts the oklch values Chrome returns for Tailwind v4 sites', () => {
+      // These are the real values from rankai.ai. Chrome renders them as
+      // rgb(250,250,250) and rgb(16,16,16) respectively — verified against a live
+      // headless render. The `color` package throws on both.
+      expect(modernColorToHex('oklch(0.985 0 0)')).toBe('#fafafa');
+      expect(modernColorToHex('oklch(0.175 0 0)')).toBe('#101010');
+    });
+
+    it('converts chromatic oklch, oklab and color(srgb ...)', () => {
+      // A saturated hue must survive as a saturated hex, not collapse to grey.
+      const purple = modernColorToHex('oklch(0.7 0.18 295)');
+      expect(purple).toMatch(/^#[0-9a-f]{6}$/);
+      const [r, g, b] = [1, 3, 5].map(i => parseInt(purple!.slice(i, i + 2), 16));
+      expect(b).toBeGreaterThan(r);
+      expect(r).toBeGreaterThan(g);
+
+      expect(modernColorToHex('color(srgb 1 0 0)')).toBe('#ff0000');
+      expect(modernColorToHex('color(srgb 0 0 0)')).toBe('#000000');
+      expect(modernColorToHex('oklab(1 0 0)')).toBe('#ffffff');
+    });
+
+    it('handles percentages and an alpha component', () => {
+      expect(modernColorToHex('oklch(100% 0 0)')).toBe('#ffffff');
+      // Alpha is stripped — we only need the opaque hex for palette extraction.
+      expect(modernColorToHex('oklch(0.985 0 0 / 0.5)')).toBe('#fafafa');
+    });
+
+    it('returns null for legacy and unparseable values so the caller can fall back', () => {
+      expect(modernColorToHex('#ff0000')).toBeNull();
+      expect(modernColorToHex('rgb(1, 2, 3)')).toBeNull();
+      expect(modernColorToHex('oklch(not-a-color)')).toBeNull();
+      expect(modernColorToHex('')).toBeNull();
     });
   });
 

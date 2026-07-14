@@ -7042,7 +7042,13 @@ emmaToolRegistry.register({
     }
     const isDelegatedAdmin = isDelegate && !!adminEmail;
 
-    const results: Array<{ title: string; success: boolean; issueId?: string; error?: string; deduped?: boolean; url?: string; trackingUrl?: string }> = [];
+    const results: Array<{ title: string; success: boolean; issueId?: string; error?: string; deduped?: boolean; url?: string; trackingUrl?: string; canonicalUrl?: string }> = [];
+    // ENG-289: the reporting admin gets the canonical Linear link back in chat — but ONLY when they are
+    // an admin or in a delegated-admin session (someone who can actually open a Linear issue). External
+    // customers and ALL external-MCP callers never receive the internal link (preserves the leak guard:
+    // the tool result is JSON.stringified to external MCP clients and preserved into Agent Mode LLM context
+    // + persisted sidebar state). The internal team notification email always gets it regardless.
+    const reporterIsInternal = context?.externalMcp !== true && (user?.isAdmin === true || isDelegatedAdmin);
     // Public, user-facing board (what the customer can actually open). Per-result `url` is the
     // internal tracker (Linear/Notion) for the team email; `trackingUrl`/`userUrl` is the user's link.
     const FEATUREBASE_BOARD_URL = 'https://agentweb.featurebase.app/';
@@ -7147,7 +7153,7 @@ emmaToolRegistry.register({
             setTimeout(() => reject(new Error('Issue filing timed out after 30s')), INTAKE_TIMEOUT_MS)
           ),
         ]);
-        const result = { pageId: filed.pageId, url: filed.trackerUrl, tracker: filed.tracker, deduped: filed.deduped, userUrl: filed.userUrl };
+        const result = { pageId: filed.pageId, url: filed.trackerUrl, tracker: filed.tracker, deduped: filed.deduped, userUrl: filed.userUrl, canonicalUrl: reporterIsInternal ? filed.canonicalUrl : undefined };
 
         // Never email the customer — internal team + admin (if known) only.
         const emailRecipients = adminEmail
@@ -7176,6 +7182,7 @@ emmaToolRegistry.register({
                 ${isDelegatedAdmin && adminEmail ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Via delegation</strong></td><td style="padding: 6px 0;">${adminEmail}</td></tr>` : ''}
                 ${result.pageId ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Issue ID</strong></td><td style="padding: 6px 0; font-family: monospace;">AGW-${result.pageId}</td></tr>` : ''}
                 ${result.url ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>${result.tracker}</strong></td><td style="padding: 6px 0;"><a href="${result.url}" style="color: #4F46E5; font-weight: 600;">→ Open in ${result.tracker}</a></td></tr>` : ''}
+                ${filed.canonicalUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Linear canonical</strong></td><td style="padding: 6px 0;"><a href="${filed.canonicalUrl}" style="color: #4F46E5; font-weight: 600;">→ Open canonical in Linear</a></td></tr>` : ''}
                 ${issue.pageUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Page URL</strong></td><td style="padding: 6px 0;"><a href="${issue.pageUrl}" style="color: #4F46E5;">${issue.pageUrl}</a></td></tr>` : ''}
               </table>
 
@@ -7192,7 +7199,7 @@ emmaToolRegistry.register({
           replyTo: user.email,
         }).catch((e: any) => console.warn('[report_product_issues] notification email failed (non-critical):', e?.message));
 
-        results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}`, deduped: result.deduped === true, url: result.url || undefined, trackingUrl: result.userUrl || undefined });
+        results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}`, deduped: result.deduped === true, url: result.url || undefined, trackingUrl: result.userUrl || undefined, canonicalUrl: result.canonicalUrl || undefined });
       } catch (err: any) {
         results.push({ title: issue.title, success: false, error: err.message });
       }
@@ -7220,6 +7227,15 @@ emmaToolRegistry.register({
     } else {
       summary = `All ${successCount} issue(s) have been reported and tracked. The engineering team has been notified.${linkLine}`;
     }
+
+    // Admins / delegated-admin sessions also get the canonical Linear link in chat (ENG-289) so they can
+    // track the eng issue directly. `canonicalUrl` is only populated on results[] for internal reporters
+    // (gated by reporterIsInternal above), so this stays empty for external customers + external-MCP callers.
+    const linearLinks = results
+      .map(r => (r.success ? r.canonicalUrl : undefined))
+      .filter((u): u is string => !!u);
+    if (linearLinks.length === 1) summary += ` Engineering is tracking this in Linear: ${linearLinks[0]}`;
+    else if (linearLinks.length > 1) summary += ` Engineering is tracking these in Linear: ${linearLinks.join(', ')}`;
 
     return {
       success: failCount === 0,
@@ -7260,11 +7276,16 @@ emmaToolRegistry.register({
     if (!user) {
       return { error: 'User profile not found.' };
     }
+    // Org members inherit the owner's tier dynamically (ENG-288) — resolve
+    // through the canonical helper instead of reading the raw field, so this
+    // self-report matches what the member actually has access to.
+    const { getUserSubscriptionType } = await import('../services/subscriptionService');
+    const subscriptionType = await getUserSubscriptionType(userId);
     return {
       email: user.email,
       displayName: user.displayName || null,
       companyName: user.companyName || null,
-      subscriptionType: user.subscriptionType || null,
+      subscriptionType: subscriptionType || null,
     };
   }
 });
@@ -8023,7 +8044,7 @@ emmaToolRegistry.register({
 
 ACTION MATRIX:
   BUDGET      → LIST, CREATE (name, amount_micros, explicitly_shared?), UPDATE (budget_resource_name, amount_micros), REMOVE (budget_resource_name; must not be attached to any campaign)
-  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy?, bidding_strategy_target?, budget_resource_name?), REMOVE (campaign_resource_name)
+  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?), REMOVE (campaign_resource_name)
               For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
   AD_GROUP    → LIST (campaign_resource_name)
                CREATE (name, campaign_resource_name, type [SEARCH_STANDARD|DISPLAY_STANDARD], cpc_bid_micros?)
@@ -8054,6 +8075,7 @@ ACTION MATRIX:
         cpc_bid_ceiling_micros: { type: 'number', description: 'Max CPC bid ceiling in micros for TARGET_IMPRESSION_SHARE campaigns. Default 100000000 (≈100 currency units). Pass a lower value to cap spend per click.' },
         location_target_ids: { type: 'array', items: { type: 'number' }, description: 'From LOCATION SEARCH.' },
         campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE and AD_GROUP LIST.' },
+        final_url_suffix: { type: 'string', description: 'Campaign-level Final URL suffix (query params appended to all final URLs, e.g. "utm_source=google&utm_medium=cpc"). For CAMPAIGN UPDATE only.' },
         ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD LIST/ADD/ADD_NEGATIVE/REMOVE, AD LIST/CREATE, AD_GROUP UPDATE.' },
         ad_resource_name: { type: 'string', description: 'AdGroupAd resource name. Required for AD UPDATE/REMOVE. Obtain from AD LIST.' },
         brand_business_name: { type: 'string', description: 'Business name for PMax brand guidelines. Required for PERFORMANCE_MAX CAMPAIGN CREATE when brand guidelines are enforced.' },
