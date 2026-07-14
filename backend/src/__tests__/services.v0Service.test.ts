@@ -153,6 +153,7 @@ import {
   V0OutputValidationError,
   BrandContext,
   remapFilesForSubPage,
+  repairSubPageImports,
   ensurePageMetadataTitle,
   buildPageSlug,
   autoFixV0Files,
@@ -2492,6 +2493,108 @@ describe("v0Service - remapFilesForSubPage — relative imports (prod: Module no
     );
     const page = out.find((f) => f.path === "app/edge/page.tsx")!.content.toString();
     expect(page).toContain('"../../outside/thing"');
+  });
+});
+
+// =============================================================================
+// repairSubPageImports — heal repos ALREADY poisoned by the pre-fix remap
+// =============================================================================
+// The remap fix stops NEW poisoning, but does nothing for pages already committed
+// to a repo. That matters more than it sounds: `next build` type-checks the whole
+// project, so ONE page with an unresolvable import fails the deployment for EVERY
+// page on the site — including new, correct ones. A site poisoned while the bug was
+// live can never deploy again, and regenerating cannot save it, because the broken
+// file is still sitting in the repo.
+//
+// The invariant that makes rewriting someone else's files safe:
+//   ONLY rewrite an import that does not currently resolve.
+// A healthy repo is untouched. A broken one can only move toward compiling. It is
+// idempotent, and it cannot break a working site.
+describe("v0Service - repairSubPageImports", () => {
+  // A repo whose sub-page was written by the OLD remap: page.tsx kept its relative
+  // import while the component it points at was moved into _components/.
+  const poisonedRepo = () =>
+    new Set([
+      "app/page.tsx",
+      "app/layout.tsx",
+      "app/eng287-race/page.tsx",
+      "app/eng287-race/_components/landing/nav.tsx",
+      "components/ui/button.tsx",
+      "lib/utils.ts",
+    ]);
+
+  it("repairs the observed prod break — '../components/landing/nav' in a moved page", () => {
+    const out = repairSubPageImports(
+      [{ path: "app/eng287-race/page.tsx", content: `import Nav from "../components/landing/nav";\n` }],
+      poisonedRepo(),
+    );
+
+    expect(out).toHaveLength(1);
+    // The component really did move to _components/ — point at where it ACTUALLY is.
+    expect(out[0].content).toContain('"@/app/eng287-race/_components/landing/nav"');
+    expect(out[0].content).not.toContain('"../components/landing/nav"');
+  });
+
+  it("LEAVES a resolving import alone — a healthy repo is never touched", () => {
+    const out = repairSubPageImports(
+      [{ path: "app/eng287-race/page.tsx", content: `import Nav from "./_components/landing/nav";\n` }],
+      poisonedRepo(),
+    );
+    // Nothing changed → nothing to commit.
+    expect(out).toEqual([]);
+  });
+
+  it("leaves a broken import alone when NOTHING in the repo could satisfy it", () => {
+    const out = repairSubPageImports(
+      [{ path: "app/eng287-race/page.tsx", content: `import x from "../components/does/not/exist";\n` }],
+      poisonedRepo(),
+    );
+    // We will not emit a confident guess at a file that isn't there.
+    expect(out).toEqual([]);
+  });
+
+  it("repairs non-moved roots (lib/, components/ui/) to the root alias", () => {
+    const out = repairSubPageImports(
+      [
+        {
+          path: "app/eng287-race/page.tsx",
+          content: `import { Button } from "../components/ui/button";\nimport { cn } from "../lib/utils";\n`,
+        },
+      ],
+      poisonedRepo(),
+    );
+
+    expect(out[0].content).toContain('"@/components/ui/button"');
+    expect(out[0].content).toContain('"@/lib/utils"');
+  });
+
+  it("repairs a broken import inside a moved _components file (resolved against components/)", () => {
+    const paths = poisonedRepo();
+    paths.add("app/eng287-race/_components/hero.tsx");
+    const out = repairSubPageImports(
+      // Originally components/hero.tsx, so `../lib/utils` meant lib/utils at the root.
+      [{ path: "app/eng287-race/_components/hero.tsx", content: `import { cn } from "../lib/utils";\n` }],
+      paths,
+    );
+    expect(out[0].content).toContain('"@/lib/utils"');
+  });
+
+  it("is idempotent — a second pass over repaired output changes nothing", () => {
+    const paths = poisonedRepo();
+    const first = repairSubPageImports(
+      [{ path: "app/eng287-race/page.tsx", content: `import Nav from "../components/landing/nav";\n` }],
+      paths,
+    );
+    const second = repairSubPageImports(first, paths);
+    expect(second).toEqual([]);
+  });
+
+  it("never touches the ROOT page — it was never moved, so its relative imports are correct", () => {
+    const out = repairSubPageImports(
+      [{ path: "app/page.tsx", content: `import Nav from "../components/landing/nav";\n` }],
+      poisonedRepo(),
+    );
+    expect(out).toEqual([]);
   });
 });
 
