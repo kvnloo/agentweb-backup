@@ -175,21 +175,28 @@ export async function bulkSendGuardMessage(
   userId: string,
   senderEmail: string,
 ): Promise<string | null> {
+  const needle = String(senderEmail || '').toLowerCase();
   const config = await loadSenderConfig(userId);
-  const match = config.senders.find(
-    (s) => s.email?.toLowerCase() === String(senderEmail || '').toLowerCase(),
-  );
-  if (!match) {
-    // Not a configured sender (e.g. an ad-hoc custom-domain address) — leave
-    // the existing behaviour untouched.
+
+  const matches = config.senders.filter((s) => s.email?.toLowerCase() === needle);
+
+  if (matches.length === 0) {
+    // Not a configured sender (e.g. an ad-hoc custom-domain address) — leave the
+    // existing behaviour untouched.
     return null;
   }
-  try {
-    assertSenderUsableForBulkSend(match);
+
+  // A single address can legitimately have BOTH a mailbox sender and a custom-domain
+  // sender configured on it (e.g. a Google Workspace address whose domain is also
+  // verified in Resend). The composer only posts the address, so we cannot tell which
+  // one the user picked — and refusing would break a configuration that works today.
+  // Give them the benefit of the doubt: only refuse when EVERY sender on this address
+  // is mailbox-backed, i.e. when there is no way this send could have gone via Resend.
+  if (matches.some((s) => !isMailboxSender(s))) {
     return null;
-  } catch (error: any) {
-    return error.message;
   }
+
+  return new MailboxSenderNotSupportedError(matches[0]).message;
 }
 
 /** The one loader. Every reader of the sender blob goes through this. */

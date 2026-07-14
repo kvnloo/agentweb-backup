@@ -5,6 +5,7 @@ import {
   validateSender,
   assertSenderUsableForBulkSend,
   loadSenderConfig,
+  bulkSendGuardMessage,
   MailboxSenderNotSupportedError,
 } from '../services/crmSenderService';
 import { isMailboxSender, MAILBOX_PROVIDERS, CrmSender } from '../services/crmSenderTypes';
@@ -237,6 +238,54 @@ describe('assertSenderUsableForBulkSend — the guard', () => {
       expect(e.provider).toBe('outlook');
       expect(e.message).toMatch(/outlook/i);
     }
+  });
+});
+
+// The bulk-send routes only receive a bare `senderEmail` — the composer discards the
+// provider — so the guard has to resolve it back by address. If a user has BOTH a mailbox
+// sender and a custom-domain sender on the same address, blocking the send would break a
+// configuration that works today. Only refuse when EVERY sender on that address is
+// mailbox-backed.
+describe('bulkSendGuardMessage — must not block a legitimate custom-domain sender', () => {
+  const senders = (list: any[]) =>
+    mockGetSetting.mockResolvedValue({ settingValue: JSON.stringify({ senders: list }) });
+
+  beforeEach(() => jest.clearAllMocks());
+
+  it('blocks when the address only resolves to a mailbox sender', async () => {
+    senders([
+      { id: '1', email: 'habeb@baldwin.com', fromName: 'Habeb', senderType: 'outlook', connectedAccountId: 'o1' },
+    ]);
+    const msg = await bulkSendGuardMessage('u1', 'habeb@baldwin.com');
+    expect(msg).toMatch(/outlook/i);
+  });
+
+  it('ALLOWS when the same address also has a custom-domain (resend) sender', async () => {
+    senders([
+      { id: '1', email: 'habeb@baldwin.com', fromName: 'Habeb', senderType: 'outlook', connectedAccountId: 'o1' },
+      { id: '2', email: 'habeb@baldwin.com', fromName: 'Habeb (domain)' }, // legacy resend sender
+    ]);
+    expect(await bulkSendGuardMessage('u1', 'habeb@baldwin.com')).toBeNull();
+  });
+
+  it('ALLOWS regardless of which order the senders are configured in', async () => {
+    senders([
+      { id: '2', email: 'habeb@baldwin.com', fromName: 'Habeb (domain)' },
+      { id: '1', email: 'habeb@baldwin.com', fromName: 'Habeb', senderType: 'gmail', gmailAccountId: 'g1' },
+    ]);
+    expect(await bulkSendGuardMessage('u1', 'habeb@baldwin.com')).toBeNull();
+  });
+
+  it('allows an address that is not a configured sender at all', async () => {
+    senders([{ id: '1', email: 'other@acme.com', fromName: 'Other' }]);
+    expect(await bulkSendGuardMessage('u1', 'adhoc@acme.com')).toBeNull();
+  });
+
+  it('matches the address case-insensitively', async () => {
+    senders([
+      { id: '1', email: 'habeb@baldwin.com', fromName: 'H', senderType: 'gmail', gmailAccountId: 'g1' },
+    ]);
+    expect(await bulkSendGuardMessage('u1', 'Habeb@Baldwin.COM')).toMatch(/gmail/i);
   });
 });
 
