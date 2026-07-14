@@ -1,4 +1,6 @@
 import { toolResultError } from '../utils/toolResultError';
+import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { isFastTripErrorClass } from './agentMode/core/errorRetryability';
 
 export type AgentToolEffect =
   | 'read'
@@ -109,11 +111,46 @@ export class AgentToolContractValidationError extends Error {
 }
 
 export class AgentToolRepeatedFailureError extends Error {
-  constructor(readonly toolName: string, readonly failureCount: number, readonly lastErrorMessage: string) {
+  constructor(
+    readonly toolName: string,
+    readonly failureCount: number,
+    readonly lastErrorMessage: string,
+    // ENG-167: 'timeout' surfaces a distinct, timeout-specific stop signal — a tool
+    // that keeps timing out has no arguments to "fix", so the generic repeated-error
+    // guidance is misleading and let the model keep retrying the slow tool.
+    readonly reason: 'repeated' | 'timeout' = 'repeated',
+    // ENG-167 follow-up: verified against the real session's turn-4 event timeline —
+    // the model DID call report_product_issues successfully, but nothing told it to
+    // stop there, so it immediately retried the same tool again, hung for 900s, and
+    // the user never learned the bug had already been filed. When a run has already
+    // filed a report, the stop message must say so and forbid filing a second one —
+    // repeating the generic "offer to file a bug report" suggestion here is exactly
+    // what let the model think it still needed to act on report_product_issues.
+    readonly alreadyReportedThisRun: boolean = false,
+    // ENG-167 follow-up (Greptile): when the SESSION-scoped breaker trips on a brand-
+    // new run, `failureCount` is the cross-run aggregate — the tool may not have been
+    // called at all yet in this run. Saying "in this run" here is factually wrong and
+    // contradicts the model's own tool-call history, undermining trust in the stop
+    // guidance. Scope the wording to where the count actually came from.
+    readonly scope: 'run' | 'session' = 'run',
+  ) {
+    const timeoutScopePhrase = scope === 'session'
+      ? `${failureCount} times across your recent turns in this chat session (not just this run)`
+      : `${failureCount} times in this run`;
     super(
-      `Tool "${toolName}" already failed ${failureCount} times in this run with the same error: "${lastErrorMessage}". ` +
-      'Do not retry it with the same approach. Fix the arguments to address that exact error, use a different tool, ' +
-      'or tell the user what is blocking you.',
+      reason === 'timeout'
+        ? (alreadyReportedThisRun
+          ? `Tool "${toolName}" has timed out ${timeoutScopePhrase} and is consistently unable to complete in time. ` +
+            'STOP retrying it — retrying will keep timing out. You already filed a bug report for this via report_product_issues ' +
+            '— do NOT file another. Deliver whatever you have already produced, tell the user this step timed out and ' +
+            'that a bug report was already filed for it, and wrap up your turn now.'
+          : `Tool "${toolName}" has timed out ${timeoutScopePhrase} and is consistently unable to complete in time. ` +
+            'STOP retrying it — retrying will keep timing out. Deliver whatever you have already produced, tell the user this step ' +
+            'timed out and could not be completed, and offer either to try a smaller/simpler version or to file a bug report on ' +
+            'their behalf with report_product_issues.')
+        : `Tool "${toolName}" already failed ${failureCount} times in this run with the same error: "${lastErrorMessage}". ` +
+          'Do not retry it with the same approach. Fix the arguments to address that exact error, use a different tool, ' +
+          'or tell the user what is blocking you.',
     );
     this.name = 'AgentToolRepeatedFailureError';
   }
@@ -138,7 +175,34 @@ export class AgentToolBudgetExceededError extends Error {
 // retrying linkedin_outreach 15 times in 16s against the same two errors — the
 // model gets no signal to stop, so the gateway provides one. Counts are keyed
 // by (runId, toolName, error head); a success for the tool clears its counts.
+//
+// ENG-124: NON-retryable error classes (auth / upstream_rejected / invalid_args /
+// tool_unavailable / invalid_output — see core/errorRetryability.ts) trip one
+// attempt earlier (threshold 2): for those classes an identical retry is
+// KNOWN-pointless, so a second identical failure is already a spiral. The class
+// is derived from the stored error head via the same classifier the telemetry
+// uses, so breaker accounting and error taxonomy stay in lockstep.
 const REPEATED_FAILURE_THRESHOLD = 3;
+const NON_RETRYABLE_FAILURE_THRESHOLD = 2;
+// ENG-167: timeouts are retryable per-error-head (a single timeout message trips at
+// REPEATED_FAILURE_THRESHOLD), but a heavy tool that keeps timing out reports a
+// slightly DIFFERENT message each attempt ("connection timed out after Nms", an
+// AbortError, a Bedrock "ModelTimeoutException"), so no single head ever reaches the
+// threshold and the model retried the same ~2-min tool until the run was exhausted —
+// never reaching any other tool (including report_product_issues). Aggregate timeout-
+// class failures for a tool across differing messages and trip at this count. Kept at
+// 3 so a tool that succeeds after one or two transient timeouts is never blocked.
+const TIMEOUT_FAILURE_THRESHOLD = 3;
+// ENG-167 follow-up: the run-scoped aggregate above only ever sees ONE run. Verified
+// against the actual production session that filed ENG-167 — create_html_file failed
+// 6 times total across 4 SEPARATE ~10-minute turns (the user re-sending "try again"
+// mints a brand-new runId with a zeroed counter each time), never once reaching 3
+// within a single run. The run-scoped breaker never tripped, so the user hit the
+// agentModeController.ts hard 10-minute wall-clock timeout on every turn instead.
+// Aggregate timeout-class failures by SESSION (budgetScopeId) as well, across runs,
+// and trip earlier (2, not 3) — each unit here already cost the user up to a full
+// 10-minute controller-bounded turn, so waiting for a 3rd is needlessly slow.
+const SESSION_TIMEOUT_FAILURE_THRESHOLD = 2;
 const EXPENSIVE_MEDIA_FAILURE_BUDGET = 2;
 const MAX_TRACKED_RUNS = 500;
 const ERROR_KEY_LENGTH = 80;
@@ -159,6 +223,58 @@ function errorHead(error: unknown): string {
   return message.slice(0, ERROR_KEY_LENGTH);
 }
 
+// ENG-182: LinkedIn per-recipient write actions carry a recipient identity in
+// their args. Keyed on (tool, error-head) alone, a terminal per-recipient refusal
+// ("Cannot resend yet" — an upstream_rejected fast-trip class, threshold 2) from
+// two DIFFERENT profiles trips the breaker for linkedin_outreach as a whole, then
+// blocks send-invite to genuinely different recipients that were never attempted.
+// Isolate the failure accounting per recipient so a "already invited" for profile
+// A does not block an invite to profile B. Every other tool (and any LinkedIn
+// action without a recipient, e.g. search-people) returns '' — a single shared
+// scope, exactly preserving the prior per-tool behavior.
+//
+// send-invite/send-message/send-inmail/get-profile/update-conversation-history
+// identify the recipient by profile_url or provider_id; accept-invitation/
+// cancel-invitation identify it by invitation_id (see agentModeService.ts). Read
+// whichever this action actually carries so every allowlisted action resolves to
+// a real per-recipient scope instead of ''.
+//
+// ENG-313: get-profile must be scoped too. When the model first calls get-profile
+// with only keywords (no profile_url/provider_id) it fails "Either profile_url or
+// provider_id is required" — an invalid_args fast-trip (threshold 2). Without a
+// recipient scope those two arg-less failures shared scope '' with a LATER,
+// corrected call that finally passed a valid profile_url, so the breaker blocked
+// the corrected call. Scoping get-profile by its target means the arg-less
+// failures (scope '') and the corrected call (scope = the profile URL) land in
+// different buckets, so a materially different, now-valid attempt is not blocked.
+const LINKEDIN_RECIPIENT_ACTIONS = new Set([
+  'send-invite',
+  'send-message',
+  'send-inmail',
+  'get-profile',
+  'update-conversation-history',
+  'cancel-invitation',
+  'accept-invitation',
+]);
+
+function failureScope(toolName: string, args: unknown): string {
+  if (toolName !== 'linkedin_outreach') return '';
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
+  const record = args as Record<string, unknown>;
+  const action = typeof record.action === 'string' ? record.action.toLowerCase() : '';
+  if (!LINKEDIN_RECIPIENT_ACTIONS.has(action)) return '';
+  const target = typeof record.profile_url === 'string' && record.profile_url.trim()
+    ? record.profile_url
+    : typeof record.provider_id === 'string' && record.provider_id.trim()
+    ? record.provider_id
+    : typeof record.invitation_id === 'string' && record.invitation_id.trim()
+    ? record.invitation_id
+    : '';
+  // Normalize so the same recipient with a trailing slash or query params
+  // (LinkedIn appends miniProfileUrn tracking) collapses to one scope.
+  return target.trim().toLowerCase().split('?')[0].replace(/\/+$/, '').slice(0, ERROR_KEY_LENGTH);
+}
+
 function getRunCounts(runId: string): Map<string, number> {
   let counts = runFailureCounts.get(runId);
   if (!counts) {
@@ -172,16 +288,100 @@ function getRunCounts(runId: string): Map<string, number> {
   return counts;
 }
 
-function findTrippedFailure(runId: string, toolName: string): { count: number; errorMessage: string } | null {
+// ENG-167 follow-up: a leading NUL byte can never prefix-match a real tool name key
+// (`${toolName}\0...`), so this marker is safe to store in the SAME per-run counts
+// map without a dedicated structure/eviction policy of its own.
+const REPORTED_ISSUE_MARKER = '\0report_product_issues_filed';
+
+/** Mark that report_product_issues succeeded in this run (ENG-167 follow-up) — so a
+ * later timeout stop-message can tell the model not to file a second report. */
+function markReportedIssue(runId: string): void {
+  getRunCounts(runId).set(REPORTED_ISSUE_MARKER, 1);
+}
+
+function hasReportedIssue(runId: string): boolean {
+  return runFailureCounts.get(runId)?.has(REPORTED_ISSUE_MARKER) ?? false;
+}
+
+/** Breaker threshold for one (tool, error-head) key: non-retryable classes trip
+ * at 2 (identical retry is known-pointless), transient/unknown classes at 3.
+ * Classified from the stored error head — same classifier as the telemetry. */
+function failureThresholdFor(errorMessageHead: string): number {
+  return isFastTripErrorClass(classifyToolErrorClass(errorMessageHead))
+    ? NON_RETRYABLE_FAILURE_THRESHOLD
+    : REPEATED_FAILURE_THRESHOLD;
+}
+
+/** Sum this tool's failures (within one recipient scope, ENG-182) whose stored
+ * error head classifies as `timeout`, regardless of the exact wording (ENG-167).
+ * Returns null when there are none. */
+function countTimeoutFailures(
+  id: string,
+  toolName: string,
+  scope: string,
+): { count: number; errorMessage: string } | null {
+  const counts = runFailureCounts.get(id);
+  if (!counts) return null;
+  const prefix = `${toolName}\0${scope}\0`;
+  let total = 0;
+  let sampleMessage = '';
+  for (const [key, count] of counts) {
+    if (!key.startsWith(prefix)) continue;
+    const errorMessage = key.slice(prefix.length);
+    if (classifyToolErrorClass(errorMessage) !== 'timeout') continue;
+    total += count;
+    if (!sampleMessage) sampleMessage = errorMessage;
+  }
+  return total > 0 ? { count: total, errorMessage: sampleMessage } : null;
+}
+
+function findTrippedFailure(
+  runId: string,
+  toolName: string,
+  scope: string,
+): { count: number; errorMessage: string; reason: 'repeated' | 'timeout' } | null {
   const counts = runFailureCounts.get(runId);
   if (!counts) return null;
-  const prefix = `${toolName}\0`;
+  const prefix = `${toolName}\0${scope}\0`;
+  // Timeout aggregate first so a spiral of same-tool timeouts (identical OR varied
+  // wording) yields the timeout-specific stop guidance instead of the generic one.
+  const timeoutAgg = countTimeoutFailures(runId, toolName, scope);
+  if (timeoutAgg && timeoutAgg.count >= TIMEOUT_FAILURE_THRESHOLD) {
+    return { ...timeoutAgg, reason: 'timeout' };
+  }
   for (const [key, count] of counts) {
-    if (count >= REPEATED_FAILURE_THRESHOLD && key.startsWith(prefix)) {
-      return { count, errorMessage: key.slice(prefix.length) };
+    if (!key.startsWith(prefix)) continue;
+    const errorMessage = key.slice(prefix.length);
+    if (count >= failureThresholdFor(errorMessage)) {
+      return { count, errorMessage, reason: 'repeated' };
     }
   }
   return null;
+}
+
+/** Cross-run session aggregate for timeout-class failures (ENG-167 follow-up).
+ * `countTimeoutFailures` is generic over the id it's keyed by, so passing the
+ * session's budgetScopeId here reuses the exact same per-tool aggregation the
+ * run-scoped check uses — just accumulated across every run in the session. */
+function findTrippedSessionTimeout(
+  budgetScopeId: string,
+  toolName: string,
+  scope: string,
+): { count: number; errorMessage: string; reason: 'timeout' } | null {
+  const timeoutAgg = countTimeoutFailures(budgetScopeId, toolName, scope);
+  if (timeoutAgg && timeoutAgg.count >= SESSION_TIMEOUT_FAILURE_THRESHOLD) {
+    return { ...timeoutAgg, reason: 'timeout' };
+  }
+  return null;
+}
+
+/** Whether a failure for this tool should also be recorded into the session-wide
+ * (budgetScopeId) bucket, not just the per-run one. True for the pre-existing
+ * expensive-media budget tools, and now also for any timeout-class failure
+ * (ENG-167 follow-up) — a tool that's timing out is a session-wide signal, not
+ * a per-run one, since the model retries it across separate user turns/runs. */
+function shouldTrackInSessionScope(toolName: string, error: unknown): boolean {
+  return mediaFailureBudget(toolName) != null || classifyToolErrorClass(error) === 'timeout';
 }
 
 function mediaFailureBudget(toolName: string): number | null {
@@ -206,16 +406,21 @@ function findTrippedBudget(runId: string, toolName: string): { count: number; bu
   return count >= budget ? { count, budget } : null;
 }
 
-function recordToolFailure(runId: string, toolName: string, error: unknown): void {
+function recordToolFailure(runId: string, toolName: string, args: unknown, error: unknown): void {
   const counts = getRunCounts(runId);
-  const key = `${toolName}\0${errorHead(error)}`;
+  const key = `${toolName}\0${failureScope(toolName, args)}\0${errorHead(error)}`;
   counts.set(key, (counts.get(key) ?? 0) + 1);
 }
 
-function clearToolFailures(runId: string, toolName: string): void {
+function clearToolFailures(runId: string, toolName: string, args: unknown): void {
   const counts = runFailureCounts.get(runId);
   if (!counts) return;
-  const prefix = `${toolName}\0`;
+  // ENG-182: scope the clear to the SAME recipient that succeeded. A tool-wide
+  // clear (prefix `${toolName}\0`) would let a success for recipient B wipe a
+  // tripped/pending breaker for an unrelated recipient A, re-enabling the wasted
+  // retries the per-recipient isolation exists to prevent. Non-recipient tools
+  // resolve to scope '' — prefix `${toolName}\0\0` — preserving prior behavior.
+  const prefix = `${toolName}\0${failureScope(toolName, args)}\0`;
   for (const key of counts.keys()) {
     if (key.startsWith(prefix)) counts.delete(key);
   }
@@ -470,6 +675,12 @@ export function validateAndRepairToolArgs(
     if (coerced.changed) {
       repairedArgs[name] = coerced.value;
       repairs.push(`${name}:scalar_coerce`);
+      continue;
+    }
+    const container = coerceJsonContainerForSchema(repairedArgs[name], propSchema);
+    if (container.changed) {
+      repairedArgs[name] = container.value;
+      repairs.push(`${name}:json_parse`);
     }
   }
 
@@ -559,11 +770,42 @@ export async function executeAgentToolThroughGateway(
       };
     }
 
-    const tripped = findTrippedFailure(input.runId, policyDecision.toolName);
+    const recipientScope = failureScope(policyDecision.toolName, input.args);
+
+    // Session-scoped timeout aggregate first (ENG-167 follow-up) — a tool that's
+    // timed out repeatedly across earlier runs in this session should fail fast
+    // here, before ever reaching the run-scoped check below (which only ever sees
+    // this one run and would let a fresh runId through with a zeroed counter).
+    if (input.budgetScopeId && input.budgetScopeId !== input.runId) {
+      const trippedSession = findTrippedSessionTimeout(input.budgetScopeId, policyDecision.toolName, recipientScope);
+      if (trippedSession) {
+        return {
+          status: 'error',
+          error: new AgentToolRepeatedFailureError(
+            policyDecision.toolName,
+            trippedSession.count,
+            trippedSession.errorMessage,
+            trippedSession.reason,
+            !!input.runId && hasReportedIssue(input.runId),
+            'session',
+          ),
+          policyDecision,
+          durationMs: Math.max(0, now() - startedAt),
+        };
+      }
+    }
+
+    const tripped = findTrippedFailure(input.runId, policyDecision.toolName, recipientScope);
     if (tripped) {
       return {
         status: 'error',
-        error: new AgentToolRepeatedFailureError(policyDecision.toolName, tripped.count, tripped.errorMessage),
+        error: new AgentToolRepeatedFailureError(
+          policyDecision.toolName,
+          tripped.count,
+          tripped.errorMessage,
+          tripped.reason,
+          !!input.runId && hasReportedIssue(input.runId),
+        ),
         policyDecision,
         durationMs: Math.max(0, now() - startedAt),
       };
@@ -581,13 +823,13 @@ export async function executeAgentToolThroughGateway(
     // failure exactly like the catch path; do NOT clear prior failure counts.
     const structuredFailure = toolResultError(result);
     if (structuredFailure) {
-      if (input.runId) recordToolFailure(input.runId, policyDecision.toolName, structuredFailure);
+      if (input.runId) recordToolFailure(input.runId, policyDecision.toolName, input.args, structuredFailure);
       if (
         input.budgetScopeId
         && input.budgetScopeId !== input.runId
-        && mediaFailureBudget(policyDecision.toolName) != null
+        && shouldTrackInSessionScope(policyDecision.toolName, structuredFailure)
       ) {
-        recordToolFailure(input.budgetScopeId, policyDecision.toolName, structuredFailure);
+        recordToolFailure(input.budgetScopeId, policyDecision.toolName, input.args, structuredFailure);
       }
       // Keep returning status:'success' with the result so the dispatcher's
       // downgrade (toolDispatch.ts) carries the structured payload to the model.
@@ -600,9 +842,15 @@ export async function executeAgentToolThroughGateway(
         durationMs: Math.max(0, now() - startedAt),
       };
     }
-    if (input.runId) clearToolFailures(input.runId, policyDecision.toolName);
+    if (input.runId) clearToolFailures(input.runId, policyDecision.toolName, input.args);
     if (input.budgetScopeId && input.budgetScopeId !== input.runId) {
-      clearToolFailures(input.budgetScopeId, policyDecision.toolName);
+      clearToolFailures(input.budgetScopeId, policyDecision.toolName, input.args);
+    }
+    // ENG-167 follow-up: remember a successful report_product_issues call for the
+    // rest of this run so a later timeout stop-message doesn't tell the model to
+    // file a second one.
+    if (input.runId && policyDecision.toolName === 'report_product_issues') {
+      markReportedIssue(input.runId);
     }
     return {
       status: 'success',
@@ -611,13 +859,13 @@ export async function executeAgentToolThroughGateway(
       durationMs: Math.max(0, now() - startedAt),
     };
   } catch (error) {
-    if (input.runId) recordToolFailure(input.runId, policyDecision.toolName, error);
+    if (input.runId) recordToolFailure(input.runId, policyDecision.toolName, input.args, error);
     if (
       input.budgetScopeId
       && input.budgetScopeId !== input.runId
-      && mediaFailureBudget(policyDecision.toolName) != null
+      && shouldTrackInSessionScope(policyDecision.toolName, error)
     ) {
-      recordToolFailure(input.budgetScopeId, policyDecision.toolName, error);
+      recordToolFailure(input.budgetScopeId, policyDecision.toolName, input.args, error);
     }
     return {
       status: 'error',
@@ -844,6 +1092,52 @@ function coerceScalarForSchema(value: unknown, schema: any): { changed: boolean;
   return { changed: false, value };
 }
 
+/**
+ * Coerce a stringified JSON array/object to its parsed value when the schema
+ * expects an `array` or `object` (and does NOT also accept `string`). LLMs
+ * frequently double-encode a nested container argument — emitting
+ * `files: "[{...}]"` instead of `files: [{...}]` — which the type validator then
+ * hard-rejected with "Expected array." (ENG-127). Parse a string that cleanly
+ * round-trips to the expected container type so the call succeeds instead of
+ * bouncing back to the model.
+ *
+ * Behavior-preserving: returns `changed: false` for non-string inputs, for
+ * schemas that also accept `string`, for strings that don't look like / parse as
+ * JSON, and for parsed values whose type doesn't match the expected container —
+ * so a genuinely wrong value still surfaces as a type_mismatch issue downstream.
+ */
+function coerceJsonContainerForSchema(value: unknown, schema: any): { changed: boolean; value: unknown } {
+  if (typeof value !== 'string') return { changed: false, value };
+  const expected = schema?.type;
+  if (!expected) return { changed: false, value };
+  const expectedTypes = Array.isArray(expected) ? expected : [expected];
+
+  // If the schema accepts a string, the string is already valid — never coerce.
+  if (expectedTypes.includes('string')) return { changed: false, value };
+
+  const wantsArray = expectedTypes.includes('array');
+  const wantsObject = expectedTypes.includes('object');
+  if (!wantsArray && !wantsObject) return { changed: false, value };
+
+  const trimmed = value.trim();
+  const firstChar = trimmed[0];
+  // Only attempt a parse for values that actually look like a JSON container.
+  if (firstChar !== '[' && firstChar !== '{') return { changed: false, value };
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return { changed: false, value };
+  }
+
+  if (wantsArray && Array.isArray(parsed)) return { changed: true, value: parsed };
+  if (wantsObject && Boolean(parsed) && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    return { changed: true, value: parsed };
+  }
+  return { changed: false, value };
+}
+
 function validateJsonSchemaConstraints(name: string, value: unknown, schema: any): AgentToolContractIssue[] {
   const issues: AgentToolContractIssue[] = [];
 
@@ -872,21 +1166,14 @@ function isNonEmptyString(value: unknown): boolean {
 }
 
 function validateSemanticToolContract(toolName: string, args: Record<string, unknown>): AgentToolContractIssue[] {
-  if (toolName === 'linkedin_outreach') {
-    if (args.action !== 'send-invite') return [];
-    if (typeof args.message !== 'string') return [];
-
-    const conservativeInviteLimit = 200;
-    if (args.message.length <= conservativeInviteLimit) return [];
-
-    return [{
-      code: 'invalid_args',
-      path: '$.message',
-      message:
-        `LinkedIn send-invite notes must be ${conservativeInviteLimit} characters or fewer for Agent Mode. ` +
-        `This note is ${args.message.length} characters. Rewrite it as a complete shorter note before retrying.`,
-    }];
-  }
+  // ENG-243: intentionally NO length gate on linkedin_outreach send-invite notes.
+  // The send path (LinkedInOutreachService.sendInvitation) resolves the account's
+  // tier limit (200 free / 300 Premium) and auto-trims the note on a word boundary,
+  // so a send never fails on length. Hard-rejecting an over-limit note here instead
+  // produced repeated invalid_args failures (a fast-trip error class) that tripped
+  // the anti-loop breaker after 2 attempts and sent 0 invites — and it contradicts
+  // the tool description, which promises the backend auto-trims. The gateway cannot
+  // know the account tier synchronously, so trimming is deferred to that send path.
 
   // ENG-106: the send_email_from_sender schema can only mark `to`/`subject`
   // required — the body is a 3-way alternative (html OR text OR body) the

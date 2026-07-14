@@ -9,6 +9,7 @@ import { contactEventsDb, normalizeContactId } from '../services/contactEventsDb
 import { chatbotDb } from '../services/chatbotService';
 import { getExecutionsWithAssets } from '../routes/tasks';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
+import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
 import { enqueueAutoHumanEval } from '../services/autoHumanEvalService';
 
@@ -342,7 +343,7 @@ Actions:
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
 - list-received-invitations: (exact action string: "list-received-invitations") List pending connection requests received from others. Returns paginated results with sender info.
-- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended. IMPORTANT: the invite note limit is 200 characters on free LinkedIn accounts and 300 on Premium. Aim for 200 characters or fewer (target ~195) so the whole message — including your call-to-action — fits and reads well. The backend auto-trims an over-limit note to the account's limit on a word boundary before sending, so a send never fails on length; but a note you keep within the limit yourself stays complete and coherent. Also: do not send-invite to someone you are already connected with (network_distance FIRST_DEGREE) — use send-message instead; check with get-profile or list-connections if unsure.
+- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended. IMPORTANT: the invite note limit is 200 characters on free LinkedIn accounts and 300 on Premium. Aim for 200 characters or fewer (target ~195) so the whole message — including your call-to-action — fits and reads well. The backend auto-trims an over-limit note to the account's limit on a word boundary before sending, so a send never fails on length; but a note you keep within the limit yourself stays complete and coherent. Also: do not send-invite to someone you are already connected with (network_distance FIRST_DEGREE) — use send-message instead; check with get-profile or list-connections if unsure. NOTE-QUOTA GATE: if send-invite returns requiresDecision/noteQuotaExceeded, the account's monthly personalized-note quota is spent and the note was NOT sent — do NOT retry automatically; ask the user whether to send WITHOUT the note or skip, and only re-call with on_note_quota="send_without_note" if they agree.
 - send-message: Send a direct message. Requires profile_url or provider_id. message required. Only works for 1st-degree connections or open profiles. When sending to a CRM lead, always provide list_id and lead_id — the system enforces that update-conversation-history was called within the last 24 hours before allowing a send.
 - send-inmail: Send a LinkedIn InMail to any profile regardless of connection degree (2nd/3rd-degree connections). Requires profile_url or provider_id, message (body), and subject. Requires a LinkedIn Premium account with available InMail credits. Use this when send-message is not possible due to connection degree restrictions. list_id and lead_id are optional but recommended for CRM persistence.
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
@@ -377,6 +378,11 @@ For target person identification (send-invite, send-message, get-profile, update
         message: {
           type: 'string',
           description: 'Message content. Required for send-message and send-inmail; recommended for send-invite. For send-invite: aim for 200 characters or fewer (300 on Premium). The backend auto-trims an over-limit note on a word boundary before sending, so the send never fails on length — but a note you keep within the limit stays complete.'
+        },
+        on_note_quota: {
+          type: 'string',
+          enum: ['send_without_note'],
+          description: 'For send-invite ONLY. Leave this UNSET on the first attempt. If a send-invite comes back with requiresDecision/noteQuotaExceeded, it means this account\'s monthly quota for personalized invitation notes is spent and the note could not be attached — do NOT decide on your own: ASK the user whether to send the connection request without the note or skip the person. Only if they choose to proceed, re-call send-invite with the SAME target and on_note_quota="send_without_note" to send it note-less. If they choose to skip, do not re-call.'
         },
         subject: {
           type: 'string',
@@ -473,6 +479,191 @@ For target person identification (send-invite, send-message, get-profile, update
       }
     }
     return await agentModeService.linkedinOutreach(context.userId, args);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'twitter_manage_post',
+  definition: {
+    name: 'twitter_manage_post',
+    description: `Manage X (Twitter) tweet interactions. ⚠️ NEVER use this tool to post a single new tweet — use post_on_connected_account for that. This tool is for: multi-tweet threads (2+ tweets), replies, quote-tweets, deletes, likes, retweets, and analytics. NOTE: X's public API does not support editing tweets — there is no edit action; to fix a mistake, delete_tweet and post a new one.
+
+To find the account_id, call list_connected_accounts(platform='twitter'). account_id is optional when the user has exactly one X account connected.
+
+Actions:
+- reply: Reply to an existing tweet. Requires text and in_reply_to_tweet_id.
+- post_thread: Post a NEW chain of 2 or more tweets in sequence. Requires tweets array with MINIMUM 2 entries — if you only have 1 tweet, use post_on_connected_account instead. Each entry auto-trimmed to 280 chars.
+- quote_tweet: Quote-tweet a tweet with added commentary. Requires text and tweet_id.
+- delete_tweet: Delete a tweet you authored. Requires tweet_id. CRITICAL: Always get explicit user approval before deleting.
+- like: Like a tweet. Requires tweet_id.
+- unlike: Remove a like from a tweet. Requires tweet_id.
+- retweet: Retweet a tweet. Requires tweet_id.
+- unretweet: Undo a retweet. Requires tweet_id.
+- get_tweet_metrics: Fetch public engagement metrics (retweets, replies, likes, quotes, impressions, bookmarks) for one or more tweets. Requires tweet_ids array.
+- list_replies: List replies to a tweet (searches last 7 days). Requires tweet_id. Optional max_results (default 10, max 100).
+- get_retweeters: List users who retweeted a tweet. Requires tweet_id.
+- get_liking_users: List users who liked a tweet. Requires tweet_id.
+- get_quote_tweets: List quote tweets of a tweet. Requires tweet_id. Optional max_results.
+
+For CRM logging of sent tweets, optionally pass list_id, lead_id and lead_email.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: [
+            'reply', 'post_thread', 'quote_tweet',
+            'delete_tweet',
+            'like', 'unlike', 'retweet', 'unretweet',
+            'get_tweet_metrics', 'list_replies',
+            'get_retweeters', 'get_liking_users', 'get_quote_tweets',
+          ],
+          description: 'The X post action to perform.'
+        },
+        account_id: {
+          type: 'string',
+          description: "The connected X account ID. Optional when the user has exactly one X account connected. Obtain via list_connected_accounts(platform='twitter')."
+        },
+        text: {
+          type: 'string',
+          description: 'Tweet text. Required for reply, quote_tweet. Auto-trimmed to 280 chars on a word boundary.'
+        },
+        tweet_id: {
+          type: 'string',
+          description: 'Tweet ID. Required for delete_tweet, like, unlike, retweet, unretweet, quote_tweet, list_replies, get_retweeters, get_liking_users, get_quote_tweets.'
+        },
+        in_reply_to_tweet_id: {
+          type: 'string',
+          description: 'ID of the tweet being replied to. Required for reply.'
+        },
+        tweets: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of tweet texts for post_thread, posted as a chained thread in order.'
+        },
+        max_results: {
+          type: 'number',
+          description: 'Maximum results to return. Optional for list_replies and get_quote_tweets (default 10, max 100).'
+        },
+        tweet_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of tweet IDs to fetch metrics for. Required for get_tweet_metrics.'
+        },
+        list_id: {
+          type: 'string',
+          description: 'CRM lead list ID. Optional — provide with lead_id and lead_email to log the sent tweet to CRM history.'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'CRM lead ID. Optional — provide with list_id and lead_email for CRM logging.'
+        },
+        lead_email: {
+          type: 'string',
+          description: 'CRM lead email. Optional — provide with list_id and lead_id for CRM logging.'
+        }
+      },
+      required: ['action']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) {
+      throw new Error("Missing user context");
+    }
+    return await agentModeService.twitterManagePost(context.userId, args);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'twitter_outreach',
+  definition: {
+    name: 'twitter_outreach',
+    description: `Manage X (Twitter) people and outreach interactions using a connected X account. Use this for profile lookup, follows, DMs, user search, bookmarks, and account management (block/mute).
+
+To find the account_id, call list_connected_accounts(platform='twitter'). account_id is optional when the user has exactly one X account connected.
+
+Actions:
+- get_profile: Get an X user's public profile by handle. Requires handle.
+- follow: Follow a user by handle. Requires handle. CRITICAL: Always get explicit user approval before following.
+- unfollow: Unfollow a user by handle. Requires handle. CRITICAL: Always get explicit user approval before unfollowing.
+- list_followers: List followers of the connected account (or another user if handle is provided).
+- list_following: List accounts the connected account follows (or another user if handle is provided).
+- search_tweets: Search recent tweets by query. Requires query. Optional max_results (default 10, max 100).
+- get_user_tweets: Get recent tweets by a user. Requires handle. Optional max_results (default 10, max 100).
+- send_dm: Send a direct message. Requires handle and text. DM text over 10000 chars is auto-trimmed. CRITICAL: Always get explicit user approval before sending.
+- list_dms: List recent DM events for the connected account.
+- get_dm_conversation: Get DM history with a specific user. Requires handle.
+- bookmark: Bookmark a tweet. Requires tweet_id.
+- get_bookmarks: Retrieve the authenticated user's bookmarked tweets.
+- block: Block a user by handle. Requires handle. CRITICAL: Always get explicit user approval before blocking.
+- unblock: Unblock a user by handle. Requires handle. CRITICAL: Always get explicit user approval before unblocking.
+- mute: Mute a user by handle. Requires handle. CRITICAL: Always get explicit user approval before muting.
+- unmute: Unmute a user by handle. Requires handle. CRITICAL: Always get explicit user approval before unmuting.
+
+For CRM logging of sent DMs, optionally pass list_id, lead_id and lead_email.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: [
+            'get_profile', 'follow', 'unfollow', 'list_followers', 'list_following',
+            'search_tweets', 'get_user_tweets',
+            'send_dm', 'list_dms', 'get_dm_conversation',
+            'bookmark', 'get_bookmarks',
+            'block', 'unblock', 'mute', 'unmute',
+          ],
+          description: 'The X outreach action to perform.'
+        },
+        account_id: {
+          type: 'string',
+          description: "The connected X account ID. Optional when the user has exactly one X account connected. Obtain via list_connected_accounts(platform='twitter')."
+        },
+        text: {
+          type: 'string',
+          description: 'DM text. Required for send_dm. Auto-trimmed to 10000 chars on a word boundary.'
+        },
+        handle: {
+          type: 'string',
+          description: 'The @handle to look up or act on. Required for get_profile, follow, unfollow, send_dm, get_dm_conversation, get_user_tweets, block, unblock, mute, unmute. Optional for list_followers and list_following (defaults to own account).'
+        },
+        recipient_handle: {
+          type: 'string',
+          description: 'Alias for handle. Use when the context makes "recipient" clearer (e.g., send_dm).'
+        },
+        query: {
+          type: 'string',
+          description: 'Search query string. Required for search_tweets.'
+        },
+        tweet_id: {
+          type: 'string',
+          description: 'Tweet ID. Required for bookmark.'
+        },
+        max_results: {
+          type: 'number',
+          description: 'Maximum results to return. Optional for search_tweets and get_user_tweets (default 10, max 100).'
+        },
+        list_id: {
+          type: 'string',
+          description: 'CRM lead list ID. Optional — provide with lead_id and lead_email to log the sent DM to CRM history.'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'CRM lead ID. Optional — provide with list_id and lead_email for CRM logging.'
+        },
+        lead_email: {
+          type: 'string',
+          description: 'CRM lead email. Optional — provide with list_id and lead_id for CRM logging.'
+        }
+      },
+      required: ['action']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) {
+      throw new Error("Missing user context");
+    }
+    return await agentModeService.twitterOutreach(context.userId, args);
   }
 });
 
@@ -993,7 +1184,7 @@ ENTITY HIERARCHY: Ad Account → Campaign Group → Campaign → Creative
     sender is auto-resolved from the connected account — do NOT ask the user for it.
 
   CONVERSATION AD (branching message, campaign type: SPONSORED_INMAILS):
-    CONVERSATION_AD/CREATE (name) → CONVERSATION_AD/CREATE_CONTENT (×N message nodes with buttons) → CONVERSATION_AD/SET_FIRST_CONTENT → CREATIVE/CREATE (inmail_content_urn=conversation_ad_urn, campaign_id)
+    CONVERSATION_AD/CREATE (name, optional — becomes the ad's headline text; omit to let LinkedIn use the first message as the headline) → CONVERSATION_AD/CREATE_CONTENT (×N message nodes with buttons) → CONVERSATION_AD/SET_FIRST_CONTENT → CREATIVE/CREATE (inmail_content_urn=conversation_ad_urn, campaign_id)
     Each button can link to another message node (SEND_MESSAGE action) or a URL (OPEN_URL action).
 
   JOBS AD (campaign type: DYNAMIC, campaign format: JOBS):
@@ -1042,7 +1233,7 @@ REQUIRED PARAMS PER ENTITY + ACTION:
   MEDIA UPLOAD_DOCUMENT: document_url (public URL to PDF/PPT/DOC). Returns document_urn.
   INMAIL CREATE_CONTENT: name, subject, htmlBody, callToActionText (max 20 chars), callToActionLandingPageUrl. Optional: salutationText, senderName, senderTitle, senderCompany. (sender auto-resolved — do NOT pass it)
   INMAIL SEND_TEST: inmail_content_urn, recipient_email
-  CONVERSATION_AD CREATE: name
+  CONVERSATION_AD CREATE: none required. Optional: name (becomes the ad's headlineText — LinkedIn has no "name" field on this resource, so it is mapped for you)
   CONVERSATION_AD CREATE_CONTENT: conversation_ad_urn, body (message text), buttons (array of { text, action: OPEN_URL|SEND_MESSAGE, url? }). Optional: subject, footer.
   CONVERSATION_AD SET_FIRST_CONTENT: conversation_ad_urn, first_content_urn
 
@@ -1072,7 +1263,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
           description: 'Action-specific parameters. See tool description for required fields per entity + action.',
           properties: {
             // Campaign Group / Campaign common
-            name: { type: 'string', description: 'Entity name.' },
+            name: { type: 'string', description: 'Entity name (internal label). Exception: for CONVERSATION_AD CREATE it becomes the member-visible headline text shown in LinkedIn inboxes — write headline copy, not an internal label.' },
             status: { type: 'string', enum: ['ACTIVE', 'PAUSED', 'ARCHIVED', 'DRAFT', 'CANCELED', 'COMPLETED'], description: 'Entity status.' },
             campaign_group_id: { type: 'string', description: 'Campaign Group numeric ID. Used for CAMPAIGN LIST.' },
             campaignGroup: { type: 'string', description: 'Campaign Group URN (urn:li:sponsoredCampaignGroup:ID). Required for CAMPAIGN CREATE.' },
@@ -1340,7 +1531,7 @@ emmaToolRegistry.register({
   name: 'update_brand_guidelines',
   definition: {
     name: 'update_brand_guidelines',
-    description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.). NOTE: SVG files are NOT allowed for logo or secondaryLogo uploads. If the user provides an SVG file, ask them to convert it to PNG or another raster format first.',
+    description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.). NOTE: SVG files are NOT allowed for logo or secondaryLogo uploads. If the user provides an SVG file, ask them to convert it to PNG or another raster format first. RE-SETUP SCOPE: when the user asks for a broad brand re-setup or refresh (NOT a single-field edit like changing just the tagline or one color), pass refreshMarketStrategy=true so the same operation also refreshes market strategy positioning by regenerating ICPs and competitors from the updated brand. This REPLACES current ICPs and competitors while preserving the business overview. For a small single-field edit, leave refreshMarketStrategy false/omitted.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1399,6 +1590,10 @@ emmaToolRegistry.register({
               filename: { type: 'string', description: 'Original filename of the brand asset' }
             }
           }
+        },
+        refreshMarketStrategy: {
+          type: 'boolean',
+          description: 'Set true for a broad brand re-setup/refresh so ICPs and competitors are regenerated from the updated brand in the same operation. Omit or false for single-field edits and brand-only updates.'
         }
       },
       required: []
@@ -1470,6 +1665,23 @@ emmaToolRegistry.register({
   },
   execute: async (args, context) => {
     return await agentModeService.updateMarketStrategy(args, context?.userId);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'regenerate_market_strategy',
+  definition: {
+    name: 'regenerate_market_strategy',
+    description: 'Regenerate the user\'s market strategy (ideal customer profiles and competitors) from their CURRENT brand guidelines, so the strategy matches the latest brand. DESTRUCTIVE: this REPLACES the existing competitors and ICPs (the business overview is preserved). Only call this AFTER the user has explicitly confirmed they want to regenerate — if they already have competitors/ICPs, first tell them how many will be replaced and get a clear yes. Takes ~30-60s. Typically used as part of a brand re-setup when the user chose to also refresh their positioning/market strategy (option 2 of the brand re-setup scope question).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+      },
+      required: []
+    }
+  },
+  execute: async (args, context) => {
+    return await agentModeService.regenerateMarketStrategy(context?.userId);
   }
 });
 
@@ -2964,7 +3176,7 @@ emmaToolRegistry.register({
   name: 'search_leads',
   definition: {
     name: 'search_leads',
-    description: 'Find leads matching structured field-level criteria within one or more lead lists. Pass list_id for a single list (legacy) or list_ids for up to 5 lists at once — each returned lead carries its listId/listName so you can attribute results. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields. For cross-CRM strategic questions ("who should I reach out to?"), prefer ask_crm. Each returned lead also carries `enrichmentMetadata`: a per-field provenance map (keyed by field name, including enriched custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) with `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile), `sourceUrl`/`sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt`. When the user asks about enriched values across leads (e.g. "what is the funding stage for each lead?"), USE THIS to report the source and confidence per value — present a table with the value alongside its provider/source and confidence rather than stating values as bare fact, and explicitly caveat medium/low-confidence or web-sourced values. A field with no entry in enrichmentMetadata was entered manually or imported, not enriched.',
+    description: 'Find leads matching structured field-level criteria within one or more lead lists. Pass list_id for a single list (legacy) or list_ids for up to 5 lists at once — each returned lead carries its listId/listName so you can attribute results. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, createdAt, updatedAt), ICP fields (icpScore, icpMatch), engagementCount, custom field names, and dot-notation paths (e.g. "customFields.createdAt"). Use greater_than/less_than with ISO date strings for date filtering. All filters use AND logic. Optionally combine with a keyword search across all fields. For cross-CRM strategic questions ("who should I reach out to?"), prefer ask_crm. Each returned lead also carries `enrichmentMetadata`: a per-field provenance map (keyed by field name, including enriched custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) with `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile), `sourceUrl`/`sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt`. When the user asks about enriched values across leads (e.g. "what is the funding stage for each lead?"), USE THIS to report the source and confidence per value — present a table with the value alongside its provider/source and confidence rather than stating values as bare fact, and explicitly caveat medium/low-confidence or web-sourced values. Each meta entry also carries `grounding`: "grounded" = the value was verified against a real fetched source (safe to state plainly); "web-unverified" = from a web source that could not be confirmed; "ai-knowledge" = the AI asserted it from its own general knowledge with no source found. NEVER state a "web-unverified" or "ai-knowledge" value as established fact — flag it as unverified and say which (e.g. "Series C (unverified — from an unconfirmed web source)" or "Series C (unverified — from AI general knowledge, no source found)"). A field with no entry in enrichmentMetadata was entered manually or imported, not enriched.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3111,7 +3323,7 @@ emmaToolRegistry.register({
   name: 'get_lead_details',
   definition: {
     name: 'get_lead_details',
-    description: 'Get full details for a single lead including all fields, ICP match info, email drafts, and recent engagement history. Also returns `lead.enrichmentMetadata`: a per-field provenance map (keyed by field name, including custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) describing where each enriched value came from — `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile), `sourceUrl` and `sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt` (ISO timestamp). USE THIS to answer "where does this data come from / how accurate is it?" — cite the provider, source URL, and confidence rather than guessing. Fields with no entry in enrichmentMetadata were entered manually or imported, not enriched. Also returns `lead.linkedInConnectionStatus`: if the lead has a LinkedIn URL, this field indicates whether they are a 1st-degree connection (`isConnected: true/false`), and if connected, when they connected (`connectedAt` ISO string, `connectedAtTimestamp` UNIX seconds). Returns `null` if the lead has no LinkedIn URL. Use this to decide whether to send a connection invite vs. a direct message.',
+    description: 'Get full details for a single lead including all fields, ICP match info, email drafts, and recent engagement history. Also returns `lead.enrichmentMetadata`: a per-field provenance map (keyed by field name, including custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) describing where each enriched value came from — `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile), `sourceUrl` and `sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt` (ISO timestamp). USE THIS to answer "where does this data come from / how accurate is it?" — cite the provider, source URL, and confidence rather than guessing. Each meta entry also carries `grounding`: "grounded" = verified against a real fetched source (safe to state plainly); "web-unverified" = from a web source that could not be confirmed; "ai-knowledge" = the AI asserted it from its own general knowledge with no source found. NEVER state a "web-unverified" or "ai-knowledge" value as established fact — flag it as unverified and name which (e.g. "unverified — from an unconfirmed web source" / "unverified — from AI general knowledge, no source found"), alongside the confidence. Fields with no entry in enrichmentMetadata were entered manually or imported, not enriched. Also returns `lead.linkedInConnectionStatus`: if the lead has a LinkedIn URL, this field indicates whether they are a 1st-degree connection (`isConnected: true/false`), and if connected, when they connected (`connectedAt` ISO string, `connectedAtTimestamp` UNIX seconds). Returns `null` if the lead has no LinkedIn URL. Use this to decide whether to send a connection invite vs. a direct message.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3752,11 +3964,12 @@ emmaToolRegistry.register({
   name: 'post_on_connected_account',
   definition: {
     name: 'post_on_connected_account',
-    description: 'Create a post on a connected social media account. Supports LinkedIn, Instagram, and YouTube. For YouTube: this UPLOADS a video — you MUST provide a video URL in media_urls. The content becomes the video title (first 100 chars) and description. CRITICAL: Always review the post content with the user and get explicit approval before publishing to social media. IMPORTANT: The content parameter must contain the COMPLETE, FULL post text exactly as approved by the user. Never truncate, abbreviate, summarize, or use placeholders like "..." in the content.',
+    description: 'Create a post on a connected social media account. Supports LinkedIn, Instagram, YouTube, and X (Twitter). This is the ONLY tool for posting a new standalone tweet on X/Twitter — do NOT use twitter_manage_post for this. For YouTube: this UPLOADS a video — you MUST provide a video URL in media_urls. The content becomes the video title (first 100 chars) and description. For X (Twitter): content is trimmed to 280 characters on a word boundary. Provide either account_id OR platform — the tool auto-resolves to the matching account. CRITICAL: Always review the post content with the user and get explicit approval before publishing to social media. IMPORTANT: The content parameter must contain the COMPLETE, FULL post text exactly as approved by the user. Never truncate, abbreviate, summarize, or use placeholders like "..." in the content.',
     inputSchema: {
       type: 'object',
       properties: {
-        account_id: { type: 'string', description: 'The connected account ID' },
+        account_id: { type: 'string', description: 'The connected account ID. Optional — provide either account_id or platform, not both. Use account_id when the user has multiple accounts on the same platform.' },
+        platform: { type: 'string', enum: ['twitter', 'linkedin', 'instagram', 'youtube'], description: 'Platform to post on. Optional — use instead of account_id when the user has one account per platform. E.g. platform="twitter" to post a tweet.' },
         content: { type: 'string', description: 'The COMPLETE post text content. MUST include the full, untruncated text exactly as approved by the user. Do NOT abbreviate, summarize, or omit any part of the content. Include all paragraphs, hashtags, emojis, and formatting. Length limits depend on the specific platform. CRITICAL FOR LINKEDIN: LinkedIn does NOT render markdown. Never use **bold**, *italic*, - bullets, [links](url), or # headings — they appear as raw text. Use LinkedIn-native plain text: line breaks, unicode bullets (•), emojis for emphasis, and full URLs (LinkedIn auto-links them).' },
         media_urls: {
           type: 'array',
@@ -3764,11 +3977,11 @@ emmaToolRegistry.register({
           description: 'Optional URLs of images/videos to attach. REQUIRED for YouTube — must be a direct video file URL (e.g. .mp4). The video will be downloaded and uploaded to YouTube.'
         }
       },
-      required: ['account_id', 'content']
+      required: ['content']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls);
+    return await agentModeService.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform);
   }
 });
 
@@ -4503,6 +4716,9 @@ emmaToolRegistry.register({
         ctaUrl: args.cta_url,
         audioUrl: args.audio_url,
         audioVolume: args.audio_volume,
+        // Runtime budget (not a model arg): the run's media-gen deadline, so a long render
+        // hands off before the run's hard wall-clock timeout instead of being killed (ENG-123).
+        renderDeadlineMs: context?.renderDeadlineMs,
       },
       args.clip_duration_seconds,
       args.target_duration_seconds,
@@ -4877,7 +5093,7 @@ emmaToolRegistry.register({
   name: "list_knowledge_base_files",
   definition: {
     name: "list_knowledge_base_files",
-    description: 'List available knowledge base files for the current user, including private/public task KBs, Google Drive shared folders, ClickUp docs, and Foreplay boards. Google Drive entries have identifiers starting with "gdrive:". ClickUp doc entries start with "clickup:" and include a docId field — use docId as parent_doc_id in write_clickup_doc to nest content inside that doc. ClickUp folder entries start with "clickup-folder:" (these are task-hierarchy folders, for reference only — not writable doc parents). Use modified_after/modified_before to filter by date (ISO format, e.g. "2026-04-15") — this is the most efficient way to find recent files. Use limit/offset to paginate through large folders (default limit is 100). Use kb_type to narrow to a specific source ("google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"). Returns file names, identifiers, sizes, types, and last modified timestamps. IMPORTANT: Use this tool (not search_knowledge_base) when you need to browse or list files by name or date.',
+    description: 'List available knowledge base files for the current user, including private/public task KBs, Google Drive shared folders, ClickUp docs, and Foreplay boards. Google Drive entries have identifiers starting with "gdrive:". ClickUp doc entries start with "clickup:" and include a docId field — use docId as parent_doc_id in write_clickup_doc to nest content inside that doc. ClickUp folder entries start with "clickup-folder:" (these are task-hierarchy folders, for reference only — not writable doc parents). Use modified_after/modified_before to filter by date (ISO format, e.g. "2026-04-15") — this is the most efficient way to find recent files. Use limit/offset to paginate through large folders (default limit is 100). Use kb_type to narrow to a specific source ("google-drive", "private", "public", "clickup", "clickup-tasks", "foreplay-swipefile", "foreplay-board"). Returns file names, identifiers, sizes, types, and last modified timestamps. IMPORTANT: Use this tool (not search_knowledge_base) when you need to browse or list files by name or date. NOTE: the Google Drive entries here are READ-ONLY shared folders — CREATING or EDITING Google Docs/Sheets is a SEPARATE capability; discover and install the skill that provides Google Docs/Sheets create/edit tools via list_available_skills.',
     inputSchema: {
       type: "object",
       properties: {
@@ -6100,7 +6316,7 @@ emmaToolRegistry.register({
 
 Returns: runId, processedCount (the 2 sampled leads), and samples — each with leadId, enrichedFields, and unverifiedFields. In enrichedFields a missing value means nothing was found; tell the user "not found" rather than showing null. Show the samples and ask the user to confirm before calling enrich_leads_execute.
 
-IMPORTANT — data accuracy / unverifiedFields: unverifiedFields lists the fields in this sample whose value is low-confidence or unverified (typically pulled from web search rather than a structured provider, and not confirmed by the fact-check critic). These values may be wrong — for example a small company's funding_stage guessed from the web. Do NOT state unverified values as established fact. When you present them, caveat them explicitly (e.g. "funding_stage: Series C (unverified — from web search, please confirm)"). Fields NOT in unverifiedFields are high-confidence and can be stated plainly. If the user questions or corrects an unverified value, accept the correction gracefully and explain it came from a low-confidence source.
+IMPORTANT — data accuracy / unverifiedFields: unverifiedFields lists the fields in this sample whose value is low-confidence or unverified (could not be confirmed against a real fetched source). These values may be wrong — for example a small company's funding_stage guessed from the web. Do NOT state unverified values as established fact. When you present them, caveat them explicitly. Use unverifiedProvenance (a per-field map) to say WHY: "ai-knowledge" means the value came from the AI's own general knowledge with no source found (e.g. "funding_stage: Series C (unverified — from AI knowledge, no source found; please confirm)"); "web-unverified" means it came from a web source the fact-check couldn't confirm (e.g. "funding_stage: Series C (unverified — from an unconfirmed web source; please confirm)"). If a field is in unverifiedFields but not in unverifiedProvenance, caveat it generically as unverified. Fields NOT in unverifiedFields are high-confidence (verified against a real source) and can be stated plainly. If the user questions or corrects an unverified value, accept the correction gracefully and explain it came from a low-confidence source.
 
 IMPORTANT — identity resolution failures: If processedCount is 0 and failureBreakdown.identityResolutionFailed > 0, the sampled leads could not be matched to a real person/company. The engine already attempts a contextual LinkedIn search for name-only leads using the lead list's name/description (e.g. a "YC Poker Night" list disambiguates common names), so a failure here means even that fell short for the sample. Before declaring the list unenrichable: (1) if the leads have at least a full name but no email/LinkedIn/company, a contextual LinkedIn search needs a connected LinkedIn account — if the user has none, tell them connecting one (or adding email/LinkedIn/company to the list) would let enrichment resolve these leads; (2) the list name/description is the disambiguation signal, so a vague list name reduces match rate. If the leads truly lack any full name (only partial data), the list is genuinely unenrichable — tell the user clearly and do NOT call enrich_leads_execute for it. Otherwise, surface the above options rather than flatly refusing. Skip it and continue with the other lists either way.
 
@@ -6242,7 +6458,7 @@ emmaToolRegistry.register({
     name: 'enrich_lead_custom',
     description: `Enrich a single CRM lead with custom fields on demand, without running a whole-list job.
 
-Use this when the user wants specific missing information filled on one lead (e.g. "find this person's LinkedIn headline and company size"). It runs the V3 enrichment engine on a batch of one. The response includes enrichedValues — a map of field name to the found value (null if nothing was found). Values are also persisted to the lead. Always show enrichedValues to the user; if a value is null, say nothing was found for that field. The response also includes enrichmentMetadata — a per-field provenance map (source, provider, sourceUrl/sourceQuote, confidence high/medium/low, enrichedAt). Cite the source and confidence for each value, and explicitly caveat web-sourced or medium/low-confidence values (e.g. a funding stage found via web search) rather than stating them as established fact.
+Use this when the user wants specific missing information filled on one lead (e.g. "find this person's LinkedIn headline and company size"). It runs the V3 enrichment engine on a batch of one. The response includes enrichedValues — a map of field name to the found value (null if nothing was found). Values are also persisted to the lead. Always show enrichedValues to the user; if a value is null, say nothing was found for that field. The response also includes enrichmentMetadata — a per-field provenance map (source, provider, sourceUrl/sourceQuote, confidence high/medium/low, enrichedAt, and a grounding field). Cite the source and confidence for each value, and explicitly caveat web-sourced or medium/low-confidence values (e.g. a funding stage found via web search) rather than stating them as established fact. Use grounding to be specific: "grounded" = verified against a real source (safe to state); "web-unverified" = from an unconfirmed web source; "ai-knowledge" = asserted from the AI's own general knowledge with no source found — flag these last two as unverified and name which.
 
 output_fields: one entry per field to populate, each with a snake_case "name", an "instruction" describing what to find, and an optional "overwrite_policy" (defaults to fill_if_empty; use always_overwrite to refresh a field that already has a value). If the result includes fieldRemaps, tell the user which requested fields were mapped onto existing CRM columns to avoid duplicates.`,
     inputSchema: {
@@ -6826,7 +7042,13 @@ emmaToolRegistry.register({
     }
     const isDelegatedAdmin = isDelegate && !!adminEmail;
 
-    const results: Array<{ title: string; success: boolean; issueId?: string; error?: string; deduped?: boolean; url?: string; trackingUrl?: string }> = [];
+    const results: Array<{ title: string; success: boolean; issueId?: string; error?: string; deduped?: boolean; url?: string; trackingUrl?: string; canonicalUrl?: string }> = [];
+    // ENG-289: the reporting admin gets the canonical Linear link back in chat — but ONLY when they are
+    // an admin or in a delegated-admin session (someone who can actually open a Linear issue). External
+    // customers and ALL external-MCP callers never receive the internal link (preserves the leak guard:
+    // the tool result is JSON.stringified to external MCP clients and preserved into Agent Mode LLM context
+    // + persisted sidebar state). The internal team notification email always gets it regardless.
+    const reporterIsInternal = context?.externalMcp !== true && (user?.isAdmin === true || isDelegatedAdmin);
     // Public, user-facing board (what the customer can actually open). Per-result `url` is the
     // internal tracker (Linear/Notion) for the team email; `trackingUrl`/`userUrl` is the user's link.
     const FEATUREBASE_BOARD_URL = 'https://agentweb.featurebase.app/';
@@ -6834,6 +7056,8 @@ emmaToolRegistry.register({
     // Fetch once before the loop to avoid N DynamoDB reads for a batch of issues
     const { settingsService } = await import('../services/settingsService');
     const productIssueEmails = await settingsService.getJsonArraySetting('product_issue_emails', ['founders@agentweb.pro']);
+    const funnelStatusLabel = getUserFunnelStatusLabel(user.funnelStatus);
+    const funnelStatusTags = getUserFunnelStatusIssueTags(user.funnelStatus);
 
     for (const rawIssue of args.issues) {
       // Gemini may serialize array items as JSON strings instead of objects — normalize
@@ -6847,6 +7071,9 @@ emmaToolRegistry.register({
           'Page URL': issue.pageUrl || 'N/A',
           'Session ID': context?.sessionId || 'N/A',
         };
+        if (funnelStatusLabel) {
+          issueContext['User Status'] = funnelStatusLabel;
+        }
 
         const attachmentUrls = Array.isArray(issue.attachment_urls)
           ? issue.attachment_urls.filter((u: unknown): u is string => typeof u === 'string' && /^https?:\/\//.test(u))
@@ -6909,16 +7136,24 @@ emmaToolRegistry.register({
             userName: user.displayName || user.email,
             reportedByAdmin: isDelegatedAdmin && adminEmail ? adminEmail : undefined,
             sessionId: context?.sessionId,
+            // Same value that lands as "Priority:" text in issueContext — the intake service
+            // maps it onto the Linear priority field so text and board agree (ENG-231).
+            priority: issue.priority,
+            // Linear-side triage enrichment (ENG-187): stage labels + priority/state/assignee defaults.
+            funnelStatus: user.funnelStatus,
             // External MCP clients (Claude Code etc.) are tagged distinctly so benchmark
             // filters on Customer Reported stay clean (used on the flag-off Notion path).
-            notionTags: [context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported'],
+            notionTags: [
+              context?.externalMcp === true ? 'MCP Reported' : 'Customer Reported',
+              ...funnelStatusTags,
+            ],
             notionContext: issueContext,
           }),
           new Promise<never>((_, reject) =>
             setTimeout(() => reject(new Error('Issue filing timed out after 30s')), INTAKE_TIMEOUT_MS)
           ),
         ]);
-        const result = { pageId: filed.pageId, url: filed.trackerUrl, tracker: filed.tracker, deduped: filed.deduped, userUrl: filed.userUrl };
+        const result = { pageId: filed.pageId, url: filed.trackerUrl, tracker: filed.tracker, deduped: filed.deduped, userUrl: filed.userUrl, canonicalUrl: reporterIsInternal ? filed.canonicalUrl : undefined };
 
         // Never email the customer — internal team + admin (if known) only.
         const emailRecipients = adminEmail
@@ -6943,9 +7178,11 @@ emmaToolRegistry.register({
                   <td style="padding: 6px 0; color: #666; width: 140px; vertical-align: top;"><strong>Reported by</strong></td>
                   <td style="padding: 6px 0;"><a href="mailto:${user.email}" style="color: #4F46E5;">${user.displayName || user.email}</a> (${user.email})</td>
                 </tr>
+                ${funnelStatusLabel ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>User status</strong></td><td style="padding: 6px 0;">${funnelStatusLabel}</td></tr>` : ''}
                 ${isDelegatedAdmin && adminEmail ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Via delegation</strong></td><td style="padding: 6px 0;">${adminEmail}</td></tr>` : ''}
                 ${result.pageId ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Issue ID</strong></td><td style="padding: 6px 0; font-family: monospace;">AGW-${result.pageId}</td></tr>` : ''}
                 ${result.url ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>${result.tracker}</strong></td><td style="padding: 6px 0;"><a href="${result.url}" style="color: #4F46E5; font-weight: 600;">→ Open in ${result.tracker}</a></td></tr>` : ''}
+                ${filed.canonicalUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Linear canonical</strong></td><td style="padding: 6px 0;"><a href="${filed.canonicalUrl}" style="color: #4F46E5; font-weight: 600;">→ Open canonical in Linear</a></td></tr>` : ''}
                 ${issue.pageUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Page URL</strong></td><td style="padding: 6px 0;"><a href="${issue.pageUrl}" style="color: #4F46E5;">${issue.pageUrl}</a></td></tr>` : ''}
               </table>
 
@@ -6962,7 +7199,7 @@ emmaToolRegistry.register({
           replyTo: user.email,
         }).catch((e: any) => console.warn('[report_product_issues] notification email failed (non-critical):', e?.message));
 
-        results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}`, deduped: result.deduped === true, url: result.url || undefined, trackingUrl: result.userUrl || undefined });
+        results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}`, deduped: result.deduped === true, url: result.url || undefined, trackingUrl: result.userUrl || undefined, canonicalUrl: result.canonicalUrl || undefined });
       } catch (err: any) {
         results.push({ title: issue.title, success: false, error: err.message });
       }
@@ -6990,6 +7227,15 @@ emmaToolRegistry.register({
     } else {
       summary = `All ${successCount} issue(s) have been reported and tracked. The engineering team has been notified.${linkLine}`;
     }
+
+    // Admins / delegated-admin sessions also get the canonical Linear link in chat (ENG-289) so they can
+    // track the eng issue directly. `canonicalUrl` is only populated on results[] for internal reporters
+    // (gated by reporterIsInternal above), so this stays empty for external customers + external-MCP callers.
+    const linearLinks = results
+      .map(r => (r.success ? r.canonicalUrl : undefined))
+      .filter((u): u is string => !!u);
+    if (linearLinks.length === 1) summary += ` Engineering is tracking this in Linear: ${linearLinks[0]}`;
+    else if (linearLinks.length > 1) summary += ` Engineering is tracking these in Linear: ${linearLinks.join(', ')}`;
 
     return {
       success: failCount === 0,
@@ -7030,11 +7276,16 @@ emmaToolRegistry.register({
     if (!user) {
       return { error: 'User profile not found.' };
     }
+    // Org members inherit the owner's tier dynamically (ENG-288) — resolve
+    // through the canonical helper instead of reading the raw field, so this
+    // self-report matches what the member actually has access to.
+    const { getUserSubscriptionType } = await import('../services/subscriptionService');
+    const subscriptionType = await getUserSubscriptionType(userId);
     return {
       email: user.email,
       displayName: user.displayName || null,
       companyName: user.companyName || null,
-      subscriptionType: user.subscriptionType || null,
+      subscriptionType: subscriptionType || null,
     };
   }
 });
@@ -7793,7 +8044,7 @@ emmaToolRegistry.register({
 
 ACTION MATRIX:
   BUDGET      → LIST, CREATE (name, amount_micros, explicitly_shared?), UPDATE (budget_resource_name, amount_micros), REMOVE (budget_resource_name; must not be attached to any campaign)
-  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy?, bidding_strategy_target?, budget_resource_name?), REMOVE (campaign_resource_name)
+  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?), REMOVE (campaign_resource_name)
               For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
   AD_GROUP    → LIST (campaign_resource_name)
                CREATE (name, campaign_resource_name, type [SEARCH_STANDARD|DISPLAY_STANDARD], cpc_bid_micros?)
@@ -7824,6 +8075,7 @@ ACTION MATRIX:
         cpc_bid_ceiling_micros: { type: 'number', description: 'Max CPC bid ceiling in micros for TARGET_IMPRESSION_SHARE campaigns. Default 100000000 (≈100 currency units). Pass a lower value to cap spend per click.' },
         location_target_ids: { type: 'array', items: { type: 'number' }, description: 'From LOCATION SEARCH.' },
         campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE and AD_GROUP LIST.' },
+        final_url_suffix: { type: 'string', description: 'Campaign-level Final URL suffix (query params appended to all final URLs, e.g. "utm_source=google&utm_medium=cpc"). For CAMPAIGN UPDATE only.' },
         ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD LIST/ADD/ADD_NEGATIVE/REMOVE, AD LIST/CREATE, AD_GROUP UPDATE.' },
         ad_resource_name: { type: 'string', description: 'AdGroupAd resource name. Required for AD UPDATE/REMOVE. Obtain from AD LIST.' },
         brand_business_name: { type: 'string', description: 'Business name for PMax brand guidelines. Required for PERFORMANCE_MAX CAMPAIGN CREATE when brand guidelines are enforced.' },
@@ -8141,7 +8393,7 @@ emmaToolRegistry.register({
         },
         content: {
           type: 'string',
-          description: 'Content in markdown format. Write full markdown (# Heading 1, ## Heading 2, **bold**, *italic*, - bullet lists, 1. numbered lists, | tables |, ```code blocks```, > blockquotes, [text](url) links). Markdown is automatically converted to rich Google Docs formatting — do NOT flatten to plain text.',
+          description: 'Content in markdown format. Write full markdown (# Heading 1, ## Heading 2, **bold**, *italic*, - bullet lists, 1. numbered lists, | tables |, ```code blocks```, > blockquotes, [text](url) links). Markdown is automatically converted to rich Google Docs formatting — do NOT flatten to plain text. To style just one word/phrase without affecting the rest of the document (not the document-wide accent/font from style_options), use an inline style span: [text]{attr=value;flag;...}. Supported: color=blue or color=#ff0000 (text color), font=Verdana (font family — letters/spaces only, e.g. "Times New Roman"), underline (flag, no value), italic (flag), bold (flag). Combine multiple in one span with semicolons, e.g. [Phase 1]{color=yellow;font=Verdana;italic;underline}. Only use this when the user explicitly asks for specific word/line formatting, not proactively. This composes with heading markdown: writing "# [test 2]{color=blue}" makes that one heading big+bold (from the # itself) AND blue, without recoloring any other heading in the document — do NOT treat "make it a heading" and "color it" as mutually exclusive options; combine them in a single line for a "big, bold, and [color]" request on one specific item.',
         },
         folder_id: {
           type: 'string',
@@ -8199,7 +8451,7 @@ emmaToolRegistry.register({
   name: 'update_google_doc',
   definition: {
     name: 'update_google_doc',
-    description: 'Replace the entire content of an existing Google Doc with rich formatting. Content is written in markdown and automatically converted to rich Google Docs formatting — write full markdown, do NOT flatten to plain text. Use this to write revised content back to a Doc after the team has left comments and the user has approved edits. Accepts a Doc URL or file ID. BEHAVIOR: Just do it when the user has clearly asked for an update. Only ask for clarification if multiple Docs are in context and it\'s genuinely ambiguous which one to update.',
+    description: 'Replace the entire content of an existing Google Doc with rich formatting. Content is written in markdown and automatically converted to rich Google Docs formatting — write full markdown, do NOT flatten to plain text. Use this to write revised content back to a Doc after the team has left comments and the user has approved edits. Accepts a Doc URL or file ID. BEHAVIOR: this REPLACES THE WHOLE DOCUMENT. On the FIRST update_google_doc call in a conversation, warn the user first (e.g. "this will replace the entire doc\'s content — the previous version stays recoverable via File → Version History if needed. Want me to go ahead?") and wait for explicit confirmation before calling this tool — do NOT call it on the first ask. For any SUBSEQUENT update_google_doc call later in the SAME conversation (i.e. you already asked and the user confirmed once before), do not ask again — just call it directly, but still briefly mention afterward that the previous version is recoverable via File → Version History, every time. STYLING: unlike create_google_doc, an update defaults to leaving the doc\'s existing visual decoration alone (headings/bullets/tables still render properly, just without imposed colors/fonts) — only pass plain=false or style_options when the user explicitly asks for the doc to be restyled/colorized.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -8209,7 +8461,7 @@ emmaToolRegistry.register({
         },
         content: {
           type: 'string',
-          description: 'New content in markdown format (replaces all existing content). Write full markdown — it is automatically converted to rich Google Docs formatting. Do NOT flatten to plain text.',
+          description: 'New content in markdown format (replaces all existing content). Write full markdown — it is automatically converted to rich Google Docs formatting. Do NOT flatten to plain text. To style just one word/phrase without affecting the rest of the document (not the document-wide accent/font from style_options), use an inline style span: [text]{attr=value;flag;...}. Supported: color=blue or color=#ff0000 (text color), font=Verdana (font family — letters/spaces only, e.g. "Times New Roman"), underline (flag, no value), italic (flag), bold (flag). Combine multiple in one span with semicolons, e.g. [Phase 1]{color=yellow;font=Verdana;italic;underline}. Only use this when the user explicitly asks for specific word/line formatting, not proactively. This composes with heading markdown: writing "# [test 2]{color=blue}" makes that one heading big+bold (from the # itself) AND blue, without recoloring any other heading in the document — do NOT treat "make it a heading" and "color it" as mutually exclusive options; combine them in a single line for a "big, bold, and [color]" request on one specific item.',
         },
         plain: {
           type: 'boolean',
@@ -8232,7 +8484,9 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
-    const style = args.plain === true ? 'plain' : 'styled';
+    // Unlike create (styled by default), an update defaults to leaving the doc's existing
+    // look alone — only restyle when the user explicitly asked (plain: false) or gave style_options.
+    const style = args.plain === true ? 'plain' : (args.plain === false || args.style_options) ? 'styled' : 'plain';
     const so = args.style_options;
     const styleOptions = so ? { primaryColor: so.primary_color, fontFamily: so.font_family, fontSize: so.font_size, lineHeight: so.line_height, compact: so.compact } : undefined;
     return agentModeService.updateGoogleDoc(args.url_or_id, args.content, context.userId, style, styleOptions);

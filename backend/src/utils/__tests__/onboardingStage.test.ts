@@ -171,6 +171,14 @@ describe("ALLOWED_ONBOARDING_EVENTS", () => {
     }
   });
 
+  it("allows the manual brand-fallback event so the recovery modal's telemetry is not dropped", () => {
+    // The graceful brand-build failure modal (ManualBrandFallback) emits
+    // this when a user supplies a manual brand description. Without it the
+    // POST /onboarding/events call 400s and we lose the signal for how often
+    // brand-build failures push users onto the manual path.
+    expect(ALLOWED_ONBOARDING_EVENTS.has("brand_fallback_manual")).toBe(true);
+  });
+
   it("rejects made-up event names — allowlist is strict", () => {
     expect(ALLOWED_ONBOARDING_EVENTS.has("totally_made_up")).toBe(false);
     expect(ALLOWED_ONBOARDING_EVENTS.has("")).toBe(false);

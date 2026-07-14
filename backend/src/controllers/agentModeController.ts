@@ -35,6 +35,18 @@ const ZERO_ASSISTANT_REQUEUE_BASE_MS = 15 * 60 * 1000;
 const ZERO_ASSISTANT_REQUEUE_MAX_MS = 2 * 60 * 60 * 1000;
 const ZERO_ASSISTANT_MAX_REQUEUES = 3;
 
+// User-facing fallback shown when a scheduled run terminates with zero assistant
+// output (crash/timeout/context-limit). A silent, empty session reads as a total
+// failure to the user (ENG-209: a 40-competitor report produced no output). This
+// guarantees the session is never left blank — the user always sees a structured
+// "job incomplete" message with a concrete next step (split into smaller batches).
+const SCHEDULED_JOB_INCOMPLETE_MESSAGE =
+  "This scheduled run stopped before it could produce a response, so no results were generated. " +
+  "Large jobs that research many items in a single run — for example, dozens of competitors in one report — " +
+  "can exceed the run's time or memory budget and end without finishing. " +
+  "The run will be retried automatically. If this keeps happening, split the request into smaller batches " +
+  "(fewer items per run) so each run can complete and report its results.";
+
 /**
  * In-memory set of session IDs that are currently generating a response.
  * Used to reject concurrent /generate requests for the same session with 409.
@@ -683,6 +695,25 @@ export function scheduledRunSignalsIncompleteWork(content: string): boolean {
   return INCOMPLETE_WORK_PATTERNS.some((re) => re.test(content));
 }
 
+// Whole-response completion-gate check for scheduled runs. A turn signals
+// unfinished work if EITHER:
+//   (a) the run was truncated because it exhausted its step budget
+//       (truncatedByStepBudget) — the ENG-244 root cause. This is a
+//       deterministic STATE flag set by generateSessionResponse whenever the
+//       tool loop hits maxIterations, so it fires whether the final content is
+//       the canned "reached the maximum steps" apology OR the model's own
+//       partial text (the model usually complies with the "wrap up" nudge and
+//       writes non-report text, so text-pattern matching alone misses it); or
+//   (b) the final text explicitly admits it left work unfinished
+//       (scheduledRunSignalsIncompleteWork).
+export function scheduledRunSignalsIncompleteResponse(response: {
+  content?: string;
+  truncatedByStepBudget?: boolean;
+}): boolean {
+  if (response?.truncatedByStepBudget === true) return true;
+  return scheduledRunSignalsIncompleteWork(response?.content || '');
+}
+
 // Common function to run verified chat with work plan, keywords, and function call verification
 // Used by both scheduled chat and verified-generate
 export async function runVerifiedChat(
@@ -842,6 +873,11 @@ export async function runVerifiedChat(
   // Set when the completion gate asks for one more continuation turn; the next
   // iteration uses a "finish the unfinished entities" continuation message.
   let completionGateContinue = false;
+  // True when that continuation was triggered because the prior turn was cut off at
+  // its step budget (truncatedByStepBudget) rather than admitting unfinished work.
+  // Lets the continuation message be tailored so a merely-truncated turn is not
+  // wrongly told it "indicated" unfinished work (ENG-244).
+  let completionGateBudgetTruncated = false;
 
   while (attempt < maxAttempts) {
     attempt++;
@@ -851,14 +887,22 @@ export async function runVerifiedChat(
       let userMessage = startingMessage;
 
       if (completionGateContinue) {
-        // Completion-gate continuation: the prior turn admitted unfinished work.
+        // Completion-gate continuation. The prior turn either admitted unfinished
+        // work OR was cut off at its step budget; tailor the message to which, so a
+        // merely-truncated turn is not falsely told it "indicated" unfinished work
+        // (which could prompt it to argue instead of synthesizing) — ENG-244.
         completionGateContinue = false;
-        userMessage =
-          'Your previous response indicated some entities/steps were not finished. ' +
-          'Complete ALL remaining per-entity work now (research, filtering, approval ' +
-          'checks, drafts) for every entity that is not finished and not genuinely ' +
-          'blocked. Do not stop early. Then produce the final consolidated report, ' +
-          'surfacing any genuinely blocked items as actionable next steps.';
+        userMessage = completionGateBudgetTruncated
+          ? 'The previous run was cut short because it exhausted its processing-step ' +
+            'budget before it could produce the final deliverable. Using the data ' +
+            'already gathered, produce the final consolidated report now. Surface any ' +
+            'entities you could not fully research as actionable next steps.'
+          : 'Your previous response indicated some entities/steps were not finished. ' +
+            'Complete ALL remaining per-entity work now (research, filtering, approval ' +
+            'checks, drafts) for every entity that is not finished and not genuinely ' +
+            'blocked. Do not stop early. Then produce the final consolidated report, ' +
+            'surfacing any genuinely blocked items as actionable next steps.';
+        completionGateBudgetTruncated = false;
         const continuationResponse = await generateSessionResponse(
           sessionId,
           userMessage,
@@ -878,10 +922,11 @@ export async function runVerifiedChat(
         if (
           completionGateContinuationsUsed < completionGateMaxContinuations &&
           attempt < maxAttempts &&
-          scheduledRunSignalsIncompleteWork(continuationResponse.content || '')
+          scheduledRunSignalsIncompleteResponse(continuationResponse)
         ) {
           completionGateContinuationsUsed++;
           completionGateContinue = true;
+          completionGateBudgetTruncated = continuationResponse.truncatedByStepBudget === true;
           await waitForVerifiedChatRetry(attempt);
           continue;
         }
@@ -1026,13 +1071,14 @@ export async function runVerifiedChat(
         completionGate &&
         completionGateContinuationsUsed < completionGateMaxContinuations &&
         attempt < maxAttempts &&
-        scheduledRunSignalsIncompleteWork(response.content || '')
+        scheduledRunSignalsIncompleteResponse(response)
       ) {
         completionGateContinuationsUsed++;
         console.log(
           `AgentMode runVerifiedChat: completion gate triggered (continuation ${completionGateContinuationsUsed}/${completionGateMaxContinuations}) — latest turn admitted unfinished work for session ${sessionId}`
         );
         completionGateContinue = true;
+        completionGateBudgetTruncated = response.truncatedByStepBudget === true;
         await waitForVerifiedChatRetry(attempt);
         continue;
       }
@@ -1534,25 +1580,13 @@ export async function runScheduledChat(
       }
     }
 
-    // Send oncall alert and Notion ticket if scheduled chat failed validation (not for test runs)
+    // Send oncall alert and Notion ticket if scheduled chat failed validation (not for test runs).
+    // Single-writer (ENG-240): file the tracked issue FIRST, THEN alert. The oncall path also files an
+    // issue, but by then it dedups onto this one via the shared Schedule/Session idempotency key — so
+    // the event yields exactly ONE issue, with the oncall alert landing as an occurrence comment
+    // instead of a second, near-identical twin.
     if (!finalResult.passed && !isTest) {
-      sendAgentModeOncallAlert({
-        subject: `Scheduled Chat Failed: ${schedule.scheduleName}`,
-        message: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
-        sessionId,
-        context: {
-          'Schedule ID': schedule.scheduleId,
-          'Schedule Name': schedule.scheduleName,
-          'User ID': userId,
-          'Attempts': finalResult.attempt,
-          'Execution Time (ms)': finalResult.executionTime,
-          'Function Call Misses': finalResult.functionCallMisses.join(', ') || 'none',
-          'Function Call Matches': finalResult.functionCallMatches.join(', ') || 'none',
-          'Keyword Misses': finalResult.keywordMisses.join(', ') || 'none',
-          'Timestamp': finalResult.createdAt
-        }
-      }).catch(err => console.error('Failed to send oncall alert for scheduled chat failure:', err));
-      fileAutoIssue({
+      void fileAutoIssue({
         title: `Scheduled Chat Failed: ${schedule.scheduleName}`,
         description: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
         source: 'Scheduled chat (validation)',
@@ -1564,7 +1598,25 @@ export async function runScheduledChat(
           'Session ID': sessionId,
           'Attempts': finalResult.attempt,
         }
-      }).catch(err => console.error('Failed to file scheduled-chat-failure issue:', err));
+      })
+        .catch(err => console.error('Failed to file scheduled-chat-failure issue:', err))
+        .then(() => sendAgentModeOncallAlert({
+          subject: `Scheduled Chat Failed: ${schedule.scheduleName}`,
+          message: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
+          sessionId,
+          context: {
+            'Schedule ID': schedule.scheduleId,
+            'Schedule Name': schedule.scheduleName,
+            'User ID': userId,
+            'Attempts': finalResult.attempt,
+            'Execution Time (ms)': finalResult.executionTime,
+            'Function Call Misses': finalResult.functionCallMisses.join(', ') || 'none',
+            'Function Call Matches': finalResult.functionCallMatches.join(', ') || 'none',
+            'Keyword Misses': finalResult.keywordMisses.join(', ') || 'none',
+            'Timestamp': finalResult.createdAt
+          }
+        }))
+        .catch(err => console.error('Failed to send oncall alert for scheduled chat failure:', err));
     }
 
     // Also sync Research Reports execution for email campaigns
@@ -1631,6 +1683,27 @@ export async function runScheduledChat(
 
     let zeroAssistantRequeuedAt: string | undefined;
     if (zeroAssistantOutput) {
+      // Never leave the session silent (ENG-209). Persist a structured
+      // "job incomplete" assistant message so the user sees graceful feedback
+      // instead of an empty session. Done BEFORE requeue so the failed session
+      // is self-explanatory; the requeue (below) runs in a fresh session.
+      if (sessionId) {
+        try {
+          await chatbotDb.addMessageToSession(sessionId, {
+            role: 'assistant',
+            content: SCHEDULED_JOB_INCOMPLETE_MESSAGE,
+            timestamp: new Date().toISOString(),
+            metadata: {
+              timestamp: new Date().toISOString(),
+              isErrorMessage: true,
+              jobIncomplete: true,
+            },
+          });
+        } catch (persistError) {
+          console.error('Failed to persist job-incomplete message to session:', persistError);
+        }
+      }
+
       console.error('Scheduled chat zero-assistant-output dead-man triggered:', {
         scheduleId: schedule.scheduleId,
         scheduleName: schedule.scheduleName,
@@ -1702,31 +1775,13 @@ export async function runScheduledChat(
       // Continue even if saving fails - we still want to return the result
     }
 
-    // Send oncall alert and Notion ticket for scheduled chat exception (always, including test runs)
+    // Send oncall alert and Notion ticket for scheduled chat exception (always, including test runs).
+    // Single-writer (ENG-240): file the tracked issue FIRST, THEN alert, so the oncall path's own
+    // filing dedups onto this issue via the shared Schedule/Session idempotency key. A zero-output run
+    // used to trip BOTH filers and land two identical Linear issues <1s apart; now it lands one issue
+    // plus an occurrence comment.
     const originalMessage = (error as any)?.originalMessage;
-    sendAgentModeOncallAlert({
-      subject: zeroAssistantOutput
-        ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
-        : `Scheduled Chat Error: ${schedule.scheduleName}`,
-      message: zeroAssistantOutput
-        ? `Scheduled chat "${schedule.scheduleName}" terminated with zero assistant messages.${zeroAssistantRequeuedAt ? ` It was requeued for ${zeroAssistantRequeuedAt}.` : ''}\n\nError: ${errorMessage}`
-        : `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
-      sessionId: sessionId || undefined,
-      context: {
-        'Schedule ID': schedule.scheduleId,
-        'Schedule Name': schedule.scheduleName,
-        'User ID': userId,
-        'Is Test Run': isTest ? 'Yes' : 'No',
-        'Zero Assistant Output': zeroAssistantOutput ? 'Yes' : 'No',
-        ...(zeroAssistantRequeuedAt ? { 'Requeued At': zeroAssistantRequeuedAt } : {}),
-        'Error Message': errorMessage,
-        ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
-        'Error Stack': error instanceof Error ? (error.stack || 'No stack trace') : 'N/A',
-        'Execution Time (ms)': errorResult.executionTime,
-        'Timestamp': errorResult.createdAt
-      }
-    }).catch(err => console.error('Failed to send oncall alert for scheduled chat error:', err));
-    fileAutoIssue({
+    void fileAutoIssue({
       title: zeroAssistantOutput
         ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
         : `Scheduled Chat Error: ${schedule.scheduleName}`,
@@ -1746,7 +1801,31 @@ export async function runScheduledChat(
         'Error Message': errorMessage,
         ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
       }
-    }).catch(err => console.error('Failed to file scheduled-chat-error issue:', err));
+    })
+      .catch(err => console.error('Failed to file scheduled-chat-error issue:', err))
+      .then(() => sendAgentModeOncallAlert({
+        subject: zeroAssistantOutput
+          ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
+          : `Scheduled Chat Error: ${schedule.scheduleName}`,
+        message: zeroAssistantOutput
+          ? `Scheduled chat "${schedule.scheduleName}" terminated with zero assistant messages.${zeroAssistantRequeuedAt ? ` It was requeued for ${zeroAssistantRequeuedAt}.` : ''}\n\nError: ${errorMessage}`
+          : `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
+        sessionId: sessionId || undefined,
+        context: {
+          'Schedule ID': schedule.scheduleId,
+          'Schedule Name': schedule.scheduleName,
+          'User ID': userId,
+          'Is Test Run': isTest ? 'Yes' : 'No',
+          'Zero Assistant Output': zeroAssistantOutput ? 'Yes' : 'No',
+          ...(zeroAssistantRequeuedAt ? { 'Requeued At': zeroAssistantRequeuedAt } : {}),
+          'Error Message': errorMessage,
+          ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
+          'Error Stack': error instanceof Error ? (error.stack || 'No stack trace') : 'N/A',
+          'Execution Time (ms)': errorResult.executionTime,
+          'Timestamp': errorResult.createdAt
+        }
+      }))
+      .catch(err => console.error('Failed to send oncall alert for scheduled chat error:', err));
 
     // Return error result for error reporting
     return errorResult;
@@ -1921,6 +2000,10 @@ export async function generateSessionResponse(
   backupModelUsed?: boolean;
   originalModel?: string;
   backupModel?: string;
+  // ENG-244: true when the underlying run exhausted its step budget (maxIterations)
+  // and was truncated before emitting the final deliverable. The scheduled-run
+  // completion gate uses this flag (not response text) to force a synthesis turn.
+  truncatedByStepBudget?: boolean;
 }> {
   // Clear any stale cancel from a previous request on this session
   clearCancel(sessionId);
@@ -2584,12 +2667,25 @@ export const agentModeController = {
         // Don't report a false failure — tell the user it's still building and post
         // the result back to this session when it finishes. Scoped to landing builds
         // in flight; everything else re-throws to the existing error handling.
-        if (durableLanding && genErr?.isGenerationTimeout) {
+        // NOT gated on DURABLE_LANDING_GENERATION: a real v0 build routinely exceeds the
+        // run's wall-clock budget, and hard-failing it (ENG-189) is wrong regardless of
+        // the multi-site rollout flag. findInFlightJobForSession returns null when no
+        // build is in flight, so non-landing timeouts fall through to the cancel path.
+        if (genErr?.isGenerationTimeout) {
           try {
             const inFlight = await findInFlightJobForSession(session.userId, sessionId);
             if (inFlight) {
-              await markAwaitingReconnect(inFlight.id);
-              attachInProcessCompletion(genPromise, inFlight.id, session.userId, sessionId);
+              // Only bind a completion hook the first time this build's run times out.
+              // markAwaitingReconnect already ran for it, so a prior timeout attached a
+              // hook to THIS build's own genPromise. A second, unrelated generation in the
+              // same session that also times out must NOT re-attach: its genPromise resolves
+              // with different content and would win the exactly-once claimCompletion race,
+              // delivering wrong content and permanently dropping this build's real link
+              // (there is no backstop poller when DURABLE_LANDING_GENERATION is off).
+              if (!inFlight.awaitingReconnect) {
+                await markAwaitingReconnect(inFlight.id);
+                attachInProcessCompletion(genPromise, inFlight.id, session.userId, sessionId);
+              }
               markProgressComplete(sessionId);
               await chatbotDb.addMessageToSession(sessionId, {
                 role: 'assistant',
@@ -2628,6 +2724,7 @@ export const agentModeController = {
         const PAGE_INVALIDATION_MAP: Record<string, string[]> = {
           'update_brand_guidelines': ['brand-guidelines'],
           'update_market_strategy': ['market-strategy'],
+          'regenerate_market_strategy': ['market-strategy', 'brand-guidelines'],
           'update_gtm_plan': ['gtm-plan'],
           'add_gtm_phase': ['gtm-plan'],
           'add_gtm_work_items': ['gtm-plan'],

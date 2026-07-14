@@ -116,7 +116,7 @@ describe('GenerateMarketingResponseWorkerService', () => {
     messageContent: 'Test message',
     sessionHistory: [],
     userId: 'test-user-id',
-    llmModel: 'gpt-5.1',
+    llmModel: 'gpt-5.5',
     sessionId: 'test-session-id',
     mockMode: false
   };
@@ -627,8 +627,11 @@ describe('GenerateMarketingResponseWorkerService', () => {
       // Shutdown should wait for the in-flight request and then kill the worker
       await workerService.shutdown();
 
-      // Worker is killed after drain completes
-      expect(mockWorker.kill).toHaveBeenCalledWith('SIGTERM');
+      // Worker is force-killed (SIGKILL) after drain completes. SIGTERM is
+      // intentionally ignored by the worker so the OS process-group/cgroup SIGTERM
+      // that fires on deploy cannot abort an in-flight run before the drain (ENG-201),
+      // so the parent must use SIGKILL to actually terminate it.
+      expect(mockWorker.kill).toHaveBeenCalledWith('SIGKILL');
 
       // The in-flight request resolved naturally (not rejected)
       await expect(promise).resolves.toMatchObject({ content: 'done' });

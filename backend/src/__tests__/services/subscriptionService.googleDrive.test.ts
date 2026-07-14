@@ -77,6 +77,7 @@ describe('getAllAvailableConnectedAccounts', () => {
       'youtube',
       'fathom',
       'instagram',
+      'twitter',
       'hubspot',
       'attio',
       'google_ads',
@@ -86,9 +87,9 @@ describe('getAllAvailableConnectedAccounts', () => {
     }
   });
 
-  it('returns exactly 11 items', () => {
+  it('returns exactly 12 items', () => {
     const result = getAllAvailableConnectedAccounts();
-    expect(result).toHaveLength(11);
+    expect(result).toHaveLength(12);
   });
 
   it('does not include unexpected platforms', () => {
@@ -101,6 +102,7 @@ describe('getAllAvailableConnectedAccounts', () => {
       'youtube',
       'fathom',
       'instagram',
+      'twitter',
       'hubspot',
       'attio',
       'google_ads',

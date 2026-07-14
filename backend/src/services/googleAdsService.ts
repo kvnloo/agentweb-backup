@@ -456,13 +456,15 @@ export class GoogleAdsService {
     biddingStrategyTarget?: number;
     cpcBidCeilingMicros?: number;
     budgetResourceName?: string;
-  }): Promise<void> {
+    finalUrlSuffix?: string;
+  }): Promise<boolean> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const updateMask: string[] = [];
     const update: any = { resourceName: campaignResourceName };
     if (params.name) { update.name = params.name; updateMask.push('name'); }
     if (params.status) { update.status = params.status; updateMask.push('status'); }
     if (params.budgetResourceName) { update.campaignBudget = params.budgetResourceName; updateMask.push('campaign_budget'); }
+    if (params.finalUrlSuffix !== undefined) { update.finalUrlSuffix = params.finalUrlSuffix; updateMask.push('final_url_suffix'); }
     if (params.biddingStrategy) {
       if (params.biddingStrategy === 'MAXIMIZE_CONVERSIONS') {
         update.maximizeConversions = { targetCpaMicros: '0' };
@@ -488,16 +490,17 @@ export class GoogleAdsService {
         updateMask.push('manual_cpc.enhanced_cpc_enabled');
       }
     }
-    if (updateMask.length === 0) return;
+    if (updateMask.length === 0) return false;
     await this.mutate(customerId, accessToken, 'campaigns', [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
+    return true;
   }
 
   async pauseCampaign(userId: string, customerId: string, campaignResourceName: string): Promise<void> {
-    return this.updateCampaign(userId, customerId, campaignResourceName, { status: 'PAUSED' });
+    await this.updateCampaign(userId, customerId, campaignResourceName, { status: 'PAUSED' });
   }
 
   async resumeCampaign(userId: string, customerId: string, campaignResourceName: string): Promise<void> {
-    return this.updateCampaign(userId, customerId, campaignResourceName, { status: 'ENABLED' });
+    await this.updateCampaign(userId, customerId, campaignResourceName, { status: 'ENABLED' });
   }
 
   async removeCampaign(userId: string, customerId: string, campaignResourceName: string): Promise<void> {
@@ -575,7 +578,7 @@ export class GoogleAdsService {
     adRotationMode?: 'OPTIMIZE' | 'ROTATE_FOREVER';
     targetCpaMicros?: number;
     targetRoas?: number;
-  }): Promise<void> {
+  }): Promise<boolean> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const updateMask: string[] = [];
     const update: any = { resourceName: adGroupResourceName };
@@ -585,8 +588,9 @@ export class GoogleAdsService {
     if (params.adRotationMode) { update.adRotationMode = params.adRotationMode; updateMask.push('ad_rotation_mode'); }
     if (params.targetCpaMicros !== undefined) { update.targetCpaMicros = String(params.targetCpaMicros); updateMask.push('target_cpa_micros'); }
     if (params.targetRoas !== undefined) { update.targetRoas = params.targetRoas; updateMask.push('target_roas'); }
-    if (updateMask.length === 0) return;
+    if (updateMask.length === 0) return false;
     await this.mutate(customerId, accessToken, 'adGroups', [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
+    return true;
   }
 
   async removeAdGroup(userId: string, customerId: string, adGroupResourceName: string): Promise<void> {
@@ -653,14 +657,15 @@ export class GoogleAdsService {
   async updateKeyword(userId: string, customerId: string, criterionResourceName: string, params: {
     status?: 'ENABLED' | 'PAUSED';
     cpcBidMicros?: number;
-  }): Promise<void> {
+  }): Promise<boolean> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const updateMask: string[] = [];
     const update: any = { resourceName: criterionResourceName };
     if (params.status) { update.status = params.status; updateMask.push('status'); }
     if (params.cpcBidMicros !== undefined) { update.cpcBidMicros = String(params.cpcBidMicros); updateMask.push('cpc_bid_micros'); }
-    if (updateMask.length === 0) return;
+    if (updateMask.length === 0) return false;
     await this.mutate(customerId, accessToken, 'adGroupCriteria', [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
+    return true;
   }
 
   async removeKeyword(userId: string, customerId: string, criterionResourceName: string): Promise<void> {
@@ -733,13 +738,14 @@ export class GoogleAdsService {
 
   async updateAd(userId: string, customerId: string, adGroupAdResourceName: string, params: {
     status?: 'ENABLED' | 'PAUSED';
-  }): Promise<void> {
+  }): Promise<boolean> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const updateMask: string[] = [];
     const update: any = { resourceName: adGroupAdResourceName };
     if (params.status) { update.status = params.status; updateMask.push('status'); }
-    if (updateMask.length === 0) return;
+    if (updateMask.length === 0) return false;
     await this.mutate(customerId, accessToken, 'adGroupAds', [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
+    return true;
   }
 
   async removeAd(userId: string, customerId: string, adGroupAdResourceName: string): Promise<void> {

@@ -37,6 +37,19 @@ jest.mock('uuid', () => ({
   v4: jest.fn().mockReturnValue('test-instance-id'),
 }));
 
+// isCronEnabled defaults to true so every existing timer test below (which
+// exercises setInterval/setTimeout ticks without caring about drain state)
+// keeps behaving exactly as before. Only the new "drain gap" tests toggle it.
+const mockIsCronEnabled = jest.fn().mockReturnValue(true);
+jest.mock('../utils/instanceState', () => ({
+  isCronEnabled: () => mockIsCronEnabled(),
+}));
+
+const mockCronJobRegistryTrack = jest.fn((_name: string, promise: Promise<any>) => promise);
+jest.mock('../utils/cronJobRegistry', () => ({
+  cronJobRegistry: { track: (name: string, promise: Promise<any>) => mockCronJobRegistryTrack(name, promise) },
+}));
+
 import { scheduleDb, userDb, socialEngagementTrackingDb } from '../services/db';
 import { LinkedInAdapter } from '../services/adapters/linkedInAdapter';
 import { agentModeService } from '../services/agentModeService';
@@ -1045,6 +1058,8 @@ describe('SocialEngagementTimerScheduler', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     jest.useFakeTimers();
+    mockIsCronEnabled.mockReturnValue(true);
+    mockCronJobRegistryTrack.mockClear();
     executor = new SocialEngagementExecutor();
     jest.spyOn(executor, 'processQueue').mockResolvedValue(true);
     scheduler = new SocialEngagementTimerScheduler(executor);
@@ -1113,6 +1128,56 @@ describe('SocialEngagementTimerScheduler', () => {
     await jest.advanceTimersByTimeAsync(100);
 
     expect(executor.processQueue).toHaveBeenCalled();
+  });
+
+  it('skips the interval-triggered scheduleUpcoming check when isCronEnabled() is false (drain in progress)', async () => {
+    mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([]);
+
+    scheduler.start();
+    await jest.advanceTimersByTimeAsync(1000); // startup pass still fires (not gated)
+    mockScheduleDb.getSocialEngagementActionsUpTo.mockClear();
+
+    mockIsCronEnabled.mockReturnValue(false);
+    await jest.advanceTimersByTimeAsync(30 * 60 * 1000); // interval tick
+
+    expect(mockScheduleDb.getSocialEngagementActionsUpTo).not.toHaveBeenCalled();
+  });
+
+  it('tracks scheduleUpcoming and processQueue via cronJobRegistry', async () => {
+    const dueAction = {
+      scheduleId: 'tracked-sched',
+      nextRunTime: new Date(Date.now() - 1000).toISOString(), // overdue -> fires immediately
+    };
+    mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([dueAction as any]);
+
+    scheduler.start();
+    await jest.advanceTimersByTimeAsync(1000);
+    await jest.advanceTimersByTimeAsync(100);
+
+    expect(mockCronJobRegistryTrack).toHaveBeenCalledWith(
+      'SocialEngagementTimerScheduler.scheduleUpcoming',
+      expect.any(Promise)
+    );
+    expect(mockCronJobRegistryTrack).toHaveBeenCalledWith(
+      'SocialEngagementExecutor.processQueue',
+      expect.any(Promise)
+    );
+  });
+
+  it('skips a fired per-action timer when isCronEnabled() flips false before it fires', async () => {
+    const futureAction = {
+      scheduleId: 'gated-sched',
+      nextRunTime: new Date(Date.now() + 5000).toISOString(),
+    };
+    mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValueOnce([futureAction as any]).mockResolvedValueOnce([]);
+
+    scheduler.start();
+    await jest.advanceTimersByTimeAsync(1000); // registers the 5s per-action timer
+
+    mockIsCronEnabled.mockReturnValue(false);
+    await jest.advanceTimersByTimeAsync(5000); // per-action timer fires, but cron is disabled
+
+    expect(executor.processQueue).not.toHaveBeenCalled();
   });
 });
 

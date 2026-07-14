@@ -1,6 +1,7 @@
 import express from "express";
 import { disconnectStaleUserSockets } from "../services/sessionSockets";
 import jwt from "jsonwebtoken";
+import { getJwtSecret } from "../config/jwt";
 import bcrypt from "bcryptjs";
 import axios from "axios";
 import { authenticateToken } from "../middleware/auth";
@@ -75,6 +76,33 @@ const parseCrmSyncSetting = (rawValue?: string | null): CrmSyncSetting | null =>
 };
 
 const getCrmSyncSettingName = (source: string) => `${CRM_SYNC_SETTING_PREFIX}${source}`;
+
+const CUSTOMER_PORTAL_ROLES = new Set(["partner", "customer", "free"] as const);
+type CustomerPortalRole = "partner" | "customer" | "free";
+
+const normalizeCustomerPortalCreateRoles = (input: unknown): CustomerPortalRole[] => {
+  const requested = Array.isArray(input) ? input : ["customer"];
+  const uniqueValidRoles = Array.from(
+    new Set(
+      requested.filter((role): role is CustomerPortalRole =>
+        typeof role === "string" && CUSTOMER_PORTAL_ROLES.has(role as CustomerPortalRole)
+      )
+    )
+  );
+
+  const roles: CustomerPortalRole[] = uniqueValidRoles.length > 0 ? uniqueValidRoles : ["customer"];
+  return roles.includes("customer") ? roles : [...roles, "customer"];
+};
+
+const mergeExistingRolesForCustomerAccess = (
+  existingRoles: unknown,
+  requestedRoles: CustomerPortalRole[]
+): string[] => {
+  const existing = Array.isArray(existingRoles)
+    ? existingRoles.filter((role): role is string => typeof role === "string")
+    : [];
+  return Array.from(new Set([...existing, ...requestedRoles, "customer"]));
+};
 
 const splitName = (fullName?: string | null): { firstName?: string; lastName?: string } => {
   if (!fullName || typeof fullName !== "string") {
@@ -646,16 +674,33 @@ router.get("/users", async (req, res) => {
     const users = await userDb.getAllUsers(hideBotLike);
     const sanitized = users.map(compactAdminUserForList);
 
-    // Batch-fetch org name + owner + analytics-sharing flag for users in an org
+    // Batch-fetch org name + owner + analytics-sharing flag for users in an org.
+    // Also capture the owner's subscription tier so org members can inherit it
+    // for display (ENG-237): a member's own subscriptionType is not updated when
+    // the org owner upgrades, so showing it raw renders paid members as "Free".
+    const subscriptionByUserId = new Map<string, string | undefined>(
+      users.map((u: any) => [u.userId, u.subscriptionType])
+    );
     const orgIds = [...new Set(sanitized.filter((u: any) => u.orgId).map((u: any) => u.orgId as string))];
-    const orgMap: Record<string, { name: string; ownerUserId: string; shareAnalyticsWithOrg: boolean }> = {};
+    const orgMap: Record<string, { name: string; ownerUserId: string; shareAnalyticsWithOrg: boolean; ownerSubscriptionType?: string }> = {};
     await Promise.all(
       orgIds.map(async (orgId) => {
         const org = await orgDb.getOrgById(orgId).catch(() => null);
-        if (org) orgMap[orgId] = {
+        if (!org) return;
+        // Prefer the owner already loaded in the user list; fall back to a direct
+        // fetch if the owner was filtered out (e.g. bot-like hiding).
+        let ownerSubscriptionType: string | undefined;
+        if (subscriptionByUserId.has(org.ownerUserId)) {
+          ownerSubscriptionType = subscriptionByUserId.get(org.ownerUserId) ?? undefined;
+        } else {
+          const owner = await userDb.getUserById(org.ownerUserId).catch(() => null);
+          ownerSubscriptionType = owner?.subscriptionType ?? undefined;
+        }
+        orgMap[orgId] = {
           name: org.name,
           ownerUserId: org.ownerUserId,
           shareAnalyticsWithOrg: !!(org.shareSettings?.analytics?.enabled ?? org.shareAnalyticsWithOrg),
+          ownerSubscriptionType,
         };
       })
     );
@@ -665,6 +710,15 @@ router.get("/users", async (req, res) => {
         user.orgName = orgInfo.name;
         user.isOrgOwner = orgInfo.ownerUserId === user.userId;
         user.orgShareAnalyticsWithOrg = orgInfo.shareAnalyticsWithOrg;
+        // Members inherit the org owner's tier. Only override when the owner is on
+        // a real (truthy, non-"Free") tier so we never downgrade a member.
+        if (
+          !user.isOrgOwner &&
+          orgInfo.ownerSubscriptionType &&
+          orgInfo.ownerSubscriptionType !== "Free"
+        ) {
+          user.subscriptionType = orgInfo.ownerSubscriptionType;
+        }
       }
     }
 
@@ -898,6 +952,38 @@ router.put("/users/:userId/support-note", async (req, res) => {
   } catch (error) {
     console.error("Error updating user support note:", error);
     res.status(500).json({ message: "Error updating support note" });
+  }
+});
+
+// Update user display name
+
+// Update user funnel status
+router.put("/users/:userId/funnel-status", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { funnelStatus } = req.body;
+
+    if (funnelStatus !== null && funnelStatus !== undefined && typeof funnelStatus !== "string") {
+      return res.status(400).json({ message: "funnelStatus must be a string or null" });
+    }
+
+    const normalizedStatus = typeof funnelStatus === "string" ? funnelStatus.trim() : "";
+    if (normalizedStatus.length > 80) {
+      return res.status(400).json({ message: "funnelStatus must be 80 characters or fewer" });
+    }
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const updatedUser = await userDb.updateUser(userId, {
+      funnelStatus: normalizedStatus || null,
+    });
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error updating user funnel status:", error);
+    res.status(500).json({ message: "Error updating funnel status" });
   }
 });
 
@@ -1525,7 +1611,7 @@ router.put("/users/:userId/password", async (req, res) => {
           isAdmin: user.isAdmin || false,
           sv: newSessionVersion,
         },
-        process.env.JWT_SECRET || "your-secret-key",
+        getJwtSecret(),
         { expiresIn: "90d" }
       );
     }
@@ -1544,7 +1630,7 @@ router.put("/users/:userId/password", async (req, res) => {
 router.post("/waitlist/:email/create-user", async (req, res) => {
   try {
     const { email } = req.params;
-    const { roles = ["customer"] } = req.body;
+    const roles = normalizeCustomerPortalCreateRoles(req.body?.roles);
 
     // Check if user already exists
     const existingUser = await userDb.getUserByEmail(email);
@@ -1572,7 +1658,7 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
 
     if (existingUser) {
       // Update existing free user with new roles and copy stripe_customer_id if missing
-      const updatedRoles = [...(existingUser.roles || []), ...roles];
+      const updatedRoles = mergeExistingRolesForCustomerAccess(existingUser.roles, roles);
       const updatePayload: any = {
         roles: updatedRoles,
         ...freeTierDefaults,
@@ -1698,7 +1784,7 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
 
     const delegateToken = jwt.sign(
       delegatePayload,
-      process.env.JWT_SECRET || "your-secret-key",
+      getJwtSecret(),
       { expiresIn: "90d" } // Delegate tokens expire in 90 days for security
     );
 

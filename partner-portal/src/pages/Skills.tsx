@@ -117,6 +117,7 @@ export default function Skills() {
   const [skillToSync, setSkillToSync] = useState<Skill | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [successMessage, setSuccessMessage] = useState("");
+  const [warningMessage, setWarningMessage] = useState("");
   const [syncStatus, setSyncStatus] = useState<Record<string, SkillSyncInfo>>({});
   const [backendEnv, setBackendEnv] = useState<'development' | 'production'>('production');
   const [foundationTools, setFoundationTools] = useState<string[]>([]);
@@ -331,11 +332,12 @@ export default function Skills() {
         }),
       };
 
-      if (currentSkill && currentSkill.skillId) {
-        await skillService.updateSkill(currentSkill.skillId, skillData, token!);
-      } else {
-        await skillService.createSkill(skillData, token!);
-      }
+      const saved = currentSkill && currentSkill.skillId
+        ? await skillService.updateSkill(currentSkill.skillId, skillData, token!)
+        : await skillService.createSkill(skillData, token!);
+      // ENG-173: surface the backend publish-guardrail warning (published skill not
+      // entitled to any subscription tier → invisible to users).
+      setWarningMessage(saved?.warnings?.length ? saved.warnings.join(" ") : "");
       fetchSkills();
       handleCloseEditDialog();
     } catch (err) {
@@ -543,6 +545,7 @@ export default function Skills() {
 
         {error && <Alert severity="error" sx={{ mb: 3 }} onClose={() => setError("")}>{error}</Alert>}
         {successMessage && <Alert severity="success" sx={{ mb: 3 }} onClose={() => setSuccessMessage("")}>{successMessage}</Alert>}
+        {warningMessage && <Alert severity="warning" sx={{ mb: 3 }} onClose={() => setWarningMessage("")}>{warningMessage}</Alert>}
 
         {/* Review Queue Section */}
         {pendingSkills.length > 0 && (

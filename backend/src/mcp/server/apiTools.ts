@@ -524,7 +524,7 @@ mcpToolRegistry.register({
   name: 'test_scheduled_chat',
   definition: {
     name: 'test_scheduled_chat',
-    description: 'Trigger a test run of a scheduled chat. Variables must already be set on the schedule. Returns immediately with a runId — the run executes in the background and can take several minutes for complex tasks. After calling this, wait ~30 seconds then poll get_scheduled_chat_test_history to check for a result matching the returned runId.',
+    description: 'Trigger a test run of a scheduled chat. This is a side-effecting action — only call it when the user has EXPLICITLY asked to test or run the schedule now. Do NOT trigger a test run on your own initiative, and do NOT treat a bare "retry"/regenerate of your previous turn as authorization to run a test; in that case simply re-answer the prior turn. Variables must already be set on the schedule. Returns immediately with a runId — the run executes in the background and can take several minutes for complex tasks. After calling this, wait ~30 seconds then poll get_scheduled_chat_test_history to check for a result matching the returned runId.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -558,6 +558,23 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({ method: 'GET', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/test-history`, context: ctx(context) });
+    // A test run started via test_scheduled_chat executes in the background and can take
+    // several minutes. When the history is still empty, returning a bare `[]` leads the model
+    // to report "empty results" to the user as if the run finished with nothing. Instead,
+    // surface an actionable diagnostic so the model waits/polls or checks the variables.
+    if (Array.isArray(data) && data.length === 0) {
+      return jsonResult({
+        history: [],
+        note: 'No test/run results are available yet for this scheduled chat. A test run triggered '
+          + 'via test_scheduled_chat executes in the background and can take several minutes, so it '
+          + 'may still be running. Wait ~30 seconds and poll get_scheduled_chat_test_history again '
+          + 'with the same schedule_id. If results are still empty after a few polls, the schedule may '
+          + 'be missing required variable values (check with list_scheduled_chats and set them via '
+          + 'submit_scheduled_chat_variables) or may not have been run yet. Do NOT report this empty '
+          + 'result to the user as a finished or failed run — explain that the run is still in progress '
+          + 'or that variables/setup need to be confirmed.',
+      });
+    }
     return jsonResult(data);
   }
 });

@@ -35,16 +35,38 @@ const IN_FLIGHT_STATUSES: ReadonlyArray<GeneratedLandingPage["status"]> = [
 ];
 
 /**
+ * A build still sitting in an in-flight status this long after it was created has
+ * no live process behind it — the owning run has long since timed out (and, if it
+ * were still legitimately running detached, finished). Past this age an in-flight
+ * record is a zombie: reconnecting to it would wedge the session on "still building"
+ * forever. Shared with the redeploy poller (its stuck ceiling) so both agree on the
+ * exact moment an in-flight build is considered dead.
+ */
+export const STUCK_CEILING_MS = 30 * 60 * 1000;
+
+/**
+ * True when an in-flight record is old enough that no live process can still own it
+ * (see {@link STUCK_CEILING_MS}). A record with no createdAt is treated as fresh
+ * (never a zombie) — the same lenient default the poller uses.
+ */
+function isZombieInFlight(page: GeneratedLandingPage, nowMs: number): boolean {
+  if (!page.createdAt) return false;
+  return nowMs - new Date(page.createdAt).getTime() > STUCK_CEILING_MS;
+}
+
+/**
  * Find the in-flight landing-page build (if any) that the given session spawned.
  * Used by the retry-reconnect path: when a user re-asks to build a page while one
  * is still generating, we return THIS instead of starting a second build (which
  * is what corrupts the single repo). Best-effort: any query failure resolves to
  * null so a transient DB error degrades to today's behavior rather than throwing
- * in the agent-mode hot path.
+ * in the agent-mode hot path. Records stuck in-flight past {@link STUCK_CEILING_MS}
+ * are treated as dead (zombies) and skipped so a crashed build never blocks retries.
  */
 export async function findInFlightJobForSession(
   userId: string,
-  sessionId: string
+  sessionId: string,
+  nowMs: number = Date.now()
 ): Promise<GeneratedLandingPage | null> {
   try {
     const pages = await paginatedQuery<GeneratedLandingPage>(dynamodb, {
@@ -56,7 +78,11 @@ export async function findInFlightJobForSession(
     const inFlight = pages.filter(
       (p) =>
         p.originatingSessionId === sessionId &&
-        IN_FLIGHT_STATUSES.includes(p.status)
+        IN_FLIGHT_STATUSES.includes(p.status) &&
+        // Skip zombies: a build stuck in-flight past the ceiling has no live process,
+        // so reconnecting would wedge the session on "still building" forever. Ignoring
+        // it lets a fresh build start instead.
+        !isZombieInFlight(p, nowMs)
     );
     if (inFlight.length === 0) return null;
     // Newest first — if somehow more than one is in flight, reconnect to the latest.

@@ -155,9 +155,37 @@ describe('executePreparedTools', () => {
     expect(input.toolCallsLedger[0]).toMatchObject({ name: 'read_brand_guidelines' });
     expect(input.toolCallsLedger[0].error).toBeUndefined();
     expect(input.toolCallsLedger[1]).toMatchObject({ name: 'read_market_strategy', error: 'boom' });
-    expect(input.messages[1].content).toBe('ERR: boom');
+    // ENG-124: every executed-tool error now carries an explicit retryability
+    // verdict line appended to the formatted error the model sees.
+    expect(input.messages[1].content).toContain('ERR: boom');
+    expect(input.messages[1].content).toContain('Retryable: no');
     expect(result.pendingCounterUpdates).toEqual({ read_brand_guidelines: 1 });
     expect(result.failedCounterUpdates).toEqual({ read_market_strategy: 1 });
+  });
+
+  it('marks a transient (rate-limit) tool error as retryable in the model-visible content (ENG-124)', async () => {
+    const ports = makePorts({
+      executePreparedAgentTool: async () => {
+        throw new Error('429 too many requests — rate limit exceeded');
+      },
+    });
+    const input = makeInput([toolCall('a', 'you_search_web', '{}')], ports);
+    await executePreparedTools(input);
+
+    expect(input.messages[0].content).toContain('Retryable: yes');
+  });
+
+  it('marks an auth tool error as NOT retryable and tells the model to stop (ENG-124)', async () => {
+    const ports = makePorts({
+      executePreparedAgentTool: async () => {
+        throw new Error('Unauthorized: invalid api key');
+      },
+    });
+    const input = makeInput([toolCall('a', 'send_email', '{}')], ports);
+    await executePreparedTools(input);
+
+    expect(input.messages[0].content).toContain('Retryable: no');
+    expect(input.messages[0].content).toContain('Do NOT retry');
   });
 
   it('downgrades a success result that toolResultError flags as an error', async () => {
@@ -173,7 +201,8 @@ describe('executePreparedTools', () => {
     // not an Error instance). The tool message content uses String(error).
     expect(input.toolCallsLedger[0].error).toBe('Unknown error');
     expect(input.toolCallsLedger[0].result).toEqual({ bad: true });
-    expect(input.messages[0].content).toBe('ERR: flagged error');
+    expect(input.messages[0].content).toContain('ERR: flagged error');
+    expect(input.messages[0].content).toContain('Retryable:');
     expect(result.failedCounterUpdates).toEqual({ read_brand_guidelines: 1 });
     expect(result.pendingCounterUpdates).toEqual({});
   });
@@ -240,7 +269,11 @@ describe('executePreparedTools', () => {
     expect(emit).toHaveBeenCalledWith('user:user-1', 'crm:data-changed', { changed: true });
   });
 
-  it('blocks the actual overlong LinkedIn send-invite tool-call shape before gateway execution', async () => {
+  // ENG-243: an overlong send-invite note must NOT be pre-blocked here. The send
+  // path (sendInvitation) auto-trims to the account-tier limit, so the call should
+  // reach the gateway and succeed instead of failing repeatedly and tripping the
+  // anti-loop breaker (which sent 0 invites in a real scheduled session).
+  it('lets an overlong LinkedIn send-invite note reach the gateway (tier-aware send path trims it)', async () => {
     const executeAgentToolThroughGatewaySpy = jest.fn(executeAgentToolThroughGateway);
     const ports = makePorts({
       evaluateAgentToolPolicy,
@@ -270,17 +303,12 @@ describe('executePreparedTools', () => {
 
     const result = await executePreparedTools(input);
 
-    expect(executeAgentToolThroughGatewaySpy).not.toHaveBeenCalled();
-    expect(input.toolCallsLedger[0]).toMatchObject({
-      name: 'linkedin_outreach',
-      error: expect.stringContaining('200 characters or fewer'),
-    });
-    expect(input.messages[0]).toMatchObject({
-      role: 'tool',
-      name: 'linkedin_outreach',
-      content: expect.stringContaining('Rewrite it as a complete shorter note before retrying'),
-    });
-    expect(result.failedCounterUpdates).toEqual({ linkedin_outreach: 1 });
+    expect(executeAgentToolThroughGatewaySpy).toHaveBeenCalledTimes(1);
+    expect(input.toolCallsLedger[0]).toMatchObject({ name: 'linkedin_outreach' });
+    expect(input.toolCallsLedger[0].error).toBeFalsy();
+    expect(input.messages[0].content).not.toContain('200 characters or fewer');
+    expect(result.failedCounterUpdates).toEqual({});
+    expect(result.pendingCounterUpdates).toEqual({ linkedin_outreach: 1 });
   });
 
   it('blocks the third actual generate_image call shape after two failed attempts in the same session', async () => {

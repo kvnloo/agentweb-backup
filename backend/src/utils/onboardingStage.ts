@@ -74,6 +74,7 @@ export const ALLOWED_ONBOARDING_EVENTS = new Set<string>([
   "welcome_offer_shown",
   "welcome_offer_outcome",
   "brand_build_status",
+  "brand_fallback_manual",
   "onboarding_abandoned",
   "deviation",
   // Outreach (test-env re-enable — not committed to harsha/dev)
