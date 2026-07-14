@@ -957,6 +957,14 @@ export default function AdminDashboard() {
   const [costBreakdownData, setCostBreakdownData] = useState<UsageByModelDay | null>(null);
   const [costBreakdownLoading, setCostBreakdownLoading] = useState(false);
   const [costBreakdownError, setCostBreakdownError] = useState<string | null>(null);
+  // Table vs bar-chart view for the cost-breakdown modal — remembered per-admin.
+  const [costBreakdownView, setCostBreakdownView] = useState<"table" | "bars">(
+    () => (typeof window !== "undefined" && localStorage.getItem("costBreakdownView") === "bars" ? "bars" : "table")
+  );
+  const changeCostBreakdownView = (v: "table" | "bars") => {
+    setCostBreakdownView(v);
+    try { localStorage.setItem("costBreakdownView", v); } catch { /* non-fatal */ }
+  };
   const [grantBonusDialogOpen, setGrantBonusDialogOpen] = useState(false);
   const [grantBonusUserId, setGrantBonusUserId] = useState<string | null>(null);
   const [grantBonusEmail, setGrantBonusEmail] = useState("");
@@ -6632,18 +6640,35 @@ export default function AdminDashboard() {
       <Dialog open={!!costBreakdownUser} onClose={() => setCostBreakdownUser(null)} maxWidth="md" fullWidth>
         <DialogTitle sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 2 }}>
           <span>LLM Cost Burn — {costBreakdownUser?.email}</span>
-          <TextField
-            select
-            size="small"
-            label="Month"
-            value={costBreakdownMonth}
-            onChange={(e) => setCostBreakdownMonth(e.target.value)}
-            sx={{ width: 170 }}
-          >
-            {recentMonthOptions(12).map((m) => (
-              <MenuItem key={m.value} value={m.value}>{m.label}</MenuItem>
-            ))}
-          </TextField>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1.5 }}>
+            <ButtonGroup size="small" aria-label="cost breakdown view">
+              <Button
+                variant={costBreakdownView === "table" ? "contained" : "outlined"}
+                onClick={() => changeCostBreakdownView("table")}
+              >
+                Table
+              </Button>
+              <Button
+                variant={costBreakdownView === "bars" ? "contained" : "outlined"}
+                onClick={() => changeCostBreakdownView("bars")}
+                startIcon={<BarChartIcon fontSize="small" />}
+              >
+                Bars
+              </Button>
+            </ButtonGroup>
+            <TextField
+              select
+              size="small"
+              label="Month"
+              value={costBreakdownMonth}
+              onChange={(e) => setCostBreakdownMonth(e.target.value)}
+              sx={{ width: 170 }}
+            >
+              {recentMonthOptions(12).map((m) => (
+                <MenuItem key={m.value} value={m.value}>{m.label}</MenuItem>
+              ))}
+            </TextField>
+          </Box>
         </DialogTitle>
         <DialogContent dividers>
           {costBreakdownLoading ? (
@@ -6670,6 +6695,11 @@ export default function AdminDashboard() {
             // counter predates per-call burn tracking, so burn can legitimately read
             // lower than what's counted to quota during the ramp-up window.
             const burnLagsDeducted = modelRows.length > 0 && burn + 0.005 < deducted;
+            // Overall cost quota (bars view): deducted spend vs the tier's cap — the
+            // same figure the enforcement gate checks. Null cap = unlimited (no bar).
+            const costAllowance = subscriptionTypeCostAllowanceMap[costBreakdownUser?.subscriptionType || "Basic"] ?? null;
+            const quotaPct = costAllowance != null && costAllowance > 0 ? (deducted / costAllowance) * 100 : null;
+            const quotaColor = quotaPct == null ? "grey.500" : quotaPct >= 100 ? "error.main" : quotaPct >= 80 ? "warning.main" : "success.main";
             return (
               <>
                 <Grid container spacing={2} sx={{ mb: 2 }}>
@@ -6704,6 +6734,27 @@ export default function AdminDashboard() {
                     </Box>
                   </Grid>
                 </Grid>
+                {costBreakdownView === "bars" && (
+                  costAllowance != null ? (
+                    <Box sx={{ mb: 2 }}>
+                      <Box sx={{ display: "flex", justifyContent: "space-between", mb: 0.5 }}>
+                        <Typography variant="body2" fontWeight={600}>Monthly cost quota</Typography>
+                        <Typography variant="body2" sx={{ fontVariantNumeric: "tabular-nums" }}>
+                          ${deducted.toFixed(2)} / ${costAllowance.toFixed(2)} ({Math.round(quotaPct ?? 0)}%)
+                        </Typography>
+                      </Box>
+                      <Tooltip title={`${Math.round(quotaPct ?? 0)}% of the monthly cost cap consumed (deducted spend vs cap)`}>
+                        <Box sx={{ height: 12, borderRadius: 6, bgcolor: "grey.200", overflow: "hidden" }}>
+                          <Box sx={{ height: "100%", width: `${Math.min(100, quotaPct ?? 0)}%`, bgcolor: quotaColor, transition: "width .3s" }} />
+                        </Box>
+                      </Tooltip>
+                    </Box>
+                  ) : (
+                    <Alert severity="info" sx={{ mb: 2 }}>
+                      This user's tier has no cost cap (unlimited) — no quota bar. Per-model spend share is shown below.
+                    </Alert>
+                  )
+                )}
                 {modelRows.length === 0 ? (
                   <Alert severity="info" sx={{ mb: 1 }}>
                     No per-model burn has been recorded for this month yet. Burn is captured per LLM
@@ -6721,6 +6772,27 @@ export default function AdminDashboard() {
                         until burn catches up.
                       </Alert>
                     )}
+                    {costBreakdownView === "bars" ? (
+                      <Box data-testid="cost-breakdown-bars">
+                        <Typography variant="caption" color="text.secondary">Spend share by model (of ${burn.toFixed(2)} gross burn)</Typography>
+                        {modelRows.map((m) => {
+                          const share = burn > 0 ? (m.costUsd / burn) * 100 : 0;
+                          return (
+                            <Box key={m.model} sx={{ mt: 1 }}>
+                              <Box sx={{ display: "flex", justifyContent: "space-between" }}>
+                                <Typography variant="caption" sx={{ fontFamily: "monospace" }}>{m.model}</Typography>
+                                <Typography variant="caption" sx={{ fontVariantNumeric: "tabular-nums" }}>
+                                  ${m.costUsd.toFixed(4)} ({share.toFixed(1)}%)
+                                </Typography>
+                              </Box>
+                              <Box sx={{ height: 8, borderRadius: 4, bgcolor: "grey.100", overflow: "hidden" }}>
+                                <Box sx={{ height: "100%", width: `${Math.max(share, 0.5)}%`, bgcolor: "primary.main" }} />
+                              </Box>
+                            </Box>
+                          );
+                        })}
+                      </Box>
+                    ) : (
                     <Table size="small">
                     <TableHead>
                       <TableRow>
@@ -6747,6 +6819,7 @@ export default function AdminDashboard() {
                       </TableRow>
                     </TableBody>
                   </Table>
+                    )}
                   </>
                 )}
               </>
