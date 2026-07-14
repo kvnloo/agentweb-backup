@@ -2598,6 +2598,109 @@ describe("v0Service - repairSubPageImports", () => {
   });
 });
 
+// =============================================================================
+// deleteLandingPageByRecord — remove the WHOLE page directory from the repo
+// =============================================================================
+// removePageFromGitHub deleted exactly one file: app/<slug>/page.tsx. But the remap
+// also writes app/<slug>/_components/**. next build type-checks the whole project, so
+// an orphaned component left behind with an unresolvable import STILL fails the build
+// for every page on the site — meaning "delete the broken page" did not actually
+// unbreak the site. Deleting a page must take its whole directory with it.
+describe("v0Service - deleteLandingPageByRecord removes the whole page directory", () => {
+  const repoTree = {
+    data: {
+      tree: [
+        { path: "app/page.tsx", type: "blob" },
+        { path: "app/pricing/page.tsx", type: "blob" },
+        { path: "app/pricing/_components/landing/nav.tsx", type: "blob" },
+        { path: "app/keep-me/page.tsx", type: "blob" },
+      ],
+    },
+  };
+
+  beforeEach(() => {
+    mockAxiosGet.mockReset();
+    mockAxiosPost.mockReset();
+    mockAxiosPatch.mockReset();
+    mockAxiosGet.mockImplementation((url: string) =>
+      Promise.resolve(
+        String(url).includes("/git/trees/") ? repoTree : { data: { object: { sha: "main-sha" } } },
+      ),
+    );
+    mockAxiosPost.mockResolvedValue({ data: { sha: "new-sha" } });
+    mockAxiosPatch.mockResolvedValue({ data: {} });
+  });
+
+  const deletedPaths = () => {
+    const treeCall = mockAxiosPost.mock.calls.find((c) => String(c[0]).includes("/git/trees"));
+    if (!treeCall) return null;
+    return (treeCall[1].tree as any[])
+      .filter((e) => e.sha === null)
+      .map((e) => e.path)
+      .sort();
+  };
+
+  it("deletes _components too, not just page.tsx (an orphan component bricks the site build)", async () => {
+    await deleteLandingPageByRecord({
+      id: "p1",
+      userId: "u1",
+      slug: "pricing",
+      name: "Pricing",
+      status: "deployed",
+      githubRepoUrl: "https://github.com/o/r",
+    } as any);
+
+    expect(deletedPaths()).toEqual([
+      "app/pricing/_components/landing/nav.tsx",
+      "app/pricing/page.tsx",
+    ]);
+  });
+
+  it("does not touch any OTHER page in the shared repo", async () => {
+    await deleteLandingPageByRecord({
+      id: "p1",
+      userId: "u1",
+      slug: "pricing",
+      name: "Pricing",
+      status: "deployed",
+      githubRepoUrl: "https://github.com/o/r",
+    } as any);
+
+    const deleted = deletedPaths()!;
+    expect(deleted).not.toContain("app/keep-me/page.tsx");
+    expect(deleted).not.toContain("app/page.tsx");
+  });
+
+  it("commits nothing when the page directory is not in the repo", async () => {
+    await deleteLandingPageByRecord({
+      id: "p1",
+      userId: "u1",
+      slug: "never-committed",
+      name: "Ghost",
+      status: "failed",
+      githubRepoUrl: "https://github.com/o/r",
+    } as any);
+
+    // Nothing to remove — do not push an empty commit and trigger a pointless rebuild.
+    expect(deletedPaths()).toBeNull();
+  });
+
+  it("a GitHub failure does not block the record delete (the page must still disappear)", async () => {
+    mockAxiosGet.mockRejectedValue(new Error("GitHub 500"));
+
+    await expect(
+      deleteLandingPageByRecord({
+        id: "p1",
+        userId: "u1",
+        slug: "pricing",
+        name: "Pricing",
+        status: "deployed",
+        githubRepoUrl: "https://github.com/o/r",
+      } as any),
+    ).resolves.not.toThrow();
+  });
+});
+
 describe("v0Service - remapFilesForSubPage", () => {
   const buf = (s: string) => Buffer.from(s);
 
