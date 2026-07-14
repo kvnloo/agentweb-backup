@@ -19,6 +19,11 @@ import { emailEventsDb } from './emailEventsDb';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { substituteVariables, injectUnsubscribeUrl, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { settingsService } from './settingsService';
+import { v4 as uuidv4 } from 'uuid';
+
+// Identifies this process for the claimedBy field — mirrors
+// socialEngagementExecutor.ts's INSTANCE_ID, used for log correlation only.
+const INSTANCE_ID = uuidv4();
 
 export async function processDueEnrollments(): Promise<{
   processed: number;
@@ -37,6 +42,19 @@ export async function processDueEnrollments(): Promise<{
   }
 
   for (const enrollment of due) {
+    // Claim before sending so a process killed between the send and the
+    // advance/complete write doesn't get its step re-sent by the very next
+    // tick (or by another instance). A claim self-heals after its stale
+    // window, so a crash never strands the enrollment permanently.
+    let claimed: boolean;
+    try {
+      claimed = await dripSequenceDb.claimEnrollment(enrollment.enrollmentId, INSTANCE_ID);
+    } catch (err) {
+      console.error(`[dripWorker] Failed to claim enrollment ${enrollment.enrollmentId}:`, err);
+      continue;
+    }
+    if (!claimed) continue; // another instance or a recent crash still holds this enrollment
+
     stats.processed++;
     try {
       await processEnrollment(enrollment, stats);
@@ -50,6 +68,11 @@ export async function processDueEnrollments(): Promise<{
         const retryAt = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
         await dripSequenceDb.snoozeEnrollment(enrollment.enrollmentId, retryAt).catch(() => {});
         console.log(`[dripWorker] Snoozed enrollment ${enrollment.enrollmentId} until ${retryAt} (not yet connected)`);
+      } else {
+        // Generic/transient error: release the claim so this enrollment is
+        // retried on the very next tick, same as today's behavior, instead
+        // of waiting out the stale-claim window.
+        await dripSequenceDb.releaseEnrollmentClaim(enrollment.enrollmentId).catch(() => {});
       }
     }
   }

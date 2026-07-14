@@ -10,6 +10,7 @@
 
 import { AgentFailureRuleSet } from '../loops/instances/agent-mode/failureRuleSet';
 import {
+  EVT_RUN_VERDICT,
   EVT_TOOL_FAILED,
   EVT_TOOL_INVOKED,
   EVT_TOOL_SUCCEEDED,
@@ -45,6 +46,16 @@ function failed(toolName: string, n: number, errorClass = 'TimeoutError'): Norma
 }
 function succeeded(toolName: string, n: number): NormalizedEvent[] {
   return Array.from({ length: n }, () => evt(EVT_TOOL_SUCCEEDED, toolName));
+}
+
+/** A run_verdict event, as emitVerdict() writes it — no toolName dimension. */
+function verdict(reasons: string[], sessionId = `session-${++seq}`): NormalizedEvent {
+  return {
+    subjectId: asSubjectId(sessionId),
+    eventType: EVT_RUN_VERDICT,
+    ts: new Date('2026-06-04T00:00:00Z'),
+    dimensions: { verdict: reasons.length > 0 ? 'degraded' : 'ok', reasons: reasons.join(','), sessionId },
+  };
 }
 
 describe('AgentFailureRuleSet', () => {
@@ -119,5 +130,79 @@ describe('AgentFailureRuleSet', () => {
     };
     const proposals = await policy.evaluate([orphan, orphan, orphan, orphan], WINDOW);
     expect(proposals).toHaveLength(0);
+  });
+});
+
+/**
+ * claim_mismatch clustering (ENG-143 gap): the finalize guard writes
+ * agent_run_verdict events with reasons including 'claim_mismatch', but until
+ * now nothing clustered them — the 17:30 UTC cron only ever scanned
+ * agent_tool_invoked/agent_tool_failed, so a real truthfulness problem could
+ * fire the guard every day and nobody would be told. These events carry no
+ * toolName dimension (they're a whole-run verdict, not a per-tool outcome),
+ * so they cannot flow through the per-tool clustering above — they need their
+ * own aggregate count across the window.
+ */
+describe('AgentFailureRuleSet — claim_mismatch clustering (ENG-143)', () => {
+  const policy = new AgentFailureRuleSet({ minClaimMismatches: 2 });
+
+  it('proposes a truthfulness fix once claim_mismatch verdicts cross the threshold', async () => {
+    const events = [
+      verdict(['claim_mismatch'], 's-1'),
+      verdict(['claim_mismatch'], 's-2'),
+      verdict([], 's-3'), // clean run — must not count
+    ];
+    const proposals = await policy.evaluate(events, WINDOW);
+    const claimProposal = proposals.find((p) => p.sourceRuleId === 'claim-mismatch:truthfulness');
+    expect(claimProposal).toBeDefined();
+    expect(claimProposal!.kind).toBe('code_change');
+    expect(claimProposal!.payload).toEqual(
+      expect.objectContaining({ occurrences: 2, sessionIds: ['s-1', 's-2'] }),
+    );
+    expect(claimProposal!.triggeringStats).toEqual(expect.objectContaining({ occurrences: 2 }));
+  });
+
+  it('does NOT propose below the threshold', async () => {
+    const events = [verdict(['claim_mismatch'], 's-1'), verdict([], 's-2'), verdict([], 's-3')];
+    const proposals = await policy.evaluate(events, WINDOW);
+    expect(proposals.find((p) => p.sourceRuleId === 'claim-mismatch:truthfulness')).toBeUndefined();
+  });
+
+  it('ignores run_verdict events whose reasons do not include claim_mismatch', async () => {
+    const events = [
+      verdict(['failed_tool_calls'], 's-1'),
+      verdict(['high_failure_ratio'], 's-2'),
+      verdict(['repeated_tool_failures'], 's-3'),
+    ];
+    const proposals = await policy.evaluate(events, WINDOW);
+    expect(proposals.find((p) => p.sourceRuleId === 'claim-mismatch:truthfulness')).toBeUndefined();
+  });
+
+  it('coexists with per-tool failure proposals in the same window', async () => {
+    const events = [
+      ...invoked('generate_image', 10),
+      ...failed('generate_image', 4),
+      verdict(['claim_mismatch'], 's-1'),
+      verdict(['claim_mismatch'], 's-2'),
+    ];
+    const proposals = await policy.evaluate(events, WINDOW);
+    expect(proposals.map((p) => p.sourceRuleId).sort()).toEqual(
+      ['claim-mismatch:truthfulness', 'tool-failure:generate_image'].sort(),
+    );
+  });
+
+  it('sorts the claim-mismatch proposal FIRST regardless of tool failure rate', async () => {
+    const events = [
+      // 90% failure rate — would sort first under the old tool-only comparator
+      ...invoked('generate_image', 10),
+      ...failed('generate_image', 9),
+      verdict(['claim_mismatch'], 's-1'),
+      verdict(['claim_mismatch'], 's-2'),
+    ];
+    const proposals = await policy.evaluate(events, WINDOW);
+    expect(proposals.map((p) => p.sourceRuleId)).toEqual([
+      'claim-mismatch:truthfulness',
+      'tool-failure:generate_image',
+    ]);
   });
 });

@@ -1,5 +1,5 @@
 import { settingsService } from '../services/settingsService';
-import { userDb } from '../services/db';
+import { userDb, orgDb } from '../services/db';
 import { CUSTOMER_PORTAL_PAGES } from '../services/customerPortalPages';
 import {
   getUserSubscriptionType,
@@ -10,9 +10,12 @@ import {
   getAllowedPages,
   filterFunctionCalls,
   getAllAvailableSkills,
+  getAllAvailableConnectedAccounts,
+  getAllowedConnectedAccounts,
   getAllowedSkills,
   getPublicAllowedSkills,
   resolveSkillsToToolNames,
+  findTiersAllowingSkill,
 } from '../services/subscriptionService';
 
 jest.mock('../services/settingsService', () => ({
@@ -24,6 +27,9 @@ jest.mock('../services/settingsService', () => ({
 jest.mock('../services/db', () => ({
   userDb: {
     getUserById: jest.fn(),
+  },
+  orgDb: {
+    getOrgById: jest.fn(),
   },
 }));
 
@@ -84,6 +90,169 @@ describe('subscriptionService', () => {
     mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u2' } as any);
     const t2 = await getUserSubscriptionType('u2');
     expect(t2).toBe('Free');
+  });
+
+  it('getUserSubscriptionType resolves an org member to the owner tier dynamically (ENG-288)', async () => {
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    // Member record itself carries no paid tier — it must resolve from the owner.
+    mockedUserDb.getUserById.mockImplementation(async (id: string) => {
+      if (id === 'member-1') return { userId: 'member-1', orgId: 'org-1', orgRole: 'member', subscriptionType: 'Free' } as any;
+      if (id === 'owner-1') return { userId: 'owner-1', subscriptionType: 'Pro' } as any;
+      return null as any;
+    });
+    mockedOrgDb.getOrgById.mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1' } as any);
+
+    const tier = await getUserSubscriptionType('member-1');
+    expect(tier).toBe('Pro');
+  });
+
+  it('getUserSubscriptionType returns the member own tier once they leave the org (ENG-288 revocation)', async () => {
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    // After leaving, orgId/orgRole are cleared — no org lookup, no inherited tier.
+    mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'ex-member', subscriptionType: 'Free' } as any);
+
+    const tier = await getUserSubscriptionType('ex-member');
+    expect(tier).toBe('Free');
+    expect(mockedOrgDb.getOrgById).not.toHaveBeenCalled();
+  });
+
+  it('getUserSubscriptionType falls back to the member own tier when the org lookup throws, instead of hard "Free"', async () => {
+    // A transient org-lookup failure (DynamoDB throttling, network blip) must
+    // not discard the already-fetched user record and its real own tier —
+    // that would wrongly downgrade a paying member to Free for the duration
+    // of an unrelated, transient error.
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    mockedUserDb.getUserById.mockResolvedValueOnce({
+      userId: 'member-1', orgId: 'org-1', orgRole: 'member', subscriptionType: 'Pro',
+    } as any);
+    mockedOrgDb.getOrgById.mockRejectedValueOnce(new Error('ProvisionedThroughputExceededException'));
+
+    const tier = await getUserSubscriptionType('member-1');
+    expect(tier).toBe('Pro');
+  });
+
+  it('getUserSubscriptionType lets a member own ACTIVE subscription govern instead of the owner (regression: pvandervalk@xcures.com)', async () => {
+    // A member can hold their own paid Stripe subscription independent of the
+    // org — accept-invite touches no billing state. Their own tier must win
+    // when their subscription is genuinely active, even under a different
+    // owner tier, or a self-paying member would be silently downgraded.
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    mockedUserDb.getUserById.mockImplementation(async (id: string) => {
+      if (id === 'member-active') {
+        return {
+          userId: 'member-active', orgId: 'org-1', orgRole: 'member',
+          subscriptionType: 'Pro', subscription_status: 'active',
+        } as any;
+      }
+      if (id === 'owner-1') return { userId: 'owner-1', subscriptionType: 'Managed' } as any;
+      return null as any;
+    });
+    mockedOrgDb.getOrgById.mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1' } as any);
+
+    const tier = await getUserSubscriptionType('member-active');
+    expect(tier).toBe('Pro');
+    expect(mockedOrgDb.getOrgById).not.toHaveBeenCalled();
+  });
+
+  it('getUserSubscriptionType lets a member own TRIALING subscription govern instead of the owner', async () => {
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    mockedUserDb.getUserById.mockImplementation(async (id: string) => {
+      if (id === 'member-trial') {
+        return {
+          userId: 'member-trial', orgId: 'org-1', orgRole: 'member',
+          subscriptionType: 'Starter', subscription_status: 'trialing',
+        } as any;
+      }
+      if (id === 'owner-1') return { userId: 'owner-1', subscriptionType: 'Free' } as any;
+      return null as any;
+    });
+    mockedOrgDb.getOrgById.mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1' } as any);
+
+    const tier = await getUserSubscriptionType('member-trial');
+    expect(tier).toBe('Starter');
+  });
+
+  it('getUserSubscriptionType still inherits the owner tier for a member with a CANCELED subscription (the Harsha case)', async () => {
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    mockedUserDb.getUserById.mockImplementation(async (id: string) => {
+      if (id === 'member-canceled') {
+        return {
+          userId: 'member-canceled', orgId: 'org-1', orgRole: 'member',
+          subscriptionType: 'Pro', subscription_status: 'canceled',
+        } as any;
+      }
+      if (id === 'owner-1') return { userId: 'owner-1', subscriptionType: 'Super Premium' } as any;
+      return null as any;
+    });
+    mockedOrgDb.getOrgById.mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1' } as any);
+
+    const tier = await getUserSubscriptionType('member-canceled');
+    expect(tier).toBe('Super Premium');
+  });
+
+  it('getUserSubscriptionType inherits the owner tier for a member with no subscription_status at all (fresh invite)', async () => {
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    mockedUserDb.getUserById.mockImplementation(async (id: string) => {
+      if (id === 'member-fresh') {
+        return { userId: 'member-fresh', orgId: 'org-1', orgRole: 'member', subscriptionType: 'Free' } as any;
+      }
+      if (id === 'owner-1') return { userId: 'owner-1', subscriptionType: 'Pro' } as any;
+      return null as any;
+    });
+    mockedOrgDb.getOrgById.mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1' } as any);
+
+    const tier = await getUserSubscriptionType('member-fresh');
+    expect(tier).toBe('Pro');
+  });
+
+  it('getAllowedConnectedAccounts resolves an org member to the owner tier (regression: Harsha/Twitter flash-then-hide bug)', async () => {
+    // Reproduces the reported symptom: member's own record is Pro (no twitter),
+    // org owner is Super Premium (includes twitter). Before centralizing tier
+    // resolution in getUserSubscriptionType, routes/connectedAccounts.ts called
+    // getAllowedConnectedAccounts(userId) with the member's own id directly,
+    // so Twitter was excluded from allowedConnectedAccounts even though the
+    // owner had shared/granted it — the card would flash (from the already
+    // org-aware /me response) then disappear once this endpoint's response
+    // landed with the member's own, un-inherited tier.
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    mockedUserDb.getUserById.mockImplementation(async (id: string) => {
+      if (id === 'member-harsha') {
+        return { userId: 'member-harsha', orgId: 'org-1', orgRole: 'member', subscriptionType: 'Pro' } as any;
+      }
+      if (id === 'owner-1') {
+        return { userId: 'owner-1', subscriptionType: 'Super Premium' } as any;
+      }
+      return null as any;
+    });
+    mockedOrgDb.getOrgById.mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1' } as any);
+
+    mockedSettingsService.getSetting.mockResolvedValue({
+      settingValue: JSON.stringify([
+        { name: 'Pro', allowedPages: ['/'], allowedSkills: ['*'], allowedConnectedAccounts: ['linkedin', 'gmail'] },
+        { name: 'Super Premium', allowedPages: ['/'], allowedSkills: ['*'], allowedConnectedAccounts: ['linkedin', 'gmail', 'twitter'] },
+      ]),
+    } as any);
+
+    const allowed = await getAllowedConnectedAccounts('member-harsha');
+
+    expect(allowed).toContain('twitter');
+    expect(allowed).toEqual(['linkedin', 'gmail', 'twitter']);
+  });
+
+  it('getAllowedConnectedAccounts uses the member own tier once they leave the org', async () => {
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'ex-member', subscriptionType: 'Pro' } as any);
+    mockedSettingsService.getSetting.mockResolvedValue({
+      settingValue: JSON.stringify([
+        { name: 'Pro', allowedPages: ['/'], allowedSkills: ['*'], allowedConnectedAccounts: ['linkedin', 'gmail'] },
+      ]),
+    } as any);
+
+    const allowed = await getAllowedConnectedAccounts('ex-member');
+
+    expect(allowed).toEqual(['linkedin', 'gmail']);
+    expect(allowed).not.toContain('twitter');
+    expect(mockedOrgDb.getOrgById).not.toHaveBeenCalled();
   });
 
   it('getAllAvailablePages includes default pages and customer portal pages', () => {
@@ -153,6 +322,92 @@ describe('subscriptionService', () => {
     const cfg = await getSubscriptionTypeConfig('Legacy');
     expect(cfg).not.toBeNull();
     expect(cfg!.allowedSkills).toEqual(['*']);
+  });
+
+  // ---- findTiersAllowingSkill (ENG-173 publish guardrail) ----
+
+  const tiersSetting = (types: any[]) => ({
+    settingName: 'subscription_types',
+    settingValue: JSON.stringify(types),
+  });
+
+  it('findTiersAllowingSkill: reachable when skill is in a tier allowedSkills', async () => {
+    mockedSettingsService.getSetting.mockResolvedValueOnce(tiersSetting([
+      { name: 'Free', allowedPages: [], allowedSkills: ['other'] },
+      { name: 'Pro', allowedPages: [], allowedSkills: ['skill-x', 'other'] },
+    ]) as any);
+
+    const res = await findTiersAllowingSkill('skill-x');
+    expect(res.reachable).toBe(true);
+    expect(res.allowingTiers).toContain('Pro');
+    expect(res.totalTiers).toBe(2);
+  });
+
+  it('findTiersAllowingSkill: NOT reachable when skill is in no tier', async () => {
+    mockedSettingsService.getSetting.mockResolvedValueOnce(tiersSetting([
+      { name: 'Free', allowedPages: [], allowedSkills: ['other'] },
+      { name: 'Pro', allowedPages: [], allowedSkills: ['another'] },
+    ]) as any);
+
+    const res = await findTiersAllowingSkill('skill-x');
+    expect(res.reachable).toBe(false);
+    expect(res.allowingTiers).toEqual([]);
+    expect(res.totalTiers).toBe(2);
+  });
+
+  it('findTiersAllowingSkill: wildcard tier makes any skill reachable', async () => {
+    mockedSettingsService.getSetting.mockResolvedValueOnce(tiersSetting([
+      { name: 'Super', allowedPages: [], allowedSkills: ['*'] },
+    ]) as any);
+
+    const res = await findTiersAllowingSkill('skill-x');
+    expect(res.reachable).toBe(true);
+    expect(res.allowingTiers).toContain('Super');
+  });
+
+  it('findTiersAllowingSkill: tier missing allowedSkills is treated as wildcard (backward compat)', async () => {
+    mockedSettingsService.getSetting.mockResolvedValueOnce(tiersSetting([
+      { name: 'Legacy', allowedPages: [], allowedFunctionCalls: ['x'] },
+    ]) as any);
+
+    const res = await findTiersAllowingSkill('skill-x');
+    expect(res.reachable).toBe(true);
+  });
+
+  it('findTiersAllowingSkill: fail-open (reachable) when no subscription_types setting exists', async () => {
+    mockedSettingsService.getSetting.mockResolvedValueOnce(null as any);
+
+    const res = await findTiersAllowingSkill('skill-x');
+    expect(res.reachable).toBe(true);
+    expect(res.totalTiers).toBe(0);
+  });
+
+  it('findTiersAllowingSkill: fail-open when settingValue is malformed JSON', async () => {
+    mockedSettingsService.getSetting.mockResolvedValueOnce({
+      settingName: 'subscription_types',
+      settingValue: '{ not valid json',
+    } as any);
+
+    const res = await findTiersAllowingSkill('skill-x');
+    expect(res.reachable).toBe(true);
+    expect(res.totalTiers).toBe(0);
+  });
+
+  it('findTiersAllowingSkill: fail-open when tiers array is empty', async () => {
+    mockedSettingsService.getSetting.mockResolvedValueOnce(tiersSetting([]) as any);
+
+    const res = await findTiersAllowingSkill('skill-x');
+    expect(res.reachable).toBe(true);
+    expect(res.totalTiers).toBe(0);
+  });
+
+  it('findTiersAllowingSkill: fail-open when the settings lookup throws', async () => {
+    mockedSettingsService.getSetting.mockRejectedValueOnce(new Error('dynamo down'));
+
+    const res = await findTiersAllowingSkill('skill-x');
+    expect(res.reachable).toBe(true);
+    expect(res.allowingTiers).toEqual([]);
+    expect(res.totalTiers).toBe(0);
   });
 
   // ---- getAllAvailableSkills tests ----
@@ -356,5 +611,21 @@ describe('subscriptionService', () => {
       { type: 'plain', other: true },
       { type: 'function', function: { name: undefined as any } },
     ]);
+  });
+});
+
+describe('getAllAvailableConnectedAccounts', () => {
+  it('includes twitter as a gateable platform', () => {
+    expect(getAllAvailableConnectedAccounts()).toContain('twitter');
+  });
+
+  it('includes all known connectable platforms', () => {
+    const accounts = getAllAvailableConnectedAccounts();
+    for (const platform of [
+      'linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom',
+      'instagram', 'twitter', 'hubspot', 'attio', 'google_ads', 'google_drive',
+    ]) {
+      expect(accounts).toContain(platform);
+    }
   });
 });

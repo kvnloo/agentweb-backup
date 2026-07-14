@@ -2,6 +2,7 @@ import { SocialPlatformAdapter } from './adapters/socialPlatformTypes';
 import { LinkedInAdapter } from './adapters/linkedInAdapter';
 import { InstagramAdapter } from './adapters/instagramAdapter';
 import { YouTubeAdapter } from './adapters/youtubeAdapter';
+import { TwitterAdapter } from './adapters/twitterAdapter';
 
 // Re-export types for consumers
 export * from './adapters/socialPlatformTypes';
@@ -14,6 +15,7 @@ export const socialPlatformService = {
     linkedin: new LinkedInAdapter(),
     instagram: new InstagramAdapter(),
     youtube: new YouTubeAdapter(),
+    twitter: new TwitterAdapter(),
   } as Record<string, SocialPlatformAdapter>,
 
   getAdapter(platform: string): SocialPlatformAdapter {

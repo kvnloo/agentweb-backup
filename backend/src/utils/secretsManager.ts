@@ -308,17 +308,6 @@ export interface GmailCredentials {
  * @returns Gmail OAuth client credentials
  */
 export async function getGmailCredentials(): Promise<GmailCredentials> {
-  // Env-var shortcut: if both Gmail OAuth client credentials are provided
-  // directly, use them and skip Secrets Manager entirely. Mirrors the same
-  // pattern used by getV0ApiKey/getGithubOrgToken and keeps local/dev runs
-  // working without AWS access.
-  if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
-    return {
-      clientId: process.env.GOOGLE_CLIENT_ID,
-      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-    };
-  }
-
   try {
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production'
@@ -341,6 +330,48 @@ export async function getGmailCredentials(): Promise<GmailCredentials> {
   } catch (error) {
     console.error('Error fetching Gmail credentials from Secrets Manager:', error);
     throw new Error('Failed to fetch Gmail credentials from Secrets Manager');
+  }
+}
+
+/**
+ * Interface for Twitter/X OAuth2 credentials returned from Secrets Manager
+ */
+export interface TwitterCredentials {
+  clientId: string;
+  clientSecret: string;
+}
+
+/**
+ * Get Twitter/X OAuth2 (Authorization Code + PKCE) client credentials from AWS Secrets Manager.
+ *
+ * Secret location: dev/AgentWeb/Twitter (or prod/AgentWeb/Twitter for production)
+ * Secret format: { "clientId": "...", "clientSecret": "..." }
+ *
+ * @returns Twitter/X OAuth2 client credentials
+ */
+export async function getTwitterCredentials(): Promise<TwitterCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/Twitter'
+      : 'dev/AgentWeb/Twitter';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('Twitter credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as TwitterCredentials;
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new Error('Twitter credentials missing clientId or clientSecret');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching Twitter credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch Twitter credentials from Secrets Manager');
   }
 }
 

@@ -10,6 +10,7 @@ import { instagramService } from '../services/instagramService';
 import { createAccount } from '../services/connectedAccountsDb';
 import { oauthSessionDb } from '../services/db';
 import { MetaAdAccount, MetaInstagramAccount } from '../types/meta';
+import { getJwtSecret } from '../config/jwt';
 
 const router = express.Router();
 
@@ -21,14 +22,11 @@ const router = express.Router();
 // ============================================
 
 function generateState(userId: string, extra: Record<string, any> = {}): string {
-    const secret = process.env.JWT_SECRET;
-    if (!secret) throw new Error('JWT_SECRET is not configured');
-    return jwt.sign({ userId, ...extra, timestamp: Date.now(), nonce: crypto.randomBytes(16).toString('hex') }, secret, { expiresIn: '10m' });
+    return jwt.sign({ userId, ...extra, timestamp: Date.now(), nonce: crypto.randomBytes(16).toString('hex') }, getJwtSecret(), { expiresIn: '10m' });
 }
 
 function verifyState(state: string): { userId: string; flow?: MetaFlowType } {
-    const secret = process.env.JWT_SECRET;
-    if (!secret) throw new Error('JWT_SECRET is not configured');
+    const secret = getJwtSecret();
     try {
         return jwt.verify(state, secret) as { userId: string; flow?: MetaFlowType };
     } catch {

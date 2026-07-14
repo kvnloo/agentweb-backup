@@ -35,6 +35,9 @@ export interface Skill {
   welcomeMessage?: string;
   createdAt: string;
   updatedAt: string;
+  // ENG-173: set by the backend publish guardrail when a published skill is not in
+  // any subscription tier's allow-list (invisible to non-wildcard users).
+  warnings?: string[];
 }
 
 export type AssignmentStatus = 'active' | 'paused' | 'completed' | 'error';

@@ -360,6 +360,38 @@ class EmailEventsDb {
     await dynamodb.put({ TableName: TABLE_NAME, Item: item }).promise();
   }
 
+  /**
+   * Persist a sent Twitter/X tweet or DM to AW-EmailEvents for CRM engagement
+   * history. Mirrors addLinkedInMessageEvent; domain is `twitter-{listId}`.
+   */
+  async addTwitterMessageEvent(params: {
+    eventId: string;
+    emailDomain: string;
+    leadEmail: string;
+    eventType: 'twitter.tweet.sent' | 'twitter.dm.sent';
+    text: string | null;
+    timestamp: string;
+    senderId: string;
+    messageProviderId: string;
+  }): Promise<void> {
+    const item = {
+      eventId: params.eventId,
+      // emailId is a GSI key — DynamoDB rejects empty strings; fall back to eventId
+      emailId: params.messageProviderId || params.eventId,
+      emailDomain: params.emailDomain,
+      eventType: params.eventType,
+      createdAt: params.timestamp,
+      processedAt: new Date().toISOString(),
+      leadEmail: params.leadEmail,
+      data: {
+        text: params.text,
+        sender_id: params.senderId,
+      } as any,
+    };
+
+    await dynamodb.put({ TableName: TABLE_NAME, Item: item }).promise();
+  }
+
 }
 
 export const emailEventsDb = new EmailEventsDb();

@@ -145,71 +145,120 @@ const IntroOverlay: React.FC<{
   );
 };
 
-/** CTA card shown at the end */
+/**
+ * Pick a legible text color (near-black or white) for text placed on top of `hexBg`,
+ * based on perceived luminance. Guards the end-card button against unreadable
+ * dark-on-dark / light-on-light when a brand's secondary color is at either extreme.
+ */
+const readableOn = (hexBg: string): string => {
+  const h = (hexBg || "").replace("#", "");
+  const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h;
+  const r = parseInt(full.slice(0, 2), 16);
+  const g = parseInt(full.slice(2, 4), 16);
+  const b = parseInt(full.slice(4, 6), 16);
+  // Unparseable (e.g. a CSS named color) → keep the prior dark-text behavior so we never
+  // regress; the luminance branch only ever improves the valid-hex cases.
+  if ([r, g, b].some((v) => Number.isNaN(v))) return "#0a0a0f";
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luminance > 0.6 ? "#0a0a0f" : "#ffffff";
+};
+
+/**
+ * Full-frame branded end card (skill Layer 8): brand mark, single offer line, URL button.
+ * An OPAQUE brand-anchored slate that replaces the footage for the final beats — a
+ * dedicated CTA frame, not the old translucent wash over the last clip (which, combined
+ * with the ENG-123 black tail, read as a logo-less card floating over black). Brand color
+ * anchors hardest here; elements stagger in brand mark → offer → URL.
+ */
 const OutroOverlay: React.FC<{
   ctaText: string;
   ctaUrl?: string;
+  brandName: string;
+  logoUrl?: string;
   primaryColor: string;
   secondaryColor: string;
   durationFrames: number;
-}> = ({ ctaText, ctaUrl, primaryColor, secondaryColor, durationFrames }) => {
+}> = ({ ctaText, ctaUrl, brandName, logoUrl, primaryColor, secondaryColor, durationFrames }) => {
   const frame = useCurrentFrame();
 
-  const opacity = interpolate(frame, [0, 20, durationFrames - 10, durationFrames], [0, 1, 1, 0], {
-    extrapolateLeft: "clamp",
-    extrapolateRight: "clamp",
-  });
+  // Whole-card dissolve in/out so it reads as a dedicated end frame, not a hard cut.
+  const cardOpacity = interpolate(
+    frame,
+    [0, 12, durationFrames - 10, durationFrames],
+    [0, 1, 1, 0],
+    { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
+  );
 
-  const scale = interpolate(frame, [0, 20], [0.9, 1], {
-    easing: Easing.out(Easing.back(1.5)),
-    extrapolateLeft: "clamp",
-    extrapolateRight: "clamp",
-  });
+  // Staggered element reveal (Layer 8 ordering: brand mark → offer → URL), EASE_OUT_QUART.
+  const reveal = (start: number) => {
+    const arrival = { extrapolateLeft: "clamp" as const, extrapolateRight: "clamp" as const, easing: Easing.bezier(0.22, 1, 0.36, 1) };
+    return {
+      opacity: interpolate(frame, [start, start + 12], [0, 1], arrival),
+      transform: `translateY(${interpolate(frame, [start, start + 12], [18, 0], arrival)}px)`,
+    };
+  };
 
   return (
     <AbsoluteFill
       style={{
+        opacity: cardOpacity,
+        // Opaque brand-anchored slate with depth. A light (18%) dark scrim just takes the
+        // edge off so the white headline stays legible on very light brand primaries —
+        // intentionally subtle so the brand color still reads (not a gloomy overlay).
+        background: `linear-gradient(rgba(10,10,15,0.18), rgba(10,10,15,0.18)), radial-gradient(circle at 50% 34%, ${secondaryColor}22, transparent 62%), linear-gradient(160deg, ${primaryColor}, #0a0a0f)`,
         display: "flex",
+        flexDirection: "column",
         alignItems: "center",
         justifyContent: "center",
-        background: `${primaryColor}cc`,
+        gap: 22,
         pointerEvents: "none",
+        fontFamily: "Arial, sans-serif",
+        textAlign: "center",
+        padding: "0 80px",
       }}
     >
+      {/* Brand mark — logo if provided, else a wordmark (Layer 8 requires a brand mark). */}
+      {logoUrl ? (
+        <img src={logoUrl} alt={brandName} style={{ height: 72, objectFit: "contain", ...reveal(0) }} />
+      ) : (
+        <div style={{ fontSize: 40, fontWeight: 800, color: "#ffffff", letterSpacing: 0.5, ...reveal(0) }}>
+          {brandName}
+        </div>
+      )}
+
+      {/* Single offer line */}
       <div
         style={{
-          opacity,
-          transform: `scale(${scale})`,
-          textAlign: "center",
-          padding: "40px 60px",
-          background: "rgba(255,255,255,0.12)",
-          borderRadius: 16,
-          border: `2px solid ${secondaryColor}`,
+          fontSize: 60,
+          fontWeight: 800,
+          color: "#ffffff",
+          lineHeight: 1.1,
+          maxWidth: "90%",
+          textShadow: "0 2px 12px rgba(0,0,0,0.35)",
+          ...reveal(8),
         }}
       >
+        {ctaText}
+      </div>
+
+      {/* URL rendered as the CTA button (brand secondary color anchors the action). */}
+      {ctaUrl && (
         <div
           style={{
-            fontSize: 42,
+            marginTop: 6,
+            fontSize: 30,
             fontWeight: 700,
-            color: "#ffffff",
-            fontFamily: "Arial, sans-serif",
-            marginBottom: 16,
+            color: readableOn(secondaryColor),
+            background: secondaryColor,
+            padding: "16px 40px",
+            borderRadius: 999,
+            boxShadow: "0 6px 20px rgba(0,0,0,0.35)",
+            ...reveal(16),
           }}
         >
-          {ctaText}
+          {ctaUrl}
         </div>
-        {ctaUrl && (
-          <div
-            style={{
-              fontSize: 24,
-              color: "#ffffffbb",
-              fontFamily: "Arial, sans-serif",
-            }}
-          >
-            {ctaUrl}
-          </div>
-        )}
-      </div>
+      )}
     </AbsoluteFill>
   );
 };
@@ -370,6 +419,8 @@ export const BrandedVideo: React.FC<BrandedVideoProps> = ({
           <OutroOverlay
             ctaText={ctaText}
             ctaUrl={ctaUrl}
+            brandName={brandName}
+            logoUrl={logoUrl}
             primaryColor={primaryColor}
             secondaryColor={secondaryColor}
             durationFrames={safeOutroDuration}

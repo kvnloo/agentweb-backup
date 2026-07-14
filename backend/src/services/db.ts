@@ -112,6 +112,7 @@ export interface User {
   lastLoginTime?: string;
   lastActiveAt?: string; // Updated when user creates a chat session (non-delegated); more accurate than lastLoginTime for DAU/WAU/MAU
   signupSource?: "password" | "oauth" | "waitlist" | "admin" | string; // How the account was created. Set at signup; do not mutate.
+  funnelStatus?: string | null; // Admin-owned business funnel status for triage/prioritization.
   supportNote?: string;
   roles?: ("partner" | "customer" | "free" | "contractor")[];
   displayName?: string;
@@ -124,6 +125,7 @@ export interface User {
   slackChannel?: string; // @deprecated — use slackChannels. Kept for backward-compat reads.
   slackChannels?: string[]; // Slack channels configured for this user (agent tools are restricted to these)
   slackSuggestedRepliesDisabled?: boolean; // When true, suppress Slack suggested-reply (slack-triggered) sessions/emails for this user. Absent/false = enabled (default).
+  slackShipNotifyDisabled?: boolean; // When true, suppress the Slack ping when an item this user reported ships (shipNotifyService). Absent/false = enabled (default).
   secrets?: Record<string, string>; // Encrypted per-user secrets (key → encrypted value)
   seoDomains?: string[]; // SEO domains to track (e.g., ["example.com", "subdomain.example.com"])
   googleAnalyticsPropertyId?: string; // DEPRECATED: Google Analytics Property ID (numeric, e.g., 123456789) - use googleAnalyticsProperties instead
@@ -154,6 +156,7 @@ export interface User {
   useCaseCategories?: string[];
   emmaHelpInterests?: string[]; // Onboarding multi-select: what user wants Emma to help with (e.g., "brand", "paid_ads", "founder_led_sales")
   emmaHelpInterestsSetAt?: string; // ISO timestamp when the user first saved their interests
+  fathomOnboardingIngestions?: Array<Record<string, unknown>>; // Review-first Fathom sales/prospect-call onboarding context ledger
   /**
    * Onboarding event log — appended to by POST /api/onboarding/events. Used
    * by the Lifecycle Drip Phase 1 feature to derive `onboardingStage`. Each
@@ -1355,31 +1358,46 @@ export class UserDB {
       return user; // Return the fetched user object if no updates are needed
     }
 
-    const updateExpressions: string[] = [];
+    const setExpressions: string[] = [];
+    const removeExpressions: string[] = [];
     const expressionAttributeNames: { [key: string]: string } = {};
     const expressionAttributeValues: { [key: string]: any } = {};
 
     Object.entries(updatableFields).forEach(([key, value]) => {
-      // Ensure value is not undefined. Allow null to explicitly remove/set a field to null.
-      if (value !== undefined) {
-        updateExpressions.push(`#${key} = :${key}`);
-        expressionAttributeNames[`#${key}`] = key;
+      if (value === undefined) return;
+      expressionAttributeNames[`#${key}`] = key;
+      if (value === null) {
+        // DynamoDB rejects SET-ing a GSI key attribute (e.g. orgId on
+        // OrgIdIndex) to NULL — it must be REMOVEd instead. Applying this to
+        // every null (not just GSI keys) keeps the semantics consistent and
+        // matches the REMOVE-on-null pattern already used in updateLead.
+        removeExpressions.push(`#${key}`);
+      } else {
+        setExpressions.push(`#${key} = :${key}`);
         expressionAttributeValues[`:${key}`] = value;
       }
     });
 
-    if (updateExpressions.length === 0) {
+    if (setExpressions.length === 0 && removeExpressions.length === 0) {
       return user;
     }
 
-    const params = {
+    const updateExpressionParts: string[] = [];
+    if (setExpressions.length > 0) updateExpressionParts.push(`SET ${setExpressions.join(", ")}`);
+    if (removeExpressions.length > 0) updateExpressionParts.push(`REMOVE ${removeExpressions.join(", ")}`);
+
+    const params: any = {
       TableName: this.tableName,
       Key: { email: user.email }, // Use email as the primary key
-      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      UpdateExpression: updateExpressionParts.join(" "),
       ExpressionAttributeNames: expressionAttributeNames,
-      ExpressionAttributeValues: expressionAttributeValues,
       ReturnValues: "ALL_NEW",
     };
+    // DynamoDB rejects an empty ExpressionAttributeValues map (e.g. when every
+    // update is a REMOVE-on-null with no SET clauses at all).
+    if (Object.keys(expressionAttributeValues).length > 0) {
+      params.ExpressionAttributeValues = expressionAttributeValues;
+    }
 
     try {
       const result = await this.docClient.update(params).promise();

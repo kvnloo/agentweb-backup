@@ -146,6 +146,14 @@ describe('SEO Agent Mode Tools', () => {
       const tool = emmaToolRegistry.getTool('get_seo_metrics');
       const result = await tool!.execute({}, { userId: 'test-user' });
       expect(result.message).toContain('Google Search Console is not configured');
+      // The message must give a concrete self-serve handoff (Settings → Analytics
+      // & SEO) so the agent guides the user to connect rather than filing a bug.
+      expect(result.message).toContain('/settings/analytics-seo');
+      expect(result.message).toContain('do not file a product issue');
+      // GSC-accurate grant steps (distinct from GA4): Search Console uses
+      // "Users and permissions" + "Full", not GA4's "Property Access Management"/"Viewer".
+      expect(result.message).toContain('Users and permissions');
+      expect(result.message).toContain('Full');
     });
 
     it('should return helpful message when user has no seoDomains field', async () => {
@@ -156,6 +164,7 @@ describe('SEO Agent Mode Tools', () => {
       const tool = emmaToolRegistry.getTool('get_seo_metrics');
       const result = await tool!.execute({}, { userId: 'test-user' });
       expect(result.message).toContain('Google Search Console is not configured');
+      expect(result.message).toContain('/settings/analytics-seo');
     });
 
     it('should return error when user not found', async () => {
@@ -296,6 +305,14 @@ describe('SEO Agent Mode Tools', () => {
       const tool = emmaToolRegistry.getTool('get_website_analytics');
       const result = await tool!.execute({}, { userId: 'test-user' });
       expect(result.message).toContain('Google Analytics (GA4) is not configured');
+      // Self-serve handoff so the agent points the user to connect GA4 instead of
+      // treating a missing connection as a product bug.
+      expect(result.message).toContain('/settings/analytics-seo');
+      expect(result.message).toContain('do not file a product issue');
+      // GA4-accurate grant steps (distinct from GSC): GA4 uses "Property Access
+      // Management" + "Viewer", and the identifier is a numeric Property ID.
+      expect(result.message).toContain('Property Access Management');
+      expect(result.message).toContain('Viewer');
     });
 
     it('should return error when user not found', async () => {
@@ -464,6 +481,100 @@ describe('SEO Agent Mode Tools', () => {
       expect(firstCall.dimensionFilter).toBeDefined();
       expect(firstCall.dimensionFilter.andGroup.expressions).toHaveLength(1);
       expect(firstCall.dimensionFilter.andGroup.expressions[0].notExpression.filter.stringFilter.value).toBe('staging.example.com');
+    });
+
+    it('should return conversions in trafficSources entries', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user',
+        googleAnalyticsPropertyId: '123456',
+        seoDomains: ['example.com'],
+      });
+
+      // overall, pages engagement, daily, traffic sources (with conversions), conversions-by-source
+      mockRunReport
+        .mockResolvedValueOnce([{
+          rows: [{
+            metricValues: [
+              { value: '500' }, { value: '400' }, { value: '1500' }, { value: '90.0' }, { value: '0.30' },
+            ]
+          }]
+        }])
+        .mockResolvedValueOnce([{ rows: [] }]) // pages engagement
+        .mockResolvedValueOnce([{ rows: [] }]) // daily
+        .mockResolvedValueOnce([{              // traffic sources with conversions
+          rows: [{
+            dimensionValues: [{ value: 'google' }, { value: 'cpc' }],
+            metricValues: [{ value: '300' }, { value: '250' }, { value: '900' }, { value: '75.0' }, { value: '12' }],
+          }]
+        }])
+        .mockResolvedValueOnce([{ rows: [] }]); // conversions by source+event
+
+      const tool = emmaToolRegistry.getTool('get_website_analytics');
+      const result = await tool!.execute({ timeframe: '30d' }, { userId: 'test-user' });
+
+      expect(result.metrics[0].trafficSources).toHaveLength(1);
+      expect(result.metrics[0].trafficSources[0].source).toBe('google');
+      expect(result.metrics[0].trafficSources[0].medium).toBe('cpc');
+      expect(result.metrics[0].trafficSources[0].conversions).toBe(12);
+    });
+
+    it('should return conversionsBySource array with source/medium/eventName breakdown', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user',
+        googleAnalyticsPropertyId: '123456',
+        seoDomains: ['example.com'],
+      });
+
+      mockRunReport
+        .mockResolvedValueOnce([{ rows: [] }]) // overall
+        .mockResolvedValueOnce([{ rows: [] }]) // pages engagement
+        .mockResolvedValueOnce([{ rows: [] }]) // daily
+        .mockResolvedValueOnce([{ rows: [] }]) // traffic sources
+        .mockResolvedValueOnce([{              // conversions by source+event
+          rows: [
+            {
+              dimensionValues: [{ value: 'google' }, { value: 'cpc' }, { value: 'generate_lead' }],
+              metricValues: [{ value: '8' }],
+            },
+            {
+              dimensionValues: [{ value: 'facebook' }, { value: 'paid' }, { value: 'form_submit' }],
+              metricValues: [{ value: '3' }],
+            },
+          ]
+        }]);
+
+      const tool = emmaToolRegistry.getTool('get_website_analytics');
+      const result = await tool!.execute({ timeframe: '30d' }, { userId: 'test-user' });
+
+      expect(result.metrics[0].conversionsBySource).toBeDefined();
+      expect(result.metrics[0].conversionsBySource).toHaveLength(2);
+      expect(result.metrics[0].conversionsBySource[0]).toEqual({
+        source: 'google',
+        medium: 'cpc',
+        eventName: 'generate_lead',
+        conversions: 8,
+      });
+      expect(result.metrics[0].conversionsBySource[1]).toEqual({
+        source: 'facebook',
+        medium: 'paid',
+        eventName: 'form_submit',
+        conversions: 3,
+      });
+    });
+
+    it('should return empty conversionsBySource when no key events configured', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user',
+        googleAnalyticsPropertyId: '123456',
+      });
+
+      mockRunReport.mockResolvedValue([{ rows: [] }]);
+
+      const tool = emmaToolRegistry.getTool('get_website_analytics');
+      const result = await tool!.execute({}, { userId: 'test-user' });
+
+      expect(result.metrics[0].conversionsBySource).toBeDefined();
+      expect(result.metrics[0].conversionsBySource).toHaveLength(0);
     });
   });
 

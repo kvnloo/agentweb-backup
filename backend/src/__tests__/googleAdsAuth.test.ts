@@ -65,7 +65,13 @@ beforeEach(() => {
   mockAuthUserId = 'user-123';
   jest.clearAllMocks();
   mockAxiosPost.mockResolvedValue({
-    data: { access_token: 'gads-token', refresh_token: 'gads-refresh', expires_in: 3600 },
+    data: {
+      access_token: 'gads-token',
+      refresh_token: 'gads-refresh',
+      expires_in: 3600,
+      // Google returns the scopes actually granted; the adwords scope must be present.
+      scope: 'https://www.googleapis.com/auth/adwords https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile',
+    },
   });
 });
 
@@ -135,6 +141,110 @@ describe('POST /finalize', () => {
   it('returns 400 for missing code', async () => {
     const state = makeState('user-123');
     await request(app).post('/finalize').send({ state }).expect(400);
+  });
+
+  it('returns 422 insufficient_scopes when the adwords scope was not granted', async () => {
+    const { listAccountHierarchy } = require('../services/googleAdsService').googleAdsService;
+    // Google Workspace admin policy (or an unchecked box on the "unverified app"
+    // consent screen) can drop the sensitive adwords scope while still issuing a
+    // token for the userinfo scopes — the connection must fail with a clear error.
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        access_token: 'gads-token',
+        refresh_token: 'gads-refresh',
+        expires_in: 3600,
+        scope: 'https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile',
+      },
+    });
+    const state = makeState('user-123');
+    const res = await request(app)
+      .post('/finalize')
+      .send({ code: 'auth-code', state })
+      .expect(422);
+    expect(res.body.error).toBe('insufficient_scopes');
+    expect(res.body.message).toMatch(/permission/i);
+    expect(res.body.grantedScopes).not.toContain('https://www.googleapis.com/auth/adwords');
+    // Must fail fast — never probe the Google Ads API with a scope-less token.
+    expect(listAccountHierarchy).not.toHaveBeenCalled();
+  });
+
+  it('returns 422 insufficient_scopes when the token response has no scope field', async () => {
+    const { listAccountHierarchy } = require('../services/googleAdsService').googleAdsService;
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { access_token: 'gads-token', refresh_token: 'gads-refresh', expires_in: 3600 },
+    });
+    const state = makeState('user-123');
+    const res = await request(app)
+      .post('/finalize')
+      .send({ code: 'auth-code', state })
+      .expect(422);
+    expect(res.body.error).toBe('insufficient_scopes');
+    expect(listAccountHierarchy).not.toHaveBeenCalled();
+  });
+
+  describe('diagnostic logging', () => {
+    let warnSpy: jest.SpyInstance;
+    let errorSpy: jest.SpyInstance;
+    let logSpy: jest.SpyInstance;
+
+    beforeEach(() => {
+      warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+      logSpy.mockRestore();
+    });
+
+    it('logs userId and the missing/granted scopes when adwords scope is absent', async () => {
+      mockAxiosPost.mockResolvedValueOnce({
+        data: {
+          access_token: 'gads-token',
+          refresh_token: 'gads-refresh',
+          expires_in: 3600,
+          scope: 'https://www.googleapis.com/auth/userinfo.email',
+        },
+      });
+      const state = makeState('user-123');
+      await request(app).post('/finalize').send({ code: 'auth-code', state }).expect(422);
+
+      const logged = warnSpy.mock.calls.map(c => JSON.stringify(c)).join('\n');
+      expect(logged).toMatch(/insufficient_scopes/);
+      expect(logged).toContain('user-123');
+      expect(logged).toContain('https://www.googleapis.com/auth/userinfo.email');
+      expect(logged).not.toContain('gads-token');
+      expect(logged).not.toContain('gads-refresh');
+    });
+
+    it('logs the Google API error status/body (not just a generic message) when the account probe fails', async () => {
+      const { listAccountHierarchy } = require('../services/googleAdsService').googleAdsService;
+      const apiError: any = new Error('Request failed with status code 403');
+      apiError.response = {
+        status: 403,
+        data: { error: { code: 403, message: 'The caller does not have permission', status: 'PERMISSION_DENIED' } },
+      };
+      (listAccountHierarchy as jest.Mock).mockRejectedValueOnce(apiError);
+
+      const state = makeState('user-123');
+      await request(app).post('/finalize').send({ code: 'auth-code', state }).expect(500);
+
+      const logged = errorSpy.mock.calls.map(c => JSON.stringify(c)).join('\n');
+      expect(logged).toContain('user-123');
+      expect(logged).toContain('PERMISSION_DENIED');
+      expect(logged).toContain('403');
+    });
+
+    it('logs userId and account count on a successful finalize', async () => {
+      const state = makeState('user-123');
+      await request(app).post('/finalize').send({ code: 'auth-code', state }).expect(200);
+
+      const logged = logSpy.mock.calls.map(c => JSON.stringify(c)).join('\n');
+      expect(logged).toContain('user-123');
+      expect(logged).toMatch(/finalize/i);
+    });
   });
 });
 

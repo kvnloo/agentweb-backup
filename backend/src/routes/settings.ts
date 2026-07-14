@@ -938,13 +938,8 @@ router.post('/google-drive/folders', authenticateToken, async (req, res) => {
     const { google } = await import('googleapis');
 
     const environment = process.env.NODE_ENV || 'development';
-    const secretName = environment === 'production'
-      ? 'prod/AgentWeb/Google/Share'
-      : 'dev/AgentWeb/Google/Share';
-
-    const secretString = await getSecret(secretName);
-    const credentials = JSON.parse(secretString);
-
+    const secretName = environment === 'production' ? 'prod/AgentWeb/Google/Share' : 'dev/AgentWeb/Google/Share';
+    const credentials = JSON.parse(await getSecret(secretName));
     const auth = new google.auth.GoogleAuth({
       credentials,
       scopes: ['https://www.googleapis.com/auth/drive.readonly'],
@@ -1095,13 +1090,8 @@ router.get('/google-drive/folders/:folderId/files', authenticateToken, async (re
     const { google } = await import('googleapis');
 
     const environment = process.env.NODE_ENV || 'development';
-    const secretName = environment === 'production'
-      ? 'prod/AgentWeb/Google/Share'
-      : 'dev/AgentWeb/Google/Share';
-
-    const secretString = await getSecret(secretName);
-    const credentials = JSON.parse(secretString);
-
+    const secretName = environment === 'production' ? 'prod/AgentWeb/Google/Share' : 'dev/AgentWeb/Google/Share';
+    const credentials = JSON.parse(await getSecret(secretName));
     const auth = new google.auth.GoogleAuth({
       credentials,
       scopes: ['https://www.googleapis.com/auth/drive.readonly'],

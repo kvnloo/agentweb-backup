@@ -6,36 +6,12 @@ import {
   getRecentChannelMessages,
   getThreadReplies,
   postSlackMessage,
+  getEffectiveAllowedChannels,
 } from '../services/slackService';
-import { userDb, orgDb } from '../services/db';
+import { userDb } from '../services/db';
 
 const NO_SLACK_CHANNEL_ERROR = 'No Slack channel is configured for your account. Ask your admin to set one up.';
 const NO_CHANNEL_SPECIFIED_ERROR = 'You have multiple Slack channels configured. Specify which channel to use via channel_id or channel_name.';
-
-// Returns the list of allowed channel IDs for a non-admin user (supports slackChannels array + legacy slackChannel).
-function getUserAllowedChannels(user: { slackChannels?: string[]; slackChannel?: string }): string[] {
-  if (user.slackChannels && user.slackChannels.length > 0) return user.slackChannels;
-  if (user.slackChannel) return [user.slackChannel];
-  return [];
-}
-
-// Returns allowed channels for a user, falling back to the org's channel config for org members.
-// Priority: personal channels → org.slackChannel (if set on org record) → org owner's user channels.
-async function getEffectiveAllowedChannels(user: { slackChannels?: string[]; slackChannel?: string; orgId?: string } | null | undefined): Promise<string[]> {
-  const personal = getUserAllowedChannels(user ?? {});
-  if (personal.length > 0) return personal;
-  if (user?.orgId) {
-    const org = await orgDb.getOrgById(user.orgId);
-    if (org?.slackChannel) return [org.slackChannel];
-    // Channels are typically stored on the org owner's user record, not the org record itself
-    if (org?.ownerUserId) {
-      const owner = await userDb.getUserById(org.ownerUserId);
-      const ownerChannels = getUserAllowedChannels(owner ?? {});
-      if (ownerChannels.length > 0) return ownerChannels;
-    }
-  }
-  return [];
-}
 
 // Returns the channel ID to use for a tool call.
 // Regular users are scoped to their configured slackChannels; admins can target any channel.

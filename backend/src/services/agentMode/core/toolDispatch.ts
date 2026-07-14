@@ -26,6 +26,8 @@
  */
 
 import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
+import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
+import { appendRetryabilityGuidance } from './errorRetryability';
 
 /**
  * Media-generation tools whose batches must run sequentially (rate limits) AND are
@@ -40,6 +42,30 @@ export const MEDIA_GEN_TOOLS = new Set<string>([
   'generate_video',
   'generate_voiceover',
 ]);
+
+/**
+ * Tools exempt from same-turn dedupe (ENG-108) — they have legitimate repeat
+ * semantics within a single assistant turn, so two identical calls are NOT a
+ * double-execution bug. `wait_seconds` is the canonical case (sleeping twice is
+ * meaningful and intended). Keep this set conservative: only add a tool here
+ * when an identical call back-to-back in one turn is genuinely valid.
+ */
+export const NON_DEDUPABLE_TOOLS = new Set<string>([
+  'wait_seconds',
+]);
+
+/**
+ * Deterministic, key-sorted stringify so two calls with the same fields in a
+ * different order ({a,b} vs {b,a}) produce the same dedupe key. Used only to
+ * build the same-turn dedupe signature — not for storage or model output.
+ */
+export function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(',')}}`;
+}
 
 /**
  * A media-gen tool can return `success: true` WITHOUT producing an asset: the
@@ -135,8 +161,24 @@ export interface ToolDispatchPorts {
   executePreparedAgentTool: (input: any) => Promise<any>;
   /** classify a "successful" result that actually encodes an error -> downgrade to error */
   toolResultError: (result: any) => any;
+  /**
+   * Validate a "successful" result against the minimum-output contract (ENG-105):
+   * returns an Error when the output is empty/undefined/unusable so the boundary
+   * can downgrade it to a structured tool failure (telemetry class invalid_output),
+   * else null. Optional — when absent the contract check is skipped (behavior
+   * preserved for callers that don't wire it).
+   */
+  validateToolOutput?: (result: any) => any;
   /** record per-iteration tool telemetry (best-effort, observability-only) */
   recordToolTelemetry: (telemetryToolResults: Array<DispatchToolResult | PreflightToolResult>) => void;
+  /**
+   * Record same-turn duplicate tool-call suppression (ENG-108), SEPARATELY from
+   * success/failure telemetry (suppressed duplicates are deliberately NOT passed
+   * to recordToolTelemetry, which buckets non-success as a failure). Optional +
+   * observability-only. */
+  recordDuplicateSuppression?: (
+    entries: Array<{ toolCall: any; functionArgs: any; duplicateOfId: string }>,
+  ) => void;
   /** extract the minimal result stored on the toolCalls ledger entry */
   extractMinimalToolResult: (result: any, toolName: string) => any;
   /** extract the string content fed back to the model as the tool message */
@@ -270,6 +312,39 @@ export async function executePreparedTools(
   const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision }> = [];
   const preflightToolResults: PreflightToolResult[] = [];
 
+  // Same-turn dedupe (ENG-108): collapse identical (name + args) calls emitted in
+  // ONE assistant turn so they execute once and can't double-bill. We still MUST
+  // answer every emitted tool_call_id (or the next LLM turn rejects the orphaned
+  // call — same invariant the deferred-media path documents), so a suppressed
+  // duplicate gets its own tool-role message pointing at the call that IS being
+  // handled. Suppression is neither success nor failure: no counter, no telemetry
+  // through the success/failure path.
+  const seenToolCallKeys = new Map<string, string>(); // dedupe key -> first tool_call_id
+  const suppressedDuplicates: Array<{ toolCall: any; functionArgs: any; duplicateOfId: string }> = [];
+
+  const appendSuppressedDuplicate = (
+    suppressed: { toolCall: any; functionArgs: any; duplicateOfId: string },
+  ) => {
+    const { toolCall, functionArgs, duplicateOfId } = suppressed;
+    const suppressMsg =
+      `This call was collapsed: an identical ${toolCall.function.name} call with the same arguments `
+      + `was already handled by tool_call_id ${duplicateOfId}. Use that completed tool result — do not repeat this call.`;
+    (messages as any[]).push({
+      tool_call_id: toolCall.id,
+      role: 'tool',
+      name: toolCall.function.name,
+      content: suppressMsg,
+      metadata: { timestamp: new Date().toISOString(), duplicateSuppressed: true, duplicateOfId },
+    });
+    toolCalls.push({
+      id: toolCall.id,
+      name: toolCall.function.name,
+      arguments: functionArgs,
+      duplicateOf: duplicateOfId,
+      duration: 0,
+    });
+  };
+
   const appendPreflightToolFailure = (
     toolCall: any,
     functionArgs: any,
@@ -357,7 +432,12 @@ export async function executePreparedTools(
       });
 
       if (contractResult.status === 'invalid') {
-        const errorContent = ports.formatToolError(toolCall.function.name, contractResult.modelMessage);
+        // ENG-124: schema rejects carry the explicit not-retryable-as-is verdict
+        // (fix the args first) so the model can't spiral on the identical call.
+        const errorContent = appendRetryabilityGuidance(
+          ports.formatToolError(toolCall.function.name, contractResult.modelMessage),
+          classifyToolErrorClass(contractResult.modelMessage),
+        );
         appendPreflightToolFailure(toolCall, functionArgs, contractResult.modelMessage, errorContent, initialPolicyDecision);
         continue;
       }
@@ -385,11 +465,28 @@ export async function executePreparedTools(
         continue;
       }
 
+      // Same-turn dedupe (ENG-108): if an identical (name + canonical args) call
+      // was already accepted this turn and the tool isn't exempt, collapse this
+      // one — do NOT execute it. Still answer its tool_call_id with a tool-role
+      // message + a ledger entry so the next LLM turn isn't left with an orphan.
+      const dedupeKey = `${toolCall.function.name}:${stableStringify(preparedFunctionArgs)}`;
+      if (!NON_DEDUPABLE_TOOLS.has(toolCall.function.name) && seenToolCallKeys.has(dedupeKey)) {
+        const duplicateOfId = seenToolCallKeys.get(dedupeKey) as string;
+        suppressedDuplicates.push({ toolCall, functionArgs: preparedFunctionArgs, duplicateOfId });
+        continue;
+      }
+      seenToolCallKeys.set(dedupeKey, toolCall.id);
+
       preparedCalls.push({ toolCall, functionArgs: preparedFunctionArgs, policyDecision });
     } catch (error) {
       console.error(`AgentMode: Tool argument parse error for ${toolCall.function.name}:`, error);
       const errMsg = error instanceof Error ? error.message : String(error);
-      const errorContent = ports.formatToolError(toolCall.function.name, `Failed to parse arguments: ${errMsg}`);
+      // ENG-124: unparseable args are never retryable as-is — emit the corrected-
+      // arguments verdict alongside the formatted error.
+      const errorContent = appendRetryabilityGuidance(
+        ports.formatToolError(toolCall.function.name, `Failed to parse arguments: ${errMsg}`),
+        'invalid_args',
+      );
       appendPreflightToolFailure(toolCall, undefined, `Failed to parse arguments: ${errMsg}`, errorContent);
     }
   }
@@ -421,6 +518,12 @@ export async function executePreparedTools(
         socketEmit: ports.socketEmit,
         screenshotUrl,
         isDelegatedAccess,
+        // Long-render tools (compose_video) read this to hand off before the run's hard
+        // wall-clock timeout rather than blocking until killed with no asset (ENG-123).
+        renderDeadlineMs: mediaGenerationDeadlineMs,
+        // Run wall-clock budget deadline so wait_seconds can cap its sleep and not be
+        // killed mid-wait by the generation timeout (ENG-124).
+        runBudgetDeadlineMs: mediaGenerationDeadlineMs,
       }),
     });
 
@@ -492,10 +595,17 @@ export async function executePreparedTools(
     toolResults = await Promise.all(toolPromises);
   }
 
-  // Downgrade "successful" results that actually encode an error.
+  // Downgrade "successful" results that actually encode an error (toolResultError)
+  // OR that fail the minimum-output contract (ENG-105: undefined/empty/{}/empty
+  // content array). The encoded-error check runs first; the output-contract check
+  // catches the empty/invalid-output case the encoded-error check does not. Either
+  // way the call becomes a structured tool failure rather than feeding garbage to
+  // the model and being counted as a success.
   toolResults = toolResults.map((toolResult) => {
     if (toolResult.status !== 'success') return toolResult;
-    const error = ports.toolResultError(toolResult.result);
+    const encodedError = ports.toolResultError(toolResult.result);
+    const error = encodedError
+      ?? (ports.validateToolOutput ? ports.validateToolOutput(toolResult.result) : null);
     if (!error) return toolResult;
     return {
       status: 'error' as const,
@@ -507,14 +617,23 @@ export async function executePreparedTools(
       policyDecision: toolResult.policyDecision,
     };
   });
-  // Deferred calls never executed, so they carry no success/error telemetry signal.
+  // Deferred calls never executed, but they ARE forwarded to telemetry as their
+  // own class (ENG-103): the telemetry layer records them via toolDeferred (not
+  // toolInvoked/succeeded/failed), so deferred/skipped is accounted separately
+  // from success and failure and never pollutes the reliability ratio.
   const telemetryToolResults: Array<DispatchToolResult | PreflightToolResult> = [
     ...preflightToolResults,
-    ...toolResults.filter((r) => r.status !== 'deferred'),
+    ...toolResults,
   ];
 
   // Runtime-spine telemetry (best-effort, observability-only).
   ports.recordToolTelemetry(telemetryToolResults);
+
+  // Record same-turn duplicate suppression SEPARATELY (ENG-108) — never through
+  // recordToolTelemetry above, which would mislabel a suppression as a failure.
+  if (suppressedDuplicates.length > 0) {
+    ports.recordDuplicateSuppression?.(suppressedDuplicates);
+  }
 
   // Phase 3: Process results in original order — append to messages, toolCalls, counters
   for (const toolResult of toolResults) {
@@ -672,8 +791,17 @@ export async function executePreparedTools(
       failedCounterUpdates[toolCall.function.name] =
         (failedCounterUpdates[toolCall.function.name] || 0) + 1;
 
+      // ENG-124: the model-visible error carries (a) what failed (formatToolError
+      // names the tool + reason, with per-tool fix text), and (b+c) an explicit
+      // retryable yes/no verdict + actionable next step derived from the same
+      // classifier the telemetry uses — so a terminal failure (auth, provider
+      // rejection, schema reject) carries a hard stop signal instead of inviting
+      // a retry spiral.
       const errMsg = error instanceof Error ? error.message : String(error);
-      const errorContent = ports.formatToolError(toolCall.function.name, errMsg);
+      const errorContent = appendRetryabilityGuidance(
+        ports.formatToolError(toolCall.function.name, errMsg),
+        classifyToolErrorClass(error),
+      );
       messages.push({
         tool_call_id: toolCall.id,
         role: 'tool',
@@ -682,6 +810,12 @@ export async function executePreparedTools(
         metadata: { timestamp: new Date().toISOString() },
       });
     }
+  }
+
+  // Same-turn duplicates are appended only after the real tool results above, so
+  // the model sees the completed original call before the "use that result" note.
+  for (const suppressed of suppressedDuplicates) {
+    appendSuppressedDuplicate(suppressed);
   }
 
   return { pendingCounterUpdates, failedCounterUpdates, skillsUpdated, mediaAssetsProduced, mediaBudgetDeferred };

@@ -217,7 +217,19 @@ export function copySiblingConfigFields(
               source: 'web_search',
               provider: sibMeta!.provider ?? 'agentweb',
               enrichedAt,
-              confidence: sibMeta!.confidence,
+              // A web-sourced sibling value is second-hand: it was grounded (if
+              // at all) against the SIBLING's identity, not THIS lead's. Per the
+              // ENG-122 training-memory policy we keep the data but badge it
+              // unverified — never carry a 'grounded'/verified status or the
+              // sibling's (often 'high') confidence across leads, which would
+              // present stale copied funding as confident. Preserve an
+              // 'ai-knowledge' badge (pure-model knowledge stays that); otherwise
+              // mark 'web-unverified' since a source URL/quote exists. Low
+              // confidence makes fieldVerificationStatus() flag it as unverified
+              // so the UI/Emma caveat it; the critic still re-verifies identity
+              // on top and drops wrong-entity copies.
+              confidence: 'low',
+              grounding: sibMeta!.grounding === 'ai-knowledge' ? 'ai-knowledge' : 'web-unverified',
               sourceUrl: sibMeta!.sourceUrl,
               sourceQuote: sibMeta!.sourceQuote,
               siblingLeadId: sib.leadId,

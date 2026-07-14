@@ -1,10 +1,44 @@
-import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream } from '../services/codingAgentService';
+import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, LANDING_PAGE_PREVIEW_BRANCH, _isMissingGithubRefError, _describeGithubError, _previewBranchCommitsAheadOfMain, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream } from '../services/codingAgentService';
 import { agentModeService } from '../services/agentModeService';
 
 // Mock mcpFetch
 jest.mock('../mcp/server/httpClient', () => ({
   mcpFetch: jest.fn()
 }));
+
+// Mock only axios's HTTP methods (used by the preview-branch reset) while
+// preserving the rest of the module — other transitively-imported services
+// (e.g. Slack's WebClient) rely on axios.create/axios.defaults at load time.
+jest.mock('axios', () => {
+  const actual = jest.requireActual('axios');
+  return {
+    __esModule: true,
+    default: {
+      ...actual,
+      get: jest.fn(),
+      post: jest.fn(),
+      put: jest.fn(),
+      patch: jest.fn(),
+      delete: jest.fn(),
+    },
+  };
+});
+import axios from 'axios';
+const mockedAxios = axios as jest.Mocked<typeof axios>;
+
+// Mock the GitHub org token lookup so the reset path doesn't hit Secrets Manager.
+jest.mock('../utils/secretsManager', () => ({
+  ...jest.requireActual('../utils/secretsManager'),
+  getGitHubOrgToken: jest.fn(async () => ({ token: 'gh-test-token', org: 'AgentWebPro' })),
+}));
+
+// Build an axios-style error carrying a GitHub response body.
+const githubAxiosError = (status: number, data: any): any => {
+  const err: any = new Error(`Request failed with status code ${status}`);
+  err.isAxiosError = true;
+  err.response = { status, data };
+  return err;
+};
 
 // Mock v0Service so scope resolution doesn't hit DynamoDB. By default both lookups
 // return empty (page not found) → scope stays undefined → the agent runs
@@ -1974,5 +2008,300 @@ describe('runCodingAgent — scope enforcement', () => {
     expect(result.success).toBe(true);
     const putCalls = mockedMcpFetch.mock.calls.filter(c => c[0]?.method === 'PUT');
     expect(putCalls).toHaveLength(1);
+  });
+});
+
+// ─── GitHub error helpers (ENG-159) ───────────────────────────────────────────
+
+describe('_isMissingGithubRefError', () => {
+  test('treats 404 as a missing ref', () => {
+    expect(_isMissingGithubRefError(githubAxiosError(404, { message: 'Not Found' }))).toBe(true);
+  });
+
+  test('treats 422 "Reference does not exist" as a missing ref (Update-a-reference endpoint)', () => {
+    expect(_isMissingGithubRefError(githubAxiosError(422, { message: 'Reference does not exist' }))).toBe(true);
+  });
+
+  test('treats 422 with a nested "does not exist" error entry as a missing ref', () => {
+    const err = githubAxiosError(422, {
+      message: 'Validation Failed',
+      errors: [{ resource: 'Reference', code: 'custom', message: 'Reference does not exist' }],
+    });
+    expect(_isMissingGithubRefError(err)).toBe(true);
+  });
+
+  test('does NOT treat an unrelated 422 as a missing ref', () => {
+    expect(_isMissingGithubRefError(githubAxiosError(422, { message: 'sha is not a commit' }))).toBe(false);
+  });
+
+  test('does NOT treat a 500 as a missing ref', () => {
+    expect(_isMissingGithubRefError(githubAxiosError(500, { message: 'Server Error' }))).toBe(false);
+  });
+
+  test('handles a non-axios error without throwing', () => {
+    expect(_isMissingGithubRefError(new Error('boom'))).toBe(false);
+  });
+});
+
+describe('_describeGithubError', () => {
+  test('surfaces the GitHub message and status instead of a bare axios string', () => {
+    const detail = _describeGithubError(
+      githubAxiosError(422, { message: 'Reference does not exist' }),
+      'reset the preview branch',
+    );
+    expect(detail).toContain('HTTP 422');
+    expect(detail).toContain('Reference does not exist');
+    expect(detail).not.toBe('Request failed with status code 422');
+  });
+
+  test('includes nested validation error messages', () => {
+    const detail = _describeGithubError(
+      githubAxiosError(422, { message: 'Validation Failed', errors: [{ message: 'sha is not a commit' }] }),
+      'reset the preview branch',
+    );
+    expect(detail).toContain('sha is not a commit');
+  });
+
+  test('falls back to the error message when there is no response body', () => {
+    expect(_describeGithubError(new Error('network down'), 'read the repo main branch')).toContain('network down');
+  });
+});
+
+// ─── Preview-branch reset: 422 missing-ref recovery (ENG-159) ─────────────────
+
+describe('runCodingAgent — preview-branch reset resilience', () => {
+  const previewContext: CodingAgentContext = {
+    pageId: 'test-page-123',
+    userId: 'user-456',
+    sessionId: 'session-789',
+    llmModel: 'anthropic.claude-sonnet-4-6',
+    draftBranch: LANDING_PAGE_PREVIEW_BRANCH,
+  };
+
+  const editablePage = {
+    id: 'test-page-123',
+    githubRepoUrl: 'https://github.com/AgentWebPro/lp-free-ai-seo-geo-audit-37343865',
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedMcpFetch.mockReset();
+    mockCreate.mockReset();
+    _setBedrockClientForTest(mockClient);
+    _setSleepFnForTest(async () => {});
+    // Page exists and is editable by the caller so we reach the reset path.
+    mockGetLandingPageById.mockResolvedValue(editablePage);
+    mockGetLandingPagesByOwner.mockResolvedValue([]);
+    mockCanUserEditLandingPage.mockResolvedValue(true);
+    mockedAxios.get.mockReset();
+    mockedAxios.patch.mockReset();
+    mockedAxios.post.mockReset();
+  });
+
+  afterAll(() => {
+    _setBedrockClientForTest(null);
+  });
+
+  test('creates the branch when GitHub returns 422 "Reference does not exist" (was: every edit 422s)', async () => {
+    // main ref read OK, PATCH update fails because the draft branch is absent
+    // (GitHub reports this as 422, not 404), create succeeds.
+    mockedAxios.get.mockResolvedValueOnce({ data: { object: { sha: 'main-sha-abc' } } } as any);
+    mockedAxios.patch.mockRejectedValueOnce(githubAxiosError(422, { message: 'Reference does not exist' }));
+    mockedAxios.post.mockResolvedValueOnce({ data: {} } as any);
+
+    // After a successful reset the agent proceeds; report success immediately.
+    mockCreate.mockResolvedValueOnce({
+      content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Edited the logo.', status: 'success' } }],
+      stop_reason: 'tool_use',
+    });
+
+    const result = await runCodingAgent('swap the logo image', previewContext);
+
+    // The branch was created (fell through to POST) rather than failing.
+    expect(mockedAxios.post).toHaveBeenCalledTimes(1);
+    expect(mockedAxios.post).toHaveBeenCalledWith(
+      expect.stringContaining('/git/refs'),
+      expect.objectContaining({ ref: `refs/heads/${LANDING_PAGE_PREVIEW_BRANCH}` }),
+      expect.anything(),
+    );
+    expect(result.success).toBe(true);
+    expect(result.message).not.toContain('status code 422');
+  });
+
+  test('surfaces the real GitHub 422 detail (not a bare status code) on a genuine rejection', async () => {
+    mockedAxios.get.mockResolvedValueOnce({ data: { object: { sha: 'main-sha-abc' } } } as any);
+    mockedAxios.patch.mockRejectedValueOnce(
+      githubAxiosError(422, { message: 'Validation Failed', errors: [{ message: 'sha is not a commit' }] }),
+    );
+
+    const result = await runCodingAgent('swap the logo image', previewContext);
+
+    // Genuine (non-missing-ref) 422 → run fails but the message carries the
+    // actual GitHub detail so the caller can act on it (ENG-159 request a).
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('sha is not a commit');
+    expect(result.message).not.toBe('Request failed with status code 422');
+    expect(result.retryable).toBe(true);
+    // Did NOT try to create the branch for a non-missing-ref error.
+    expect(mockedAxios.post).not.toHaveBeenCalled();
+  });
+
+  test('surfaces the real GitHub detail when reading the main ref fails (GET rejects)', async () => {
+    // GET main ref fails outright → the catch must surface the actual GitHub
+    // detail, not a bare status code (codingAgentService.ts GET catch).
+    mockedAxios.get.mockRejectedValueOnce(githubAxiosError(500, { message: 'Service Unavailable' }));
+
+    const result = await runCodingAgent('swap the logo image', previewContext);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('Service Unavailable');
+    expect(result.message).not.toBe('Request failed with status code 500');
+    // Never got far enough to update or create the branch.
+    expect(mockedAxios.patch).not.toHaveBeenCalled();
+    expect(mockedAxios.post).not.toHaveBeenCalled();
+  });
+
+  test('surfaces the real GitHub detail when creating the branch fails (POST rejects after missing-ref fallthrough)', async () => {
+    // main ref read OK, PATCH fails with a missing-ref 422 (falls through to
+    // create), but the POST create itself fails → surface the POST detail, not
+    // a bare status code (codingAgentService.ts POST catch).
+    mockedAxios.get.mockResolvedValueOnce({ data: { object: { sha: 'main-sha-abc' } } } as any);
+    mockedAxios.patch.mockRejectedValueOnce(githubAxiosError(422, { message: 'Reference does not exist' }));
+    mockedAxios.post.mockRejectedValueOnce(
+      githubAxiosError(422, { message: 'Validation Failed', errors: [{ message: 'Reference already exists' }] }),
+    );
+
+    const result = await runCodingAgent('swap the logo image', previewContext);
+
+    expect(mockedAxios.post).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('Reference already exists');
+    expect(result.message).not.toBe('Request failed with status code 422');
+  });
+});
+
+// ─── Preview-branch reset: preserve unpublished sequential edits (ENG-176) ─────
+
+describe('runCodingAgent — sequential edits do not clobber (ENG-176)', () => {
+  const previewContext: CodingAgentContext = {
+    pageId: 'test-page-123',
+    userId: 'user-456',
+    sessionId: 'session-789',
+    llmModel: 'anthropic.claude-sonnet-4-6',
+    draftBranch: LANDING_PAGE_PREVIEW_BRANCH,
+  };
+
+  const editablePage = {
+    id: 'test-page-123',
+    githubRepoUrl: 'https://github.com/AgentWebPro/lp-free-ai-seo-geo-audit-37343865',
+  };
+
+  const reportSuccess = () =>
+    mockCreate.mockResolvedValueOnce({
+      content: [{ type: 'tool_use', id: 'tu_1', name: 'report_to_user', input: { message: 'Added the book card.', status: 'success' } }],
+      stop_reason: 'tool_use',
+    });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedMcpFetch.mockReset();
+    mockCreate.mockReset();
+    _setBedrockClientForTest(mockClient);
+    _setSleepFnForTest(async () => {});
+    mockGetLandingPageById.mockResolvedValue(editablePage);
+    mockGetLandingPagesByOwner.mockResolvedValue([]);
+    mockCanUserEditLandingPage.mockResolvedValue(true);
+    mockedAxios.get.mockReset();
+    mockedAxios.patch.mockReset();
+    mockedAxios.post.mockReset();
+  });
+
+  afterAll(() => {
+    _setBedrockClientForTest(null);
+  });
+
+  test('does NOT reset the preview branch when it has unpublished commits ahead of main', async () => {
+    // A previous coding_agent run already added the first book card to the
+    // preview branch (1 unpublished commit ahead of main) and it was never
+    // published. The second edit must layer on top — NOT force-reset to main,
+    // which would discard the first book. This is the exact ENG-176 clobber.
+    mockedAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: 'main-sha-abc' } } } as any) // main ref
+      .mockResolvedValueOnce({ data: { status: 'ahead', ahead_by: 1, behind_by: 0 } } as any); // compare main...preview
+    reportSuccess();
+
+    const result = await runCodingAgent('append a second book card', previewContext);
+
+    // The reusable branch was preserved: no reset (PATCH) and no re-create (POST).
+    expect(mockedAxios.patch).not.toHaveBeenCalled();
+    expect(mockedAxios.post).not.toHaveBeenCalled();
+    // The ahead-check hit the correct compare endpoint (main...<encoded preview>).
+    // If URL construction ever broke, the compare would 404, be read as "0 ahead
+    // → reset", and silently reintroduce the clobber — so assert it explicitly.
+    expect(mockedAxios.get).toHaveBeenLastCalledWith(
+      expect.stringContaining('/compare/main...draft%2Fagentweb-preview'),
+      expect.anything(),
+    );
+    expect(result.success).toBe(true);
+  });
+
+  test('resets the preview branch to main when it is not ahead (fully published / identical)', async () => {
+    // No unpublished work on the branch → safe to reset to the latest main so
+    // the edit starts from the freshest published state (original behavior).
+    mockedAxios.get
+      .mockResolvedValueOnce({ data: { object: { sha: 'main-sha-abc' } } } as any) // main ref
+      .mockResolvedValueOnce({ data: { status: 'identical', ahead_by: 0, behind_by: 0 } } as any); // compare
+    mockedAxios.patch.mockResolvedValueOnce({ data: {} } as any);
+    reportSuccess();
+
+    const result = await runCodingAgent('edit the hero', previewContext);
+
+    expect(mockedAxios.patch).toHaveBeenCalledTimes(1);
+    expect(mockedAxios.patch).toHaveBeenCalledWith(
+      expect.stringContaining(`/git/refs/heads/${LANDING_PAGE_PREVIEW_BRANCH}`),
+      expect.objectContaining({ sha: 'main-sha-abc', force: true }),
+      expect.anything(),
+    );
+    expect(result.success).toBe(true);
+  });
+});
+
+describe('_previewBranchCommitsAheadOfMain', () => {
+  const repoBase = 'https://api.github.com/repos/AgentWebPro/lp-example';
+  const headers = { Authorization: 'Bearer x', Accept: 'application/vnd.github.v3+json' };
+
+  beforeEach(() => {
+    mockedAxios.get.mockReset();
+  });
+
+  test('returns the ahead count when the branch has unpublished commits', async () => {
+    mockedAxios.get.mockResolvedValueOnce({ data: { status: 'ahead', ahead_by: 2, behind_by: 0 } } as any);
+    await expect(_previewBranchCommitsAheadOfMain(repoBase, headers)).resolves.toBe(2);
+    // Guard the single safety-critical call: a broken URL (wrong encoding/ref
+    // order/path) would 404, be read as "0 ahead → reset", and silently
+    // reintroduce the ENG-176 clobber while every other assertion still passed.
+    expect(mockedAxios.get).toHaveBeenLastCalledWith(
+      expect.stringContaining('/compare/main...draft%2Fagentweb-preview'),
+      expect.objectContaining({ headers }),
+    );
+  });
+
+  test('returns 0 when identical to main', async () => {
+    mockedAxios.get.mockResolvedValueOnce({ data: { status: 'identical', ahead_by: 0, behind_by: 0 } } as any);
+    await expect(_previewBranchCommitsAheadOfMain(repoBase, headers)).resolves.toBe(0);
+  });
+
+  test('returns 0 when the preview branch does not exist yet (404)', async () => {
+    mockedAxios.get.mockRejectedValueOnce(githubAxiosError(404, { message: 'Not Found' }));
+    await expect(_previewBranchCommitsAheadOfMain(repoBase, headers)).resolves.toBe(0);
+  });
+
+  test('fails CLOSED (treats branch as ahead) on a transient comparison error so unpublished work is never clobbered', async () => {
+    // A 5xx/timeout/rate-limit must NOT be read as "0 ahead → safe to reset":
+    // that would let a transient GitHub hiccup force-reset the preview branch to
+    // main and destroy genuine unpublished edits (the ENG-176 clobber). Fail
+    // closed by reporting the branch as ahead so the caller skips the reset.
+    mockedAxios.get.mockRejectedValueOnce(githubAxiosError(500, { message: 'Service Unavailable' }));
+    await expect(_previewBranchCommitsAheadOfMain(repoBase, headers)).resolves.toBeGreaterThan(0);
   });
 });

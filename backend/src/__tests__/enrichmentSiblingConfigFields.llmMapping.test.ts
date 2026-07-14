@@ -327,12 +327,76 @@ describe('Tier 0b copySiblingConfigFields', () => {
     expect(out.fills[0].meta).toMatchObject({
       source: 'web_search',
       provider: 'llm_web_search',
-      confidence: 'medium',
       sourceUrl: 'https://www.slash.com/blog/slash-raises-series-b',
       sourceQuote: 'Slash has recently raised $41 million in a Series B funding round',
       // sibling lineage retained for debugging
       siblingLeadId: 'sib-web',
     });
+  });
+
+  // ── Training-memory grounding badge (ENG-122) ────────────────────────────
+  // A web-sourced copy is second-hand — never verified against THIS lead's
+  // identity — so it is badged unverified and forced to low confidence rather
+  // than inheriting the sibling's (often 'high') confidence. This prevents
+  // stale copied funding from presenting as confident/verified.
+  it('badges a web-sourced sibling copy as web-unverified at low confidence (not the sibling\'s high confidence)', () => {
+    const sib = sibling({
+      leadId: 'sib-web',
+      customFields: { total_funding: '$6.5M' },
+      enrichmentMetadata: {
+        total_funding: {
+          source: 'web_search',
+          provider: 'llm_web_search',
+          confidence: 'high',
+          sourceQuote: 'Raises $6.5M',
+          enrichedAt: '2026-06-23T09:59:32Z',
+        } as any,
+      },
+    });
+    const out = copySiblingConfigFields(lead(), [sib], [field('total_funding')], emptyMap);
+    expect(out.fills).toHaveLength(1);
+    expect(out.fills[0].meta).toMatchObject({
+      source: 'web_search',
+      grounding: 'web-unverified',
+      confidence: 'low',
+    });
+  });
+
+  it('downgrades a sibling that was \'grounded\' to \'web-unverified\' when copied to another lead', () => {
+    const sib = sibling({
+      customFields: { total_funding: '$41M' },
+      enrichmentMetadata: {
+        total_funding: {
+          source: 'web_search',
+          provider: 'llm_web_search',
+          confidence: 'high',
+          grounding: 'grounded',
+          sourceQuote: 'raised $41 million',
+          enrichedAt: '2026-06-23T00:00:00Z',
+        } as any,
+      },
+    });
+    const out = copySiblingConfigFields(lead(), [sib], [field('total_funding')], emptyMap);
+    expect(out.fills).toHaveLength(1);
+    expect(out.fills[0].meta).toMatchObject({ grounding: 'web-unverified', confidence: 'low' });
+  });
+
+  it('preserves an \'ai-knowledge\' badge on a web-sourced sibling copy', () => {
+    const sib = sibling({
+      customFields: { total_funding: '$100M' },
+      enrichmentMetadata: {
+        total_funding: {
+          source: 'web_search',
+          provider: 'llm_web_search',
+          confidence: 'low',
+          grounding: 'ai-knowledge',
+          enrichedAt: '2026-06-23T00:00:00Z',
+        } as any,
+      },
+    });
+    const out = copySiblingConfigFields(lead(), [sib], [field('total_funding')], emptyMap);
+    expect(out.fills).toHaveLength(1);
+    expect(out.fills[0].meta).toMatchObject({ grounding: 'ai-knowledge', confidence: 'low' });
   });
 
   it('keeps the plain crm-history shape for a non-web (Apollo) sibling value', () => {

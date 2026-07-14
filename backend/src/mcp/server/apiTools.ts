@@ -430,7 +430,7 @@ mcpToolRegistry.register({
   name: 'manage_scheduled_chat',
   definition: {
     name: 'manage_scheduled_chat',
-    description: 'Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: "create", "update", "toggle", or "delete". For "create": schedule_name, starting_message, schedule_frequency, and at least one email_notifications address are REQUIRED — do not call with action "create" unless you have all four. For "update": schedule_id is required; omit any field to keep its existing value — if you provide email_notifications it must be non-empty. IMPORTANT: When email_notifications is configured on the schedule, the system automatically emails results after every run — do NOT include notify_session or any email-sending instruction in starting_message, as that would cause duplicate emails (one from the system, one from the AI executing the tool).',
+    description: 'Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: "create", "update", "toggle", or "delete". For "create": schedule_name, starting_message, and schedule_frequency are REQUIRED — do not call with action "create" unless you have all three. email_notifications is optional but strongly recommended — without it, the user gets no automatic notification when a run completes. For "update": schedule_id is required; omit any field to keep its existing value — if you provide email_notifications it must be non-empty. IMPORTANT: When email_notifications is configured on the schedule, the system automatically emails results after every run — do NOT include notify_session or any email-sending instruction in starting_message, as that would cause duplicate emails (one from the system, one from the AI executing the tool).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -445,7 +445,7 @@ mcpToolRegistry.register({
         keywords: { type: 'array', items: { type: 'string' }, description: 'Keywords to look for in results (create/update)' },
         required_function_calls: { type: 'array', items: { type: 'string' }, description: 'Function calls required in each run (create/update)' },
         function_call_min_calls: { type: 'object', description: 'Minimum call counts per function (create/update)' },
-        email_notifications: { type: 'array', items: { type: 'string' }, description: 'Email addresses for notifications (REQUIRED for create — must include at least one; optional for update but must be non-empty if provided)' },
+        email_notifications: { type: 'array', items: { type: 'string' }, description: 'Email addresses for notifications (optional for create/update but strongly recommended — without it, the user gets no automatic notification when a run completes; if provided, must be non-empty)' },
         daily_digest: { type: 'boolean', description: 'Send daily digest instead of per-run emails (create/update, hourly only)' },
         self_improve: { type: 'boolean', description: 'When true, after each run a reflection turn reviews the result and may automatically refine starting_message so future runs do better. Off by default (create/update).' },
         run_count: { type: 'number', description: 'Number of runs (-1 for unlimited, create/update)' },
@@ -524,7 +524,7 @@ mcpToolRegistry.register({
   name: 'test_scheduled_chat',
   definition: {
     name: 'test_scheduled_chat',
-    description: 'Trigger a test run of a scheduled chat. Variables must already be set on the schedule. Returns immediately with a runId — the run executes in the background and can take several minutes for complex tasks. After calling this, wait ~30 seconds then poll get_scheduled_chat_test_history to check for a result matching the returned runId.',
+    description: 'Trigger a test run of a scheduled chat. This is a side-effecting action — only call it when the user has EXPLICITLY asked to test or run the schedule now. Do NOT trigger a test run on your own initiative, and do NOT treat a bare "retry"/regenerate of your previous turn as authorization to run a test; in that case simply re-answer the prior turn. Variables must already be set on the schedule. Returns immediately with a runId — the run executes in the background and can take several minutes for complex tasks. After calling this, wait ~30 seconds then poll get_scheduled_chat_test_history to check for a result matching the returned runId.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -558,6 +558,23 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({ method: 'GET', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/test-history`, context: ctx(context) });
+    // A test run started via test_scheduled_chat executes in the background and can take
+    // several minutes. When the history is still empty, returning a bare `[]` leads the model
+    // to report "empty results" to the user as if the run finished with nothing. Instead,
+    // surface an actionable diagnostic so the model waits/polls or checks the variables.
+    if (Array.isArray(data) && data.length === 0) {
+      return jsonResult({
+        history: [],
+        note: 'No test/run results are available yet for this scheduled chat. A test run triggered '
+          + 'via test_scheduled_chat executes in the background and can take several minutes, so it '
+          + 'may still be running. Wait ~30 seconds and poll get_scheduled_chat_test_history again '
+          + 'with the same schedule_id. If results are still empty after a few polls, the schedule may '
+          + 'be missing required variable values (check with list_scheduled_chats and set them via '
+          + 'submit_scheduled_chat_variables) or may not have been run yet. Do NOT report this empty '
+          + 'result to the user as a finished or failed run — explain that the run is still in progress '
+          + 'or that variables/setup need to be confirmed.',
+      });
+    }
     return jsonResult(data);
   }
 });

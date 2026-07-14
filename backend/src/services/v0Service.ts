@@ -10,7 +10,10 @@ import { canEditItem } from "./orgShareService";
 import { addSubdomain, generateSubdomain, listDomains, SUBDOMAIN_BASE } from "./customDomainService";
 import { settingsService } from "./settingsService";
 import { paginatedQuery } from "../utils/dynamoPagination";
-import { guardedV0ChatCreate, guardedV0CorrectionMessage } from "./v0UsageGuard";
+import { guardedV0ChatCreate, guardedV0CorrectionMessage, clearV0UsageForPage } from "./v0UsageGuard";
+// Type-only imports from durableLandingService live elsewhere; this constant import is
+// runtime-safe because durableLandingService only imports a TYPE from this module.
+import { STUCK_CEILING_MS } from "./durableLandingService";
 import { enqueueAutoHumanEval } from "./autoHumanEvalService";
 
 // Note: global fetch (undici) timeouts are managed by httpClient.ts (15 min headersTimeout/bodyTimeout).
@@ -27,12 +30,160 @@ const VERCEL_POLL_TIMEOUT_MS = 30_000;
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 2_000; // 2s, 4s, 8s
 
-// Poll intervals for waiting on v0 generation to complete
-let v0PollIntervalsMs = [0, 15_000, 30_000, 45_000, 60_000];
+// Hard ceiling for a single external-API network call inside withRetry. Node's
+// global fetch (undici) can otherwise wait up to the 15-min headersTimeout set in
+// httpClient.ts, so a v0 request that connects but never responds hangs the whole
+// generation with no output and no error (ENG-158). Bounding each attempt turns
+// that silent hang into a loud, retryable timeout. 5 minutes comfortably exceeds
+// any healthy single v0/GitHub call (generation progress is polled separately).
+const V0_ATTEMPT_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * Build a diagnostic message from an error, unwrapping the undici `cause` chain.
+ *
+ * Node's global fetch (undici) throws a bare `TypeError: fetch failed` and stashes
+ * the REAL reason (Connect Timeout, ECONNREFUSED, ENOTFOUND, TLS failure, …) on
+ * `error.cause` — often itself an `AggregateError` whose `errors[]` hold the codes.
+ * Persisting only `error.message` gave users a useless "fetch failed" with zero
+ * detail (ENG-135), and the same swallowing hid v0's HTTP error bodies behind a
+ * bare status (ENG-159). This walks message → code → cause → aggregate errors and
+ * joins the distinct pieces so callers surface WHY a call failed. Safe on any input.
+ */
+export function describeError(err: any): string {
+  const parts: string[] = [];
+  const seen = new Set<any>();
+  const push = (s: unknown) => {
+    if (typeof s === "string" && s.trim() && !parts.includes(s)) parts.push(s);
+  };
+
+  let cur: any = err;
+  let depth = 0;
+  while (cur && depth < 10) {
+    if (typeof cur === "string") {
+      push(cur);
+      break;
+    }
+    if (typeof cur === "object") {
+      if (seen.has(cur)) break;
+      seen.add(cur);
+      push(cur.message);
+      // Surface a distinct error code (e.g. ECONNRESET, UND_ERR_CONNECT_TIMEOUT)
+      // when it isn't already visible in the message text.
+      if (typeof cur.code === "string" && !parts.some((p) => p.includes(cur.code))) {
+        push(cur.code);
+      }
+      // AggregateError (multiple connect attempts) carries the real codes here.
+      if (Array.isArray(cur.errors)) {
+        for (const e of cur.errors) push(describeError(e));
+      }
+    }
+    cur = cur?.cause;
+    depth++;
+  }
+
+  return parts.join(" | ") || (err == null ? "Unknown error" : String(err));
+}
+
+/**
+ * Reject if `promise` has not settled within `ms`. The timeout error message
+ * contains "timed out" so withRetry treats it as retryable, and it surfaces
+ * clearly to the caller after retries are exhausted (never a silent hang).
+ * The underlying request is not aborted — undici's socket-level timeouts still
+ * apply — we just stop waiting on it so generation can fail loudly.
+ */
+export async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const e: any = new Error(`${label} timed out after ${Math.round(ms / 1000)}s`);
+      e.code = "V0_CALL_TIMEOUT";
+      reject(e);
+    }, ms);
+    // Don't keep the event loop alive solely for this guard timer.
+    if (typeof timer.unref === "function") timer.unref();
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// Poll intervals for waiting on v0 generation to complete. With chat creation in
+// async responseMode the create call returns in seconds and THIS loop absorbs the
+// real generation time — prod evidence (ENG-287, AW-V0Usage 2026-07-10) shows
+// brand-enriched generations routinely take 3–15 min, so the budget must exceed
+// that. Ramps to a steady 30s cadence, ~16 min total.
+let v0PollIntervalsMs = [0, 10_000, 15_000, 20_000, 30_000, 45_000, ...Array(28).fill(30_000)];
 
 /** Override poll intervals (for testing) */
 export function setV0PollIntervals(intervals: number[]) {
   v0PollIntervalsMs = intervals;
+}
+
+/**
+ * Poll a v0 chat until its latest version reaches a terminal state and return the
+ * completed version id.
+ *
+ * Async-mode chats expose the version immediately with `status: 'pending'` while
+ * generation runs, so readiness is the version's status — NOT its existence
+ * (grabbing a pending version downloads a half-generated page). A missing status
+ * field (older sync-mode responses) is treated as completed, preserving the
+ * pre-async behavior. A transient poll-read failure only costs that attempt — a
+ * 15-minute generation must not die because one status read timed out; the loop's
+ * budget bounds the total wait and the exit is loud.
+ */
+async function waitForCompletedV0Version(
+  v0: any,
+  chatId: string,
+  label: string
+): Promise<string> {
+  const intervals = v0PollIntervalsMs;
+  let lastReadError: string | undefined;
+  for (let pollAttempt = 0; pollAttempt < intervals.length; pollAttempt++) {
+    if (intervals[pollAttempt] > 0) {
+      console.log(
+        `[V0 SERVICE] ${label}: generation not ready yet, waiting ${intervals[pollAttempt] / 1000}s (attempt ${pollAttempt + 1}/${intervals.length})...`
+      );
+      await new Promise((resolve) => setTimeout(resolve, intervals[pollAttempt]));
+    }
+
+    let chat: any;
+    try {
+      chat = await withRetry(
+        () => v0.chats.getById({ chatId }),
+        `${label} (status poll)`,
+        undefined, undefined, undefined,
+        { retryOnTimeout: false }
+      );
+    } catch (err: any) {
+      lastReadError = describeError(err);
+      console.warn(`[V0 SERVICE] ${label}: status poll failed (${lastReadError}), continuing...`);
+      continue;
+    }
+
+    const version = chat?.latestVersion;
+    if (version?.status === "failed") {
+      // Typed so callers can distinguish "this chat is a dead end" (clear the
+      // idempotency identity — a retry must mint a FRESH chat, not reuse this one)
+      // from a transient/poll-budget failure (where reusing the chat is free and right).
+      const failedErr: any = new Error(
+        `v0 reported the generation as failed (version ${version.id}). Retry the generation — failed attempts do not block retries.`
+      );
+      failedErr.code = "V0_VERSION_FAILED";
+      throw failedErr;
+    }
+    if (version?.id && version.status !== "pending") {
+      console.log(`[V0 SERVICE] ${label}: version ${version.id} ready (poll attempt ${pollAttempt + 1})`);
+      return version.id;
+    }
+  }
+
+  const budgetMin = Math.round(intervals.reduce((a, b) => a + b, 0) / 60_000);
+  throw new Error(
+    `No completed version in v0 chat after ~${budgetMin} minutes of polling — v0 generation is unusually slow or stalled` +
+    (lastReadError ? ` (last poll error: ${lastReadError})` : "")
+  );
 }
 
 // Vercel deployment polling config
@@ -49,40 +200,60 @@ export async function withRetry<T>(
   fn: () => Promise<T>,
   label: string,
   maxRetries = MAX_RETRIES,
-  baseDelayMs = BASE_DELAY_MS
+  baseDelayMs = BASE_DELAY_MS,
+  timeoutMs = V0_ATTEMPT_TIMEOUT_MS,
+  opts: { retryOnTimeout?: boolean } = {}
 ): Promise<T> {
+  // Whether to retry OUR synthetic per-attempt timeout (V0_CALL_TIMEOUT). Retrying
+  // it re-waits the full `timeoutMs` budget each time — e.g. 3 × 300s ≈ 15 min,
+  // which reproduces the hang ENG-158 set out to kill. Callers on an interactive
+  // path (chat-create) pass `false` to fail fast with a clean retry path; other
+  // callers keep the default so a genuinely transient hang still gets a retry.
+  const retryOnTimeout = opts.retryOnTimeout ?? true;
   let lastError: Error | undefined;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      return await fn();
+      // Bound each attempt so a request that never responds fails loudly instead
+      // of hanging until undici's 15-min headersTimeout (ENG-158).
+      return await withTimeout(Promise.resolve().then(fn), timeoutMs, label);
     } catch (err: any) {
       lastError = err;
+      // Unwrap the full failure reason (undici hides it on `err.cause`) so both the
+      // retry decision and the surfaced error see the REAL problem, not "fetch failed".
+      const detail = describeError(err);
+      // Our own per-attempt timeout: we already waited the full budget. Only retry it
+      // when the caller opted in (default). 5xx/network errors below are unaffected —
+      // those recover in seconds and stay retryable regardless. (ENG-287)
+      const isOurTimeout = err.code === "V0_CALL_TIMEOUT";
       // The v0 SDK throws `Error("HTTP <status>: <body>")` on any non-2xx response.
       // Transient server-side failures (5xx) and rate limiting (429) should be
       // retried with backoff — a v0 500 is the documented symptom of a v0 outage
       // that often recovers within seconds.
-      const isRetryableHttpStatus = /\bHTTP (429|408|5\d\d)\b/.test(err.message || "");
+      const isRetryableHttpStatus = /\bHTTP (429|408|5\d\d)\b/.test(detail);
       const isRetryable =
-        isRetryableHttpStatus ||
-        err.message?.includes("fetch failed") ||
-        err.message?.includes("ECONNREFUSED") ||
-        err.message?.includes("ENOTFOUND") ||
-        err.message?.includes("network error") ||
-        err.message?.includes("NetworkError") ||
-        err.message?.includes("ETIMEDOUT") ||
-        err.message?.includes("socket hang up") ||
-        err.code === "ECONNRESET" ||
-        err.code === "UND_ERR_HEADERS_TIMEOUT";
+        (isOurTimeout
+          ? retryOnTimeout
+          : isRetryableHttpStatus ||
+            /fetch failed|ECONNREFUSED|ENOTFOUND|network error|NetworkError|ETIMEDOUT|socket hang up|Connect Timeout|timed out|UND_ERR/i.test(
+              detail
+            ) ||
+            err.code === "ECONNRESET" ||
+            err.code === "UND_ERR_HEADERS_TIMEOUT");
 
       if (!isRetryable || attempt === maxRetries) {
-        console.error(`[V0 SERVICE] ${label} failed after ${attempt} attempt(s):`, err.message);
+        console.error(`[V0 SERVICE] ${label} failed after ${attempt} attempt(s):`, detail);
+        // Surface the unwrapped detail to the caller (who persists it as the page's
+        // errorMessage and returns it to the user) — never a bare "fetch failed"/422.
+        if (err && typeof err === "object" && detail && detail !== err.message) {
+          try { err.message = detail; } catch { /* frozen error — leave as-is */ }
+        }
         throw err;
       }
 
       const jitter = Math.random() * 500;
       const delay = baseDelayMs * Math.pow(2, attempt - 1) + jitter;
       console.warn(
-        `[V0 SERVICE] ${label} attempt ${attempt}/${maxRetries} failed (${err.message}), retrying in ${delay}ms...`
+        `[V0 SERVICE] ${label} attempt ${attempt}/${maxRetries} failed (${detail}), retrying in ${delay}ms...`
       );
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
@@ -397,16 +568,13 @@ export function buildBrandEnrichedPrompt(
   }
 
   if (leadListId) {
-    const apiBase = process.env.BACKEND_URL || 'https://api.agentweb.pro';
     parts.push(
       `\n\nLEAD CAPTURE FORM — IMPORTANT ARCHITECTURE:\n` +
-      `1. Create a Next.js API route at app/api/capture/route.ts that proxies form submissions to the backend.\n` +
-      `   The proxy route should POST to: ${apiBase}/api/webhooks/forward-lead\n` +
-      `   The proxy route must add listId: '${leadListId}' and source: 'landing-page' to the body before forwarding.\n` +
-      `2. The frontend form component MUST fetch('/api/capture', ...) using the RELATIVE path — never hardcode any backend URL in client-side code.\n` +
-      `   The form should collect: email (required), firstName, lastName, company, phone.\n` +
+      `1. Build a lead capture form component collecting: email (required), firstName, lastName, company, phone.\n` +
+      `   The form MUST submit via fetch('/api/capture', { method: 'POST', ... }) using the RELATIVE path — never hardcode any backend URL in client-side code.\n` +
       `   Show a success message after submission. Show an error message on failure.\n` +
-      `3. NEVER put absolute backend URLs (like ${apiBase}) in any client-side .tsx file. Only the server-side API route should know the backend URL.`
+      `2. Do NOT create app/api/capture/route.ts yourself — the platform injects this API route automatically. Only build the form component that posts to the relative /api/capture path.\n` +
+      `3. NEVER put absolute backend URLs in any client-side .tsx file.`
     );
   }
 
@@ -512,13 +680,26 @@ async function getV0Client() {
  */
 export async function findReusablePageForRoute(
   userId: string,
-  slug: string
+  slug: string,
+  siteId?: string
 ): Promise<GeneratedLandingPage | null> {
   const pages = await listLandingPages(userId);
-  const REUSE_STATUSES = ["deployed", "generating", "deploying"];
-  const match = pages.find(
-    (p) => (p.slug || buildPageSlug(p.name)) === slug && REUSE_STATUSES.includes(p.status)
-  );
+  const nowMs = Date.now();
+  const match = pages.find((p) => {
+    // Routes are per-site: /book-a-demo on Site A must never satisfy a request
+    // targeting Site B (the guard key is siteId-scoped for the same reason).
+    if (siteId && p.siteId !== siteId && p.id !== siteId) return false;
+    if ((p.slug || (p.name ? buildPageSlug(p.name) : undefined)) !== slug) return false;
+    if (p.status === "deployed") return true;
+    // In-flight records are only reusable while plausibly alive. A record stuck in
+    // generating/deploying past the stuck ceiling was abandoned by a crash/redeploy —
+    // reusing it would let one wedged record swallow every future build of this
+    // route forever (the ENG-277 wedge). The janitor will mark it failed; a fresh
+    // build must be allowed to proceed now.
+    if (p.status !== "generating" && p.status !== "deploying") return false;
+    const ageMs = nowMs - new Date(p.updatedAt || p.createdAt).getTime();
+    return Number.isFinite(ageMs) && ageMs <= STUCK_CEILING_MS;
+  });
   return match || null;
 }
 
@@ -617,6 +798,12 @@ export async function generateLandingPage(
     if (opts?.siteId) {
       const site = await findSiteById(opts.siteId, userId);
       if (site?.githubRepoUrl) {
+        const slug = buildPageSlug(name);
+        const reuse = await findReusablePageForRoute(userId, slug, site.siteId ?? site.id);
+        if (reuse) {
+          console.log(`[V0 SERVICE] Route /${slug} is already ${reuse.status} (${reuse.id}) — reusing, skipping duplicate build`);
+          return reuse;
+        }
         return addSubPage(
           site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
         );
@@ -637,6 +824,12 @@ export async function generateLandingPage(
     //    under it. Falls back to creating the first site if none exists yet.
     const existing = await findUserSiteRecord(userId);
     if (existing?.githubRepoUrl) {
+      const slug = buildPageSlug(name);
+      const reuse = await findReusablePageForRoute(userId, slug, existing.siteId ?? existing.id);
+      if (reuse) {
+        console.log(`[V0 SERVICE] Route /${slug} is already ${reuse.status} (${reuse.id}) — reusing, skipping duplicate build`);
+        return reuse;
+      }
       return addSubPage(
         existing, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
       );
@@ -820,9 +1013,17 @@ async function generateFirstPage(
       operation: "first_page_chat_create",
       scopeId: id,
       prompt: enrichedPrompt,
+      // responseMode async: sync mode blocks the HTTP call for the FULL generation
+      // (3–15 min in prod), guaranteeing a loss against the 300s attempt timeout and
+      // minting an orphan, credit-burning chat on every "timeout". Async returns the
+      // chatId in seconds; waitForCompletedV0Version absorbs the generation time. (ENG-287)
       create: () => withRetry(
-        () => v0.chats.create({ message: enrichedPrompt }),
-        "v0 chat creation"
+        () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" }),
+        "v0 chat creation",
+        // Interactive path: fail fast on a timeout instead of re-burning 3 × 300s
+        // ≈ 15 min. 5xx/network still retry. The guard makes the user's retry clean. (ENG-287)
+        undefined, undefined, undefined,
+        { retryOnTimeout: false }
       ),
     });
 
@@ -859,6 +1060,14 @@ async function generateFirstPage(
     return deployed;
   } catch (error: any) {
     console.error("[V0 SERVICE] Generation failed:", error);
+
+    if (error?.code === "V0_VERSION_FAILED") {
+      // v0 marked this chat's generation failed — the chat is a dead end. Free the
+      // idempotency identity so a retry mints a fresh chat instead of reusing it
+      // and failing instantly again. Best-effort; the failed-status write below is
+      // the critical step.
+      await clearV0UsageForPage({ userId, pageId: id });
+    }
 
     await dynamodb
       .update({
@@ -1101,9 +1310,15 @@ async function addPageToExistingRepo(
       scopeId: existingPage.siteId ?? existingPage.id,
       slug,
       prompt: enrichedPrompt,
+      // responseMode async — see the first-page call site for why sync mode cannot
+      // survive the 300s attempt timeout. (ENG-287)
       create: () => withRetry(
-        () => v0.chats.create({ message: enrichedPrompt }),
-        "v0 chat creation (additional page)"
+        () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" }),
+        "v0 chat creation (additional page)",
+        // Interactive path: fail fast on a timeout instead of re-burning 3 × 300s
+        // ≈ 15 min. 5xx/network still retry. The guard makes the user's retry clean. (ENG-287)
+        undefined, undefined, undefined,
+        { retryOnTimeout: false }
       ),
     });
 
@@ -1125,31 +1340,9 @@ async function addPageToExistingRepo(
       })
       .promise();
 
-    // ── Step 2: Poll for v0 version completion ──
-    const V0_POLL_INTERVALS_MS = v0PollIntervalsMs;
-    let versionId: string | undefined;
-
-    for (let pollAttempt = 0; pollAttempt < V0_POLL_INTERVALS_MS.length; pollAttempt++) {
-      if (V0_POLL_INTERVALS_MS[pollAttempt] > 0) {
-        console.log(`[V0 SERVICE] v0 generation not ready yet for /${slug}, waiting ${V0_POLL_INTERVALS_MS[pollAttempt] / 1000}s (attempt ${pollAttempt + 1}/${V0_POLL_INTERVALS_MS.length})...`);
-        await new Promise(resolve => setTimeout(resolve, V0_POLL_INTERVALS_MS[pollAttempt]));
-      }
-
-      const chat = await withRetry(
-        () => v0.chats.getById({ chatId }),
-        "v0 chat fetch (additional page)"
-      );
-      versionId = chat.latestVersion?.id;
-
-      if (versionId) {
-        console.log(`[V0 SERVICE] v0 version found for /${slug}: ${versionId} (poll attempt ${pollAttempt + 1})`);
-        break;
-      }
-    }
-
-    if (!versionId) {
-      throw new Error("No version found in v0 chat after polling — generation may have failed");
-    }
+    // ── Step 2: Poll for v0 version completion (status-gated — a pending version
+    // must not be downloaded half-generated) ──
+    let versionId: string | undefined = await waitForCompletedV0Version(v0, chatId, `v0 generation for /${slug}`);
 
     // ── Step 3: Download and validate v0 output ──
     await dynamodb
@@ -1204,7 +1397,11 @@ async function addPageToExistingRepo(
                   "Output must include .tsx files with real React components using export and function/const. " +
                   `Issue: ${valErr.reason}`,
               }),
-              "v0 correction message (additional page)"
+              "v0 correction message (additional page)",
+              // A correction that outlives the attempt timeout must fail once, not be
+              // re-sent 3× — each retry could double-apply the correction at full cost. (ENG-287)
+              undefined, undefined, undefined,
+              { retryOnTimeout: false }
             ),
           });
 
@@ -1310,6 +1507,17 @@ async function addPageToExistingRepo(
     return deployedSubPage;
   } catch (error: any) {
     console.error("[V0 SERVICE] Failed to add page to repo:", error);
+
+    if (error?.code === "V0_VERSION_FAILED") {
+      // Dead-end chat (see generateFirstPage catch) — free the route identity so the
+      // retry creates a fresh chat rather than reusing the one v0 marked failed.
+      await clearV0UsageForPage({
+        userId,
+        pageId: id,
+        siteId: existingPage.siteId ?? existingPage.id,
+        slug,
+      });
+    }
 
     await dynamodb
       .update({
@@ -1540,32 +1748,11 @@ export async function deployLandingPage(
   try {
     const v0 = await getV0Client();
 
-    // Step 1: Get the latest version from v0 chat (poll with backoff if generation is still in progress)
+    // Step 1: Wait for the latest version to complete (status-gated — async-mode
+    // chats expose a pending version immediately; downloading it would ship a
+    // half-generated page)
     console.log(`[V0 SERVICE] Step 1: Getting latest version for chat ${record.v0ChatId}`);
-    const V0_POLL_INTERVALS_MS = v0PollIntervalsMs; // total wait: up to ~2.5 min
-    let versionId: string | undefined;
-
-    for (let pollAttempt = 0; pollAttempt < V0_POLL_INTERVALS_MS.length; pollAttempt++) {
-      if (V0_POLL_INTERVALS_MS[pollAttempt] > 0) {
-        console.log(`[V0 SERVICE] v0 generation not ready yet, waiting ${V0_POLL_INTERVALS_MS[pollAttempt] / 1000}s before retry (attempt ${pollAttempt + 1}/${V0_POLL_INTERVALS_MS.length})...`);
-        await new Promise(resolve => setTimeout(resolve, V0_POLL_INTERVALS_MS[pollAttempt]));
-      }
-
-      const chat = await withRetry(
-        () => v0.chats.getById({ chatId: record.v0ChatId! }),
-        "v0 chat fetch"
-      );
-      versionId = chat.latestVersion?.id;
-
-      if (versionId) {
-        console.log(`[V0 SERVICE] v0 version found: ${versionId} (poll attempt ${pollAttempt + 1})`);
-        break;
-      }
-    }
-
-    if (!versionId) {
-      throw new Error("No version found in v0 chat after polling for ~2.5 minutes — generation may have failed");
-    }
+    let versionId: string | undefined = await waitForCompletedV0Version(v0, record.v0ChatId!, "v0 generation");
 
     // Step 2: Download + validate v0 output (with retry on bad output)
     const V0_VALIDATION_MAX_RETRIES = 2;
@@ -1609,7 +1796,11 @@ export async function deployLandingPage(
                   "Output must include .tsx files with real React components using export and function/const. " +
                   `Issue: ${valErr.reason}`,
               }),
-              "v0 correction message"
+              "v0 correction message",
+              // A correction that outlives the attempt timeout must fail once, not be
+              // re-sent 3× — each retry could double-apply the correction at full cost. (ENG-287)
+              undefined, undefined, undefined,
+              { retryOnTimeout: false }
             ),
           });
 
@@ -1635,7 +1826,7 @@ export async function deployLandingPage(
     console.log("[V0 SERVICE] Step 3: Creating GitHub repo and pushing files");
     const slug = buildPageSlug(record.name);
     const repoName = `lp-${slug}-${id.slice(0, 8)}`;
-    const { githubRepoUrl, repoFullName, commitSha } = await createGitHubRepoAndPush(repoName, zipBuffer, record.name);
+    const { githubRepoUrl, repoFullName, commitSha } = await createGitHubRepoAndPush(repoName, zipBuffer, record.name, record.leadListId);
 
     // Save GitHub repo URL immediately so it's not lost if Vercel step fails
     await dynamodb
@@ -1967,12 +2158,211 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
 }
 
 /**
+ * Deterministically inject platform-owned lead-capture attribution files into a
+ * generated repo's file set, and drop any v0-generated capture route / middleware
+ * that would conflict with them.
+ *
+ * Design: relying on v0 (an LLM) to capture/forward UTM attribution is
+ * non-deterministic. Instead we force-inject a server-side middleware that
+ * stamps a first-touch cookie, and a capture API route that reads that cookie
+ * and forwards `attribution` (top-level, not customFields) to the backend
+ * webhook. Any v0-generated `app/api/capture/route.ts` (or route-group
+ * variants) and any v0 `middleware.ts` are dropped first so ours are
+ * authoritative (avoids "conflicting routes" build errors / duplicate
+ * middleware).
+ */
+/**
+ * Normalizes a generated file path to its effective Next.js route by stripping
+ * an optional `src/` root prefix and any route-group segments (`(group)`),
+ * neither of which affect the resulting URL/route. Used to detect v0 output
+ * that is *semantically* the same route as our injected files even when the
+ * literal path differs (e.g. `src/app/(marketing)/api/capture/route.tsx`).
+ */
+function normalizeGeneratedPath(p: string): string {
+  return p
+    .replace(/^src\//, "")
+    .split("/")
+    .filter((seg) => !/^\([^)]*\)$/.test(seg))
+    .join("/");
+}
+
+function isV0CaptureRoute(p: string): boolean {
+  return /^app\/api\/capture\/route\.(ts|tsx|js|jsx)$/.test(normalizeGeneratedPath(p));
+}
+
+function isV0Middleware(p: string): boolean {
+  return /^middleware\.(ts|js)$/.test(normalizeGeneratedPath(p));
+}
+
+/** v0 may emit its own domainMap; ours is authoritative (the middleware imports it). */
+function isV0DomainMap(p: string): boolean {
+  return /^domainMap\.(ts|js)$/.test(normalizeGeneratedPath(p));
+}
+
+/**
+ * Defense in depth: if a v0-generated file somehow survives the drop-filter above
+ * and still collides with our injected route/middleware, fail loudly here
+ * (generation time, before any GitHub push) rather than silently at Vercel build
+ * time later. Exported standalone so the throw path can be exercised directly,
+ * since it is structurally unreachable through injectLeadCaptureAttribution itself
+ * (the same filter that would let a duplicate through would also drop it).
+ */
+export function assertNoDuplicateInjectedRoutes(files: Array<{ path: string; content: Buffer }>): void {
+  const captureRouteCount = files.filter((f) => f.path === "app/api/capture/route.ts").length;
+  const middlewareCount = files.filter((f) => f.path === "middleware.ts").length;
+  const domainMapCount = files.filter((f) => f.path === "domainMap.ts").length;
+  if (captureRouteCount > 1 || middlewareCount > 1 || domainMapCount > 1) {
+    throw new Error(
+      `[V0 SERVICE] duplicate route after lead-capture injection (capture routes: ${captureRouteCount}, middleware: ${middlewareCount}, domainMap: ${domainMapCount})`
+    );
+  }
+}
+
+/**
+ * The ONE `middleware.ts` a generated landing page ever gets. ENG-308.
+ *
+ * Next.js allows exactly one middleware at the repo root, and TWO things need to
+ * happen there: the per-page subdomain rewrite, and the first-touch attribution
+ * capture. They used to be written by two different functions that each emitted the
+ * whole file — so `updateSubdomainMiddleware` (fired on any domain attach/detach)
+ * committed a routing-only middleware straight over the capture one and **silently
+ * destroyed attribution** for that page, permanently, until it was regenerated.
+ *
+ * Both writers now emit THIS. A test asserts they are byte-identical, which is the
+ * only real guarantee they cannot drift apart again.
+ *
+ * Two things to preserve if you edit this:
+ *  - The cookie is set on the SAME response we return, on BOTH paths. Early-returning
+ *    the rewrite would skip capture for exactly the pages a customer cared enough
+ *    about to give a domain to.
+ *  - The `matcher` must exclude `api/` — WITH the trailing slash. The capture route
+ *    lives at `app/api/capture/route.ts` and READS this cookie, so it must never be
+ *    rewritten. But excluding a bare `api` (no slash) would also strip the middleware
+ *    from ordinary page routes that merely begin with those letters — `/api-docs`,
+ *    `/apis`, `/api-integration` — and those pages would lose their SUBDOMAIN REWRITE,
+ *    i.e. visibly break for the customer. The two middlewares this replaces disagreed
+ *    on exactly this; the slash-ful form is the correct one.
+ *
+ * It imports `./domainMap`, so every writer must also emit a `domainMap.ts`.
+ */
+export function buildLandingPageMiddleware(): string {
+  return `import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
+import { DOMAIN_MAP } from "./domainMap";
+
+const COOKIE = "aw_first_touch";
+const MAX_AGE = 60 * 60 * 24 * 90; // 90 days
+
+export function middleware(req: NextRequest) {
+  // 1. Per-page subdomain routing: rewrite the host to its mapped path, if any.
+  const host = (req.headers.get("host") || "").replace(/:\\d+$/, "");
+  const targetPath = DOMAIN_MAP[host];
+  let res: NextResponse;
+  if (targetPath) {
+    const url = req.nextUrl.clone();
+    url.pathname = targetPath;
+    res = NextResponse.rewrite(url);
+  } else {
+    res = NextResponse.next();
+  }
+
+  // 2. First-touch attribution capture, on WHICHEVER response we are returning.
+  //    (Returning the rewrite early here would silently kill attribution on every
+  //    page that has a custom domain — which is most of the ones that matter.)
+  if (req.cookies.get(COOKIE)) return res;              // first-touch: never overwrite
+
+  const sp = req.nextUrl.searchParams;
+  const utm: Record<string, string> = {};
+  for (const k of ["source", "medium", "campaign", "content", "term"]) {
+    const v = sp.get("utm_" + k); if (v) utm[k] = v;
+  }
+  const clickIds: Record<string, string> = {};
+  for (const [q, key] of [["gclid","gclid"],["fbclid","fbclid"],["ttclid","ttclid"],["li_fat_id","liFatId"]] as const) {
+    const v = sp.get(q); if (v) clickIds[key] = v;
+  }
+  const referrer = req.headers.get("referer") || "";
+  const ref = sp.get("ref") || "";
+
+  const touch: Record<string, unknown> = { timestamp: new Date().toISOString(), landingUrl: req.nextUrl.href };
+  if (Object.keys(utm).length) touch.utm = utm;
+  if (Object.keys(clickIds).length) touch.clickIds = clickIds;
+  if (referrer && !referrer.includes(req.nextUrl.host)) touch.referrer = referrer;
+  if (ref) touch.ref = ref;
+
+  res.cookies.set(COOKIE, JSON.stringify(touch), { maxAge: MAX_AGE, path: "/", sameSite: "lax" });
+  return res;
+}
+
+export const config = { matcher: ["/((?!api\\/|_next\\/static|_next\\/image|favicon\\.ico).*)"] };
+`;
+}
+
+/** `domainMap.ts` for a given host→path map. Emitted alongside every middleware. */
+export function buildDomainMapFile(domainMap: Record<string, string> = {}): string {
+  return (
+    `// Generated by AgentWeb — maps a custom hostname to the page path it serves.\n` +
+    `export const DOMAIN_MAP: Record<string, string> = ${JSON.stringify(domainMap, null, 2)};\n`
+  );
+}
+
+export function injectLeadCaptureAttribution(
+  files: Array<{ path: string; content: Buffer }>,
+  leadListId: string
+): Array<{ path: string; content: Buffer }> {
+  const filtered = files.filter(
+    (f) => !isV0CaptureRoute(f.path) && !isV0Middleware(f.path) && !isV0DomainMap(f.path)
+  );
+
+  const apiBase = process.env.BACKEND_URL || "https://api.agentweb.pro";
+
+  const middlewareContent = buildLandingPageMiddleware();
+
+  const routeContent = `import { NextResponse } from "next/server";
+import { cookies } from "next/headers";
+
+const LIST_ID = "${leadListId}";
+const FORWARD_URL = "${apiBase}/api/webhooks/forward-lead";
+
+export async function POST(req: Request) {
+  try {
+    const body = await req.json().catch(() => ({}));
+    let attribution: unknown;
+    const raw = (await cookies()).get("aw_first_touch")?.value;
+    if (raw) { try { attribution = JSON.parse(raw); } catch {} }
+
+    const res = await fetch(FORWARD_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, listId: LIST_ID, source: "landing-page", ...(attribution ? { attribution } : {}) }),
+    });
+    if (!res.ok) return NextResponse.json({ success: false }, { status: 502 });
+    return NextResponse.json({ success: true });
+  } catch {
+    return NextResponse.json({ success: false }, { status: 500 });
+  }
+}
+`;
+
+  filtered.push({ path: "middleware.ts", content: Buffer.from(middlewareContent) });
+  filtered.push({ path: "app/api/capture/route.ts", content: Buffer.from(routeContent) });
+  // The middleware imports ./domainMap, so a fresh page MUST ship one or its very
+  // first Vercel build fails. Empty until a subdomain is actually attached, at which
+  // point updateSubdomainMiddleware rewrites it with the real map.
+  filtered.push({ path: "domainMap.ts", content: Buffer.from(buildDomainMapFile({})) });
+
+  assertNoDuplicateInjectedRoutes(filtered);
+
+  return filtered;
+}
+
+/**
  * Create a GitHub repo under the AgentWebPro org and push all files via the Contents API.
  */
 async function createGitHubRepoAndPush(
   repoName: string,
   zipData: any,
-  description: string
+  description: string,
+  leadListId?: string
 ): Promise<{ githubRepoUrl: string; repoFullName: string; commitSha: string }> {
   const { token, org } = await getGitHubOrgToken();
   const headers = {
@@ -2094,8 +2484,16 @@ async function createGitHubRepoAndPush(
     files.push(...scaffoldFiles);
   }
 
+  // Deterministically inject platform-owned lead-capture attribution (middleware.ts +
+  // app/api/capture/route.ts), force-replacing any v0-generated equivalents.
+  let finalFiles = files;
+  if (leadListId) {
+    finalFiles = injectLeadCaptureAttribution(files, leadListId);
+    console.log(`[V0 SERVICE] Injected lead-capture attribution files (middleware.ts, app/api/capture/route.ts) for list ${leadListId}`);
+  }
+
   // Auto-fix common v0 build issues before pushing to GitHub
-  const fixCount = autoFixV0Files(files);
+  const fixCount = autoFixV0Files(finalFiles);
   if (fixCount > 0) {
     console.log(`[V0 SERVICE] Auto-fixed ${fixCount} files for build compatibility`);
   }
@@ -2109,7 +2507,7 @@ async function createGitHubRepoAndPush(
   const latestCommitSha = refRes.data.object.sha;
 
   // Step B: Create blobs for each file
-  const blobPromises = files.map(async (file) => {
+  const blobPromises = finalFiles.map(async (file) => {
     const blobRes = await axios.post<any>(
       `https://api.github.com/repos/${repoFullName}/git/blobs`,
       {
@@ -2156,7 +2554,7 @@ async function createGitHubRepoAndPush(
     { headers, timeout: GITHUB_API_TIMEOUT_MS }
   );
 
-  console.log(`[V0 SERVICE] Pushed ${files.length} files to ${repoFullName} (${commitSha.substring(0, 7)})`);
+  console.log(`[V0 SERVICE] Pushed ${finalFiles.length} files to ${repoFullName} (${commitSha.substring(0, 7)})`);
 
   return { githubRepoUrl, repoFullName, commitSha };
 }
@@ -2816,7 +3214,13 @@ export async function iterateLandingPage(
         chatId: record.v0ChatId!,
         message,
       }),
-      "v0 chat iterate"
+      "v0 chat iterate",
+      // Interactive path: a >300s iteration fails fast with a clean retry instead of
+      // hanging ~15 min and possibly applying the message multiple times. Kept in
+      // sync responseMode deliberately — the deploy that follows reads latestVersion,
+      // and async here would let it grab the pre-iteration version. (ENG-287)
+      undefined, undefined, undefined,
+      { retryOnTimeout: false }
     );
 
     // Reset status to draft (needs re-deploy after iteration)
@@ -3126,6 +3530,16 @@ export async function deleteLandingPage(
       },
     })
     .promise();
+
+  // Free the idempotency identity so regenerating this slug creates a NEW page
+  // instead of reusing the archived page's chat forever. Best-effort — the delete
+  // above already succeeded and must not be un-done by a cleanup failure.
+  await clearV0UsageForPage({
+    userId,
+    pageId: id,
+    siteId: record.siteId,
+    slug: record.slug || (record.name ? buildPageSlug(record.name) : undefined),
+  });
 }
 
 export async function updateLandingPageGtm(
@@ -3334,25 +3748,16 @@ export async function deleteLandingPageByRecord(record: GeneratedLandingPage): P
     .promise();
 }
 
-const MIDDLEWARE_CONTENT = `import { NextResponse } from "next/server";
-import type { NextRequest } from "next/server";
-import { DOMAIN_MAP } from "./domainMap";
-
-export function middleware(request: NextRequest) {
-  const host = (request.headers.get("host") || "").replace(/:\\d+$/, "");
-  const targetPath = DOMAIN_MAP[host];
-  if (targetPath) {
-    const url = request.nextUrl.clone();
-    url.pathname = targetPath;
-    return NextResponse.rewrite(url);
-  }
-  return NextResponse.next();
-}
-
-export const config = {
-  matcher: ["/((?!_next\\/static|_next\\/image|favicon\\.ico|api\\/).*)"],
-};
-`;
+/**
+ * ENG-308: this used to be a routing-ONLY middleware, and `updateSubdomainMiddleware`
+ * committed it straight over the generated `middleware.ts` on every domain attach or
+ * detach — silently destroying the lead-capture middleware, and with it all
+ * attribution for that page, until the page was regenerated.
+ *
+ * It is now the same canonical middleware generation emits: subdomain rewrite AND
+ * first-touch capture. A test asserts the two are byte-identical.
+ */
+export const MIDDLEWARE_CONTENT = buildLandingPageMiddleware();
 
 /**
  * Commit updated domainMap.ts and middleware.ts to the GitHub repo.
@@ -3372,9 +3777,7 @@ export async function updateSubdomainMiddleware(
     Accept: "application/vnd.github.v3+json",
   };
 
-  const domainMapContent =
-    `// Auto-generated by AgentWeb — do not edit manually.\n` +
-    `export const DOMAIN_MAP: Record<string, string> = ${JSON.stringify(domainMap, null, 2)};\n`;
+  const domainMapContent = buildDomainMapFile(domainMap);
 
   const refRes = await axios.get<any>(
     `https://api.github.com/repos/${repoFullName}/git/ref/heads/main`,

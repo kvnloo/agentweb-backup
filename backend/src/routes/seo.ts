@@ -658,36 +658,6 @@ router.get("/metrics", async (req, res) => {
               ...(dimensionFilter && { dimensionFilter }),
             });
 
-            // Fetch traffic sources for AEO analysis
-            const [trafficSourcesResponse] = await gaClient.runReport({
-              property: `properties/${propertyId}`,
-              dateRanges: [
-                {
-                  startDate: startDateStr,
-                  endDate: endDateStr,
-                },
-              ],
-              dimensions: [
-                { name: "sessionSource" },
-                { name: "sessionMedium" },
-              ],
-              metrics: [
-                { name: "sessions" },
-                { name: "activeUsers" },
-                { name: "screenPageViews" },
-                { name: "averageSessionDuration" },
-              ],
-              orderBys: [
-                {
-                  metric: { metricName: "sessions" },
-                  desc: true,
-                },
-              ],
-              limit: 50,
-              ...(dimensionFilter && { dimensionFilter }),
-            });
-
-
             // Process overall metrics
             let totalSessions = 0;
             let totalUsers = 0;
@@ -736,7 +706,7 @@ router.get("/metrics", async (req, res) => {
             // Sort daily data by date to ensure proper chronological order
             dailyData.sort((a, b) => a.date.localeCompare(b.date));
 
-            // Process traffic sources
+            // Fetch and process traffic sources (with conversion counts per source/medium)
             interface TrafficSource {
               source: string;
               medium: string;
@@ -744,31 +714,98 @@ router.get("/metrics", async (req, res) => {
               users: number;
               pageViews: number;
               avgSessionDuration: number;
+              conversions: number;
             }
 
-            const trafficSources: TrafficSource[] = [];
-
-            if (trafficSourcesResponse.rows) {
-              trafficSourcesResponse.rows.forEach((row) => {
-                const dimensions = row.dimensionValues || [];
-                const metrics = row.metricValues || [];
-                const source = dimensions[0]?.value || "(direct)";
-                const medium = dimensions[1]?.value || "(none)";
-                const sessions = parseInt(metrics[0]?.value || "0");
-                const users = parseInt(metrics[1]?.value || "0");
-                const pageViews = parseInt(metrics[2]?.value || "0");
-                const avgSessionDuration = parseFloat(metrics[3]?.value || "0");
-
-                trafficSources.push({
-                  source,
-                  medium,
-                  sessions,
-                  users,
-                  pageViews,
-                  avgSessionDuration,
-                });
-              });
+            // Fetch key-event/conversion breakdown by source, medium, and event name
+            interface ConversionBySource {
+              source: string;
+              medium: string;
+              eventName: string;
+              conversions: number;
             }
+
+            const [trafficSources, conversionsBySource] = await Promise.all([
+              (async (): Promise<TrafficSource[]> => {
+                try {
+                  const [trafficSourcesResponse] = await gaClient.runReport({
+                    property: `properties/${propertyId}`,
+                    dateRanges: [{ startDate: startDateStr, endDate: endDateStr }],
+                    dimensions: [
+                      { name: "sessionSource" },
+                      { name: "sessionMedium" },
+                    ],
+                    metrics: [
+                      { name: "sessions" },
+                      { name: "activeUsers" },
+                      { name: "screenPageViews" },
+                      { name: "averageSessionDuration" },
+                      { name: "conversions" },
+                    ],
+                    orderBys: [{ metric: { metricName: "sessions" }, desc: true }],
+                    limit: 50,
+                    ...(dimensionFilter && { dimensionFilter }),
+                  });
+                  const result: TrafficSource[] = [];
+                  if (trafficSourcesResponse.rows) {
+                    trafficSourcesResponse.rows.forEach((row) => {
+                      const dimensions = row.dimensionValues || [];
+                      const metrics = row.metricValues || [];
+                      result.push({
+                        source: dimensions[0]?.value || "(direct)",
+                        medium: dimensions[1]?.value || "(none)",
+                        sessions: parseInt(metrics[0]?.value || "0"),
+                        users: parseInt(metrics[1]?.value || "0"),
+                        pageViews: parseInt(metrics[2]?.value || "0"),
+                        avgSessionDuration: parseFloat(metrics[3]?.value || "0"),
+                        conversions: parseInt(metrics[4]?.value || "0"),
+                      });
+                    });
+                  }
+                  return result;
+                } catch (trafficError: any) {
+                  console.warn(`Error fetching traffic sources for property ${propertyId}:`, trafficError.message);
+                  return [];
+                }
+              })(),
+              (async (): Promise<ConversionBySource[]> => {
+                try {
+                  const [convBySourceResponse] = await gaClient.runReport({
+                    property: `properties/${propertyId}`,
+                    dateRanges: [{ startDate: startDateStr, endDate: endDateStr }],
+                    dimensions: [
+                      { name: "sessionSource" },
+                      { name: "sessionMedium" },
+                      { name: "eventName" },
+                    ],
+                    metrics: [{ name: "conversions" }],
+                    orderBys: [{ metric: { metricName: "conversions" }, desc: true }],
+                    limit: 100,
+                    ...(dimensionFilter && { dimensionFilter }),
+                  });
+                  const result: ConversionBySource[] = [];
+                  if (convBySourceResponse.rows) {
+                    convBySourceResponse.rows.forEach((row) => {
+                      const dimensions = row.dimensionValues || [];
+                      const metrics = row.metricValues || [];
+                      const conversions = parseInt(metrics[0]?.value || "0");
+                      if (conversions > 0) {
+                        result.push({
+                          source: dimensions[0]?.value || "(direct)",
+                          medium: dimensions[1]?.value || "(none)",
+                          eventName: dimensions[2]?.value || "",
+                          conversions,
+                        });
+                      }
+                    });
+                  }
+                  return result;
+                } catch (convError: any) {
+                  console.warn(`Error fetching conversions by source for property ${propertyId}:`, convError.message);
+                  return [];
+                }
+              })(),
+            ]);
 
             return {
               propertyId,
@@ -780,6 +817,7 @@ router.get("/metrics", async (req, res) => {
               bounceRate,
               dailyData: dailyData.sort((a, b) => a.date.localeCompare(b.date)),
               trafficSources: trafficSources.sort((a, b) => b.sessions - a.sessions).slice(0, 20),
+              conversionsBySource,
               topPagesByEngagement,
               dateRange: {
                 startDate: startDateStr,
