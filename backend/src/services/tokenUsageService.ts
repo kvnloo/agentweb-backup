@@ -128,10 +128,12 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
   // Cost enforcement is OFF by default (observe-only): we accumulate and surface
   // per-user cost so we can gather real spend data before deciding to gate on it,
   // but we do NOT block users on cost yet. Token-count remains the only hard gate.
-  // The dollar figure is not yet trustworthy enough to block paying users on —
-  // un-priced models (e.g. Fable) fall back to default pricing until ENG-207
-  // (model pricing & normalization) lands. Flip ENFORCE_COST_CAP=true to enable
-  // the cost cap once pricing is accurate; the enforcement path stays tested below.
+  // Per-model pricing is now normalized and accurate (ENG-207 — every model,
+  // including Fable, is priced from the shared llmPricing book), so the dollar
+  // figure is trustworthy. We still keep the cap observe-only until we've
+  // validated real per-user spend against the shadow book. Flip
+  // ENFORCE_COST_CAP=true to enable the cost cap; the enforcement path stays
+  // tested below.
   const enforceCostCap = process.env.ENFORCE_COST_CAP === "true";
 
   const tokenPercentUsed = computePercentUsed(usage.totalTokens, effectiveAllowance);

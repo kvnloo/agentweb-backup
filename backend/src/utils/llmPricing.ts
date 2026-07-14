@@ -73,7 +73,7 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'gpt-5.2-chat': withDerivedCache(1.75, 14), // developers.openai.com/api/docs/models/gpt-5.2
   'gpt-5.4': withDerivedCache(2.5, 15), // developers.openai.com/api/docs/pricing
   'gpt-5.4-nano': withDerivedCache(0.2, 1.25), // per public listings (pricepertoken/gptbreeze, Jun 2026)
-  'gpt-5.5': withDerivedCache(5, 30), // OpenAI direct list price; UNVERIFIED for Azure deployments (Azure rate may differ)
+  'gpt-5.5': withDerivedCache(5, 30), // $5/$30 in/out + $0.50/1M cached — developers.openai.com/api/docs/pricing (Apr 23 2026 GPT-5-line price doubling); cache-read derives to $0.50, matching the published rate
 
   // ── Google Gemini ────────────────────────────────────────────────────────────
   // All Gemini rates verified against ai.google.dev/gemini-api/docs/pricing (Jul 2026).
@@ -84,12 +84,13 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'gemini-3.1-flash-lite': withDerivedCache(0.25, 1.5), // was 0.075/0.3 — stale
   'gemini-3.5-flash': withDerivedCache(1.5, 9), // was 0.15/0.6 — stale
   'gemini-2.5-flash': withDerivedCache(0.3, 2.5), // text/chat model — was MISSING (recorded $0)
-  'gemini-3.1-flash-live-preview': withDerivedCache(0.75, 4.5), // text rate per public listings (cloudprice, Jun 2026); UNVERIFIED — audio/video tokens are billed at higher live-API rates not modeled here
-  // Deep Research agents report token usage via usageMetadata; priced at Gemini
-  // Pro token rates as a best-effort estimate. UNVERIFIED — Google has not
-  // published per-token rates for the deep-research agents (ENG-207 to confirm).
-  'deep-research-preview-04-2026': withDerivedCache(1.25, 10), // UNVERIFIED
-  'deep-research-max-preview-04-2026': withDerivedCache(1.25, 10), // UNVERIFIED
+  'gemini-3.1-flash-live-preview': withDerivedCache(0.75, 4.5), // $0.75/$4.50 text tokens — verified (langcopilot/cloudprice, 2026). SCOPE: audio/video tokens on the Live API bill at higher per-modality rates not modeled here; this is the text-token approximation used for cost metering.
+  // Deep Research agents (Gemini) report usage via usageMetadata and run on
+  // Gemini 3.1 Pro token rates: $2/1M in, $12/1M out (tokencost.app, Jul 2026;
+  // matches gemini-3.1-pro-preview above). Per-task Google Search grounding is
+  // billed separately at a per-query rate — not a per-token cost, so not modeled here.
+  'deep-research-preview-04-2026': withDerivedCache(2, 12),
+  'deep-research-max-preview-04-2026': withDerivedCache(2, 12), // same per-token rate as standard; Max differs in task depth / search volume, not token price
 
   // ── Chatbot (Emma) Azure deployments ────────────────────────────────────────
   // NOTE: chatbotService.calculateCost() carries per-1K rates that are 10x the
