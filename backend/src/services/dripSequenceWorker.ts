@@ -307,8 +307,21 @@ async function checkExitConditions(
         .getEventsByEmailDomainAndLeadEmail(emailDomain, enrollment.leadEmail)
         .catch(() => []);
 
+      // Scope to engagement that happened AFTER this enrollment started.
+      //
+      // The query returns EVERY event for that lead, ever — it is not scoped to a sequence
+      // or a time window. Without this bound, a lead who opened some unrelated email months
+      // ago would exit a sequence enrolled yesterday before it ever sent them anything. The
+      // LinkedIn reply exit below already does exactly this.
+      //
+      // An event with no createdAt cannot be proven to post-date enrollment, so it does not
+      // count — better to keep sending than to silently kill a live sequence.
+      const enrolledAt = new Date(enrollment.enrolledAt).getTime();
       const wanted = exitConditions.onEmailEngagement;
       const engaged = events.some((e: any) => {
+        const at = e.createdAt ? new Date(e.createdAt).getTime() : NaN;
+        if (!Number.isFinite(at) || at <= enrolledAt) return false;
+
         if (wanted.includes('opened') && e.eventType === 'email.opened') return true;
         if (wanted.includes('clicked') && e.eventType === 'email.clicked') return true;
         // An inbound reply is stored as email.received, with leadEmail set to the SENDER

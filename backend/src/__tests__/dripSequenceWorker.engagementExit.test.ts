@@ -49,6 +49,9 @@ const USER_ID = 'user-1';
 const EMAIL_DOMAIN = 'mail.baldwin.com';
 const LEAD_EMAIL = 'lead@contractor.com';
 
+const ENROLLED_AT = '2026-07-01T00:00:00.000Z';
+const ENGAGED_AT = '2026-07-05T00:00:00.000Z'; // after enrolment — see the time-scoping block below
+
 const enrollment = {
   enrollmentId: 'e1',
   sequenceId: 'seq-1',
@@ -58,6 +61,7 @@ const enrollment = {
   leadEmail: LEAD_EMAIL,
   currentStep: 0,
   status: 'active',
+  enrolledAt: ENROLLED_AT,
 };
 
 const sequenceWith = (onEmailEngagement: string[]) => ({
@@ -100,7 +104,7 @@ describe('drip engagement exit — the query must use a REAL partition key (ENG-
 
   it('exits on an opened event', async () => {
     (dripSequenceDb.getSequence as jest.Mock).mockResolvedValue(sequenceWith(['opened']));
-    mockEvents.mockResolvedValue([{ eventType: 'email.opened', leadEmail: LEAD_EMAIL }]);
+    mockEvents.mockResolvedValue([{ eventType: 'email.opened', leadEmail: LEAD_EMAIL, createdAt: ENGAGED_AT }]);
 
     await processDueEnrollments();
 
@@ -109,7 +113,7 @@ describe('drip engagement exit — the query must use a REAL partition key (ENG-
 
   it('exits on a clicked event', async () => {
     (dripSequenceDb.getSequence as jest.Mock).mockResolvedValue(sequenceWith(['clicked']));
-    mockEvents.mockResolvedValue([{ eventType: 'email.clicked', leadEmail: LEAD_EMAIL }]);
+    mockEvents.mockResolvedValue([{ eventType: 'email.clicked', leadEmail: LEAD_EMAIL, createdAt: ENGAGED_AT }]);
 
     await processDueEnrollments();
 
@@ -119,7 +123,7 @@ describe('drip engagement exit — the query must use a REAL partition key (ENG-
   // THE ONE THAT MATTERS: a lead who REPLIED kept receiving sequence emails.
   it('exits on a reply (email.received) — previously never evaluated at all', async () => {
     (dripSequenceDb.getSequence as jest.Mock).mockResolvedValue(sequenceWith(['replied']));
-    mockEvents.mockResolvedValue([{ eventType: 'email.received', leadEmail: LEAD_EMAIL }]);
+    mockEvents.mockResolvedValue([{ eventType: 'email.received', leadEmail: LEAD_EMAIL, createdAt: ENGAGED_AT }]);
 
     await processDueEnrollments();
 
@@ -128,7 +132,8 @@ describe('drip engagement exit — the query must use a REAL partition key (ENG-
 
   it('does NOT exit when the event type is not one the sequence asked for', async () => {
     (dripSequenceDb.getSequence as jest.Mock).mockResolvedValue(sequenceWith(['clicked']));
-    mockEvents.mockResolvedValue([{ eventType: 'email.opened', leadEmail: LEAD_EMAIL }]);
+    // valid timestamp — so this must be rejected on TYPE, not on time
+    mockEvents.mockResolvedValue([{ eventType: 'email.opened', leadEmail: LEAD_EMAIL, createdAt: ENGAGED_AT }]);
 
     await processDueEnrollments();
 
@@ -162,5 +167,72 @@ describe('drip engagement exit — the query must use a REAL partition key (ENG-
     await processDueEnrollments();
 
     expect(mockEvents).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Engagement must be scoped to AFTER enrollment.
+ *
+ * getEventsByEmailDomainAndLeadEmail returns EVERY event for that lead, ever — it is not
+ * scoped to a sequence or a time window. Without a time bound, a lead who opened some
+ * unrelated email six months ago would exit a sequence they were enrolled in yesterday,
+ * before it ever sent them anything. Worse, on deploy every in-flight enrollment whose lead
+ * had ever engaged would exit en masse on the next worker tick.
+ *
+ * The LinkedIn reply exit immediately below already does this correctly (`> enrolledAt`).
+ */
+describe('drip engagement exit — must only count engagement AFTER enrollment', () => {
+  const BEFORE = '2026-01-01T00:00:00.000Z';
+  const ENROLLED = '2026-07-01T00:00:00.000Z';
+  const AFTER = '2026-07-05T00:00:00.000Z';
+
+  beforeEach(() => {
+    (dripSequenceDb.getAllDueEnrollments as jest.Mock).mockResolvedValue([
+      { ...enrollment, enrolledAt: ENROLLED },
+    ]);
+  });
+
+  it('does NOT exit on engagement that predates the enrollment', async () => {
+    (dripSequenceDb.getSequence as jest.Mock).mockResolvedValue(sequenceWith(['opened']));
+    mockEvents.mockResolvedValue([
+      { eventType: 'email.opened', leadEmail: LEAD_EMAIL, createdAt: BEFORE },
+    ]);
+
+    await processDueEnrollments();
+
+    expect(dripSequenceDb.exitEnrollment).not.toHaveBeenCalledWith('e1', 'engagement');
+  });
+
+  it('DOES exit on engagement that happened after the enrollment', async () => {
+    (dripSequenceDb.getSequence as jest.Mock).mockResolvedValue(sequenceWith(['opened']));
+    mockEvents.mockResolvedValue([
+      { eventType: 'email.opened', leadEmail: LEAD_EMAIL, createdAt: AFTER },
+    ]);
+
+    await processDueEnrollments();
+
+    expect(dripSequenceDb.exitEnrollment).toHaveBeenCalledWith('e1', 'engagement');
+  });
+
+  it('ignores a stale event but still honours a fresh one in the same result set', async () => {
+    (dripSequenceDb.getSequence as jest.Mock).mockResolvedValue(sequenceWith(['replied']));
+    mockEvents.mockResolvedValue([
+      { eventType: 'email.received', leadEmail: LEAD_EMAIL, createdAt: BEFORE },
+      { eventType: 'email.received', leadEmail: LEAD_EMAIL, createdAt: AFTER },
+    ]);
+
+    await processDueEnrollments();
+
+    expect(dripSequenceDb.exitEnrollment).toHaveBeenCalledWith('e1', 'engagement');
+  });
+
+  it('does not exit on an event with no timestamp (cannot prove it came after enrollment)', async () => {
+    (dripSequenceDb.getSequence as jest.Mock).mockResolvedValue(sequenceWith(['opened']));
+    // deliberately NO createdAt
+    mockEvents.mockResolvedValue([{ eventType: 'email.opened', leadEmail: LEAD_EMAIL }]);
+
+    await processDueEnrollments();
+
+    expect(dripSequenceDb.exitEnrollment).not.toHaveBeenCalledWith('e1', 'engagement');
   });
 });
