@@ -38,18 +38,27 @@ const srcOf = (files: Array<{ path: string; content: Buffer }>, path: string) =>
 };
 
 /** The two behaviours that must coexist in ANY middleware we ship. */
-function assertDoesSubdomainRewrite(src: string, label: string) {
+function assertDoesSubdomainRewrite(src: string) {
   expect(src).toMatch(/DOMAIN_MAP/);
   expect(src).toMatch(/NextResponse\.rewrite/);
   expect(src).toContain('from "./domainMap"');
 }
-function assertDoesFirstTouchCapture(src: string, label: string) {
+
+function assertDoesFirstTouchCapture(src: string) {
   expect(src).toContain('aw_first_touch');
-  // reads the five UTM keys the CRM side actually parses
+
+  // The middleware builds its keys dynamically — `sp.get("utm_" + k)` over a literal
+  // array of suffixes — so the string `utm_source` never appears in the source. Assert
+  // on what IS there: every one of the five suffixes, AND the `utm_` prefixing that
+  // turns them into the real param names. (Asserting `toContain('"utm_" + k')` five
+  // times, as this once did, is a no-op: it checks the same fixed string each pass and
+  // would still pass if the array had lost three of its keys. The runtime suite proves
+  // the behaviour; this one must at least pin the key list.)
   for (const k of ['source', 'medium', 'campaign', 'content', 'term']) {
-    expect(src).toContain(`"utm_" + k`);
+    expect(src).toContain(`"${k}"`);
   }
-  expect(src).toMatch(/utm_/);
+  expect(src).toContain('"utm_" + k');
+
   // and the ad-platform click ids
   for (const id of ['gclid', 'fbclid', 'ttclid', 'li_fat_id']) {
     expect(src).toContain(id);
@@ -62,11 +71,11 @@ describe('ENG-308 — one middleware, both jobs', () => {
     const src = buildLandingPageMiddleware();
 
     it('performs the subdomain rewrite', () => {
-      assertDoesSubdomainRewrite(src, 'canonical');
+      assertDoesSubdomainRewrite(src);
     });
 
     it('performs the first-touch capture', () => {
-      assertDoesFirstTouchCapture(src, 'canonical');
+      assertDoesFirstTouchCapture(src);
     });
 
     it('sets the cookie on the SAME response it returns, on BOTH paths', () => {
@@ -124,11 +133,11 @@ describe('ENG-308 — one middleware, both jobs', () => {
     it('emits a middleware that ALSO does the subdomain rewrite', () => {
       // Before ENG-308 this middleware had no rewrite at all, so a later domain
       // operation had to replace it wholesale — which is what destroyed capture.
-      assertDoesSubdomainRewrite(srcOf(files, 'middleware.ts'), 'generation');
+      assertDoesSubdomainRewrite(srcOf(files, 'middleware.ts'));
     });
 
     it('still emits the capture middleware and the capture route', () => {
-      assertDoesFirstTouchCapture(srcOf(files, 'middleware.ts'), 'generation');
+      assertDoesFirstTouchCapture(srcOf(files, 'middleware.ts'));
       expect(srcOf(files, 'app/api/capture/route.ts')).toContain('list_abc');
     });
 
@@ -164,11 +173,11 @@ describe('ENG-308 — one middleware, both jobs', () => {
       // THE REGRESSION THIS FILE EXISTS FOR. This constant is committed over the
       // top of the generated middleware.ts on every domain operation. If it lacks
       // capture, attaching a subdomain silently destroys attribution.
-      assertDoesFirstTouchCapture(MIDDLEWARE_CONTENT, 'subdomain');
+      assertDoesFirstTouchCapture(MIDDLEWARE_CONTENT);
     });
 
     it('still performs the subdomain rewrite', () => {
-      assertDoesSubdomainRewrite(MIDDLEWARE_CONTENT, 'subdomain');
+      assertDoesSubdomainRewrite(MIDDLEWARE_CONTENT);
     });
 
     it('is byte-identical to what generation emits — one template, no drift', () => {
@@ -184,12 +193,12 @@ describe('ENG-308 — one middleware, both jobs', () => {
       // Simulate exactly what updateSubdomainMiddleware does to a freshly generated
       // repo: replace middleware.ts wholesale. Capture must survive.
       const generated = srcOf(injectLeadCaptureAttribution([], 'list_abc'), 'middleware.ts');
-      assertDoesFirstTouchCapture(generated, 'before');
+      assertDoesFirstTouchCapture(generated);
 
       const afterDomainAttach = MIDDLEWARE_CONTENT; // what gets committed over it
 
-      assertDoesFirstTouchCapture(afterDomainAttach, 'after'); // <- was the bug
-      assertDoesSubdomainRewrite(afterDomainAttach, 'after');
+      assertDoesFirstTouchCapture(afterDomainAttach); // <- was the bug
+      assertDoesSubdomainRewrite(afterDomainAttach);
     });
   });
 });
