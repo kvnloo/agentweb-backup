@@ -481,3 +481,157 @@ describe('intakeService.fileBugReport — reopen, not refile (ENG-240 contract #
     expect(r).toMatchObject({ deduped: false });
   });
 });
+
+describe('intakeService.fileBugReport — exact-reference short-circuit (fix for AGW false-new-duplicate, ENG-329 incident)', () => {
+  const realFlag = process.env.FEATUREBASE_INTAKE;
+  beforeEach(() => {
+    process.env.FEATUREBASE_INTAKE = 'true';
+    fb.createTicket.mockResolvedValue({ id: 'tk', number: 121, url: 'https://fb/t/121' });
+  });
+  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+
+  it('no ticket reference in text -> fuzzy dedup runs exactly as before, getIssueComments never called', async () => {
+    linear.listOpenBugCanonicals.mockResolvedValue([
+      { identifier: 'ENG-9', issueId: 'uuid-9', title: 'Unrelated bug', description: 'unrelated' },
+    ]);
+    dedup.findDuplicate.mockResolvedValue(null);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-10', url: 'lin', id: 'uuid-10' });
+
+    await fileUserIssue({ type: 'bug', title: 'Save button crashes', description: 'clicking save throws', userEmail: 'u@e.com' });
+
+    expect(dedup.findDuplicate).toHaveBeenCalled();
+    expect(linear.getIssueComments).not.toHaveBeenCalled();
+  });
+
+  it('reference present but no candidate comment matches it -> falls through to fuzzy dedup, no throw', async () => {
+    linear.listOpenBugCanonicals.mockResolvedValue([
+      { identifier: 'ENG-9', issueId: 'uuid-9', title: 'Unrelated bug', description: 'unrelated' },
+    ]);
+    linear.getIssueComments.mockResolvedValue(['some unrelated comment', '[reporter-ticket #999 other@e.com] Affected user: other@e.com']);
+    dedup.findDuplicate.mockResolvedValue(null);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-10', url: 'lin', id: 'uuid-10' });
+
+    const r = await fileUserIssue({
+      type: 'bug',
+      title: 'AGW-112 follow-up: something',
+      description: 'evidence text',
+      userEmail: 'u@e.com',
+    });
+
+    expect(dedup.findDuplicate).toHaveBeenCalled();
+    expect(linear.createInternalLinearIssue).toHaveBeenCalled();
+    expect(r).toMatchObject({ deduped: false });
+  });
+
+  it('a literal "ENG-N" mention in the text does NOT deterministically match by identifier alone (avoids false positives on casual mentions)', async () => {
+    // Regression guard for the design refinement: unlike AGW-N, ENG-N is never matched by a bare
+    // identifier compare — only AGW-N (via the private reporter-ticket comment marker) triggers
+    // the deterministic short-circuit. A report merely naming an ENG-N id in passing must still go
+    // through the fuzzy judge, exactly as today.
+    linear.listOpenBugCanonicals.mockResolvedValue([
+      { identifier: 'ENG-312', issueId: 'uuid-312', title: 'final_url_suffix silently fails', description: 'old report' },
+    ]);
+    dedup.findDuplicate.mockResolvedValue(null);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-999', url: 'lin', id: 'uuid-999' });
+
+    const r = await fileUserIssue({
+      type: 'bug',
+      title: 'New unrelated bug (mentions ENG-312 loosely)',
+      description: 'not actually the same thing',
+      userEmail: 'u@e.com',
+    });
+
+    expect(linear.getIssueComments).not.toHaveBeenCalled();
+    expect(linear.createInternalLinearIssue).toHaveBeenCalled();
+    expect(r).toMatchObject({ deduped: false });
+  });
+
+  it('getIssueComments throws for one candidate -> scan skips it, continues, never throws out of fileBugReport', async () => {
+    linear.listOpenBugCanonicals.mockResolvedValue([
+      { identifier: 'ENG-8', issueId: 'uuid-8', title: 'Other bug', description: 'x' },
+      { identifier: 'ENG-312', issueId: 'uuid-312', title: 'final_url_suffix silently fails', description: 'old report' },
+    ]);
+    linear.getIssueComments
+      .mockRejectedValueOnce(new Error('Linear API error'))
+      .mockResolvedValueOnce(['[reporter-ticket #112 emongiovi@xcures.com] Affected user: emongiovi@xcures.com']);
+    dedup.findDuplicate.mockResolvedValue(null);
+
+    const r = await fileUserIssue({
+      type: 'bug',
+      title: 'AGW-112 follow-up: intermittent behavior',
+      description: 'evidence',
+      userEmail: 'emongiovi@xcures.com',
+    });
+
+    expect(linear.getIssueComments).toHaveBeenCalledTimes(2);
+    expect(dedup.findDuplicate).not.toHaveBeenCalled(); // exact match found on the 2nd candidate
+    expect(r).toMatchObject({ deduped: true, canonicalUrl: expect.stringContaining('ENG-312') });
+  });
+
+  it('getIssueComments resolves with a non-array value (unmocked/malformed) -> caught, never throws out of fileBugReport', async () => {
+    // Regression guard for the Greptile-flagged structural issue: bodies.some(...) must be
+    // covered by the same try/catch as the await — a resolved-but-non-array value (e.g. an
+    // unmocked jest.fn() defaulting to `undefined`, or any real malformed API response) must
+    // degrade gracefully, not throw a TypeError that escapes findExactCanonicalMatch.
+    linear.listOpenBugCanonicals.mockResolvedValue([
+      { identifier: 'ENG-312', issueId: 'uuid-312', title: 'final_url_suffix silently fails', description: 'old report' },
+    ]);
+    linear.getIssueComments.mockResolvedValue(undefined as any);
+    dedup.findDuplicate.mockResolvedValue(null);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-999', url: 'lin', id: 'uuid-999' });
+
+    const r = await fileUserIssue({
+      type: 'bug',
+      title: 'AGW-112 follow-up: something',
+      description: 'evidence text',
+      userEmail: 'u@e.com',
+    });
+
+    expect(dedup.findDuplicate).toHaveBeenCalled();
+    expect(linear.createInternalLinearIssue).toHaveBeenCalled();
+    expect(r).toMatchObject({ deduped: false });
+  });
+
+  it('report citing AGW-112 matches an OPEN canonical by its reporter-ticket comment -> groups directly, fuzzy judge never called (ENG-329 incident scenario)', async () => {
+    linear.listOpenBugCanonicals.mockResolvedValue([
+      { identifier: 'ENG-312', issueId: 'uuid-312', title: 'final_url_suffix silently fails', description: 'old report' },
+    ]);
+    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #112 emongiovi@xcures.com] Affected user: emongiovi@xcures.com (Edward Mongiovi)']);
+
+    const r = await fileUserIssue({
+      type: 'bug',
+      title: 'AGW-112 follow-up: Google Ads campaign final_url_suffix UPDATE is INTERMITTENT',
+      description: 'UPDATE to AGW-112 evidence: ... same session, same tool ...',
+      userEmail: 'emongiovi@xcures.com',
+    });
+
+    expect(dedup.findDuplicate).not.toHaveBeenCalled();
+    expect(linear.raiseIssueTriage).toHaveBeenCalled();
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ deduped: true, canonicalUrl: expect.stringContaining('ENG-312') });
+  });
+
+  it('report citing AGW-112 whose reporter-ticket comment is on a RESOLVED (not open) canonical -> reopens it, fuzzy judge never called', async () => {
+    linear.listOpenBugCanonicals.mockResolvedValue([]);
+    linear.listRecentlyResolvedBugCanonicals.mockResolvedValue([
+      { identifier: 'ENG-312', issueId: 'uuid-312', title: 'final_url_suffix silently fails', description: 'old report' },
+    ]);
+    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #112 emongiovi@xcures.com] Affected user: emongiovi@xcures.com']);
+
+    const r = await fileUserIssue({
+      type: 'bug',
+      title: 'AGW-112 follow-up: Google Ads campaign final_url_suffix UPDATE is INTERMITTENT',
+      description: 'evidence text',
+      userEmail: 'emongiovi@xcures.com',
+    });
+
+    // The open-canonical check still invokes the fuzzy judge once with an EMPTY candidate list
+    // (pre-existing behavior — findDuplicate self-short-circuits on an empty array); the real
+    // invariant this test protects is that it's never invoked with the actual resolved candidate.
+    expect(dedup.findDuplicate).not.toHaveBeenCalledWith(expect.anything(), expect.arrayContaining([expect.objectContaining({ ref: 'ENG-312' })]));
+    expect(linear.reopenIssue).toHaveBeenCalledWith('uuid-312', 'Todo');
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-312', expect.stringContaining('Reopened by a new report'));
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ deduped: true });
+  });
+});
