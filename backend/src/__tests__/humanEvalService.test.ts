@@ -1,4 +1,4 @@
-import { HumanEvalCandidate, HumanEvalService } from '../services/humanEvalService';
+import { HumanEvalCandidate, HumanEvalService, parseHumanEvalCategoryFilter } from '../services/humanEvalService';
 
 function makeHarness() {
   const items = new Map<string, HumanEvalCandidate>();
@@ -609,6 +609,22 @@ describe('HumanEvalService', () => {
 
     const all = await service.listCandidates();
     expect(all.map((c) => c.candidateId)).toEqual(['cand-ad', 'cand-organic', 'cand-legacy']);
+  });
+
+  it('strictly parses category filter values: friendly spellings map, near-misses return null', () => {
+    // Recognized spellings (case/space/hyphen tolerant) map to the canonical value.
+    expect(parseHumanEvalCategoryFilter('ad')).toBe('ad');
+    expect(parseHumanEvalCategoryFilter('Ad')).toBe('ad');
+    expect(parseHumanEvalCategoryFilter('Organic Post')).toBe('organic_post');
+    expect(parseHumanEvalCategoryFilter('organic-post')).toBe('organic_post');
+    expect(parseHumanEvalCategoryFilter('UNCATEGORIZED')).toBe('uncategorized');
+
+    // Anything else is null so the read path can reject instead of coercing —
+    // a filter must never silently return the wrong record set.
+    expect(parseHumanEvalCategoryFilter('ads')).toBeNull();
+    expect(parseHumanEvalCategoryFilter('orgnic_post')).toBeNull();
+    expect(parseHumanEvalCategoryFilter('')).toBeNull();
+    expect(parseHumanEvalCategoryFilter('organic post extra')).toBeNull();
   });
 
   it('lists candidates newest-first with a limit and supports status/reviewType filters', async () => {

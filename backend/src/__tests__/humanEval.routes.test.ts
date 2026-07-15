@@ -12,13 +12,18 @@ jest.mock('../middleware/auth', () => ({
   },
 }));
 
-jest.mock('../services/humanEvalService', () => ({
-  humanEvalService: {
-    createCandidate: jest.fn(),
-    getCandidate: jest.fn(),
-    listCandidates: jest.fn(),
-  },
-}));
+jest.mock('../services/humanEvalService', () => {
+  const actual = jest.requireActual('../services/humanEvalService');
+  return {
+    // Pure parser stays real so the route's strict filter validation is exercised.
+    parseHumanEvalCategoryFilter: actual.parseHumanEvalCategoryFilter,
+    humanEvalService: {
+      createCandidate: jest.fn(),
+      getCandidate: jest.fn(),
+      listCandidates: jest.fn(),
+    },
+  };
+});
 
 import humanEvalRoutes from '../routes/humanEval';
 import { humanEvalService } from '../services/humanEvalService';
@@ -89,6 +94,56 @@ describe('GET /api/human-eval/candidates', () => {
       reviewType: 'creative_image',
       limit: 10,
     });
+  });
+
+  it('accepts friendly category spellings and forwards the canonical value', async () => {
+    const res = await request(app)
+      .get('/api/human-eval/candidates?category=Organic%20Post')
+      .set('x-admin', '1');
+
+    expect(res.status).toBe(200);
+    expect(mockListCandidates).toHaveBeenCalledWith(expect.objectContaining({
+      category: 'organic_post',
+    }));
+  });
+
+  it('rejects an unrecognized category with 400 instead of silently coercing it', async () => {
+    const res = await request(app)
+      .get('/api/human-eval/candidates?category=orgnic_post')
+      .set('x-admin', '1');
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain('category');
+    expect(mockListCandidates).not.toHaveBeenCalled();
+  });
+
+  it('rejects near-miss category values like "ads" with 400', async () => {
+    const res = await request(app)
+      .get('/api/human-eval/candidates?category=ads')
+      .set('x-admin', '1');
+
+    expect(res.status).toBe(400);
+    expect(mockListCandidates).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unknown status value with 400', async () => {
+    const res = await request(app)
+      .get('/api/human-eval/candidates?status=bogus')
+      .set('x-admin', '1');
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain('status');
+    expect(mockListCandidates).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unknown reviewType value with 400', async () => {
+    const res = await request(app)
+      .get('/api/human-eval/candidates?reviewType=bogus')
+      .set('x-admin', '1');
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain('reviewType');
+    expect(mockListCandidates).not.toHaveBeenCalled();
   });
 
   it('lists without filters when none are provided', async () => {
