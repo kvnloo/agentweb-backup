@@ -277,7 +277,7 @@ export const growthGeniusController = {
       if (isFirstMessage) {
         try {
           console.log('GrowthGenius: First message detected, generating session title');
-          const title = await growthGeniusService.generateSessionTitle(content);
+          const title = await growthGeniusService.generateSessionTitle(content, user.userId);
           await chatbotDb.updateSessionTitle(sessionId, title);
           console.log('GrowthGenius: Session title updated to:', title);
         } catch (error) {

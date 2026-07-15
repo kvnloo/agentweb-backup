@@ -2,6 +2,7 @@ import { crmDb } from './db';
 import { agentModeService } from './agentModeService';
 import { settingsService } from './settingsService';
 import { incrementExtraCostUsage } from './tokenUsageService';
+import { meterUsageFromResponse } from '../utils/llmClients';
 import { v4 as uuidv4 } from 'uuid';
 import {
   getRawDataFromCache,
@@ -955,6 +956,12 @@ export class CrmEnrichmentService {
         dataExtractionModel,
         'extractFieldsViaLLM:json',
       );
+      meterUsageFromResponse({
+        userId: spec.userId,
+        model: dataExtractionModel,
+        provider: dataExtractionModel.startsWith('anthropic') || dataExtractionModel.startsWith('claude') ? 'bedrock' : 'azure',
+        feature: 'crm_enrichment_extract',
+      }, completion);
       const raw = completion.choices?.[0]?.message?.content || '';
       console.log(`[CrmEnrichment][extractFieldsViaLLM] LLM responded in ${Date.now()-tLlm}ms rawLen=${raw.length}`);
       response = JSON.parse(raw);
@@ -976,6 +983,12 @@ export class CrmEnrichmentService {
         dataExtractionModel,
         'extractFieldsViaLLM:plain',
       );
+      meterUsageFromResponse({
+        userId: spec.userId,
+        model: dataExtractionModel,
+        provider: dataExtractionModel.startsWith('anthropic') || dataExtractionModel.startsWith('claude') ? 'bedrock' : 'azure',
+        feature: 'crm_enrichment_extract',
+      }, retry);
       const rawRetry = retry.choices?.[0]?.message?.content || '';
 
       const cleaned = rawRetry
@@ -1072,7 +1085,8 @@ export class CrmEnrichmentService {
     fields: Record<string, string | null>,
     citations: Record<string, FieldCitation>,
     sourceContext: string,
-    enrichConfig: { dataExtractionModel: string }
+    enrichConfig: { dataExtractionModel: string },
+    userId?: string
   ): Promise<void> {
     if (process.env.ENRICHMENT_CRITIC === '0') return;
 
@@ -1102,6 +1116,12 @@ export class CrmEnrichmentService {
         enrichConfig.dataExtractionModel,
         'criticPass',
       );
+      meterUsageFromResponse({
+        userId,
+        model: enrichConfig.dataExtractionModel,
+        provider: enrichConfig.dataExtractionModel.startsWith('anthropic') || enrichConfig.dataExtractionModel.startsWith('claude') ? 'bedrock' : 'azure',
+        feature: 'crm_enrichment_critic',
+      }, completion);
       const raw = completion.choices?.[0]?.message?.content || '';
       const parsed = JSON.parse(raw) as Record<string, { verdict?: string; reason?: string }>;
       for (const c of claims) {
@@ -1349,6 +1369,7 @@ export class CrmEnrichmentService {
               ungrouped,
               spec.fieldDescriptions || {},
               { company: lead.company, emailDomain: emailDomainForCtx },
+              spec.userId,
             );
             if (clusterResult.newlyCreated.length > 0) {
               console.log(`[CrmEnrichment][enrichLead] LLM-clustered ungrouped fields lead=${lead.leadId}: ${JSON.stringify(clusterResult.newlyCreated.map(c => ({ fields: c.fields, q: c.searchTemplate })))}`);
@@ -1535,7 +1556,7 @@ export class CrmEnrichmentService {
     let fields = CrmEnrichmentService.verifyCitations(fieldsMerged, citationsMerged, combinedSource, spec.outputFields);
 
     // Critic / verifier pass (item #6) — drops unsupported claims, downgrades partial ones
-    await this.runCriticPass(fields, citationsMerged, combinedSource, enrichConfig!);
+    await this.runCriticPass(fields, citationsMerged, combinedSource, enrichConfig!, spec.userId);
 
     console.log(`[CrmEnrichment][enrichLead] extractFieldsViaLLM DONE lead=${lead.leadId} elapsed=${Date.now()-t0}ms fields=${JSON.stringify(fields)}`);
 
@@ -1650,7 +1671,7 @@ export class CrmEnrichmentService {
 
     // Resolve user-named fields to canonical FIELD_GROUPS names. Once. Cached
     // per list. See enrichmentFieldAliasService.
-    const aliasResult = await resolveFieldAliases(spec.listId, spec.outputFields);
+    const aliasResult = await resolveFieldAliases(spec.listId, spec.outputFields, spec.userId);
     spec = { ...spec, fieldAliases: aliasResult.effectiveMap };
     if (Object.keys(aliasResult.newlyResolved).length > 0) {
       console.log(`[CrmEnrichment][preview] LLM-resolved new aliases: ${JSON.stringify(aliasResult.newlyResolved)}`);
@@ -1727,7 +1748,7 @@ export class CrmEnrichmentService {
 
     // Resolve user-named fields to canonical FIELD_GROUPS names. Once per job.
     // Persisted per list — subsequent jobs hit the cache without an LLM call.
-    const aliasResult = await resolveFieldAliases(spec.listId, spec.outputFields);
+    const aliasResult = await resolveFieldAliases(spec.listId, spec.outputFields, spec.userId);
     spec = { ...spec, fieldAliases: aliasResult.effectiveMap };
     if (Object.keys(aliasResult.newlyResolved).length > 0) {
       console.log(`[CrmEnrichment][execute] LLM-resolved new aliases: ${JSON.stringify(aliasResult.newlyResolved)}`);
@@ -2005,7 +2026,8 @@ export class CrmEnrichmentService {
       existingStandardFields?: string[];
       existingCustomFields?: string[];
       commonlyEmptyFields?: string[];
-    }
+    },
+    userId?: string
   ): Promise<{
     instruction: string;
     outputFields: string[];
@@ -2060,6 +2082,12 @@ export class CrmEnrichmentService {
         ],
         response_format: { type: 'json_object' },
       });
+      meterUsageFromResponse({
+        userId,
+        model: enrichmentModel,
+        provider: enrichmentModel.startsWith('anthropic') || enrichmentModel.startsWith('claude') ? 'bedrock' : 'azure',
+        feature: 'crm_enrichment_suggest',
+      }, completion);
       raw = completion.choices?.[0]?.message?.content || '';
     } catch (err) {
       // Retry without json_object mode
@@ -2072,6 +2100,12 @@ export class CrmEnrichmentService {
             { role: 'user', content: `${userPrompt}\n\nCRITICAL: Return ONLY a valid JSON object. No markdown, no backticks.` },
           ],
         });
+        meterUsageFromResponse({
+          userId,
+          model: enrichmentModel,
+          provider: enrichmentModel.startsWith('anthropic') || enrichmentModel.startsWith('claude') ? 'bedrock' : 'azure',
+          feature: 'crm_enrichment_suggest',
+        }, retry);
         raw = retry.choices?.[0]?.message?.content || '';
         raw = raw.trim().replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/, '').trim();
       } catch (retryErr) {

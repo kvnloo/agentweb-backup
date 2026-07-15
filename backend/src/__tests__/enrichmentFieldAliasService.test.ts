@@ -27,16 +27,41 @@ jest.mock('../services/crmEnrichmentService', () => ({
   },
 }));
 
+const mockMeterUserUsage = jest.fn();
+jest.mock('../services/usageRecorderService', () => ({
+  meterUserUsage: (...a: any[]) => mockMeterUserUsage(...a),
+}));
+
 import { resolveFieldAliases, STATIC_FIELD_ALIASES, canonicalFieldSet } from '../services/enrichmentFieldAliasService';
 import { crmDb } from '../services/db';
 const mockDb = crmDb as jest.Mocked<typeof crmDb>;
 
 beforeEach(() => {
   mockLLM.mockReset();
+  mockMeterUserUsage.mockReset();
   mockDb.getLeadListById.mockReset();
   mockDb.updateLeadList.mockReset();
   mockDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'u1' } as any);
   mockDb.updateLeadList.mockResolvedValue(undefined as any);
+});
+
+describe('resolveFieldAliases — per-user metering (ENG-200)', () => {
+  it('charges the field-mapping LLM call to the caller (userId + tokens) via meterUserUsage', async () => {
+    // A non-canonical field forces the LLM mapping tier to run.
+    mockLLM.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({ some_weird_field: null }) } }],
+      usage: { prompt_tokens: 90, completion_tokens: 12 },
+    });
+
+    await resolveFieldAliases('list1', ['some_weird_field'], 'user-3');
+
+    expect(mockMeterUserUsage).toHaveBeenCalledWith(expect.objectContaining({
+      userId: 'user-3',
+      feature: 'crm_enrichment_field_alias',
+      inputTokens: 90,
+      outputTokens: 12,
+    }));
+  });
 });
 
 function llmReply(map: Record<string, string | null>) {

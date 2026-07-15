@@ -11,15 +11,23 @@ jest.mock('../services/usageRecordDb', () => ({
   },
 }));
 
+const mockIncrementUserTokenUsage = jest.fn();
+jest.mock('../services/tokenUsageService', () => ({
+  incrementUserTokenUsage: (...a: any[]) => mockIncrementUserTokenUsage(...a),
+}));
+
 import { usageRecordDb } from '../services/usageRecordDb';
 import {
   recordUsage,
+  meterUserUsage,
   computeCostMicroUsd,
   __resetErrorLogThrottleForTests,
 } from '../services/usageRecorderService';
 import { __resetUnknownModelWarnsForTests } from '../utils/llmPricing';
 
 const mockIncrement = usageRecordDb.incrementUsage as jest.Mock;
+
+const flush = () => new Promise((r) => setImmediate(r));
 
 const baseCtx = {
   userId: 'user-1',
@@ -37,6 +45,7 @@ describe('usageRecorderService', () => {
     __resetErrorLogThrottleForTests();
     __resetUnknownModelWarnsForTests();
     mockIncrement.mockResolvedValue(undefined);
+    mockIncrementUserTokenUsage.mockReset().mockResolvedValue(undefined);
   });
 
   describe('fail-open behavior (acceptance criterion)', () => {
@@ -125,6 +134,20 @@ describe('usageRecorderService', () => {
       expect(warnSpy).toHaveBeenCalledTimes(1);
     });
 
+    it('records an explicit costUsdOverride verbatim (per-generation image/video, not token-priced)', async () => {
+      // gemini image model: getModelPrice returns null → token cost would be 0.
+      await recordUsage({
+        ...baseCtx,
+        model: 'gemini-2.5-flash-image',
+        inputTokens: 0,
+        outputTokens: 0,
+        costUsdOverride: 0.039,
+      });
+      const inc = mockIncrement.mock.calls[0][0];
+      expect(inc.costMicroUsd).toBe(39000); // 0.039 USD → microdollars, not 0
+      expect(Number.isInteger(inc.costMicroUsd)).toBe(true);
+    });
+
     it('sanitizes negative / fractional token counts', async () => {
       await recordUsage({ ...baseCtx, inputTokens: -5, outputTokens: 10.6 });
       const inc = mockIncrement.mock.calls[0][0];
@@ -152,6 +175,74 @@ describe('usageRecorderService', () => {
     });
   });
 
+  describe('meterUserUsage (shadow + enforced per-user cap)', () => {
+    it('records to the shadow table AND charges the per-user cap with summed tokens + dollar cost', async () => {
+      meterUserUsage({ ...baseCtx, cacheReadTokens: 100, cacheWriteTokens: 40 });
+      await flush();
+
+      // Shadow record still happens.
+      expect(mockIncrement).toHaveBeenCalledTimes(1);
+      // Cap charged: totalTokens = 1000+200+100+40 = 1340; cost = 6180 microUsd = 0.00618 USD.
+      expect(mockIncrementUserTokenUsage).toHaveBeenCalledTimes(1);
+      const [userId, tokens, cost] = mockIncrementUserTokenUsage.mock.calls[0];
+      expect(userId).toBe('user-1');
+      expect(tokens).toBe(1340);
+      expect(cost).toBeCloseTo(0.00618, 8);
+    });
+
+    it('does NOT charge the cap when no user is attributable (shadow still records under system)', async () => {
+      meterUserUsage({ ...baseCtx, userId: undefined });
+      await flush();
+
+      expect(mockIncrement).toHaveBeenCalledTimes(1);
+      expect(mockIncrement.mock.calls[0][0].userId).toBe('system');
+      expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
+    });
+
+    it('charges tokens with cost 0 for an unknown model (tokens trustworthy, cost best-effort)', async () => {
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      meterUserUsage({ ...baseCtx, model: 'mystery-model-x' });
+      await flush();
+
+      const [, tokens, cost] = mockIncrementUserTokenUsage.mock.calls[0];
+      expect(tokens).toBe(1200); // 1000 + 200
+      expect(cost).toBe(0);
+    });
+
+    it('skips the cap charge entirely when there is no usage (no tokens, no cost)', async () => {
+      meterUserUsage({ ...baseCtx, inputTokens: 0, outputTokens: 0, model: 'mystery-model-x' });
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      await flush();
+
+      expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
+    });
+
+    it('charges costUsdOverride to the cap for per-generation (image/video) calls with 0 tokens', async () => {
+      // Image/video are billed per generation, not per token — the override IS the cost.
+      meterUserUsage({ ...baseCtx, inputTokens: 0, outputTokens: 0, model: 'runway-gen4', costUsdOverride: 0.42 });
+      await flush();
+      const [uid, tokens, cost] = mockIncrementUserTokenUsage.mock.calls[0];
+      expect(uid).toBe('user-1');
+      expect(tokens).toBe(0);
+      expect(cost).toBe(0.42);
+    });
+
+    it('does not deduct an override when no user is attributable', async () => {
+      meterUserUsage({ ...baseCtx, userId: undefined, inputTokens: 0, outputTokens: 0, costUsdOverride: 5 });
+      await flush();
+      expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
+    });
+
+    it('never throws when the cap charge rejects (fail-open)', async () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockIncrementUserTokenUsage.mockRejectedValue(new Error('cap write failed'));
+
+      expect(() => meterUserUsage(baseCtx)).not.toThrow();
+      await flush();
+      expect(errorSpy).toHaveBeenCalled();
+    });
+  });
+
   describe('computeCostMicroUsd', () => {
     it('computes token cost in integer microdollars', () => {
       // gpt-5-chat-2: in $2.5/M, out $10/M
@@ -161,10 +252,18 @@ describe('usageRecorderService', () => {
     });
 
     it('prices cache reads and writes when present', () => {
-      // opus: in $15/M → cacheRead $1.5/M, cacheWrite $18.75/M
+      // opus 4.6: in $5/M → cacheRead $0.5/M (10%), cacheWrite $6.25/M (125%)
       expect(
         computeCostMicroUsd('anthropic.claude-opus-4-6-v1', 0, 0, 1000, 1000)
-      ).toBe(Math.round(1000 * 1.5 + 1000 * 18.75));
+      ).toBe(Math.round(1000 * 0.5 + 1000 * 6.25));
+    });
+
+    it('prices the deep-research agents (so their per-run cost is counted, not 0)', () => {
+      // ENG-207: verified — Deep Research runs on Gemini 3.1 Pro rates: in $2/M, out $12/M.
+      expect(computeCostMicroUsd('deep-research-preview-04-2026', 1_000_000, 100_000)).toBe(
+        2_000_000 + 1_200_000
+      );
+      expect(computeCostMicroUsd('deep-research-max-preview-04-2026', 1_000_000, 0)).toBe(2_000_000);
     });
 
     it('returns 0 for unknown models', () => {

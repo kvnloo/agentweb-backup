@@ -26,7 +26,7 @@ import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
 import { normalizeEmailList } from '../utils/validation';
 import { getAllowedSkills } from '../services/subscriptionService';
-import { checkTokenUsage } from '../services/tokenUsageService';
+import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
 import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 import { DynamoDB } from 'aws-sdk';
@@ -1407,12 +1407,21 @@ export async function runScheduledChat(
         );
       }
 
+      // A block can be caused by either the token-count cap or the dollar cost
+      // cap (ENG-200). When the cost cap is the trigger — which is the only reason
+      // a user with an unlimited token allowance can be blocked — render a
+      // cost-based message so it doesn't misleadingly read "0 tokens used".
+      const { blockedByCost } = deriveBlockedByCost(usageStatus);
+      const blockMessage = blockedByCost
+        ? `Scheduled chat cannot run: Monthly cost limit reached ($${(usageStatus.costUsed ?? 0).toFixed(2)} / $${(usageStatus.costAllowance ?? 0).toFixed(2)} spent this month).`
+        : `Scheduled chat cannot run: Monthly token limit reached (${usageStatus.used?.toLocaleString() ?? 0} / ${usageStatus.allowance?.toLocaleString() ?? 0} tokens used).`;
+
       const tokenLimitResult = {
         scheduleId: schedule.scheduleId,
         runId: require('uuid').v4(),
         status: 'failure' as const,
         passed: false,
-        actualResponse: `Scheduled chat cannot run: Monthly token limit reached (${usageStatus.used?.toLocaleString() ?? 0} / ${usageStatus.allowance?.toLocaleString() ?? 0} tokens used).`,
+        actualResponse: blockMessage,
         actualFunctionCalls: [],
         keywordMatches: [],
         keywordMisses: schedule.keywords || [],

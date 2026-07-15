@@ -91,6 +91,9 @@ jest.mock('../services/emailService', () => ({
 }));
 
 jest.mock('../services/tokenUsageService', () => ({
+  // deriveBlockedByCost is a pure helper — use the real implementation so the
+  // block-message derivation is exercised, not stubbed.
+  ...jest.requireActual('../services/tokenUsageService'),
   checkTokenUsage: jest.fn(async () => ({
     allowed: true,
     warning: false,
@@ -2824,13 +2827,17 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     it('should block scheduled chat and send token limit email when user is over token limit', async () => {
       mockedCheckTokenUsage.mockResolvedValueOnce({
         allowed: false,
-        warning: true,
+        warning: false,
         used: 1050000,
         allowance: 1000000,
         percentUsed: 105,
         effectiveAllowance: 1000000,
         bonus: 0,
         month: '2026-04',
+        costUsed: 0,
+        costAllowance: null,
+        costPercentUsed: 0,
+        costEnforced: false,
       });
 
       const scheduleWithEmails = {
@@ -2855,13 +2862,17 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     it('should block scheduled chat over token limit and fall back to user email when no emailNotifications set', async () => {
       mockedCheckTokenUsage.mockResolvedValueOnce({
         allowed: false,
-        warning: true,
+        warning: false,
         used: 1050000,
         allowance: 1000000,
         percentUsed: 105,
         effectiveAllowance: 1000000,
         bonus: 0,
         month: '2026-04',
+        costUsed: 0,
+        costAllowance: null,
+        costPercentUsed: 0,
+        costEnforced: false,
       });
 
       const scheduleNoEmails = {
@@ -2884,13 +2895,17 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     it('should save failure run result to DB when token limit is exceeded', async () => {
       mockedCheckTokenUsage.mockResolvedValueOnce({
         allowed: false,
-        warning: true,
+        warning: false,
         used: 1050000,
         allowance: 1000000,
         percentUsed: 105,
         effectiveAllowance: 1000000,
         bonus: 0,
         month: '2026-04',
+        costUsed: 0,
+        costAllowance: null,
+        costPercentUsed: 0,
+        costEnforced: false,
       });
 
       const scheduleWithEmails = { ...baseSchedule, requiredFunctionCalls: [], emailNotifications: ['owner@example.com'] };
@@ -2900,6 +2915,37 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         mockScheduleId,
         expect.objectContaining({ status: 'failure', passed: false })
       );
+    });
+
+    it('should render a cost-based block message when the cost cap is the cause and tokens are unlimited', async () => {
+      mockedCheckTokenUsage.mockResolvedValueOnce({
+        allowed: false,
+        warning: false,
+        used: 5000000,
+        allowance: null,
+        percentUsed: 0,
+        effectiveAllowance: null,
+        bonus: 0,
+        month: '2026-04',
+        costUsed: 42.5,
+        costAllowance: 40,
+        costPercentUsed: 106,
+        costEnforced: true,
+      });
+
+      const scheduleWithEmails = {
+        ...baseSchedule,
+        requiredFunctionCalls: [],
+        emailNotifications: ['owner@example.com'],
+      };
+
+      const result = await runScheduledChat(scheduleWithEmails, mockUserId, true);
+
+      expect(mockEmailService.sendScheduledChatTokenLimitEmail).toHaveBeenCalled();
+      expect(result.actualResponse).toContain('Monthly cost limit reached');
+      expect(result.actualResponse).toContain('$42.50 / $40.00 spent this month');
+      expect(result.actualResponse).not.toContain('tokens used');
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
     });
 
     it('should allow scheduled chat when token usage is under the limit', async () => {

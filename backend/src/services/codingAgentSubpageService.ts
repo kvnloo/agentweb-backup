@@ -16,6 +16,7 @@
 import AWS from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
 import { LANDING_PAGE_PREVIEW_BRANCH, runCodingAgent } from "./codingAgentService";
+import { incrementUserTokenUsage } from "./tokenUsageService";
 import { mcpFetch } from "../mcp/server/httpClient";
 import { buildPageSlug } from "./v0Service";
 import type { GeneratedLandingPage, BrandContext } from "./v0Service";
@@ -98,6 +99,18 @@ export async function addPageViaCodingAgent(
       llmModel: SUBPAGE_MODEL,
       draftBranch,
     });
+
+    // Charge this sub-page run's own LLM turns to the caller's monthly usage. The
+    // coding loop makes its own (often high-cost Opus) calls that no parent meter
+    // sees, so without this its spend escapes the per-user token/cost cap (ENG-200).
+    // Charged whether the build went green or not — the turns cost money either way.
+    // Fire-and-forget + fail-open: metering must never fail/slow sub-page generation.
+    if (result.usageTotals) {
+      const { totalTokens, costUsd } = result.usageTotals;
+      incrementUserTokenUsage(userId, totalTokens, costUsd).catch((err: unknown) =>
+        console.error("addPageViaCodingAgent: failed to record per-user usage:", err)
+      );
+    }
 
     if (!result.success) {
       // Build never went green on the preview — main is untouched.
