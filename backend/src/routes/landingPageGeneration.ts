@@ -38,6 +38,7 @@ import {
   resolveLandingPageLiveUrl,
   canUserEditLandingPage,
 } from "../services/v0Service";
+import { injectGtmIntoLayout } from "../utils/gtmInjection";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { MISSING_BRAND_LOGO_ERROR } from "../services/agentMode/brandLogo";
 import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
@@ -1766,46 +1767,9 @@ async function saveGtmForPage(
       currentContent = Buffer.from(fileRes.data.content, "base64").toString("utf-8");
       fileSha = fileRes.data.sha;
 
-      // 2. Build GTM snippets
-      const gtmHeadSnippet =
-        `        {/* Google Tag Manager */}\n` +
-        `        <script dangerouslySetInnerHTML={{ __html: \`(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src='https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);})(window,document,'script','dataLayer','${containerId}');\` }} />\n` +
-        `        {/* End Google Tag Manager */}`;
-
-      const gtmBodySnippet =
-        `        {/* Google Tag Manager (noscript) */}\n` +
-        `        <noscript dangerouslySetInnerHTML={{ __html: \`<iframe src="https://www.googletagmanager.com/ns.html?id=${containerId}" height="0" width="0" style="display:none;visibility:hidden"></iframe>\` }} />\n` +
-        `        {/* End Google Tag Manager (noscript) */}`;
-
-      // 3. Strip any existing GTM blocks (always, whether adding or removing)
-      let updatedContent = currentContent
-        .replace(/[ \t]*\{\/\* Google Tag Manager \*\/\}[\s\S]*?\{\/\* End Google Tag Manager \*\/\}\n?/g, "")
-        .replace(/[ \t]*\{\/\* Google Tag Manager \(noscript\) \*\/\}[\s\S]*?\{\/\* End Google Tag Manager \(noscript\) \*\/\}\n?/g, "");
-
-      // Only re-inject if we have a non-empty containerId
-      if (containerId) {
-        // Insert head snippet inside <head> (before </head> or before first child after <head>)
-        if (/<head[^>]*>/.test(updatedContent)) {
-          updatedContent = updatedContent.replace(
-            /(<head[^>]*>)/,
-            `$1\n${gtmHeadSnippet}`
-          );
-        } else {
-          // Fallback: insert before <body
-          updatedContent = updatedContent.replace(
-            /(<body[^>]*>)/,
-            `${gtmHeadSnippet}\n      $1`
-          );
-        }
-
-        // Insert noscript snippet immediately after <body ...>
-        if (/<body[^>]*>/.test(updatedContent)) {
-          updatedContent = updatedContent.replace(
-            /(<body[^>]*>)/,
-            `$1\n${gtmBodySnippet}`
-          );
-        }
-      }
+      // 2–3. Strip any existing GTM block and re-inject (idempotent). Shared with the
+      //       auto-inject-at-generation path so both emit byte-identical output (ENG-334).
+      const updatedContent = injectGtmIntoLayout(currentContent, containerId);
 
       // 4. Commit updated layout.tsx to GitHub
       const base64New = Buffer.from(updatedContent, "utf-8").toString("base64");

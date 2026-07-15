@@ -5,6 +5,7 @@ import fs from "fs";
 import path from "path";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken, getLandingPagesConfig } from "../utils/secretsManager";
 import { resolveLandingPageGa4 } from "../utils/landingPageGa4";
+import { injectGtmIntoLayoutFiles } from "../utils/gtmInjection";
 import { userDb, orgDb } from "./db";
 import { canEditItem } from "./orgShareService";
 import { addSubdomain, generateSubdomain, listDomains, SUBDOMAIN_BASE } from "./customDomainService";
@@ -468,6 +469,13 @@ export interface GeneratedLandingPage {
   archived?: boolean;
   archivedAt?: string;
   gtmContainerId?: string;
+  /**
+   * ENG-334: whether conversion tracking (the site's GTM container) was injected into the
+   * generated layout at push time. `false` means the lander shipped with NO tracking — an
+   * explicit, machine-readable signal so this can be surfaced/alerted on without reading the
+   * generated code. Never implies a fallback to AgentWeb's own GA4 property.
+   */
+  trackingInstalled?: boolean;
   context?: string;
   /**
    * State captured at the most recent publish, used to revert it. The pre-merge
@@ -2347,18 +2355,31 @@ export async function deployLandingPage(
     // convention routes/domains.ts uses to build its domain map (`p.slug ? "/"+p.slug : "/"`).
     const pagePath = record.slug ? `/${record.slug}` : "/";
     const listByPath: Record<string, string> = record.leadListId ? { [pagePath]: record.leadListId } : {};
-    const { githubRepoUrl, repoFullName, commitSha } = await createGitHubRepoAndPush(repoName, zipBuffer, record.name, listByPath);
+    const { githubRepoUrl, repoFullName, commitSha, gtmInjected } = await createGitHubRepoAndPush(
+      repoName,
+      zipBuffer,
+      record.name,
+      listByPath,
+      record.gtmContainerId,
+    );
+    // Reflect the tracking signal on the in-memory record so every downstream return
+    // (deployed or build-failed) carries it consistently with what we persisted.
+    record.trackingInstalled = gtmInjected;
 
-    // Save GitHub repo URL immediately so it's not lost if Vercel step fails
+    // Save GitHub repo URL immediately so it's not lost if Vercel step fails.
+    // ENG-334: persist an explicit tracking signal so "shipped with no conversion tracking"
+    // is detectable from the record itself, without reading the generated code.
     await dynamodb
       .update({
         TableName: TABLE_NAME,
         Key: { id },
-        UpdateExpression: "SET #status = :status, githubRepoUrl = :repoUrl, updatedAt = :updatedAt",
+        UpdateExpression:
+          "SET #status = :status, githubRepoUrl = :repoUrl, trackingInstalled = :trackingInstalled, updatedAt = :updatedAt",
         ExpressionAttributeNames: { "#status": "status" },
         ExpressionAttributeValues: {
           ":status": "deploying",
           ":repoUrl": githubRepoUrl,
+          ":trackingInstalled": gtmInjected,
           ":updatedAt": new Date().toISOString(),
         },
       })
@@ -2986,8 +3007,15 @@ async function createGitHubRepoAndPush(
    * but the lead list is per-page, so it needs the whole map (ENG-310). May be empty —
    * the files are injected regardless (ENG-309).
    */
-  listByPath: Record<string, string> = {}
-): Promise<{ githubRepoUrl: string; repoFullName: string; commitSha: string }> {
+  listByPath: Record<string, string> = {},
+  /**
+   * The site's saved GTM container id (ENG-334). When set, the head+noscript snippet is
+   * injected into the root layout before the initial commit so paid traffic is measurable
+   * from the first deploy. When absent, NOTHING is injected — no fallback to AgentWeb's
+   * platform GA4 property on a customer page.
+   */
+  gtmContainerId?: string,
+): Promise<{ githubRepoUrl: string; repoFullName: string; commitSha: string; gtmInjected: boolean }> {
   const { token, org } = await getGitHubOrgToken();
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -3092,14 +3120,12 @@ async function createGitHubRepoAndPush(
   }
 
   if (!hasFile("app/layout.tsx")) {
-    const lpConfig = await getLandingPagesConfig();
-    const measurementId = lpConfig?.ga4MeasurementId;
-    const gtagBlock = measurementId
-      ? `\n        <script async src="https://www.googletagmanager.com/gtag/js?id=${measurementId}"></script>\n        <script dangerouslySetInnerHTML={{ __html: \`window.dataLayer = window.dataLayer || []; function gtag(){dataLayer.push(arguments);} gtag('js', new Date()); gtag('config', '${measurementId}');\` }} />`
-      : '';
+    // ENG-334: no platform-GA4 fallback here — a customer page must never ship AgentWeb's
+    // own GA4 property. Conversion tracking comes solely from the site's own GTM container,
+    // injected below from `gtmContainerId` (or nothing, flagged as "no tracking installed").
     scaffoldFiles.push({
       path: "app/layout.tsx",
-      content: Buffer.from(`import type { Metadata } from "next";\nimport "./globals.css";\n\nexport const metadata: Metadata = {\n  title: "Landing Page",\n  description: "Generated landing page",\n};\n\nexport default function RootLayout({\n  children,\n}: {\n  children: React.ReactNode;\n}) {\n  return (\n    <html lang="en">\n      <head>${gtagBlock}\n      </head>\n      <body>{children}</body>\n    </html>\n  );\n}\n`),
+      content: Buffer.from(`import type { Metadata } from "next";\nimport "./globals.css";\n\nexport const metadata: Metadata = {\n  title: "Landing Page",\n  description: "Generated landing page",\n};\n\nexport default function RootLayout({\n  children,\n}: {\n  children: React.ReactNode;\n}) {\n  return (\n    <html lang="en">\n      <head>\n      </head>\n      <body>{children}</body>\n    </html>\n  );\n}\n`),
     });
   }
 
@@ -3130,6 +3156,17 @@ async function createGitHubRepoAndPush(
   if (fixCount > 0) {
     console.log(`[V0 SERVICE] Auto-fixed ${fixCount} files for build compatibility`);
   }
+
+  // ENG-334: auto-inject the site's GTM container into the root layout BEFORE the initial
+  // commit, so every generated lander (and its subpages, via the shared layout) is
+  // measurable from the first deploy — no manual "Add GTM" step. Absent a container id,
+  // nothing is injected and the caller records a "no tracking installed" signal.
+  const gtmInjected = injectGtmIntoLayoutFiles(finalFiles, gtmContainerId);
+  console.log(
+    gtmInjected
+      ? `[V0 SERVICE] Injected GTM container ${gtmContainerId} into app/layout.tsx`
+      : `[V0 SERVICE] No GTM container configured for this site — pushing WITHOUT conversion tracking`,
+  );
 
   // Push files to the repo using the Git Trees API (single commit for all files)
   // Step A: Get the default branch SHA
@@ -3189,7 +3226,7 @@ async function createGitHubRepoAndPush(
 
   console.log(`[V0 SERVICE] Pushed ${finalFiles.length} files to ${repoFullName} (${commitSha.substring(0, 7)})`);
 
-  return { githubRepoUrl, repoFullName, commitSha };
+  return { githubRepoUrl, repoFullName, commitSha, gtmInjected };
 }
 
 /**
