@@ -211,12 +211,21 @@ export async function markRunTerminal(
       // Dynamic import keeps this module light and avoids a load-time cycle
       // (agentModeAlerts -> chatbotService).
       const { sendAgentModeOncallAlert } = await import('../../utils/agentModeAlerts');
+      // Accepted trade-off: the dedupeKey is scoped to the TABLE, not the
+      // runId — oncall gets ONE alert per store per window even if a systemic
+      // DynamoDB failure leaves dozens of runs stale. Per-run keys would flood
+      // oncall during exactly that brownout; the alert signals the failure
+      // CLASS, and the per-run detail lives in the console.error above (one
+      // line per affected run, greppable by "markRunTerminal").
       await sendAgentModeOncallAlert({
         subject: 'Agent run store: terminal status update failed',
         message:
           `Failed to mark run ${runId} as ${status} in ${AGENT_RUNS_TABLE} after one retry. ` +
-          `The run's durable record is stale until its ttl expires.\n\nError: ${(secondErr as Error)?.message}`,
-        dedupeKey: 'run_store:terminal_update_failed',
+          `The run's durable record is stale until its ttl expires.\n\n` +
+          `NOTE: this alert is deduped per table — further terminal-update failures in the next ` +
+          `hour are suppressed. Check server logs ("[runStore] markRunTerminal") for the full ` +
+          `list of affected runs.\n\nError: ${(secondErr as Error)?.message}`,
+        dedupeKey: `run_store:terminal_update_failed:${AGENT_RUNS_TABLE}`,
         dedupeWindowMs: 60 * 60 * 1000,
         context: { 'Run ID': runId, 'Intended Status': status },
       });

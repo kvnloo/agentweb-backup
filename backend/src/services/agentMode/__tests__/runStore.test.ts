@@ -24,6 +24,7 @@ import {
   isRunStoreEnabled,
   IDEM_TTL_INTERACTIVE_S,
   IDEM_TTL_SCHEDULED_S,
+  AGENT_RUNS_TABLE,
   __setDocumentClientForTests,
 } from '../runStore';
 import { sendAgentModeOncallAlert } from '../../../utils/agentModeAlerts';
@@ -303,6 +304,28 @@ describe('runStore', () => {
       expect(sendAgentModeOncallAlert).toHaveBeenCalledTimes(1);
       const args = (sendAgentModeOncallAlert as jest.Mock).mock.calls[0][0];
       expect(args.dedupeKey).toBeTruthy();
+    });
+
+    it('alert dedupeKey is table-scoped (one alert per store per window, not per run) and the message names the suppression window', async () => {
+      await createRunRecord({ runId: 'r1', kind: 'interactive', sessionId: 's1', userId: 'u1' });
+      const failingFake = new DdbFake();
+      failingFake.update = (() => ({
+        promise: async () => {
+          throw new Error('ddb down hard');
+        },
+      })) as any;
+      __setDocumentClientForTests(failingFake as any);
+      await markRunTerminal('r1', 'failed');
+      const args = (sendAgentModeOncallAlert as jest.Mock).mock.calls[0][0];
+      // Scoped to the table, NOT the runId: per-run keys would flood oncall
+      // during a systemic DynamoDB failure; a fixed global key would silently
+      // cross-suppress if a second store ever reused this alert class.
+      expect(args.dedupeKey).toBe(`run_store:terminal_update_failed:${AGENT_RUNS_TABLE}`);
+      expect(args.dedupeKey).not.toContain('r1');
+      // Oncall must be told this alert throttles — further failures in the
+      // window are log-only, so the message points at the logs for full count.
+      expect(args.message).toMatch(/suppressed/i);
+      expect(args.message).toMatch(/server logs/i);
     });
   });
 
