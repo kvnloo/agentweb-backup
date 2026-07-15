@@ -78,7 +78,9 @@ const BreakdownBody: React.FC<{
     <div>
       <div>Burned (gross) ${burn.toFixed(2)}</div>
       <div>Counted to quota ${deducted.toFixed(2)}</div>
-      <div>Absorbed by platform ${absorbed.toFixed(2)}</div>
+      <div data-testid="absorbed-card" data-leaking={absorbed > 0.005 ? 'true' : 'false'}>
+        Absorbed by platform ${absorbed.toFixed(2)}
+      </div>
       {view === 'bars' && (
         costAllowance != null ? (
           <div data-testid="quota-bar" data-color={quotaColor} data-pct={String(Math.min(100, Math.round(quotaPct ?? 0)))}>
@@ -200,6 +202,18 @@ describe('AdminDashboard per-model burn breakdown (isolated)', () => {
     expect(screen.getByText('Burned (gross) $10.00')).toBeInTheDocument();
     expect(screen.getByText('Counted to quota $4.00')).toBeInTheDocument();
     expect(screen.getByText('Absorbed by platform $6.00')).toBeInTheDocument();
+    // Under the charge-all policy, non-zero absorbed = a leak → flagged.
+    expect(screen.getByTestId('absorbed-card')).toHaveAttribute('data-leaking', 'true');
+  });
+
+  it('does NOT flag a leak when everything is charged (absorbed ~$0)', () => {
+    // deducted (10) >= burn (10) → absorbed clamps to 0, no leak flag.
+    const chargedUser: User = { ...user, tokenUsage: { month, totalTokens: 5000, totalCost: 10, resetDate: '' } };
+    const rows: UsageRow[] = [
+      { date: '2026-07-01', model: 'claude-fable-5', feature: 'agent_mode', totalTokens: 1000, callCount: 2, costUsd: 10 },
+    ];
+    render(<BreakdownBody user={chargedUser} month={month} rows={rows} />);
+    expect(screen.getByTestId('absorbed-card')).toHaveAttribute('data-leaking', 'false');
   });
 
   it('shows an explanatory empty-state alert (not a broken view) when no burn is recorded', () => {
