@@ -1084,7 +1084,7 @@ export class GoogleAdsService {
     const adGroupResourceName = this.adGroupFromAdGroupAd(adGroupAdResourceName);
     const inherited = adGroupResourceName
       ? await this.getInheritedFinalUrlSuffix(customerId, accessToken, adGroupResourceName, loginCustomerId)
-      : ({ ok: true } as const);
+      : ({ ok: true as const, suffix: undefined as string | undefined });
     const finalUrlSuffix = inherited.ok
       ? this.buildAdFinalUrlSuffix({
           finalUrl: params.finalUrl,
