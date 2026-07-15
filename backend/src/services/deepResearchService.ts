@@ -1,7 +1,7 @@
 import { getSecret } from "../utils/secretsManager";
 import { DEEP_RESEARCH_AGENT_SPEED, DEEP_RESEARCH_AGENT_MAX } from '../config';
 import { getGeminiClient, normalizeGeminiUsage } from '../utils/llmClients';
-import { recordUsage } from './usageRecorderService';
+import { meterUserUsage } from './usageRecorderService';
 
 /**
  * Result from deep research operation
@@ -24,6 +24,7 @@ interface DeepResearchParams {
   style?: string;             // e.g., 'default', 'substack'
   depth?: string;             // e.g., 'overview', 'detailed', 'comprehensive'
   focus_areas?: string[];     // Specific areas to focus on
+  userId?: string;            // caller's user id — for per-user burn attribution (not quota)
 }
 
 /**
@@ -128,10 +129,10 @@ export class DeepResearchService {
   async performDeepResearch(params: DeepResearchParams): Promise<DeepResearchResult> {
     try {
       const apiKey = await this.getGeminiApiKey();
-      // Metered factory client (shadow metering). Deep research runs in a
-      // system/background context — no per-user attribution available here, so
-      // the recorder attributes usage to 'system'.
-      const ai = await getGeminiClient({ feature: 'content_gen' }, apiKey);
+      // Metered factory client (shadow metering). Usage is attributed to
+      // params.userId when the caller supplies it (per-user burn, not quota) and
+      // falls back to 'system' otherwise.
+      const ai = await getGeminiClient({ userId: params.userId, feature: 'content_gen' }, apiKey);
 
       // Build the research prompt with tone/style steerability
       // See: https://ai.google.dev/gemini-api/docs/deep-research#steerability_and_formatting
@@ -292,7 +293,8 @@ export class DeepResearchService {
       try {
         const usage = normalizeGeminiUsage((interaction as any)?.usageMetadata);
         const hasUsage = usage.inputTokens > 0 || usage.outputTokens > 0;
-        void recordUsage({
+        void meterUserUsage({
+          userId: params.userId, // charge the caller's cap when supplied; else "system" (absorbed)
           model: agent,
           provider: 'gemini',
           feature: hasUsage ? 'content_gen' : 'content_gen:interactions-no-usage',

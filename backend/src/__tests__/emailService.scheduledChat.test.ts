@@ -172,4 +172,65 @@ describe('emailService.sendScheduledChatResultEmail', () => {
   });
 });
 
+describe('emailService.sendScheduledChatTokenLimitEmail', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('renders a token-based message and subject when the token cap is the cause', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatTokenLimitEmail(
+      'user@example.com',
+      'My Schedule',
+      'schedule-123',
+      {
+        used: 1050000,
+        allowance: 1000000,
+        effectiveAllowance: 1000000,
+        percentUsed: 105,
+        costUsed: 0,
+        costAllowance: null,
+        costPercentUsed: 0,
+      }
+    );
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [, subject, textContent, htmlContent] = spy.mock.calls[0];
+    expect(subject).toContain('Monthly Token Limit Reached');
+    expect(htmlContent).toContain('Monthly Token Limit Reached');
+    expect(htmlContent).toContain('1,050,000 / 1,000,000 tokens used this month');
+    expect(textContent).toContain('1,050,000 / 1,000,000 tokens used this month');
+    expect(htmlContent).not.toContain('spent this month');
+  });
+
+  it('renders a cost-based message when the cost cap is the cause and token allowance is unlimited', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatTokenLimitEmail(
+      'user@example.com',
+      'My Schedule',
+      'schedule-123',
+      {
+        used: 5000000,
+        allowance: null,
+        effectiveAllowance: null,
+        percentUsed: 0,
+        costUsed: 42.5,
+        costAllowance: 40,
+        costPercentUsed: 106,
+      }
+    );
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [, subject, textContent, htmlContent] = spy.mock.calls[0];
+    expect(subject).toContain('Monthly Cost Limit Reached');
+    expect(htmlContent).toContain('Monthly Cost Limit Reached');
+    expect(htmlContent).toContain('$42.50 / $40.00 spent this month');
+    expect(textContent).toContain('$42.50 / $40.00 spent this month');
+    // Must not misleadingly show "N/A tokens" when tokens are unlimited
+    expect(htmlContent).not.toContain('N/A tokens');
+  });
+});
+
 
