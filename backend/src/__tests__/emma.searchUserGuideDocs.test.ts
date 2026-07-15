@@ -42,6 +42,14 @@ describe('documentationSite helpers', () => {
     expect(ref).toContain('https://docs.agentweb.pro');
     expect(ref).toContain('https://docs.agentweb.pro/integrations/hubspot');
   });
+
+  it('reference text does not instruct fabricating links for unlisted integrations', () => {
+    const ref = buildDocumentationReference();
+    // Must not carry a placeholder pattern Emma could fill in for an
+    // unsupported integration (e.g. Salesforce) — that produced dead links.
+    expect(ref).not.toContain('<integration-slug>');
+    expect(ref.toLowerCase()).toContain('do not invent');
+  });
 });
 
 describe('search_user_guide tool', () => {

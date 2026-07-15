@@ -46,7 +46,7 @@ export function buildDocumentationReference(): string {
     '',
     '---',
     '## AgentWeb Documentation Site',
-    `The canonical product documentation lives at ${DOCS_SITE_BASE_URL}/. When a client asks how to set up, connect, or use an integration, return the specific integration guide deep link below. For an integration not listed here, use the same pattern: ${DOCS_SITE_BASE_URL}/integrations/<integration-slug>.`,
+    `The canonical product documentation lives at ${DOCS_SITE_BASE_URL}/. When a client asks how to set up, connect, or use an integration, return the specific integration guide deep link below. Only return the deep links listed here — do not invent a docs URL for an integration that isn't listed. If a client asks about an integration that isn't listed, tell them it isn't a supported integration yet and offer the relevant workaround instead of guessing a link.`,
     '',
     '### Integration guides',
     ...integrationLines,
