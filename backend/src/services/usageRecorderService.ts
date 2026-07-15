@@ -13,7 +13,11 @@
 
 import { getModelPrice } from "../utils/llmPricing";
 import { usageRecordDb } from "./usageRecordDb";
-import { incrementUserTokenUsage } from "./tokenUsageService";
+// tokenUsageService is lazy-required inside meterUserUsage (not statically imported):
+// it pulls in db.ts -> config/aws.ts, and usageRecorderService is imported very widely
+// (via llmClients). A static import would drag that whole graph into every consumer's
+// module-load, breaking suites that mock aws-sdk without a `config` (e.g. blog.test.ts)
+// and matching the existing lazy-load pattern in llmClients.ts.
 
 export interface RecordUsageContext {
   userId?: string;
@@ -153,6 +157,8 @@ export function meterUserUsage(ctx: RecordUsageContext): void {
 
   if (totalTokens <= 0 && costUsd <= 0) return;
 
+  // Lazy-required (see import-site note) to keep this module's static load graph light.
+  const { incrementUserTokenUsage } = require("./tokenUsageService") as typeof import("./tokenUsageService");
   void incrementUserTokenUsage(ctx.userId, totalTokens, costUsd).catch((err: unknown) =>
     console.error(
       "[usageRecorder] meterUserUsage: failed to charge per-user cap:",
