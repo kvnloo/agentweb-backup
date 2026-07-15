@@ -6372,6 +6372,39 @@ export class AgentModeService {
   }
 
   /**
+   * Bound a describe_image vision LLM call so a slow or hung vision model fails
+   * fast instead of consuming the whole agent-mode generation wall-clock budget
+   * (ENG-294). Without this, a single un-bounded vision call can stall for the
+   * client's 5-minute per-request timeout — and with callLLM's internal retries
+   * plus the fallback model, one image could burn 10+ minutes and blow the run's
+   * GENERATION_TIMEOUT_MS (default 10 min). Reported by a CSV→CRM sync that OCR'd
+   * contact screenshots and timed out repeatedly (6 failed describe_image calls).
+   *
+   * The timeout REJECTS with a "timed out" error, which isRetryableMediaToolError()
+   * classifies as retryable — so a primary-model timeout routes to the fallback
+   * model rather than aborting the whole tool call. Set the timeout to 0 (via
+   * AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS=0) to disable the bound entirely.
+   */
+  private async callVisionLLMWithTimeout(model: string, messages: any[], options: any): Promise<any> {
+    const timeoutMs = parseInt(process.env.AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS || '90000', 10);
+    if (!(timeoutMs > 0)) {
+      return this.callLLM(model, messages, options);
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`describe_image vision call to "${model}" timed out after ${timeoutMs}ms`)),
+        timeoutMs
+      );
+    });
+    try {
+      return await Promise.race([this.callLLM(model, messages, options), timeoutPromise]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
    * Analyze an image with a vision-capable LLM.
    *
    * @param llmModel - Optional. When omitted (the agent-mode `describe_image` tool
@@ -6456,7 +6489,7 @@ export class AgentModeService {
       let primaryError: string | undefined;
       let response: any;
       try {
-        response = await this.callLLM(visionModelUsed, messages, {
+        response = await this.callVisionLLMWithTimeout(visionModelUsed, messages, {
           max_completion_tokens: 2000
         });
       } catch (primaryFailure: any) {
@@ -6471,7 +6504,7 @@ export class AgentModeService {
           primaryError
         );
         try {
-          response = await this.callLLM(fallbackModel, messages, {
+          response = await this.callVisionLLMWithTimeout(fallbackModel, messages, {
             max_completion_tokens: 2000
           });
         } catch (fallbackFailure: any) {
