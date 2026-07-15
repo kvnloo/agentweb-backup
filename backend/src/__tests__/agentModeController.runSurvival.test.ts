@@ -85,6 +85,12 @@ jest.mock('../utils/agentModeAlerts', () => ({
   sendAgentModeOncallAlert: jest.fn().mockResolvedValue(undefined),
 }));
 
+jest.mock('../services/durableLandingService', () => ({
+  findInFlightJobForSession: jest.fn().mockResolvedValue(null),
+  claimCompletion: jest.fn().mockResolvedValue(false),
+  markAwaitingReconnect: jest.fn().mockResolvedValue(undefined),
+}));
+
 // The run store is fully mocked — controller tests assert the intake wiring,
 // not DynamoDB behavior (that's runStore.test.ts).
 jest.mock('../services/agentMode/runStore', () => ({
@@ -105,6 +111,7 @@ jest.mock('../services/agentMode/runStore', () => ({
 import { agentModeController, activeSessionGenerations } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
+import { findInFlightJobForSession, markAwaitingReconnect } from '../services/durableLandingService';
 import * as runStore from '../services/agentMode/runStore';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
@@ -271,6 +278,58 @@ describe('AgentModeController — run-survival intake (interactive lane)', () =>
     expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
     expect(mockRunStore.releaseIdempotency).toHaveBeenCalledTimes(1);
     expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+  });
+
+  describe('durable-landing still-building early returns (run records must not stay "running" for 30d)', () => {
+    afterEach(() => {
+      delete process.env.DURABLE_LANDING_GENERATION;
+    });
+
+    it('pre-generation reconnect (build already in flight) → run record marked terminal with finishReason detached_still_building, locks released', async () => {
+      process.env.DURABLE_LANDING_GENERATION = 'true';
+      (findInFlightJobForSession as jest.Mock).mockResolvedValueOnce({
+        id: 'page-1',
+        awaitingReconnect: true,
+      });
+
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq(mockSessionId), res);
+
+      expect((res.json as jest.Mock).mock.calls[0][0].stillBuilding).toBe(true);
+      expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
+      expect(mockRunStore.markRunTerminal).toHaveBeenCalledWith(
+        expect.any(String),
+        'completed',
+        expect.objectContaining({ finishReason: 'detached_still_building' })
+      );
+      expect(mockRunStore.releaseIdempotency).toHaveBeenCalledTimes(1);
+      expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+    });
+
+    it('generation timeout with a build still in flight (detach path) → run record marked terminal with finishReason detached_still_building, locks released', async () => {
+      // Not gated on DURABLE_LANDING_GENERATION (see controller comment) —
+      // trigger via a generation rejection tagged isGenerationTimeout.
+      const timeoutErr: any = new Error('Generation timed out');
+      timeoutErr.isGenerationTimeout = true;
+      mockWorkerService.runInWorker.mockRejectedValueOnce(timeoutErr);
+      (findInFlightJobForSession as jest.Mock).mockResolvedValueOnce({
+        id: 'page-2',
+        awaitingReconnect: false,
+      });
+
+      const res = makeRes();
+      await agentModeController.generateResponse(makeReq(mockSessionId), res);
+
+      expect(markAwaitingReconnect).toHaveBeenCalledWith('page-2');
+      expect((res.json as jest.Mock).mock.calls[0][0].stillBuilding).toBe(true);
+      expect(mockRunStore.markRunTerminal).toHaveBeenCalledWith(
+        expect.any(String),
+        'completed',
+        expect.objectContaining({ finishReason: 'detached_still_building' })
+      );
+      expect(mockRunStore.releaseIdempotency).toHaveBeenCalledTimes(1);
+      expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+    });
   });
 
   it('BEHAVIOR-PRESERVING: flag off → zero run-store calls, normal response (today\'s exact behavior)', async () => {
