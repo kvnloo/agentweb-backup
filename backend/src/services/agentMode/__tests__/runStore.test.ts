@@ -1,6 +1,6 @@
 /**
- * runStore — durable run records + idempotency submit-locks + incident dedupe
- * on the AW-AgentRuns DynamoDB table (ENG-40, ENG-147, ENG-145, ENG-146).
+ * runStore — durable run records + idempotency submit-locks on the
+ * AW-AgentRuns DynamoDB table (ENG-40, ENG-147, ENG-145, ENG-146).
  *
  * Tested against a DynamoDB DocumentClient fake (no network). The fake
  * implements the aws-sdk v2 `.promise()` call shape and enforces
@@ -18,7 +18,6 @@ import {
   claimIdempotency,
   releaseIdempotency,
   recordIdempotencySessionId,
-  claimIncident,
   interactiveIdempotencyKey,
   scheduledIdempotencyKey,
   createSessionIdempotencyKey,
@@ -304,23 +303,6 @@ describe('runStore', () => {
       expect(sendAgentModeOncallAlert).toHaveBeenCalledTimes(1);
       const args = (sendAgentModeOncallAlert as jest.Mock).mock.calls[0][0];
       expect(args.dedupeKey).toBeTruthy();
-    });
-  });
-
-  describe('claimIncident', () => {
-    it('first claim per runId returns true; second returns false (one issue per run)', async () => {
-      expect(await claimIncident('run-1')).toBe(true);
-      expect(await claimIncident('run-1')).toBe(false);
-    });
-
-    it('different runIds claim independently', async () => {
-      expect(await claimIncident('run-1')).toBe(true);
-      expect(await claimIncident('run-2')).toBe(true);
-    });
-
-    it('propagates unexpected DynamoDB errors so the caller\'s best-effort wrapper logs them', async () => {
-      fake.failNext = { op: 'put', error: new Error('ddb down') };
-      await expect(claimIncident('run-3')).rejects.toThrow('ddb down');
     });
   });
 

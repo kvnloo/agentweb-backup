@@ -1,13 +1,17 @@
 /**
- * Scheduled-lane incident dedupe (ENG-147 remainder, ENG-145/146 class).
+ * Scheduled-lane oncall-alert keying (ENG-147 remainder, ENG-145/146 class).
  *
  * Pins the two scheduled failure sites in runScheduledChat when the run
  * store is enabled:
- *  - both incident-filing sites (validation-fail + exception) pass the run's
- *    runId as fileAutoIssue dedupeKey → structurally one issue per run
  *  - both oncall-alert sites carry a (user, schedule, errorClass) dedupe key
  *    with a 1h window so one flapping schedule cannot flood oncall
- *  - flag off → today's exact behavior (no dedupeKey on either path)
+ *  - the incident filings themselves pass NO dedupeKey — per-run structural
+ *    incident dedupe was removed as inert (each production runScheduledChat
+ *    call mints a fresh runId and the two filing sites are mutually
+ *    exclusive, so a per-runId claim could never fire; the pre-existing
+ *    ENG-240 sequenced search-gate inside fileAutoIssue remains the real
+ *    incident dedupe)
+ *  - flag off → today's exact behavior (no dedupeKey on the alerts either)
  */
 jest.mock('../services/subscriptionService', () => ({
   getAllowedFunctionCalls: jest.fn(async () => ['get_marketing_tips']),
@@ -107,7 +111,6 @@ jest.mock('../services/agentMode/runStore', () => ({
   recordIdempotencySessionId: jest.fn().mockResolvedValue(undefined),
   createRunRecord: jest.fn().mockResolvedValue(undefined),
   markRunTerminal: jest.fn().mockResolvedValue(undefined),
-  claimIncident: jest.fn().mockResolvedValue(true),
   IDEM_TTL_INTERACTIVE_S: 600,
   IDEM_TTL_SCHEDULED_S: 86400,
 }));
@@ -189,8 +192,8 @@ beforeEach(() => {
   mockUserDb.getUserById.mockResolvedValue({ userId: mockUserId, email: 'o@example.com' } as any);
 });
 
-describe('runScheduledChat — incident dedupe + alert keying (ENG-145/146 class)', () => {
-  it('validation-fail site passes the runId as fileAutoIssue dedupeKey and keys the oncall alert per (user, schedule, errorClass) with a 1h window', async () => {
+describe('runScheduledChat — oncall-alert keying (ENG-145/146 class)', () => {
+  it('validation-fail site keys the oncall alert per (user, schedule, errorClass) with a 1h window; the incident filing carries no dedupeKey', async () => {
     const schedule = { ...baseSchedule, keywords: ['nevermatches'] };
     mockWorker.runInWorker.mockResolvedValue({ ...okResponse, content: 'nope' } as any);
     (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([
@@ -202,7 +205,7 @@ describe('runScheduledChat — incident dedupe + alert keying (ENG-145/146 class
 
     expect(result.passed).toBe(false);
     expect(fileAutoIssue).toHaveBeenCalledTimes(1);
-    expect((fileAutoIssue as jest.Mock).mock.calls[0][0].dedupeKey).toBe('run-dedupe-1');
+    expect((fileAutoIssue as jest.Mock).mock.calls[0][0]).not.toHaveProperty('dedupeKey');
 
     expect(sendAgentModeOncallAlert).toHaveBeenCalledTimes(1);
     const alert = (sendAgentModeOncallAlert as jest.Mock).mock.calls[0][0];
@@ -212,7 +215,7 @@ describe('runScheduledChat — incident dedupe + alert keying (ENG-145/146 class
     expect(alert.dedupeWindowMs).toBe(60 * 60 * 1000);
   }, 30000);
 
-  it('exception site passes the SAME runId as dedupeKey → one issue per run, alert keyed per (user, schedule, errorClass)', async () => {
+  it('exception site keys the alert per (user, schedule, errorClass); the incident filing carries no dedupeKey', async () => {
     mockWorker.runInWorker.mockRejectedValue(new Error('kaboom'));
 
     const result = await runScheduledChat({ ...baseSchedule }, mockUserId, false, 'run-dedupe-2');
@@ -220,7 +223,7 @@ describe('runScheduledChat — incident dedupe + alert keying (ENG-145/146 class
 
     expect(result.status).toBe('failure');
     expect(fileAutoIssue).toHaveBeenCalledTimes(1);
-    expect((fileAutoIssue as jest.Mock).mock.calls[0][0].dedupeKey).toBe('run-dedupe-2');
+    expect((fileAutoIssue as jest.Mock).mock.calls[0][0]).not.toHaveProperty('dedupeKey');
 
     const alert = (sendAgentModeOncallAlert as jest.Mock).mock.calls[0][0];
     expect(alert.dedupeKey).toContain(mockUserId);
@@ -236,7 +239,7 @@ describe('runScheduledChat — incident dedupe + alert keying (ENG-145/146 class
     await flushAsync();
 
     expect(fileAutoIssue).toHaveBeenCalledTimes(1);
-    expect((fileAutoIssue as jest.Mock).mock.calls[0][0].dedupeKey).toBeUndefined();
+    expect((fileAutoIssue as jest.Mock).mock.calls[0][0]).not.toHaveProperty('dedupeKey');
 
     expect(sendAgentModeOncallAlert).toHaveBeenCalled();
     const alert = (sendAgentModeOncallAlert as jest.Mock).mock.calls[0][0];

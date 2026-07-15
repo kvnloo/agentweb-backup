@@ -1719,13 +1719,14 @@ const createUsageRecordsTable = async () => {
   }
 };
 
-// Create Agent Runs table (run-survival core — durable run records,
-// idempotency submit-locks, incident-dedupe claims; see
-// services/agentMode/runStore.ts). Single pk hash key with three item kinds:
-// run#<runId>, idem#<key>, incident#<runId>.
-// TTL: rows carry a `ttl` attr (epoch seconds — 30d runs / 10m idem /
-// 24h incidents). Enable DynamoDB native TTL on the `ttl` attribute manually —
-// same manual TTL-enable step as the UsageRecords/LoopEvents tables.
+// Create Agent Runs table (run-survival core — durable run records +
+// idempotency submit-locks; see services/agentMode/runStore.ts). Single pk
+// hash key with two item kinds: run#<runId>, idem#<key>.
+// TTL: rows carry a `ttl` attr (epoch seconds — 30d runs / 10m-24h idem).
+// Enable DynamoDB native TTL on the `ttl` attribute manually — same manual
+// TTL-enable step as the UsageRecords/LoopEvents tables. Note: TTL reaping is
+// eventual; the store's conditional puts treat expired items as absent, so
+// correctness never depends on the reaper having run.
 const createAgentRunsTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: `${TABLE_PREFIX}AW-AgentRuns`,

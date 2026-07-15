@@ -1604,9 +1604,6 @@ export async function runScheduledChat(
         title: `Scheduled Chat Failed: ${schedule.scheduleName}`,
         description: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
         source: 'Scheduled chat (validation)',
-        // Same runId as the exception site below → structurally one incident
-        // per run (run-store gated inside fileAutoIssue; flag off = no-op).
-        ...(isRunStoreEnabled() ? { dedupeKey: finalResult.runId } : {}),
         extraLabels: ['Scheduled Chat'],
         notionTags: ['Scheduled Chat'],
         notionContext: {
@@ -1812,8 +1809,6 @@ export async function runScheduledChat(
         ? `Scheduled chat "${schedule.scheduleName}" terminated with zero assistant messages.${zeroAssistantRequeuedAt ? ` It was requeued for ${zeroAssistantRequeuedAt}.` : ''}\n\nError: ${errorMessage}${originalMessage ? `\n\nOriginal API error: ${originalMessage}` : ''}`
         : `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}${originalMessage ? `\n\nOriginal API error: ${originalMessage}` : ''}`,
       source: 'Scheduled chat (error)',
-      // Same runId as the validation site above → one incident per run.
-      ...(isRunStoreEnabled() ? { dedupeKey: errorResult.runId } : {}),
       extraLabels: ['Scheduled Chat'],
       notionTags: ['Scheduled Chat'],
       notionContext: {

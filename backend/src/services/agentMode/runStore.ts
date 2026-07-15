@@ -1,6 +1,6 @@
 /**
- * runStore — durable run records, idempotency submit-locks, and incident
- * dedupe on ONE DynamoDB table (AW-AgentRuns). The run-survival core for
+ * runStore — durable run records and idempotency submit-locks on ONE
+ * DynamoDB table (AW-AgentRuns). The run-survival core for
  * ENG-40 / ENG-147 / ENG-145 / ENG-146.
  *
  * Item kinds (single `pk` hash key):
@@ -15,17 +15,15 @@
  *                        the in-process concurrency guard — this item is the
  *                        cross-restart / cross-retry dedupe. Same concept, two
  *                        enforcement points.
- *   incident#<runId>  — incident-filed claim, conditional put, ttl 24h. One
- *                        run can never file two Linear/Notion incidents.
  *
  * Config gate: the whole store is behind AGENT_RUN_STORE=true (an A-or-B
  * migration switch — flag absent = feature off; NOT an on-error fallback).
  * Callers check isRunStoreEnabled() before calling in.
  *
  * Failure policy (NO hidden fallbacks):
- *   - createRunRecord / claimIdempotency / claimIncident THROW on real
- *     DynamoDB failures — run-record creation is core state and the caller
- *     aborts the request loudly.
+ *   - createRunRecord / claimIdempotency THROW on real DynamoDB failures —
+ *     run-record creation is core state and the caller aborts the request
+ *     loudly.
  *   - markRunTerminal is the one sanctioned best-effort step: a terminal
  *     status update cannot retro-fail a chat that was already delivered, so
  *     it retries once and then fires a single deduped oncall alert. It is
@@ -50,7 +48,6 @@ export const IDEM_TTL_INTERACTIVE_S = 600; // 10 minutes
 export const IDEM_TTL_SCHEDULED_S = 24 * 3600; // 24 hours
 
 const RUN_RECORD_TTL_S = 30 * 24 * 3600; // 30 days
-const INCIDENT_TTL_S = 24 * 3600; // 24 hours
 
 export type AgentRunKind = 'interactive' | 'scheduled' | 'test';
 export type AgentRunTerminalStatus = 'interrupted' | 'completed' | 'failed';
@@ -319,27 +316,5 @@ export async function releaseIdempotency(key: string): Promise<void> {
     await getClient().delete({ TableName: AGENT_RUNS_TABLE, Key: { pk: `idem#${key}` } }).promise();
   } catch (err) {
     console.error(`[runStore] releaseIdempotency(${key}) failed — lock expires via ttl:`, err);
-  }
-}
-
-/**
- * Claim the right to file THE incident for a run. Conditional put — returns
- * true exactly once per runId. THROWS on real DynamoDB failures so the
- * caller's existing best-effort wrapper logs it (no silent double-file, no
- * silent drop).
- */
-export async function claimIncident(runId: string): Promise<boolean> {
-  try {
-    await getClient()
-      .put({
-        TableName: AGENT_RUNS_TABLE,
-        Item: { pk: `incident#${runId}`, runId, ttl: nowEpochS() + INCIDENT_TTL_S },
-        ConditionExpression: 'attribute_not_exists(pk)',
-      })
-      .promise();
-    return true;
-  } catch (err) {
-    if (isConditionalCheckFailed(err)) return false;
-    throw err;
   }
 }

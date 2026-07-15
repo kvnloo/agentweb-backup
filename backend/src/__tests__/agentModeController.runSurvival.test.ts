@@ -103,7 +103,6 @@ jest.mock('../services/agentMode/runStore', () => ({
   recordIdempotencySessionId: jest.fn().mockResolvedValue(undefined),
   createRunRecord: jest.fn().mockResolvedValue(undefined),
   markRunTerminal: jest.fn().mockResolvedValue(undefined),
-  claimIncident: jest.fn().mockResolvedValue(true),
   IDEM_TTL_INTERACTIVE_S: 600,
   IDEM_TTL_SCHEDULED_S: 86400,
 }));
