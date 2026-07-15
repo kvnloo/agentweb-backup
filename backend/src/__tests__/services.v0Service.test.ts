@@ -2600,6 +2600,41 @@ describe("v0Service - repairSubPageImports", () => {
 });
 
 // =============================================================================
+// ensurePageMetadataTitle — never inject metadata into a CLIENT component
+// =============================================================================
+// A client component cannot export `metadata` — Next.js fails the build with
+// "You are attempting to export metadata from a component marked with use client".
+// We were injecting it right after the 'use client' directive and calling that
+// "defensive". It is the opposite: it manufactures a page that can never build, and
+// because next build type-checks the whole project, that one page bricks the WHOLE
+// site. Observed in prod on a shared site whose sibling pages "illegally exported
+// metadata from client components" — pages we generated.
+//
+// A missing <title> is a cosmetic problem. An unbuildable site is not. When v0 emits a
+// client component, we drop the title rather than break the deployment.
+describe("v0Service - ensurePageMetadataTitle — client components", () => {
+  it("does NOT inject metadata into a 'use client' page (it would fail the build)", () => {
+    const out = ensurePageMetadataTitle(`"use client";\n\nexport default function P(){return null;}`, "Pricing");
+    expect(out).not.toContain("export const metadata");
+  });
+
+  it("handles the single-quoted directive too", () => {
+    const out = ensurePageMetadataTitle(`'use client'\n\nexport default function P(){return null;}`, "Pricing");
+    expect(out).not.toContain("export const metadata");
+  });
+
+  it("leaves the client component's source otherwise untouched", () => {
+    const src = `"use client";\n\nexport default function P(){return null;}`;
+    expect(ensurePageMetadataTitle(src, "Pricing")).toBe(src);
+  });
+
+  it("still injects metadata into a SERVER component (the normal case)", () => {
+    const out = ensurePageMetadataTitle(`export default function P(){return null;}`, "Pricing");
+    expect(out).toContain('export const metadata = { title: "Pricing" };');
+  });
+});
+
+// =============================================================================
 // repairPoisonedSubPagesInRepo — the wiring that heals a live repo
 // =============================================================================
 // Adding a page to a poisoned site is exactly when we can heal it: we are already
@@ -2970,12 +3005,14 @@ describe("v0Service - ensurePageMetadataTitle", () => {
     expect(out).toContain('robots: "index"');
   });
 
-  it("preserves 'use client' directive position", () => {
+  it("leaves a 'use client' page untouched — exporting metadata there fails the build", () => {
+    // This test previously asserted the bug: it expected metadata to be INJECTED right after
+    // the directive. A client component cannot export metadata — Next.js hard-fails the build,
+    // and because it type-checks the whole project, that one page bricks the entire site.
     const input = `'use client'\n\nexport default function Page() {}`;
     const out = ensurePageMetadataTitle(input, "Client Page");
-    // 'use client' must remain first line
-    expect(out.split("\n")[0]).toBe("'use client'");
-    expect(out).toContain('export const metadata = { title: "Client Page" };');
+    expect(out).toBe(input);
+    expect(out).not.toContain("export const metadata");
   });
 
   it("returns input unchanged when title is empty", () => {
