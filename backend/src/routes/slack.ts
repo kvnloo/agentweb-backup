@@ -16,7 +16,8 @@ import {
   getSlackUserDisplayName,
   getSlackUserEmail,
   resolveSlackMentionsInText,
-  downloadSlackFile
+  downloadSlackFile,
+  resolveSlackFileUrl
 } from "../services/slackService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
 import { taskDb, subscriberDb } from "../services/db";
@@ -343,7 +344,10 @@ async function handleSlackSessionResponse(params: {
   if (files && files.length > 0) {
     for (const file of files) {
       try {
-        const fileBuffer = await downloadSlackFile(file.url_private);
+        // Slack Connect / ext-shared channels omit url_private and send a stub
+        // (file_access: 'check_file_info') — hydrate it via files.info first (ENG-323).
+        const fileUrl = await resolveSlackFileUrl(file);
+        const fileBuffer = await downloadSlackFile(fileUrl);
         const { uploadFileToS3 } = await import('../utils/s3Utils');
         const uploadResult = await uploadFileToS3(
           fileBuffer,
@@ -975,7 +979,10 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               if (files && files.length > 0) {
                 for (const file of files) {
                   try {
-                    const fileBuffer = await downloadSlackFile(file.url_private);
+                    // Slack Connect / ext-shared channels omit url_private and send a stub
+                    // (file_access: 'check_file_info') — hydrate it via files.info first (ENG-323).
+                    const fileUrl = await resolveSlackFileUrl(file);
+                    const fileBuffer = await downloadSlackFile(fileUrl);
                     const { uploadFileToS3 } = await import('../utils/s3Utils');
                     const uploadResult = await uploadFileToS3(
                       fileBuffer,

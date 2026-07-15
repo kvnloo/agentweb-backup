@@ -1348,6 +1348,50 @@ export async function postSlackMessage(
   };
 }
 
+/**
+ * A file reference as it arrives on a Slack `file_share` event.
+ *
+ * In a normal channel Slack includes `url_private`. In a Slack Connect /
+ * externally-shared channel (`is_ext_shared_channel: true`) it instead sends a
+ * stub with `file_access: 'check_file_info'` and NO `url_private`, expecting the
+ * app to call files.info to hydrate it.
+ */
+export interface SlackFileRef {
+  id?: string;
+  url_private?: string;
+  url_private_download?: string;
+  file_access?: string;
+}
+
+/**
+ * Resolve a downloadable Slack file URL from a `file_share` file object.
+ *
+ * If the file already carries a `url_private` (normal channels) it is returned
+ * as-is. If it is a Slack Connect stub (`file_access: 'check_file_info'`, no
+ * `url_private`), we hydrate it via files.info (requires the `files:read` scope)
+ * to obtain the real URL. Without this, `url_private` is undefined and
+ * downloadSlackFile → axios throws `TypeError: Invalid URL`, silently dropping
+ * the attachment (ENG-323).
+ */
+export async function resolveSlackFileUrl(file: SlackFileRef): Promise<string> {
+  if (file.url_private) {
+    return file.url_private;
+  }
+  if (!file.id) {
+    throw new Error('Slack file has no id or url_private; cannot resolve a download URL');
+  }
+  if (!slackClient) {
+    throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
+  }
+
+  const info = await slackClient.files.info({ file: file.id });
+  const url = info.file?.url_private_download || info.file?.url_private;
+  if (!url) {
+    throw new Error(`Slack files.info returned no url_private for file ${file.id}`);
+  }
+  return url;
+}
+
 export async function downloadSlackFile(urlPrivate: string): Promise<Buffer> {
   if (!process.env.SLACK_BOT_TOKEN) {
     throw new Error('SLACK_BOT_TOKEN not set');
