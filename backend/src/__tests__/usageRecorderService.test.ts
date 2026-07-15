@@ -217,6 +217,22 @@ describe('usageRecorderService', () => {
       expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
     });
 
+    it('charges costUsdOverride to the cap for per-generation (image/video) calls with 0 tokens', async () => {
+      // Image/video are billed per generation, not per token — the override IS the cost.
+      meterUserUsage({ ...baseCtx, inputTokens: 0, outputTokens: 0, model: 'runway-gen4', costUsdOverride: 0.42 });
+      await flush();
+      const [uid, tokens, cost] = mockIncrementUserTokenUsage.mock.calls[0];
+      expect(uid).toBe('user-1');
+      expect(tokens).toBe(0);
+      expect(cost).toBe(0.42);
+    });
+
+    it('does not deduct an override when no user is attributable', async () => {
+      meterUserUsage({ ...baseCtx, userId: undefined, inputTokens: 0, outputTokens: 0, costUsdOverride: 5 });
+      await flush();
+      expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
+    });
+
     it('never throws when the cap charge rejects (fail-open)', async () => {
       const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
       mockIncrementUserTokenUsage.mockRejectedValue(new Error('cap write failed'));
