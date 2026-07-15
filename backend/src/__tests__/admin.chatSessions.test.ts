@@ -258,30 +258,26 @@ describe("Admin chat sessions endpoint", () => {
       );
     });
 
-    it("re-fetches sessions after judge scoring to include new scores", async () => {
+    it("applies newly generated judge scores to the response in-memory (ENG-291: no re-fetch)", async () => {
       const judges = [{ id: "j1", name: "Judge", systemPrompt: "p", createdAt: "2024-01-01", updatedAt: "2024-01-01" }];
       mockSettingsService.getSetting.mockResolvedValue({
         settingName: "scoring-judges",
         settingValue: JSON.stringify(judges),
       } as any);
 
-      // After scoring, getChatSession is called again to refresh
-      // First call is for hydration, second is for refresh after scoring
-      const refreshedSession = {
-        ...makeSession("s1"),
-        judgeScores: { j1: { score: 4, reason: "good", evaluatedAt: "2024-01-01", evaluatedMessageIndex: 2, judgeName: "Judge" } },
-      };
-      mockChatbotDb.getChatSession
-        .mockResolvedValueOnce(makeSession("s1") as any) // hydration
-        .mockResolvedValueOnce(refreshedSession as any); // refresh after scoring
+      // ENG-291: scores are now applied in-memory from the scorer's return value,
+      // so the response includes the new judge score WITHOUT a second per-session
+      // getChatSession round-trip (the sequential re-fetch loop was removed).
+      const judgeScore = { score: 4, reason: "good", evaluatedAt: "2024-01-01", evaluatedMessageIndex: 2, judgeName: "Judge" };
+      mockScoreSessionWithJudgeIfNeeded.mockResolvedValue(judgeScore as any);
 
       const res = await request(app)
         .get("/api/admin/chat-sessions?sync=true")
         .expect(200);
 
-      // getChatSession called twice: once for hydration, once for refresh
-      expect(mockChatbotDb.getChatSession).toHaveBeenCalledTimes(2);
-      expect(res.body.sessions[0].judgeScores).toEqual(refreshedSession.judgeScores);
+      // Only the hydration read — no post-scoring refresh round-trip
+      expect(mockChatbotDb.getChatSession).toHaveBeenCalledTimes(1);
+      expect(res.body.sessions[0].judgeScores).toEqual({ j1: judgeScore });
     });
 
     it("continues scoring other sessions if one judge scoring fails", async () => {
@@ -323,29 +319,22 @@ describe("Admin chat sessions endpoint", () => {
       expect(mockScoreSessionWithJudgeIfNeeded).not.toHaveBeenCalled();
     });
 
-    it("re-fetches sessions after default scoring even when no judges are configured", async () => {
-      // Bug: when sync=true but judges=[],  scoreSessionIfNeeded writes a new score to DB
-      // but the response returns the stale in-memory object (satisfactionScore: null).
+    it("applies newly generated default scores to the response even with no judges (ENG-291: in-memory)", async () => {
+      // Original bug: scoreSessionIfNeeded wrote a new score to DB but the response
+      // returned the stale in-memory object (satisfactionScore: null). The fix now
+      // applies the scorer's return value in-memory, so the response reflects it
+      // without a re-fetch round-trip.
       mockSettingsService.getSetting.mockResolvedValue(null as any);
 
       const newScore = { score: 2, reason: "poor", evaluatedAt: "2024-01-01T01:00:00Z", evaluatedMessageIndex: 2, dimensions: { goalCompletion: 2, dataAccuracy: 2, outputQuality: 2 } };
       mockScoreSessionIfNeeded.mockResolvedValue(newScore as any);
 
-      // First call: hydration; second call: re-fetch after scoring
-      const baseSession = makeSession("s1");
-      const refreshedSession = { ...baseSession, satisfactionScore: newScore };
-      let callCount = 0;
-      mockChatbotDb.getChatSession.mockImplementation(async (_id: string) => {
-        callCount++;
-        return callCount === 1 ? (baseSession as any) : (refreshedSession as any);
-      });
-
       const res = await request(app)
         .get("/api/admin/chat-sessions?sync=true")
         .expect(200);
 
-      // Must re-fetch regardless of whether judges exist, so the newly scored session is returned
-      expect(mockChatbotDb.getChatSession).toHaveBeenCalledTimes(2);
+      // Newly scored value returned without a re-fetch (only the hydration read)
+      expect(mockChatbotDb.getChatSession).toHaveBeenCalledTimes(1);
       expect(res.body.sessions[0].satisfactionScore).toEqual(newScore);
     });
 
