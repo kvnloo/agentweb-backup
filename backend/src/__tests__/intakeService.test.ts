@@ -568,6 +568,30 @@ describe('intakeService.fileBugReport — exact-reference short-circuit (fix for
     expect(r).toMatchObject({ deduped: true, canonicalUrl: expect.stringContaining('ENG-312') });
   });
 
+  it('getIssueComments resolves with a non-array value (unmocked/malformed) -> caught, never throws out of fileBugReport', async () => {
+    // Regression guard for the Greptile-flagged structural issue: bodies.some(...) must be
+    // covered by the same try/catch as the await — a resolved-but-non-array value (e.g. an
+    // unmocked jest.fn() defaulting to `undefined`, or any real malformed API response) must
+    // degrade gracefully, not throw a TypeError that escapes findExactCanonicalMatch.
+    linear.listOpenBugCanonicals.mockResolvedValue([
+      { identifier: 'ENG-312', issueId: 'uuid-312', title: 'final_url_suffix silently fails', description: 'old report' },
+    ]);
+    linear.getIssueComments.mockResolvedValue(undefined as any);
+    dedup.findDuplicate.mockResolvedValue(null);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-999', url: 'lin', id: 'uuid-999' });
+
+    const r = await fileUserIssue({
+      type: 'bug',
+      title: 'AGW-112 follow-up: something',
+      description: 'evidence text',
+      userEmail: 'u@e.com',
+    });
+
+    expect(dedup.findDuplicate).toHaveBeenCalled();
+    expect(linear.createInternalLinearIssue).toHaveBeenCalled();
+    expect(r).toMatchObject({ deduped: false });
+  });
+
   it('report citing AGW-112 matches an OPEN canonical by its reporter-ticket comment -> groups directly, fuzzy judge never called (ENG-329 incident scenario)', async () => {
     linear.listOpenBugCanonicals.mockResolvedValue([
       { identifier: 'ENG-312', issueId: 'uuid-312', title: 'final_url_suffix silently fails', description: 'old report' },

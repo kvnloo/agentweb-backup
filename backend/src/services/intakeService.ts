@@ -76,15 +76,16 @@ async function findExactCanonicalMatch(
 
   const { getIssueComments } = await import('./linearService');
   for (const c of candidates.slice(0, EXACT_MATCH_COMMENT_SCAN_LIMIT)) {
-    let bodies: string[];
     try {
-      bodies = await getIssueComments(c.issueId);
+      const bodies = await getIssueComments(c.issueId);
+      for (const n of refs.agwNumbers) {
+        if (bodies.some((b) => b.includes(`[reporter-ticket #${n} `))) return c;
+      }
     } catch (e) {
+      // Also catches a malformed (non-array) resolved value, not just a rejection — keeps the
+      // "never throw" contract even if getIssueComments' return shape is ever unexpected.
       console.warn(`[intake] exact-ref comment scan failed for ${c.identifier}:`, e instanceof Error ? e.message : e);
       continue; // best-effort — a read failure on one candidate must not block the others or the filing
-    }
-    for (const n of refs.agwNumbers) {
-      if (bodies.some((b) => b.includes(`[reporter-ticket #${n} `))) return c;
     }
   }
   return null;
