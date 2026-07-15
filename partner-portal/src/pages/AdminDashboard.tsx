@@ -3043,8 +3043,12 @@ export default function AdminDashboard() {
         }
       );
 
-      if (response.status === 200) {
-        const { customerPortalUrl } = response.data;
+      // Key off the presence of the URL rather than an exact 200 so any 2xx
+      // response is handled. If the response has no URL (unexpected), fall
+      // through to the else and close the placeholder tab so it is never
+      // orphaned as a blank window.
+      const customerPortalUrl = response?.data?.customerPortalUrl;
+      if (customerPortalUrl) {
         if (placeholderTab && !placeholderTab.closed) {
           // Navigate the pre-opened tab to the delegated customer portal.
           placeholderTab.location.href = customerPortalUrl;
@@ -3054,6 +3058,12 @@ export default function AdminDashboard() {
           setDelegatedPortalUrl(customerPortalUrl);
           setDelegatedUrlCopied(false);
         }
+      } else {
+        // No usable URL in the response — don't leave a blank tab behind.
+        if (placeholderTab && !placeholderTab.closed) {
+          placeholderTab.close();
+        }
+        setError("Delegate access did not return a portal URL");
       }
     } catch (error: any) {
       // Close the placeholder tab we opened optimistically so we don't leave a
@@ -6499,7 +6509,7 @@ export default function AdminDashboard() {
       {/* Delegated Customer Portal Link Dialog (popup-blocked recovery) */}
       <Dialog
         open={Boolean(delegatedPortalUrl)}
-        onClose={() => setDelegatedPortalUrl(null)}
+        onClose={() => { setDelegatedPortalUrl(null); setDelegatedUrlCopied(false); }}
         maxWidth="sm"
         fullWidth
       >
@@ -6533,7 +6543,7 @@ export default function AdminDashboard() {
           />
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setDelegatedPortalUrl(null)}>Close</Button>
+          <Button onClick={() => { setDelegatedPortalUrl(null); setDelegatedUrlCopied(false); }}>Close</Button>
           {delegatedPortalUrl && (
             <Button
               component={Link}
