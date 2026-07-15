@@ -656,6 +656,26 @@ createTestAccount().then(async () => {
         console.error('[metaTokenRefreshCron] Failed to initialize:', error);
       }
 
+      // Outlook Bounce/Complaint Monitor (ENG-266 Part 3, option B+) — runs every 15
+      // minutes. Resend's webhook-based bounce/complaint auto-DNC cannot fire for a
+      // mailbox send (Graph produces no Resend webhooks), so this polls each connected
+      // Outlook mailbox's Inbox for delivery-failure notifications and applies the same
+      // suppression. This is the compliance floor B+ exists for — not optional.
+      try {
+        const { runOutlookBounceMonitor } = await import('./cron/outlookBounceMonitorCron');
+        const OUTLOOK_BOUNCE_MONITOR_INTERVAL_MS = 15 * 60 * 1000;
+        cronJobRegistry.track('outlookBounceMonitorCron', runOutlookBounceMonitor())
+          .catch(e => console.error('[outlookBounceMonitorCron] Error on first run:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('outlookBounceMonitorCron', runOutlookBounceMonitor())
+            .catch(e => console.error('[outlookBounceMonitorCron] Error:', e));
+        }, OUTLOOK_BOUNCE_MONITOR_INTERVAL_MS);
+        console.log('[outlookBounceMonitorCron] Initialized — running every 15 minutes');
+      } catch (error) {
+        console.error('[outlookBounceMonitorCron] Failed to initialize:', error);
+      }
+
       // Onboarding stuck-user detector — DISABLED 2026-05-07. Was posting one
       // Notion oncall task per day grouped by stage. The cron itself is well-
       // designed but the broader telemetry pipeline (incl. per-event UI Error
