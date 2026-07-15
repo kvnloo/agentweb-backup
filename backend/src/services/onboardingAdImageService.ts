@@ -54,6 +54,7 @@ import {
   extractIcpBrandContext,
   IcpBrandContext,
 } from "./onboardingIcpService";
+import { getPersistedBrandLogoUrl } from "./agentMode/brandLogo";
 import type { ICPPersona } from "./icpStatusService";
 import type { CreativeDirResult } from "./creativeDirStatusService";
 import {
@@ -414,8 +415,17 @@ export function extractAdImageBrandContext(user: any): AdImageBrandContext {
   if (typeof bd.logoUrl === "string" && bd.logoUrl) {
     ctx.logoUrl = bd.logoUrl;
   }
-  // Some user records carry the logo on a separate `brandAssets` array. We
-  // pick the first asset whose type indicates a logo.
+  // The canonical asset store is `brandGuidelines.attachments` — that's where
+  // updateBrandGuidelines (Emma's tool + the ENG-326 deterministic onboarding
+  // step) persists the `logo` asset. Check it before the legacy shapes.
+  if (!ctx.logoUrl) {
+    const attachmentLogo = getPersistedBrandLogoUrl({
+      attachments: user?.brandGuidelines?.attachments,
+    });
+    if (attachmentLogo) ctx.logoUrl = attachmentLogo;
+  }
+  // Some legacy user records carry the logo on a separate `brandAssets`
+  // array. We pick the first asset whose type indicates a logo.
   const assets = Array.isArray(user?.brandGuidelines?.brandAssets)
     ? user.brandGuidelines.brandAssets
     : [];
@@ -737,6 +747,36 @@ export async function triggerAdImageGenerationForUser(
       ? (u.creativeDirResult as CreativeDirResult)
       : { concepts: [], copy_angles: [], format_archetypes: [] };
   const brand = extractAdImageBrandContext(u);
+
+  // ENG-326 AC-3: ad images are BRANDED assets — without a persisted logo the
+  // prompt builder would render an approximate typographic wordmark, which is
+  // exactly the "random logo" defect. Fail the run pointing the user at brand
+  // config instead of silently substituting.
+  if (!brand.logoUrl) {
+    const reason =
+      "no brand logo is saved in Brand Guidelines — upload your logo in brand config, then regenerate. " +
+      "Ad images are never generated with an invented or approximate logo (ENG-326).";
+    const current = await userDb.getUserById(userId);
+    await userDb.updateUser(
+      userId,
+      adImageFailedPatch(((current as any) || {}) as AdImageStatusFields, reason) as any
+    );
+    // eslint-disable-next-line no-console
+    console.error("[onboardingAdImageService] gated on missing brand logo", {
+      userId,
+      reason,
+    });
+    void reportUIError({
+      operation: "onboarding:ad-image:missing-brand-logo",
+      errorMessage: reason,
+      userId,
+      context: {
+        Source: "backend",
+        Step: "adImage",
+      },
+    });
+    return;
+  }
 
   // Close the image feedback loop: if the user has rejected variants on a
   // prior generation (♥/✕ swipe → adImageVariantsRated), distill those
