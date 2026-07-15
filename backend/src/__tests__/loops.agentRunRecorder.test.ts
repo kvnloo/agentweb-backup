@@ -59,6 +59,30 @@ describe('AgentRunRecorder', () => {
     expect(String(item.tsSession)).toContain('sess-1:run:abc');
   });
 
+  it('records the OTel traceId on run start dimensions when provided (ENG-141 bridge)', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    await rec.runStarted('sess-1:run:abc', {
+      llmModel: 'claude-opus-4-8',
+      sessionId: 'sess-1',
+      traceId: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
+    });
+
+    const item = puts[0].item as any;
+    expect(item.dimensions.traceId).toBe('a1b2c3d4e5f60718293a4b5c6d7e8f90');
+  });
+
+  it('omits traceId from run start dimensions when not provided (tracing off)', async () => {
+    const { port, puts } = fakeDynamo();
+    const rec = new AgentRunRecorder(port, clock);
+
+    await rec.runStarted('sess-1:run:abc', { llmModel: 'claude-opus-4-8', sessionId: 'sess-1' });
+
+    const item = puts[0].item as any;
+    expect(item.dimensions.traceId).toBeUndefined();
+  });
+
   it('records a decision with the chosen tool names', async () => {
     const { port, puts } = fakeDynamo();
     const rec = new AgentRunRecorder(port, clock);

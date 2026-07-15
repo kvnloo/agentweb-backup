@@ -15,6 +15,12 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { mcpToolRegistry } from './registry';
+import {
+  McpAuthMethod,
+  McpClientType,
+  recordMcpFirstToolUse,
+  recordMcpToolUse,
+} from '../../services/mcpUsageEventsService';
 
 // Import API-wrapping tools (replaces direct tools.ts and portalTools.ts)
 import './apiTools';
@@ -23,6 +29,12 @@ export interface McpSessionContext {
   agentUserId?: string;
   sessionId?: string;               // MCP session ID
   isInternal?: boolean;             // Internal clients can override userId
+  authMethod?: McpAuthMethod;
+  apiKeyId?: string;
+  oauthClientId?: string;
+  oauthClientName?: string;
+  clientType?: McpClientType;
+  userAgent?: string;
 }
 
 /**
@@ -89,6 +101,12 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
       llmModel,
       agentUserId: sessionContext?.agentUserId,
       isInternal: sessionContext?.isInternal,
+      authMethod: sessionContext?.authMethod,
+      apiKeyId: sessionContext?.apiKeyId,
+      oauthClientId: sessionContext?.oauthClientId,
+      oauthClientName: sessionContext?.oauthClientName,
+      clientType: sessionContext?.clientType,
+      userAgent: sessionContext?.userAgent,
       // True only for external MCP clients (API key / OAuth) — in-process
       // portal callers never set this. Tools use it for source attribution.
       externalMcp: sessionContext ? sessionContext.isInternal !== true : false,
@@ -96,6 +114,36 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
 
     try {
       const result = await mcpToolRegistry.execute(name, toolArgs, context);
+      if (context.externalMcp && effectiveUserId) {
+        void Promise.all([
+          recordMcpToolUse({
+            userId: effectiveUserId,
+            toolName: name,
+            authMethod: sessionContext?.authMethod,
+            apiKeyId: sessionContext?.apiKeyId,
+            clientId: sessionContext?.oauthClientId,
+            clientName: sessionContext?.oauthClientName,
+            clientType: sessionContext?.clientType,
+            sessionId: context.sessionId,
+            llmModel,
+            userAgent: sessionContext?.userAgent,
+          }),
+          recordMcpFirstToolUse({
+            userId: effectiveUserId,
+            toolName: name,
+            authMethod: sessionContext?.authMethod,
+            apiKeyId: sessionContext?.apiKeyId,
+            clientId: sessionContext?.oauthClientId,
+            clientName: sessionContext?.oauthClientName,
+            clientType: sessionContext?.clientType,
+            sessionId: context.sessionId,
+            llmModel,
+            userAgent: sessionContext?.userAgent,
+          }),
+        ]).catch((err) => {
+          console.error('[MCP] Failed to record tool use:', err);
+        });
+      }
       
       if (result && typeof result === 'object' && 'content' in result) {
         return result;
@@ -128,4 +176,3 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
 
 // Re-export for convenience
 export { mcpToolRegistry };
-

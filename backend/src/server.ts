@@ -396,6 +396,10 @@ const gracefulShutdown = async (signal: string) => {
   // 6. Close parent MCP clients after the drain (child has its own MCP instance)
   await agentModeService.shutdown();
 
+  // 6.5. Flush OTel spans (ENG-141) — best-effort, never rejects, no-op when
+  //      tracing is off. Deploy-killed runs are exactly the traces we need.
+  await (await import('./observability/tracing')).flushTelemetry();
+
   // 7. Clean exit
   process.exit(0);
 };

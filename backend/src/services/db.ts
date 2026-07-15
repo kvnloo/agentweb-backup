@@ -157,6 +157,14 @@ export interface User {
   emmaHelpInterests?: string[]; // Onboarding multi-select: what user wants Emma to help with (e.g., "brand", "paid_ads", "founder_led_sales")
   emmaHelpInterestsSetAt?: string; // ISO timestamp when the user first saved their interests
   fathomOnboardingIngestions?: Array<Record<string, unknown>>; // Review-first Fathom sales/prospect-call onboarding context ledger
+  fathomDraftAccount?: boolean; // System-created disabled account from Harsha-owned Fathom onboarding automation.
+  fathomDraftStatus?: "needs_review" | "approved" | "discarded" | string;
+  fathomReviewOwnerUserId?: string;
+  fathomSourceRecordingId?: string;
+  fathomSourceRecordingUrl?: string;
+  fathomSourceContactEmail?: string;
+  fathomSourceContactName?: string;
+  fathomSourceWebsite?: string;
   /**
    * Onboarding event log — appended to by POST /api/onboarding/events. Used
    * by the Lifecycle Drip Phase 1 feature to derive `onboardingStage`. Each
@@ -946,6 +954,60 @@ export class UserDB {
       return params.Item as User;
     } catch (error) {
       handleDynamoDbError(error, "createUser");
+      return undefined;
+    }
+  }
+
+  async createFathomDraftUser(input: {
+    email: string;
+    userId: string;
+    displayName?: string;
+    companyName?: string;
+    reviewOwnerUserId: string;
+    sourceRecordingId: string;
+    sourceRecordingUrl?: string;
+    sourceContactEmail?: string;
+    sourceContactName?: string;
+    sourceWebsite?: string;
+  }): Promise<User | undefined> {
+    const now = new Date().toISOString();
+    const normalizedEmail = input.email.toLowerCase();
+    const itemToCreate: any = {
+      userId: input.userId,
+      email: normalizedEmail,
+      password: "!disabled-fathom-draft-account!",
+      isOAuthUser: false,
+      isAdmin: false,
+      isActive: false,
+      createdAt: now,
+      roles: ["customer"],
+      signupSource: "fathom_auto_onboarding_draft",
+      fathomDraftAccount: true,
+      fathomDraftStatus: "needs_review",
+      fathomReviewOwnerUserId: input.reviewOwnerUserId,
+      fathomSourceRecordingId: input.sourceRecordingId,
+      emailDomain: normalizedEmail.split("@")[1] || "agentweb.internal",
+      memoryEnabled: true,
+    };
+
+    if (input.displayName) itemToCreate.displayName = input.displayName;
+    if (input.companyName) itemToCreate.companyName = input.companyName;
+    if (input.sourceRecordingUrl) itemToCreate.fathomSourceRecordingUrl = input.sourceRecordingUrl;
+    if (input.sourceContactEmail) itemToCreate.fathomSourceContactEmail = input.sourceContactEmail.toLowerCase();
+    if (input.sourceContactName) itemToCreate.fathomSourceContactName = input.sourceContactName;
+    if (input.sourceWebsite) itemToCreate.fathomSourceWebsite = input.sourceWebsite;
+
+    const params = {
+      TableName: this.tableName,
+      Item: itemToCreate,
+      ConditionExpression: "attribute_not_exists(email)",
+    };
+
+    try {
+      await this.docClient.put(params).promise();
+      return params.Item as User;
+    } catch (error) {
+      handleDynamoDbError(error, "createFathomDraftUser");
       return undefined;
     }
   }

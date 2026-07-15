@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-30
+// Last updated: 2026-07-14
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,28 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-07-14',
+    changes: [
+      'Fixed: Your Landing Pages Now Actually Record Where Their Leads Came From',
+      '- When someone filled in a form on one of your landing pages, the lead reached your CRM with no record of how they found you — the ad, the campaign, the source were all lost on the way in',
+      '- Leads from your landing pages now arrive carrying where they came from, so you can finally tell which campaign or ad actually produced them',
+      '- Two things were quietly breaking this. Attaching a custom domain or subdomain to a page silently removed its lead-tracking code, so any page you had bothered to give a proper address to was the least likely to be tracked. And wiring a page to a CRM list AFTER it was built never actually installed the code that saves the leads — the page looked correctly configured and captured nothing',
+      '- Both are fixed, and existing pages are repaired automatically the next time they are updated',
+      '',
+      'Fixed: Leads From Multi-Page Sites Went Into the Wrong List',
+      '- If your site had several pages pointing at different CRM lists, every page was saving its leads into whichever list was set up last — so leads from your pricing page could quietly end up in your webinar list',
+      '- Each page now saves to its own list, correctly',
+      '',
+      'Changed: Pages With No CRM List Now Tell You Instead of Silently Losing Leads',
+      '- A page with no CRM list attached cannot save leads anywhere. It used to accept the form and quietly discard the submission (or, on a multi-page site, file it into a different page\'s list)',
+      '- Such a page is now clearly flagged in your dashboard, and its form shows an error rather than pretending to have worked. If a form that seemed fine starts reporting an error, it means it was never really saving those leads — attach a CRM list and it will start working properly',
+      '',
+      'Changed: Attaching a CRM List Republishes the Page',
+      '- The code that saves leads lives inside the page itself, so changing the CRM list republishes your live page. It takes about a minute, and the dashboard now tells you before and after',
+      '- Detaching a list now asks you to confirm, because it stops that page saving leads immediately',
+    ],
+  },
   {
     date: '2026-07-08',
     changes: [
