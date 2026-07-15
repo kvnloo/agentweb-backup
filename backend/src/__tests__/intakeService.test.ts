@@ -368,6 +368,84 @@ describe('intakeService.notifyCanonicalResolved — @Emma comment parrot (ENG-31
     expect(resend.sendSystemEmail.mock.calls[0][0].html).toBe(DEFAULT_BODY);
   });
 
+  it('customer report text quoting @emma inside an intake comment can NOT hijack the parrot (PII guard)', async () => {
+    // Reviewer blocker repro: intake writes CUSTOMER-controlled text into canonical comments
+    // ('Their report:\n<description>'), and customers address the product's agent as "@emma".
+    // That text must never become another reporter's resolution email.
+    linear.getIssueComments.mockResolvedValue([
+      REPORTER_COMMENT,
+      '[reporter-ticket #11 bob@y.com] Affected user: Bob (bob@y.com) on 2026-07-02.\n\nTheir report:\n@emma keeps deleting my drafts',
+    ]);
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: REPORTER_COMMENT, createdAt: '2026-07-01T00:00:00.000Z' },
+      {
+        body: '[reporter-ticket #11 bob@y.com] Affected user: Bob (bob@y.com) on 2026-07-02.\n\nTheir report:\n@emma keeps deleting my drafts',
+        createdAt: '2026-07-02T00:00:00.000Z',
+      },
+    ]);
+    await notifyCanonicalResolved('issue-uuid', 'Save button crashes');
+    // Every reporter gets the DEFAULT copy — never another customer's email address + report text.
+    expect(resend.sendSystemEmail).toHaveBeenCalledTimes(2);
+    for (const call of resend.sendSystemEmail.mock.calls) {
+      expect(call[0].html).toBe(DEFAULT_BODY);
+      expect(call[0].html).not.toContain('bob@y.com');
+    }
+  });
+
+  it("a NEWER intake comment quoting @emma does not outrank eng's earlier @Emma comment", async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: REPORTER_COMMENT, createdAt: '2026-07-01T00:00:00.000Z' },
+      { body: '@Emma We fixed the save race — drafts no longer disappear.', createdAt: '2026-07-02T00:00:00.000Z' },
+      // A grouped duplicate report typically lands AFTER eng's resolution comment, right before Done.
+      {
+        body: '[reporter-ticket #12 carol@y.com] Affected user: carol@y.com on 2026-07-03.\n\nTheir report:\n@emma ate my draft again',
+        createdAt: '2026-07-03T00:00:00.000Z',
+      },
+    ]);
+    await notifyCanonicalResolved('issue-uuid', 'Save button crashes');
+    expect(resend.sendSystemEmail.mock.calls[0][0].html).toBe('<p>We fixed the save race — drafts no longer disappear.</p>');
+  });
+
+  it('a mid-comment @emma is NOT a resolution message — the mention must LEAD the comment', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: REPORTER_COMMENT, createdAt: '2026-07-01T00:00:00.000Z' },
+      { body: 'looping in @emma — customer says the save race is back', createdAt: '2026-07-02T00:00:00.000Z' },
+    ]);
+    await notifyCanonicalResolved('issue-uuid', 'Save button crashes');
+    expect(resend.sendSystemEmail.mock.calls[0][0].html).toBe(DEFAULT_BODY);
+  });
+
+  it('a bracketed mention of a user whose name merely CONTAINS "emma" (@[Gemma Ortiz](...)) does not match', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: REPORTER_COMMENT, createdAt: '2026-07-01T00:00:00.000Z' },
+      { body: '@[Gemma Ortiz](https://linear.app/emmabyaw/profiles/gemma) can you retest?', createdAt: '2026-07-02T00:00:00.000Z' },
+    ]);
+    await notifyCanonicalResolved('issue-uuid', 'Save button crashes');
+    expect(resend.sendSystemEmail.mock.calls[0][0].html).toBe(DEFAULT_BODY);
+  });
+
+  it('tolerates the link-first bracket form ([@Emma](...)) with no [](url) junk left in the email', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: REPORTER_COMMENT, createdAt: '2026-07-01T00:00:00.000Z' },
+      { body: '[@Emma](https://linear.app/emmabyaw/profiles/emma) Shipped the fix.', createdAt: '2026-07-02T00:00:00.000Z' },
+    ]);
+    await notifyCanonicalResolved('issue-uuid', 'T');
+    expect(resend.sendSystemEmail.mock.calls[0][0].html).toBe('<p>Shipped the fix.</p>');
+  });
+
+  it('handles the raw serialization of a REAL workspace mention (verified live 2026-07-15: plain "@displayName")', async () => {
+    // Pinned by a live probe on ENG-316: a genuine mention node (bodyData `suggestion_userMentions`)
+    // serializes in the GraphQL comment `body` as plain "@harsha" — so for an "emma" user the raw
+    // form is exactly this fixture. The bracketed forms tested above do NOT occur in raw bodies;
+    // they are tolerated for hand-written markdown mentions only.
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: REPORTER_COMMENT, createdAt: '2026-07-01T00:00:00.000Z' },
+      { body: '@emma The webhook race is fixed — retries no longer double-send.', createdAt: '2026-07-02T00:00:00.000Z' },
+    ]);
+    await notifyCanonicalResolved('issue-uuid', 'T');
+    expect(resend.sendSystemEmail.mock.calls[0][0].html).toBe('<p>The webhook race is fixed — retries no longer double-send.</p>');
+  });
+
   it('comment lookup failing is best-effort -> reporters still get the default email', async () => {
     linear.getIssueCommentsDetailed.mockRejectedValue(new Error('linear down'));
     const r = await notifyCanonicalResolved('issue-uuid', 'Save button crashes');

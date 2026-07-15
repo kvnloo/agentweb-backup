@@ -508,27 +508,44 @@ const REPORTER_TICKET_RE = /\[reporter-ticket #(\d+)\s+([^\]\s]+)\]/g;
 const escapeHtml = (s: string) => s.replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c] as string));
 
 // ENG-316: an `@Emma <message>` comment on the canonical becomes the customer-facing resolution
-// email body. Tolerates both a real Linear workspace mention (raw markdown `@[Emma …](…)`) and
-// plain-text `@emma` (case-insensitive); the mention token itself is stripped from the parroted
-// text. Word-boundary rules keep email addresses (support@emma.com — a word char precedes the @)
-// and handles like @emmabyaw (no boundary after "emma") from matching.
-const EMMA_LINEAR_MENTION_RE = /@\[[^\]]*emma[^\]]*\]\([^)]*\)/gi;
-const EMMA_PLAIN_MENTION_RE = /(^|[^\w])@emma\b/gi;
+// email body. VERIFIED LIVE (2026-07-15, probe comment on ENG-316 read back through the same
+// GraphQL field the service uses): a REAL Linear workspace mention serializes in the raw comment
+// `body` as plain `@displayName` (the bodyData mention node round-trips to just "@harsha"), so
+// plain-text `@emma` (case-insensitive) is the mainline form; the bracketed link forms
+// (`@[Emma …](…)` / `[@Emma …](…)`) never occur in raw bodies but are tolerated for hand-written
+// markdown mentions — either bracket order, so no stray `[](url)` ever reaches a customer email.
+//
+// The mention must be the comment's LEADING token — the documented convention is
+// "@Emma <message>", and requiring it up front is the primary guard that keeps customer-written
+// report text (which routinely addresses the agent as "@emma") from ever qualifying.
+// `emma\b` anchoring keeps @emmabyaw and names that merely contain "emma" (@[Gemma Ortiz](…))
+// from matching.
+const EMMA_LEADING_MENTION_RE = /^\s*(?:@emma\b|@\[\s*emma\b[^\]]*\]\([^)]*\)|\[@\s*emma\b[^\]]*\]\([^)]*\))\s*/i;
+// Non-global twin of REPORTER_TICKET_RE (`.test()` on a /g/ regex is stateful): marks a comment
+// as intake-authored — i.e. carrying CUSTOMER-controlled report text.
+const INTAKE_COMMENT_MARKER_RE = /\[reporter-ticket #\d+\s+[^\]\s]+\]/;
 
 /**
  * Pick the customer-facing resolution message from the canonical's comments: the MOST RECENT
- * (by createdAt, not list order) comment mentioning @Emma, mention token stripped, trimmed.
- * Returns null when no comment qualifies — including mention-only comments — so the default
- * copy stays in play and we never send an empty email.
+ * (by createdAt, not list order) comment that STARTS with an @Emma mention, mention stripped,
+ * trimmed. Returns null when no comment qualifies — including mention-only comments — so the
+ * default copy stays in play and we never send an empty email.
+ *
+ * PII guard (reviewer blocker on ENG-316): intake writes customer-controlled text into canonical
+ * comments (`Their report:\n<description>`, intake comment above), and customers routinely
+ * address the agent as "@emma" inside that text. Those comments are excluded twice over — they
+ * carry the reporter-ticket marker, and the mention is never their leading token — so one
+ * customer's report (email address included) can never become every reporter's resolution email.
  */
 function pickEmmaResolutionMessage(comments: Array<{ body: string; createdAt: string }>): string | null {
   let best: { text: string; ts: number } | null = null;
   for (const c of comments) {
-    let mentioned = false;
-    let text = (c.body || '').replace(EMMA_LINEAR_MENTION_RE, () => { mentioned = true; return ''; });
-    text = text.replace(EMMA_PLAIN_MENTION_RE, (_m, pre: string) => { mentioned = true; return pre; });
-    text = text.trim();
-    if (!mentioned || !text) continue;
+    const body = c.body || '';
+    if (INTAKE_COMMENT_MARKER_RE.test(body)) continue;
+    const m = body.match(EMMA_LEADING_MENTION_RE);
+    if (!m) continue;
+    const text = body.slice(m[0].length).trim();
+    if (!text) continue;
     const parsed = Date.parse(c.createdAt || '');
     const ts = Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
     if (!best || ts >= best.ts) best = { text, ts };
