@@ -22,18 +22,24 @@ emmaToolRegistry.register({
     },
   },
   execute: async () => {
+    // The documentation site is a knowledge source Emma always consults so it
+    // can return correct integration deep links even when the Notion portal
+    // guide has no dedicated walkthrough for the integration in question. Build
+    // it up front so the static reference still surfaces if Notion fails.
+    const docsReference = buildDocumentationReference();
     try {
-      // The documentation site is a knowledge source Emma always consults so it
-      // can return correct integration deep links even when the Notion portal
-      // guide has no dedicated walkthrough for the integration in question.
-      const docsReference = buildDocumentationReference();
       const content = await getUserGuideContent();
       if (!content || content.trim().length === 0) {
         return { success: true, content: docsReference.trim() };
       }
       return { success: true, content: `${content}\n${docsReference}` };
     } catch (error: any) {
-      return { success: false, message: `Failed to fetch user guide: ${error.message}` };
+      // Notion is an unrelated dependency; if it fails, still return the
+      // canonical docs reference so integration deep links remain available.
+      return {
+        success: true,
+        content: `The portal user guide was temporarily unavailable (${error.message}).\n${docsReference}`.trim(),
+      };
     }
   },
 });
