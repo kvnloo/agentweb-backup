@@ -1,3 +1,43 @@
+## Brand logo never persisted during onboarding → random logos in assets (2026-07-15, ENG-326)
+
+Root cause (named by Fangfang on the 07-14 Argusoft night call): the whole logo pipeline EXISTED —
+cssExtractor discovery heuristics, a download+S3 block inside `extractCSSFromURL`, the
+`brandData.logoUrl` field on `update_brand_guidelines`, logo-preferring consumption in ad-image and
+v0 prompts — but the only thing connecting them during onboarding was a PROMPTED Emma session
+(`onboardingBrandBuildService`) that was merely *asked* to include `logoUrl` in its one
+`update_brand_guidelines` call. When she didn't, the account had no logo anywhere, and every
+downstream generator "helpfully" invented one (Gemini renders an approximate mark; the ad-image
+builder falls back to a typographic wordmark; v0 gets no Logo URL line at all).
+
+Fixes (all deterministic, none rely on the LLM volunteering):
+1. **`services/agentMode/brandLogo.ts`** — new module. The download+S3 block was extracted out of the
+   `agentModeService.extractCSSFromURL` monolith (characterization test pins the old behavior); adds
+   `ensureBrandLogoPersisted` (post-scrape onboarding step) and one shared logo resolver.
+2. **Brand build** runs `ensureBrandLogoPersisted` after every successful Emma session: no logo on the
+   account → discover on the company URL → pin to S3 → persist `brandData.logoUrl` + a `logo`
+   attachment via the same `updateBrandGuidelines` path Emma uses.
+3. **`generate_image`** — prompt asks for a logo + model passed no `logo_image` → inject the persisted
+   logo; none persisted → return an ask-the-user tool result pointing at brand config. Never invent.
+4. **Onboarding ad images** — no persisted logo → run fails with "upload your logo in brand config"
+   instead of shipping wordmark variants; with one, every variant composites it as a real image input.
+5. **Landing pages** — the two duplicated brand-context blocks in `routes/landingPageGeneration.ts`
+   collapsed into `v0Service.buildBrandContextFromUser`, which resolves the logo attachments-first
+   with a `brandData.logoUrl` fallback (the route previously read attachments ONLY, so a
+   scrape-persisted logo never reached v0).
+
+### Assumptions to validate
+- **Resolution precedence: attachments beat `brandData.logoUrl`.** Rationale: an explicit brand-config
+  upload (`routes/brand.ts`) writes ONLY an attachment, while `brandData.logoUrl` can hold a stale
+  scraped URL — what the user sees in brand config must be what generation composites. If Emma
+  re-scrapes and updates only `brandData.logoUrl`, the older auto-attachment still wins; acceptable
+  because the deterministic step writes both with the same URL.
+- **Failing the onboarding ad-image run on missing logo is the intended UX** (vs. generating wordmark
+  variants). Matches Fangfang's interim guidance ("upload/review the logo in brand config before image
+  creation") and AC-3, but it's a visible behavior change on accounts with undiscoverable logos.
+- **The `promptRequestsLogo` heuristic** (`/\blogos?\b/i` with a negation guard) is deliberately
+  narrow; prompts that mean the logo without saying "logo" ("with our brand mark") won't trigger the
+  gate. The model still passes `logo_image` explicitly on those per its tool description.
+
 ## Landing pages: the residual wedge + hang the first fix left behind (2026-07-13, ENG-287 follow-up)
 
 The 07-11 fix (PR #2066, below) correctly killed the sync-create 300s race. But the same failure
