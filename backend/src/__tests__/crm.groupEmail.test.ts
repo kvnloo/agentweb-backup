@@ -22,6 +22,7 @@ jest.mock('../controllers/templates', () => ({
 import { Request, Response } from 'express';
 import { crmDb } from '../services/db';
 import { resendService } from '../services/resendService';
+import { settingsService } from '../services/settingsService';
 import { io } from '../server';
 import router from '../routes/crm';
 
@@ -78,6 +79,12 @@ jest.mock('../services/resendService', () => ({
   resendService: {
     sendEmail: jest.fn(),
   },
+}));
+
+const mockGetEmailProvider = jest.fn();
+jest.mock('../services/emailProviderService', () => ({
+  getEmailProvider: (...args: any[]) => mockGetEmailProvider(...args),
+  bootstrapEmailProviders: jest.fn().mockResolvedValue(undefined),
 }));
 
 jest.mock('../services/leadListAlertService', () => ({
@@ -391,6 +398,99 @@ describe('CRM Group Email Endpoints', () => {
 
       expect(io.to).toHaveBeenCalledWith('socket-123');
     });
+
+    describe('ENG-266 Part 3 — routes through the sender\'s real provider', () => {
+      const mailboxSenderConfig = () =>
+        (settingsService.getSetting as jest.Mock).mockResolvedValue({
+          settingValue: JSON.stringify({
+            senders: [{ id: 'ol-1', email: 'hunter@baldwin.com', fromName: 'Hunter', senderType: 'outlook', connectedAccountId: 'acct-1' }],
+          }),
+        });
+
+      const manyLeads = (count: number) =>
+        Array.from({ length: count }, (_, i) => ({ leadId: `${i}`, email: `lead${i}@test.com` }));
+
+      it('FAIL: rejects a mailbox sender bulk send over the 50-lead cap without sending anything', async () => {
+        mailboxSenderConfig();
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+          items: manyLeads(51),
+          lastEvaluatedKey: undefined,
+        });
+
+        mockReq.body = {
+          senderId: 'ol-1',
+          senderEmail: 'hunter@baldwin.com',
+          senderName: 'Hunter',
+          subject: 'Hi',
+          htmlContent: '<p>Hello</p>',
+        };
+
+        const handler = findHandler('/lists/:listId/group-email/send', 'post');
+        await handler!(mockReq, mockRes);
+
+        expect(mockRes.status).toHaveBeenCalledWith(400);
+        expect(mockRes.json).toHaveBeenCalledWith(
+          expect.objectContaining({ code: 'MAILBOX_SENDER_LEAD_CAP_EXCEEDED' }),
+        );
+        expect(resendService.sendEmail).not.toHaveBeenCalled();
+        expect(mockGetEmailProvider).not.toHaveBeenCalled();
+      });
+
+      it('FAIL: a thrown send counts as failed instead of crashing the request', async () => {
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+          items: [{ leadId: '1', email: 'a@test.com' }, { leadId: '2', email: 'b@test.com' }],
+          lastEvaluatedKey: undefined,
+        });
+        (resendService.sendEmail as jest.Mock)
+          .mockResolvedValueOnce({ id: 'msg-1' })
+          .mockRejectedValueOnce(new Error('resend down'));
+
+        mockReq.body = {
+          senderEmail: 'me@test.com',
+          senderName: 'Me',
+          subject: 'Hi',
+          htmlContent: '<p>Hello</p>',
+        };
+
+        const handler = findHandler('/lists/:listId/group-email/send', 'post');
+        await handler!(mockReq, mockRes);
+
+        const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+        expect(response.sent).toBe(1);
+        expect(response.failed).toBe(1);
+      });
+
+      it('SUCCESS: a mailbox sender under the cap sends via its real provider, not Resend', async () => {
+        mailboxSenderConfig();
+        mockGetEmailProvider.mockReturnValue({
+          sendEmail: jest.fn().mockResolvedValue({ messageId: 'ol-msg-1', threadId: '' }),
+        });
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+          items: [{ leadId: '1', email: 'a@test.com', firstName: 'A' }],
+          lastEvaluatedKey: undefined,
+        });
+
+        mockReq.body = {
+          senderId: 'ol-1',
+          senderEmail: 'hunter@baldwin.com',
+          senderName: 'Hunter',
+          subject: 'Hi {{firstName}}',
+          htmlContent: '<p>Hello</p>',
+        };
+
+        const handler = findHandler('/lists/:listId/group-email/send', 'post');
+        await handler!(mockReq, mockRes);
+
+        expect(resendService.sendEmail).not.toHaveBeenCalled();
+        expect(mockGetEmailProvider).toHaveBeenCalledWith('outlook');
+        const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+        expect(response.sent).toBe(1);
+        expect(response.failed).toBe(0);
+      });
+    });
   });
 
   describe('POST /lists/:listId/group-email/test', () => {
@@ -456,6 +556,38 @@ describe('CRM Group Email Endpoints', () => {
       await handler!(mockReq, mockRes);
 
       expect(resendService.sendEmail).toHaveBeenCalledTimes(2);
+    });
+
+    it('ENG-266 Part 3: routes a mailbox sender through its real provider, not Resend', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+        listId: 'list-1',
+        userId: 'test-user-id',
+      });
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify({
+          senders: [{ id: 'ol-1', email: 'hunter@baldwin.com', fromName: 'Hunter', senderType: 'outlook', connectedAccountId: 'acct-1' }],
+        }),
+      });
+      mockGetEmailProvider.mockReturnValue({
+        sendEmail: jest.fn().mockResolvedValue({ messageId: 'ol-msg-1', threadId: '' }),
+      });
+
+      mockReq.body = {
+        senderId: 'ol-1',
+        senderEmail: 'hunter@baldwin.com',
+        senderName: 'Hunter',
+        subject: 'Test',
+        htmlContent: '<p>Hi</p>',
+        recipients: ['test@recipient.com'],
+      };
+
+      const handler = findHandler('/lists/:listId/group-email/test', 'post');
+      await handler!(mockReq, mockRes);
+
+      expect(resendService.sendEmail).not.toHaveBeenCalled();
+      expect(mockGetEmailProvider).toHaveBeenCalledWith('outlook');
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(response.sent).toBe(1);
     });
   });
 });

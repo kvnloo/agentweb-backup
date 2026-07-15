@@ -208,9 +208,10 @@ import {
   serializeSender,
   validateSender,
   senderSettingName,
-  bulkSendGuardMessage,
+  resolveSenderForSend,
 } from '../services/crmSenderService';
-import { MAILBOX_PROVIDERS } from '../services/crmSenderTypes';
+import { MAILBOX_PROVIDERS, CrmSender, isMailboxSender } from '../services/crmSenderTypes';
+import { sendAsSender } from '../services/sendAsSender';
 router.use(apolloSubRouter);
 
 const normalizeAlertEvents = (alertEvents: any) => {
@@ -5216,7 +5217,7 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId, leadId } = req.params;
-    const { senderEmail, senderName, subject, htmlContent, textContent } = req.body;
+    const { senderId, senderEmail, senderName, subject, htmlContent, textContent } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -5243,25 +5244,28 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    // Send email via Resend
-    // GUARD (ENG-266 Part 3): sends unconditionally through Resend — refuse a
-    // mailbox-backed sender rather than silently sending from the wrong system.
-    const mailboxGuard = await bulkSendGuardMessage(userId, senderEmail);
-    if (mailboxGuard) {
-      return res.status(400).json({ message: mailboxGuard, code: 'MAILBOX_SENDER_NOT_SUPPORTED' });
-    }
+    // ENG-266 Part 3: route through the sender's real provider. If senderId/senderEmail
+    // don't resolve to a configured sender (an older client, or an ad-hoc address),
+    // fall back to a synthesized resend sender from the raw fields — same as before.
+    const resolvedSender = await resolveSenderForSend(userId, senderId, senderEmail);
+    const sender: CrmSender = resolvedSender ?? {
+      id: '__adhoc__',
+      email: senderEmail,
+      fromName: senderName,
+      senderProvider: 'resend',
+    };
 
-    const from = `${senderName} <${senderEmail}>`;
-    const result = await resendService.sendEmail({
-      from,
-      to: lead.email,
-      subject,
-      html: htmlContent,
-      text: textContent
-    });
-
-    if (!result) {
-      return res.status(500).json({ message: 'Failed to send email via Resend' });
+    let sendResult;
+    try {
+      sendResult = await sendAsSender(userId, sender, {
+        to: lead.email,
+        subject,
+        html: htmlContent,
+        text: textContent,
+      });
+    } catch (error: any) {
+      console.error('Error sending email:', error);
+      return res.status(500).json({ message: error.message || 'Failed to send email' });
     }
 
     // Remove the email draft after successfully sending
@@ -5271,7 +5275,7 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
 
     res.json({
       message: 'Email sent successfully',
-      emailId: result.id
+      emailId: sendResult.messageId
     });
   } catch (error: any) {
     console.error('Error sending email:', error);
@@ -5289,7 +5293,7 @@ router.post('/lists/:listId/leads/:leadId/reply-email', async (req: Request, res
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId, leadId } = req.params;
-    const { senderEmail, senderName, subject, htmlContent, messageId } = req.body;
+    const { senderId, senderEmail, senderName, subject, htmlContent, messageId } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -5316,30 +5320,33 @@ router.post('/lists/:listId/leads/:leadId/reply-email', async (req: Request, res
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    // Send reply email via Resend with In-Reply-To header
-    // GUARD (ENG-266 Part 3): sends unconditionally through Resend — refuse a
-    // mailbox-backed sender rather than silently sending from the wrong system.
-    const mailboxGuard = await bulkSendGuardMessage(userId, senderEmail);
-    if (mailboxGuard) {
-      return res.status(400).json({ message: mailboxGuard, code: 'MAILBOX_SENDER_NOT_SUPPORTED' });
-    }
+    // ENG-266 Part 3: route through the sender's real provider, same fallback as send-email.
+    // messageId here is best-effort (see sendAsSender's replyToMessageId docs) — it only
+    // "worked" as an RFC In-Reply-To before because every send was hardcoded to Resend.
+    const resolvedSender = await resolveSenderForSend(userId, senderId, senderEmail);
+    const sender: CrmSender = resolvedSender ?? {
+      id: '__adhoc__',
+      email: senderEmail,
+      fromName: senderName,
+      senderProvider: 'resend',
+    };
 
-    const from = `${senderName} <${senderEmail}>`;
-    const result = await resendService.sendEmail({
-      from,
-      to: lead.email,
-      subject,
-      html: htmlContent,
-      inReplyTo: messageId
-    });
-
-    if (!result) {
-      return res.status(500).json({ message: 'Failed to send reply email via Resend' });
+    let sendResult;
+    try {
+      sendResult = await sendAsSender(userId, sender, {
+        to: lead.email,
+        subject,
+        html: htmlContent,
+        replyToMessageId: messageId,
+      });
+    } catch (error: any) {
+      console.error('Error sending reply email:', error);
+      return res.status(500).json({ message: error.message || 'Failed to send reply email' });
     }
 
     res.json({
       message: 'Reply email sent successfully',
-      emailId: result.id
+      emailId: sendResult.messageId
     });
   } catch (error: any) {
     console.error('Error sending reply email:', error);
@@ -5760,17 +5767,16 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       return res.status(400).json({ message: 'senderEmail, senderName, subject, and htmlContent are required' });
     }
 
-    // GUARD (ENG-266 Part 3): this route sends unconditionally through Resend. The
-    // composer only posts senderEmail/senderName, so resolve it back to the sender
-    // record and refuse if it is mailbox-backed — otherwise a connected Gmail/Outlook
-    // sender would silently go out via Resend from an address we don't own.
-    // senderId is preferred and unambiguous. senderEmail is the legacy fallback: one address
-    // can have both a mailbox and a custom-domain sender, and the address alone cannot tell
-    // them apart.
-    const guardCheck = await bulkSendGuardMessage(userId, senderEmail, senderId);
-    if (guardCheck) {
-      return res.status(400).json({ message: guardCheck, code: 'MAILBOX_SENDER_NOT_SUPPORTED' });
-    }
+    // ENG-266 Part 3: route through the sender's real provider. senderId is preferred and
+    // unambiguous; senderEmail is the legacy fallback for older clients — falls back to a
+    // synthesized resend sender if nothing configured matches (same as before).
+    const resolvedSender = await resolveSenderForSend(userId, senderId, senderEmail);
+    const sender: CrmSender = resolvedSender ?? {
+      id: '__adhoc__',
+      email: senderEmail,
+      fromName: senderName,
+      senderProvider: 'resend',
+    };
 
     const list = await crmDb.getLeadListById(listId);
     if (!list) {
@@ -5829,8 +5835,18 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
 
     const total = eligibleLeads.length;
 
+    // ENG-266 Part 3: a mailbox send (Gmail/Graph) has no shared queue like Resend's, and
+    // budgets ~600ms/send (round-trip + throttle) — 50 leads keeps one HTTP request
+    // comfortably inside a 60s ALB timeout. Reject up front rather than partway through.
+    const MAILBOX_SENDER_LEAD_CAP = 50;
+    if (isMailboxSender(sender) && total > MAILBOX_SENDER_LEAD_CAP) {
+      return res.status(400).json({
+        message: `Sending from a connected mailbox is limited to ${MAILBOX_SENDER_LEAD_CAP} recipients per campaign. This list has ${total} eligible leads.`,
+        code: 'MAILBOX_SENDER_LEAD_CAP_EXCEEDED',
+      });
+    }
+
     const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
-    const from = `${senderName} <${senderEmail}>`;
 
     let sent = 0;
     let failed = 0;
@@ -5855,20 +5871,13 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
         });
         personalizedHtml = injectUnsubscribeUrl(personalizedHtml, unsubscribeUrl, unsubscribeFooterHtml);
 
-        const result = await resendService.sendEmail({
-          from,
+        await sendAsSender(userId, sender, {
           to: lead.email,
           subject: personalizedSubject,
           html: personalizedHtml,
           text: personalizedText,
         });
-
-        if (result && result.id) {
-          sent++;
-        } else {
-          failed++;
-          failedEmails.push(lead.email);
-        }
+        sent++;
       } catch (err: any) {
         console.error(`Failed to send group email to ${lead.email}:`, err.message || err);
         failed++;
@@ -5906,7 +5915,7 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { senderEmail, senderName, subject, htmlContent, textContent, recipients, unsubscribeFooterHtml } = req.body;
+    const { senderId, senderEmail, senderName, subject, htmlContent, textContent, recipients, unsubscribeFooterHtml } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -5952,14 +5961,16 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
       : testBanner + testBaseHtml;
     // Wire up unsubscribe URL with the real portal domain
     const testHtml = injectUnsubscribeUrl(withBanner, testUnsubscribeUrl, unsubscribeFooterHtml);
-    // GUARD (ENG-266 Part 3): sends unconditionally through Resend — refuse a
-    // mailbox-backed sender rather than silently sending from the wrong system.
-    const mailboxGuard = await bulkSendGuardMessage(userId, senderEmail);
-    if (mailboxGuard) {
-      return res.status(400).json({ message: mailboxGuard, code: 'MAILBOX_SENDER_NOT_SUPPORTED' });
-    }
 
-    const from = `${senderName} <${senderEmail}>`;
+    // ENG-266 Part 3: route through the sender's real provider (same fallback as the
+    // other send sites). No lead cap here — test sends are inherently small.
+    const resolvedSender = await resolveSenderForSend(userId, senderId, senderEmail);
+    const sender: CrmSender = resolvedSender ?? {
+      id: '__adhoc__',
+      email: senderEmail,
+      fromName: senderName,
+      senderProvider: 'resend',
+    };
 
     let sent = 0;
     let failedCount = 0;
@@ -5967,20 +5978,13 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
 
     for (const email of validEmails) {
       try {
-        const result = await resendService.sendEmail({
-          from,
+        await sendAsSender(userId, sender, {
           to: email.trim(),
           subject: `[TEST] ${subject}`,
           html: testHtml,
           text: textContent,
         });
-
-        if (result && result.id) {
-          sent++;
-        } else {
-          failedCount++;
-          failedEmails.push(email);
-        }
+        sent++;
       } catch (err: any) {
         console.error(`Failed to send test group email to ${email}:`, err.message || err);
         failedCount++;
