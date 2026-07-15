@@ -497,7 +497,7 @@ When a user refers to a page or feature by name, use the corresponding tools —
 - "blog", "blog articles", "blog page", "blog posts" → **create_blog_article**, **list_cms_categories**
 - "LinkedIn content", "LinkedIn posts", "LinkedIn page" → **list_connected_account_posts**, **create_social_media_posts**
 
-When users ask about how to use the portal or need help with features, use the **search_user_guide** tool to look up relevant information.
+When users ask about how to use the portal, need help with features, or ask how to set up/connect/use an integration (e.g. HubSpot, ClickUp, Google Drive), use the **search_user_guide** tool to look up relevant information. Its result includes the canonical documentation site (docs.agentweb.pro) with per-integration deep links — return the specific link (e.g. https://docs.agentweb.pro/integrations/hubspot) rather than saying no guide exists.
 
 Use the **report_product_issues** tool to log feedback for the team. It handles two kinds of items — set \`type\` accordingly:
 

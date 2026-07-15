@@ -7,13 +7,14 @@ import {
   deleteBlock,
   getBlock,
 } from '../services/notionService';
+import { buildDocumentationReference } from './documentationSite';
 
 // Available to all users — Emma uses this to answer user guide questions
 emmaToolRegistry.register({
   name: 'search_user_guide',
   definition: {
     name: 'search_user_guide',
-    description: 'Fetch the full user guide content from the Notion page. Use this tool when users ask about how to use the portal, need help with features, or have questions about functionality. Returns the complete user guide text.',
+    description: 'Fetch the full user guide content plus the canonical documentation site reference (docs.agentweb.pro). Use this tool when users ask about how to use the portal, need help with features, or ask how to set up/use an integration (e.g. HubSpot). Returns the user guide text and the documentation deep links (e.g. https://docs.agentweb.pro/integrations/hubspot).',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -22,11 +23,15 @@ emmaToolRegistry.register({
   },
   execute: async () => {
     try {
+      // The documentation site is a knowledge source Emma always consults so it
+      // can return correct integration deep links even when the Notion portal
+      // guide has no dedicated walkthrough for the integration in question.
+      const docsReference = buildDocumentationReference();
       const content = await getUserGuideContent();
       if (!content || content.trim().length === 0) {
-        return { success: false, message: 'User guide page is empty or inaccessible.' };
+        return { success: true, content: docsReference.trim() };
       }
-      return { success: true, content };
+      return { success: true, content: `${content}\n${docsReference}` };
     } catch (error: any) {
       return { success: false, message: `Failed to fetch user guide: ${error.message}` };
     }
