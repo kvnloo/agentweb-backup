@@ -95,12 +95,27 @@ const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 class DdbFake {
   items = new Map<string, any>();
 
+  /**
+   * Evaluate the ConditionExpression shapes runStore uses, like DynamoDB does.
+   * TTL deletion is EVENTUAL — an expired item still exists and blocks a plain
+   * `attribute_not_exists(pk)` put; claims tolerate it via `OR #ttl < :now`.
+   */
+  private putConditionFails(params: any): boolean {
+    const cond = params.ConditionExpression;
+    if (!cond) return false;
+    const existing = this.items.get(params.Item.pk);
+    if (cond === 'attribute_not_exists(pk)') return existing !== undefined;
+    if (cond === 'attribute_not_exists(pk) OR #ttl < :now') {
+      if (existing === undefined) return false;
+      const now = params.ExpressionAttributeValues?.[':now'];
+      return !(typeof existing.ttl === 'number' && existing.ttl < now);
+    }
+    throw new Error(`DdbFake: unsupported put ConditionExpression: ${cond}`);
+  }
+
   put = (params: any) => ({
     promise: async () => {
-      if (
-        params.ConditionExpression === 'attribute_not_exists(pk)' &&
-        this.items.has(params.Item.pk)
-      ) {
+      if (this.putConditionFails(params)) {
         const err: any = new Error('The conditional request failed');
         err.code = 'ConditionalCheckFailedException';
         throw err;
@@ -269,6 +284,21 @@ describe('createSession idempotency (acceptance — ENG-147)', () => {
     expect(res.statusCode).toBe(409);
     expect(res.body.code).toBe('DUPLICATE_SUBMIT');
     expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+  });
+
+  it('ACCEPTANCE: a claim leaked by a hard process crash (expired ttl, not yet reaped by DynamoDB) does not lock the user out — the next createSession claims and creates', async () => {
+    const key = createSessionIdempotencyKey(mockUserId, 'storm-key-leak');
+    fake.items.set(`idem#${key}`, {
+      pk: `idem#${key}`,
+      runId: 'run-dead',
+      ttl: Math.floor(Date.now() / 1000) - 60,
+    });
+
+    const res = makeRes();
+    await agentModeController.createSession(makeReq('storm-key-leak'), res);
+
+    expect(res.statusCode).toBe(201);
+    expect(mockChatbotDb.createChatSession).toHaveBeenCalledTimes(1);
   });
 
   it('winner\'s session-creation failure releases the claim so a retry is accepted (no permanent lockout)', async () => {

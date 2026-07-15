@@ -43,14 +43,31 @@ class DdbFake {
     }
   }
 
+  /**
+   * Evaluate the ConditionExpression shapes runStore uses, the way DynamoDB
+   * does. Crucially: native TTL deletion is EVENTUAL (minutes to hours of
+   * reaper lag) — an expired item still EXISTS and blocks a plain
+   * `attribute_not_exists(pk)` put. Claims must tolerate that themselves
+   * via `OR #ttl < :now`.
+   */
+  private putConditionFails(params: any): boolean {
+    const cond = params.ConditionExpression;
+    if (!cond) return false;
+    const existing = this.items.get(params.Item.pk);
+    if (cond === 'attribute_not_exists(pk)') return existing !== undefined;
+    if (cond === 'attribute_not_exists(pk) OR #ttl < :now') {
+      if (existing === undefined) return false;
+      const now = params.ExpressionAttributeValues?.[':now'];
+      return !(typeof existing.ttl === 'number' && existing.ttl < now);
+    }
+    throw new Error(`DdbFake: unsupported put ConditionExpression: ${cond}`);
+  }
+
   put = (params: any) => ({
     promise: async () => {
       this.calls.push({ op: 'put', params });
       this.maybeFail('put');
-      if (
-        params.ConditionExpression === 'attribute_not_exists(pk)' &&
-        this.items.has(params.Item.pk)
-      ) {
+      if (this.putConditionFails(params)) {
         const err: any = new Error('The conditional request failed');
         err.code = 'ConditionalCheckFailedException';
         throw err;
@@ -188,6 +205,46 @@ describe('runStore', () => {
     it('propagates unexpected DynamoDB errors (not conditional failures)', async () => {
       fake.failNext = { op: 'put', error: new Error('throttled') };
       await expect(claimIdempotency('k2', 'run-a', 600)).rejects.toThrow('throttled');
+    });
+
+    it('an EXPIRED-but-unreaped item does NOT block a new claim — DynamoDB TTL deletion is eventual, so reaper lag must never extend a leaked lock past its window', async () => {
+      // A process died hard mid-generation: its claim leaked and its ttl has
+      // passed, but the native TTL reaper has not deleted the item yet
+      // (documented as eventual — minutes to hours under load).
+      fake.items.set('idem#k-leak', {
+        pk: 'idem#k-leak',
+        runId: 'run-dead',
+        ttl: Math.floor(Date.now() / 1000) - 60,
+      });
+      const res = await claimIdempotency('k-leak', 'run-new', IDEM_TTL_INTERACTIVE_S);
+      expect(res).toEqual({ claimed: true });
+      expect(fake.items.get('idem#k-leak').runId).toBe('run-new');
+      expect(fake.items.get('idem#k-leak').ttl).toBeGreaterThan(Math.floor(Date.now() / 1000));
+    });
+
+    it('loser-path read is strongly consistent (ConsistentRead) so attach semantics are exact', async () => {
+      await claimIdempotency('k1', 'run-a', IDEM_TTL_INTERACTIVE_S);
+      await claimIdempotency('k1', 'run-b', IDEM_TTL_INTERACTIVE_S);
+      const get = fake.calls.find((c) => c.op === 'get');
+      expect(get).toBeDefined();
+      expect(get!.params.ConsistentRead).toBe(true);
+    });
+
+    it('loser-path read treats an item that expired between the put and the read as absent — never exposes a stale runId/sessionId', async () => {
+      await claimIdempotency('k1', 'run-a', IDEM_TTL_INTERACTIVE_S);
+      await recordIdempotencySessionId('k1', 'stale-session');
+      // Simulate the race window: the item is live at put time, expired by read time.
+      const realGet = fake.get.bind(fake);
+      fake.get = ((params: any) => ({
+        promise: async () => {
+          const r = await realGet(params).promise();
+          return r.Item
+            ? { Item: { ...r.Item, ttl: Math.floor(Date.now() / 1000) - 1 } }
+            : r;
+        },
+      })) as any;
+      const res = await claimIdempotency('k1', 'run-b', IDEM_TTL_INTERACTIVE_S);
+      expect(res).toEqual({ claimed: false });
     });
   });
 
