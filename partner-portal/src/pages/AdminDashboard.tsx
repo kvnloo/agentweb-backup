@@ -101,6 +101,7 @@ import {
   Cancel as CancelIcon,
   Search as SearchIcon,
   Email as EmailIcon,
+  ContentCopy as ContentCopyIcon,
 } from "@mui/icons-material";
 
 interface TabPanelProps {
@@ -898,6 +899,8 @@ export default function AdminDashboard() {
   const [introEmailUserEmail, setIntroEmailUserEmail] = useState("");
   const [introEmailLoading, setIntroEmailLoading] = useState(false);
   const [delegateAccessLoading, setDelegateAccessLoading] = useState<string | null>(null);
+  const [delegatedPortalUrl, setDelegatedPortalUrl] = useState<string | null>(null);
+  const [delegatedUrlCopied, setDelegatedUrlCopied] = useState(false);
   const [emailToDelete, setEmailToDelete] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [userIdToDelete, setUserIdToDelete] = useState<string | null>(null);
@@ -3023,9 +3026,15 @@ export default function AdminDashboard() {
   };
 
   const handleAccessCustomerPortal = async (userId: string) => {
+    // Open a placeholder tab synchronously (inside the click handler) so the
+    // browser treats it as a user-initiated action and does not block it. We
+    // navigate this tab to the delegated URL once the async request resolves.
+    // If the browser still blocks the popup, `placeholderTab` is null and we
+    // fall back to exposing the URL in the UI so the admin can copy/open it.
+    const placeholderTab = window.open("", "_blank");
     try {
       setDelegateAccessLoading(userId);
-      
+
       const response = await axios.post(
         buildApiUrl(`/api/admin/users/${userId}/delegate-access`),
         {},
@@ -3034,17 +3043,72 @@ export default function AdminDashboard() {
         }
       );
 
-      if (response.status === 200) {
-        const { customerPortalUrl } = response.data;
-        // Open customer portal in new tab with delegate token
-        window.open(customerPortalUrl, '_blank');
-        setSuccess("Delegate access created successfully!");
+      // Key off the presence of the URL rather than an exact 200 so any 2xx
+      // response is handled. If the response has no URL (unexpected), fall
+      // through to the else and close the placeholder tab so it is never
+      // orphaned as a blank window.
+      const customerPortalUrl = response?.data?.customerPortalUrl;
+      if (customerPortalUrl) {
+        if (placeholderTab && !placeholderTab.closed) {
+          // Navigate the pre-opened tab to the delegated customer portal.
+          placeholderTab.location.href = customerPortalUrl;
+          setSuccess("Delegate access created successfully!");
+        } else {
+          // Popup was blocked — surface the URL so the admin can still recover it.
+          setDelegatedPortalUrl(customerPortalUrl);
+          setDelegatedUrlCopied(false);
+        }
+      } else {
+        // No usable URL in the response — don't leave a blank tab behind.
+        if (placeholderTab && !placeholderTab.closed) {
+          placeholderTab.close();
+        }
+        setError("Delegate access did not return a portal URL");
       }
     } catch (error: any) {
+      // Close the placeholder tab we opened optimistically so we don't leave a
+      // blank tab behind when the request fails.
+      if (placeholderTab && !placeholderTab.closed) {
+        placeholderTab.close();
+      }
       console.error("Error creating delegate access:", error);
       setError(error.response?.data?.message || "Failed to create delegate access");
     } finally {
       setDelegateAccessLoading(null);
+    }
+  };
+
+  const handleCopyDelegatedUrl = async () => {
+    if (!delegatedPortalUrl) return;
+    // Prefer the async Clipboard API, but it is only exposed in secure contexts
+    // (HTTPS/localhost). On plain HTTP (e.g. preview envs) navigator.clipboard is
+    // undefined, so fall back to a temporary textarea + execCommand("copy").
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(delegatedPortalUrl);
+        setDelegatedUrlCopied(true);
+        return;
+      } catch (error) {
+        console.error("Clipboard API copy failed, falling back to execCommand:", error);
+      }
+    }
+    try {
+      const textarea = document.createElement("textarea");
+      textarea.value = delegatedPortalUrl;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand("copy");
+      document.body.removeChild(textarea);
+      if (copied) {
+        setDelegatedUrlCopied(true);
+      } else {
+        console.error("Failed to copy delegated URL: execCommand returned false");
+      }
+    } catch (error) {
+      console.error("Failed to copy delegated URL:", error);
     }
   };
 
@@ -6442,7 +6506,59 @@ export default function AdminDashboard() {
         </DialogActions>
       </Dialog>
 
-      {/* Grant Token Bonus Dialog */}
+      {/* Delegated Customer Portal Link Dialog (popup-blocked recovery) */}
+      <Dialog
+        open={Boolean(delegatedPortalUrl)}
+        onClose={() => { setDelegatedPortalUrl(null); setDelegatedUrlCopied(false); }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>Delegated Customer Portal Link</DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ mb: 2 }}>
+            Your browser blocked the popup, so the customer portal did not open
+            automatically. Use the link below to open the delegated session or
+            copy it to share/reuse.
+          </DialogContentText>
+          <TextField
+            value={delegatedPortalUrl || ""}
+            fullWidth
+            multiline
+            InputProps={{
+              readOnly: true,
+              endAdornment: (
+                <InputAdornment position="end">
+                  <Tooltip title={delegatedUrlCopied ? "Copied!" : "Copy link"}>
+                    <IconButton onClick={handleCopyDelegatedUrl} edge="end">
+                      {delegatedUrlCopied ? (
+                        <CheckIcon fontSize="small" color="success" />
+                      ) : (
+                        <ContentCopyIcon fontSize="small" />
+                      )}
+                    </IconButton>
+                  </Tooltip>
+                </InputAdornment>
+              ),
+            }}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => { setDelegatedPortalUrl(null); setDelegatedUrlCopied(false); }}>Close</Button>
+          {delegatedPortalUrl && (
+            <Button
+              component={Link}
+              href={delegatedPortalUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              variant="contained"
+              startIcon={<OpenInNewIcon />}
+            >
+              Open Portal
+            </Button>
+          )}
+        </DialogActions>
+      </Dialog>
+
       <Dialog open={introEmailDialogOpen} onClose={() => setIntroEmailDialogOpen(false)}>
         <DialogTitle>Send Team Introduction Email</DialogTitle>
         <DialogContent>
@@ -6458,6 +6574,7 @@ export default function AdminDashboard() {
         </DialogActions>
       </Dialog>
 
+      {/* Grant Bonus Tokens Dialog */}
       <Dialog open={grantBonusDialogOpen} onClose={() => setGrantBonusDialogOpen(false)}>
         <DialogTitle>Grant Bonus Tokens</DialogTitle>
         <DialogContent>

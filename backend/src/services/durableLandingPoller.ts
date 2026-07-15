@@ -33,8 +33,13 @@ const TABLE_NAME = `${TABLE_PREFIX}AW-LandingPages`;
 
 function isStuck(page: GeneratedLandingPage, nowMs: number): boolean {
   if (page.status !== "generating" && page.status !== "deploying") return false;
-  const created = page.createdAt ? new Date(page.createdAt).getTime() : nowMs;
-  return nowMs - created > STUCK_CEILING_MS;
+  // `updatedAt`, matching the janitor below: a build that PROGRESSED recently is alive even
+  // if it started long ago. Keyed on `createdAt`, this declared a long-but-healthy build
+  // dead, and deliverStuckFailure then burned its one-shot completion claim — so the real
+  // success could never be delivered afterwards. (ENG-287 residual)
+  const ts = page.updatedAt || page.createdAt;
+  const last = ts ? new Date(ts).getTime() : nowMs;
+  return Number.isFinite(last) && nowMs - last > STUCK_CEILING_MS;
 }
 
 /**
