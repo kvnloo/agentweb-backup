@@ -347,6 +347,33 @@ export function isProcessCrashReturncode(returncode: number | null | undefined):
 }
 
 /**
+ * A SIGKILL (-9, or 137 = 128+9) reaches us from TWO sources that are
+ * indistinguishable by returncode alone:
+ *   1. the OS OOM-killer / a genuine worker crash, OR
+ *   2. the relay's OWN per-task timeout — runner.py SIGKILLs the worker when a
+ *      task outruns timeout_seconds and STILL returns HTTP 200 + returncode -9
+ *      (runner.py `proc.kill()`, http_server.py final body).
+ * Treating (2) as an OOM crash mislabels a slow-but-healthy task (the ENG-339
+ * 3-subreddit digest needs >120s) and wrongly forbids the retry it actually needs.
+ * We disambiguate by ELAPSED wall-time: a worker killed at (or just shy of) the
+ * task-timeout window almost certainly hit the relay timeout — retryable with a
+ * larger timeout; one killed well UNDER the timeout was almost certainly
+ * OOM/crash-killed and must NOT be retried (it just crashes again — ENG-339).
+ *
+ * Only SIGKILL is timeout-ambiguous; other fatal signals (SIGSEGV/SIGABRT, ...)
+ * are never produced by the relay timeout path, so they stay genuine crashes.
+ */
+export function isLikelyRelayTimeoutKill(
+  returncode: number,
+  elapsedMs: number,
+  timeoutSeconds: number,
+): boolean {
+  if (returncode !== -9 && returncode !== 137) return false;
+  if (!Number.isFinite(elapsedMs) || !Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) return false;
+  return elapsedMs >= timeoutSeconds * 1000 * 0.9;
+}
+
+/**
  * Shape a worker process-crash as a GRACEFUL, non-retryable outcome — the same
  * pattern as buildLocalAgentUnavailableResult. success:true keeps the dispatch
  * layer from recording it as agent_tool_failed / feeding the repeated-failure
@@ -378,6 +405,50 @@ export function buildLocalAgentCrashResult(returncode: number): {
       'This is an infrastructure fault, not a problem with the task — the worker keeps getting killed, so retrying will crash it the same way. ' +
       'Do NOT retry run_local_agent_task in this run. Continue with the cloud browser tools and you_search_web to gather what you can. ' +
       'If the data is unreachable from those, report that the local agent is temporarily unavailable rather than marking the whole run as an internal tool failure.',
+  };
+}
+
+/**
+ * Shape a relay TIMEOUT-kill (worker SIGKILLed for outrunning timeout_seconds, not
+ * OOM) as a graceful, RETRYABLE outcome. Unlike a genuine crash, the task simply
+ * needs more time, so we PRESERVE the retry-with-larger-timeout recovery path
+ * (ENG-339 rec #3: retry-with-backoff) instead of forbidding all local-agent
+ * retries. success:true keeps it off the repeated-failure breaker; reason:'timed_out'
+ * distinguishes it from a genuine 'crashed'.
+ */
+export function buildLocalAgentTimeoutResult(
+  returncode: number,
+  timeoutSeconds: number,
+): {
+  success: true;
+  unavailable: true;
+  reason: 'timed_out';
+  returncode: number;
+  timeoutSeconds: number;
+  suggestedTimeoutSeconds: number;
+  message: string;
+  formattedContent: string;
+} {
+  // Back off with a larger timeout, capped at the tool's 900s ceiling.
+  const suggestedTimeoutSeconds = Math.min(Math.round(timeoutSeconds * 2), 900);
+  const canRetryLonger = suggestedTimeoutSeconds > timeoutSeconds;
+  const message = `The local browser agent task ran the full ${timeoutSeconds}s and was stopped (returncode ${returncode}) — it timed out rather than crashing.`;
+  return {
+    success: true,
+    unavailable: true,
+    reason: 'timed_out',
+    returncode,
+    timeoutSeconds,
+    suggestedTimeoutSeconds,
+    message,
+    formattedContent:
+      `${message}\n\n` +
+      (canRetryLonger
+        ? 'This is a timeout, not an infrastructure crash — the task simply needs more time (e.g. a multi-subreddit digest). ' +
+          `Retry run_local_agent_task ONCE with timeout_seconds: ${suggestedTimeoutSeconds}, and narrow the task if you can (fewer pages per call). ` +
+          'If it times out again, fall back to the cloud browser tools and you_search_web instead of retrying further.'
+        : `The task already ran at the maximum timeout (${timeoutSeconds}s), so a longer retry is not possible. ` +
+          'Fall back to the cloud browser tools and you_search_web, or split the task into smaller per-page calls.'),
   };
 }
 
@@ -475,6 +546,7 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
     const taskUrl = config.endpoint.replace(/\/$/, '') + '/task';
 
     let rawResponse: { status: number; data: string };
+    const startedAt = Date.now();
     try {
       rawResponse = await httpRequest('POST', taskUrl, config.apiKey, requestBody, (timeoutSeconds + 90) * 1000);
     } catch (err: any) {
@@ -483,6 +555,7 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
         `Failed to reach local agent relay: ${err.message}`,
       );
     }
+    const elapsedMs = Date.now() - startedAt;
 
     if (rawResponse.status === 401) {
       return buildLocalAgentUnavailableResult(
@@ -510,7 +583,13 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
     // A process-level crash of the worker (killed by a signal — OOM SIGKILL, etc.)
     // recurs on every task, so treat it as a graceful, non-retryable unavailable
     // outcome instead of a task failure the model retries into the ground (ENG-339).
+    // BUT a SIGKILL that lands at the end of the timeout window is the relay's OWN
+    // per-task timeout (runner.py kills the worker on TimeoutExpired), not an OOM
+    // crash — that IS retryable with a larger timeout, so keep that recovery path.
     if (parsed.ok !== true && isProcessCrashReturncode(parsed.returncode)) {
+      if (isLikelyRelayTimeoutKill(parsed.returncode, elapsedMs, timeoutSeconds)) {
+        return buildLocalAgentTimeoutResult(parsed.returncode, timeoutSeconds);
+      }
       return buildLocalAgentCrashResult(parsed.returncode);
     }
 
