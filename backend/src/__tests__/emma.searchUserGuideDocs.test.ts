@@ -59,7 +59,7 @@ describe('search_user_guide tool', () => {
     expect(result.content).toContain('https://docs.agentweb.pro/integrations/hubspot');
   });
 
-  it('still surfaces the documentation site when the Notion guide is empty', async () => {
+  it('still surfaces the documentation site when the Notion guide is blank whitespace', async () => {
     (getUserGuideContent as jest.Mock).mockResolvedValue('   ');
 
     const result = await emmaToolRegistry.execute(TOOL, {});
@@ -68,12 +68,22 @@ describe('search_user_guide tool', () => {
     expect(result.content).toContain('https://docs.agentweb.pro/integrations/hubspot');
   });
 
-  it('returns a failure message when fetching the user guide throws', async () => {
+  it('still surfaces the documentation site when the Notion page is empty', async () => {
+    (getUserGuideContent as jest.Mock).mockResolvedValue('');
+
+    const result = await emmaToolRegistry.execute(TOOL, {});
+
+    expect(result.success).toBe(true);
+    expect(result.content).toContain('https://docs.agentweb.pro/integrations/hubspot');
+  });
+
+  it('still surfaces the documentation site when fetching the user guide throws', async () => {
     (getUserGuideContent as jest.Mock).mockRejectedValue(new Error('notion down'));
 
     const result = await emmaToolRegistry.execute(TOOL, {});
 
-    expect(result.success).toBe(false);
-    expect(result.message).toContain('notion down');
+    expect(result.success).toBe(true);
+    expect(result.content).toContain('https://docs.agentweb.pro/integrations/hubspot');
+    expect(result.content).toContain('notion down');
   });
 });
