@@ -1,3 +1,34 @@
+## ENG-326 review hardening: org dead-ends, unverified persists, guard false negatives (2026-07-15)
+
+Senior review of the ENG-326 branch surfaced four real bugs in the first cut; all fixed with tests.
+
+1. **Org accounts hit a dead end in both missing-logo gates.** `updateBrandGuidelines` and brand-config
+   uploads write the **ORG** record for org members, but the ad-image gate read `user.brandGuidelines`
+   only — so "upload your logo in brand config, then regenerate" could never be satisfied. The
+   ad-image trigger AND the landing-page routes now resolve brandGuidelines org-aware
+   (`resolveBrandGuidelinesForLoadedUser` / a `brandGuidelinesOverride` param on
+   `buildBrandContextFromUser`).
+2. **Unverified logo URLs are never persisted.** `downloadBrandLogoToS3` now returns a discriminated
+   outcome (`uploaded | svg | download-failed | upload-failed`). The onboarding step falls back to the
+   raw discovered URL only on `upload-failed` (bytes proven raster, just the S3 pin failed) — a dead /
+   hotlink-protected URL or an SVG served from an extensionless URL never becomes the canonical brand
+   asset. Emma-facing `extractCSSFromURL` output is unchanged (characterization suite untouched).
+3. **Landing pages got the missing half of AC-3.** `/generate` and `/generated/:id/duplicate` return
+   `422 { error: "missing_brand_logo" }` pointing at brand config when no logo resolves, BEFORE side
+   effects (lead-list public-access flip, site-mode lock). Previously v0 silently invented a wordmark.
+4. **Negation guard tightened.** The 0–40-char window swallowed positive asks ("no text, just our
+   logo", "Do not crop the logo"). Negators must now sit directly on the logo mention (≤2 whitelisted
+   filler words); `don't`/`do not` understood.
+
+### Assumptions to validate (delta over the section below)
+- **422 on logo-less landing-page generation is the intended UX** for the frontend — same reasoning as
+  the ad-image gate (Fangfang's brand-config guidance), but the portal UI may render the 422 as a
+  generic failure until it learns the `missing_brand_logo` code. Duplicate of a pre-gate page with no
+  persisted logo is now also blocked by design.
+- **`upload-failed` remote-URL fallback is safe**: the bytes were just downloaded successfully, so the
+  URL serves a real raster; if the site later takes it down we degrade the same way any hosted asset
+  does.
+
 ## Brand logo never persisted during onboarding → random logos in assets (2026-07-15, ENG-326)
 
 Root cause (named by Fangfang on the 07-14 Argusoft night call): the whole logo pipeline EXISTED —
