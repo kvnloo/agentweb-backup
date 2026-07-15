@@ -25,10 +25,9 @@ export const senderSettingName = (userId: string) => `crm_sender_emails_${userId
 /**
  * Thrown when a mailbox-backed sender reaches a send path that cannot honour it.
  *
- * The campaign, sequence and drip paths still send unconditionally through
- * Resend (ENG-266 Part 3). Until they route by provider, a mailbox sender
- * reaching them would silently send from the wrong system — so we refuse
- * loudly instead.
+ * As of ENG-266 Part 3, the campaign/sequence/drip paths route mailbox senders
+ * through their real provider instead of refusing them — this error is now only
+ * reachable from a future or un-migrated send path that still hardcodes Resend.
  */
 export class MailboxSenderNotSupportedError extends Error {
   public readonly provider: SenderProvider;
@@ -36,8 +35,8 @@ export class MailboxSenderNotSupportedError extends Error {
 
   constructor(sender: Pick<CrmSender, 'senderProvider' | 'id'>) {
     super(
-      `This sender uses a connected ${sender.senderProvider} mailbox, which cannot be used for ` +
-        `campaigns or sequences yet. Pick a custom-domain sender, or send from Emma chat.`,
+      `This sender uses a connected ${sender.senderProvider} mailbox, which this send path ` +
+        `cannot use yet. Pick a custom-domain sender, or send from Emma chat.`,
     );
     this.name = 'MailboxSenderNotSupportedError';
     this.provider = sender.senderProvider;
@@ -151,9 +150,13 @@ export function validateSender(raw: any, connectedAccounts: any[]): SenderValida
 }
 
 /**
- * Guard for the bulk send paths (campaign / sequence / drip).
+ * Guard for a bulk send path that still hardcodes Resend.
  *
- * Remove this once those paths route by provider (ENG-266 Part 3).
+ * As of ENG-266 Part 3, the campaign/sequence/drip send sites resolve a sender
+ * via resolveSenderForSend() and call sendAsSender() instead of guarding this
+ * way — they route by provider now, they don't refuse. This stays exported for
+ * any future or un-migrated send path that still only knows how to talk to
+ * Resend.
  */
 export function assertSenderUsableForBulkSend(sender: CrmSender): void {
   if (isMailboxSender(sender)) {
@@ -169,7 +172,11 @@ export function assertSenderUsableForBulkSend(sender: CrmSender): void {
  * back to the configured sender and report whether the send must be refused.
  *
  * Returns an error message to surface to the user, or null if the send may proceed.
- * Remove once these routes take a senderId and route by provider (ENG-266 Part 3).
+ *
+ * As of ENG-266 Part 3, the crm.ts/sequences.ts send sites use
+ * resolveSenderForSend() + sendAsSender() instead — they route by provider now.
+ * This stays exported for any future or un-migrated send path that only
+ * receives a bare address and still only knows how to talk to Resend.
  */
 export async function bulkSendGuardMessage(
   userId: string,
@@ -209,6 +216,36 @@ export async function bulkSendGuardMessage(
   }
 
   return new MailboxSenderNotSupportedError(matches[0]).message;
+}
+
+/**
+ * Resolve the exact CrmSender a send should use — the ENG-266 Part 3 counterpart
+ * to bulkSendGuardMessage, returning the sender itself instead of a refusal.
+ *
+ * Preferred path: senderId, resolved exactly. Fallback for older clients that only
+ * post an address: match by email (case-insensitively); if that address is
+ * ambiguous (a Workspace address that is both a mailbox sender and a verified
+ * Resend custom domain), prefer the resend sender — same ambiguity handling
+ * bulkSendGuardMessage already uses, now for full resolution.
+ */
+export async function resolveSenderForSend(
+  userId: string,
+  senderId: string | undefined,
+  senderEmail: string,
+): Promise<CrmSender | null> {
+  const config = await loadSenderConfig(userId);
+
+  if (senderId) {
+    return config.senders.find((s) => s.id === senderId) ?? null;
+  }
+
+  const needle = String(senderEmail || '').toLowerCase();
+  const matches = config.senders.filter((s) => s.email?.toLowerCase() === needle);
+  if (matches.length === 0) {
+    return null;
+  }
+
+  return matches.find((s) => !isMailboxSender(s)) ?? matches[0];
 }
 
 /** The one loader. Every reader of the sender blob goes through this. */

@@ -6,6 +6,7 @@ import {
   assertSenderUsableForBulkSend,
   loadSenderConfig,
   bulkSendGuardMessage,
+  resolveSenderForSend,
   MailboxSenderNotSupportedError,
 } from '../services/crmSenderService';
 import { isMailboxSender, MAILBOX_PROVIDERS, CrmSender } from '../services/crmSenderTypes';
@@ -311,6 +312,65 @@ describe('bulkSendGuardMessage — must not block a legitimate custom-domain sen
     it('falls back to the address when the id is unknown', async () => {
       ambiguous();
       expect(await bulkSendGuardMessage('u1', 'habeb@baldwin.com', 'no-such-id')).toBeNull();
+    });
+  });
+});
+
+describe('resolveSenderForSend — full sender resolution for the ENG-266 Part 3 send sites', () => {
+  const senders = (list: any[]) =>
+    mockGetSetting.mockResolvedValue({ settingValue: JSON.stringify({ senders: list }) });
+
+  beforeEach(() => jest.clearAllMocks());
+
+  describe('FAIL cases', () => {
+    it('returns null for an unknown senderId', async () => {
+      senders([{ id: '1', email: 'a@acme.com', fromName: 'A' }]);
+      expect(await resolveSenderForSend('u1', 'no-such-id', 'a@acme.com')).toBeNull();
+    });
+
+    it('returns null when no senderId is given and the email matches nothing', async () => {
+      senders([{ id: '1', email: 'other@acme.com', fromName: 'Other' }]);
+      expect(await resolveSenderForSend('u1', undefined, 'nobody@acme.com')).toBeNull();
+    });
+
+    it('returns null for an ad-hoc address with no configured senders at all', async () => {
+      senders([]);
+      expect(await resolveSenderForSend('u1', undefined, 'nobody@acme.com')).toBeNull();
+    });
+  });
+
+  describe('SUCCESS cases', () => {
+    it('resolves the exact sender by senderId, ignoring the email argument', async () => {
+      senders([
+        { id: 'mailbox', email: 'habeb@baldwin.com', fromName: 'H', senderType: 'outlook', connectedAccountId: 'o1' },
+        { id: 'domain', email: 'habeb@baldwin.com', fromName: 'H (domain)' },
+      ]);
+      const sender = await resolveSenderForSend('u1', 'mailbox', 'habeb@baldwin.com');
+      expect(sender?.id).toBe('mailbox');
+      expect(sender?.senderProvider).toBe('outlook');
+    });
+
+    it('resolves by email when only one sender matches', async () => {
+      senders([{ id: '1', email: 'a@acme.com', fromName: 'A', senderType: 'gmail', connectedAccountId: 'g1' }]);
+      const sender = await resolveSenderForSend('u1', undefined, 'a@acme.com');
+      expect(sender?.id).toBe('1');
+      expect(sender?.senderProvider).toBe('gmail');
+    });
+
+    it('prefers the resend sender when an address is ambiguous and no senderId is given', async () => {
+      senders([
+        { id: 'mailbox', email: 'habeb@baldwin.com', fromName: 'H', senderType: 'outlook', connectedAccountId: 'o1' },
+        { id: 'domain', email: 'habeb@baldwin.com', fromName: 'H (domain)' },
+      ]);
+      const sender = await resolveSenderForSend('u1', undefined, 'habeb@baldwin.com');
+      expect(sender?.id).toBe('domain');
+      expect(sender?.senderProvider).toBe('resend');
+    });
+
+    it('matches the address case-insensitively', async () => {
+      senders([{ id: '1', email: 'habeb@baldwin.com', fromName: 'H', senderType: 'gmail', connectedAccountId: 'g1' }]);
+      const sender = await resolveSenderForSend('u1', undefined, 'Habeb@Baldwin.COM');
+      expect(sender?.id).toBe('1');
     });
   });
 });
