@@ -204,6 +204,17 @@ const TIMEOUT_FAILURE_THRESHOLD = 3;
 // 10-minute controller-bounded turn, so waiting for a 3rd is needlessly slow.
 const SESSION_TIMEOUT_FAILURE_THRESHOLD = 2;
 const EXPENSIVE_MEDIA_FAILURE_BUDGET = 2;
+// ENG-291 follow-up: cost-scoping get_chat_history (chatHistoryFailureScope) fixed the
+// hard-block of legitimate cheaper recovery calls, but it also removed the session-wide
+// protection the prior shared-'' scope provided: a model that keeps VARYING sync/limit/
+// window lands each attempt in a DIFFERENT cost bucket, so neither the per-scope session
+// timeout breaker (threshold 2 per bucket) nor the media budget (get_chat_history is not
+// a media tool) ever trips — and each timeout can burn a full ~10-minute controller-
+// bounded turn. Cap the TOTAL get_chat_history timeouts across ALL cost buckets in a
+// session with a coarse aggregate budget. Kept deliberately high (6) so the few genuine
+// reduced-request recovery paths (sync=false, smaller window/limit) still run before the
+// aggregate cap engages — only a sustained, multi-bucket timeout spiral trips it.
+const CHAT_HISTORY_FAILURE_BUDGET = 6;
 const MAX_TRACKED_RUNS = 500;
 const ERROR_KEY_LENGTH = 80;
 
@@ -417,6 +428,17 @@ function mediaFailureBudget(toolName: string): number | null {
   return EXPENSIVE_MEDIA_TOOLS.has(toolName) ? EXPENSIVE_MEDIA_FAILURE_BUDGET : null;
 }
 
+// The coarse tool-wide aggregate budget applied in findTrippedBudget. Extends the
+// expensive-media budget with get_chat_history's higher cross-bucket timeout cap
+// (ENG-291). Kept separate from mediaFailureBudget so shouldTrackInSessionScope's
+// media branch is unchanged — get_chat_history reaches the session bucket only via
+// its timeout branch, so this aggregate counts get_chat_history TIMEOUTS specifically,
+// not one-off arg errors.
+function aggregateFailureBudget(toolName: string): number | null {
+  if (toolName === 'get_chat_history') return CHAT_HISTORY_FAILURE_BUDGET;
+  return mediaFailureBudget(toolName);
+}
+
 function countToolFailures(runId: string, toolName: string): number {
   const counts = runFailureCounts.get(runId);
   if (!counts) return 0;
@@ -429,7 +451,7 @@ function countToolFailures(runId: string, toolName: string): number {
 }
 
 function findTrippedBudget(runId: string, toolName: string): { count: number; budget: number } | null {
-  const budget = mediaFailureBudget(toolName);
+  const budget = aggregateFailureBudget(toolName);
   if (budget == null) return null;
   const count = countToolFailures(runId, toolName);
   return count >= budget ? { count, budget } : null;
