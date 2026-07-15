@@ -2,6 +2,7 @@ import {
   _resetV0UsageGuardForTest,
   buildV0IdempotencyKey,
   isReservationBlocking,
+  canReuseChat,
   guardedV0ChatCreate,
   guardedV0CorrectionMessage,
   getV0UsageCountForScope,
@@ -235,25 +236,32 @@ describe('v0UsageGuard', () => {
     expect(create).toHaveBeenCalledTimes(2);
   });
 
-  test('allows only one correction message per chat', async () => {
+  test('dedupes a double-fire of the SAME correction attempt', async () => {
     const send = jest.fn().mockResolvedValue({ ok: true });
+    const args = { userId: 'user_1', scopeId: 'page_1', chatId: 'chat_1', attempt: 0, send };
 
-    const first = await guardedV0CorrectionMessage({
-      userId: 'user_1',
-      scopeId: 'page_1',
-      chatId: 'chat_1',
-      send,
-    });
-    const second = await guardedV0CorrectionMessage({
-      userId: 'user_1',
-      scopeId: 'page_1',
-      chatId: 'chat_1',
-      send,
-    });
+    const first = await guardedV0CorrectionMessage(args);
+    const second = await guardedV0CorrectionMessage(args);
 
     expect(first).toEqual({ ok: true });
     expect(second).toEqual({ skipped: true });
     expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  test('a LATER correction attempt on the same chat still sends — the validation loop is 3 attempts, not 1 (ENG-287 residual F7)', async () => {
+    // The correction key used to be (user, scope, chatId) with no attempt component, so
+    // once the first correction succeeded every subsequent attempt returned {skipped:true}.
+    // The call sites ignore that flag, so the loop re-downloaded the SAME broken zip and
+    // failed identically — the 3-attempt self-heal was really 1 attempt + 2 wasted rounds.
+    const send = jest.fn().mockResolvedValue({ ok: true });
+    const base = { userId: 'user_1', scopeId: 'page_1', chatId: 'chat_1', send };
+
+    const first = await guardedV0CorrectionMessage({ ...base, attempt: 0 });
+    const second = await guardedV0CorrectionMessage({ ...base, attempt: 1 });
+
+    expect(first).toEqual({ ok: true });
+    expect(second).toEqual({ ok: true });
+    expect(send).toHaveBeenCalledTimes(2);
   });
 
   test('a FAILED correction does not skip the retry — the validation loop depends on it (ENG-287)', async () => {
@@ -299,5 +307,92 @@ describe('v0UsageGuard', () => {
 
     expect(second).toMatchObject({ id: 'chat_new' });
     expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  describe('chat reuse is bounded by age — a `succeeded` row must not be immortal (ENG-287 residual F2)', () => {
+    // `status: succeeded` means "the CHAT was created", NOT "a page was delivered".
+    // Reuse is correct while v0 is merely slow (resume is free and catches a late
+    // completion). It is a permanent wedge once the chat is a dead end: every retry
+    // reuses the same dead chat, and since the prompt is deliberately not part of the
+    // key, retrying with a DIFFERENT prompt changes nothing. The age ceiling is the
+    // backstop that makes "cannot wedge" a guarantee rather than a hope.
+    const args = () => ({
+      userId: 'user_1',
+      operation: 'additional_page_chat_create' as const,
+      scopeId: 'site_1',
+      slug: 'book-a-demo',
+      prompt: 'p',
+    });
+
+    test('a FRESH succeeded chat is still reused — a slow v0 generation resumes for free', async () => {
+      jest.useFakeTimers().setSystemTime(new Date('2026-07-10T04:00:00.000Z'));
+      const create = jest.fn().mockResolvedValue({ id: 'chat_1' });
+
+      await guardedV0ChatCreate({ ...args(), create });
+      // Retry 10 min later — inside the reuse ceiling. v0 may still be finishing.
+      jest.setSystemTime(new Date('2026-07-10T04:10:00.000Z'));
+      const second = await guardedV0ChatCreate({ ...args(), create });
+
+      expect(second).toEqual({ id: 'chat_1', reused: true });
+      expect(create).toHaveBeenCalledTimes(1); // no second charge
+    });
+
+    test('canReuseChat: a succeeded row with an unreadable createdAt is not reusable (and so must be reclaimable — see the dynamo condition)', () => {
+      // Refusing to reuse an unknown-age chat is only safe because `reserveInDynamo` carries
+      // a matching `attribute_not_exists(createdAt)` clause that lets the row be RECLAIMED.
+      // Without that second half this would fail CLOSED — every attempt throwing "already in
+      // progress", forever — which is the exact eternal wedge this guard exists to kill.
+      const now = Date.parse('2026-07-10T04:00:00.000Z');
+      const row: V0UsageRecord = {
+        idempotencyKey: 'k',
+        userId: 'u',
+        operation: 'additional_page_chat_create',
+        scopeId: 's',
+        chatId: 'chat_legacy',
+        status: 'succeeded',
+        createdAt: 'not-a-date',
+        updatedAt: 'not-a-date',
+      };
+      expect(canReuseChat(row, now)).toBe(false);
+      expect(canReuseChat({ ...row, createdAt: new Date(now - 60_000).toISOString() }, now)).toBe(true);
+    });
+
+    test('a STALE succeeded chat is NOT reused — the retry mints a fresh chat instead of wedging forever', async () => {
+      jest.useFakeTimers().setSystemTime(new Date('2026-07-10T04:00:00.000Z'));
+      const create = jest
+        .fn()
+        .mockResolvedValueOnce({ id: 'chat_dead' })
+        .mockResolvedValueOnce({ id: 'chat_fresh' });
+
+      await guardedV0ChatCreate({ ...args(), create });
+      // Past the 45-min reuse ceiling: whatever happened to chat_dead, it is never
+      // going to deliver. Without this, the route is unbuildable for all time.
+      jest.setSystemTime(new Date('2026-07-10T05:00:00.000Z'));
+      const second = await guardedV0ChatCreate({ ...args(), create });
+
+      expect(second).toMatchObject({ id: 'chat_fresh' });
+      expect(create).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  test('deleting a ROOT page does not free a sub-page identity that merely shares its slug (ENG-287 residual F11b)', async () => {
+    const create = jest.fn().mockResolvedValue({ id: 'chat_subpage' });
+    const subPage = {
+      userId: 'user_1',
+      operation: 'additional_page_chat_create' as const,
+      scopeId: 'site_1',
+      slug: 'pricing',
+      prompt: 'p',
+      create,
+    };
+
+    await guardedV0ChatCreate(subPage);
+    // Root pages have no slug. Passing a slug derived from the root's NAME could collide
+    // with a real sub-page route on the same site and free the wrong identity.
+    await clearV0UsageForPage({ userId: 'user_1', pageId: 'root_page', siteId: 'site_1' });
+    const afterRootDelete = await guardedV0ChatCreate(subPage);
+
+    expect(afterRootDelete).toEqual({ id: 'chat_subpage', reused: true });
+    expect(create).toHaveBeenCalledTimes(1);
   });
 });

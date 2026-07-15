@@ -1363,7 +1363,14 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/iterate`, context: ctx(context),
-      body: { message: args.message }
+      body: { message: args.message },
+      // An iteration is a full v0 generation round — it takes as long as a build. This passed
+      // NO timeout, so it fell back to the ~5-min default and aborted while v0 was still
+      // working. Matched to generate_landing_page. Note the global undici headersTimeout
+      // (15 min, mcp/server/httpClient.ts) is the real ceiling above this; past that the call
+      // still aborts, but the edit lands and the record is left deployable, so the user can
+      // finish from the portal instead of losing the edit. (ENG-287 follow-up)
+      timeoutMs: 25 * 60 * 1000
     });
     return jsonResult(data);
   }
