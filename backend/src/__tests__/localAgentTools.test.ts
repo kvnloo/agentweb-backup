@@ -1,7 +1,9 @@
 import {
   buildLocalAgentResult,
   isProcessCrashReturncode,
+  isLikelyRelayTimeoutKill,
   buildLocalAgentCrashResult,
+  buildLocalAgentTimeoutResult,
 } from '../emma/localAgentTools';
 import { toolResultError } from '../utils/toolResultError';
 
@@ -95,6 +97,68 @@ describe('isProcessCrashReturncode — worker killed by a signal (ENG-339)', () 
   it('does NOT flag a missing or non-numeric returncode', () => {
     expect(isProcessCrashReturncode(undefined)).toBe(false);
     expect(isProcessCrashReturncode(NaN)).toBe(false);
+  });
+
+  it('holds exactly at the -2 / 128 thresholds it depends on (off-by-one guard)', () => {
+    expect(isProcessCrashReturncode(-2)).toBe(true);  // first signal code past the -1 sentinel
+    expect(isProcessCrashReturncode(128)).toBe(false); // 128 = 128+0, no signal → not a crash
+  });
+});
+
+/**
+ * ENG-339 refix — returncode -9/137 is NOT unique to OOM. The relay SIGKILLs the
+ * worker on its OWN per-task timeout (runner.py) and returns HTTP 200 + returncode
+ * -9, indistinguishable from OOM by code alone. A slow-but-healthy task (the
+ * 3-subreddit digest needing >120s) must be treated as a retryable timeout, not a
+ * non-retryable crash. We disambiguate by elapsed wall-time.
+ */
+describe('isLikelyRelayTimeoutKill — timeout-kill vs genuine crash (ENG-339)', () => {
+  it('flags a SIGKILL that ran the full timeout window as a relay timeout', () => {
+    expect(isLikelyRelayTimeoutKill(-9, 120_000, 120)).toBe(true);
+    expect(isLikelyRelayTimeoutKill(137, 118_000, 120)).toBe(true); // shell encoding, just shy of the window
+  });
+
+  it('does NOT flag a SIGKILL that died well under the timeout (genuine OOM crash)', () => {
+    expect(isLikelyRelayTimeoutKill(-9, 12_000, 120)).toBe(false);
+    expect(isLikelyRelayTimeoutKill(137, 5_000, 120)).toBe(false);
+  });
+
+  it('only treats SIGKILL as timeout-ambiguous — other fatal signals are always crashes', () => {
+    expect(isLikelyRelayTimeoutKill(-11, 120_000, 120)).toBe(false); // SIGSEGV never comes from the timeout path
+    expect(isLikelyRelayTimeoutKill(-6, 120_000, 120)).toBe(false);  // SIGABRT
+  });
+
+  it('is robust to a missing/invalid elapsed or timeout', () => {
+    expect(isLikelyRelayTimeoutKill(-9, NaN, 120)).toBe(false);
+    expect(isLikelyRelayTimeoutKill(-9, 120_000, 0)).toBe(false);
+  });
+});
+
+describe('buildLocalAgentTimeoutResult — graceful, RETRYABLE timeout (ENG-339)', () => {
+  it('returns success:true so it does not trip the repeated-failure breaker', () => {
+    const r = buildLocalAgentTimeoutResult(-9, 120);
+    expect(r.success).toBe(true);
+    expect(r.reason).toBe('timed_out');
+    expect(toolResultError(r)).toBeNull();
+  });
+
+  it('preserves the retry path with a backed-off, capped timeout', () => {
+    const r = buildLocalAgentTimeoutResult(-9, 120);
+    expect(r.suggestedTimeoutSeconds).toBe(240);
+    expect(r.formattedContent).toContain('Retry run_local_agent_task');
+    expect(r.formattedContent).toContain('240');
+  });
+
+  it('caps the suggested timeout at 900 and, at the ceiling, stops retrying', () => {
+    expect(buildLocalAgentTimeoutResult(-9, 600).suggestedTimeoutSeconds).toBe(900);
+    const atMax = buildLocalAgentTimeoutResult(-9, 900);
+    expect(atMax.suggestedTimeoutSeconds).toBe(900);
+    expect(atMax.formattedContent).not.toContain('Retry run_local_agent_task');
+    expect(atMax.formattedContent.toLowerCase()).toContain('fall back');
+  });
+
+  it('does NOT mislabel a timeout as out of memory', () => {
+    expect(buildLocalAgentTimeoutResult(-9, 120).message.toLowerCase()).not.toContain('memory');
   });
 });
 
