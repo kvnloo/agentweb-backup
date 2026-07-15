@@ -24,9 +24,10 @@ const mockGenerateContentStream = jest.fn();
 // Use manual mock from __mocks__ directory
 jest.mock('@google/genai');
 
-jest.mock('../services/usageRecorderService', () => ({ recordUsage: jest.fn() }));
-import { recordUsage } from '../services/usageRecorderService';
+jest.mock('../services/usageRecorderService', () => ({ recordUsage: jest.fn(), meterUserUsage: jest.fn() }));
+import { recordUsage, meterUserUsage } from '../services/usageRecorderService';
 const mockRecordUsage = recordUsage as jest.Mock;
+const mockMeterUserUsage = meterUserUsage as jest.Mock;
 
 describe('ImageService', () => {
   let imageService: ImageService;
@@ -73,7 +74,8 @@ describe('ImageService', () => {
       });
 
       expect(result.success).toBe(true);
-      expect(mockRecordUsage).toHaveBeenCalledWith(
+      // image_generation now CHARGES the user's cap (meterUserUsage), not burn-only.
+      expect(mockMeterUserUsage).toHaveBeenCalledWith(
         expect.objectContaining({
           userId: 'user123',
           model: 'gemini-3-pro-image-preview',
@@ -83,7 +85,7 @@ describe('ImageService', () => {
       );
     });
 
-    it('does not record an image_generation cost when the model is invalid (no generation)', async () => {
+    it('does not charge an image_generation cost when the model is invalid (no generation)', async () => {
       const result = await imageService.generateImage({
         prompt: 'x',
         filename: 'x.png',
@@ -91,7 +93,7 @@ describe('ImageService', () => {
         imageModel: 'not-a-real-model' as any,
       });
       expect(result.success).toBe(false);
-      expect(mockRecordUsage).not.toHaveBeenCalledWith(
+      expect(mockMeterUserUsage).not.toHaveBeenCalledWith(
         expect.objectContaining({ feature: 'image_generation' })
       );
     });

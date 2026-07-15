@@ -29,9 +29,10 @@ jest.mock('../mcp/client/mcpClientService', () => ({
   })),
 }));
 
-jest.mock('../services/usageRecorderService', () => ({ recordUsage: jest.fn() }));
-import { recordUsage } from '../services/usageRecorderService';
+jest.mock('../services/usageRecorderService', () => ({ recordUsage: jest.fn(), meterUserUsage: jest.fn() }));
+import { recordUsage, meterUserUsage } from '../services/usageRecorderService';
 const mockRecordUsage = recordUsage as jest.Mock;
+const mockMeterUserUsage = meterUserUsage as jest.Mock;
 
 describe('VideoService', () => {
   let videoService: VideoService;
@@ -307,13 +308,13 @@ describe('VideoService', () => {
       expect(genCall[1].params.model).toBe('seedance_2_0');
     });
 
-    it('meters the successful Seedance generation exactly once at the source (burn-only)', async () => {
+    it('charges the successful Seedance generation to the user exactly once at the source', async () => {
       routeTools();
       const result = await videoService.generateVideo({ ...baseParams });
 
       expect(result.success).toBe(true);
-      expect(mockRecordUsage).toHaveBeenCalledTimes(1);
-      expect(mockRecordUsage).toHaveBeenCalledWith(
+      expect(mockMeterUserUsage).toHaveBeenCalledTimes(1);
+      expect(mockMeterUserUsage).toHaveBeenCalledWith(
         expect.objectContaining({
           userId: 'user123',
           model: 'seedance-2.0',
@@ -333,9 +334,9 @@ describe('VideoService', () => {
 
       expect(result.success).toBe(true);
       // The failed Seedance attempt returns into the Veo recursion BEFORE its own meter,
-      // so only the terminal (successful) Veo model is recorded — exactly once.
-      expect(mockRecordUsage).toHaveBeenCalledTimes(1);
-      expect(mockRecordUsage).toHaveBeenCalledWith(
+      // so only the terminal (successful) Veo model is charged — exactly once.
+      expect(mockMeterUserUsage).toHaveBeenCalledTimes(1);
+      expect(mockMeterUserUsage).toHaveBeenCalledWith(
         expect.objectContaining({
           model: 'veo-3.1-generate-preview',
           feature: 'video_generation',
@@ -345,10 +346,10 @@ describe('VideoService', () => {
       veoSpy.mockRestore();
     });
 
-    it('does not meter when generation fails (invalid model)', async () => {
+    it('does not charge when generation fails (invalid model)', async () => {
       const result = await videoService.generateVideo({ ...baseParams, videoModel: 'not-a-real-model' });
       expect(result.success).toBe(false);
-      expect(mockRecordUsage).not.toHaveBeenCalled();
+      expect(mockMeterUserUsage).not.toHaveBeenCalled();
     });
 
     it('falls back to Veo when Seedance THROWS (auth/credits/stream error)', async () => {
