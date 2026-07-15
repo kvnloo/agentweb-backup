@@ -35,6 +35,16 @@ function withDerivedCache(inPerM: number, outPerM: number): ModelPrice {
   };
 }
 
+// Fable 5 / Haiku 4.5 list prices, confirmed against Anthropic's official pricing
+// (Fable $10/$50, Haiku $1/$5). Defined once and registered under BOTH the bare
+// Vertex id (e.g. claude-fable-5) and the anthropic.-prefixed Bedrock id, because
+// the registry key ENG-199 uses depends on the provider it wires Fable through
+// (Vertex → bare, Bedrock → anthropic.<id>). Same object reference on both keys so
+// the two can never drift. Without the prefixed key, a Bedrock rollout would miss
+// the lookup and record $0 — the exact blind spot ENG-200 exists to close.
+const FABLE_5_PRICE = withDerivedCache(10, 50);
+const HAIKU_4_5_PRICE = withDerivedCache(1, 5);
+
 /**
  * Token-priced models. Sources:
  * - Ported from agentModeService.estimateCost() where present.
@@ -46,30 +56,51 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   // ── AWS Bedrock Anthropic (ported from estimateCost) ───────────────────────
   'anthropic.claude-sonnet-4-5-20250929-v1:0': withDerivedCache(3, 15),
   'anthropic.claude-sonnet-4-6': withDerivedCache(3, 15),
-  'anthropic.claude-opus-4-6-v1': withDerivedCache(15, 75),
-  'anthropic.claude-opus-4-8': withDerivedCache(15, 75),
+  'anthropic.claude-opus-4-6-v1': withDerivedCache(5, 25),
+  'anthropic.claude-opus-4-8': withDerivedCache(5, 25),
+  // Anthropic dropped Opus to $5/$25 at the 4.5 generation; the old $15/$75 rate
+  // above was stale (ported from estimateCost) and overcharged the cost cap 3x.
+  // Fable 5 is ENG-200's target model — staged here so the cost cap is accurate
+  // the moment ENG-199 wires it into the registry, under whichever provider id it
+  // ends up invoked as (Vertex bare or Bedrock anthropic.-prefixed — see above).
+  'claude-fable-5': FABLE_5_PRICE,
+  'anthropic.claude-fable-5': FABLE_5_PRICE,
+  'claude-haiku-4-5': HAIKU_4_5_PRICE,
+  'anthropic.claude-haiku-4-5': HAIKU_4_5_PRICE,
 
   // ── Azure OpenAI chat deployments ───────────────────────────────────────────
   'gpt-5-chat-2': withDerivedCache(2.5, 10), // ported from estimateCost
-  'gpt-5.2-chat': withDerivedCache(3, 12), // ported from estimateCost
-  'gpt-5.4': withDerivedCache(2.5, 10), // input $2.50/M per public listings; output UNVERIFIED (estimated at 4x input, matching gpt-5-chat-2 ratio)
+  'gpt-5.2-chat': withDerivedCache(1.75, 14), // developers.openai.com/api/docs/models/gpt-5.2
+  'gpt-5.4': withDerivedCache(2.5, 15), // developers.openai.com/api/docs/pricing
   'gpt-5.4-nano': withDerivedCache(0.2, 1.25), // per public listings (pricepertoken/gptbreeze, Jun 2026)
-  'gpt-5.5': withDerivedCache(5, 30), // OpenAI direct list price; UNVERIFIED for Azure deployments (Azure rate may differ)
+  'gpt-5.5': withDerivedCache(5, 30), // $5/$30 in/out + $0.50/1M cached — developers.openai.com/api/docs/pricing (Apr 23 2026 GPT-5-line price doubling); cache-read derives to $0.50, matching the published rate
 
   // ── Google Gemini ────────────────────────────────────────────────────────────
-  'gemini-3-pro-preview': withDerivedCache(1.25, 10), // ported from estimateCost
-  'gemini-3-flash-preview': withDerivedCache(0.15, 0.6), // ported from estimateCost
-  'gemini-3.1-pro-preview': withDerivedCache(1.25, 10), // ported from estimateCost
-  'gemini-3.1-flash-lite': withDerivedCache(0.075, 0.3), // ported from estimateCost
-  'gemini-3.5-flash': withDerivedCache(0.15, 0.6), // ported from estimateCost
-  'gemini-3.1-flash-live-preview': withDerivedCache(0.75, 4.5), // text rate per public listings (cloudprice, Jun 2026); UNVERIFIED — audio/video tokens are billed at higher live-API rates not modeled here
+  // All Gemini rates verified against ai.google.dev/gemini-api/docs/pricing (Jul 2026).
+  // Standard (≤200K prompt) rates; gemini-3.1-pro doubles above 200K (not modeled here).
+  'gemini-3-pro-preview': withDerivedCache(1.25, 10), // DEPRECATED 2026-03-09 (migrate to 3.1-pro); rate left as last-known
+  'gemini-3-flash-preview': withDerivedCache(0.5, 3), // was 0.15/0.6 — stale
+  'gemini-3.1-pro-preview': withDerivedCache(2, 12), // was 1.25/10 — stale
+  'gemini-3.1-flash-lite': withDerivedCache(0.25, 1.5), // was 0.075/0.3 — stale
+  'gemini-3.5-flash': withDerivedCache(1.5, 9), // was 0.15/0.6 — stale
+  'gemini-2.5-flash': withDerivedCache(0.3, 2.5), // text/chat model — was MISSING (recorded $0)
+  'gemini-3.1-flash-live-preview': withDerivedCache(0.75, 4.5), // $0.75/$4.50 text tokens — verified (langcopilot/cloudprice, 2026). SCOPE: audio/video tokens on the Live API bill at higher per-modality rates not modeled here; this is the text-token approximation used for cost metering.
+  // Deep Research agents (Gemini) report usage via usageMetadata and run on
+  // Gemini 3.1 Pro token rates: $2/1M in, $12/1M out (tokencost.app, Jul 2026;
+  // matches gemini-3.1-pro-preview above). Per-task Google Search grounding is
+  // billed separately at a per-query rate — not a per-token cost, so not modeled here.
+  'deep-research-preview-04-2026': withDerivedCache(2, 12),
+  'deep-research-max-preview-04-2026': withDerivedCache(2, 12), // same per-token rate as standard; Max differs in task depth / search volume, not token price
 
   // ── Chatbot (Emma) Azure deployments ────────────────────────────────────────
   // NOTE: chatbotService.calculateCost() carries per-1K rates that are 10x the
   // published Azure list prices (likely a long-standing bug). The shadow price
   // book uses the official list prices instead — the comparison endpoint is
   // expected to surface this discrepancy.
-  'gpt-4o': withDerivedCache(2.5, 10),
+  // OpenAI publishes gpt-4o cached input at $1.25/1M (50% of the $2.50 input rate),
+  // not the 10%-of-input default our convention would derive ($0.25). Override the
+  // cache-read rate with the real published number; write stays on the convention.
+  'gpt-4o': { ...withDerivedCache(2.5, 10), cacheReadPerM: 1.25 },
   'gpt-4.1': withDerivedCache(2, 8),
   'gpt-4': withDerivedCache(30, 60), // legacy default deployment name; official GPT-4 8k list price
 
@@ -87,7 +118,7 @@ export const IMAGE_GENERATION_PRICING_USD: Record<string, number> = {
   'gpt-image-1': 0.04,
   'gpt-image-2': 0.04,
   'gemini-2.5-flash-image': 0.039,
-  'gemini-3-pro-image-preview': 0.039,
+  'gemini-3-pro-image-preview': 0.134, // Pro ("Nano Banana Pro") standard-tier; was mispriced at flash-tier 0.039 (ai.google.dev)
   'gemini-3.1-flash-image': 0.039,
   // Legacy preview id kept so historical usage records still price correctly.
   'gemini-3.1-flash-image-preview': 0.039,
@@ -100,12 +131,71 @@ export const IMAGE_GENERATION_PRICING_USD: Record<string, number> = {
  * Ported from agentModeService.estimateVideoGenerationCost().
  */
 export const VIDEO_GENERATION_PRICING_USD_PER_CLIP: Record<string, number> = {
-  'veo-3.1-generate-preview': 2.8,
-  'veo-3.1-fast-generate-preview': 1.4,
+  'veo-3.1-generate-preview': 3.2, // $0.40/s x 8s, audio incl. (ai.google.dev); was 2.8
+  'veo-3.1-fast-generate-preview': 1.4, // within official fast range ($0.10-0.30/s)
+  'veo-3-generate-preview': 3.2, // $0.40/s x 8s (ai.google.dev); was unpriced -> recorded $0
+  // Seedance 2.0: effective Higgsfield rate for a 720p 8s standard clip = $1.55
+  // (Higgsfield's own published per-clip cost, higgsfield.ai/blog/seedance-2-0-pricing-2026;
+  // cross-checked ~40 credits/clip x $0.039/credit on the Plus plan = $1.56). Our path is
+  // Higgsfield MCP, so this beats the fal.ai proxy ($2.43). Fast mode would be $1.20.
+  'seedance-2.0': 1.55,
 };
+
+/**
+ * Per-generation USD cost for an image model (billed per image, not per token).
+ * Single source of truth for image cost — used by the generation source meter and
+ * agent-mode session accounting alike.
+ */
+export function imageGenerationCostUsd(model: string): number {
+  return IMAGE_GENERATION_PRICING_USD[model] ?? 0.04;
+}
+
+/**
+ * Per-generation USD cost for a video model. Video is billed per 8s clip; a longer
+ * requested duration bills as ceil(seconds / 8) clips.
+ */
+export function videoGenerationCostUsd(model: string, durationSeconds?: number): number {
+  const clipPrice = VIDEO_GENERATION_PRICING_USD_PER_CLIP[model] ?? 3.2;
+  const VEO_MAX_SECONDS = 8;
+  const clipCount =
+    durationSeconds && durationSeconds > VEO_MAX_SECONDS
+      ? Math.ceil(durationSeconds / VEO_MAX_SECONDS)
+      : 1;
+  return clipPrice * clipCount;
+}
 
 /** Models we've already warned about this process — dedupes the unknown-model warn. */
 const warnedUnknownModels = new Set<string>();
+
+/**
+ * Rolling-alias model ids that providers return in `response.model` but that are
+ * NOT literal registry keys. Azure/OpenAI report a rolling alias for some
+ * deployments (e.g. the gpt-5-chat-2 deployment reports "gpt-chat-latest"), so
+ * without this map that usage meters at $0. Map alias → canonical registry key.
+ */
+const MODEL_ID_ALIASES: Record<string, string> = {
+  'gpt-chat-latest': 'gpt-5-chat-2',
+};
+
+/** Trailing dated-snapshot suffix, e.g. "-2025-04-14" on "gpt-4.1-2025-04-14". */
+const DATE_SNAPSHOT_SUFFIX = /-\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Collapse a provider-returned model id to its canonical pricing key. Handles the
+ * two ways Azure/OpenAI `response.model` drifts from the deployment/registry name:
+ * a rolling alias (MODEL_ID_ALIASES) or a dated snapshot suffix
+ * ("gpt-4.1-2025-04-14" → "gpt-4.1"). Returns the input unchanged when neither
+ * applies — so an unknown model stays unknown (never a false price match).
+ */
+function canonicalModelId(model: string): string {
+  // Defensive: recordUsage may call getModelPrice with a missing/empty model
+  // (typed string, but undefined at runtime) — return it unchanged, never throw.
+  if (typeof model !== 'string' || !model) return model;
+  if (MODEL_ID_ALIASES[model]) return MODEL_ID_ALIASES[model];
+  const stripped = model.replace(DATE_SNAPSHOT_SUFFIX, '');
+  if (stripped !== model && MODEL_ID_ALIASES[stripped]) return MODEL_ID_ALIASES[stripped];
+  return stripped;
+}
 
 /**
  * Look up the token price for a model.
@@ -117,6 +207,17 @@ const warnedUnknownModels = new Set<string>();
 export function getModelPrice(model: string): ModelPrice | null {
   const price = MODEL_PRICING[model];
   if (price) return price;
+
+  // Normalize provider-returned `response.model` drift (rolling aliases + dated
+  // snapshot suffixes) to the canonical registry key before giving up. This is
+  // not "substitute another model's price" — it resolves the SAME model reported
+  // under a non-canonical id (e.g. "gpt-4.1-2025-04-14" → "gpt-4.1"), which would
+  // otherwise meter at $0.
+  const canonical = canonicalModelId(model);
+  if (canonical !== model) {
+    const canonicalPrice = MODEL_PRICING[canonical];
+    if (canonicalPrice) return canonicalPrice;
+  }
 
   // Image and video models are intentionally NOT token-priced — they are billed
   // per-image / per-clip via IMAGE_GENERATION_PRICING_USD and

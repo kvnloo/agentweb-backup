@@ -2,6 +2,7 @@ import { scheduleDb, userDb, socialEngagementTrackingDb } from '../services/db';
 import { LinkedInAdapter } from '../services/adapters/linkedInAdapter';
 import { ConnectedAccount } from '../services/connectedAccountsDb';
 import { agentModeService } from '../services/agentModeService';
+import { meterUsageFromResponse } from '../utils/llmClients';
 import { v4 as uuidv4 } from 'uuid';
 import { isCronEnabled } from '../utils/instanceState';
 import { cronJobRegistry } from '../utils/cronJobRegistry';
@@ -327,7 +328,7 @@ export class SocialEngagementExecutor {
                     console.log(`[Executor] Account ${engagingConnection.account_id} already commented on ${postId}, skipping comment.`);
                 } else {
                     const recentComments = await socialEngagementTrackingDb.getRecentGeneratedTexts(engagingConnection.account_id, 10);
-                    const comment = await this.generatePostComment(postContent, engagerMemory, engagerPersonality, ownerContext, recentComments);
+                    const comment = await this.generatePostComment(postContent, engagerMemory, engagerPersonality, ownerContext, recentComments, engagingUserId);
                     if (!comment) {
                         console.warn(`[Executor] No usable comment generated for ${postId}, skipping comment.`);
                     } else {
@@ -342,7 +343,7 @@ export class SocialEngagementExecutor {
 
         if (doLike) {
             try {
-                reactionType = await this.generateReactionType(postContent || '');
+                reactionType = await this.generateReactionType(postContent || '', engagingUserId);
                 await adapter.createReaction(engagingConnection, postId, reactionType, engagingUserId);
                 console.log(`[Executor] Reacted "${reactionType}" on post ${postId}`);
             } catch (likeErr: any) {
@@ -414,7 +415,7 @@ export class SocialEngagementExecutor {
         }
     }
 
-    private async generatePostComment(postContent: string, engagerMemory?: string, personality?: { presets: string[]; custom?: string }, ownerContext?: { name?: string; memory?: string }, recentComments?: string[]): Promise<string | null> {
+    private async generatePostComment(postContent: string, engagerMemory?: string, personality?: { presets: string[]; custom?: string }, ownerContext?: { name?: string; memory?: string }, recentComments?: string[], engagingUserId?: string): Promise<string | null> {
         try {
             let systemPrompt = POST_COMMENT_SYSTEM_PROMPT;
             if (personality?.presets?.length || personality?.custom) {
@@ -444,6 +445,14 @@ export class SocialEngagementExecutor {
                 ],
                 temperature: COMMENT_TEMPERATURE,
             });
+            // Charge automated engagement spend to the account owner's quota — policy:
+            // every LLM call with a real userId is billed to that user, nothing absorbed.
+            meterUsageFromResponse({
+                userId: engagingUserId,
+                model: COMMENT_MODEL,
+                provider: 'gemini',
+                feature: 'social_engagement_comment',
+            }, completion);
             const sanitized = sanitizeGeneratedComment(completion.choices[0]?.message?.content);
             if (sanitized) return sanitized;
             console.warn(`[Executor] Generated comment rejected by sanitizer (refusal/meta/empty), skipping comment.`);
@@ -455,7 +464,7 @@ export class SocialEngagementExecutor {
         return null;
     }
 
-    private async generateReactionType(content: string): Promise<LinkedInReaction> {
+    private async generateReactionType(content: string, engagingUserId?: string): Promise<LinkedInReaction> {
         try {
             const geminiClient = await agentModeService.getGeminiClient();
             const completion = await geminiClient.chat.completions.create({
@@ -466,6 +475,12 @@ export class SocialEngagementExecutor {
                 ],
                 temperature: 0.1,
             });
+            meterUsageFromResponse({
+                userId: engagingUserId,
+                model: COMMENT_MODEL,
+                provider: 'gemini',
+                feature: 'social_engagement_reaction',
+            }, completion);
             const raw = completion.choices[0]?.message?.content?.trim().toUpperCase() as LinkedInReaction;
             if (VALID_REACTIONS.includes(raw)) return raw;
             console.warn(`[Executor] LLM returned invalid reaction "${raw}", defaulting to LIKE`);
@@ -510,7 +525,7 @@ export class SocialEngagementExecutor {
                 console.warn(`[Executor] Skipping reply on ${commentId}: original comment text unavailable.`);
             } else {
                 const recentComments = await socialEngagementTrackingDb.getRecentGeneratedTexts(engagingConnection.account_id, 10);
-                const reply = await this.generateCommentReply(commentText, engagerMemory, engagerPersonality, recentComments);
+                const reply = await this.generateCommentReply(commentText, engagerMemory, engagerPersonality, recentComments, engagingUserId);
                 if (!reply) {
                     console.warn(`[Executor] No usable reply generated for ${commentId}, skipping reply.`);
                 } else {
@@ -524,7 +539,7 @@ export class SocialEngagementExecutor {
 
         if (doLike) {
             try {
-                reactionType = await this.generateReactionType(commentText || '');
+                reactionType = await this.generateReactionType(commentText || '', engagingUserId);
                 await adapter.createReaction(engagingConnection, commentId, reactionType, engagingUserId);
                 console.log(`[Executor] Reacted "${reactionType}" on comment ${commentId}`);
             } catch (likeErr: any) {
@@ -543,7 +558,7 @@ export class SocialEngagementExecutor {
         return { generatedText, reactionType };
     }
 
-    private async generateCommentReply(commentText: string, engagerMemory?: string, personality?: { presets: string[]; custom?: string }, recentComments?: string[]): Promise<string | null> {
+    private async generateCommentReply(commentText: string, engagerMemory?: string, personality?: { presets: string[]; custom?: string }, recentComments?: string[], engagingUserId?: string): Promise<string | null> {
         try {
             let systemPrompt = COMMENT_REPLY_SYSTEM_PROMPT;
             if (personality?.presets?.length || personality?.custom) {
@@ -567,6 +582,13 @@ export class SocialEngagementExecutor {
                 ],
                 temperature: COMMENT_TEMPERATURE,
             });
+            // Charge automated reply spend to the account owner's quota (all-cost-to-user policy).
+            meterUsageFromResponse({
+                userId: engagingUserId,
+                model: COMMENT_MODEL,
+                provider: 'gemini',
+                feature: 'social_engagement_reply',
+            }, completion);
             const sanitized = sanitizeGeneratedComment(completion.choices[0]?.message?.content);
             if (sanitized) return sanitized;
             console.warn(`[Executor] Generated reply rejected by sanitizer (refusal/meta/empty), skipping reply.`);

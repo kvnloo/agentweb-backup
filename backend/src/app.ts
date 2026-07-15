@@ -217,7 +217,11 @@ const corsOptions = {
   // OPTIONS is intentionally omitted — the cors middleware handles preflight (OPTIONS)
   // requests automatically. This list specifies allowed methods for actual requests.
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  // Cache-Control + Pragma are needed because the top-nav UsageMeter's
+  // useTokenUsage hook cache-busts /api/subscription/usage with those request
+  // headers; cross-origin (app.agentweb.pro -> api.agentweb.pro) the browser
+  // preflights them and, if absent here, blocks the fetch so the meter never loads.
+  allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "Pragma"],
   credentials: true,
 };
 

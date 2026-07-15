@@ -297,6 +297,54 @@ describe('runCodingAgent', () => {
     expect(result.iterations).toBe(3);
   });
 
+  // --- PER-USER USAGE ACCOUNTING ---
+  // The coding agent runs a self-contained multi-turn LLM loop whose token spend is
+  // invisible to the parent agent-mode meter. runCodingAgent must surface the summed
+  // usage so the caller can charge it to the per-user token/cost cap (ENG-200).
+
+  test('accumulates token usage across turns and returns usageTotals with computed cost', async () => {
+    // Turn 1: a tool call (usage present, includes cache tokens)
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'list_files', input: {} }
+      ],
+      stop_reason: 'tool_use',
+      usage: { input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 5, cache_creation_input_tokens: 3 },
+    });
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 1000 }] });
+    // Turn 2: report success (usage present)
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Done!', status: 'success' } }
+      ],
+      stop_reason: 'tool_use',
+      usage: { input_tokens: 200, output_tokens: 40, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    });
+
+    const result = await runCodingAgent('edit the page', mockContext);
+
+    expect(result.usageTotals).toBeDefined();
+    expect(result.usageTotals!.inputTokens).toBe(300);
+    expect(result.usageTotals!.outputTokens).toBe(60);
+    expect(result.usageTotals!.cacheReadTokens).toBe(5);
+    expect(result.usageTotals!.cacheWriteTokens).toBe(3);
+    // totalTokens is every token the model processed (input + output + cache).
+    expect(result.usageTotals!.totalTokens).toBe(368);
+    // Priced via the same source as the shadow meter (Sonnet 4.6 fallback model), in USD.
+    // 300*3 + 60*15 + 5*0.3 + 3*3.75 = 1812.75, rounded to integer microUsd (1813) → $0.001813
+    expect(result.usageTotals!.costUsd).toBeCloseTo(1813 / 1e6, 9);
+  });
+
+  test('omits usageTotals when the run never made a priced LLM call', async () => {
+    // Pre-flight list_files fails with 403 before any LLM turn — no usage to report.
+    mockedMcpFetch.mockRejectedValueOnce(new Error('API error (403): Not authorized to edit this landing page'));
+
+    const result = await runCodingAgent('Change the heading', mockContext);
+
+    expect(result.success).toBe(false);
+    expect(result.usageTotals).toBeUndefined();
+  });
+
   test('max iterations failure includes files edited and preview URL', async () => {
     // Iteration 1: read_file
     mockCreate.mockResolvedValueOnce({
