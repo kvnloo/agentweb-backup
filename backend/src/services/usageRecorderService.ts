@@ -142,9 +142,14 @@ export function meterUserUsage(ctx: RecordUsageContext): void {
   const cacheReadTokens = Math.max(0, Math.round(ctx.cacheReadTokens || 0));
   const cacheWriteTokens = Math.max(0, Math.round(ctx.cacheWriteTokens || 0));
   const totalTokens = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+  // Honor an explicit dollar cost for calls that are NOT token-priced (image is
+  // billed per generation, video per clip). Without this, image/video would deduct
+  // $0 from the cap even though they're the largest costs — mirrors recordUsage.
   const costUsd =
-    computeCostMicroUsd(ctx.model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) /
-    1e6;
+    ctx.costUsdOverride != null
+      ? Math.max(0, ctx.costUsdOverride)
+      : computeCostMicroUsd(ctx.model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) /
+        1e6;
 
   if (totalTokens <= 0 && costUsd <= 0) return;
 
