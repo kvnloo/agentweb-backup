@@ -191,6 +191,25 @@ export async function getIssueComments(issueId: string): Promise<string[]> {
   return (data?.issue?.comments?.nodes || []).map((c: any) => c?.body || '');
 }
 
+/** An issue comment with its creation timestamp (ISO string), for order-sensitive consumers. */
+export interface IssueCommentDetail {
+  body: string;
+  createdAt: string;
+}
+
+/**
+ * Read an issue's comments WITH `createdAt`, so callers that need "the most recent comment" can
+ * decide by timestamp instead of relying on the API's list order. The resolve bridge uses this to
+ * pick the latest `@Emma` comment as the customer-facing resolution message (ENG-316).
+ */
+export async function getIssueCommentsDetailed(issueId: string): Promise<IssueCommentDetail[]> {
+  const data = await linearGraphQL(
+    `query($id: String!) { issue(id: $id) { comments { nodes { body createdAt } } } }`,
+    { id: issueId },
+  );
+  return (data?.issue?.comments?.nodes || []).map((c: any) => ({ body: c?.body || '', createdAt: c?.createdAt || '' }));
+}
+
 /** Add a comment to a Linear issue (used to record additional reporters on a canonical). */
 export async function addIssueComment(issueId: string, body: string): Promise<void> {
   const data = await linearGraphQL(

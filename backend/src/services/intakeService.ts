@@ -497,18 +497,51 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
  * can't block the rest; idempotent in effect (re-flipping a Completed card is a no-op; a duplicate
  * email is harmless). Returns the ticket numbers we acted on. Called by the Linear webhook handler.
  *
+ * Email body (ENG-316): if the canonical carries an `@Emma <message>` comment, the LATEST one
+ * (by createdAt) is parroted as the email body — eng controls the customer-facing "here's what
+ * happened" from inside Linear. Otherwise the default copy below is sent, unchanged.
+ *
  * Feature requests need no bridge: their Featurebase post is synced to Linear, so marking the Linear
  * issue Done flips the post to Completed and Featurebase emails every upvoter natively (verified).
  */
 const REPORTER_TICKET_RE = /\[reporter-ticket #(\d+)\s+([^\]\s]+)\]/g;
 const escapeHtml = (s: string) => s.replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c] as string));
 
+// ENG-316: an `@Emma <message>` comment on the canonical becomes the customer-facing resolution
+// email body. Tolerates both a real Linear workspace mention (raw markdown `@[Emma …](…)`) and
+// plain-text `@emma` (case-insensitive); the mention token itself is stripped from the parroted
+// text. Word-boundary rules keep email addresses (support@emma.com — a word char precedes the @)
+// and handles like @emmabyaw (no boundary after "emma") from matching.
+const EMMA_LINEAR_MENTION_RE = /@\[[^\]]*emma[^\]]*\]\([^)]*\)/gi;
+const EMMA_PLAIN_MENTION_RE = /(^|[^\w])@emma\b/gi;
+
+/**
+ * Pick the customer-facing resolution message from the canonical's comments: the MOST RECENT
+ * (by createdAt, not list order) comment mentioning @Emma, mention token stripped, trimmed.
+ * Returns null when no comment qualifies — including mention-only comments — so the default
+ * copy stays in play and we never send an empty email.
+ */
+function pickEmmaResolutionMessage(comments: Array<{ body: string; createdAt: string }>): string | null {
+  let best: { text: string; ts: number } | null = null;
+  for (const c of comments) {
+    let mentioned = false;
+    let text = (c.body || '').replace(EMMA_LINEAR_MENTION_RE, () => { mentioned = true; return ''; });
+    text = text.replace(EMMA_PLAIN_MENTION_RE, (_m, pre: string) => { mentioned = true; return pre; });
+    text = text.trim();
+    if (!mentioned || !text) continue;
+    const parsed = Date.parse(c.createdAt || '');
+    const ts = Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
+    if (!best || ts >= best.ts) best = { text, ts };
+  }
+  return best ? best.text : null;
+}
+
 export async function notifyCanonicalResolved(
   canonicalIssueId: string,
   issueTitle = 'the issue you reported',
 ): Promise<{ ticketNumbers: number[] }> {
-  const { getIssueComments } = await import('./linearService');
-  const { getTicketStatusId, patchTicketStatus } = await import('./featurebaseService');
+  const { getIssueComments, getIssueCommentsDetailed } = await import('./linearService');
+  const { getTicketStatusId, patchTicketStatus, mdToFeaturebaseHtml } = await import('./featurebaseService');
   const { resendService } = await import('./resendService');
   const { notifyReporterShipped } = await import('./shipNotifyService');
 
@@ -521,8 +554,24 @@ export async function notifyCanonicalResolved(
   }
   if (reporters.size === 0) return { ticketNumbers: [] };
 
+  // ENG-316: eng writes the "here's what happened" message as an `@Emma <message>` comment on the
+  // canonical before flipping it to Done; the latest one is parroted as the email body. Rendered
+  // via mdToFeaturebaseHtml, which HTML-escapes FIRST — Linear comments are untrusted input for a
+  // customer email. Best-effort: a lookup failure degrades to the default copy (loud warn), it
+  // never blocks notifying the reporters.
+  let emmaHtml: string | null = null;
+  try {
+    const message = pickEmmaResolutionMessage(await getIssueCommentsDetailed(canonicalIssueId));
+    emmaHtml = message ? mdToFeaturebaseHtml(message) || null : null;
+  } catch (e) {
+    console.warn('[resolve-bridge] @Emma comment lookup failed — using default copy:', e instanceof Error ? e.message : e);
+  }
+
   const completedId = await getTicketStatusId('Completed');
   const safeTitle = escapeHtml(issueTitle);
+  const emailHtml =
+    emmaHtml ??
+    `<p>Good news — the issue you reported (<strong>${safeTitle}</strong>) has been resolved. Thanks for flagging it!</p><p>If you still run into it, just reply to this email and we'll take another look.</p>`;
   const acted: number[] = [];
   for (const [num, email] of reporters) {
     // Slack ping in the reporter's own channel — ADDITIVE to the email, independent of it.
@@ -538,7 +587,7 @@ export async function notifyCanonicalResolved(
       await resendService.sendSystemEmail({
         to: email,
         subject: `Resolved: ${issueTitle}`,
-        html: `<p>Good news — the issue you reported (<strong>${safeTitle}</strong>) has been resolved. Thanks for flagging it!</p><p>If you still run into it, just reply to this email and we'll take another look.</p>`,
+        html: emailHtml,
       });
       await patchTicketStatus(num, completedId);
       acted.push(num);
