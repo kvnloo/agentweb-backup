@@ -35,6 +35,62 @@ const LINEAR_ISSUE_BASE = 'https://linear.app/emmabyaw/issue';
  */
 const REFERENCES_CANONICAL = /\b(?:AGW|ENG)-\d+\b/i;
 
+/**
+ * Explicit ticket references extracted from a report's text — the input to the deterministic
+ * exact-match short-circuit below. Only `agwNumbers` drives an exact match (see
+ * `findExactCanonicalMatch`): a bare "ENG-N" mention is intentionally NOT compared against
+ * `OpenCanonical.identifier` directly, because a report can casually NAME another ticket without
+ * actually being the same bug (e.g. "new unrelated bug, mentions ENG-500 loosely") — that must
+ * still go through the fuzzy judge, exactly as before this change. AGW-N is safe to match
+ * deterministically because it only matches when the EXACT number appears in a candidate's own
+ * private `[reporter-ticket #N ...]` comment (see `fileBugReport` below) — a real ticket-number
+ * placement, not incidental prose.
+ */
+interface CanonicalRefs {
+  agwNumbers: Set<string>;
+}
+
+function extractCanonicalRefs(text: string): CanonicalRefs {
+  const agwNumbers = new Set<string>();
+  for (const m of text.matchAll(/\bAGW-(\d+)\b/gi)) agwNumbers.add(m[1]);
+  return { agwNumbers };
+}
+
+/**
+ * Deterministic exact-match lookup for an explicit AGW-N reference — the fix for the "reported
+ * new evidence against an already-tracked bug -> fuzzy judge misses it -> duplicate filed"
+ * failure mode (ENG-329 incident). Runs BEFORE the fuzzy judge and only when the report text
+ * names a specific AGW ticket number; on any miss (bad number, stale reference, candidate outside
+ * the fetched window, a `getIssueComments` failure) it returns null and the caller falls through
+ * unchanged to the existing fuzzy dedup path — this must never throw and never block filing.
+ */
+const EXACT_MATCH_COMMENT_SCAN_LIMIT = 10; // bounds worst-case Linear calls; both lists are already
+// ordered most-recent-first, so capping below MAX_CANDIDATES (30) costs little match coverage
+// while keeping worst-case added latency comfortably under report_product_issues' 30s filing timeout.
+
+async function findExactCanonicalMatch(
+  refs: CanonicalRefs,
+  candidates: OpenCanonical[],
+): Promise<OpenCanonical | null> {
+  if (refs.agwNumbers.size === 0 || candidates.length === 0) return null;
+
+  const { getIssueComments } = await import('./linearService');
+  for (const c of candidates.slice(0, EXACT_MATCH_COMMENT_SCAN_LIMIT)) {
+    try {
+      const bodies = await getIssueComments(c.issueId);
+      for (const n of refs.agwNumbers) {
+        if (bodies.some((b) => b.includes(`[reporter-ticket #${n} `))) return c;
+      }
+    } catch (e) {
+      // Also catches a malformed (non-array) resolved value, not just a rejection — keeps the
+      // "never throw" contract even if getIssueComments' return shape is ever unexpected.
+      console.warn(`[intake] exact-ref comment scan failed for ${c.identifier}:`, e instanceof Error ? e.message : e);
+      continue; // best-effort — a read failure on one candidate must not block the others or the filing
+    }
+  }
+  return null;
+}
+
 function intakeEnabled(): boolean {
   return process.env.FEATUREBASE_INTAKE === 'true';
 }
@@ -243,10 +299,18 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   // 2. Find or create the ONE canonical Linear ticket for this bug (dedup groups reporters).
   const cans = await listOpenBugCanonicals(MAX_CANDIDATES);
   const byRef = new Map(cans.map((c) => [c.identifier, c]));
-  const dup = await findDuplicate(
-    { type: 'bug', title: p.title, description: p.description },
-    cans.map((c) => ({ ref: c.identifier, title: c.title, description: c.description })),
-  );
+  const refs = extractCanonicalRefs(`${p.title}\n${p.description}`);
+
+  // Deterministic short-circuit (fixes the ENG-329 false-duplicate incident): an explicit AGW-N
+  // reference is checked for an EXACT match — via its private reporter-ticket comment — before the
+  // fuzzy judge ever runs. No AGW-N reference present -> no-op -> behavior identical to today.
+  const exactOpenMatch = await findExactCanonicalMatch(refs, cans);
+  const dup = exactOpenMatch
+    ? { ref: exactOpenMatch.identifier, title: exactOpenMatch.title, description: exactOpenMatch.description }
+    : await findDuplicate(
+        { type: 'bug', title: p.title, description: p.description },
+        cans.map((c) => ({ ref: c.identifier, title: c.title, description: c.description })),
+      );
 
   // Reopen, not refile (ENG-240 contract #3): when no OPEN canonical matches but the report explicitly
   // references an existing ticket (regression / failed retest, e.g. "AGW-58" or "ENG-179"), match it
@@ -256,11 +320,16 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
     const resolved = await listRecentlyResolvedBugCanonicals(MAX_CANDIDATES);
     if (resolved.length) {
       const rByRef = new Map(resolved.map((c) => [c.identifier, c]));
-      const rdup = await findDuplicate(
-        { type: 'bug', title: p.title, description: p.description },
-        resolved.map((c) => ({ ref: c.identifier, title: c.title, description: c.description })),
-      );
-      reopenTarget = rdup ? rByRef.get(rdup.ref) || null : null;
+      const exactResolvedMatch = await findExactCanonicalMatch(refs, resolved);
+      if (exactResolvedMatch) {
+        reopenTarget = exactResolvedMatch;
+      } else {
+        const rdup = await findDuplicate(
+          { type: 'bug', title: p.title, description: p.description },
+          resolved.map((c) => ({ ref: c.identifier, title: c.title, description: c.description })),
+        );
+        reopenTarget = rdup ? rByRef.get(rdup.ref) || null : null;
+      }
     }
   }
 
