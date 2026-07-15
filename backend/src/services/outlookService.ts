@@ -264,6 +264,43 @@ export class OutlookService implements IEmailService {
     }
   }
 
+  /**
+   * Recent Inbox messages since a cursor — the read side of the ENG-266 Part 3
+   * bounce/complaint monitor. Stays transport-only and generic: NDR
+   * classification is the cron job's job, not this service's.
+   */
+  async listRecentInboxMessages(
+    userId: string,
+    accountId: string,
+    sinceISO: string,
+    maxResults = 50,
+  ): Promise<Array<{ id: string; subject: string; receivedDateTime: string; from: string; body: string }>> {
+    const auth = await this.authHeader(userId, accountId);
+    const url =
+      `${GRAPH_BASE}/me/mailFolders('Inbox')/messages` +
+      `?$filter=receivedDateTime ge ${encodeURIComponent(sinceISO)}` +
+      `&$select=id,subject,receivedDateTime,from,body` +
+      `&$orderby=receivedDateTime asc` +
+      `&$top=${maxResults}`;
+
+    try {
+      const { data } = await axios.get<any>(url, auth);
+      return (data?.value || []).map((m: any) => {
+        const fromAddr = m?.from?.emailAddress?.address || '';
+        const fromName = m?.from?.emailAddress?.name || '';
+        return {
+          id: m.id,
+          subject: m.subject || '',
+          receivedDateTime: m.receivedDateTime || '',
+          from: fromName ? `${fromName} <${fromAddr}>` : fromAddr,
+          body: m?.body?.content || '',
+        };
+      });
+    } catch (error: any) {
+      throw graphError(error);
+    }
+  }
+
   async getEmails(userId: string, accountId: string, messageIds: string[]): Promise<EmailBatchResult[]> {
     const auth = await this.authHeader(userId, accountId);
 

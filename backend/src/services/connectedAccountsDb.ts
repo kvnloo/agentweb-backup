@@ -127,6 +127,9 @@ export interface OutlookConfig extends BaseOAuthConfig {
   // refresh_token is inherited optional from BaseOAuthConfig, but Outlook cannot
   // function without one (offline_access grants it). outlookAuth refuses to store
   // an account lacking one, and outlookService throws if it is ever missing.
+  // Watermark for outlookBounceMonitorCron (ENG-266 Part 3) — the last receivedDateTime
+  // scanned for NDRs, so each run only looks at mail since the previous one.
+  lastNdrCheckAt?: string;
 }
 
 /**

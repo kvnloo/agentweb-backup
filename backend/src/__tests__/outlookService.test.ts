@@ -276,3 +276,72 @@ describe('OutlookService — read side', () => {
     expect((out[0] as any).error).toBeTruthy();
   });
 });
+
+describe('OutlookService — listRecentInboxMessages (ENG-266 Part 3 bounce monitor read)', () => {
+  const ndrMessage = {
+    id: 'ndr-1',
+    subject: 'Undeliverable: Hi there',
+    receivedDateTime: '2026-07-14T10:00:00Z',
+    from: { emailAddress: { address: 'postmaster@baldwin.com', name: 'Mail Delivery Subsystem' } },
+    body: { content: 'The following recipient could not be reached: bad@contractor.com', contentType: 'text' },
+  };
+
+  describe('FAIL cases', () => {
+    it('maps a 401 onto OutlookTokenRevokedError, same as the other read methods', async () => {
+      mockGetAccount.mockResolvedValue(account());
+      mockAxios.get.mockRejectedValueOnce({ response: { status: 401 } });
+
+      await expect(
+        service.listRecentInboxMessages('u1', 'habeb@baldwin.com', '2026-07-01T00:00:00Z'),
+      ).rejects.toThrow(OutlookTokenRevokedError);
+    });
+
+    it('propagates a 429 as a Graph throttling error', async () => {
+      mockGetAccount.mockResolvedValue(account());
+      mockAxios.get.mockRejectedValueOnce({ response: { status: 429 } });
+
+      await expect(
+        service.listRecentInboxMessages('u1', 'habeb@baldwin.com', '2026-07-01T00:00:00Z'),
+      ).rejects.toThrow();
+    });
+
+    it('returns an empty array for an empty inbox rather than throwing', async () => {
+      mockGetAccount.mockResolvedValue(account());
+      mockAxios.get.mockResolvedValueOnce({ data: { value: [] } });
+
+      const out = await service.listRecentInboxMessages('u1', 'habeb@baldwin.com', '2026-07-01T00:00:00Z');
+      expect(out).toEqual([]);
+    });
+  });
+
+  describe('SUCCESS cases', () => {
+    it('builds the correct $filter/$select query against the Inbox folder', async () => {
+      mockGetAccount.mockResolvedValue(account());
+      mockAxios.get.mockResolvedValueOnce({ data: { value: [ndrMessage] } });
+
+      await service.listRecentInboxMessages('u1', 'habeb@baldwin.com', '2026-07-01T00:00:00Z', 25);
+
+      const url = mockAxios.get.mock.calls[0][0] as string;
+      expect(url).toContain("mailFolders('Inbox')/messages");
+      expect(url).toContain('receivedDateTime ge 2026-07-01T00%3A00%3A00Z');
+      expect(url).toContain('$top=25');
+    });
+
+    it('maps a Graph NDR message onto the flat shape the cron classifier expects', async () => {
+      mockGetAccount.mockResolvedValue(account());
+      mockAxios.get.mockResolvedValueOnce({ data: { value: [ndrMessage] } });
+
+      const out = await service.listRecentInboxMessages('u1', 'habeb@baldwin.com', '2026-07-01T00:00:00Z');
+
+      expect(out).toEqual([
+        {
+          id: 'ndr-1',
+          subject: 'Undeliverable: Hi there',
+          receivedDateTime: '2026-07-14T10:00:00Z',
+          from: 'Mail Delivery Subsystem <postmaster@baldwin.com>',
+          body: 'The following recipient could not be reached: bad@contractor.com',
+        },
+      ]);
+    });
+  });
+});
