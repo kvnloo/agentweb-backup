@@ -11,6 +11,7 @@ export interface SubscriptionType {
   allowedConnectedAccounts?: string[]; // Array of platform types (e.g., ["linkedin", "gmail"]) or ["*"] for all; undefined = all
   allowedFunctionCalls?: string[]; // Deprecated — kept for on-read migration from old configs
   monthlyTokenAllowance?: number | null; // Monthly token limit; null/undefined = unlimited
+  monthlyCostAllowance?: number | null; // Monthly LLM spend limit in USD (cost-based cap; guards higher-cost models); null/undefined = unlimited
   monthlyExtraCostAllowance?: number | null; // Monthly extra API cost limit in USD (enrichment, etc.); null/undefined = unlimited
 }
 

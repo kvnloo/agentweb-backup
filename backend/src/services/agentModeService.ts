@@ -33,6 +33,12 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { recordUsage } from './usageRecorderService';
+import { meterUsageFromResponse } from '../utils/llmClients';
+import {
+  getModelPrice,
+  imageGenerationCostUsd,
+  videoGenerationCostUsd,
+} from '../utils/llmPricing';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
 import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmMutationEvents';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
@@ -2478,41 +2484,21 @@ export class AgentModeService {
    * Prices are per 1M tokens (input/output).
    */
   private estimateCost(model: string, inputTokens: number, outputTokens: number, cacheReadTokens: number = 0, cacheWriteTokens: number = 0): number {
-    // Pricing per 1M tokens: [input, output]
-    const pricing: Record<string, [number, number]> = {
-      'anthropic.claude-sonnet-4-5-20250929-v1:0': [3, 15],
-      'anthropic.claude-sonnet-4-6': [3, 15],
-      'anthropic.claude-opus-4-6-v1': [15, 75],
-      'anthropic.claude-opus-4-8': [15, 75],
-      'gpt-5-chat-2': [2.5, 10],
-      'gpt-5.2-chat': [3, 12],
-      'gemini-3-pro-preview': [1.25, 10],
-      'gemini-3-flash-preview': [0.15, 0.6],
-      'gemini-3.1-pro-preview': [1.25, 10],
-      'gemini-3.1-flash-lite': [0.075, 0.3],
-      'gemini-3.5-flash': [0.15, 0.6],
-    };
-    const [inputPrice, outputPrice] = pricing[model] || [3, 15]; // Default to Sonnet pricing
-    // Cache reads are 10% of input price; cache writes are 125% of input price
-    const cacheReadPrice = inputPrice * 0.1;
-    const cacheWritePrice = inputPrice * 1.25;
+    // Single source of truth for rates: llmPricing.MODEL_PRICING (via getModelPrice).
+    // Unknown models fall back to Sonnet pricing here, preserving long-standing behavior.
+    const price = getModelPrice(model);
+    const inputPrice = price?.inPerM ?? 3;
+    const outputPrice = price?.outPerM ?? 15;
+    // Cache reads are 10% of input price; cache writes are 125% of input price.
+    const cacheReadPrice = price?.cacheReadPerM ?? inputPrice * 0.1;
+    const cacheWritePrice = price?.cacheWritePerM ?? inputPrice * 1.25;
     return (inputTokens * inputPrice + outputTokens * outputPrice
       + cacheReadTokens * cacheReadPrice + cacheWriteTokens * cacheWritePrice) / 1_000_000;
   }
 
-  /** Cost per image generation in USD (fixed per-generation pricing). */
+  /** Cost per image generation in USD (fixed per-generation pricing, sourced from llmPricing). */
   private estimateImageGenerationCost(model: string): number {
-    const pricing: Record<string, number> = {
-      'gpt-image-1': 0.04,
-      'gpt-image-2': 0.04,
-      'gemini-2.5-flash-image': 0.039,
-      'gemini-3-pro-image-preview': 0.039,
-      'gemini-3.1-flash-image': 0.039,
-      'gemini-3.1-flash-image-preview': 0.039,
-      'gen4_image': 0.05,
-      'gemini_2.5_flash': 0.04,
-    };
-    return pricing[model] ?? 0.04;
+    return imageGenerationCostUsd(model);
   }
 
   private isRetryableMediaToolError(error: unknown): boolean {
@@ -2568,18 +2554,8 @@ export class AgentModeService {
 
   /** Cost per video generation in USD. Veo bills per 8s clip, so longer videos cost proportionally more. */
   private estimateVideoGenerationCost(model: string, durationSeconds?: number): number {
-    const pricePerClip: Record<string, number> = {
-      'veo-3.1-generate-preview': 2.80,
-      'veo-3.1-fast-generate-preview': 1.40,
-      // Higgsfield Seedance — approximate per-clip cost; adjust to match billed Higgsfield rates.
-      'seedance-2.0': 0.50,
-    };
-    const clipPrice = pricePerClip[model] ?? 2.80;
-    const VEO_MAX_SECONDS = 8;
-    const clipCount = durationSeconds && durationSeconds > VEO_MAX_SECONDS
-      ? Math.ceil(durationSeconds / VEO_MAX_SECONDS)
-      : 1;
-    return clipPrice * clipCount;
+    // Per-clip rates sourced from llmPricing (single source of truth).
+    return videoGenerationCostUsd(model, durationSeconds);
   }
 
   /** Returns an onUsage callback that records LLM token usage for a named tool. */
@@ -7259,24 +7235,13 @@ export class AgentModeService {
         }
       );
 
-      // Shadow usage metering (Ship 1): direct REST call, so observe the
-      // usageMetadata off the already-resolved response. Fire-and-forget +
-      // fail-open — never awaited, never throws.
-      try {
-        const usageMetadata = (apiResponse.data as any)?.usageMetadata;
-        if (usageMetadata) {
-          void recordUsage({
-            userId,
-            model: modelName,
-            provider: 'gemini',
-            feature: 'agent_task',
-            inputTokens: usageMetadata.promptTokenCount || 0,
-            outputTokens: usageMetadata.candidatesTokenCount || 0,
-            cacheReadTokens: usageMetadata.cachedContentTokenCount || 0,
-          });
-        }
-      } catch {
-        // Metering must never break the call.
+      // Usage metering (Ship 1): direct REST call — meter off the resolved response
+      // via the shared hook. Charges the user's cap (all-cost-to-user policy), fail-open.
+      if ((apiResponse.data as any)?.usageMetadata) {
+        meterUsageFromResponse(
+          { userId, model: modelName, provider: 'gemini', feature: 'agent_task' },
+          apiResponse.data
+        );
       }
 
       // Extract and format the response
@@ -11252,6 +11217,20 @@ ${emailDraftFormat === 'text'
         response_format: { type: 'json_object' }
       });
 
+      // Shadow-meter this direct Azure completion (bypasses callLLM). Burn-only, fail-open.
+      if ((completion as any)?.usage) {
+        meterUsageFromResponse(
+          {
+            userId,
+            sessionId,
+            model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
+            provider: 'azure-openai',
+            feature: 'email_draft',
+          },
+          completion
+        );
+      }
+
       const responseContent = completion.choices[0].message.content;
       if (!responseContent) {
         throw new Error('No content generated from LLM');
@@ -11352,6 +11331,14 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         max_tokens: 2048,
       } as any);
 
+      // Shadow-meter this direct Gemini completion (bypasses callLLM). Burn-only, fail-open.
+      if ((messageCompletion as any)?.usage) {
+        meterUsageFromResponse(
+          { userId, sessionId, model: 'gemini-3.5-flash', provider: 'gemini', feature: 'invite_message' },
+          messageCompletion
+        );
+      }
+
       const messageResponseContent = messageCompletion.choices[0].message.content;
       if (!messageResponseContent) {
         throw new Error('No message content generated from LLM');
@@ -11386,7 +11373,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         // guarantee — same trimInviteMessage() the inline send path uses, kept consistent.
         if (noteText.length > inviteCharLimit) {
           const { shortenInviteNoteToLimit } = await import('./inviteNoteShortener');
-          noteText = await shortenInviteNoteToLimit(geminiClient, noteText, inviteCharLimit, 2);
+          noteText = await shortenInviteNoteToLimit(geminiClient, noteText, inviteCharLimit, 2, userId, sessionId);
         }
         messageDraft = {
           content: LinkedInOutreachService.trimInviteMessage(noteText, inviteCharLimit),
@@ -20565,11 +20552,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       if (result.success && result.imageUrl) {
-        // Track generation cost (image APIs are billed per generation, not per token)
+        // Session cost accounting (agent-mode chat). The per-user burn shadow record is
+        // fired once at the generation SOURCE (imageService.generateImage) so every caller
+        // is metered exactly once — see llmPricing.imageGenerationCostUsd (ENG-200).
         const imageCost = this.estimateImageGenerationCost(imageModelUsed);
-        incrementUserTokenUsage(userId, 0, imageCost).catch((err) =>
-          console.error('AgentMode: Failed to track token usage for generateImage:', err)
-        );
         chatbotDb.addToolCostToSession(sessionId, imageCost, 'generateImage').catch((err) =>
           console.error('AgentMode: Failed to add image cost to session:', err)
         );
@@ -20708,11 +20694,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       if (result.success && result.videoUrl) {
-        // Track generation cost (video APIs are billed per 8s clip; longer videos cost more)
+        // Session cost accounting (agent-mode chat). The per-user burn shadow record is
+        // fired once at the generation SOURCE (videoService.generateVideo) so every caller
+        // is metered exactly once — see llmPricing.videoGenerationCostUsd (ENG-200).
         const videoCost = this.estimateVideoGenerationCost(videoModel || 'veo-3.1-generate-preview', durationSeconds);
-        incrementUserTokenUsage(userId, 0, videoCost).catch((err) =>
-          console.error('AgentMode: Failed to track token usage for generateVideo:', err)
-        );
         chatbotDb.addToolCostToSession(sessionId, videoCost, 'generateVideo').catch((err) =>
           console.error('AgentMode: Failed to add video cost to session:', err)
         );
@@ -21289,7 +21274,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         prompt,
         tone,
         depth,
-        focus_areas
+        focus_areas,
+        userId
       });
 
       if (!researchResult.success || !researchResult.markdownContent) {
@@ -21397,7 +21383,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           topic: researchTopic,
           prompt: requirements || undefined,
           tone: 'professional',
-          style
+          style,
+          userId
         });
 
         if (!researchResult.success || !researchResult.markdownContent) {
@@ -27713,7 +27700,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (llmTitles.length > 0) {
         try {
           const llmClient = await this.getClientForModel('gemini-2.5-flash');
-          const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, llmClient);
+          const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, llmClient, userId);
           for (let k = 0; k < llmIndices.length; k++) {
             const v = results[k];
             if (v && v !== 'NONE') leads[llmIndices[k]].company = v;
@@ -28653,6 +28640,7 @@ function parseCompanyFromTitle(title: any): string | null {
 async function batchParseCompaniesFromTitlesWithLLM(
   titles: string[],
   llmClient: any,
+  userId?: string,
 ): Promise<string[]> {
   if (!Array.isArray(titles) || titles.length === 0) return [];
   if (!llmClient?.chat?.completions?.create) return titles.map(() => 'NONE');
@@ -28681,6 +28669,15 @@ async function batchParseCompaniesFromTitlesWithLLM(
       max_completion_tokens: Math.max(500, titles.length * 30),
       temperature: 0.1,
     });
+    // Shadow-meter this direct Gemini completion (bypasses callLLM). Burn-only, fail-open.
+    // Tokens are recorded even though gemini-2.5-flash may be unpriced (cost 0
+    // until a price row exists) — token visibility is still worth having.
+    if ((completion as any)?.usage) {
+      meterUsageFromResponse(
+        { userId, model: 'gemini-2.5-flash', provider: 'gemini', feature: 'title_company_parse' },
+        completion
+      );
+    }
     const raw = String(completion?.choices?.[0]?.message?.content ?? '').trim();
     // Gemini Flash often adds preamble / postamble / markdown fences despite
     // explicit instructions. Locate the widest `[ ... ]` substring instead of
