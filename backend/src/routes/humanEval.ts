@@ -1,6 +1,15 @@
 import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
-import { humanEvalService, HumanEvalReviewType, HumanEvalStatus } from '../services/humanEvalService';
+import {
+  humanEvalService,
+  parseHumanEvalCategoryFilter,
+  HumanEvalCategory,
+  HumanEvalReviewType,
+  HumanEvalStatus,
+} from '../services/humanEvalService';
+
+const HUMAN_EVAL_STATUSES: readonly HumanEvalStatus[] = ['pending', 'reviewed'];
+const HUMAN_EVAL_REVIEW_TYPES: readonly HumanEvalReviewType[] = ['creative_image', 'landing_page', 'lead_enrichment'];
 
 const router = express.Router();
 
@@ -57,11 +66,42 @@ router.get('/candidates', async (req: Request, res: Response): Promise<void> => 
     }
 
     const { category, status, reviewType, limit } = req.query;
+
+    // Filters are validated strictly: a typo must 400, never silently coerce
+    // and return the wrong record set as a success (ENG-90 review fix).
+    let categoryFilter: HumanEvalCategory | undefined;
+    if (category !== undefined) {
+      const parsed = typeof category === 'string' ? parseHumanEvalCategoryFilter(category) : null;
+      if (parsed === null) {
+        res.status(400).json({ error: `Invalid category filter. Valid values: ad, organic_post, uncategorized.` });
+        return;
+      }
+      categoryFilter = parsed;
+    }
+
+    let statusFilter: HumanEvalStatus | undefined;
+    if (status !== undefined) {
+      if (typeof status !== 'string' || !HUMAN_EVAL_STATUSES.includes(status as HumanEvalStatus)) {
+        res.status(400).json({ error: `Invalid status filter. Valid values: ${HUMAN_EVAL_STATUSES.join(', ')}.` });
+        return;
+      }
+      statusFilter = status as HumanEvalStatus;
+    }
+
+    let reviewTypeFilter: HumanEvalReviewType | undefined;
+    if (reviewType !== undefined) {
+      if (typeof reviewType !== 'string' || !HUMAN_EVAL_REVIEW_TYPES.includes(reviewType as HumanEvalReviewType)) {
+        res.status(400).json({ error: `Invalid reviewType filter. Valid values: ${HUMAN_EVAL_REVIEW_TYPES.join(', ')}.` });
+        return;
+      }
+      reviewTypeFilter = reviewType as HumanEvalReviewType;
+    }
+
     const parsedLimit = typeof limit === 'string' ? parseInt(limit, 10) : NaN;
     const candidates = await humanEvalService.listCandidates({
-      category: typeof category === 'string' ? category : undefined,
-      status: typeof status === 'string' ? status as HumanEvalStatus : undefined,
-      reviewType: typeof reviewType === 'string' ? reviewType as HumanEvalReviewType : undefined,
+      category: categoryFilter,
+      status: statusFilter,
+      reviewType: reviewTypeFilter,
       limit: Number.isFinite(parsedLimit) ? parsedLimit : undefined,
     });
 

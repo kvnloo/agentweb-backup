@@ -47,6 +47,21 @@ export function normalizeHumanEvalCategory(value: unknown): HumanEvalCategory {
   return 'uncategorized';
 }
 
+/**
+ * Strict parser for the READ/filter path (ENG-90 review fix). Fail-open is only
+ * justified where it protects enqueueing; a list filter must never silently
+ * coerce a typo ('ads', 'orgnic_post') to 'uncategorized' and return the wrong
+ * record set as a success. Recognized spellings (case/space/hyphen tolerant)
+ * map to the canonical value; anything else returns null so callers can 400.
+ */
+export function parseHumanEvalCategoryFilter(value: string): HumanEvalCategory | null {
+  const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, '_');
+  if (normalized === 'ad' || normalized === 'organic_post' || normalized === 'uncategorized') {
+    return normalized;
+  }
+  return null;
+}
+
 export function humanEvalCategoryLabel(category: HumanEvalCategory | undefined): string {
   switch (category) {
     case 'ad':
@@ -444,15 +459,14 @@ export class HumanEvalService {
    * match `category: 'uncategorized'`.
    */
   async listCandidates(filter: {
-    category?: string;
+    /** Canonical value only — parse raw input via parseHumanEvalCategoryFilter and reject nulls. */
+    category?: HumanEvalCategory;
     status?: HumanEvalStatus;
     reviewType?: HumanEvalReviewType;
     limit?: number;
   } = {}): Promise<HumanEvalCandidate[]> {
     const limit = Math.min(Math.max(Math.floor(filter.limit ?? 50), 1), 200);
-    const categoryFilter = filter.category !== undefined
-      ? normalizeHumanEvalCategory(filter.category)
-      : undefined;
+    const categoryFilter = filter.category;
 
     const matches: HumanEvalCandidate[] = [];
     let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
