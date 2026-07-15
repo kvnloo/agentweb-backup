@@ -112,12 +112,32 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
 const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
+import { twitterService } from './twitterService';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
 import { HubSpotService } from './hubspotService';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
+import { computeRunVerdict } from '../loops/instances/agent-mode/runRecorder';
+// OTel spine (ENG-141) — inert no-ops unless exporter env config is present.
+import {
+  endChatSpan,
+  endInvokeAgentSpan,
+  getRunTraceId,
+  recordSpanError,
+  startInvokeAgentSpan,
+  startRunChildSpan,
+} from '../observability/tracing';
+import {
+  ATTR_GEN_AI_OPERATION_NAME,
+  ATTR_GEN_AI_PROVIDER_NAME,
+  ATTR_GEN_AI_REQUEST_MODEL,
+  ATTR_SESSION_ID,
+  GEN_AI_OP_CHAT,
+  SPAN_CHAT_PREFIX,
+  providerForModel,
+} from '../observability/semconv';
 import {
   AgentToolPolicyDecision,
   executeAgentToolThroughGateway,
@@ -264,15 +284,29 @@ function recordAgentModeRunStarted(
   runId: string,
   info: { llmModel?: string; sessionType?: string; userId?: string; sessionId?: string },
 ): void {
+  // OTel spine (ENG-141): the invoke_agent span opens here and closes in
+  // recordAgentModeRunCompleted/Failed — the run-telemetry lifecycle exactly.
+  // The traceId is bridged into the recorder's agent_run_started dimensions so
+  // Dev-AW-LoopEvents rows can be joined to Langfuse/Okareo traces by ID.
+  startInvokeAgentSpan(runId, info);
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
-  void recorder.runStarted(runId, info);
+  const traceId = getRunTraceId(runId);
+  void recorder.runStarted(runId, traceId ? { ...info, traceId } : info);
 }
 
 function recordAgentModeRunCompleted(
   runId: string,
   info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string; claimMismatch?: boolean },
 ): void {
+  endInvokeAgentSpan(runId, {
+    verdict: computeRunVerdict({
+      failed: false,
+      toolCalls: info.toolCalls ?? 0,
+      failedToolCalls: info.failedToolCalls ?? 0,
+      maxSameToolFailures: info.maxSameToolFailures,
+    }).verdict,
+  });
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runCompleted(runId, info);
@@ -300,6 +334,7 @@ function recordAgentModeRunFailed(
   runId: string,
   info: { error: unknown; toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
 ): void {
+  endInvokeAgentSpan(runId, { verdict: 'failed', error: info.error });
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runFailed(runId, info);
@@ -661,6 +696,19 @@ function buildFindReason(filters: {
   return joined.length > 200 ? joined.slice(0, 197) + '...' : joined;
 }
 
+/**
+ * ENG-182: extract a LinkedIn public identifier from a profile URL, e.g.
+ * "https://www.linkedin.com/in/chang-liu?miniProfileUrn=..." -> "chang-liu".
+ * Strips query string, fragment, trailing slash and casing so it matches the
+ * public id the sent-invitation cache is keyed on. Returns null for anything
+ * that isn't a /in/{id} profile URL (e.g. a raw provider_id).
+ */
+function linkedInPublicIdFromUrl(url: string | undefined | null): string | null {
+  if (!url || typeof url !== 'string') return null;
+  const match = url.trim().toLowerCase().match(/\/in\/([^/?#]+)/);
+  return match ? match[1] : null;
+}
+
 
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
@@ -766,7 +814,7 @@ export class AgentModeService {
         description:
           'Access meeting recordings, transcripts, and action items from Fathom. ' +
           'Requires a connected Fathom account (Settings → Connected Accounts).',
-        toolNames: ['fathom_get_meetings', 'fathom_get_transcript'],
+        toolNames: ['fathom_get_meetings', 'fathom_get_transcript', 'fathom_get_onboarding_context'],
         category: 'tool_bundle',
       },
       {
@@ -2540,7 +2588,7 @@ export class AgentModeService {
     excludeTools?: string[],
     screenshotUrl?: string,
     isDelegatedAccess: boolean = false
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string }> {
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
@@ -2820,6 +2868,13 @@ export class AgentModeService {
       const MAX_EMPTY_SYNTHESIS_RETRIES = 1;
 
       let wasCancelled = false;
+      // ENG-244: set true when the loop exits because the step budget (maxIterations)
+      // was exhausted. This is the deterministic signal a long data-gathering
+      // scheduled run was truncated before it could emit the final deliverable —
+      // regardless of whether `content` holds the canned apology or the model's own
+      // partial text. The completion gate consumes this flag directly rather than
+      // pattern-matching the response text.
+      let truncatedByStepBudget = false;
       while (iteration < maxIterations) {
         // Check for cancellation before each iteration
         if (isCancelled?.()) {
@@ -2927,6 +2982,15 @@ export class AgentModeService {
         // Make LLM call (with backup model fallback on transient errors)
         const llmStart = Date.now();
         let response: any;
+        // OTel `chat` span (ENG-141): brackets the primary call AND the backup
+        // retry; the `finally` closes it with the FINAL model + usage attrs
+        // (response undefined there = both attempts threw → status ERROR).
+        const chatSpan = startRunChildSpan(agentRuntimeRunId, `${SPAN_CHAT_PREFIX} ${llmModel}`, {
+          [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OP_CHAT,
+          [ATTR_GEN_AI_REQUEST_MODEL]: llmModel,
+          [ATTR_GEN_AI_PROVIDER_NAME]: providerForModel(llmModel),
+          [ATTR_SESSION_ID]: sessionId,
+        });
         try {
           response = await this.callLLM(llmModel, trimmedMessages, {
             tools: filteredToolsCache,
@@ -2958,11 +3022,15 @@ export class AgentModeService {
                 usageContext: { userId, sessionId, feature: 'agent_task' }
               });
             } else {
+              recordSpanError(chatSpan, callError);
               throw callError;
             }
           } else {
+            recordSpanError(chatSpan, callError);
             throw callError;
           }
+        } finally {
+          endChatSpan(chatSpan, { model: llmModel, response, inputMessages: trimmedMessages });
         }
         const llmDurationMs = Date.now() - llmStart;
 
@@ -3327,6 +3395,12 @@ export class AgentModeService {
 
       if (iteration >= maxIterations) {
         console.warn('AgentMode: Reached maximum tool execution iterations');
+        // ENG-244: flag the truncation for the completion gate BEFORE any
+        // content fallback. The model often complies with the "wrap up soon"
+        // nudge and emits its own partial text, so `content` is usually
+        // non-empty here and the canned apology below never runs — the flag,
+        // not the text, is what makes truncation reliably detectable.
+        truncatedByStepBudget = true;
         if (!content) {
           content = "I've reached the maximum number of processing steps for this request. Here's what was completed so far — please review and let me know if you'd like me to continue with any remaining items.";
         }
@@ -3483,6 +3557,7 @@ export class AgentModeService {
         sources,
         responseMessages,
         ...(wasCancelled ? { cancelled: true } : {}),
+        ...(truncatedByStepBudget ? { truncatedByStepBudget: true } : {}),
         ...(backupModelUsed ? { backupModelUsed: true, originalModel: originalLlmModel, backupModel: llmModel } : {})
       };
     } catch (error: any) {
@@ -4202,6 +4277,7 @@ export class AgentModeService {
     // Meeting Intelligence (Fathom)
     'fathom_get_meetings',
     'fathom_get_transcript',
+    'fathom_get_onboarding_context',
 
     // Coding Agent (sub-agent for code editing tasks)
     'coding_agent',
@@ -7596,7 +7672,7 @@ export class AgentModeService {
   }
 
   // Update user's market strategy
-  public async updateMarketStrategy(updateData: any, userId: string): Promise<any> {
+  public async updateMarketStrategy(updateData: any, userId: string, opts: { replace?: boolean } = {}): Promise<any> {
     try {
       const { userDb, orgDb } = await import('./db');
       const { canEditItem } = await import('./orgShareService');
@@ -7636,8 +7712,12 @@ export class AgentModeService {
       // Extract market strategy fields from updateData
       const { businessOverview, competitors, icp, ...otherFields } = updateData;
 
-      // Merge competitors by name - preserve existing entries, update or add new ones
-      let mergedCompetitors = [...(existingMarketStrategy?.competitors || [])];
+      // Merge competitors by name - preserve existing entries, update or add new ones.
+      // When opts.replace is set and a competitors array is provided, the provided
+      // list REPLACES the existing one wholesale (used by regenerate_market_strategy
+      // after the user has explicitly confirmed the regeneration). ENG-44.
+      const replaceCompetitors = opts.replace === true && competitors !== undefined && Array.isArray(competitors);
+      let mergedCompetitors = replaceCompetitors ? [] : [...(existingMarketStrategy?.competitors || [])];
       if (competitors !== undefined && Array.isArray(competitors)) {
         competitors.forEach(newCompetitor => {
           const existingIndex = mergedCompetitors.findIndex(existing =>
@@ -7656,8 +7736,10 @@ export class AgentModeService {
         });
       }
 
-      // Merge ICPs by title - preserve existing entries, update or add new ones
-      let mergedICP = [...(existingMarketStrategy?.icp || [])];
+      // Merge ICPs by title - preserve existing entries, update or add new ones.
+      // When opts.replace is set and an icp array is provided, REPLACE wholesale. ENG-44.
+      const replaceIcp = opts.replace === true && icp !== undefined && Array.isArray(icp);
+      let mergedICP = replaceIcp ? [] : [...(existingMarketStrategy?.icp || [])];
       if (icp !== undefined && Array.isArray(icp)) {
         icp.forEach(newICP => {
           const existingIndex = mergedICP.findIndex(existing =>
@@ -11351,8 +11433,8 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         existingBrand = initialBrandGuidelines;
       }
 
-      // Extract brandData and brandAssets from updateData
-      const { brandData, brandAssets, ...otherFields } = updateData;
+      // Extract brandData, brandAssets, and optional market-strategy refresh from updateData
+      const { brandData, brandAssets, refreshMarketStrategy, ...otherFields } = updateData;
 
       // Merge with existing brandData - only update provided fields
       const updatedBrandData = {
@@ -11476,6 +11558,10 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         await userDb.updateUser(userId, { brandGuidelines: updatedGuidelines });
       }
 
+      const marketStrategyRefresh = refreshMarketStrategy === true
+        ? await this.regenerateMarketStrategy(userId)
+        : undefined;
+
       // Onboarding v2 Phase 1: flip brand-build status to ready if we were
       // building. Best-effort; wrapped in try/catch so metrics failures don't
       // break the tool-call response path.
@@ -11506,11 +11592,23 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
 
       return {
         success: true,
-        message: 'Brand guidelines updated successfully',
+        message: marketStrategyRefresh?.success
+          ? 'Brand guidelines and market strategy updated successfully'
+          : 'Brand guidelines updated successfully',
         updatedFields,
         brandData: updatedBrandData,
         attachments: updatedAttachments,
         updatedAssets: updatedAssets, // Only the assets that were actually updated
+        ...(marketStrategyRefresh
+          ? {
+            marketStrategyRefresh: {
+              success: marketStrategyRefresh.success,
+              replaced: marketStrategyRefresh.replaced,
+              generated: marketStrategyRefresh.generated,
+              ...(marketStrategyRefresh.error ? { error: marketStrategyRefresh.error } : {}),
+            }
+          }
+          : {}),
         formattedContent
       };
     } catch (error) {
@@ -11519,6 +11617,100 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         success: false,
         message: 'Failed to update brand guidelines',
         error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Read the user's effective market strategy (org-level if the user belongs to
+   * an org, otherwise personal). Shared by the brand re-setup offer and the
+   * regenerate flow so both report the same "what exists today" counts. (ENG-44)
+   */
+  private async getExistingMarketStrategy(user: any): Promise<any> {
+    if (user?.orgId) {
+      const { orgDb } = await import('./db');
+      const org = await orgDb.getOrgById(user.orgId);
+      if (org && org.marketStrategy) return org.marketStrategy;
+    }
+    return user?.marketStrategy;
+  }
+
+  /**
+   * Regenerate the user's market strategy (ICPs + competitors) from their CURRENT
+   * brand guidelines, then REPLACE the existing ICPs/competitors (business overview
+   * is preserved). Composes the same generators the onboarding pipeline uses, so
+   * there is no new generation logic here. Destructive by design — the caller
+   * (Emma) must have explicit user confirmation before invoking. Returns the
+   * before/after counts. (ENG-44)
+   */
+  public async regenerateMarketStrategy(
+    userId: string,
+    deps: {
+      llm?: any;
+      webSearchFn?: any;
+    } = {},
+  ): Promise<any> {
+    try {
+      const { userDb } = await import('./db');
+      const {
+        extractIcpBrandContext,
+        generateIcpsForUser,
+        mapIcpResultToMarketStrategy,
+      } = await import('./onboardingIcpService');
+      const {
+        generateCompetitorStrategyForUser,
+        mapCompetitorResultToMarketStrategy,
+      } = await import('./onboardingCompetitorService');
+
+      const user: any = await userDb.getUserById(userId);
+      if (!user) {
+        return { success: false, message: 'User not found', error: 'User not found' };
+      }
+
+      const brand = extractIcpBrandContext(user);
+      if (!brand.companyName && !brand.companyUrl) {
+        return {
+          success: false,
+          message:
+            'There are no brand guidelines to base a market strategy on yet. Set up the brand first, then regenerate the market strategy.',
+          error: 'Missing brand context',
+        };
+      }
+
+      // Count what we are about to replace (org-aware) BEFORE regenerating.
+      const existing = await this.getExistingMarketStrategy(user);
+      const replaced = {
+        competitors: Array.isArray(existing?.competitors) ? existing.competitors.length : 0,
+        icps: Array.isArray(existing?.icp) ? existing.icp.length : 0,
+      };
+
+      // Generate ICPs first, then competitors (competitors need the ICPs as input).
+      const personas = await generateIcpsForUser(brand, { llm: deps.llm }, userId);
+      let competitorResult: any = { per_icp: [] };
+      if (Array.isArray(personas) && personas.length > 0) {
+        competitorResult = await generateCompetitorStrategyForUser(brand, personas, deps);
+      }
+
+      const icp = mapIcpResultToMarketStrategy(personas);
+      const competitors = mapCompetitorResultToMarketStrategy(competitorResult);
+
+      // Persist via updateMarketStrategy with replace:true so org-vs-user routing,
+      // permission checks, and businessOverview preservation are all reused.
+      const writeResult = await this.updateMarketStrategy({ icp, competitors }, userId, { replace: true });
+      if (!writeResult.success) return writeResult;
+
+      return {
+        success: true,
+        message: `Market strategy regenerated to match the current brand. Replaced ${replaced.competitors} competitor(s) and ${replaced.icps} ICP(s) with ${competitors.length} new competitor(s) and ${icp.length} new ICP(s).`,
+        replaced,
+        generated: { competitors: competitors.length, icps: icp.length },
+      };
+    } catch (error) {
+      console.error('AgentMode: Error regenerating market strategy:', error);
+      return {
+        success: false,
+        message: 'Failed to regenerate market strategy',
+        error: error instanceof Error ? error.message : 'Unknown error',
       };
     }
   }
@@ -11609,11 +11801,40 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         }
       }, null, 2);
 
+      // A site may render a completely different design under a dark color-scheme
+      // preference (ENG-285: rankai.ai is matte black with a purple accent under
+      // dark, near-white under light). The tokens above describe the site's
+      // DEFAULT render; when a distinct dark render exists, analyze it too and
+      // surface both so the caller can pick the intended brand theme.
+      let darkThemeTokens: any = null;
+      if (extractedCSS.themes?.hasDarkVariant && extractedCSS.themes.dark) {
+        try {
+          // Analyse the dark render with ITS OWN computed styles AND stylesheets —
+          // reusing the light render's stylesheets would blend light colours into
+          // the reported dark palette (ENG-285).
+          const darkCSS = {
+            ...extractedCSS,
+            computedElements: extractedCSS.themes.dark.computedElements,
+            stylesheets: extractedCSS.themes.dark.stylesheets,
+          };
+          const darkDetailed = await analyzeDesignTokens(darkCSS);
+          darkThemeTokens = {
+            ...inferBrandTokens(darkDetailed),
+            backgrounds: darkDetailed.colors.backgrounds.slice(0, 3),
+            text: darkDetailed.colors.text.slice(0, 3),
+          };
+          console.log(`Dark color-scheme variant detected for ${url}; extracted its palette too.`);
+        } catch (err) {
+          console.warn('Dark-variant token analysis failed; reporting default render only:', err);
+        }
+      }
+
       // Format summary for LLM
       const formattedSummary = this.formatCSSExtractionResult({
         url,
         suggestedBrandTokens,
         detailedTokens,
+        darkThemeTokens,
         brandIdentity: {
           logoUrl: s3LogoUrl || brandIdentity.logoUrl || null,
           brandName: brandIdentity.brandName || null,
@@ -11636,6 +11857,8 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         suggestedBrandTokens: enrichedBrandTokens,
         detailedTokens,
         detailedTokensJSON, // Emma can save this to KB using update_knowledge_base_file tool
+        hasDarkVariant: !!darkThemeTokens,
+        darkThemeTokens, // null unless the site renders a distinct dark theme
         formattedContent: formattedSummary
       };
     } catch (error: any) {
@@ -11652,7 +11875,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
    * Format CSS extraction result for LLM consumption
    */
   private formatCSSExtractionResult(data: any): string {
-    const { url, suggestedBrandTokens, detailedTokens, brandIdentity } = data;
+    const { url, suggestedBrandTokens, detailedTokens, brandIdentity, darkThemeTokens } = data;
 
     let formatted = `# CSS Extraction Results\n\n`;
     formatted += `**Source:** ${url}\n\n`;
@@ -11685,6 +11908,23 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
     formatted += `### Visual Effects\n`;
     formatted += `- **Primary Shadow:** ${suggestedBrandTokens.visualEffects.primaryShadow}\n`;
     formatted += `- **Border Radius:** ${suggestedBrandTokens.visualEffects.borderRadius}\n\n`;
+
+    // Dark color-scheme variant, when the site has one. The tokens above describe
+    // what the site serves a no-preference visitor; this is what a dark-mode
+    // visitor sees. Which one is "the brand" is a judgement call, so present both
+    // rather than silently choosing (ENG-285).
+    if (darkThemeTokens) {
+      formatted += `## Dark Theme Variant Detected\n\n`;
+      formatted += `This site renders a **distinct dark theme** under \`prefers-color-scheme: dark\`. `;
+      formatted += `The tokens above are its DEFAULT (light) render; the dark render is:\n\n`;
+      formatted += `- **Primary:** ${darkThemeTokens.colors.primary}\n`;
+      formatted += `- **Secondary:** ${darkThemeTokens.colors.secondary}\n`;
+      formatted += `- **Backgrounds:** ${(darkThemeTokens.backgrounds || []).join(', ') || 'Not detected'}\n`;
+      formatted += `- **Text:** ${(darkThemeTokens.text || []).join(', ') || 'Not detected'}\n`;
+      formatted += `- **Palette:** ${darkThemeTokens.colors.palette.join(', ')}\n\n`;
+      formatted += `⚠️ Confirm with the user which theme represents their brand before applying tokens — `;
+      formatted += `a site whose design is dark still serves the light render to visitors whose OS is set to light.\n\n`;
+    }
 
     // Summary of detailed tokens
     formatted += `## Detailed Analysis\n\n`;
@@ -18108,6 +18348,36 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (m) { result += `<code style="background-color:#f1f3f4;padding:1px 5px;border-radius:3px;font-family:Courier New,monospace;font-size:90%;text-decoration:none">${AgentModeService.escapeHtml(m[1])}</code>`; remaining = remaining.slice(m[0].length); continue; }
       m = remaining.match(/^\[([^\]]+)\]\(([^)]+)\)/);
       if (m) { result += `<a href="${AgentModeService.escapeHtml(m[2])}">${AgentModeService.escapeHtml(m[1])}</a>`; remaining = remaining.slice(m[0].length); continue; }
+      // Inline style span for a single word/phrase — [text]{color=blue}, [text]{underline},
+      // [text]{color=yellow;font=Verdana;italic;underline}, etc. The attribute-string charset is
+      // restricted to letters/digits/#/=/;/space — no quotes, parens, or angle brackets can ever
+      // appear, so a malformed/hostile value can never break out of the style attribute. Each
+      // ';'-separated segment is checked against a fixed whitelist (color, font, bold, italic,
+      // underline); unrecognized segments are silently ignored rather than rejecting the whole
+      // span. If nothing recognized survives, this doesn't match at all — falls through to plain
+      // escaped text below, preserving the original literal text (including the brackets).
+      m = remaining.match(/^\[([^\]]+)\]\{([a-zA-Z0-9#=; ]+)\}/);
+      if (m) {
+        const decls: string[] = [];
+        for (const rawSeg of m[2].split(';')) {
+          const seg = rawSeg.trim();
+          if (!seg) continue;
+          if (seg === 'underline') { decls.push('text-decoration:underline'); continue; }
+          if (seg === 'italic') { decls.push('font-style:italic'); continue; }
+          if (seg === 'bold') { decls.push('font-weight:700'); continue; }
+          let am = seg.match(/^color=(#[0-9a-fA-F]{3,8}|[a-zA-Z]+)$/);
+          if (am) { decls.push(`color:${am[1]}`); continue; }
+          am = seg.match(/^font=([a-zA-Z ]+)$/);
+          if (am) { decls.push(`font-family:${am[1]}`); continue; }
+          // Unrecognized attribute name/value — ignore silently, do not fail the whole span.
+        }
+        if (decls.length > 0) {
+          result += `<span style="${decls.join(';')}">${AgentModeService.escapeHtml(m[1])}</span>`;
+          remaining = remaining.slice(m[0].length);
+          continue;
+        }
+        // Nothing recognized — fall through to ordinary text below (do not consume the match).
+      }
       m = remaining.match(/^<[^>]+>/);
       if (m) { remaining = remaining.slice(m[0].length); continue; }
       result += AgentModeService.escapeHtml(remaining[0]);
@@ -19908,11 +20178,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           };
         }
 
-        // External URL — plain fetch
+        // External URL — plain fetch. Send no-cache headers so scrapes (e.g.
+        // onboarding brand-build reading the user's live site) reflect the
+        // CURRENT content and never a stale CDN/intermediary copy.
         const response = await axios.get(normalizedFileUrl, {
           timeout: 30000,
           responseType: 'arraybuffer',
-          headers: { 'User-Agent': 'AgentWeb-Backend/1.0' },
+          headers: {
+            'User-Agent': 'AgentWeb-Backend/1.0',
+            'Cache-Control': 'no-cache',
+            Pragma: 'no-cache',
+          },
         });
         buffer = Buffer.from(response.data as ArrayBuffer);
         contentType = response.headers['content-type'] || '';
@@ -25288,70 +25564,87 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   // Post on connected account helper
-  async postOnConnectedAccount(userId: string, accountId: string, content: string, mediaUrls: string[] = []): Promise<any> {
+  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string): Promise<any> {
     console.log('[AgentMode] postOnConnectedAccount called:', {
       userId,
       accountId,
+      platform,
       contentLength: content?.length || 0,
       mediaUrlCount: mediaUrls?.length || 0
     });
 
     try {
-      const { getAccountById, isTokenValid } = await import('./connectedAccountsDb');
+      const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
-      try {
-        console.log('[AgentMode] Looking up account:', accountId);
-        const account = await getAccountById(accountId, userId);
-        console.log('[AgentMode] Account lookup result:', account ? {
-          found: true,
-          platform: account.platform,
-          accountType: account.config?.account_type,
-          accountName: account.account_name
-        } : { found: false });
+      // Fetch all accessible accounts (own + org-shared) once, so org-shared accounts
+      // are visible for both the auto-resolve path and explicit accountId lookups.
+      // getAccountById(accountId, userId) only searches the caller's own DynamoDB record,
+      // which returns null for accounts owned by an org member — use this instead.
+      const allAccounts = await getAccountsWithOwnerIncludingOrgShared(userId);
+      const socialAccounts = allAccounts.filter((a: any) =>
+        ['twitter', 'linkedin', 'instagram', 'youtube'].includes(a.platform)
+      );
 
-        if (!account) {
-          console.log('[AgentMode] Account not found, returning error');
-          return {
-            success: false,
-            message: 'Account not found or access denied'
-          };
+      let account: any;
+
+      if (!accountId) {
+        // Narrow by platform hint when provided
+        const candidates = platform
+          ? socialAccounts.filter((a: any) => a.platform === platform)
+          : socialAccounts;
+        if (candidates.length === 0) {
+          const msg = platform
+            ? `No ${platform} account connected. Connect one in Settings → Connected Accounts.`
+            : 'No social media accounts connected. Connect an account in Settings → Connected Accounts.';
+          return { success: false, message: msg };
         }
-
-        // NOTE: Skipping isTokenValid check here because the adapter's getValidToken()
-        // method will automatically refresh expired tokens. The adapter handles token
-        // refresh internally before making API calls.
-        console.log('[AgentMode] Getting adapter for platform:', account.platform);
-        const adapter = socialPlatformService.getAdapter(account.platform);
-        console.log('[AgentMode] Calling adapter.createPost (adapter will handle token refresh if needed)...');
-        const result = await adapter.createPost(account, content, mediaUrls, userId);
-
-        return {
-          success: true,
-          message: result.message,
-          post_id: result.postId,
-          post_url: result.postUrl
-        };
-      } catch (error: any) {
-        // Handle specific error messages
-        let message = error.message;
-        if (message.includes('access token expired')) {
-          message = 'Account token expired. Please reconnect the account in Settings.';
+        if (candidates.length > 1) {
+          const names = candidates.map((a: any) => a.account_id).join(', ');
+          const platformHint = platform ? `platform="${platform}"` : '';
+          return { success: false, message: `Multiple ${platform ?? 'social'} accounts connected. Call list_connected_accounts(${platformHint}) to see account names, ask the user which one to use, then re-call with account_id. Connected IDs: ${names}` };
         }
-
-        return {
-          success: false,
-          message: `Failed to post: ${message}`
-        };
+        account = candidates[0];
+        accountId = account.account_id;
+        console.log('[AgentMode] Auto-resolved account_id:', accountId);
+      } else {
+        account = socialAccounts.find((a: any) => a.account_id === accountId);
       }
 
-    } catch (error) {
-      console.error('AgentMode: Error posting on account:', error);
+      console.log('[AgentMode] Account lookup result:', account ? {
+        found: true,
+        platform: account.platform,
+        accountType: account.config?.account_type,
+        accountName: account.account_name
+      } : { found: false });
+
+      if (!account) {
+        console.log('[AgentMode] Account not found, returning error');
+        return { success: false, message: 'Account not found or access denied' };
+      }
+
+      // account.userId is the token owner (equals userId for own accounts,
+      // the org member's userId for org-shared accounts).
+      const ownerUserId: string = (account as any).userId || userId;
+
+      // The adapter handles token refresh internally before making API calls.
+      console.log('[AgentMode] Getting adapter for platform:', account.platform);
+      const adapter = socialPlatformService.getAdapter(account.platform);
+      console.log('[AgentMode] Calling adapter.createPost (adapter will handle token refresh if needed)...');
+      const result = await adapter.createPost(account, content, mediaUrls, ownerUserId);
+
       return {
-        success: false,
-        message: 'Failed to create post',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        success: true,
+        message: result.message,
+        post_id: result.postId,
+        post_url: result.postUrl
       };
+    } catch (error: any) {
+      const message = error?.message?.includes('access token expired')
+        ? 'Account token expired. Please reconnect the account in Settings.'
+        : (error?.message ?? 'Unknown error');
+      console.error('AgentMode: Error posting on account:', error);
+      return { success: false, message: `Failed to post: ${message}` };
     }
   }
 
@@ -25845,7 +26138,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   async linkedinOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
-    const { profile_url, provider_id, message } = args;
+    const { profile_url, provider_id, message, on_note_quota } = args;
     console.log(`[AgentMode] linkedinOutreach called: action=${action}, account_id=${account_id}`);
 
     // Write actions must use an account that is either owned by the calling user or
@@ -25998,10 +26291,95 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'send-invite': {
           if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
+
+          // ENG-182: cross-check the account's PENDING sent-invitation cache before
+          // spending a run's invite quota. A profile with an OUTSTANDING (sent but
+          // not-yet-accepted) invite is NOT a 1st-degree connection, so it slips past
+          // the already-connected guard inside sendInvitation and Unipile then rejects
+          // the resend with "Cannot resend yet" — which both wastes the run's quota and
+          // surfaces as a per-recipient tool failure. The cache (AW-UnipileSentInvitations)
+          // is refreshed every ~10 min by the connection-sync cron straight from Unipile's
+          // live sent feed, so it also reflects invites made outside this system.
+          //
+          // Look up via the publicProfileUrl GSI, matching the CRM path (crm.ts): both
+          // this URL and the cron's stored key are lowercased by normalizeLinkedInUrl, so
+          // the match is case-insensitive. We rebuild a CANONICAL /in/{publicId}/ URL from
+          // the parsed public id first, because normalizeLinkedInUrl does NOT strip query
+          // params (e.g. LinkedIn's ?miniProfileUrn tracking) — passing the raw URL through
+          // would miss. The cache is keyed by public id, so only a /in/{publicId} URL can be
+          // deduped; a raw provider_id invite falls through to the live send unchanged.
+          const invitePublicId = isUrl && profile_url ? linkedInPublicIdFromUrl(profile_url) : null;
+          const inviteCanonicalUrl = invitePublicId ? `https://www.linkedin.com/in/${invitePublicId}/` : null;
+          if (inviteCanonicalUrl) {
+            const { getSentInvitationByProfileUrlAndAccount } = await import('./unipileSentInvitationsDb');
+            const pending = await getSentInvitationByProfileUrlAndAccount(inviteCanonicalUrl, account_id).catch(() => null);
+            if (pending) {
+              console.log(`[AgentMode] send-invite: skipping ${profile_url} — invitation already pending (sent ${pending.sentAt ?? 'previously'})`);
+              return {
+                success: true,
+                alreadyInvited: true,
+                message: `A LinkedIn connection invitation is already pending for this profile (sent ${pending.sentAt ?? 'previously'}). Skipped to avoid a duplicate — no invite quota was used. Move on to the next lead.`,
+                data: { alreadyInvited: true, sentAt: pending.sentAt ?? null },
+              };
+            }
+          }
+
           // Premium accounts allow 300-char invites; free accounts 200.
           const inviteCharLimit = await linkedInOutreachService.getInviteCharLimitForAccount(userId, account_id);
-          const inviteResult = await linkedInOutreachService.sendInvitation(account_id, target, isUrl, message, inviteCharLimit);
-          return { success: true, data: inviteResult };
+          // Note-quota policy (ENG-213). Default to 'skip' — HOLD rather than silently
+          // drop a note the customer wrote. Only send note-less when the customer has
+          // explicitly authorized it via on_note_quota='send_without_note'.
+          const onNoteQuota: 'send_without_note' | 'skip' =
+            on_note_quota === 'send_without_note' ? 'send_without_note' : 'skip';
+          try {
+            const inviteResult = await linkedInOutreachService.sendInvitation(
+              account_id, target, isUrl, message, inviteCharLimit, { onNoteQuota },
+            );
+
+            // ENG-182: write the pending invite through to the cache immediately (mirrors
+            // the CRM route) so a subsequent run — before the next ~10-min sync cron — sees
+            // it and dedups via the check above. Best-effort: a cache write must never fail
+            // an invite that Unipile already accepted. (Written with the same lowercased
+            // publicProfileUrl the GSI reads, so the next lookup matches case-insensitively.)
+            if (invitePublicId) {
+              try {
+                const { upsertSentInvitation } = await import('./unipileSentInvitationsDb');
+                const { normalizeLinkedInUrl } = await import('./unipileConnectionsDb');
+                const nowIso = new Date().toISOString();
+                await upsertSentInvitation({
+                  accountId: account_id,
+                  invitedUserPublicId: invitePublicId,
+                  publicProfileUrl: normalizeLinkedInUrl(`https://www.linkedin.com/in/${invitePublicId}/`),
+                  invitationId: (inviteResult && (inviteResult.invitation_id || inviteResult.id)) || '',
+                  invitedUserName: '',
+                  invitationText: message ?? '',
+                  sentAt: nowIso,
+                  syncedAt: nowIso,
+                });
+              } catch (cacheErr) {
+                console.warn('[AgentMode] send-invite: failed to cache sent invitation (non-fatal):', cacheErr);
+              }
+            }
+
+            return { success: true, data: inviteResult };
+          } catch (inviteErr: any) {
+            if (inviteErr?.noteQuotaExceeded) {
+              // Decision gate — do NOT decide for the customer. Ask them, then re-call
+              // send-invite with on_note_quota. In a scheduled run there is no one to
+              // answer, so the agent stops here and the invite is simply left un-sent
+              // (the lead stays eligible); the customer resolves it by reopening the chat.
+              return {
+                success: false,
+                requiresDecision: true,
+                noteQuotaExceeded: true,
+                error:
+                  `This LinkedIn account's monthly quota for personalized invitation notes is spent, so the note "${message}" cannot be attached. ` +
+                  `Do NOT decide on your own — ask the user whether to send the connection request WITHOUT the note or skip this person. ` +
+                  `Then re-call send-invite with the same target plus on_note_quota="send_without_note" to send note-less, or leave it un-sent if they choose to skip.`,
+              };
+            }
+            throw inviteErr;
+          }
         }
 
         case 'send-message': {
@@ -26297,6 +26675,368 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         message: 'LinkedIn outreach action failed',
         error: errorMessage
       };
+    }
+  }
+
+  // --- Twitter / X ---
+
+  /**
+   * Dispatch Twitter/X interaction actions for Emma via the official X API.
+   * Posting a single tweet is handled by post_on_connected_account (TwitterAdapter).
+   * This method covers all other interactions: reply, thread, edit, delete, like,
+   * retweet, follow, DMs, search, bookmarks, and profile lookup.
+   *
+   * Every action requires an account owned by the caller or shared with their org.
+   * The owner's userId is passed to twitterService so refreshed OAuth tokens are
+   * written back to the owner's record. When list_id/lead_id/lead_email are
+   * supplied, sent tweets and DMs are logged to AW-EmailEvents for CRM parity.
+   */
+  async twitterManagePost(userId: string, args: any): Promise<any> {
+    let { account_id } = args;
+    const action = (args.action as string)?.replace(/_/g, '-');
+    const { text, in_reply_to_tweet_id, tweet_id, tweet_ids, handle, recipient_handle, tweets, list_id, lead_id, lead_email, query, max_results } = args;
+    console.log(`[AgentMode] twitterManagePost called: action=${action}, account_id=${account_id}`);
+
+    const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+    const twitterAccounts = (await getAccountsWithOwnerIncludingOrgShared(userId))
+      .filter((a: any) => a.platform === 'twitter');
+
+    if (twitterAccounts.length === 0) {
+      return {
+        success: false,
+        error: 'No X (Twitter) account is connected. Connect your X account in Settings → Connected Accounts.',
+      };
+    }
+
+    let account: any;
+    if (account_id) {
+      account = twitterAccounts.find((a: any) => a.account_id === account_id);
+      if (!account) {
+        return { success: false, error: `X account ${account_id} is not connected to your profile.` };
+      }
+    } else if (twitterAccounts.length === 1) {
+      account = twitterAccounts[0];
+    } else {
+      return {
+        success: false,
+        error: 'Multiple X accounts are connected — specify account_id. Use list_connected_accounts(platform="twitter").',
+      };
+    }
+
+    const ownerUserId = account.userId;
+    account_id = account.account_id;
+
+    // Best-effort CRM logging — never fails the action.
+    const logCrm = async (
+      eventType: 'twitter.tweet.sent' | 'twitter.dm.sent',
+      messageProviderId: string,
+      bodyText: string
+    ): Promise<void> => {
+      if (!list_id || !lead_id || !lead_email) return;
+      try {
+        const { emailEventsDb } = await import('./emailEventsDb');
+        await emailEventsDb.addTwitterMessageEvent({
+          eventId: `twitter_${eventType.includes('dm') ? 'dm' : 'tweet'}_${messageProviderId}`,
+          emailDomain: `twitter-${list_id}`,
+          leadEmail: lead_email,
+          eventType,
+          text: bodyText ?? null,
+          timestamp: new Date().toISOString(),
+          senderId: account_id,
+          messageProviderId,
+        });
+      } catch (e) {
+        console.error('[AgentMode] twitterManagePost CRM logging failed (non-fatal):', e);
+      }
+    };
+
+    try {
+      switch (action) {
+        case 'reply': {
+          if (!text) throw new Error('text is required for reply');
+          if (!in_reply_to_tweet_id) throw new Error('in_reply_to_tweet_id is required for reply');
+          const result = await twitterService.postTweet(ownerUserId, account_id, text, {
+            inReplyToTweetId: in_reply_to_tweet_id,
+          });
+          await logCrm('twitter.tweet.sent', result.id, result.text);
+          return { success: true, data: result };
+        }
+
+        case 'post-thread': {
+          if (!Array.isArray(tweets) || tweets.length === 0) {
+            throw new Error('tweets (non-empty array of strings) is required for post-thread');
+          }
+          if (tweets.length < 2) {
+            throw new Error('post_thread requires at least 2 tweets. To post a single tweet, use post_on_connected_account instead.');
+          }
+          const result = await twitterService.postThread(ownerUserId, account_id, tweets);
+          if (result[0]) await logCrm('twitter.tweet.sent', result[0].id, result[0].text);
+          return { success: true, data: result };
+        }
+
+        case 'quote-tweet': {
+          if (!text) throw new Error('text is required for quote_tweet');
+          if (!tweet_id) throw new Error('tweet_id is required for quote_tweet');
+          const result = await twitterService.quoteTweet(ownerUserId, account_id, text, tweet_id);
+          await logCrm('twitter.tweet.sent', result.id, result.text);
+          return { success: true, data: result };
+        }
+
+        case 'delete-tweet': {
+          if (!tweet_id) throw new Error('tweet_id is required for delete-tweet');
+          const result = await twitterService.deleteTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'like': {
+          if (!tweet_id) throw new Error('tweet_id is required for like');
+          const result = await twitterService.likeTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'unlike': {
+          if (!tweet_id) throw new Error('tweet_id is required for unlike');
+          const result = await twitterService.unlikeTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'retweet': {
+          if (!tweet_id) throw new Error('tweet_id is required for retweet');
+          const result = await twitterService.retweetTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'unretweet': {
+          if (!tweet_id) throw new Error('tweet_id is required for unretweet');
+          const result = await twitterService.unretweetTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-tweet-metrics': {
+          if (!tweet_ids?.length) throw new Error('tweet_ids is required for get_tweet_metrics');
+          const result = await twitterService.getTweetMetrics(ownerUserId, account_id, tweet_ids);
+          return { success: true, data: result };
+        }
+
+        case 'list-replies': {
+          if (!tweet_id) throw new Error('tweet_id is required for list_replies');
+          const result = await twitterService.listReplies(ownerUserId, account_id, tweet_id, max_results);
+          return { success: true, data: result };
+        }
+
+        case 'get-retweeters': {
+          if (!tweet_id) throw new Error('tweet_id is required for get_retweeters');
+          const result = await twitterService.getRetweeters(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-liking-users': {
+          if (!tweet_id) throw new Error('tweet_id is required for get_liking_users');
+          const result = await twitterService.getLikingUsers(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-quote-tweets': {
+          if (!tweet_id) throw new Error('tweet_id is required for get_quote_tweets');
+          const result = await twitterService.getQuoteTweets(ownerUserId, account_id, tweet_id, max_results);
+          return { success: true, data: result };
+        }
+
+        default: {
+          const validActions = [
+            'reply', 'post-thread', 'quote-tweet',
+            'delete-tweet',
+            'like', 'unlike', 'retweet', 'unretweet',
+            'list-replies', 'get-tweet-metrics',
+            'get-retweeters', 'get-liking-users', 'get-quote-tweets',
+          ];
+          throw new Error(`Unsupported twitter_manage_post action: "${action}". Valid actions are: ${validActions.join(', ')}`);
+        }
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      console.error('AgentMode: twitter_manage_post failed:', errorMessage);
+      return { success: false, message: 'Twitter action failed', error: errorMessage };
+    }
+  }
+
+  async twitterOutreach(userId: string, args: any): Promise<any> {
+    let { account_id } = args;
+    const action = (args.action as string)?.replace(/_/g, '-');
+    const { text, handle, recipient_handle, query, max_results, tweet_id, list_id, lead_id, lead_email } = args;
+    console.log(`[AgentMode] twitterOutreach called: action=${action}, account_id=${account_id}`);
+
+    const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+    const twitterAccounts = (await getAccountsWithOwnerIncludingOrgShared(userId))
+      .filter((a: any) => a.platform === 'twitter');
+
+    if (twitterAccounts.length === 0) {
+      return {
+        success: false,
+        error: 'No X (Twitter) account is connected. Connect your X account in Settings → Connected Accounts.',
+      };
+    }
+
+    let account: any;
+    if (account_id) {
+      account = twitterAccounts.find((a: any) => a.account_id === account_id);
+      if (!account) {
+        return { success: false, error: `X account ${account_id} is not connected to your profile.` };
+      }
+    } else if (twitterAccounts.length === 1) {
+      account = twitterAccounts[0];
+    } else {
+      return {
+        success: false,
+        error: 'Multiple X accounts are connected — specify account_id. Use list_connected_accounts(platform="twitter").',
+      };
+    }
+
+    const ownerUserId = account.userId;
+    account_id = account.account_id;
+
+    const logCrm = async (messageProviderId: string, bodyText: string): Promise<void> => {
+      if (!list_id || !lead_id || !lead_email) return;
+      try {
+        const { emailEventsDb } = await import('./emailEventsDb');
+        await emailEventsDb.addTwitterMessageEvent({
+          eventId: `twitter_dm_${messageProviderId}`,
+          emailDomain: `twitter-${list_id}`,
+          leadEmail: lead_email,
+          eventType: 'twitter.dm.sent',
+          text: bodyText ?? null,
+          timestamp: new Date().toISOString(),
+          senderId: account_id,
+          messageProviderId,
+        });
+      } catch (e) {
+        console.error('[AgentMode] twitterOutreach CRM logging failed (non-fatal):', e);
+      }
+    };
+
+    try {
+      switch (action) {
+        case 'get-profile': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for get_profile');
+          const result = await twitterService.getProfile(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'follow': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for follow');
+          const result = await twitterService.followUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'unfollow': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for unfollow');
+          const result = await twitterService.unfollowUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'list-followers': {
+          const target = handle || recipient_handle;
+          const result = await twitterService.listFollowers(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'list-following': {
+          const target = handle || recipient_handle;
+          const result = await twitterService.listFollowing(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'search-tweets': {
+          if (!query) throw new Error('query is required for search_tweets');
+          const result = await twitterService.searchTweets(ownerUserId, account_id, query, max_results);
+          return { success: true, data: result };
+        }
+
+        case 'get-user-tweets': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for get_user_tweets');
+          const result = await twitterService.getUserTweets(ownerUserId, account_id, target, max_results);
+          return { success: true, data: result };
+        }
+
+        case 'send-dm': {
+          const target = recipient_handle || handle;
+          if (!target) throw new Error('handle is required for send_dm');
+          if (!text) throw new Error('text is required for send_dm');
+          const result = await twitterService.sendDm(ownerUserId, account_id, target, text);
+          await logCrm(result?.dm_event_id || `${account_id}_dm`, text);
+          return { success: true, data: result };
+        }
+
+        case 'list-dms': {
+          const result = await twitterService.listDms(ownerUserId, account_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-dm-conversation': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for get_dm_conversation');
+          const result = await twitterService.getDmConversation(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'bookmark': {
+          if (!tweet_id) throw new Error('tweet_id is required for bookmark');
+          const result = await twitterService.bookmarkTweet(ownerUserId, account_id, tweet_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-bookmarks': {
+          const result = await twitterService.getBookmarks(ownerUserId, account_id);
+          return { success: true, data: result };
+        }
+
+        case 'block': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for block');
+          const result = await twitterService.blockUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'unblock': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for unblock');
+          const result = await twitterService.unblockUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'mute': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for mute');
+          const result = await twitterService.muteUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        case 'unmute': {
+          const target = handle || recipient_handle;
+          if (!target) throw new Error('handle is required for unmute');
+          const result = await twitterService.unmuteUser(ownerUserId, account_id, target);
+          return { success: true, data: result };
+        }
+
+        default: {
+          const validActions = [
+            'get-profile', 'follow', 'unfollow', 'list-followers', 'list-following',
+            'search-tweets', 'get-user-tweets',
+            'send-dm', 'list-dms', 'get-dm-conversation',
+            'bookmark', 'get-bookmarks',
+            'block', 'unblock', 'mute', 'unmute',
+          ];
+          throw new Error(`Unsupported twitter_outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
+        }
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      console.error('AgentMode: twitter_outreach failed:', errorMessage);
+      return { success: false, message: 'Twitter outreach action failed', error: errorMessage };
     }
   }
 
@@ -27086,14 +27826,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for UPDATE action' };
-          await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
+          const didUpdate = await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
             name: args.name,
             status: args.status,
             biddingStrategy: args.bidding_strategy,
             biddingStrategyTarget: args.bidding_strategy_target,
             cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
             budgetResourceName: args.budget_resource_name,
+            finalUrlSuffix: args.final_url_suffix,
           });
+          if (!didUpdate) return { success: false, error: 'This tool does not support updating the field(s) requested for CAMPAIGN — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Campaign updated' };
         }
       }
@@ -27136,7 +27878,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.ad_group_resource_name) return { success: false, error: 'ad_group_resource_name is required for UPDATE action' };
-          await googleAdsService.updateAdGroup(userId, customer_id, args.ad_group_resource_name, {
+          const didUpdateAdGroup = await googleAdsService.updateAdGroup(userId, customer_id, args.ad_group_resource_name, {
             name: args.name,
             status: args.status,
             cpcBidMicros: args.cpc_bid_micros,
@@ -27144,6 +27886,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             targetCpaMicros: args.target_cpa_micros,
             targetRoas: args.target_roas,
           });
+          if (!didUpdateAdGroup) return { success: false, error: 'This tool does not support updating the field(s) requested for AD_GROUP — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Ad group updated' };
         }
         if (action === 'REMOVE') {
@@ -27176,10 +27919,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.criterion_resource_name) return { success: false, error: 'criterion_resource_name is required for KEYWORD UPDATE' };
-          await googleAdsService.updateKeyword(userId, customer_id, args.criterion_resource_name, {
+          const didUpdateKeyword = await googleAdsService.updateKeyword(userId, customer_id, args.criterion_resource_name, {
             status: args.status,
             cpcBidMicros: args.cpc_bid_micros,
           });
+          if (!didUpdateKeyword) return { success: false, error: 'This tool does not support updating the field(s) requested for KEYWORD — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Keyword updated' };
         }
         if (action === 'REMOVE') {
@@ -27220,9 +27964,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD UPDATE' };
-          await googleAdsService.updateAd(userId, customer_id, args.ad_resource_name, {
+          const didUpdateAd = await googleAdsService.updateAd(userId, customer_id, args.ad_resource_name, {
             status: args.status,
           });
+          if (!didUpdateAd) return { success: false, error: 'This tool does not support updating the field(s) requested for AD — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Ad updated' };
         }
         if (action === 'REMOVE') {

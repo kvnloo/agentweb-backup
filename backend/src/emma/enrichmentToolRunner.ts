@@ -9,7 +9,7 @@ import { buildOrchestratorDeps } from '../services/enrichmentV3RealDeps';
 import type { SocketEmitFn } from '../services/crmEnrichmentService';
 import { buildRawEnrichmentConfig, type EmmaEnrichmentOutputField } from './enrichmentToolConfig';
 import { normalizeOutputFields, type FieldRemap } from './enrichmentFieldNormalizer';
-import { fieldVerificationStatus } from '../utils/enrichedFieldValue';
+import { fieldVerificationStatus, fieldProvenanceBadge } from '../utils/enrichedFieldValue';
 
 /**
  * Build the list-level disambiguation context string from a lead list record.
@@ -42,6 +42,11 @@ export interface EmmaEnrichmentSummary {
      *  critic-flagged) and should be caveated rather than stated as fact.
      *  Empty array means every populated field is high-confidence/verified. */
     unverifiedFields: string[];
+    /** Per-field provenance for the unverified fields, so Emma can name WHY a
+     *  value is unverified (ENG-122): 'ai-knowledge' = asserted from the model's
+     *  own training memory (no source); 'web-unverified' = from a web source the
+     *  fact-check couldn't confirm. Omitted when no field carries a badge. */
+    unverifiedProvenance?: Record<string, 'web-unverified' | 'ai-knowledge'>;
   }>;
   /** Field renames applied before building the config (synonym/alias normalization). */
   fieldRemaps?: FieldRemap[];
@@ -126,15 +131,27 @@ export async function runEmmaEnrichment(
     warnings,
   };
   if (params.mode === 'preview' && Array.isArray(result.preview)) {
-    summary.samples = result.preview.map(p => ({
-      leadId: p.leadId,
-      enrichedFields: p.extractedFields,
+    summary.samples = result.preview.map(p => {
+      const meta = p.meta ?? {};
       // Flag each populated field that is low-confidence / unverified so Emma
       // can caveat it (the Slashy funding_stage bug) instead of asserting it.
-      unverifiedFields: Object.keys(p.extractedFields).filter(
-        field => fieldVerificationStatus(p.meta?.[field]) === 'unverified',
-      ),
-    }));
+      const unverifiedFields = Object.keys(p.extractedFields).filter(
+        field => fieldVerificationStatus(meta[field]) === 'unverified',
+      );
+      // Name WHY each unverified field is unverified so Emma can caveat it
+      // specifically — AI-knowledge (model memory) vs an unconfirmed web source.
+      const unverifiedProvenance: Record<string, 'web-unverified' | 'ai-knowledge'> = {};
+      for (const field of unverifiedFields) {
+        const badge = fieldProvenanceBadge(meta[field]);
+        if (badge) unverifiedProvenance[field] = badge;
+      }
+      return {
+        leadId: p.leadId,
+        enrichedFields: p.extractedFields,
+        unverifiedFields,
+        ...(Object.keys(unverifiedProvenance).length > 0 ? { unverifiedProvenance } : {}),
+      };
+    });
   }
   if (remaps.length > 0) {
     summary.fieldRemaps = remaps;

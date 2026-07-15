@@ -41,7 +41,13 @@ export class LLMService {
   private isGemini: boolean;
   private provider: string;
 
-  constructor(modelName?: string, temperature: number = 0.8, maxTokens?: number) {
+  /**
+   * @param temperature Pass `null` to omit the parameter entirely and let the
+   *   deployment use its default. Some Azure deployments (e.g. gpt-5-chat-2)
+   *   reject ANY non-default temperature with a 400 `unsupported_value`, which
+   *   callers then swallow — silently disabling whatever they were doing.
+   */
+  constructor(modelName?: string, temperature: number | null = 0.8, maxTokens?: number) {
     const model = modelName || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
     this.modelName = model;
     this.isGemini = model.toLowerCase().includes('gemini');
@@ -83,7 +89,7 @@ export class LLMService {
         model: modelId,
         region,
         client: bedrockClient,
-        temperature,
+        ...(temperature === null ? {} : { temperature }),
         ...(maxTokens && { maxTokens }),
       });
     } else {
@@ -98,7 +104,7 @@ export class LLMService {
         azureOpenAIApiInstanceName: instanceName,
         azureOpenAIApiDeploymentName: model,
         azureOpenAIApiVersion: process.env.AZURE_OPENAI_API_VERSION || '2024-08-01-preview',
-        temperature,
+        ...(temperature === null ? {} : { temperature }),
         ...(maxTokens && { maxTokens }),
       });
     }
@@ -537,7 +543,7 @@ The HTML must be a complete, well-formed HTML document with proper DOCTYPE, head
  */
 export function createLLMService(
   modelName?: string,
-  temperature: number = 0.8,
+  temperature: number | null = 0.8,
   maxTokens?: number
 ): LLMService {
   return new LLMService(modelName, temperature, maxTokens);

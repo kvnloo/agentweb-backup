@@ -31,6 +31,7 @@ import { emmaToolRegistry } from '../emma/registry';
 import '../emma/fathomTools';
 
 import { getAccountsByUserId } from '../services/connectedAccountsDb';
+import { userDb } from '../services/db';
 
 const mockedAxios = axios as jest.Mocked<typeof axios>;
 const mockedGetAccounts = getAccountsByUserId as jest.MockedFunction<typeof getAccountsByUserId>;
@@ -346,5 +347,58 @@ describe('fathom_get_transcript', () => {
 
     expect(result.success).toBe(false);
     expect(result.message).toContain('reconnect');
+  });
+});
+
+describe('fathom_get_onboarding_context', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('should be registered in emmaToolRegistry', () => {
+    expect(emmaToolRegistry.getTool('fathom_get_onboarding_context')).toBeDefined();
+  });
+
+  it('returns only reviewed Fathom onboarding contexts for the current account', async () => {
+    jest.spyOn(userDb, 'getUserById').mockResolvedValueOnce({
+      userId: 'user-1',
+      email: 'owner@acme.ai',
+      fathomOnboardingIngestions: [
+        {
+          recordingId: '123',
+          recordingUrl: 'https://fathom.video/calls/123',
+          status: 'reviewed',
+          extractionState: 'human_reviewed',
+          updatedAt: '2026-07-08T20:00:00.000Z',
+          matchReason: 'manual_target_user',
+          context: { companyName: 'Acme AI', primaryGtmGoal: 'Book qualified demos' },
+        },
+        {
+          recordingId: '456',
+          status: 'needs_review',
+          extractionState: 'auto_extracted',
+          context: { companyName: 'Draft Co' },
+        },
+      ],
+    } as any);
+
+    const result = await executeTool('fathom_get_onboarding_context', {}, { userId: 'user-1' });
+
+    expect(result.success).toBe(true);
+    expect(result.count).toBe(1);
+    expect(result.contexts).toEqual([
+      expect.objectContaining({
+        recordingId: '123',
+        extractionState: 'human_reviewed',
+        context: expect.objectContaining({ companyName: 'Acme AI' }),
+      }),
+    ]);
+  });
+
+  it('requires user context', async () => {
+    const result = await executeTool('fathom_get_onboarding_context', {}, {});
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('Authentication required');
   });
 });

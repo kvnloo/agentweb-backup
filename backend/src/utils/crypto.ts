@@ -4,6 +4,7 @@
  */
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
+import { getJwtSecret } from '../config/jwt';
 
 // Function to derive a 32-byte key from JWT_SECRET
 function deriveKey(secret: string): Buffer {
@@ -14,13 +15,13 @@ function deriveKey(secret: string): Buffer {
 
 export function encryptPassword(password: string, userId: string): string {
   // First sign the password with userId
-  const signedPassword = jwt.sign({ password, userId }, process.env.JWT_SECRET!);
-  
+  const signedPassword = jwt.sign({ password, userId }, getJwtSecret());
+
   // Generate a random IV
   const iv = crypto.randomBytes(16);
-  
+
   // Derive a 32-byte key from JWT_SECRET
-  const key = deriveKey(process.env.JWT_SECRET!);
+  const key = deriveKey(getJwtSecret());
   
   // Create cipher using derived key
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
@@ -50,16 +51,16 @@ export function decryptPassword(encryptedString: string): { password: string, us
     const authTag = buffer.slice(buffer.length - 16);
     const encryptedText = buffer.slice(16, buffer.length - 16);
     
-    const key = deriveKey(process.env.JWT_SECRET!);
+    const key = deriveKey(getJwtSecret());
     const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-    
+
     decipher.setAuthTag(authTag);
-    
+
     let decrypted = decipher.update(encryptedText.toString('hex'), 'hex', 'utf8');
     decrypted += decipher.final('utf8');
-    
+
     // Verify signature and extract content
-    const decoded = jwt.verify(decrypted, process.env.JWT_SECRET!) as { password: string, userId: string };
+    const decoded = jwt.verify(decrypted, getJwtSecret()) as { password: string, userId: string };
     return decoded;
   } catch (error) {
     throw new Error('Failed to decrypt password');

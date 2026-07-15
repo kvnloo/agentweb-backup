@@ -269,6 +269,8 @@ export function suggestAlternativeTool(task: string): string {
   if (/\b(code|repo|repository|commit|deploy|build|script|function|bug|fix)\b/i.test(task)) return 'coding_agent';
   if (/\b(analyz|analys|data analysis|metrics|chart|spreadsheet|csv|dataset)\b/i.test(task)) return 'perform_data_analysis';
   if (/\b(post|comment|message|dm|connect|invite|outreach)\b/i.test(task) && /\blinkedin\b/i.test(task)) return 'linkedin_outreach';
+  if (/\b(dm|follow|unfollow|profile|block|mute|bookmark|search)\b/i.test(task) && /\b(twitter|x|tweet)\b/i.test(task)) return 'twitter_outreach';
+  if (/\b(tweet|thread|reply|post|like|retweet|quote)\b/i.test(task) && /\b(twitter|x|tweet)\b/i.test(task)) return 'twitter_manage_post';
   if (/\b(send|email|reply)\b/i.test(task) && /\bemail\b/i.test(task)) return 'send_email';
   return 'you_search_web';
 }
@@ -297,6 +299,30 @@ export function buildScopeRejectionResult(reason: string, suggestedTool: string)
     guidance,
     suggestedTool,
     formattedContent: guidance,
+  };
+}
+
+export function buildLocalAgentUnavailableResult(
+  reason: 'not_configured' | 'unreachable' | 'auth_failed' | 'bad_response',
+  message: string,
+): {
+  success: true;
+  unavailable: true;
+  reason: string;
+  message: string;
+  formattedContent: string;
+} {
+  return {
+    success: true,
+    unavailable: true,
+    reason,
+    message,
+    formattedContent:
+      `${message}\n\n` +
+      'The local browser relay is unavailable, but this is only a fallback. ' +
+      'Do not retry run_local_agent_task in this run; continue the website scan with the cloud Playwright browser tools, read_page_source, and search tools. ' +
+      'If the cloud browser can load enough page content, complete the audit from that evidence. ' +
+      'If bot protection blocks all cloud-browser evidence, report that manual browser verification is needed instead of marking the whole scan as an internal tool failure.',
   };
 }
 
@@ -364,10 +390,10 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
 
     const config = await getRelayConfig();
     if (!config) {
-      return {
-        success: false,
-        error: 'Local agent relay not configured. Store the secret at dev/AgentWeb/LocalAgentRelay (or prod/...) with {"endpoint":"https://xxx.ngrok-free.app","apiKey":"YOUR_API_KEY"}.',
-      };
+      return buildLocalAgentUnavailableResult(
+        'not_configured',
+        'Local agent relay is not configured for this environment.',
+      );
     }
 
     const timeoutSeconds = Math.min(args.timeout_seconds ?? 120, 900);
@@ -397,21 +423,33 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
     try {
       rawResponse = await httpRequest('POST', taskUrl, config.apiKey, requestBody, (timeoutSeconds + 90) * 1000);
     } catch (err: any) {
-      return { success: false, error: `Failed to reach local agent relay: ${err.message}` };
+      return buildLocalAgentUnavailableResult(
+        'unreachable',
+        `Failed to reach local agent relay: ${err.message}`,
+      );
     }
 
     if (rawResponse.status === 401) {
-      return { success: false, error: 'Local agent relay rejected the request — check the secret token.' };
+      return buildLocalAgentUnavailableResult(
+        'auth_failed',
+        'Local agent relay rejected the request.',
+      );
     }
     if (rawResponse.status !== 200) {
-      return { success: false, error: `Local agent relay returned status ${rawResponse.status}: ${rawResponse.data.slice(0, 500)}` };
+      return buildLocalAgentUnavailableResult(
+        'bad_response',
+        `Local agent relay returned status ${rawResponse.status}: ${rawResponse.data.slice(0, 200)}`,
+      );
     }
 
     let parsed: any;
     try {
       parsed = JSON.parse(rawResponse.data);
     } catch {
-      return { success: false, error: 'Invalid JSON from local agent relay.' };
+      return buildLocalAgentUnavailableResult(
+        'bad_response',
+        'Invalid JSON from local agent relay.',
+      );
     }
 
     const screenshotUrls: string[] = [];

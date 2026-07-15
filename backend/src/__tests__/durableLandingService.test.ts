@@ -136,6 +136,32 @@ describe("findInFlightJobForSession — reconnect lookup", () => {
     expect(job?.id).toBe("live");
   });
 
+  it("a LONG build that is still PROGRESSING is not a zombie — staleness is updatedAt, matching the janitor (ENG-287 residual F6)", async () => {
+    // This measured age from `createdAt` while the abandoned-build janitor measured it from
+    // `updatedAt`, so the two disagreed about what "dead" means. A build that legitimately
+    // runs long (slow generation + a correction round + a slow Vercel build) but is
+    // heartbeating was declared a zombie: deliverStuckFailure then BURNED its one-shot
+    // completion claim to tell the user "nothing was deployed" — after which the real
+    // success could never be delivered, because the claim was already spent. The page went
+    // live at a URL the user was never given, and their retry started a second build.
+    mockQuery.mockReturnValue(
+      ok({
+        Items: [
+          {
+            id: "long-but-alive",
+            userId: "u1",
+            status: "generating",
+            originatingSessionId: "s1",
+            createdAt: FORTY_MIN_AGO, // started long ago...
+            updatedAt: FIVE_MIN_AGO,  // ...but heartbeated 5 min ago: alive.
+          },
+        ],
+      })
+    );
+    const job = await findInFlightJobForSession("u1", "s1", NOW);
+    expect(job?.id).toBe("long-but-alive");
+  });
+
   it("returns null when every in-flight record for the session is a zombie past the ceiling", async () => {
     // Two in-flight builds, both older than STUCK_CEILING_MS. The pre-fix newest-first
     // sort would return the newer zombie ("z2"); the zombie guard must filter both and

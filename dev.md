@@ -1,3 +1,254 @@
+## Landing pages: the residual wedge + hang the first fix left behind (2026-07-13, ENG-287 follow-up)
+
+The 07-11 fix (PR #2066, below) correctly killed the sync-create 300s race. But the same failure
+CLASS was still reachable by other doors, and the sync→async switch introduced two regressions. An
+audit of the merged code found the following, each verified against the code and now fixed with tests.
+
+### The semantic bug underneath all of it
+A `succeeded` guard row records that the **chat was created** — NOT that a page was delivered. It was
+then reused unconditionally and forever: no TTL on `AW-V0Usage`, never clobbered, age-blind. So ANY
+post-create failure left the row behind and every retry reused the same dead chat. And because #2066
+deliberately removed the prompt from the key, retrying with a **different prompt** reused it too.
+
+### Wedges (a route that can never be built again)
+1. **Vercel build error RETURNS instead of throwing** (`addPageToExistingRepo`), so the catch that
+   frees the identity never ran. v0 emits code that will not compile → guard row stays `succeeded` →
+   every retry re-downloads the same broken version. Forever. Deterministic, and the user has no lever.
+2. **The DELETE route never freed the identity.** It calls `deleteLandingPageByRecord`;
+   `deleteLandingPage` (which did free it) is imported by that route and never used. Combined with the
+   prompt-free key, a surviving row **hijacks the next generation**: delete a page, regenerate the same
+   slug with a new prompt, get the OLD chat back — the new prompt is never sent to v0.
+3. **No backstop.** Now `V0_CHAT_REUSE_CEILING_MS` (45 min) bounds reuse even on paths nobody
+   anticipated, so "cannot wedge forever" is a guarantee rather than a hope.
+
+The fix draws the line explicitly (`isDeadEndV0Failure`): a **dead end** (v0 marked the version failed
+/ output will not validate / code will not build) frees the identity so the retry mints a fresh chat; a
+merely-**slow** generation keeps it so the retry RESUMES the same chat for free. Freeing on slowness
+would mint a second full-cost chat while the first is still generating — the exact orphan-chat credit
+burn this whole issue is about.
+
+### The original hang, still live
+`withRetry`'s default re-burns our synthetic 300s ceiling 3×. Four sites still used it —
+`downloadVersion` ×2 and the post-correction `getById` ×2 — and they sit INSIDE a 3-round validation
+loop: worst case **3 × 3 × 300s = 45 min**, worse than the 15-min hang that started this and past the
+MCP tool's own 25-min budget. Also, the "~16 min" poll budget bounded **sleeps, not wall-clock** (each
+status read was allowed 300s → a real ceiling near 3h, and the error message said 16 min). Now: an
+ABSOLUTE deadline (`V0_GENERATION_BUDGET_MS` 20 min), status polls bounded at 30s, and fail-fast at all
+four sites (5xx/network stay retryable).
+
+### Regressions introduced by the async switch
+- **First-page builds spent their whole generation in `draft`.** Async create returns in seconds and
+  the long poll moved into `deployLandingPage`, but the record was flipped to `draft` first — a status
+  `IN_FLIGHT_STATUSES`, the janitor, and route-reuse all ignore. Agent mode (10-min run timeout) could
+  not find the in-flight job, told the user it **FAILED**, and the retry built a **duplicate site**
+  (second repo, second Vercel project). That is the ENG-189 class, reopened. Now stays `generating`;
+  `deployLandingPage` accepts that status only for its own auto-deploy, so a user-initiated deploy
+  still refuses an actively-generating record.
+- **`deployLandingPage` rethrew a bare `new Error()`**, destroying `error.code`. It is the ONLY place
+  the first-page path reaches the version poll, so `generateFirstPage`'s dead-end branch was
+  unreachable **dead code** — the safety net did not exist. Code + cause now preserved.
+
+### Constants (coherent ladder)
+| constant | value | why |
+| -- | -- | -- |
+| `V0_STATUS_POLL_TIMEOUT_MS` | 30s | a status read is a cheap GET; 300s let wall-clock reach ~3h |
+| `V0_GENERATION_BUDGET_MS` | 20 min | ABSOLUTE deadline, threaded through the whole build (initial wait + every correction round) so it is spent ONCE. Computing it per call re-armed it, letting one build poll 3 × 20 min and outlive both ceilings below. |
+| `V0_RESERVATION_TTL_MS` | 20 min | unchanged; `reserved` now lives seconds (async create) |
+| `STUCK_CEILING_MS` | 30 min | janitor + route reuse; above the generation budget, so a live build is never swept |
+| `V0_CHAT_REUSE_CEILING_MS` | 45 min | > 2 generation budgets, so a resume-after-timeout retry always lands inside it |
+
+**The real transport ceiling is 15 min, not 25.** `mcp/server/httpClient.ts` installs a global undici
+dispatcher with `headersTimeout: 15 min`, and the backend sends no headers until the generation
+finishes — so `generate_landing_page`'s `timeoutMs: 25 min` can never be reached; the fetch aborts at
+15 min with `UND_ERR_HEADERS_TIMEOUT`. A generation in the 15–20 min window therefore always loses its
+MCP call even though the backend budget allows it. That is survivable — the durable/reconnect path
+(`findInFlightJobForSession`) and sub-page route-reuse both pick the build back up — but it means the
+in-band MCP call is NOT the thing that delivers a slow build, and nobody should size a constant
+against the 25-min number.
+
+### Also fixed
+- A long build **heartbeats `updatedAt`**, so the janitor cannot mark a LIVE build failed (which let a
+  retry run a second build into the same repo). This is why draft→generating and the heartbeat had to
+  land together.
+- `isStuck`/`isZombieInFlight` now measure from `updatedAt`, matching the janitor. Keyed on `createdAt`
+  they declared a long-but-progressing build dead, and `deliverStuckFailure` **burned its one-shot
+  completion claim** — so the real success could never be delivered afterwards. The page went live at a
+  URL the user was never given.
+- The **correction key gained an `attempt`** component. It was `(user, scope, chatId)`, so round 2
+  returned `{skipped:true}` and the loop re-downloaded the same broken zip: a 3-attempt self-heal that
+  was really 1. (Appended only when supplied, so chat-create keys stay byte-identical to prod rows.)
+- The post-correction version is **status-gated** rather than read raw off `latestVersion` — the exact
+  mistake `waitForCompletedV0Version` exists to prevent (shipping a half-generated page).
+
+### Sub-page builds died on `Module not found: '../components/landing/nav'` (found in manual test)
+
+Our bug, not v0's. `remapFilesForSubPage` rewrote exactly two import forms — the
+`@/components/*` alias and `./_components/*` inside component files. Plain **relative** imports were
+never touched, and v0 emits those too. They are correct at the repo root (`../components/landing/nav`
+from `app/page.tsx` = `components/landing/nav`), but we move the file to `app/<slug>/page.tsx`, where
+that same string means `app/components/landing/nav` — nonexistent — and the component itself has also
+moved into `_components/`. Wrong twice over. It looked intermittent only because it depended on
+whether v0 happened to emit alias-style or relative-style imports.
+
+Fix: resolve every relative import against the file's ORIGINAL directory and re-emit as `@/...`
+(always resolves from the repo root) BEFORE the alias pass, which then handles moved components
+uniformly. Also fixes the same latent break for `../lib/*`, `../hooks/*`, `../components/ui/*` — none
+of which move, and which nobody had hit yet.
+
+Worth noting how it surfaced: the ENG-287 fix is what let us *see* it. The Vercel build error now
+frees the route identity, so the retry minted a fresh chat. Pre-fix that route would have silently
+re-downloaded the same broken version forever.
+
+### Caught in adversarial review of THIS change (worth knowing about)
+- **A Vercel poll `timeout` is NOT a dead end.** `pollVercelDeployment` gives up after 5 min and also
+  degrades API flakiness to `timeout`. The first cut of this fix freed the identity on it — which
+  would have been the orphan double-spend it exists to prevent: a normal Next.js cold build outruns
+  the poll, the page goes live a minute later, and the user's retry mints a second full-cost chat and
+  pushes a second commit. Only `buildStatus === "error"` frees the identity.
+- **`setupVercelDeployErrorMock()` in the test suite does not test the build-error path.** Its
+  deployment carries no `meta.githubCommitSha`, so `pollVercelDeployment`'s SHA-match guard never
+  selects it and the poll falls through to `timeout`. Any test that wants a real build error must set
+  the SHA. (Pre-existing; the helper predates the SHA guard.)
+- **The guard must fail OPEN, both halves.** `canReuseChat` refuses to reuse a `succeeded` row with an
+  unreadable `createdAt` — so the reserve condition needs a matching
+  `attribute_not_exists(createdAt)` clause, because in DynamoDB a `<` against a missing attribute is
+  false. Without it the row matches nothing, the conditional put fails on every attempt, and the route
+  wedges forever: exactly the bug, reintroduced by the fix for it.
+- **Deleting an IN-FLIGHT page must not free its identity** — the archived record is invisible to
+  route-reuse, so the guard row is the only thing left deduping, and freeing it lets a second chat
+  build into the same repo concurrently.
+
+### iterate: the last sync v0 call (now fixed)
+
+`iterateLandingPage` was the last v0 call still sitting behind the 300s ceiling. A >300s iteration
+failed FOUR ways at once: v0 applied the edit and charged for it anyway; the record never incremented
+and stayed `deployed`; `deployLandingPage` then REFUSED it ("Cannot deploy a landing page with
+status: deployed"), stranding the edit inside v0; and the retry re-sent the same message with no
+guard, so v0 applied it TWICE.
+
+Async was blocked for a real reason: `deployLandingPage` reads "the latest completed version", so an
+iterate that returned before v0 published the new one would let the deploy ship the **pre-iteration**
+version and silently lose the user's edit — worse than failing. `waitForCompletedV0Version`'s
+`afterVersionId` guard is what unblocked it: we do not return until v0 publishes a version that is
+genuinely NOT the one we started from, so the hazard is structurally impossible.
+
+`pendingIteration {baseVersionId, messageHash}` is recorded the instant v0 ACCEPTS the send (before
+the wait). A retry of the same message resumes instead of re-sending; if v0 has since published a
+newer version, the edit landed and we adopt it. v0's own state is the source of truth, not a guess.
+
+Note what is deliberately NOT done: the status is not flipped to `generating` during an edit. The
+page is still live, and a crash mid-iterate would then let the janitor mark a LIVE page `failed`.
+
+### Still open
+- **The 15-min transport ceiling.** `mcp/server/httpClient.ts` sets a global undici
+  `headersTimeout: 15 min`, so any generation or iteration past that loses its in-band HTTP response
+  no matter what the backend budget says. The work still lands and the record is left correct
+  (deployable), so the user finishes from the portal — but the in-band call is not what delivers a
+  slow build. Removing this properly means returning 202 immediately and having the portal poll
+  (ENG-290 pattern 5) — a product change, not a bug fix.
+- `bestEffortPut` fails open on a Dynamo outage → a bounded double-spend across instances. Accepted
+  trade-off; the alternative is recreating the permanent wedge.
+- The DynamoDB `ConditionExpression` in `v0UsageGuard` is only asserted as a STRING in tests (the
+  DocumentClient is mocked) — it has never executed against a real table. If its semantics are wrong,
+  the symptom is the wedge it exists to prevent. Worth one real exercise against a dev table.
+
+## Landing-page generation failing routinely (RankAI/Opsera/internal) — root cause + fix (2026-07-11, ENG-287/ENG-277)
+
+Matt reported the landing-page builder "keeps failing routinely" for RankAI (07-10); Opsera's urgent
+Monday case hit "another bug on the v0 side"; internal evals were rescuing Opsera-branded attempts by
+hand. Anurag's earlier fixes (ENG-135/157/158/159/160/189, merged 07-02..07-08) were real but fixed
+DIFFERENT failure modes (coding-agent 422 preview-branch, zombie durable records, opaque errors,
+model timeout). The 07-09/07-10 failures are a distinct, never-fixed mode.
+
+### Root cause (adversarially verified, prod evidence in AW-V0Usage + v0 chat list)
+1. **Sync-mode create loses a race against our own timeout.** `v0.chats.create` was called with no
+   `responseMode` → sync → the HTTP call blocks for the FULL generation. Prod generations of
+   brand-enriched prompts take 3–15 min; our per-attempt ceiling is 300s (`V0_CALL_TIMEOUT`). Every
+   slow generation = guaranteed client-side "timeout" while v0 finishes anyway → **orphan chat,
+   credits burned, user sees failure** (v0 chat list showed 4 orphan "Forge + Cursor rebrand" chats at
+   a 5-min retry cadence on 07-10; ~$39 of the $50 on-demand block burned in 10 days).
+2. **Our reliability layers amplified it**: `withRetry` re-burned the 300s timeout 3× (≈15-min hang),
+   and the idempotency guard (volatile prompt-hash key, no TTL, failed-blocks-retry) converted
+   failures into the permanent "already in flight" wedge (ENG-277, rankai-book-a-demo).
+3. **NOT credits, NOT auth** (Harsha's two hypotheses ruled out): prod key healthy (200s on
+   /user, /plan, /billing, /rate-limits; account deploy@agentweb.pro, v0-team, OWNER); balance
+   existed at failure time and creates succeeded later the same day. **BUT balance is now LOW:
+   ~$12.76 spendable, and the orphan-burn loop would exhaust it within days** — top-up is a
+   Session: Money item; the fix stops the orphan burn.
+
+### The fix (branch `defense/lander-reliability`, supersedes PR #2065)
+Merged Manan's `manan/v0-subpage-generation-timeout` + Codex's `codex/landing-page-idempotency`
+(conditions tightened: only `failed` or stale-`reserved` records are reclaimable — both originals
+could clobber a `succeeded` record), then the root-cause work: async `responseMode` on both create
+sites + `waitForCompletedV0Version` (status-gated ~16-min poll; `pending` never downloaded, `failed`
+fails fast), fail-fast on iterate/correction sends, universal abandoned-build janitor (portal builds
+included, poller unconditional), stale in-flight records excluded from route reuse, correction-guard
+reclaim, usage-identity cleanup on page delete.
+
+### Assumptions to validate
+- v0 async responseMode returns the chat id in seconds under load (observed for reads; not yet
+  measured for async creates at scale).
+- The ~16-min poll budget covers p99 generation time (evidence maxed ~15 min; janitor + retry path
+  cover the tail).
+- ENG-277's wedged prod record self-heals on next retry via failed-not-blocking + janitor (verify
+  live after deploy; a one-off data fix is the fallback).
+- Iterate/corrections stay sync deliberately (async there risks deploying the pre-iteration version;
+  needs version-id tracking — follow-up).
+## Linear webhook fired customer comms too early / repeatedly — root cause + fix (2026-07-07)
+
+The Linear→customer-comms bridge (`POST /api/integrations/linear/webhook`, `backend/src/routes/integrations.ts`) was firing the full resolve bridge (`notifyCanonicalResolved`: Resend "Resolved" email to every reporter + Featurebase card flip to Completed + Slack ship ping) on the wrong events. Surfaced during the 2026-07-07 merged≠done investigation; the premature-email proof is ENG-173 (an xCures reporter was emailed 2.9s after PR merge, pre-deploy).
+
+### Two root causes
+1. **Gated on state CATEGORY, not the Done state.** The predicate was `data.state.type === 'completed'`. The board now runs Merged → Verifying → Done and all three are completed-type in Linear, but only **Done** is customer-communicable — so a move into Merged or Verifying emailed reporters. Fix: gate by the Done **state ID** (`LINEAR_DONE_STATE_ID`, ENG Done = `b36918be-3026-4a37-b788-47eef453a581`), not by name — a rename would silently kill or misroute the bridge.
+2. **Not transition-detecting.** It fired on EVERY Issue `update` while the issue sat in a completed state (a later title/label edit on an already-Done bug re-emailed every reporter — the Slack ping is deduped via `claimSetMember`, but the email + card re-flip are not) and also on `action:'create'`. Fix: use the webhook's `updatedFrom.stateId` (Linear puts the prior value of each changed field there) to fire only on an ACTUAL transition into Done — `updatedFrom` must carry a `stateId` key whose value ≠ Done.
+
+### Fail-loud config guard
+If `LINEAR_DONE_STATE_ID` is unset the handler refuses to fire (logs a distinct `[linear-webhook] LINEAR_DONE_STATE_ID is not set …` line, returns 200 `ok:false`) rather than reverting to firing on any completed state — not silently open, not silently closed. 200 is kept so Linear doesn't retry-storm.
+
+### Tests
+`backend/src/__tests__/integrations.linearWebhook.test.ts` (new — the route had zero tests): Merged/Verifying → 0 comms, already-Done edit → nothing, transition into Done → fires once, non-Done completed ID → nothing, missing config → loud no-op, signature enforcement. The Linear-side fix (git-automation merge→Merged, states created) shipped 2026-07-07; this is the code-side hardening (ENG-222).
+
+## "Priority: High" in text but priority field unset — root cause + fix (2026-07-07, ENG-231)
+
+Argusoft reported auto-generated Linear bugs whose descriptions say "Priority: High" while the actual Linear priority field is None and the issue sits in Backlog unassigned — invisible to priority-sorted triage. 11 live issues had this shape (ENG-167/189/190/191/197/200/201/202/203/209/213; hand-backfilled 2026-07-07).
+
+### Root cause (adversarially verified)
+`createInternalLinearIssue` (linearService) set only teamId/title/description/labelIds + stateId=Backlog — never `priority`/`assigneeId`. Emma's `report_product_issues` accepts a `priority: High|Medium|Low` param but only rendered it as description text via `issueContext['Priority']` → `contextLines()`. The legacy Notion path (`createOncallItem`) set an Owner + Move-to-Current-Sprint, so the Linear migration had silently regressed triage visibility.
+
+### Fix
+`FileUserIssueParams.priority` (text) is now mapped onto the Linear priority field in `fileBugReport` (urgent=1/high=2/medium=3/low=4; absent/unknown → Medium — bugs never arrive "No priority" per the board doc). High+ additionally lands `startInTodo` + default bug assignee (Harshit, env override `LINEAR_BUG_DEFAULT_ASSIGNEE_ID`). `getTeamMeta` resolves `todoStateId`; `createInternalLinearIssue` gained optional `priority`/`assigneeId`/`startInTodo`.
+
+### Assumptions to validate
+- Dup-grouped High re-reports do NOT escalate the existing canonical's priority/state (kept out of scope; the reporter-count modifier in the board doc may want this later).
+- `fileAutoIssue` (telemetry/oncall) still files unset-priority Backlog items by design — no text/field mismatch there, but they remain triage-invisible until ENG-187-style intake rules cover them.
+
+## LinkedIn send-invite returns "Invalid parameters" for a valid <200-char note — root cause + fix (2026-07-07)
+
+Scheduled LinkedIn outreach (ENG-213; reported by info@pmps.ai, session 3cac962b, and hit live on Hannah K's account NN-72jZtRD6nQSzEeK6n1g) kept failing send-invite with a generic `Invalid parameters`. The note-length red herring threw the first triage: the very first attempt failed correctly on a 203-char note (over LinkedIn's 200 limit), but after both notes were trimmed to 194 and 197 chars send-invite *still* returned `Invalid parameters` — for provider_id-based calls AND a profile_url-based call. search-people, get-profile, and list-sent-invitations all worked in the same session, so the fault was isolated to the invite endpoint, not auth or the note.
+
+### Root cause (identifier form, not note length)
+The agent passed a **public-identifier slug** (e.g. `william-kwak`, `leah-marcus-bab4981a0`) as `provider_id`. Unipile's profile-lookup endpoints accept *either* the slug or the canonical member URN, so `get-profile` and `search-people` worked fine — but Unipile's **invite** endpoint accepts **only** the canonical `provider_id` (member URN) and rejects a slug with the generic, undifferentiated `Invalid parameters`. Our send path (`LinkedInOutreachService.sendInvitation`) resolved the input via `resolveProviderId` (which for a slug just forwards the slug through) and sent that raw value straight to `client.users.sendInvitation`, so any slug-based invite was rejected regardless of note length.
+
+### Fix
+`checkIsNotAlreadyConnected` — the connection-check profile fetch we already perform before every invite — now **returns** the canonical `provider_id` revealed by the live profile lookup, and `sendInvitation` sends *that* rather than whatever identifier the caller passed. When the lookup fails or reveals no `provider_id`, it falls back to the passed identifier so a transient lookup failure never blocks (or breaks) the invite. No extra API call: we reuse the profile fetch that was already happening for the already-connected guard. Covered by the send-invite canonical-resolution test in `backend/src/__tests__/`.
+
+## Scheduled runs crash with no assistant response — process-group SIGTERM kills the LLM worker mid-run (2026-07-07, ENG-202)
+
+Second instance of the same signature (first: the Daily Token Usage report). A scheduled chat (session `64ebbde3`, xCures Daily Site Health Check, opus-4-8) died with `messageCount=2` (only the trigger), `totalTokens`/`totalCost` null — the run crashed before persisting any assistant message. A sibling site-scan schedule (session `d7d45dea`, sonnet-4-6) completed the same class of task 5/5 in the same window, so the failure is NOT task- or model-inherent; it's an execution/infra abort.
+
+### Root cause (NOT the model path)
+`generateSessionResponse` runs the LLM turn in a **forked child** (`services/generateMarketingResponseWorkerService.ts` → `workers/generateMarketingResponseWorker.ts`). A forked child shares its parent's process group by default. When the platform terminates the instance (Elastic Beanstalk deploy, autoscaling replacement, health-check restart) it broadcasts SIGTERM to the **whole group**, so the worker received SIGTERM directly. With no handler installed, Node's default action killed it instantly, mid-run — surfacing as `Worker process exited with code null and signal SIGTERM` and zero persisted assistant messages, even though the parent's graceful drain (`shutdown()`) would gladly have waited for the in-flight request to finish. The opus-4-8 correlation is a red herring: opus turns are longer, so they're simply more likely to be in flight when a group SIGTERM lands.
+
+### Fix (shipped on main as ENG-201, PR #2038 — same root cause landed in parallel)
+The runtime fix was authored twice independently for the same worker-crash signature; ENG-201 (PR #2038 — opened ~30 min after this ENG-202 PR #2037, but reviewed and merged first) landed the runtime code, so this branch defers to its implementation and this entry documents the shared root cause plus the one net-additive guard ENG-202 adds.
+- `workers/workerShutdownGuards.ts` (`installWorkerShutdownGuards`), wired at the worker's module load (`generateMarketingResponseWorker.ts:13`). The worker now **ignores SIGTERM/SIGINT** — its lifecycle is owned entirely by the parent, which drains in-flight requests and then issues an explicit kill. Ignoring the racing group-signal lets the in-flight run complete during the drain instead of being aborted. As an orphan-safety net, the worker still exits on IPC `disconnect` (parent channel closed → no parent left to orchestrate shutdown).
+- `GenerateMarketingResponseWorkerService.shutdown()` teardown switches `SIGTERM` → `SIGKILL`, since the worker no longer honors SIGTERM. Safe by that point — the drain above already let in-flight requests finish (or force-failed them at the ceiling).
+- **ENG-202 addition:** a module-load wiring guard in `agentModeService.publishFixes.test.ts` asserting `installWorkerShutdownGuards()` is actually invoked at the top of the worker (not merely imported) — so accidental removal of the call, which would silently reintroduce this crash, fails a test.
+
+### Assumptions — VERIFIED
+- The worker is a `fork()` child sharing the parent group (confirmed in `generateMarketingResponseWorkerService.ts`), so a group SIGTERM reaches it directly — matching the `signal SIGTERM`, `code null` crash signature.
+- Ignoring SIGTERM cannot strand the worker: the parent owns kill via `shutdown()` (drain → SIGKILL), and IPC `disconnect` covers the orphaned-parent case. Pinned by `workerShutdownGuards.test.ts` (SIGTERM/SIGINT ignored, `disconnect` exits) and the `shutdown` SIGKILL assertion in `generateMarketingResponseWorkerService.test.ts`.
+
 ## Featurebase feature requests land as run-on blobs in Linear — root cause + fix (2026-07-06)
 
 Customer feature requests filed via Emma's `report_product_issues` were showing up in Linear as one giant run-on paragraph (reported on ENG-204). Chased it to ground truth.
@@ -49,6 +300,17 @@ Added `shipNotifyService` + `POST /api/integrations/featurebase/webhook`: when a
 - Voter list is fetched single-page (limit 100, warn on `nextCursor`) — fine at current board size.
 
 Rollout: create webhook in Featurebase Settings → Advanced → Webhooks (topic `post.updated`, nova version) pointing at prod, set `FEATUREBASE_WEBHOOK_SECRET` (value in the Featurebase dashboard per-webhook), redeploy. Kill switch: unset the env var (endpoint goes dark again). Per-user opt-out: `slackShipNotifyDisabled` on AW-Users.
+
+## OTel spine shipped — spans over the agent loop, dual-emit with the loops recorder (2026-07-02, ENG-141)
+
+Added `backend/src/observability/` (tracing.ts + semconv.ts) and three span sites: `invoke_agent` opens/closes exactly with the run-recorder lifecycle in `agentModeService` (verdict from `computeRunVerdict` on end), `chat` brackets the loop's `callLLM` including the backup-model retry, `execute_tool` wraps the gateway call inside `toolDispatch.runOne` (errorClass from `toolErrorClassifier`). Two direct OTLP/proto exporters — Langfuse (`LANGFUSE_OTEL_HOST`+`LANGFUSE_PUBLIC_KEY`+`LANGFUSE_SECRET_KEY`, Basic auth) and Okareo (`OKAREO_API_KEY`, api-key header) — each registered ONLY when its env config is present; no env = tracing off; no collector. `session.id` + `gen_ai.conversation.id` carry the Emma sessionId for Okareo sim-linking. DUAL-EMIT: `Dev-AW-LoopEvents` stays the policy/learning store; the bridge is by IDs only (`traceId` added to `agent_run_started` dimensions). Prompt/completion content capture is `AGENT_OTEL_CAPTURE_CONTENT`-flagged, default OFF.
+
+**Design choices to remember:** provider is module-private and NOT registered on the global OTel API, no context manager — parenting is explicit via a runId-keyed span registry (async-context propagation through a 24k-line monolith would be un-auditable). `gen_ai.*` names are pinned in `semconv.ts` because the upstream semconv is Development-status (renames must land in one file).
+
+**Assumptions to validate:**
+- Spans are produced in the WORKER process; `flushTelemetry()` runs in the parent's `gracefulShutdown`. The 2s BatchSpanProcessor delay + the worker drain window should export worker spans before the child is killed, but a worker SIGKILL <2s after a run ends can still drop that run's spans. If deploy-window traces go missing, add a bounded flush to the worker's per-run tail (next to `flushAgentRunRecorderSafe`).
+- Langfuse OTLP trace path is `{host}/api/public/otel/v1/traces` (signal-specific URL, since the exporter takes the full URL). Verify on first real export.
+- Okareo protobuf ingest accepts the `api-key` header form and links sims via `session.id`.
 
 ## Prod outage: partner-portal "Failed to load users" — full disk + nginx PrivateTmp trap (2026-06-26)
 
@@ -4173,15 +4435,12 @@ Processing batch: 13 schedules (Total scanned: 89)
 Processing batch: 19 schedules (Total scanned: 108)
   ✓ Updated 40 schedules, cleaned 2179 runResults entries so far...
 
-==================================================
 Repair process completed!
-==================================================
 Total schedules scanned: 108
 Total schedules updated: 43
 Total schedules skipped: 65 (no runResults or already cleaned)
 Total runResults entries cleaned: 2179
 Total errors: 0
-==================================================
 
 ✅ Repair completed successfully!
 
