@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-07-15',
+    changes: [
+      'Fixed: Daily Satisfaction Score Report No Longer Times Out on Busy Days',
+      '- When you asked for chat history with on-the-fly satisfaction scoring (sync=true) over a busy time range, the request could take so long generating scores that it timed out and returned nothing — leaving the Daily Satisfaction Score Report with no data',
+      '- Scoring now runs several sessions in parallel and within a time budget, so the request returns before it can time out',
+      '- If a range has more unscored sessions than fit in that budget, you now get the sessions with the scores computed so far (plus any already-cached scores) instead of an all-or-nothing failure; the remaining sessions are scored on the next run, so coverage catches up automatically',
+    ],
+  },
+  {
     date: '2026-07-08',
     changes: [
       'Improved: Your LinkedIn Invite Note Is Never Silently Dropped',
