@@ -2929,13 +2929,10 @@ export const agentModeController = {
         );
       }
 
-      // Release a held idem claim if the error unwound BEFORE the inner
-      // finally existed (e.g. run-record creation failed) — the client's
-      // retry must be accepted, not locked out for the idem ttl.
-      if (idemKeyHeld) {
-        await releaseIdempotency(idemKeyHeld);
-        idemKeyHeld = undefined;
-      }
+      // No idem release here: every path that errors with the claim held runs
+      // through the inner finally first (releaseIdempotency never throws, and
+      // the pre-inner-try code between claim and lock is synchronous Set ops),
+      // so idemKeyHeld is always undefined by the time this catch runs.
 
       // Clean up progress store on error so session doesn't appear stuck in generating state
       const sessionId = req.body?.sessionId;
