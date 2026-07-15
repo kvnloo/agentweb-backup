@@ -91,6 +91,9 @@ jest.mock('../services/emailService', () => ({
 }));
 
 jest.mock('../services/tokenUsageService', () => ({
+  // deriveBlockedByCost is a pure helper — use the real implementation so the
+  // block-message derivation is exercised, not stubbed.
+  ...jest.requireActual('../services/tokenUsageService'),
   checkTokenUsage: jest.fn(async () => ({
     allowed: true,
     warning: false,
@@ -2824,7 +2827,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     it('should block scheduled chat and send token limit email when user is over token limit', async () => {
       mockedCheckTokenUsage.mockResolvedValueOnce({
         allowed: false,
-        warning: true,
+        warning: false,
         used: 1050000,
         allowance: 1000000,
         percentUsed: 105,
@@ -2859,7 +2862,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     it('should block scheduled chat over token limit and fall back to user email when no emailNotifications set', async () => {
       mockedCheckTokenUsage.mockResolvedValueOnce({
         allowed: false,
-        warning: true,
+        warning: false,
         used: 1050000,
         allowance: 1000000,
         percentUsed: 105,
@@ -2892,7 +2895,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     it('should save failure run result to DB when token limit is exceeded', async () => {
       mockedCheckTokenUsage.mockResolvedValueOnce({
         allowed: false,
-        warning: true,
+        warning: false,
         used: 1050000,
         allowance: 1000000,
         percentUsed: 105,
@@ -2917,7 +2920,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     it('should render a cost-based block message when the cost cap is the cause and tokens are unlimited', async () => {
       mockedCheckTokenUsage.mockResolvedValueOnce({
         allowed: false,
-        warning: true,
+        warning: false,
         used: 5000000,
         allowance: null,
         percentUsed: 0,
