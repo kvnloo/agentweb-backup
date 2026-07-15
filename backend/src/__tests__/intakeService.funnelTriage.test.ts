@@ -31,6 +31,7 @@ jest.mock('../services/linearService', () => ({
   addIssueComment: jest.fn(),
   raiseIssueTriage: jest.fn(),
   getIssueComments: jest.fn(),
+  getIssueCommentsDetailed: jest.fn().mockResolvedValue([]),
 }));
 jest.mock('../services/resendService', () => ({ resendService: { sendSystemEmail: jest.fn() } }));
 jest.mock('../services/shipNotifyService', () => ({ notifyReporterShipped: jest.fn().mockResolvedValue('sent') }));

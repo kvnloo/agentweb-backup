@@ -12,6 +12,8 @@ jest.mock('../services/featurebaseService', () => ({
   createTicket: jest.fn(),
   getTicketStatusId: jest.fn().mockResolvedValue('status-completed'),
   patchTicketStatus: jest.fn(),
+  // Real converter: the ENG-316 parrot tests assert actual markdown rendering + escaping.
+  mdToFeaturebaseHtml: jest.requireActual('../services/featurebaseService').mdToFeaturebaseHtml,
 }));
 jest.mock('../services/linearService', () => ({
   listOpenBugCanonicals: jest.fn().mockResolvedValue([]),
@@ -22,6 +24,7 @@ jest.mock('../services/linearService', () => ({
   reopenIssue: jest.fn(),
   listOpenIssuesByLabel: jest.fn(),
   getIssueComments: jest.fn(),
+  getIssueCommentsDetailed: jest.fn().mockResolvedValue([]),
 }));
 jest.mock('../services/resendService', () => ({ resendService: { sendSystemEmail: jest.fn() } }));
 jest.mock('../services/shipNotifyService', () => ({ notifyReporterShipped: jest.fn().mockResolvedValue('sent') }));
@@ -267,6 +270,109 @@ describe('intakeService.notifyCanonicalResolved (resolve bridge)', () => {
     resend.sendSystemEmail.mockRejectedValueOnce(new Error('resend down'));
     await notifyCanonicalResolved('issue-uuid', 'T');
     expect(shipNotify.notifyReporterShipped).toHaveBeenCalledWith(expect.objectContaining({ email: 'a@e.com' }));
+  });
+});
+
+describe('intakeService.notifyCanonicalResolved — @Emma comment parrot (ENG-316)', () => {
+  const { notifyCanonicalResolved } = require('../services/intakeService');
+  const REPORTER_COMMENT = '[reporter-ticket #10 a@e.com] Affected user: a@e.com on 2026-06-29.';
+  // The pre-ENG-316 hardcoded copy — the fallback must stay BYTE-IDENTICAL to this.
+  const DEFAULT_BODY =
+    "<p>Good news — the issue you reported (<strong>Save button crashes</strong>) has been resolved. Thanks for flagging it!</p><p>If you still run into it, just reply to this email and we'll take another look.</p>";
+
+  beforeEach(() => {
+    // Pin implementations installed by earlier describes (jest.clearAllMocks clears calls, not impls).
+    resend.sendSystemEmail.mockImplementation(() => Promise.resolve());
+    linear.getIssueComments.mockResolvedValue([REPORTER_COMMENT]);
+    linear.getIssueCommentsDetailed.mockResolvedValue([]);
+  });
+  afterEach(() => jest.clearAllMocks());
+
+  it('parrots the @Emma comment as the email body (rendered), not the default copy — reporter parse untouched', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: REPORTER_COMMENT, createdAt: '2026-07-01T00:00:00.000Z' },
+      { body: '@Emma We fixed the save race — drafts no longer disappear.', createdAt: '2026-07-02T00:00:00.000Z' },
+    ]);
+    const r = await notifyCanonicalResolved('issue-uuid', 'Save button crashes');
+    expect(resend.sendSystemEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ to: 'a@e.com', subject: 'Resolved: Save button crashes' }),
+    );
+    expect(resend.sendSystemEmail.mock.calls[0][0].html).toBe('<p>We fixed the save race — drafts no longer disappear.</p>');
+    // The [reporter-ticket #N] parse + card flip are untouched by the parrot path.
+    expect(r.ticketNumbers).toEqual([10]);
+    expect(fb.patchTicketStatus).toHaveBeenCalledWith(10, 'status-completed');
+  });
+
+  it('multiple @Emma comments -> the most recent by createdAt wins (not array order)', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      // Newest listed FIRST: any array-position heuristic would pick the wrong one.
+      { body: '@emma Final wording: fixed by hardening the save endpoint.', createdAt: '2026-07-03T12:00:00.000Z' },
+      { body: '@Emma Early draft wording.', createdAt: '2026-07-01T00:00:00.000Z' },
+    ]);
+    await notifyCanonicalResolved('issue-uuid', 'T');
+    expect(resend.sendSystemEmail.mock.calls[0][0].html).toBe('<p>Final wording: fixed by hardening the save endpoint.</p>');
+  });
+
+  it('no @Emma comment -> the default email body, byte-identical to the historical copy', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: REPORTER_COMMENT, createdAt: '2026-07-01T00:00:00.000Z' },
+      { body: 'internal eng note without any mention', createdAt: '2026-07-02T00:00:00.000Z' },
+    ]);
+    await notifyCanonicalResolved('issue-uuid', 'Save button crashes');
+    expect(resend.sendSystemEmail.mock.calls[0][0].html).toBe(DEFAULT_BODY);
+  });
+
+  it('renders the comment markdown to email HTML (bold + lists)', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: '@Emma **Fixed!**\n\n- saving is instant now\n- drafts survive a refresh', createdAt: '2026-07-02T00:00:00.000Z' },
+    ]);
+    await notifyCanonicalResolved('issue-uuid', 'T');
+    const html = resend.sendSystemEmail.mock.calls[0][0].html;
+    expect(html).toContain('<strong>Fixed!</strong>');
+    expect(html).toContain('<li>saving is instant now</li>');
+    expect(html).toContain('<li>drafts survive a refresh</li>');
+  });
+
+  it('escapes HTML in the @Emma comment — Linear comments are untrusted email input', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: '@Emma <script>alert(1)</script> all sorted now', createdAt: '2026-07-02T00:00:00.000Z' },
+    ]);
+    await notifyCanonicalResolved('issue-uuid', 'T');
+    const html = resend.sendSystemEmail.mock.calls[0][0].html;
+    expect(html).toContain('&lt;script&gt;');
+    expect(html).not.toContain('<script>');
+  });
+
+  it('tolerates a real Linear workspace mention (@[Emma](...)) and strips it', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: "@[Emma](https://linear.app/emmabyaw/profiles/emma) Shipped the fix in tonight's deploy.", createdAt: '2026-07-02T00:00:00.000Z' },
+    ]);
+    await notifyCanonicalResolved('issue-uuid', 'T');
+    expect(resend.sendSystemEmail.mock.calls[0][0].html).toBe("<p>Shipped the fix in tonight's deploy.</p>");
+  });
+
+  it('an @Emma comment with no message text -> default copy (never an empty email)', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: '  @Emma  ', createdAt: '2026-07-02T00:00:00.000Z' },
+    ]);
+    await notifyCanonicalResolved('issue-uuid', 'Save button crashes');
+    expect(resend.sendSystemEmail.mock.calls[0][0].html).toBe(DEFAULT_BODY);
+  });
+
+  it('a reporter-ticket marker email like x@emma.com is NOT an Emma mention', async () => {
+    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #10 x@emma.com] Affected user: x@emma.com']);
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: '[reporter-ticket #10 x@emma.com] Affected user: x@emma.com', createdAt: '2026-07-01T00:00:00.000Z' },
+    ]);
+    await notifyCanonicalResolved('issue-uuid', 'Save button crashes');
+    expect(resend.sendSystemEmail.mock.calls[0][0].html).toBe(DEFAULT_BODY);
+  });
+
+  it('comment lookup failing is best-effort -> reporters still get the default email', async () => {
+    linear.getIssueCommentsDetailed.mockRejectedValue(new Error('linear down'));
+    const r = await notifyCanonicalResolved('issue-uuid', 'Save button crashes');
+    expect(resend.sendSystemEmail.mock.calls[0][0].html).toBe(DEFAULT_BODY);
+    expect(r.ticketNumbers).toEqual([10]);
   });
 });
 

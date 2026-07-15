@@ -2,6 +2,7 @@ import {
   addIssueComment,
   createInternalLinearIssue,
   getEngineeringBugStats,
+  getIssueCommentsDetailed,
   listOpenIssuesByLabel,
   listRecentlyResolvedBugCanonicals,
   reopenIssue,
@@ -308,6 +309,36 @@ describe('linearService.addIssueComment', () => {
   it('throws when commentCreate fails', async () => {
     (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { commentCreate: { success: false } } }) } as any));
     await expect(addIssueComment('uuid-1', 'x')).rejects.toThrow(/commentCreate failed/);
+  });
+});
+
+describe('linearService.getIssueCommentsDetailed (ENG-316)', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  it('returns body + createdAt per comment (the "most recent @Emma wins" contract needs the timestamp), tolerating null nodes/fields', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ data: { issue: { comments: { nodes: [
+        { body: 'first', createdAt: '2026-07-01T00:00:00.000Z' },
+        { body: null, createdAt: null },
+        null,
+      ] } } } }),
+    } as any));
+    const r = await getIssueCommentsDetailed('uuid-1');
+    expect(r).toEqual([
+      { body: 'first', createdAt: '2026-07-01T00:00:00.000Z' },
+      { body: '', createdAt: '' },
+      { body: '', createdAt: '' },
+    ]);
+    const body = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body);
+    expect(body.query).toContain('createdAt');
+    expect(body.variables).toEqual({ id: 'uuid-1' });
+  });
+
+  it('missing issue -> empty list', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { issue: null } }) } as any));
+    await expect(getIssueCommentsDetailed('nope')).resolves.toEqual([]);
   });
 });
 
