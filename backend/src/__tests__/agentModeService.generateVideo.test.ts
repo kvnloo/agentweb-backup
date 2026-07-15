@@ -230,7 +230,7 @@ describe('AgentModeService - generate_video function', () => {
   });
 
   describe('Cost Tracking', () => {
-    it('should charge $2.80 for an 8s veo-3.1-generate-preview video (single clip)', async () => {
+    it('should charge $3.20 for an 8s veo-3.1-generate-preview video (single clip)', async () => {
       const { chatbotDb } = require('../services/chatbotService');
       mockVideoService.generateVideo.mockResolvedValue({
         success: true,
@@ -244,10 +244,10 @@ describe('AgentModeService - generate_video function', () => {
         false, undefined, 8
       );
 
-      expect(chatbotDb.addToolCostToSession).toHaveBeenCalledWith('session123', 2.80, 'generateVideo');
+      expect(chatbotDb.addToolCostToSession).toHaveBeenCalledWith('session123', 3.20, 'generateVideo');
     });
 
-    it('should charge $5.60 for a 16s video (2 clips × $2.80)', async () => {
+    it('should charge $6.40 for a 16s video (2 clips × $3.20)', async () => {
       const { chatbotDb } = require('../services/chatbotService');
       mockVideoService.generateVideo.mockResolvedValue({
         success: true,
@@ -261,10 +261,10 @@ describe('AgentModeService - generate_video function', () => {
         false, undefined, 16
       );
 
-      expect(chatbotDb.addToolCostToSession).toHaveBeenCalledWith('session123', 5.60, 'generateVideo');
+      expect(chatbotDb.addToolCostToSession).toHaveBeenCalledWith('session123', 6.40, 'generateVideo');
     });
 
-    it('should charge $8.40 for a 24s video (3 clips × $2.80)', async () => {
+    it('should charge $9.60 for a 24s video (3 clips × $3.20)', async () => {
       const { chatbotDb } = require('../services/chatbotService');
       mockVideoService.generateVideo.mockResolvedValue({
         success: true,
@@ -280,11 +280,11 @@ describe('AgentModeService - generate_video function', () => {
 
       const call = chatbotDb.addToolCostToSession.mock.calls[0];
       expect(call[0]).toBe('session123');
-      expect(call[1]).toBeCloseTo(8.40, 5);
+      expect(call[1]).toBeCloseTo(9.60, 5);
       expect(call[2]).toBe('generateVideo');
     });
 
-    it('should charge $2.80 when durationSeconds is undefined (defaults to single clip)', async () => {
+    it('should charge $3.20 when durationSeconds is undefined (defaults to single clip)', async () => {
       const { chatbotDb } = require('../services/chatbotService');
       mockVideoService.generateVideo.mockResolvedValue({
         success: true,
@@ -297,7 +297,7 @@ describe('AgentModeService - generate_video function', () => {
         'veo-3.1-generate-preview'
       );
 
-      expect(chatbotDb.addToolCostToSession).toHaveBeenCalledWith('session123', 2.80, 'generateVideo');
+      expect(chatbotDb.addToolCostToSession).toHaveBeenCalledWith('session123', 3.20, 'generateVideo');
     });
 
     it('should charge $2.80 for a 16s fast video (2 clips × $1.40)', async () => {

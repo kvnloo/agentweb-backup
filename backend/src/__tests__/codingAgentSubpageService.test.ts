@@ -31,6 +31,11 @@ jest.mock("../services/v0Service", () => ({
     n.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 30),
 }));
 
+const mockIncrementUserTokenUsage = jest.fn();
+jest.mock("../services/tokenUsageService", () => ({
+  incrementUserTokenUsage: (...a: any[]) => mockIncrementUserTokenUsage(...a),
+}));
+
 import { addPageViaCodingAgent, buildSubPageTask } from "../services/codingAgentSubpageService";
 
 const ok = (v: any) => ({ promise: () => Promise.resolve(v) });
@@ -47,6 +52,7 @@ beforeEach(() => {
   mockUpdate.mockReset().mockReturnValue(ok({}));
   mockRunCodingAgent.mockReset();
   mockMcpFetch.mockReset();
+  mockIncrementUserTokenUsage.mockReset().mockResolvedValue(undefined);
 });
 
 describe("addPageViaCodingAgent", () => {
@@ -119,6 +125,65 @@ describe("addPageViaCodingAgent", () => {
     const res = await addPageViaCodingAgent(site, "u1", "p", "About", {} as any);
     expect(res.status).toBe("failed");
     expect(res.errorMessage).toContain("LLM down");
+  });
+
+  it("charges the coding-agent LLM spend to the caller's monthly usage cap (ENG-200)", async () => {
+    mockRunCodingAgent.mockResolvedValue({
+      success: true,
+      message: "done",
+      iterations: 5,
+      previewUrl: "https://r.vercel.app/pricing",
+      usageTotals: { totalTokens: 1200, costUsd: 0.42 },
+    });
+    mockMcpFetch.mockResolvedValue({ success: true, live_url: "https://acme.agentwebforms.com/pricing" });
+
+    await addPageViaCodingAgent(site, "u1", "p", "Pricing", {} as any);
+
+    // The sub-page coding loop makes its own high-cost LLM calls the parent meter
+    // never sees; without this the spend escapes the per-user cap.
+    expect(mockIncrementUserTokenUsage).toHaveBeenCalledWith("u1", 1200, 0.42);
+  });
+
+  it("charges the LLM spend even when the build never goes green (turns still cost money)", async () => {
+    mockRunCodingAgent.mockResolvedValue({
+      success: false,
+      message: "build broke",
+      iterations: 3,
+      usageTotals: { totalTokens: 800, costUsd: 0.31 },
+    });
+
+    const res = await addPageViaCodingAgent(site, "u1", "p", "Contact", {} as any);
+
+    expect(res.status).toBe("failed");
+    expect(mockIncrementUserTokenUsage).toHaveBeenCalledWith("u1", 800, 0.31);
+  });
+
+  it("does not charge the cap when the agent reports no usage totals", async () => {
+    mockRunCodingAgent.mockResolvedValue({
+      success: false,
+      message: "auth denied before any LLM call",
+      iterations: 0,
+    });
+
+    await addPageViaCodingAgent(site, "u1", "p", "About", {} as any);
+
+    expect(mockIncrementUserTokenUsage).not.toHaveBeenCalled();
+  });
+
+  it("never lets a cap-charge failure break sub-page generation (fail-open)", async () => {
+    mockRunCodingAgent.mockResolvedValue({
+      success: true,
+      message: "done",
+      iterations: 2,
+      previewUrl: "https://r.vercel.app/faq",
+      usageTotals: { totalTokens: 500, costUsd: 0.1 },
+    });
+    mockMcpFetch.mockResolvedValue({ success: true, live_url: "https://acme.agentwebforms.com/faq" });
+    mockIncrementUserTokenUsage.mockRejectedValue(new Error("dynamo down"));
+
+    const res = await addPageViaCodingAgent(site, "u1", "p", "FAQ", {} as any);
+
+    expect(res.status).toBe("deployed"); // metering failure did not surface
   });
 
   it("rejects a site with no deployed repo before creating anything", async () => {

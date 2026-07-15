@@ -19,6 +19,7 @@
 import { crmDb } from './db';
 import { agentModeService } from './agentModeService';
 import { buildClusterFieldsSystemPrompt, buildClusterFieldsUserPrompt } from './enrichmentPrompts';
+import { meterUsageFromResponse } from '../utils/llmClients';
 
 export interface FieldCluster {
   /** User-facing field names this cluster covers. */
@@ -52,7 +53,8 @@ function isValidCluster(c: any): c is FieldCluster {
 
 async function llmClusterFields(
   fields: FieldDescriptor[],
-  exampleLead?: { company?: string; emailDomain?: string }
+  exampleLead?: { company?: string; emailDomain?: string },
+  userId?: string
 ): Promise<FieldCluster[]> {
   if (fields.length === 0) return [];
 
@@ -70,6 +72,12 @@ async function llmClusterFields(
       ],
       response_format: { type: 'json_object' },
     });
+    meterUsageFromResponse({
+      userId,
+      model: enrichmentModel,
+      provider: enrichmentModel.startsWith('anthropic') || enrichmentModel.startsWith('claude') ? 'bedrock' : 'azure',
+      feature: 'crm_enrichment_cluster',
+    }, completion);
     const raw = completion.choices?.[0]?.message?.content || '';
     const parsed = JSON.parse(raw);
     const candidates = Array.isArray(parsed) ? parsed : (parsed?.clusters || []);
@@ -97,7 +105,8 @@ export async function getOrCreateClustersForFields(
   listId: string,
   ungroupedFields: string[],
   fieldDescriptions: Record<string, string> = {},
-  exampleLead?: { company?: string; emailDomain?: string }
+  exampleLead?: { company?: string; emailDomain?: string },
+  userId?: string
 ): Promise<GetOrCreateResult> {
   if (ungroupedFields.length === 0) {
     return { clusters: [], newlyCreated: [] };
@@ -128,7 +137,7 @@ export async function getOrCreateClustersForFields(
     name: f,
     description: fieldDescriptions[f],
   }));
-  const newClusters = await llmClusterFields(descriptors, exampleLead);
+  const newClusters = await llmClusterFields(descriptors, exampleLead, userId);
 
   // If the LLM call failed entirely, fall back to one cluster per uncovered
   // field with a generic per-field query. Worse than a tuned cluster but
