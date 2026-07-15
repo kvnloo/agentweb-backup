@@ -61,7 +61,7 @@ function extractCanonicalRefs(text: string): CanonicalRefs {
  * new evidence against an already-tracked bug -> fuzzy judge misses it -> duplicate filed"
  * failure mode (ENG-329 incident). Runs BEFORE the fuzzy judge and only when the report text
  * names a specific AGW ticket number; on any miss (bad number, stale reference, candidate outside
- * the fetched window, a `getIssueComments` failure) it returns null and the caller falls through
+ * the fetched window, a comments-fetch failure) it returns null and the caller falls through
  * unchanged to the existing fuzzy dedup path — this must never throw and never block filing.
  */
 const EXACT_MATCH_COMMENT_SCAN_LIMIT = 10; // bounds worst-case Linear calls; both lists are already
@@ -74,16 +74,16 @@ async function findExactCanonicalMatch(
 ): Promise<OpenCanonical | null> {
   if (refs.agwNumbers.size === 0 || candidates.length === 0) return null;
 
-  const { getIssueComments } = await import('./linearService');
+  const { getIssueCommentsDetailed } = await import('./linearService');
   for (const c of candidates.slice(0, EXACT_MATCH_COMMENT_SCAN_LIMIT)) {
     try {
-      const bodies = await getIssueComments(c.issueId);
+      const comments = await getIssueCommentsDetailed(c.issueId);
       for (const n of refs.agwNumbers) {
-        if (bodies.some((b) => b.includes(`[reporter-ticket #${n} `))) return c;
+        if (comments.some((cm) => cm.body.includes(`[reporter-ticket #${n} `))) return c;
       }
     } catch (e) {
       // Also catches a malformed (non-array) resolved value, not just a rejection — keeps the
-      // "never throw" contract even if getIssueComments' return shape is ever unexpected.
+      // "never throw" contract even if the helper's return shape is ever unexpected.
       console.warn(`[intake] exact-ref comment scan failed for ${c.identifier}:`, e instanceof Error ? e.message : e);
       continue; // best-effort — a read failure on one candidate must not block the others or the filing
     }

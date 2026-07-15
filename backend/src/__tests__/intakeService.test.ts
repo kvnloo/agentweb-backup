@@ -685,13 +685,16 @@ describe('intakeService.fileBugReport — reopen, not refile (ENG-240 contract #
 
 describe('intakeService.fileBugReport — exact-reference short-circuit (fix for AGW false-new-duplicate, ENG-329 incident)', () => {
   const realFlag = process.env.FEATUREBASE_INTAKE;
+  // The exact-ref scan reads comments through the same detailed helper as the resolve bridge.
+  const c = (body: string) => ({ body, createdAt: '2026-07-01T00:00:00.000Z' });
   beforeEach(() => {
     process.env.FEATUREBASE_INTAKE = 'true';
     fb.createTicket.mockResolvedValue({ id: 'tk', number: 121, url: 'https://fb/t/121' });
+    linear.getIssueCommentsDetailed.mockResolvedValue([]);
   });
   afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
 
-  it('no ticket reference in text -> fuzzy dedup runs exactly as before, getIssueComments never called', async () => {
+  it('no ticket reference in text -> fuzzy dedup runs exactly as before, the comment scan never fires', async () => {
     linear.listOpenBugCanonicals.mockResolvedValue([
       { identifier: 'ENG-9', issueId: 'uuid-9', title: 'Unrelated bug', description: 'unrelated' },
     ]);
@@ -701,14 +704,14 @@ describe('intakeService.fileBugReport — exact-reference short-circuit (fix for
     await fileUserIssue({ type: 'bug', title: 'Save button crashes', description: 'clicking save throws', userEmail: 'u@e.com' });
 
     expect(dedup.findDuplicate).toHaveBeenCalled();
-    expect(linear.getIssueComments).not.toHaveBeenCalled();
+    expect(linear.getIssueCommentsDetailed).not.toHaveBeenCalled();
   });
 
   it('reference present but no candidate comment matches it -> falls through to fuzzy dedup, no throw', async () => {
     linear.listOpenBugCanonicals.mockResolvedValue([
       { identifier: 'ENG-9', issueId: 'uuid-9', title: 'Unrelated bug', description: 'unrelated' },
     ]);
-    linear.getIssueComments.mockResolvedValue(['some unrelated comment', '[reporter-ticket #999 other@e.com] Affected user: other@e.com']);
+    linear.getIssueCommentsDetailed.mockResolvedValue([c('some unrelated comment'), c('[reporter-ticket #999 other@e.com] Affected user: other@e.com')]);
     dedup.findDuplicate.mockResolvedValue(null);
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-10', url: 'lin', id: 'uuid-10' });
 
@@ -742,19 +745,19 @@ describe('intakeService.fileBugReport — exact-reference short-circuit (fix for
       userEmail: 'u@e.com',
     });
 
-    expect(linear.getIssueComments).not.toHaveBeenCalled();
+    expect(linear.getIssueCommentsDetailed).not.toHaveBeenCalled();
     expect(linear.createInternalLinearIssue).toHaveBeenCalled();
     expect(r).toMatchObject({ deduped: false });
   });
 
-  it('getIssueComments throws for one candidate -> scan skips it, continues, never throws out of fileBugReport', async () => {
+  it('comment fetch throws for one candidate -> scan skips it, continues, never throws out of fileBugReport', async () => {
     linear.listOpenBugCanonicals.mockResolvedValue([
       { identifier: 'ENG-8', issueId: 'uuid-8', title: 'Other bug', description: 'x' },
       { identifier: 'ENG-312', issueId: 'uuid-312', title: 'final_url_suffix silently fails', description: 'old report' },
     ]);
-    linear.getIssueComments
+    linear.getIssueCommentsDetailed
       .mockRejectedValueOnce(new Error('Linear API error'))
-      .mockResolvedValueOnce(['[reporter-ticket #112 emongiovi@xcures.com] Affected user: emongiovi@xcures.com']);
+      .mockResolvedValueOnce([c('[reporter-ticket #112 emongiovi@xcures.com] Affected user: emongiovi@xcures.com')]);
     dedup.findDuplicate.mockResolvedValue(null);
 
     const r = await fileUserIssue({
@@ -764,12 +767,12 @@ describe('intakeService.fileBugReport — exact-reference short-circuit (fix for
       userEmail: 'emongiovi@xcures.com',
     });
 
-    expect(linear.getIssueComments).toHaveBeenCalledTimes(2);
+    expect(linear.getIssueCommentsDetailed).toHaveBeenCalledTimes(2);
     expect(dedup.findDuplicate).not.toHaveBeenCalled(); // exact match found on the 2nd candidate
     expect(r).toMatchObject({ deduped: true, canonicalUrl: expect.stringContaining('ENG-312') });
   });
 
-  it('getIssueComments resolves with a non-array value (unmocked/malformed) -> caught, never throws out of fileBugReport', async () => {
+  it('comment fetch resolves with a non-array value (unmocked/malformed) -> caught, never throws out of fileBugReport', async () => {
     // Regression guard for the Greptile-flagged structural issue: bodies.some(...) must be
     // covered by the same try/catch as the await — a resolved-but-non-array value (e.g. an
     // unmocked jest.fn() defaulting to `undefined`, or any real malformed API response) must
@@ -777,7 +780,7 @@ describe('intakeService.fileBugReport — exact-reference short-circuit (fix for
     linear.listOpenBugCanonicals.mockResolvedValue([
       { identifier: 'ENG-312', issueId: 'uuid-312', title: 'final_url_suffix silently fails', description: 'old report' },
     ]);
-    linear.getIssueComments.mockResolvedValue(undefined as any);
+    linear.getIssueCommentsDetailed.mockResolvedValue(undefined as any);
     dedup.findDuplicate.mockResolvedValue(null);
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-999', url: 'lin', id: 'uuid-999' });
 
@@ -797,7 +800,7 @@ describe('intakeService.fileBugReport — exact-reference short-circuit (fix for
     linear.listOpenBugCanonicals.mockResolvedValue([
       { identifier: 'ENG-312', issueId: 'uuid-312', title: 'final_url_suffix silently fails', description: 'old report' },
     ]);
-    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #112 emongiovi@xcures.com] Affected user: emongiovi@xcures.com (Edward Mongiovi)']);
+    linear.getIssueCommentsDetailed.mockResolvedValue([c('[reporter-ticket #112 emongiovi@xcures.com] Affected user: emongiovi@xcures.com (Edward Mongiovi)')]);
 
     const r = await fileUserIssue({
       type: 'bug',
@@ -817,7 +820,7 @@ describe('intakeService.fileBugReport — exact-reference short-circuit (fix for
     linear.listRecentlyResolvedBugCanonicals.mockResolvedValue([
       { identifier: 'ENG-312', issueId: 'uuid-312', title: 'final_url_suffix silently fails', description: 'old report' },
     ]);
-    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #112 emongiovi@xcures.com] Affected user: emongiovi@xcures.com']);
+    linear.getIssueCommentsDetailed.mockResolvedValue([c('[reporter-ticket #112 emongiovi@xcures.com] Affected user: emongiovi@xcures.com')]);
 
     const r = await fileUserIssue({
       type: 'bug',
