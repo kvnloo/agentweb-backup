@@ -229,7 +229,7 @@ function appendQuery(url: string, query: string): string {
 
 // ─── Links 2+3: run the GENERATED middleware / capture-route source ───────────
 
-const injectedFiles = injectLeadCaptureAttribution([], LIST_ID);
+const injectedFiles = injectLeadCaptureAttribution([], { [new URL(LANDING_PAGE).pathname || '/']: LIST_ID });
 const middlewareSource = fileContent(injectedFiles, 'middleware.ts');
 const captureRouteSource = fileContent(injectedFiles, 'app/api/capture/route.ts');
 
@@ -272,6 +272,7 @@ function visitLandingPage(clickUrl: string, referrer = 'https://www.facebook.com
   };
   const middleware = loadInjected(middlewareSource, (m) => {
     if (m === 'next/server') return nextServer;
+    if (m === './domainMap') return { DOMAIN_MAP: {} };
     throw new Error(`middleware.ts required an unexpected module: ${m}`);
   }).middleware;
 
@@ -388,7 +389,7 @@ describe('ENG-239 AC2 — ad click → landing page → CRM, end to end', () => 
       expect(captureRouteSource).toContain(
         '...(attribution ? { attribution } : {})',
       );
-      expect(captureRouteSource).toContain(`const LIST_ID = "${LIST_ID}"`);
+      expect(captureRouteSource).toContain(`"/": "${LIST_ID}"`);
     });
   });
 
