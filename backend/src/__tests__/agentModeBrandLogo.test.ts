@@ -151,6 +151,18 @@ describe('promptRequestsLogo', () => {
     expect(promptRequestsLogo('Minimal poster, no logo')).toBe(false);
     expect(promptRequestsLogo('Hero image without any logos')).toBe(false);
     expect(promptRequestsLogo('Abstract background — omit the logo entirely')).toBe(false);
+    expect(promptRequestsLogo('without a company logo')).toBe(false);
+    expect(promptRequestsLogo('do not include the logo')).toBe(false);
+    expect(promptRequestsLogo("don't show our logo")).toBe(false);
+  });
+
+  it('does NOT swallow positive logo asks that merely have a negation nearby', () => {
+    // Reviewer cases (finding #4): each of these asks FOR the logo — the
+    // negation modifies something else. A false negative here means the model
+    // is free to invent a logo again (AC-2/AC-3 violated).
+    expect(promptRequestsLogo('no text, just our logo front and center')).toBe(true);
+    expect(promptRequestsLogo('Do not crop the logo')).toBe(true);
+    expect(promptRequestsLogo('skip the border, add the logo')).toBe(true);
   });
 });
 

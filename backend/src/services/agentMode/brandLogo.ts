@@ -97,10 +97,16 @@ export async function getPersistedBrandLogoUrlForUser(
 
 /**
  * Negated logo mentions ("no logo", "without any logos", "omit the logo",
- * "remove the logo") must not trigger the brand-logo gate.
+ * "do not include the logo") must not trigger the brand-logo gate.
+ *
+ * The negation must DIRECTLY modify "logo": a negator followed by at most two
+ * filler words from a small whitelist (determiners / possessives / logo-ish
+ * verbs) before "logo(s)". A wide scan window (the first cut used 0-40 chars)
+ * swallowed positive asks like "no text, just our logo" or "Do not crop the
+ * logo" — re-opening the invented-logo hole the gate exists to close.
  */
 const NEGATED_LOGO_RE =
-  /\b(?:no|not|without|never|avoid|omit|exclude|remove|skip|minus)\b[^.!?\n]{0,40}?\blogos?\b/gi;
+  /\b(?:no|not|don'?t|do\s+not|without|never|avoid|omit|exclude|remove|skip|minus)(?:\s+(?:a|an|any|the|our|your|their|its|all|either|both|company|brand|visible|include|including|show|showing|use|using|add|adding|display|displaying)){0,2}\s+logos?\b/gi;
 const LOGO_RE = /\blogos?\b/i;
 
 /** Does this image prompt ask for a logo to appear in the output? */
