@@ -182,15 +182,6 @@ export async function listOpenBugCanonicals(limit = 30): Promise<OpenCanonical[]
   return nodes.map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }));
 }
 
-/** Read an issue's comment bodies (the resolve bridge parses `[reporter-ticket #N]` from these). */
-export async function getIssueComments(issueId: string): Promise<string[]> {
-  const data = await linearGraphQL(
-    `query($id: String!) { issue(id: $id) { comments { nodes { body } } } }`,
-    { id: issueId },
-  );
-  return (data?.issue?.comments?.nodes || []).map((c: any) => c?.body || '');
-}
-
 /** An issue comment with its creation timestamp (ISO string), for order-sensitive consumers. */
 export interface IssueCommentDetail {
   body: string;
@@ -199,8 +190,9 @@ export interface IssueCommentDetail {
 
 /**
  * Read an issue's comments WITH `createdAt`, so callers that need "the most recent comment" can
- * decide by timestamp instead of relying on the API's list order. The resolve bridge uses this to
- * pick the latest `@Emma` comment as the customer-facing resolution message (ENG-316).
+ * decide by timestamp instead of relying on the API's list order. The resolve bridge reads this
+ * ONCE per resolve for both of its jobs: parsing the `[reporter-ticket #N <email>]` markers and
+ * picking the latest `@Emma` comment as the customer-facing resolution message (ENG-316).
  *
  * Explicitly sized + ordered: Linear defaults connections to 50 nodes — the same silent-truncation
  * trap getTeamMeta documents — and a high-reporter canonical can carry more comments than that.

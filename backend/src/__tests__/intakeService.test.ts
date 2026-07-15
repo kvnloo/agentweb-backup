@@ -12,8 +12,9 @@ jest.mock('../services/featurebaseService', () => ({
   createTicket: jest.fn(),
   getTicketStatusId: jest.fn().mockResolvedValue('status-completed'),
   patchTicketStatus: jest.fn(),
-  // Real converter: the ENG-316 parrot tests assert actual markdown rendering + escaping.
-  mdToFeaturebaseHtml: jest.requireActual('../services/featurebaseService').mdToFeaturebaseHtml,
+  // Real converter behind a jest.fn wrapper: the ENG-316 parrot tests assert actual markdown
+  // rendering + escaping, while the converter-failure test can still override per call.
+  mdToFeaturebaseHtml: jest.fn((md: string) => jest.requireActual('../services/featurebaseService').mdToFeaturebaseHtml(md)),
 }));
 jest.mock('../services/linearService', () => ({
   listOpenBugCanonicals: jest.fn().mockResolvedValue([]),
@@ -23,7 +24,6 @@ jest.mock('../services/linearService', () => ({
   raiseIssueTriage: jest.fn(),
   reopenIssue: jest.fn(),
   listOpenIssuesByLabel: jest.fn(),
-  getIssueComments: jest.fn(),
   getIssueCommentsDetailed: jest.fn().mockResolvedValue([]),
 }));
 jest.mock('../services/resendService', () => ({ resendService: { sendSystemEmail: jest.fn() } }));
@@ -188,13 +188,16 @@ describe('fileUserIssue — bug priority mapping (ENG-231: stated priority becom
 
 describe('intakeService.notifyCanonicalResolved (resolve bridge)', () => {
   const { notifyCanonicalResolved } = require('../services/intakeService');
+  // One comment fetch (getIssueCommentsDetailed) feeds both the reporter parse and the @Emma
+  // parrot since ENG-316. This helper shapes plain bodies for reporter-parse-focused tests.
+  const c = (body: string) => ({ body, createdAt: '2026-07-01T00:00:00.000Z' });
   afterEach(() => jest.clearAllMocks());
 
   it('reads [reporter-ticket #N <email>] from the canonical comments and EMAILs + flips each card', async () => {
-    linear.getIssueComments.mockResolvedValue([
-      'Customer-reported bug...\nAffected user: a@e.com',
-      '[reporter-ticket #10 a@e.com] Affected user: a@e.com on 2026-06-29.\nSession: s1',
-      '[reporter-ticket #11 b@e.com] Affected user: b@e.com on 2026-06-29.\nSession: s2',
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      c('Customer-reported bug...\nAffected user: a@e.com'),
+      c('[reporter-ticket #10 a@e.com] Affected user: a@e.com on 2026-06-29.\nSession: s1'),
+      c('[reporter-ticket #11 b@e.com] Affected user: b@e.com on 2026-06-29.\nSession: s2'),
     ]);
     const r = await notifyCanonicalResolved('issue-uuid', 'Save button crashes');
     expect(r.ticketNumbers.sort()).toEqual([10, 11]);
@@ -207,7 +210,7 @@ describe('intakeService.notifyCanonicalResolved (resolve bridge)', () => {
   });
 
   it('escapes HTML in the issue title in the email body (one reporter is emailed another reporter title)', async () => {
-    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #10 a@e.com] x']);
+    linear.getIssueCommentsDetailed.mockResolvedValue([c('[reporter-ticket #10 a@e.com] x')]);
     await notifyCanonicalResolved('issue-uuid', '<script>alert(1)</script>');
     const html = resend.sendSystemEmail.mock.calls[0][0].html;
     expect(html).toContain('&lt;script&gt;');
@@ -215,7 +218,7 @@ describe('intakeService.notifyCanonicalResolved (resolve bridge)', () => {
   });
 
   it('no reporter-ticket comments -> no-op (not a bug canonical)', async () => {
-    linear.getIssueComments.mockResolvedValue(['just a normal comment', 'another']);
+    linear.getIssueCommentsDetailed.mockResolvedValue([c('just a normal comment'), c('another')]);
     const r = await notifyCanonicalResolved('issue-uuid');
     expect(r.ticketNumbers).toEqual([]);
     expect(resend.sendSystemEmail).not.toHaveBeenCalled();
@@ -223,14 +226,14 @@ describe('intakeService.notifyCanonicalResolved (resolve bridge)', () => {
   });
 
   it('dedupes repeated ticket numbers across comments', async () => {
-    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #7 x@e.com] x', '[reporter-ticket #7 x@e.com] x again']);
+    linear.getIssueCommentsDetailed.mockResolvedValue([c('[reporter-ticket #7 x@e.com] x'), c('[reporter-ticket #7 x@e.com] x again')]);
     const r = await notifyCanonicalResolved('issue-uuid');
     expect(r.ticketNumbers).toEqual([7]);
     expect(resend.sendSystemEmail).toHaveBeenCalledTimes(1);
   });
 
   it('one reporter failing is best-effort -> the others still get notified', async () => {
-    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #10 a@e.com] a', '[reporter-ticket #11 b@e.com] b']);
+    linear.getIssueCommentsDetailed.mockResolvedValue([c('[reporter-ticket #10 a@e.com] a'), c('[reporter-ticket #11 b@e.com] b')]);
     resend.sendSystemEmail.mockImplementation((p: any) => (p.to === 'a@e.com' ? Promise.reject(new Error('down')) : Promise.resolve()));
     const r = await notifyCanonicalResolved('issue-uuid');
     expect(r.ticketNumbers).toEqual([11]); // 10 failed, 11 succeeded
@@ -238,9 +241,9 @@ describe('intakeService.notifyCanonicalResolved (resolve bridge)', () => {
   });
 
   it('pings each reporter on Slack beside the email (kind bug, canonical id as the idempotency key)', async () => {
-    linear.getIssueComments.mockResolvedValue([
-      '[reporter-ticket #10 a@e.com] a',
-      '[reporter-ticket #11 b@e.com] b',
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      c('[reporter-ticket #10 a@e.com] a'),
+      c('[reporter-ticket #11 b@e.com] b'),
     ]);
     await notifyCanonicalResolved('issue-uuid', 'Save button crashes');
     expect(shipNotify.notifyReporterShipped).toHaveBeenCalledWith(
@@ -254,7 +257,7 @@ describe('intakeService.notifyCanonicalResolved (resolve bridge)', () => {
   });
 
   it('Slack notifier blowing up does not block the email or the card flip', async () => {
-    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #10 a@e.com] a']);
+    linear.getIssueCommentsDetailed.mockResolvedValue([c('[reporter-ticket #10 a@e.com] a')]);
     // Pin the email mock: an earlier test installs a persistent per-address rejection
     // via mockImplementation, which jest.clearAllMocks() does not remove.
     resend.sendSystemEmail.mockImplementation(() => Promise.resolve());
@@ -266,7 +269,7 @@ describe('intakeService.notifyCanonicalResolved (resolve bridge)', () => {
   });
 
   it('email failure does not suppress the Slack ping (channels are independent)', async () => {
-    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #10 a@e.com] a']);
+    linear.getIssueCommentsDetailed.mockResolvedValue([c('[reporter-ticket #10 a@e.com] a')]);
     resend.sendSystemEmail.mockRejectedValueOnce(new Error('resend down'));
     await notifyCanonicalResolved('issue-uuid', 'T');
     expect(shipNotify.notifyReporterShipped).toHaveBeenCalledWith(expect.objectContaining({ email: 'a@e.com' }));
@@ -283,8 +286,9 @@ describe('intakeService.notifyCanonicalResolved — @Emma comment parrot (ENG-31
   beforeEach(() => {
     // Pin implementations installed by earlier describes (jest.clearAllMocks clears calls, not impls).
     resend.sendSystemEmail.mockImplementation(() => Promise.resolve());
-    linear.getIssueComments.mockResolvedValue([REPORTER_COMMENT]);
-    linear.getIssueCommentsDetailed.mockResolvedValue([]);
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: REPORTER_COMMENT, createdAt: '2026-07-01T00:00:00.000Z' },
+    ]);
   });
   afterEach(() => jest.clearAllMocks());
 
@@ -301,6 +305,9 @@ describe('intakeService.notifyCanonicalResolved — @Emma comment parrot (ENG-31
     // The [reporter-ticket #N] parse + card flip are untouched by the parrot path.
     expect(r.ticketNumbers).toEqual([10]);
     expect(fb.patchTicketStatus).toHaveBeenCalledWith(10, 'status-completed');
+    // ONE fetch serves both the reporter parse and the parrot — the two can never disagree
+    // on a mid-resolve snapshot, and the Linear call count stays flat.
+    expect(linear.getIssueCommentsDetailed).toHaveBeenCalledTimes(1);
   });
 
   it('multiple @Emma comments -> the most recent by createdAt wins (not array order)', async () => {
@@ -308,6 +315,7 @@ describe('intakeService.notifyCanonicalResolved — @Emma comment parrot (ENG-31
       // Newest listed FIRST: any array-position heuristic would pick the wrong one.
       { body: '@emma Final wording: fixed by hardening the save endpoint.', createdAt: '2026-07-03T12:00:00.000Z' },
       { body: '@Emma Early draft wording.', createdAt: '2026-07-01T00:00:00.000Z' },
+      { body: REPORTER_COMMENT, createdAt: '2026-06-29T00:00:00.000Z' },
     ]);
     await notifyCanonicalResolved('issue-uuid', 'T');
     expect(resend.sendSystemEmail.mock.calls[0][0].html).toBe('<p>Final wording: fixed by hardening the save endpoint.</p>');
@@ -324,6 +332,7 @@ describe('intakeService.notifyCanonicalResolved — @Emma comment parrot (ENG-31
 
   it('renders the comment markdown to email HTML (bold + lists)', async () => {
     linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: REPORTER_COMMENT, createdAt: '2026-07-01T00:00:00.000Z' },
       { body: '@Emma **Fixed!**\n\n- saving is instant now\n- drafts survive a refresh', createdAt: '2026-07-02T00:00:00.000Z' },
     ]);
     await notifyCanonicalResolved('issue-uuid', 'T');
@@ -335,6 +344,7 @@ describe('intakeService.notifyCanonicalResolved — @Emma comment parrot (ENG-31
 
   it('escapes HTML in the @Emma comment — Linear comments are untrusted email input', async () => {
     linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: REPORTER_COMMENT, createdAt: '2026-07-01T00:00:00.000Z' },
       { body: '@Emma <script>alert(1)</script> all sorted now', createdAt: '2026-07-02T00:00:00.000Z' },
     ]);
     await notifyCanonicalResolved('issue-uuid', 'T');
@@ -345,6 +355,7 @@ describe('intakeService.notifyCanonicalResolved — @Emma comment parrot (ENG-31
 
   it('tolerates a real Linear workspace mention (@[Emma](...)) and strips it', async () => {
     linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: REPORTER_COMMENT, createdAt: '2026-07-01T00:00:00.000Z' },
       { body: "@[Emma](https://linear.app/emmabyaw/profiles/emma) Shipped the fix in tonight's deploy.", createdAt: '2026-07-02T00:00:00.000Z' },
     ]);
     await notifyCanonicalResolved('issue-uuid', 'T');
@@ -353,6 +364,7 @@ describe('intakeService.notifyCanonicalResolved — @Emma comment parrot (ENG-31
 
   it('an @Emma comment with no message text -> default copy (never an empty email)', async () => {
     linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: REPORTER_COMMENT, createdAt: '2026-07-01T00:00:00.000Z' },
       { body: '  @Emma  ', createdAt: '2026-07-02T00:00:00.000Z' },
     ]);
     await notifyCanonicalResolved('issue-uuid', 'Save button crashes');
@@ -360,7 +372,6 @@ describe('intakeService.notifyCanonicalResolved — @Emma comment parrot (ENG-31
   });
 
   it('a reporter-ticket marker email like x@emma.com is NOT an Emma mention', async () => {
-    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #10 x@emma.com] Affected user: x@emma.com']);
     linear.getIssueCommentsDetailed.mockResolvedValue([
       { body: '[reporter-ticket #10 x@emma.com] Affected user: x@emma.com', createdAt: '2026-07-01T00:00:00.000Z' },
     ]);
@@ -372,10 +383,6 @@ describe('intakeService.notifyCanonicalResolved — @Emma comment parrot (ENG-31
     // Reviewer blocker repro: intake writes CUSTOMER-controlled text into canonical comments
     // ('Their report:\n<description>'), and customers address the product's agent as "@emma".
     // That text must never become another reporter's resolution email.
-    linear.getIssueComments.mockResolvedValue([
-      REPORTER_COMMENT,
-      '[reporter-ticket #11 bob@y.com] Affected user: Bob (bob@y.com) on 2026-07-02.\n\nTheir report:\n@emma keeps deleting my drafts',
-    ]);
     linear.getIssueCommentsDetailed.mockResolvedValue([
       { body: REPORTER_COMMENT, createdAt: '2026-07-01T00:00:00.000Z' },
       {
@@ -446,8 +453,18 @@ describe('intakeService.notifyCanonicalResolved — @Emma comment parrot (ENG-31
     expect(resend.sendSystemEmail.mock.calls[0][0].html).toBe('<p>The webhook race is fixed — retries no longer double-send.</p>');
   });
 
-  it('comment lookup failing is best-effort -> reporters still get the default email', async () => {
+  it('comments fetch failure propagates — without the comments there is nobody to notify (webhook route catches + logs)', async () => {
     linear.getIssueCommentsDetailed.mockRejectedValue(new Error('linear down'));
+    await expect(notifyCanonicalResolved('issue-uuid', 'Save button crashes')).rejects.toThrow('linear down');
+    expect(resend.sendSystemEmail).not.toHaveBeenCalled();
+  });
+
+  it('converter blowing up is best-effort -> reporters still get the default email', async () => {
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: REPORTER_COMMENT, createdAt: '2026-07-01T00:00:00.000Z' },
+      { body: '@Emma We fixed it.', createdAt: '2026-07-02T00:00:00.000Z' },
+    ]);
+    fb.mdToFeaturebaseHtml.mockImplementationOnce(() => { throw new Error('converter bug'); });
     const r = await notifyCanonicalResolved('issue-uuid', 'Save button crashes');
     expect(resend.sendSystemEmail.mock.calls[0][0].html).toBe(DEFAULT_BODY);
     expect(r.ticketNumbers).toEqual([10]);

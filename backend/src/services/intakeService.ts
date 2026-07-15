@@ -557,14 +557,18 @@ export async function notifyCanonicalResolved(
   canonicalIssueId: string,
   issueTitle = 'the issue you reported',
 ): Promise<{ ticketNumbers: number[] }> {
-  const { getIssueComments, getIssueCommentsDetailed } = await import('./linearService');
+  const { getIssueCommentsDetailed } = await import('./linearService');
   const { getTicketStatusId, patchTicketStatus, mdToFeaturebaseHtml } = await import('./featurebaseService');
   const { resendService } = await import('./resendService');
   const { notifyReporterShipped } = await import('./shipNotifyService');
 
-  const comments = await getIssueComments(canonicalIssueId);
+  // ONE comment fetch feeds both consumers — the reporter parse and the @Emma parrot — so the two
+  // can never disagree on a mid-resolve snapshot. A fetch failure propagates (as it always has for
+  // the reporter parse): without the comments there is nobody to notify, and the webhook route
+  // catches + logs it.
+  const comments = await getIssueCommentsDetailed(canonicalIssueId);
   const reporters = new Map<number, string>(); // ticket number -> reporter email
-  for (const body of comments) {
+  for (const { body } of comments) {
     let m: RegExpExecArray | null;
     REPORTER_TICKET_RE.lastIndex = 0;
     while ((m = REPORTER_TICKET_RE.exec(body)) !== null) reporters.set(Number(m[1]), m[2]);
@@ -574,14 +578,14 @@ export async function notifyCanonicalResolved(
   // ENG-316: eng writes the "here's what happened" message as an `@Emma <message>` comment on the
   // canonical before flipping it to Done; the latest one is parroted as the email body. Rendered
   // via mdToFeaturebaseHtml, which HTML-escapes FIRST — Linear comments are untrusted input for a
-  // customer email. Best-effort: a lookup failure degrades to the default copy (loud warn), it
+  // customer email. Best-effort: a rendering failure degrades to the default copy (loud warn), it
   // never blocks notifying the reporters.
   let emmaHtml: string | null = null;
   try {
-    const message = pickEmmaResolutionMessage(await getIssueCommentsDetailed(canonicalIssueId));
+    const message = pickEmmaResolutionMessage(comments);
     emmaHtml = message ? mdToFeaturebaseHtml(message) || null : null;
   } catch (e) {
-    console.warn('[resolve-bridge] @Emma comment lookup failed — using default copy:', e instanceof Error ? e.message : e);
+    console.warn('[resolve-bridge] @Emma resolution message rendering failed — using default copy:', e instanceof Error ? e.message : e);
   }
 
   const completedId = await getTicketStatusId('Completed');
