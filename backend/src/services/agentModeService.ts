@@ -6382,12 +6382,19 @@ export class AgentModeService {
    *
    * The timeout REJECTS with a "timed out" error, which isRetryableMediaToolError()
    * classifies as retryable — so a primary-model timeout routes to the fallback
-   * model rather than aborting the whole tool call. Set the timeout to 0 (via
-   * AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS=0) to disable the bound entirely.
+   * model rather than aborting the whole tool call. Set the timeout to exactly 0
+   * (via AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS=0) to disable the bound entirely.
+   *
+   * Parsing fails CLOSED: a malformed override (non-numeric like "90s", negative,
+   * or NaN) falls back to the default bound rather than silently disabling it —
+   * otherwise a typo would recreate the exact unbounded-call bug this exists to
+   * prevent. Only a clean, explicit 0 disables the timeout.
    */
+  private static readonly DEFAULT_DESCRIBE_IMAGE_TIMEOUT_MS = 90000;
+
   private async callVisionLLMWithTimeout(model: string, messages: any[], options: any): Promise<any> {
-    const timeoutMs = parseInt(process.env.AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS || '90000', 10);
-    if (!(timeoutMs > 0)) {
+    const timeoutMs = AgentModeService.resolveDescribeImageTimeoutMs();
+    if (timeoutMs <= 0) {
       return this.callLLM(model, messages, options);
     }
     let timer: NodeJS.Timeout | undefined;
@@ -6402,6 +6409,24 @@ export class AgentModeService {
     } finally {
       if (timer) clearTimeout(timer);
     }
+  }
+
+  /**
+   * Resolve the describe_image timeout (ms) from AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS.
+   * Fails closed: unset/empty/malformed/negative values yield the default bound; only
+   * a clean, explicit non-negative integer (including 0, which disables) is honored.
+   */
+  static resolveDescribeImageTimeoutMs(): number {
+    const raw = process.env.AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS;
+    if (raw === undefined || raw.trim() === '') {
+      return AgentModeService.DEFAULT_DESCRIBE_IMAGE_TIMEOUT_MS;
+    }
+    // Number() (not parseInt) so partial junk like "90s" becomes NaN instead of 90.
+    const parsed = Number(raw.trim());
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      return AgentModeService.DEFAULT_DESCRIBE_IMAGE_TIMEOUT_MS;
+    }
+    return parsed;
   }
 
   /**
