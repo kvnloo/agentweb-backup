@@ -1876,7 +1876,7 @@ mcpToolRegistry.register({
   internal: true,
   definition: {
     name: 'send_email',
-    description: 'Read, search, and send emails across connected email accounts (Gmail, etc.).',
+    description: 'Read, search, and send emails across connected email accounts (Gmail, Outlook, etc.).',
     inputSchema: {
       type: 'object',
       properties: {
