@@ -2753,6 +2753,12 @@ export const agentModeController = {
           if (inFlight) {
             markProgressComplete(sessionId);
             res.json({ content: STILL_BUILDING_MESSAGE, stillBuilding: true });
+            // This request's lifecycle is over (it handed off to the detached
+            // build) — without a terminal mark the run record would sit
+            // status='running' for its whole 30d ttl. Best-effort by design.
+            if (runSurvivalRunId) {
+              void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'detached_still_building' });
+            }
             return;
           }
         } catch (reconnectErr) {
@@ -2808,6 +2814,12 @@ export const agentModeController = {
                 metadata: { timestamp: new Date().toISOString() },
               }).catch(() => {});
               res.json({ content: STILL_BUILDING_MESSAGE, stillBuilding: true });
+              // Same as the pre-generation reconnect above: the request ended
+              // by detaching — mark the run record terminal or it stays
+              // 'running' for 30d. Best-effort by design.
+              if (runSurvivalRunId) {
+                void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'detached_still_building' });
+              }
               return;
             }
           } catch (durErr) {
