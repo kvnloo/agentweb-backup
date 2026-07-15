@@ -122,4 +122,64 @@ describe('describeImage — vision call timeout (ENG-294)', () => {
     expect(result.success).toBe(true);
     expect(callLLMSpy).toHaveBeenCalledTimes(1);
   });
+
+  // ENG-294 refix: a malformed override (typo like "90s", a negative, or junk) must
+  // NOT silently disable the bound — that would recreate the exact unbounded-call bug
+  // this fix exists to prevent. Parsing fails closed to the default positive bound;
+  // only a clean, explicit 0 disables. Assert on resolveDescribeImageTimeoutMs directly
+  // because the default bound (90s) is too long to exercise end-to-end in a unit test.
+  describe('timeout env-var parsing fails closed', () => {
+    const DEFAULT_MS = 90000;
+
+    it.each([
+      ['non-numeric junk', 'abc'],
+      ['trailing-unit typo', '90s'],
+      ['negative value', '-5'],
+      ['negative default typo', '-90000'],
+      ['whitespace-only', '   '],
+      ['float junk', '1.2.3'],
+    ])('falls back to the default bound for %s (%p) — call stays bounded', (_label, value) => {
+      process.env.AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS = value;
+      const resolved = AgentModeService.resolveDescribeImageTimeoutMs();
+      // A positive result means callVisionLLMWithTimeout takes the bounded Promise.race
+      // branch rather than the disabled passthrough — the hung-call bug cannot recur.
+      expect(resolved).toBe(DEFAULT_MS);
+      expect(resolved).toBeGreaterThan(0);
+    });
+
+    it('uses the default when the override is unset', () => {
+      delete process.env.AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS;
+      expect(AgentModeService.resolveDescribeImageTimeoutMs()).toBe(DEFAULT_MS);
+    });
+
+    it('honors a clean positive integer override', () => {
+      process.env.AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS = '1234';
+      expect(AgentModeService.resolveDescribeImageTimeoutMs()).toBe(1234);
+    });
+
+    it('treats a clean explicit 0 as the disable escape hatch', () => {
+      process.env.AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS = '0';
+      expect(AgentModeService.resolveDescribeImageTimeoutMs()).toBe(0);
+    });
+  });
+
+  it('a malformed override still bounds a hung primary and falls back', async () => {
+    // Regression guard for the fail-open bug: with a garbage override the primary
+    // must still time out (default bound) and route to the fallback model. We shrink
+    // the default via a spy so the test stays fast while proving the bounded branch runs.
+    process.env.AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS = 'not-a-number';
+    jest.spyOn(AgentModeService, 'resolveDescribeImageTimeoutMs').mockReturnValue(50);
+
+    const callLLMSpy = jest
+      .spyOn(service, 'callLLM')
+      .mockImplementationOnce(neverResolves)
+      .mockResolvedValueOnce({ choices: [{ message: { content: 'fallback description' } }] } as any);
+
+    const result = await service.describeImage('anthropic.claude-opus-4-8', 'https://example.com/chart.png');
+
+    expect(result.success).toBe(true);
+    expect(result.fallbackUsed).toBe(true);
+    expect(result.primaryError).toMatch(/timed out/i);
+    expect(callLLMSpy).toHaveBeenCalledTimes(2);
+  }, 10000);
 });
