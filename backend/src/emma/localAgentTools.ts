@@ -326,6 +326,61 @@ export function buildLocalAgentUnavailableResult(
   };
 }
 
+/**
+ * Detect a PROCESS-LEVEL crash of the local-agent worker — killed by an OS signal
+ * (SIGKILL from the OOM-killer, SIGSEGV, SIGABRT, ...) — as opposed to a normal task
+ * failure (worker ran, exited non-zero, or returned ok:false with a text reason).
+ *
+ * A signal-kill is INFRASTRUCTURE, not task content: it recurs on every task no
+ * matter what we send, so retrying just crashes the worker again (ENG-339: a
+ * scheduled run crashed 4x with returncode -9 and tripped the repeated-failure
+ * breaker). Two encodings appear in the wild:
+ *   - Python subprocess: killed by signal N  -> returncode -N   (SIGKILL -> -9)
+ *   - Shell / 128+signal: killed by signal N -> returncode 128+N (SIGKILL -> 137)
+ * -1 is our "returncode omitted" sentinel (see buildLocalAgentResult), NOT a signal.
+ */
+export function isProcessCrashReturncode(returncode: number | null | undefined): boolean {
+  if (typeof returncode !== 'number' || !Number.isFinite(returncode)) return false;
+  if (returncode <= -2) return true; // -N signal encoding (excludes the -1 sentinel)
+  if (returncode > 128) return true; // 128+N shell encoding (137 = OOM SIGKILL)
+  return false;
+}
+
+/**
+ * Shape a worker process-crash as a GRACEFUL, non-retryable outcome — the same
+ * pattern as buildLocalAgentUnavailableResult. success:true keeps the dispatch
+ * layer from recording it as agent_tool_failed / feeding the repeated-failure
+ * breaker (a crash is not a task failure), and the guidance stops the model from
+ * re-invoking a worker that will just crash again (ENG-339).
+ */
+export function buildLocalAgentCrashResult(returncode: number): {
+  success: true;
+  unavailable: true;
+  reason: 'crashed';
+  returncode: number;
+  message: string;
+  formattedContent: string;
+} {
+  // -9 (SIGKILL) and 137 (128+9) are what the OS OOM-killer produces — name memory
+  // explicitly so the reason is actionable. Other signals are generic crashes.
+  const likelyOom = returncode === -9 || returncode === 137;
+  const message = likelyOom
+    ? `The local browser agent worker was killed (returncode ${returncode}), most likely out of memory.`
+    : `The local browser agent worker crashed at the process level (returncode ${returncode}).`;
+  return {
+    success: true,
+    unavailable: true,
+    reason: 'crashed',
+    returncode,
+    message,
+    formattedContent:
+      `${message}\n\n` +
+      'This is an infrastructure fault, not a problem with the task — the worker keeps getting killed, so retrying will crash it the same way. ' +
+      'Do NOT retry run_local_agent_task in this run. Continue with the cloud browser tools and you_search_web to gather what you can. ' +
+      'If the data is unreachable from those, report that the local agent is temporarily unavailable rather than marking the whole run as an internal tool failure.',
+  };
+}
+
 emmaToolRegistry.register({
   name: 'run_local_agent_task',
   definition: {
@@ -450,6 +505,13 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
         'bad_response',
         'Invalid JSON from local agent relay.',
       );
+    }
+
+    // A process-level crash of the worker (killed by a signal — OOM SIGKILL, etc.)
+    // recurs on every task, so treat it as a graceful, non-retryable unavailable
+    // outcome instead of a task failure the model retries into the ground (ENG-339).
+    if (parsed.ok !== true && isProcessCrashReturncode(parsed.returncode)) {
+      return buildLocalAgentCrashResult(parsed.returncode);
     }
 
     const screenshotUrls: string[] = [];
