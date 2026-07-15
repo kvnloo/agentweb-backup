@@ -14,8 +14,9 @@ import {
   UpdateSequenceInput,
 } from '../services/dripSequenceDb';
 import { crmDb } from '../services/db';
-import { resendService } from '../services/resendService';
-import { bulkSendGuardMessage } from '../services/crmSenderService';
+import { resolveSenderForSend } from '../services/crmSenderService';
+import { CrmSender } from '../services/crmSenderTypes';
+import { sendAsSender } from '../services/sendAsSender';
 import axios from 'axios';
 import { extractVariables, leadHasVariable, isSupportedVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
@@ -315,7 +316,7 @@ router.post(
   async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
-    const { senderEmail, senderName, subject, htmlContent, recipients } = req.body;
+    const { senderId, senderEmail, senderName, subject, htmlContent, recipients } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -353,14 +354,16 @@ router.post(
     const withNormalizedUrls = normalizeYoutubeUrls(withRewrittenImages);
     // Wire up unsubscribe URL with the real portal domain
     const testHtml = injectUnsubscribeUrl(withNormalizedUrls, testUnsubscribeUrl);
-    // GUARD (ENG-266 Part 3): sends unconditionally through Resend — refuse a
-    // mailbox-backed sender rather than silently sending from the wrong system.
-    const mailboxGuard = await bulkSendGuardMessage(userId, senderEmail);
-    if (mailboxGuard) {
-      return res.status(400).json({ message: mailboxGuard, code: 'MAILBOX_SENDER_NOT_SUPPORTED' });
-    }
 
-    const from = `${senderName} <${senderEmail}>`;
+    // ENG-266 Part 3: route through the sender's real provider (same fallback pattern
+    // as the crm.ts send sites).
+    const resolvedSender = await resolveSenderForSend(userId, senderId, senderEmail);
+    const sender: CrmSender = resolvedSender ?? {
+      id: '__adhoc__',
+      email: senderEmail,
+      fromName: senderName,
+      senderProvider: 'resend',
+    };
 
     let sent = 0;
     let failedCount = 0;
@@ -368,19 +371,12 @@ router.post(
 
     for (const email of validEmails) {
       try {
-        const result = await resendService.sendEmail({
-          from,
+        await sendAsSender(userId, sender, {
           to: email.trim(),
           subject: `[TEST] ${subject}`,
           html: testHtml,
         });
-
-        if (result && result.id) {
-          sent++;
-        } else {
-          failedCount++;
-          failedEmails.push(email);
-        }
+        sent++;
       } catch (err: any) {
         console.error(`[sequences] Failed to send test email to ${email}:`, err.message || err);
         failedCount++;
