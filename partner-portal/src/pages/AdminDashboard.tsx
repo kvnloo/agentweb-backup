@@ -6679,6 +6679,10 @@ export default function AdminDashboard() {
             const burn = costBreakdownData.totals.costUsd;
             const deducted = costBreakdownUser ? deductedCostForMonth(costBreakdownUser, costBreakdownMonth) : 0;
             const absorbed = Math.max(0, burn - deducted);
+            // Policy: every LLM call with a real userId is charged to the user, so
+            // absorbed should be ~$0. A non-trivial value flags spend still escaping
+            // the cap (a metering leak) — surface it in red as a monitor.
+            const isLeaking = absorbed > 0.005;
             // Aggregate the per-(day, model, feature) rows up to per-model totals.
             const byModel: Record<string, { model: string; callCount: number; totalTokens: number; costUsd: number }> = {};
             costBreakdownData.rows.forEach((r) => {
@@ -6724,13 +6728,31 @@ export default function AdminDashboard() {
                     </Box>
                   </Grid>
                   <Grid item xs={4}>
-                    <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 1.5 }}>
+                    <Box
+                      data-testid="absorbed-card"
+                      data-leaking={isLeaking ? "true" : "false"}
+                      sx={{
+                        border: 1,
+                        borderColor: isLeaking ? "error.main" : "divider",
+                        bgcolor: isLeaking ? "error.50" : "transparent",
+                        borderRadius: 1,
+                        p: 1.5,
+                      }}
+                    >
                       <HelpCaption
-                        label="Absorbed by platform"
-                        help="Burn the platform ate — gross burn minus what was counted to quota. This is cost we generated on the user's behalf but did not charge against their cap."
+                        label={isLeaking ? "⚠ Absorbed by platform" : "Absorbed by platform"}
+                        help="Burn the platform ate — gross burn minus what was counted to quota. Policy is to charge every call with a real userId to the user, so this should read ~$0. A non-zero value means spend is still escaping the cap (a metering leak) or predates the charge-all rollout."
                       />
-                      <Typography variant="h6" sx={{ fontVariantNumeric: "tabular-nums" }}>${absorbed.toFixed(2)}</Typography>
-                      <Typography variant="caption" color="text.secondary">burn not charged to the user</Typography>
+                      <Typography
+                        variant="h6"
+                        sx={{ fontVariantNumeric: "tabular-nums" }}
+                        color={isLeaking ? "error.main" : "text.primary"}
+                      >
+                        ${absorbed.toFixed(2)}
+                      </Typography>
+                      <Typography variant="caption" color={isLeaking ? "error.main" : "text.secondary"}>
+                        {isLeaking ? "spend escaping the cap — investigate" : "fully charged (no leak)"}
+                      </Typography>
                     </Box>
                   </Grid>
                 </Grid>
