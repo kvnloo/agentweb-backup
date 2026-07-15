@@ -12,16 +12,13 @@
  */
 
 import { dripSequenceDb, DripSequence, SequenceEnrollment, StepCondition, SequenceChannel } from './dripSequenceDb';
-import { resendService } from './resendService';
+import { sendAsSender } from './sendAsSender';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { crmDb, userDb } from './db';
 import { emailEventsDb } from './emailEventsDb';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { substituteVariables, injectUnsubscribeUrl, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
-import {
-  loadSenderConfig as loadCrmSenderConfig,
-  assertSenderUsableForBulkSend,
-} from './crmSenderService';
+import { loadSenderConfig as loadCrmSenderConfig } from './crmSenderService';
 import { CrmSender } from './crmSenderTypes';
 import { settingsService } from './settingsService';
 import { v4 as uuidv4 } from 'uuid';
@@ -186,39 +183,29 @@ async function sendEmailStep(
   const unsubscribeUrl = `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe?listId=${encodeURIComponent(enrollment.listId)}&leadId=${encodeURIComponent(enrollment.leadId)}&email=${encodeURIComponent(enrollment.leadEmail)}`;
   bodyHtml = injectUnsubscribeUrl(bodyHtml, unsubscribeUrl);
 
-  // GUARD (ENG-266 Part 3): this path still sends unconditionally through Resend.
-  // A mailbox-backed sender reaching it would silently send from the wrong system,
-  // so refuse loudly. Remove once the send path routes by provider.
   const selectedSender = senderConfig.senders.find(
     (s) => s.id === (step.senderId ?? senderConfig.defaultSenderId),
   );
-  if (selectedSender) {
-    assertSenderUsableForBulkSend(selectedSender);
-  }
+  const sender = selectedSender ?? legacyDefaultSender(user);
 
-  const senderEmail = resolveSenderEmail(user, senderConfig, step.senderId);
-  const senderName = resolveSenderName(user, senderConfig, step.senderId);
-
-  if (!senderEmail) {
+  if (!sender) {
     console.error(`[dripWorker] Skipping enrollment ${enrollment.enrollmentId}: user ${enrollment.userId} has no email sender configured`);
     throw new Error(`No email sender configured for user ${enrollment.userId}`);
   }
 
-  const fromField = senderName ? `${senderName} <${senderEmail}>` : senderEmail;
-
-  const sendResult = await resendService.sendEmail({
-    from: fromField,
-    to: [enrollment.leadEmail],
-    subject,
-    html: bodyHtml,
-  });
-
-  if (!sendResult) {
-    console.error(`[dripWorker] Resend returned null for step ${step.stepNumber} to ${enrollment.leadEmail} — not advancing`);
-    throw new Error(`Email send failed for ${enrollment.leadEmail}`);
+  let sendResult;
+  try {
+    sendResult = await sendAsSender(enrollment.userId, sender, {
+      to: enrollment.leadEmail,
+      subject,
+      html: bodyHtml,
+    });
+  } catch (error) {
+    console.error(`[dripWorker] Send failed for step ${step.stepNumber} to ${enrollment.leadEmail}:`, error);
+    throw error;
   }
 
-  console.log(`[dripWorker] Sent email step ${step.stepNumber} to ${enrollment.leadEmail} (id: ${sendResult.id})`);
+  console.log(`[dripWorker] Sent email step ${step.stepNumber} to ${enrollment.leadEmail} via ${sendResult.provider} (id: ${sendResult.messageId})`);
 }
 
 async function sendLinkedInStep(
@@ -421,24 +408,20 @@ async function loadSenderConfig(userId: string): Promise<{ senders: CrmSender[];
   return { senders: config.senders, defaultSenderId: config.defaultSenderId };
 }
 
-function resolveSenderEmail(user: any, senderConfig: { senders: any[]; defaultSenderId: string | null }, senderId?: string): string | null {
-  const id = senderId ?? senderConfig.defaultSenderId;
-  if (id) {
-    const match = senderConfig.senders.find((s: any) => s.id === id);
-    if (match?.email) return match.email;
+/**
+ * Pre-dates CRM senders entirely: a user with no sender configured at all still
+ * gets a best-effort custom-domain address built from their own account fields.
+ * Synthesized as a resend CrmSender so it can go through sendAsSender like any
+ * other sender.
+ */
+function legacyDefaultSender(user: any): CrmSender | null {
+  if (!user?.emailDomain || !user?.defaultSenderUsername) {
+    return null;
   }
-  // Legacy fallback: user-level defaultSenderUsername
-  if (user?.emailDomain && user?.defaultSenderUsername) {
-    return `${user.defaultSenderUsername}@${user.emailDomain}`;
-  }
-  return null;
-}
-
-function resolveSenderName(user: any, senderConfig: { senders: any[]; defaultSenderId: string | null }, senderId?: string): string {
-  const id = senderId ?? senderConfig.defaultSenderId;
-  if (id) {
-    const match = senderConfig.senders.find((s: any) => s.id === id);
-    if (match?.fromName) return match.fromName;
-  }
-  return user?.fromName ?? user?.displayName ?? user?.name ?? '';
+  return {
+    id: '__legacy_user_default__',
+    email: `${user.defaultSenderUsername}@${user.emailDomain}`,
+    fromName: user?.fromName ?? user?.displayName ?? user?.name ?? '',
+    senderProvider: 'resend',
+  };
 }
