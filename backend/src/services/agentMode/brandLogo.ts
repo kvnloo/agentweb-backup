@@ -1,0 +1,311 @@
+/**
+ * Brand-logo handling for AgentMode + onboarding (ENG-326).
+ *
+ * The customer's real logo must be a persisted brand asset — never something
+ * an image model invents on the fly. This module owns the deterministic
+ * pieces of that contract:
+ *
+ *   - `downloadBrandLogoToS3` — the download + S3 persist block extracted
+ *     (behavior-preserving) out of `agentModeService.extractCSSFromURL`.
+ *   - `ensureBrandLogoPersisted` — the deterministic post-scrape onboarding
+ *     step: if the Emma brand-build session left no logo on the account,
+ *     discover one with the existing cssExtractor heuristics, pin it to S3,
+ *     and persist it as `brandData.logoUrl` + a `logo` brand asset (AC-1).
+ *   - `getPersistedBrandLogoUrl(ForUser)` — the one shared resolution order
+ *     for "what is this account's logo": brandData.logoUrl → attachments
+ *     `logo` asset → legacy brandAssets array (org-aware for the ByUser
+ *     variant).
+ *   - `promptRequestsLogo` + `missingBrandLogoToolResult` — the generate_image
+ *     gate: prompts that ask for a logo either composite the persisted one or
+ *     come back as an explicit ask-the-user result pointing at brand config
+ *     (AC-2 / AC-3). Never a silent invented logo.
+ *
+ * All external boundaries (axios, S3, Dynamo, cssExtractor, the
+ * brand-guidelines write path) are lazy-loaded and injectable so every branch
+ * is unit-testable with mocks.
+ */
+
+export interface BrandGuidelinesLike {
+  brandData?: Record<string, unknown>;
+  attachments?: unknown;
+  /** Legacy shape — some old records carry assets here instead of attachments. */
+  brandAssets?: unknown;
+}
+
+export const MISSING_BRAND_LOGO_ERROR = 'missing_brand_logo';
+
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === 'string' && v.trim().length > 0;
+}
+
+function firstLogoAssetUrl(list: unknown): string | null {
+  if (!Array.isArray(list)) return null;
+  for (const asset of list) {
+    const url = isNonEmptyString((asset as any)?.url) ? (asset as any).url.trim() : '';
+    const type =
+      typeof (asset as any)?.type === 'string'
+        ? (asset as any).type.toLowerCase()
+        : '';
+    if (url && type.includes('logo')) return url;
+  }
+  return null;
+}
+
+/**
+ * Resolve the persisted brand logo off a brandGuidelines object.
+ * Order: brandData.logoUrl → attachments `logo` asset → legacy brandAssets.
+ */
+export function getPersistedBrandLogoUrl(
+  brand: BrandGuidelinesLike | null | undefined,
+): string | null {
+  if (!brand) return null;
+  const logoUrl = (brand.brandData as any)?.logoUrl;
+  if (isNonEmptyString(logoUrl)) return logoUrl.trim();
+  return firstLogoAssetUrl(brand.attachments) ?? firstLogoAssetUrl(brand.brandAssets);
+}
+
+/**
+ * Org-aware brandGuidelines read — same resolution as
+ * `agentModeService.readBrandGuidelines` (org members read the org record).
+ */
+export async function resolveBrandGuidelinesForUser(
+  userId: string,
+): Promise<BrandGuidelinesLike | null> {
+  const { userDb, orgDb } = await import('../db');
+  const user: any = await userDb.getUserById(userId);
+  if (!user) return null;
+  let brand: BrandGuidelinesLike | null = user.brandGuidelines ?? null;
+  if (user.orgId) {
+    const org: any = await orgDb.getOrgById(user.orgId);
+    if (org?.brandGuidelines) brand = org.brandGuidelines;
+  }
+  return brand;
+}
+
+export async function getPersistedBrandLogoUrlForUser(
+  userId: string,
+): Promise<string | null> {
+  return getPersistedBrandLogoUrl(await resolveBrandGuidelinesForUser(userId));
+}
+
+/**
+ * Negated logo mentions ("no logo", "without any logos", "omit the logo",
+ * "remove the logo") must not trigger the brand-logo gate.
+ */
+const NEGATED_LOGO_RE =
+  /\b(?:no|not|without|never|avoid|omit|exclude|remove|skip|minus)\b[^.!?\n]{0,40}?\blogos?\b/gi;
+const LOGO_RE = /\blogos?\b/i;
+
+/** Does this image prompt ask for a logo to appear in the output? */
+export function promptRequestsLogo(prompt: string): boolean {
+  if (!isNonEmptyString(prompt)) return false;
+  return LOGO_RE.test(prompt.replace(NEGATED_LOGO_RE, ' '));
+}
+
+/**
+ * The AC-3 tool result: the model must ask the user for their real logo (or
+ * point them at brand config) instead of generating with an invented one.
+ */
+export function missingBrandLogoToolResult(): {
+  success: false;
+  error: string;
+  askUser: true;
+  message: string;
+} {
+  return {
+    success: false,
+    error: MISSING_BRAND_LOGO_ERROR,
+    askUser: true,
+    message:
+      'This image request asks for the brand logo, but no logo is saved in the ' +
+      "account's Brand Guidelines. Do NOT generate the image with an invented, " +
+      'approximate, or AI-rendered logo. Ask the user to provide their real logo — ' +
+      'they can upload it in Brand Guidelines (brand config) or share the file/URL ' +
+      'here — then call generate_image again with logo_image set to that URL. If the ' +
+      'user explicitly says to proceed without a logo, call generate_image again with ' +
+      'a prompt that does not mention a logo.',
+  };
+}
+
+/**
+ * Download a discovered logo and pin it to S3 under
+ * `users/{userId}/brand/logo`. Extracted verbatim from
+ * `agentModeService.extractCSSFromURL` (ENG-326) — behavior-preserving:
+ * SVGs are skipped (brand guidelines reject them), any download/upload
+ * failure logs a warning and resolves null. Never throws.
+ */
+export async function downloadBrandLogoToS3(
+  logoUrl: string,
+  userId: string,
+): Promise<string | null> {
+  try {
+    console.log(`Downloading logo from ${logoUrl}...`);
+    const axios = (await import('axios')).default;
+    const logoResponse = await axios.get(logoUrl, {
+      responseType: 'arraybuffer',
+      timeout: 15000,
+    });
+    const contentType = logoResponse.headers['content-type'] || '';
+    // Skip SVG since brand guidelines doesn't accept it
+    if (contentType.includes('svg')) {
+      console.log('Skipping SVG logo (not supported by brand guidelines)');
+      return null;
+    }
+    const ext = contentType.includes('png')
+      ? 'png'
+      : contentType.includes('gif')
+        ? 'gif'
+        : 'jpg';
+    const filename = `logo.${ext}`;
+    const { uploadFileToS3WithPath } = await import('../../utils/s3Utils');
+    const uploadResult = await uploadFileToS3WithPath(
+      Buffer.from(logoResponse.data as ArrayBuffer),
+      filename,
+      contentType,
+      `users/${userId}/brand/logo`,
+    );
+    if (uploadResult.success && uploadResult.url) {
+      console.log(`Logo uploaded to S3: ${uploadResult.url}`);
+      return uploadResult.url;
+    }
+    return null;
+  } catch (logoErr: any) {
+    console.warn('Failed to download/upload logo:', logoErr?.message ?? String(logoErr));
+    return null;
+  }
+}
+
+export interface EnsureBrandLogoDeps {
+  /** Org-aware brandGuidelines read. Defaults to the real Dynamo read. */
+  resolveBrand?: (userId: string) => Promise<BrandGuidelinesLike | null>;
+  /** Logo discovery. Defaults to the cssExtractor heuristics on the company URL. */
+  discoverLogoUrl?: (companyUrl: string) => Promise<string | null>;
+  /** Download + S3 pin. Defaults to `downloadBrandLogoToS3`. */
+  download?: (logoUrl: string, userId: string) => Promise<string | null>;
+  /**
+   * Brand-guidelines write. Defaults to
+   * `agentModeService.updateBrandGuidelines` — the same org-aware,
+   * merge-by-type path Emma's update_brand_guidelines tool uses.
+   */
+  persist?: (
+    userId: string,
+    logoUrl: string,
+    filename: string,
+  ) => Promise<{ success: boolean; error?: string }>;
+}
+
+export interface EnsureBrandLogoOutcome {
+  persisted: boolean;
+  logoUrl: string | null;
+  reason:
+    | 'persisted'
+    | 'already-present'
+    | 'no-logo-found'
+    | 'svg-only'
+    | 'persist-failed'
+    | 'error';
+  detail?: string;
+}
+
+function isSvgUrl(url: string): boolean {
+  const lower = url.toLowerCase();
+  return lower.endsWith('.svg') || lower.includes('.svg?');
+}
+
+function filenameFromUrl(url: string): string {
+  try {
+    const base = new URL(url).pathname.split('/').filter(Boolean).pop();
+    if (base && /\.(png|jpe?g|gif|webp|ico)$/i.test(base)) return base;
+  } catch {
+    /* fall through to default */
+  }
+  return 'logo.png';
+}
+
+async function defaultDiscoverLogoUrl(companyUrl: string): Promise<string | null> {
+  // Lazy require — cssExtractor pulls JSDOM and friends; only load when the
+  // deterministic step actually runs (tests inject a fake).
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { extractCSSFromURL } = require('../cssExtractor');
+  const extracted = await extractCSSFromURL(companyUrl);
+  const logoUrl = extracted?.brandIdentity?.logoUrl;
+  return isNonEmptyString(logoUrl) ? logoUrl : null;
+}
+
+async function defaultPersistBrandLogo(
+  userId: string,
+  logoUrl: string,
+  filename: string,
+): Promise<{ success: boolean; error?: string }> {
+  // Lazy import — agentModeService imports this module, so the reverse edge
+  // must resolve at call time to avoid a load-order cycle.
+  const { agentModeService } = await import('../agentModeService');
+  return agentModeService.updateBrandGuidelines(
+    {
+      brandData: { logoUrl },
+      brandAssets: {
+        type: 'logo',
+        url: logoUrl,
+        filename,
+        key: `auto-logo-${Date.now()}`,
+      },
+    },
+    userId,
+  );
+}
+
+/**
+ * Deterministic post-scrape onboarding step (AC-1): whenever the Emma
+ * brand-build session left no logo on the account, discover one on the
+ * company site, pin it to S3, and persist it as `brandData.logoUrl` plus a
+ * `logo` brand asset. Never throws — the caller treats every outcome as
+ * best-effort and logs it.
+ */
+export async function ensureBrandLogoPersisted(
+  userId: string,
+  companyUrl: string,
+  deps: EnsureBrandLogoDeps = {},
+): Promise<EnsureBrandLogoOutcome> {
+  try {
+    const resolveBrand = deps.resolveBrand ?? resolveBrandGuidelinesForUser;
+    const existing = getPersistedBrandLogoUrl(await resolveBrand(userId));
+    if (existing) {
+      return { persisted: false, logoUrl: existing, reason: 'already-present' };
+    }
+
+    const discoverLogoUrl = deps.discoverLogoUrl ?? defaultDiscoverLogoUrl;
+    const discovered = await discoverLogoUrl(companyUrl);
+    if (!discovered) {
+      return { persisted: false, logoUrl: null, reason: 'no-logo-found' };
+    }
+
+    const download = deps.download ?? downloadBrandLogoToS3;
+    const s3Url = await download(discovered, userId);
+    // S3-pinned URL preferred; a raster URL on the customer's site is still a
+    // real logo if the pin failed. An SVG that S3 skipped has no usable
+    // fallback (brand guidelines reject SVG assets).
+    const finalUrl = s3Url ?? (isSvgUrl(discovered) ? null : discovered);
+    if (!finalUrl) {
+      return { persisted: false, logoUrl: null, reason: 'svg-only' };
+    }
+
+    const persist = deps.persist ?? defaultPersistBrandLogo;
+    const result = await persist(userId, finalUrl, filenameFromUrl(finalUrl));
+    if (!result?.success) {
+      return {
+        persisted: false,
+        logoUrl: finalUrl,
+        reason: 'persist-failed',
+        detail: result?.error,
+      };
+    }
+    return { persisted: true, logoUrl: finalUrl, reason: 'persisted' };
+  } catch (err: any) {
+    return {
+      persisted: false,
+      logoUrl: null,
+      reason: 'error',
+      detail: err?.message ?? String(err),
+    };
+  }
+}
