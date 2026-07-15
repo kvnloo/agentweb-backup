@@ -10,7 +10,7 @@ import '@testing-library/jest-dom';
 
 interface HandlerDeps {
   windowOpen: (url: string, target: string) => Window | null;
-  post: () => Promise<{ status: number; data: { customerPortalUrl: string } }>;
+  post: () => Promise<{ status: number; data: { customerPortalUrl?: string } }>;
   onSuccess: (msg: string) => void;
   onExposeUrl: (url: string) => void;
   onError: (msg: string) => void;
@@ -20,14 +20,22 @@ async function handleAccessCustomerPortal(deps: HandlerDeps) {
   const placeholderTab = deps.windowOpen('', '_blank');
   try {
     const response = await deps.post();
-    if (response.status === 200) {
-      const { customerPortalUrl } = response.data;
+    // Key off the presence of the URL (any 2xx), not an exact 200, and close
+    // the placeholder tab if the response has no usable URL so it is never
+    // orphaned as a blank window.
+    const customerPortalUrl = response?.data?.customerPortalUrl;
+    if (customerPortalUrl) {
       if (placeholderTab && !placeholderTab.closed) {
         placeholderTab.location.href = customerPortalUrl;
         deps.onSuccess('Delegate access created successfully!');
       } else {
         deps.onExposeUrl(customerPortalUrl);
       }
+    } else {
+      if (placeholderTab && !placeholderTab.closed) {
+        placeholderTab.close();
+      }
+      deps.onError('Delegate access did not return a portal URL');
     }
   } catch (error: any) {
     if (placeholderTab && !placeholderTab.closed) {
@@ -134,6 +142,31 @@ describe('AdminDashboard - Access Portal delegate access (ENG-279)', () => {
     // No blank tab should be left behind, and the error must surface.
     expect((fakeTab as any).close).toHaveBeenCalled();
     expect(deps.onError).toHaveBeenCalledWith('Failed to create delegate access');
+    expect(deps.onSuccess).not.toHaveBeenCalled();
+    expect(deps.onExposeUrl).not.toHaveBeenCalled();
+  });
+
+  it('closes the placeholder tab (no orphan) when the response has no portal URL', async () => {
+    const fakeTab = {
+      closed: false,
+      location: { href: '' },
+      close: jest.fn(),
+    } as unknown as Window;
+
+    const deps: HandlerDeps = {
+      windowOpen: jest.fn(() => fakeTab),
+      // e.g. a 2xx (or 200) with an unexpected empty body — must not orphan a blank tab
+      post: jest.fn(async () => ({ status: 200, data: {} })),
+      onSuccess: jest.fn(),
+      onExposeUrl: jest.fn(),
+      onError: jest.fn(),
+    };
+
+    await handleAccessCustomerPortal(deps);
+
+    expect((fakeTab as any).close).toHaveBeenCalled();
+    expect((fakeTab as any).location.href).toBe('');
+    expect(deps.onError).toHaveBeenCalledWith('Delegate access did not return a portal URL');
     expect(deps.onSuccess).not.toHaveBeenCalled();
     expect(deps.onExposeUrl).not.toHaveBeenCalled();
   });
