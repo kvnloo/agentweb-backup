@@ -971,9 +971,6 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               }
 
               const displayName = await getSlackUserDisplayName(slackUserId);
-              // When user sends only a file with no text, provide a placeholder so Emma knows a file was shared
-              const messageText = text || (files && files.length > 0 ? '[attached file]' : '');
-              const formattedMessage = `${displayName}: ${messageText}`.trim();
 
               const attachments: any[] = [];
               if (files && files.length > 0) {
@@ -1005,6 +1002,17 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
                   }
                 }
               }
+
+              // When the user sent only a file (no text), give Emma a placeholder so it knows
+              // a file was shared — but only claim '[attached file]' if an attachment actually
+              // reached the agent. If ingestion failed and attachments is empty, an honest
+              // marker keeps the model from calling read_file_content('[attached file]') on a
+              // non-URL and returning 'Invalid URL format' to the user (ENG-323).
+              let messageText = text;
+              if (!messageText && files && files.length > 0) {
+                messageText = attachments.length > 0 ? '[attached file]' : '[attachment could not be read]';
+              }
+              const formattedMessage = `${displayName}: ${messageText || ''}`.trim();
 
               const thinkingTs = await postThinkingMessage(channel, threadTs);
               const llmModel = session.llmModel || await agentModeService.getDefaultModel();
