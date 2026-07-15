@@ -2,6 +2,7 @@ import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
 
 import { resendService } from './resendService';
+import { deriveBlockedByCost } from './tokenUsageService';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { chatbotDb } from './chatbotService';
 import { settingsService } from './settingsService';
@@ -979,15 +980,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       // (ENG-200). When the cost cap is the trigger — the only reason a user with an
       // unlimited token allowance can be blocked — render a cost-based message so it
       // doesn't misleadingly read "N/A tokens".
-      const costCapTriggered =
-        usageStatus.costAllowance != null && (usageStatus.costPercentUsed ?? 0) >= 100;
-      const effectiveTokenAllowance =
-        usageStatus.effectiveAllowance !== undefined
-          ? usageStatus.effectiveAllowance
-          : usageStatus.allowance;
-      const tokenCapTriggered =
-        effectiveTokenAllowance != null && (usageStatus.percentUsed ?? 0) >= 100;
-      const blockedByCost = costCapTriggered && !tokenCapTriggered;
+      const { blockedByCost } = deriveBlockedByCost(usageStatus);
 
       const limitLabel = blockedByCost ? 'Monthly Cost Limit Reached' : 'Monthly Token Limit Reached';
       const limitReasonText = blockedByCost ? 'monthly cost limit' : 'monthly token limit';

@@ -171,6 +171,36 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
 }
 
 /**
+ * Given a usage status, determine whether a *block* was caused by the dollar cost
+ * cap rather than the token-count cap (ENG-200). Shared by the scheduled-chat
+ * block message (agentModeController) and its email (emailService) so both agree
+ * on the reason — a user with an unlimited token allowance can only be blocked by
+ * the cost cap, and the message must then read in dollars, not "0 / N/A tokens".
+ *
+ * Tolerant of partial status objects (the email caller passes a subset): a missing
+ * effectiveAllowance falls back to allowance, and missing percentages read as 0.
+ */
+export function deriveBlockedByCost(status: {
+  allowance?: number | null;
+  effectiveAllowance?: number | null;
+  percentUsed?: number;
+  costAllowance?: number | null;
+  costPercentUsed?: number;
+}): { costCapTriggered: boolean; tokenCapTriggered: boolean; blockedByCost: boolean } {
+  const costCapTriggered =
+    status.costAllowance != null && (status.costPercentUsed ?? 0) >= 100;
+  const effectiveTokenAllowance =
+    status.effectiveAllowance != null ? status.effectiveAllowance : status.allowance;
+  const tokenCapTriggered =
+    effectiveTokenAllowance != null && (status.percentUsed ?? 0) >= 100;
+  return {
+    costCapTriggered,
+    tokenCapTriggered,
+    blockedByCost: costCapTriggered && !tokenCapTriggered,
+  };
+}
+
+/**
  * Atomically increment a user's token usage for the current month.
  * For org members, usage is recorded on the org owner's account.
  * Performs lazy monthly reset if the stored month differs from current.
