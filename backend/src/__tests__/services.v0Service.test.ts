@@ -264,6 +264,27 @@ describe("v0Service - buildBrandContextFromUser", () => {
     expect(buildBrandContextFromUser({})).toEqual({});
   });
 
+  it("uses the brandGuidelines override (org record) over the user record when provided", () => {
+    // Org members' brand — including the persisted/uploaded logo — lives on
+    // the ORG record; the route passes it explicitly (ENG-326).
+    const ctx = buildBrandContextFromUser(
+      {
+        brandGuidelines: {
+          brandData: { brandName: "StaleUser", logoUrl: "https://s3/stale-user.png" },
+        },
+        marketStrategy: { businessOverview: "Acme makes rockets" },
+      },
+      {
+        brandData: { brandName: "Acme" },
+        attachments: [{ type: "logo", url: "https://s3/org/logo.png" }],
+      },
+    );
+    expect(ctx.brandName).toBe("Acme");
+    expect(ctx.logoUrl).toBe("https://s3/org/logo.png");
+    // marketStrategy still comes from the user record.
+    expect(ctx.businessOverview).toBe("Acme makes rockets");
+  });
+
   it("the enriched v0 prompt carries the persisted logo URL (landing pages receive the real logo)", () => {
     const prompt = buildBrandEnrichedPrompt(
       "Build a landing page",

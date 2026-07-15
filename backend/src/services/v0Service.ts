@@ -608,12 +608,20 @@ export interface BrandContext {
  * record (ENG-326). One shared implementation for every v0 entry point so the
  * persisted brand logo — resolved attachments-first via the shared brandLogo
  * module — always reaches the generation prompt.
+ *
+ * `brandGuidelinesOverride` carries the effective brand record when it does
+ * NOT live on the user: org members' brandGuidelines (incl. the persisted /
+ * uploaded logo) live on the ORG record, so callers pass
+ * `org.brandGuidelines` for them. marketStrategy always comes from the user.
  */
-export function buildBrandContextFromUser(user: any): BrandContext {
+export function buildBrandContextFromUser(
+  user: any,
+  brandGuidelinesOverride?: any,
+): BrandContext {
   const brandContext: BrandContext = {};
   if (!user) return brandContext;
 
-  const bg: any = user.brandGuidelines;
+  const bg: any = brandGuidelinesOverride ?? user.brandGuidelines;
   if (bg) {
     const bd = bg.brandData || {};
     brandContext.brandName = bd.brandName;

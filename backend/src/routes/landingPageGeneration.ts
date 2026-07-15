@@ -39,6 +39,7 @@ import {
   canUserEditLandingPage,
 } from "../services/v0Service";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
+import { MISSING_BRAND_LOGO_ERROR } from "../services/agentMode/brandLogo";
 import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
 
 const router = Router();
@@ -281,12 +282,13 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
 
     // Org-level create gating: in an org, only the org owner or a listed
     // editor (when landingPages sharing is enabled) may generate new pages.
+    // The org record is also the brand source for org members below.
     const caller = await userDb.getUserById(userId);
+    const callerOrg = caller?.orgId ? await orgDb.getOrgById(caller.orgId) : null;
     if (caller?.orgId) {
-      const org = await orgDb.getOrgById(caller.orgId);
       const allowed = canManageOrgFeature(
         { userId, orgId: caller.orgId, orgRole: caller.orgRole as "owner" | "member" | undefined },
-        org,
+        callerOrg,
         "landingPages",
       );
       if (!allowed) {
@@ -338,17 +340,28 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
 
     const pageName = name || prompt.slice(0, 60);
 
-    // Fetch brand guidelines + market strategy for maximum context. The
-    // shared projection resolves the persisted brand logo attachments-first
-    // (ENG-326) so the generated page carries the real logo.
-    let brandContext: BrandContext = {};
-    let userSiteMode: "unified" | "separate" | undefined;
-    try {
-      const user = await userDb.getUserById(userId);
-      userSiteMode = user?.landingSiteMode;
-      brandContext = buildBrandContextFromUser(user);
-    } catch (error) {
-      console.error("[LP GENERATION] Failed to fetch brand guidelines, continuing without:", error);
+    // Brand guidelines + market strategy for maximum context. The shared
+    // projection resolves the persisted brand logo attachments-first and
+    // org-aware — an org member's brand (incl. the uploaded logo) lives on
+    // the ORG record (ENG-326). Pure projection off records already loaded.
+    const brandContext: BrandContext = buildBrandContextFromUser(
+      caller,
+      callerOrg?.brandGuidelines,
+    );
+    const userSiteMode: "unified" | "separate" | undefined = caller?.landingSiteMode;
+
+    // ENG-326 AC-3: landing pages are BRANDED assets — without a persisted
+    // logo v0 renders an invented/approximate wordmark, the exact defect the
+    // issue names. Point the user at brand config instead of generating.
+    // Gate BEFORE any side effect (lead-list flip, site-mode lock).
+    if (!brandContext.logoUrl) {
+      return res.status(422).json({
+        error: MISSING_BRAND_LOGO_ERROR,
+        message:
+          "No brand logo is saved in Brand Guidelines. Upload your logo in brand config " +
+          "(Brand Guidelines), then generate again — landing pages are never generated " +
+          "with an invented or approximate logo.",
+      });
     }
 
     // Auto-enable public access on the lead list so the landing page form works
@@ -688,12 +701,22 @@ router.post("/generated/:id/duplicate", async (req, res: Response) => {
     const newName = name || `${original.name} (copy)`;
 
     // Re-generate using the original prompt + full brand context (shared
-    // ENG-326 projection — persisted logo resolved attachments-first).
-    let brandContext: BrandContext = {};
-    try {
-      const user = await userDb.getUserById(userId);
-      brandContext = buildBrandContextFromUser(user);
-    } catch {}
+    // ENG-326 projection — org-aware, persisted logo attachments-first).
+    const user = await userDb.getUserById(userId);
+    const org = user?.orgId ? await orgDb.getOrgById(user.orgId) : null;
+    const brandContext = buildBrandContextFromUser(user, org?.brandGuidelines);
+
+    // ENG-326 AC-3: duplicating re-generates the page — same gate as
+    // /generate. Without a persisted logo v0 would invent a wordmark.
+    if (!brandContext.logoUrl) {
+      return res.status(422).json({
+        error: MISSING_BRAND_LOGO_ERROR,
+        message:
+          "No brand logo is saved in Brand Guidelines. Upload your logo in brand config " +
+          "(Brand Guidelines), then duplicate again — landing pages are never generated " +
+          "with an invented or approximate logo.",
+      });
+    }
 
     const result = await generateLandingPage(userId, original.prompt, newName, brandContext);
     res.status(201).json(result);
