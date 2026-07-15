@@ -33,11 +33,14 @@ export type UtmKey = (typeof UTM_KEYS)[number];
 /**
  * ENG-239's acceptance criteria mandate `utm_medium=paid`.
  *
- * Caveat worth knowing: GA4's default channel grouping keys on `cpc` / `ppc` /
- * `paidsearch`, so `paid` lands in Unassigned rather than Paid Search / Paid
- * Social. Our own attribution is unaffected (the CRM stores the medium verbatim),
- * and reports keyed on source/medium pairs still work. If that ruling changes,
- * flipping this constant is the entire fix.
+ * Checked against GA4's default channel grouping (which keys on `cpc`/`ppc`/
+ * `paidsearch` and would otherwise bucket `paid` as Unassigned): nothing in this
+ * codebase queries that dimension. ENG-96's conversions-by-source report
+ * (`seoService.ts` traffic-source queries) reads the raw `sessionSource` +
+ * `sessionMedium` pair, not `sessionDefaultChannelGroup`, so `paid` is exactly as
+ * legible to it as `cpc` would be. If a future report starts querying channel
+ * grouping, re-evaluate then — until it does, `paid` is the correct value with no
+ * downstream cost. If that changes, flipping this constant is the entire fix.
  */
 export const UTM_MEDIUM_PAID = "paid";
 

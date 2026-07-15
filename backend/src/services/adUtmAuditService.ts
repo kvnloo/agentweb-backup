@@ -103,6 +103,13 @@ const VALID_PLATFORMS: readonly AdPlatform[] = ["meta", "google", "linkedin"];
  * `finalUrlSuffix`), which is a bare query string like
  * `utm_source=meta&utm_content={{ad.id}}`. Parsing is lenient and never throws;
  * matching is case-insensitive, mirroring `existingUtmKeys`.
+ *
+ * Note this checks the field as CONFIGURED, macro and all — it never waits for a
+ * click to resolve `{{ad.id}}`/`{creative}` into a real value. That's a deliberate
+ * reading of ENG-239 AC1 ("verifiable in the platform's ad settings"): the macro
+ * text visible in Ads Manager IS the proof the tagging pipeline ran correctly: a
+ * human (or this audit) can see it without ever firing a click. Requiring a
+ * resolved click to call something "tagged" isn't how this tool works at all.
  */
 function appendFieldUtmKeys(appendField: string): Set<UtmKey> {
   const present = new Set<UtmKey>();
