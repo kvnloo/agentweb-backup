@@ -1,6 +1,6 @@
 import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
-import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
+import { humanEvalService, HumanEvalReviewType, HumanEvalStatus } from '../services/humanEvalService';
 
 const router = express.Router();
 
@@ -17,6 +17,7 @@ router.post('/candidates', async (req: Request, res: Response): Promise<void> =>
       artifactUrl,
       chatUrl,
       originalRequest,
+      category,
     } = req.body || {};
 
     if (!reviewType || !outputSummary) {
@@ -32,6 +33,7 @@ router.post('/candidates', async (req: Request, res: Response): Promise<void> =>
       artifactUrl: typeof artifactUrl === 'string' ? artifactUrl : undefined,
       chatUrl: typeof chatUrl === 'string' ? chatUrl : undefined,
       originalRequest: typeof originalRequest === 'string' ? originalRequest : undefined,
+      category: typeof category === 'string' ? category : undefined,
       userId: authReq.user?.userId,
     });
 
@@ -40,6 +42,32 @@ router.post('/candidates', async (req: Request, res: Response): Promise<void> =>
     const message = error?.message || 'Failed to create human eval candidate';
     const status = message.includes('reviewType') || message.includes('required') ? 400 : 500;
     res.status(status).json({ error: message });
+  }
+});
+
+// Admin-only: the queue spans all users' outputs, so listing is not exposed to
+// regular users. Filterable by category (ad | organic_post | uncategorized),
+// status, and reviewType (ENG-90).
+router.get('/candidates', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user?.isAdmin) {
+      res.status(403).json({ error: 'Admin access required' });
+      return;
+    }
+
+    const { category, status, reviewType, limit } = req.query;
+    const parsedLimit = typeof limit === 'string' ? parseInt(limit, 10) : NaN;
+    const candidates = await humanEvalService.listCandidates({
+      category: typeof category === 'string' ? category : undefined,
+      status: typeof status === 'string' ? status as HumanEvalStatus : undefined,
+      reviewType: typeof reviewType === 'string' ? reviewType as HumanEvalReviewType : undefined,
+      limit: Number.isFinite(parsedLimit) ? parsedLimit : undefined,
+    });
+
+    res.json({ success: true, candidates });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || 'Failed to list human eval candidates' });
   }
 });
 
