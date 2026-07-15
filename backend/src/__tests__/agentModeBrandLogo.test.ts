@@ -166,7 +166,7 @@ describe('missingBrandLogoToolResult', () => {
   });
 });
 
-describe('downloadBrandLogoToS3 (extracted from extractCSSFromURL — behavior-preserving)', () => {
+describe('downloadBrandLogoToS3 (extracted from extractCSSFromURL — discriminated outcome)', () => {
   it('downloads a raster logo and uploads it under users/{userId}/brand/logo', async () => {
     mockedAxiosGet.mockResolvedValue({
       headers: { 'content-type': 'image/png' },
@@ -179,7 +179,10 @@ describe('downloadBrandLogoToS3 (extracted from extractCSSFromURL — behavior-p
 
     await expect(
       downloadBrandLogoToS3('https://acme.com/logo.png', 'u1'),
-    ).resolves.toBe('https://s3.example.com/users/u1/brand/logo/logo.png');
+    ).resolves.toEqual({
+      status: 'uploaded',
+      url: 'https://s3.example.com/users/u1/brand/logo/logo.png',
+    });
 
     expect(mockedAxiosGet).toHaveBeenCalledWith('https://acme.com/logo.png', {
       responseType: 'arraybuffer',
@@ -212,7 +215,7 @@ describe('downloadBrandLogoToS3 (extracted from extractCSSFromURL — behavior-p
     );
   });
 
-  it('skips SVG logos and returns null (no upload)', async () => {
+  it('reports svg for SVG logos (no upload) — even from an extensionless URL', async () => {
     mockedAxiosGet.mockResolvedValue({
       headers: { 'content-type': 'image/svg+xml' },
       data: new ArrayBuffer(8),
@@ -220,26 +223,46 @@ describe('downloadBrandLogoToS3 (extracted from extractCSSFromURL — behavior-p
 
     await expect(
       downloadBrandLogoToS3('https://acme.com/logo.svg', 'u1'),
-    ).resolves.toBeNull();
+    ).resolves.toEqual({ status: 'svg' });
+    // An SVG served from an extensionless URL is still an SVG — the
+    // content-type is the truth, not the extension.
+    await expect(
+      downloadBrandLogoToS3('https://acme.com/logo', 'u1'),
+    ).resolves.toEqual({ status: 'svg' });
     expect(s3Utils.uploadFileToS3WithPath).not.toHaveBeenCalled();
   });
 
-  it('returns null on download failure without throwing', async () => {
+  it('reports download-failed (with detail) on download failure without throwing', async () => {
     mockedAxiosGet.mockRejectedValue(new Error('ETIMEDOUT'));
     await expect(
       downloadBrandLogoToS3('https://acme.com/logo.png', 'u1'),
-    ).resolves.toBeNull();
+    ).resolves.toEqual({ status: 'download-failed', detail: 'ETIMEDOUT' });
+    expect(s3Utils.uploadFileToS3WithPath).not.toHaveBeenCalled();
   });
 
-  it('returns null when the S3 upload reports failure', async () => {
+  it('reports upload-failed when the S3 upload reports failure', async () => {
     mockedAxiosGet.mockResolvedValue({
       headers: { 'content-type': 'image/png' },
       data: new ArrayBuffer(8),
     });
-    s3Utils.uploadFileToS3WithPath.mockResolvedValue({ success: false });
+    s3Utils.uploadFileToS3WithPath.mockResolvedValue({
+      success: false,
+      error: 'AccessDenied',
+    });
     await expect(
       downloadBrandLogoToS3('https://acme.com/logo.png', 'u1'),
-    ).resolves.toBeNull();
+    ).resolves.toEqual({ status: 'upload-failed', detail: 'AccessDenied' });
+  });
+
+  it('reports upload-failed when the S3 upload throws', async () => {
+    mockedAxiosGet.mockResolvedValue({
+      headers: { 'content-type': 'image/png' },
+      data: new ArrayBuffer(8),
+    });
+    s3Utils.uploadFileToS3WithPath.mockRejectedValue(new Error('socket hang up'));
+    await expect(
+      downloadBrandLogoToS3('https://acme.com/logo.png', 'u1'),
+    ).resolves.toEqual({ status: 'upload-failed', detail: 'socket hang up' });
   });
 });
 
@@ -247,7 +270,9 @@ describe('ensureBrandLogoPersisted (deterministic onboarding step — AC-1)', ()
   const baseDeps = () => ({
     resolveBrand: jest.fn().mockResolvedValue(null),
     discoverLogoUrl: jest.fn().mockResolvedValue('https://acme.com/logo.png'),
-    download: jest.fn().mockResolvedValue('https://s3/brand/logo.png'),
+    download: jest
+      .fn()
+      .mockResolvedValue({ status: 'uploaded', url: 'https://s3/brand/logo.png' }),
     persist: jest.fn().mockResolvedValue({ success: true }),
   });
 
@@ -285,9 +310,9 @@ describe('ensureBrandLogoPersisted (deterministic onboarding step — AC-1)', ()
     expect(out.reason).toBe('persisted');
   });
 
-  it('persists the raw discovered URL when the S3 persist path fails on a raster logo', async () => {
+  it('persists the raw discovered URL only when the download proved raster bytes and just the S3 pin failed', async () => {
     const deps = baseDeps();
-    deps.download.mockResolvedValue(null);
+    deps.download.mockResolvedValue({ status: 'upload-failed', detail: 'AccessDenied' });
 
     const out = await ensureBrandLogoPersisted('u1', 'https://acme.com', deps);
 
@@ -299,10 +324,27 @@ describe('ensureBrandLogoPersisted (deterministic onboarding step — AC-1)', ()
     expect(out.persisted).toBe(true);
   });
 
-  it('does not persist when only an SVG was discovered and S3 skipped it', async () => {
+  it('does NOT persist an unverified URL when the download itself failed (dead/hotlink-protected link)', async () => {
     const deps = baseDeps();
-    deps.discoverLogoUrl.mockResolvedValue('https://acme.com/logo.svg');
-    deps.download.mockResolvedValue(null);
+    deps.download.mockResolvedValue({ status: 'download-failed', detail: 'Request failed with status code 403' });
+
+    const out = await ensureBrandLogoPersisted('u1', 'https://acme.com', deps);
+
+    expect(deps.persist).not.toHaveBeenCalled();
+    expect(out).toEqual({
+      persisted: false,
+      logoUrl: null,
+      reason: 'download-failed',
+      detail: 'Request failed with status code 403',
+    });
+  });
+
+  it('does not persist when the discovered logo is an SVG (extension irrelevant — content-type decides)', async () => {
+    const deps = baseDeps();
+    // Extensionless URL that served image/svg+xml: must never become the
+    // canonical brand asset (brand guidelines + image models reject SVG).
+    deps.discoverLogoUrl.mockResolvedValue('https://acme.com/logo');
+    deps.download.mockResolvedValue({ status: 'svg' });
 
     const out = await ensureBrandLogoPersisted('u1', 'https://acme.com', deps);
 

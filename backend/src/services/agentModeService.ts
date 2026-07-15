@@ -11834,9 +11834,14 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
       // services/agentMode/brandLogo.ts (ENG-326); behavior pinned by
       // agentModeService.extractCSSFromURL.logo.test.ts.
       const brandIdentity = extractedCSS.brandIdentity || { logoUrl: null, brandName: null, tagline: null, favicon: null };
-      const s3LogoUrl: string | null = brandIdentity.logoUrl
+      const logoDownload = brandIdentity.logoUrl
         ? await downloadBrandLogoToS3(brandIdentity.logoUrl, userId)
         : null;
+      // Non-uploaded outcomes fall back to surfacing the raw discovered URL
+      // below (`s3LogoUrl || brandIdentity.logoUrl`) — unchanged extraction
+      // behavior; only the deterministic PERSIST path treats them differently.
+      const s3LogoUrl: string | null =
+        logoDownload?.status === 'uploaded' ? logoDownload.url : null;
 
       // Format detailed tokens as JSON string for Emma to save to KB if needed
       const detailedTokensJSON = JSON.stringify({

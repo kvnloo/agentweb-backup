@@ -135,29 +135,49 @@ export function missingBrandLogoToolResult(): {
 }
 
 /**
+ * Outcome of the download + S3 pin. Discriminated so callers can tell
+ * "the URL is a verified raster image but the pin failed" (remote-URL
+ * fallback is safe) apart from "the URL never yielded image bytes" or
+ * "the logo is an SVG" (persisting the URL would be wrong).
+ */
+export type BrandLogoDownloadOutcome =
+  | { status: 'uploaded'; url: string }
+  | { status: 'svg' }
+  | { status: 'download-failed'; detail?: string }
+  | { status: 'upload-failed'; detail?: string };
+
+/**
  * Download a discovered logo and pin it to S3 under
- * `users/{userId}/brand/logo`. Extracted verbatim from
- * `agentModeService.extractCSSFromURL` (ENG-326) — behavior-preserving:
- * SVGs are skipped (brand guidelines reject them), any download/upload
- * failure logs a warning and resolves null. Never throws.
+ * `users/{userId}/brand/logo`. The download + upload mechanics are the block
+ * extracted from `agentModeService.extractCSSFromURL` (ENG-326): SVGs are
+ * skipped by CONTENT-TYPE (brand guidelines reject them; extensions lie),
+ * failures log a warning. Never throws — every branch resolves to a
+ * `BrandLogoDownloadOutcome`.
  */
 export async function downloadBrandLogoToS3(
   logoUrl: string,
   userId: string,
-): Promise<string | null> {
+): Promise<BrandLogoDownloadOutcome> {
+  let logoResponse: { headers: Record<string, string>; data: unknown };
   try {
     console.log(`Downloading logo from ${logoUrl}...`);
     const axios = (await import('axios')).default;
-    const logoResponse = await axios.get(logoUrl, {
+    logoResponse = await axios.get(logoUrl, {
       responseType: 'arraybuffer',
       timeout: 15000,
     });
-    const contentType = logoResponse.headers['content-type'] || '';
-    // Skip SVG since brand guidelines doesn't accept it
-    if (contentType.includes('svg')) {
-      console.log('Skipping SVG logo (not supported by brand guidelines)');
-      return null;
-    }
+  } catch (logoErr: any) {
+    const detail = logoErr?.message ?? String(logoErr);
+    console.warn('Failed to download logo:', detail);
+    return { status: 'download-failed', detail };
+  }
+  const contentType = logoResponse.headers['content-type'] || '';
+  // Skip SVG since brand guidelines doesn't accept it
+  if (contentType.includes('svg')) {
+    console.log('Skipping SVG logo (not supported by brand guidelines)');
+    return { status: 'svg' };
+  }
+  try {
     const ext = contentType.includes('png')
       ? 'png'
       : contentType.includes('gif')
@@ -173,12 +193,13 @@ export async function downloadBrandLogoToS3(
     );
     if (uploadResult.success && uploadResult.url) {
       console.log(`Logo uploaded to S3: ${uploadResult.url}`);
-      return uploadResult.url;
+      return { status: 'uploaded', url: uploadResult.url };
     }
-    return null;
-  } catch (logoErr: any) {
-    console.warn('Failed to download/upload logo:', logoErr?.message ?? String(logoErr));
-    return null;
+    return { status: 'upload-failed', detail: uploadResult.error };
+  } catch (uploadErr: any) {
+    const detail = uploadErr?.message ?? String(uploadErr);
+    console.warn('Failed to upload logo:', detail);
+    return { status: 'upload-failed', detail };
   }
 }
 
@@ -188,7 +209,7 @@ export interface EnsureBrandLogoDeps {
   /** Logo discovery. Defaults to the cssExtractor heuristics on the company URL. */
   discoverLogoUrl?: (companyUrl: string) => Promise<string | null>;
   /** Download + S3 pin. Defaults to `downloadBrandLogoToS3`. */
-  download?: (logoUrl: string, userId: string) => Promise<string | null>;
+  download?: (logoUrl: string, userId: string) => Promise<BrandLogoDownloadOutcome>;
   /**
    * Brand-guidelines write. Defaults to
    * `agentModeService.updateBrandGuidelines` — the same org-aware,
@@ -209,14 +230,10 @@ export interface EnsureBrandLogoOutcome {
     | 'already-present'
     | 'no-logo-found'
     | 'svg-only'
+    | 'download-failed'
     | 'persist-failed'
     | 'error';
   detail?: string;
-}
-
-function isSvgUrl(url: string): boolean {
-  const lower = url.toLowerCase();
-  return lower.endsWith('.svg') || lower.includes('.svg?');
 }
 
 function filenameFromUrl(url: string): string {
@@ -287,13 +304,28 @@ export async function ensureBrandLogoPersisted(
     }
 
     const download = deps.download ?? downloadBrandLogoToS3;
-    const s3Url = await download(discovered, userId);
-    // S3-pinned URL preferred; a raster URL on the customer's site is still a
-    // real logo if the pin failed. An SVG that S3 skipped has no usable
-    // fallback (brand guidelines reject SVG assets).
-    const finalUrl = s3Url ?? (isSvgUrl(discovered) ? null : discovered);
-    if (!finalUrl) {
+    const outcome = await download(discovered, userId);
+    let finalUrl: string;
+    if (outcome.status === 'uploaded') {
+      finalUrl = outcome.url;
+    } else if (outcome.status === 'upload-failed') {
+      // The download PROVED the URL serves raster image bytes — only the S3
+      // pin failed. The customer's own hosted logo is still their real logo.
+      finalUrl = discovered;
+    } else if (outcome.status === 'svg') {
+      // Brand guidelines reject SVG assets and image models can't ingest
+      // them — nothing usable to persist, whatever the URL's extension says.
       return { persisted: false, logoUrl: null, reason: 'svg-only' };
+    } else {
+      // download-failed: the URL never yielded verified image bytes (404,
+      // hotlink protection, timeout). Persisting it would make a broken
+      // image the account's canonical logo — fail this step loudly instead.
+      return {
+        persisted: false,
+        logoUrl: null,
+        reason: 'download-failed',
+        detail: outcome.detail,
+      };
     }
 
     const persist = deps.persist ?? defaultPersistBrandLogo;
