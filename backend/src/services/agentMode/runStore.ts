@@ -34,8 +34,10 @@
  *     markRunTerminal, and without the condition update() would UPSERT a
  *     phantom run#<id> item with no ttl. Condition failure = documented
  *     no-op (nothing to mark).
- *   - releaseIdempotency is best-effort: on delete failure the item expires
- *     via its ttl (bounded staleness, logged loudly).
+ *   - releaseIdempotency is best-effort: on delete failure the lock's
+ *     staleness is bounded by its ttl WINDOW — not by DynamoDB's TTL reaper
+ *     (which is eventual, minutes to hours) but by claimIdempotency itself,
+ *     whose conditional put treats an expired-but-unreaped item as absent.
  */
 import AWS from 'aws-sdk';
 import crypto from 'crypto';
@@ -234,12 +236,19 @@ export async function markRunTerminal(
  */
 export async function claimIdempotency(key: string, runId: string, ttlSeconds: number): Promise<IdempotencyClaim> {
   const pk = `idem#${key}`;
+  const now = nowEpochS();
   try {
     await getClient()
       .put({
         TableName: AGENT_RUNS_TABLE,
-        Item: { pk, runId, ttl: nowEpochS() + ttlSeconds },
-        ConditionExpression: 'attribute_not_exists(pk)',
+        Item: { pk, runId, ttl: now + ttlSeconds },
+        // DynamoDB native TTL deletion is EVENTUAL (minutes to hours of reaper
+        // lag) — an expired item still exists at this pk. Tolerating it here
+        // (`OR #ttl < :now`) is what actually bounds a leaked lock's staleness
+        // to the ttl window; relying on the reaper would not.
+        ConditionExpression: 'attribute_not_exists(pk) OR #ttl < :now',
+        ExpressionAttributeNames: { '#ttl': 'ttl' },
+        ExpressionAttributeValues: { ':now': now },
       })
       .promise();
     return { claimed: true };
@@ -247,12 +256,23 @@ export async function claimIdempotency(key: string, runId: string, ttlSeconds: n
     if (!isConditionalCheckFailed(err)) throw err;
     // Best-effort read of the winner's runId (for the 409 body) and — on the
     // session-creation lane — the winner's sessionId so the loser can attach.
+    // ConsistentRead: the put just lost against this item; an eventually
+    // consistent read could miss the winner's stamped sessionId and turn an
+    // attachable duplicate into a spurious 409.
     try {
-      const existing = await getClient().get({ TableName: AGENT_RUNS_TABLE, Key: { pk } }).promise();
+      const existing = await getClient()
+        .get({ TableName: AGENT_RUNS_TABLE, Key: { pk }, ConsistentRead: true })
+        .promise();
+      const item = existing.Item;
+      if (!item || (typeof item.ttl === 'number' && item.ttl < nowEpochS())) {
+        // Expired in the race window between the put and this read — stale
+        // data; expose nothing. The caller 409s and the client's retry wins.
+        return { claimed: false };
+      }
       return {
         claimed: false,
-        inFlightRunId: existing.Item?.runId,
-        ...(existing.Item?.sessionId ? { sessionId: existing.Item.sessionId } : {}),
+        inFlightRunId: item.runId,
+        ...(item.sessionId ? { sessionId: item.sessionId } : {}),
       };
     } catch {
       return { claimed: false };
