@@ -3,8 +3,8 @@
  *
  * The module owns deterministic brand-logo handling:
  *   - getPersistedBrandLogoUrl: resolve the persisted logo off a
- *     brandGuidelines object (brandData.logoUrl → attachments → legacy
- *     brandAssets)
+ *     brandGuidelines object (attachments `logo` asset wins → brandData
+ *     .logoUrl → legacy brandAssets)
  *   - getPersistedBrandLogoUrlForUser: org-aware lookup by userId
  *   - promptRequestsLogo: does an image prompt ask for a logo (with a
  *     negation guard so "no logo" doesn't trigger)

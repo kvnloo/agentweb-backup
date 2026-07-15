@@ -12,9 +12,9 @@
  *     discover one with the existing cssExtractor heuristics, pin it to S3,
  *     and persist it as `brandData.logoUrl` + a `logo` brand asset (AC-1).
  *   - `getPersistedBrandLogoUrl(ForUser)` — the one shared resolution order
- *     for "what is this account's logo": brandData.logoUrl → attachments
- *     `logo` asset → legacy brandAssets array (org-aware for the ByUser
- *     variant).
+ *     for "what is this account's logo": attachments `logo` asset (an
+ *     explicit brand-config upload wins) → brandData.logoUrl → legacy
+ *     brandAssets array (org-aware for the ForUser variant).
  *   - `promptRequestsLogo` + `missingBrandLogoToolResult` — the generate_image
  *     gate: prompts that ask for a logo either composite the persisted one or
  *     come back as an explicit ask-the-user result pointing at brand config
