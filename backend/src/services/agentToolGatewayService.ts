@@ -257,7 +257,36 @@ const LINKEDIN_RECIPIENT_ACTIONS = new Set([
   'accept-invitation',
 ]);
 
+// ENG-291: get_chat_history (the Daily Satisfaction Score Report's data source)
+// is expensive in proportion to its request COST — a wide time window with a high
+// limit and sync=true (which generates satisfaction scores on the fly) can take
+// long enough to hit the tool timeout. When the report's heavy 24h/limit=1000/
+// sync=true call timed out twice, the SESSION-scoped timeout breaker tripped and
+// then hard-blocked EVERY later get_chat_history in the session — including the
+// legitimate recovery paths the report tried next (the same window with sync=false,
+// and a much smaller 6h window). The model was told "STOP retrying" and never got
+// to run the cheaper request that would have completed. Scope the breaker by the
+// request's cost signature (sync flag + limit + window-duration) — exactly like the
+// per-recipient LinkedIn scoping above — so a materially cheaper/smaller call lands
+// in a different bucket and is not blocked by an expensive call's timeouts. An
+// IDENTICAL heavy request still shares one scope, so a genuine retry spiral on the
+// same call is still caught.
+function chatHistoryFailureScope(args: unknown): string {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
+  const record = args as Record<string, unknown>;
+  const sync = record.sync === true || record.sync === 'true' ? '1' : '0';
+  const rawLimit = Number(record.limit);
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 1000) : 500;
+  const start = typeof record.start_time === 'string' ? Date.parse(record.start_time) : NaN;
+  const end = typeof record.end_time === 'string' ? Date.parse(record.end_time) : NaN;
+  const hours = Number.isFinite(start) && Number.isFinite(end) && end > start
+    ? Math.max(1, Math.round((end - start) / 3_600_000))
+    : 0;
+  return `sync=${sync}|limit=${limit}|hours=${hours}`;
+}
+
 function failureScope(toolName: string, args: unknown): string {
+  if (toolName === 'get_chat_history') return chatHistoryFailureScope(args);
   if (toolName !== 'linkedin_outreach') return '';
   if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
   const record = args as Record<string, unknown>;
