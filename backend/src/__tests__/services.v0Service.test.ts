@@ -142,6 +142,7 @@ jest.mock("../services/customDomainService", () => ({
 }));
 
 import {
+  buildBrandContextFromUser,
   buildBrandEnrichedPrompt,
   generateLandingPage,
   deployLandingPage,
@@ -195,6 +196,81 @@ beforeEach(() => {
   // Use zero-delay poll intervals in tests to avoid waiting ~2.5 min
   setV0PollIntervals([0, 0, 0, 0, 0]);
   setVercelPollConfig(0, 30);
+});
+
+// =============================================================================
+// buildBrandContextFromUser (ENG-326)
+// =============================================================================
+describe("v0Service - buildBrandContextFromUser", () => {
+  const fullUser = {
+    brandGuidelines: {
+      brandData: {
+        brandName: "Acme",
+        primaryColor: "#5E6AD2",
+        secondaryColor: "#FFFFFF",
+        fontFamily: "Inter",
+        tagline: "Rockets, delivered",
+        toneOfVoice: "Confident",
+        brandPersonality: "Bold",
+        keyMessages: ["Fast"],
+        brandValues: ["Speed"],
+        targetAudience: "Founders",
+        founders: [{ name: "Wile E.", jobTitle: "CEO", styleTone: "direct" }],
+      },
+      attachments: [
+        { type: "brandGuide", url: "https://x/guide.pdf" },
+        { type: "logo", url: "https://s3/brand/logo.png", filename: "logo.png" },
+      ],
+    },
+    marketStrategy: {
+      businessOverview: "Acme makes rockets",
+      icp: [{ title: "Coyotes", description: "d", valueProposition: "v", buyerPersonas: ["p"] }],
+      competitors: [{ name: "Looney Inc", description: "ordnance" }],
+    },
+  };
+
+  it("maps brandData + marketStrategy and resolves the attachments logo", () => {
+    const ctx = buildBrandContextFromUser(fullUser);
+    expect(ctx.brandName).toBe("Acme");
+    expect(ctx.primaryColor).toBe("#5E6AD2");
+    expect(ctx.logoUrl).toBe("https://s3/brand/logo.png");
+    expect(ctx.businessOverview).toBe("Acme makes rockets");
+    expect(ctx.icp).toHaveLength(1);
+    expect(ctx.competitors?.[0].name).toBe("Looney Inc");
+  });
+
+  it("falls back to brandData.logoUrl when no logo attachment exists (Emma/scrape-persisted state)", () => {
+    const ctx = buildBrandContextFromUser({
+      brandGuidelines: {
+        brandData: { brandName: "Acme", logoUrl: "https://s3/brand/scraped.png" },
+        attachments: [{ type: "brandGuide", url: "https://x/guide.pdf" }],
+      },
+    });
+    expect(ctx.logoUrl).toBe("https://s3/brand/scraped.png");
+  });
+
+  it("prefers the uploaded attachments logo over a scraped brandData.logoUrl", () => {
+    const ctx = buildBrandContextFromUser({
+      brandGuidelines: {
+        brandData: { logoUrl: "https://acme.com/stale-scraped.png" },
+        attachments: [{ type: "logo", url: "https://s3/uploaded.png" }],
+      },
+    });
+    expect(ctx.logoUrl).toBe("https://s3/uploaded.png");
+  });
+
+  it("returns an empty context for missing users / guidelines", () => {
+    expect(buildBrandContextFromUser(null)).toEqual({});
+    expect(buildBrandContextFromUser({})).toEqual({});
+  });
+
+  it("the enriched v0 prompt carries the persisted logo URL (landing pages receive the real logo)", () => {
+    const prompt = buildBrandEnrichedPrompt(
+      "Build a landing page",
+      buildBrandContextFromUser(fullUser),
+    );
+    expect(prompt).toContain("Logo URL: https://s3/brand/logo.png");
+  });
 });
 
 // =============================================================================

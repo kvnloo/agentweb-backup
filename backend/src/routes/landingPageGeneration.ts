@@ -17,6 +17,7 @@ import {
   deleteLandingPageByRecord,
   updateLandingPageGtm,
   BrandContext,
+  buildBrandContextFromUser,
   GeneratedLandingPage,
   getDeploymentStatus,
   getPreviewDeploymentUrl,
@@ -337,49 +338,15 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
 
     const pageName = name || prompt.slice(0, 60);
 
-    // Fetch brand guidelines + market strategy for maximum context
+    // Fetch brand guidelines + market strategy for maximum context. The
+    // shared projection resolves the persisted brand logo attachments-first
+    // (ENG-326) so the generated page carries the real logo.
     let brandContext: BrandContext = {};
     let userSiteMode: "unified" | "separate" | undefined;
     try {
       const user = await userDb.getUserById(userId);
       userSiteMode = user?.landingSiteMode;
-      if (user?.brandGuidelines) {
-        const bg = user.brandGuidelines;
-        const bd = (bg as any).brandData || {};
-        brandContext = {
-          brandName: bd.brandName,
-          primaryColor: bd.primaryColor,
-          primaryColorEnd: bd.primaryColorEnd,
-          isGradient: bd.isGradient,
-          secondaryColor: bd.secondaryColor,
-          fontFamily: bd.fontFamily,
-          tagline: bd.tagline,
-          toneOfVoice: bd.toneOfVoice,
-          brandPersonality: bd.brandPersonality,
-          keyMessages: bd.keyMessages,
-          brandValues: bd.brandValues,
-          targetAudience: bd.targetAudience,
-          founders: bd.founders,
-        };
-
-        // Get logo URL from attachments
-        if ((bg as any).attachments && Array.isArray((bg as any).attachments)) {
-          const logo = (bg as any).attachments.find(
-            (a: any) => a.type === "logo" && a.url
-          );
-          if (logo) {
-            brandContext.logoUrl = logo.url;
-          }
-        }
-      }
-
-      // Pull market strategy for richer landing page copy
-      if (user?.marketStrategy) {
-        const ms = user.marketStrategy;
-        brandContext.businessOverview = ms.businessOverview;
-        brandContext.icp = ms.icp;
-        brandContext.competitors = ms.competitors;
-      }
+      brandContext = buildBrandContextFromUser(user);
     } catch (error) {
       console.error("[LP GENERATION] Failed to fetch brand guidelines, continuing without:", error);
     }
@@ -720,38 +687,12 @@ router.post("/generated/:id/duplicate", async (req, res: Response) => {
     const { name } = req.body;
     const newName = name || `${original.name} (copy)`;
 
-    // Re-generate using the original prompt + full brand context
+    // Re-generate using the original prompt + full brand context (shared
+    // ENG-326 projection — persisted logo resolved attachments-first).
     let brandContext: BrandContext = {};
     try {
       const user = await userDb.getUserById(userId);
-      if (user?.brandGuidelines) {
-        const bg = user.brandGuidelines;
-        const bd = (bg as any).brandData || {};
-        brandContext = {
-          brandName: bd.brandName,
-          primaryColor: bd.primaryColor,
-          primaryColorEnd: bd.primaryColorEnd,
-          isGradient: bd.isGradient,
-          secondaryColor: bd.secondaryColor,
-          fontFamily: bd.fontFamily,
-          tagline: bd.tagline,
-          toneOfVoice: bd.toneOfVoice,
-          brandPersonality: bd.brandPersonality,
-          keyMessages: bd.keyMessages,
-          brandValues: bd.brandValues,
-          targetAudience: bd.targetAudience,
-          founders: bd.founders,
-        };
-        if ((bg as any).attachments && Array.isArray((bg as any).attachments)) {
-          const logo = (bg as any).attachments.find((a: any) => a.type === "logo" && a.url);
-          if (logo) brandContext.logoUrl = logo.url;
-        }
-      }
-      if (user?.marketStrategy) {
-        brandContext.businessOverview = user.marketStrategy.businessOverview;
-        brandContext.icp = user.marketStrategy.icp;
-        brandContext.competitors = user.marketStrategy.competitors;
-      }
+      brandContext = buildBrandContextFromUser(user);
     } catch {}
 
     const result = await generateLandingPage(userId, original.prompt, newName, brandContext);

@@ -15,6 +15,7 @@ import { guardedV0ChatCreate, guardedV0CorrectionMessage, clearV0UsageForPage, h
 // runtime-safe because durableLandingService only imports a TYPE from this module.
 import { STUCK_CEILING_MS } from "./durableLandingService";
 import { enqueueAutoHumanEval } from "./autoHumanEvalService";
+import { getPersistedBrandLogoUrl } from "./agentMode/brandLogo";
 
 // Note: global fetch (undici) timeouts are managed by httpClient.ts (15 min headersTimeout/bodyTimeout).
 // No setGlobalDispatcher call here — duplicate calls cause the last-loaded config to win unpredictably.
@@ -600,6 +601,47 @@ export interface BrandContext {
   businessOverview?: string;
   icp?: Array<{ title: string; description: string; valueProposition: string; buyerPersonas: string[] }>;
   competitors?: Array<{ name: string; description: string }>;
+}
+
+/**
+ * Project the BrandContext for landing-page generation off a persisted User
+ * record (ENG-326). One shared implementation for every v0 entry point so the
+ * persisted brand logo — resolved attachments-first via the shared brandLogo
+ * module — always reaches the generation prompt.
+ */
+export function buildBrandContextFromUser(user: any): BrandContext {
+  const brandContext: BrandContext = {};
+  if (!user) return brandContext;
+
+  const bg: any = user.brandGuidelines;
+  if (bg) {
+    const bd = bg.brandData || {};
+    brandContext.brandName = bd.brandName;
+    brandContext.primaryColor = bd.primaryColor;
+    brandContext.primaryColorEnd = bd.primaryColorEnd;
+    brandContext.isGradient = bd.isGradient;
+    brandContext.secondaryColor = bd.secondaryColor;
+    brandContext.fontFamily = bd.fontFamily;
+    brandContext.tagline = bd.tagline;
+    brandContext.toneOfVoice = bd.toneOfVoice;
+    brandContext.brandPersonality = bd.brandPersonality;
+    brandContext.keyMessages = bd.keyMessages;
+    brandContext.brandValues = bd.brandValues;
+    brandContext.targetAudience = bd.targetAudience;
+    brandContext.founders = bd.founders;
+
+    const logoUrl = getPersistedBrandLogoUrl(bg);
+    if (logoUrl) brandContext.logoUrl = logoUrl;
+  }
+
+  // Market strategy — gives v0 real business context for landing page copy
+  if (user.marketStrategy) {
+    brandContext.businessOverview = user.marketStrategy.businessOverview;
+    brandContext.icp = user.marketStrategy.icp;
+    brandContext.competitors = user.marketStrategy.competitors;
+  }
+
+  return brandContext;
 }
 
 /**
