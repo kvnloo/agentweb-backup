@@ -16,6 +16,7 @@ import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusRe
 import { notifySlackWorkItemCompleted } from "../services/gtmPlanService";
 import { chatbotDb, ChatSession } from "../services/chatbotService";
 import { scoreSessionIfNeeded, scoreSessionWithJudgeIfNeeded, ScoringJudge } from "../services/sessionScoringService";
+import { backfillSessionScores } from "../services/scoreBackfill";
 import { DynamoDB } from "aws-sdk";
 import { workflowDb } from "../services/workflowDb";
 import { paginatedScan } from "../utils/dynamoPagination";
@@ -3163,31 +3164,20 @@ router.get("/chat-sessions", async (req, res) => {
         console.error("Error loading scoring judges for sync mode:", error);
       }
 
-      for (const session of sessionsWithMessages) {
-        const s = session as any;
-        try {
-          await scoreSessionIfNeeded(s);
-        } catch (error) {
-          console.error(`Error scoring session ${s.sessionId}:`, error);
-        }
-
-        for (const judge of judges) {
-          try {
-            await scoreSessionWithJudgeIfNeeded(s, judge);
-          } catch (error) {
-            console.error(`Error scoring session ${s.sessionId} with judge ${judge.id}:`, error);
-          }
-        }
-      }
-
-      // Re-fetch sessions so response includes newly generated scores (both default and judge)
-      for (let i = 0; i < sessionsWithMessages.length; i++) {
-        try {
-          const refreshed = await chatbotDb.getChatSession((sessionsWithMessages[i] as any).sessionId);
-          if (refreshed) sessionsWithMessages[i] = refreshed;
-        } catch (error) {
-          // Keep original session data on refresh failure
-        }
+      // ENG-291: score with bounded concurrency under a wall-clock budget and
+      // apply the results in-memory. This returns before the tool timeout even on
+      // busy windows (the old sequential loop + per-session re-fetch could exceed
+      // it and abort the Daily Satisfaction Score Report). Any sessions not reached
+      // within the budget keep their cached scores here and are scored on a later
+      // run — each score persists, so already-scored sessions are skipped next time.
+      const backfill = await backfillSessionScores(sessionsWithMessages as any, judges, {
+        onError: (session, error) =>
+          console.error(`Error scoring session ${(session as any).sessionId}:`, error),
+      });
+      if (backfill.timedOut) {
+        console.warn(
+          `[chat-history] sync scoring hit its time budget: scored ${backfill.scored}/${backfill.scored + backfill.skipped}, ${backfill.skipped} left for a later run`
+        );
       }
     }
 
