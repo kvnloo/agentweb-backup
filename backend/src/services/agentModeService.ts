@@ -20443,6 +20443,27 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     try {
+      // ENG-326: branded text-to-image asks must composite the account's REAL
+      // persisted logo — never one the model invents. When the prompt asks for
+      // a logo and the model didn't pass logo_image, prefer the persisted
+      // brand logo (AC-2); when none is persisted, ask the user / point at
+      // brand config instead of generating (AC-3). Edits (inputImages) are
+      // out of scope — the source images already carry the branding.
+      if (
+        !logoImage &&
+        (!Array.isArray(inputImages) || inputImages.length === 0) &&
+        promptRequestsLogo(prompt)
+      ) {
+        const persistedLogo = await getPersistedBrandLogoUrlForUser(userId);
+        if (!persistedLogo) {
+          return missingBrandLogoToolResult();
+        }
+        logoImage = persistedLogo;
+        console.log(
+          `AgentMode: generate_image prompt asks for a logo — compositing the persisted brand logo (${persistedLogo})`
+        );
+      }
+
       // Import the image generation service
       const { imageService } = await import('./imageGeneration');
 
