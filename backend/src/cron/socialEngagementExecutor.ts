@@ -445,14 +445,14 @@ export class SocialEngagementExecutor {
                 ],
                 temperature: COMMENT_TEMPERATURE,
             });
-            // Burn-only: attribute this automated engagement spend to the account owner
-            // for visibility, but never deduct it from their quota (a background feature).
+            // Charge automated engagement spend to the account owner's quota — policy:
+            // every LLM call with a real userId is billed to that user, nothing absorbed.
             meterUsageFromResponse({
                 userId: engagingUserId,
                 model: COMMENT_MODEL,
                 provider: 'gemini',
                 feature: 'social_engagement_comment',
-            }, completion, { mode: 'burn' });
+            }, completion);
             const sanitized = sanitizeGeneratedComment(completion.choices[0]?.message?.content);
             if (sanitized) return sanitized;
             console.warn(`[Executor] Generated comment rejected by sanitizer (refusal/meta/empty), skipping comment.`);
@@ -480,7 +480,7 @@ export class SocialEngagementExecutor {
                 model: COMMENT_MODEL,
                 provider: 'gemini',
                 feature: 'social_engagement_reaction',
-            }, completion, { mode: 'burn' });
+            }, completion);
             const raw = completion.choices[0]?.message?.content?.trim().toUpperCase() as LinkedInReaction;
             if (VALID_REACTIONS.includes(raw)) return raw;
             console.warn(`[Executor] LLM returned invalid reaction "${raw}", defaulting to LIKE`);
@@ -582,13 +582,13 @@ export class SocialEngagementExecutor {
                 ],
                 temperature: COMMENT_TEMPERATURE,
             });
-            // Burn-only: attribute automated reply spend to the account owner, no cap charge.
+            // Charge automated reply spend to the account owner's quota (all-cost-to-user policy).
             meterUsageFromResponse({
                 userId: engagingUserId,
                 model: COMMENT_MODEL,
                 provider: 'gemini',
                 feature: 'social_engagement_reply',
-            }, completion, { mode: 'burn' });
+            }, completion);
             const sanitized = sanitizeGeneratedComment(completion.choices[0]?.message?.content);
             if (sanitized) return sanitized;
             console.warn(`[Executor] Generated reply rejected by sanitizer (refusal/meta/empty), skipping reply.`);

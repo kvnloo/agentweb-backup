@@ -2,7 +2,7 @@ import axios from "axios";
 import { getSecret } from "../utils/secretsManager";
 import { uploadFileToS3 } from "../utils/s3Utils";
 import { getOpenAIClient, getGeminiClient } from "../utils/llmClients";
-import { recordUsage } from "./usageRecorderService";
+import { recordUsage, meterUserUsage } from "./usageRecorderService";
 import { imageGenerationCostUsd } from "../utils/llmPricing";
 
 interface ImageGenerationResult {
@@ -482,10 +482,12 @@ export class ImageService {
         
         // If generation was successful, upload to S3
         if (result.success && result.imageUrl) {
-          // Burn-only shadow record, fired ONCE at the source so every caller (agent-mode
-          // and non-agent) is metered exactly once. Images bill per generation (not per
-          // token); attribute the dollar cost to the user's burn but never charge quota.
-          void recordUsage({
+          // Meter ONCE at the source so every caller (agent-mode and non-agent) is charged
+          // exactly once. Images bill per generation (not per token); charge the per-gen
+          // dollar cost to the user's cap when a userId is present (all-cost-to-user policy).
+          // This is the canonical charge point — provider sub-methods (e.g. generateWithOpenAI)
+          // keep their token record burn-only so we never double-charge an image.
+          void meterUserUsage({
             userId: params.userId,
             model: modelToUse,
             provider: modelToUse.startsWith("gpt-image")

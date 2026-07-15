@@ -105,14 +105,14 @@ Remember: You're here to help startups and businesses grow through smart marketi
         max_completion_tokens: 20
       });
 
-      // Burn-only: count this cheap title call in the user's burn for visibility,
-      // but do NOT deduct it from quota (the real Growth Genius turn deducts).
+      // Charge this title call to the user's quota too (all-cost-to-user policy); it's
+      // its own LLM call with real cost, separate from the main Growth Genius turn.
       meterUsageFromResponse({
         userId,
         model: process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
         provider: 'azure',
         feature: 'growth_genius_title',
-      }, response, { mode: 'burn' });
+      }, response);
 
       const raw = response.choices[0]?.message?.content?.trim() || '';
       // Extract first line, strip markdown, hard-truncate to 60 chars

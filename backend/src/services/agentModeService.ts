@@ -7101,13 +7101,12 @@ export class AgentModeService {
         }
       );
 
-      // Shadow usage metering (Ship 1): direct REST call — meter off the resolved
-      // response via the shared hook. Burn-only, fail-open (never awaited/throws).
+      // Usage metering (Ship 1): direct REST call — meter off the resolved response
+      // via the shared hook. Charges the user's cap (all-cost-to-user policy), fail-open.
       if ((apiResponse.data as any)?.usageMetadata) {
         meterUsageFromResponse(
           { userId, model: modelName, provider: 'gemini', feature: 'agent_task' },
-          apiResponse.data,
-          { mode: 'burn' }
+          apiResponse.data
         );
       }
 
@@ -11088,8 +11087,7 @@ ${emailDraftFormat === 'text'
             provider: 'azure-openai',
             feature: 'email_draft',
           },
-          completion,
-          { mode: 'burn' }
+          completion
         );
       }
 
@@ -11197,8 +11195,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
       if ((messageCompletion as any)?.usage) {
         meterUsageFromResponse(
           { userId, sessionId, model: 'gemini-3.5-flash', provider: 'gemini', feature: 'invite_message' },
-          messageCompletion,
-          { mode: 'burn' }
+          messageCompletion
         );
       }
 
@@ -27875,8 +27872,7 @@ async function batchParseCompaniesFromTitlesWithLLM(
     if ((completion as any)?.usage) {
       meterUsageFromResponse(
         { userId, model: 'gemini-2.5-flash', provider: 'gemini', feature: 'title_company_parse' },
-        completion,
-        { mode: 'burn' }
+        completion
       );
     }
     const raw = String(completion?.choices?.[0]?.message?.content ?? '').trim();

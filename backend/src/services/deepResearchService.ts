@@ -1,7 +1,7 @@
 import { getSecret } from "../utils/secretsManager";
 import { DEEP_RESEARCH_AGENT_SPEED, DEEP_RESEARCH_AGENT_MAX } from '../config';
 import { getGeminiClient, normalizeGeminiUsage } from '../utils/llmClients';
-import { recordUsage } from './usageRecorderService';
+import { meterUserUsage } from './usageRecorderService';
 
 /**
  * Result from deep research operation
@@ -293,8 +293,8 @@ export class DeepResearchService {
       try {
         const usage = normalizeGeminiUsage((interaction as any)?.usageMetadata);
         const hasUsage = usage.inputTokens > 0 || usage.outputTokens > 0;
-        void recordUsage({
-          userId: params.userId, // per-user burn where the caller supplied it; else "system"
+        void meterUserUsage({
+          userId: params.userId, // charge the caller's cap when supplied; else "system" (absorbed)
           model: agent,
           provider: 'gemini',
           feature: hasUsage ? 'content_gen' : 'content_gen:interactions-no-usage',
