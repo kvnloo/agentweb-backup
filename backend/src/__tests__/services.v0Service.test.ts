@@ -189,6 +189,36 @@ async function createMinimalV0Zip(): Promise<Buffer> {
   return zip.toBuffer();
 }
 
+// ENG-334: a v0 zip that INCLUDES its own app/layout.tsx — the common case the old
+// scaffold-only fallback missed. Used to prove GTM is injected into v0's real layout.
+const V0_ZIP_LAYOUT = `import type { Metadata } from "next";
+import "./globals.css";
+
+export const metadata: Metadata = { title: "Compare", description: "" };
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <head>
+        <link rel="icon" href="/favicon.ico" />
+      </head>
+      <body>{children}</body>
+    </html>
+  );
+}
+`;
+
+async function createV0ZipWithLayout(): Promise<Buffer> {
+  const AdmZip = (await import("adm-zip")).default;
+  const zip = new AdmZip();
+  zip.addFile(
+    "app/page.tsx",
+    Buffer.from("export default function Page() { return <main>Hi</main>; }"),
+  );
+  zip.addFile("app/layout.tsx", Buffer.from(V0_ZIP_LAYOUT));
+  return zip.toBuffer();
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
   _resetV0UsageGuardForTest();
@@ -1714,6 +1744,143 @@ describe("v0Service - deployLandingPage", () => {
     await expect(deployLandingPage("sub-page-1", "user-1")).rejects.toThrow(
       "sub-page"
     );
+  });
+
+  // ---------------------------------------------------------------------------
+  // ENG-334: GTM auto-injection wiring — record.gtmContainerId flows through the
+  // push path into the files array pushed to GitHub, and the tracking signal is
+  // persisted. The pure util is covered elsewhere; these pin the WIRING, so a
+  // wiring regression can't ship with all tests green (acceptance criteria 1 & 4).
+  // ---------------------------------------------------------------------------
+
+  // Wire up a full happy-path deploy (GitHub push + Vercel deploy) so the run
+  // reaches the push and the tracking-signal DynamoDB update.
+  function wireHappyPathDeploy() {
+    mockAxiosGet.mockImplementation((url: string) => {
+      if (url.includes("/git/ref/heads/main")) {
+        return Promise.resolve({ data: { object: { sha: "base-sha" } } });
+      }
+      if (url === "https://api.github.com/repos/AgentWebPro/repo") {
+        return Promise.resolve({ data: { id: 12345 } });
+      }
+      if (url.includes("/v6/deployments")) {
+        return Promise.resolve({
+          data: { deployments: [{ uid: "dpl_1", readyState: "READY", meta: { githubCommitSha: "commit-sha" } }] },
+        });
+      }
+      if (url.includes("/v9/projects/prj_1")) {
+        return Promise.resolve({ data: { targets: { production: { alias: ["demo.vercel.app"] } } } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    mockAxiosPost.mockImplementation((url: string) => {
+      if (url.includes("/orgs/TestOrg/repos")) {
+        return Promise.resolve({ data: { name: "repo", full_name: "AgentWebPro/repo", html_url: "https://github.com/AgentWebPro/repo" } });
+      }
+      if (url.includes("/git/blobs")) {
+        return Promise.resolve({ data: { sha: `blob-${mockAxiosPost.mock.calls.length}` } });
+      }
+      if (url.includes("/git/trees")) {
+        return Promise.resolve({ data: { sha: "tree-sha" } });
+      }
+      if (url.includes("/git/commits")) {
+        return Promise.resolve({ data: { sha: "commit-sha" } });
+      }
+      if (url === "https://api.vercel.com/v10/projects") {
+        return Promise.resolve({ data: { id: "prj_1", name: "demo", targets: { production: { alias: ["demo.vercel.app"] } } } });
+      }
+      if (url === "https://api.vercel.com/v13/deployments") {
+        return Promise.resolve({ data: { uid: "dpl_1" } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    mockAxiosPatch.mockResolvedValue({ data: {} });
+  }
+
+  // Decode the base64 blob bodies POSTed to GitHub — this is the exact `files`
+  // array content that lands in the repo at the initial commit.
+  function pushedLayoutBlob(): string | undefined {
+    return mockAxiosPost.mock.calls
+      .filter((c) => typeof c[0] === "string" && c[0].includes("/git/blobs"))
+      .map((c) => Buffer.from(c[1].content, "base64").toString("utf8"))
+      .find((content) => content.includes("RootLayout"));
+  }
+
+  function pushedTrackingSignal(): boolean | undefined {
+    const call = mockUpdate.mock.calls.find(
+      (c) => c[0]?.ExpressionAttributeValues && ":trackingInstalled" in c[0].ExpressionAttributeValues,
+    );
+    return call?.[0].ExpressionAttributeValues[":trackingInstalled"];
+  }
+
+  it("SUCCESS (criterion 1): a site with gtmContainerId pushes an app/layout.tsx carrying the GTM snippet and records trackingInstalled=true", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page-1",
+            userId: "user-1",
+            name: "Compare Landing Page",
+            prompt: "Build a compare landing page",
+            status: "draft",
+            v0ChatId: "chat_1",
+            iterations: 0,
+            gtmContainerId: "GTM-TEST99",
+          },
+        }),
+    });
+    mockChatsGetById.mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+    // The zip carries v0's OWN layout.tsx — the case the scaffold-only fallback missed.
+    mockChatsDownloadVersion.mockResolvedValueOnce(await createV0ZipWithLayout());
+    wireHappyPathDeploy();
+
+    const result = await deployLandingPage("page-1", "user-1");
+
+    expect(result.status).toBe("deployed");
+    // The layout blob actually pushed to GitHub carries the customer's GTM container —
+    // no manual "Add GTM" step, and it was v0's own layout, not a scaffold.
+    const layout = pushedLayoutBlob();
+    expect(layout).toBeDefined();
+    expect(layout).toContain("https://www.googletagmanager.com/ns.html?id=GTM-TEST99");
+    expect(layout).toContain("'GTM-TEST99'");
+    expect(layout).toContain('rel="icon"'); // v0's original layout content preserved
+    // The tracking signal is persisted, detectable without reading the generated code.
+    expect(pushedTrackingSignal()).toBe(true);
+  });
+
+  it("SUCCESS (criterion 4): a site with NO gtmContainerId still deploys, but pushes NO GTM tag and records trackingInstalled=false", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page-1",
+            userId: "user-1",
+            name: "Untracked Landing Page",
+            prompt: "Build an untracked landing page",
+            status: "draft",
+            v0ChatId: "chat_1",
+            iterations: 0,
+            // gtmContainerId intentionally absent
+          },
+        }),
+    });
+    mockChatsGetById.mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+    mockChatsDownloadVersion.mockResolvedValueOnce(await createV0ZipWithLayout());
+    wireHappyPathDeploy();
+
+    const result = await deployLandingPage("page-1", "user-1");
+
+    expect(result.status).toBe("deployed");
+    // No fallback to AgentWeb's platform GA4 — the pushed layout carries no tag at all.
+    const layout = pushedLayoutBlob();
+    expect(layout).toBeDefined();
+    expect(layout).not.toContain("googletagmanager.com");
+    // Every pushed file is untracked, and the "no tracking installed" signal is persisted.
+    const anyTagPushed = mockAxiosPost.mock.calls
+      .filter((c) => typeof c[0] === "string" && c[0].includes("/git/blobs"))
+      .some((c) => Buffer.from(c[1].content, "base64").toString("utf8").includes("googletagmanager.com"));
+    expect(anyTagPushed).toBe(false);
+    expect(pushedTrackingSignal()).toBe(false);
   });
 });
 
