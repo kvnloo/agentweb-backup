@@ -1782,14 +1782,26 @@ async function addPageToExistingRepo(
  * layout metadata, so this is sufficient to fix the rendered <title>.
  *
  * Behaviour:
+ * - A CLIENT component is left completely alone — see below.
  * - If the file already exports a `metadata` object, rewrite its `title`
  *   field (or insert one) to the provided title.
- * - Otherwise, prepend a new `export const metadata = { title: "…" }` block
- *   right after any leading `'use client'` directive (if present — though
- *   `metadata` exports only work in server components, so this case is rare).
+ * - Otherwise, prepend a new `export const metadata = { title: "…" }` block.
  */
 export function ensurePageMetadataTitle(content: string, title: string): string {
   if (!title || !title.trim()) return content;
+
+  // A CLIENT component must never export `metadata` — Next.js hard-fails the build with
+  // "You are attempting to export metadata from a component marked with use client". We used
+  // to inject it right after the directive and call that defensive; it is the opposite. It
+  // manufactures a page that can never build, and because `next build` type-checks the whole
+  // project, that ONE page bricks the entire site — every sibling page included. Seen in prod
+  // on a shared site whose sub-pages "illegally exported metadata from client components".
+  //
+  // A missing <title> is cosmetic. An undeployable site is not. So when v0 emits a client
+  // component, leave it entirely alone — no injection, and no rewrite of an existing export
+  // either, since touching it would only relabel code that cannot compile.
+  if (/^\s*(?:'use client'|"use client")/.test(content)) return content;
+
   const escaped = title.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 
   // Case 1: existing `export const metadata = { ... }` — rewrite its title field
@@ -1815,12 +1827,7 @@ export function ensurePageMetadataTitle(content: string, title: string): string 
   // Case 2: no existing metadata export — prepend a fresh one after any
   // 'use client' directive. In practice page.tsx should be a server component
   // so the directive is unusual here, but we handle it defensively.
-  const metadataBlock = `export const metadata = { title: "${escaped}" };\n\n`;
-  const useClientMatch = content.match(/^(\s*(?:'use client'|"use client");?\s*\n)/);
-  if (useClientMatch) {
-    return useClientMatch[1] + metadataBlock + content.slice(useClientMatch[1].length);
-  }
-  return metadataBlock + content;
+  return `export const metadata = { title: "${escaped}" };\n\n` + content;
 }
 
 /**
