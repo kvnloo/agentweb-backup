@@ -296,7 +296,10 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   const file = (path: string, content = "// v0 generated") => ({ path, content: Buffer.from(content) });
 
   it("SUCCESS: injects middleware.ts and app/api/capture/route.ts with the list id and forward URL", () => {
-    const result = injectLeadCaptureAttribution([file("app/page.tsx")], "list_xyz");
+    // ENG-310: the capture route is repo-level but the lead list is per-page, so it now
+    // takes a path->list MAP rather than one hardcoded LIST_ID. A site with several pages
+    // used to file every lead into whichever list was injected last.
+    const result = injectLeadCaptureAttribution([file("app/page.tsx")], { "/": "list_xyz" });
 
     const middleware = result.find((f) => f.path === "middleware.ts");
     const route = result.find((f) => f.path === "app/api/capture/route.ts");
@@ -307,7 +310,8 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
 
     expect(route).toBeDefined();
     const routeSrc = route!.content.toString();
-    expect(routeSrc).toContain('const LIST_ID = "list_xyz"');
+    expect(routeSrc).toContain("LIST_BY_PATH");
+    expect(routeSrc).toContain('"list_xyz"');
     expect(routeSrc).toContain("/api/webhooks/forward-lead");
     expect(routeSrc).toContain('from "next/headers"');
     expect(routeSrc).toContain("aw_first_touch");
@@ -316,7 +320,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("FAIL: v0-generated app/api/capture/route.ts is replaced, not duplicated", () => {
     const result = injectLeadCaptureAttribution(
       [file("app/api/capture/route.ts", "// v0's own capture route"), file("app/page.tsx")],
-      "list_xyz"
+      { "/": "list_xyz" }
     );
 
     const captureRoutes = result.filter((f) => f.path === "app/api/capture/route.ts");
@@ -327,7 +331,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("FAIL: route-group variant of v0's capture route is also dropped", () => {
     const result = injectLeadCaptureAttribution(
       [file("app/(frontend)/api/capture/route.ts", "// v0 route-group capture"), file("app/page.tsx")],
-      "list_xyz"
+      { "/": "list_xyz" }
     );
 
     expect(result.some((f) => f.path === "app/(frontend)/api/capture/route.ts")).toBe(false);
@@ -338,7 +342,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("FAIL: v0-generated middleware.ts is replaced, not duplicated", () => {
     const result = injectLeadCaptureAttribution(
       [file("middleware.ts", "// v0's own middleware"), file("app/page.tsx")],
-      "list_xyz"
+      { "/": "list_xyz" }
     );
 
     const middlewares = result.filter((f) => f.path === "middleware.ts");
@@ -349,7 +353,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("SUCCESS: unrelated files are left untouched", () => {
     const result = injectLeadCaptureAttribution(
       [file("app/page.tsx", "// page"), file("lib/utils.ts", "// utils")],
-      "list_xyz"
+      { "/": "list_xyz" }
     );
 
     expect(result.find((f) => f.path === "app/page.tsx")!.content.toString()).toBe("// page");
@@ -359,7 +363,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("FAIL: src/app capture route variant is dropped, not duplicated", () => {
     const result = injectLeadCaptureAttribution(
       [file("src/app/api/capture/route.ts", "// v0 src/app capture"), file("app/page.tsx")],
-      "list_xyz"
+      { "/": "list_xyz" }
     );
 
     expect(result.some((f) => f.path === "src/app/api/capture/route.ts")).toBe(false);
@@ -370,7 +374,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("FAIL: nested/multiple route-group capture variant is dropped, not duplicated", () => {
     const result = injectLeadCaptureAttribution(
       [file("src/app/(marketing)/(v2)/api/capture/route.tsx", "// v0 nested"), file("app/page.tsx")],
-      "list_xyz"
+      { "/": "list_xyz" }
     );
 
     expect(result.some((f) => f.path.includes("(marketing)"))).toBe(false);
@@ -381,7 +385,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("FAIL: src/middleware.ts variant is replaced, not duplicated", () => {
     const result = injectLeadCaptureAttribution(
       [file("src/middleware.ts", "// v0's own src middleware"), file("app/page.tsx")],
-      "list_xyz"
+      { "/": "list_xyz" }
     );
 
     expect(result.some((f) => f.path === "src/middleware.ts")).toBe(false);
@@ -393,7 +397,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("SUCCESS: a non-root helper file literally named middleware.ts is left alone (not a real Next.js middleware)", () => {
     const result = injectLeadCaptureAttribution(
       [file("components/middleware.ts", "// unrelated helper, not Next middleware"), file("app/page.tsx")],
-      "list_xyz"
+      { "/": "list_xyz" }
     );
 
     const helper = result.find((f) => f.path === "components/middleware.ts");
@@ -403,7 +407,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
 
   it("SUCCESS: injectLeadCaptureAttribution never trips the duplicate guard on the normal path", () => {
     const files = [file("app/page.tsx"), file("app/api/capture/route.ts", "// v0's own"), file("middleware.ts", "// v0's own")];
-    expect(() => injectLeadCaptureAttribution(files, "list_xyz")).not.toThrow();
+    expect(() => injectLeadCaptureAttribution(files, { "/": "list_xyz" })).not.toThrow();
   });
 });
 
