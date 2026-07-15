@@ -54,7 +54,10 @@ import {
   extractIcpBrandContext,
   IcpBrandContext,
 } from "./onboardingIcpService";
-import { getPersistedBrandLogoUrl } from "./agentMode/brandLogo";
+import {
+  getPersistedBrandLogoUrl,
+  resolveBrandGuidelinesForLoadedUser,
+} from "./agentMode/brandLogo";
 import type { ICPPersona } from "./icpStatusService";
 import type { CreativeDirResult } from "./creativeDirStatusService";
 import {
@@ -741,7 +744,16 @@ export async function triggerAdImageGenerationForUser(
     u.creativeDirResult && typeof u.creativeDirResult === "object"
       ? (u.creativeDirResult as CreativeDirResult)
       : { concepts: [], copy_angles: [], format_archetypes: [] };
-  const brand = extractAdImageBrandContext(u);
+  // ENG-326: org members' brandGuidelines — including the auto-persisted
+  // onboarding logo and manual brand-config uploads — live on the ORG record
+  // (updateBrandGuidelines + routes/brand.ts both write there for them).
+  // Resolve org-aware, or the missing-logo gate below tells org users to
+  // "upload your logo in brand config" and then never sees the upload.
+  const effectiveBrandGuidelines = await resolveBrandGuidelinesForLoadedUser(u);
+  const brand = extractAdImageBrandContext({
+    ...u,
+    brandGuidelines: effectiveBrandGuidelines,
+  });
 
   // ENG-326 AC-3: ad images are BRANDED assets — without a persisted logo the
   // prompt builder would render an approximate typographic wordmark, which is

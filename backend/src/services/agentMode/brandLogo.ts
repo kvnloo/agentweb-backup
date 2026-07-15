@@ -72,21 +72,35 @@ export function getPersistedBrandLogoUrl(
 }
 
 /**
- * Org-aware brandGuidelines read — same resolution as
- * `agentModeService.readBrandGuidelines` (org members read the org record).
+ * Org-aware brandGuidelines read off an ALREADY-LOADED user record — same
+ * resolution as `agentModeService.readBrandGuidelines` (org members read the
+ * org record, because that is where updateBrandGuidelines and brand-config
+ * uploads write for them). Use this when the caller already holds the user
+ * to avoid a duplicate Dynamo read.
  */
-export async function resolveBrandGuidelinesForUser(
-  userId: string,
+export async function resolveBrandGuidelinesForLoadedUser(
+  user:
+    | { orgId?: string; brandGuidelines?: BrandGuidelinesLike | null }
+    | null
+    | undefined,
 ): Promise<BrandGuidelinesLike | null> {
-  const { userDb, orgDb } = await import('../db');
-  const user: any = await userDb.getUserById(userId);
   if (!user) return null;
   let brand: BrandGuidelinesLike | null = user.brandGuidelines ?? null;
   if (user.orgId) {
+    const { orgDb } = await import('../db');
     const org: any = await orgDb.getOrgById(user.orgId);
     if (org?.brandGuidelines) brand = org.brandGuidelines;
   }
   return brand;
+}
+
+/** Org-aware brandGuidelines read by userId. */
+export async function resolveBrandGuidelinesForUser(
+  userId: string,
+): Promise<BrandGuidelinesLike | null> {
+  const { userDb } = await import('../db');
+  const user: any = await userDb.getUserById(userId);
+  return resolveBrandGuidelinesForLoadedUser(user);
 }
 
 export async function getPersistedBrandLogoUrlForUser(
