@@ -1878,6 +1878,111 @@ describe('agentToolGatewayService', () => {
       expect(execute).not.toHaveBeenCalled();
     });
 
+    // ENG-291: the Daily Satisfaction Score Report calls get_chat_history over a
+    // 24h window with sync=true (on-the-fly score generation). That heavy request
+    // timed out twice, tripping the SESSION-scoped timeout aggregate at threshold
+    // 2 — which then hard-blocked EVERY subsequent get_chat_history in the session,
+    // including the legitimate recovery paths (the same window with sync=false, and
+    // a much smaller 6h window). The model was told "STOP retrying" and could never
+    // discover that a cheaper request would have completed, so the report produced
+    // zero output. Scope the breaker by request COST (sync flag + limit + window
+    // duration) so a materially cheaper/smaller call lands in a different bucket and
+    // is NOT blocked by an expensive call's timeouts — exactly like the ENG-182 /
+    // ENG-313 per-recipient scoping above.
+    const HISTORY_24H = { start_time: '2026-07-10T00:00:00Z', end_time: '2026-07-11T00:00:00Z' };
+    const HISTORY_6H = { start_time: '2026-07-10T18:00:00Z', end_time: '2026-07-11T00:00:00Z' };
+
+    it('ENG-291: does not block a sync=false get_chat_history after the sync=true request timed out twice', async () => {
+      const sessionScope = 'session-eng291-daily-satisfaction';
+      // Two identical heavy sync=true requests time out (turns 1 & 2 of the report).
+      for (const runId of ['run-history-1', 'run-history-2']) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'get_chat_history',
+          args: { ...HISTORY_24H, limit: 1000, sync: true },
+          runId,
+          budgetScopeId: sessionScope,
+          execute: failingExecute('This operation was aborted'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      // The legitimate recovery path — same window, but sync=false (cached scores
+      // only) — is a cheaper request and must still execute.
+      const execute = jest.fn().mockResolvedValue({ sessions: [] });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'get_chat_history',
+        args: { ...HISTORY_24H, limit: 1000, sync: false },
+        runId: 'run-history-3',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('ENG-291: does not block a smaller-window get_chat_history after a larger window timed out twice', async () => {
+      const sessionScope = 'session-eng291-smaller-window';
+      // The larger 24h window (sync=false) times out twice.
+      for (const runId of ['run-history-a', 'run-history-b']) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'get_chat_history',
+          args: { ...HISTORY_24H, limit: 1000, sync: false },
+          runId,
+          budgetScopeId: sessionScope,
+          execute: failingExecute('This operation was aborted'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      // A materially smaller 6h window with a smaller limit is a legitimate reduced
+      // request and must still execute.
+      const execute = jest.fn().mockResolvedValue({ sessions: [] });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'get_chat_history',
+        args: { ...HISTORY_6H, limit: 200, sync: false },
+        runId: 'run-history-c',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('ENG-291: still blocks an IDENTICAL get_chat_history request that keeps timing out', async () => {
+      const sessionScope = 'session-eng291-identical';
+      for (const runId of ['run-history-x', 'run-history-y']) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'get_chat_history',
+          args: { ...HISTORY_24H, limit: 1000, sync: true },
+          runId,
+          budgetScopeId: sessionScope,
+          execute: failingExecute('This operation was aborted'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      // Same expensive request a third time — this should still be blocked so the
+      // model stops thrashing on the identical call that keeps timing out.
+      const execute = jest.fn().mockResolvedValue({ sessions: [] });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'get_chat_history',
+        args: { ...HISTORY_24H, limit: 1000, sync: true },
+        runId: 'run-history-z',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+        expect((outcome.error as Error).message).toContain('get_chat_history');
+        expect((outcome.error as Error).message.toLowerCase()).toContain('timed out');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
     it('blocks expensive media tools after two failures even when the error messages differ', async () => {
       await failNTimes('run-media', 'generate_image', 'Safety filter rejected image prompt', 1);
       await failNTimes('run-media', 'generate_image', 'Google image generation timed out after 10 minutes', 1);
