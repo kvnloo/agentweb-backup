@@ -53,6 +53,20 @@ describe('getPersistedBrandLogoUrl', () => {
     ).toBe('https://s3.example.com/logo.png');
   });
 
+  it('prefers the uploaded attachments logo over a scraped brandData.logoUrl', () => {
+    // An explicit brand-config upload lands only on attachments; a stale
+    // scraped URL can linger on brandData.logoUrl. The upload must win —
+    // generation composites the logo the user sees in brand config.
+    expect(
+      getPersistedBrandLogoUrl({
+        brandData: { logoUrl: 'https://acme.com/stale-scraped.png' },
+        attachments: [
+          { type: 'logo', url: 'https://s3.example.com/uploaded.png' },
+        ],
+      }),
+    ).toBe('https://s3.example.com/uploaded.png');
+  });
+
   it('falls back to the attachments logo asset (the canonical asset store)', () => {
     expect(
       getPersistedBrandLogoUrl({

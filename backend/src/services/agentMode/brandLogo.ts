@@ -53,15 +53,22 @@ function firstLogoAssetUrl(list: unknown): string | null {
 
 /**
  * Resolve the persisted brand logo off a brandGuidelines object.
- * Order: brandData.logoUrl → attachments `logo` asset → legacy brandAssets.
+ * Order: attachments `logo` asset → brandData.logoUrl → legacy brandAssets.
+ *
+ * Attachments win over brandData.logoUrl deliberately: an explicit logo
+ * upload in brand config lands ONLY on attachments (routes/brand.ts), while
+ * brandData.logoUrl can hold a stale scraped URL — the logo the user sees in
+ * brand config must be the logo generation composites.
  */
 export function getPersistedBrandLogoUrl(
   brand: BrandGuidelinesLike | null | undefined,
 ): string | null {
   if (!brand) return null;
+  const attachmentLogo = firstLogoAssetUrl(brand.attachments);
+  if (attachmentLogo) return attachmentLogo;
   const logoUrl = (brand.brandData as any)?.logoUrl;
   if (isNonEmptyString(logoUrl)) return logoUrl.trim();
-  return firstLogoAssetUrl(brand.attachments) ?? firstLogoAssetUrl(brand.brandAssets);
+  return firstLogoAssetUrl(brand.brandAssets);
 }
 
 /**

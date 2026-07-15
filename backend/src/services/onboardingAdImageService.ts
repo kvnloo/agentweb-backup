@@ -412,20 +412,15 @@ export function extractAdImageBrandContext(user: any): AdImageBrandContext {
   if (typeof bd.fontFamily === "string" && bd.fontFamily) {
     ctx.fontFamily = bd.fontFamily;
   }
-  if (typeof bd.logoUrl === "string" && bd.logoUrl) {
-    ctx.logoUrl = bd.logoUrl;
+  // Shared ENG-326 resolution: attachments `logo` asset (the store the brand
+  // config UI + updateBrandGuidelines actually write) → brandData.logoUrl →
+  // legacy brandAssets with a logo-ish type.
+  const persistedLogo = getPersistedBrandLogoUrl(user?.brandGuidelines);
+  if (persistedLogo) {
+    ctx.logoUrl = persistedLogo;
   }
-  // The canonical asset store is `brandGuidelines.attachments` — that's where
-  // updateBrandGuidelines (Emma's tool + the ENG-326 deterministic onboarding
-  // step) persists the `logo` asset. Check it before the legacy shapes.
-  if (!ctx.logoUrl) {
-    const attachmentLogo = getPersistedBrandLogoUrl({
-      attachments: user?.brandGuidelines?.attachments,
-    });
-    if (attachmentLogo) ctx.logoUrl = attachmentLogo;
-  }
-  // Some legacy user records carry the logo on a separate `brandAssets`
-  // array. We pick the first asset whose type indicates a logo.
+  // Ad-image-only legacy fallback: some old records carry the logo on
+  // `brandAssets` typed as plain "image", which the shared resolver ignores.
   const assets = Array.isArray(user?.brandGuidelines?.brandAssets)
     ? user.brandGuidelines.brandAssets
     : [];
