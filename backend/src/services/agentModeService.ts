@@ -11,6 +11,12 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { computeTermination } from './agentMode/core/agentStep';
+import {
+  downloadBrandLogoToS3,
+  getPersistedBrandLogoUrlForUser,
+  missingBrandLogoToolResult,
+  promptRequestsLogo,
+} from './agentMode/brandLogo';
 import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
@@ -11809,40 +11815,18 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
       console.log('Inferring brand tokens...');
       const suggestedBrandTokens = inferBrandTokens(detailedTokens);
 
-      // Process brand identity: download logo and upload to S3
+      // Process brand identity: download logo and upload to S3. Extracted to
+      // services/agentMode/brandLogo.ts (ENG-326); behavior pinned by
+      // agentModeService.extractCSSFromURL.logo.test.ts.
       const brandIdentity = extractedCSS.brandIdentity || { logoUrl: null, brandName: null, tagline: null, favicon: null };
-      let s3LogoUrl: string | null = null;
-
-      if (brandIdentity.logoUrl) {
-        try {
-          console.log(`Downloading logo from ${brandIdentity.logoUrl}...`);
-          const logoResponse = await axios.get(brandIdentity.logoUrl, {
-            responseType: 'arraybuffer',
-            timeout: 15000,
-          });
-          const contentType = logoResponse.headers['content-type'] || '';
-          // Skip SVG since brand guidelines doesn't accept it
-          if (!contentType.includes('svg')) {
-            const ext = contentType.includes('png') ? 'png' : contentType.includes('gif') ? 'gif' : 'jpg';
-            const filename = `logo.${ext}`;
-            const { uploadFileToS3WithPath } = await import('../utils/s3Utils');
-            const uploadResult = await uploadFileToS3WithPath(
-              Buffer.from(logoResponse.data as ArrayBuffer),
-              filename,
-              contentType,
-              `users/${userId}/brand/logo`
-            );
-            if (uploadResult.success && uploadResult.url) {
-              s3LogoUrl = uploadResult.url;
-              console.log(`Logo uploaded to S3: ${s3LogoUrl}`);
-            }
-          } else {
-            console.log('Skipping SVG logo (not supported by brand guidelines)');
-          }
-        } catch (logoErr: any) {
-          console.warn('Failed to download/upload logo:', logoErr.message);
-        }
-      }
+      const logoDownload = brandIdentity.logoUrl
+        ? await downloadBrandLogoToS3(brandIdentity.logoUrl, userId)
+        : null;
+      // Non-uploaded outcomes fall back to surfacing the raw discovered URL
+      // below (`s3LogoUrl || brandIdentity.logoUrl`) — unchanged extraction
+      // behavior; only the deterministic PERSIST path treats them differently.
+      const s3LogoUrl: string | null =
+        logoDownload?.status === 'uploaded' ? logoDownload.url : null;
 
       // Format detailed tokens as JSON string for Emma to save to KB if needed
       const detailedTokensJSON = JSON.stringify({
@@ -20449,6 +20433,27 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     try {
+      // ENG-326: branded text-to-image asks must composite the account's REAL
+      // persisted logo — never one the model invents. When the prompt asks for
+      // a logo and the model didn't pass logo_image, prefer the persisted
+      // brand logo (AC-2); when none is persisted, ask the user / point at
+      // brand config instead of generating (AC-3). Edits (inputImages) are
+      // out of scope — the source images already carry the branding.
+      if (
+        !logoImage &&
+        (!Array.isArray(inputImages) || inputImages.length === 0) &&
+        promptRequestsLogo(prompt)
+      ) {
+        const persistedLogo = await getPersistedBrandLogoUrlForUser(userId);
+        if (!persistedLogo) {
+          return missingBrandLogoToolResult();
+        }
+        logoImage = persistedLogo;
+        console.log(
+          `AgentMode: generate_image prompt asks for a logo — compositing the persisted brand logo (${persistedLogo})`
+        );
+      }
+
       // Import the image generation service
       const { imageService } = await import('./imageGeneration');
 

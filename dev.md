@@ -1,3 +1,74 @@
+## ENG-326 review hardening: org dead-ends, unverified persists, guard false negatives (2026-07-15)
+
+Senior review of the ENG-326 branch surfaced four real bugs in the first cut; all fixed with tests.
+
+1. **Org accounts hit a dead end in both missing-logo gates.** `updateBrandGuidelines` and brand-config
+   uploads write the **ORG** record for org members, but the ad-image gate read `user.brandGuidelines`
+   only — so "upload your logo in brand config, then regenerate" could never be satisfied. The
+   ad-image trigger AND the landing-page routes now resolve brandGuidelines org-aware
+   (`resolveBrandGuidelinesForLoadedUser` / a `brandGuidelinesOverride` param on
+   `buildBrandContextFromUser`).
+2. **Unverified logo URLs are never persisted.** `downloadBrandLogoToS3` now returns a discriminated
+   outcome (`uploaded | svg | download-failed | upload-failed`). The onboarding step falls back to the
+   raw discovered URL only on `upload-failed` (bytes proven raster, just the S3 pin failed) — a dead /
+   hotlink-protected URL or an SVG served from an extensionless URL never becomes the canonical brand
+   asset. Emma-facing `extractCSSFromURL` output is unchanged (characterization suite untouched).
+3. **Landing pages got the missing half of AC-3.** `/generate` and `/generated/:id/duplicate` return
+   `422 { error: "missing_brand_logo" }` pointing at brand config when no logo resolves, BEFORE side
+   effects (lead-list public-access flip, site-mode lock). Previously v0 silently invented a wordmark.
+4. **Negation guard tightened.** The 0–40-char window swallowed positive asks ("no text, just our
+   logo", "Do not crop the logo"). Negators must now sit directly on the logo mention (≤2 whitelisted
+   filler words); `don't`/`do not` understood.
+
+### Assumptions to validate (delta over the section below)
+- **422 on logo-less landing-page generation is the intended UX** for the frontend — same reasoning as
+  the ad-image gate (Fangfang's brand-config guidance), but the portal UI may render the 422 as a
+  generic failure until it learns the `missing_brand_logo` code. Duplicate of a pre-gate page with no
+  persisted logo is now also blocked by design.
+- **`upload-failed` remote-URL fallback is safe**: the bytes were just downloaded successfully, so the
+  URL serves a real raster; if the site later takes it down we degrade the same way any hosted asset
+  does.
+
+## Brand logo never persisted during onboarding → random logos in assets (2026-07-15, ENG-326)
+
+Root cause (named by Fangfang on the 07-14 Argusoft night call): the whole logo pipeline EXISTED —
+cssExtractor discovery heuristics, a download+S3 block inside `extractCSSFromURL`, the
+`brandData.logoUrl` field on `update_brand_guidelines`, logo-preferring consumption in ad-image and
+v0 prompts — but the only thing connecting them during onboarding was a PROMPTED Emma session
+(`onboardingBrandBuildService`) that was merely *asked* to include `logoUrl` in its one
+`update_brand_guidelines` call. When she didn't, the account had no logo anywhere, and every
+downstream generator "helpfully" invented one (Gemini renders an approximate mark; the ad-image
+builder falls back to a typographic wordmark; v0 gets no Logo URL line at all).
+
+Fixes (all deterministic, none rely on the LLM volunteering):
+1. **`services/agentMode/brandLogo.ts`** — new module. The download+S3 block was extracted out of the
+   `agentModeService.extractCSSFromURL` monolith (characterization test pins the old behavior); adds
+   `ensureBrandLogoPersisted` (post-scrape onboarding step) and one shared logo resolver.
+2. **Brand build** runs `ensureBrandLogoPersisted` after every successful Emma session: no logo on the
+   account → discover on the company URL → pin to S3 → persist `brandData.logoUrl` + a `logo`
+   attachment via the same `updateBrandGuidelines` path Emma uses.
+3. **`generate_image`** — prompt asks for a logo + model passed no `logo_image` → inject the persisted
+   logo; none persisted → return an ask-the-user tool result pointing at brand config. Never invent.
+4. **Onboarding ad images** — no persisted logo → run fails with "upload your logo in brand config"
+   instead of shipping wordmark variants; with one, every variant composites it as a real image input.
+5. **Landing pages** — the two duplicated brand-context blocks in `routes/landingPageGeneration.ts`
+   collapsed into `v0Service.buildBrandContextFromUser`, which resolves the logo attachments-first
+   with a `brandData.logoUrl` fallback (the route previously read attachments ONLY, so a
+   scrape-persisted logo never reached v0).
+
+### Assumptions to validate
+- **Resolution precedence: attachments beat `brandData.logoUrl`.** Rationale: an explicit brand-config
+  upload (`routes/brand.ts`) writes ONLY an attachment, while `brandData.logoUrl` can hold a stale
+  scraped URL — what the user sees in brand config must be what generation composites. If Emma
+  re-scrapes and updates only `brandData.logoUrl`, the older auto-attachment still wins; acceptable
+  because the deterministic step writes both with the same URL.
+- **Failing the onboarding ad-image run on missing logo is the intended UX** (vs. generating wordmark
+  variants). Matches Fangfang's interim guidance ("upload/review the logo in brand config before image
+  creation") and AC-3, but it's a visible behavior change on accounts with undiscoverable logos.
+- **The `promptRequestsLogo` heuristic** (`/\blogos?\b/i` with a negation guard) is deliberately
+  narrow; prompts that mean the logo without saying "logo" ("with our brand mark") won't trigger the
+  gate. The model still passes `logo_image` explicitly on those per its tool description.
+
 ## Resolve-bridge @Emma parrot: mention serialization pinned live + a PII hijack closed (2026-07-15, ENG-316)
 
 The resolve bridge now parrots the latest `@Emma <message>` comment on a bug canonical as the
