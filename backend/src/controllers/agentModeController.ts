@@ -1910,7 +1910,14 @@ export async function runScheduledChat(
 export async function recoverAbandonedScheduledRun(schedule: any, lease: any): Promise<boolean> {
   const nowIso = new Date().toISOString();
   const nextRetryCount = getZeroAssistantRetryCount(schedule) + 1;
-  const willRequeue = nextRetryCount <= ZERO_ASSISTANT_MAX_REQUEUES;
+  // Only reschedule schedules that are still active. A runCount-limited schedule
+  // auto-pauses at dispatch, so requeuing it would resurrect a completed-quota
+  // schedule; a paused run is still recovered (lease cleared, session annotated,
+  // failure recorded) — just not rescheduled.
+  const isActive = schedule.status === 'active';
+  const overCap = nextRetryCount > ZERO_ASSISTANT_MAX_REQUEUES;
+  const willRequeue = isActive && !overCap;
+  const noRequeueReason = willRequeue ? '' : (!isActive ? `schedule is ${schedule.status}` : 'over requeue cap');
   const requeuedAt = willRequeue
     ? new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString()
     : undefined;
@@ -1975,13 +1982,13 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
     deadInstanceId: lease.instanceId,
     heartbeatAt: lease.heartbeatAt,
     requeued: willRequeue,
-    requeuedAt: requeuedAt || 'N/A (over requeue cap)',
+    requeuedAt: requeuedAt || `N/A (${noRequeueReason})`,
   });
 
   // Surface to oncall (best-effort, never throws into the sweep).
   void sendAgentModeOncallAlert({
     subject: `Scheduled Chat Abandoned Run Recovered: ${schedule.scheduleName}`,
-    message: `A scheduled run for "${schedule.scheduleName}" was abandoned when its process died mid-run and has been ${willRequeue ? `requeued for ${requeuedAt}` : 'left failed (over requeue cap)'}.`,
+    message: `A scheduled run for "${schedule.scheduleName}" was abandoned when its process died mid-run and has been ${willRequeue ? `requeued for ${requeuedAt}` : `left failed (${noRequeueReason})`}.`,
     sessionId: lease.sessionId || undefined,
     context: {
       'Schedule ID': schedule.scheduleId,
@@ -1990,7 +1997,7 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
       'Session ID': lease.sessionId || 'N/A',
       'Dead Instance': lease.instanceId || 'unknown',
       'Last Heartbeat': lease.heartbeatAt || 'unknown',
-      'Requeued': willRequeue ? `Yes (${requeuedAt})` : 'No (over cap)',
+      'Requeued': willRequeue ? `Yes (${requeuedAt})` : `No (${noRequeueReason})`,
       'Retry Count': String(nextRetryCount),
     },
   }).catch(err => console.error('Failed to send oncall alert for recovered abandoned run:', err));

@@ -3049,20 +3049,26 @@ export const scheduleDb = {
     }
   },
 
-  // Active scheduled-chat schedules that currently hold an in-flight lease.
-  // Sparse by nature — most schedules have no runInFlight. Volume is low; promote
-  // to a dedicated sparse GSI if the active-schedule count ever grows large.
+  // Scheduled-chat schedules that currently hold an in-flight lease. Sparse by
+  // nature — most schedules have no runInFlight. We sweep BOTH 'active' and
+  // 'paused' partitions of StatusStartTimeIndex: a runCount-limited schedule
+  // auto-pauses at dispatch (before its final run sets a lease), so an abandoned
+  // run on a paused schedule would otherwise never be reaped. Volume is low;
+  // promote to a dedicated sparse GSI if the schedule count ever grows large.
   async getInFlightSchedules(): Promise<any[]> {
     try {
-      const params = {
-        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-        IndexName: 'StatusStartTimeIndex',
-        KeyConditionExpression: '#status = :status',
-        FilterExpression: '#type = :type AND attribute_exists(runInFlight)',
-        ExpressionAttributeNames: { '#status': 'status', '#type': 'type' },
-        ExpressionAttributeValues: { ':status': 'active', ':type': 'scheduled_chat' },
-      };
-      return await paginatedQuery(dynamodb, params);
+      const statuses = ['active', 'paused'];
+      const results = await Promise.all(statuses.map(status =>
+        paginatedQuery(dynamodb, {
+          TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+          IndexName: 'StatusStartTimeIndex',
+          KeyConditionExpression: '#status = :status',
+          FilterExpression: '#type = :type AND attribute_exists(runInFlight)',
+          ExpressionAttributeNames: { '#status': 'status', '#type': 'type' },
+          ExpressionAttributeValues: { ':status': status, ':type': 'scheduled_chat' },
+        })
+      ));
+      return results.flat();
     } catch (error) {
       // Best-effort reconciler input: a transient list failure just skips this
       // sweep (the next one retries), so log and return empty rather than throw.
