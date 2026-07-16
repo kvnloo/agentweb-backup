@@ -24,6 +24,7 @@ jest.mock('../services/linearService', () => ({
   raiseIssueTriage: jest.fn(),
   reopenIssue: jest.fn(),
   listOpenIssuesByLabel: jest.fn(),
+  escalateIssue: jest.fn(),
   getIssueCommentsDetailed: jest.fn().mockResolvedValue([]),
 }));
 jest.mock('../services/resendService', () => ({ resendService: { sendSystemEmail: jest.fn() } }));
@@ -836,6 +837,194 @@ describe('intakeService.fileBugReport — exact-reference short-circuit (fix for
     expect(linear.reopenIssue).toHaveBeenCalledWith('uuid-312', 'Todo');
     expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-312', expect.stringContaining('Reopened by a new report'));
     expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ deduped: true });
+  });
+});
+
+describe('intakeService.fileAutoIssue — alert-class clustering (ENG-358)', () => {
+  const realFlag = process.env.FEATUREBASE_INTAKE;
+  beforeEach(() => { process.env.FEATUREBASE_INTAKE = 'true'; });
+  afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
+
+  const V0_CONTEXT = {
+    'Plan': 'v0-team',
+    'Total spendable': '$59.15',
+    'Warn level': 'low',
+    'Alert Class': 'v0-credits',
+    'Alert Priority': 'high',
+  };
+
+  // AC #1: an open canonical for the same alert class owns every occurrence — a moved balance
+  // (different title AND different body numbers) must append, never file a new issue.
+  it('AC1: occurrence with a different balance groups onto the open canonical carrying the same Alert Class', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-337', issueId: 'uuid-337', title: 'v0 credits LOW — $58.51 spendable', description: 'body\n* Warn level: low\n* Alert Class: v0-credits' },
+    ]);
+    const r = await fileAutoIssue({
+      title: 'v0 credits LOW — $59.15 spendable',
+      description: 'd',
+      source: 'Oncall alert',
+      extraLabels: ['Oncall'],
+      notionContext: V0_CONTEXT,
+    });
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-337', expect.stringContaining('Recurred on'));
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ pageId: 'ENG-337', deduped: true, tracker: 'Linear' });
+  });
+
+  // AC #2: no open issue for the class -> exactly ONE new issue, carrying the class marker in its
+  // body (so the next occurrence matches) and the mapped priority (so it never lands "No priority").
+  it('AC2: no open issue for the class -> creates exactly one issue with the class marker + priority', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-400', id: 'uuid-400', url: 'u' });
+    const r = await fileAutoIssue({
+      title: 'v0 credits LOW — $20.00 spendable',
+      description: 'd',
+      source: 'Oncall alert',
+      extraLabels: ['Oncall'],
+      notionContext: V0_CONTEXT,
+    });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({
+      labelNames: ['Auto', 'Oncall'],
+      priority: 2, // 'high'
+      description: expect.stringContaining('Alert Class: v0-credits'),
+    }));
+    expect(r).toMatchObject({ deduped: false, tracker: 'Linear' });
+  });
+
+  // AC #3: warn-level escalation (low -> critical) on an existing open canonical updates its
+  // priority/title in place — no new issue.
+  it('AC3: low -> critical escalation updates the open canonical title + priority, files nothing new', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-337', issueId: 'uuid-337', title: 'v0 credits LOW — $58.51 spendable', description: 'body\n* Alert Class: v0-credits' },
+    ]);
+    const r = await fileAutoIssue({
+      title: 'v0 credits CRITICAL — $9.10 spendable',
+      description: 'd',
+      source: 'Oncall alert',
+      extraLabels: ['Oncall'],
+      notionContext: { ...V0_CONTEXT, 'Warn level': 'critical', 'Alert Priority': 'urgent' },
+    });
+    expect(linear.escalateIssue).toHaveBeenCalledWith('uuid-337', { title: 'v0 credits CRITICAL — $9.10 spendable', priority: 1 });
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ deduped: true });
+  });
+
+  // AC #4: a closed canonical is not a candidate (listOpenIssuesByLabel is open-only, and as of
+  // ENG-358 excludes duplicate-state issues too) -> ONE fresh canonical, never a reopen storm.
+  it('AC4: closed canonical + new occurrence -> one fresh issue, no reopen', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([]); // closed/duplicate issues are filtered upstream
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-401', id: 'uuid-401', url: 'u' });
+    const r = await fileAutoIssue({
+      title: 'v0 credits LOW — $21.00 spendable',
+      description: 'd',
+      source: 'Oncall alert',
+      notionContext: V0_CONTEXT,
+    });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    expect(linear.reopenIssue).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ deduped: false });
+  });
+
+  // Migration: the pre-ENG-358 open canonical (ENG-337) carries NO class marker in its body. The
+  // amount-insensitive title match must still group onto it instead of filing a parallel canonical.
+  it('legacy open canonical without the class marker still matches when titles differ only by the amount', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-337', issueId: 'uuid-337', title: 'v0 credits LOW — $58.51 spendable', description: 'no class marker here' },
+    ]);
+    const r = await fileAutoIssue({
+      title: 'v0 credits LOW — $59.15 spendable',
+      description: 'd',
+      source: 'Oncall alert',
+      notionContext: V0_CONTEXT,
+    });
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ pageId: 'ENG-337', deduped: true });
+  });
+
+  // Needle specificity: a different alert class must never absorb this class's occurrences.
+  it('a candidate carrying a DIFFERENT Alert Class does not match', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-390', issueId: 'uuid-390', title: 'Meta token refresh failing', description: 'body\n* Alert Class: meta-token-refresh' },
+    ]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-402', id: 'uuid-402', url: 'u' });
+    const r = await fileAutoIssue({
+      title: 'v0 credits LOW — $22.00 spendable',
+      description: 'd',
+      source: 'Oncall alert',
+      notionContext: V0_CONTEXT,
+    });
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    expect(r).toMatchObject({ deduped: false });
+  });
+
+  // Prefix collision (Greptile P2 on #2107): a class name that extends this one ("v0-credits" vs
+  // "v0-credits-backup") must not cross-match in EITHER direction — the needle is anchored at
+  // end-of-line, not a bare substring.
+  it('class names where one is a prefix of the other never cross-match', async () => {
+    // Direction 1: filing "v0-credits" must NOT land on a canonical classed "v0-credits-backup".
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-391', issueId: 'uuid-391', title: 'v0 credits backup exhausted', description: 'body\n* Alert Class: v0-credits-backup\n* Plan: v0-team' },
+    ]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-403', id: 'uuid-403', url: 'u' });
+    const r1 = await fileAutoIssue({
+      title: 'v0 credits LOW — $23.00 spendable',
+      description: 'd',
+      source: 'Oncall alert',
+      notionContext: V0_CONTEXT,
+    });
+    expect(linear.addIssueComment).not.toHaveBeenCalled();
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    expect(r1).toMatchObject({ deduped: false });
+
+    jest.clearAllMocks();
+
+    // Direction 2: filing "v0-credits-backup" must NOT land on a canonical classed "v0-credits" —
+    // and the anchored match still finds its own class when that line is mid-body, not last.
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-337', issueId: 'uuid-337', title: 'v0 credits LOW — $58.51 spendable', description: 'body\n* Alert Class: v0-credits\n* Plan: v0-team' },
+      { identifier: 'ENG-392', issueId: 'uuid-392', title: 'v0 backup credits LOW', description: 'body\n* Alert Class: v0-credits-backup\n* Plan: v0-team' },
+    ]);
+    const r2 = await fileAutoIssue({
+      title: 'v0 backup credits LOW — $5.00 spendable',
+      description: 'd',
+      source: 'Oncall alert',
+      notionContext: { ...V0_CONTEXT, 'Alert Class': 'v0-credits-backup' },
+    });
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-392', expect.stringContaining('Recurred on'));
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(r2).toMatchObject({ pageId: 'ENG-392', deduped: true });
+  });
+
+  // Escalation is best-effort: a Linear hiccup on the escalate call must not break the dedupe
+  // result (the occurrence comment + grouped return still stand, next occurrence retries).
+  it('escalateIssue failure is best-effort — the grouped result still returns', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-337', issueId: 'uuid-337', title: 't', description: '* Alert Class: v0-credits' },
+    ]);
+    linear.escalateIssue.mockRejectedValueOnce(new Error('linear 500'));
+    const r = await fileAutoIssue({
+      title: 'v0 credits CRITICAL — $9.00 spendable',
+      description: 'd',
+      source: 'Oncall alert',
+      notionContext: { ...V0_CONTEXT, 'Alert Priority': 'urgent' },
+    });
+    expect(r).toMatchObject({ deduped: true });
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+  });
+
+  // Behavior preservation: an unclassed filer (no Alert Class in context) keeps today's exact
+  // semantics — normalized-title match still requires the SAME numbers, so distinct amounts in
+  // otherwise-identical titles of unclassed issues keep their pre-ENG-358 grouping behavior via
+  // the amount-insensitive norm (deliberate: amounts are occurrence data, not identity).
+  it('unclassed occurrence still groups by title (existing behavior unchanged)', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-7', issueId: 'uuid-7', title: 'Context limit reached', description: 'body' },
+    ]);
+    const r = await fileAutoIssue({ title: 'context limit reached', description: 'd', source: 'Context limit' });
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-7', expect.stringContaining('Recurred on'));
+    expect(linear.escalateIssue).not.toHaveBeenCalled();
     expect(r).toMatchObject({ deduped: true });
   });
 });
