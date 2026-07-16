@@ -30,7 +30,7 @@ jest.mock('../services/linearService', () => ({
   createInternalLinearIssue: jest.fn(),
   addIssueComment: jest.fn(),
   raiseIssueTriage: jest.fn(),
-  getIssueComments: jest.fn(),
+  getIssueCommentsDetailed: jest.fn().mockResolvedValue([]),
 }));
 jest.mock('../services/resendService', () => ({ resendService: { sendSystemEmail: jest.fn() } }));
 jest.mock('../services/shipNotifyService', () => ({ notifyReporterShipped: jest.fn().mockResolvedValue('sent') }));
@@ -207,7 +207,9 @@ describe('funnel privacy — zero leakage to Featurebase or reporter-facing emai
   });
 
   it('reporter-facing resolve email carries no funnel/stage string', async () => {
-    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #10 a@e.com] Affected user: a@e.com']);
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: '[reporter-ticket #10 a@e.com] Affected user: a@e.com', createdAt: '2026-07-01T00:00:00.000Z' },
+    ]);
     await notifyCanonicalResolved('uuid-canonical', 'Save button crashes');
     expect(resend.sendSystemEmail).toHaveBeenCalledTimes(1);
     expectNoFunnelStrings(resend.sendSystemEmail.mock.calls[0]);
