@@ -959,6 +959,44 @@ describe('intakeService.fileAutoIssue — alert-class clustering (ENG-358)', () 
     expect(r).toMatchObject({ deduped: false });
   });
 
+  // Prefix collision (Greptile P2 on #2107): a class name that extends this one ("v0-credits" vs
+  // "v0-credits-backup") must not cross-match in EITHER direction — the needle is anchored at
+  // end-of-line, not a bare substring.
+  it('class names where one is a prefix of the other never cross-match', async () => {
+    // Direction 1: filing "v0-credits" must NOT land on a canonical classed "v0-credits-backup".
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-391', issueId: 'uuid-391', title: 'v0 credits backup exhausted', description: 'body\n* Alert Class: v0-credits-backup\n* Plan: v0-team' },
+    ]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-403', id: 'uuid-403', url: 'u' });
+    const r1 = await fileAutoIssue({
+      title: 'v0 credits LOW — $23.00 spendable',
+      description: 'd',
+      source: 'Oncall alert',
+      notionContext: V0_CONTEXT,
+    });
+    expect(linear.addIssueComment).not.toHaveBeenCalled();
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
+    expect(r1).toMatchObject({ deduped: false });
+
+    jest.clearAllMocks();
+
+    // Direction 2: filing "v0-credits-backup" must NOT land on a canonical classed "v0-credits" —
+    // and the anchored match still finds its own class when that line is mid-body, not last.
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-337', issueId: 'uuid-337', title: 'v0 credits LOW — $58.51 spendable', description: 'body\n* Alert Class: v0-credits\n* Plan: v0-team' },
+      { identifier: 'ENG-392', issueId: 'uuid-392', title: 'v0 backup credits LOW', description: 'body\n* Alert Class: v0-credits-backup\n* Plan: v0-team' },
+    ]);
+    const r2 = await fileAutoIssue({
+      title: 'v0 backup credits LOW — $5.00 spendable',
+      description: 'd',
+      source: 'Oncall alert',
+      notionContext: { ...V0_CONTEXT, 'Alert Class': 'v0-credits-backup' },
+    });
+    expect(linear.addIssueComment).toHaveBeenCalledWith('uuid-392', expect.stringContaining('Recurred on'));
+    expect(linear.createInternalLinearIssue).not.toHaveBeenCalled();
+    expect(r2).toMatchObject({ pageId: 'ENG-392', deduped: true });
+  });
+
   // Escalation is best-effort: a Linear hiccup on the escalate call must not break the dedupe
   // result (the occurrence comment + grouped return still stand, next occurrence retries).
   it('escalateIssue failure is best-effort — the grouped result still returns', async () => {
