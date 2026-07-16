@@ -1,3 +1,33 @@
+## Resolve-bridge @Emma parrot: mention serialization pinned live + a PII hijack closed (2026-07-15, ENG-316)
+
+The resolve bridge now parrots the latest `@Emma <message>` comment on a bug canonical as the
+reporter resolution email. Three findings from the review/finalize pass worth keeping:
+
+### How a Linear mention ACTUALLY serializes (verified live, not guessed)
+Probe: created a comment on ENG-316 through Linear's own agent surface (it builds a genuine
+ProseMirror `suggestion_userMentions` node — confirmed via `comment.bodyData`), then read it back
+through the exact GraphQL field the service uses (`comments { nodes { body } }`). **A real
+workspace mention round-trips as plain `@displayName`** (`@harsha`) — no bracket/link markup at
+all. So plain-text `@emma` is the mainline matcher; the bracketed forms (`@[Emma](url)` /
+`[@Emma](url)`) never occur in raw bodies and are tolerated only for hand-written markdown. Also
+verified: `issue(id:)` accepts both UUID and identifier, and `comments(orderBy: createdAt)`
+returns **newest-first** (so `first: 250` overflow drops the oldest). Note: no "Emma" user exists
+in the workspace today (2026-07-15) — the convention works via plain-text `@emma` until one does.
+
+### The hijack class: intake comments carry CUSTOMER-controlled text
+Intake appends `Their report:\n<raw customer description>` to canonical comments, and customers
+address the agent as "@emma" in bug reports — so any anywhere-in-body mention matcher lets one
+customer's report (plus their email in the marker line) become EVERY reporter's resolution email.
+Closed twice over: the mention must be the comment's LEADING token (the documented `@Emma
+<message>` convention), and any comment carrying a `[reporter-ticket #N]` marker is excluded from
+parrot candidacy outright. Assumption to validate if intake formats ever change: intake-authored
+canonical comments always carry the reporter-ticket marker.
+
+### Linear's 50-node connection default, third sighting
+The un-sized `comments` connection silently caps at 50 — same trap `getTeamMeta` documents for
+states/labels. Any Linear connection query in this repo must be explicitly sized (250 max) with a
+loud `pageInfo.hasNextPage` log. Grep for un-sized connections when touching `linearService`.
+
 ## Eval-queue Ad vs Organic Post categorization (2026-07-15, ENG-90)
 
 Matt's ask: reviewer feedback on an image differs by use case, so eval-queue items need an
