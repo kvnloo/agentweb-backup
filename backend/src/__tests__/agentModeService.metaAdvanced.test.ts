@@ -382,7 +382,8 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
           '123456789',
           'mock-access-token',
           'marketing',
-          'adinterest'
+          'adinterest',
+          undefined
         );
       });
 
@@ -453,7 +454,22 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
 
         await agentModeService.searchAdTargeting('user123', '987654321', 'test', 'adinterest');
 
-        expect(metaService.searchTargeting).toHaveBeenCalledWith('987654321', 'token2', 'test', 'adinterest');
+        expect(metaService.searchTargeting).toHaveBeenCalledWith('987654321', 'token2', 'test', 'adinterest', undefined);
+      });
+
+      it('should forward location_types to metaService.searchTargeting for adgeolocation', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.searchTargeting as jest.Mock).mockResolvedValue([]);
+
+        await agentModeService.searchAdTargeting('user123', '123456789', 'San Jose', 'adgeolocation', ['city']);
+
+        expect(metaService.searchTargeting).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          'San Jose',
+          'adgeolocation',
+          ['city']
+        );
       });
     });
   });
