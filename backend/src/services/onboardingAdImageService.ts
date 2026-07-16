@@ -54,6 +54,10 @@ import {
   extractIcpBrandContext,
   IcpBrandContext,
 } from "./onboardingIcpService";
+import {
+  getPersistedBrandLogoUrl,
+  resolveBrandGuidelinesForLoadedUser,
+} from "./agentMode/brandLogo";
 import type { ICPPersona } from "./icpStatusService";
 import type { CreativeDirResult } from "./creativeDirStatusService";
 import {
@@ -411,11 +415,15 @@ export function extractAdImageBrandContext(user: any): AdImageBrandContext {
   if (typeof bd.fontFamily === "string" && bd.fontFamily) {
     ctx.fontFamily = bd.fontFamily;
   }
-  if (typeof bd.logoUrl === "string" && bd.logoUrl) {
-    ctx.logoUrl = bd.logoUrl;
+  // Shared ENG-326 resolution: attachments `logo` asset (the store the brand
+  // config UI + updateBrandGuidelines actually write) → brandData.logoUrl →
+  // legacy brandAssets with a logo-ish type.
+  const persistedLogo = getPersistedBrandLogoUrl(user?.brandGuidelines);
+  if (persistedLogo) {
+    ctx.logoUrl = persistedLogo;
   }
-  // Some user records carry the logo on a separate `brandAssets` array. We
-  // pick the first asset whose type indicates a logo.
+  // Ad-image-only legacy fallback: some old records carry the logo on
+  // `brandAssets` typed as plain "image", which the shared resolver ignores.
   const assets = Array.isArray(user?.brandGuidelines?.brandAssets)
     ? user.brandGuidelines.brandAssets
     : [];
@@ -736,7 +744,46 @@ export async function triggerAdImageGenerationForUser(
     u.creativeDirResult && typeof u.creativeDirResult === "object"
       ? (u.creativeDirResult as CreativeDirResult)
       : { concepts: [], copy_angles: [], format_archetypes: [] };
-  const brand = extractAdImageBrandContext(u);
+  // ENG-326: org members' brandGuidelines — including the auto-persisted
+  // onboarding logo and manual brand-config uploads — live on the ORG record
+  // (updateBrandGuidelines + routes/brand.ts both write there for them).
+  // Resolve org-aware, or the missing-logo gate below tells org users to
+  // "upload your logo in brand config" and then never sees the upload.
+  const effectiveBrandGuidelines = await resolveBrandGuidelinesForLoadedUser(u);
+  const brand = extractAdImageBrandContext({
+    ...u,
+    brandGuidelines: effectiveBrandGuidelines,
+  });
+
+  // ENG-326 AC-3: ad images are BRANDED assets — without a persisted logo the
+  // prompt builder would render an approximate typographic wordmark, which is
+  // exactly the "random logo" defect. Fail the run pointing the user at brand
+  // config instead of silently substituting.
+  if (!brand.logoUrl) {
+    const reason =
+      "no brand logo is saved in Brand Guidelines — upload your logo in brand config, then regenerate. " +
+      "Ad images are never generated with an invented or approximate logo (ENG-326).";
+    const current = await userDb.getUserById(userId);
+    await userDb.updateUser(
+      userId,
+      adImageFailedPatch(((current as any) || {}) as AdImageStatusFields, reason) as any
+    );
+    // eslint-disable-next-line no-console
+    console.error("[onboardingAdImageService] gated on missing brand logo", {
+      userId,
+      reason,
+    });
+    void reportUIError({
+      operation: "onboarding:ad-image:missing-brand-logo",
+      errorMessage: reason,
+      userId,
+      context: {
+        Source: "backend",
+        Step: "adImage",
+      },
+    });
+    return;
+  }
 
   // Close the image feedback loop: if the user has rejected variants on a
   // prior generation (♥/✕ swipe → adImageVariantsRated), distill those

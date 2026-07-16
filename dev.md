@@ -1,3 +1,106 @@
+## ENG-358: v0-credit alert dedupe at the intake gate — class clustering + Duplicate-state leak (2026-07-16)
+
+The hourly v0-credit alert filed a new Linear issue per occurrence (14 near-identical issues in 5
+days, ENG-292…350) and, after a manual dedupe pass, appended its recurrence comments to a canceled
+**Duplicate** (ENG-350) instead of the open canonical (ENG-337). Two root causes, both fixed at the
+ENG-240 intake gate:
+
+1. **Titles embed occurrence data.** `v0 credits LOW — $59.15 spendable` changes with every balance
+   move, so `fileAutoIssue`'s normalized-title fallback never matched and each occurrence filed
+   fresh. Fix: (a) alert-class clustering — the v0 filer now passes `"Alert Class": "v0-credits"` +
+   `"Alert Priority"` in its context; the gate matches candidates whose body carries the rendered
+   `Alert Class: <name>` line before any title comparison (same context-key mechanism as the
+   Session/Schedule idempotency keys), and escalates the open canonical in place (raise-only
+   priority + title refresh via new `linearService.escalateIssue`) on low→critical. (b) The title
+   norm is now amount-insensitive (`$58.51` ≡ `$59.15`) so pre-existing canonicals without the
+   class marker keep matching post-deploy.
+2. **Linear's Duplicate state has its own state type.** Verified live on ENG-350: `statusType:
+   "duplicate"` — NOT `"canceled"`. `listOpenIssuesByLabel` / `listOpenBugCanonicals` filtered with
+   a `nin: [completed, canceled]` blacklist, so duplicate-state issues stayed dedupe candidates and
+   absorbed recurrences. Both now WHITELIST open state types (`triage, backlog, unstarted,
+   started`), which also future-proofs against new closed-ish types.
+
+**Assumptions to validate**
+- The hourly re-fire itself (24h in-memory `lastAlerted` window not holding across prod
+  instances/worker restarts — observed 5+ alerts in one morning) is NOT fixed here; the gate now
+  makes re-fires converge on one issue, but each still sends an oncall email. If email cadence
+  matters, the window needs durable state (ENG-345 seam). Flagged on the Linear issue.
+- Priority mapping chosen: v0 `low` → High, `critical` → Urgent. Adjust in
+  `ALERT_PRIORITY_BY_LEVEL` (v0BillingService) if the board should rank ops alerts differently.
+- Amount-insensitive title normalization intentionally treats two auto-issue titles differing only
+  by a dollar figure as the same issue. No current Auto filer embeds amounts except the v0 alert.
+
+## ENG-326 review hardening: org dead-ends, unverified persists, guard false negatives (2026-07-15)
+
+Senior review of the ENG-326 branch surfaced four real bugs in the first cut; all fixed with tests.
+
+1. **Org accounts hit a dead end in both missing-logo gates.** `updateBrandGuidelines` and brand-config
+   uploads write the **ORG** record for org members, but the ad-image gate read `user.brandGuidelines`
+   only — so "upload your logo in brand config, then regenerate" could never be satisfied. The
+   ad-image trigger AND the landing-page routes now resolve brandGuidelines org-aware
+   (`resolveBrandGuidelinesForLoadedUser` / a `brandGuidelinesOverride` param on
+   `buildBrandContextFromUser`).
+2. **Unverified logo URLs are never persisted.** `downloadBrandLogoToS3` now returns a discriminated
+   outcome (`uploaded | svg | download-failed | upload-failed`). The onboarding step falls back to the
+   raw discovered URL only on `upload-failed` (bytes proven raster, just the S3 pin failed) — a dead /
+   hotlink-protected URL or an SVG served from an extensionless URL never becomes the canonical brand
+   asset. Emma-facing `extractCSSFromURL` output is unchanged (characterization suite untouched).
+3. **Landing pages got the missing half of AC-3.** `/generate` and `/generated/:id/duplicate` return
+   `422 { error: "missing_brand_logo" }` pointing at brand config when no logo resolves, BEFORE side
+   effects (lead-list public-access flip, site-mode lock). Previously v0 silently invented a wordmark.
+4. **Negation guard tightened.** The 0–40-char window swallowed positive asks ("no text, just our
+   logo", "Do not crop the logo"). Negators must now sit directly on the logo mention (≤2 whitelisted
+   filler words); `don't`/`do not` understood.
+
+### Assumptions to validate (delta over the section below)
+- **422 on logo-less landing-page generation is the intended UX** for the frontend — same reasoning as
+  the ad-image gate (Fangfang's brand-config guidance), but the portal UI may render the 422 as a
+  generic failure until it learns the `missing_brand_logo` code. Duplicate of a pre-gate page with no
+  persisted logo is now also blocked by design.
+- **`upload-failed` remote-URL fallback is safe**: the bytes were just downloaded successfully, so the
+  URL serves a real raster; if the site later takes it down we degrade the same way any hosted asset
+  does.
+
+## Brand logo never persisted during onboarding → random logos in assets (2026-07-15, ENG-326)
+
+Root cause (named by Fangfang on the 07-14 Argusoft night call): the whole logo pipeline EXISTED —
+cssExtractor discovery heuristics, a download+S3 block inside `extractCSSFromURL`, the
+`brandData.logoUrl` field on `update_brand_guidelines`, logo-preferring consumption in ad-image and
+v0 prompts — but the only thing connecting them during onboarding was a PROMPTED Emma session
+(`onboardingBrandBuildService`) that was merely *asked* to include `logoUrl` in its one
+`update_brand_guidelines` call. When she didn't, the account had no logo anywhere, and every
+downstream generator "helpfully" invented one (Gemini renders an approximate mark; the ad-image
+builder falls back to a typographic wordmark; v0 gets no Logo URL line at all).
+
+Fixes (all deterministic, none rely on the LLM volunteering):
+1. **`services/agentMode/brandLogo.ts`** — new module. The download+S3 block was extracted out of the
+   `agentModeService.extractCSSFromURL` monolith (characterization test pins the old behavior); adds
+   `ensureBrandLogoPersisted` (post-scrape onboarding step) and one shared logo resolver.
+2. **Brand build** runs `ensureBrandLogoPersisted` after every successful Emma session: no logo on the
+   account → discover on the company URL → pin to S3 → persist `brandData.logoUrl` + a `logo`
+   attachment via the same `updateBrandGuidelines` path Emma uses.
+3. **`generate_image`** — prompt asks for a logo + model passed no `logo_image` → inject the persisted
+   logo; none persisted → return an ask-the-user tool result pointing at brand config. Never invent.
+4. **Onboarding ad images** — no persisted logo → run fails with "upload your logo in brand config"
+   instead of shipping wordmark variants; with one, every variant composites it as a real image input.
+5. **Landing pages** — the two duplicated brand-context blocks in `routes/landingPageGeneration.ts`
+   collapsed into `v0Service.buildBrandContextFromUser`, which resolves the logo attachments-first
+   with a `brandData.logoUrl` fallback (the route previously read attachments ONLY, so a
+   scrape-persisted logo never reached v0).
+
+### Assumptions to validate
+- **Resolution precedence: attachments beat `brandData.logoUrl`.** Rationale: an explicit brand-config
+  upload (`routes/brand.ts`) writes ONLY an attachment, while `brandData.logoUrl` can hold a stale
+  scraped URL — what the user sees in brand config must be what generation composites. If Emma
+  re-scrapes and updates only `brandData.logoUrl`, the older auto-attachment still wins; acceptable
+  because the deterministic step writes both with the same URL.
+- **Failing the onboarding ad-image run on missing logo is the intended UX** (vs. generating wordmark
+  variants). Matches Fangfang's interim guidance ("upload/review the logo in brand config before image
+  creation") and AC-3, but it's a visible behavior change on accounts with undiscoverable logos.
+- **The `promptRequestsLogo` heuristic** (`/\blogos?\b/i` with a negation guard) is deliberately
+  narrow; prompts that mean the logo without saying "logo" ("with our brand mark") won't trigger the
+  gate. The model still passes `logo_image` explicitly on those per its tool description.
+
 ## Resolve-bridge @Emma parrot: mention serialization pinned live + a PII hijack closed (2026-07-15, ENG-316)
 
 The resolve bridge now parrots the latest `@Emma <message>` comment on a bug canonical as the
