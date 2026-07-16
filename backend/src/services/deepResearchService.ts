@@ -140,7 +140,14 @@ export class DeepResearchService {
       
       // Add formatting instructions based on tone and style
       const formatInstructions: string[] = [];
-      
+
+      // ENG-351: cite the source of every quoted figure inline, next to the number it
+      // supports — matching the Claude/Gemini inline-citation style — so readers can
+      // trace each figure without scrolling to a separate references section.
+      formatInstructions.push(
+        'Cite the source of every quoted number, statistic, or data point INLINE — immediately next to the figure it supports (a linked source or a parenthetical attribution) — rather than collecting sources only in a separate references section at the end. Match the inline-citation style of Claude and Gemini outputs, where the source sits adjacent to the claim it backs.'
+      );
+
       if (params.tone) {
         const toneDescriptions: Record<string, string> = {
           'professional': 'professional and authoritative, suitable for business audiences',
