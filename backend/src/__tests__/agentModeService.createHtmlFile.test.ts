@@ -330,6 +330,12 @@ describe('AgentModeService - createHtmlFile', () => {
         expect(result.success).toBe(false);
         expect(result.error).toContain('timed out');
         expect(mockGenerateHTML).toHaveBeenCalledTimes(3);
+        // Exhaustion on a transient error is logged distinctly so it can be
+        // separated from one-off blips and terminal errors (ENG-203 observability).
+        expect(consoleErrorSpy).toHaveBeenCalledWith(
+          expect.stringContaining('exhausted all 3 attempts on a transient error'),
+          expect.anything()
+        );
 
         consoleErrorSpy.mockRestore();
         consoleWarnSpy.mockRestore();
