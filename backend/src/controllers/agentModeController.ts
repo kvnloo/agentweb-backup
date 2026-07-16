@@ -20,6 +20,17 @@ import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } fro
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
+import {
+  isRunStoreEnabled,
+  interactiveIdempotencyKey,
+  createSessionIdempotencyKey,
+  claimIdempotency,
+  releaseIdempotency,
+  recordIdempotencySessionId,
+  createRunRecord,
+  markRunTerminal,
+  IDEM_TTL_INTERACTIVE_S,
+} from '../services/agentMode/runStore';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
@@ -1660,6 +1671,12 @@ export async function runScheduledChat(
           subject: `Scheduled Chat Failed: ${schedule.scheduleName}`,
           message: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
           sessionId,
+          // One alert per (user, schedule, errorClass) per hour — a flapping
+          // schedule cannot flood oncall (ENG-145/146 class). Gated so flag
+          // off = today's exact behavior.
+          ...(isRunStoreEnabled()
+            ? { dedupeKey: `scheduled_chat:${userId}:${schedule.scheduleId}:validation_failed`, dedupeWindowMs: 60 * 60 * 1000 }
+            : {}),
           context: {
             'Schedule ID': schedule.scheduleId,
             'Schedule Name': schedule.scheduleName,
@@ -1866,6 +1883,11 @@ export async function runScheduledChat(
         message: zeroAssistantOutput
           ? `Scheduled chat "${schedule.scheduleName}" terminated with zero assistant messages.${zeroAssistantRequeuedAt ? ` It was requeued for ${zeroAssistantRequeuedAt}.` : ''}\n\nError: ${errorMessage}`
           : `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
+        // One alert per (user, schedule, errorClass) per hour (ENG-145/146
+        // class). Gated so flag off = today's exact behavior.
+        ...(isRunStoreEnabled()
+          ? { dedupeKey: `scheduled_chat:${userId}:${schedule.scheduleId}:${zeroAssistantOutput ? 'zero_output' : 'run_error'}`, dedupeWindowMs: 60 * 60 * 1000 }
+          : {}),
         sessionId: sessionId || undefined,
         context: {
           'Schedule ID': schedule.scheduleId,
@@ -2629,10 +2651,40 @@ export const agentModeController = {
 
   // Create new agent chat session
   async createSession(req: Request, res: Response) {
+    // Session-creation idempotency (ENG-147: one client "send" retried into
+    // ~30 create-session calls on 6/27). Hoisted so the catch block can
+    // release a held claim after an error unwinds.
+    let createIdemKeyHeld: string | undefined;
     try {
       const authReq = req as AuthenticatedRequest;
       const user = authReq.user as User;
-      const { portalType = 'agent', pageIdentifier = 'agent-mode', sessionType } = req.body;
+      const { portalType = 'agent', pageIdentifier = 'agent-mode', sessionType, idempotencyKey } = req.body;
+
+      // Cross-restart duplicate-submit lock, keyed by the client-provided
+      // idempotencyKey scoped to this user. The conditional idem#… put means
+      // exactly one of N concurrent duplicates creates a session; losers
+      // ATTACH to the winner's session once it's recorded, or get 409 while
+      // the winner is still in flight. No key (or flag off) = today's exact
+      // behavior — every call creates a fresh session.
+      if (isRunStoreEnabled() && typeof idempotencyKey === 'string' && idempotencyKey.length > 0) {
+        const idemKey = createSessionIdempotencyKey(user.userId, idempotencyKey);
+        const claim = await claimIdempotency(idemKey, uuidv4(), IDEM_TTL_INTERACTIVE_S);
+        if (!claim.claimed) {
+          if (claim.sessionId) {
+            const existing = await chatbotDb.getChatSession(claim.sessionId);
+            if (existing && existing.userId === user.userId) {
+              // Duplicate of a completed create — attach to the winner's session.
+              return res.status(200).json({ ...existing, idempotentReplay: true });
+            }
+          }
+          return res.status(409).json({
+            error: 'Duplicate submit',
+            message: 'This request was already submitted and is still being processed. Please retry in a moment.',
+            code: 'DUPLICATE_SUBMIT',
+          });
+        }
+        createIdemKeyHeld = idemKey;
+      }
 
       // Determine sessionType: if explicitly provided, use it; otherwise default to 'regular'
       // For ad image generation from Images page, sessionType should be 'image-generation'
@@ -2667,9 +2719,21 @@ export const agentModeController = {
       }
       const sessionWithModel = await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
 
+      // Stamp the winner's sessionId on the idem claim so duplicate losers
+      // attach to THIS session instead of getting 409 (best-effort by design —
+      // on failure losers 409 until the 10m ttl bounds the staleness).
+      if (createIdemKeyHeld) {
+        await recordIdempotencySessionId(createIdemKeyHeld, session.sessionId);
+      }
+
       res.status(201).json(sessionWithModel);
     } catch (error) {
       console.error('AgentMode: Create session error:', error);
+      // Release the claim so the client's retry is accepted — a failed create
+      // must not lock the user out for the idem ttl.
+      if (createIdemKeyHeld) {
+        await releaseIdempotency(createIdemKeyHeld);
+      }
       res.status(500).json({ error: 'Failed to create session' });
     }
   },
@@ -2757,6 +2821,10 @@ export const agentModeController = {
 
   // Generate AI response for marketing conversation
   async generateResponse(req: Request, res: Response) {
+    // Run-survival tracking (ENG-147) — hoisted so the catch block can mark
+    // the durable run record terminal after an error unwinds the inner finally.
+    let runSurvivalRunId: string | undefined;
+    let idemKeyHeld: string | undefined;
     try {
       const user = req.user as User;
       const { sessionId, llmModel, attachments, currentUrl, structuredContext, screenshot, audioInput } = req.body;
@@ -2776,10 +2844,36 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Session ID and user message are required' });
       }
 
+      // Cross-restart duplicate-submit lock (ENG-147: one question spawned ~30
+      // sessions). Claimed BEFORE the in-process Set: two layers, ONE concept —
+      // the conditional idem#sha256(sessionId+userMessage+llmModel) put dedupes
+      // duplicates across retries/restarts, the Set guards in-process
+      // concurrency. The loser gets the existing 409 shape + the in-flight runId.
+      if (isRunStoreEnabled()) {
+        runSurvivalRunId = uuidv4();
+        const idemKey = interactiveIdempotencyKey(sessionId, userMessage, llmModel || '');
+        const claim = await claimIdempotency(idemKey, runSurvivalRunId, IDEM_TTL_INTERACTIVE_S);
+        if (!claim.claimed) {
+          return res.status(409).json({
+            error: 'Session is busy',
+            message: 'A response is already being generated for this session. Please wait.',
+            code: 'SESSION_BUSY',
+            ...(claim.inFlightRunId ? { runId: claim.inFlightRunId } : {}),
+          });
+        }
+        idemKeyHeld = idemKey;
+      }
+
       // Reject concurrent requests for the same session. The claim is atomic
       // (check-and-set in one call) so two near-simultaneous requests can never
       // both proceed — exactly one wins, the other gets 409 SESSION_BUSY.
       if (!tryClaimSessionGeneration(sessionId)) {
+        // A DIFFERENT message on a busy session: give back the idem claim we
+        // just took so the user's retry (after the busy run finishes) is accepted.
+        if (idemKeyHeld) {
+          await releaseIdempotency(idemKeyHeld);
+          idemKeyHeld = undefined;
+        }
         return res.status(409).json({
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
@@ -2807,6 +2901,18 @@ export const agentModeController = {
       // Clear old progress store (but keep active connections)
       // Don't call cleanupProgress here as it removes active SSE connections
       progressStore.delete(sessionId);
+
+      // Durable run record, minted ONCE at intake. NO-FALLBACK: creation
+      // failure aborts this request loudly (dedupe would lie without the
+      // record) — the session lock and idem claim release in finally/catch.
+      if (isRunStoreEnabled() && runSurvivalRunId) {
+        await createRunRecord({
+          runId: runSurvivalRunId,
+          kind: 'interactive',
+          sessionId,
+          userId: session.userId,
+        });
+      }
 
       // Cancel generation immediately when the client disconnects (e.g. Stop button aborts the fetch).
       // This fires before /stop reaches the backend and ensures the worker receives the cancel signal
@@ -2848,6 +2954,12 @@ export const agentModeController = {
           if (inFlight) {
             markProgressComplete(sessionId);
             res.json({ content: STILL_BUILDING_MESSAGE, stillBuilding: true });
+            // This request's lifecycle is over (it handed off to the detached
+            // build) — without a terminal mark the run record would sit
+            // status='running' for its whole 30d ttl. Best-effort by design.
+            if (runSurvivalRunId) {
+              void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'detached_still_building' });
+            }
             return;
           }
         } catch (reconnectErr) {
@@ -2903,6 +3015,12 @@ export const agentModeController = {
                 metadata: { timestamp: new Date().toISOString() },
               }).catch(() => {});
               res.json({ content: STILL_BUILDING_MESSAGE, stillBuilding: true });
+              // Same as the pre-generation reconnect above: the request ended
+              // by detaching — mark the run record terminal or it stays
+              // 'running' for 30d. Best-effort by design.
+              if (runSurvivalRunId) {
+                void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'detached_still_building' });
+              }
               return;
             }
           } catch (durErr) {
@@ -2974,11 +3092,44 @@ export const agentModeController = {
         ...(invalidations ? { invalidations } : {}),
         ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
+
+      // Terminal update is best-effort BY DESIGN: markRunTerminal retries once,
+      // then fires one deduped oncall alert — it can never retro-fail a chat
+      // that was already delivered above.
+      if (runSurvivalRunId) {
+        void markRunTerminal(runSurvivalRunId, 'completed');
+      }
       } finally {
         releaseSessionGeneration(sessionId);
+        // Terminal state reached (success OR error unwinding through here):
+        // release the submit-lock so an identical, legitimate resubmit is
+        // accepted. Best-effort — on failure the item expires via its 10m ttl.
+        if (idemKeyHeld) {
+          await releaseIdempotency(idemKeyHeld);
+          idemKeyHeld = undefined;
+        }
       }
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
+
+      // Run-survival: record the terminal state on the durable run record.
+      // Worker death = 'interrupted' (the honest state — tools may not have
+      // executed); anything else = 'failed'. Best-effort by design (see
+      // markRunTerminal) — never blocks the error response below. If
+      // createRunRecord itself threw, markRunTerminal is a conditional no-op.
+      if (runSurvivalRunId) {
+        const wasInterrupted = error instanceof Error && isWorkerShutdownError(error);
+        void markRunTerminal(
+          runSurvivalRunId,
+          wasInterrupted ? 'interrupted' : 'failed',
+          { finishReason: wasInterrupted ? 'worker_exit' : 'error' }
+        );
+      }
+
+      // No idem release here: every path that errors with the claim held runs
+      // through the inner finally first (releaseIdempotency never throws, and
+      // the pre-inner-try code between claim and lock is synchronous Set ops),
+      // so idemKeyHeld is always undefined by the time this catch runs.
 
       // Clean up progress store on error so session doesn't appear stuck in generating state
       const sessionId = req.body?.sessionId;

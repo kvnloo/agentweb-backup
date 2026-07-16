@@ -339,4 +339,97 @@ describe("onboardingBrandBuildService", () => {
       expect(touchedBrandStatus).toBeUndefined();
     });
   });
+
+  describe("deterministic brand-logo persistence (ENG-326 AC-1)", () => {
+    const readyFlow = () => {
+      userDb.getUserById
+        // entrance
+        .mockResolvedValueOnce({
+          userId: "u1",
+          productDomain: "https://acme.com",
+          brandBuildStatus: "building",
+          brandBuildStartedAt: new Date().toISOString(),
+        })
+        // post-Emma read
+        .mockResolvedValueOnce({
+          userId: "u1",
+          productDomain: "https://acme.com",
+          brandBuildStatus: "ready",
+          brandGuidelines: { brandData: { brandName: "Acme" } },
+        })
+        // final-status check
+        .mockResolvedValueOnce({ userId: "u1", brandBuildStatus: "ready" });
+      return {
+        createChatSession: jest.fn().mockResolvedValueOnce({ sessionId: "s1" }),
+        generateSessionResponse: jest.fn().mockResolvedValueOnce({}),
+      };
+    };
+
+    it("runs the deterministic logo step with the company URL after a successful build", async () => {
+      const ensureBrandLogo = jest
+        .fn()
+        .mockResolvedValue({ persisted: true, logoUrl: "https://s3/logo.png", reason: "persisted" });
+
+      await triggerBrandBuildForUser("u1", {
+        ...readyFlow(),
+        ensureBrandLogo,
+      });
+
+      expect(ensureBrandLogo).toHaveBeenCalledTimes(1);
+      expect(ensureBrandLogo).toHaveBeenCalledWith("u1", "https://acme.com");
+      // The build must not be flipped to failed by the logo step.
+      const failedWrite = userDb.updateUser.mock.calls.find(
+        (c: any[]) => c[1]?.brandBuildStatus === "failed",
+      );
+      expect(failedWrite).toBeUndefined();
+    });
+
+    it("does NOT run the logo step when the build failed (Emma never wrote the brand)", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          productDomain: "https://acme.com",
+          brandBuildStatus: "building",
+          brandBuildStartedAt: new Date().toISOString(),
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          productDomain: "https://acme.com",
+          brandBuildStatus: "building",
+          brandBuildStartedAt: new Date().toISOString(),
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          productDomain: "https://acme.com",
+          brandBuildStatus: "building",
+          brandBuildStartedAt: new Date().toISOString(),
+        });
+      const ensureBrandLogo = jest.fn();
+
+      await triggerBrandBuildForUser("u1", {
+        createChatSession: jest.fn().mockResolvedValueOnce({ sessionId: "s1" }),
+        generateSessionResponse: jest.fn().mockResolvedValueOnce({}),
+        ensureBrandLogo,
+      });
+
+      expect(ensureBrandLogo).not.toHaveBeenCalled();
+    });
+
+    it("a crashing logo step never fails a build that already succeeded", async () => {
+      const ensureBrandLogo = jest
+        .fn()
+        .mockRejectedValue(new Error("Puppeteer exploded"));
+
+      await triggerBrandBuildForUser("u1", {
+        ...readyFlow(),
+        ensureBrandLogo,
+      });
+
+      expect(ensureBrandLogo).toHaveBeenCalledTimes(1);
+      const failedWrite = userDb.updateUser.mock.calls.find(
+        (c: any[]) => c[1]?.brandBuildStatus === "failed",
+      );
+      expect(failedWrite).toBeUndefined();
+    });
+  });
 });
