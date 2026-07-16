@@ -2647,6 +2647,21 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Session ID and user message are required' });
       }
 
+      // Session ownership (ENG-346). Deliberately BEFORE the idempotency claim
+      // and the session-busy lock: an unauthorized requester must not be able
+      // to create/hold an idem claim or trip the busy lock for someone else's
+      // session (a squatted claim would 409 the real owner for its ttl window).
+      // Same predicate as getSession — owner or admin. Delegated tokens already
+      // resolve req.user to the TARGET user (middleware/auth.ts), so plain
+      // equality is delegation-safe.
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+      if (session.userId !== user.userId && !user.isAdmin) {
+        return res.status(403).json({ error: 'Unauthorized access to session' });
+      }
+
       // Cross-restart duplicate-submit lock (ENG-147: one question spawned ~30
       // sessions). Claimed BEFORE the in-process Set: two layers, ONE concept —
       // the conditional idem#sha256(sessionId+userMessage+llmModel) put dedupes
@@ -2695,11 +2710,7 @@ export const agentModeController = {
         });
       }
 
-      // Get session
-      const session = await chatbotDb.getChatSession(sessionId);
-      if (!session) {
-        return res.status(404).json({ error: 'Session not found' });
-      }
+      // (Session was fetched + ownership-checked above, before the locks.)
 
       // Clear old progress store (but keep active connections)
       // Don't call cleanupProgress here as it removes active SSE connections
