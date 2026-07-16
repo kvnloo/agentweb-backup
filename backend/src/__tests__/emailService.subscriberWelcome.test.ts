@@ -1,9 +1,5 @@
-// Mock nodemailer
-jest.mock('nodemailer', () => ({
-  createTransport: jest.fn(() => ({
-    sendMail: jest.fn().mockResolvedValue({ messageId: 'test-message-id' })
-  }))
-}));
+// ENG-164: SMTP path deleted — all subscriber welcome emails go through
+// resendService with a task-level -> account-level -> system-default sender.
 
 // Mock database services
 jest.mock('../services/db', () => ({
@@ -25,23 +21,16 @@ jest.mock('../services/resendService', () => ({
 import { emailService } from '../services/emailService';
 import { taskDb, userDb } from '../services/db';
 import { resendService } from '../services/resendService';
+import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 
-// Mock environment variables
-process.env.SMTP_HOST = 'test-smtp-host';
-process.env.SMTP_PORT = '587';
-process.env.SMTP_USER = 'test-user';
-process.env.SMTP_PASS = 'test-pass';
-process.env.FROM_EMAIL = 'test@example.com';
 process.env.CUSTOMER_FRONTEND_URL = 'https://customer.agentweb.pro';
 
-describe('EmailService - Subscriber Welcome Email', () => {
-  const mockSendEmail = jest.fn();
+const SYSTEM_FROM = `${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`;
 
+describe('EmailService - Subscriber Welcome Email', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockSendEmail.mockResolvedValue(undefined);
     (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'resend-email-id' });
-    (emailService as any).sendEmail = mockSendEmail;
   });
 
   describe('sendSubscriberWelcomeEmail', () => {
@@ -49,7 +38,7 @@ describe('EmailService - Subscriber Welcome Email', () => {
     const email = 'subscriber@example.com';
     const taskName = 'My Test Task';
 
-    it('should send welcome email using SMTP when no custom sender configured', async () => {
+    it('should send via Resend with the system sender when no custom sender configured', async () => {
       const mockTask = {
         taskId,
         userId: 'user-123',
@@ -73,13 +62,14 @@ describe('EmailService - Subscriber Welcome Email', () => {
 
       expect(taskDb.getTaskById).toHaveBeenCalledWith(taskId);
       expect(userDb.getUserById).toHaveBeenCalledWith('user-123');
-      expect(mockSendEmail).toHaveBeenCalledWith(
-        email,
-        `Welcome! You've subscribed to ${taskName}`,
-        expect.stringContaining(taskName),
-        expect.stringContaining(taskName)
-      );
-      expect(resendService.sendEmail).not.toHaveBeenCalled();
+      expect(resendService.sendEmail).toHaveBeenCalledWith({
+        from: SYSTEM_FROM,
+        to: email,
+        subject: `Welcome! You've subscribed to ${taskName}`,
+        html: expect.stringContaining(taskName),
+        text: expect.stringContaining(taskName),
+        replyTo: 'support@agentweb.pro',
+      });
     });
 
     it('should send welcome email using Resend when task has custom sender', async () => {
@@ -108,7 +98,6 @@ describe('EmailService - Subscriber Welcome Email', () => {
         html: expect.stringContaining(taskName),
         text: expect.stringContaining(taskName),
       });
-      expect(mockSendEmail).not.toHaveBeenCalled();
     });
 
     it('should send welcome email using Resend when account has default sender', async () => {
@@ -140,7 +129,6 @@ describe('EmailService - Subscriber Welcome Email', () => {
         html: expect.stringContaining(taskName),
         text: expect.stringContaining(taskName),
       });
-      expect(mockSendEmail).not.toHaveBeenCalled();
     });
 
     it('should include unsubscribe link in email', async () => {
@@ -165,9 +153,9 @@ describe('EmailService - Subscriber Welcome Email', () => {
 
       await emailService.sendSubscriberWelcomeEmail(email, taskId);
 
-      const callArgs = mockSendEmail.mock.calls[0];
-      const htmlContent = callArgs[3];
-      const textContent = callArgs[2];
+      const sendArgs = (resendService.sendEmail as jest.Mock).mock.calls[0][0];
+      const htmlContent = sendArgs.html;
+      const textContent = sendArgs.text;
 
       expect(htmlContent).toContain('/unsubscribe?taskId=');
       expect(htmlContent).toContain(`taskId=${taskId}`);
@@ -175,7 +163,7 @@ describe('EmailService - Subscriber Welcome Email', () => {
       expect(textContent).toContain('/unsubscribe?taskId=');
     });
 
-    it('should not include AgentWeb branding in email', async () => {
+    it('should not include AgentWeb branding in email body', async () => {
       const mockTask = {
         taskId,
         userId: 'user-123',
@@ -197,9 +185,9 @@ describe('EmailService - Subscriber Welcome Email', () => {
 
       await emailService.sendSubscriberWelcomeEmail(email, taskId);
 
-      const callArgs = mockSendEmail.mock.calls[0];
-      const htmlContent = callArgs[3];
-      const textContent = callArgs[2];
+      const sendArgs = (resendService.sendEmail as jest.Mock).mock.calls[0][0];
+      const htmlContent = sendArgs.html;
+      const textContent = sendArgs.text;
 
       expect(htmlContent).not.toContain('AgentWeb');
       expect(htmlContent).not.toContain('The AgentWeb Team');
@@ -212,7 +200,6 @@ describe('EmailService - Subscriber Welcome Email', () => {
 
       await emailService.sendSubscriberWelcomeEmail(email, taskId);
 
-      expect(mockSendEmail).not.toHaveBeenCalled();
       expect(resendService.sendEmail).not.toHaveBeenCalled();
     });
 
@@ -228,9 +215,31 @@ describe('EmailService - Subscriber Welcome Email', () => {
 
       await emailService.sendSubscriberWelcomeEmail(email, taskId);
 
-      expect(mockSendEmail).not.toHaveBeenCalled();
       expect(resendService.sendEmail).not.toHaveBeenCalled();
+    });
+
+    it('does not throw when the Resend send fails (subscription must still succeed)', async () => {
+      const mockTask = {
+        taskId,
+        userId: 'user-123',
+        name: taskName,
+        emailSender: null,
+        fromName: null,
+        sendHtmlReportOnly: false,
+      };
+
+      const mockUser = {
+        userId: 'user-123',
+        emailDomain: null,
+        defaultSenderUsername: null,
+        fromName: null,
+      };
+
+      (taskDb.getTaskById as jest.Mock).mockResolvedValue(mockTask);
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (resendService.sendEmail as jest.Mock).mockRejectedValue(new Error('Resend API error: down'));
+
+      await expect(emailService.sendSubscriberWelcomeEmail(email, taskId)).resolves.toBeUndefined();
     });
   });
 });
-
