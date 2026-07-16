@@ -117,7 +117,7 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
   return undefined;
 }
 const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
-import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
+import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { twitterService } from './twitterService';
 import * as linkedInAdsService from './linkedInAdsService';
@@ -14539,7 +14539,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * Keys that indicate a destination/creative content change rather than an ad-level change.
    * When these are present in params, we need to create a new creative and swap it.
    */
-  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets'];
+  // 'url_tags' lives on the creative, same as the others — an ad-level update
+  // silently drops it (see updateAd's params typing), so a UTM-only retag
+  // (ENG-239 retrofit, agentModeService.retagMetaAdUtm) must also go through
+  // the swap path. carriedUrlTags below already forwards it correctly.
+  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets', 'url_tags'];
 
   public async updateMetaAdsAd(userId: string, adId: string, params: any, account_id?: string): Promise<any> {
     try {
@@ -14978,6 +14982,70 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to delete Meta ad.',
+        error: error.message
+      };
+    }
+  }
+
+  /**
+   * Retag ONE existing, already-live Meta ad that's missing UTMs (Harsha's ask —
+   * the audit tool can only find these, never fix them). Deliberately single-ad:
+   * never loop or accept a list, so there is no "bulk retag" surface.
+   *
+   * Meta creatives are immutable for `url_tags`/`link_url`, so this reuses the
+   * SAME create-new-creative-then-swap machinery `updateAdViaCreativeSwap`
+   * already provides for other field changes — only `url_tags` changes here,
+   * the ad's existing destination is preserved untouched.
+   *
+   * Callers (the Emma tool) MUST tell the user before invoking this: swapping a
+   * live creative resets the ad's learning phase, which can hurt a paying
+   * client's performance. That is not enforced here — it belongs in the tool
+   * description Emma reads before deciding to call it.
+   */
+  public async retagMetaAdUtm(userId: string, adId: string, account_id?: string): Promise<any> {
+    try {
+      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+
+      const adData = await metaService.getAd(accessToken, adId);
+      const creativeId = adData?.creative?.creative_id || adData?.creative?.id;
+      if (!creativeId) {
+        return {
+          success: false,
+          message: 'Could not determine the current creative for this ad. The ad may not have a creative assigned.',
+          error: 'MISSING_CREATIVE'
+        };
+      }
+
+      const creativeData = await metaService.getAdCreative(accessToken, creativeId);
+      if (!creativeData?.object_story_spec) {
+        return {
+          success: false,
+          message: 'Could not read the current creative details. The creative may have been deleted or is in an unsupported format.',
+          error: 'MISSING_OBJECT_STORY_SPEC'
+        };
+      }
+
+      // Same reference-link extraction resolveUrlTags/updateAdViaCreativeSwap use:
+      // top-level link_data/video_data link, plus every carousel card's link.
+      const spec = creativeData.object_story_spec;
+      const linkUrls: string[] = [
+        spec.link_data?.link,
+        spec.video_data?.call_to_action?.value?.link,
+        ...(spec.link_data?.child_attachments?.map((c: any) => c.link) ?? []),
+      ].filter((u: any): u is string => Boolean(u));
+
+      const { urlTags, changed } = computeRetagUrlTags(creativeData.url_tags, linkUrls);
+      if (!changed) {
+        return { success: true, alreadyTagged: true };
+      }
+
+      return await this.updateMetaAdsAd(userId, adId, { url_tags: urlTags }, account_id);
+    } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
+      console.error('AgentMode: Error retagging Meta ad UTMs:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to retag Meta ad UTMs.',
         error: error.message
       };
     }

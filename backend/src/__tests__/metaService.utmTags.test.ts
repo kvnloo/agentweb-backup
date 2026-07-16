@@ -1,4 +1,4 @@
-import { MetaService } from '../services/metaService';
+import { MetaService, computeRetagUrlTags } from '../services/metaService';
 import { AdAccount, AdCreative } from 'facebook-nodejs-business-sdk';
 
 // Mock the facebook-nodejs-business-sdk (mirrors metaService.test.ts, scoped to the
@@ -223,5 +223,47 @@ describe('MetaService — url_tags edge cases', () => {
       carousel_cards: [{ link_url: 'not a url', image_hash: 'h1' }],
     };
     expect((MetaService as any).resolveUrlTags(params)).toBeUndefined();
+  });
+});
+
+describe('computeRetagUrlTags — single existing ad retrofit (Harsha\'s ask)', () => {
+  it('reports unchanged when the link already carries every UTM key and there is no existing url_tags', () => {
+    const result = computeRetagUrlTags(
+      undefined,
+      ['https://a.com/?utm_source=a&utm_medium=b&utm_campaign=c&utm_content=d&utm_term=e'],
+    );
+    expect(result).toEqual({ urlTags: undefined, changed: false });
+  });
+
+  it('reports unchanged when the existing url_tags already carries every required key', () => {
+    const existing = 'utm_source=meta&utm_medium=paid&utm_campaign={{campaign.id}}&utm_content={{ad.id}}';
+    const result = computeRetagUrlTags(existing, ['https://a.com/']);
+    expect(result).toEqual({ urlTags: existing, changed: false });
+  });
+
+  it('does not touch anything when a link URL is unparseable (never risk a duplicate)', () => {
+    const result = computeRetagUrlTags('utm_source=meta', ['not a url']);
+    expect(result).toEqual({ urlTags: 'utm_source=meta', changed: false });
+  });
+
+  it('builds the full UTM set when there is no existing url_tags and the link carries none (happy path)', () => {
+    const result = computeRetagUrlTags(undefined, ['https://a.com/']);
+    expect(result.changed).toBe(true);
+    expect(result.urlTags).toBe('utm_source=meta&utm_medium=paid&utm_campaign={{campaign.id}}&utm_content={{ad.id}}');
+  });
+
+  it('merges in only the missing keys, preserving existing url_tags content verbatim', () => {
+    const result = computeRetagUrlTags('utm_source=meta&partner_id=123', ['https://a.com/']);
+    expect(result.changed).toBe(true);
+    expect(result.urlTags).toBe(
+      'utm_source=meta&partner_id=123&utm_medium=paid&utm_campaign={{campaign.id}}&utm_content={{ad.id}}',
+    );
+  });
+
+  it('omits a key already present on the link URL even if url_tags does not have it', () => {
+    const result = computeRetagUrlTags(undefined, ['https://a.com/?utm_source=partner']);
+    expect(result.changed).toBe(true);
+    expect(result.urlTags).not.toContain('utm_source');
+    expect(result.urlTags).toContain('utm_medium=paid');
   });
 });

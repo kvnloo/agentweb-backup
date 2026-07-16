@@ -3,7 +3,7 @@ import axios from 'axios';
 import { MetaAdAccount, MetaPage } from '../types/meta';
 import { INTEGRATION_CONFIG } from '../config/integrations';
 import { getMetaCredentials } from '../utils/secretsManager';
-import { buildUtmSpec, readUtmKeys, utmQueryString } from '../utils/adUtm';
+import { buildUtmSpec, readUtmKeys, utmQueryString, mergeUtmIntoQueryString, utmKeysInQueryString } from '../utils/adUtm';
 
 export interface MetaAdsCampaignParams {
   name: string;
@@ -1866,3 +1866,40 @@ export class MetaService {
 }
 
 export const metaService = MetaService.getInstance();
+
+/**
+ * Compute the `url_tags` an existing, already-live ad should carry after a
+ * single-ad UTM retrofit (Harsha's ask — the audit tool can only find campaigns
+ * missing UTMs, never fix them).
+ *
+ * Mirrors `resolveUrlTags`'s algorithm (a key already on ANY reference link URL
+ * is never duplicated into `url_tags`) but operates on primitives instead of a
+ * full `MetaAdsAdCreativeParams`, since a retrofit only has what it read back
+ * from an existing creative, not a caller-supplied params object.
+ *
+ * `changed:false` means nothing should be written — either every required key
+ * is already present (on `currentUrlTags` or any link URL), or a link URL could
+ * not be parsed and we refuse to risk a duplicate. The caller (the creative-swap
+ * retrofit) uses `changed` to skip the API call entirely rather than diffing
+ * strings, which would be fooled by a normalized leading `?`/`&` on the input.
+ */
+export function computeRetagUrlTags(
+  currentUrlTags: string | undefined,
+  linkUrls: string[],
+): { urlTags: string | undefined; changed: boolean } {
+  const omit = new Set<string>(utmKeysInQueryString(currentUrlTags));
+  for (const url of linkUrls) {
+    const keys = readUtmKeys(url);
+    // Unreadable link → we cannot know what it already carries, so we do not
+    // tag at all rather than risk a duplicate — same rule as resolveUrlTags.
+    if (!keys) return { urlTags: currentUrlTags, changed: false };
+    for (const k of keys) omit.add(k);
+  }
+
+  const spec = buildUtmSpec('meta', { campaign: '{{campaign.id}}', content: '{{ad.id}}' });
+  const merged = mergeUtmIntoQueryString(currentUrlTags, spec, omit);
+  const normalizedCurrent = (currentUrlTags || '').replace(/^[?&]+/, '').replace(/&+$/, '');
+
+  if (merged === normalizedCurrent) return { urlTags: currentUrlTags, changed: false };
+  return { urlTags: merged || undefined, changed: true };
+}
