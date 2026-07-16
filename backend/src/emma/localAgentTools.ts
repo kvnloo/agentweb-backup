@@ -452,6 +452,36 @@ export function buildLocalAgentTimeoutResult(
   };
 }
 
+/**
+ * Route a parsed relay response to a graceful process-crash outcome, or null if it
+ * is not a worker crash and should fall through to normal result handling (ENG-339).
+ *
+ * A process-level crash (killed by a signal — OOM SIGKILL, etc.) recurs on every
+ * task, so it degrades to a non-retryable unavailable outcome instead of a task
+ * failure the model retries into the ground. BUT a SIGKILL that lands at the end of
+ * the timeout window is the relay's OWN per-task timeout (runner.py kills the worker
+ * on TimeoutExpired), not an OOM crash — that IS retryable with a larger timeout, so
+ * that path is preserved. `parsed.ok === true` and normal non-zero exits (returncode
+ * 1, "Page returned 500", …) return null and keep their existing error handling.
+ *
+ * Extracted from the handler so the exact routing — the ok-guard and the
+ * timeout-vs-crash split — is unit-testable without mocking the relay transport.
+ */
+export function classifyRelayProcessCrash(
+  parsed: { ok?: unknown; returncode?: number | null },
+  elapsedMs: number,
+  timeoutSeconds: number,
+):
+  | ReturnType<typeof buildLocalAgentTimeoutResult>
+  | ReturnType<typeof buildLocalAgentCrashResult>
+  | null {
+  if (parsed.ok === true || !isProcessCrashReturncode(parsed.returncode)) return null;
+  const returncode = parsed.returncode as number;
+  return isLikelyRelayTimeoutKill(returncode, elapsedMs, timeoutSeconds)
+    ? buildLocalAgentTimeoutResult(returncode, timeoutSeconds)
+    : buildLocalAgentCrashResult(returncode);
+}
+
 emmaToolRegistry.register({
   name: 'run_local_agent_task',
   definition: {
@@ -580,18 +610,11 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
       );
     }
 
-    // A process-level crash of the worker (killed by a signal — OOM SIGKILL, etc.)
-    // recurs on every task, so treat it as a graceful, non-retryable unavailable
-    // outcome instead of a task failure the model retries into the ground (ENG-339).
-    // BUT a SIGKILL that lands at the end of the timeout window is the relay's OWN
-    // per-task timeout (runner.py kills the worker on TimeoutExpired), not an OOM
-    // crash — that IS retryable with a larger timeout, so keep that recovery path.
-    if (parsed.ok !== true && isProcessCrashReturncode(parsed.returncode)) {
-      if (isLikelyRelayTimeoutKill(parsed.returncode, elapsedMs, timeoutSeconds)) {
-        return buildLocalAgentTimeoutResult(parsed.returncode, timeoutSeconds);
-      }
-      return buildLocalAgentCrashResult(parsed.returncode);
-    }
+    // A process-level worker crash (OOM SIGKILL, etc.) degrades gracefully instead
+    // of being retried into the ground; a timeout-kill stays retryable (ENG-339).
+    // See classifyRelayProcessCrash for the full routing rationale.
+    const crashResult = classifyRelayProcessCrash(parsed, elapsedMs, timeoutSeconds);
+    if (crashResult) return crashResult;
 
     const screenshotUrls: string[] = [];
     if (parsed.ok && Array.isArray(parsed.screenshots) && parsed.screenshots.length > 0) {
