@@ -489,6 +489,83 @@ describe('listBudgets', () => {
   });
 });
 
+describe('listBiddingStrategies (portfolio / shared strategies)', () => {
+  it('returns mapped portfolio strategies from GAQL search', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          biddingStrategy: {
+            resourceName: 'customers/123/biddingStrategies/555',
+            id: '555',
+            name: 'My Portfolio tCPA',
+            type: 'TARGET_CPA',
+            status: 'ENABLED',
+          },
+        }],
+      },
+    });
+    const strategies = await service.listBiddingStrategies('user-123', '1234567890');
+    expect(strategies).toHaveLength(1);
+    expect(strategies[0].resourceName).toBe('customers/123/biddingStrategies/555');
+    expect(strategies[0].name).toBe('My Portfolio tCPA');
+    expect(strategies[0].type).toBe('TARGET_CPA');
+    expect(strategies[0].status).toBe('ENABLED');
+  });
+
+  it('sends correct GAQL fields in the search query', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
+    await service.listBiddingStrategies('user-123', '1234567890');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.query).toContain('bidding_strategy.resource_name');
+    expect(body.query).toContain('bidding_strategy.type');
+  });
+});
+
+describe('updateCampaign — portfolio / shared bidding strategy', () => {
+  it('attaches a portfolio strategy by masking the bidding_strategy resource field', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    const didUpdate = await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+      biddingStrategyResourceName: 'customers/123/biddingStrategies/555',
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    const op = body.operations[0];
+    expect(op.update.biddingStrategy).toBe('customers/123/biddingStrategies/555');
+    expect(op.updateMask.split(',')).toContain('bidding_strategy');
+    // Portfolio attach is a scalar resource-name field — never emit an embedded-strategy path.
+    expect(op.updateMask).not.toContain('maximize_conversions');
+    expect(op.updateMask).not.toContain('target_spend');
+    expect(didUpdate).toBe(true);
+  });
+
+  it('rejects passing both a standard bidding_strategy and a portfolio resource name', async () => {
+    await expect(
+      service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+        biddingStrategy: 'MANUAL_CPC',
+        biddingStrategyResourceName: 'customers/123/biddingStrategies/555',
+      }),
+    ).rejects.toThrow(/either .*bidding_strategy.*or.*bidding_strategy_resource_name|not both/i);
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+});
+
+describe('createCampaign — portfolio / shared bidding strategy', () => {
+  it('creates a campaign attached to a portfolio strategy (no embedded strategy field)', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/campaigns/9' }] } });
+    const res = await service.createCampaign('user-123', '1234567890', {
+      name: 'Portfolio Campaign',
+      type: 'SEARCH',
+      budgetResourceName: 'customers/123/campaignBudgets/1',
+      biddingStrategyResourceName: 'customers/123/biddingStrategies/555',
+      locationTargetIds: [],
+    });
+    const create = mockAxiosPost.mock.calls[0][1].operations[0].create;
+    expect(create.biddingStrategy).toBe('customers/123/biddingStrategies/555');
+    expect(create.maximizeConversions).toBeUndefined();
+    expect(create.targetSpend).toBeUndefined();
+    expect(res.resourceName).toBe('customers/123/campaigns/9');
+  });
+});
+
 describe('listCampaigns', () => {
   it('returns campaigns from GAQL search', async () => {
     mockAxiosPost.mockResolvedValueOnce({
