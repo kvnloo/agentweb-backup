@@ -103,7 +103,12 @@ export function describeMemoryAge(savedAtIso: string | undefined, now: Date): st
   if (!savedAtIso) return null;
   const savedMs = Date.parse(savedAtIso);
   if (Number.isNaN(savedMs)) return null;
-  const days = Math.floor((now.getTime() - savedMs) / MS_PER_DAY);
+  // Compare UTC calendar dates, not raw 24h windows: the displayed saved-date is the UTC
+  // calendar date, so bucketing by elapsed hours would emit self-contradictory stamps like
+  // "(saved 2026-07-12, today)" around midnight — exactly when scheduled runs fire (ENG-305).
+  const savedDay = Date.parse(new Date(savedMs).toISOString().split('T')[0]);
+  const nowDay = Date.parse(new Date(now.getTime()).toISOString().split('T')[0]);
+  const days = Math.round((nowDay - savedDay) / MS_PER_DAY);
   if (days <= 0) return 'today';
   if (days === 1) return 'yesterday';
   return `${days} days ago`;
