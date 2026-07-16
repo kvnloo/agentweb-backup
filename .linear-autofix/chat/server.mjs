@@ -145,6 +145,7 @@ function listIssues() {
         identifier: e.identifier,
         standalone: e.standalone || false,
         ownerName: e.ownerName || null,
+        assigneeName: e.assignee?.name || null, // Linear assignee — shown in the sidebar so it's clear who owns the issue
         outcome: e.outcome,
         triage: e.triage || null,
         branch: e.branch || null,
