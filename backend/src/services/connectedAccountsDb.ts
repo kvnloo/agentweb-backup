@@ -324,7 +324,11 @@ export const createAccount = async (
   );
   const existingAccount = existingIndex >= 0 ? existingAccounts[existingIndex] : null;
 
+  // On reconnect (existing platform+account_id), spread the existing entry first so
+  // top-level fields like sharedWithOrg/engagementMemory survive re-OAuth (ENG-348),
+  // then override the refreshed fields.
   const accountConfig: ConnectedAccountConfig = {
+    ...existingAccount,
     platform,
     account_id: input.account_id,
     account_name: input.account_name,
