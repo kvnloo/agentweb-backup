@@ -347,11 +347,11 @@ describe('UTM — non-URL creative paths are untouched', () => {
 
 // ─── retagCreativeUtm — single existing creative retrofit (Harsha's ask) ───────
 //
-// UNVERIFIED against a live account: unlike the rest of this file (which mirrors
-// what LinkedIn's create-time API contract already proves out), the PARTIAL_UPDATE
-// shape used here (`content.textAd.landingPage` under a nested $set) is inferred
-// from the sibling campaign/campaignGroup convention, never confirmed live. Do not
-// treat these passing mocked tests as proof the live API accepts this shape.
+// The PARTIAL_UPDATE mechanism (POST + X-RestLi-Method + nested $set) is confirmed
+// against LinkedIn's own docs. UNVERIFIED: whether content.textAd.landingPage
+// specifically accepts a partial update (the docs' own examples only cover
+// top-level fields like intendedStatus) — do not treat these passing mocked
+// tests as proof the live API accepts an update at this nested path.
 describe('retagCreativeUtm — single existing creative retrofit (Harsha\'s ask)', () => {
   function mockGet(data: any) {
     mockAxiosFn.mockResolvedValueOnce({ data, headers: {}, status: 200 });
@@ -391,7 +391,7 @@ describe('retagCreativeUtm — single existing creative retrofit (Harsha\'s ask)
     const writeCall = mockAxiosFn.mock.calls[1][0];
     expect(writeCall.method).toBe('POST');
     expect(writeCall.headers['X-RestLi-Method']).toBe('PARTIAL_UPDATE');
-    const newUrl = writeCall.data.patch.$set['content.textAd.landingPage'];
+    const newUrl = writeCall.data.patch.$set.content.textAd.landingPage;
     expect(utm(newUrl).utm_source).toBe('linkedin');
     expect(utm(newUrl).utm_medium).toBe('paid');
     expect(utm(newUrl).utm_content).toBeUndefined();

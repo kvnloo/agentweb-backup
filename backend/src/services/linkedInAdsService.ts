@@ -967,14 +967,14 @@ export async function createCreativeInline(
  * the audit tool can only find these, never fix them). Deliberately single-creative:
  * never loop or accept a list, so there is no "bulk retag" surface.
  *
- * ⚠️ UNVERIFIED AGAINST A LIVE ACCOUNT. Unlike the rest of this file (whose
- * create-time contract is proven by LinkedIn's own API), this function's write
- * shape is inferred, not confirmed:
- *  - The PARTIAL_UPDATE (`POST` + `X-RestLi-Method: PARTIAL_UPDATE` + nested
- *    `$set`) is the pattern `updateCampaignGroup`/`updateCampaign` already use for
- *    campaign-level resources; whether the `creatives` resource accepts a PATCH at
- *    all, and whether `content.textAd.landingPage` is a valid nested $set path, is
- *    unverified.
+ * ⚠️ UNVERIFIED AGAINST A LIVE ACCOUNT. The mechanism itself (`POST` +
+ * `X-RestLi-Method: PARTIAL_UPDATE`, `$set` nested to mirror the resource's own
+ * shape — REST.li's convention per LinkedIn's own docs, e.g. `{ $set: {
+ * intendedStatus: "ACTIVE" } }` for a top-level field) is confirmed against
+ * LinkedIn's Marketing API docs (learn.microsoft.com/linkedin/marketing/...
+ * create-and-manage-creatives). What is still unverified:
+ *  - Whether `content.textAd.landingPage` specifically accepts a partial update
+ *    (the docs' own examples only show top-level fields like `intendedStatus`).
  *  - LinkedIn creatives may be immutable post-creation, same as Meta's — if so
  *    this fails live and needs a different design (delete + recreate, most likely).
  *
@@ -1016,7 +1016,7 @@ export async function retagCreativeUtm(
     'POST',
     `/rest/adAccounts/${adAccountId}/creatives/${encoded}`,
     accessToken,
-    { patch: { $set: { 'content.textAd.landingPage': newUrl } } },
+    { patch: { $set: { content: { textAd: { landingPage: newUrl } } } } },
     { 'X-RestLi-Method': 'PARTIAL_UPDATE' },
   );
 }

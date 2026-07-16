@@ -1108,6 +1108,13 @@ export class GoogleAdsService {
    * for the create AND edit paths. `success:false` here is ambiguous by design —
    * it means either "already fully tagged" or "no write was safe to make" — the
    * caller should not infer a specific reason from it.
+   *
+   * `final_url_suffix` is NOT annotated IMMUTABLE in the v24 `Ad` proto
+   * (googleapis/google/ads/googleads/v24/resources/ad.proto) — unlike the
+   * ad-type oneof fields (text_ad, image_ad, etc.), which are. This is the
+   * mechanism the still-unverified-live edit path (ENG-239 handoff item #1)
+   * relies on; still worth a live confirmation, but it is not resting on a
+   * field the API's own schema calls immutable.
    */
   async retagAdUtm(
     userId: string,
