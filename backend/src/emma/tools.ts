@@ -712,7 +712,7 @@ ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
   AD_SET        → LIST, CREATE, UPDATE, DELETE
   AD_CREATIVE   → LIST, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
-  AD            → LIST, CREATE, UPDATE, DELETE, COPY_AD
+  AD            → LIST, CREATE, UPDATE, DELETE, COPY_AD, RETAG_UTM
   CUSTOM_AUDIENCE → LIST, CREATE, UPLOAD_USERS
   TARGETING     → SEARCH
   PAGE          → LIST
@@ -731,7 +731,16 @@ REQUIRED IDs PER ACTION:
   AD CREATE               → ad_set_id required
   AD UPDATE/DELETE        → ad_id required
   AD COPY_AD              → ad_id (source ad to copy) required
+  AD RETAG_UTM            → ad_id required
   TARGETING SEARCH        → params.q and params.type required
+
+AD RETAG_UTM (ENG-239 — retrofit UTMs onto ONE existing ad that's missing them):
+  Only for ads that already exist and were found untagged, e.g. via audit_ad_utm_coverage. Never call this
+  in a loop over multiple ads — it is a single-target action, one ad per call, always. Retagging swaps in a
+  NEW creative for the ad, which RESETS THE AD'S LEARNING PHASE and can hurt performance on a live client
+  campaign. You MUST tell the user this cost explicitly before calling — do not call it as a quiet "fix" in
+  the middle of another task. The normal confirmation flow (see above) will also surface this same warning,
+  but say it yourself first regardless.
 
 REQUIRED PARAMS PER ENTITY + ACTION:
   CAMPAIGN CREATE:      name, objective, special_ad_categories (e.g. ["NONE"])
@@ -835,7 +844,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
         },
         action: {
           type: "string",
-          enum: ["LIST", "CREATE", "UPDATE", "DELETE", "COPY_AD", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
+          enum: ["LIST", "CREATE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
           description: "The operation to perform. Must be valid for the chosen entity_type."
         },
         account_id: {
@@ -1145,7 +1154,7 @@ ACTION MATRIX (entity_type → supported actions):
   AD_ACCOUNT      → LIST
   CAMPAIGN_GROUP  → LIST, CREATE, UPDATE
   CAMPAIGN        → LIST, CREATE, UPDATE
-  CREATIVE        → LIST, CREATE, CREATE_INLINE, CREATE_DYNAMIC
+  CREATIVE        → LIST, CREATE, CREATE_INLINE, CREATE_DYNAMIC, RETAG_UTM
   POST            → CREATE
   TARGETING       → LIST_FACETS, SEARCH, ESTIMATE_REACH
   MEDIA           → UPLOAD_IMAGE, UPLOAD_VIDEO, UPLOAD_DOCUMENT
@@ -1230,6 +1239,15 @@ REQUIRED PARAMS PER ENTITY + ACTION:
   CREATIVE CREATE: campaign_id + one of: post_urn (sponsored content/event/article/document), headline+description+landing_page (text ad), inmail_content_urn (message/conversation ad), vast_tag_url (VAST video). Optional: pre_event_registration_image (event ads). Lead Gen ad: also pass leadgen_form_urn + cta_label_type to attach an existing Lead Gen Form.
   CREATIVE CREATE_INLINE: Dark post only. Required: campaign_id, commentary, image_urn OR video_urn OR document_urn OR carousel_cards. Lead Gen ad (LEAD_GENERATION campaign): also pass leadgen_form_urn (adForm URN) + cta_label_type (e.g. SIGN_UP) to attach an existing Lead Gen Form.
   CREATIVE CREATE_DYNAMIC: campaign_id, format (JOBS|SPOTLIGHT|FOLLOW_COMPANY). JOBS needs headline+button_label. SPOTLIGHT needs headline+call_to_action+landing_page+logo_urn (logo_urn is REQUIRED — upload logo with MEDIA/UPLOAD_IMAGE first). FOLLOW_COMPANY needs headline.
+  CREATIVE RETAG_UTM (ENG-239 — retrofit UTMs onto ONE existing creative found untagged, e.g. via audit_ad_utm_coverage):
+    Requires creative_id + campaign_id. Single-target only, one creative per call — never loop over multiple.
+    ⚠️ UNVERIFIED against a live account — the write mechanism (a partial update on the creatives resource) is
+    inferred, not confirmed. It may fail entirely if LinkedIn treats creatives as immutable post-creation, same
+    as Meta. If it fails, tell the user plainly rather than retrying blindly.
+    Only works on TEXT_AD creatives — the far more common sponsored-content (post-reference) creative type has
+    its destination URL on the underlying LinkedIn POST, not the creative, and this action cannot retag those;
+    it will return an UNSUPPORTED_CREATIVE_TYPE error. Tell the user this plainly rather than treating it as a
+    generic failure.
   TARGETING SEARCH: facet (URN like urn:li:adTargetingFacet:locations), query (optional — omit for facets without typeahead like seniorities/industries)
     Common facets: locations, titles (job titles — NOT jobTitles), seniorities, industries, functions, staffCountRanges, memberInterests, skills
   TARGETING ESTIMATE_REACH: targeting_include (array of { facet_urn, values } — SAME shape as CAMPAIGN CREATE; resolve value URNs via TARGETING SEARCH first). Optional targeting_exclude. Returns { active, total }; total is 0 when the audience is under the 300-member minimum. ALWAYS run this before CAMPAIGN CREATE to confirm reach ≥ 300.
@@ -1265,7 +1283,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
         },
         action: {
           type: 'string',
-          enum: ['LIST', 'CREATE', 'CREATE_INLINE', 'CREATE_DYNAMIC', 'UPDATE', 'LIST_FACETS', 'SEARCH', 'ESTIMATE_REACH', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'UPLOAD_DOCUMENT', 'INIT_VIDEO_UPLOAD', 'FINALIZE_VIDEO', 'CREATE_CONTENT', 'SEND_TEST', 'SET_FIRST_CONTENT'],
+          enum: ['LIST', 'CREATE', 'CREATE_INLINE', 'CREATE_DYNAMIC', 'RETAG_UTM', 'UPDATE', 'LIST_FACETS', 'SEARCH', 'ESTIMATE_REACH', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'UPLOAD_DOCUMENT', 'INIT_VIDEO_UPLOAD', 'FINALIZE_VIDEO', 'CREATE_CONTENT', 'SEND_TEST', 'SET_FIRST_CONTENT'],
           description: 'The operation to perform. Must be valid for the chosen entity_type.'
         },
         account_id: {
@@ -1313,6 +1331,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
             },
             // Creative
             type: { type: 'string', enum: ['TEXT_AD', 'SPONSORED_UPDATES', 'SPONSORED_INMAILS', 'DYNAMIC'], description: 'Campaign/creative type.' },
+            creative_id: { type: 'string', description: 'Creative ID or URN. Required for CREATIVE/RETAG_UTM (with campaign_id). Obtain from CREATIVE LIST or audit_ad_utm_coverage.' },
             format: { type: 'string', description: 'Campaign or creative format. DYNAMIC campaigns: JOBS|SPOTLIGHT|FOLLOW_COMPANY. Event campaigns: SPONSORED_UPDATE_EVENT.' },
             reference: { type: 'string', description: 'Post URN for SPONSORED_UPDATES creatives.' },
             // Creative — text ad
@@ -8090,8 +8109,11 @@ ACTION MATRIX:
                UPDATE (ad_group_resource_name, name?, status?, cpc_bid_micros?, ad_rotation_mode?, target_cpa_micros?, target_roas?)
                REMOVE (ad_group_resource_name)
   KEYWORD     → LIST (ad_group_resource_name), ADD (ad_group_resource_name, keywords[]), ADD_NEGATIVE (keywords[], campaign_resource_name OR ad_group_resource_name), UPDATE (criterion_resource_name, status?, cpc_bid_micros?), REMOVE (criterion_resource_name)
-  AD          → LIST (ad_group_resource_name), CREATE (ad_group_resource_name, type [RESPONSIVE_SEARCH_AD|RESPONSIVE_DISPLAY_AD], headlines[], descriptions[], final_url), UPDATE (ad_resource_name, status?), REMOVE (ad_resource_name)
+  AD          → LIST (ad_group_resource_name), CREATE (ad_group_resource_name, type [RESPONSIVE_SEARCH_AD|RESPONSIVE_DISPLAY_AD], headlines[], descriptions[], final_url), UPDATE (ad_resource_name, status?), REMOVE (ad_resource_name), RETAG_UTM (ad_resource_name)
               NOTE: final_url, headlines, descriptions are ALL immutable after creation — to change any of these, REMOVE and recreate the ad
+              RETAG_UTM (ENG-239 — retrofit UTMs onto ONE existing ad found untagged, e.g. via audit_ad_utm_coverage): reads the ad's
+              current final_url and writes a UTM final_url_suffix if missing. This does NOT touch final_url/headlines/descriptions, so
+              it's safe on a live ad. Never call in a loop over multiple ads — single-target only, one ad per call.
   ASSET       → UPLOAD
   CAMPAIGN_ASSET → ATTACH (campaign_resource_name, assets[{fieldType, assetResourceName?, text?}])
               fieldType values: BUSINESS_NAME (use text), LOGO, SQUARE_MARKETING_IMAGE, MARKETING_IMAGE (use assetResourceName)

@@ -13775,7 +13775,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
         return this.listMetaAdsAds(userId, ad_set_id, account_id);
@@ -13791,6 +13791,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       case 'COPY_AD':
         if (!ad_id) throw new Error('ad_id (source_ad_id) is required for COPY_AD action');
         return this.copyMetaAdsAd(userId, ad_id, params, account_id);
+      case 'RETAG_UTM':
+        // ENG-239 retrofit: retags ONE existing ad, never a list. Swaps in a new
+        // creative -- the caller (Emma) must have already told the user this
+        // resets the ad's learning phase, per the RETAG_UTM tool description.
+        if (!ad_id) throw new Error('ad_id is required for RETAG_UTM action');
+        return this.retagMetaAdUtm(userId, ad_id, account_id);
       default:
         throw new Error(`Invalid action: ${action}`);
     }
@@ -15439,6 +15445,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           throw new Error('AD DELETE requires "ad_id".');
         } else if (action === 'COPY_AD' && !ad_id) {
           throw new Error('AD COPY_AD requires "ad_id" (the source ad to copy).');
+        } else if (action === 'RETAG_UTM' && !ad_id) {
+          throw new Error('AD RETAG_UTM requires "ad_id".');
         }
         break;
 
@@ -15466,7 +15474,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   private static META_WRITE_ACTIONS: Record<string, string[]> = {
     CAMPAIGN: ['CREATE', 'UPDATE', 'DELETE'],
     AD_SET: ['CREATE', 'UPDATE', 'DELETE'],
-    AD: ['CREATE', 'UPDATE', 'DELETE', 'COPY_AD'],
+    AD: ['CREATE', 'UPDATE', 'DELETE', 'COPY_AD', 'RETAG_UTM'],
     // Account-level assets. CREATE publishes a creative; UPLOAD_USERS pushes PII
     // user data to Meta. UPLOAD_IMAGE/UPLOAD_VIDEO only stage assets (no publish),
     // and LIST is read-only — none of those need confirmation.
@@ -15598,6 +15606,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         target.target_ad_set = nameOf(adSet, targetAdSetId);
         target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
         lines.push(`Copy ad ${target.source_ad} into ad set ${target.target_ad_set}${target.campaign ? `, which belongs to campaign ${target.campaign}` : ''}.`);
+      } else if (action === 'RETAG_UTM') {
+        const ad = await resolveAd(ad_id);
+        target.ad = nameOf(ad, ad_id);
+        // Mandatory risk statement (Harsha's ENG-239 retrofit ask): retagging a
+        // Meta ad swaps in a new creative, which resets the ad's learning phase
+        // and can hurt a live client's performance. This must be part of what the
+        // user confirms, not just a code comment nobody reads before approving.
+        lines.push(`Retag ad ${target.ad} with UTMs. This creates a NEW creative and swaps the ad to it, `
+          + `which RESETS THE AD'S LEARNING PHASE and can hurt performance on a live client campaign.`);
       } else {
         const ad = await resolveAd(ad_id);
         const adSet = await resolveAdSet(ad?.adset_id);
@@ -27432,6 +27449,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!result.success) throw new Error(result.error || 'Failed to create dynamic creative');
           return { success: true, message: 'Dynamic creative created', creative: result.data };
         }
+        if (action === 'RETAG_UTM') {
+          // ENG-239 retrofit: retags ONE existing creative, never a list.
+          // UNVERIFIED against a live account — see retagCreativeUtm's warning.
+          if (!params.creative_id) throw new Error('RETAG_UTM requires creative_id');
+          if (!params.campaign_id) throw new Error('RETAG_UTM requires campaign_id');
+          const result = await linkedInAdsService.retagCreativeUtm(accessToken, accountId, params.creative_id, params.campaign_id);
+          if (!result.success) throw new Error(result.error || 'Failed to retag creative UTMs');
+          if (result.alreadyTagged) return { success: true, message: 'Creative already carries every UTM key — no change made.' };
+          return { success: true, message: 'Creative retagged with UTMs' };
+        }
         throw new Error(`Unknown action "${action}" for CREATIVE`);
       }
 
@@ -28327,6 +28354,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD REMOVE' };
           await googleAdsService.removeAd(userId, customer_id, args.ad_resource_name);
           return { success: true, message: 'Ad removed' };
+        }
+        if (action === 'RETAG_UTM') {
+          // ENG-239 retrofit: retags ONE existing ad, never a list.
+          if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD RETAG_UTM' };
+          const result = await googleAdsService.retagAdUtm(userId, customer_id, args.ad_resource_name);
+          if (!result.success) {
+            return {
+              success: false,
+              error: result.reason === 'no_destination_url'
+                ? 'This ad has no destination URL to tag.'
+                : 'No change was made — the ad already carries every UTM key, or the campaign-level read needed to avoid clobbering existing tracking failed.',
+            };
+          }
+          return { success: true, message: 'Ad retagged with UTMs' };
         }
       }
 
