@@ -88,12 +88,16 @@ async function defaultFetchHtml(url: string): Promise<string> {
   // `as any` routes around the legacy @types/axios shim that omits maxContentLength /
   // validateStatus (same workaround as googleAdsService.uploadAsset). Any non-2xx
   // (a 4xx/5xx landing page) throws → surfaced as 'unverifiable' by checkUrlTracking.
+  // maxRedirects:0 — assertPublicHostname only vets the pre-redirect host, so a URL
+  // that 302s to an internal/metadata endpoint would bypass the SSRF guard if we
+  // followed it. A redirect therefore surfaces as non-2xx → 'unverifiable', mirroring
+  // routes/crm.ts and googleAdsService.uploadAsset.
   const response = await axios.get(url, {
     responseType: 'text',
     timeout: 10000,
     maxContentLength: MAX_HTML_BYTES,
     maxBodyLength: MAX_HTML_BYTES,
-    maxRedirects: 5,
+    maxRedirects: 0,
     validateStatus: (s: number) => s >= 200 && s < 300,
     headers: { 'User-Agent': 'AgentWeb-TrackingPreflight/1.0' },
   } as any);
