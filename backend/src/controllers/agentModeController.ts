@@ -2651,9 +2651,16 @@ export const agentModeController = {
       // and the session-busy lock: an unauthorized requester must not be able
       // to create/hold an idem claim or trip the busy lock for someone else's
       // session (a squatted claim would 409 the real owner for its ttl window).
-      // Same predicate as getSession — owner or admin. Delegated tokens already
-      // resolve req.user to the TARGET user (middleware/auth.ts), so plain
-      // equality is delegation-safe.
+      // Owner-or-admin predicate, matching the other session-mutating
+      // endpoints (uploadImageToSession, updateSessionTitle,
+      // updateSessionLlmModel). Delegated tokens already resolve req.user to
+      // the TARGET user (middleware/auth.ts), so plain equality is
+      // delegation-safe.
+      // DELIBERATE: non-owner gets a distinct 403 (vs 404 for missing). This
+      // discloses that the sessionId exists, unlike the collapsed-404 style in
+      // getProgress/verify-session blocks. Accepted: sessionIds are
+      // non-enumerable UUIDs, the 403 matches the sibling endpoints above, and
+      // the ENG-346 acceptance contract pins 403 for the non-owner lane.
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
