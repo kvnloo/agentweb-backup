@@ -26,6 +26,7 @@ jest.mock('../services/linkedInAdsService', () => ({
   createDynamicCreative: jest.fn(),
   listCreatives: jest.fn(),
   createPost: jest.fn(),
+  getPost: jest.fn(),
   listTargetingFacets: jest.fn(),
   searchTargetingEntities: jest.fn(),
   getAudienceCount: jest.fn(),
@@ -121,6 +122,7 @@ beforeEach(() => {
   (linkedInAdsService.listCreatives as jest.Mock).mockResolvedValue({ success: true, data: { elements: [] } });
   (linkedInAdsService.createCreative as jest.Mock).mockResolvedValue({ success: true, data: { id: 'cr-1' } });
   (linkedInAdsService.createPost as jest.Mock).mockResolvedValue({ success: true, data: { id: 'post-1' } });
+  (linkedInAdsService.getPost as jest.Mock).mockResolvedValue({ success: true, data: { id: 'post-1', contentLandingPage: 'https://example.com/' } });
   (linkedInAdsService.listTargetingFacets as jest.Mock).mockResolvedValue({ success: true, data: { elements: [] } });
   (linkedInAdsService.searchTargetingEntities as jest.Mock).mockResolvedValue({ success: true, data: { elements: [] } });
   (linkedInAdsService.getAudienceCount as jest.Mock).mockResolvedValue({ success: true, data: { count: 50000 } });
@@ -324,6 +326,43 @@ describe('callLinkedInMarketingApi — CREATIVE', () => {
     expect(linkedInAdsService.listCreatives).toHaveBeenCalledWith(ACCESS_TOKEN, ACCOUNT_ID, 'camp-1');
   });
 
+  it('LIST enriches a content.reference creative with the referenced post\'s fields', async () => {
+    (linkedInAdsService.listCreatives as jest.Mock).mockResolvedValueOnce({
+      success: true,
+      data: { elements: [{ id: 'cr-1', content: { reference: 'urn:li:share:999' } }] },
+    });
+    (linkedInAdsService.getPost as jest.Mock).mockResolvedValueOnce({
+      success: true,
+      data: { contentLandingPage: 'https://example.com/' },
+    });
+    const result = await service.callLinkedInMarketingApi(USER_ID, 'CREATIVE', 'LIST', ACCOUNT_ID, { campaign_id: 'camp-1' });
+    expect(linkedInAdsService.getPost).toHaveBeenCalledWith(ACCESS_TOKEN, 'urn:li:share:999');
+    expect(result.creatives[0].referencedPost).toEqual({ contentLandingPage: 'https://example.com/' });
+    expect(result.creatives[0].id).toBe('cr-1'); // original creative fields preserved
+  });
+
+  it('LIST leaves a TEXT_AD creative (no content.reference) untouched -- no extra GET', async () => {
+    (linkedInAdsService.listCreatives as jest.Mock).mockResolvedValueOnce({
+      success: true,
+      data: { elements: [{ id: 'cr-2', content: { textAd: { landingPage: 'https://example.com/' } } }] },
+    });
+    const result = await service.callLinkedInMarketingApi(USER_ID, 'CREATIVE', 'LIST', ACCOUNT_ID, { campaign_id: 'camp-1' });
+    expect(linkedInAdsService.getPost).not.toHaveBeenCalled();
+    expect(result.creatives[0]).toEqual({ id: 'cr-2', content: { textAd: { landingPage: 'https://example.com/' } } });
+  });
+
+  it('LIST does not fail the whole call when a referenced post read fails -- keeps the bare creative', async () => {
+    (linkedInAdsService.listCreatives as jest.Mock).mockResolvedValueOnce({
+      success: true,
+      data: { elements: [{ id: 'cr-3', content: { reference: 'urn:li:share:404' } }] },
+    });
+    (linkedInAdsService.getPost as jest.Mock).mockResolvedValueOnce({ success: false, error: 'not found' });
+    const result = await service.callLinkedInMarketingApi(USER_ID, 'CREATIVE', 'LIST', ACCOUNT_ID, { campaign_id: 'camp-1' });
+    expect(result.success).toBe(true);
+    expect(result.creatives[0].id).toBe('cr-3');
+    expect(result.creatives[0].referencedPost).toBeUndefined();
+  });
+
   it('CREATE calls createCreative passing full params', async () => {
     await service.callLinkedInMarketingApi(USER_ID, 'CREATIVE', 'CREATE', ACCOUNT_ID, {
       campaign_id: 'camp-1',
@@ -401,6 +440,21 @@ describe('callLinkedInMarketingApi — POST', () => {
     await expect(
       service.callLinkedInMarketingApi(USER_ID, 'POST', 'CREATE', ACCOUNT_ID, { commentary: 'Hi' })
     ).rejects.toThrow('author_urn');
+  });
+
+  it('GET calls getPost with post_urn and returns the post', async () => {
+    const result = await service.callLinkedInMarketingApi(USER_ID, 'POST', 'GET', ACCOUNT_ID, {
+      post_urn: 'urn:li:share:999',
+    });
+    expect(linkedInAdsService.getPost).toHaveBeenCalledWith(ACCESS_TOKEN, 'urn:li:share:999');
+    expect(result.success).toBe(true);
+    expect(result.post).toEqual({ id: 'post-1', contentLandingPage: 'https://example.com/' });
+  });
+
+  it('GET requires post_urn', async () => {
+    await expect(
+      service.callLinkedInMarketingApi(USER_ID, 'POST', 'GET', ACCOUNT_ID, {})
+    ).rejects.toThrow('post_urn');
   });
 });
 

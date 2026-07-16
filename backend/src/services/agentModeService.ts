@@ -27422,7 +27422,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!params.campaign_id) throw new Error('LIST creatives requires params.campaign_id');
           const result = await linkedInAdsService.listCreatives(accessToken, accountId, params.campaign_id);
           if (!result.success) throw new Error(result.error || 'Failed to list creatives');
-          return { success: true, creatives: result.data?.elements || [] };
+          const rawCreatives: any[] = result.data?.elements || [];
+          // ENG-239: a content.reference creative only carries a bare post URN
+          // pointer -- expand it with the referenced post's own fields
+          // (contentLandingPage etc) so a caller can see the actual destination
+          // without a manual follow-up POST/GET per creative. A failed read
+          // (e.g. deleted post) degrades to the bare creative rather than
+          // failing the whole LIST.
+          const creatives = await Promise.all(rawCreatives.map(async (creative) => {
+            const postUrn = creative?.content?.reference;
+            if (!postUrn) return creative;
+            const postResult = await linkedInAdsService.getPost(accessToken, postUrn);
+            return postResult.success ? { ...creative, referencedPost: postResult.data } : creative;
+          }));
+          return { success: true, creatives };
         }
         if (action === 'CREATE') {
           if (!params.campaign_id) throw new Error('CREATE creative requires params.campaign_id');
@@ -27474,6 +27487,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const postType = feedDistribution === 'MAIN_FEED' ? 'Company page post' : 'Dark post';
           const postUrl = postUrn ? `https://www.linkedin.com/feed/update/${encodeURIComponent(postUrn)}/` : undefined;
           return { success: true, message: `${postType} created. Use post_urn as reference in CREATIVE/CREATE.`, post_urn: postUrn, post_url: postUrl, post: result.data };
+        }
+        if (action === 'GET') {
+          if (!params.post_urn) throw new Error('POST GET requires params.post_urn');
+          const result = await linkedInAdsService.getPost(accessToken, params.post_urn);
+          if (!result.success) throw new Error(result.error || 'Failed to get post');
+          return { success: true, post: result.data };
         }
         throw new Error(`Unknown action "${action}" for POST`);
       }

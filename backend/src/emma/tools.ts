@@ -1155,7 +1155,7 @@ ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN_GROUP  → LIST, CREATE, UPDATE
   CAMPAIGN        → LIST, CREATE, UPDATE
   CREATIVE        → LIST, CREATE, CREATE_INLINE, CREATE_DYNAMIC, RETAG_UTM
-  POST            → CREATE
+  POST            → CREATE, GET (post_urn)
   TARGETING       → LIST_FACETS, SEARCH, ESTIMATE_REACH
   MEDIA           → UPLOAD_IMAGE, UPLOAD_VIDEO, UPLOAD_DOCUMENT
   INMAIL          → CREATE_CONTENT, SEND_TEST
@@ -1261,6 +1261,9 @@ REQUIRED PARAMS PER ENTITY + ACTION:
   CONVERSATION_AD SET_FIRST_CONTENT: conversation_ad_urn, first_content_urn
 
 POST/CREATE params: commentary (text), feed_distribution (NONE=dark post|MAIN_FEED=company page), campaign_id (OPTIONAL but STRONGLY RECOMMENDED — see UTM ATTRIBUTION below). Media: image_urn | video_urn | document_urn | article_url+article_title+article_description+thumbnail_urn | carousel_cards.
+POST/GET params: post_urn (required). Reads a post/share's own stored fields (commentary, content, contentLandingPage, etc) — use this to inspect
+  the actual destination of a sponsored-content creative, since CREATIVE LIST only returns the bare content.reference URN pointer for those, never
+  the post's own fields.
 
 UTM ATTRIBUTION — pass campaign_id to the CONTENT actions too:
   POST/CREATE, INMAIL/CREATE_CONTENT and CONVERSATION_AD/CREATE_CONTENT accept an OPTIONAL campaign_id.
@@ -1283,7 +1286,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
         },
         action: {
           type: 'string',
-          enum: ['LIST', 'CREATE', 'CREATE_INLINE', 'CREATE_DYNAMIC', 'RETAG_UTM', 'UPDATE', 'LIST_FACETS', 'SEARCH', 'ESTIMATE_REACH', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'UPLOAD_DOCUMENT', 'INIT_VIDEO_UPLOAD', 'FINALIZE_VIDEO', 'CREATE_CONTENT', 'SEND_TEST', 'SET_FIRST_CONTENT'],
+          enum: ['LIST', 'GET', 'CREATE', 'CREATE_INLINE', 'CREATE_DYNAMIC', 'RETAG_UTM', 'UPDATE', 'LIST_FACETS', 'SEARCH', 'ESTIMATE_REACH', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'UPLOAD_DOCUMENT', 'INIT_VIDEO_UPLOAD', 'FINALIZE_VIDEO', 'CREATE_CONTENT', 'SEND_TEST', 'SET_FIRST_CONTENT'],
           description: 'The operation to perform. Must be valid for the chosen entity_type.'
         },
         account_id: {
@@ -1334,6 +1337,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
             creative_id: { type: 'string', description: 'Creative ID or URN. Required for CREATIVE/RETAG_UTM (with campaign_id). Obtain from CREATIVE LIST or audit_ad_utm_coverage.' },
             format: { type: 'string', description: 'Campaign or creative format. DYNAMIC campaigns: JOBS|SPOTLIGHT|FOLLOW_COMPANY. Event campaigns: SPONSORED_UPDATE_EVENT.' },
             reference: { type: 'string', description: 'Post URN for SPONSORED_UPDATES creatives.' },
+            post_urn: { type: 'string', description: 'Post/share URN (urn:li:share:... or urn:li:ugcPost:...). Required for POST/GET. Also accepted as an alias for reference/post_urn on CREATIVE/CREATE.' },
             // Creative — text ad
             headline: { type: 'string', description: 'Text ad headline. Required for CREATIVE/CREATE text ads.' },
             description: { type: 'string', description: 'Text ad description.' },

@@ -424,6 +424,31 @@ describe('retagCreativeUtm — single existing creative retrofit (Harsha\'s ask)
   });
 });
 
+// ─── getPost — read-back for a POST/share URN (closes the CREATIVE LIST gap) ──
+//
+// Nothing previously exposed a way to read a post's own fields (contentLandingPage,
+// commentary, article source, etc) -- CREATIVE LIST only returns the bare
+// content.reference URN pointer for sponsored-content creatives, and POST had no
+// read action at all. This is the same GET retagPostUtm already used internally,
+// now factored out and exposed directly.
+describe('getPost — read a post/share by URN', () => {
+  it('fetches a post by URN', async () => {
+    mockAxiosFn.mockResolvedValueOnce({ data: { contentLandingPage: 'https://example.com/' }, headers: {}, status: 200 });
+    const result = await svc.getPost(ACCESS_TOKEN, 'urn:li:share:999');
+    expect(result.success).toBe(true);
+    expect(result.data).toEqual({ contentLandingPage: 'https://example.com/' });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.method).toBe('GET');
+    expect(call.url).toContain(encodeURIComponent('urn:li:share:999'));
+  });
+
+  it('propagates a failure reading the post', async () => {
+    mockAxiosFn.mockRejectedValueOnce({ response: { status: 404, data: { message: 'not found' } } });
+    const result = await svc.getPost(ACCESS_TOKEN, 'urn:li:share:999');
+    expect(result.success).toBe(false);
+  });
+});
+
 // ─── retagPostUtm — sponsored-content retrofit (content.reference creatives) ──
 //
 // LinkedIn's own Posts API docs list contentLandingPage (the post's CTA-button

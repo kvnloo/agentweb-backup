@@ -1026,6 +1026,18 @@ export async function retagCreativeUtm(
 }
 
 /**
+ * Read a LinkedIn post/share by URN. Closes a real gap: CREATIVE LIST only
+ * returns the bare `content.reference` URN pointer for sponsored-content
+ * creatives, never the post's own fields — and POST previously had no read
+ * action at all, so a referenced post's destination could never be inspected
+ * directly (only inferred indirectly, e.g. via retag idempotency behavior).
+ */
+export async function getPost(accessToken: string, postUrn: string): Promise<LinkedInAdsApiResult> {
+  const encoded = encodeURIComponent(postUrn);
+  return makeRequest('GET', `/rest/posts/${encoded}`, accessToken);
+}
+
+/**
  * Retag the LinkedIn POST a `content.reference` creative points to (Harsha's
  * ask, sponsored-content slice — `retagCreativeUtm`'s text-ad path only covers
  * creatives that carry a destination directly).
@@ -1051,7 +1063,7 @@ export async function retagPostUtm(
   campaign: string,
 ): Promise<LinkedInAdsApiResult & { alreadyTagged?: boolean }> {
   const encoded = encodeURIComponent(postUrn);
-  const getResult = await makeRequest('GET', `/rest/posts/${encoded}`, accessToken);
+  const getResult = await getPost(accessToken, postUrn);
   if (!getResult.success) return getResult;
 
   const currentUrl: string | undefined = (getResult.data as any)?.contentLandingPage;
