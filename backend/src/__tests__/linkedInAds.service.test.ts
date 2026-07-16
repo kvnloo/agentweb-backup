@@ -330,6 +330,17 @@ describe('createCreative', () => {
     expect(result.success).toBe(false);
     expect(result.error).toContain('cta_label_type');
   });
+
+  it('errors when a labelType is given without a lead gen form', async () => {
+    const result = await svc.createCreative(ACCESS_TOKEN, {
+      campaign_id: 'camp-1',
+      post_urn: 'urn:li:share:999',
+      ad_account_id: ACCOUNT_ID,
+      cta_label_type: 'SIGN_UP',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('leadgen_form_urn');
+  });
 });
 
 describe('createCreativeInline', () => {
@@ -429,6 +440,18 @@ describe('createCreativeInline', () => {
     });
     expect(result.success).toBe(false);
     expect(result.error).toContain('cta_label_type');
+  });
+
+  it('errors when a labelType is given without a lead gen form', async () => {
+    const result = await svc.createCreativeInline(ACCESS_TOKEN, {
+      ad_account_id: ACCOUNT_ID,
+      campaign_id: 'camp-1',
+      author_urn: 'urn:li:organization:org-1',
+      image_urn: 'urn:li:image:img-1',
+      cta_label_type: 'SIGN_UP',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('leadgen_form_urn');
   });
 
   it('omits callToAction for a non-lead-gen creative', async () => {
