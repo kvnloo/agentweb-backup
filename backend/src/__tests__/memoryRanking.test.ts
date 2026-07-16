@@ -122,6 +122,11 @@ describe('describeMemoryAge', () => {
     expect(describeMemoryAge('not-a-date', now)).toBeNull();
   });
 
+  it('returns null for a future saved-date rather than a contradictory "today"', () => {
+    // Clock skew or an updatedAt bumped ahead would otherwise render "(saved <future>, today)".
+    expect(describeMemoryAge('2026-07-25T12:00:00Z', now)).toBeNull();
+  });
+
   it('buckets by UTC calendar date, not 24h windows, so it never contradicts the saved date near midnight', () => {
     // Scheduled runs fire around midnight; a memory saved the previous calendar day but
     // < 24h ago must read "yesterday" (matching its displayed 2026-07-12 stamp), not "today".

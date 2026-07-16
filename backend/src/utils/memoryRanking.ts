@@ -97,7 +97,8 @@ export interface FormattableMemory {
 
 /**
  * Human-readable age of a saved memory relative to `now`, e.g. "today", "yesterday",
- * "4 days ago". Returns null when the timestamp is missing or unparseable (never "NaN days").
+ * "4 days ago". Returns null when the timestamp is missing, unparseable (never "NaN days"),
+ * or in the future — a future saved-date labelled "today" would contradict its own stamp.
  */
 export function describeMemoryAge(savedAtIso: string | undefined, now: Date): string | null {
   if (!savedAtIso) return null;
@@ -109,7 +110,10 @@ export function describeMemoryAge(savedAtIso: string | undefined, now: Date): st
   const savedDay = Date.parse(new Date(savedMs).toISOString().split('T')[0]);
   const nowDay = Date.parse(new Date(now.getTime()).toISOString().split('T')[0]);
   const days = Math.round((nowDay - savedDay) / MS_PER_DAY);
-  if (days <= 0) return 'today';
+  // A future saved-date (clock skew, or an updatedAt bumped ahead) would otherwise render as
+  // "(saved <future-date>, today)" — a self-contradiction. Fall back to the unstamped line.
+  if (days < 0) return null;
+  if (days === 0) return 'today';
   if (days === 1) return 'yesterday';
   return `${days} days ago`;
 }
