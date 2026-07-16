@@ -1,3 +1,37 @@
+## ENG-164 phase 1: nodemailer Gmail SMTP path deleted — backend email is Resend-only (2026-07-16)
+
+The 2026-07-02 buy-vs-build audit verdict, executed. `emailService` no longer owns a Gmail SMTP
+transporter; every backend email leaves through `resendService`.
+
+1. **Fix-first (AC-2): `resendService` failures now propagate.** Previously `retryWithBackoff`
+   returned `null` after exhausted/non-retryable failures, `performSend` returned `null` when the
+   API key was missing, and the send queue could only resolve — so a caller could not tell a dropped
+   email from a sent one. Now the queue rejects the failed item's promise (and keeps processing later
+   items), non-retryable 4xx errors reject immediately, and a missing key throws instead of turning
+   every send into a no-op.
+2. **SMTP branches deleted.** `sendEmail` (best-effort, unchanged contract) and `sendEmailStrict`
+   (throws; `messageId` = Resend id) route through the system sender `AgentWeb
+   <hi@updates.agentweb.pro>` with replyTo `support@agentweb.pro`. The SMTP-vs-Resend dual paths in
+   `sendTaskExecutionEmail` / `sendSubscriberWelcomeEmail` collapsed into one send with task-level ->
+   account-level -> system-default sender fallback; history rows now always carry
+   `senderType: 'resend'` + the real Resend id.
+3. **Dependency dropped:** `nodemailer` + `@types/nodemailer` removed from package.json.
+
+### Assumptions to validate
+- **~20 existing `resendService.sendEmail` call sites keep their null-guards** (`if (!result)` in
+  crm.ts, admin.ts, agentModeService.ts, dripSequenceWorker.ts, sequences.ts…). Audited every site:
+  each is inside a try/catch whose failure handling matches (or improves on) the old null branch, so
+  the guards are now dead-but-harmless defense; left untouched to keep this PR one seam. Follow-up
+  cleanup can delete them.
+- **The only fire-and-forget call** (`emma/tools.ts` issue-report notification) already had a
+  `.catch()`, so the new rejection contract cannot produce an unhandled rejection there.
+- **`SMTP_USER`/`SMTP_PASS`/`FROM_EMAIL` env vars are now unread by the backend.** The Gmail secret
+  pair itself stays alive until agent-engine phase 2 (`email_utils.py` still uses smtplib) — that is
+  the explicitly-parked phase 2 issue, not a leftover.
+- **Default-sender task-report emails now come from `hi@updates.agentweb.pro`** (previously the Gmail
+  `FROM_EMAIL`) and failures in that path propagate to callers instead of silently logging — callers
+  were audited (controllers/tasks.ts, routes/slack.ts) and handle rejections.
+
 ## ENG-326 review hardening: org dead-ends, unverified persists, guard false negatives (2026-07-15)
 
 Senior review of the ENG-326 branch surfaced four real bugs in the first cut; all fixed with tests.
