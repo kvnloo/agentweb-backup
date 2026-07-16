@@ -577,6 +577,25 @@ describe('createCampaign — portfolio / shared bidding strategy', () => {
     ).rejects.toThrow('Unsupported bidding_strategy');
     expect(mockAxiosPost).not.toHaveBeenCalled();
   });
+
+  it('rejects TARGET_SPEND create with a zero/negative ceiling but allows uncapped (omitted)', async () => {
+    for (const ceiling of [0, -1]) {
+      await expect(
+        service.createCampaign('user-123', '1234567890', {
+          name: 'Zero Ceiling', type: 'SEARCH', budgetResourceName: 'customers/123/campaignBudgets/1',
+          biddingStrategy: 'TARGET_SPEND', cpcBidCeilingMicros: ceiling, locationTargetIds: [],
+        }),
+      ).rejects.toThrow('cpc_bid_ceiling_micros');
+    }
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+    // Uncapped (omitted) is still valid on create → empty target_spend, no ceiling sent.
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/campaigns/7' }] } });
+    await service.createCampaign('user-123', '1234567890', {
+      name: 'Uncapped', type: 'SEARCH', budgetResourceName: 'customers/123/campaignBudgets/1',
+      biddingStrategy: 'TARGET_SPEND', locationTargetIds: [],
+    });
+    expect(mockAxiosPost.mock.calls[0][1].operations[0].create.targetSpend).toEqual({});
+  });
 });
 
 describe('listCampaigns', () => {
