@@ -19,6 +19,7 @@ import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorker
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
+import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
@@ -4841,7 +4842,10 @@ export const agentModeController = {
           variableValuesUpdatedAt: nowIso
         };
 
-        runScheduledChat(scheduleToRun, user.userId, false).then(async (result) => {
+        // Track with the graceful-shutdown drain so a deploy/SIGTERM waits for
+        // this in-flight run (incl. its requeue/persist catch) instead of
+        // abandoning it mid-flight (ENG-324).
+        trackScheduledRun(runScheduledChat(scheduleToRun, user.userId, false).then(async (result) => {
           if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
             try {
               await scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
@@ -4881,7 +4885,7 @@ export const agentModeController = {
             });
           }
           console.error(`Error triggering scheduled chat after variable submission for ${scheduleToRun.scheduleName}:`, runError);
-        });
+        }));
       }
 
       res.json({
@@ -5010,7 +5014,10 @@ export const agentModeController = {
         variableValuesUpdatedAt: nowIso
       };
 
-      runScheduledChat(scheduleToRun, schedule.userId, false).then(async (result) => {
+      // Track with the graceful-shutdown drain so a deploy/SIGTERM waits for
+      // this in-flight run (incl. its requeue/persist catch) instead of
+      // abandoning it mid-flight (ENG-324).
+      trackScheduledRun(runScheduledChat(scheduleToRun, schedule.userId, false).then(async (result) => {
         if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
           try {
             await scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
@@ -5050,7 +5057,7 @@ export const agentModeController = {
           });
         }
         console.error(`Error triggering scheduled chat after public variable submission for ${scheduleToRun.scheduleName}:`, runError);
-      });
+      }));
 
       return res.json({
         message: 'Variable values submitted successfully. Scheduled chat run started.',
@@ -5542,8 +5549,12 @@ export const agentModeController = {
           const accessTokenWasConsumed = typeof schedule.variableRequestAccessTokenConsumedAt === 'string' && schedule.variableRequestAccessTokenConsumedAt.length > 0;
           const shouldClearVariablesAfterRun = hasVariableRequestSentAt && accessTokenWasConsumed;
 
-          // Start the scheduled chat run asynchronously (don't await)
-          runScheduledChat(schedule, schedule.userId, false).then(async (result) => {
+          // Start the scheduled chat run asynchronously (don't await).
+          // Track with the graceful-shutdown drain so a deploy/SIGTERM waits for
+          // this in-flight run (incl. its requeue/persist catch) instead of
+          // abandoning it mid-flight — which left the session with only a kickoff
+          // message, no assistant output, and no run result (ENG-324).
+          trackScheduledRun(runScheduledChat(schedule, schedule.userId, false).then(async (result) => {
             // Decrement concurrent run counter when done
             currentConcurrentRuns--;
             if (scheduleVariables.length > 0 && shouldClearVariablesAfterRun) {
@@ -5671,7 +5682,7 @@ export const agentModeController = {
                 console.error('Error importing emailService:', importError);
               });
             }
-          });
+          }));
 
           results.push({
             scheduleId: schedule.scheduleId,
