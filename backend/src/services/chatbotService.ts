@@ -494,6 +494,21 @@ function keywordBasedChunkRetrieval(
   return scoredChunks.slice(0, maxChunks).map((item) => item.chunk);
 }
 
+/**
+ * Persisted audit of a Google Ads pre-flight tracking check (ENG-335), stored on
+ * the chat/run record so a launch's measurement status is durable and auditable.
+ */
+export interface GoogleAdsMeasurementCheckRecord {
+  customerId: string;
+  campaignResourceName: string;
+  action: string;
+  /** Overall outcome of the gate for this launch attempt. */
+  outcome: 'passed' | 'blocked' | 'overridden';
+  /** Per-URL check results (url + status + detected mechanisms). */
+  urlResults: Array<{ url: string; status: string; mechanisms: string[]; error?: string }>;
+  checkedAt: string;
+}
+
 export class ChatbotDB {
   private tableName: string;
   private messagesTableName: string;
@@ -826,6 +841,35 @@ export class ChatbotDB {
       }).promise();
     } catch (error) {
       console.error(`Error adding tool cost to session ${sessionId}:`, error);
+    }
+  }
+
+  /**
+   * Append a Google Ads pre-flight tracking check to the session's run record
+   * (ENG-335). This is the durable audit trail so a launch decision — passed,
+   * blocked, or explicitly overridden — and its per-URL measurement status can
+   * never be silently hidden (e.g. by a later "0 conversions" report). Best-effort:
+   * a persistence failure must never break the launch flow itself.
+   */
+  async recordGoogleAdsMeasurementCheck(
+    sessionId: string,
+    record: GoogleAdsMeasurementCheckRecord
+  ): Promise<void> {
+    if (!sessionId) return;
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression:
+          'SET googleAdsMeasurementChecks = list_append(if_not_exists(googleAdsMeasurementChecks, :empty), :rec), updatedAt = :now',
+        ExpressionAttributeValues: {
+          ':empty': [],
+          ':rec': [record],
+          ':now': new Date().toISOString(),
+        },
+      }).promise();
+    } catch (error) {
+      console.error(`Error recording Google Ads measurement check for session ${sessionId}:`, error);
     }
   }
 

@@ -121,6 +121,7 @@ import { linkedInOutreachService } from './linkedInOutreachService';
 import { twitterService } from './twitterService';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
+import { preflightTrackingGate } from './googleAdsTrackingPreflight';
 import { HubSpotService } from './hubspotService';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
@@ -27866,14 +27867,71 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     return response;
   }
 
+  /**
+   * Deterministic pre-flight tracking gate (ENG-335). Before a campaign is
+   * enabled/launched, fetch its final URLs and confirm each serves a detectable
+   * conversion-measurement mechanism (GA4 / GTM / Google Ads conversion snippet).
+   * Blocks the launch by default when any URL is unmeasured or unverifiable;
+   * an explicit `override_tracking_check` proceeds but is recorded. The per-URL
+   * result and the decision are persisted to the run record so a later report
+   * can state measurement status instead of a bare "0 conversions".
+   *
+   * Returns `{ proceed: false, blockResult }` when the launch must be blocked
+   * (caller returns blockResult verbatim), or `{ proceed: true }` to continue.
+   */
+  private async enforceGoogleAdsLaunchGate(
+    userId: string,
+    customerId: string,
+    campaignResourceName: string,
+    action: string,
+    override: boolean,
+    sessionId?: string,
+  ): Promise<{ proceed: boolean; blockResult?: any }> {
+    const finalUrls = await googleAdsService.getCampaignFinalUrls(userId, customerId, campaignResourceName);
+    // No serving URLs (e.g. a campaign with no ads yet) ⇒ nothing to gate.
+    if (finalUrls.length === 0) return { proceed: true };
+
+    const gate = await preflightTrackingGate(finalUrls);
+    const urlResults = gate.results.map(r => ({ url: r.url, status: r.status, mechanisms: r.mechanisms, error: r.error }));
+
+    if (gate.ok) {
+      await chatbotDb.recordGoogleAdsMeasurementCheck(sessionId || '', {
+        customerId, campaignResourceName, action, outcome: 'passed', urlResults, checkedAt: new Date().toISOString(),
+      });
+      return { proceed: true };
+    }
+
+    if (override) {
+      await chatbotDb.recordGoogleAdsMeasurementCheck(sessionId || '', {
+        customerId, campaignResourceName, action, outcome: 'overridden', urlResults, checkedAt: new Date().toISOString(),
+      });
+      return { proceed: true };
+    }
+
+    await chatbotDb.recordGoogleAdsMeasurementCheck(sessionId || '', {
+      customerId, campaignResourceName, action, outcome: 'blocked', urlResults, checkedAt: new Date().toISOString(),
+    });
+    return {
+      proceed: false,
+      blockResult: {
+        success: false,
+        blocked: true,
+        reason: 'tracking_preflight',
+        error: gate.message,
+        trackingCheck: { measured: false, urlResults },
+      },
+    };
+  }
+
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
     entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
     action: string;
     [key: string]: any;
-  }): Promise<any> {
+  }, opts?: { sessionId?: string }): Promise<any> {
     try {
       const { customer_id, entity_type, action } = args;
+      const overrideTrackingCheck = args.override_tracking_check === true;
 
       if (entity_type === 'BIDDING_STRATEGY' && action === 'LIST') {
         const biddingStrategies = await googleAdsService.listBiddingStrategies(userId, customer_id);
@@ -27892,6 +27950,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'RESUME') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for RESUME action' };
+          const gate = await this.enforceGoogleAdsLaunchGate(userId, customer_id, args.campaign_resource_name, 'RESUME', overrideTrackingCheck, opts?.sessionId);
+          if (!gate.proceed) return gate.blockResult;
           await googleAdsService.resumeCampaign(userId, customer_id, args.campaign_resource_name);
           return { success: true, message: 'Campaign resumed' };
         }
@@ -27930,6 +27990,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for UPDATE action' };
+          // Enabling a campaign via UPDATE(status=ENABLED) is a launch — gate it like RESUME.
+          if (args.status === 'ENABLED') {
+            const gate = await this.enforceGoogleAdsLaunchGate(userId, customer_id, args.campaign_resource_name, 'UPDATE', overrideTrackingCheck, opts?.sessionId);
+            if (!gate.proceed) return gate.blockResult;
+          }
           const didUpdate = await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
             name: args.name,
             status: args.status,

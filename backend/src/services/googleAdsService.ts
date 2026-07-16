@@ -568,6 +568,34 @@ export class GoogleAdsService {
     await this.mutate(customerId, accessToken, 'campaigns', [{ remove: campaignResourceName }], loginCustomerId);
   }
 
+  /**
+   * Collect the de-duplicated set of final URLs a campaign points at, across its
+   * (non-removed) responsive ads and PMax asset groups. Used by the pre-flight
+   * tracking gate (ENG-335) before a campaign is enabled/launched.
+   */
+  async getCampaignFinalUrls(userId: string, customerId: string, campaignResourceName: string): Promise<string[]> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const urls = new Set<string>();
+
+    const adRows = await this.search(customerId, accessToken,
+      `SELECT ad_group_ad.ad.final_urls FROM ad_group_ad WHERE campaign.resource_name = '${campaignResourceName}' AND ad_group_ad.status != 'REMOVED'`,
+      loginCustomerId,
+    );
+    for (const r of adRows) {
+      for (const u of (r.adGroupAd?.ad?.finalUrls || [])) urls.add(u);
+    }
+
+    const assetGroupRows = await this.search(customerId, accessToken,
+      `SELECT asset_group.final_urls FROM asset_group WHERE campaign.resource_name = '${campaignResourceName}' AND asset_group.status != 'REMOVED'`,
+      loginCustomerId,
+    );
+    for (const r of assetGroupRows) {
+      for (const u of (r.assetGroup?.finalUrls || [])) urls.add(u);
+    }
+
+    return [...urls];
+  }
+
   // ── Location search ───────────────────────────────────────────────────────
 
   async searchLocations(userId: string, customerId: string, query: string, locale: string = 'en'): Promise<{ id: string; name: string; countryCode: string; targetType: string }[]> {
