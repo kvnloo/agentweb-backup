@@ -737,7 +737,7 @@ REQUIRED PARAMS PER ENTITY + ACTION:
   AD CREATE:            name, creative_id (plus ad_set_id top-level param)
   AD COPY_AD:           ad_id = source ad ID. Optional params: name (new ad name), adset_id (target ad set; defaults to source ad's set), link_url (override destination URL), body, title, status (default PAUSED). Automatically copies images — no manual upload needed.
   CUSTOM_AUDIENCE CREATE: name, subtype (CUSTOM or LOOKALIKE)
-  TARGETING SEARCH:     q (search query), type (adinterest | adbehavior | addemographics)
+  TARGETING SEARCH:     q (search query), type (adinterest | adbehavior | addemographics | adgeolocation). For type=adgeolocation, results include a location key/region_id for use in ad set geo_locations; optionally pass location_types (e.g. ['city']).
 
 COPY_AD WORKFLOW (clone an existing ad with optional overrides):
   1. Use AD LIST to find the source ad and get its ad_id
@@ -935,7 +935,8 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
 
             // --- Targeting Search ---
             q: { type: "string", description: "Search query for targeting search." },
-            type: { type: "string", enum: ["adinterest", "adbehavior", "addemographics"], description: "Targeting category to search." },
+            type: { type: "string", enum: ["adinterest", "adbehavior", "addemographics", "adgeolocation"], description: "Targeting category to search. Use 'adgeolocation' to resolve geo-targeting locations (cities/regions/zips) into keys usable in ad set geo_locations." },
+            location_types: { type: "array", items: { type: "string" }, description: "For type='adgeolocation' only: restrict results to specific location kinds, e.g. ['city'], ['region'], ['zip'], ['country']." },
 
             // --- Dataset ---
             dataset_id: { type: "string", description: "Dataset ID. Required for DATASET GET_MATCH_QUALITY." }

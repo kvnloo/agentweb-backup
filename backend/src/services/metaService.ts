@@ -1492,14 +1492,41 @@ export class MetaService {
     }
   }
 
+  // Geolocation search types must go through the top-level /search endpoint,
+  // NOT the ad account 'targetingsearch' edge (which only resolves interests/
+  // behaviors/demographics and silently returns interest-style results for
+  // geo queries). See ENG-331.
+  private static readonly GEO_SEARCH_TYPES = new Set([
+    'adgeolocation',
+    'adgeolocationmeta',
+    'adcountry',
+    'adregion',
+    'adcity',
+    'adzipcode',
+  ]);
+
   /**
    * Search for Detailed Targeting options
    */
-  public async searchTargeting(adAccountId: string, accessToken: string, q: string, type: string) {
+  public async searchTargeting(
+    adAccountId: string,
+    accessToken: string,
+    q: string,
+    type: string,
+    locationTypes?: string[]
+  ) {
+    // Geolocation lookups (cities, regions, zips, countries) resolve via the
+    // top-level /search endpoint, which returns entries with location keys/
+    // region_ids usable in ad set geo_locations. The targetingsearch edge does
+    // not support these types and returns interest results instead.
+    if (MetaService.GEO_SEARCH_TYPES.has(type)) {
+      return this.searchGeoLocations(accessToken, q, type, locationTypes);
+    }
+
     try {
       this.initApi(accessToken);
       const account = new AdAccount(`act_${adAccountId}`);
-      
+
       const params: any = {
         q: q,
         type: type,
@@ -1511,15 +1538,43 @@ export class MetaService {
       }
 
       this.log(`Searching targeting options in account: ${adAccountId}`, params);
-      
+
       // 'targetingsearch' edge returns a list of targeting options
       const results = await account.getTargetingSearch([], params);
-      
+
       // Handle both Cursor and plain array responses
       const data = results.map((item: any) => item._data);
       return data;
     } catch (error) {
       return this.handleError(error, 'searchTargeting');
+    }
+  }
+
+  /**
+   * Search for geo-targeting locations (cities, regions, zips, countries) via the
+   * top-level Graph API /search endpoint. Returns entries with a location `key`
+   * and `region_id` that can be used directly in an ad set's `geo_locations`.
+   */
+  private async searchGeoLocations(accessToken: string, q: string, type: string, locationTypes?: string[]) {
+    try {
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
+      let url = `https://graph.facebook.com/${apiVersion}/search?type=${encodeURIComponent(type)}` +
+        `&q=${encodeURIComponent(q)}&limit=25&access_token=${encodeURIComponent(accessToken)}`;
+      if (locationTypes && locationTypes.length > 0) {
+        url += `&location_types=${encodeURIComponent(JSON.stringify(locationTypes))}`;
+      }
+
+      this.log(`Searching geo locations (type=${type})`, { q, locationTypes });
+
+      const { fetchWithRetry } = await import('../utils/metaApiFetch');
+      const response = await fetchWithRetry(url);
+      const data = await response.json();
+      if (data.error) {
+        throw new Error(data.error.message || 'Failed to search geo locations');
+      }
+      return data.data || [];
+    } catch (error) {
+      return this.handleError(error, 'searchGeoLocations');
     }
   }
 
