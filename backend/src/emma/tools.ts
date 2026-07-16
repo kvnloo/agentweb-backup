@@ -1223,8 +1223,8 @@ REQUIRED PARAMS PER ENTITY + ACTION:
     ALWAYS use targeting_include/targeting_exclude — never construct targetingCriteria manually
   CAMPAIGN UPDATE: campaign_id + fields to update
   CREATIVE LIST: params.campaign_id required
-  CREATIVE CREATE: campaign_id + one of: post_urn (sponsored content/event/article/document), headline+description+landing_page (text ad), inmail_content_urn (message/conversation ad), vast_tag_url (VAST video). Optional: pre_event_registration_image (event ads).
-  CREATIVE CREATE_INLINE: Dark post only. Required: campaign_id, commentary, image_urn OR video_urn OR document_urn OR carousel_cards.
+  CREATIVE CREATE: campaign_id + one of: post_urn (sponsored content/event/article/document), headline+description+landing_page (text ad), inmail_content_urn (message/conversation ad), vast_tag_url (VAST video). Optional: pre_event_registration_image (event ads). Lead Gen ad: also pass leadgen_form_urn + cta_label_type to attach an existing Lead Gen Form.
+  CREATIVE CREATE_INLINE: Dark post only. Required: campaign_id, commentary, image_urn OR video_urn OR document_urn OR carousel_cards. Lead Gen ad (LEAD_GENERATION campaign): also pass leadgen_form_urn (adForm URN) + cta_label_type (e.g. SIGN_UP) to attach an existing Lead Gen Form.
   CREATIVE CREATE_DYNAMIC: campaign_id, format (JOBS|SPOTLIGHT|FOLLOW_COMPANY). JOBS needs headline+button_label. SPOTLIGHT needs headline+call_to_action+landing_page+logo_urn (logo_urn is REQUIRED — upload logo with MEDIA/UPLOAD_IMAGE first). FOLLOW_COMPANY needs headline.
   TARGETING SEARCH: facet (URN like urn:li:adTargetingFacet:locations), query (optional — omit for facets without typeahead like seniorities/industries)
     Common facets: locations, titles (job titles — NOT jobTitles), seniorities, industries, functions, staffCountRanges, memberInterests, skills
@@ -1310,6 +1310,9 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
             vast_tag_url: { type: 'string', description: 'VAST tag URL for third-party video ads (e.g. from Innovid). Required for CREATIVE/CREATE VAST video.' },
             // Creative — Event Ad
             pre_event_registration_image: { type: 'string', description: 'Image URN for pre-event registration. Optional for event ad creatives.' },
+            // Creative — Lead Gen Form (LEAD_GENERATION campaigns)
+            leadgen_form_urn: { type: 'string', description: 'Existing Lead Gen Form adForm URN (e.g. urn:li:adForm:1016740005 or just the numeric id). REQUIRED for a Lead Gen creative in CREATIVE/CREATE or CREATIVE/CREATE_INLINE — sets callToAction.target. Must be paired with cta_label_type.' },
+            cta_label_type: { type: 'string', description: 'Lead Gen creative CTA button label type (callToAction.labelType), e.g. SIGN_UP, DOWNLOAD, LEARN_MORE, REGISTER, SUBSCRIBE, REQUEST_DEMO. REQUIRED alongside leadgen_form_urn for Lead Gen creatives.' },
             // Creative — Dynamic Ad (Jobs / Spotlight / Follower)
             button_label: { type: 'string', description: 'CTA button text for Jobs dynamic ads (CREATIVE/CREATE_DYNAMIC format=JOBS).' },
             call_to_action: { type: 'string', description: 'CTA text for Spotlight/Follower dynamic ads.' },
