@@ -2984,6 +2984,147 @@ export const scheduleDb = {
     }
   },
 
+  // ENG-324: durable in-flight lease for scheduled-chat runs. A run that is
+  // killed mid-flight (deploy SIGTERM past the drain ceiling, SIGKILL, OOM) can
+  // never persist its own failure/requeue from the in-process catch, leaving the
+  // session at messageCount=2 with no run result. These helpers stamp a lease on
+  // dispatch, heartbeat it while the run is alive, and let a surviving instance
+  // reconcile (requeue) any lease whose heartbeat has gone stale.
+  async setRunInFlight(
+    scheduleId: string,
+    lease: { runId: string; sessionId: string; startedAt: string; instanceId: string }
+  ): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        Key: { scheduleId },
+        UpdateExpression: 'SET runInFlight = :lease',
+        ExpressionAttributeValues: {
+          ':lease': { ...lease, heartbeatAt: lease.startedAt },
+        },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'setRunInFlight');
+    }
+  },
+
+  // Refresh the lease's heartbeat. Conditional on the runId so a heartbeat can
+  // never resurrect a lease that a reconciler already reaped (or a newer run
+  // replaced). A failed condition means "someone else owns this now" — swallow.
+  async heartbeatRunInFlight(scheduleId: string, runId: string): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        Key: { scheduleId },
+        UpdateExpression: 'SET runInFlight.heartbeatAt = :now',
+        ConditionExpression: 'runInFlight.runId = :runId',
+        ExpressionAttributeValues: { ':now': new Date().toISOString(), ':runId': runId },
+      }).promise();
+    } catch (error: any) {
+      // Best-effort, fired from a timer via `void` — never rethrow (that would be
+      // an unhandled rejection). A stale condition just means the lease moved on.
+      if (error?.code !== 'ConditionalCheckFailedException') {
+        console.error('DynamoDB heartbeatRunInFlight error:', error);
+      }
+    }
+  },
+
+  // Clear the lease when the run settles normally. Conditional on runId so a
+  // run that finishes right after being reaped doesn't wipe the reconciler's
+  // requeue. Returns true when this call cleared the lease.
+  async clearRunInFlight(scheduleId: string, runId: string): Promise<boolean> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        Key: { scheduleId },
+        UpdateExpression: 'REMOVE runInFlight',
+        ConditionExpression: 'runInFlight.runId = :runId',
+        ExpressionAttributeValues: { ':runId': runId },
+      }).promise();
+      return true;
+    } catch (error: any) {
+      if (error.code === 'ConditionalCheckFailedException') return false;
+      handleDynamoDbError(error, 'clearRunInFlight');
+      return false;
+    }
+  },
+
+  // Scheduled-chat schedules that currently hold an in-flight lease. Sparse by
+  // nature — most schedules have no runInFlight. We sweep BOTH 'active' and
+  // 'paused' partitions of StatusStartTimeIndex: a runCount-limited schedule
+  // auto-pauses at dispatch (before its final run sets a lease), so an abandoned
+  // run on a paused schedule would otherwise never be reaped. Volume is low;
+  // promote to a dedicated sparse GSI if the schedule count ever grows large.
+  async getInFlightSchedules(): Promise<any[]> {
+    try {
+      const statuses = ['active', 'paused'];
+      const results = await Promise.all(statuses.map(status =>
+        paginatedQuery(dynamodb, {
+          TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+          IndexName: 'StatusStartTimeIndex',
+          KeyConditionExpression: '#status = :status',
+          FilterExpression: '#type = :type AND attribute_exists(runInFlight)',
+          ExpressionAttributeNames: { '#status': 'status', '#type': 'type' },
+          ExpressionAttributeValues: { ':status': status, ':type': 'scheduled_chat' },
+        })
+      ));
+      return results.flat();
+    } catch (error) {
+      // Best-effort reconciler input: a transient list failure just skips this
+      // sweep (the next one retries), so log and return empty rather than throw.
+      console.error('DynamoDB getInFlightSchedules error:', error);
+      return [];
+    }
+  },
+
+  // Single-winner claim of an abandoned run: atomically REMOVE the stale lease
+  // and (optionally) requeue the schedule, conditional on the runId still
+  // matching. Exactly one reconciler across all instances wins; the rest get
+  // ConditionalCheckFailed and return false (no-op). When `requeue` is null the
+  // run has exceeded the requeue cap — the lease is cleared but not rescheduled.
+  async claimAbandonedRun(
+    scheduleId: string,
+    runId: string,
+    requeue: { nextRunTime: string; retryCount: number; sessionId: string; lastAt: string } | null
+  ): Promise<boolean> {
+    const nowIso = new Date().toISOString();
+    try {
+      if (requeue) {
+        await dynamodb.update({
+          TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+          Key: { scheduleId },
+          UpdateExpression:
+            'SET #status = :active, nextRunTime = :nextRunTime, zeroAssistantRetryCount = :n, ' +
+            'lastZeroAssistantOutputAt = :lastAt, lastZeroAssistantOutputSessionId = :sid, updatedAt = :now REMOVE runInFlight',
+          ConditionExpression: 'runInFlight.runId = :runId',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: {
+            ':active': 'active',
+            ':nextRunTime': requeue.nextRunTime,
+            ':n': requeue.retryCount,
+            ':lastAt': requeue.lastAt,
+            ':sid': requeue.sessionId,
+            ':now': nowIso,
+            ':runId': runId,
+          },
+        }).promise();
+      } else {
+        await dynamodb.update({
+          TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+          Key: { scheduleId },
+          UpdateExpression: 'SET updatedAt = :now REMOVE runInFlight',
+          ConditionExpression: 'runInFlight.runId = :runId',
+          ExpressionAttributeValues: { ':now': nowIso, ':runId': runId },
+        }).promise();
+      }
+      return true;
+    } catch (error: any) {
+      if (error.code === 'ConditionalCheckFailedException') return false;
+      handleDynamoDbError(error, 'claimAbandonedRun');
+      return false;
+    }
+  },
+
   async getSocialEngagementActionsUpTo(windowEnd: string): Promise<any[]> {
     try {
       const params = {
