@@ -72,8 +72,17 @@ export function extractBounceCandidate(message: { subject: string; from: string;
   return anyMatch ? anyMatch[1].toLowerCase() : null;
 }
 
-async function flagLeadIfMatched(userId: string, candidateEmail: string, subject: string): Promise<boolean> {
+/**
+ * Flags every list the candidate address appears in as a lead, not just the
+ * first — mirrors webhooks.ts's Resend-side email.bounced handler, which does
+ * the same full sweep. The same real person can be a lead in more than one
+ * list (imports, org-shared lists); stopping at the first match would leave
+ * them contactable through every other list, defeating the point of the
+ * suppression. Returns the number of leads flagged.
+ */
+async function flagLeadIfMatched(userId: string, candidateEmail: string, subject: string): Promise<number> {
   const lists = await crmDb.getLeadListsByUserId(userId);
+  let flagged = 0;
   for (const list of lists || []) {
     const lead = await crmDb.getLeadByEmail(list.listId, candidateEmail);
     if (lead && !isDoNotContact(lead)) {
@@ -87,10 +96,10 @@ async function flagLeadIfMatched(userId: string, candidateEmail: string, subject
         unsubscribedFromGroupEmailAt: new Date().toISOString(),
       });
       console.log(`${TAG} Flagged lead ${lead.leadId} in list ${list.listId} as do-not-contact (Outlook bounce)`);
-      return true;
+      flagged++;
     }
   }
-  return false;
+  return flagged;
 }
 
 /**
@@ -151,9 +160,7 @@ export async function runOutlookBounceMonitor(): Promise<OutlookBounceMonitorSum
           if (!candidateEmail) continue;
           summary.ndrCandidatesFound++;
 
-          if (await flagLeadIfMatched(user.userId, candidateEmail, message.subject)) {
-            summary.leadsFlagged++;
-          }
+          summary.leadsFlagged += await flagLeadIfMatched(user.userId, candidateEmail, message.subject);
         }
 
         if (isFirstRun || newCursor !== sinceISO) {

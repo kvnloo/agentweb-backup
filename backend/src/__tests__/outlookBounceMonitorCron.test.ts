@@ -216,6 +216,49 @@ describe('runOutlookBounceMonitor — SUCCESS cases', () => {
     expect(summary.leadsFlagged).toBe(1);
   });
 
+  it('flags every list a matching lead appears in, not just the first (parity with the Resend webhook handler)', async () => {
+    mockGetAllUsers.mockResolvedValue([{ userId: 'u1', connected_accounts: [outlookAccount()] }]);
+    mockListRecentInboxMessages.mockResolvedValue([ndrMessage()]);
+    mockGetLeadListsByUserId.mockResolvedValue([{ listId: 'list-1' }, { listId: 'list-2' }]);
+    mockGetLeadByEmail.mockImplementation((listId: string) => {
+      if (listId === 'list-1') return Promise.resolve({ leadId: 'lead-1', email: 'bad@contractor.com' });
+      if (listId === 'list-2') return Promise.resolve({ leadId: 'lead-2', email: 'bad@contractor.com' });
+      return Promise.resolve(null);
+    });
+
+    const summary = await runOutlookBounceMonitor();
+
+    expect(mockUpdateLead).toHaveBeenCalledWith(
+      'list-1', 'lead-1', expect.objectContaining({ contactStatus: 'do-not-contact' }),
+    );
+    expect(mockUpdateLead).toHaveBeenCalledWith(
+      'list-2', 'lead-2', expect.objectContaining({ contactStatus: 'do-not-contact' }),
+    );
+    expect(mockUpdateLead).toHaveBeenCalledTimes(2);
+    expect(summary.leadsFlagged).toBe(2);
+  });
+
+  it('still flags the remaining lists when one matching lead is already do-not-contact', async () => {
+    mockGetAllUsers.mockResolvedValue([{ userId: 'u1', connected_accounts: [outlookAccount()] }]);
+    mockListRecentInboxMessages.mockResolvedValue([ndrMessage()]);
+    mockGetLeadListsByUserId.mockResolvedValue([{ listId: 'list-1' }, { listId: 'list-2' }]);
+    mockGetLeadByEmail.mockImplementation((listId: string) => {
+      if (listId === 'list-1') {
+        return Promise.resolve({ leadId: 'lead-1', email: 'bad@contractor.com', contactStatus: 'do-not-contact' });
+      }
+      if (listId === 'list-2') return Promise.resolve({ leadId: 'lead-2', email: 'bad@contractor.com' });
+      return Promise.resolve(null);
+    });
+
+    const summary = await runOutlookBounceMonitor();
+
+    expect(mockUpdateLead).toHaveBeenCalledTimes(1);
+    expect(mockUpdateLead).toHaveBeenCalledWith(
+      'list-2', 'lead-2', expect.objectContaining({ contactStatus: 'do-not-contact' }),
+    );
+    expect(summary.leadsFlagged).toBe(1);
+  });
+
   it('seeds the cursor to "now" on the first-ever run per account, without acting on any messages returned', async () => {
     mockGetAllUsers.mockResolvedValue([
       { userId: 'u1', connected_accounts: [outlookAccount({ lastNdrCheckAt: undefined })] },
