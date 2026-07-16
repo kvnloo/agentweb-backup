@@ -304,6 +304,32 @@ describe('createCreative', () => {
     expect(result.success).toBe(false);
     expect(result.error).toContain('ad_account_id');
   });
+
+  it('attaches Lead Gen callToAction for a sponsored content lead gen creative', async () => {
+    await svc.createCreative(ACCESS_TOKEN, {
+      campaign_id: 'camp-1',
+      post_urn: 'urn:li:share:999',
+      ad_account_id: ACCOUNT_ID,
+      leadgen_form_urn: 'urn:li:adForm:1016740005',
+      cta_label_type: 'SIGN_UP',
+    });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.callToAction).toEqual({
+      target: 'urn:li:adForm:1016740005',
+      labelType: 'SIGN_UP',
+    });
+  });
+
+  it('errors when a lead gen form is given without a labelType', async () => {
+    const result = await svc.createCreative(ACCESS_TOKEN, {
+      campaign_id: 'camp-1',
+      post_urn: 'urn:li:share:999',
+      ad_account_id: ACCOUNT_ID,
+      leadgen_form_urn: 'urn:li:adForm:1016740005',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('cta_label_type');
+  });
 });
 
 describe('createCreativeInline', () => {
@@ -358,6 +384,62 @@ describe('createCreativeInline', () => {
     const result = await svc.createCreativeInline(ACCESS_TOKEN, { ad_account_id: ACCOUNT_ID, campaign_id: 'camp-1' });
     expect(result.success).toBe(false);
     expect(result.error).toContain('author_urn');
+  });
+
+  it('attaches Lead Gen callToAction (target + labelType) for a lead gen creative', async () => {
+    await svc.createCreativeInline(ACCESS_TOKEN, {
+      ad_account_id: ACCOUNT_ID,
+      campaign_id: 'camp-1',
+      author_urn: 'urn:li:organization:org-1',
+      image_urn: 'urn:li:image:img-1',
+      commentary: 'Grab the guide',
+      leadgen_form_urn: 'urn:li:adForm:1016740005',
+      cta_label_type: 'SIGN_UP',
+    });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.creative.callToAction).toEqual({
+      target: 'urn:li:adForm:1016740005',
+      labelType: 'SIGN_UP',
+    });
+  });
+
+  it('normalizes a bare adForm id into a full URN', async () => {
+    await svc.createCreativeInline(ACCESS_TOKEN, {
+      ad_account_id: ACCOUNT_ID,
+      campaign_id: 'camp-1',
+      author_urn: 'urn:li:organization:org-1',
+      image_urn: 'urn:li:image:img-1',
+      leadgen_form_urn: '1016740005',
+      cta_label_type: 'download',
+    });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.creative.callToAction).toEqual({
+      target: 'urn:li:adForm:1016740005',
+      labelType: 'DOWNLOAD',
+    });
+  });
+
+  it('errors when a lead gen form is given without a labelType', async () => {
+    const result = await svc.createCreativeInline(ACCESS_TOKEN, {
+      ad_account_id: ACCOUNT_ID,
+      campaign_id: 'camp-1',
+      author_urn: 'urn:li:organization:org-1',
+      image_urn: 'urn:li:image:img-1',
+      leadgen_form_urn: 'urn:li:adForm:1016740005',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('cta_label_type');
+  });
+
+  it('omits callToAction for a non-lead-gen creative', async () => {
+    await svc.createCreativeInline(ACCESS_TOKEN, {
+      ad_account_id: ACCOUNT_ID,
+      campaign_id: 'camp-1',
+      author_urn: 'urn:li:organization:org-1',
+      image_urn: 'urn:li:image:img-1',
+    });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.creative.callToAction).toBeUndefined();
   });
 });
 
