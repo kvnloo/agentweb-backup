@@ -1310,9 +1310,15 @@ export class GoogleAdsService {
     // UTMs straight into `final_urls`. `mergeUtmIntoUrl` is per-key, so a UTM the
     // user already set is left untouched (AC4); ValueTrack macros pass through
     // un-encoded and resolve at click time.
+    //
+    // No `content` here: Google's own developer docs mark `{creative}` unsupported
+    // for Performance Max (developers.google.com/google-ads/api/performance-max/
+    // valuetrack) -- it never resolves on a PMax asset group, so emitting it would
+    // bake literal, permanently-unresolved text into every click URL. Same fallback
+    // LinkedIn already uses for a macro it can't supply.
     const finalUrlWithUtm = mergeUtmIntoUrl(
       params.finalUrl,
-      buildUtmSpec('google', { campaign: '{campaignid}', content: '{creative}' }),
+      buildUtmSpec('google', { campaign: '{campaignid}' }),
     );
 
     const assetGroupOp = {

@@ -1130,9 +1130,10 @@ describe('createAssetGroup', () => {
     expect(body.mutateOperations[3].assetGroupOperation.create.name).toBe('My Asset Group');
     expect(body.mutateOperations[3].assetGroupOperation.create.campaign).toBe('customers/123/campaigns/1');
     // ENG-239: asset_group has no final_url_suffix field, so Emma merges the UTMs
-    // straight into final_urls (ValueTrack macros pass through un-encoded).
+    // straight into final_urls (ValueTrack macros pass through un-encoded). No
+    // utm_content: Google's docs mark {creative} unsupported on Performance Max.
     expect(body.mutateOperations[3].assetGroupOperation.create.finalUrls[0]).toBe(
-      'https://example.com?utm_source=google&utm_medium=paid&utm_campaign={campaignid}&utm_content={creative}',
+      'https://example.com?utm_source=google&utm_medium=paid&utm_campaign={campaignid}',
     );
   });
 

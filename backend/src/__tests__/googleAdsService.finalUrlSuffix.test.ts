@@ -349,7 +349,7 @@ describe('createAssetGroup — asset_group has no suffix field, so UTMs merge in
     };
   }
 
-  it('appends the UTMs (with macros) to the asset group final_urls', async () => {
+  it('appends the UTMs (with macros, no utm_content) to the asset group final_urls', async () => {
     mockAxiosPost.mockResolvedValueOnce(assetGroupBatchResponse());
     await service.createAssetGroup('user-123', '1234567890', {
       name: 'AG',
@@ -363,7 +363,11 @@ describe('createAssetGroup — asset_group has no suffix field, so UTMs merge in
       finalUrl: 'https://example.com/',
     });
     const create = mockAxiosPost.mock.calls[0][1].mutateOperations[3].assetGroupOperation.create;
-    expect(create.finalUrls[0]).toBe(`https://example.com/?${FULL_SUFFIX}`);
+    // Google's own developer docs mark {creative} unsupported for Performance Max
+    // (developers.google.com/google-ads/api/performance-max/valuetrack) -- it
+    // never resolves, so it must never be emitted here, unlike the ad-level path.
+    expect(create.finalUrls[0]).toBe('https://example.com/?utm_source=google&utm_medium=paid&utm_campaign={campaignid}');
+    expect(create.finalUrls[0]).not.toContain('utm_content');
     // asset_group has no final_url_suffix field — must not emit one.
     expect(create).not.toHaveProperty('finalUrlSuffix');
   });
@@ -383,7 +387,7 @@ describe('createAssetGroup — asset_group has no suffix field, so UTMs merge in
     });
     const create = mockAxiosPost.mock.calls[0][1].mutateOperations[3].assetGroupOperation.create;
     expect(create.finalUrls[0]).toBe(
-      'https://example.com/?utm_source=newsletter&utm_medium=paid&utm_campaign={campaignid}&utm_content={creative}',
+      'https://example.com/?utm_source=newsletter&utm_medium=paid&utm_campaign={campaignid}',
     );
   });
 });
