@@ -136,6 +136,23 @@ class ResendService {
     throw lastError;
   }
 
+  /**
+   * Like retryWithBackoff, but preserves the legacy null-on-failure contract
+   * for the read/domain helpers (their callers branch on null/false/[]).
+   * Send operations must NOT use this — send failures propagate (ENG-164).
+   */
+  private async retryWithBackoffOrNull<T>(
+    operation: () => Promise<T>,
+    operationName: string
+  ): Promise<T | null> {
+    try {
+      return await this.retryWithBackoff(operation, operationName);
+    } catch {
+      // Final error already logged by retryWithBackoff.
+      return null;
+    }
+  }
+
   private async processSendQueue() {
     if (this.isQueueWorkerRunning) {
       return;
@@ -347,7 +364,7 @@ class ResendService {
       }>;
     }
 
-    const result = await this.retryWithBackoff<ResendEmailContent>(
+    const result = await this.retryWithBackoffOrNull<ResendEmailContent>(
       async () => {
         try {
           const response = await axios.get<ResendEmailContent>(
@@ -434,7 +451,7 @@ class ResendService {
       headers?: Record<string, string>;
     }
 
-    const result = await this.retryWithBackoff<ResendEmailContent>(
+    const result = await this.retryWithBackoffOrNull<ResendEmailContent>(
       async () => {
         try {
           // Try receiving endpoint first (as shown in user's example)
@@ -518,7 +535,7 @@ class ResendService {
       return null;
     }
 
-    const result = await this.retryWithBackoff(
+    const result = await this.retryWithBackoffOrNull(
       async () => {
         const { data, error } = await this.resend!.domains.create({ name });
         if (error) {
@@ -574,7 +591,7 @@ class ResendService {
       return null;
     }
 
-    const result = await this.retryWithBackoff(
+    const result = await this.retryWithBackoffOrNull(
       async () => {
         const { data, error } = await this.resend!.domains.get(domainId);
         if (error) {
@@ -616,7 +633,7 @@ class ResendService {
       return false;
     }
 
-    const result = await this.retryWithBackoff(
+    const result = await this.retryWithBackoffOrNull(
       async () => {
         const { data, error } = await this.resend!.domains.verify(domainId);
         if (error) {
@@ -642,7 +659,7 @@ class ResendService {
       return [];
     }
 
-    const result = await this.retryWithBackoff(
+    const result = await this.retryWithBackoffOrNull(
       async () => {
         const { data, error } = await this.resend!.domains.list();
         if (error) {

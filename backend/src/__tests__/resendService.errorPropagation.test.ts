@@ -105,6 +105,32 @@ describe('ResendService - error propagation (ENG-164 AC-2)', () => {
     expect((second as PromiseFulfilledResult<any>).value).toEqual({ id: 'second-email-id' });
   });
 
+  it('read/domain helpers keep their legacy no-throw contracts (only sends propagate)', async () => {
+    // Greptile P1 on #2111: retryWithBackoff is shared by non-send helpers whose
+    // callers branch on null/false/[] — those contracts must not change.
+    const resendService = await importFreshService();
+    const domainsError = { statusCode: 500, message: 'domains api down' };
+    const resendInstance = (await import('resend')).Resend as jest.Mock;
+
+    mockResendSend.mockResolvedValue({ data: null, error: { statusCode: 500, message: 'send down' } });
+    resendInstance.mockImplementation(() => ({
+      emails: { send: mockResendSend },
+      domains: {
+        create: jest.fn().mockResolvedValue({ data: null, error: domainsError }),
+        get: jest.fn().mockResolvedValue({ data: null, error: domainsError }),
+        verify: jest.fn().mockResolvedValue({ data: null, error: domainsError }),
+        list: jest.fn().mockResolvedValue({ data: null, error: domainsError }),
+      },
+    }));
+
+    await expect(resendService.verifyDomain('dom-1')).resolves.toBe(false);
+    await expect(resendService.listDomains()).resolves.toEqual([]);
+    await expect(resendService.createDomain('example.com')).resolves.toBeNull();
+    await expect(resendService.getDomain('dom-1')).resolves.toBeNull();
+    // ...while the send path on the very same instance still rejects.
+    await expect(resendService.sendEmail(baseParams)).rejects.toThrow(/Resend API error/);
+  });
+
   it('still resolves with the Resend payload on success', async () => {
     mockResendSend.mockResolvedValue({
       data: { id: 'happy-path-id' },
