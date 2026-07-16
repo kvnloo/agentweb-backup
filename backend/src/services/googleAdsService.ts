@@ -408,9 +408,16 @@ export class GoogleAdsService {
       cpcBidCeilingMicros: String(params.cpcBidCeilingMicros ?? 100_000_000),
     };
     else if (params.biddingStrategy === 'MANUAL_CPC') biddingField.manualCpc = { enhancedCpcEnabled: false };
-    else if (params.biddingStrategy === 'TARGET_SPEND') biddingField.targetSpend = params.cpcBidCeilingMicros !== undefined
-      ? { cpcBidCeilingMicros: String(params.cpcBidCeilingMicros) }
-      : {};
+    else if (params.biddingStrategy === 'TARGET_SPEND') {
+      // Uncapped is valid on CREATE (empty target_spend). A provided ceiling must be positive —
+      // Google rejects 0 as TOO_LOW — so reject <= 0 locally rather than send it and get an opaque error.
+      if (params.cpcBidCeilingMicros !== undefined && params.cpcBidCeilingMicros <= 0) {
+        throw new Error('TARGET_SPEND (Maximize Clicks) requires a positive cpc_bid_ceiling_micros, or omit it for an uncapped strategy. A ceiling of 0 is rejected by Google as TOO_LOW.');
+      }
+      biddingField.targetSpend = params.cpcBidCeilingMicros !== undefined
+        ? { cpcBidCeilingMicros: String(params.cpcBidCeilingMicros) }
+        : {};
+    }
     else throw new Error(`Unsupported bidding_strategy '${params.biddingStrategy}' for CAMPAIGN CREATE. Supported values: MAXIMIZE_CONVERSIONS, MAXIMIZE_CONVERSION_VALUE, TARGET_CPA, TARGET_ROAS, TARGET_IMPRESSION_SHARE, TARGET_SPEND, MANUAL_CPC.`);
 
     const campaignCreate = {
