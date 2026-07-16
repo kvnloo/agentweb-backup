@@ -40,6 +40,7 @@ const AVAILABLE_CONNECTED_ACCOUNTS = [
   { id: 'unipile', label: 'LinkedIn Outreach' },
   { id: 'meta', label: 'Meta Marketing' },
   { id: 'instagram', label: 'Instagram Business' },
+  { id: 'twitter', label: 'Twitter/X' },
   { id: 'gmail', label: 'Gmail' },
   { id: 'youtube', label: 'YouTube' },
   { id: 'fathom', label: 'Fathom' },
@@ -70,6 +71,23 @@ describe('AVAILABLE_CONNECTED_ACCOUNTS — google_drive entry', () => {
   it('google_drive is the last entry in the list', () => {
     const last = AVAILABLE_CONNECTED_ACCOUNTS[AVAILABLE_CONNECTED_ACCOUNTS.length - 1];
     expect(last.id).toBe('google_drive');
+  });
+});
+
+describe('AVAILABLE_CONNECTED_ACCOUNTS — twitter entry', () => {
+  it('contains a twitter entry with label "Twitter/X"', () => {
+    const entry = AVAILABLE_CONNECTED_ACCOUNTS.find((a) => a.id === 'twitter');
+    expect(entry).toBeDefined();
+    expect(entry?.label).toBe('Twitter/X');
+  });
+
+  it('twitter appears after instagram in the list', () => {
+    const ids = AVAILABLE_CONNECTED_ACCOUNTS.map((a) => a.id);
+    const instagramIndex = ids.indexOf('instagram');
+    const twitterIndex = ids.indexOf('twitter');
+
+    expect(instagramIndex).toBeGreaterThanOrEqual(0);
+    expect(twitterIndex).toBeGreaterThan(instagramIndex);
   });
 });
 

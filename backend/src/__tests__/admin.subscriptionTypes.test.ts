@@ -196,6 +196,62 @@ describe('Admin subscription types routes', () => {
     expect(pro.allowedSkills).not.toContain('*');
   });
 
+  // ENG-200: the per-user cost cap lives on the tier as monthlyCostAllowance. The
+  // admin read/write paths must round-trip it (symmetric with monthlyTokenAllowance)
+  // or the Users-tab "LLM Cost $X / $cap" display can never show a cap, and any
+  // tier edit via the admin UI silently wipes a cap set out-of-band.
+  it('GET /api/admin/subscription-types should return monthlyCostAllowance when set', async () => {
+    const storedTypes = [
+      { name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], monthlyTokenAllowance: 20000000, monthlyCostAllowance: 500 },
+      { name: 'Free', allowedPages: ['/tasks'], allowedSkills: ['skill-1'] },
+    ];
+    mockedSettingsService.getSetting.mockResolvedValue({
+      settingName: 'subscription_types',
+      settingValue: JSON.stringify(storedTypes),
+      description: 'Subscription types',
+      updatedAt: new Date().toISOString(),
+      updatedBy: 'system',
+    } as any);
+
+    const res = await request(app)
+      .get('/api/admin/subscription-types')
+      .set('Authorization', 'Bearer test-token')
+      .expect(200);
+
+    const starter = res.body.find((t: any) => t.name === 'Starter');
+    const free = res.body.find((t: any) => t.name === 'Free');
+    expect(starter.monthlyCostAllowance).toBe(500);
+    // Unset stays absent (unlimited), not coerced to a number
+    expect(free.monthlyCostAllowance).toBeUndefined();
+  });
+
+  it('POST /api/admin/subscription-types should persist monthlyCostAllowance', async () => {
+    // No wildcards in the payload below, so the page/skill expansion mocks are
+    // irrelevant here — leave the shared mocks untouched to avoid leaking a
+    // narrowed skill list into later wildcard-expansion tests.
+    mockedSettingsService.setSetting.mockResolvedValue(undefined as any);
+
+    const payload = {
+      subscriptionTypes: [
+        { name: 'Starter', allowedPages: ['/tasks'], allowedSkills: ['skill-1'], monthlyCostAllowance: 250 },
+        { name: 'Free', allowedPages: ['/tasks'], allowedSkills: ['skill-1'] },
+      ],
+    };
+
+    await request(app)
+      .post('/api/admin/subscription-types')
+      .set('Authorization', 'Bearer test-token')
+      .send(payload)
+      .expect(200);
+
+    const [, settingValue] = mockedSettingsService.setSetting.mock.calls[0];
+    const savedTypes = JSON.parse(settingValue as string);
+    const starter = savedTypes.find((t: any) => t.name === 'Starter');
+    const free = savedTypes.find((t: any) => t.name === 'Free');
+    expect(starter.monthlyCostAllowance).toBe(250);
+    expect(free.monthlyCostAllowance).toBeUndefined();
+  });
+
   describe('POST /api/admin/subscription-types/:typeName/skills', () => {
     const storedTypes = [
       { name: 'Basic', allowedPages: ['/'], allowedSkills: ['skill-1'] },

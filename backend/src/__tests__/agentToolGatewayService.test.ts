@@ -1005,13 +1005,19 @@ describe('agentToolGatewayService', () => {
       }
     });
 
-    it('rejects LinkedIn send-invite notes over the conservative 200 character agent limit before dispatch', () => {
+    // ENG-243: an over-limit send-invite note must NOT be hard-rejected at the
+    // gateway. The send path (sendInvitation) resolves the account-tier limit
+    // (200 free / 300 Premium) and auto-trims the note on a word boundary, so a
+    // send never fails on length. Pre-rejecting here instead produced repeated
+    // invalid_args failures that tripped the anti-loop breaker and sent 0 invites.
+    it('does not reject LinkedIn send-invite notes over 200 chars — the tier-aware send path trims them', () => {
+      const overLimitNote = 'x'.repeat(201);
       const result = validateAndRepairToolArgs({
         toolName: 'linkedin_outreach',
         args: {
           action: 'send-invite',
           profile_url: 'https://www.linkedin.com/in/example/',
-          message: 'x'.repeat(201),
+          message: overLimitNote,
         },
         inputSchema: {
           type: 'object',
@@ -1025,17 +1031,12 @@ describe('agentToolGatewayService', () => {
         effect: 'external_send',
       });
 
-      expect(result.status).toBe('invalid');
-      if (result.status === 'invalid') {
-        expect(result.issues).toEqual(expect.arrayContaining([
-          expect.objectContaining({
-            code: 'invalid_args',
-            path: '$.message',
-          }),
-        ]));
-        expect(result.modelMessage).toContain('200 characters or fewer');
-        expect(result.modelMessage).toContain('201');
-      }
+      expect(result.status).toBe('valid');
+      // The note is passed through untouched so the tier-aware send path can trim
+      // it to the correct per-account limit (a free-tier gateway guess would
+      // needlessly clip a Premium account's 300-char allowance).
+      expect((result.args as Record<string, unknown>).message).toBe(overLimitNote);
+      expect(result.issues).toEqual([]);
     });
 
     it('allows LinkedIn send-message bodies over 200 characters because the invite-note limit is action-specific', () => {
@@ -1210,12 +1211,19 @@ describe('agentToolGatewayService', () => {
 
     const failingExecute = (message: string) => () => Promise.reject(new Error(message));
 
-    async function failNTimes(runId: string, toolName: string, message: string, n: number): Promise<void> {
+    async function failNTimes(
+      runId: string,
+      toolName: string,
+      message: string,
+      n: number,
+      budgetScopeId?: string,
+    ): Promise<void> {
       for (let i = 0; i < n; i += 1) {
         const outcome = await executeAgentToolThroughGateway({
           toolName,
           args: { attempt: i },
           runId,
+          ...(budgetScopeId ? { budgetScopeId } : {}),
           execute: failingExecute(message),
         });
         expect(outcome.status).toBe('error');
@@ -1323,6 +1331,825 @@ describe('agentToolGatewayService', () => {
 
       expect(outcome.status).toBe('success');
       expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    // ENG-167: a heavy content-generation tool (create_html_file / campaign-brief
+    // generation) that keeps TIMING OUT surfaces a slightly different message each
+    // attempt (a raw "connection timed out after Nms", an AbortError, a Bedrock
+    // "ModelTimeoutException"). Keyed by exact error head, none reaches the per-key
+    // threshold, so the model retried the same ~2-min tool until the whole run was
+    // consumed and it could never reach any other tool. Timeouts are aggregated by
+    // CLASS so N timeouts of one tool trip the breaker regardless of exact wording.
+    it('trips the breaker after repeated TIMEOUTS of one tool even when each timeout message differs (ENG-167)', async () => {
+      await failNTimes('run-timeout-spiral', 'create_html_file', 'connection timed out after 300000ms', 1);
+      await failNTimes('run-timeout-spiral', 'create_html_file', 'The operation was aborted due to timeout', 1);
+      await failNTimes('run-timeout-spiral', 'create_html_file', 'ModelTimeoutException: model invocation timed out', 1);
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'create_html_file',
+        args: { title: 'Campaign Brief', content_draft: 'try again' },
+        runId: 'run-timeout-spiral',
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+        const message = (outcome.error as Error).message;
+        expect(message).toContain('create_html_file');
+        expect(message.toLowerCase()).toContain('timed out');
+        // The model must be told to stop AND given the escalation/report path.
+        expect(message.toLowerCase()).toContain('report_product_issues');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('does not trip the timeout aggregate after only two differing timeouts (threshold is 3)', async () => {
+      await failNTimes('run-timeout-two', 'create_html_file', 'connection timed out after 300000ms', 1);
+      await failNTimes('run-timeout-two', 'create_html_file', 'The operation was aborted due to timeout', 1);
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'create_html_file',
+        args: { title: 'Campaign Brief', content_draft: 'third attempt' },
+        runId: 'run-timeout-two',
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not let one tool\'s timeout spiral block a DIFFERENT lightweight tool (report_product_issues stays callable)', async () => {
+      await failNTimes('run-timeout-iso', 'create_html_file', 'connection timed out after 300000ms', 1);
+      await failNTimes('run-timeout-iso', 'create_html_file', 'The operation was aborted due to timeout', 1);
+      await failNTimes('run-timeout-iso', 'create_html_file', 'ModelTimeoutException: model invocation timed out', 1);
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'report_product_issues',
+        args: { title: 'Skill run keeps timing out' },
+        runId: 'run-timeout-iso',
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    // ENG-167 follow-up: the run-scoped timeout aggregate above only ever sees ONE
+    // run. Real-world sessions retry across separate runs — the user re-sends "try
+    // again" as a new message, which mints a brand-new runId with a zeroed counter.
+    // Verified against the actual production session (94253d20-712e...) that filed
+    // ENG-167: create_html_file failed 6 times total across 4 separate ~10-minute
+    // turns (1-2 per turn), never once reaching 3 within a single run, so the
+    // run-scoped breaker above never tripped and the user hit the controller's hard
+    // 10-minute wall-clock timeout on every single turn. Timeout-class failures must
+    // also aggregate by session (budgetScopeId) across runs so a tool that's timing
+    // out spiral-wide gets caught well before the per-run breaker ever could.
+    it('trips the SESSION-scoped timeout aggregate across separate runs sharing a budgetScopeId (ENG-167 cross-turn retry)', async () => {
+      const sessionScope = 'session-eng167-cross-turn';
+      // Turn 1 and turn 2 each fail exactly once, in their OWN runs — mirrors two
+      // separate user "try again" turns, each a brand-new runId.
+      await failNTimes(
+        'run-turn-1', 'create_html_file', 'connection timed out after 300000ms', 1, sessionScope,
+      );
+      await failNTimes(
+        'run-turn-2', 'create_html_file', 'The operation was aborted due to timeout', 1, sessionScope,
+      );
+
+      // Third turn, third fresh runId, and — critically — this run has NOT called
+      // create_html_file before. Session has now seen 2 timeout failures across
+      // turns 1 and 2 only.
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome3 = await executeAgentToolThroughGateway({
+        toolName: 'create_html_file',
+        args: { title: 'Campaign Brief' },
+        runId: 'run-turn-3',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome3.status).toBe('error');
+      if (outcome3.status === 'error') {
+        expect(outcome3.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+        const message = (outcome3.error as Error).message;
+        expect(message).toContain('create_html_file');
+        expect(message.toLowerCase()).toContain('timed out');
+        expect(message.toLowerCase()).toContain('report_product_issues');
+        // Greptile ENG-167 follow-up: run-turn-3 never called create_html_file
+        // before this attempt — the message must NOT claim the failures happened
+        // "in this run" (factually wrong, contradicts the model's own tool-call
+        // history) and must instead say they came from earlier turns/session.
+        expect(message.toLowerCase()).not.toContain('in this run');
+        expect(message.toLowerCase()).toContain('session');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('does not trip the session-scoped timeout aggregate after only ONE cross-run timeout (threshold is 2)', async () => {
+      const sessionScope = 'session-eng167-single-timeout';
+      const outcome1 = await executeAgentToolThroughGateway({
+        toolName: 'create_html_file',
+        args: { title: 'Campaign Brief' },
+        runId: 'run-turn-1',
+        budgetScopeId: sessionScope,
+        execute: () => Promise.reject(new Error('connection timed out after 300000ms')),
+      });
+      expect(outcome1.status).toBe('error');
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome2 = await executeAgentToolThroughGateway({
+        toolName: 'create_html_file',
+        args: { title: 'Campaign Brief' },
+        runId: 'run-turn-2',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome2.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('a session-scoped timeout spiral for one tool does not block a DIFFERENT tool in a new run (report_product_issues stays callable)', async () => {
+      const sessionScope = 'session-eng167-cross-turn-isolation';
+      await executeAgentToolThroughGateway({
+        toolName: 'create_html_file',
+        args: { title: 'Campaign Brief' },
+        runId: 'run-turn-1',
+        budgetScopeId: sessionScope,
+        execute: () => Promise.reject(new Error('connection timed out after 300000ms')),
+      });
+      await executeAgentToolThroughGateway({
+        toolName: 'create_html_file',
+        args: { title: 'Campaign Brief' },
+        runId: 'run-turn-2',
+        budgetScopeId: sessionScope,
+        execute: () => Promise.reject(new Error('ModelTimeoutException: model invocation timed out')),
+      });
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'report_product_issues',
+        args: { title: 'Skill run keeps timing out' },
+        runId: 'run-turn-3',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('a session-scoped timeout success clears the aggregate so a later spiral starts fresh', async () => {
+      const sessionScope = 'session-eng167-cross-turn-reset';
+      await executeAgentToolThroughGateway({
+        toolName: 'create_html_file',
+        args: { title: 'Campaign Brief' },
+        runId: 'run-turn-1',
+        budgetScopeId: sessionScope,
+        execute: () => Promise.reject(new Error('connection timed out after 300000ms')),
+      });
+
+      // A later turn succeeds — the session-scoped aggregate for this tool should clear.
+      const successOutcome = await executeAgentToolThroughGateway({
+        toolName: 'create_html_file',
+        args: { title: 'Campaign Brief' },
+        runId: 'run-turn-2',
+        budgetScopeId: sessionScope,
+        execute: () => Promise.resolve({ success: true }),
+      });
+      expect(successOutcome.status).toBe('success');
+
+      // A single new timeout afterward should NOT trip (aggregate was cleared, back to 1).
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      await executeAgentToolThroughGateway({
+        toolName: 'create_html_file',
+        args: { title: 'Campaign Brief' },
+        runId: 'run-turn-3',
+        budgetScopeId: sessionScope,
+        execute: () => Promise.reject(new Error('The operation was aborted due to timeout')),
+      });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'create_html_file',
+        args: { title: 'Campaign Brief' },
+        runId: 'run-turn-4',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    // ENG-167 follow-up #2: verified against the actual production session's turn-4
+    // event timeline (run mr1cvg71:4crc31) — the model correctly called
+    // report_product_issues and it succeeded in 5.2s, but nothing told the model to
+    // STOP there. It immediately retried create_html_file again in the SAME run,
+    // which hung for 900s and got killed by the controller's 10-minute wall clock
+    // before the model could ever tell the user the bug was already filed. Once a
+    // run has successfully filed a report, a subsequent timeout trip in that SAME
+    // run must say so explicitly — not repeat "offer to file a bug report" as if
+    // nothing had been filed yet.
+    it('tells the model NOT to file another report when report_product_issues already succeeded this run (ENG-167 follow-up)', async () => {
+      const sessionScope = 'session-eng167-already-reported';
+      // Two earlier turns/runs already push the session-scoped timeout aggregate to
+      // threshold (mirrors turns 1 & 2 of the real session, both fully resolved
+      // before the "report bug" turn started).
+      await executeAgentToolThroughGateway({
+        toolName: 'create_html_file',
+        args: { title: 'Campaign Brief' },
+        runId: 'run-turn-1',
+        budgetScopeId: sessionScope,
+        execute: () => Promise.reject(new Error('Stream timed out because of no activity for 300000 ms')),
+      });
+      await executeAgentToolThroughGateway({
+        toolName: 'create_html_file',
+        args: { title: 'Campaign Brief' },
+        runId: 'run-turn-2',
+        budgetScopeId: sessionScope,
+        execute: () => Promise.reject(new Error('Stream timed out because of no activity for 300000 ms')),
+      });
+
+      // Turn 4's own run: report_product_issues succeeds first...
+      const reportOutcome = await executeAgentToolThroughGateway({
+        toolName: 'report_product_issues',
+        args: { issues: [{ type: 'bug', title: 'Skill run keeps timing out' }] },
+        runId: 'run-turn-4',
+        budgetScopeId: sessionScope,
+        execute: () => Promise.resolve({ success: true }),
+      });
+      expect(reportOutcome.status).toBe('success');
+
+      // ...then the model retries create_html_file in the SAME run. The
+      // session-scoped aggregate is already at threshold, so this trips instantly.
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'create_html_file',
+        args: { title: 'Campaign Brief' },
+        runId: 'run-turn-4',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+        const message = (outcome.error as Error).message.toLowerCase();
+        expect(message).toContain('already filed');
+        expect(message).toContain('do not file another');
+        // Must NOT repeat the generic "offer to file a bug report" suggestion —
+        // that's what already happened once and confused the model into thinking
+        // it still needed to do something with report_product_issues.
+        expect(message).not.toContain('offer either to try');
+        // Greptile ENG-167 follow-up: run-turn-4 never called create_html_file
+        // before this attempt — the 2 counted failures came from turns 1 & 2.
+        expect(message).not.toContain('in this run');
+        expect(message).toContain('session');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('still offers to file a bug report when report_product_issues has NOT been called yet this run (unchanged behavior)', async () => {
+      await failNTimes('run-timeout-no-report', 'create_html_file', 'connection timed out after 300000ms', 1);
+      await failNTimes('run-timeout-no-report', 'create_html_file', 'The operation was aborted due to timeout', 1);
+      await failNTimes('run-timeout-no-report', 'create_html_file', 'ModelTimeoutException: model invocation timed out', 1);
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'create_html_file',
+        args: { title: 'Campaign Brief' },
+        runId: 'run-timeout-no-report',
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        const message = (outcome.error as Error).message.toLowerCase();
+        expect(message).toContain('report_product_issues');
+        expect(message).not.toContain('already filed');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('ENG-182: a per-recipient LinkedIn refusal does not block invites to other recipients', async () => {
+      const runId = 'run-eng182';
+      // Two DIFFERENT profiles each hit LinkedIn's terminal "Cannot resend yet"
+      // (upstream_rejected → fast-trip threshold 2). Keyed on the error text alone
+      // these two identical refusals would trip the breaker for the whole tool.
+      for (const profile of [
+        'https://www.linkedin.com/in/chang-liu/',
+        'https://www.linkedin.com/in/liang-guo/',
+      ]) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'linkedin_outreach',
+          args: { action: 'send-invite', profile_url: profile },
+          runId,
+          execute: failingExecute('Cannot resend yet'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      // A genuinely different recipient, never individually attempted, must still run.
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: 'https://www.linkedin.com/in/mei-chen/' },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('ENG-182: still trips the breaker when the SAME LinkedIn recipient refuses repeatedly', async () => {
+      const runId = 'run-eng182-same';
+      const profile = 'https://www.linkedin.com/in/chang-liu/';
+      for (let i = 0; i < 2; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'linkedin_outreach',
+          args: { action: 'send-invite', profile_url: profile },
+          runId,
+          execute: failingExecute('Cannot resend yet'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: profile },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('ENG-182: collapses query/trailing-slash variants of one recipient into a single scope', async () => {
+      const runId = 'run-eng182-norm';
+      // Same profile, two URL shapes LinkedIn hands back (trailing slash + tracking query).
+      for (const profile of [
+        'https://www.linkedin.com/in/chang-liu/',
+        'https://www.linkedin.com/in/chang-liu?miniProfileUrn=urn%3Ali%3Aabc',
+      ]) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'linkedin_outreach',
+          args: { action: 'send-invite', profile_url: profile },
+          runId,
+          execute: failingExecute('Cannot resend yet'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: 'https://www.linkedin.com/in/chang-liu' },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('ENG-182: a success for one recipient does NOT reset a pending breaker for another (per-recipient clear)', async () => {
+      const runId = 'run-eng182-clear';
+      const alice = 'https://www.linkedin.com/in/alice/';
+      const bob = 'https://www.linkedin.com/in/bob/';
+
+      // Alice refuses once — below the fast-trip threshold of 2 for "Cannot resend yet".
+      const firstAlice = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: alice },
+        runId,
+        execute: failingExecute('Cannot resend yet'),
+      });
+      expect(firstAlice.status).toBe('error');
+
+      // Bob succeeds. A tool-wide clear would wipe Alice's pending count here; the
+      // per-recipient clear must leave it intact.
+      const bobSuccess = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: bob },
+        runId,
+        execute: () => Promise.resolve({ success: true }),
+      });
+      expect(bobSuccess.status).toBe('success');
+
+      // Alice refuses a second time — now at the original threshold (2), so she trips.
+      const secondAlice = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: alice },
+        runId,
+        execute: failingExecute('Cannot resend yet'),
+      });
+      expect(secondAlice.status).toBe('error');
+
+      // The next Alice call is blocked without executing — Bob's success did not
+      // reset her counter. If the clear were tool-wide, this would run and succeed.
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', profile_url: alice },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('ENG-182: scopes the breaker per provider_id when no profile_url is present', async () => {
+      const runId = 'run-eng182-provider';
+      // Live send-invite calls often carry provider_id instead of profile_url.
+      for (const providerId of ['ACoAA-alice', 'ACoAA-bob']) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'linkedin_outreach',
+          args: { action: 'send-invite', provider_id: providerId },
+          runId,
+          execute: failingExecute('Cannot resend yet'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      // A third, distinct provider_id is not cross-blocked by the other two.
+      const carol = jest.fn().mockResolvedValue({ success: true });
+      const carolOutcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', provider_id: 'ACoAA-carol' },
+        runId,
+        execute: carol,
+      });
+      expect(carolOutcome.status).toBe('success');
+      expect(carol).toHaveBeenCalledTimes(1);
+
+      // A second refusal for the SAME provider_id reaches threshold 2 and trips it.
+      const secondAlice = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', provider_id: 'ACoAA-alice' },
+        runId,
+        execute: failingExecute('Cannot resend yet'),
+      });
+      expect(secondAlice.status).toBe('error');
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'send-invite', provider_id: 'ACoAA-alice' },
+        runId,
+        execute,
+      });
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('ENG-313: a corrected get-profile with a valid profile_url runs after two argument-less failures', async () => {
+      const runId = 'run-eng313';
+      // The model twice calls get-profile with only keywords (no profile_url /
+      // provider_id), so it fails "Either profile_url or provider_id is required"
+      // — an invalid_args class (fast-trip threshold 2) with an empty recipient
+      // scope. Two of these must NOT block a later, corrected call that finally
+      // carries a real profile_url — that is a materially different, now-valid
+      // attempt, not a spiral.
+      for (let i = 0; i < 2; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'linkedin_outreach',
+          args: { action: 'get-profile', keywords: 'nalin pradeep' },
+          runId,
+          execute: failingExecute('Either profile_url or provider_id is required for get-profile'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'get-profile', profile_url: 'https://www.linkedin.com/in/nalinpradeep/' },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('ENG-313: still trips when the SAME get-profile recipient fails repeatedly', async () => {
+      const runId = 'run-eng313-same';
+      const profile = 'https://www.linkedin.com/in/nalinpradeep/';
+      for (let i = 0; i < 2; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'linkedin_outreach',
+          args: { action: 'get-profile', profile_url: profile },
+          runId,
+          execute: failingExecute('Invalid parameters'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ success: true });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'linkedin_outreach',
+        args: { action: 'get-profile', profile_url: profile },
+        runId,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    // ENG-291: the Daily Satisfaction Score Report calls get_chat_history over a
+    // 24h window with sync=true (on-the-fly score generation). That heavy request
+    // timed out twice, tripping the SESSION-scoped timeout aggregate at threshold
+    // 2 — which then hard-blocked EVERY subsequent get_chat_history in the session,
+    // including the legitimate recovery paths (the same window with sync=false, and
+    // a much smaller 6h window). The model was told "STOP retrying" and could never
+    // discover that a cheaper request would have completed, so the report produced
+    // zero output. Scope the breaker by request COST (sync flag + limit + window
+    // duration) so a materially cheaper/smaller call lands in a different bucket and
+    // is NOT blocked by an expensive call's timeouts — exactly like the ENG-182 /
+    // ENG-313 per-recipient scoping above.
+    const HISTORY_24H = { start_time: '2026-07-10T00:00:00Z', end_time: '2026-07-11T00:00:00Z' };
+    const HISTORY_6H = { start_time: '2026-07-10T18:00:00Z', end_time: '2026-07-11T00:00:00Z' };
+
+    it('ENG-291: does not block a sync=false get_chat_history after the sync=true request timed out twice', async () => {
+      const sessionScope = 'session-eng291-daily-satisfaction';
+      // Two identical heavy sync=true requests time out (turns 1 & 2 of the report).
+      for (const runId of ['run-history-1', 'run-history-2']) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'get_chat_history',
+          args: { ...HISTORY_24H, limit: 1000, sync: true },
+          runId,
+          budgetScopeId: sessionScope,
+          execute: failingExecute('This operation was aborted'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      // The legitimate recovery path — same window, but sync=false (cached scores
+      // only) — is a cheaper request and must still execute.
+      const execute = jest.fn().mockResolvedValue({ sessions: [] });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'get_chat_history',
+        args: { ...HISTORY_24H, limit: 1000, sync: false },
+        runId: 'run-history-3',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('ENG-291: does not block a smaller-window get_chat_history after a larger window timed out twice', async () => {
+      const sessionScope = 'session-eng291-smaller-window';
+      // The larger 24h window (sync=false) times out twice.
+      for (const runId of ['run-history-a', 'run-history-b']) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'get_chat_history',
+          args: { ...HISTORY_24H, limit: 1000, sync: false },
+          runId,
+          budgetScopeId: sessionScope,
+          execute: failingExecute('This operation was aborted'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      // A materially smaller 6h window with a smaller limit is a legitimate reduced
+      // request and must still execute.
+      const execute = jest.fn().mockResolvedValue({ sessions: [] });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'get_chat_history',
+        args: { ...HISTORY_6H, limit: 200, sync: false },
+        runId: 'run-history-c',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('success');
+      expect(execute).toHaveBeenCalledTimes(1);
+    });
+
+    it('ENG-291: still blocks an IDENTICAL get_chat_history request that keeps timing out', async () => {
+      const sessionScope = 'session-eng291-identical';
+      for (const runId of ['run-history-x', 'run-history-y']) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'get_chat_history',
+          args: { ...HISTORY_24H, limit: 1000, sync: true },
+          runId,
+          budgetScopeId: sessionScope,
+          execute: failingExecute('This operation was aborted'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      // Same expensive request a third time — this should still be blocked so the
+      // model stops thrashing on the identical call that keeps timing out.
+      const execute = jest.fn().mockResolvedValue({ sessions: [] });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'get_chat_history',
+        args: { ...HISTORY_24H, limit: 1000, sync: true },
+        runId: 'run-history-z',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+        expect((outcome.error as Error).message).toContain('get_chat_history');
+        expect((outcome.error as Error).message.toLowerCase()).toContain('timed out');
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    // ENG-291 boundary coverage: chatHistoryFailureScope must degrade sanely on the
+    // malformed / missing / oversized inputs a model actually sends, since the scope
+    // string is what routes a failure into a bucket. These document the invalid-input
+    // branches (non-object args, unparsable/missing timestamps, limit clamp/default).
+    it('ENG-291: collapses missing/unparsable timestamps into one hours=0 bucket', async () => {
+      const sessionScope = 'session-eng291-hours0';
+      // Neither request carries a parseable window (malformed timestamps here, none at
+      // all on the recovery), so chatHistoryFailureScope derives hours=0 for both and
+      // they share sync=0|limit=500|hours=0. This documents that unparsable timestamps
+      // re-create the shared-scope bug class the cost-scoping fix targets: after two
+      // timeouts a differently-shaped-but-equally-windowless call is still hard-blocked.
+      for (const runId of ['run-h0-a', 'run-h0-b']) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'get_chat_history',
+          args: { start_time: 'not-a-real-date', end_time: 'also-bad' },
+          runId,
+          budgetScopeId: sessionScope,
+          execute: failingExecute('This operation was aborted'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ sessions: [] });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'get_chat_history',
+        args: { limit: 500 },
+        runId: 'run-h0-c',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('ENG-291: clamps limit>1000 so over-large limits share one bucket', async () => {
+      const sessionScope = 'session-eng291-limit-clamp';
+      // limit 5000 and limit 1200 both clamp to 1000, so the same-window recovery is
+      // treated as the same request and is blocked after the first times out twice.
+      for (const runId of ['run-clamp-a', 'run-clamp-b']) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'get_chat_history',
+          args: { ...HISTORY_24H, limit: 5000, sync: false },
+          runId,
+          budgetScopeId: sessionScope,
+          execute: failingExecute('This operation was aborted'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ sessions: [] });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'get_chat_history',
+        args: { ...HISTORY_24H, limit: 1200, sync: false },
+        runId: 'run-clamp-c',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('ENG-291: defaults a missing limit to 500 so omitted and explicit-500 share one bucket', async () => {
+      const sessionScope = 'session-eng291-limit-default';
+      // Omitted limit defaults to 500; an explicit limit=500 recovery over the same
+      // window lands in the same bucket and is blocked after two timeouts.
+      for (const runId of ['run-default-a', 'run-default-b']) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'get_chat_history',
+          args: { ...HISTORY_24H, sync: false },
+          runId,
+          budgetScopeId: sessionScope,
+          execute: failingExecute('This operation was aborted'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ sessions: [] });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'get_chat_history',
+        args: { ...HISTORY_24H, limit: 500, sync: false },
+        runId: 'run-default-c',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('ENG-291: treats non-object args as scope "" so array and string args share one bucket', async () => {
+      const sessionScope = 'session-eng291-nonobject';
+      // Non-object args (array, string) carry no cost signature, so the scope is ''
+      // for all of them — they collapse to one shared bucket.
+      for (const runId of ['run-nonobj-a', 'run-nonobj-b']) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'get_chat_history',
+          args: [],
+          runId,
+          budgetScopeId: sessionScope,
+          execute: failingExecute('This operation was aborted'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      const execute = jest.fn().mockResolvedValue({ sessions: [] });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'get_chat_history',
+        args: 'not-an-object',
+        runId: 'run-nonobj-c',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolRepeatedFailureError);
+      }
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('ENG-291: caps total get_chat_history timeouts across varying cost buckets (aggregate session budget)', async () => {
+      const sessionScope = 'session-eng291-aggregate';
+      // A model that keeps VARYING the limit never accumulates two timeouts in any one
+      // cost bucket, so the per-scope session timeout breaker (threshold 2) never trips.
+      // Six single-timeout buckets still burn six ~10-minute turns; the coarse aggregate
+      // budget (6) caps the session total so a seventh get_chat_history is blocked
+      // regardless of its bucket — the session-wide protection cost-scoping removed.
+      const limits = [100, 200, 300, 400, 600, 700];
+      for (let i = 0; i < limits.length; i += 1) {
+        const outcome = await executeAgentToolThroughGateway({
+          toolName: 'get_chat_history',
+          args: { ...HISTORY_24H, limit: limits[i], sync: false },
+          runId: `run-agg-${i}`,
+          budgetScopeId: sessionScope,
+          execute: failingExecute('This operation was aborted'),
+        });
+        expect(outcome.status).toBe('error');
+      }
+
+      // A seventh call in a brand-new (smaller) bucket is still blocked by the coarse cap.
+      const execute = jest.fn().mockResolvedValue({ sessions: [] });
+      const outcome = await executeAgentToolThroughGateway({
+        toolName: 'get_chat_history',
+        args: { ...HISTORY_6H, limit: 50, sync: false },
+        runId: 'run-agg-final',
+        budgetScopeId: sessionScope,
+        execute,
+      });
+
+      expect(outcome.status).toBe('error');
+      if (outcome.status === 'error') {
+        expect(outcome.error).toBeInstanceOf(AgentToolBudgetExceededError);
+        expect((outcome.error as Error).message).toContain('retry budget of 6');
+        expect((outcome.error as Error).message).toContain('in this session');
+      }
+      expect(execute).not.toHaveBeenCalled();
     });
 
     it('blocks expensive media tools after two failures even when the error messages differ', async () => {

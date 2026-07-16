@@ -6,6 +6,7 @@ import { getLinkedInConfig, getLinkedInScopesForType, LinkedInAccountType } from
 import { createAccount } from '../services/connectedAccountsDb';
 import { linkedInService } from '../services/linkedInService';
 import { authenticateToken } from '../middleware/auth';
+import { getJwtSecret } from '../config/jwt';
 
 const router = express.Router();
 
@@ -24,15 +25,6 @@ const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
-// JWT Secret for signing the state parameter
-// REQUIRED: Must be set in environment variables
-const STATE_SECRET = process.env.JWT_SECRET;
-if (!STATE_SECRET) {
-  throw new Error('JWT_SECRET environment variable must be set for OAuth state verification');
-}
-
-
-
 interface StatePayload {
   userId: string;
   nonce: string;
@@ -43,7 +35,7 @@ interface StatePayload {
 const generateState = (userId: string, accountType?: LinkedInAccountType): string => {
   const nonce = crypto.randomBytes(16).toString('hex');
   const payload: StatePayload = { userId, nonce, accountType };
-  return jwt.sign(payload, STATE_SECRET, { expiresIn: STATE_EXPIRATION });
+  return jwt.sign(payload, getJwtSecret(), { expiresIn: STATE_EXPIRATION });
 };
 
 // ============================================
@@ -63,7 +55,7 @@ const buildOAuthUrl = (config: { authorizationUrl: string; clientId?: string; re
 // Helper to verify state and extract payload
 const verifyState = (state: string, userId: string): StatePayload | null => {
   try {
-    const decoded = jwt.verify(state, STATE_SECRET) as StatePayload;
+    const decoded = jwt.verify(state, getJwtSecret()) as StatePayload;
     if (decoded.userId !== userId) return null;
     return decoded;
   } catch (error) {

@@ -30,7 +30,7 @@ import type {
   BedrockRuntimeClient,
   BedrockRuntimeClientConfig,
 } from "@aws-sdk/client-bedrock-runtime";
-import { recordUsage } from "../services/usageRecorderService";
+import { recordUsage, meterUserUsage } from "../services/usageRecorderService";
 
 export interface MeterContext {
   userId?: string;
@@ -84,6 +84,135 @@ export function normalizeGeminiUsage(usageMetadata: any): NormalizedUsage {
     outputTokens: usageMetadata?.candidatesTokenCount || 0,
     cacheReadTokens: usageMetadata?.cachedContentTokenCount || 0,
   };
+}
+
+/**
+ * Anthropic Messages API (native SDK, AnthropicBedrock, and Vertex bearer clients —
+ * `client.messages.create`): usage{input_tokens, output_tokens, cache_read_input_tokens,
+ * cache_creation_input_tokens}. Note this is a DIFFERENT shape from Bedrock Converse
+ * (which uses inputTokens/cacheReadInputTokens) and from OpenAI (prompt_tokens).
+ */
+export function normalizeAnthropicUsage(usage: any): NormalizedUsage {
+  return {
+    inputTokens: usage?.input_tokens || 0,
+    outputTokens: usage?.output_tokens || 0,
+    cacheReadTokens: usage?.cache_read_input_tokens || 0,
+    cacheWriteTokens: usage?.cache_creation_input_tokens || 0,
+  };
+}
+
+/**
+ * Detect the provider usage shape of a raw completion response and normalize it.
+ * Returns null when no usage is present (caller decides what to do).
+ *
+ * Keying off the RESPONSE SHAPE (not a caller-supplied provider label) is deliberate:
+ * some call sites label a request `provider:'bedrock'` yet receive an OpenAI-compatible
+ * shim response (e.g. crm enrichment via getClientForModel), so only the shape is a
+ * reliable signal for extraction. Ordering matters — Gemini nests usage under
+ * `usageMetadata`; the three `usage.*` shapes are disambiguated by their field names:
+ *   OpenAI/Azure  -> prompt_tokens / completion_tokens (embeddings omit completion)
+ *   Anthropic     -> input_tokens / output_tokens (snake_case)
+ *   Bedrock Conv. -> inputTokens / outputTokens (camelCase)
+ */
+export function normalizeUsageFromResponse(response: any): NormalizedUsage | null {
+  if (!response || typeof response !== "object") return null;
+
+  const gm = (response as any).usageMetadata;
+  if (
+    gm &&
+    typeof gm === "object" &&
+    (gm.promptTokenCount != null ||
+      gm.candidatesTokenCount != null ||
+      gm.cachedContentTokenCount != null)
+  ) {
+    return normalizeGeminiUsage(gm);
+  }
+
+  const u = (response as any).usage;
+  if (u && typeof u === "object") {
+    if (u.prompt_tokens != null || u.completion_tokens != null) {
+      return normalizeOpenAIUsage(u);
+    }
+    if (u.input_tokens != null || u.output_tokens != null) {
+      return normalizeAnthropicUsage(u);
+    }
+    if (u.inputTokens != null || u.outputTokens != null) {
+      return normalizeBedrockUsage(u);
+    }
+  }
+
+  return null;
+}
+
+export interface MeterFromResponseContext {
+  userId?: string;
+  billingUserId?: string;
+  onBehalfOf?: string;
+  model: string;
+  provider: string;
+  feature: string;
+  sessionId?: string;
+  taskId?: string;
+}
+
+/**
+ * How a metered call is accounted:
+ *   - 'meter' (default) -> burn visibility AND the enforced per-user cap deduction.
+ *   - 'burn'            -> burn visibility ONLY (platform absorbs the cost; still
+ *                          attributed to the user, but never charges the cap).
+ *
+ * 'meter' is a SUPERSET of 'burn' — it always records the burn and then also deducts.
+ * So flipping a site from { mode: 'burn' } to the default (or { mode: 'meter' }) ADDS
+ * the deduction on top of the burn; it never loses the visibility.
+ */
+export type MeterMode = "burn" | "meter";
+
+/**
+ * ONE-LINER metering hook for any direct-provider (non-factory) token-based LLM call.
+ * Extracts token usage from the raw provider `response` (any of OpenAI/Azure, Anthropic
+ * Messages, Bedrock Converse, or Gemini shapes) and meters it:
+ *   - default / { mode: 'meter' } -> shadow analytics (burn) + the per-user cap deduction
+ *   - { mode: 'burn' }            -> burn only; used for deep research, email drafts,
+ *                                    session titles, background automation, etc.
+ *
+ * Deduction only happens when a real ctx.userId is present — with no user, 'meter'
+ * degrades to a bare burn record under "system", so a site can never deduct against nobody.
+ *
+ * Fire-and-forget + fail-open: it never throws into, awaits, or slows the caller. When the
+ * response carries no usage, the call is still recorded (with zero tokens) so call volume
+ * stays visible — matching the metered-factory clients' behavior. NOT for image/video,
+ * which are per-generation priced (use recordUsage with costUsdOverride for those).
+ */
+export function meterUsageFromResponse(
+  ctx: MeterFromResponseContext,
+  response: any,
+  opts?: { mode?: MeterMode }
+): void {
+  try {
+    const usage =
+      normalizeUsageFromResponse(response) ?? { inputTokens: 0, outputTokens: 0 };
+    const meterCtx = {
+      userId: ctx.userId,
+      billingUserId: ctx.billingUserId,
+      onBehalfOf: ctx.onBehalfOf,
+      model: ctx.model,
+      provider: ctx.provider,
+      feature: ctx.feature,
+      sessionId: ctx.sessionId,
+      taskId: ctx.taskId,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheReadTokens: usage.cacheReadTokens,
+      cacheWriteTokens: usage.cacheWriteTokens,
+    };
+    if (opts?.mode === "burn") {
+      void recordUsage(meterCtx);
+    } else {
+      meterUserUsage(meterCtx);
+    }
+  } catch {
+    // Metering must never break or slow an LLM call.
+  }
 }
 
 // ── Internal: fire recordUsage without ever throwing or awaiting ──────────────

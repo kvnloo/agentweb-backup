@@ -29,9 +29,13 @@ import {
   summariseStepMetrics,
 } from '../services/onboardingMetricsService';
 import { userDb } from '../services/db';
+import { awsDynamoAdapter } from '../loops/adapters/awsAdapters';
+import { claimLoopDailyDigestPost } from '../loops/core/digest/dailyDigestClaim';
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 const RUNS_TABLE = `${TABLE_PREFIX}AW-OnboardingLoopRuns`;
+const ONBOARDING_LEGACY_LOOP_ID = 'onboarding-loop-legacy';
+const ONBOARDING_HEARTBEAT_LOOP_ID = 'onboarding-loop-heartbeat';
 
 // ~6 LLM calls per cycle (generate + critique per underperforming step).
 // At ~$0.015/call (1000 in + 500 out on sonnet-4-6) the floor is ~$0.09 per step pair.
@@ -111,6 +115,7 @@ export async function runOnboardingLoop(): Promise<void> {
 
   const runId = `loop-${Date.now()}`;
   const docClient = buildDynamoDB();
+  const claimDynamo = awsDynamoAdapter();
 
   console.log(`[OnboardingLoop] Starting run ${runId}`);
 
@@ -216,9 +221,19 @@ export async function runOnboardingLoop(): Promise<void> {
         try {
           const metrics = computeHeartbeatMetrics(users, config);
           metrics.reliability = reliability;
-          const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-          const dm = await postHeartbeatSlackDM(metrics, slackUserId, slackClient);
-          console.log(`[OnboardingLoop] Heartbeat DM posted — channel=${dm.channel} ts=${dm.ts}`);
+          const claimed = await claimLoopDailyDigestPost(claimDynamo, {
+            loopId: ONBOARDING_HEARTBEAT_LOOP_ID,
+            digestDate: metrics.todayStr,
+            slackUserId,
+            runId,
+          });
+          if (claimed) {
+            const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+            const dm = await postHeartbeatSlackDM(metrics, slackUserId, slackClient);
+            console.log(`[OnboardingLoop] Heartbeat DM posted — channel=${dm.channel} ts=${dm.ts}`);
+          } else {
+            console.log(`[OnboardingLoop] Heartbeat DM already posted for ${metrics.todayStr}; skipping duplicate`);
+          }
         } catch (err) {
           // Non-fatal — log and continue. The runs-table log is the source of
           // truth for "did the cron fire."
@@ -248,8 +263,25 @@ export async function runOnboardingLoop(): Promise<void> {
 
     // Post Slack DM first so we have the channel+ts to stamp on each variant.
     const slackUserId = process.env.ONBOARDING_LOOP_APPROVER_SLACK_USER_ID;
+    const todayStr = new Date().toISOString().slice(0, 10);
     if (slackUserId && process.env.SLACK_BOT_TOKEN) {
       try {
+        const claimed = await claimLoopDailyDigestPost(claimDynamo, {
+          loopId: ONBOARDING_LEGACY_LOOP_ID,
+          digestDate: todayStr,
+          slackUserId,
+          runId,
+        });
+        if (!claimed) {
+          console.log(`[OnboardingLoop] Daily review DM already posted for ${todayStr}; skipping duplicate run`);
+          await logRun(docClient, runId, 'skipped', {
+            reason: 'duplicate_daily_review',
+            underperformingSteps,
+            versionId,
+          });
+          return;
+        }
+
         const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
         const dm = await postDailySlackDM(
           proposedMutations,

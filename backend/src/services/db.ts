@@ -112,6 +112,7 @@ export interface User {
   lastLoginTime?: string;
   lastActiveAt?: string; // Updated when user creates a chat session (non-delegated); more accurate than lastLoginTime for DAU/WAU/MAU
   signupSource?: "password" | "oauth" | "waitlist" | "admin" | string; // How the account was created. Set at signup; do not mutate.
+  funnelStatus?: string | null; // Admin-owned business funnel status for triage/prioritization.
   supportNote?: string;
   roles?: ("partner" | "customer" | "free" | "contractor")[];
   displayName?: string;
@@ -155,6 +156,15 @@ export interface User {
   useCaseCategories?: string[];
   emmaHelpInterests?: string[]; // Onboarding multi-select: what user wants Emma to help with (e.g., "brand", "paid_ads", "founder_led_sales")
   emmaHelpInterestsSetAt?: string; // ISO timestamp when the user first saved their interests
+  fathomOnboardingIngestions?: Array<Record<string, unknown>>; // Review-first Fathom sales/prospect-call onboarding context ledger
+  fathomDraftAccount?: boolean; // System-created disabled account from Harsha-owned Fathom onboarding automation.
+  fathomDraftStatus?: "needs_review" | "approved" | "discarded" | string;
+  fathomReviewOwnerUserId?: string;
+  fathomSourceRecordingId?: string;
+  fathomSourceRecordingUrl?: string;
+  fathomSourceContactEmail?: string;
+  fathomSourceContactName?: string;
+  fathomSourceWebsite?: string;
   /**
    * Onboarding event log — appended to by POST /api/onboarding/events. Used
    * by the Lifecycle Drip Phase 1 feature to derive `onboardingStage`. Each
@@ -948,6 +958,60 @@ export class UserDB {
     }
   }
 
+  async createFathomDraftUser(input: {
+    email: string;
+    userId: string;
+    displayName?: string;
+    companyName?: string;
+    reviewOwnerUserId: string;
+    sourceRecordingId: string;
+    sourceRecordingUrl?: string;
+    sourceContactEmail?: string;
+    sourceContactName?: string;
+    sourceWebsite?: string;
+  }): Promise<User | undefined> {
+    const now = new Date().toISOString();
+    const normalizedEmail = input.email.toLowerCase();
+    const itemToCreate: any = {
+      userId: input.userId,
+      email: normalizedEmail,
+      password: "!disabled-fathom-draft-account!",
+      isOAuthUser: false,
+      isAdmin: false,
+      isActive: false,
+      createdAt: now,
+      roles: ["customer"],
+      signupSource: "fathom_auto_onboarding_draft",
+      fathomDraftAccount: true,
+      fathomDraftStatus: "needs_review",
+      fathomReviewOwnerUserId: input.reviewOwnerUserId,
+      fathomSourceRecordingId: input.sourceRecordingId,
+      emailDomain: normalizedEmail.split("@")[1] || "agentweb.internal",
+      memoryEnabled: true,
+    };
+
+    if (input.displayName) itemToCreate.displayName = input.displayName;
+    if (input.companyName) itemToCreate.companyName = input.companyName;
+    if (input.sourceRecordingUrl) itemToCreate.fathomSourceRecordingUrl = input.sourceRecordingUrl;
+    if (input.sourceContactEmail) itemToCreate.fathomSourceContactEmail = input.sourceContactEmail.toLowerCase();
+    if (input.sourceContactName) itemToCreate.fathomSourceContactName = input.sourceContactName;
+    if (input.sourceWebsite) itemToCreate.fathomSourceWebsite = input.sourceWebsite;
+
+    const params = {
+      TableName: this.tableName,
+      Item: itemToCreate,
+      ConditionExpression: "attribute_not_exists(email)",
+    };
+
+    try {
+      await this.docClient.put(params).promise();
+      return params.Item as User;
+    } catch (error) {
+      handleDynamoDbError(error, "createFathomDraftUser");
+      return undefined;
+    }
+  }
+
   async getUserByEmail(email: string) {
     const params = {
       TableName: this.tableName,
@@ -1356,31 +1420,46 @@ export class UserDB {
       return user; // Return the fetched user object if no updates are needed
     }
 
-    const updateExpressions: string[] = [];
+    const setExpressions: string[] = [];
+    const removeExpressions: string[] = [];
     const expressionAttributeNames: { [key: string]: string } = {};
     const expressionAttributeValues: { [key: string]: any } = {};
 
     Object.entries(updatableFields).forEach(([key, value]) => {
-      // Ensure value is not undefined. Allow null to explicitly remove/set a field to null.
-      if (value !== undefined) {
-        updateExpressions.push(`#${key} = :${key}`);
-        expressionAttributeNames[`#${key}`] = key;
+      if (value === undefined) return;
+      expressionAttributeNames[`#${key}`] = key;
+      if (value === null) {
+        // DynamoDB rejects SET-ing a GSI key attribute (e.g. orgId on
+        // OrgIdIndex) to NULL — it must be REMOVEd instead. Applying this to
+        // every null (not just GSI keys) keeps the semantics consistent and
+        // matches the REMOVE-on-null pattern already used in updateLead.
+        removeExpressions.push(`#${key}`);
+      } else {
+        setExpressions.push(`#${key} = :${key}`);
         expressionAttributeValues[`:${key}`] = value;
       }
     });
 
-    if (updateExpressions.length === 0) {
+    if (setExpressions.length === 0 && removeExpressions.length === 0) {
       return user;
     }
 
-    const params = {
+    const updateExpressionParts: string[] = [];
+    if (setExpressions.length > 0) updateExpressionParts.push(`SET ${setExpressions.join(", ")}`);
+    if (removeExpressions.length > 0) updateExpressionParts.push(`REMOVE ${removeExpressions.join(", ")}`);
+
+    const params: any = {
       TableName: this.tableName,
       Key: { email: user.email }, // Use email as the primary key
-      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      UpdateExpression: updateExpressionParts.join(" "),
       ExpressionAttributeNames: expressionAttributeNames,
-      ExpressionAttributeValues: expressionAttributeValues,
       ReturnValues: "ALL_NEW",
     };
+    // DynamoDB rejects an empty ExpressionAttributeValues map (e.g. when every
+    // update is a REMOVE-on-null with no SET clauses at all).
+    if (Object.keys(expressionAttributeValues).length > 0) {
+      params.ExpressionAttributeValues = expressionAttributeValues;
+    }
 
     try {
       const result = await this.docClient.update(params).promise();

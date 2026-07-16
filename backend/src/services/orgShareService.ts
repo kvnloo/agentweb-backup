@@ -26,17 +26,29 @@ export function isMemberOwnedFeature(f: Feature): boolean { return MEMBER_OWNED.
 
 // Single source of truth for per-feature share defaults. Used both as the
 // runtime fallback when an org's shareSettings (or a specific feature key) is
-// absent, and to initialize shareSettings on org creation. `skills` and
-// `workPlans` are shared org-wide by default; everything else is opt-in.
-// Always-on features (BG/MS) ignore `enabled` entirely, so their default is
-// irrelevant to gating but reported as `true` for completeness.
+// absent, and to initialize shareSettings on org creation.
+//
+// Everything an org can share is now shared by default. An org is a company: the
+// point of putting your team in one is that they can see each other's knowledge
+// bases, templates, landing pages and analytics. Defaulting these to private meant
+// a new team saw an empty product until someone found this settings page, and most
+// never did.
+//
+// This is safe to flip for existing orgs because the runtime gate prefers an
+// explicit value over the default (`isFeatureEnabled`: `if (typeof cfg.enabled ===
+// "boolean") return cfg.enabled`). An org that deliberately turned something OFF has
+// `enabled: false` stored and keeps it off. The default only fills a gap where the
+// org never expressed a preference.
+//
+// Always-on features (brandGuidelines/marketingStrategy) ignore `enabled` entirely,
+// so their default is irrelevant to gating but reported as `true` for completeness.
 const DEFAULT_ENABLED: Readonly<Record<ToggleableFeature, boolean>> = {
-  knowledgeBase: false,
-  htmlTemplates: false,
-  landingPages: false,
+  knowledgeBase: true,
+  htmlTemplates: true,
+  landingPages: true,
   workPlans: true,
   skills: true,
-  analytics: false,
+  analytics: true,
 };
 
 // The effective `enabled` default for a feature when no explicit value exists.

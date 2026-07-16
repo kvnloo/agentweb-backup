@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { userDb } from '../services/db';
+import { getJwtSecret } from '../config/jwt';
 
 export interface AuthenticatedRequest extends Request {
   user: {
@@ -56,7 +57,7 @@ export async function getUserFromToken(req: Request): Promise<{
   try {
     const decoded = jwt.verify(
       token,
-      process.env.JWT_SECRET || 'your-secret-key'
+      getJwtSecret()
     ) as UserPayload;
 
     // Handle delegate access tokens

@@ -200,7 +200,7 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
     const req: any = { user: { userId: 'test-user-id' }, params: { listId: 'list-123', leadId: 'lead-456' }, body: {} };
     const res = makeRes();
     await handler!(req, res);
-    expect(mockSendInvitation).toHaveBeenCalledWith('list-acct-9', LEAD_WITH_LINKEDIN.linkedin, true, undefined, 200);
+    expect(mockSendInvitation).toHaveBeenCalledWith('list-acct-9', LEAD_WITH_LINKEDIN.linkedin, true, undefined, 200, { onNoteQuota: 'skip' });
     expect(mockResolveUserOwnedAccountId).not.toHaveBeenCalled();
   });
 
@@ -213,7 +213,7 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
     };
     const res = makeRes();
     await handler!(req, res);
-    expect(mockSendInvitation).toHaveBeenCalledWith('caller-acct-1', LEAD_WITH_LINKEDIN.linkedin, true, undefined, 200);
+    expect(mockSendInvitation).toHaveBeenCalledWith('caller-acct-1', LEAD_WITH_LINKEDIN.linkedin, true, undefined, 200, { onNoteQuota: 'skip' });
     expect(mockResolveUserOwnedAccountId).not.toHaveBeenCalled();
   });
 
@@ -222,7 +222,7 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
     const res = makeRes();
     await handler!(req, res);
     expect(mockResolveUserOwnedAccountId).toHaveBeenCalledWith('test-user-id');
-    expect(mockSendInvitation).toHaveBeenCalledWith('user-own-acct', LEAD_WITH_LINKEDIN.linkedin, true, undefined, 200);
+    expect(mockSendInvitation).toHaveBeenCalledWith('user-own-acct', LEAD_WITH_LINKEDIN.linkedin, true, undefined, 200, { onNoteQuota: 'skip' });
   });
 
   it('sends the invite, stamps linkedInInviteSentAt, and returns success on happy path', async () => {
@@ -235,7 +235,7 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
     await handler!(req, res);
 
     // note is trimmed; free-account limit (200) is passed through
-    expect(mockSendInvitation).toHaveBeenCalledWith('user-own-acct', LEAD_WITH_LINKEDIN.linkedin, true, 'Hi John — nice work on X', 200);
+    expect(mockSendInvitation).toHaveBeenCalledWith('user-own-acct', LEAD_WITH_LINKEDIN.linkedin, true, 'Hi John — nice work on X', 200, { onNoteQuota: 'skip' });
     expect(mockUpdateLead).toHaveBeenCalledWith('list-123', 'lead-456', expect.objectContaining({
       linkedInInviteSentAt: expect.any(String),
     }));
@@ -252,6 +252,53 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
     const res = makeRes();
     await handler!(req, res);
     expect(mockGetInviteCharLimitForAccount).toHaveBeenCalledWith('test-user-id', 'user-own-acct');
-    expect(mockSendInvitation).toHaveBeenCalledWith('user-own-acct', LEAD_WITH_LINKEDIN.linkedin, true, 'hello', 300);
+    expect(mockSendInvitation).toHaveBeenCalledWith('user-own-acct', LEAD_WITH_LINKEDIN.linkedin, true, 'hello', 300, { onNoteQuota: 'skip' });
+  });
+
+  // ─── Note-quota hold / decision gate (ENG-213) ───────────────────────────────
+
+  it('holds (does not send) and returns a decision gate when the note quota is spent', async () => {
+    const held: any = new Error('LinkedIn note quota reached — the personalized note could not be attached.');
+    held.noteQuotaExceeded = true;
+    mockSendInvitation.mockRejectedValue(held);
+    const req: any = {
+      user: { userId: 'test-user-id' },
+      params: { listId: 'list-123', leadId: 'lead-456' },
+      body: { message: 'A deliberately personalised note' },
+    };
+    const res = makeRes();
+    await handler!(req, res);
+
+    // Default policy is 'skip' — the invite is HELD, not sent note-less.
+    expect(mockSendInvitation).toHaveBeenCalledWith(
+      'user-own-acct', LEAD_WITH_LINKEDIN.linkedin, true, 'A deliberately personalised note', 200, { onNoteQuota: 'skip' },
+    );
+    // Gate returned to the UI so it can ask "send without note / cancel".
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: false, noteQuotaExceeded: true }));
+    // The lead is NOT marked invited and nothing is cached — nothing was sent.
+    expect(mockUpdateLead).not.toHaveBeenCalled();
+    expect(mockUpsertSentInvitation).not.toHaveBeenCalled();
+  });
+
+  it("sends note-less when the customer authorizes it via on_note_quota='send_without_note'", async () => {
+    mockSendInvitation.mockResolvedValue({ note_dropped: true });
+    const req: any = {
+      user: { userId: 'test-user-id' },
+      params: { listId: 'list-123', leadId: 'lead-456' },
+      body: { message: 'A personalised note', on_note_quota: 'send_without_note' },
+    };
+    const res = makeRes();
+    await handler!(req, res);
+
+    expect(mockSendInvitation).toHaveBeenCalledWith(
+      'user-own-acct', LEAD_WITH_LINKEDIN.linkedin, true, 'A personalised note', 200, { onNoteQuota: 'send_without_note' },
+    );
+    // Sent (note dropped) — the lead is stamped and the response flags noteDropped.
+    expect(mockUpdateLead).toHaveBeenCalledWith('list-123', 'lead-456', expect.objectContaining({
+      linkedInInviteSentAt: expect.any(String),
+    }));
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true, noteDropped: true }));
+    // The dropped note must NOT be cached as if it were delivered.
+    expect(mockUpsertSentInvitation).toHaveBeenCalledWith(expect.objectContaining({ invitationText: '' }));
   });
 });

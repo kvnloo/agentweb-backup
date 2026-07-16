@@ -2,6 +2,7 @@ import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
 
 import { resendService } from './resendService';
+import { deriveBlockedByCost } from './tokenUsageService';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { chatbotDb } from './chatbotService';
 import { settingsService } from './settingsService';
@@ -954,7 +955,15 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     toEmails: string | string[],
     scheduleName: string,
     scheduleId: string,
-    usageStatus: { used: number; allowance: number | null; percentUsed?: number }
+    usageStatus: {
+      used: number;
+      allowance: number | null;
+      percentUsed?: number;
+      effectiveAllowance?: number | null;
+      costUsed?: number;
+      costAllowance?: number | null;
+      costPercentUsed?: number;
+    }
   ) {
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
@@ -967,8 +976,21 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
         minute: '2-digit'
       });
 
-      const usedFormatted = usageStatus.used.toLocaleString();
-      const allowanceFormatted = usageStatus.allowance != null ? usageStatus.allowance.toLocaleString() : 'N/A';
+      // A block can be caused by either the token-count cap or the dollar cost cap
+      // (ENG-200). When the cost cap is the trigger — the only reason a user with an
+      // unlimited token allowance can be blocked — render a cost-based message so it
+      // doesn't misleadingly read "N/A tokens".
+      const { blockedByCost } = deriveBlockedByCost(usageStatus);
+
+      const limitLabel = blockedByCost ? 'Monthly Cost Limit Reached' : 'Monthly Token Limit Reached';
+      const limitReasonText = blockedByCost ? 'monthly cost limit' : 'monthly token limit';
+      const usageLine = blockedByCost
+        ? `<strong>Spend:</strong> $${(usageStatus.costUsed ?? 0).toFixed(2)} / $${(usageStatus.costAllowance ?? 0).toFixed(2)} spent this month.`
+        : `<strong>Usage:</strong> ${usageStatus.used.toLocaleString()} / ${usageStatus.allowance != null ? usageStatus.allowance.toLocaleString() : 'N/A'} tokens used this month.`;
+      const usageLineText = blockedByCost
+        ? `Spend: $${(usageStatus.costUsed ?? 0).toFixed(2)} / $${(usageStatus.costAllowance ?? 0).toFixed(2)} spent this month.`
+        : `Usage: ${usageStatus.used.toLocaleString()} / ${usageStatus.allowance != null ? usageStatus.allowance.toLocaleString() : 'N/A'} tokens used this month.`;
+      const allowanceResetNoun = blockedByCost ? 'cost allowance' : 'token allowance';
 
       const html = `
         <html>
@@ -993,16 +1015,16 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
             </div>
             <div class="content">
               <div class="error-section">
-                <h3>⚠️ Monthly Token Limit Reached</h3>
+                <h3>⚠️ ${limitLabel}</h3>
                 <p style="margin: 0; line-height: 1.6;">
                   Your scheduled chat <strong>"${scheduleName}"</strong> was scheduled to run at <strong>${currentDate}</strong>,
-                  but it cannot execute because you have reached your monthly token limit.
+                  but it cannot execute because you have reached your ${limitReasonText}.
                 </p>
                 <p style="margin: 10px 0 0 0; line-height: 1.6;">
-                  <strong>Usage:</strong> ${usedFormatted} / ${allowanceFormatted} tokens used this month.
+                  ${usageLine}
                 </p>
                 <p style="margin: 10px 0 0 0; line-height: 1.6;">
-                  Your token allowance resets at the start of each billing period. To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
+                  Your ${allowanceResetNoun} resets at the start of each billing period. To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
                 </p>
               </div>
             </div>
@@ -1020,18 +1042,18 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       const text = `
 Scheduled Chat Error: ${scheduleName}
 
-Your scheduled chat "${scheduleName}" was scheduled to run at ${currentDate}, but it cannot execute because you have reached your monthly token limit.
+Your scheduled chat "${scheduleName}" was scheduled to run at ${currentDate}, but it cannot execute because you have reached your ${limitReasonText}.
 
-Usage: ${usedFormatted} / ${allowanceFormatted} tokens used this month.
+${usageLineText}
 
-Your token allowance resets at the start of each billing period. To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
+Your ${allowanceResetNoun} resets at the start of each billing period. To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
 
 ---
 This is an automated email from your scheduled chat.
 Manage your schedules: ${customerFrontendUrl}/agent-mode
       `;
 
-      const subject = `❌ Scheduled Chat Error: ${scheduleName} - Monthly Token Limit Reached`;
+      const subject = `❌ Scheduled Chat Error: ${scheduleName} - ${limitLabel}`;
 
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       await this.sendEmail(emailList, subject, text, html);

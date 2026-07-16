@@ -17,7 +17,7 @@ import { GoogleGenAI, Modality, LiveServerMessage, Session, Transcription } from
 import { chatbotDb, ChatMessage } from './chatbotService';
 import { getSecret } from '../utils/secretsManager';
 import { agentModeService } from './agentModeService';
-import { recordUsage } from './usageRecorderService';
+import { meterUserUsage } from './usageRecorderService';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -598,7 +598,7 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
   if (message.usageMetadata) {
     try {
       const um: any = message.usageMetadata;
-      void recordUsage({
+      void meterUserUsage({
         userId: entry.userId,
         model: LIVE_MODEL.replace(/^models\//, ''),
         provider: 'gemini',

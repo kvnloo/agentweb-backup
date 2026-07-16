@@ -91,6 +91,9 @@ jest.mock('../services/emailService', () => ({
 }));
 
 jest.mock('../services/tokenUsageService', () => ({
+  // deriveBlockedByCost is a pure helper — use the real implementation so the
+  // block-message derivation is exercised, not stubbed.
+  ...jest.requireActual('../services/tokenUsageService'),
   checkTokenUsage: jest.fn(async () => ({
     allowed: true,
     warning: false,
@@ -183,6 +186,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     // Setup default mocks
     mockChatbotDb.createChatSession.mockResolvedValue(mockSession);
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
+    // Reset persist implementation each test (clearAllMocks does not reset implementations)
+    mockChatbotDb.addMessageToSession.mockResolvedValue(undefined as any);
     (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
     mockChatbotDb.updateSessionLlmModel.mockResolvedValue(mockSession);
     mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
@@ -527,6 +532,116 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       const retryAt = new Date(nextRunTime as string).getTime();
       expect(retryAt).toBeGreaterThanOrEqual(beforeRun + 14 * 60 * 1000);
       expect(retryAt).toBeLessThanOrEqual(Date.now() + 16 * 60 * 1000);
+    });
+
+    it('should persist a structured incomplete-job assistant message so the session is never left silent after zero assistant output', async () => {
+      // Reproduces ENG-209: a large scheduled research job (e.g. 40-competitor
+      // report) crashes/times out and the run produces zero assistant output.
+      // The session must NOT be left blank — the user should see a graceful
+      // "job incomplete" message rather than an empty session.
+      const simpleSchedule = {
+        ...baseSchedule,
+        keywords: [],
+        requiredFunctionCalls: [],
+        zeroAssistantRetryCount: 0,
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: '',
+        toolCalls: [],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      await runScheduledChat(simpleSchedule, mockUserId, false);
+
+      const fallbackCall = mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call: any[]) => call[1]?.metadata?.jobIncomplete === true
+      );
+      expect(fallbackCall).toBeDefined();
+      expect(fallbackCall![0]).toBe('test-session-123');
+      expect(fallbackCall![1]).toEqual(
+        expect.objectContaining({
+          role: 'assistant',
+          content: expect.any(String),
+          metadata: expect.objectContaining({
+            isErrorMessage: true,
+            jobIncomplete: true,
+          }),
+        })
+      );
+      expect(fallbackCall![1].content.length).toBeGreaterThan(0);
+    });
+
+    it('should still requeue after zero assistant output even when persisting the job-incomplete message fails', async () => {
+      // The job-incomplete persist runs inside a try/catch (ENG-209): if DynamoDB
+      // rejects, the error must be swallowed so the requeue still proceeds and the
+      // run does not crash.
+      const simpleSchedule = {
+        ...baseSchedule,
+        keywords: [],
+        requiredFunctionCalls: [],
+        zeroAssistantRetryCount: 0,
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: '',
+        toolCalls: [],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+      mockChatbotDb.addMessageToSession.mockRejectedValue(new Error('DynamoDB write failed'));
+
+      const result = await runScheduledChat(simpleSchedule, mockUserId, false);
+
+      // Run still completes gracefully despite the persist failure
+      expect(result).toEqual(expect.objectContaining({ status: 'failure', passed: false }));
+
+      // The persist was attempted...
+      const fallbackCall = mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call: any[]) => call[1]?.metadata?.jobIncomplete === true
+      );
+      expect(fallbackCall).toBeDefined();
+
+      // ...but the requeue still fired even though the persist rejected
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        simpleSchedule.scheduleId,
+        expect.objectContaining({
+          status: 'active',
+          zeroAssistantRetryCount: 1,
+          nextRunTime: expect.any(String),
+        })
+      );
+    });
+
+    it('should skip the job-incomplete persist and not crash when no session was created', async () => {
+      // The persist block is guarded by `if (sessionId)`; when session creation
+      // yields a falsy sessionId the persist must be skipped without throwing.
+      const simpleSchedule = {
+        ...baseSchedule,
+        keywords: [],
+        requiredFunctionCalls: [],
+        zeroAssistantRetryCount: 0,
+      };
+      mockChatbotDb.createChatSession.mockResolvedValue({ ...mockSession, sessionId: '' });
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: '',
+        toolCalls: [],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      const result = await runScheduledChat(simpleSchedule, mockUserId, false);
+
+      // No throw — returns a graceful failure result
+      expect(result).toEqual(expect.objectContaining({ status: 'failure', passed: false }));
+
+      // The job-incomplete message must NOT be persisted when there is no session
+      const fallbackCall = mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call: any[]) => call[1]?.metadata?.jobIncomplete === true
+      );
+      expect(fallbackCall).toBeUndefined();
     });
 
     it('should reset zero assistant retry tracking after a successful production run', async () => {
@@ -2712,13 +2827,17 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     it('should block scheduled chat and send token limit email when user is over token limit', async () => {
       mockedCheckTokenUsage.mockResolvedValueOnce({
         allowed: false,
-        warning: true,
+        warning: false,
         used: 1050000,
         allowance: 1000000,
         percentUsed: 105,
         effectiveAllowance: 1000000,
         bonus: 0,
         month: '2026-04',
+        costUsed: 0,
+        costAllowance: null,
+        costPercentUsed: 0,
+        costEnforced: false,
       });
 
       const scheduleWithEmails = {
@@ -2743,13 +2862,17 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     it('should block scheduled chat over token limit and fall back to user email when no emailNotifications set', async () => {
       mockedCheckTokenUsage.mockResolvedValueOnce({
         allowed: false,
-        warning: true,
+        warning: false,
         used: 1050000,
         allowance: 1000000,
         percentUsed: 105,
         effectiveAllowance: 1000000,
         bonus: 0,
         month: '2026-04',
+        costUsed: 0,
+        costAllowance: null,
+        costPercentUsed: 0,
+        costEnforced: false,
       });
 
       const scheduleNoEmails = {
@@ -2772,13 +2895,17 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     it('should save failure run result to DB when token limit is exceeded', async () => {
       mockedCheckTokenUsage.mockResolvedValueOnce({
         allowed: false,
-        warning: true,
+        warning: false,
         used: 1050000,
         allowance: 1000000,
         percentUsed: 105,
         effectiveAllowance: 1000000,
         bonus: 0,
         month: '2026-04',
+        costUsed: 0,
+        costAllowance: null,
+        costPercentUsed: 0,
+        costEnforced: false,
       });
 
       const scheduleWithEmails = { ...baseSchedule, requiredFunctionCalls: [], emailNotifications: ['owner@example.com'] };
@@ -2788,6 +2915,37 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         mockScheduleId,
         expect.objectContaining({ status: 'failure', passed: false })
       );
+    });
+
+    it('should render a cost-based block message when the cost cap is the cause and tokens are unlimited', async () => {
+      mockedCheckTokenUsage.mockResolvedValueOnce({
+        allowed: false,
+        warning: false,
+        used: 5000000,
+        allowance: null,
+        percentUsed: 0,
+        effectiveAllowance: null,
+        bonus: 0,
+        month: '2026-04',
+        costUsed: 42.5,
+        costAllowance: 40,
+        costPercentUsed: 106,
+        costEnforced: true,
+      });
+
+      const scheduleWithEmails = {
+        ...baseSchedule,
+        requiredFunctionCalls: [],
+        emailNotifications: ['owner@example.com'],
+      };
+
+      const result = await runScheduledChat(scheduleWithEmails, mockUserId, true);
+
+      expect(mockEmailService.sendScheduledChatTokenLimitEmail).toHaveBeenCalled();
+      expect(result.actualResponse).toContain('Monthly cost limit reached');
+      expect(result.actualResponse).toContain('$42.50 / $40.00 spent this month');
+      expect(result.actualResponse).not.toContain('tokens used');
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
     });
 
     it('should allow scheduled chat when token usage is under the limit', async () => {

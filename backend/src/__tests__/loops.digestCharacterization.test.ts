@@ -2,10 +2,11 @@
  * Characterization tests — pin the EXACT rendered Slack digest text of every
  * loop instance across the digest consolidation refactor.
  *
- * The Slack approval dispatcher regex-parses these digests (the Run ID line,
- * the numbered findings, and the 'React ✅ to dispatch all to cloud-dev'
- * footer — see services/loopSlackApprovalDispatcher.ts), so the rendered text
- * is a wire format: any drift is a functional regression, not cosmetics.
+ * The Slack approval dispatcher regex-parses actionable findings digests (the
+ * Run ID line, the numbered findings, and the 'React ✅ to dispatch all to
+ * cloud-dev' footer — see services/loopSlackApprovalDispatcher.ts), so the
+ * rendered text is a wire format: any drift is a functional regression, not
+ * cosmetics.
  *
  * These tests were written BEFORE the consolidation and must pass unchanged
  * after it. Do not "fix" an expected string to match new output — fix the
@@ -76,7 +77,7 @@ describe('loop digest characterization (exact rendered text)', () => {
     slackPosts = [];
     ports = {
       s3: {},
-      dynamo: {},
+      dynamo: { putItemIfAbsent: jest.fn().mockResolvedValue(true) },
       bedrock: {},
       slack: {
         postMessage: jest.fn().mockImplementation(async (_user: string, markdown: string) => {
@@ -148,7 +149,7 @@ describe('loop digest characterization (exact rendered text)', () => {
           'Run ID: `run_agent_1`',
           'Tool events scanned: 42  |  Failing tools: 2',
           '',
-          '*Failing tools (fix specs dispatched: 0)*',
+          '*Failing tools (fix specs prepared: 0)*',
           '1. Tool `publish_blog_article` failed 6/9 calls (67%) — top error: Webflow 502',
           '2. Tool `search_leads` failed 3/7 calls (43%) — top error: timeout',
           '',
@@ -169,8 +170,6 @@ describe('loop digest characterization (exact rendered text)', () => {
           'Tool events scanned: 0  |  Failing tools: 0',
           '',
           '_No agent-mode tool events in the 7d window — recorder off, or no tool use. Not "healthy", just empty._',
-          '',
-          FOOTER,
         ].join('\n'),
       );
     });
@@ -186,9 +185,7 @@ describe('loop digest characterization (exact rendered text)', () => {
           'Run ID: `run_agent_3`',
           'Tool events scanned: 17  |  Failing tools: 0',
           '',
-          '_No tool crossed the failure threshold this window. Tool reliability looks healthy._',
-          '',
-          FOOTER,
+          '_No tool crossed the failure threshold this window. Keep watching the trend; this is not a dispatchable finding._',
         ].join('\n'),
       );
     });
@@ -245,8 +242,6 @@ describe('loop digest characterization (exact rendered text)', () => {
           'Users/events scanned: 0  |  Findings: 0',
           '',
           '_No onboarding events in the window — too thin to judge._',
-          '',
-          FOOTER,
         ].join('\n'),
       );
     });
@@ -262,9 +257,7 @@ describe('loop digest characterization (exact rendered text)', () => {
           'Run ID: `run_ob_3`',
           'Users/events scanned: 12  |  Findings: 0',
           '',
-          '_Funnel looks healthy — no issues surfaced._',
-          '',
-          FOOTER,
+          '_No analyst proposal fired this window. Check the reliability heartbeat before treating onboarding as clear._',
         ].join('\n'),
       );
     });
@@ -324,8 +317,6 @@ describe('loop digest characterization (exact rendered text)', () => {
           '*Startup decisions (low-data, permission-gated)*',
           '1. `low-data-no-traffic` — Verify telemetry and route at least one owned surface into /ai-readiness today before changing page copy.',
           '   Evidence: 0 /ai-readiness landings in the 7d window.  |  Confidence: low  |  Needs approval: yes',
-          '',
-          FOOTER,
         ].join('\n'),
       );
     });
@@ -343,8 +334,6 @@ describe('loop digest characterization (exact rendered text)', () => {
           'Events scanned: 50  |  Findings: 0',
           '',
           '_No page-level fix surfaced — check the binding constraint manually._',
-          '',
-          FOOTER,
         ].join('\n'),
       );
     });
@@ -363,8 +352,6 @@ describe('loop digest characterization (exact rendered text)', () => {
           '*Funnel (7d):* landed `800` → quiz `400` → *captured `120`* → book `40` / signup `40`',
           '',
           '_No disproportionate leak this window. Watch the shape above; the next push is whichever stage is thinnest._',
-          '',
-          FOOTER,
         ].join('\n'),
       );
     });
@@ -448,9 +435,6 @@ describe('loop digest characterization (exact rendered text)', () => {
           'Events scanned: 0  |  Rules fired: 0  |  Mutations: 0',
           '',
           "_No events in the last 168h window. Either traffic is dry or telemetry isn't reaching the table yet._",
-          '',
-          FOOTER,
-          'Reply in thread to skip a specific item (e.g. "skip 2").',
         ].join('\n'),
       );
     });
@@ -471,10 +455,7 @@ describe('loop digest characterization (exact rendered text)', () => {
           'Run ID: `run-eval-3`',
           'Events scanned: 88  |  Rules fired: 0  |  Mutations: 0',
           '',
-          '_No rules fired — funnel is healthy._',
-          '',
-          FOOTER,
-          'Reply in thread to skip a specific item (e.g. "skip 2").',
+          '_No rules fired this window. Treat this as no dispatchable finding, not proof the funnel is healthy._',
         ].join('\n'),
       );
     });

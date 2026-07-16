@@ -88,6 +88,14 @@ export interface BrandBuildDeps {
   timeoutMs?: number;
   /** Inject `() => new Date()` for deterministic tests. */
   now?: () => Date;
+  /**
+   * Override for the deterministic post-scrape logo step (ENG-326).
+   * Defaults to `ensureBrandLogoPersisted` from services/agentMode/brandLogo.
+   */
+  ensureBrandLogo?: (
+    userId: string,
+    companyUrl: string,
+  ) => Promise<{ persisted: boolean; logoUrl: string | null; reason: string }>;
 }
 
 function buildBrandPrompt(input: {
@@ -117,7 +125,7 @@ function buildBrandPrompt(input: {
     `2. Call update_brand_guidelines exactly once with the full brand object: brandName, tagline, primaryColor, secondaryColor, fontFamily, toneOfVoice, brandPersonality, brandValues, keyMessages, targetAudience, valueProposition, founders, logoUrl. Ground every field in what the site actually says — do not invent.`,
     "",
     `Constraints:`,
-    `- Do NOT call update_market_strategy in this session. ICPs and competitor research are handled by separate steps after the user reviews the brand.`,
+    `- Do NOT call update_market_strategy or regenerate_market_strategy in this session, and do NOT offer to regenerate the market strategy. ICPs and competitor research are handled by separate steps after the user reviews the brand.`,
     `- Do NOT ask the user to verify anything mid-flight.`,
     `- Do NOT call any work-plan tools, do NOT create GTM plans, email campaigns, or landing pages.`,
     `- After update_brand_guidelines succeeds, reply with a single line "DONE" and stop.`,
@@ -423,6 +431,34 @@ export async function triggerBrandBuildForUser(
       now(),
     );
     return;
+  }
+
+  // ENG-326 AC-1: Emma's session VOLUNTARILY persists the logo — and often
+  // doesn't. Run the deterministic post-scrape step: if the account still has
+  // no persisted brand logo, discover one with the cssExtractor heuristics,
+  // pin it to S3, and persist brandData.logoUrl + a 'logo' brand asset.
+  // Best-effort — a logo failure must never fail a brand build that already
+  // succeeded — but every outcome is logged loudly.
+  try {
+    const ensureBrandLogo =
+      deps.ensureBrandLogo ??
+      // Lazy require — brandLogo's default deps pull cssExtractor (JSDOM) and
+      // agentModeService; tests inject a fake and never trigger this path.
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      (require("./agentMode/brandLogo")
+        .ensureBrandLogoPersisted as NonNullable<BrandBuildDeps["ensureBrandLogo"]>);
+    const logoOutcome = await ensureBrandLogo(userId, companyUrl);
+    // eslint-disable-next-line no-console
+    console.log("[onboardingBrandBuildService] brand-logo step", {
+      userId,
+      ...logoOutcome,
+    });
+  } catch (logoErr) {
+    // eslint-disable-next-line no-console
+    console.warn("[onboardingBrandBuildService] brand-logo step crashed", {
+      userId,
+      error: logoErr instanceof Error ? logoErr.message : String(logoErr),
+    });
   }
 
   // Happy-path metric. Pull the started/completed timestamps from the

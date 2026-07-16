@@ -372,7 +372,11 @@ router.post("/accept-invite", async (req: Request, res: Response) => {
     updatedInvites.splice(inviteIndex, 1);
     await orgDb.updateOrg(orgId, { pendingInvites: updatedInvites });
 
-    // Add user to org and clear the pending invite stamp
+    // Add user to org and clear the pending invite stamp. We intentionally do
+    // NOT snapshot the owner's subscription tier onto the member here — the org's
+    // effective tier is resolved dynamically from the owner at read time
+    // (getUserSubscriptionType), which keeps members in sync with owner up/
+    // downgrades and auto-revokes entitlements when they leave. See ENG-288.
     await userDb.updateUser(userId, { orgId, orgRole: "member", pendingOrgInvite: null });
 
     return res.json({ success: true, message: "Successfully joined the organization" });

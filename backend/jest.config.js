@@ -21,6 +21,10 @@ module.exports = {
   moduleNameMapper: {
     // marked v16 is ESM-only; redirect to manual mock so Jest (CJS mode) can load it
     '^marked$': '<rootDir>/__mocks__/marked.ts',
+    // Safety net for twitter-api-v2: if a test file's own jest.mock('twitter-api-v2', factory)
+    // ever fails to register, resolution falls back here instead of the real SDK, so a test can
+    // never silently make a live HTTP call to X's production API. See __mocks__/twitter-api-v2.ts.
+    '^twitter-api-v2$': '<rootDir>/__mocks__/twitter-api-v2.ts',
   },
   collectCoverageFrom: [
     'src/utils/**/*.ts',

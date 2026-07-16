@@ -6,6 +6,12 @@ import { createMcpServer } from './mcpServerCore';
 import { agentApiKeyService } from '../../services/agentApiKeyService';
 import { mcpOAuthService } from '../oauth/oauthService';
 import { RateLimiter } from '../../middleware/rateLimiter';
+import {
+  classifyMcpClient,
+  McpAuthMethod,
+  McpClientType,
+  recordMcpConnectionAttempt,
+} from '../../services/mcpUsageEventsService';
 
 // Rate limiter for MCP requests authenticated via aw_* API keys
 const mcpRateLimiter = new RateLimiter();
@@ -20,6 +26,12 @@ interface SessionEntry {
   lastActivity: number;
   agentUserId?: string;           // User ID from API key auth
   isInternal: boolean;            // Internal clients can override userId
+  authMethod?: McpAuthMethod;
+  apiKeyId?: string;
+  oauthClientId?: string;
+  oauthClientName?: string;
+  clientType?: McpClientType;
+  userAgent?: string;
 }
 
 /**
@@ -36,9 +48,10 @@ async function validateMcpAccessToken(req: Request, res: Response, next: NextFun
   // No token provided at all
   if (!authHeader) {
     console.error("[MCP] Access denied: Missing Authorization header");
+    setMcpAuthChallenge(res, baseUrl);
     return res.status(401).json({
       error: "Unauthorized: Missing access token",
-      hint: `Authentication is required. Pass your API key as: Authorization: Bearer aw_YOUR_KEY`,
+      hint: `Authentication is required. Use OAuth sign-in from your MCP client, or pass your API key as: Authorization: Bearer aw_YOUR_KEY`,
       setup: `Get an API key at https://agentweb.pro (Settings > API Keys). Full guide: ${baseUrl}/skill.md`,
     });
   }
@@ -48,9 +61,10 @@ async function validateMcpAccessToken(req: Request, res: Response, next: NextFun
   const providedToken = tokenMatch ? tokenMatch[1] : authHeader;
 
   if (!providedToken) {
+    setMcpAuthChallenge(res, baseUrl, "invalid_token");
     return res.status(401).json({
       error: "Unauthorized: Empty access token",
-      hint: `Pass your API key as: Authorization: Bearer aw_YOUR_KEY`,
+      hint: `Use OAuth sign-in from your MCP client, or pass your API key as: Authorization: Bearer aw_YOUR_KEY`,
       setup: `Get an API key at https://agentweb.pro (Settings > API Keys). Full guide: ${baseUrl}/skill.md`,
     });
   }
@@ -61,6 +75,7 @@ async function validateMcpAccessToken(req: Request, res: Response, next: NextFun
       const keyRecord = await agentApiKeyService.validateKey(providedToken);
       if (!keyRecord) {
         console.error("[MCP] Access denied: Invalid agent API key");
+        setMcpAuthChallenge(res, baseUrl, "invalid_token");
         return res.status(401).json({
           error: "Unauthorized: Invalid API key",
           hint: "This API key is not recognized. It may have been revoked or is incorrect.",
@@ -79,6 +94,9 @@ async function validateMcpAccessToken(req: Request, res: Response, next: NextFun
       // Store the userId from the API key on the request for downstream use
       (req as any)._agentApiUserId = keyRecord.userId;
       (req as any)._mcpIsInternal = false;  // External client
+      (req as any)._mcpAuthMethod = 'api_key';
+      (req as any)._mcpApiKeyId = keyRecord.keyId;
+      (req as any)._mcpClientType = classifyMcpClient({ authMethod: 'api_key', userAgent: req.get('user-agent') });
       return next();
     } catch (error) {
       console.error("[MCP] Error validating agent API key:", error);
@@ -90,6 +108,8 @@ async function validateMcpAccessToken(req: Request, res: Response, next: NextFun
   const expectedToken = process.env.MCP_ACCESS_TOKEN;
   if (expectedToken && providedToken === expectedToken) {
     (req as any)._mcpIsInternal = true;  // Internal client
+    (req as any)._mcpAuthMethod = 'internal_token';
+    (req as any)._mcpClientType = 'unknown';
     return next();
   }
 
@@ -97,6 +117,7 @@ async function validateMcpAccessToken(req: Request, res: Response, next: NextFun
   try {
     const tokenRecord = await mcpOAuthService.validateAccessToken(providedToken);
     if (tokenRecord) {
+      const client = await mcpOAuthService.getClient(tokenRecord.clientId).catch(() => null);
       // Rate limit OAuth tokens by userId
       const rateLimitResult = mcpRateLimiter.check(`oauth:${tokenRecord.userId}`, 60);
       if (!rateLimitResult.allowed) {
@@ -107,6 +128,10 @@ async function validateMcpAccessToken(req: Request, res: Response, next: NextFun
       }
       (req as any)._agentApiUserId = tokenRecord.userId;
       (req as any)._mcpIsInternal = false;  // External client
+      (req as any)._mcpAuthMethod = 'oauth';
+      (req as any)._mcpOAuthClientId = tokenRecord.clientId;
+      (req as any)._mcpOAuthClientName = client?.clientName;
+      (req as any)._mcpClientType = classifyMcpClient({ clientName: client?.clientName, userAgent: req.get('user-agent') });
       return next();
     }
   } catch (error) {
@@ -116,11 +141,25 @@ async function validateMcpAccessToken(req: Request, res: Response, next: NextFun
 
   // All auth methods failed
   console.error("[MCP] Access denied: No valid credentials");
+  setMcpAuthChallenge(res, baseUrl, "invalid_token");
   return res.status(401).json({
     error: "Unauthorized: Invalid access token",
     hint: `The provided token is not a valid API key, MCP token, or OAuth token.`,
     setup: `Get an API key at https://agentweb.pro (Settings > API Keys). Full guide: ${baseUrl}/skill.md`,
   });
+}
+
+export function buildMcpAuthChallenge(baseUrl: string, error?: string): string {
+  const params = [
+    `resource_metadata="${baseUrl}/.well-known/oauth-protected-resource/mcp"`,
+    `scope="mcp:tools"`,
+  ];
+  if (error) params.push(`error="${error}"`);
+  return `Bearer ${params.join(", ")}`;
+}
+
+function setMcpAuthChallenge(res: Response, baseUrl: string, error?: string) {
+  res.setHeader("WWW-Authenticate", buildMcpAuthChallenge(baseUrl, error));
 }
 
 export function setupMcpServer(app: express.Express) {
@@ -203,7 +242,13 @@ export function setupMcpServer(app: express.Express) {
     return createMcpServer("Emma - GTM Automation Specialist", {
       agentUserId: sessionEntry?.agentUserId || (req as any)?._agentApiUserId,
       sessionId: sessionId,
-      isInternal: sessionEntry?.isInternal || (req as any)?._mcpIsInternal || false
+      isInternal: sessionEntry?.isInternal || (req as any)?._mcpIsInternal || false,
+      authMethod: sessionEntry?.authMethod || (req as any)?._mcpAuthMethod,
+      apiKeyId: sessionEntry?.apiKeyId || (req as any)?._mcpApiKeyId,
+      oauthClientId: sessionEntry?.oauthClientId || (req as any)?._mcpOAuthClientId,
+      oauthClientName: sessionEntry?.oauthClientName || (req as any)?._mcpOAuthClientName,
+      clientType: sessionEntry?.clientType || (req as any)?._mcpClientType,
+      userAgent: sessionEntry?.userAgent || req?.get('user-agent'),
     });
   };
 
@@ -230,19 +275,48 @@ export function setupMcpServer(app: express.Express) {
         // Create session state that will be shared between server and session entry
         const sharedState = {
           agentUserId: (req as any)._agentApiUserId,
-          isInternal: (req as any)._mcpIsInternal || false
+          isInternal: (req as any)._mcpIsInternal || false,
+          authMethod: (req as any)._mcpAuthMethod as McpAuthMethod | undefined,
+          apiKeyId: (req as any)._mcpApiKeyId,
+          oauthClientId: (req as any)._mcpOAuthClientId,
+          oauthClientName: (req as any)._mcpOAuthClientName,
+          clientType: (req as any)._mcpClientType as McpClientType | undefined,
+          userAgent: req.get('user-agent'),
+          sessionId: undefined as string | undefined,
         };
 
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId: string) => {
             console.log(`[MCP-SERVER-DEBUG] New MCP session created: ${newSessionId}`);
+            sharedState.sessionId = newSessionId;
             sessions.set(newSessionId, {
               transport,
               lastActivity: Date.now(),
               agentUserId: sharedState.agentUserId,
-              isInternal: sharedState.isInternal
+              isInternal: sharedState.isInternal,
+              authMethod: sharedState.authMethod,
+              apiKeyId: sharedState.apiKeyId,
+              oauthClientId: sharedState.oauthClientId,
+              oauthClientName: sharedState.oauthClientName,
+              clientType: sharedState.clientType,
+              userAgent: sharedState.userAgent,
             });
+            if (!sharedState.isInternal) {
+              void recordMcpConnectionAttempt({
+                userId: sharedState.agentUserId,
+                authMethod: sharedState.authMethod,
+                apiKeyId: sharedState.apiKeyId,
+                clientId: sharedState.oauthClientId,
+                clientName: sharedState.oauthClientName,
+                clientType: sharedState.clientType,
+                sessionId: newSessionId,
+                userAgent: sharedState.userAgent,
+                requestId: req.get('x-request-id') || newSessionId,
+              }).catch((err) => {
+                console.error('[MCP] Failed to record connection attempt:', err);
+              });
+            }
           }
         });
 
@@ -255,11 +329,7 @@ export function setupMcpServer(app: express.Express) {
         };
 
         // Connect server to transport BEFORE handling request
-        const server = createMcpServer("Emma - GTM Automation Specialist", {
-          agentUserId: sharedState.agentUserId,
-          sessionId: undefined,
-          isInternal: sharedState.isInternal
-        });
+        const server = createMcpServer("Emma - GTM Automation Specialist", sharedState);
         await server.connect(transport);
         
         // Handle the initialization request

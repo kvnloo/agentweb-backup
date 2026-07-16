@@ -2,6 +2,7 @@ import {
   trimQuote,
   mergeMeta,
   fieldVerificationStatus,
+  fieldProvenanceBadge,
   EnrichedFieldMeta,
 } from '../utils/enrichedFieldValue';
 
@@ -162,5 +163,38 @@ describe('fieldVerificationStatus', () => {
       enrichedAt: at,
     };
     expect(fieldVerificationStatus(meta)).toBe('unverified');
+  });
+
+  // ENG-122 grounding classification
+  it('treats a grounded web value as verified', () => {
+    expect(fieldVerificationStatus({ source: 'web_search', grounding: 'grounded', enrichedAt: at })).toBe('verified');
+  });
+
+  it('treats web-unverified and ai-knowledge as unverified even if confidence somehow says high', () => {
+    expect(fieldVerificationStatus({ source: 'web_search', grounding: 'web-unverified', confidence: 'high', enrichedAt: at })).toBe('unverified');
+    expect(fieldVerificationStatus({ source: 'web_search', grounding: 'ai-knowledge', confidence: 'high', enrichedAt: at })).toBe('unverified');
+  });
+
+  it('lets critic caution downgrade a grounded value (possible wrong entity)', () => {
+    expect(fieldVerificationStatus({ source: 'web_search', grounding: 'grounded', criticView: 'low', enrichedAt: at })).toBe('unverified');
+  });
+});
+
+describe('fieldProvenanceBadge', () => {
+  const at = '2026-07-01T00:00:00.000Z';
+  it('returns null for a verified (grounded) value', () => {
+    expect(fieldProvenanceBadge({ source: 'web_search', grounding: 'grounded', enrichedAt: at })).toBeNull();
+  });
+  it('returns the ai-knowledge badge for a training-memory value', () => {
+    expect(fieldProvenanceBadge({ source: 'web_search', grounding: 'ai-knowledge', enrichedAt: at })).toBe('ai-knowledge');
+  });
+  it('returns the web-unverified badge for an unmatched web value', () => {
+    expect(fieldProvenanceBadge({ source: 'web_search', grounding: 'web-unverified', enrichedAt: at })).toBe('web-unverified');
+  });
+  it('falls back to the web badge for legacy web-sourced unverified values', () => {
+    expect(fieldProvenanceBadge({ source: 'web_search', confidence: 'low', enrichedAt: at })).toBe('web-unverified');
+  });
+  it('returns null when there is no meta', () => {
+    expect(fieldProvenanceBadge(undefined)).toBeNull();
   });
 });

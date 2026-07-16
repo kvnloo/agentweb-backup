@@ -10,8 +10,12 @@ import { canEditItem } from "./orgShareService";
 import { addSubdomain, generateSubdomain, listDomains, SUBDOMAIN_BASE } from "./customDomainService";
 import { settingsService } from "./settingsService";
 import { paginatedQuery } from "../utils/dynamoPagination";
-import { guardedV0ChatCreate, guardedV0CorrectionMessage } from "./v0UsageGuard";
+import { guardedV0ChatCreate, guardedV0CorrectionMessage, clearV0UsageForPage, hashV0Prompt } from "./v0UsageGuard";
+// Type-only imports from durableLandingService live elsewhere; this constant import is
+// runtime-safe because durableLandingService only imports a TYPE from this module.
+import { STUCK_CEILING_MS } from "./durableLandingService";
 import { enqueueAutoHumanEval } from "./autoHumanEvalService";
+import { getPersistedBrandLogoUrl } from "./agentMode/brandLogo";
 
 // Note: global fetch (undici) timeouts are managed by httpClient.ts (15 min headersTimeout/bodyTimeout).
 // No setGlobalDispatcher call here — duplicate calls cause the last-loaded config to win unpredictably.
@@ -106,12 +110,198 @@ export async function withTimeout<T>(promise: Promise<T>, ms: number, label: str
   }
 }
 
-// Poll intervals for waiting on v0 generation to complete
-let v0PollIntervalsMs = [0, 15_000, 30_000, 45_000, 60_000];
+// Poll intervals for waiting on v0 generation to complete. With chat creation in
+// async responseMode the create call returns in seconds and THIS loop absorbs the
+// real generation time — prod evidence (ENG-287, AW-V0Usage 2026-07-10) shows
+// brand-enriched generations routinely take 3–15 min, so the budget must exceed
+// that. Ramps to a steady 30s cadence, ~16 min total.
+let v0PollIntervalsMs = [0, 10_000, 15_000, 20_000, 30_000, 45_000, ...Array(28).fill(30_000)];
 
 /** Override poll intervals (for testing) */
 export function setV0PollIntervals(intervals: number[]) {
   v0PollIntervalsMs = intervals;
+}
+
+/**
+ * A status read is a cheap GET. Bounding it at the full 300s attempt ceiling meant the
+ * poll loop's real wall-clock was `sum(sleeps) + 34 × 300s ≈ 3 hours`, not the ~16 min its
+ * own error message claimed — and nothing refreshed the record while it ran, so the
+ * abandoned-build janitor (30-min `updatedAt` ceiling) would mark a LIVE build failed.
+ * (ENG-287 residual)
+ */
+const V0_STATUS_POLL_TIMEOUT_MS = 30_000;
+
+/**
+ * ABSOLUTE wall-clock budget for a generation — the sleep table alone bounds only the time
+ * we spend *sleeping*. Sits above prod p99 (~15 min) and below `STUCK_CEILING_MS` (30 min),
+ * so a build that blows this budget fails loudly on its own terms before the janitor ever
+ * has to consider it. (ENG-287 residual)
+ */
+const V0_GENERATION_BUDGET_MS = 20 * 60 * 1000;
+
+/**
+ * Is this failure a DEAD END for the v0 chat that produced it — i.e. will retrying against
+ * the same chat fail identically, forever?
+ *
+ * This is the line between the two halves of the reuse contract:
+ *  - dead end  → free the route identity so the retry mints a FRESH chat;
+ *  - anything else (slow v0, transient read, poll budget exhausted while still `pending`)
+ *    → KEEP the identity so the retry RESUMES the same chat for free. Freeing it there
+ *    would mint a second full-cost chat while the first is still generating — the exact
+ *    orphan-chat credit burn this issue is about.
+ * (ENG-287 residual)
+ */
+export function isDeadEndV0Failure(error: any): boolean {
+  // A Vercel build ERROR is also a dead end, but that path RETURNS a failed record instead
+  // of throwing, so it frees the identity inline rather than through this predicate — there
+  // is deliberately no VERCEL_BUILD_ERROR arm here, because nothing throws one and a dead
+  // arm would imply coverage that does not exist.
+  return (
+    error?.code === "V0_VERSION_FAILED" || // v0 itself marked the version failed
+    error?.code === "V0_OUTPUT_INVALID"    // v0 keeps emitting output we cannot ship
+  );
+}
+
+/** Refresh a record's `updatedAt` without touching its status — a liveness heartbeat. */
+async function touchLandingPageRecord(id: string): Promise<void> {
+  try {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "SET updatedAt = :now",
+        // UpdateItem is an UPSERT. Without this, a heartbeat racing a hard delete would
+        // resurrect a stub record with no userId/status — invisible to every owner check.
+        ConditionExpression: "attribute_exists(id)",
+        ExpressionAttributeValues: { ":now": new Date().toISOString() },
+      })
+      .promise();
+  } catch (err: any) {
+    // Best-effort: a missed heartbeat costs liveness, never correctness.
+    if (err?.code === "ConditionalCheckFailedException") return; // record is gone — nothing to keep alive
+    console.warn(`[V0 SERVICE] heartbeat failed for ${id}: ${err?.message}`);
+  }
+}
+
+/**
+ * Keep a record's `updatedAt` fresh for the WHOLE of `fn`, not just the v0 poll.
+ *
+ * The version poll is only the first phase of a build. The zip download, the correction
+ * sends, the GitHub push and the 5-min Vercel poll all follow it, each with their own
+ * multi-minute retry budgets — and none of them writes `updatedAt`. So the `deploying`
+ * phase could plausibly run past the janitor's 30-min ceiling in total silence, and the
+ * janitor would mark a LIVE build failed (after which a retry runs a SECOND build into the
+ * same repo, and `deliverStuckFailure` burns the one-shot completion claim so the real
+ * success can never be delivered). Heartbeating for the entire build closes that hole.
+ * (ENG-287 residual)
+ */
+const BUILD_HEARTBEAT_INTERVAL_MS = 60_000;
+function startBuildHeartbeat(id: string): () => void {
+  const timer = setInterval(() => { void touchLandingPageRecord(id); }, BUILD_HEARTBEAT_INTERVAL_MS);
+  // Never hold the process open just for a heartbeat.
+  if (typeof timer.unref === "function") timer.unref();
+  return () => clearInterval(timer);
+}
+
+/**
+ * Poll a v0 chat until its latest version reaches a terminal state and return the
+ * completed version id.
+ *
+ * Async-mode chats expose the version immediately with `status: 'pending'` while
+ * generation runs, so readiness is the version's status — NOT its existence
+ * (grabbing a pending version downloads a half-generated page). A missing status
+ * field (older sync-mode responses) is treated as completed, preserving the
+ * pre-async behavior. A transient poll-read failure only costs that attempt — a
+ * 15-minute generation must not die because one status read timed out; the loop's
+ * budget bounds the total wait and the exit is loud.
+ */
+async function waitForCompletedV0Version(
+  v0: any,
+  chatId: string,
+  label: string,
+  opts: {
+    heartbeat?: () => Promise<void>;
+    /**
+     * Absolute epoch-ms deadline for the WHOLE build. Passed in so the budget is spent
+     * once across the initial wait AND every correction round — computing it per call would
+     * re-arm it each time, letting one build poll 3 × 20 min and outlive both the janitor
+     * ceiling and the chat-reuse ceiling the guard depends on. (ENG-287 residual)
+     */
+    deadline?: number;
+    /**
+     * The version we already have. A correction produces a NEW version, but v0 may still be
+     * reporting the OLD (completed) one for a moment — returning it would re-download the
+     * identical broken zip and silently waste the correction round. Treat it as not-ready.
+     */
+    afterVersionId?: string;
+  } = {}
+): Promise<string> {
+  const intervals = v0PollIntervalsMs;
+  const deadline = opts.deadline ?? Date.now() + V0_GENERATION_BUDGET_MS;
+  let lastReadError: string | undefined;
+  for (let pollAttempt = 0; pollAttempt < intervals.length; pollAttempt++) {
+    if (intervals[pollAttempt] > 0) {
+      console.log(
+        `[V0 SERVICE] ${label}: generation not ready yet, waiting ${intervals[pollAttempt] / 1000}s (attempt ${pollAttempt + 1}/${intervals.length})...`
+      );
+      await new Promise((resolve) => setTimeout(resolve, intervals[pollAttempt]));
+    }
+
+    // Tell the world this build is alive. Without it, nothing refreshes the record for the
+    // whole generation and the janitor marks a LIVE build failed at 30 min — after which a
+    // retry runs a SECOND build against the same chat and repo. (ENG-287 residual)
+    if (opts.heartbeat) await opts.heartbeat();
+
+    // Bound the real wall-clock, not just the time spent sleeping.
+    if (Date.now() >= deadline) break;
+
+    let chat: any;
+    try {
+      chat = await withRetry(
+        () => v0.chats.getById({ chatId }),
+        `${label} (status poll)`,
+        undefined, undefined, V0_STATUS_POLL_TIMEOUT_MS,
+        { retryOnTimeout: false }
+      );
+    } catch (err: any) {
+      lastReadError = describeError(err);
+      console.warn(`[V0 SERVICE] ${label}: status poll failed (${lastReadError}), continuing...`);
+      continue;
+    }
+
+    const version = chat?.latestVersion;
+    if (version?.status === "failed") {
+      // Typed so callers can distinguish "this chat is a dead end" (clear the
+      // idempotency identity — a retry must mint a FRESH chat, not reuse this one)
+      // from a transient/poll-budget failure (where reusing the chat is free and right).
+      const failedErr: any = new Error(
+        `v0 reported the generation as failed (version ${version.id}). Retry the generation — failed attempts do not block retries.`
+      );
+      failedErr.code = "V0_VERSION_FAILED";
+      throw failedErr;
+    }
+    if (version?.id && version.status !== "pending") {
+      // Still the version we came in with — v0 has not published the correction's new one
+      // yet. Returning it would re-download the identical zip and waste the round.
+      if (opts.afterVersionId && version.id === opts.afterVersionId) continue;
+      console.log(`[V0 SERVICE] ${label}: version ${version.id} ready (poll attempt ${pollAttempt + 1})`);
+      return version.id;
+    }
+  }
+
+  const budgetMin = Math.round(
+    Math.min(intervals.reduce((a, b) => a + b, 0), V0_GENERATION_BUDGET_MS) / 60_000
+  );
+  // NOT a dead end: v0 may still be generating and finish in the background. The chat is
+  // deliberately left reusable so a retry RESUMES it instead of paying for a second one.
+  // `isDeadEndV0Failure` returns false for this code — that is the whole point.
+  const timeoutErr: any = new Error(
+    `No completed version in v0 chat after ~${budgetMin} minutes — v0 is still generating or has stalled. ` +
+    `Retry: the generation resumes on the same chat and is not charged again.` +
+    (lastReadError ? ` (last poll error: ${lastReadError})` : "")
+  );
+  timeoutErr.code = "V0_GENERATION_TIMEOUT";
+  throw timeoutErr;
 }
 
 // Vercel deployment polling config
@@ -129,8 +319,15 @@ export async function withRetry<T>(
   label: string,
   maxRetries = MAX_RETRIES,
   baseDelayMs = BASE_DELAY_MS,
-  timeoutMs = V0_ATTEMPT_TIMEOUT_MS
+  timeoutMs = V0_ATTEMPT_TIMEOUT_MS,
+  opts: { retryOnTimeout?: boolean } = {}
 ): Promise<T> {
+  // Whether to retry OUR synthetic per-attempt timeout (V0_CALL_TIMEOUT). Retrying
+  // it re-waits the full `timeoutMs` budget each time — e.g. 3 × 300s ≈ 15 min,
+  // which reproduces the hang ENG-158 set out to kill. Callers on an interactive
+  // path (chat-create) pass `false` to fail fast with a clean retry path; other
+  // callers keep the default so a genuinely transient hang still gets a retry.
+  const retryOnTimeout = opts.retryOnTimeout ?? true;
   let lastError: Error | undefined;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
@@ -142,18 +339,24 @@ export async function withRetry<T>(
       // Unwrap the full failure reason (undici hides it on `err.cause`) so both the
       // retry decision and the surfaced error see the REAL problem, not "fetch failed".
       const detail = describeError(err);
+      // Our own per-attempt timeout: we already waited the full budget. Only retry it
+      // when the caller opted in (default). 5xx/network errors below are unaffected —
+      // those recover in seconds and stay retryable regardless. (ENG-287)
+      const isOurTimeout = err.code === "V0_CALL_TIMEOUT";
       // The v0 SDK throws `Error("HTTP <status>: <body>")` on any non-2xx response.
       // Transient server-side failures (5xx) and rate limiting (429) should be
       // retried with backoff — a v0 500 is the documented symptom of a v0 outage
       // that often recovers within seconds.
       const isRetryableHttpStatus = /\bHTTP (429|408|5\d\d)\b/.test(detail);
       const isRetryable =
-        isRetryableHttpStatus ||
-        /fetch failed|ECONNREFUSED|ENOTFOUND|network error|NetworkError|ETIMEDOUT|socket hang up|Connect Timeout|timed out|UND_ERR/i.test(
-          detail
-        ) ||
-        err.code === "ECONNRESET" ||
-        err.code === "UND_ERR_HEADERS_TIMEOUT";
+        (isOurTimeout
+          ? retryOnTimeout
+          : isRetryableHttpStatus ||
+            /fetch failed|ECONNREFUSED|ENOTFOUND|network error|NetworkError|ETIMEDOUT|socket hang up|Connect Timeout|timed out|UND_ERR/i.test(
+              detail
+            ) ||
+            err.code === "ECONNRESET" ||
+            err.code === "UND_ERR_HEADERS_TIMEOUT");
 
       if (!isRetryable || attempt === maxRetries) {
         console.error(`[V0 SERVICE] ${label} failed after ${attempt} attempt(s):`, detail);
@@ -198,12 +401,29 @@ export function buildPageSlug(name: string): string {
     .replace(/^-|-$/g, "");
 }
 
+/**
+ * An iteration v0 has ACCEPTED but not yet published a version for.
+ *
+ * Recorded the moment `chats.sendMessage` returns, so a retry whose HTTP response the user
+ * lost does not re-send the same instruction — v0 would apply it TWICE ("add a testimonials
+ * section" becomes two sections, charged twice). `baseVersionId` is the chat's latest
+ * version at send time: once v0 publishes something newer, the edit has landed and the retry
+ * adopts it instead of re-sending. v0's own state is the source of truth, not our guess.
+ * (ENG-287 follow-up)
+ */
+export interface PendingIteration {
+  baseVersionId: string;
+  messageHash: string;
+  startedAt: string;
+}
+
 export interface GeneratedLandingPage {
   id: string;
   userId: string;
   name: string;
   prompt: string;
   status: "generating" | "draft" | "deploying" | "deployed" | "failed";
+  pendingIteration?: PendingIteration;
   v0ProjectId?: string;
   v0ChatId?: string;
   vercelProjectId?: string;
@@ -381,6 +601,55 @@ export interface BrandContext {
   businessOverview?: string;
   icp?: Array<{ title: string; description: string; valueProposition: string; buyerPersonas: string[] }>;
   competitors?: Array<{ name: string; description: string }>;
+}
+
+/**
+ * Project the BrandContext for landing-page generation off a persisted User
+ * record (ENG-326). One shared implementation for every v0 entry point so the
+ * persisted brand logo — resolved attachments-first via the shared brandLogo
+ * module — always reaches the generation prompt.
+ *
+ * `brandGuidelinesOverride` carries the effective brand record when it does
+ * NOT live on the user: org members' brandGuidelines (incl. the persisted /
+ * uploaded logo) live on the ORG record, so callers pass
+ * `org.brandGuidelines` for them. marketStrategy always comes from the user.
+ */
+export function buildBrandContextFromUser(
+  user: any,
+  brandGuidelinesOverride?: any,
+): BrandContext {
+  const brandContext: BrandContext = {};
+  if (!user) return brandContext;
+
+  const bg: any = brandGuidelinesOverride ?? user.brandGuidelines;
+  if (bg) {
+    const bd = bg.brandData || {};
+    brandContext.brandName = bd.brandName;
+    brandContext.primaryColor = bd.primaryColor;
+    brandContext.primaryColorEnd = bd.primaryColorEnd;
+    brandContext.isGradient = bd.isGradient;
+    brandContext.secondaryColor = bd.secondaryColor;
+    brandContext.fontFamily = bd.fontFamily;
+    brandContext.tagline = bd.tagline;
+    brandContext.toneOfVoice = bd.toneOfVoice;
+    brandContext.brandPersonality = bd.brandPersonality;
+    brandContext.keyMessages = bd.keyMessages;
+    brandContext.brandValues = bd.brandValues;
+    brandContext.targetAudience = bd.targetAudience;
+    brandContext.founders = bd.founders;
+
+    const logoUrl = getPersistedBrandLogoUrl(bg);
+    if (logoUrl) brandContext.logoUrl = logoUrl;
+  }
+
+  // Market strategy — gives v0 real business context for landing page copy
+  if (user.marketStrategy) {
+    brandContext.businessOverview = user.marketStrategy.businessOverview;
+    brandContext.icp = user.marketStrategy.icp;
+    brandContext.competitors = user.marketStrategy.competitors;
+  }
+
+  return brandContext;
 }
 
 /**
@@ -595,13 +864,26 @@ async function getV0Client() {
  */
 export async function findReusablePageForRoute(
   userId: string,
-  slug: string
+  slug: string,
+  siteId?: string
 ): Promise<GeneratedLandingPage | null> {
   const pages = await listLandingPages(userId);
-  const REUSE_STATUSES = ["deployed", "generating", "deploying"];
-  const match = pages.find(
-    (p) => (p.slug || buildPageSlug(p.name)) === slug && REUSE_STATUSES.includes(p.status)
-  );
+  const nowMs = Date.now();
+  const match = pages.find((p) => {
+    // Routes are per-site: /book-a-demo on Site A must never satisfy a request
+    // targeting Site B (the guard key is siteId-scoped for the same reason).
+    if (siteId && p.siteId !== siteId && p.id !== siteId) return false;
+    if ((p.slug || (p.name ? buildPageSlug(p.name) : undefined)) !== slug) return false;
+    if (p.status === "deployed") return true;
+    // In-flight records are only reusable while plausibly alive. A record stuck in
+    // generating/deploying past the stuck ceiling was abandoned by a crash/redeploy —
+    // reusing it would let one wedged record swallow every future build of this
+    // route forever (the ENG-277 wedge). The janitor will mark it failed; a fresh
+    // build must be allowed to proceed now.
+    if (p.status !== "generating" && p.status !== "deploying") return false;
+    const ageMs = nowMs - new Date(p.updatedAt || p.createdAt).getTime();
+    return Number.isFinite(ageMs) && ageMs <= STUCK_CEILING_MS;
+  });
   return match || null;
 }
 
@@ -700,6 +982,12 @@ export async function generateLandingPage(
     if (opts?.siteId) {
       const site = await findSiteById(opts.siteId, userId);
       if (site?.githubRepoUrl) {
+        const slug = buildPageSlug(name);
+        const reuse = await findReusablePageForRoute(userId, slug, site.siteId ?? site.id);
+        if (reuse) {
+          console.log(`[V0 SERVICE] Route /${slug} is already ${reuse.status} (${reuse.id}) — reusing, skipping duplicate build`);
+          return reuse;
+        }
         return addSubPage(
           site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
         );
@@ -720,6 +1008,12 @@ export async function generateLandingPage(
     //    under it. Falls back to creating the first site if none exists yet.
     const existing = await findUserSiteRecord(userId);
     if (existing?.githubRepoUrl) {
+      const slug = buildPageSlug(name);
+      const reuse = await findReusablePageForRoute(userId, slug, existing.siteId ?? existing.id);
+      if (reuse) {
+        console.log(`[V0 SERVICE] Route /${slug} is already ${reuse.status} (${reuse.id}) — reusing, skipping duplicate build`);
+        return reuse;
+      }
       return addSubPage(
         existing, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
       );
@@ -903,9 +1197,17 @@ async function generateFirstPage(
       operation: "first_page_chat_create",
       scopeId: id,
       prompt: enrichedPrompt,
+      // responseMode async: sync mode blocks the HTTP call for the FULL generation
+      // (3–15 min in prod), guaranteeing a loss against the 300s attempt timeout and
+      // minting an orphan, credit-burning chat on every "timeout". Async returns the
+      // chatId in seconds; waitForCompletedV0Version absorbs the generation time. (ENG-287)
       create: () => withRetry(
-        () => v0.chats.create({ message: enrichedPrompt }),
-        "v0 chat creation"
+        () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" }),
+        "v0 chat creation",
+        // Interactive path: fail fast on a timeout instead of re-burning 3 × 300s
+        // ≈ 15 min. 5xx/network still retry. The guard makes the user's retry clean. (ENG-287)
+        undefined, undefined, undefined,
+        { retryOnTimeout: false }
       ),
     });
 
@@ -917,7 +1219,14 @@ async function generateFirstPage(
     let updateExpression =
       "SET #status = :status, v0ChatId = :chatId, updatedAt = :updatedAt";
     const expressionAttributeValues: Record<string, any> = {
-      ":status": "draft",
+      // Stay `generating` — the ~16-min version poll happens inside deployLandingPage
+      // below, so flipping to `draft` here parked the record in a status that
+      // IN_FLIGHT_STATUSES, the abandoned-build janitor and route-reuse all ignore for
+      // the entire generation. Agent mode then could not find the in-flight job at its
+      // 10-min timeout, told the user it FAILED, and the retry started a duplicate build
+      // with a second repo and Vercel project. `draft` means "has an undeployed version
+      // ready", which is not true yet. (ENG-287 residual)
+      ":status": "generating",
       ":chatId": chatId,
       ":updatedAt": new Date().toISOString(),
     };
@@ -938,10 +1247,23 @@ async function generateFirstPage(
       .promise();
 
     console.log(`[V0 SERVICE] v0 chat created (${chatId}), auto-deploying...`);
-    const deployed = await deployLandingPage(id, userId);
+    // fromGeneration: this record is legitimately still `generating` (see above) — the
+    // public deploy route must keep refusing an actively-generating record.
+    const deployed = await deployLandingPage(id, userId, { fromGeneration: true });
     return deployed;
   } catch (error: any) {
     console.error("[V0 SERVICE] Generation failed:", error);
+
+    if (isDeadEndV0Failure(error)) {
+      // The chat is a dead end — v0 marked it failed, its output will not validate, or its
+      // code will not build. Retrying against it fails identically forever, and since the
+      // prompt is not part of the key, a DIFFERENT prompt would reuse it too. Free the
+      // identity so the retry mints a fresh chat. A merely-slow generation
+      // (V0_GENERATION_TIMEOUT) deliberately does NOT land here: that chat stays reusable
+      // so the retry resumes it for free. Best-effort; the failed-status write below is
+      // the critical step. (ENG-287 residual)
+      await clearV0UsageForPage({ userId, pageId: id });
+    }
 
     await dynamodb
       .update({
@@ -974,7 +1296,10 @@ async function generateFirstPage(
 /** A file to commit: repo-relative path + raw bytes. */
 interface RepoFileToCommit {
   path: string;
-  content: Buffer;
+  /** Omitted for a deletion — the tree entry carries `sha: null` instead of a blob. */
+  content?: Buffer;
+  /** Remove this path from the repo in the same commit. */
+  deleted?: boolean;
 }
 
 /** Whether a GitHub-push error is worth retrying (transient network/server) or a
@@ -1046,9 +1371,16 @@ export async function commitFilesToRepoMain(
 
       const treeItems = await Promise.all(
         filesToCommit.map(async (file) => {
+          // A deletion carries no blob — GitHub removes a path when its tree entry has a
+          // null sha. Routing it through here (rather than the contents API) means deletes
+          // inherit this function's rebase/idempotency retry, which matters when another
+          // page is being committed into the same repo concurrently.
+          if (file.deleted) {
+            return { path: file.path, mode: "100644" as const, type: "blob" as const, sha: null };
+          }
           const blobRes = await axios.post<any>(
             `https://api.github.com/repos/${repoFullName}/git/blobs`,
-            { content: file.content.toString("base64"), encoding: "base64" },
+            { content: file.content!.toString("base64"), encoding: "base64" },
             { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
           );
           return { path: file.path, mode: "100644" as const, type: "blob" as const, sha: blobRes.data.sha };
@@ -1169,6 +1501,13 @@ async function addPageToExistingRepo(
 
   await dynamodb.put({ TableName: TABLE_NAME, Item: record }).promise();
 
+  // Covers the WHOLE build, not just the v0 poll: the zip download, the corrections, the
+  // GitHub push and the 5-min Vercel poll each carry multi-minute retry budgets and write
+  // nothing, so without this the record can go silent past the janitor's 30-min ceiling and
+  // a LIVE build gets marked failed. (ENG-287 residual)
+  const stopHeartbeat = startBuildHeartbeat(id);
+  // One budget for the whole build, shared by the initial wait and every correction round.
+  const buildDeadline = Date.now() + V0_GENERATION_BUDGET_MS;
   try {
     // ── Step 1: Call v0 to generate proper page content ──
     // If no template provided, fall back to landing-page-v2 (same behaviour as generateFirstPage)
@@ -1184,9 +1523,15 @@ async function addPageToExistingRepo(
       scopeId: existingPage.siteId ?? existingPage.id,
       slug,
       prompt: enrichedPrompt,
+      // responseMode async — see the first-page call site for why sync mode cannot
+      // survive the 300s attempt timeout. (ENG-287)
       create: () => withRetry(
-        () => v0.chats.create({ message: enrichedPrompt }),
-        "v0 chat creation (additional page)"
+        () => v0.chats.create({ message: enrichedPrompt, responseMode: "async" }),
+        "v0 chat creation (additional page)",
+        // Interactive path: fail fast on a timeout instead of re-burning 3 × 300s
+        // ≈ 15 min. 5xx/network still retry. The guard makes the user's retry clean. (ENG-287)
+        undefined, undefined, undefined,
+        { retryOnTimeout: false }
       ),
     });
 
@@ -1208,31 +1553,14 @@ async function addPageToExistingRepo(
       })
       .promise();
 
-    // ── Step 2: Poll for v0 version completion ──
-    const V0_POLL_INTERVALS_MS = v0PollIntervalsMs;
-    let versionId: string | undefined;
-
-    for (let pollAttempt = 0; pollAttempt < V0_POLL_INTERVALS_MS.length; pollAttempt++) {
-      if (V0_POLL_INTERVALS_MS[pollAttempt] > 0) {
-        console.log(`[V0 SERVICE] v0 generation not ready yet for /${slug}, waiting ${V0_POLL_INTERVALS_MS[pollAttempt] / 1000}s (attempt ${pollAttempt + 1}/${V0_POLL_INTERVALS_MS.length})...`);
-        await new Promise(resolve => setTimeout(resolve, V0_POLL_INTERVALS_MS[pollAttempt]));
-      }
-
-      const chat = await withRetry(
-        () => v0.chats.getById({ chatId }),
-        "v0 chat fetch (additional page)"
-      );
-      versionId = chat.latestVersion?.id;
-
-      if (versionId) {
-        console.log(`[V0 SERVICE] v0 version found for /${slug}: ${versionId} (poll attempt ${pollAttempt + 1})`);
-        break;
-      }
-    }
-
-    if (!versionId) {
-      throw new Error("No version found in v0 chat after polling — generation may have failed");
-    }
+    // ── Step 2: Poll for v0 version completion (status-gated — a pending version
+    // must not be downloaded half-generated) ──
+    let versionId: string | undefined = await waitForCompletedV0Version(
+      v0,
+      chatId,
+      `v0 generation for /${slug}`,
+      { heartbeat: () => touchLandingPageRecord(id), deadline: buildDeadline }
+    );
 
     // ── Step 3: Download and validate v0 output ──
     await dynamodb
@@ -1261,7 +1589,13 @@ async function addPageToExistingRepo(
           format: "zip",
           includeDefaultFiles: true,
         }),
-        "v0 zip download (additional page)"
+        "v0 zip download (additional page)",
+        // Fail fast on OUR synthetic 300s ceiling. The default re-burns it 3× and this call
+        // sits inside a 3-round validation loop — worst case 3 × 3 × 300s = 45 min, worse
+        // than the hang that started this and past the MCP tool's 25-min budget. 5xx and
+        // network errors stay retryable. (ENG-287 residual)
+        undefined, undefined, undefined,
+        { retryOnTimeout: false }
       );
 
       const previewFiles = await unzipBuffer(zipBuffer);
@@ -1278,6 +1612,11 @@ async function addPageToExistingRepo(
             userId,
             scopeId: existingPage.siteId ?? existingPage.id,
             chatId,
+            // Each round of the loop is a genuinely different send. Without this the key was
+            // (user, scope, chatId), so round 2 returned {skipped:true}, the loop re-fetched
+            // the SAME version and re-downloaded the SAME broken zip — a 3-attempt self-heal
+            // that was really 1. (ENG-287 residual)
+            attempt: validationAttempt,
             send: () => withRetry(
               () => v0.chats.sendMessage({
                 chatId,
@@ -1287,18 +1626,28 @@ async function addPageToExistingRepo(
                   "Output must include .tsx files with real React components using export and function/const. " +
                   `Issue: ${valErr.reason}`,
               }),
-              "v0 correction message (additional page)"
+              "v0 correction message (additional page)",
+              // A correction that outlives the attempt timeout must fail once, not be
+              // re-sent 3× — each retry could double-apply the correction at full cost. (ENG-287)
+              undefined, undefined, undefined,
+              { retryOnTimeout: false }
             ),
           });
 
-          await new Promise((resolve) => setTimeout(resolve, 5000));
-
-          const updatedChat = await withRetry(
-            () => v0.chats.getById({ chatId }),
-            "v0 chat re-fetch (additional page)"
+          // Status-gated, like the initial wait: reading `latestVersion.id` straight off the
+          // chat is the exact mistake waitForCompletedV0Version exists to prevent — a
+          // correction's version is `pending` for a while, and downloading it ships a
+          // half-generated page. (ENG-287 residual)
+          versionId = await waitForCompletedV0Version(
+            v0,
+            chatId,
+            `v0 correction for /${slug}`,
+            {
+              heartbeat: () => touchLandingPageRecord(id),
+              deadline: buildDeadline,
+              afterVersionId: versionId, // must be the correction's NEW version, not the old one
+            }
           );
-          versionId = updatedChat.latestVersion?.id;
-          if (!versionId) throw new Error("No version found after correction message");
 
           continue;
         }
@@ -1325,11 +1674,33 @@ async function addPageToExistingRepo(
     // generated into the SAME repo) is rebased onto rather than rejected as a
     // non-fast-forward. Transient network/5xx failures are retried too — this
     // path was previously bare axios, the dominant source of "fetch failed".
+    // Heal sub-pages the PRE-FIX remap poisoned. `next build` type-checks the whole project,
+    // so one sibling page with an unresolvable import fails the deployment for every page —
+    // our correct new page included. Repairs ride in the SAME commit, so a single Vercel
+    // build validates both. Best-effort: a repo we cannot scan must not block the page add.
+    let repairs: RepoFileToCommit[] = [];
+    try {
+      repairs = await repairPoisonedSubPagesInRepo(
+        repoFullName,
+        ghHeaders,
+        new Set(filesToCommit.map((f) => f.path)),
+      );
+      if (repairs.length > 0) {
+        console.log(
+          `[V0 SERVICE] Repairing ${repairs.length} poisoned import(s) in ${repoFullName}: ${repairs.map((f) => f.path).join(", ")}`
+        );
+      }
+    } catch (repairErr: any) {
+      console.warn(`[V0 SERVICE] Import repair scan failed for ${repoFullName} (continuing): ${repairErr?.message}`);
+    }
+
     const { pushedCommitSha, pushTimestampMs } = await commitFilesToRepoMain(
       repoFullName,
       ghHeaders,
-      filesToCommit,
-      `Add new page: ${name} (/${slug})`
+      [...filesToCommit, ...repairs],
+      repairs.length > 0
+        ? `Add new page: ${name} (/${slug}) + repair ${repairs.length} broken import(s)`
+        : `Add new page: ${name} (/${slug})`
     );
 
     console.log(`[V0 SERVICE] Pushed ${filesToCommit.length} files for /${slug} to ${repoFullName} (${pushedCommitSha.substring(0, 7)}) — polling Vercel for build status`);
@@ -1343,6 +1714,27 @@ async function addPageToExistingRepo(
     if (deploymentResult.buildStatus === "error" || deploymentResult.buildStatus === "timeout") {
       const errorMsg = `Vercel build failed for /${slug}: ${deploymentResult.buildError || "Unknown build error"}`;
       console.error(`[V0 SERVICE] ${errorMsg}`);
+
+      // ONLY a real build `error` is a dead end. `timeout` means "we stopped waiting after
+      // 5 min", NOT "this code will never compile" — a normal Next.js cold build can outrun
+      // that poll, and pollVercelDeployment also degrades API flakiness to `timeout`. Freeing
+      // the identity there would be the orphan double-spend this whole split exists to
+      // prevent: the page goes live a minute later, the user retries the `failed` card, and
+      // we mint a second full-cost chat and push a second commit to the same repo.
+      //
+      // A genuine build error IS a dead end: this chat's code does not compile and will not
+      // compile next time either, so every retry would reuse it, re-download the same broken
+      // version and fail identically, forever — and because the prompt is not part of the
+      // key, even a NEW prompt would reuse it. Cleared inline because this path RETURNS
+      // rather than throwing, so the catch below never runs. (ENG-287 residual)
+      if (deploymentResult.buildStatus === "error") {
+        await clearV0UsageForPage({
+          userId,
+          pageId: id,
+          siteId: existingPage.siteId ?? existingPage.id,
+          slug,
+        });
+      }
 
       await dynamodb
         .update({
@@ -1394,6 +1786,19 @@ async function addPageToExistingRepo(
   } catch (error: any) {
     console.error("[V0 SERVICE] Failed to add page to repo:", error);
 
+    if (isDeadEndV0Failure(error)) {
+      // Dead-end chat (see generateFirstPage catch) — free the route identity so the retry
+      // creates a fresh chat rather than reusing one that can never deliver. A merely-slow
+      // generation (V0_GENERATION_TIMEOUT) deliberately keeps its chat so the retry resumes
+      // it for free. (ENG-287 residual)
+      await clearV0UsageForPage({
+        userId,
+        pageId: id,
+        siteId: existingPage.siteId ?? existingPage.id,
+        slug,
+      });
+    }
+
     await dynamodb
       .update({
         TableName: TABLE_NAME,
@@ -1414,6 +1819,8 @@ async function addPageToExistingRepo(
       status: "failed",
       errorMessage: error.message || "Failed to add page to repo",
     };
+  } finally {
+    stopHeartbeat();
   }
 }
 
@@ -1425,14 +1832,26 @@ async function addPageToExistingRepo(
  * layout metadata, so this is sufficient to fix the rendered <title>.
  *
  * Behaviour:
+ * - A CLIENT component is left completely alone — see below.
  * - If the file already exports a `metadata` object, rewrite its `title`
  *   field (or insert one) to the provided title.
- * - Otherwise, prepend a new `export const metadata = { title: "…" }` block
- *   right after any leading `'use client'` directive (if present — though
- *   `metadata` exports only work in server components, so this case is rare).
+ * - Otherwise, prepend a new `export const metadata = { title: "…" }` block.
  */
 export function ensurePageMetadataTitle(content: string, title: string): string {
   if (!title || !title.trim()) return content;
+
+  // A CLIENT component must never export `metadata` — Next.js hard-fails the build with
+  // "You are attempting to export metadata from a component marked with use client". We used
+  // to inject it right after the directive and call that defensive; it is the opposite. It
+  // manufactures a page that can never build, and because `next build` type-checks the whole
+  // project, that ONE page bricks the entire site — every sibling page included. Seen in prod
+  // on a shared site whose sub-pages "illegally exported metadata from client components".
+  //
+  // A missing <title> is cosmetic. An undeployable site is not. So when v0 emits a client
+  // component, leave it entirely alone — no injection, and no rewrite of an existing export
+  // either, since touching it would only relabel code that cannot compile.
+  if (/^\s*(?:'use client'|"use client")/.test(content)) return content;
+
   const escaped = title.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 
   // Case 1: existing `export const metadata = { ... }` — rewrite its title field
@@ -1458,12 +1877,7 @@ export function ensurePageMetadataTitle(content: string, title: string): string 
   // Case 2: no existing metadata export — prepend a fresh one after any
   // 'use client' directive. In practice page.tsx should be a server component
   // so the directive is unusual here, but we handle it defensively.
-  const metadataBlock = `export const metadata = { title: "${escaped}" };\n\n`;
-  const useClientMatch = content.match(/^(\s*(?:'use client'|"use client");?\s*\n)/);
-  if (useClientMatch) {
-    return useClientMatch[1] + metadataBlock + content.slice(useClientMatch[1].length);
-  }
-  return metadataBlock + content;
+  return `export const metadata = { title: "${escaped}" };\n\n` + content;
 }
 
 /**
@@ -1502,6 +1916,9 @@ export function remapFilesForSubPage(
 
   const result: Array<{ path: string; content: Buffer }> = [];
   const componentRenames = new Map<string, string>(); // old import path → new import path
+  // Where each emitted file CAME FROM. A relative import is only meaningful against the
+  // file's original location, so resolving one after the move needs this.
+  const originalPathOf = new Map<string, string>(); // new path → original path
 
   for (const file of files) {
     // Skip config and shared files
@@ -1510,11 +1927,13 @@ export function remapFilesForSubPage(
     if (file.path === "app/page.tsx") {
       // Main page → sub-route page
       result.push({ path: `app/${slug}/page.tsx`, content: file.content });
+      originalPathOf.set(`app/${slug}/page.tsx`, file.path);
     } else if (file.path.startsWith("components/") && !file.path.startsWith("components/ui/")) {
       // Custom components → namespaced under the sub-route to avoid conflicts
       const relativeName = file.path.replace("components/", "");
       const newPath = `app/${slug}/_components/${relativeName}`;
       result.push({ path: newPath, content: file.content });
+      originalPathOf.set(newPath, file.path);
       // Track rename: @/components/foo → ./_components/foo (relative from app/<slug>/)
       const oldImport = `@/components/${relativeName.replace(/\.tsx$/, "")}`;
       const newImport = `./_components/${relativeName.replace(/\.tsx$/, "")}`;
@@ -1527,6 +1946,7 @@ export function remapFilesForSubPage(
       // Other app files (e.g. app/loading.tsx) → namespace under slug
       const relativeName = file.path.replace("app/", "");
       result.push({ path: `app/${slug}/${relativeName}`, content: file.content });
+      originalPathOf.set(`app/${slug}/${relativeName}`, file.path);
     }
     // Skip everything else (public/, lib/, etc.) — root project already has them
   }
@@ -1536,6 +1956,37 @@ export function remapFilesForSubPage(
     if (!file.path.endsWith(".tsx") && !file.path.endsWith(".ts")) continue;
     let content = file.content.toString("utf-8");
     let changed = false;
+
+    // 0. Normalize RELATIVE imports to the `@/` alias, resolved against the file's ORIGINAL
+    //    location.
+    //
+    //    v0 does not always emit the `@/` alias — it also emits plain relative paths, which
+    //    are perfectly correct at the repo root. They break the instant we move the file:
+    //    `../components/landing/nav` from `app/page.tsx` means `components/landing/nav`, but
+    //    from `app/<slug>/page.tsx` it means `app/components/landing/nav`, which does not
+    //    exist. The component has ALSO moved (to `_components/`), so the path is wrong twice
+    //    over. Observed in prod as `Module not found: '../components/landing/nav'` — a failed
+    //    Vercel build and a dead sub-page.
+    //
+    //    Resolving against the original directory and re-emitting as `@/...` (which always
+    //    resolves from the repo root) makes step 1 below handle moved components uniformly,
+    //    and fixes the same latent break for `../lib/...`, `../hooks/...` and
+    //    `../components/ui/...`, none of which move.
+    const origPath = originalPathOf.get(file.path);
+    if (origPath) {
+      const origDir = path.posix.dirname(origPath);
+      content = content.replace(
+        /(from\s+['"])(\.\.?\/[^'"]+)(['"])/g,
+        (whole, pre: string, spec: string, post: string) => {
+          const resolved = path.posix.normalize(path.posix.join(origDir, spec));
+          // Escapes the repo root — we cannot say what it points at; leave it untouched
+          // rather than emit something confidently wrong.
+          if (resolved.startsWith("..")) return whole;
+          changed = true;
+          return `${pre}@/${resolved}${post}`;
+        }
+      );
+    }
 
     // 1. Rewrite @/components/foo → ./_components/foo (absolute → relative)
     for (const [oldImport, newImport] of componentRenames) {
@@ -1583,6 +2034,160 @@ export function remapFilesForSubPage(
   return result;
 }
 
+/** Extensions Next/TS will try when an import omits one. */
+const MODULE_EXTENSIONS = [".tsx", ".ts", ".jsx", ".js"];
+
+/** Does `target` (repo-root-relative, extensionless) name a file that actually exists? */
+function moduleExists(target: string, existingPaths: Set<string>): boolean {
+  if (existingPaths.has(target)) return true;
+  for (const ext of MODULE_EXTENSIONS) {
+    if (existingPaths.has(`${target}${ext}`)) return true;
+    if (existingPaths.has(`${target}/index${ext}`)) return true;
+  }
+  return false;
+}
+
+/**
+ * Invert remapFilesForSubPage: where did this committed file live when v0 emitted it?
+ * A relative import is only meaningful against the file's ORIGINAL directory, so healing
+ * one after the fact requires undoing the move.
+ *
+ * Returns null for anything that was never moved (the root page, layout, etc.) — those
+ * files' relative imports are correct and must not be touched.
+ */
+function originalPathOfSubPageFile(filePath: string): { slug: string; original: string } | null {
+  const m = filePath.match(/^app\/([^/]+)\/(.+)$/);
+  if (!m) return null; // app/page.tsx, app/layout.tsx — never moved
+  const [, slug, rest] = m;
+  if (rest.startsWith("_components/")) {
+    // app/<slug>/_components/x.tsx  ←  components/x.tsx
+    return { slug, original: `components/${rest.slice("_components/".length)}` };
+  }
+  // app/<slug>/page.tsx ← app/page.tsx;  app/<slug>/loading.tsx ← app/loading.tsx
+  return { slug, original: `app/${rest}` };
+}
+
+/**
+ * Repair sub-page files already committed to a repo by the PRE-FIX remap, which moved files
+ * without rewriting their plain relative imports.
+ *
+ * Why this exists at all: `next build` type-checks the whole project, so a SINGLE page with an
+ * unresolvable import fails the deployment for EVERY page on the site. A site poisoned while
+ * that bug was live is permanently undeployable — regenerating cannot save it, because the
+ * broken file is still in the repo. remapFilesForSubPage stops new poisoning; this undoes the
+ * damage already done.
+ *
+ * The invariant that makes it safe to rewrite files we did not generate this run:
+ *
+ *   ONLY rewrite an import that does not CURRENTLY resolve.
+ *
+ * A healthy repo is untouched. A broken one can only move toward compiling — we never
+ * "fix" something that already works, and when no file in the repo could satisfy an import we
+ * leave it alone rather than emit a confident guess. It follows that the pass is idempotent.
+ *
+ * Pure: `existingPaths` is the repo's file list, so this is fully testable without GitHub.
+ * Returns ONLY the files whose content changed.
+ */
+export function repairSubPageImports(
+  files: Array<{ path: string; content: string }>,
+  existingPaths: Set<string>,
+): Array<{ path: string; content: string }> {
+  const repaired: Array<{ path: string; content: string }> = [];
+
+  for (const file of files) {
+    if (!file.path.endsWith(".tsx") && !file.path.endsWith(".ts")) continue;
+    const origin = originalPathOfSubPageFile(file.path);
+    if (!origin) continue; // never moved → its relative imports were always correct
+
+    const { slug, original } = origin;
+    const currentDir = path.posix.dirname(file.path);
+    const originalDir = path.posix.dirname(original);
+    let changed = false;
+
+    const content = file.content.replace(
+      /(from\s+['"])(\.\.?\/[^'"]+)(['"])/g,
+      (whole, pre: string, spec: string, post: string) => {
+        // Already resolves from where the file sits now? Then it is not broken — hands off.
+        const asWritten = path.posix.normalize(path.posix.join(currentDir, spec));
+        if (moduleExists(asWritten, existingPaths)) return whole;
+
+        // Broken. Read it the way v0 meant it — against the file's ORIGINAL directory.
+        const intended = path.posix.normalize(path.posix.join(originalDir, spec));
+        if (intended.startsWith("..")) return whole; // escapes the repo root — unknowable
+
+        // The remap relocates components/* (but not components/ui/*) into the page's
+        // _components/. Look there first, then at the untouched root.
+        const candidates: string[] = [];
+        if (intended.startsWith("components/") && !intended.startsWith("components/ui/")) {
+          candidates.push(`app/${slug}/_components/${intended.slice("components/".length)}`);
+        }
+        candidates.push(intended);
+
+        const target = candidates.find((c) => moduleExists(c, existingPaths));
+        if (!target) return whole; // nothing in the repo satisfies it — do not guess
+
+        changed = true;
+        return `${pre}@/${target}${post}`;
+      },
+    );
+
+    if (changed) repaired.push({ path: file.path, content });
+  }
+
+  return repaired;
+}
+
+/** Upper bound on files read during a repair scan, so a huge repo can't stall a page add. */
+const REPAIR_SCAN_MAX_FILES = 200;
+
+/**
+ * Scan a repo's existing sub-pages for imports poisoned by the pre-fix remap and return the
+ * repaired files, ready to ride along in the caller's commit.
+ *
+ * Adding a page to a poisoned site is precisely when we can heal it — we are already listing
+ * the repo and pushing a commit, and a repair in that SAME commit means one Vercel build
+ * validates both. Without this, the new page is correct and the site still cannot deploy,
+ * because a sibling page's broken import fails the build for everything.
+ *
+ * `skipPaths` are the files the caller is committing this run: they are correct by
+ * construction, and re-reading the stale copies from the repo would clobber them.
+ */
+export async function repairPoisonedSubPagesInRepo(
+  repoFullName: string,
+  ghHeaders: Record<string, string>,
+  skipPaths: Set<string>,
+): Promise<RepoFileToCommit[]> {
+  const tree = await listRepoTree(repoFullName, ghHeaders);
+  const existingPaths = new Set(tree);
+
+  const candidates = tree.filter(
+    (p) => /^app\/[^/]+\/.+\.(tsx|ts)$/.test(p) && !skipPaths.has(p),
+  );
+  if (candidates.length === 0) return [];
+
+  const scanned = candidates.slice(0, REPAIR_SCAN_MAX_FILES);
+  if (scanned.length < candidates.length) {
+    console.warn(
+      `[V0 SERVICE] Import repair scanned ${scanned.length} of ${candidates.length} files in ${repoFullName} — ` +
+        `${candidates.length - scanned.length} skipped by the ${REPAIR_SCAN_MAX_FILES}-file cap`,
+    );
+  }
+
+  const files = await Promise.all(
+    scanned.map(async (p) => {
+      const res = await axios.get<any>(
+        `https://api.github.com/repos/${repoFullName}/contents/${p}`,
+        { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS },
+      );
+      return { path: p, content: Buffer.from(res.data.content, "base64").toString("utf-8") };
+    }),
+  );
+
+  return repairSubPageImports(files, existingPaths).map((f) => ({
+    path: f.path,
+    content: Buffer.from(f.content),
+  }));
+}
 
 /**
  * Deploy a generated landing page: download from v0 → create GitHub repo → connect to Vercel.
@@ -1590,7 +2195,8 @@ export function remapFilesForSubPage(
  */
 export async function deployLandingPage(
   id: string,
-  userId: string
+  userId: string,
+  opts: { fromGeneration?: boolean } = {}
 ): Promise<GeneratedLandingPage> {
   const record = await getLandingPage(id, userId);
   if (!record) {
@@ -1606,7 +2212,23 @@ export async function deployLandingPage(
     );
   }
 
-  if (!["draft", "failed", "deploying"].includes(record.status)) {
+  // `generating` is accepted in exactly two cases:
+  //  1. generateFirstPage's own auto-deploy — that record is legitimately mid-generation and
+  //     THIS call is the thing driving it;
+  //  2. the build is abandoned (no progress past the stuck ceiling), so there is no live
+  //     process to race. Without this, a crashed build would refuse a manual deploy until
+  //     the janitor flips it to `failed`, leaving the user stuck for up to 30 min.
+  // A user-initiated deploy of an ACTIVELY-generating record is still refused — otherwise
+  // two builds race commits into the same repo. The heartbeat is what keeps a live build
+  // looking live here. (ENG-287 residual)
+  const lastMovedMs = new Date(record.updatedAt || record.createdAt).getTime();
+  const abandoned =
+    Number.isFinite(lastMovedMs) && Date.now() - lastMovedMs > STUCK_CEILING_MS;
+  const deployableStatuses =
+    opts.fromGeneration || abandoned
+      ? ["generating", "draft", "failed", "deploying"]
+      : ["draft", "failed", "deploying"];
+  if (!deployableStatuses.includes(record.status)) {
     throw new Error(`Cannot deploy a landing page with status: ${record.status}`);
   }
 
@@ -1620,35 +2242,24 @@ export async function deployLandingPage(
     );
   }
 
+  // Covers the whole deploy (download → corrections → GitHub push → 5-min Vercel poll), not
+  // just the v0 poll — see startBuildHeartbeat. (ENG-287 residual)
+  const stopHeartbeat = startBuildHeartbeat(id);
+  // One budget for the whole deploy, shared by the initial wait and every correction round.
+  const buildDeadline = Date.now() + V0_GENERATION_BUDGET_MS;
   try {
     const v0 = await getV0Client();
 
-    // Step 1: Get the latest version from v0 chat (poll with backoff if generation is still in progress)
+    // Step 1: Wait for the latest version to complete (status-gated — async-mode
+    // chats expose a pending version immediately; downloading it would ship a
+    // half-generated page)
     console.log(`[V0 SERVICE] Step 1: Getting latest version for chat ${record.v0ChatId}`);
-    const V0_POLL_INTERVALS_MS = v0PollIntervalsMs; // total wait: up to ~2.5 min
-    let versionId: string | undefined;
-
-    for (let pollAttempt = 0; pollAttempt < V0_POLL_INTERVALS_MS.length; pollAttempt++) {
-      if (V0_POLL_INTERVALS_MS[pollAttempt] > 0) {
-        console.log(`[V0 SERVICE] v0 generation not ready yet, waiting ${V0_POLL_INTERVALS_MS[pollAttempt] / 1000}s before retry (attempt ${pollAttempt + 1}/${V0_POLL_INTERVALS_MS.length})...`);
-        await new Promise(resolve => setTimeout(resolve, V0_POLL_INTERVALS_MS[pollAttempt]));
-      }
-
-      const chat = await withRetry(
-        () => v0.chats.getById({ chatId: record.v0ChatId! }),
-        "v0 chat fetch"
-      );
-      versionId = chat.latestVersion?.id;
-
-      if (versionId) {
-        console.log(`[V0 SERVICE] v0 version found: ${versionId} (poll attempt ${pollAttempt + 1})`);
-        break;
-      }
-    }
-
-    if (!versionId) {
-      throw new Error("No version found in v0 chat after polling for ~2.5 minutes — generation may have failed");
-    }
+    let versionId: string | undefined = await waitForCompletedV0Version(
+      v0,
+      record.v0ChatId!,
+      "v0 generation",
+      { heartbeat: () => touchLandingPageRecord(id), deadline: buildDeadline }
+    );
 
     // Step 2: Download + validate v0 output (with retry on bad output)
     const V0_VALIDATION_MAX_RETRIES = 2;
@@ -1664,7 +2275,11 @@ export async function deployLandingPage(
           format: "zip",
           includeDefaultFiles: true,
         }),
-        "v0 zip download"
+        "v0 zip download",
+        // Fail fast on our synthetic 300s ceiling — see the sub-page download for why the
+        // default (3× re-burn, inside a 3-round loop) is a 45-minute hang. (ENG-287 residual)
+        undefined, undefined, undefined,
+        { retryOnTimeout: false }
       );
 
       // Unzip and validate before pushing to GitHub
@@ -1683,6 +2298,9 @@ export async function deployLandingPage(
             userId,
             scopeId: record.siteId ?? record.id,
             chatId: record.v0ChatId!,
+            // Each loop round is a different send — without this discriminator round 2 was
+            // skipped and we re-downloaded the same broken zip. (ENG-287 residual)
+            attempt: validationAttempt,
             send: () => withRetry(
               () => v0.chats.sendMessage({
                 chatId: record.v0ChatId!,
@@ -1692,20 +2310,27 @@ export async function deployLandingPage(
                   "Output must include .tsx files with real React components using export and function/const. " +
                   `Issue: ${valErr.reason}`,
               }),
-              "v0 correction message"
+              "v0 correction message",
+              // A correction that outlives the attempt timeout must fail once, not be
+              // re-sent 3× — each retry could double-apply the correction at full cost. (ENG-287)
+              undefined, undefined, undefined,
+              { retryOnTimeout: false }
             ),
           });
 
-          // Wait for v0 to process the correction
-          await new Promise((resolve) => setTimeout(resolve, 5000));
-
-          // Get the new version
-          const updatedChat = await withRetry(
-            () => v0.chats.getById({ chatId: record.v0ChatId! }),
-            "v0 chat re-fetch"
+          // Status-gated: a correction's version is `pending` for a while, and reading
+          // `latestVersion.id` straight off the chat downloads it half-generated — the exact
+          // mistake waitForCompletedV0Version exists to prevent. (ENG-287 residual)
+          versionId = await waitForCompletedV0Version(
+            v0,
+            record.v0ChatId!,
+            "v0 correction",
+            {
+              heartbeat: () => touchLandingPageRecord(id),
+              deadline: buildDeadline,
+              afterVersionId: versionId, // must be the correction's NEW version, not the old one
+            }
           );
-          versionId = updatedChat.latestVersion?.id;
-          if (!versionId) throw new Error("No version found after correction message");
 
           continue;
         }
@@ -1718,7 +2343,11 @@ export async function deployLandingPage(
     console.log("[V0 SERVICE] Step 3: Creating GitHub repo and pushing files");
     const slug = buildPageSlug(record.name);
     const repoName = `lp-${slug}-${id.slice(0, 8)}`;
-    const { githubRepoUrl, repoFullName, commitSha } = await createGitHubRepoAndPush(repoName, zipBuffer, record.name, record.leadListId);
+    // NB: `slug` above names the REPO. The page PATH is the record's own slug — the same
+    // convention routes/domains.ts uses to build its domain map (`p.slug ? "/"+p.slug : "/"`).
+    const pagePath = record.slug ? `/${record.slug}` : "/";
+    const listByPath: Record<string, string> = record.leadListId ? { [pagePath]: record.leadListId } : {};
+    const { githubRepoUrl, repoFullName, commitSha } = await createGitHubRepoAndPush(repoName, zipBuffer, record.name, listByPath);
 
     // Save GitHub repo URL immediately so it's not lost if Vercel step fails
     await dynamodb
@@ -1867,7 +2496,17 @@ export async function deployLandingPage(
       console.error("[V0 SERVICE] Failed to update DB after deploy error:", dbError);
     }
 
-    throw new Error(`Deployment failed: ${error.message}`);
+    // Re-wrapping with a bare `new Error(...)` destroyed `error.code`. deployLandingPage is
+    // the ONLY place the first-page path reaches waitForCompletedV0Version, so the lost code
+    // made generateFirstPage's dead-end branch unreachable — the safety net did not exist.
+    // Preserve the code (and the cause) so callers can still tell a dead-end chat from a
+    // slow one. (ENG-287 residual)
+    const wrapped: any = new Error(`Deployment failed: ${error.message}`);
+    if (error?.code) wrapped.code = error.code;
+    wrapped.cause = error;
+    throw wrapped;
+  } finally {
+    stopHeartbeat();
   }
 }
 
@@ -1981,6 +2620,12 @@ export function autoFixV0Files(files: Array<{ path: string; content: Buffer }>):
 // ---------------------------------------------------------------------------
 
 export class V0OutputValidationError extends Error {
+  /**
+   * Carried as a `code` (not just a prototype) so it survives being re-wrapped across a
+   * throw boundary — `instanceof` does not, and deployLandingPage re-wraps. This is what
+   * lets `isDeadEndV0Failure` still recognise it. (ENG-287 residual)
+   */
+  readonly code = "V0_OUTPUT_INVALID";
   constructor(public readonly reason: string) {
     super(`v0 output validation failed: ${reason}`);
     this.name = "V0OutputValidationError";
@@ -2086,6 +2731,11 @@ function isV0Middleware(p: string): boolean {
   return /^middleware\.(ts|js)$/.test(normalizeGeneratedPath(p));
 }
 
+/** v0 may emit its own domainMap; ours is authoritative (the middleware imports it). */
+function isV0DomainMap(p: string): boolean {
+  return /^domainMap\.(ts|js)$/.test(normalizeGeneratedPath(p));
+}
+
 /**
  * Defense in depth: if a v0-generated file somehow survives the drop-filter above
  * and still collides with our injected route/middleware, fail loudly here
@@ -2097,29 +2747,75 @@ function isV0Middleware(p: string): boolean {
 export function assertNoDuplicateInjectedRoutes(files: Array<{ path: string; content: Buffer }>): void {
   const captureRouteCount = files.filter((f) => f.path === "app/api/capture/route.ts").length;
   const middlewareCount = files.filter((f) => f.path === "middleware.ts").length;
-  if (captureRouteCount > 1 || middlewareCount > 1) {
+  const domainMapCount = files.filter((f) => f.path === "domainMap.ts").length;
+  if (captureRouteCount > 1 || middlewareCount > 1 || domainMapCount > 1) {
     throw new Error(
-      `[V0 SERVICE] duplicate route after lead-capture injection (capture routes: ${captureRouteCount}, middleware: ${middlewareCount})`
+      `[V0 SERVICE] duplicate route after lead-capture injection (capture routes: ${captureRouteCount}, middleware: ${middlewareCount}, domainMap: ${domainMapCount})`
     );
   }
 }
 
-export function injectLeadCaptureAttribution(
-  files: Array<{ path: string; content: Buffer }>,
-  leadListId: string
-): Array<{ path: string; content: Buffer }> {
-  const filtered = files.filter((f) => !isV0CaptureRoute(f.path) && !isV0Middleware(f.path));
-
-  const apiBase = process.env.BACKEND_URL || "https://api.agentweb.pro";
-
-  const middlewareContent = `import { NextResponse } from "next/server";
+/**
+ * The ONE `middleware.ts` a generated landing page ever gets. ENG-308.
+ *
+ * Next.js allows exactly one middleware at the repo root, and TWO things need to
+ * happen there: the per-page subdomain rewrite, and the first-touch attribution
+ * capture. They used to be written by two different functions that each emitted the
+ * whole file — so `updateSubdomainMiddleware` (fired on any domain attach/detach)
+ * committed a routing-only middleware straight over the capture one and **silently
+ * destroyed attribution** for that page, permanently, until it was regenerated.
+ *
+ * Both writers now emit THIS. A test asserts they are byte-identical, which is the
+ * only real guarantee they cannot drift apart again.
+ *
+ * Two things to preserve if you edit this:
+ *  - The cookie is set on the SAME response we return, on BOTH paths. Early-returning
+ *    the rewrite would skip capture for exactly the pages a customer cared enough
+ *    about to give a domain to.
+ *  - The `matcher` must exclude `api/` — WITH the trailing slash. The capture route
+ *    lives at `app/api/capture/route.ts` and READS this cookie, so it must never be
+ *    rewritten. But excluding a bare `api` (no slash) would also strip the middleware
+ *    from ordinary page routes that merely begin with those letters — `/api-docs`,
+ *    `/apis`, `/api-integration` — and those pages would lose their SUBDOMAIN REWRITE,
+ *    i.e. visibly break for the customer. The two middlewares this replaces disagreed
+ *    on exactly this; the slash-ful form is the correct one.
+ *
+ * It imports `./domainMap`, so every writer must also emit a `domainMap.ts`.
+ */
+export function buildLandingPageMiddleware(): string {
+  return `import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
+import { DOMAIN_MAP } from "./domainMap";
 
 const COOKIE = "aw_first_touch";
 const MAX_AGE = 60 * 60 * 24 * 90; // 90 days
 
 export function middleware(req: NextRequest) {
-  const res = NextResponse.next();
+  // 1. Per-page subdomain routing: rewrite the host to its mapped path, if any.
+  const host = (req.headers.get("host") || "").replace(/:\\d+$/, "");
+  const targetPath = DOMAIN_MAP[host];
+  let res: NextResponse;
+  if (targetPath) {
+    const url = req.nextUrl.clone();
+    url.pathname = targetPath;
+    res = NextResponse.rewrite(url);
+  } else {
+    res = NextResponse.next();
+  }
+
+  // 2. Which page is this, AFTER any rewrite? The capture route needs to know, because
+  //    the lead list is per-page while the route is per-repo. We stamp it rather than
+  //    letting the route read the Referer: for a rewritten host the browser reports
+  //    pathname "/" (e.g. pricing.acme.com/), so a Referer lookup would miss and file
+  //    the lead against the wrong page's list. Overwritten every request — a visitor
+  //    may land on one page and submit the form on another, and the lead belongs to the
+  //    page they submitted from.
+  const PAGE_COOKIE = "aw_page";
+  res.cookies.set(PAGE_COOKIE, targetPath || req.nextUrl.pathname, { path: "/", sameSite: "lax" });
+
+  // 3. First-touch attribution capture, on WHICHEVER response we are returning.
+  //    (Returning the rewrite early here would silently kill attribution on every
+  //    page that has a custom domain — which is most of the ones that matter.)
   if (req.cookies.get(COOKIE)) return res;              // first-touch: never overwrite
 
   const sp = req.nextUrl.searchParams;
@@ -2144,18 +2840,91 @@ export function middleware(req: NextRequest) {
   return res;
 }
 
-export const config = { matcher: ["/((?!api|_next/static|_next/image|favicon.ico).*)"] };
+export const config = { matcher: ["/((?!api\\/|_next\\/static|_next\\/image|favicon\\.ico).*)"] };
 `;
+}
 
-  const routeContent = `import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
+/** `domainMap.ts` for a given host→path map. Emitted alongside every middleware. */
+export function buildDomainMapFile(domainMap: Record<string, string> = {}): string {
+  return (
+    `// Generated by AgentWeb — maps a custom hostname to the page path it serves.\n` +
+    `export const DOMAIN_MAP: Record<string, string> = ${JSON.stringify(domainMap, null, 2)};\n`
+  );
+}
 
-const LIST_ID = "${leadListId}";
+/**
+ * The lead-capture API route a generated site ships at `app/api/capture/route.ts`.
+ *
+ * The route is REPO-level (one per site) but the lead list is PER PAGE — a site can have
+ * many pages, each wired to a different list. The old route hardcoded a single
+ * `const LIST_ID`, so on any multi-page site the leads from every page would be filed
+ * into whichever list happened to be injected last. That is worse than the bug it sits
+ * behind: attribution today is merely *missing*, and a naive fix would make it *wrong*.
+ * Misfiled leads are far harder to notice and far worse to explain to a customer.
+ *
+ * So the route takes the whole path→list map and resolves the page from the `aw_page`
+ * cookie the middleware stamps. It deliberately does NOT trust the Referer: a page can be
+ * served at `pricing.acme.com/` and rewritten to `/pricing` (see
+ * `buildLandingPageMiddleware`), so the browser reports pathname `/` and a Referer lookup
+ * would miss. The middleware already resolved the real path, so it stamps it. Referer is
+ * kept only as a fallback for the (rare) request that arrives with no cookie.
+ *
+ * A page with no configured list FAILS LOUDLY. It must never fall back to "some other
+ * list on this site" — silently filing a lead into the wrong list is the failure this
+ * whole design exists to prevent.
+ */
+export function buildCaptureRoute(
+  listByPath: Record<string, string>,
+  apiBase: string = process.env.BACKEND_URL || "https://api.agentweb.pro"
+): string {
+  // Guard the shape. This used to take a bare `leadListId: string`, and passing the old
+  // string form here silently produced `const LIST_BY_PATH = "list_xyz"` — a route that
+  // compiles, deploys, and files every lead nowhere. ts-jest did not catch it. Fail here
+  // instead of shipping a broken route to a customer's site.
+  if (listByPath === null || typeof listByPath !== "object" || Array.isArray(listByPath)) {
+    throw new Error(
+      `[V0 SERVICE] buildCaptureRoute expects a path->leadListId map, got ${typeof listByPath}. ` +
+      `(It used to take a single leadListId string; the capture route is repo-level but the ` +
+      `lead list is per-page, so it now needs the whole map.)`
+    );
+  }
+
+  return `import { NextResponse } from "next/server";
+import { cookies, headers } from "next/headers";
+
+// path -> lead list. One entry per page of this site; the route is shared by all of them.
+const LIST_BY_PATH: Record<string, string> = ${JSON.stringify(listByPath, null, 2)};
 const FORWARD_URL = "${apiBase}/api/webhooks/forward-lead";
+
+/** Which page was this form submitted from? */
+async function resolvePagePath(): Promise<string | undefined> {
+  const jar = await cookies();
+  // Stamped by the middleware with the page path AFTER any subdomain rewrite. This is
+  // the authoritative answer; the Referer is not (a rewritten host reports "/").
+  const stamped = jar.get("aw_page")?.value;
+  if (stamped) return stamped;
+
+  // Fallback only: no cookie (blocked, expired, or a direct API call).
+  const referer = (await headers()).get("referer");
+  if (!referer) return undefined;
+  try { return new URL(referer).pathname; } catch { return undefined; }
+}
 
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
+
+    const path = await resolvePagePath();
+    const listId = path ? LIST_BY_PATH[path] : undefined;
+    if (!listId) {
+      // Fail loudly. Do NOT guess a list: a lead filed into the wrong list is worse than
+      // a lead that visibly failed to submit.
+      return NextResponse.json(
+        { success: false, error: "This page has no lead list configured, so the submission was not saved." },
+        { status: 422 }
+      );
+    }
+
     let attribution: unknown;
     const raw = (await cookies()).get("aw_first_touch")?.value;
     if (raw) { try { attribution = JSON.parse(raw); } catch {} }
@@ -2163,7 +2932,7 @@ export async function POST(req: Request) {
     const res = await fetch(FORWARD_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...body, listId: LIST_ID, source: "landing-page", ...(attribution ? { attribution } : {}) }),
+      body: JSON.stringify({ ...body, listId, source: "landing-page", ...(attribution ? { attribution } : {}) }),
     });
     if (!res.ok) return NextResponse.json({ success: false }, { status: 502 });
     return NextResponse.json({ success: true });
@@ -2172,9 +2941,33 @@ export async function POST(req: Request) {
   }
 }
 `;
+}
 
-  filtered.push({ path: "middleware.ts", content: Buffer.from(middlewareContent) });
-  filtered.push({ path: "app/api/capture/route.ts", content: Buffer.from(routeContent) });
+/**
+ * Inject the platform-owned capture files into a generated site's file set.
+ *
+ * ENG-309: all three files are ALWAYS emitted, even with no lead list. The middleware
+ * needs no list (it only stamps cookies), and a capture route that says "this page has no
+ * lead list configured" is debuggable where a bare 404 is not. Skipping the injection
+ * because no list happened to be attached is what left pages silently unattributable
+ * forever.
+ *
+ * @param listByPath page path -> lead list id, for EVERY page of this site. May be empty.
+ */
+export function injectLeadCaptureAttribution(
+  files: Array<{ path: string; content: Buffer }>,
+  listByPath: Record<string, string>
+): Array<{ path: string; content: Buffer }> {
+  const filtered = files.filter(
+    (f) => !isV0CaptureRoute(f.path) && !isV0Middleware(f.path) && !isV0DomainMap(f.path)
+  );
+
+  filtered.push({ path: "middleware.ts", content: Buffer.from(buildLandingPageMiddleware()) });
+  filtered.push({ path: "app/api/capture/route.ts", content: Buffer.from(buildCaptureRoute(listByPath)) });
+  // The middleware imports ./domainMap, so a fresh page MUST ship one or its very
+  // first Vercel build fails. Empty until a subdomain is actually attached, at which
+  // point updateSubdomainMiddleware rewrites it with the real map.
+  filtered.push({ path: "domainMap.ts", content: Buffer.from(buildDomainMapFile({})) });
 
   assertNoDuplicateInjectedRoutes(filtered);
 
@@ -2188,7 +2981,12 @@ async function createGitHubRepoAndPush(
   repoName: string,
   zipData: any,
   description: string,
-  leadListId?: string
+  /**
+   * Page path -> lead list, for every page of this site. The capture route is repo-level
+   * but the lead list is per-page, so it needs the whole map (ENG-310). May be empty —
+   * the files are injected regardless (ENG-309).
+   */
+  listByPath: Record<string, string> = {}
 ): Promise<{ githubRepoUrl: string; repoFullName: string; commitSha: string }> {
   const { token, org } = await getGitHubOrgToken();
   const headers = {
@@ -2311,12 +3109,21 @@ async function createGitHubRepoAndPush(
   }
 
   // Deterministically inject platform-owned lead-capture attribution (middleware.ts +
-  // app/api/capture/route.ts), force-replacing any v0-generated equivalents.
-  let finalFiles = files;
-  if (leadListId) {
-    finalFiles = injectLeadCaptureAttribution(files, leadListId);
-    console.log(`[V0 SERVICE] Injected lead-capture attribution files (middleware.ts, app/api/capture/route.ts) for list ${leadListId}`);
-  }
+  // domainMap.ts + app/api/capture/route.ts), force-replacing any v0-generated equivalents.
+  //
+  // ENG-309: this used to be guarded by `if (leadListId)`. A page generated without a lead
+  // list got NO capture at all — silently, with no error — and stayed unattributable
+  // forever, even after a list was attached later. The middleware needs no list (it only
+  // stamps cookies), and a capture route that reports "this page has no lead list
+  // configured" beats a bare 404, so we always inject. The route simply carries an empty
+  // map until a list is wired up.
+  const finalFiles = injectLeadCaptureAttribution(files, listByPath);
+  const wired = Object.entries(listByPath);
+  console.log(
+    wired.length
+      ? `[V0 SERVICE] Injected lead-capture files; ${wired.map(([p, l]) => `${p} -> ${l}`).join(", ")}`
+      : `[V0 SERVICE] Injected lead-capture files with NO lead list — this site will not capture leads until one is attached`
+  );
 
   // Auto-fix common v0 build issues before pushing to GitHub
   const fixCount = autoFixV0Files(finalFiles);
@@ -3032,45 +3839,119 @@ export async function iterateLandingPage(
     );
   }
 
+  const chatId = record.v0ChatId!;
+  const deadline = Date.now() + V0_GENERATION_BUDGET_MS;
+
   try {
     const v0 = await getV0Client();
 
-    await withRetry(
-      () => v0.chats.sendMessage({
-        chatId: record.v0ChatId!,
-        message,
-      }),
-      "v0 chat iterate"
+    // Where the chat stands BEFORE this edit. Everything below is anchored to it: it is both
+    // the "don't hand me back the old version" guard and the "did my earlier send land?"
+    // question. (ENG-287 follow-up)
+    const baseVersionId = await waitForCompletedV0Version(
+      v0,
+      chatId,
+      "v0 iterate (base version)",
+      { deadline }
     );
 
-    // Reset status to draft (needs re-deploy after iteration)
-    const newStatus = record.status === "deployed" ? "draft" : record.status;
+    const messageHash = hashV0Prompt(message);
+    const pending = record.pendingIteration;
+    const isSameEdit = pending?.messageHash === messageHash;
 
-    await dynamodb
-      .update({
-        TableName: TABLE_NAME,
-        Key: { id },
-        UpdateExpression:
-          "SET #status = :status, iterations = :iterations, updatedAt = :updatedAt",
-        ExpressionAttributeNames: { "#status": "status" },
-        ExpressionAttributeValues: {
-          ":status": newStatus,
-          ":iterations": (record.iterations || 0) + 1,
-          ":updatedAt": new Date().toISOString(),
-        },
-      })
-      .promise();
+    if (isSameEdit && pending!.baseVersionId !== baseVersionId) {
+      // v0 has published a version SINCE we recorded the send — the edit already landed.
+      // Adopt it. Re-sending here is the double-apply bug: the user would get their
+      // instruction twice and be charged twice.
+      console.log(`[V0 SERVICE] iterate: edit already applied (${pending!.baseVersionId} → ${baseVersionId}), adopting`);
+      return await finishIteration(id, record, baseVersionId);
+    }
 
-    return {
-      ...record,
-      status: newStatus,
-      iterations: (record.iterations || 0) + 1,
-      updatedAt: new Date().toISOString(),
-    };
+    if (!isSameEdit) {
+      // responseMode async: sync mode blocks the HTTP call for the whole edit, which is the
+      // 300s race that made a slow iteration fail while v0 applied and CHARGED for it anyway
+      // — leaving the edit stranded (the record stayed `deployed`, which deployLandingPage
+      // refuses). Async returns in seconds; the version wait below absorbs the real time.
+      // Safe now only because that wait is anchored to `afterVersionId` — without it, a deploy
+      // could grab the PRE-iteration version and silently ship the page without the edit.
+      await withRetry(
+        () => v0.chats.sendMessage({ chatId, message, responseMode: "async" }),
+        "v0 chat iterate",
+        undefined, undefined, undefined,
+        { retryOnTimeout: false }
+      );
+
+      // Record it the instant v0 accepts, BEFORE the wait — if the wait dies (timeout, crash,
+      // lost response), the retry must know the message is already with v0.
+      const nowIso = new Date().toISOString();
+      await dynamodb
+        .update({
+          TableName: TABLE_NAME,
+          Key: { id },
+          UpdateExpression: "SET pendingIteration = :p, updatedAt = :now",
+          ExpressionAttributeValues: {
+            ":p": { baseVersionId, messageHash, startedAt: nowIso },
+            ":now": nowIso,
+          },
+        })
+        .promise();
+    } else {
+      console.log(`[V0 SERVICE] iterate: message already sent and still generating — resuming the wait, not re-sending`);
+    }
+
+    // Do not return until v0 publishes a version that is NOT the one we started from. This is
+    // what makes the async send safe: the deploy that follows reads the latest completed
+    // version, so returning early would ship the pre-iteration page.
+    const newVersionId = await waitForCompletedV0Version(
+      v0,
+      chatId,
+      "v0 iterate",
+      { deadline, afterVersionId: pending && isSameEdit ? pending.baseVersionId : baseVersionId }
+    );
+
+    return await finishIteration(id, record, newVersionId);
   } catch (error: any) {
     console.error("[V0 SERVICE] Iteration failed:", error);
-    throw new Error(`Iteration failed: ${error.message}`);
+    // Deliberately NOT flipping the record to `failed`: the page is still live at its URL, and
+    // `pendingIteration` is deliberately LEFT in place so the retry resumes instead of
+    // re-sending. The status is untouched for the same reason.
+    const wrapped: any = new Error(`Iteration failed: ${error.message}`);
+    if (error?.code) wrapped.code = error.code;
+    wrapped.cause = error;
+    throw wrapped;
   }
+}
+
+/** Land a completed iteration: clear the pending marker, count it, make it deployable. */
+async function finishIteration(
+  id: string,
+  record: GeneratedLandingPage,
+  versionId: string
+): Promise<GeneratedLandingPage> {
+  // `draft` == "has an undeployed version ready", which is now exactly true. It is also what
+  // makes the edit reachable: deployLandingPage accepts `draft` and refuses `deployed`, which
+  // is precisely how a timed-out iteration used to get stranded inside v0.
+  const newStatus = record.status === "deployed" ? "draft" : record.status;
+  const iterations = (record.iterations || 0) + 1;
+  const nowIso = new Date().toISOString();
+
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      UpdateExpression:
+        "SET #status = :status, iterations = :iterations, updatedAt = :updatedAt REMOVE pendingIteration",
+      ExpressionAttributeNames: { "#status": "status" },
+      ExpressionAttributeValues: {
+        ":status": newStatus,
+        ":iterations": iterations,
+        ":updatedAt": nowIso,
+      },
+    })
+    .promise();
+
+  console.log(`[V0 SERVICE] iterate: version ${versionId} ready — page is deployable`);
+  return { ...record, status: newStatus, iterations, updatedAt: nowIso, pendingIteration: undefined };
 }
 
 /**
@@ -3282,12 +4163,32 @@ export async function canUserEditLandingPage(
 /**
  * Remove a page route file from the GitHub repo.
  */
+async function listRepoTree(
+  repoFullName: string,
+  ghHeaders: Record<string, string>
+): Promise<string[]> {
+  const res = await axios.get<any>(
+    `https://api.github.com/repos/${repoFullName}/git/trees/main?recursive=1`,
+    { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+  );
+  return (res.data?.tree ?? [])
+    .filter((e: any) => e.type === "blob")
+    .map((e: any) => e.path as string);
+}
+
+/**
+ * Remove a page's ENTIRE directory (app/<slug>/**) from the repo.
+ *
+ * This used to delete exactly one file — app/<slug>/page.tsx — and leave
+ * app/<slug>/_components/** behind. `next build` type-checks the whole project, so an
+ * orphaned component with an unresolvable import still fails the build for EVERY page on
+ * the site: "delete the broken page" did not actually unbreak the site.
+ */
 async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promise<void> {
   const match = githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
   if (!match) return;
   const [, owner, repo] = match;
-  const repoName = repo.replace(".git", "");
-  const filePath = `app/${slug}/page.tsx`;
+  const repoFullName = `${owner}/${repo.replace(".git", "")}`;
 
   const { token: ghToken } = await getGitHubOrgToken();
   const ghHeaders = {
@@ -3295,23 +4196,22 @@ async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promis
     Accept: "application/vnd.github.v3+json",
   };
 
-  // Get the file SHA (required for deletion)
-  const fileRes = await axios.get<any>(
-    `https://api.github.com/repos/${owner}/${repoName}/contents/${filePath}`,
-    { headers: ghHeaders }
+  const prefix = `app/${slug}/`;
+  const toDelete = (await listRepoTree(repoFullName, ghHeaders)).filter((p) => p.startsWith(prefix));
+
+  if (toDelete.length === 0) {
+    console.log(`[GITHUB] Nothing to remove for /${slug} in ${repoFullName}`);
+    return; // never push an empty commit — it would trigger a pointless rebuild
+  }
+
+  await commitFilesToRepoMain(
+    repoFullName,
+    ghHeaders,
+    toDelete.map((path) => ({ path, deleted: true })),
+    `Remove page /${slug}`
   );
 
-  await axios({
-    method: "DELETE",
-    url: `https://api.github.com/repos/${owner}/${repoName}/contents/${filePath}`,
-    headers: ghHeaders,
-    data: {
-      message: `Remove page /${slug}`,
-      sha: fileRes.data.sha,
-    },
-  });
-
-  console.log(`[GITHUB] Removed ${filePath} from ${owner}/${repoName}`);
+  console.log(`[GITHUB] Removed ${toDelete.length} file(s) under ${prefix} from ${repoFullName}`);
 }
 
 /**
@@ -3350,6 +4250,19 @@ export async function deleteLandingPage(
       },
     })
     .promise();
+
+  // Free the idempotency identity so regenerating this slug creates a NEW page
+  // instead of reusing the archived page's chat forever. Best-effort — the delete
+  // above already succeeded and must not be un-done by a cleanup failure.
+  await clearV0UsageForPage({
+    userId,
+    pageId: id,
+    siteId: record.siteId,
+    // Only a REAL slug. A root page has none, and deriving one from its name could match a
+    // genuine sub-page route on the same site and free the wrong identity — that sub-page
+    // would then pay for a fresh chat on its next build. (ENG-287 residual)
+    slug: record.slug,
+  });
 }
 
 export async function updateLandingPageGtm(
@@ -3556,27 +4469,45 @@ export async function deleteLandingPageByRecord(record: GeneratedLandingPage): P
       },
     })
     .promise();
-}
 
-const MIDDLEWARE_CONTENT = `import { NextResponse } from "next/server";
-import type { NextRequest } from "next/server";
-import { DOMAIN_MAP } from "./domainMap";
-
-export function middleware(request: NextRequest) {
-  const host = (request.headers.get("host") || "").replace(/:\\d+$/, "");
-  const targetPath = DOMAIN_MAP[host];
-  if (targetPath) {
-    const url = request.nextUrl.clone();
-    url.pathname = targetPath;
-    return NextResponse.rewrite(url);
+  // Free the v0 usage identity. This is the function the DELETE route actually calls —
+  // `deleteLandingPage` (which did clear it) is imported by that route and never used, so
+  // in practice no user-initiated delete ever freed the identity. Because the fix removed
+  // the prompt from the idempotency key, a `succeeded` row silently HIJACKS the next
+  // generation of the same route: the user deletes a page, regenerates the same slug with a
+  // brand-new prompt, and gets the OLD chat back — their prompt is never sent to v0.
+  //
+  // NOT for an in-flight build. Deleting the identity of a live build lets the next request
+  // for that slug mint a SECOND chat while the first is still running — two builds racing
+  // commits into the same app/<slug>/ in the same repo. The archived record is invisible to
+  // findReusablePageForRoute, so the guard row is the only thing still deduping them. Such a
+  // row is not immortal anyway: the reuse ceiling reclaims it.
+  //
+  // Best-effort: the archive above already succeeded and must not be undone by a cleanup
+  // failure. Pass the slug only when there is a real one — a root page has none, and
+  // deriving one from its name would free a SUB-page's identity that merely shares the slug.
+  // (ENG-287 residual)
+  const inFlight = record.status === "generating" || record.status === "deploying";
+  if (!inFlight) {
+    await clearV0UsageForPage({
+      userId: record.userId,
+      pageId: record.id,
+      siteId: record.siteId,
+      slug: record.slug,
+    });
   }
-  return NextResponse.next();
 }
 
-export const config = {
-  matcher: ["/((?!_next\\/static|_next\\/image|favicon\\.ico|api\\/).*)"],
-};
-`;
+/**
+ * ENG-308: this used to be a routing-ONLY middleware, and `updateSubdomainMiddleware`
+ * committed it straight over the generated `middleware.ts` on every domain attach or
+ * detach — silently destroying the lead-capture middleware, and with it all
+ * attribution for that page, until the page was regenerated.
+ *
+ * It is now the same canonical middleware generation emits: subdomain rewrite AND
+ * first-touch capture. A test asserts the two are byte-identical.
+ */
+export const MIDDLEWARE_CONTENT = buildLandingPageMiddleware();
 
 /**
  * Commit updated domainMap.ts and middleware.ts to the GitHub repo.
@@ -3596,9 +4527,7 @@ export async function updateSubdomainMiddleware(
     Accept: "application/vnd.github.v3+json",
   };
 
-  const domainMapContent =
-    `// Auto-generated by AgentWeb — do not edit manually.\n` +
-    `export const DOMAIN_MAP: Record<string, string> = ${JSON.stringify(domainMap, null, 2)};\n`;
+  const domainMapContent = buildDomainMapFile(domainMap);
 
   const refRes = await axios.get<any>(
     `https://api.github.com/repos/${repoFullName}/git/ref/heads/main`,
@@ -3646,4 +4575,168 @@ export async function updateSubdomainMiddleware(
     { sha: commitRes.data.sha },
     { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
   );
+}
+
+/**
+ * Read a file from a repo's `main`, or `null` if it does not exist.
+ * Any status other than 404 is a real failure and is rethrown.
+ */
+async function readRepoFile(
+  repoFullName: string,
+  path: string,
+  ghHeaders: Record<string, string>
+): Promise<string | null> {
+  try {
+    const res = await axios.get<any>(
+      `https://api.github.com/repos/${repoFullName}/contents/${path}?ref=main`,
+      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+    );
+    const data = res.data;
+    if (!data || typeof data.content !== "string") return null;
+    return Buffer.from(data.content, "base64").toString("utf-8");
+  } catch (err: any) {
+    if (err?.response?.status === 404) return null;
+    throw err;
+  }
+}
+
+/**
+ * Push the lead-capture files into an EXISTING landing-page repo. ENG-310.
+ *
+ * Generation injects `middleware.ts` / `domainMap.ts` / `app/api/capture/route.ts` into
+ * every new site, but attaching a lead list to an ALREADY-GENERATED page used to write
+ * DynamoDB and nothing else: the repo was never touched, so a deployed site whose pages
+ * all carried a `leadListId` still 404'd on `/api/capture`. The record claimed a lead
+ * list that meant nothing. This is the missing half — same blob → tree → commit → ref
+ * push as {@link updateSubdomainMiddleware}, and the push is what makes Vercel redeploy.
+ *
+ * Two things it is careful about, both of which cost a customer real money if got wrong:
+ *
+ *  - It does NOT touch `domainMap.ts` when the repo already has one. That file holds the
+ *    live host → path map for any subdomain the customer has attached; overwriting it
+ *    with `{}` would break their routing — ENG-308's bug with the roles reversed. It is
+ *    only written (empty) when ABSENT, because the middleware imports it and the Vercel
+ *    build fails outright without it.
+ *
+ *  - It is idempotent. If the repo already has byte-for-byte what we would write, it
+ *    makes no commit at all: a pointless commit is a pointless redeploy of a live site.
+ *
+ * It never throws. The caller has already committed the DynamoDB write by the time this
+ * runs, and a GitHub hiccup must not unwind that — the result says what happened and the
+ * caller decides how to surface it.
+ *
+ * @param repoFullName e.g. "AgentWebPro/lp-product-abc12345"
+ * @param listByPath page path -> lead list id, for EVERY page of the site (the capture
+ *   route is repo-level while the lead list is per-page). May be empty.
+ */
+export async function syncLeadCaptureFilesToRepo(
+  repoFullName: string,
+  listByPath: Record<string, string>
+): Promise<{ committed: boolean; reason?: string }> {
+  try {
+    const { token: ghToken } = await getGitHubOrgToken();
+    const ghHeaders = {
+      Authorization: `Bearer ${ghToken}`,
+      Accept: "application/vnd.github.v3+json",
+    };
+
+    const middlewareContent = buildLandingPageMiddleware();
+    const captureRouteContent = buildCaptureRoute(listByPath);
+
+    const [existingMiddleware, existingCaptureRoute, existingDomainMap] = await Promise.all([
+      readRepoFile(repoFullName, "middleware.ts", ghHeaders),
+      readRepoFile(repoFullName, "app/api/capture/route.ts", ghHeaders),
+      readRepoFile(repoFullName, "domainMap.ts", ghHeaders),
+    ]);
+
+    // Only write domainMap.ts if the repo has none. If it exists it may carry a real
+    // subdomain map — clobbering it with {} would break the customer's routing.
+    const needsDomainMap = existingDomainMap === null;
+
+    if (
+      !needsDomainMap &&
+      existingMiddleware === middlewareContent &&
+      existingCaptureRoute === captureRouteContent
+    ) {
+      console.log(
+        `[V0 SERVICE] Lead-capture files already up to date in ${repoFullName} — skipping commit (no redeploy)`
+      );
+      return { committed: false, reason: "up-to-date" };
+    }
+
+    const filesToCommit: Array<{ path: string; content: string }> = [
+      { path: "middleware.ts", content: middlewareContent },
+      { path: "app/api/capture/route.ts", content: captureRouteContent },
+    ];
+    if (needsDomainMap) {
+      // Pre-ENG-308 repo: the middleware imports ./domainMap, so it MUST exist or the
+      // Vercel build fails. Empty is correct here — no subdomain has ever been attached.
+      filesToCommit.push({ path: "domainMap.ts", content: buildDomainMapFile({}) });
+    }
+
+    const refRes = await axios.get<any>(
+      `https://api.github.com/repos/${repoFullName}/git/ref/heads/main`,
+      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+    );
+    const latestCommitSha = refRes.data.object.sha;
+
+    const treeItems = await Promise.all(
+      filesToCommit.map(async (file) => {
+        const blobRes = await axios.post<any>(
+          `https://api.github.com/repos/${repoFullName}/git/blobs`,
+          { content: Buffer.from(file.content).toString("base64"), encoding: "base64" },
+          { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+        );
+        return {
+          path: file.path,
+          mode: "100644" as const,
+          type: "blob" as const,
+          sha: blobRes.data.sha,
+        };
+      })
+    );
+
+    const treeRes = await axios.post<any>(
+      `https://api.github.com/repos/${repoFullName}/git/trees`,
+      { base_tree: latestCommitSha, tree: treeItems },
+      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+    );
+
+    const commitRes = await axios.post<any>(
+      `https://api.github.com/repos/${repoFullName}/git/commits`,
+      {
+        message: "chore: sync lead-capture route and middleware",
+        tree: treeRes.data.sha,
+        parents: [latestCommitSha],
+      },
+      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+    );
+
+    await axios.patch<any>(
+      `https://api.github.com/repos/${repoFullName}/git/refs/heads/main`,
+      { sha: commitRes.data.sha },
+      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+    );
+
+    const wired = Object.entries(listByPath);
+    console.log(
+      `[V0 SERVICE] Synced lead-capture files to ${repoFullName} (${filesToCommit
+        .map((f) => f.path)
+        .join(", ")}); ${
+        wired.length
+          ? wired.map(([p, l]) => `${p} -> ${l}`).join(", ")
+          : "NO page of this site has a lead list — its forms will fail loudly"
+      }`
+    );
+    return { committed: true };
+  } catch (err: any) {
+    const reason = err?.response?.data?.message || err?.message || String(err);
+    console.error(
+      `[V0 SERVICE] FAILED to sync lead-capture files to ${repoFullName}: ${reason}. ` +
+        `The lead list is wired in DynamoDB but this repo's /api/capture route is STALE — ` +
+        `leads submitted from this site will not be filed correctly until this is retried.`,
+      err?.response?.status ? `(HTTP ${err.response.status})` : ""
+    );
+    return { committed: false, reason };
+  }
 }
