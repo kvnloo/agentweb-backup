@@ -492,10 +492,15 @@ export class GoogleAdsService {
         update.manualCpc = { enhancedCpcEnabled: false };
         updateMask.push('manual_cpc.enhanced_cpc_enabled');
       } else if (params.biddingStrategy === 'TARGET_SPEND') {
-        // Maximize Clicks. cpc_bid_ceiling_micros is optional; default it to 0 (uncapped)
-        // when omitted and always mask the leaf path, so the campaign switches strategy.
-        // Masking the bare parent 'target_spend' path risks FieldMaskError.FIELD_HAS_SUBFIELDS.
-        update.targetSpend = { cpcBidCeilingMicros: String(params.cpcBidCeilingMicros ?? 0) };
+        // Maximize Clicks. The Google Ads update mutate can only mask the leaf
+        // 'target_spend.cpc_bid_ceiling_micros': masking the bare parent 'target_spend'
+        // is rejected with FieldMaskError.FIELD_HAS_SUBFIELDS, and a ceiling of 0 is
+        // rejected as TOO_LOW. So a truly uncapped switch isn't expressible on an
+        // existing campaign — a real cpc_bid_ceiling_micros is required.
+        if (params.cpcBidCeilingMicros === undefined) {
+          throw new Error('TARGET_SPEND (Maximize Clicks) requires cpc_bid_ceiling_micros — the max CPC bid limit in micros (e.g. 9000000 for $9). Ask the user for their max CPC bid before switching an existing campaign to Maximize Clicks.');
+        }
+        update.targetSpend = { cpcBidCeilingMicros: String(params.cpcBidCeilingMicros) };
         updateMask.push('target_spend.cpc_bid_ceiling_micros');
       } else {
         throw new Error(`Unsupported bidding_strategy '${params.biddingStrategy}' for CAMPAIGN UPDATE. Supported values: MAXIMIZE_CONVERSIONS, MAXIMIZE_CONVERSION_VALUE, TARGET_CPA, TARGET_ROAS, TARGET_IMPRESSION_SHARE, TARGET_SPEND, MANUAL_CPC.`);
