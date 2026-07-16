@@ -556,13 +556,19 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
   const rawClass = p.notionContext?.[ALERT_CLASS_CONTEXT_KEY];
   const alertClass = rawClass === undefined || rawClass === null ? '' : String(rawClass).trim();
   // Both writer (contextLines above) and matcher live in this file; the bullet prefix is left out
-  // of the needle because Linear normalizes "- " bullets to "* " in stored descriptions.
-  const classNeedle = alertClass ? `${ALERT_CLASS_CONTEXT_KEY}: ${alertClass}` : null;
+  // of the needle because Linear normalizes "- " bullets to "* " in stored descriptions. The match
+  // is anchored at end-of-line so a class name that is a prefix of another ("v0-credits" vs
+  // "v0-credits-backup") can never cross-match — the writer always emits the class as the last
+  // thing on its own line.
+  const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const classNeedle = alertClass
+    ? new RegExp(`${escapeRegExp(`${ALERT_CLASS_CONTEXT_KEY}: ${alertClass}`)}\\s*$`, 'm')
+    : null;
   const rawPriority = p.notionContext?.[ALERT_PRIORITY_CONTEXT_KEY];
   const priority = rawPriority ? LINEAR_PRIORITY[String(rawPriority).trim().toLowerCase()] : undefined;
   const idKeys = idempotencyKeys(p.notionContext);
   const match =
-    (classNeedle ? open.find((i) => (i.description || '').includes(classNeedle)) : undefined) ||
+    (classNeedle ? open.find((i) => classNeedle.test(i.description || '')) : undefined) ||
     (idKeys.length ? open.find((i) => idKeys.some((k) => (i.description || '').includes(k))) : undefined) ||
     open.find((i) => norm(i.title) === norm(p.title));
   if (match) {
