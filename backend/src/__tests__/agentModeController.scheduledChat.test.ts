@@ -63,6 +63,11 @@ jest.mock('../services/db', () => ({
     getScheduleById: jest.fn(),
     getSchedulesReadyToRun: jest.fn(),
     updateScheduleAfterRun: jest.fn(),
+    setRunInFlight: jest.fn().mockResolvedValue(undefined),
+    heartbeatRunInFlight: jest.fn().mockResolvedValue(undefined),
+    clearRunInFlight: jest.fn().mockResolvedValue(true),
+    getInFlightSchedules: jest.fn().mockResolvedValue([]),
+    claimAbandonedRun: jest.fn().mockResolvedValue(true),
     updateSchedule: jest.fn(),
     getSchedulesByUserId: jest.fn(),
   },
@@ -236,6 +241,32 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           functionCallMisses: [],
         })
       );
+    });
+
+    it('stamps an in-flight lease on a production run and releases it when the run settles (ENG-324)', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        ...mockResponse,
+        content: 'Here are some marketing strategy and tips for your business.',
+      });
+
+      await runScheduledChat(baseSchedule, mockUserId, false);
+
+      // Lease is stamped once the session exists, before the (long) LLM turn.
+      expect(mockScheduleDb.setRunInFlight).toHaveBeenCalledTimes(1);
+      const [leaseScheduleId, lease] = (mockScheduleDb.setRunInFlight as jest.Mock).mock.calls[0];
+      expect(leaseScheduleId).toBe(mockScheduleId);
+      expect(lease).toEqual(
+        expect.objectContaining({ sessionId: mockSession.sessionId, runId: expect.any(String) })
+      );
+      // And released in `finally` once the run settles.
+      expect(mockScheduleDb.clearRunInFlight).toHaveBeenCalledTimes(1);
+      expect((mockScheduleDb.clearRunInFlight as jest.Mock).mock.calls[0][0]).toBe(mockScheduleId);
+    });
+
+    it('does NOT stamp an in-flight lease for a test run (ENG-324)', async () => {
+      await runScheduledChat(baseSchedule, mockUserId, true);
+      expect(mockScheduleDb.setRunInFlight).not.toHaveBeenCalled();
+      expect(mockScheduleDb.clearRunInFlight).not.toHaveBeenCalled();
     });
 
     it('should require canonical you_search_web for You.com web search', async () => {

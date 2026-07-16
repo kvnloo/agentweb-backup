@@ -15323,7 +15323,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       case 'TARGETING':
         if (action === 'SEARCH') {
           if (!params.q) throw new Error('TARGETING SEARCH requires "params.q" (search query).');
-          if (!params.type) throw new Error('TARGETING SEARCH requires "params.type" (adinterest | adbehavior | addemographics).');
+          if (!params.type) throw new Error('TARGETING SEARCH requires "params.type" (adinterest | adbehavior | addemographics | adgeolocation).');
         }
         break;
 
@@ -15605,7 +15605,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return this.manageMetaCustomAudiences(userId, action as any, account_id, params);
 
       case 'TARGETING':
-        return this.searchAdTargeting(userId, account_id, params.q, params.type);
+        return this.searchAdTargeting(userId, account_id, params.q, params.type, params.location_types);
 
       case 'PAGE':
         return this.listMetaPages(userId, account_id);
@@ -15806,12 +15806,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     userId: string,
     account_id: string,
     q: string,
-    type: string = 'adTargetingCategory'
+    type: string = 'adTargetingCategory',
+    locationTypes?: string[]
   ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
 
-      const searchResult = await metaService.searchTargeting(accountId, accessToken, q, type);
+      const searchResult = await metaService.searchTargeting(accountId, accessToken, q, type, locationTypes);
       const results = Array.isArray(searchResult) ? searchResult : [];
 
       return {
@@ -27867,12 +27868,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
-    entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION';
+    entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
     action: string;
     [key: string]: any;
   }): Promise<any> {
     try {
       const { customer_id, entity_type, action } = args;
+
+      if (entity_type === 'BIDDING_STRATEGY' && action === 'LIST') {
+        const biddingStrategies = await googleAdsService.listBiddingStrategies(userId, customer_id);
+        return { success: true, biddingStrategies };
+      }
 
       if (entity_type === 'CAMPAIGN') {
         if (action === 'LIST') {
@@ -27895,8 +27901,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, message: 'Campaign removed' };
         }
         if (action === 'CREATE') {
-          if (!args.budget_resource_name || !args.name || !args.type || !args.bidding_strategy) {
-            return { success: false, error: 'name, type, budget_resource_name, and bidding_strategy are required to create a campaign' };
+          if (!args.budget_resource_name || !args.name || !args.type || (!args.bidding_strategy && !args.bidding_strategy_resource_name)) {
+            return { success: false, error: 'name, type, budget_resource_name, and a bidding strategy (bidding_strategy for a standard strategy, or bidding_strategy_resource_name for a portfolio/shared strategy) are required to create a campaign' };
+          }
+          if (args.bidding_strategy && args.bidding_strategy_resource_name) {
+            return { success: false, error: 'Provide either bidding_strategy (standard) or bidding_strategy_resource_name (portfolio/shared), not both.' };
           }
           if (args.bidding_strategy === 'TARGET_CPA' && !args.bidding_strategy_target) {
             return { success: false, error: 'TARGET_CPA requires bidding_strategy_target (CPA value in account currency, e.g. 20 for $20). Ask the user for their target CPA before proceeding.' };
@@ -27909,6 +27918,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             type: args.type,
             budgetResourceName: args.budget_resource_name,
             biddingStrategy: args.bidding_strategy,
+            biddingStrategyResourceName: args.bidding_strategy_resource_name,
             biddingStrategyTarget: args.bidding_strategy_target,
             cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
             locationTargetIds: args.location_target_ids || [],
@@ -27924,6 +27934,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             name: args.name,
             status: args.status,
             biddingStrategy: args.bidding_strategy,
+            biddingStrategyResourceName: args.bidding_strategy_resource_name,
             biddingStrategyTarget: args.bidding_strategy_target,
             cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
             budgetResourceName: args.budget_resource_name,

@@ -19,6 +19,7 @@ import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorker
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
+import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
   isRunStoreEnabled,
   interactiveIdempotencyKey,
@@ -45,6 +46,21 @@ import { DynamoDB } from 'aws-sdk';
 const ZERO_ASSISTANT_REQUEUE_BASE_MS = 15 * 60 * 1000;
 const ZERO_ASSISTANT_REQUEUE_MAX_MS = 2 * 60 * 60 * 1000;
 const ZERO_ASSISTANT_MAX_REQUEUES = 3;
+
+// ENG-324: durable in-flight lease + reconciliation. The graceful-shutdown drain
+// only saves a run that finishes within DRAIN_CEILING_MS (10 min) of SIGTERM; a
+// longer run, a SIGKILL, or an OOM kills the process before its catch can persist
+// a failure/requeue, leaving the session at messageCount=2 with no run result.
+// A live run heartbeats its lease every HEARTBEAT_INTERVAL_MS; a surviving
+// instance's reconciler requeues any lease whose heartbeat is older than
+// LEASE_STALE_MS (i.e. the owning process died). LEASE_STALE_MS is heartbeat-based
+// (not startedAt-based) so a legitimately long run is never falsely reaped.
+const HEARTBEAT_INTERVAL_MS = 60 * 1000; // 1 min
+const LEASE_STALE_MS = 5 * 60 * 1000; // reap after 5 missed heartbeats
+export const RECONCILE_INTERVAL_MS = 2 * 60 * 1000; // reconciler sweep cadence
+// Per-process identity (mirrors the social executor's INSTANCE_ID) — stamped on
+// each lease so a rebooted instance can recognise/reclaim its own prior-life runs.
+const SCHEDULED_RUN_INSTANCE_ID: string = require('uuid').v4();
 
 // User-facing fallback shown when a scheduled run terminates with zero assistant
 // output (crash/timeout/context-limit). A silent, empty session reads as a total
@@ -1261,6 +1277,13 @@ export async function runScheduledChat(
   let sessionId: string = '';
   let generatedSummary: string | undefined;
 
+  // ENG-324: durable in-flight lease. Set once the session exists (below), kept
+  // fresh by a heartbeat timer, and always cleared in `finally`. Skipped for test
+  // runs, which are never requeued.
+  const leaseRunId: string = preGeneratedRunId || require('uuid').v4();
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  let leaseAcquired = false;
+
   try {
     // Guard against orphaned schedules whose owning user no longer exists.
     // Without this, downstream calls (e.g. token-usage checks) throw
@@ -1468,6 +1491,27 @@ export async function runScheduledChat(
       'scheduled' // sessionType
     );
     sessionId = testSession.sessionId;
+
+    // ENG-324: stamp the durable in-flight lease now that we have a session, and
+    // start heartbeating it. If this process dies during the (possibly long) LLM
+    // turn below, the reconciler will find this lease stale and requeue the run.
+    if (!isTest) {
+      try {
+        await scheduleDb.setRunInFlight(schedule.scheduleId, {
+          runId: leaseRunId,
+          sessionId,
+          startedAt: new Date().toISOString(),
+          instanceId: SCHEDULED_RUN_INSTANCE_ID,
+        });
+        leaseAcquired = true;
+        heartbeatTimer = setInterval(() => {
+          void scheduleDb.heartbeatRunInFlight(schedule.scheduleId, leaseRunId);
+        }, HEARTBEAT_INTERVAL_MS);
+        if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
+      } catch (leaseError) {
+        console.error(`Failed to set in-flight lease for schedule ${schedule.scheduleId}:`, leaseError);
+      }
+    }
 
     // Set the session title to the schedule name
     await chatbotDb.updateSessionTitle(sessionId, sessionTitle);
@@ -1863,7 +1907,160 @@ export async function runScheduledChat(
 
     // Return error result for error reporting
     return errorResult;
+  } finally {
+    // ENG-324: stop heartbeating and release the lease. Conditional on runId, so
+    // if the reconciler already reaped this run (heartbeat went stale), the clear
+    // no-ops and the requeue it wrote stands.
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    if (leaseAcquired) {
+      try {
+        await scheduleDb.clearRunInFlight(schedule.scheduleId, leaseRunId);
+      } catch (clearError) {
+        console.error(`Failed to clear in-flight lease for schedule ${schedule.scheduleId}:`, clearError);
+      }
+    }
   }
+}
+
+/**
+ * ENG-324: recover a single scheduled run whose owning process died mid-flight.
+ * Claims the stale lease atomically (single-winner across instances) and, if we
+ * win, requeues the schedule (respecting the zero-output requeue cap), annotates
+ * the orphaned session so it isn't silent, and records a failure run result.
+ * Returns true only if THIS caller performed the recovery.
+ */
+export async function recoverAbandonedScheduledRun(schedule: any, lease: any): Promise<boolean> {
+  const nowIso = new Date().toISOString();
+  const nextRetryCount = getZeroAssistantRetryCount(schedule) + 1;
+  // Only reschedule schedules that are still active. A runCount-limited schedule
+  // auto-pauses at dispatch, so requeuing it would resurrect a completed-quota
+  // schedule; a paused run is still recovered (lease cleared, session annotated,
+  // failure recorded) — just not rescheduled.
+  const isActive = schedule.status === 'active';
+  const overCap = nextRetryCount > ZERO_ASSISTANT_MAX_REQUEUES;
+  const willRequeue = isActive && !overCap;
+  const noRequeueReason = willRequeue ? '' : (!isActive ? `schedule is ${schedule.status}` : 'over requeue cap');
+  const requeuedAt = willRequeue
+    ? new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString()
+    : undefined;
+
+  // Atomic single-winner claim. If another instance already reaped this lease the
+  // conditional write fails and we return false without touching the session.
+  const won = await scheduleDb.claimAbandonedRun(
+    schedule.scheduleId,
+    lease.runId,
+    willRequeue
+      ? { nextRunTime: requeuedAt!, retryCount: nextRetryCount, sessionId: lease.sessionId || '', lastAt: nowIso }
+      : null
+  );
+  if (!won) return false;
+
+  // We own the recovery. Make the orphaned session self-explanatory (best-effort).
+  if (lease.sessionId) {
+    try {
+      await chatbotDb.addMessageToSession(lease.sessionId, {
+        role: 'assistant',
+        content: SCHEDULED_JOB_INCOMPLETE_MESSAGE,
+        timestamp: nowIso,
+        metadata: { timestamp: nowIso, isErrorMessage: true, jobIncomplete: true },
+      });
+      await chatbotDb.updateSessionError(
+        lease.sessionId,
+        'Scheduled run abandoned: the owning process terminated mid-run (recovered by reconciler).'
+      );
+    } catch (annotateError) {
+      console.error(`recoverAbandonedScheduledRun: failed to annotate session ${lease.sessionId}:`, annotateError);
+    }
+  }
+
+  // Persist a failure run result so the abandonment is visible in the UI, mirroring
+  // the shape the in-process catch writes for a caught zero-output run.
+  try {
+    await scheduleDb.addRunResult(schedule.scheduleId, {
+      scheduleId: schedule.scheduleId,
+      runId: lease.runId,
+      status: 'failure',
+      passed: false,
+      keywordMatches: [],
+      keywordMisses: schedule.keywords || [],
+      functionCallMatches: [],
+      functionCallMisses: schedule.requiredFunctionCalls || [],
+      executionTime: 0,
+      sessionId: lease.sessionId || '',
+      attempt: 0,
+      createdAt: nowIso,
+      zeroAssistantOutput: true,
+      abandoned: true,
+      ...(requeuedAt ? { requeuedAt } : {}),
+    });
+  } catch (resultError) {
+    console.error(`recoverAbandonedScheduledRun: failed to persist run result for ${schedule.scheduleId}:`, resultError);
+  }
+
+  console.error('Scheduled chat abandoned-run recovered by reconciler:', {
+    scheduleId: schedule.scheduleId,
+    scheduleName: schedule.scheduleName,
+    sessionId: lease.sessionId || 'N/A',
+    deadInstanceId: lease.instanceId,
+    heartbeatAt: lease.heartbeatAt,
+    requeued: willRequeue,
+    requeuedAt: requeuedAt || `N/A (${noRequeueReason})`,
+  });
+
+  // Surface to oncall (best-effort, never throws into the sweep).
+  void sendAgentModeOncallAlert({
+    subject: `Scheduled Chat Abandoned Run Recovered: ${schedule.scheduleName}`,
+    message: `A scheduled run for "${schedule.scheduleName}" was abandoned when its process died mid-run and has been ${willRequeue ? `requeued for ${requeuedAt}` : `left failed (${noRequeueReason})`}.`,
+    sessionId: lease.sessionId || undefined,
+    context: {
+      'Schedule ID': schedule.scheduleId,
+      'Schedule Name': schedule.scheduleName,
+      'User ID': schedule.userId,
+      'Session ID': lease.sessionId || 'N/A',
+      'Dead Instance': lease.instanceId || 'unknown',
+      'Last Heartbeat': lease.heartbeatAt || 'unknown',
+      'Requeued': willRequeue ? `Yes (${requeuedAt})` : `No (${noRequeueReason})`,
+      'Retry Count': String(nextRetryCount),
+    },
+  }).catch(err => console.error('Failed to send oncall alert for recovered abandoned run:', err));
+
+  return true;
+}
+
+/**
+ * ENG-324: sweep active scheduled-chat schedules for in-flight leases whose
+ * heartbeat has gone stale (owning process died) and recover each one. Safe to
+ * run concurrently on every instance — each recovery is a single-winner claim.
+ * `now` is injectable for deterministic tests.
+ */
+export async function reconcileStaleScheduledRuns(now: number = Date.now()): Promise<{ scanned: number; reconciled: number }> {
+  let schedules: any[] = [];
+  try {
+    schedules = await scheduleDb.getInFlightSchedules();
+  } catch (listError) {
+    console.error('reconcileStaleScheduledRuns: failed to list in-flight schedules:', listError);
+    return { scanned: 0, reconciled: 0 };
+  }
+
+  let reconciled = 0;
+  for (const schedule of schedules) {
+    const lease = schedule?.runInFlight;
+    if (!lease || !lease.runId) continue;
+    const heartbeatIso = lease.heartbeatAt || lease.startedAt;
+    const heartbeatMs = heartbeatIso ? new Date(heartbeatIso).getTime() : NaN;
+    // A fresh heartbeat means the run is alive and working (any duration) — skip.
+    if (Number.isFinite(heartbeatMs) && now - heartbeatMs <= LEASE_STALE_MS) continue;
+    try {
+      if (await recoverAbandonedScheduledRun(schedule, lease)) reconciled++;
+    } catch (recoverError) {
+      console.error(`reconcileStaleScheduledRuns: failed to recover schedule ${schedule.scheduleId}:`, recoverError);
+    }
+  }
+
+  if (reconciled > 0) {
+    console.log(`reconcileStaleScheduledRuns: recovered ${reconciled} abandoned scheduled run(s) of ${schedules.length} in-flight.`);
+  }
+  return { scanned: schedules.length, reconciled };
 }
 
 // Run one reflection turn (a real Emma turn in the same session, with full tool access)
@@ -4992,7 +5189,10 @@ export const agentModeController = {
           variableValuesUpdatedAt: nowIso
         };
 
-        runScheduledChat(scheduleToRun, user.userId, false).then(async (result) => {
+        // Track with the graceful-shutdown drain so a deploy/SIGTERM waits for
+        // this in-flight run (incl. its requeue/persist catch) instead of
+        // abandoning it mid-flight (ENG-324).
+        trackScheduledRun(runScheduledChat(scheduleToRun, user.userId, false).then(async (result) => {
           if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
             try {
               await scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
@@ -5023,7 +5223,7 @@ export const agentModeController = {
           }
         }).catch(async (runError) => {
           if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
-            scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
+            await scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
               variableValues: {},
               variableRequestStatus: 'pending',
               updatedAt: new Date().toISOString()
@@ -5032,7 +5232,7 @@ export const agentModeController = {
             });
           }
           console.error(`Error triggering scheduled chat after variable submission for ${scheduleToRun.scheduleName}:`, runError);
-        });
+        }));
       }
 
       res.json({
@@ -5161,7 +5361,10 @@ export const agentModeController = {
         variableValuesUpdatedAt: nowIso
       };
 
-      runScheduledChat(scheduleToRun, schedule.userId, false).then(async (result) => {
+      // Track with the graceful-shutdown drain so a deploy/SIGTERM waits for
+      // this in-flight run (incl. its requeue/persist catch) instead of
+      // abandoning it mid-flight (ENG-324).
+      trackScheduledRun(runScheduledChat(scheduleToRun, schedule.userId, false).then(async (result) => {
         if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
           try {
             await scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
@@ -5190,9 +5393,9 @@ export const agentModeController = {
             console.error('Error sending scheduled chat result email after public variable submit:', emailError);
           }
         }
-      }).catch((runError) => {
+      }).catch(async (runError) => {
         if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
-          scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
+          await scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
             variableValues: {},
             variableRequestStatus: 'pending',
             updatedAt: new Date().toISOString()
@@ -5201,7 +5404,7 @@ export const agentModeController = {
           });
         }
         console.error(`Error triggering scheduled chat after public variable submission for ${scheduleToRun.scheduleName}:`, runError);
-      });
+      }));
 
       return res.json({
         message: 'Variable values submitted successfully. Scheduled chat run started.',
@@ -5693,8 +5896,12 @@ export const agentModeController = {
           const accessTokenWasConsumed = typeof schedule.variableRequestAccessTokenConsumedAt === 'string' && schedule.variableRequestAccessTokenConsumedAt.length > 0;
           const shouldClearVariablesAfterRun = hasVariableRequestSentAt && accessTokenWasConsumed;
 
-          // Start the scheduled chat run asynchronously (don't await)
-          runScheduledChat(schedule, schedule.userId, false).then(async (result) => {
+          // Start the scheduled chat run asynchronously (don't await).
+          // Track with the graceful-shutdown drain so a deploy/SIGTERM waits for
+          // this in-flight run (incl. its requeue/persist catch) instead of
+          // abandoning it mid-flight — which left the session with only a kickoff
+          // message, no assistant output, and no run result (ENG-324).
+          trackScheduledRun(runScheduledChat(schedule, schedule.userId, false).then(async (result) => {
             // Decrement concurrent run counter when done
             currentConcurrentRuns--;
             if (scheduleVariables.length > 0 && shouldClearVariablesAfterRun) {
@@ -5748,7 +5955,7 @@ export const agentModeController = {
               }
             }
             // If result.sessionId is empty, the error email was already sent in runScheduledChat
-          }).catch((error) => {
+          }).catch(async (error) => {
             // Decrement concurrent run counter on error
             currentConcurrentRuns--;
 
@@ -5788,12 +5995,12 @@ export const agentModeController = {
               createdAt: new Date().toISOString()
             };
 
-            scheduleDb.addRunResult(schedule.scheduleId, errorResult).catch((saveError) => {
+            await scheduleDb.addRunResult(schedule.scheduleId, errorResult).catch((saveError) => {
               console.error(`Error saving failure run result for schedule ${schedule.scheduleName}:`, saveError);
             });
 
             // Send oncall alert for unhandled scheduled chat error (safety net)
-            sendAgentModeOncallAlert({
+            await sendAgentModeOncallAlert({
               subject: `Scheduled Chat Unhandled Error: ${schedule.scheduleName}`,
               message: `Scheduled chat "${schedule.scheduleName}" failed with an unhandled error in the fire-and-forget handler.\n\nError: ${error.message || 'Unknown error'}`,
               context: {
@@ -5809,8 +6016,8 @@ export const agentModeController = {
             // Send error notification email
             const emailNotifications = schedule.emailNotifications || [];
             if (emailNotifications.length > 0) {
-              import('../services/emailService').then(({ emailService }) => {
-                emailService.sendScheduledChatResultEmail(
+              await import('../services/emailService').then(({ emailService }) => {
+                return emailService.sendScheduledChatResultEmail(
                   emailNotifications,
                   schedule.scheduleName,
                   errorResult,
@@ -5822,7 +6029,7 @@ export const agentModeController = {
                 console.error('Error importing emailService:', importError);
               });
             }
-          });
+          }));
 
           results.push({
             scheduleId: schedule.scheduleId,
