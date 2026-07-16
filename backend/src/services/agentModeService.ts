@@ -23672,9 +23672,42 @@ ${formatRequirements ? `\nFormat Requirements:\n${formatRequirements}` : ''}
 
 Please generate a complete, professional HTML document that properly formats and presents this content.`;
 
-      // Generate HTML using LLMService
+      // Generate HTML using LLMService.
+      // The final render is a single long-running LLM call; on Bedrock it can hit
+      // the 5-minute requestTimeout and throw. Without a retry, one transient
+      // timeout discards ALL completed upstream work (steps 1-3), which is exactly
+      // the systemic failure reported in ENG-203. Retry the render step with
+      // exponential backoff on transient errors (timeouts / 5xx / network) so a
+      // single blip no longer loses the report. Terminal errors (invalid args,
+      // auth, content-filter) are not retried — an identical call would just fail
+      // again.
       console.log(`AgentMode: Generating HTML ${isEmail ? 'email' : 'file'} with LLMService (Claude model)`);
-      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
+      const maxRenderAttempts = 3;
+      let htmlContent = '';
+      for (let attempt = 1; attempt <= maxRenderAttempts; attempt++) {
+        try {
+          htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
+          break;
+        } catch (renderError) {
+          const isLastAttempt = attempt === maxRenderAttempts;
+          const isTransient = isTransientLLMError(renderError);
+          if (isLastAttempt || !isTransient) {
+            // Distinguish exhaustion from a terminal error. If every attempt hit a
+            // transient timeout, the render likely can't finish inside the per-call
+            // budget deterministically (e.g. an oversized report) — retrying the same
+            // call won't help, and this is the signal that would justify streaming/
+            // chunking the render (ENG-203 follow-up). Log it distinctly so these are
+            // greppable and separable from one-off blips and terminal errors.
+            if (isLastAttempt && isTransient) {
+              console.error(`AgentMode: HTML render exhausted all ${maxRenderAttempts} attempts on a transient error (session ${sessionId}); render may be deterministically over the per-call timeout:`, renderError instanceof Error ? renderError.message : renderError);
+            }
+            throw renderError;
+          }
+          const backoffMs = 1000 * Math.pow(2, attempt - 1);
+          console.warn(`AgentMode: HTML render attempt ${attempt}/${maxRenderAttempts} failed with a transient error, retrying in ${backoffMs}ms:`, renderError instanceof Error ? renderError.message : renderError);
+          await this.sleep(backoffMs);
+        }
+      }
 
       if (!htmlContent || htmlContent.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
