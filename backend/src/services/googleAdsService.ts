@@ -334,6 +334,23 @@ export class GoogleAdsService {
     }));
   }
 
+  // ── Portfolio (shared) bidding strategies ─────────────────────────────────
+
+  async listBiddingStrategies(userId: string, customerId: string): Promise<{ resourceName: string; id: string; name: string; type: string; status: string }[]> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const results = await this.search(customerId, accessToken,
+      'SELECT bidding_strategy.resource_name, bidding_strategy.id, bidding_strategy.name, bidding_strategy.type, bidding_strategy.status FROM bidding_strategy ORDER BY bidding_strategy.name',
+      loginCustomerId,
+    );
+    return results.map((r: any) => ({
+      resourceName: r.biddingStrategy.resourceName,
+      id: String(r.biddingStrategy.id),
+      name: r.biddingStrategy.name,
+      type: r.biddingStrategy.type,
+      status: r.biddingStrategy.status,
+    }));
+  }
+
   // ── Campaigns ────────────────────────────────────────────────────────────
 
   async listCampaigns(userId: string, customerId: string): Promise<{ resourceName: string; id: string; name: string; status: string; type: string }[]> {
@@ -355,7 +372,8 @@ export class GoogleAdsService {
     name: string;
     type: 'SEARCH' | 'DISPLAY' | 'PERFORMANCE_MAX';
     budgetResourceName: string;
-    biddingStrategy: 'MAXIMIZE_CONVERSIONS' | 'TARGET_CPA' | 'TARGET_ROAS' | 'MAXIMIZE_CONVERSION_VALUE' | 'TARGET_IMPRESSION_SHARE' | 'TARGET_SPEND' | 'MANUAL_CPC';
+    biddingStrategy?: 'MAXIMIZE_CONVERSIONS' | 'TARGET_CPA' | 'TARGET_ROAS' | 'MAXIMIZE_CONVERSION_VALUE' | 'TARGET_IMPRESSION_SHARE' | 'TARGET_SPEND' | 'MANUAL_CPC';
+    biddingStrategyResourceName?: string;
     biddingStrategyTarget?: number;
     cpcBidCeilingMicros?: number;
     locationTargetIds: number[];
@@ -370,8 +388,17 @@ export class GoogleAdsService {
       throw new Error('DISPLAY campaigns do not support MAXIMIZE_CONVERSIONS with a shared budget. Use MANUAL_CPC or TARGET_CPA instead.');
     }
 
+    if (params.biddingStrategy && params.biddingStrategyResourceName) {
+      throw new Error('Provide either bidding_strategy (a standard strategy) or bidding_strategy_resource_name (a portfolio/shared strategy), not both.');
+    }
+    if (!params.biddingStrategy && !params.biddingStrategyResourceName) {
+      throw new Error('A campaign requires a bidding strategy: pass bidding_strategy (standard) or bidding_strategy_resource_name (portfolio/shared).');
+    }
+
     const biddingField: Record<string, any> = {};
-    if (params.biddingStrategy === 'MAXIMIZE_CONVERSIONS') biddingField.maximizeConversions = {};
+    // Portfolio/shared strategy: attach by resource-name reference on campaign.bidding_strategy.
+    if (params.biddingStrategyResourceName) biddingField.biddingStrategy = params.biddingStrategyResourceName;
+    else if (params.biddingStrategy === 'MAXIMIZE_CONVERSIONS') biddingField.maximizeConversions = {};
     else if (params.biddingStrategy === 'MAXIMIZE_CONVERSION_VALUE') biddingField.maximizeConversionValue = {};
     else if (params.biddingStrategy === 'TARGET_CPA') biddingField.targetCpa = { targetCpaMicros: String(Math.round((params.biddingStrategyTarget || 0) * 1_000_000)) };
     else if (params.biddingStrategy === 'TARGET_ROAS') biddingField.targetRoas = { targetRoas: params.biddingStrategyTarget || 1 };
@@ -456,11 +483,15 @@ export class GoogleAdsService {
     name?: string;
     status?: 'ENABLED' | 'PAUSED';
     biddingStrategy?: string;
+    biddingStrategyResourceName?: string;
     biddingStrategyTarget?: number;
     cpcBidCeilingMicros?: number;
     budgetResourceName?: string;
     finalUrlSuffix?: string;
   }): Promise<boolean> {
+    if (params.biddingStrategy && params.biddingStrategyResourceName) {
+      throw new Error('Provide either bidding_strategy (a standard strategy) or bidding_strategy_resource_name (a portfolio/shared strategy), not both.');
+    }
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const updateMask: string[] = [];
     const update: any = { resourceName: campaignResourceName };
@@ -468,7 +499,12 @@ export class GoogleAdsService {
     if (params.status) { update.status = params.status; updateMask.push('status'); }
     if (params.budgetResourceName) { update.campaignBudget = params.budgetResourceName; updateMask.push('campaign_budget'); }
     if (params.finalUrlSuffix !== undefined) { update.finalUrlSuffix = params.finalUrlSuffix; updateMask.push('final_url_suffix'); }
-    if (params.biddingStrategy) {
+    if (params.biddingStrategyResourceName) {
+      // Portfolio/shared strategy: bidding_strategy is a scalar resource-name field, so masking
+      // the leaf directly is correct (and setting it detaches any prior embedded strategy).
+      update.biddingStrategy = params.biddingStrategyResourceName;
+      updateMask.push('bidding_strategy');
+    } else if (params.biddingStrategy) {
       if (params.biddingStrategy === 'MAXIMIZE_CONVERSIONS') {
         update.maximizeConversions = { targetCpaMicros: '0' };
         updateMask.push('maximize_conversions.target_cpa_micros');
