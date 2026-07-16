@@ -8,6 +8,10 @@ jest.mock('../services/googleAdsService', () => ({
     getCampaignFinalUrls: jest.fn(),
     resumeCampaign: jest.fn().mockResolvedValue(undefined),
     updateCampaign: jest.fn().mockResolvedValue(true),
+    getCampaignStatus: jest.fn(),
+    getAdGroupCampaign: jest.fn(),
+    createAd: jest.fn().mockResolvedValue({ resourceName: 'customers/123/adGroupAds/1~1' }),
+    createAssetGroup: jest.fn().mockResolvedValue({ resourceName: 'customers/123/assetGroups/1' }),
   },
 }));
 
@@ -128,5 +132,84 @@ describe('ENG-335 launch gate — CAMPAIGN UPDATE(status=ENABLED)', () => {
     expect(result.success).toBe(true);
     expect(preflightTrackingGate).not.toHaveBeenCalled();
     expect(googleAdsService.updateCampaign).toHaveBeenCalled();
+  });
+});
+
+describe('ENG-335 launch gate — AD CREATE on a live campaign', () => {
+  const AD_GROUP = 'customers/123/adGroups/9';
+
+  it('blocks adding an ad with an unmeasured final_url to an ENABLED campaign', async () => {
+    (googleAdsService.getAdGroupCampaign as jest.Mock).mockResolvedValue({ campaignResourceName: CAMPAIGN, campaignStatus: 'ENABLED' });
+    (preflightTrackingGate as jest.Mock).mockResolvedValue(blockedGate);
+
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890', entity_type: 'AD', action: 'CREATE', ad_group_resource_name: AD_GROUP,
+      type: 'SEARCH', headlines: ['h'], descriptions: ['d'], final_url: 'https://acme.com/compare',
+    }, { sessionId: 'sess-1' });
+
+    expect(result.success).toBe(false);
+    expect(result.blocked).toBe(true);
+    expect(preflightTrackingGate).toHaveBeenCalledWith(['https://acme.com/compare']);
+    expect(googleAdsService.createAd).not.toHaveBeenCalled();
+    expect(recordSpy).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'blocked', action: 'AD_CREATE' }));
+  });
+
+  it('does NOT gate an ad added to a PAUSED campaign (re-checked at launch)', async () => {
+    (googleAdsService.getAdGroupCampaign as jest.Mock).mockResolvedValue({ campaignResourceName: CAMPAIGN, campaignStatus: 'PAUSED' });
+
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890', entity_type: 'AD', action: 'CREATE', ad_group_resource_name: AD_GROUP,
+      type: 'SEARCH', headlines: ['h'], descriptions: ['d'], final_url: 'https://acme.com/compare',
+    }, { sessionId: 'sess-1' });
+
+    expect(result.success).toBe(true);
+    expect(preflightTrackingGate).not.toHaveBeenCalled();
+    expect(googleAdsService.createAd).toHaveBeenCalled();
+  });
+
+  it('proceeds and records an override when adding to a live campaign with override_tracking_check=true', async () => {
+    (googleAdsService.getAdGroupCampaign as jest.Mock).mockResolvedValue({ campaignResourceName: CAMPAIGN, campaignStatus: 'ENABLED' });
+    (preflightTrackingGate as jest.Mock).mockResolvedValue(blockedGate);
+
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890', entity_type: 'AD', action: 'CREATE', ad_group_resource_name: AD_GROUP,
+      type: 'SEARCH', headlines: ['h'], descriptions: ['d'], final_url: 'https://acme.com/compare',
+      override_tracking_check: true,
+    }, { sessionId: 'sess-1' });
+
+    expect(result.success).toBe(true);
+    expect(googleAdsService.createAd).toHaveBeenCalled();
+    expect(recordSpy).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'overridden', action: 'AD_CREATE' }));
+  });
+});
+
+describe('ENG-335 launch gate — ASSET_GROUP CREATE on a live campaign', () => {
+  const validAssetGroupArgs = {
+    customer_id: '1234567890', entity_type: 'ASSET_GROUP' as const, action: 'CREATE',
+    name: 'AG', campaign_resource_name: CAMPAIGN, headlines: ['h'], long_headlines: ['lh'], descriptions: ['d'],
+    square_image_assets: ['s'], landscape_image_assets: ['l'], logo_assets: ['lo'], final_url: 'https://acme.com/compare',
+  };
+
+  it('blocks adding a PMax asset group with an unmeasured final_url to an ENABLED campaign', async () => {
+    (googleAdsService.getCampaignStatus as jest.Mock).mockResolvedValue('ENABLED');
+    (preflightTrackingGate as jest.Mock).mockResolvedValue(blockedGate);
+
+    const result = await service.handleCallGoogleAdsApi('user-123', { ...validAssetGroupArgs }, { sessionId: 'sess-1' });
+
+    expect(result.success).toBe(false);
+    expect(result.blocked).toBe(true);
+    expect(preflightTrackingGate).toHaveBeenCalledWith(['https://acme.com/compare']);
+    expect(googleAdsService.createAssetGroup).not.toHaveBeenCalled();
+    expect(recordSpy).toHaveBeenCalledWith('sess-1', expect.objectContaining({ outcome: 'blocked', action: 'ASSET_GROUP_CREATE' }));
+  });
+
+  it('does NOT gate an asset group added to a PAUSED campaign', async () => {
+    (googleAdsService.getCampaignStatus as jest.Mock).mockResolvedValue('PAUSED');
+
+    const result = await service.handleCallGoogleAdsApi('user-123', { ...validAssetGroupArgs }, { sessionId: 'sess-1' });
+
+    expect(result.success).toBe(true);
+    expect(preflightTrackingGate).not.toHaveBeenCalled();
+    expect(googleAdsService.createAssetGroup).toHaveBeenCalled();
   });
 });
