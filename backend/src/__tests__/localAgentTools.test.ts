@@ -4,6 +4,7 @@ import {
   isLikelyRelayTimeoutKill,
   buildLocalAgentCrashResult,
   buildLocalAgentTimeoutResult,
+  classifyRelayProcessCrash,
 } from '../emma/localAgentTools';
 import { toolResultError } from '../utils/toolResultError';
 
@@ -191,5 +192,53 @@ describe('buildLocalAgentCrashResult — graceful, non-retryable crash (ENG-339)
     const r = buildLocalAgentCrashResult(-11);
     expect(r.message.toLowerCase()).not.toContain('memory');
     expect(r.message.toLowerCase()).toContain('crash');
+  });
+});
+
+/**
+ * ENG-339 — classifyRelayProcessCrash is the routing extracted from the
+ * run_local_agent_task handler: the parsed.ok guard + the timeout-vs-crash split
+ * that were previously only reachable through the live relay path (uncoverable by
+ * browser/curl, per the manual-test note). These lock the exact wiring the handler
+ * now delegates to, without mocking the transport.
+ */
+describe('classifyRelayProcessCrash — handler routing (ENG-339)', () => {
+  it('routes a fast SIGKILL (well under the timeout) to a non-retryable crash', () => {
+    const r = classifyRelayProcessCrash({ ok: false, returncode: -9 }, 12_000, 120);
+    expect(r).not.toBeNull();
+    expect(r!.success).toBe(true);
+    expect(r!.reason).toBe('crashed');
+    expect(toolResultError(r)).toBeNull(); // does not trip the repeated-failure breaker
+  });
+
+  it('routes a SIGKILL at the end of the timeout window to a retryable timeout', () => {
+    const r = classifyRelayProcessCrash({ ok: false, returncode: -9 }, 120_000, 120);
+    expect(r).not.toBeNull();
+    expect(r!.reason).toBe('timed_out');
+    expect(toolResultError(r)).toBeNull();
+  });
+
+  it('also routes the 137 shell encoding (128+9) as a crash', () => {
+    const r = classifyRelayProcessCrash({ ok: false, returncode: 137 }, 5_000, 120);
+    expect(r!.reason).toBe('crashed');
+  });
+
+  it('returns null for a normal non-zero task failure (returncode 1) — falls through to real error handling', () => {
+    expect(classifyRelayProcessCrash({ ok: false, returncode: 1 }, 5_000, 120)).toBeNull();
+  });
+
+  it('returns null when the worker succeeded, even if a returncode is present', () => {
+    expect(classifyRelayProcessCrash({ ok: true, returncode: -9 }, 5_000, 120)).toBeNull();
+  });
+
+  it('returns null for the -1 "returncode omitted" sentinel and a missing returncode', () => {
+    expect(classifyRelayProcessCrash({ ok: false, returncode: -1 }, 5_000, 120)).toBeNull();
+    expect(classifyRelayProcessCrash({ ok: false }, 5_000, 120)).toBeNull();
+  });
+
+  it('treats a non-SIGKILL fatal signal at the timeout window as a crash, not a timeout', () => {
+    // SIGSEGV never comes from the relay timeout path, so elapsed time must not flip it.
+    const r = classifyRelayProcessCrash({ ok: false, returncode: -11 }, 120_000, 120);
+    expect(r!.reason).toBe('crashed');
   });
 });
