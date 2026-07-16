@@ -1098,6 +1098,35 @@ export class GoogleAdsService {
     return true;
   }
 
+  /**
+   * Retag ONE existing, already-live ad that's missing UTMs (Harsha's ask —
+   * the audit tool can only find these, never fix them). Deliberately single-ad:
+   * never loop or accept a list, so there is no "bulk retag" surface.
+   *
+   * Reads the ad's current `final_urls` and delegates entirely to `updateAd`,
+   * which already does the whole computation (inherited-suffix read, AC4 merge)
+   * for the create AND edit paths. `success:false` here is ambiguous by design —
+   * it means either "already fully tagged" or "no write was safe to make" — the
+   * caller should not infer a specific reason from it.
+   */
+  async retagAdUtm(
+    userId: string,
+    customerId: string,
+    adGroupAdResourceName: string,
+  ): Promise<{ success: boolean; reason?: 'no_destination_url' }> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const rows = await this.search(
+      customerId,
+      accessToken,
+      `SELECT ad_group_ad.ad.final_urls FROM ad_group_ad WHERE ad_group_ad.resource_name = '${adGroupAdResourceName}'`,
+      loginCustomerId,
+    );
+    const finalUrl = rows[0]?.adGroupAd?.ad?.finalUrls?.[0];
+    if (!finalUrl) return { success: false, reason: 'no_destination_url' };
+    const success = await this.updateAd(userId, customerId, adGroupAdResourceName, { finalUrl });
+    return { success };
+  }
+
   async removeAd(userId: string, customerId: string, adGroupAdResourceName: string): Promise<void> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     await this.mutate(customerId, accessToken, 'adGroupAds', [{ remove: adGroupAdResourceName }], loginCustomerId);

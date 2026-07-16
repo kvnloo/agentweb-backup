@@ -226,6 +226,52 @@ describe('updateAd — final_url_suffix (AC1: an edited ad keeps/gains its suffi
   });
 });
 
+describe('retagAdUtm — single existing ad, on-demand retrofit (Harsha\'s ask)', () => {
+  it('returns success:false with a reason when the ad has no destination URL', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
+    const result = await service.retagAdUtm('user-123', '1234567890', 'customers/123/adGroupAds/1');
+    expect(result).toEqual({ success: false, reason: 'no_destination_url' });
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1); // only the read — never reaches updateAd
+  });
+
+  it('is a no-op (success:false) when the destination already carries every UTM key', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          adGroupAd: {
+            ad: { finalUrls: ['https://example.com/?utm_source=a&utm_medium=b&utm_campaign=c&utm_content=d&utm_term=e'] },
+          },
+        }],
+      },
+    });
+    const result = await service.retagAdUtm('user-123', '1234567890', 'customers/123/adGroupAds/1');
+    expect(result).toEqual({ success: false });
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1); // read only — updateAd's own mutate never fires
+  });
+
+  it('adds the missing UTM suffix to an untagged ad (happy path)', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ adGroupAd: { ad: { finalUrls: ['https://example.com/'] } } }] },
+    });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } }); // the mutate
+    const result = await service.retagAdUtm('user-123', '1234567890', 'customers/123/adGroupAds/1');
+    expect(result).toEqual({ success: true });
+    const op = mutateOperation();
+    expect(op.update.resourceName).toBe('customers/123/adGroupAds/1');
+    expect(op.update.ad.finalUrlSuffix).toBe(FULL_SUFFIX);
+  });
+
+  it('reads exactly the resource name it was given (no destination-URL guessing)', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ adGroupAd: { ad: { finalUrls: ['https://example.com/'] } } }] },
+    });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.retagAdUtm('user-123', '1234567890', 'customers/123/adGroupAds/42');
+    const readQuery = mockAxiosPost.mock.calls[0][1].query;
+    expect(readQuery).toContain(`ad_group_ad.resource_name = 'customers/123/adGroupAds/42'`);
+  });
+});
+
 describe('createAssetGroup — asset_group has no suffix field, so UTMs merge into final_urls', () => {
   function assetGroupBatchResponse() {
     return {
