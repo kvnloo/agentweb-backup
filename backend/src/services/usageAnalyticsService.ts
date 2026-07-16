@@ -172,3 +172,220 @@ export async function getUsageComparison(
     },
   };
 }
+
+// ── ENG-366: cross-user cost aggregation (backend slice of ENG-353) ──────────
+//
+// Sums the costMicroUsd counters ALREADY priced at record time via
+// utils/llmPricing.ts — this module never re-derives cost from token counts
+// (ENG-353 behavioral contract, assertion 2: single source of pricing truth).
+
+interface CounterTotals {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  callCount: number;
+  costMicroUsd: number;
+  costUsd: number;
+}
+
+export interface CostByModelRow extends CounterTotals {
+  model: string;
+}
+
+export interface CostSeriesRow {
+  date: string;
+  model: string;
+  costMicroUsd: number;
+  costUsd: number;
+  totalTokens: number;
+  callCount: number;
+}
+
+export interface CostByFeatureRow {
+  feature: string;
+  costMicroUsd: number;
+  costUsd: number;
+  totalTokens: number;
+  callCount: number;
+}
+
+export interface CostTopUser extends CounterTotals {
+  userId: string;
+  /** Best-effort enrichment from AW-Users; null when the user record is missing or the lookup fails. */
+  email: string | null;
+  byModel: CostByModelRow[];
+}
+
+export interface CostAggregation {
+  start: string;
+  end: string;
+  totals: CounterTotals;
+  /** Sorted by spend, highest first. */
+  byModel: CostByModelRow[];
+  /** Per (date, model) buckets, sorted by date then model — the time series. */
+  series: CostSeriesRow[];
+  /** Secondary cut over the stored feature dimension, sorted by spend. */
+  byFeature: CostByFeatureRow[];
+  /** Sorted by spend, highest first, limited to topUsersLimit. */
+  topUsers: CostTopUser[];
+}
+
+function zeroTotals(): CounterTotals {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    totalTokens: 0,
+    callCount: 0,
+    costMicroUsd: 0,
+    costUsd: 0,
+  };
+}
+
+/** Add one raw row into a counter bucket. Missing counters count as 0 — never NaN. */
+function addInto(acc: CounterTotals, item: UsageRecordRow): void {
+  acc.inputTokens += item.inputTokens || 0;
+  acc.outputTokens += item.outputTokens || 0;
+  acc.cacheReadTokens += item.cacheReadTokens || 0;
+  acc.cacheWriteTokens += item.cacheWriteTokens || 0;
+  acc.totalTokens += item.totalTokens || 0;
+  acc.callCount += item.callCount || 0;
+  acc.costMicroUsd += item.costMicroUsd || 0;
+}
+
+function finalizeUsd(acc: CounterTotals): void {
+  acc.costUsd = acc.costMicroUsd / 1_000_000;
+}
+
+function bucketByModel(items: UsageRecordRow[]): CostByModelRow[] {
+  const byModel = new Map<string, CostByModelRow>();
+  for (const item of items) {
+    let bucket = byModel.get(item.model);
+    if (!bucket) {
+      bucket = { model: item.model, ...zeroTotals() };
+      byModel.set(item.model, bucket);
+    }
+    addInto(bucket, item);
+  }
+  const rows = [...byModel.values()];
+  rows.forEach(finalizeUsd);
+  rows.sort(
+    (a, b) => b.costMicroUsd - a.costMicroUsd || a.model.localeCompare(b.model)
+  );
+  return rows;
+}
+
+/**
+ * Aggregate spend across ALL users for an inclusive date window, for the admin
+ * cost dashboard (ENG-353). Window filtering happens in the data layer
+ * (usageRecordDb.scanByDateRange) so out-of-window records never reach any of
+ * the cuts below (contract assertion 3). An empty window yields explicit zeros
+ * and empty arrays (contract assertion 4, API half).
+ */
+export async function getCostAggregation(
+  start: string,
+  end: string,
+  topUsersLimit = 10
+): Promise<CostAggregation> {
+  if (!DATE_RE.test(start) || !DATE_RE.test(end)) {
+    throw new Error("start and end must be YYYY-MM-DD");
+  }
+  if (start > end) {
+    throw new Error("start must be <= end");
+  }
+  if (!Number.isInteger(topUsersLimit) || topUsersLimit < 1 || topUsersLimit > 100) {
+    throw new Error("topUsersLimit must be an integer between 1 and 100");
+  }
+
+  const items = await usageRecordDb.scanByDateRange(start, end);
+
+  // Overall totals.
+  const totals = zeroTotals();
+  items.forEach((item) => addInto(totals, item));
+  finalizeUsd(totals);
+
+  // Headline cut: spend by model.
+  const byModel = bucketByModel(items);
+
+  // Time series: per (date, model) buckets.
+  const seriesBuckets = new Map<string, CostSeriesRow>();
+  for (const item of items) {
+    const key = `${item.date}#${item.model}`;
+    let bucket = seriesBuckets.get(key);
+    if (!bucket) {
+      bucket = {
+        date: item.date,
+        model: item.model,
+        costMicroUsd: 0,
+        costUsd: 0,
+        totalTokens: 0,
+        callCount: 0,
+      };
+      seriesBuckets.set(key, bucket);
+    }
+    bucket.costMicroUsd += item.costMicroUsd || 0;
+    bucket.totalTokens += item.totalTokens || 0;
+    bucket.callCount += item.callCount || 0;
+  }
+  const series = [...seriesBuckets.values()];
+  series.forEach((s) => {
+    s.costUsd = s.costMicroUsd / 1_000_000;
+  });
+  series.sort(
+    (a, b) => a.date.localeCompare(b.date) || a.model.localeCompare(b.model)
+  );
+
+  // Secondary cut: spend by feature (session type dimension already on the rows).
+  const featureBuckets = new Map<string, CostByFeatureRow>();
+  for (const item of items) {
+    let bucket = featureBuckets.get(item.feature);
+    if (!bucket) {
+      bucket = { feature: item.feature, costMicroUsd: 0, costUsd: 0, totalTokens: 0, callCount: 0 };
+      featureBuckets.set(item.feature, bucket);
+    }
+    bucket.costMicroUsd += item.costMicroUsd || 0;
+    bucket.totalTokens += item.totalTokens || 0;
+    bucket.callCount += item.callCount || 0;
+  }
+  const byFeature = [...featureBuckets.values()];
+  byFeature.forEach((f) => {
+    f.costUsd = f.costMicroUsd / 1_000_000;
+  });
+  byFeature.sort(
+    (a, b) => b.costMicroUsd - a.costMicroUsd || a.feature.localeCompare(b.feature)
+  );
+
+  // Top users by spend, with per-model breakdown.
+  const userItems = new Map<string, UsageRecordRow[]>();
+  for (const item of items) {
+    const list = userItems.get(item.userId);
+    if (list) {
+      list.push(item);
+    } else {
+      userItems.set(item.userId, [item]);
+    }
+  }
+  const rankedUsers = [...userItems.entries()]
+    .map(([userId, rows]) => {
+      const userTotals = zeroTotals();
+      rows.forEach((r) => addInto(userTotals, r));
+      finalizeUsd(userTotals);
+      return { userId, ...userTotals, byModel: bucketByModel(rows) };
+    })
+    .sort((a, b) => b.costMicroUsd - a.costMicroUsd || a.userId.localeCompare(b.userId))
+    .slice(0, topUsersLimit);
+
+  // Email enrichment is decoration on an admin analytics payload — a per-user
+  // lookup failure must not fail the whole aggregation (best-effort sub-step).
+  const topUsers: CostTopUser[] = await Promise.all(
+    rankedUsers.map(async (u) => {
+      const user = await userDb.getUserById(u.userId).catch(() => null);
+      return { ...u, email: user?.email ?? null };
+    })
+  );
+
+  return { start, end, totals, byModel, series, byFeature, topUsers };
+}
