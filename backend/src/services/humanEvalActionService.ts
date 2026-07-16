@@ -95,6 +95,8 @@ async function rerunLeadEnrichment(
     reviewType: 'lead_enrichment',
     userId: action.userId,
     sessionId: candidate.sessionId,
+    // The rerun reviews the same underlying use case as the original candidate.
+    category: candidate.category,
     originalRequest:
       `${action.toolName} feedback rerun list=${action.listId}` +
       `${action.leadId ? ` lead=${action.leadId}` : ''}`,

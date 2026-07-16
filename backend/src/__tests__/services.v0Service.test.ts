@@ -142,6 +142,7 @@ jest.mock("../services/customDomainService", () => ({
 }));
 
 import {
+  buildBrandContextFromUser,
   buildBrandEnrichedPrompt,
   generateLandingPage,
   deployLandingPage,
@@ -153,6 +154,8 @@ import {
   V0OutputValidationError,
   BrandContext,
   remapFilesForSubPage,
+  repairSubPageImports,
+  repairPoisonedSubPagesInRepo,
   ensurePageMetadataTitle,
   buildPageSlug,
   autoFixV0Files,
@@ -172,8 +175,8 @@ import {
   assertNoDuplicateInjectedRoutes,
 } from "../services/v0Service";
 
-import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
-import { _resetV0UsageGuardForTest } from "../services/v0UsageGuard";
+import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord } from "../services/v0Service";
+import { _resetV0UsageGuardForTest, guardedV0ChatCreate, hashV0Prompt } from "../services/v0UsageGuard";
 const { enqueueAutoHumanEval } = jest.requireMock("../services/autoHumanEvalService");
 
 async function createMinimalV0Zip(): Promise<Buffer> {
@@ -193,6 +196,102 @@ beforeEach(() => {
   // Use zero-delay poll intervals in tests to avoid waiting ~2.5 min
   setV0PollIntervals([0, 0, 0, 0, 0]);
   setVercelPollConfig(0, 30);
+});
+
+// =============================================================================
+// buildBrandContextFromUser (ENG-326)
+// =============================================================================
+describe("v0Service - buildBrandContextFromUser", () => {
+  const fullUser = {
+    brandGuidelines: {
+      brandData: {
+        brandName: "Acme",
+        primaryColor: "#5E6AD2",
+        secondaryColor: "#FFFFFF",
+        fontFamily: "Inter",
+        tagline: "Rockets, delivered",
+        toneOfVoice: "Confident",
+        brandPersonality: "Bold",
+        keyMessages: ["Fast"],
+        brandValues: ["Speed"],
+        targetAudience: "Founders",
+        founders: [{ name: "Wile E.", jobTitle: "CEO", styleTone: "direct" }],
+      },
+      attachments: [
+        { type: "brandGuide", url: "https://x/guide.pdf" },
+        { type: "logo", url: "https://s3/brand/logo.png", filename: "logo.png" },
+      ],
+    },
+    marketStrategy: {
+      businessOverview: "Acme makes rockets",
+      icp: [{ title: "Coyotes", description: "d", valueProposition: "v", buyerPersonas: ["p"] }],
+      competitors: [{ name: "Looney Inc", description: "ordnance" }],
+    },
+  };
+
+  it("maps brandData + marketStrategy and resolves the attachments logo", () => {
+    const ctx = buildBrandContextFromUser(fullUser);
+    expect(ctx.brandName).toBe("Acme");
+    expect(ctx.primaryColor).toBe("#5E6AD2");
+    expect(ctx.logoUrl).toBe("https://s3/brand/logo.png");
+    expect(ctx.businessOverview).toBe("Acme makes rockets");
+    expect(ctx.icp).toHaveLength(1);
+    expect(ctx.competitors?.[0].name).toBe("Looney Inc");
+  });
+
+  it("falls back to brandData.logoUrl when no logo attachment exists (Emma/scrape-persisted state)", () => {
+    const ctx = buildBrandContextFromUser({
+      brandGuidelines: {
+        brandData: { brandName: "Acme", logoUrl: "https://s3/brand/scraped.png" },
+        attachments: [{ type: "brandGuide", url: "https://x/guide.pdf" }],
+      },
+    });
+    expect(ctx.logoUrl).toBe("https://s3/brand/scraped.png");
+  });
+
+  it("prefers the uploaded attachments logo over a scraped brandData.logoUrl", () => {
+    const ctx = buildBrandContextFromUser({
+      brandGuidelines: {
+        brandData: { logoUrl: "https://acme.com/stale-scraped.png" },
+        attachments: [{ type: "logo", url: "https://s3/uploaded.png" }],
+      },
+    });
+    expect(ctx.logoUrl).toBe("https://s3/uploaded.png");
+  });
+
+  it("returns an empty context for missing users / guidelines", () => {
+    expect(buildBrandContextFromUser(null)).toEqual({});
+    expect(buildBrandContextFromUser({})).toEqual({});
+  });
+
+  it("uses the brandGuidelines override (org record) over the user record when provided", () => {
+    // Org members' brand — including the persisted/uploaded logo — lives on
+    // the ORG record; the route passes it explicitly (ENG-326).
+    const ctx = buildBrandContextFromUser(
+      {
+        brandGuidelines: {
+          brandData: { brandName: "StaleUser", logoUrl: "https://s3/stale-user.png" },
+        },
+        marketStrategy: { businessOverview: "Acme makes rockets" },
+      },
+      {
+        brandData: { brandName: "Acme" },
+        attachments: [{ type: "logo", url: "https://s3/org/logo.png" }],
+      },
+    );
+    expect(ctx.brandName).toBe("Acme");
+    expect(ctx.logoUrl).toBe("https://s3/org/logo.png");
+    // marketStrategy still comes from the user record.
+    expect(ctx.businessOverview).toBe("Acme makes rockets");
+  });
+
+  it("the enriched v0 prompt carries the persisted logo URL (landing pages receive the real logo)", () => {
+    const prompt = buildBrandEnrichedPrompt(
+      "Build a landing page",
+      buildBrandContextFromUser(fullUser),
+    );
+    expect(prompt).toContain("Logo URL: https://s3/brand/logo.png");
+  });
 });
 
 // =============================================================================
@@ -296,7 +395,10 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   const file = (path: string, content = "// v0 generated") => ({ path, content: Buffer.from(content) });
 
   it("SUCCESS: injects middleware.ts and app/api/capture/route.ts with the list id and forward URL", () => {
-    const result = injectLeadCaptureAttribution([file("app/page.tsx")], "list_xyz");
+    // ENG-310: the capture route is repo-level but the lead list is per-page, so it now
+    // takes a path->list MAP rather than one hardcoded LIST_ID. A site with several pages
+    // used to file every lead into whichever list was injected last.
+    const result = injectLeadCaptureAttribution([file("app/page.tsx")], { "/": "list_xyz" });
 
     const middleware = result.find((f) => f.path === "middleware.ts");
     const route = result.find((f) => f.path === "app/api/capture/route.ts");
@@ -307,7 +409,8 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
 
     expect(route).toBeDefined();
     const routeSrc = route!.content.toString();
-    expect(routeSrc).toContain('const LIST_ID = "list_xyz"');
+    expect(routeSrc).toContain("LIST_BY_PATH");
+    expect(routeSrc).toContain('"list_xyz"');
     expect(routeSrc).toContain("/api/webhooks/forward-lead");
     expect(routeSrc).toContain('from "next/headers"');
     expect(routeSrc).toContain("aw_first_touch");
@@ -316,7 +419,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("FAIL: v0-generated app/api/capture/route.ts is replaced, not duplicated", () => {
     const result = injectLeadCaptureAttribution(
       [file("app/api/capture/route.ts", "// v0's own capture route"), file("app/page.tsx")],
-      "list_xyz"
+      { "/": "list_xyz" }
     );
 
     const captureRoutes = result.filter((f) => f.path === "app/api/capture/route.ts");
@@ -327,7 +430,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("FAIL: route-group variant of v0's capture route is also dropped", () => {
     const result = injectLeadCaptureAttribution(
       [file("app/(frontend)/api/capture/route.ts", "// v0 route-group capture"), file("app/page.tsx")],
-      "list_xyz"
+      { "/": "list_xyz" }
     );
 
     expect(result.some((f) => f.path === "app/(frontend)/api/capture/route.ts")).toBe(false);
@@ -338,7 +441,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("FAIL: v0-generated middleware.ts is replaced, not duplicated", () => {
     const result = injectLeadCaptureAttribution(
       [file("middleware.ts", "// v0's own middleware"), file("app/page.tsx")],
-      "list_xyz"
+      { "/": "list_xyz" }
     );
 
     const middlewares = result.filter((f) => f.path === "middleware.ts");
@@ -349,7 +452,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("SUCCESS: unrelated files are left untouched", () => {
     const result = injectLeadCaptureAttribution(
       [file("app/page.tsx", "// page"), file("lib/utils.ts", "// utils")],
-      "list_xyz"
+      { "/": "list_xyz" }
     );
 
     expect(result.find((f) => f.path === "app/page.tsx")!.content.toString()).toBe("// page");
@@ -359,7 +462,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("FAIL: src/app capture route variant is dropped, not duplicated", () => {
     const result = injectLeadCaptureAttribution(
       [file("src/app/api/capture/route.ts", "// v0 src/app capture"), file("app/page.tsx")],
-      "list_xyz"
+      { "/": "list_xyz" }
     );
 
     expect(result.some((f) => f.path === "src/app/api/capture/route.ts")).toBe(false);
@@ -370,7 +473,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("FAIL: nested/multiple route-group capture variant is dropped, not duplicated", () => {
     const result = injectLeadCaptureAttribution(
       [file("src/app/(marketing)/(v2)/api/capture/route.tsx", "// v0 nested"), file("app/page.tsx")],
-      "list_xyz"
+      { "/": "list_xyz" }
     );
 
     expect(result.some((f) => f.path.includes("(marketing)"))).toBe(false);
@@ -381,7 +484,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("FAIL: src/middleware.ts variant is replaced, not duplicated", () => {
     const result = injectLeadCaptureAttribution(
       [file("src/middleware.ts", "// v0's own src middleware"), file("app/page.tsx")],
-      "list_xyz"
+      { "/": "list_xyz" }
     );
 
     expect(result.some((f) => f.path === "src/middleware.ts")).toBe(false);
@@ -393,7 +496,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("SUCCESS: a non-root helper file literally named middleware.ts is left alone (not a real Next.js middleware)", () => {
     const result = injectLeadCaptureAttribution(
       [file("components/middleware.ts", "// unrelated helper, not Next middleware"), file("app/page.tsx")],
-      "list_xyz"
+      { "/": "list_xyz" }
     );
 
     const helper = result.find((f) => f.path === "components/middleware.ts");
@@ -403,7 +506,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
 
   it("SUCCESS: injectLeadCaptureAttribution never trips the duplicate guard on the normal path", () => {
     const files = [file("app/page.tsx"), file("app/api/capture/route.ts", "// v0's own"), file("middleware.ts", "// v0's own")];
-    expect(() => injectLeadCaptureAttribution(files, "list_xyz")).not.toThrow();
+    expect(() => injectLeadCaptureAttribution(files, { "/": "list_xyz" })).not.toThrow();
   });
 });
 
@@ -927,6 +1030,222 @@ describe("v0Service - multi-site routing (DURABLE_LANDING_GENERATION=on)", () =>
 
     expect(mockPut.mock.calls[0][0].Item.originatingSessionId).toBe("sess-9");
   });
+});
+
+describe("v0Service - ENG-287 residual hardening", () => {
+  const statusesWritten = () =>
+    mockUpdate.mock.calls
+      .map((c: any) => c[0].ExpressionAttributeValues?.[":status"])
+      .filter(Boolean);
+
+  it("a first-page build stays `generating` while v0 generates — never `draft` (ENG-287 residual F3)", async () => {
+    // Async create returns a chatId in seconds and the ~16-min poll now happens inside
+    // deployLandingPage. The record used to be flipped to `draft` first, so a first-page
+    // build spent its ENTIRE generation in a status that IN_FLIGHT_STATUSES, the
+    // abandoned-build janitor, and route-reuse all ignore. Agent mode (10-min run
+    // timeout) then could not find the in-flight job, told the user it FAILED, and a
+    // retry started a duplicate build with a second repo and a second Vercel project.
+    // `draft` keeps its real meaning: "has an undeployed version ready".
+    mockQuery.mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) });
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_1" });
+    // Version is still pending on the first poll, completed on the second — i.e. the
+    // record is mid-generation, which is exactly the window that used to read `draft`.
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v1", status: "pending" } })
+      .mockResolvedValue({ latestVersion: { id: "v1", status: "completed" } });
+    mockChatsDownloadVersion.mockRejectedValue(new Error("stop here — we only care about the status window"));
+
+    await generateLandingPage("user-1", "Launch", "Acme Home", {});
+
+    expect(statusesWritten()).not.toContain("draft");
+    expect(statusesWritten()).toContain("generating");
+    mockChatsGetById.mockReset();
+    mockChatsDownloadVersion.mockReset();
+  });
+
+  it("deployLandingPage preserves error.code on rethrow — the dead-chat branch is not dead code (ENG-287 residual F4)", async () => {
+    // deployLandingPage rethrew `new Error(\`Deployment failed: ${e.message}\`)`, minting a
+    // fresh Error and destroying `.code`. waitForCompletedV0Version is only ever reached
+    // through deployLandingPage on the first-page path, so generateFirstPage's
+    // `if (error.code === "V0_VERSION_FAILED") clearV0UsageForPage(...)` could never fire.
+    mockGet.mockReturnValue({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page_1",
+            userId: "user-1",
+            status: "draft",
+            v0ChatId: "chat_dead",
+            name: "Acme",
+            prompt: "p",
+          },
+        }),
+    });
+    mockChatsGetById.mockResolvedValue({ latestVersion: { id: "v_failed", status: "failed" } });
+
+    await expect(deployLandingPage("page_1", "user-1")).rejects.toMatchObject({
+      code: "V0_VERSION_FAILED",
+    });
+    mockChatsGetById.mockReset();
+    mockGet.mockReturnValue({ promise: () => Promise.resolve({ Item: null }) });
+  });
+
+  it("a user deploy is REFUSED while a build is actively generating — two builds must not race into one repo (ENG-287 residual)", async () => {
+    mockGet.mockReturnValue({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page_live",
+            userId: "user-1",
+            status: "generating",
+            v0ChatId: "chat_1",
+            name: "Acme",
+            prompt: "p",
+            updatedAt: new Date().toISOString(), // heartbeating — alive
+          },
+        }),
+    });
+
+    await expect(deployLandingPage("page_live", "user-1")).rejects.toThrow(/status: generating/);
+    mockGet.mockReturnValue({ promise: () => Promise.resolve({ Item: null }) });
+  });
+
+  it("but an ABANDONED generating build IS deployable — a crashed build must not block manual recovery for 30 min (ENG-287 residual)", async () => {
+    // The record no longer sits in `draft`, so it is now visible to the janitor (it used to
+    // be an eternal wedge). But until the janitor flips it to `failed` the user would be
+    // told "Cannot deploy a landing page with status: generating". No live process owns a
+    // build that has not moved past the stuck ceiling, so there is nothing to race.
+    const FORTY_MIN_AGO = new Date(Date.now() - 40 * 60 * 1000).toISOString();
+    mockGet.mockReturnValue({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page_dead",
+            userId: "user-1",
+            status: "generating",
+            v0ChatId: "chat_1",
+            name: "Acme",
+            prompt: "p",
+            updatedAt: FORTY_MIN_AGO, // no heartbeat for 40 min — abandoned
+          },
+        }),
+    });
+    mockChatsGetById.mockResolvedValue({ latestVersion: { id: "v1", status: "failed" } });
+
+    // Gets past the status gate and into the real deploy (which then fails on the dead chat)
+    // — the point is that it is no longer rejected out of hand.
+    await expect(deployLandingPage("page_dead", "user-1")).rejects.not.toThrow(/status: generating/);
+
+    mockChatsGetById.mockReset();
+    mockGet.mockReturnValue({ promise: () => Promise.resolve({ Item: null }) });
+  });
+
+  it("a long generation heartbeats `updatedAt` so the janitor cannot mark a LIVE build failed (ENG-287 residual F5)", async () => {
+    // The poll budget bounds SLEEPS, not wall-clock: each status read was itself allowed
+    // 300s, so a slow-but-alive v0 could keep the record untouched well past the
+    // janitor's 30-min `updatedAt` ceiling. The janitor would then mark a live build
+    // failed, the user would retry, and TWO live builds would push to the same repo.
+    mockQuery.mockReturnValue({ promise: () => Promise.resolve({ Items: [] }) });
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_1" });
+    // deployLandingPage re-reads the record — without this it throws "not found" and the
+    // poll (where the heartbeat lives) never runs.
+    mockGet.mockReturnValue({
+      promise: () =>
+        Promise.resolve({
+          Item: { id: "page_1", userId: "user-1", status: "generating", v0ChatId: "chat_1", name: "Acme Home", prompt: "p" },
+        }),
+    });
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v1", status: "pending" } })
+      .mockResolvedValueOnce({ latestVersion: { id: "v1", status: "pending" } })
+      .mockResolvedValue({ latestVersion: { id: "v1", status: "completed" } });
+    mockChatsDownloadVersion.mockRejectedValue(new Error("stop after the poll"));
+
+    await generateLandingPage("user-1", "Launch", "Acme Home", {});
+
+    // A heartbeat touches ONLY updatedAt — it must not smuggle in a status change.
+    const heartbeats = mockUpdate.mock.calls.filter(
+      (c: any) =>
+        /SET updatedAt/.test(c[0].UpdateExpression || "") &&
+        c[0].ExpressionAttributeValues?.[":status"] === undefined
+    );
+    expect(heartbeats.length).toBeGreaterThan(0);
+    mockChatsGetById.mockReset();
+    mockChatsDownloadVersion.mockReset();
+    mockGet.mockReturnValue({ promise: () => Promise.resolve({ Item: null }) });
+  });
+
+  it("deleteLandingPageByRecord frees the v0 identity — a deleted page's slug does not hijack the next generation (ENG-287 residual F1)", async () => {
+    // This is the function the DELETE route actually calls. `deleteLandingPage` — the one
+    // that DID free the identity — is imported by that route and never used, so in practice
+    // no user-initiated delete ever freed it. That only became dangerous when the fix
+    // removed the prompt from the idempotency key: a surviving `succeeded` row now silently
+    // HIJACKS the next generation of the same route. The user deletes a page, regenerates
+    // the same slug with a brand-new prompt, and gets the OLD chat back — their prompt is
+    // never sent to v0 and the identical page reappears.
+    const create = jest
+      .fn()
+      .mockResolvedValueOnce({ id: "chat_old" })
+      .mockResolvedValueOnce({ id: "chat_new" });
+    const args = {
+      userId: "user-1",
+      operation: "additional_page_chat_create" as const,
+      scopeId: "site-1",
+      slug: "pricing",
+      prompt: "the original prompt",
+      create,
+    };
+
+    await guardedV0ChatCreate(args);
+
+    await deleteLandingPageByRecord({
+      id: "page-1",
+      userId: "user-1",
+      siteId: "site-1",
+      slug: "pricing",
+      name: "Pricing",
+      status: "deployed",
+    } as any);
+
+    const afterDelete = await guardedV0ChatCreate({ ...args, prompt: "a COMPLETELY different prompt" });
+
+    expect(afterDelete).toMatchObject({ id: "chat_new" });
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it("deleting an IN-FLIGHT page does not free its identity — two live builds must never race into the same repo (ENG-287 residual)", async () => {
+    // The delete route does not check status. Freeing the identity of a build that is still
+    // running lets the next request for that slug mint a SECOND chat while the first is alive,
+    // and both commit into the same app/<slug>/ in the same repo. The archived record is
+    // invisible to findReusablePageForRoute, so the guard row is the only thing still deduping
+    // them. It is not immortal anyway — the reuse ceiling reclaims it.
+    const create = jest.fn().mockResolvedValue({ id: "chat_inflight" });
+    const args = {
+      userId: "user-1",
+      operation: "additional_page_chat_create" as const,
+      scopeId: "site-1",
+      slug: "about",
+      prompt: "p",
+      create,
+    };
+
+    await guardedV0ChatCreate(args);
+
+    await deleteLandingPageByRecord({
+      id: "page-2",
+      userId: "user-1",
+      siteId: "site-1",
+      slug: "about",
+      name: "About",
+      status: "generating", // still building
+    } as any);
+
+    const afterDelete = await guardedV0ChatCreate(args);
+
+    expect(afterDelete).toEqual({ id: "chat_inflight", reused: true });
+    expect(create).toHaveBeenCalledTimes(1); // no second chat, no second build
+  });
+
 });
 
 describe("v0Service - findSiteById (explicit site identity, replaces oldest-repo guess)", () => {
@@ -1536,6 +1855,9 @@ describe("v0Service - iterateLandingPage", () => {
         }),
     });
 
+    // iterate now reads the chat's current version before sending (that base version is what
+    // makes the async send safe), so the chat has to answer for sendMessage to be reached.
+    mockChatsGetById.mockResolvedValue({ latestVersion: { id: "v_base", status: "completed" } });
     mockChatsSendMessage.mockRejectedValueOnce(
       new Error("Send message failed")
     );
@@ -1543,6 +1865,7 @@ describe("v0Service - iterateLandingPage", () => {
     await expect(
       iterateLandingPage("page-1", "user-1", "change color")
     ).rejects.toThrow("Iteration failed");
+    mockChatsGetById.mockReset();
   });
 
   it("SUCCESS: deployed page → status reverts to draft, iterations +1", async () => {
@@ -1559,6 +1882,9 @@ describe("v0Service - iterateLandingPage", () => {
         }),
     });
 
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } })
+      .mockResolvedValue({ latestVersion: { id: "v_new", status: "completed" } });
     mockChatsSendMessage.mockResolvedValueOnce({});
 
     const result = await iterateLandingPage(
@@ -1569,6 +1895,149 @@ describe("v0Service - iterateLandingPage", () => {
 
     expect(result.status).toBe("draft");
     expect(result.iterations).toBe(3);
+    mockChatsGetById.mockReset();
+  });
+
+  // ── ENG-287 follow-up: iterate was the last sync v0 call behind the 300s ceiling ──
+  //
+  // A >300s iteration used to fail four ways at once: v0 applied the edit and charged for
+  // it anyway; our record never incremented and stayed `deployed`; deployLandingPage then
+  // REFUSED it ("Cannot deploy a landing page with status: deployed"), stranding the edit
+  // inside v0; and the retry re-sent the same message with no guard, so v0 applied it twice.
+  //
+  // Async was blocked because deployLandingPage reads "the latest completed version" — if
+  // iterate returned before v0 published the new one, the deploy would ship the
+  // PRE-iteration version and silently lose the user's edit. waitForCompletedV0Version's
+  // `afterVersionId` guard is what makes it safe: we do not return until v0 has published a
+  // version that is genuinely NOT the one we came in with.
+  const iterRecord = (over: Record<string, any> = {}) => ({
+    promise: () =>
+      Promise.resolve({
+        Item: {
+          id: "page-1",
+          userId: "user-1",
+          status: "deployed",
+          v0ChatId: "chat_1",
+          iterations: 0,
+          ...over,
+        },
+      }),
+  });
+
+  it("sends the iteration in ASYNC responseMode — no 300s race", async () => {
+    mockGet.mockReturnValue(iterRecord());
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } })
+      .mockResolvedValue({ latestVersion: { id: "v_new", status: "completed" } });
+    mockChatsSendMessage.mockResolvedValueOnce({});
+
+    await iterateLandingPage("page-1", "user-1", "Add testimonials");
+
+    expect(mockChatsSendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ responseMode: "async" })
+    );
+    mockChatsGetById.mockReset();
+  });
+
+  it("waits for a NEW version — a deploy can never grab the PRE-iteration version", async () => {
+    mockGet.mockReturnValue(iterRecord());
+    // v0 keeps reporting the OLD version for two polls before publishing the new one.
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } }) // base
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } }) // not yet
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } }) // not yet
+      .mockResolvedValue({ latestVersion: { id: "v_new", status: "completed" } });
+    mockChatsSendMessage.mockResolvedValueOnce({});
+
+    const result = await iterateLandingPage("page-1", "user-1", "Add testimonials");
+
+    // Only returns once v0 published something that is NOT v_base.
+    expect(result.status).toBe("draft"); // deployable — the edit is not stranded
+    expect(result.iterations).toBe(1);
+    mockChatsGetById.mockReset();
+  });
+
+  it("a retry of the SAME message while an iteration is pending does NOT re-send it (no double-apply)", async () => {
+    // The record already carries a pendingIteration from the attempt whose HTTP response the
+    // user lost. v0 accepted that message and is still working on it. Re-sending would apply
+    // the instruction twice — "add a testimonials section" becomes two sections, charged twice.
+    mockGet.mockReturnValue(
+      iterRecord({
+        pendingIteration: {
+          baseVersionId: "v_base",
+          messageHash: hashV0Prompt("Add testimonials"),
+          startedAt: new Date().toISOString(),
+        },
+      })
+    );
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } }) // unchanged → still generating
+      .mockResolvedValue({ latestVersion: { id: "v_new", status: "completed" } });
+
+    const result = await iterateLandingPage("page-1", "user-1", "Add testimonials");
+
+    expect(mockChatsSendMessage).not.toHaveBeenCalled(); // resumed, never re-sent
+    expect(result.status).toBe("draft");
+    mockChatsGetById.mockReset();
+  });
+
+  it("a retry AFTER v0 already published the edit adopts it — no re-send, no second charge", async () => {
+    mockGet.mockReturnValue(
+      iterRecord({
+        pendingIteration: {
+          baseVersionId: "v_base",
+          messageHash: hashV0Prompt("Add testimonials"),
+          startedAt: new Date().toISOString(),
+        },
+      })
+    );
+    // The version has MOVED ON from the recorded base → the earlier send landed.
+    mockChatsGetById.mockResolvedValue({ latestVersion: { id: "v_new", status: "completed" } });
+
+    const result = await iterateLandingPage("page-1", "user-1", "Add testimonials");
+
+    expect(mockChatsSendMessage).not.toHaveBeenCalled();
+    expect(result.status).toBe("draft");
+    expect(result.iterations).toBe(1);
+    mockChatsGetById.mockReset();
+  });
+
+  it("a DIFFERENT message still sends — the guard must not swallow a genuine second edit", async () => {
+    mockGet.mockReturnValue(
+      iterRecord({
+        pendingIteration: {
+          baseVersionId: "v_base",
+          messageHash: hashV0Prompt("Add testimonials"),
+          startedAt: new Date().toISOString(),
+        },
+      })
+    );
+    mockChatsGetById
+      .mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } })
+      .mockResolvedValue({ latestVersion: { id: "v_new2", status: "completed" } });
+    mockChatsSendMessage.mockResolvedValueOnce({});
+
+    await iterateLandingPage("page-1", "user-1", "Now make the hero blue");
+
+    expect(mockChatsSendMessage).toHaveBeenCalledTimes(1);
+    mockChatsGetById.mockReset();
+  });
+
+  it("a failed iteration leaves the page's status alone — the live page must not be marked failed", async () => {
+    mockGet.mockReturnValue(iterRecord({ status: "deployed" }));
+    mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "v_base", status: "completed" } });
+    mockChatsSendMessage.mockRejectedValueOnce(new Error("v0 is down"));
+
+    await expect(iterateLandingPage("page-1", "user-1", "Add testimonials")).rejects.toThrow(
+      /Iteration failed/
+    );
+
+    // The page is still live at its URL — nothing may flip it to `failed`.
+    const statuses = mockUpdate.mock.calls
+      .map((c: any) => c[0].ExpressionAttributeValues?.[":status"])
+      .filter(Boolean);
+    expect(statuses).not.toContain("failed");
+    mockChatsGetById.mockReset();
   });
 });
 
@@ -2058,6 +2527,402 @@ describe("V0OutputValidationError", () => {
 // =============================================================================
 // remapFilesForSubPage
 // =============================================================================
+describe("v0Service - remapFilesForSubPage — relative imports (prod: Module not found)", () => {
+  const buf = (s: string) => Buffer.from(s);
+
+  // v0 does not always emit the `@/` alias. A plain relative import is correct at the repo
+  // root and breaks the instant we move the file into app/<slug>/ — and the component it
+  // points at has usually ALSO moved into _components/, so the path is wrong twice over.
+  // Seen in prod as `Module not found: '../components/landing/nav'`: a failed Vercel build
+  // and a dead sub-page. Only the alias form was ever rewritten.
+  it("rewrites a RELATIVE import of a MOVED component (the observed failure)", () => {
+    const out = remapFilesForSubPage(
+      [
+        { path: "app/page.tsx", content: buf(`import Nav from "../components/landing/nav";\nexport default function P(){return <Nav/>;}`) },
+        { path: "components/landing/nav.tsx", content: buf(`export default function Nav(){return <nav/>;}`) },
+      ] as any,
+      "pricing",
+    );
+    const page = out.find((f) => f.path === "app/pricing/page.tsx")!.content.toString();
+
+    expect(page).not.toContain('"../components/landing/nav"');
+    expect(page).toContain('"./_components/landing/nav"');
+    // and the component really did move there
+    expect(out.map((f) => f.path)).toContain("app/pricing/_components/landing/nav.tsx");
+  });
+
+  it("rewrites a relative import of a NON-moved file (ui/lib stay at the root) to the alias", () => {
+    const out = remapFilesForSubPage(
+      [
+        {
+          path: "app/page.tsx",
+          content: buf(`import { Button } from "../components/ui/button";\nimport { cn } from "../lib/utils";\nexport default function P(){return <Button className={cn("x")}/>;}`),
+        },
+      ] as any,
+      "demo",
+    );
+    const page = out.find((f) => f.path === "app/demo/page.tsx")!.content.toString();
+
+    // components/ui and lib/utils are deliberately NOT copied — they already exist at the
+    // repo root — so the import must resolve from the root, not from app/<slug>/.
+    expect(page).toContain('"@/components/ui/button"');
+    expect(page).toContain('"@/lib/utils"');
+    expect(page).not.toContain('"../components/ui/button"');
+    expect(page).not.toContain('"../lib/utils"');
+  });
+
+  it("a component importing a SIBLING relatively still resolves after both move", () => {
+    const out = remapFilesForSubPage(
+      [
+        { path: "app/page.tsx", content: buf(`import Hero from "@/components/hero";\nexport default function P(){return <Hero/>;}`) },
+        { path: "components/hero.tsx", content: buf(`import Badge from "./badge";\nexport default function Hero(){return <Badge/>;}`) },
+        { path: "components/badge.tsx", content: buf(`export default function Badge(){return <b/>;}`) },
+      ] as any,
+      "about",
+    );
+    const hero = out.find((f) => f.path === "app/about/_components/hero.tsx")!.content.toString();
+
+    // ./badge → resolved to components/badge → @/components/badge → moved → ./_components/badge
+    // → and finally collapsed to ./badge, because hero and badge are siblings again.
+    expect(hero).toContain('"./badge"');
+    expect(hero).not.toContain("_components/badge");
+  });
+
+  it("leaves an import that escapes the repo root alone rather than emitting something wrong", () => {
+    const out = remapFilesForSubPage(
+      [{ path: "app/page.tsx", content: buf(`import x from "../../outside/thing";\nexport default function P(){return <x/>;}`) }] as any,
+      "edge",
+    );
+    const page = out.find((f) => f.path === "app/edge/page.tsx")!.content.toString();
+    expect(page).toContain('"../../outside/thing"');
+  });
+});
+
+// =============================================================================
+// repairSubPageImports — heal repos ALREADY poisoned by the pre-fix remap
+// =============================================================================
+// The remap fix stops NEW poisoning, but does nothing for pages already committed
+// to a repo. That matters more than it sounds: `next build` type-checks the whole
+// project, so ONE page with an unresolvable import fails the deployment for EVERY
+// page on the site — including new, correct ones. A site poisoned while the bug was
+// live can never deploy again, and regenerating cannot save it, because the broken
+// file is still sitting in the repo.
+//
+// The invariant that makes rewriting someone else's files safe:
+//   ONLY rewrite an import that does not currently resolve.
+// A healthy repo is untouched. A broken one can only move toward compiling. It is
+// idempotent, and it cannot break a working site.
+describe("v0Service - repairSubPageImports", () => {
+  // A repo whose sub-page was written by the OLD remap: page.tsx kept its relative
+  // import while the component it points at was moved into _components/.
+  const poisonedRepo = () =>
+    new Set([
+      "app/page.tsx",
+      "app/layout.tsx",
+      "app/eng287-race/page.tsx",
+      "app/eng287-race/_components/landing/nav.tsx",
+      "components/ui/button.tsx",
+      "lib/utils.ts",
+    ]);
+
+  it("repairs the observed prod break — '../components/landing/nav' in a moved page", () => {
+    const out = repairSubPageImports(
+      [{ path: "app/eng287-race/page.tsx", content: `import Nav from "../components/landing/nav";\n` }],
+      poisonedRepo(),
+    );
+
+    expect(out).toHaveLength(1);
+    // The component really did move to _components/ — point at where it ACTUALLY is.
+    expect(out[0].content).toContain('"@/app/eng287-race/_components/landing/nav"');
+    expect(out[0].content).not.toContain('"../components/landing/nav"');
+  });
+
+  it("LEAVES a resolving import alone — a healthy repo is never touched", () => {
+    const out = repairSubPageImports(
+      [{ path: "app/eng287-race/page.tsx", content: `import Nav from "./_components/landing/nav";\n` }],
+      poisonedRepo(),
+    );
+    // Nothing changed → nothing to commit.
+    expect(out).toEqual([]);
+  });
+
+  it("leaves a broken import alone when NOTHING in the repo could satisfy it", () => {
+    const out = repairSubPageImports(
+      [{ path: "app/eng287-race/page.tsx", content: `import x from "../components/does/not/exist";\n` }],
+      poisonedRepo(),
+    );
+    // We will not emit a confident guess at a file that isn't there.
+    expect(out).toEqual([]);
+  });
+
+  it("repairs non-moved roots (lib/, components/ui/) to the root alias", () => {
+    const out = repairSubPageImports(
+      [
+        {
+          path: "app/eng287-race/page.tsx",
+          content: `import { Button } from "../components/ui/button";\nimport { cn } from "../lib/utils";\n`,
+        },
+      ],
+      poisonedRepo(),
+    );
+
+    expect(out[0].content).toContain('"@/components/ui/button"');
+    expect(out[0].content).toContain('"@/lib/utils"');
+  });
+
+  it("repairs a broken import inside a moved _components file (resolved against components/)", () => {
+    const paths = poisonedRepo();
+    paths.add("app/eng287-race/_components/hero.tsx");
+    const out = repairSubPageImports(
+      // Originally components/hero.tsx, so `../lib/utils` meant lib/utils at the root.
+      [{ path: "app/eng287-race/_components/hero.tsx", content: `import { cn } from "../lib/utils";\n` }],
+      paths,
+    );
+    expect(out[0].content).toContain('"@/lib/utils"');
+  });
+
+  it("is idempotent — a second pass over repaired output changes nothing", () => {
+    const paths = poisonedRepo();
+    const first = repairSubPageImports(
+      [{ path: "app/eng287-race/page.tsx", content: `import Nav from "../components/landing/nav";\n` }],
+      paths,
+    );
+    const second = repairSubPageImports(first, paths);
+    expect(second).toEqual([]);
+  });
+
+  it("never touches the ROOT page — it was never moved, so its relative imports are correct", () => {
+    const out = repairSubPageImports(
+      [{ path: "app/page.tsx", content: `import Nav from "../components/landing/nav";\n` }],
+      poisonedRepo(),
+    );
+    expect(out).toEqual([]);
+  });
+});
+
+// =============================================================================
+// ensurePageMetadataTitle — never inject metadata into a CLIENT component
+// =============================================================================
+// A client component cannot export `metadata` — Next.js fails the build with
+// "You are attempting to export metadata from a component marked with use client".
+// We were injecting it right after the 'use client' directive and calling that
+// "defensive". It is the opposite: it manufactures a page that can never build, and
+// because next build type-checks the whole project, that one page bricks the WHOLE
+// site. Observed in prod on a shared site whose sibling pages "illegally exported
+// metadata from client components" — pages we generated.
+//
+// A missing <title> is a cosmetic problem. An unbuildable site is not. When v0 emits a
+// client component, we drop the title rather than break the deployment.
+describe("v0Service - ensurePageMetadataTitle — client components", () => {
+  it("does NOT inject metadata into a 'use client' page (it would fail the build)", () => {
+    const out = ensurePageMetadataTitle(`"use client";\n\nexport default function P(){return null;}`, "Pricing");
+    expect(out).not.toContain("export const metadata");
+  });
+
+  it("handles the single-quoted directive too", () => {
+    const out = ensurePageMetadataTitle(`'use client'\n\nexport default function P(){return null;}`, "Pricing");
+    expect(out).not.toContain("export const metadata");
+  });
+
+  it("leaves the client component's source otherwise untouched", () => {
+    const src = `"use client";\n\nexport default function P(){return null;}`;
+    expect(ensurePageMetadataTitle(src, "Pricing")).toBe(src);
+  });
+
+  it("still injects metadata into a SERVER component (the normal case)", () => {
+    const out = ensurePageMetadataTitle(`export default function P(){return null;}`, "Pricing");
+    expect(out).toContain('export const metadata = { title: "Pricing" };');
+  });
+});
+
+// =============================================================================
+// repairPoisonedSubPagesInRepo — the wiring that heals a live repo
+// =============================================================================
+// Adding a page to a poisoned site is exactly when we can heal it: we are already
+// listing the repo and pushing a commit. The repairs ride along in the SAME commit as
+// the new page, so one Vercel build validates both.
+describe("v0Service - repairPoisonedSubPagesInRepo", () => {
+  const tree = (paths: string[]) => ({ data: { tree: paths.map((p) => ({ path: p, type: "blob" })) } });
+  const blob = (s: string) => ({ data: { content: Buffer.from(s).toString("base64"), encoding: "base64" } });
+
+  beforeEach(() => {
+    mockAxiosGet.mockReset();
+  });
+
+  // A mockImplementation outlives the test that set it — reset, or it hijacks every
+  // axios.get in the suites that follow.
+  afterEach(() => {
+    mockAxiosGet.mockReset();
+  });
+
+  it("returns a repaired sibling page that would otherwise brick the whole site build", async () => {
+    mockAxiosGet.mockImplementation((url: string) => {
+      const u = String(url);
+      if (u.includes("/git/trees/")) {
+        return Promise.resolve(
+          tree([
+            "app/page.tsx",
+            "app/eng287-race/page.tsx",
+            "app/eng287-race/_components/landing/nav.tsx",
+          ]),
+        );
+      }
+      if (u.includes("/contents/app/eng287-race/page.tsx")) {
+        return Promise.resolve(blob(`import Nav from "../components/landing/nav";\n`));
+      }
+      return Promise.resolve(blob(`export default function C(){return null;}\n`));
+    });
+
+    const out = await repairPoisonedSubPagesInRepo("o/r", {}, new Set());
+
+    const page = out.find((f) => f.path === "app/eng287-race/page.tsx");
+    expect(page).toBeDefined();
+    expect(page!.content!.toString()).toContain('"@/app/eng287-race/_components/landing/nav"');
+  });
+
+  it("returns nothing for a healthy repo — no commit, no rebuild", async () => {
+    mockAxiosGet.mockImplementation((url: string) => {
+      const u = String(url);
+      if (u.includes("/git/trees/")) {
+        return Promise.resolve(tree(["app/ok/page.tsx", "app/ok/_components/hero.tsx"]));
+      }
+      return Promise.resolve(blob(`import Hero from "./_components/hero";\n`));
+    });
+
+    expect(await repairPoisonedSubPagesInRepo("o/r", {}, new Set())).toEqual([]);
+  });
+
+  it("skips files the caller is already committing — the new page is correct by construction", async () => {
+    mockAxiosGet.mockImplementation((url: string) => {
+      const u = String(url);
+      if (u.includes("/git/trees/")) {
+        return Promise.resolve(tree(["app/brand-new/page.tsx", "app/brand-new/_components/x.tsx"]));
+      }
+      return Promise.resolve(blob(`import X from "../components/x";\n`));
+    });
+
+    // The page being added this run is already remapped correctly — re-reading and
+    // "repairing" the stale copy in the repo would clobber it.
+    const out = await repairPoisonedSubPagesInRepo(
+      "o/r",
+      {},
+      new Set(["app/brand-new/page.tsx", "app/brand-new/_components/x.tsx"]),
+    );
+    expect(out).toEqual([]);
+  });
+});
+
+// =============================================================================
+// deleteLandingPageByRecord — remove the WHOLE page directory from the repo
+// =============================================================================
+// removePageFromGitHub deleted exactly one file: app/<slug>/page.tsx. But the remap
+// also writes app/<slug>/_components/**. next build type-checks the whole project, so
+// an orphaned component left behind with an unresolvable import STILL fails the build
+// for every page on the site — meaning "delete the broken page" did not actually
+// unbreak the site. Deleting a page must take its whole directory with it.
+describe("v0Service - deleteLandingPageByRecord removes the whole page directory", () => {
+  const repoTree = {
+    data: {
+      tree: [
+        { path: "app/page.tsx", type: "blob" },
+        { path: "app/pricing/page.tsx", type: "blob" },
+        { path: "app/pricing/_components/landing/nav.tsx", type: "blob" },
+        { path: "app/keep-me/page.tsx", type: "blob" },
+      ],
+    },
+  };
+
+  beforeEach(() => {
+    mockAxiosGet.mockReset();
+    mockAxiosPost.mockReset();
+    mockAxiosPatch.mockReset();
+    mockAxiosGet.mockImplementation((url: string) =>
+      Promise.resolve(
+        String(url).includes("/git/trees/") ? repoTree : { data: { object: { sha: "main-sha" } } },
+      ),
+    );
+    mockAxiosPost.mockResolvedValue({ data: { sha: "new-sha" } });
+    mockAxiosPatch.mockResolvedValue({ data: {} });
+  });
+
+  // These mockImplementation/mockResolvedValue defaults persist — clear them, or they
+  // hijack axios for every suite that runs after this one.
+  afterEach(() => {
+    mockAxiosGet.mockReset();
+    mockAxiosPost.mockReset();
+    mockAxiosPatch.mockReset();
+  });
+
+  const deletedPaths = () => {
+    const treeCall = mockAxiosPost.mock.calls.find((c) => String(c[0]).includes("/git/trees"));
+    if (!treeCall) return null;
+    return (treeCall[1].tree as any[])
+      .filter((e) => e.sha === null)
+      .map((e) => e.path)
+      .sort();
+  };
+
+  it("deletes _components too, not just page.tsx (an orphan component bricks the site build)", async () => {
+    await deleteLandingPageByRecord({
+      id: "p1",
+      userId: "u1",
+      slug: "pricing",
+      name: "Pricing",
+      status: "deployed",
+      githubRepoUrl: "https://github.com/o/r",
+    } as any);
+
+    expect(deletedPaths()).toEqual([
+      "app/pricing/_components/landing/nav.tsx",
+      "app/pricing/page.tsx",
+    ]);
+  });
+
+  it("does not touch any OTHER page in the shared repo", async () => {
+    await deleteLandingPageByRecord({
+      id: "p1",
+      userId: "u1",
+      slug: "pricing",
+      name: "Pricing",
+      status: "deployed",
+      githubRepoUrl: "https://github.com/o/r",
+    } as any);
+
+    const deleted = deletedPaths()!;
+    expect(deleted).not.toContain("app/keep-me/page.tsx");
+    expect(deleted).not.toContain("app/page.tsx");
+  });
+
+  it("commits nothing when the page directory is not in the repo", async () => {
+    await deleteLandingPageByRecord({
+      id: "p1",
+      userId: "u1",
+      slug: "never-committed",
+      name: "Ghost",
+      status: "failed",
+      githubRepoUrl: "https://github.com/o/r",
+    } as any);
+
+    // Nothing to remove — do not push an empty commit and trigger a pointless rebuild.
+    expect(deletedPaths()).toBeNull();
+  });
+
+  it("a GitHub failure does not block the record delete (the page must still disappear)", async () => {
+    mockAxiosGet.mockRejectedValue(new Error("GitHub 500"));
+
+    await expect(
+      deleteLandingPageByRecord({
+        id: "p1",
+        userId: "u1",
+        slug: "pricing",
+        name: "Pricing",
+        status: "deployed",
+        githubRepoUrl: "https://github.com/o/r",
+      } as any),
+    ).resolves.not.toThrow();
+  });
+});
+
 describe("v0Service - remapFilesForSubPage", () => {
   const buf = (s: string) => Buffer.from(s);
 
@@ -2241,12 +3106,14 @@ describe("v0Service - ensurePageMetadataTitle", () => {
     expect(out).toContain('robots: "index"');
   });
 
-  it("preserves 'use client' directive position", () => {
+  it("leaves a 'use client' page untouched — exporting metadata there fails the build", () => {
+    // This test previously asserted the bug: it expected metadata to be INJECTED right after
+    // the directive. A client component cannot export metadata — Next.js hard-fails the build,
+    // and because it type-checks the whole project, that one page bricks the entire site.
     const input = `'use client'\n\nexport default function Page() {}`;
     const out = ensurePageMetadataTitle(input, "Client Page");
-    // 'use client' must remain first line
-    expect(out.split("\n")[0]).toBe("'use client'");
-    expect(out).toContain('export const metadata = { title: "Client Page" };');
+    expect(out).toBe(input);
+    expect(out).not.toContain("export const metadata");
   });
 
   it("returns input unchanged when title is empty", () => {
@@ -2374,8 +3241,11 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     return zipBuffer;
   };
 
-  // Setup: mock GitHub API (ref, blob, tree, commit, patch)
+  // Setup: mock GitHub API (repair scan, ref, blob, tree, commit, patch)
   const setupGitHubMocks = () => {
+    // GET git/trees/main?recursive=1 — the poisoned-import repair scan runs first.
+    // An empty tree means a healthy repo: nothing to scan, nothing to repair, no extra reads.
+    mockAxiosGet.mockResolvedValueOnce({ data: { tree: [] } });
     // GET ref/heads/main
     mockAxiosGet.mockResolvedValueOnce({
       data: { object: { sha: "abc123" } },
@@ -2509,6 +3379,131 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     expect(result.errorMessage).toContain("Vercel build failed");
   });
 
+  it("a Vercel build failure FREES the route identity — the retry mints a FRESH chat, not the one whose code will not compile (ENG-287 residual F2)", async () => {
+    // The deterministic wedge. v0 emits code that does not build; the guard row is left
+    // `succeeded` (it records that the CHAT was created, not that a page shipped), so
+    // every retry reuses the same chat, re-downloads the same broken version and fails
+    // identically — forever. And because the prompt is deliberately not part of the key,
+    // retrying with a DIFFERENT prompt reuses it too. This route is unbuildable for all
+    // time, and the user has no lever. Note the Vercel-error path RETURNS rather than
+    // throws, so the catch block that frees the identity never even runs.
+    setupSiteRecordMock();
+    await setupV0Mocks(); // chat_new_page → code that fails to build
+    setupGitHubMocks();
+    // A REAL build error. Note setupVercelDeployErrorMock() cannot be used here: its
+    // deployment carries no meta.githubCommitSha, so pollVercelDeployment's SHA-match guard
+    // never selects it and the poll falls through to `timeout` instead — that helper does
+    // not actually exercise the build-error path.
+    mockAxiosGet.mockResolvedValueOnce({
+      data: { deployments: [{ uid: "dpl_fail", readyState: "ERROR", meta: { githubCommitSha: "commit_sha" } }] },
+    });
+    mockAxiosGet.mockResolvedValueOnce({
+      data: [{ type: "stderr", payload: { text: "Module not found: @/components/missing" } }],
+    });
+
+    const first = await generateLandingPage("user-1", "Create ABM page", "ABM Startups", {});
+    expect(first.status).toBe("failed");
+    expect(first.errorMessage).toContain("Vercel build failed");
+
+    // Retry the same route — this time v0 would produce code that builds.
+    setupSiteRecordMock();
+    const zip = await createTestZip();
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_fresh" });
+    mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "version_fresh" } });
+    mockChatsDownloadVersion.mockResolvedValueOnce(zip);
+    setupGitHubMocks();
+    setupVercelDeploySuccessMock();
+
+    const second = await generateLandingPage("user-1", "Create ABM page", "ABM Startups", {});
+
+    expect(mockChatsCreate).toHaveBeenCalledTimes(2); // a FRESH chat, not chat_new_page
+    expect(second.status).toBe("deployed");
+  });
+
+  it("a Vercel poll TIMEOUT keeps the chat — 'we stopped waiting' is not 'the code will never compile' (ENG-287 residual)", async () => {
+    // The dangerous half of the dead-end split. pollVercelDeployment returns `timeout` after
+    // only 5 minutes, and also degrades Vercel API flakiness to `timeout`. A normal Next.js
+    // cold build can outrun that. If we treated it as a dead end and freed the identity, the
+    // page would go LIVE a minute later while the card said `failed` — and the user's retry
+    // would mint a second full-cost chat and push a second commit to the same repo. That is
+    // precisely the orphan-chat double-spend this whole issue is about.
+    setupSiteRecordMock();
+    await setupV0Mocks(); // chat_new_page
+    setupGitHubMocks();
+    // Every Vercel poll says BUILDING → pollVercelDeployment gives up with buildStatus
+    // "timeout". Exactly vercelPollMaxAttempts (30, set in beforeEach) — queueing more would
+    // leak unconsumed mockResolvedValueOnce values into the tests that follow.
+    for (let i = 0; i < 30; i++) {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { deployments: [{ uid: "dpl_slow", readyState: "BUILDING", meta: { githubCommitSha: "commit_sha" } }] },
+      });
+    }
+
+    const first = await generateLandingPage("user-1", "Create a page", "Slow Build", {});
+    expect(first.status).toBe("failed");
+    expect(first.errorMessage).toMatch(/timed out/i);
+
+    // Retry: the chat is still good, so it must be REUSED, not re-minted.
+    setupSiteRecordMock();
+    const zip = await createTestZip();
+    mockChatsGetById.mockResolvedValue({ latestVersion: { id: "version_new", status: "completed" } });
+    mockChatsDownloadVersion.mockResolvedValueOnce(zip);
+    setupGitHubMocks();
+    setupVercelDeploySuccessMock();
+
+    await generateLandingPage("user-1", "Create a page", "Slow Build", {});
+
+    expect(mockChatsCreate).toHaveBeenCalledTimes(1); // never charged twice
+    mockChatsGetById.mockReset();
+  });
+
+  it("a budget-exhausted PENDING generation keeps the chat — the retry RESUMES it rather than paying twice (ENG-287 residual)", async () => {
+    // The other half of the reuse contract, and the reason the age ceiling is a backstop
+    // rather than the primary mechanism. A DEAD END must free the identity; a merely-SLOW
+    // v0 must not. Freeing it here would mint a second full-cost chat while the first is
+    // still generating — precisely the orphan-chat credit burn (~$39 of a $50 block in 10
+    // days) that this whole issue is about. Sub-page keys are (site, slug), so they are
+    // stable across retries and this is observable.
+    setV0PollIntervals([0, 0]); // exhaust the poll budget immediately
+    setupSiteRecordMock();
+    mockChatsCreate.mockResolvedValue({ id: "chat_slow" });
+    mockChatsGetById.mockResolvedValue({ latestVersion: { id: "v1", status: "pending" } });
+
+    const first = await generateLandingPage("user-1", "Create a page", "Slow Page", {});
+    expect(first.status).toBe("failed");
+
+    // v0 finishes in the background. The retry must pick the SAME chat back up.
+    setupSiteRecordMock();
+    const zip = await createTestZip();
+    mockChatsGetById.mockResolvedValue({ latestVersion: { id: "v1", status: "completed" } });
+    mockChatsDownloadVersion.mockResolvedValueOnce(zip);
+    setupGitHubMocks();
+    setupVercelDeploySuccessMock();
+
+    const second = await generateLandingPage("user-1", "Create a page", "Slow Page", {});
+
+    expect(mockChatsCreate).toHaveBeenCalledTimes(1); // resumed, never charged twice
+    expect(second.status).toBe("deployed");
+    setV0PollIntervals([0, 0, 0, 0, 0]);
+  });
+
+  it("a v0 zip-download timeout is NOT retried 3x — the original 15-min hang, moved to downloadVersion (ENG-287 residual)", async () => {
+    // withRetry's default retries OUR synthetic 300s ceiling three times. This call sits
+    // inside a 3-round validation loop, so the worst case was 3 x 3 x 300s = 45 min —
+    // worse than the hang that started this, and past the MCP tool's own 25-min budget.
+    setupSiteRecordMock();
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_slow" });
+    mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "version_slow" } });
+    const timeout: any = new Error("v0 zip download timed out after 300s");
+    timeout.code = "V0_CALL_TIMEOUT";
+    mockChatsDownloadVersion.mockRejectedValue(timeout);
+
+    const result = await generateLandingPage("user-1", "Create a page", "Slow Page", {});
+
+    expect(result.status).toBe("failed");
+    expect(mockChatsDownloadVersion).toHaveBeenCalledTimes(1); // fail fast, one attempt
+  });
+
   it("FAIL: Vercel deployment times out → record status set to failed", async () => {
     setupSiteRecordMock();
     await setupV0Mocks();
@@ -2578,8 +3573,10 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     );
 
     expect(result.status).toBe("deployed");
-    // At least 2 Vercel polling calls after the GitHub GET ref call
-    expect(mockAxiosGet).toHaveBeenCalledTimes(3); // 1 GitHub ref + 2 Vercel polls
+    // 1 repair-scan tree listing + 1 GitHub ref + 2 Vercel polls.
+    // The tree listing is the whole cost of the poisoned-import scan on a healthy repo:
+    // an empty/clean tree yields no candidates, so no file contents are ever read.
+    expect(mockAxiosGet).toHaveBeenCalledTimes(4);
   });
 
   it("SUCCESS: sub-page deployedUrl uses customDomainUrl as base when existingPage has one", async () => {

@@ -25,6 +25,7 @@ import {
   validateBrowserTask,
   buildScopeRejectionResult,
   suggestAlternativeTool,
+  buildLocalAgentUnavailableResult,
 } from '../emma/localAgentTools';
 import { toolResultError } from '../utils/toolResultError';
 
@@ -130,6 +131,39 @@ describe('run_local_agent_task scope-rejection reliability', () => {
     });
     it('accepts scraping a known site', () => {
       expect(validateBrowserTask('Scrape the product names from https://shop.example.com')).toBeNull();
+    });
+  });
+
+  describe('local-agent relay availability is a graceful fallback signal', () => {
+    it('returns success:true when the relay is unavailable so Website Scan can continue', () => {
+      const result = buildLocalAgentUnavailableResult('not_configured', 'Local agent relay not configured');
+
+      expect(result.success).toBe(true);
+      expect(result.unavailable).toBe(true);
+    });
+
+    it('is NOT downgraded to an error by toolResultError', () => {
+      const result = buildLocalAgentUnavailableResult('unreachable', 'Failed to reach local agent relay: ECONNREFUSED');
+
+      expect(toolResultError(result)).toBeNull();
+    });
+
+    it('tells the model to continue with cloud browser and read_page_source instead of retrying local agent', () => {
+      const result = buildLocalAgentUnavailableResult('not_configured', 'Local agent relay not configured');
+
+      expect(result.formattedContent).toContain('continue the website scan');
+      expect(result.formattedContent).toContain('Playwright');
+      expect(result.formattedContent).toContain('read_page_source');
+      expect(result.formattedContent).toContain('Do not retry run_local_agent_task');
+    });
+
+    it('preserves the operator-facing reason without exposing secrets', () => {
+      const result = buildLocalAgentUnavailableResult('auth_failed', 'Local agent relay rejected the request');
+
+      expect(result.reason).toBe('auth_failed');
+      expect(result.message).toContain('Local agent relay rejected the request');
+      expect(result.formattedContent).not.toContain('apiKey');
+      expect(result.formattedContent).not.toContain('secret');
     });
   });
 });

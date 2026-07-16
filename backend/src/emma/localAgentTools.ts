@@ -302,6 +302,186 @@ export function buildScopeRejectionResult(reason: string, suggestedTool: string)
   };
 }
 
+export function buildLocalAgentUnavailableResult(
+  reason: 'not_configured' | 'unreachable' | 'auth_failed' | 'bad_response',
+  message: string,
+): {
+  success: true;
+  unavailable: true;
+  reason: string;
+  message: string;
+  formattedContent: string;
+} {
+  return {
+    success: true,
+    unavailable: true,
+    reason,
+    message,
+    formattedContent:
+      `${message}\n\n` +
+      'The local browser relay is unavailable, but this is only a fallback. ' +
+      'Do not retry run_local_agent_task in this run; continue the website scan with the cloud Playwright browser tools, read_page_source, and search tools. ' +
+      'If the cloud browser can load enough page content, complete the audit from that evidence. ' +
+      'If bot protection blocks all cloud-browser evidence, report that manual browser verification is needed instead of marking the whole scan as an internal tool failure.',
+  };
+}
+
+/**
+ * Detect a PROCESS-LEVEL crash of the local-agent worker — killed by an OS signal
+ * (SIGKILL from the OOM-killer, SIGSEGV, SIGABRT, ...) — as opposed to a normal task
+ * failure (worker ran, exited non-zero, or returned ok:false with a text reason).
+ *
+ * A signal-kill is INFRASTRUCTURE, not task content: it recurs on every task no
+ * matter what we send, so retrying just crashes the worker again (ENG-339: a
+ * scheduled run crashed 4x with returncode -9 and tripped the repeated-failure
+ * breaker). Two encodings appear in the wild:
+ *   - Python subprocess: killed by signal N  -> returncode -N   (SIGKILL -> -9)
+ *   - Shell / 128+signal: killed by signal N -> returncode 128+N (SIGKILL -> 137)
+ * -1 is our "returncode omitted" sentinel (see buildLocalAgentResult), NOT a signal.
+ */
+export function isProcessCrashReturncode(returncode: number | null | undefined): boolean {
+  if (typeof returncode !== 'number' || !Number.isFinite(returncode)) return false;
+  if (returncode <= -2) return true; // -N signal encoding (excludes the -1 sentinel)
+  if (returncode > 128) return true; // 128+N shell encoding (137 = OOM SIGKILL)
+  return false;
+}
+
+/**
+ * A SIGKILL (-9, or 137 = 128+9) reaches us from TWO sources that are
+ * indistinguishable by returncode alone:
+ *   1. the OS OOM-killer / a genuine worker crash, OR
+ *   2. the relay's OWN per-task timeout — runner.py SIGKILLs the worker when a
+ *      task outruns timeout_seconds and STILL returns HTTP 200 + returncode -9
+ *      (runner.py `proc.kill()`, http_server.py final body).
+ * Treating (2) as an OOM crash mislabels a slow-but-healthy task (the ENG-339
+ * 3-subreddit digest needs >120s) and wrongly forbids the retry it actually needs.
+ * We disambiguate by ELAPSED wall-time: a worker killed at (or just shy of) the
+ * task-timeout window almost certainly hit the relay timeout — retryable with a
+ * larger timeout; one killed well UNDER the timeout was almost certainly
+ * OOM/crash-killed and must NOT be retried (it just crashes again — ENG-339).
+ *
+ * Only SIGKILL is timeout-ambiguous; other fatal signals (SIGSEGV/SIGABRT, ...)
+ * are never produced by the relay timeout path, so they stay genuine crashes.
+ */
+export function isLikelyRelayTimeoutKill(
+  returncode: number,
+  elapsedMs: number,
+  timeoutSeconds: number,
+): boolean {
+  if (returncode !== -9 && returncode !== 137) return false;
+  if (!Number.isFinite(elapsedMs) || !Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) return false;
+  return elapsedMs >= timeoutSeconds * 1000 * 0.9;
+}
+
+/**
+ * Shape a worker process-crash as a GRACEFUL, non-retryable outcome — the same
+ * pattern as buildLocalAgentUnavailableResult. success:true keeps the dispatch
+ * layer from recording it as agent_tool_failed / feeding the repeated-failure
+ * breaker (a crash is not a task failure), and the guidance stops the model from
+ * re-invoking a worker that will just crash again (ENG-339).
+ */
+export function buildLocalAgentCrashResult(returncode: number): {
+  success: true;
+  unavailable: true;
+  reason: 'crashed';
+  returncode: number;
+  message: string;
+  formattedContent: string;
+} {
+  // -9 (SIGKILL) and 137 (128+9) are what the OS OOM-killer produces — name memory
+  // explicitly so the reason is actionable. Other signals are generic crashes.
+  const likelyOom = returncode === -9 || returncode === 137;
+  const message = likelyOom
+    ? `The local browser agent worker was killed (returncode ${returncode}), most likely out of memory.`
+    : `The local browser agent worker crashed at the process level (returncode ${returncode}).`;
+  return {
+    success: true,
+    unavailable: true,
+    reason: 'crashed',
+    returncode,
+    message,
+    formattedContent:
+      `${message}\n\n` +
+      'This is an infrastructure fault, not a problem with the task — the worker keeps getting killed, so retrying will crash it the same way. ' +
+      'Do NOT retry run_local_agent_task in this run. Continue with the cloud browser tools and you_search_web to gather what you can. ' +
+      'If the data is unreachable from those, report that the local agent is temporarily unavailable rather than marking the whole run as an internal tool failure.',
+  };
+}
+
+/**
+ * Shape a relay TIMEOUT-kill (worker SIGKILLed for outrunning timeout_seconds, not
+ * OOM) as a graceful, RETRYABLE outcome. Unlike a genuine crash, the task simply
+ * needs more time, so we PRESERVE the retry-with-larger-timeout recovery path
+ * (ENG-339 rec #3: retry-with-backoff) instead of forbidding all local-agent
+ * retries. success:true keeps it off the repeated-failure breaker; reason:'timed_out'
+ * distinguishes it from a genuine 'crashed'.
+ */
+export function buildLocalAgentTimeoutResult(
+  returncode: number,
+  timeoutSeconds: number,
+): {
+  success: true;
+  unavailable: true;
+  reason: 'timed_out';
+  returncode: number;
+  timeoutSeconds: number;
+  suggestedTimeoutSeconds: number;
+  message: string;
+  formattedContent: string;
+} {
+  // Back off with a larger timeout, capped at the tool's 900s ceiling.
+  const suggestedTimeoutSeconds = Math.min(Math.round(timeoutSeconds * 2), 900);
+  const canRetryLonger = suggestedTimeoutSeconds > timeoutSeconds;
+  const message = `The local browser agent task ran the full ${timeoutSeconds}s and was stopped (returncode ${returncode}) — it timed out rather than crashing.`;
+  return {
+    success: true,
+    unavailable: true,
+    reason: 'timed_out',
+    returncode,
+    timeoutSeconds,
+    suggestedTimeoutSeconds,
+    message,
+    formattedContent:
+      `${message}\n\n` +
+      (canRetryLonger
+        ? 'This is a timeout, not an infrastructure crash — the task simply needs more time (e.g. a multi-subreddit digest). ' +
+          `Retry run_local_agent_task ONCE with timeout_seconds: ${suggestedTimeoutSeconds}, and narrow the task if you can (fewer pages per call). ` +
+          'If it times out again, fall back to the cloud browser tools and you_search_web instead of retrying further.'
+        : `The task already ran at the maximum timeout (${timeoutSeconds}s), so a longer retry is not possible. ` +
+          'Fall back to the cloud browser tools and you_search_web, or split the task into smaller per-page calls.'),
+  };
+}
+
+/**
+ * Route a parsed relay response to a graceful process-crash outcome, or null if it
+ * is not a worker crash and should fall through to normal result handling (ENG-339).
+ *
+ * A process-level crash (killed by a signal — OOM SIGKILL, etc.) recurs on every
+ * task, so it degrades to a non-retryable unavailable outcome instead of a task
+ * failure the model retries into the ground. BUT a SIGKILL that lands at the end of
+ * the timeout window is the relay's OWN per-task timeout (runner.py kills the worker
+ * on TimeoutExpired), not an OOM crash — that IS retryable with a larger timeout, so
+ * that path is preserved. `parsed.ok === true` and normal non-zero exits (returncode
+ * 1, "Page returned 500", …) return null and keep their existing error handling.
+ *
+ * Extracted from the handler so the exact routing — the ok-guard and the
+ * timeout-vs-crash split — is unit-testable without mocking the relay transport.
+ */
+export function classifyRelayProcessCrash(
+  parsed: { ok?: unknown; returncode?: number | null },
+  elapsedMs: number,
+  timeoutSeconds: number,
+):
+  | ReturnType<typeof buildLocalAgentTimeoutResult>
+  | ReturnType<typeof buildLocalAgentCrashResult>
+  | null {
+  if (parsed.ok === true || !isProcessCrashReturncode(parsed.returncode)) return null;
+  const returncode = parsed.returncode as number;
+  return isLikelyRelayTimeoutKill(returncode, elapsedMs, timeoutSeconds)
+    ? buildLocalAgentTimeoutResult(returncode, timeoutSeconds)
+    : buildLocalAgentCrashResult(returncode);
+}
+
 emmaToolRegistry.register({
   name: 'run_local_agent_task',
   definition: {
@@ -366,10 +546,10 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
 
     const config = await getRelayConfig();
     if (!config) {
-      return {
-        success: false,
-        error: 'Local agent relay not configured. Store the secret at dev/AgentWeb/LocalAgentRelay (or prod/...) with {"endpoint":"https://xxx.ngrok-free.app","apiKey":"YOUR_API_KEY"}.',
-      };
+      return buildLocalAgentUnavailableResult(
+        'not_configured',
+        'Local agent relay is not configured for this environment.',
+      );
     }
 
     const timeoutSeconds = Math.min(args.timeout_seconds ?? 120, 900);
@@ -396,25 +576,45 @@ This tool is read-only, browser-only. If the user asks for anything outside web 
     const taskUrl = config.endpoint.replace(/\/$/, '') + '/task';
 
     let rawResponse: { status: number; data: string };
+    const startedAt = Date.now();
     try {
       rawResponse = await httpRequest('POST', taskUrl, config.apiKey, requestBody, (timeoutSeconds + 90) * 1000);
     } catch (err: any) {
-      return { success: false, error: `Failed to reach local agent relay: ${err.message}` };
+      return buildLocalAgentUnavailableResult(
+        'unreachable',
+        `Failed to reach local agent relay: ${err.message}`,
+      );
     }
+    const elapsedMs = Date.now() - startedAt;
 
     if (rawResponse.status === 401) {
-      return { success: false, error: 'Local agent relay rejected the request — check the secret token.' };
+      return buildLocalAgentUnavailableResult(
+        'auth_failed',
+        'Local agent relay rejected the request.',
+      );
     }
     if (rawResponse.status !== 200) {
-      return { success: false, error: `Local agent relay returned status ${rawResponse.status}: ${rawResponse.data.slice(0, 500)}` };
+      return buildLocalAgentUnavailableResult(
+        'bad_response',
+        `Local agent relay returned status ${rawResponse.status}: ${rawResponse.data.slice(0, 200)}`,
+      );
     }
 
     let parsed: any;
     try {
       parsed = JSON.parse(rawResponse.data);
     } catch {
-      return { success: false, error: 'Invalid JSON from local agent relay.' };
+      return buildLocalAgentUnavailableResult(
+        'bad_response',
+        'Invalid JSON from local agent relay.',
+      );
     }
+
+    // A process-level worker crash (OOM SIGKILL, etc.) degrades gracefully instead
+    // of being retried into the ground; a timeout-kill stays retryable (ENG-339).
+    // See classifyRelayProcessCrash for the full routing rationale.
+    const crashResult = classifyRelayProcessCrash(parsed, elapsedMs, timeoutSeconds);
+    if (crashResult) return crashResult;
 
     const screenshotUrls: string[] = [];
     if (parsed.ok && Array.isArray(parsed.screenshots) && parsed.screenshots.length > 0) {

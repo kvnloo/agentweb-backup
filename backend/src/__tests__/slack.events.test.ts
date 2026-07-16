@@ -570,6 +570,85 @@ describe('Slack Events API', () => {
         );
       });
 
+      it('sends "[attached file]" and the S3 attachment when a file-only thread reply is ingested', async () => {
+        settingsService.getSetting.mockResolvedValue({
+          settingValue: JSON.stringify({ sessionId: 'session-123', userId: 'user-123' }),
+        });
+        chatbotDb.getChatSession.mockResolvedValue({
+          sessionId: 'session-123', userId: 'user-123', messages: [], llmModel: 'gpt-4o',
+        });
+        generateSessionResponse.mockResolvedValue({ content: 'Got the logo.', toolCalls: [] });
+
+        const response = await request(app)
+          .post('/api/slack/events')
+          .send({
+            type: 'event_callback',
+            event: {
+              type: 'message',
+              user: 'U12345',
+              text: '', // file only, no text
+              channel: 'C12345',
+              ts: '1234567891.000000',
+              thread_ts: '1234567890.123456',
+              files: [
+                { id: 'F1', name: 'logo.svg', mimetype: 'image/svg+xml', size: 10,
+                  url_private: 'https://files.slack.com/logo.svg' },
+              ],
+            },
+          });
+
+        expect(response.status).toBe(200);
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        // The attachment reached the agent, so the placeholder truthfully says "[attached file]".
+        expect(generateSessionResponse).toHaveBeenCalledWith(
+          'session-123',
+          'John Doe: [attached file]',
+          'user-123',
+          'gpt-4o',
+          [expect.objectContaining({ url: 'https://s3.example.com/file.png', filename: 'logo.svg' })],
+        );
+      });
+
+      it('sends "[attachment could not be read]" (not "[attached file]") when an ext-shared stub fails to hydrate', async () => {
+        settingsService.getSetting.mockResolvedValue({
+          settingValue: JSON.stringify({ sessionId: 'session-123', userId: 'user-123' }),
+        });
+        chatbotDb.getChatSession.mockResolvedValue({
+          sessionId: 'session-123', userId: 'user-123', messages: [], llmModel: 'gpt-4o',
+        });
+        generateSessionResponse.mockResolvedValue({ content: 'I could not read that file.', toolCalls: [] });
+
+        const response = await request(app)
+          .post('/api/slack/events')
+          .send({
+            type: 'event_callback',
+            event: {
+              type: 'message',
+              user: 'U12345',
+              text: '', // file only, no text
+              channel: 'C12345',
+              ts: '1234567891.000000',
+              thread_ts: '1234567890.123456',
+              // Slack Connect stub: no url_private, hydration via files.info fails in-test.
+              files: [{ id: 'F0BH7RZ6VM4', name: 'logo.png', filetype: 'png', file_access: 'check_file_info' }],
+            },
+          });
+
+        expect(response.status).toBe(200);
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        // Ingestion failed → no attachment, and the model must NOT be baited into
+        // read_file_content('[attached file]') on a non-URL (ENG-323).
+        expect(generateSessionResponse).toHaveBeenCalledWith(
+          'session-123',
+          'John Doe: [attachment could not be read]',
+          'user-123',
+          'gpt-4o',
+          [],
+        );
+      });
+
       it('should ignore messages not in a tracked thread', async () => {
         // Mock no thread mapping found
         settingsService.getSetting.mockResolvedValue(null);

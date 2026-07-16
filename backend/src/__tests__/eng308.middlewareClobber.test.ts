@@ -128,7 +128,7 @@ describe('ENG-308 — one middleware, both jobs', () => {
   });
 
   describe('writer 1 — injectLeadCaptureAttribution (generation)', () => {
-    const files = injectLeadCaptureAttribution([], 'list_abc');
+    const files = injectLeadCaptureAttribution([], { '/': 'list_abc' });
 
     it('emits a middleware that ALSO does the subdomain rewrite', () => {
       // Before ENG-308 this middleware had no rewrite at all, so a later domain
@@ -160,7 +160,7 @@ describe('ENG-308 — one middleware, both jobs', () => {
           { path: 'middleware.ts', content: Buffer.from('// v0 middleware') },
           { path: 'domainMap.ts', content: Buffer.from('// v0 domainMap') },
         ],
-        'list_abc',
+        { '/': 'list_abc' },
       );
       expect(srcOf(withV0, 'middleware.ts')).not.toContain('v0 middleware');
       expect(withV0.filter((f) => f.path === 'middleware.ts')).toHaveLength(1);
@@ -182,7 +182,7 @@ describe('ENG-308 — one middleware, both jobs', () => {
 
     it('is byte-identical to what generation emits — one template, no drift', () => {
       // The only real guarantee that these two can never diverge again.
-      const generated = srcOf(injectLeadCaptureAttribution([], 'list_x'), 'middleware.ts');
+      const generated = srcOf(injectLeadCaptureAttribution([], { '/': 'list_x' }), 'middleware.ts');
       expect(MIDDLEWARE_CONTENT).toBe(generated);
       expect(MIDDLEWARE_CONTENT).toBe(buildLandingPageMiddleware());
     });
@@ -192,7 +192,7 @@ describe('ENG-308 — one middleware, both jobs', () => {
     it('overwriting the generated middleware with the subdomain one preserves capture', () => {
       // Simulate exactly what updateSubdomainMiddleware does to a freshly generated
       // repo: replace middleware.ts wholesale. Capture must survive.
-      const generated = srcOf(injectLeadCaptureAttribution([], 'list_abc'), 'middleware.ts');
+      const generated = srcOf(injectLeadCaptureAttribution([], { '/': 'list_abc' }), 'middleware.ts');
       assertDoesFirstTouchCapture(generated);
 
       const afterDomainAttach = MIDDLEWARE_CONTENT; // what gets committed over it

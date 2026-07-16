@@ -56,6 +56,7 @@ import DefaultPromptsSettings from "../components/admin/DefaultPromptsSettings";
 import BenchmarksTab from "../components/admin/BenchmarksTab";
 import SubscriptionTypesTab from "../components/admin/SubscriptionTypesTab";
 import McpServersTab from "../components/admin/McpServersTab";
+import EmmaMcpUsageTab from "../components/admin/EmmaMcpUsageTab";
 import ResultEndpointsTab from "../components/admin/ResultEndpointsTab";
 import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
 import CrmTab from "../components/admin/CrmTab";
@@ -100,6 +101,8 @@ import {
   Cancel as CancelIcon,
   Search as SearchIcon,
   Email as EmailIcon,
+  BarChart as BarChartIcon,
+  ContentCopy as ContentCopyIcon,
 } from "@mui/icons-material";
 
 interface TabPanelProps {
@@ -312,6 +315,70 @@ interface User {
   orgName?: string;
   isOrgOwner?: boolean;
   orgShareAnalyticsWithOrg?: boolean;
+}
+
+// Per-(day, model, feature) shadow-usage row returned by
+// GET /api/admin/users/:userId/usage/by-model-day (see backend adminUsage.ts).
+// costUsd here is the GROSS burn — every metered AND burn-only LLM call — not the
+// amount deducted from the user's quota.
+interface UsageByModelDayRow {
+  date: string;
+  model: string;
+  feature: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  callCount: number;
+  costMicroUsd: number;
+  costUsd: number;
+}
+
+interface UsageByModelDay {
+  userId: string;
+  start: string;
+  end: string;
+  rows: UsageByModelDayRow[];
+  totals: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    totalTokens: number;
+    callCount: number;
+    costMicroUsd: number;
+    costUsd: number;
+  };
+}
+
+// Caption paired with a hover-help info icon. Used to explain the burn / deduction
+// cost terminology to admins in the Users tab without cluttering the layout.
+const HelpCaption: React.FC<{ label: string; help: string }> = ({ label, help }) => (
+  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+    <Typography variant="caption" color="text.secondary">{label}</Typography>
+    <Tooltip title={help} arrow>
+      <InfoIcon sx={{ fontSize: 14, color: "text.disabled", cursor: "help" }} />
+    </Tooltip>
+  </Box>
+);
+
+// Recent months (newest first) for the cost-breakdown picker, as
+// { value: "YYYY-MM", label: "Jul 2026" }. Bounded on purpose: burn data only
+// exists for the recent window (shadow-table TTL), so an open-ended date input
+// would mostly land on empty months. Uses the same UTC basis as tokenUsage.month
+// and the inline cost cells, so the default month always matches an option.
+function recentMonthOptions(count: number): Array<{ value: string; label: string }> {
+  const now = new Date();
+  const opts: Array<{ value: string; label: string }> = [];
+  for (let i = 0; i < count; i++) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+    opts.push({
+      value: d.toISOString().slice(0, 7),
+      label: d.toLocaleString("en-US", { month: "short", year: "numeric", timeZone: "UTC" }),
+    });
+  }
+  return opts;
 }
 
 // Define an interface for the task data shown in the admin tasks tab
@@ -749,6 +816,7 @@ export default function AdminDashboard() {
     'onboarding': 20,
     'connected-accounts': 21,
     'contractors': 22,
+    'emma-mcp': 23,
   };
   
   // Get initial tab value from URL or default to Users
@@ -886,6 +954,21 @@ export default function AdminDashboard() {
   const [subscriptionTypeEditLoading, setSubscriptionTypeEditLoading] = useState(false);
   const [availableSubscriptionTypes, setAvailableSubscriptionTypes] = useState<string[]>([]);
   const [subscriptionTypeAllowanceMap, setSubscriptionTypeAllowanceMap] = useState<Record<string, number | null>>({});
+  const [subscriptionTypeCostAllowanceMap, setSubscriptionTypeCostAllowanceMap] = useState<Record<string, number | null>>({});
+  // Per-user LLM cost breakdown modal (burn, from the shadow-usage table)
+  const [costBreakdownUser, setCostBreakdownUser] = useState<User | null>(null);
+  const [costBreakdownMonth, setCostBreakdownMonth] = useState<string>("");
+  const [costBreakdownData, setCostBreakdownData] = useState<UsageByModelDay | null>(null);
+  const [costBreakdownLoading, setCostBreakdownLoading] = useState(false);
+  const [costBreakdownError, setCostBreakdownError] = useState<string | null>(null);
+  // Table vs bar-chart view for the cost-breakdown modal — remembered per-admin.
+  const [costBreakdownView, setCostBreakdownView] = useState<"table" | "bars">(
+    () => (typeof window !== "undefined" && localStorage.getItem("costBreakdownView") === "bars" ? "bars" : "table")
+  );
+  const changeCostBreakdownView = (v: "table" | "bars") => {
+    setCostBreakdownView(v);
+    try { localStorage.setItem("costBreakdownView", v); } catch { /* non-fatal */ }
+  };
   const [grantBonusDialogOpen, setGrantBonusDialogOpen] = useState(false);
   const [grantBonusUserId, setGrantBonusUserId] = useState<string | null>(null);
   const [grantBonusEmail, setGrantBonusEmail] = useState("");
@@ -896,6 +979,8 @@ export default function AdminDashboard() {
   const [introEmailUserEmail, setIntroEmailUserEmail] = useState("");
   const [introEmailLoading, setIntroEmailLoading] = useState(false);
   const [delegateAccessLoading, setDelegateAccessLoading] = useState<string | null>(null);
+  const [delegatedPortalUrl, setDelegatedPortalUrl] = useState<string | null>(null);
+  const [delegatedUrlCopied, setDelegatedUrlCopied] = useState(false);
   const [emailToDelete, setEmailToDelete] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [userIdToDelete, setUserIdToDelete] = useState<string | null>(null);
@@ -1044,14 +1129,67 @@ export default function AdminDashboard() {
         : ['Basic'];
       setAvailableSubscriptionTypes(typeNames);
       const allowanceMap: Record<string, number | null> = {};
-      types.forEach((t: any) => { allowanceMap[t.name] = t.monthlyTokenAllowance ?? null; });
+      const costAllowanceMap: Record<string, number | null> = {};
+      types.forEach((t: any) => {
+        allowanceMap[t.name] = t.monthlyTokenAllowance ?? null;
+        costAllowanceMap[t.name] = t.monthlyCostAllowance ?? null;
+      });
       setSubscriptionTypeAllowanceMap(allowanceMap);
+      setSubscriptionTypeCostAllowanceMap(costAllowanceMap);
     } catch (error) {
       console.error('Error loading subscription types:', error);
       // Default to Basic if loading fails
       setAvailableSubscriptionTypes(['Basic']);
     }
   };
+
+  // Fetch the per-model LLM cost burn for a user over a calendar month (YYYY-MM).
+  const fetchCostBreakdown = async (userId: string, month: string) => {
+    setCostBreakdownLoading(true);
+    setCostBreakdownError(null);
+    try {
+      const start = `${month}-01`;
+      // 31 always sorts at/after the real month end; days that don't exist have no rows.
+      const end = `${month}-31`;
+      const response = await axios.get(
+        buildApiUrl(`/api/admin/users/${userId}/usage/by-model-day`),
+        { headers: { Authorization: `Bearer ${token}` }, params: { start, end } }
+      );
+      setCostBreakdownData(response.data);
+    } catch (error: any) {
+      console.error('Error loading cost breakdown:', error);
+      setCostBreakdownData(null);
+      setCostBreakdownError(error.response?.data?.message || 'Failed to load cost breakdown');
+    } finally {
+      setCostBreakdownLoading(false);
+    }
+  };
+
+  // Open the breakdown modal for a user, defaulting to the current month.
+  const openCostBreakdown = (user: User) => {
+    setCostBreakdownUser(user);
+    setCostBreakdownData(null);
+    setCostBreakdownError(null);
+    setCostBreakdownMonth(new Date().toISOString().slice(0, 7));
+  };
+
+  // Amount deducted from a user's quota for a given month (YYYY-MM). This is the
+  // "counted" cost — only metered (non-burn-only) calls — vs the gross burn shown
+  // by the breakdown endpoint. Current month comes from tokenUsage; past months
+  // from tokenUsageHistory.
+  const deductedCostForMonth = (user: User, month: string): number => {
+    if (user.tokenUsage?.month === month) return user.tokenUsage?.totalCost ?? 0;
+    const hist = user.tokenUsageHistory?.find((h) => h.month === month);
+    return hist?.totalCost ?? 0;
+  };
+
+  // (Re)load the breakdown whenever the target user or selected month changes.
+  useEffect(() => {
+    if (costBreakdownUser && costBreakdownMonth) {
+      fetchCostBreakdown(costBreakdownUser.userId, costBreakdownMonth);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [costBreakdownUser?.userId, costBreakdownMonth]);
 
   // Load waitlist data only when Waitlist tab (3) is selected
   useEffect(() => {
@@ -3021,9 +3159,15 @@ export default function AdminDashboard() {
   };
 
   const handleAccessCustomerPortal = async (userId: string) => {
+    // Open a placeholder tab synchronously (inside the click handler) so the
+    // browser treats it as a user-initiated action and does not block it. We
+    // navigate this tab to the delegated URL once the async request resolves.
+    // If the browser still blocks the popup, `placeholderTab` is null and we
+    // fall back to exposing the URL in the UI so the admin can copy/open it.
+    const placeholderTab = window.open("", "_blank");
     try {
       setDelegateAccessLoading(userId);
-      
+
       const response = await axios.post(
         buildApiUrl(`/api/admin/users/${userId}/delegate-access`),
         {},
@@ -3032,17 +3176,72 @@ export default function AdminDashboard() {
         }
       );
 
-      if (response.status === 200) {
-        const { customerPortalUrl } = response.data;
-        // Open customer portal in new tab with delegate token
-        window.open(customerPortalUrl, '_blank');
-        setSuccess("Delegate access created successfully!");
+      // Key off the presence of the URL rather than an exact 200 so any 2xx
+      // response is handled. If the response has no URL (unexpected), fall
+      // through to the else and close the placeholder tab so it is never
+      // orphaned as a blank window.
+      const customerPortalUrl = response?.data?.customerPortalUrl;
+      if (customerPortalUrl) {
+        if (placeholderTab && !placeholderTab.closed) {
+          // Navigate the pre-opened tab to the delegated customer portal.
+          placeholderTab.location.href = customerPortalUrl;
+          setSuccess("Delegate access created successfully!");
+        } else {
+          // Popup was blocked — surface the URL so the admin can still recover it.
+          setDelegatedPortalUrl(customerPortalUrl);
+          setDelegatedUrlCopied(false);
+        }
+      } else {
+        // No usable URL in the response — don't leave a blank tab behind.
+        if (placeholderTab && !placeholderTab.closed) {
+          placeholderTab.close();
+        }
+        setError("Delegate access did not return a portal URL");
       }
     } catch (error: any) {
+      // Close the placeholder tab we opened optimistically so we don't leave a
+      // blank tab behind when the request fails.
+      if (placeholderTab && !placeholderTab.closed) {
+        placeholderTab.close();
+      }
       console.error("Error creating delegate access:", error);
       setError(error.response?.data?.message || "Failed to create delegate access");
     } finally {
       setDelegateAccessLoading(null);
+    }
+  };
+
+  const handleCopyDelegatedUrl = async () => {
+    if (!delegatedPortalUrl) return;
+    // Prefer the async Clipboard API, but it is only exposed in secure contexts
+    // (HTTPS/localhost). On plain HTTP (e.g. preview envs) navigator.clipboard is
+    // undefined, so fall back to a temporary textarea + execCommand("copy").
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(delegatedPortalUrl);
+        setDelegatedUrlCopied(true);
+        return;
+      } catch (error) {
+        console.error("Clipboard API copy failed, falling back to execCommand:", error);
+      }
+    }
+    try {
+      const textarea = document.createElement("textarea");
+      textarea.value = delegatedPortalUrl;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand("copy");
+      document.body.removeChild(textarea);
+      if (copied) {
+        setDelegatedUrlCopied(true);
+      } else {
+        console.error("Failed to copy delegated URL: execCommand returned false");
+      }
+    } catch (error) {
+      console.error("Failed to copy delegated URL:", error);
     }
   };
 
@@ -3198,6 +3397,7 @@ export default function AdminDashboard() {
             <Tab label="Onboarding" {...a11yProps(20)} />
             <Tab label="Connected Accounts" {...a11yProps(21)} />
             <Tab label="Contractors" {...a11yProps(22)} />
+            <Tab label="Emma MCP" {...a11yProps(23)} />
           </Tabs>
         </Box>
 
@@ -4735,6 +4935,31 @@ export default function AdminDashboard() {
                                       ))}
                                     </Box>
                                   )}
+                                </Grid>
+                                {/* LLM Cost quota (dollar spend vs cost cap) */}
+                                <Grid item xs={6}>
+                                  <HelpCaption
+                                    label="LLM Cost"
+                                    help="Dollars deducted from this user's monthly cost cap so far this month, vs the cap (∞ = no cap). This is the counted/deducted figure — open the breakdown for gross burn per model, including platform-absorbed cost."
+                                  />
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
+                                    {user.roles?.includes("customer") ? (() => {
+                                      const currentMonth = new Date().toISOString().slice(0, 7);
+                                      const costUsed = user.tokenUsage?.month === currentMonth ? (user.tokenUsage?.totalCost ?? 0) : 0;
+                                      const costAllowance = subscriptionTypeCostAllowanceMap[user.subscriptionType || "Basic"] ?? null;
+                                      return (
+                                        <Typography variant="body2">
+                                          ${costUsed.toFixed(2)} / {costAllowance != null ? `$${costAllowance.toFixed(2)}` : "∞"}
+                                          <Typography component="span" variant="caption" color="text.secondary"> deducted</Typography>
+                                        </Typography>
+                                      );
+                                    })() : <Typography variant="body2" color="text.disabled">—</Typography>}
+                                    {user.roles?.includes("customer") && (
+                                      <Tooltip title="View per-model burn breakdown">
+                                        <IconButton size="small" onClick={() => openCostBreakdown(user)} color="primary"><BarChartIcon fontSize="small" /></IconButton>
+                                      </Tooltip>
+                                    )}
+                                  </Box>
                                 </Grid>
                                 {/* Extra Cost Usage (enrichment, image gen, etc.) */}
                                 {user.roles?.includes("customer") && (
@@ -6365,6 +6590,10 @@ export default function AdminDashboard() {
           <ContractorsTab />
         </TabPanel>
 
+        <TabPanel value={tabValue} index={23}>
+          <EmmaMcpUsageTab />
+        </TabPanel>
+
       </Paper>
 
       {/* Satisfaction Score Override Popover */}
@@ -6435,7 +6664,59 @@ export default function AdminDashboard() {
         </DialogActions>
       </Dialog>
 
-      {/* Grant Token Bonus Dialog */}
+      {/* Delegated Customer Portal Link Dialog (popup-blocked recovery) */}
+      <Dialog
+        open={Boolean(delegatedPortalUrl)}
+        onClose={() => { setDelegatedPortalUrl(null); setDelegatedUrlCopied(false); }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>Delegated Customer Portal Link</DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ mb: 2 }}>
+            Your browser blocked the popup, so the customer portal did not open
+            automatically. Use the link below to open the delegated session or
+            copy it to share/reuse.
+          </DialogContentText>
+          <TextField
+            value={delegatedPortalUrl || ""}
+            fullWidth
+            multiline
+            InputProps={{
+              readOnly: true,
+              endAdornment: (
+                <InputAdornment position="end">
+                  <Tooltip title={delegatedUrlCopied ? "Copied!" : "Copy link"}>
+                    <IconButton onClick={handleCopyDelegatedUrl} edge="end">
+                      {delegatedUrlCopied ? (
+                        <CheckIcon fontSize="small" color="success" />
+                      ) : (
+                        <ContentCopyIcon fontSize="small" />
+                      )}
+                    </IconButton>
+                  </Tooltip>
+                </InputAdornment>
+              ),
+            }}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => { setDelegatedPortalUrl(null); setDelegatedUrlCopied(false); }}>Close</Button>
+          {delegatedPortalUrl && (
+            <Button
+              component={Link}
+              href={delegatedPortalUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              variant="contained"
+              startIcon={<OpenInNewIcon />}
+            >
+              Open Portal
+            </Button>
+          )}
+        </DialogActions>
+      </Dialog>
+
       <Dialog open={introEmailDialogOpen} onClose={() => setIntroEmailDialogOpen(false)}>
         <DialogTitle>Send Team Introduction Email</DialogTitle>
         <DialogContent>
@@ -6451,6 +6732,7 @@ export default function AdminDashboard() {
         </DialogActions>
       </Dialog>
 
+      {/* Grant Bonus Tokens Dialog */}
       <Dialog open={grantBonusDialogOpen} onClose={() => setGrantBonusDialogOpen(false)}>
         <DialogTitle>Grant Bonus Tokens</DialogTitle>
         <DialogContent>
@@ -6479,6 +6761,225 @@ export default function AdminDashboard() {
           >
             {grantBonusLoading ? <CircularProgress size={24} /> : "Grant"}
           </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Per-user LLM cost burn breakdown */}
+      <Dialog open={!!costBreakdownUser} onClose={() => setCostBreakdownUser(null)} maxWidth="md" fullWidth>
+        <DialogTitle sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 2 }}>
+          <span>LLM Cost Burn — {costBreakdownUser?.email}</span>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1.5 }}>
+            <ButtonGroup size="small" aria-label="cost breakdown view">
+              <Button
+                variant={costBreakdownView === "table" ? "contained" : "outlined"}
+                onClick={() => changeCostBreakdownView("table")}
+              >
+                Table
+              </Button>
+              <Button
+                variant={costBreakdownView === "bars" ? "contained" : "outlined"}
+                onClick={() => changeCostBreakdownView("bars")}
+                startIcon={<BarChartIcon fontSize="small" />}
+              >
+                Bars
+              </Button>
+            </ButtonGroup>
+            <TextField
+              select
+              size="small"
+              label="Month"
+              value={costBreakdownMonth}
+              onChange={(e) => setCostBreakdownMonth(e.target.value)}
+              sx={{ width: 170 }}
+            >
+              {recentMonthOptions(12).map((m) => (
+                <MenuItem key={m.value} value={m.value}>{m.label}</MenuItem>
+              ))}
+            </TextField>
+          </Box>
+        </DialogTitle>
+        <DialogContent dividers>
+          {costBreakdownLoading ? (
+            <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}><CircularProgress /></Box>
+          ) : costBreakdownError ? (
+            <Typography color="error" variant="body2" sx={{ py: 2 }}>{costBreakdownError}</Typography>
+          ) : costBreakdownData ? (() => {
+            const burn = costBreakdownData.totals.costUsd;
+            const deducted = costBreakdownUser ? deductedCostForMonth(costBreakdownUser, costBreakdownMonth) : 0;
+            const absorbed = Math.max(0, burn - deducted);
+            // Policy: every LLM call with a real userId is charged to the user, so
+            // absorbed should be ~$0. A non-trivial value flags spend still escaping
+            // the cap (a metering leak) — surface it in red as a monitor.
+            const isLeaking = absorbed > 0.005;
+            // Aggregate the per-(day, model, feature) rows up to per-model totals.
+            const byModel: Record<string, { model: string; callCount: number; totalTokens: number; costUsd: number }> = {};
+            costBreakdownData.rows.forEach((r) => {
+              const m = byModel[r.model] || (byModel[r.model] = { model: r.model, callCount: 0, totalTokens: 0, costUsd: 0 });
+              m.callCount += r.callCount;
+              m.totalTokens += r.totalTokens;
+              m.costUsd += r.costUsd;
+            });
+            const modelRows = Object.values(byModel).sort((a, b) => b.costUsd - a.costUsd);
+            // rows come back sorted by (date, model) asc, so rows[0] is the earliest
+            // burn we have on record for this window — used to signal "tracking since".
+            const earliestTracked = costBreakdownData.rows.length ? costBreakdownData.rows[0].date : null;
+            // Burn (shadow table) and the deducted counter are separate pipelines; the
+            // counter predates per-call burn tracking, so burn can legitimately read
+            // lower than what's counted to quota during the ramp-up window.
+            const burnLagsDeducted = modelRows.length > 0 && burn + 0.005 < deducted;
+            // Overall cost quota (bars view): deducted spend vs the tier's cap — the
+            // same figure the enforcement gate checks. Null cap = unlimited (no bar).
+            const costAllowance = subscriptionTypeCostAllowanceMap[costBreakdownUser?.subscriptionType || "Basic"] ?? null;
+            const quotaPct = costAllowance != null && costAllowance > 0 ? (deducted / costAllowance) * 100 : null;
+            const quotaColor = quotaPct == null ? "grey.500" : quotaPct >= 100 ? "error.main" : quotaPct >= 80 ? "warning.main" : "success.main";
+            return (
+              <>
+                <Grid container spacing={2} sx={{ mb: 2 }}>
+                  <Grid item xs={4}>
+                    <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 1.5 }}>
+                      <HelpCaption
+                        label="Burned (gross)"
+                        help="Burn = the real dollar cost of every LLM call this user generated this month — including calls the platform absorbs. This is what it actually costs us to serve them, before any quota accounting."
+                      />
+                      <Typography variant="h6" sx={{ fontVariantNumeric: "tabular-nums" }}>${burn.toFixed(2)}</Typography>
+                      <Typography variant="caption" color="text.secondary">all LLM calls this user generated</Typography>
+                    </Box>
+                  </Grid>
+                  <Grid item xs={4}>
+                    <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 1.5 }}>
+                      <HelpCaption
+                        label="Counted to quota"
+                        help="Deduction = the portion of burn charged against the user's monthly cost cap. Some calls are metered burn-only (platform-absorbed) and never deduct, so this is usually ≤ gross burn."
+                      />
+                      <Typography variant="h6" sx={{ fontVariantNumeric: "tabular-nums" }}>${deducted.toFixed(2)}</Typography>
+                      <Typography variant="caption" color="text.secondary">deducted from their cost cap</Typography>
+                    </Box>
+                  </Grid>
+                  <Grid item xs={4}>
+                    <Box
+                      data-testid="absorbed-card"
+                      data-leaking={isLeaking ? "true" : "false"}
+                      sx={{
+                        border: 1,
+                        borderColor: isLeaking ? "error.main" : "divider",
+                        bgcolor: isLeaking ? "error.50" : "transparent",
+                        borderRadius: 1,
+                        p: 1.5,
+                      }}
+                    >
+                      <HelpCaption
+                        label={isLeaking ? "⚠ Absorbed by platform" : "Absorbed by platform"}
+                        help="Burn the platform ate — gross burn minus what was counted to quota. Policy is to charge every call with a real userId to the user, so this should read ~$0. A non-zero value means spend is still escaping the cap (a metering leak) or predates the charge-all rollout."
+                      />
+                      <Typography
+                        variant="h6"
+                        sx={{ fontVariantNumeric: "tabular-nums" }}
+                        color={isLeaking ? "error.main" : "text.primary"}
+                      >
+                        ${absorbed.toFixed(2)}
+                      </Typography>
+                      <Typography variant="caption" color={isLeaking ? "error.main" : "text.secondary"}>
+                        {isLeaking ? "spend escaping the cap — investigate" : "fully charged (no leak)"}
+                      </Typography>
+                    </Box>
+                  </Grid>
+                </Grid>
+                {costBreakdownView === "bars" && (
+                  costAllowance != null ? (
+                    <Box sx={{ mb: 2 }}>
+                      <Box sx={{ display: "flex", justifyContent: "space-between", mb: 0.5 }}>
+                        <Typography variant="body2" fontWeight={600}>Monthly cost quota</Typography>
+                        <Typography variant="body2" sx={{ fontVariantNumeric: "tabular-nums" }}>
+                          ${deducted.toFixed(2)} / ${costAllowance.toFixed(2)} ({Math.round(quotaPct ?? 0)}%)
+                        </Typography>
+                      </Box>
+                      <Tooltip title={`${Math.round(quotaPct ?? 0)}% of the monthly cost cap consumed (deducted spend vs cap)`}>
+                        <Box sx={{ height: 12, borderRadius: 6, bgcolor: "grey.200", overflow: "hidden" }}>
+                          <Box sx={{ height: "100%", width: `${Math.min(100, quotaPct ?? 0)}%`, bgcolor: quotaColor, transition: "width .3s" }} />
+                        </Box>
+                      </Tooltip>
+                    </Box>
+                  ) : (
+                    <Alert severity="info" sx={{ mb: 2 }}>
+                      This user's tier has no cost cap (unlimited) — no quota bar. Per-model spend share is shown below.
+                    </Alert>
+                  )
+                )}
+                {modelRows.length === 0 ? (
+                  <Alert severity="info" sx={{ mb: 1 }}>
+                    No per-model burn has been recorded for this month yet. Burn is captured per LLM
+                    call from usage records, so an empty view means no metered calls landed in this
+                    window (or this environment hasn't generated traffic yet). The “Counted to quota”
+                    figure above comes from a separate running counter and may still be non-zero.
+                  </Alert>
+                ) : (
+                  <>
+                    {burnLagsDeducted && (
+                      <Alert severity="info" sx={{ mb: 1 }}>
+                        Recorded burn{earliestTracked ? ` (tracked from ${earliestTracked})` : ""} is lower than
+                        the amount counted to this user's quota. Per-call burn tracking is newer than the quota
+                        counter, so earlier usage isn't reflected here yet; “Absorbed by platform” shows $0
+                        until burn catches up.
+                      </Alert>
+                    )}
+                    {costBreakdownView === "bars" ? (
+                      <Box data-testid="cost-breakdown-bars">
+                        <Typography variant="caption" color="text.secondary">Spend share by model (of ${burn.toFixed(2)} gross burn)</Typography>
+                        {modelRows.map((m) => {
+                          const share = burn > 0 ? (m.costUsd / burn) * 100 : 0;
+                          return (
+                            <Box key={m.model} sx={{ mt: 1 }}>
+                              <Box sx={{ display: "flex", justifyContent: "space-between" }}>
+                                <Typography variant="caption" sx={{ fontFamily: "monospace" }}>{m.model}</Typography>
+                                <Typography variant="caption" sx={{ fontVariantNumeric: "tabular-nums" }}>
+                                  ${m.costUsd.toFixed(4)} ({share.toFixed(1)}%)
+                                </Typography>
+                              </Box>
+                              <Box sx={{ height: 8, borderRadius: 4, bgcolor: "grey.100", overflow: "hidden" }}>
+                                <Box sx={{ height: "100%", width: `${Math.max(share, 0.5)}%`, bgcolor: "primary.main" }} />
+                              </Box>
+                            </Box>
+                          );
+                        })}
+                      </Box>
+                    ) : (
+                    <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Model</TableCell>
+                        <TableCell align="right">Calls</TableCell>
+                        <TableCell align="right">Tokens</TableCell>
+                        <TableCell align="right">Burn</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {modelRows.map((m) => (
+                        <TableRow key={m.model}>
+                          <TableCell>{m.model}</TableCell>
+                          <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>{m.callCount.toLocaleString()}</TableCell>
+                          <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>{m.totalTokens.toLocaleString()}</TableCell>
+                          <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>${m.costUsd.toFixed(4)}</TableCell>
+                        </TableRow>
+                      ))}
+                      <TableRow>
+                        <TableCell sx={{ fontWeight: 600 }}>Total</TableCell>
+                        <TableCell align="right" sx={{ fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>{costBreakdownData.totals.callCount.toLocaleString()}</TableCell>
+                        <TableCell align="right" sx={{ fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>{costBreakdownData.totals.totalTokens.toLocaleString()}</TableCell>
+                        <TableCell align="right" sx={{ fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>${burn.toFixed(4)}</TableCell>
+                      </TableRow>
+                    </TableBody>
+                  </Table>
+                    )}
+                  </>
+                )}
+              </>
+            );
+          })() : (
+            <Typography variant="body2" color="text.secondary" sx={{ py: 2 }}>No data.</Typography>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setCostBreakdownUser(null)}>Close</Button>
         </DialogActions>
       </Dialog>
 

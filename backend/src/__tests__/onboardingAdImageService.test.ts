@@ -17,6 +17,11 @@ jest.mock("../services/db", () => ({
     getUserById: jest.fn(),
     updateUser: jest.fn(),
   },
+  // Org-aware brand resolution (ENG-326): org members' brandGuidelines live
+  // on the ORG record — the trigger resolves through orgDb for them.
+  orgDb: {
+    getOrgById: jest.fn(),
+  },
 }));
 
 // Mock the chat-session mirror so the success path stays testable as
@@ -42,11 +47,12 @@ import {
   startAdImageGenerationForUser,
   triggerAdImageGenerationForUser,
 } from "../services/onboardingAdImageService";
-const { userDb } = require("../services/db");
+const { userDb, orgDb } = require("../services/db");
 
 class FakeImageGen {
   public callCount = 0;
   public lastPrompts: string[] = [];
+  public lastParams: Array<{ prompt: string; filename: string; userId: string; size?: string; imageModel?: string; logoImage?: string }> = [];
 
   constructor(
     private readonly responder: (n: number, prompt: string) => Promise<{
@@ -56,9 +62,10 @@ class FakeImageGen {
     }>
   ) {}
 
-  generateImage = async (params: { prompt: string; filename: string; userId: string; size?: string; imageModel?: string }) => {
+  generateImage = async (params: { prompt: string; filename: string; userId: string; size?: string; imageModel?: string; logoImage?: string }) => {
     this.callCount += 1;
     this.lastPrompts.push(params.prompt);
+    this.lastParams.push(params);
     return this.responder(this.callCount, params.prompt);
   };
 }
@@ -490,7 +497,37 @@ describe("onboardingAdImageService", () => {
       expect(userDb.updateUser.mock.calls[0][1].adImageStatus).toBe("failed");
     });
 
-    it("patches User with adImageReadyPatch on full success", async () => {
+    it("patches User with adImageReadyPatch on full success and composites the persisted logo (AC-2)", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: {
+            brandData: { brandName: "Linear", primaryColor: "#5E6AD2", logoUrl: "https://s3/brand/logo.png" },
+          },
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: new Date().toISOString(),
+        });
+      userDb.updateUser.mockResolvedValue({});
+      const gen = new FakeImageGen(okResponder);
+      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      const written = userDb.updateUser.mock.calls[0][1];
+      expect(written.adImageStatus).toBe("ready");
+      expect(written.adImageResult.variants).toHaveLength(3);
+      // Every variant call composited the REAL persisted logo as an image input.
+      expect(gen.lastParams).toHaveLength(3);
+      for (const p of gen.lastParams) {
+        expect(p.logoImage).toBe("https://s3/brand/logo.png");
+      }
+    });
+
+    it("fails the run pointing at brand config when no logo is persisted — never generates (AC-3)", async () => {
       userDb.getUserById
         .mockResolvedValueOnce({
           userId: "u1",
@@ -505,12 +542,112 @@ describe("onboardingAdImageService", () => {
           adImageStartedAt: new Date().toISOString(),
         });
       userDb.updateUser.mockResolvedValue({});
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
       const gen = new FakeImageGen(okResponder);
       await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      errSpy.mockRestore();
+
+      expect(gen.callCount).toBe(0);
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
       const written = userDb.updateUser.mock.calls[0][1];
+      expect(written.adImageStatus).toBe("failed");
+      expect(written.adImageError).toMatch(/logo/i);
+      expect(written.adImageError).toMatch(/brand/i);
+    });
+
+    it("resolves the ORG brandGuidelines for org members — an org-level logo satisfies the gate", async () => {
+      // ensureBrandLogoPersisted and manual brand-config uploads both write
+      // the ORG record for org members (updateBrandGuidelines is org-aware).
+      // The gate must read the same record, or the failure message "upload
+      // your logo in brand config, then regenerate" is a permanent dead end.
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          orgId: "org1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          // Nothing on the user record — the logo lives on the org.
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: new Date().toISOString(),
+        });
+      orgDb.getOrgById.mockResolvedValue({
+        orgId: "org1",
+        brandGuidelines: {
+          brandData: { brandName: "Linear", primaryColor: "#5E6AD2" },
+          attachments: [{ type: "logo", url: "https://s3/org/logo.png" }],
+        },
+      });
+      userDb.updateUser.mockResolvedValue({});
+      const gen = new FakeImageGen(okResponder);
+      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+
+      expect(orgDb.getOrgById).toHaveBeenCalledWith("org1");
+      const written = userDb.updateUser.mock.calls[0][1];
       expect(written.adImageStatus).toBe("ready");
-      expect(written.adImageResult.variants).toHaveLength(3);
+      expect(gen.lastParams).toHaveLength(3);
+      for (const p of gen.lastParams) {
+        expect(p.logoImage).toBe("https://s3/org/logo.png");
+      }
+    });
+
+    it("org logo wins over a stale user-record logo for org members", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          orgId: "org1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: {
+            brandData: { brandName: "Linear", logoUrl: "https://s3/stale-user.png" },
+          },
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: new Date().toISOString(),
+        });
+      orgDb.getOrgById.mockResolvedValue({
+        orgId: "org1",
+        brandGuidelines: {
+          brandData: { brandName: "Linear" },
+          attachments: [{ type: "logo", url: "https://s3/org/current.png" }],
+        },
+      });
+      userDb.updateUser.mockResolvedValue({});
+      const gen = new FakeImageGen(okResponder);
+      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+
+      expect(gen.lastParams[0].logoImage).toBe("https://s3/org/current.png");
+    });
+
+    it("finds the persisted logo on the attachments store for the gate (canonical write path)", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: {
+            brandData: { brandName: "Linear" },
+            attachments: [{ type: "logo", url: "https://s3/att/logo.png", filename: "logo.png" }],
+          },
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: new Date().toISOString(),
+        });
+      userDb.updateUser.mockResolvedValue({});
+      const gen = new FakeImageGen(okResponder);
+      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      const written = userDb.updateUser.mock.calls[0][1];
+      expect(written.adImageStatus).toBe("ready");
+      expect(gen.lastParams[0].logoImage).toBe("https://s3/att/logo.png");
     });
 
     it("drops the ready patch silently when user is no longer running", async () => {
@@ -520,6 +657,7 @@ describe("onboardingAdImageService", () => {
           creativeDirStatus: "ready",
           creativeDirResult: creativeDir,
           icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
         })
         .mockResolvedValueOnce({ userId: "u1", adImageStatus: "idle" });
       userDb.updateUser.mockResolvedValue({});
@@ -535,6 +673,7 @@ describe("onboardingAdImageService", () => {
           creativeDirStatus: "ready",
           creativeDirResult: creativeDir,
           icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
         })
         .mockResolvedValueOnce({ userId: "u1", adImageStatus: "running" });
       userDb.updateUser.mockResolvedValue({});
@@ -563,6 +702,7 @@ describe("onboardingAdImageService", () => {
           creativeDirStatus: "ready",
           creativeDirResult: creativeDir,
           icpResult: "not-an-array" as any,
+          brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
         })
         .mockResolvedValueOnce({ userId: "u1", adImageStatus: "running" });
       userDb.updateUser.mockResolvedValue({});
@@ -578,6 +718,7 @@ describe("onboardingAdImageService", () => {
           creativeDirStatus: "ready",
           creativeDirResult: null,
           icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
         })
         .mockResolvedValueOnce({ userId: "u1", adImageStatus: "running" });
       userDb.updateUser.mockResolvedValue({});
@@ -593,6 +734,7 @@ describe("onboardingAdImageService", () => {
           creativeDirStatus: "ready",
           creativeDirResult: creativeDir,
           icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
         })
         .mockResolvedValueOnce(null);
       userDb.updateUser.mockResolvedValue({});
@@ -620,6 +762,20 @@ describe("onboardingAdImageService", () => {
       expect(ctx.secondaryColor).toBe("#FFFFFF");
       expect(ctx.fontFamily).toBe("Inter");
       expect(ctx.logoUrl).toBe("https://example.com/logo.png");
+    });
+
+    it("falls back to the attachments logo asset — where updateBrandGuidelines actually persists (ENG-326)", () => {
+      const ctx = extractAdImageBrandContext({
+        companyName: "Linear",
+        brandGuidelines: {
+          brandData: { primaryColor: "#5E6AD2" },
+          attachments: [
+            { type: "brandGuide", url: "https://example.com/guide.pdf" },
+            { type: "logo", url: "https://example.com/att-logo.png" },
+          ],
+        },
+      });
+      expect(ctx.logoUrl).toBe("https://example.com/att-logo.png");
     });
 
     it("falls back to brandAssets array when brandData.logoUrl is missing", () => {

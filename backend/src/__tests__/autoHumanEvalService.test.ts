@@ -82,4 +82,33 @@ describe('enqueueAutoHumanEval', () => {
       sourceKey: 'lead-enrichment:run-1',
     })).resolves.toBeNull();
   });
+
+  it('passes the flow-derived category through to createCandidate', async () => {
+    await enqueueAutoHumanEval({
+      reviewType: 'creative_image',
+      userId: 'user-1',
+      sessionId: 'session-1',
+      outputSummary: 'Ad image generated.',
+      sourceKey: 'image:session-1:ad.png',
+      category: 'ad',
+    });
+
+    expect(mockCreateCandidate).toHaveBeenCalledWith(expect.objectContaining({
+      reviewType: 'creative_image',
+      category: 'ad',
+    }));
+  });
+
+  it('omits category when the enqueueing flow is ambiguous', async () => {
+    await enqueueAutoHumanEval({
+      reviewType: 'creative_image',
+      userId: 'user-1',
+      outputSummary: 'Image generated.',
+      sourceKey: 'image:session-2:img.png',
+    });
+
+    expect(mockCreateCandidate).toHaveBeenCalledWith(expect.objectContaining({
+      category: undefined,
+    }));
+  });
 });

@@ -4,6 +4,7 @@ import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
+import { meterUsageFromResponse } from '../utils/llmClients';
 import { substituteVariables, extractVariables, leadHasVariable, injectUnsubscribeUrl, checkEmailFormat, injectColorSchemeMeta } from '../utils/emailVariables';
 import axios from 'axios';
 import { assertPublicHostname, SsrfBlockedError } from '../utils/ssrfGuard';
@@ -3864,7 +3865,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
           existingStandardFields: STANDARD_FIELDS,
           existingCustomFields: Array.isArray(list.fieldNames) ? list.fieldNames as string[] : [],
           commonlyEmptyFields,
-        });
+        }, userId);
         return res.json({
           success: true,
           instruction: result.instruction,
@@ -4661,6 +4662,14 @@ Reply with ONLY valid JSON, nothing else: {"content": "the note text"}`;
       temperature: 0.8,
       max_tokens: 2048,
     });
+    // Meter this direct Gemini draft generation (bypasses callLLM): shadow analytics +
+    // the per-user cap, matching the invite-note shortener path for the same feature.
+    meterUsageFromResponse({
+      userId,
+      model: 'gemini-3.5-flash',
+      provider: 'gemini',
+      feature: 'invite_note_generate',
+    }, completion);
 
     const raw = completion.choices[0].message.content || '';
     let rawNote = '';

@@ -35,6 +35,62 @@ const LINEAR_ISSUE_BASE = 'https://linear.app/emmabyaw/issue';
  */
 const REFERENCES_CANONICAL = /\b(?:AGW|ENG)-\d+\b/i;
 
+/**
+ * Explicit ticket references extracted from a report's text — the input to the deterministic
+ * exact-match short-circuit below. Only `agwNumbers` drives an exact match (see
+ * `findExactCanonicalMatch`): a bare "ENG-N" mention is intentionally NOT compared against
+ * `OpenCanonical.identifier` directly, because a report can casually NAME another ticket without
+ * actually being the same bug (e.g. "new unrelated bug, mentions ENG-500 loosely") — that must
+ * still go through the fuzzy judge, exactly as before this change. AGW-N is safe to match
+ * deterministically because it only matches when the EXACT number appears in a candidate's own
+ * private `[reporter-ticket #N ...]` comment (see `fileBugReport` below) — a real ticket-number
+ * placement, not incidental prose.
+ */
+interface CanonicalRefs {
+  agwNumbers: Set<string>;
+}
+
+function extractCanonicalRefs(text: string): CanonicalRefs {
+  const agwNumbers = new Set<string>();
+  for (const m of text.matchAll(/\bAGW-(\d+)\b/gi)) agwNumbers.add(m[1]);
+  return { agwNumbers };
+}
+
+/**
+ * Deterministic exact-match lookup for an explicit AGW-N reference — the fix for the "reported
+ * new evidence against an already-tracked bug -> fuzzy judge misses it -> duplicate filed"
+ * failure mode (ENG-329 incident). Runs BEFORE the fuzzy judge and only when the report text
+ * names a specific AGW ticket number; on any miss (bad number, stale reference, candidate outside
+ * the fetched window, a comments-fetch failure) it returns null and the caller falls through
+ * unchanged to the existing fuzzy dedup path — this must never throw and never block filing.
+ */
+const EXACT_MATCH_COMMENT_SCAN_LIMIT = 10; // bounds worst-case Linear calls; both lists are already
+// ordered most-recent-first, so capping below MAX_CANDIDATES (30) costs little match coverage
+// while keeping worst-case added latency comfortably under report_product_issues' 30s filing timeout.
+
+async function findExactCanonicalMatch(
+  refs: CanonicalRefs,
+  candidates: OpenCanonical[],
+): Promise<OpenCanonical | null> {
+  if (refs.agwNumbers.size === 0 || candidates.length === 0) return null;
+
+  const { getIssueCommentsDetailed } = await import('./linearService');
+  for (const c of candidates.slice(0, EXACT_MATCH_COMMENT_SCAN_LIMIT)) {
+    try {
+      const comments = await getIssueCommentsDetailed(c.issueId);
+      for (const n of refs.agwNumbers) {
+        if (comments.some((cm) => cm.body.includes(`[reporter-ticket #${n} `))) return c;
+      }
+    } catch (e) {
+      // Also catches a malformed (non-array) resolved value, not just a rejection — keeps the
+      // "never throw" contract even if the helper's return shape is ever unexpected.
+      console.warn(`[intake] exact-ref comment scan failed for ${c.identifier}:`, e instanceof Error ? e.message : e);
+      continue; // best-effort — a read failure on one candidate must not block the others or the filing
+    }
+  }
+  return null;
+}
+
 function intakeEnabled(): boolean {
   return process.env.FEATUREBASE_INTAKE === 'true';
 }
@@ -243,10 +299,18 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   // 2. Find or create the ONE canonical Linear ticket for this bug (dedup groups reporters).
   const cans = await listOpenBugCanonicals(MAX_CANDIDATES);
   const byRef = new Map(cans.map((c) => [c.identifier, c]));
-  const dup = await findDuplicate(
-    { type: 'bug', title: p.title, description: p.description },
-    cans.map((c) => ({ ref: c.identifier, title: c.title, description: c.description })),
-  );
+  const refs = extractCanonicalRefs(`${p.title}\n${p.description}`);
+
+  // Deterministic short-circuit (fixes the ENG-329 false-duplicate incident): an explicit AGW-N
+  // reference is checked for an EXACT match — via its private reporter-ticket comment — before the
+  // fuzzy judge ever runs. No AGW-N reference present -> no-op -> behavior identical to today.
+  const exactOpenMatch = await findExactCanonicalMatch(refs, cans);
+  const dup = exactOpenMatch
+    ? { ref: exactOpenMatch.identifier, title: exactOpenMatch.title, description: exactOpenMatch.description }
+    : await findDuplicate(
+        { type: 'bug', title: p.title, description: p.description },
+        cans.map((c) => ({ ref: c.identifier, title: c.title, description: c.description })),
+      );
 
   // Reopen, not refile (ENG-240 contract #3): when no OPEN canonical matches but the report explicitly
   // references an existing ticket (regression / failed retest, e.g. "AGW-58" or "ENG-179"), match it
@@ -256,11 +320,16 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
     const resolved = await listRecentlyResolvedBugCanonicals(MAX_CANDIDATES);
     if (resolved.length) {
       const rByRef = new Map(resolved.map((c) => [c.identifier, c]));
-      const rdup = await findDuplicate(
-        { type: 'bug', title: p.title, description: p.description },
-        resolved.map((c) => ({ ref: c.identifier, title: c.title, description: c.description })),
-      );
-      reopenTarget = rdup ? rByRef.get(rdup.ref) || null : null;
+      const exactResolvedMatch = await findExactCanonicalMatch(refs, resolved);
+      if (exactResolvedMatch) {
+        reopenTarget = exactResolvedMatch;
+      } else {
+        const rdup = await findDuplicate(
+          { type: 'bug', title: p.title, description: p.description },
+          resolved.map((c) => ({ ref: c.identifier, title: c.title, description: c.description })),
+        );
+        reopenTarget = rdup ? rByRef.get(rdup.ref) || null : null;
+      }
     }
   }
 
@@ -497,32 +566,102 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
  * can't block the rest; idempotent in effect (re-flipping a Completed card is a no-op; a duplicate
  * email is harmless). Returns the ticket numbers we acted on. Called by the Linear webhook handler.
  *
+ * Email body (ENG-316): if the canonical carries an `@Emma <message>` comment, the LATEST one
+ * (by createdAt) is parroted as the email body — eng controls the customer-facing "here's what
+ * happened" from inside Linear. Otherwise the default copy below is sent, unchanged.
+ *
  * Feature requests need no bridge: their Featurebase post is synced to Linear, so marking the Linear
  * issue Done flips the post to Completed and Featurebase emails every upvoter natively (verified).
  */
 const REPORTER_TICKET_RE = /\[reporter-ticket #(\d+)\s+([^\]\s]+)\]/g;
 const escapeHtml = (s: string) => s.replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c] as string));
 
+// ENG-316: an `@Emma <message>` comment on the canonical becomes the customer-facing resolution
+// email body. VERIFIED LIVE (2026-07-15, probe comment on ENG-316 read back through the same
+// GraphQL field the service uses): a REAL Linear workspace mention serializes in the raw comment
+// `body` as plain `@displayName` (the bodyData mention node round-trips to just "@harsha"), so
+// plain-text `@emma` (case-insensitive) is the mainline form; the bracketed link forms
+// (`@[Emma …](…)` / `[@Emma …](…)`) never occur in raw bodies but are tolerated for hand-written
+// markdown mentions — either bracket order, so no stray `[](url)` ever reaches a customer email.
+//
+// The mention must be the comment's LEADING token — the documented convention is
+// "@Emma <message>", and requiring it up front is the primary guard that keeps customer-written
+// report text (which routinely addresses the agent as "@emma") from ever qualifying.
+// `emma\b` anchoring keeps @emmabyaw and names that merely contain "emma" (@[Gemma Ortiz](…))
+// from matching.
+const EMMA_LEADING_MENTION_RE = /^\s*(?:@emma\b|@\[\s*emma\b[^\]]*\]\([^)]*\)|\[@\s*emma\b[^\]]*\]\([^)]*\))\s*/i;
+// Non-global twin of REPORTER_TICKET_RE (`.test()` on a /g/ regex is stateful): marks a comment
+// as intake-authored — i.e. carrying CUSTOMER-controlled report text.
+const INTAKE_COMMENT_MARKER_RE = /\[reporter-ticket #\d+\s+[^\]\s]+\]/;
+
+/**
+ * Pick the customer-facing resolution message from the canonical's comments: the MOST RECENT
+ * (by createdAt, not list order) comment that STARTS with an @Emma mention, mention stripped,
+ * trimmed. Returns null when no comment qualifies — including mention-only comments — so the
+ * default copy stays in play and we never send an empty email.
+ *
+ * PII guard (reviewer blocker on ENG-316): intake writes customer-controlled text into canonical
+ * comments (`Their report:\n<description>`, intake comment above), and customers routinely
+ * address the agent as "@emma" inside that text. Those comments are excluded twice over — they
+ * carry the reporter-ticket marker, and the mention is never their leading token — so one
+ * customer's report (email address included) can never become every reporter's resolution email.
+ */
+function pickEmmaResolutionMessage(comments: Array<{ body: string; createdAt: string }>): string | null {
+  let best: { text: string; ts: number } | null = null;
+  for (const c of comments) {
+    const body = c.body || '';
+    if (INTAKE_COMMENT_MARKER_RE.test(body)) continue;
+    const m = body.match(EMMA_LEADING_MENTION_RE);
+    if (!m) continue;
+    const text = body.slice(m[0].length).trim();
+    if (!text) continue;
+    const parsed = Date.parse(c.createdAt || '');
+    const ts = Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
+    if (!best || ts >= best.ts) best = { text, ts };
+  }
+  return best ? best.text : null;
+}
+
 export async function notifyCanonicalResolved(
   canonicalIssueId: string,
   issueTitle = 'the issue you reported',
 ): Promise<{ ticketNumbers: number[] }> {
-  const { getIssueComments } = await import('./linearService');
-  const { getTicketStatusId, patchTicketStatus } = await import('./featurebaseService');
+  const { getIssueCommentsDetailed } = await import('./linearService');
+  const { getTicketStatusId, patchTicketStatus, mdToFeaturebaseHtml } = await import('./featurebaseService');
   const { resendService } = await import('./resendService');
   const { notifyReporterShipped } = await import('./shipNotifyService');
 
-  const comments = await getIssueComments(canonicalIssueId);
+  // ONE comment fetch feeds both consumers — the reporter parse and the @Emma parrot — so the two
+  // can never disagree on a mid-resolve snapshot. A fetch failure propagates (as it always has for
+  // the reporter parse): without the comments there is nobody to notify, and the webhook route
+  // catches + logs it.
+  const comments = await getIssueCommentsDetailed(canonicalIssueId);
   const reporters = new Map<number, string>(); // ticket number -> reporter email
-  for (const body of comments) {
+  for (const { body } of comments) {
     let m: RegExpExecArray | null;
     REPORTER_TICKET_RE.lastIndex = 0;
     while ((m = REPORTER_TICKET_RE.exec(body)) !== null) reporters.set(Number(m[1]), m[2]);
   }
   if (reporters.size === 0) return { ticketNumbers: [] };
 
+  // ENG-316: eng writes the "here's what happened" message as an `@Emma <message>` comment on the
+  // canonical before flipping it to Done; the latest one is parroted as the email body. Rendered
+  // via mdToFeaturebaseHtml, which HTML-escapes FIRST — Linear comments are untrusted input for a
+  // customer email. Best-effort: a rendering failure degrades to the default copy (loud warn), it
+  // never blocks notifying the reporters.
+  let emmaHtml: string | null = null;
+  try {
+    const message = pickEmmaResolutionMessage(comments);
+    emmaHtml = message ? mdToFeaturebaseHtml(message) || null : null;
+  } catch (e) {
+    console.warn('[resolve-bridge] @Emma resolution message rendering failed — using default copy:', e instanceof Error ? e.message : e);
+  }
+
   const completedId = await getTicketStatusId('Completed');
   const safeTitle = escapeHtml(issueTitle);
+  const emailHtml =
+    emmaHtml ??
+    `<p>Good news — the issue you reported (<strong>${safeTitle}</strong>) has been resolved. Thanks for flagging it!</p><p>If you still run into it, just reply to this email and we'll take another look.</p>`;
   const acted: number[] = [];
   for (const [num, email] of reporters) {
     // Slack ping in the reporter's own channel — ADDITIVE to the email, independent of it.
@@ -538,7 +677,7 @@ export async function notifyCanonicalResolved(
       await resendService.sendSystemEmail({
         to: email,
         subject: `Resolved: ${issueTitle}`,
-        html: `<p>Good news — the issue you reported (<strong>${safeTitle}</strong>) has been resolved. Thanks for flagging it!</p><p>If you still run into it, just reply to this email and we'll take another look.</p>`,
+        html: emailHtml,
       });
       await patchTicketStatus(num, completedId);
       acted.push(num);
