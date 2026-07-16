@@ -1,3 +1,124 @@
+## Resolve-bridge @Emma parrot: mention serialization pinned live + a PII hijack closed (2026-07-15, ENG-316)
+
+The resolve bridge now parrots the latest `@Emma <message>` comment on a bug canonical as the
+reporter resolution email. Three findings from the review/finalize pass worth keeping:
+
+### How a Linear mention ACTUALLY serializes (verified live, not guessed)
+Probe: created a comment on ENG-316 through Linear's own agent surface (it builds a genuine
+ProseMirror `suggestion_userMentions` node — confirmed via `comment.bodyData`), then read it back
+through the exact GraphQL field the service uses (`comments { nodes { body } }`). **A real
+workspace mention round-trips as plain `@displayName`** (`@harsha`) — no bracket/link markup at
+all. So plain-text `@emma` is the mainline matcher; the bracketed forms (`@[Emma](url)` /
+`[@Emma](url)`) never occur in raw bodies and are tolerated only for hand-written markdown. Also
+verified: `issue(id:)` accepts both UUID and identifier, and `comments(orderBy: createdAt)`
+returns **newest-first** (so `first: 250` overflow drops the oldest). Note: no "Emma" user exists
+in the workspace today (2026-07-15) — the convention works via plain-text `@emma` until one does.
+
+### The hijack class: intake comments carry CUSTOMER-controlled text
+Intake appends `Their report:\n<raw customer description>` to canonical comments, and customers
+address the agent as "@emma" in bug reports — so any anywhere-in-body mention matcher lets one
+customer's report (plus their email in the marker line) become EVERY reporter's resolution email.
+Closed twice over: the mention must be the comment's LEADING token (the documented `@Emma
+<message>` convention), and any comment carrying a `[reporter-ticket #N]` marker is excluded from
+parrot candidacy outright. Assumption to validate if intake formats ever change: intake-authored
+canonical comments always carry the reporter-ticket marker.
+
+### Linear's 50-node connection default, third sighting
+The un-sized `comments` connection silently caps at 50 — same trap `getTeamMeta` documents for
+states/labels. Any Linear connection query in this repo must be explicitly sized (250 max) with a
+loud `pageInfo.hasNextPage` log. Grep for un-sized connections when touching `linearService`.
+
+## Eval-queue Ad vs Organic Post categorization (2026-07-15, ENG-90)
+
+Matt's ask: reviewer feedback on an image differs by use case, so eval-queue items need an
+Ad / Organic Post classification he can see and filter on. Shipped the substrate: additive
+`HumanEvalCandidate.category` (`ad | organic_post | uncategorized`), a bold `*Category:*` tag in the
+Slack eval post, and an admin-only filterable `GET /api/human-eval/candidates`.
+
+### Call-site classification (traced every enqueue path)
+- `agentModeService.generateImage` auto-enqueue is the ONLY image enqueue path today. The
+  `generate_image` tool serves BOTH ad and organic asks with no hard flow signal in its inputs —
+  genuinely ambiguous, so it stays `uncategorized` rather than guessing from prompt text.
+- Emma `enqueue_human_eval` tool: flow unknown at enqueue; tool inputSchema deliberately untouched
+  (AgentMode prompt-surface change = Harsha's call). Follow-up filed as ENG-343.
+- v0 landing-page + lead-enrichment enqueues: not images — no category passed. The lead-enrichment
+  feedback rerun inherits the original candidate's category.
+- `onboardingAdImageService` calls `imageService.generateImage` directly and never enqueues eval
+  candidates, so it is not a categorization site today.
+
+### Assumptions to validate
+- Consequence of the no-guessing rule: every auto-enqueued image posts as Uncategorized until a flow
+  self-declares (ENG-343 is the unlock). The filter/display substrate is what this PR delivers.
+- Fail-open normalization (`unknown → uncategorized`) is correct on the WRITE path only — it protects
+  enqueueing. On the READ path a typo'd filter must 400, never coerce: reviewer caught that
+  `?category=ads` silently returned the uncategorized set with `success:true`. Strict
+  `parseHumanEvalCategoryFilter` now guards the list route (unknown status/reviewType also 400).
+- `listCandidates` is a paged scan capped at 20 pages (table is small, keyed by candidateId only).
+  If the queue ever exceeds ~20 scan pages, results silently truncate — a GSI on status/createdAt is
+  the eventual fix if listing becomes a hot surface.
+
+## Run-survival remainder shipped behind AGENT_RUN_STORE (2026-07-15, ENG-147)
+
+The 6/27 duplicate-session storm (one question → ~30 full agent runs, RCA on ENG-147) is now
+guarded at both storm seams, salvaged from closed PR #2006 and re-scoped against today's main per
+Harsha's 2026-07-14 comment: durable run records + idempotency submit-locks — a fresh, smaller PR.
+Everything is behind `AGENT_RUN_STORE=true`; flag absent = byte-identical behavior, pinned by
+BEHAVIOR-PRESERVING tests in every touched suite.
+
+### What shipped
+- `services/agentMode/runStore.ts` — one DynamoDB table (`AW-AgentRuns`, pk hash, PAY_PER_REQUEST)
+  with two item kinds: `run#<runId>` (30d ttl) and `idem#<key>` conditional-put submit-locks (10m
+  interactive). NO-FALLBACK create; best-effort terminal marks (retry once → one deduped alert),
+  conditional so a failed create never upserts a ttl-less phantom.
+- `createSession` accepts an optional client `idempotencyKey`: exactly one of N duplicates creates a
+  session; losers attach to the winner (200 + `idempotentReplay`) or get 409 `DUPLICATE_SUBMIT`
+  while it's in flight. Key is sha256-scoped by userId — no cross-user attach.
+- `/generate` claims `idem#sha256(sessionId|userMessage|llmModel)` BEFORE the in-process
+  `activeSessionGenerations` Set (two layers, one concept: cross-restart dedupe + in-process
+  concurrency; B2's atomic Set claim was already on main and is untouched). Loser gets the existing
+  409 `SESSION_BUSY` shape + the in-flight `runId`.
+- `runScheduledChat` failure sites: oncall alerts get `(user, schedule, errorClass)` keys with a
+  1h window — one flapping schedule cannot flood oncall.
+
+### Review fixes (same day, senior-review pass)
+- **DynamoDB TTL reaping is EVENTUAL, not a bound.** The original claim design relied on the native
+  TTL reaper to clear leaked locks; an expired item still exists (documented minutes-to-hours lag),
+  so a hard crash between claim and release could 409 identical resubmits far past the promised 10m.
+  Fixed: `claimIdempotency`'s conditional put is now `attribute_not_exists(pk) OR #ttl < :now` and
+  the loser-path read (`ConsistentRead: true`) treats an expired item as absent. Staleness is now
+  genuinely bounded by the ttl window regardless of reaper lag. **Do not write any future
+  `attribute_not_exists` claim that relies on the reaper.**
+- **The incident#<runId> dedupe lane was inert and got deleted.** Every production
+  `runScheduledChat` mints a fresh uuid (no `preGeneratedRunId` outside the isTest lane) and the
+  two filing sites are mutually exclusive per invocation, so `claimIncident` always won — a DDB
+  item kind with zero production effect, and the third filer (sendOncallAlert's own
+  `fileAutoIssue`) bypassed it anyway. The pre-existing ENG-240 sequenced search-gate remains the
+  real incident dedupe. Structural per-run dedupe, if wanted, means threading one runId through
+  `sendOncallAlert`'s filer + deciding loser semantics (occurrence comment / URL) — filed as a
+  follow-up Linear issue rather than shipping dead weight.
+- **Still-building early returns now mark run records terminal** (`completed` /
+  `detached_still_building`) instead of leaving `running` phantoms for the 30d ttl.
+
+### Assumptions to validate
+- The frontend does not yet SEND `idempotencyKey` on createSession — the backend seam is ready and
+  inert until the client half (disable-submit + key per send action) lands. Filed as follow-up.
+- Interactive idem ttl (10m) assumes no legitimate identical resubmit of the same message to the
+  same session within a run's lifetime; the lock releases at every terminal state, so only a
+  crash between claim and release leaves the (ttl-bounded) 10m window.
+- Enabling the flag requires the table (`create-tables.ts` now creates `AW-AgentRuns`) + manual TTL
+  enable on `ttl` — same manual step as UsageRecords/LoopEvents. With the flag on and the table
+  missing, `/generate` 500s loudly BY DESIGN (run records are core state, no silent fallback).
+  Correctness never depends on TTL enable (claims tolerate expired items); it only controls
+  storage growth.
+
+### Deliberately deferred (re-scope per Harsha's comment; each inert without the flag anyway)
+- Scheduled fire-window idempotency (`scheduledIdempotencyKey` exists in the store, unwired) +
+  scheduled durable run records.
+- The ishare/`generateSharedResponse` lane submit-lock (mirror of /generate).
+- Threading the run record's runId into worker telemetry (`agentRuntimeRunId` unification).
+- `createSessionWithPlan` idempotency — the route is public; anonymous callers can't be
+  user-scoped, needs a key-design decision.
+
 ## Landing pages: the residual wedge + hang the first fix left behind (2026-07-13, ENG-287 follow-up)
 
 The 07-11 fix (PR #2066, below) correctly killed the sync-create 300s race. But the same failure

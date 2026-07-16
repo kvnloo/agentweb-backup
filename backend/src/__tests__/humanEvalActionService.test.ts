@@ -139,4 +139,27 @@ describe('runHumanEvalFeedbackAction', () => {
       sourceKey: expect.stringContaining('lead-enrichment-feedback:candidate-1:C1:178.1:rerun-1'),
     }));
   });
+
+  it('carries the original candidate category onto the feedback-rerun eval', async () => {
+    await runHumanEvalFeedbackAction(
+      candidate({
+        reviewType: 'lead_enrichment',
+        reviewer: 'fangfang',
+        userId: 'user-1',
+        category: 'ad',
+        action: {
+          type: 'lead_enrichment_rerun',
+          listId: 'list-1',
+          userId: 'user-1',
+          outputFields: [{ name: 'industry', instruction: 'classify industry' }],
+          toolName: 'enrich_lead_custom',
+        },
+      }),
+      { ...feedback, slackUserDisplayName: 'Fangfang', text: 'Fix industry.' },
+    );
+
+    expect(enqueueAutoHumanEval).toHaveBeenCalledWith(expect.objectContaining({
+      category: 'ad',
+    }));
+  });
 });

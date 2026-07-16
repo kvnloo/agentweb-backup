@@ -1,4 +1,11 @@
-import { cosineSimilarity, rankMemoriesByRelevance } from '../utils/memoryRanking';
+import {
+  cosineSimilarity,
+  rankMemoriesByRelevance,
+  describeMemoryAge,
+  formatMemoryLine,
+  buildMemoryContextMessage,
+  MEMORY_STALENESS_NOTE,
+} from '../utils/memoryRanking';
 
 describe('cosineSimilarity', () => {
   it('returns ~1 for identical vectors', () => {
@@ -89,6 +96,97 @@ describe('rankMemoriesByRelevance', () => {
   it('does not throw when createdAt is missing/equal', () => {
     const res = rankMemoriesByRelevance([{ memoryId: 'a' }, { memoryId: 'b' }], [1, 0], 5);
     expect(res).toHaveLength(2);
+  });
+});
+
+describe('describeMemoryAge', () => {
+  const now = new Date('2026-07-13T12:00:00Z');
+
+  it('returns "today" for a memory saved earlier the same day', () => {
+    expect(describeMemoryAge('2026-07-13T01:00:00Z', now)).toBe('today');
+  });
+
+  it('returns "yesterday" for a memory saved ~1 day ago', () => {
+    expect(describeMemoryAge('2026-07-12T06:00:00Z', now)).toBe('yesterday');
+  });
+
+  it('returns "N days ago" for older memories', () => {
+    expect(describeMemoryAge('2026-07-09T12:00:00Z', now)).toBe('4 days ago');
+  });
+
+  it('returns null when the saved timestamp is missing', () => {
+    expect(describeMemoryAge(undefined, now)).toBeNull();
+  });
+
+  it('returns null for an unparseable timestamp instead of NaN', () => {
+    expect(describeMemoryAge('not-a-date', now)).toBeNull();
+  });
+
+  it('returns null for a future saved-date rather than a contradictory "today"', () => {
+    // Clock skew or an updatedAt bumped ahead would otherwise render "(saved <future>, today)".
+    expect(describeMemoryAge('2026-07-25T12:00:00Z', now)).toBeNull();
+  });
+
+  it('buckets by UTC calendar date, not 24h windows, so it never contradicts the saved date near midnight', () => {
+    // Scheduled runs fire around midnight; a memory saved the previous calendar day but
+    // < 24h ago must read "yesterday" (matching its displayed 2026-07-12 stamp), not "today".
+    const justAfterMidnight = new Date('2026-07-13T00:30:00Z');
+    expect(describeMemoryAge('2026-07-12T23:00:00Z', justAfterMidnight)).toBe('yesterday');
+  });
+});
+
+describe('formatMemoryLine', () => {
+  const now = new Date('2026-07-13T12:00:00Z');
+
+  it('stamps a memory with its saved date and age so stale facts are visibly old', () => {
+    const line = formatMemoryLine(
+      { category: 'insight', content: 'Instagram token expired — skip Instagram', createdAt: '2026-07-09T12:00:00Z' },
+      now
+    );
+    // The age prefix is what lets the model recognize a stale operational note (ENG-305).
+    expect(line).toBe('- [insight] (saved 2026-07-09, 4 days ago) Instagram token expired — skip Instagram');
+  });
+
+  it('prefers updatedAt over createdAt when both are present', () => {
+    const line = formatMemoryLine(
+      { category: 'preference', content: 'x', createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-07-12T12:00:00Z' },
+      now
+    );
+    expect(line).toBe('- [preference] (saved 2026-07-12, yesterday) x');
+  });
+
+  it('falls back to an unstamped line when no timestamp is available', () => {
+    const line = formatMemoryLine({ category: 'fact', content: 'no date here' }, now);
+    expect(line).toBe('- [fact] no date here');
+  });
+
+  it('defaults the category label when missing', () => {
+    const line = formatMemoryLine({ content: 'orphan' }, now);
+    expect(line).toBe('- [general] orphan');
+  });
+});
+
+describe('buildMemoryContextMessage', () => {
+  const now = new Date('2026-07-13T12:00:00Z');
+
+  it('returns null when there are no memories', () => {
+    expect(buildMemoryContextMessage('Account Memory:', [], now)).toBeNull();
+    expect(buildMemoryContextMessage('Account Memory:', null as any, now)).toBeNull();
+  });
+
+  it('renders a header, dated lines, and the staleness caution', () => {
+    const msg = buildMemoryContextMessage(
+      'Account Memory (facts from previous sessions):',
+      [
+        { category: 'insight', content: 'Instagram token expired — skip Instagram', createdAt: '2026-07-09T12:00:00Z' },
+        { category: 'preference', content: 'Post to LinkedIn and Instagram daily', createdAt: '2026-07-13T09:00:00Z' },
+      ],
+      now
+    );
+    expect(msg).toContain('Account Memory (facts from previous sessions):');
+    expect(msg).toContain('- [insight] (saved 2026-07-09, 4 days ago) Instagram token expired — skip Instagram');
+    expect(msg).toContain('- [preference] (saved 2026-07-13, today) Post to LinkedIn and Instagram daily');
+    expect(msg).toContain(MEMORY_STALENESS_NOTE);
   });
 });
 
