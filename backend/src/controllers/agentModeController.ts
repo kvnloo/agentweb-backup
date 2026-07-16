@@ -4876,7 +4876,7 @@ export const agentModeController = {
           }
         }).catch(async (runError) => {
           if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
-            scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
+            await scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
               variableValues: {},
               variableRequestStatus: 'pending',
               updatedAt: new Date().toISOString()
@@ -5046,9 +5046,9 @@ export const agentModeController = {
             console.error('Error sending scheduled chat result email after public variable submit:', emailError);
           }
         }
-      }).catch((runError) => {
+      }).catch(async (runError) => {
         if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
-          scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
+          await scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
             variableValues: {},
             variableRequestStatus: 'pending',
             updatedAt: new Date().toISOString()
@@ -5608,7 +5608,7 @@ export const agentModeController = {
               }
             }
             // If result.sessionId is empty, the error email was already sent in runScheduledChat
-          }).catch((error) => {
+          }).catch(async (error) => {
             // Decrement concurrent run counter on error
             currentConcurrentRuns--;
 
@@ -5648,12 +5648,12 @@ export const agentModeController = {
               createdAt: new Date().toISOString()
             };
 
-            scheduleDb.addRunResult(schedule.scheduleId, errorResult).catch((saveError) => {
+            await scheduleDb.addRunResult(schedule.scheduleId, errorResult).catch((saveError) => {
               console.error(`Error saving failure run result for schedule ${schedule.scheduleName}:`, saveError);
             });
 
             // Send oncall alert for unhandled scheduled chat error (safety net)
-            sendAgentModeOncallAlert({
+            await sendAgentModeOncallAlert({
               subject: `Scheduled Chat Unhandled Error: ${schedule.scheduleName}`,
               message: `Scheduled chat "${schedule.scheduleName}" failed with an unhandled error in the fire-and-forget handler.\n\nError: ${error.message || 'Unknown error'}`,
               context: {
@@ -5669,8 +5669,8 @@ export const agentModeController = {
             // Send error notification email
             const emailNotifications = schedule.emailNotifications || [];
             if (emailNotifications.length > 0) {
-              import('../services/emailService').then(({ emailService }) => {
-                emailService.sendScheduledChatResultEmail(
+              await import('../services/emailService').then(({ emailService }) => {
+                return emailService.sendScheduledChatResultEmail(
                   emailNotifications,
                   schedule.scheduleName,
                   errorResult,
