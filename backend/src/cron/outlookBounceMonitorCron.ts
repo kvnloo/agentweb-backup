@@ -45,8 +45,14 @@ interface InboxMessage {
 // a real lead (see runOutlookBounceMonitor).
 const NDR_SUBJECT_PATTERN = /^(undeliverable|delivery status notification|mail delivery failed|returned mail|non-delivery report)/i;
 const NDR_SENDER_PATTERN = /mailer-daemon|postmaster|delivery.*subsystem/i;
+// "Delivery has failed to these recipients or groups:" is Microsoft's own
+// documented Exchange Online/M365 NDR body phrasing (learn.microsoft.com,
+// "How to interpret an Exchange NDR") — the address sits on its OWN LINE
+// after the phrase, not on the same line, hence `[\s\S]` (matches newlines)
+// instead of `[^\n]`. The other phrases are kept as a fallback for other
+// mail systems / older NDR formats.
 const RECIPIENT_PHRASE_PATTERN =
-  /(?:the following recipient|recipient|rcpt to|mailbox unavailable|user unknown)[^\n]{0,80}?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i;
+  /(?:delivery has failed to these recipients or groups|the following recipient|recipient|rcpt to|mailbox unavailable|user unknown)[\s\S]{0,80}?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i;
 const ANY_EMAIL_PATTERN = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/;
 
 /** Pure — no I/O, so it's unit-testable without mocking Graph or the DB. */

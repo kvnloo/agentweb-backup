@@ -102,6 +102,44 @@ describe('extractBounceCandidate — SUCCESS cases', () => {
       }),
     ).toBe('dead@contractor.com');
   });
+
+  // Verbatim from Microsoft's own NDR documentation (learn.microsoft.com,
+  // "How to interpret an Exchange NDR") — the real body format differs from
+  // what an earlier version of this classifier assumed ("the following
+  // recipient..."). Real Exchange/M365 NDRs open with "Delivery has failed
+  // to these recipients or groups:" followed by the address on its OWN LINE,
+  // not on the same line as the phrase.
+  it('extracts the recipient from the real Microsoft-documented NDR body format', () => {
+    const body = [
+      'Delivery has failed to these recipients or groups:',
+      'ronald@contoso.com',
+      "Your message wasn't delivered due to a permission or security issue. It might have been rejected by a moderator, the address might only accept email from certain senders, or another restriction might be preventing delivery. The following organization rejected your message: mail.contoso.com.",
+      'Diagnostic information for administrators:',
+      'Generating server: alpineskihouse.com',
+      'ronald@contoso.com',
+      'mail.contoso.com #<exchange.contoso.com #5.7.1 smtp;530 5.7.1 Client was not authenticated> #SMTP#',
+    ].join('\n');
+
+    expect(
+      extractBounceCandidate({ subject: 'Undeliverable: Hi there', from: 'Microsoft Outlook', body }),
+    ).toBe('ronald@contoso.com');
+  });
+
+  it('anchors on the recipient phrase rather than just grabbing the first email in the body', () => {
+    // A decoy address appears before the real failed recipient. If the
+    // classifier ever regresses to "grab the first email anywhere in the
+    // body" instead of anchoring on the documented phrase, this catches it.
+    const body = [
+      'Reply-To: someone-else@notthebounce.com',
+      'Delivery has failed to these recipients or groups:',
+      'ronald@contoso.com',
+      "Your message wasn't delivered due to a permission or security issue.",
+    ].join('\n');
+
+    expect(
+      extractBounceCandidate({ subject: 'Undeliverable: Hi there', from: 'Microsoft Outlook', body }),
+    ).toBe('ronald@contoso.com');
+  });
 });
 
 // ─── runOutlookBounceMonitor — orchestration ───────────────────────────────────
