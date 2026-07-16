@@ -113,11 +113,19 @@ describe('requireScheduledChatsServiceSecret (ENG-347)', () => {
     });
 
     it('passes the request through and warns exactly once per process', () => {
+      // Re-import a fresh module copy so the once-per-process warn flag is
+      // deterministically false here, independent of test ordering (a prior
+      // test hitting the unset path would otherwise have consumed the warn).
+      jest.resetModules();
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const fresh = require('../middleware/serviceAuth') as typeof import('../middleware/serviceAuth');
+      const freshMiddleware = fresh.requireScheduledChatsServiceSecret;
+
       const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
 
       const next1 = jest.fn();
       const res1 = mockRes();
-      requireScheduledChatsServiceSecret(mockReqWithHeader(undefined), res1, next1);
+      freshMiddleware(mockReqWithHeader(undefined), res1, next1);
       expect(next1).toHaveBeenCalledTimes(1);
       expect(res1.status).not.toHaveBeenCalled();
       expect(warnSpy).toHaveBeenCalledTimes(1);
@@ -126,7 +134,7 @@ describe('requireScheduledChatsServiceSecret (ENG-347)', () => {
       // Second unauthenticated request: still passes, but no repeat warning
       // (agent-engine polls this endpoint continuously — no log flooding).
       const next2 = jest.fn();
-      requireScheduledChatsServiceSecret(mockReqWithHeader(undefined), mockRes(), next2);
+      freshMiddleware(mockReqWithHeader(undefined), mockRes(), next2);
       expect(next2).toHaveBeenCalledTimes(1);
       expect(warnSpy).toHaveBeenCalledTimes(1);
     });
