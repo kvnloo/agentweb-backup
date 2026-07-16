@@ -596,6 +596,36 @@ export class GoogleAdsService {
     return [...urls];
   }
 
+  /**
+   * Current serving status of a campaign (e.g. 'ENABLED', 'PAUSED'), or null if
+   * the campaign can't be found. Used by the ENG-335 launch gate to decide whether
+   * adding a creative to it serves paid traffic instantly.
+   */
+  async getCampaignStatus(userId: string, customerId: string, campaignResourceName: string): Promise<string | null> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const rows = await this.search(customerId, accessToken,
+      `SELECT campaign.status FROM campaign WHERE campaign.resource_name = '${campaignResourceName}'`,
+      loginCustomerId,
+    );
+    return rows[0]?.campaign?.status ?? null;
+  }
+
+  /**
+   * Resolve the parent campaign (resource name + current status) of an ad group.
+   * Returns null if the ad group can't be found. Used by the ENG-335 launch gate
+   * so a new ad added to a live campaign is checked before it serves.
+   */
+  async getAdGroupCampaign(userId: string, customerId: string, adGroupResourceName: string): Promise<{ campaignResourceName: string; campaignStatus: string } | null> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const rows = await this.search(customerId, accessToken,
+      `SELECT ad_group.campaign, campaign.status FROM ad_group WHERE ad_group.resource_name = '${adGroupResourceName}'`,
+      loginCustomerId,
+    );
+    const row = rows[0];
+    if (!row?.adGroup?.campaign) return null;
+    return { campaignResourceName: row.adGroup.campaign, campaignStatus: row.campaign?.status ?? '' };
+  }
+
   // ── Location search ───────────────────────────────────────────────────────
 
   async searchLocations(userId: string, customerId: string, query: string, locale: string = 'en'): Promise<{ id: string; name: string; countryCode: string; targetType: string }[]> {

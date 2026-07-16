@@ -27890,7 +27890,44 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     const finalUrls = await googleAdsService.getCampaignFinalUrls(userId, customerId, campaignResourceName);
     // No serving URLs (e.g. a campaign with no ads yet) ⇒ nothing to gate.
     if (finalUrls.length === 0) return { proceed: true };
+    return this.runGoogleAdsTrackingGate(customerId, campaignResourceName, action, override, sessionId, finalUrls);
+  }
 
+  /**
+   * ENG-335: adding a new ad or PMax asset group to an *already-ENABLED* campaign
+   * serves paid traffic to its final URL instantly — the same exposure as a launch.
+   * Gate the newly-added final URL(s) exactly like RESUME/UPDATE(ENABLED). Additions
+   * to a PAUSED/DRAFT campaign are not gated here; they are re-checked when that
+   * campaign is later enabled/resumed.
+   */
+  private async enforceGoogleAdsCreativeAdditionGate(
+    customerId: string,
+    campaignResourceName: string,
+    campaignStatus: string | null,
+    action: string,
+    override: boolean,
+    sessionId: string | undefined,
+    newFinalUrls: Array<string | undefined>,
+  ): Promise<{ proceed: boolean; blockResult?: any }> {
+    if (campaignStatus !== 'ENABLED') return { proceed: true };
+    const urls = newFinalUrls.filter((u): u is string => typeof u === 'string' && u.trim().length > 0);
+    if (urls.length === 0) return { proceed: true };
+    return this.runGoogleAdsTrackingGate(customerId, campaignResourceName, action, override, sessionId, urls);
+  }
+
+  /**
+   * Shared core of the tracking gate: run the deterministic pre-flight check over
+   * `finalUrls`, record the outcome (passed / blocked / overridden) on the run
+   * record, and return whether the caller may proceed.
+   */
+  private async runGoogleAdsTrackingGate(
+    customerId: string,
+    campaignResourceName: string,
+    action: string,
+    override: boolean,
+    sessionId: string | undefined,
+    finalUrls: string[],
+  ): Promise<{ proceed: boolean; blockResult?: any }> {
     const gate = await preflightTrackingGate(finalUrls);
     const urlResults = gate.results.map(r => ({ url: r.url, status: r.status, mechanisms: r.mechanisms, error: r.error }));
 
@@ -28119,6 +28156,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!args.ad_group_resource_name || !args.type || !args.headlines || !args.descriptions || !args.final_url) {
             return { success: false, error: 'ad_group_resource_name, type, headlines, descriptions, and final_url are required to create an ad' };
           }
+          // ENG-335: an ad added to an already-live campaign serves paid traffic
+          // instantly — gate its final_url like a launch when the parent is ENABLED.
+          {
+            const parent = await googleAdsService.getAdGroupCampaign(userId, customer_id, args.ad_group_resource_name);
+            if (parent) {
+              const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, parent.campaignResourceName, parent.campaignStatus, 'AD_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
+              if (!gate.proceed) return gate.blockResult;
+            }
+          }
           let adType = args.type as string;
           if (adType === 'SEARCH') adType = 'RESPONSIVE_SEARCH_AD';
           else if (adType === 'DISPLAY') adType = 'RESPONSIVE_DISPLAY_AD';
@@ -28168,6 +28214,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             !args.descriptions || !args.square_image_assets || !args.landscape_image_assets ||
             !args.logo_assets || !args.final_url) {
           return { success: false, error: 'name, campaign_resource_name, headlines, long_headlines, descriptions, square_image_assets, landscape_image_assets, logo_assets, and final_url are required' };
+        }
+        // ENG-335: a PMax asset group added to an already-live campaign serves paid
+        // traffic instantly — gate its final_url like a launch when the parent is ENABLED.
+        {
+          const campaignStatus = await googleAdsService.getCampaignStatus(userId, customer_id, args.campaign_resource_name);
+          const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, args.campaign_resource_name, campaignStatus, 'ASSET_GROUP_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
+          if (!gate.proceed) return gate.blockResult;
         }
         const assetGroup = await googleAdsService.createAssetGroup(userId, customer_id, {
           name: args.name,
