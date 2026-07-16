@@ -121,6 +121,13 @@ describe('describeMemoryAge', () => {
   it('returns null for an unparseable timestamp instead of NaN', () => {
     expect(describeMemoryAge('not-a-date', now)).toBeNull();
   });
+
+  it('buckets by UTC calendar date, not 24h windows, so it never contradicts the saved date near midnight', () => {
+    // Scheduled runs fire around midnight; a memory saved the previous calendar day but
+    // < 24h ago must read "yesterday" (matching its displayed 2026-07-12 stamp), not "today".
+    const justAfterMidnight = new Date('2026-07-13T00:30:00Z');
+    expect(describeMemoryAge('2026-07-12T23:00:00Z', justAfterMidnight)).toBe('yesterday');
+  });
 });
 
 describe('formatMemoryLine', () => {
