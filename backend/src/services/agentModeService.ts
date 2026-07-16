@@ -23366,7 +23366,17 @@ Please generate a complete, professional HTML document that properly formats and
           break;
         } catch (renderError) {
           const isLastAttempt = attempt === maxRenderAttempts;
-          if (isLastAttempt || !isTransientLLMError(renderError)) {
+          const isTransient = isTransientLLMError(renderError);
+          if (isLastAttempt || !isTransient) {
+            // Distinguish exhaustion from a terminal error. If every attempt hit a
+            // transient timeout, the render likely can't finish inside the per-call
+            // budget deterministically (e.g. an oversized report) — retrying the same
+            // call won't help, and this is the signal that would justify streaming/
+            // chunking the render (ENG-203 follow-up). Log it distinctly so these are
+            // greppable and separable from one-off blips and terminal errors.
+            if (isLastAttempt && isTransient) {
+              console.error(`AgentMode: HTML render exhausted all ${maxRenderAttempts} attempts on a transient error (session ${sessionId}); render may be deterministically over the per-call timeout:`, renderError instanceof Error ? renderError.message : renderError);
+            }
             throw renderError;
           }
           const backoffMs = 1000 * Math.pow(2, attempt - 1);
