@@ -6,7 +6,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, readdirSync, rmSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { config } from './config.mjs';
 import { resolveIssue } from './linear.mjs';
@@ -56,6 +56,34 @@ function removeWorktree(id) {
   rmSync(WT, { recursive: true, force: true });
 }
 
+// Given the current state.json entries and the set of ids that DO have a worktree, return the ids of
+// worktree-less entries whose Linear issue is Done/Canceled and are therefore safe to reap. Standalone
+// CHAT-* entries (not Linear issues), still-open issues, locked/in-flight issues, and issues that no
+// longer resolve are all left alone. The Linear/lock probes are injectable so this is unit-testable.
+export async function reapableWorktreelessIds(entries, worktreeIds, {
+  doneTypes = DONE_TYPES,
+  resolveIssue: resolveFn = resolveIssue,
+  lockActive: lockFn = lockActive,
+  log: logFn = () => {},
+} = {}) {
+  const wt = new Set([...worktreeIds].map((s) => String(s).toUpperCase()));
+  const out = [];
+  for (const e of entries || []) {
+    const id = e?.identifier;
+    if (!id || e.standalone) continue;         // standalone CHAT-* isn't a Linear issue
+    if (wt.has(id.toUpperCase())) continue;    // already handled by the worktree scan
+    if (out.includes(id)) continue;            // guard against duplicate identifiers in state
+    if (lockFn(id)) { logFn(`skip ${id} (an operation is active)`); continue; }
+    let issue;
+    try { issue = await resolveFn(id); }
+    catch (ex) { logFn(`skip ${id} (could not resolve: ${ex.message})`); continue; } // deleted/renamed issue — leave it
+    const type = issue.state?.type;
+    if (doneTypes.includes(type)) { logFn(`${id} is "${issue.state.name}" (${type}), no worktree → reap`); out.push(id); }
+    else logFn(`${id} still "${issue.state?.name}" (${type}), no worktree → keep`);
+  }
+  return out;
+}
+
 async function main() {
   if (!process.env.LINEAR_API_KEY) { console.error('[gc] LINEAR_API_KEY not set'); process.exit(2); }
 
@@ -68,9 +96,11 @@ async function main() {
     catch (e) { log(`idle-preview reap failed: ${e.message}`); }
   }
 
-  if (!existsSync(worktreesDir)) { log('no worktrees dir; nothing to do'); return; }
-  const dirs = readdirSync(worktreesDir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
-  if (!dirs.length) { log('no worktrees'); return; }
+  // Worktree dirs (may be empty). Even with none, we still reconcile worktree-less state entries below,
+  // so this no longer early-returns.
+  const dirs = existsSync(worktreesDir)
+    ? readdirSync(worktreesDir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name)
+    : [];
 
   const removedIds = [];
   for (const id of dirs) {
@@ -96,6 +126,22 @@ async function main() {
       log(`${id} still "${issue.state?.name}" (${type}) → keep`);
     }
   }
+
+  // Also reconcile state entries that never produced a worktree — issues that ended terminal-but-early
+  // (blocked / cannot_fix / setup_failed / no_change, before any branch was cut) leave no dir for the
+  // scan above, so without this they linger in the sidebar forever even after a human marks them
+  // Done/Canceled. Resolve each against Linear and drop the completed/canceled ones, mirroring the
+  // worktree path (chat-fork + log cleanup; the deletion itself is applied in the fresh-state write below).
+  const worktreeIds = new Set(dirs.map((d) => d.toUpperCase()));
+  let stateForScan = {}; try { stateForScan = JSON.parse(readFileSync(statePath, 'utf8')); } catch { /* none */ }
+  const reapIds = await reapableWorktreelessIds(Object.values(stateForScan), worktreeIds, { log });
+  for (const id of reapIds) {
+    if (removedIds.includes(id)) continue;
+    cleanChatForks(id);
+    rmSync(path.join(logsDir, id), { recursive: true, force: true }); // stage/chat tee logs for this issue
+    removedIds.push(id);
+  }
+
   // Re-read state FRESH before writing so this run's slow async loop can't clobber entries the chat
   // server added meanwhile (notably new standalone chats). Apply ONLY the deletions we actually made.
   let state = {}; try { state = JSON.parse(readFileSync(statePath, 'utf8')); } catch { /* none */ }
@@ -105,4 +151,7 @@ async function main() {
   log(`done — removed ${removed} worktree(s)`);
 }
 
-main().catch((e) => { console.error('[gc] fatal:', e); process.exit(1); });
+// Auto-run only when invoked directly (not when imported by a test).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((e) => { console.error('[gc] fatal:', e); process.exit(1); });
+}
