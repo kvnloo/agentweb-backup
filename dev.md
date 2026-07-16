@@ -69,6 +69,35 @@ Fixes (all deterministic, none rely on the LLM volunteering):
   narrow; prompts that mean the logo without saying "logo" ("with our brand mark") won't trigger the
   gate. The model still passes `logo_image` explicitly on those per its tool description.
 
+## Eval-queue Ad vs Organic Post categorization (2026-07-15, ENG-90)
+
+Matt's ask: reviewer feedback on an image differs by use case, so eval-queue items need an
+Ad / Organic Post classification he can see and filter on. Shipped the substrate: additive
+`HumanEvalCandidate.category` (`ad | organic_post | uncategorized`), a bold `*Category:*` tag in the
+Slack eval post, and an admin-only filterable `GET /api/human-eval/candidates`.
+
+### Call-site classification (traced every enqueue path)
+- `agentModeService.generateImage` auto-enqueue is the ONLY image enqueue path today. The
+  `generate_image` tool serves BOTH ad and organic asks with no hard flow signal in its inputs —
+  genuinely ambiguous, so it stays `uncategorized` rather than guessing from prompt text.
+- Emma `enqueue_human_eval` tool: flow unknown at enqueue; tool inputSchema deliberately untouched
+  (AgentMode prompt-surface change = Harsha's call). Follow-up filed as ENG-343.
+- v0 landing-page + lead-enrichment enqueues: not images — no category passed. The lead-enrichment
+  feedback rerun inherits the original candidate's category.
+- `onboardingAdImageService` calls `imageService.generateImage` directly and never enqueues eval
+  candidates, so it is not a categorization site today.
+
+### Assumptions to validate
+- Consequence of the no-guessing rule: every auto-enqueued image posts as Uncategorized until a flow
+  self-declares (ENG-343 is the unlock). The filter/display substrate is what this PR delivers.
+- Fail-open normalization (`unknown → uncategorized`) is correct on the WRITE path only — it protects
+  enqueueing. On the READ path a typo'd filter must 400, never coerce: reviewer caught that
+  `?category=ads` silently returned the uncategorized set with `success:true`. Strict
+  `parseHumanEvalCategoryFilter` now guards the list route (unknown status/reviewType also 400).
+- `listCandidates` is a paged scan capped at 20 pages (table is small, keyed by candidateId only).
+  If the queue ever exceeds ~20 scan pages, results silently truncate — a GSI on status/createdAt is
+  the eventual fix if listing becomes a hot surface.
+
 ## Run-survival remainder shipped behind AGENT_RUN_STORE (2026-07-15, ENG-147)
 
 The 6/27 duplicate-session storm (one question → ~30 full agent runs, RCA on ENG-147) is now
