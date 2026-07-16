@@ -962,6 +962,65 @@ export async function createCreativeInline(
   return makeRequest('POST', `/rest/adAccounts/${adAccountId}/creatives?action=createInline`, accessToken, body);
 }
 
+/**
+ * Retag ONE existing, already-live LinkedIn creative missing UTMs (Harsha's ask —
+ * the audit tool can only find these, never fix them). Deliberately single-creative:
+ * never loop or accept a list, so there is no "bulk retag" surface.
+ *
+ * ⚠️ UNVERIFIED AGAINST A LIVE ACCOUNT. Unlike the rest of this file (whose
+ * create-time contract is proven by LinkedIn's own API), this function's write
+ * shape is inferred, not confirmed:
+ *  - The PARTIAL_UPDATE (`POST` + `X-RestLi-Method: PARTIAL_UPDATE` + nested
+ *    `$set`) is the pattern `updateCampaignGroup`/`updateCampaign` already use for
+ *    campaign-level resources; whether the `creatives` resource accepts a PATCH at
+ *    all, and whether `content.textAd.landingPage` is a valid nested $set path, is
+ *    unverified.
+ *  - LinkedIn creatives may be immutable post-creation, same as Meta's — if so
+ *    this fails live and needs a different design (delete + recreate, most likely).
+ *
+ * Only `textAd` creatives carry a destination URL directly on the creative. The
+ * far more common `content.reference` creative type points at an existing
+ * LinkedIn POST — the destination lives on THAT resource, a different write
+ * surface this function does not attempt (same "needs a human" principle the
+ * audit tool already applies to unreadable ads).
+ */
+export async function retagCreativeUtm(
+  accessToken: string,
+  adAccountId: string,
+  creativeId: string,
+  campaign: string,
+): Promise<LinkedInAdsApiResult & { alreadyTagged?: boolean }> {
+  const creativeUrn = creativeId.startsWith('urn:') ? creativeId : `urn:li:sponsoredCreative:${creativeId}`;
+  const encoded = encodeURIComponent(creativeUrn);
+
+  const getResult = await makeRequest('GET', `/rest/adAccounts/${adAccountId}/creatives/${encoded}`, accessToken);
+  if (!getResult.success) return getResult;
+
+  const content = (getResult.data as any)?.content;
+  if (!content?.textAd) {
+    return {
+      success: false,
+      error: 'UNSUPPORTED_CREATIVE_TYPE — the destination URL for this creative lives on the '
+        + 'referenced LinkedIn post, not the creative itself. Editing a live post is not supported.',
+    };
+  }
+
+  const currentUrl: string | undefined = content.textAd.landingPage;
+  const campaignForUtm = resolveCampaignForUtm({ campaign_id: campaign });
+  const newUrl = appendLinkedInUtm(currentUrl, campaignForUtm);
+  if (newUrl === currentUrl) {
+    return { success: true, alreadyTagged: true };
+  }
+
+  return makeRequest(
+    'POST',
+    `/rest/adAccounts/${adAccountId}/creatives/${encoded}`,
+    accessToken,
+    { patch: { $set: { 'content.textAd.landingPage': newUrl } } },
+    { 'X-RestLi-Method': 'PARTIAL_UPDATE' },
+  );
+}
+
 // ─── Image upload ─────────────────────────────────────────────────────────────
 
 /**

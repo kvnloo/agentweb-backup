@@ -344,3 +344,56 @@ describe('UTM — non-URL creative paths are untouched', () => {
     expect(JSON.stringify(body())).not.toContain('utm_');
   });
 });
+
+// ─── retagCreativeUtm — single existing creative retrofit (Harsha's ask) ───────
+//
+// UNVERIFIED against a live account: unlike the rest of this file (which mirrors
+// what LinkedIn's create-time API contract already proves out), the PARTIAL_UPDATE
+// shape used here (`content.textAd.landingPage` under a nested $set) is inferred
+// from the sibling campaign/campaignGroup convention, never confirmed live. Do not
+// treat these passing mocked tests as proof the live API accepts this shape.
+describe('retagCreativeUtm — single existing creative retrofit (Harsha\'s ask)', () => {
+  function mockGet(data: any) {
+    mockAxiosFn.mockResolvedValueOnce({ data, headers: {}, status: 200 });
+  }
+
+  it('propagates a failure reading the creative', async () => {
+    mockAxiosFn.mockRejectedValueOnce({ response: { status: 404, data: { message: 'not found' } } });
+    const result = await svc.retagCreativeUtm(ACCESS_TOKEN, ACCOUNT_ID, 'creative-1', CAMPAIGN);
+    expect(result.success).toBe(false);
+    expect(mockAxiosFn).toHaveBeenCalledTimes(1); // never reaches the write
+  });
+
+  it('reports UNSUPPORTED_CREATIVE_TYPE for a content.reference creative (destination lives on the post, not here)', async () => {
+    mockGet({ content: { reference: 'urn:li:share:999' } });
+    const result = await svc.retagCreativeUtm(ACCESS_TOKEN, ACCOUNT_ID, 'creative-1', CAMPAIGN);
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('UNSUPPORTED_CREATIVE_TYPE');
+    expect(mockAxiosFn).toHaveBeenCalledTimes(1); // read only, no write attempted
+  });
+
+  it('is a no-op when the text ad landingPage already carries every UTM key', async () => {
+    const already = `https://example.com/?${['utm_source=linkedin', 'utm_medium=paid', `utm_campaign=${CAMPAIGN}`].join('&')}`;
+    mockGet({ content: { textAd: { headline: 'H', landingPage: already } } });
+    const result = await svc.retagCreativeUtm(ACCESS_TOKEN, ACCOUNT_ID, 'creative-1', CAMPAIGN);
+    expect(result).toEqual({ success: true, alreadyTagged: true });
+    expect(mockAxiosFn).toHaveBeenCalledTimes(1); // read only, no write attempted
+  });
+
+  it('retags an untagged text-ad creative (happy path)', async () => {
+    mockGet({ content: { textAd: { headline: 'H', landingPage: 'https://example.com/' } } });
+    mockAxiosFn.mockResolvedValueOnce({ data: {}, headers: {}, status: 200 }); // the PARTIAL_UPDATE write
+
+    const result = await svc.retagCreativeUtm(ACCESS_TOKEN, ACCOUNT_ID, 'creative-1', CAMPAIGN);
+
+    expect(result.success).toBe(true);
+    expect(mockAxiosFn).toHaveBeenCalledTimes(2);
+    const writeCall = mockAxiosFn.mock.calls[1][0];
+    expect(writeCall.method).toBe('POST');
+    expect(writeCall.headers['X-RestLi-Method']).toBe('PARTIAL_UPDATE');
+    const newUrl = writeCall.data.patch.$set['content.textAd.landingPage'];
+    expect(utm(newUrl).utm_source).toBe('linkedin');
+    expect(utm(newUrl).utm_medium).toBe('paid');
+    expect(utm(newUrl).utm_content).toBeUndefined();
+  });
+});
