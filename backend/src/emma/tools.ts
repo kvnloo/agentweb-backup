@@ -1241,10 +1241,7 @@ REQUIRED PARAMS PER ENTITY + ACTION:
   CREATIVE CREATE_DYNAMIC: campaign_id, format (JOBS|SPOTLIGHT|FOLLOW_COMPANY). JOBS needs headline+button_label. SPOTLIGHT needs headline+call_to_action+landing_page+logo_urn (logo_urn is REQUIRED — upload logo with MEDIA/UPLOAD_IMAGE first). FOLLOW_COMPANY needs headline.
   CREATIVE RETAG_UTM (ENG-239 — retrofit UTMs onto ONE existing creative found untagged, e.g. via audit_ad_utm_coverage):
     Requires creative_id + campaign_id. Single-target only, one creative per call — never loop over multiple.
-    ⚠️ UNVERIFIED against a live account — the write mechanism itself (partial update on the creatives
-    resource) is confirmed against LinkedIn's docs, but whether this specific nested field accepts a partial
-    update is not, and it may fail entirely if LinkedIn treats creatives as immutable post-creation, same as
-    Meta. If it fails, tell the user plainly rather than retrying blindly.
+    If it fails, tell the user plainly rather than retrying blindly.
     Only works on TEXT_AD creatives — the far more common sponsored-content (post-reference) creative type has
     its destination URL on the underlying LinkedIn POST, not the creative, and this action cannot retag those;
     it will return an UNSUPPORTED_CREATIVE_TYPE error. Tell the user this plainly rather than treating it as a

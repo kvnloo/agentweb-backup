@@ -967,16 +967,13 @@ export async function createCreativeInline(
  * the audit tool can only find these, never fix them). Deliberately single-creative:
  * never loop or accept a list, so there is no "bulk retag" surface.
  *
- * ⚠️ UNVERIFIED AGAINST A LIVE ACCOUNT. The mechanism itself (`POST` +
- * `X-RestLi-Method: PARTIAL_UPDATE`, `$set` nested to mirror the resource's own
- * shape — REST.li's convention per LinkedIn's own docs, e.g. `{ $set: {
- * intendedStatus: "ACTIVE" } }` for a top-level field) is confirmed against
- * LinkedIn's Marketing API docs (learn.microsoft.com/linkedin/marketing/...
- * create-and-manage-creatives). What is still unverified:
- *  - Whether `content.textAd.landingPage` specifically accepts a partial update
- *    (the docs' own examples only show top-level fields like `intendedStatus`).
- *  - LinkedIn creatives may be immutable post-creation, same as Meta's — if so
- *    this fails live and needs a different design (delete + recreate, most likely).
+ * LIVE-VERIFIED 2026-07-16 against a real LinkedIn ad account: creatives are
+ * NOT immutable for this field, and the PARTIAL_UPDATE mechanism works — but
+ * `$set` on `content.textAd` is NOT a deep merge. It replaces the whole
+ * `textAd` object, so an update carrying only `landingPage` fails validation
+ * ("field is required but not found and has no default value" on
+ * headline/description). The fix — confirmed live — is to echo every existing
+ * `textAd` field back in the patch, not just the one being changed.
  *
  * Only `textAd` creatives carry a destination URL directly on the creative. The
  * far more common `content.reference` creative type points at an existing
@@ -1012,11 +1009,15 @@ export async function retagCreativeUtm(
     return { success: true, alreadyTagged: true };
   }
 
+  // LIVE-VERIFIED 2026-07-16: LinkedIn's $set on content.textAd is NOT a deep
+  // merge -- it replaces the whole textAd object. Sending only landingPage
+  // fails with "field is required but not found and has no default value" on
+  // headline/description. Every existing field must be echoed back verbatim.
   return makeRequest(
     'POST',
     `/rest/adAccounts/${adAccountId}/creatives/${encoded}`,
     accessToken,
-    { patch: { $set: { content: { textAd: { landingPage: newUrl } } } } },
+    { patch: { $set: { content: { textAd: { ...content.textAd, landingPage: newUrl } } } } },
     { 'X-RestLi-Method': 'PARTIAL_UPDATE' },
   );
 }

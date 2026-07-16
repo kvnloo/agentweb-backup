@@ -381,7 +381,7 @@ describe('retagCreativeUtm — single existing creative retrofit (Harsha\'s ask)
   });
 
   it('retags an untagged text-ad creative (happy path)', async () => {
-    mockGet({ content: { textAd: { headline: 'H', landingPage: 'https://example.com/' } } });
+    mockGet({ content: { textAd: { headline: 'H', description: 'D', landingPage: 'https://example.com/' } } });
     mockAxiosFn.mockResolvedValueOnce({ data: {}, headers: {}, status: 200 }); // the PARTIAL_UPDATE write
 
     const result = await svc.retagCreativeUtm(ACCESS_TOKEN, ACCOUNT_ID, 'creative-1', CAMPAIGN);
@@ -391,9 +391,24 @@ describe('retagCreativeUtm — single existing creative retrofit (Harsha\'s ask)
     const writeCall = mockAxiosFn.mock.calls[1][0];
     expect(writeCall.method).toBe('POST');
     expect(writeCall.headers['X-RestLi-Method']).toBe('PARTIAL_UPDATE');
-    const newUrl = writeCall.data.patch.$set.content.textAd.landingPage;
+    // LIVE-VERIFIED 2026-07-16: LinkedIn's $set on content.textAd is NOT a deep
+    // merge -- it replaces the whole textAd object, so omitting required fields
+    // (headline, description) fails with "field is required but not found and
+    // has no default value". The patch must echo every existing field back.
+    const textAd = writeCall.data.patch.$set.content.textAd;
+    expect(textAd.headline).toBe('H');
+    expect(textAd.description).toBe('D');
+    const newUrl = textAd.landingPage;
     expect(utm(newUrl).utm_source).toBe('linkedin');
     expect(utm(newUrl).utm_medium).toBe('paid');
     expect(utm(newUrl).utm_content).toBeUndefined();
+  });
+
+  it('preserves an existing image field when retagging (never drops required-plus-optional fields)', async () => {
+    mockGet({ content: { textAd: { headline: 'H', description: 'D', image: 'urn:li:image:abc', landingPage: 'https://example.com/' } } });
+    mockAxiosFn.mockResolvedValueOnce({ data: {}, headers: {}, status: 200 });
+    await svc.retagCreativeUtm(ACCESS_TOKEN, ACCOUNT_ID, 'creative-1', CAMPAIGN);
+    const writeCall = mockAxiosFn.mock.calls[1][0];
+    expect(writeCall.data.patch.$set.content.textAd.image).toBe('urn:li:image:abc');
   });
 });
