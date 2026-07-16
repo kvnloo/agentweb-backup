@@ -47,7 +47,7 @@
   body.side-rail #side .issue { padding: 9px 6px; margin: 0; border-radius: 0; text-align: center; border-left: 2px solid transparent; }
   body.side-rail #side .issue.sel { border-left-color: var(--accent); }
   body.side-rail #side .issue .row1 { justify-content: center; gap: 0; margin: 0; }
-  body.side-rail #side .issue .badge, body.side-rail #side .issue .time, body.side-rail #side .issue .busydot, body.side-rail #side .issue .summ { display: none; }
+  body.side-rail #side .issue .badge, body.side-rail #side .issue .assignee, body.side-rail #side .issue .time, body.side-rail #side .issue .busydot, body.side-rail #side .issue .summ { display: none; }
   body.side-rail #side .issue .id { font-size: 11.5px; font-weight: 600; white-space: nowrap; }
   #side .sub { padding: 0 16px 10px; color: var(--dim); font-size: 12px; display: flex; justify-content: space-between; align-items: center; }
   #showAll { color: var(--accent); cursor: pointer; user-select: none; }
@@ -94,6 +94,7 @@
   .issue.sel { background: var(--panel2); border-left: 3px solid var(--accent); padding-left: 11px; }
   .issue .row1 { display: flex; align-items: center; gap: 8px; }
   .issue .id { font-weight: 600; }
+  .issue .assignee { color: var(--dim); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
   .issue .time { margin-left: auto; color: var(--dim); font-size: 11px; }
   .issue .summ { color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
   .badge { font-size: 10px; padding: 1px 7px; border-radius: 9px; color: #0d0f13; font-weight: 600; }
@@ -554,11 +555,15 @@ function chatRow(i) {
       <div class="summ">${i.ownerName ? esc(i.ownerName) : 'standalone workspace'}</div>
     </a>`;
 }
-// An ENG-issue row (unchanged): id + outcome badge + summary.
+// An ENG-issue row: id + outcome badge + Linear assignee (first name) + summary. The assignee chip makes
+// it clear at a glance who owns the issue; the full name is on hover.
 function issueRow(i) {
+  const who = i.assigneeName
+    ? `<span class="assignee" title="Assignee: ${esc(i.assigneeName)}">👤 ${esc(i.assigneeName.split(/\s+/)[0])}</span>`
+    : '';
   return `
     <a class="issue ${i.identifier === S.sel ? 'sel' : ''}" data-id="${i.identifier}" href="#${encodeURIComponent(i.identifier)}">
-      <div class="row1"><span class="id">${esc(i.identifier)}</span>${badge(i.outcome)}
+      <div class="row1"><span class="id">${esc(i.identifier)}</span>${badge(i.outcome)}${who}
         ${i.chat.busy ? '<span class="busydot"></span>' : ''}<span class="time">${rel(i.at)}</span></div>
       <div class="summ">${esc(i.summary || i.title || i.branch || '')}</div>
     </a>`;
@@ -574,7 +579,7 @@ function renderIssues() {
   const q = S.search.trim().toLowerCase();
   // When searching, look across ALL items (not just the active set) so a resolved one isn't hidden.
   let list = q ? S.issues : (S.showAll ? S.issues : S.issues.filter((i) => i.active));
-  if (q) list = list.filter((i) => `${i.identifier} ${i.summary || ''} ${i.title || ''} ${i.branch || ''}`.toLowerCase().includes(q));
+  if (q) list = list.filter((i) => `${i.identifier} ${i.summary || ''} ${i.title || ''} ${i.branch || ''} ${i.assigneeName || ''}`.toLowerCase().includes(q));
   const chats = list.filter((i) => i.standalone);
   const issues = list.filter((i) => !i.standalone);
   $('count').textContent = `${list.length} item${list.length === 1 ? '' : 's'}${q ? ' matched' : S.showAll ? '' : ' active'}`;
