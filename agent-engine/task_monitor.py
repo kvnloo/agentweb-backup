@@ -299,11 +299,20 @@ async def trigger_scheduled_chats():
         # Get the backend API URL from environment variables
         backend_url = os.getenv('BACKEND_URL', 'http://localhost:3001')
         api_url = f"{backend_url}/api/agent-mode/run-scheduled-chats"
-        
+
+        # Service-to-service auth (ENG-347): shared secret known to both the
+        # agent-engine and the backend. Sent whenever configured; the backend
+        # enforces it once its own SCHEDULED_CHATS_SERVICE_SECRET is set, so
+        # set the env var here BEFORE setting it on the backend.
+        headers = {'Content-Type': 'application/json'}
+        service_secret = os.getenv('SCHEDULED_CHATS_SERVICE_SECRET')
+        if service_secret:
+            headers['x-service-secret'] = service_secret
+
         # Make the API call
         response = requests.post(
             api_url,
-            headers={'Content-Type': 'application/json'},
+            headers=headers,
             timeout=300  # 5 minute timeout for scheduled chat processing
         )
         

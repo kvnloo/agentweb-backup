@@ -1,4 +1,4 @@
-import { HumanEvalCandidate, HumanEvalService } from '../services/humanEvalService';
+import { HumanEvalCandidate, HumanEvalService, parseHumanEvalCategoryFilter } from '../services/humanEvalService';
 
 function makeHarness() {
   const items = new Map<string, HumanEvalCandidate>();
@@ -16,6 +16,9 @@ function makeHarness() {
     })),
     get: jest.fn((params: any) => ({
       promise: async () => ({ Item: items.get(params.Key.candidateId) }),
+    })),
+    scan: jest.fn((_params: any) => ({
+      promise: async () => ({ Items: [...items.values()] }),
     })),
     update: jest.fn((params: any) => ({
       promise: async () => {
@@ -453,6 +456,221 @@ describe('HumanEvalService', () => {
       expect.objectContaining({ candidateId: candidate.candidateId }),
       expect.objectContaining({ text: expect.stringContaining('mobile hierarchy fails') }),
     );
+  });
+
+  it('stores a normalized category and surfaces a bold Ad tag in the Slack post', async () => {
+    const { service, slack, items } = makeHarness();
+
+    const candidate = await service.createCandidate({
+      reviewType: 'creative_image',
+      outputSummary: 'Meta ad image for BodyLever.',
+      artifactUrl: 'https://example.com/ad.png',
+      category: 'ad',
+    });
+
+    expect(candidate.category).toBe('ad');
+    expect(items.get(candidate.candidateId)?.category).toBe('ad');
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.stringContaining('*Category:* Ad'),
+    );
+  });
+
+  it('surfaces an Organic Post tag for organic_post images', async () => {
+    const { service, slack } = makeHarness();
+
+    const candidate = await service.createCandidate({
+      reviewType: 'creative_image',
+      outputSummary: 'LinkedIn post image.',
+      category: 'organic_post',
+    });
+
+    expect(candidate.category).toBe('organic_post');
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.stringContaining('*Category:* Organic Post'),
+    );
+  });
+
+  it('labels creative images with no category as Uncategorized without breaking enqueue', async () => {
+    const { service, slack, items } = makeHarness();
+
+    const candidate = await service.createCandidate({
+      reviewType: 'creative_image',
+      outputSummary: 'Image generated with no flow context.',
+    });
+
+    expect(candidate.category).toBe('uncategorized');
+    expect(items.get(candidate.candidateId)?.category).toBe('uncategorized');
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.stringContaining('*Category:* Uncategorized'),
+    );
+  });
+
+  it('normalizes unknown category values fail-open to uncategorized instead of throwing', async () => {
+    const { service, slack } = makeHarness();
+
+    const candidate = await service.createCandidate({
+      reviewType: 'creative_image',
+      outputSummary: 'Image generated.',
+      category: 'banner!!weirdness',
+    });
+
+    expect(candidate.category).toBe('uncategorized');
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.stringContaining('*Category:* Uncategorized'),
+    );
+  });
+
+  it('accepts human-friendly category spellings like "Organic Post"', async () => {
+    const { service } = makeHarness();
+
+    const candidate = await service.createCandidate({
+      reviewType: 'creative_image',
+      outputSummary: 'Image generated.',
+      category: ' Organic Post ',
+    });
+
+    expect(candidate.category).toBe('organic_post');
+  });
+
+  it('does not render a category tag on non-image reviews without an explicit category', async () => {
+    const { service, slack, items } = makeHarness();
+
+    const candidate = await service.createCandidate({
+      reviewType: 'lead_enrichment',
+      outputSummary: 'Lead enrichment completed.',
+    });
+
+    // Stored (filterable) but not rendered — Ad/Organic is an image distinction.
+    expect(items.get(candidate.candidateId)?.category).toBe('uncategorized');
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.not.stringContaining('*Category:*'),
+    );
+  });
+
+  it('renders the category tag on non-image reviews when explicitly categorized', async () => {
+    const { service, slack } = makeHarness();
+
+    await service.createCandidate({
+      reviewType: 'landing_page',
+      outputSummary: 'Ad landing page generated.',
+      category: 'ad',
+    });
+
+    expect(slack.postSlackMessage).toHaveBeenCalledWith(
+      'C_EVAL',
+      expect.stringContaining('*Category:* Ad'),
+    );
+  });
+
+  it('lists candidates filtered by category, treating legacy records without the field as uncategorized', async () => {
+    const { service, items } = makeHarness();
+
+    const base = {
+      reviewer: 'matt' as const,
+      status: 'pending' as const,
+      outputSummary: 'summary',
+      slackChannel: 'C_EVAL',
+      slackMessageTs: '178.0',
+      feedback: [],
+      updatedAt: '2026-07-01T00:00:00.000Z',
+    };
+    items.set('cand-ad', {
+      ...base,
+      candidateId: 'cand-ad',
+      reviewType: 'creative_image',
+      category: 'ad',
+      createdAt: '2026-07-03T00:00:00.000Z',
+    } as any);
+    items.set('cand-organic', {
+      ...base,
+      candidateId: 'cand-organic',
+      reviewType: 'creative_image',
+      category: 'organic_post',
+      createdAt: '2026-07-02T00:00:00.000Z',
+    } as any);
+    // Legacy record written before the category field existed.
+    items.set('cand-legacy', {
+      ...base,
+      candidateId: 'cand-legacy',
+      reviewType: 'creative_image',
+      createdAt: '2026-07-01T00:00:00.000Z',
+    } as any);
+
+    const ads = await service.listCandidates({ category: 'ad' });
+    expect(ads.map((c) => c.candidateId)).toEqual(['cand-ad']);
+
+    const uncategorized = await service.listCandidates({ category: 'uncategorized' });
+    expect(uncategorized.map((c) => c.candidateId)).toEqual(['cand-legacy']);
+
+    const all = await service.listCandidates();
+    expect(all.map((c) => c.candidateId)).toEqual(['cand-ad', 'cand-organic', 'cand-legacy']);
+  });
+
+  it('strictly parses category filter values: friendly spellings map, near-misses return null', () => {
+    // Recognized spellings (case/space/hyphen tolerant) map to the canonical value.
+    expect(parseHumanEvalCategoryFilter('ad')).toBe('ad');
+    expect(parseHumanEvalCategoryFilter('Ad')).toBe('ad');
+    expect(parseHumanEvalCategoryFilter('Organic Post')).toBe('organic_post');
+    expect(parseHumanEvalCategoryFilter('organic-post')).toBe('organic_post');
+    expect(parseHumanEvalCategoryFilter('UNCATEGORIZED')).toBe('uncategorized');
+
+    // Anything else is null so the read path can reject instead of coercing —
+    // a filter must never silently return the wrong record set.
+    expect(parseHumanEvalCategoryFilter('ads')).toBeNull();
+    expect(parseHumanEvalCategoryFilter('orgnic_post')).toBeNull();
+    expect(parseHumanEvalCategoryFilter('')).toBeNull();
+    expect(parseHumanEvalCategoryFilter('organic post extra')).toBeNull();
+  });
+
+  it('lists candidates newest-first with a limit and supports status/reviewType filters', async () => {
+    const { service, items } = makeHarness();
+
+    const base = {
+      reviewer: 'matt' as const,
+      outputSummary: 'summary',
+      slackChannel: 'C_EVAL',
+      slackMessageTs: '178.0',
+      feedback: [],
+      updatedAt: '2026-07-01T00:00:00.000Z',
+    };
+    items.set('old-pending', {
+      ...base,
+      candidateId: 'old-pending',
+      reviewType: 'creative_image',
+      status: 'pending',
+      category: 'ad',
+      createdAt: '2026-07-01T00:00:00.000Z',
+    } as any);
+    items.set('new-pending', {
+      ...base,
+      candidateId: 'new-pending',
+      reviewType: 'creative_image',
+      status: 'pending',
+      category: 'ad',
+      createdAt: '2026-07-04T00:00:00.000Z',
+    } as any);
+    items.set('reviewed-landing', {
+      ...base,
+      candidateId: 'reviewed-landing',
+      reviewType: 'landing_page',
+      status: 'reviewed',
+      category: 'uncategorized',
+      createdAt: '2026-07-03T00:00:00.000Z',
+    } as any);
+
+    const limited = await service.listCandidates({ limit: 1 });
+    expect(limited.map((c) => c.candidateId)).toEqual(['new-pending']);
+
+    const reviewed = await service.listCandidates({ status: 'reviewed' });
+    expect(reviewed.map((c) => c.candidateId)).toEqual(['reviewed-landing']);
+
+    const landing = await service.listCandidates({ reviewType: 'landing_page' });
+    expect(landing.map((c) => c.candidateId)).toEqual(['reviewed-landing']);
   });
 
   it('ignores replies for unrelated Slack threads', async () => {

@@ -182,13 +182,36 @@ export async function listOpenBugCanonicals(limit = 30): Promise<OpenCanonical[]
   return nodes.map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }));
 }
 
-/** Read an issue's comment bodies (the resolve bridge parses `[reporter-ticket #N]` from these). */
-export async function getIssueComments(issueId: string): Promise<string[]> {
+/** An issue comment with its creation timestamp (ISO string), for order-sensitive consumers. */
+export interface IssueCommentDetail {
+  body: string;
+  createdAt: string;
+}
+
+/**
+ * Read an issue's comments WITH `createdAt`, so callers that need "the most recent comment" can
+ * decide by timestamp instead of relying on the API's list order. The resolve bridge reads this
+ * ONCE per resolve for both of its jobs: parsing the `[reporter-ticket #N <email>]` markers and
+ * picking the latest `@Emma` comment as the customer-facing resolution message (ENG-316).
+ *
+ * Explicitly sized + ordered: Linear defaults connections to 50 nodes — the same silent-truncation
+ * trap getTeamMeta documents — and a high-reporter canonical can carry more comments than that.
+ * 250 is Linear's max page size; `orderBy: createdAt` returns NEWEST-first (verified live
+ * 2026-07-15 against ENG-316), so an overflow drops the OLDEST comments and the @Emma resolution
+ * message — written right before the flip to Done — always survives. Overflow is loud because
+ * reporter-ticket markers deep in the dropped tail would otherwise silently miss their email.
+ */
+export async function getIssueCommentsDetailed(issueId: string): Promise<IssueCommentDetail[]> {
   const data = await linearGraphQL(
-    `query($id: String!) { issue(id: $id) { comments { nodes { body } } } }`,
+    `query($id: String!) { issue(id: $id) { comments(first: 250, orderBy: createdAt) { nodes { body createdAt } pageInfo { hasNextPage } } } }`,
     { id: issueId },
   );
-  return (data?.issue?.comments?.nodes || []).map((c: any) => c?.body || '');
+  if (data?.issue?.comments?.pageInfo?.hasNextPage) {
+    console.error(
+      `[linear] issue ${issueId} has >250 comments — the page is truncated and the OLDEST comments were dropped; reporter-ticket markers may be missing. Add pagination to getIssueCommentsDetailed.`,
+    );
+  }
+  return (data?.issue?.comments?.nodes || []).map((c: any) => ({ body: c?.body || '', createdAt: c?.createdAt || '' }));
 }
 
 /** Add a comment to a Linear issue (used to record additional reporters on a canonical). */

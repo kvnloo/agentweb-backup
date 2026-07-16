@@ -30,6 +30,49 @@ export type HumanEvalReviewType = 'creative_image' | 'landing_page' | 'lead_enri
 export type HumanEvalReviewer = 'matt' | 'fangfang';
 export type HumanEvalStatus = 'pending' | 'reviewed';
 
+/**
+ * Use-case classification for reviewed outputs (ENG-90). Matt's feedback on an
+ * image differs depending on whether it was made as an Ad or an Organic Post,
+ * so enqueue call sites that know their flow tag candidates accordingly.
+ * Anything unknown/missing fail-opens to 'uncategorized' — the category must
+ * never break enqueueing or posting.
+ */
+export type HumanEvalCategory = 'ad' | 'organic_post' | 'uncategorized';
+
+/** Fail-open normalizer: unknown/missing values become 'uncategorized', never an error. */
+export function normalizeHumanEvalCategory(value: unknown): HumanEvalCategory {
+  if (typeof value !== 'string') return 'uncategorized';
+  const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, '_');
+  if (normalized === 'ad' || normalized === 'organic_post') return normalized;
+  return 'uncategorized';
+}
+
+/**
+ * Strict parser for the READ/filter path (ENG-90 review fix). Fail-open is only
+ * justified where it protects enqueueing; a list filter must never silently
+ * coerce a typo ('ads', 'orgnic_post') to 'uncategorized' and return the wrong
+ * record set as a success. Recognized spellings (case/space/hyphen tolerant)
+ * map to the canonical value; anything else returns null so callers can 400.
+ */
+export function parseHumanEvalCategoryFilter(value: string): HumanEvalCategory | null {
+  const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, '_');
+  if (normalized === 'ad' || normalized === 'organic_post' || normalized === 'uncategorized') {
+    return normalized;
+  }
+  return null;
+}
+
+export function humanEvalCategoryLabel(category: HumanEvalCategory | undefined): string {
+  switch (category) {
+    case 'ad':
+      return 'Ad';
+    case 'organic_post':
+      return 'Organic Post';
+    default:
+      return 'Uncategorized';
+  }
+}
+
 export type HumanEvalAction =
   | {
       type: 'agent_mode_image_revision';
@@ -59,6 +102,8 @@ export interface HumanEvalCandidate {
   reviewer: HumanEvalReviewer;
   reviewerSlackUserId?: string;
   status: HumanEvalStatus;
+  /** Additive (ENG-90); records created before it exist without the field — read as 'uncategorized'. */
+  category?: HumanEvalCategory;
   userId?: string;
   sessionId?: string;
   agentRunId?: string;
@@ -93,12 +138,15 @@ export interface CreateHumanEvalCandidateInput {
   chatUrl?: string;
   originalRequest?: string;
   action?: HumanEvalAction;
+  /** Optional Ad/Organic Post use-case tag; normalized fail-open (unknown → 'uncategorized'). */
+  category?: string;
 }
 
 interface DynamoLike {
   put(params: AWS.DynamoDB.DocumentClient.PutItemInput): { promise(): Promise<unknown> };
   get(params: AWS.DynamoDB.DocumentClient.GetItemInput): { promise(): Promise<AWS.DynamoDB.DocumentClient.GetItemOutput> };
   update(params: AWS.DynamoDB.DocumentClient.UpdateItemInput): { promise(): Promise<unknown> };
+  scan(params: AWS.DynamoDB.DocumentClient.ScanInput): { promise(): Promise<AWS.DynamoDB.DocumentClient.ScanOutput> };
 }
 
 interface SettingsLike {
@@ -298,6 +346,7 @@ export class HumanEvalService {
     const reviewerSlackUserId = await this.getReviewerSlackUserId(reviewer);
     const candidateId = uuidv4();
     const now = new Date().toISOString();
+    const category = normalizeHumanEvalCategory(input.category);
     const preparedInput = await this.prepareCandidateInput(input, candidateId);
     const chatUrl = await this.resolveChatUrl(preparedInput);
 
@@ -307,6 +356,7 @@ export class HumanEvalService {
       reviewer,
       reviewerSlackUserId,
       chatUrl,
+      normalizedCategory: category,
     });
 
     const posted = await this.slack.postSlackMessage(slackChannel, message);
@@ -317,6 +367,7 @@ export class HumanEvalService {
       reviewer,
       reviewerSlackUserId,
       status: 'pending',
+      category,
       userId: input.userId,
       sessionId: input.sessionId,
       agentRunId: input.agentRunId,
@@ -399,6 +450,48 @@ export class HumanEvalService {
       Key: { candidateId },
     }).promise();
     return (result.Item as HumanEvalCandidate | undefined) || null;
+  }
+
+  /**
+   * List queue entries, filterable by category / status / reviewType (ENG-90).
+   * The queue is small and keyed only by candidateId, so this is a paged scan
+   * with in-code filtering; records written before the category field existed
+   * match `category: 'uncategorized'`.
+   */
+  async listCandidates(filter: {
+    /** Canonical value only — parse raw input via parseHumanEvalCategoryFilter and reject nulls. */
+    category?: HumanEvalCategory;
+    status?: HumanEvalStatus;
+    reviewType?: HumanEvalReviewType;
+    limit?: number;
+  } = {}): Promise<HumanEvalCandidate[]> {
+    const limit = Math.min(Math.max(Math.floor(filter.limit ?? 50), 1), 200);
+    const categoryFilter = filter.category;
+
+    const matches: HumanEvalCandidate[] = [];
+    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    let pages = 0;
+    const MAX_PAGES = 20;
+
+    do {
+      const result = await this.db.scan({
+        TableName: HUMAN_EVAL_QUEUE_TABLE,
+        ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+      }).promise();
+
+      for (const item of (result.Items || []) as HumanEvalCandidate[]) {
+        if (categoryFilter !== undefined && normalizeHumanEvalCategory(item.category) !== categoryFilter) continue;
+        if (filter.status !== undefined && item.status !== filter.status) continue;
+        if (filter.reviewType !== undefined && item.reviewType !== filter.reviewType) continue;
+        matches.push(item);
+      }
+
+      lastKey = result.LastEvaluatedKey;
+      pages += 1;
+    } while (lastKey && pages < MAX_PAGES);
+
+    matches.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+    return matches.slice(0, limit);
   }
 
   private async appendFeedback(candidate: HumanEvalCandidate, feedback: HumanEvalFeedback): Promise<void> {
@@ -576,6 +669,7 @@ export class HumanEvalService {
     reviewer: HumanEvalReviewer;
     reviewerSlackUserId?: string;
     chatUrl?: string;
+    normalizedCategory: HumanEvalCategory;
   }): string {
     const reviewerMention = input.reviewerSlackUserId
       ? `<@${input.reviewerSlackUserId}>`
@@ -583,8 +677,15 @@ export class HumanEvalService {
         ? 'Fangfang'
         : 'Matt';
 
+    // Ad vs Organic Post is an image distinction (ENG-90): always tag images —
+    // including the fail-open "Uncategorized" label — and tag other review
+    // types only when the enqueueing flow explicitly categorized them.
+    const showCategory = input.reviewType === 'creative_image'
+      || input.normalizedCategory !== 'uncategorized';
+
     const lines = [
       `*Human eval: ${reviewTypeLabel(input.reviewType)}*`,
+      showCategory ? `*Category:* ${humanEvalCategoryLabel(input.normalizedCategory)}` : '',
       `Reviewer: ${reviewerMention}`,
       '',
       input.artifactUrl ? `*Output:* <${input.artifactUrl}|open output>` : '',
