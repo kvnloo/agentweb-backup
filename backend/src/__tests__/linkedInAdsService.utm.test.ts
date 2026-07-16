@@ -364,12 +364,23 @@ describe('retagCreativeUtm — single existing creative retrofit (Harsha\'s ask)
     expect(mockAxiosFn).toHaveBeenCalledTimes(1); // never reaches the write
   });
 
-  it('reports UNSUPPORTED_CREATIVE_TYPE for a content.reference creative (destination lives on the post, not here)', async () => {
-    mockGet({ content: { reference: 'urn:li:share:999' } });
+  it('delegates a content.reference creative to retagPostUtm (the destination lives on the post)', async () => {
+    mockGet({ content: { reference: 'urn:li:share:999' } }); // creative read
+    mockGet({ contentLandingPage: 'https://example.com/' }); // post read
+    mockAxiosFn.mockResolvedValueOnce({ data: {}, headers: {}, status: 200 }); // post write
+    const result = await svc.retagCreativeUtm(ACCESS_TOKEN, ACCOUNT_ID, 'creative-1', CAMPAIGN);
+    expect(result.success).toBe(true);
+    expect(mockAxiosFn).toHaveBeenCalledTimes(3);
+    expect(mockAxiosFn.mock.calls[1][0].url).toContain(encodeURIComponent('urn:li:share:999'));
+  });
+
+  it('reports NO_RETAGGABLE_DESTINATION when the referenced post has no CTA landing page (e.g. an article link)', async () => {
+    mockGet({ content: { reference: 'urn:li:share:999' } }); // creative read
+    mockGet({ content: { article: { source: 'https://example.com/article' } } }); // post read, no contentLandingPage
     const result = await svc.retagCreativeUtm(ACCESS_TOKEN, ACCOUNT_ID, 'creative-1', CAMPAIGN);
     expect(result.success).toBe(false);
-    expect(result.error).toContain('UNSUPPORTED_CREATIVE_TYPE');
-    expect(mockAxiosFn).toHaveBeenCalledTimes(1); // read only, no write attempted
+    expect(result.error).toContain('NO_RETAGGABLE_DESTINATION');
+    expect(mockAxiosFn).toHaveBeenCalledTimes(2); // both reads, no write attempted
   });
 
   it('is a no-op when the text ad landingPage already carries every UTM key', async () => {
@@ -410,5 +421,63 @@ describe('retagCreativeUtm — single existing creative retrofit (Harsha\'s ask)
     await svc.retagCreativeUtm(ACCESS_TOKEN, ACCOUNT_ID, 'creative-1', CAMPAIGN);
     const writeCall = mockAxiosFn.mock.calls[1][0];
     expect(writeCall.data.patch.$set.content.textAd.image).toBe('urn:li:image:abc');
+  });
+});
+
+// ─── retagPostUtm — sponsored-content retrofit (content.reference creatives) ──
+//
+// LinkedIn's own Posts API docs list contentLandingPage (the post's CTA-button
+// destination) as an officially UPDATABLE field via PARTIAL_UPDATE -- unlike
+// the creative case, this isn't inferred from convention. It's a top-level
+// field (not nested like content.textAd), so the deep-merge trap that broke
+// the creative retag does not apply here. What contentLandingPage does NOT
+// cover: an article post's own link (content.article.source, not in the
+// updatable-fields list) or a post with no CTA button configured at all --
+// those have no retaggable destination and must not be touched.
+describe('retagPostUtm — sponsored-content post retrofit', () => {
+  function mockGet(data: any) {
+    mockAxiosFn.mockResolvedValueOnce({ data, headers: {}, status: 200 });
+  }
+
+  it('propagates a failure reading the post', async () => {
+    mockAxiosFn.mockRejectedValueOnce({ response: { status: 404, data: { message: 'not found' } } });
+    const result = await svc.retagPostUtm(ACCESS_TOKEN, 'urn:li:share:999', CAMPAIGN);
+    expect(result.success).toBe(false);
+    expect(mockAxiosFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports NO_RETAGGABLE_DESTINATION when the post has no contentLandingPage (e.g. article post, or no CTA)', async () => {
+    mockGet({ content: { article: { source: 'https://example.com/article' } } });
+    const result = await svc.retagPostUtm(ACCESS_TOKEN, 'urn:li:share:999', CAMPAIGN);
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('NO_RETAGGABLE_DESTINATION');
+    expect(mockAxiosFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('is a no-op when contentLandingPage already carries every UTM key', async () => {
+    const already = `https://example.com/?${['utm_source=linkedin', 'utm_medium=paid', `utm_campaign=${CAMPAIGN}`].join('&')}`;
+    mockGet({ contentLandingPage: already });
+    const result = await svc.retagPostUtm(ACCESS_TOKEN, 'urn:li:share:999', CAMPAIGN);
+    expect(result).toEqual({ success: true, alreadyTagged: true });
+    expect(mockAxiosFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('retags an untagged post (happy path) -- top-level $set, no sibling fields to preserve', async () => {
+    mockGet({ contentLandingPage: 'https://example.com/' });
+    mockAxiosFn.mockResolvedValueOnce({ data: {}, headers: {}, status: 200 });
+
+    const result = await svc.retagPostUtm(ACCESS_TOKEN, 'urn:li:share:999', CAMPAIGN);
+
+    expect(result.success).toBe(true);
+    const writeCall = mockAxiosFn.mock.calls[1][0];
+    expect(writeCall.method).toBe('POST');
+    expect(writeCall.url).toContain(encodeURIComponent('urn:li:share:999'));
+    expect(writeCall.headers['X-RestLi-Method']).toBe('PARTIAL_UPDATE');
+    const newUrl = writeCall.data.patch.$set.contentLandingPage;
+    expect(utm(newUrl).utm_source).toBe('linkedin');
+    expect(utm(newUrl).utm_medium).toBe('paid');
+    expect(utm(newUrl).utm_content).toBeUndefined();
+    // Top-level $set: must NOT wrap in a nested content object, unlike the creative case.
+    expect(writeCall.data.patch.$set.content).toBeUndefined();
   });
 });

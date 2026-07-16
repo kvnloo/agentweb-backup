@@ -1242,10 +1242,12 @@ REQUIRED PARAMS PER ENTITY + ACTION:
   CREATIVE RETAG_UTM (ENG-239 — retrofit UTMs onto ONE existing creative found untagged, e.g. via audit_ad_utm_coverage):
     Requires creative_id + campaign_id. Single-target only, one creative per call — never loop over multiple.
     If it fails, tell the user plainly rather than retrying blindly.
-    Only works on TEXT_AD creatives — the far more common sponsored-content (post-reference) creative type has
-    its destination URL on the underlying LinkedIn POST, not the creative, and this action cannot retag those;
-    it will return an UNSUPPORTED_CREATIVE_TYPE error. Tell the user this plainly rather than treating it as a
-    generic failure.
+    TEXT_AD creatives: retags the creative directly.
+    Sponsored-content (post-reference) creatives: retags the underlying LinkedIn POST's CTA-button destination
+    (contentLandingPage) instead — the only post field LinkedIn allows editing after publish. This does NOT
+    cover an article post's own link, or any post with no CTA button configured; those return
+    NO_RETAGGABLE_DESTINATION. Tell the user this plainly rather than treating it as a generic failure — it
+    means a human needs to look, not that the call is broken.
   TARGETING SEARCH: facet (URN like urn:li:adTargetingFacet:locations), query (optional — omit for facets without typeahead like seniorities/industries)
     Common facets: locations, titles (job titles — NOT jobTitles), seniorities, industries, functions, staffCountRanges, memberInterests, skills
   TARGETING ESTIMATE_REACH: targeting_include (array of { facet_urn, values } — SAME shape as CAMPAIGN CREATE; resolve value URNs via TARGETING SEARCH first). Optional targeting_exclude. Returns { active, total }; total is 0 when the audience is under the 300-member minimum. ALWAYS run this before CAMPAIGN CREATE to confirm reach ≥ 300.

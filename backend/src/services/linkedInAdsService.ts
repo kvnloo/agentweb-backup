@@ -975,11 +975,12 @@ export async function createCreativeInline(
  * headline/description). The fix — confirmed live — is to echo every existing
  * `textAd` field back in the patch, not just the one being changed.
  *
- * Only `textAd` creatives carry a destination URL directly on the creative. The
- * far more common `content.reference` creative type points at an existing
- * LinkedIn POST — the destination lives on THAT resource, a different write
- * surface this function does not attempt (same "needs a human" principle the
- * audit tool already applies to unreadable ads).
+ * `textAd` creatives carry a destination URL directly on the creative. The far
+ * more common `content.reference` creative type points at an existing LinkedIn
+ * POST instead — that case is delegated to `retagPostUtm`, which can only
+ * retag the post's `contentLandingPage` (CTA-button destination); an article
+ * post's own link or a post with no CTA configured have no retaggable
+ * destination and are reported as such, not silently skipped.
  */
 export async function retagCreativeUtm(
   accessToken: string,
@@ -994,11 +995,13 @@ export async function retagCreativeUtm(
   if (!getResult.success) return getResult;
 
   const content = (getResult.data as any)?.content;
+  if (content?.reference) {
+    return retagPostUtm(accessToken, content.reference, campaign);
+  }
   if (!content?.textAd) {
     return {
       success: false,
-      error: 'UNSUPPORTED_CREATIVE_TYPE — the destination URL for this creative lives on the '
-        + 'referenced LinkedIn post, not the creative itself. Editing a live post is not supported.',
+      error: 'UNSUPPORTED_CREATIVE_TYPE — could not determine a retaggable destination for this creative type.',
     };
   }
 
@@ -1018,6 +1021,60 @@ export async function retagCreativeUtm(
     `/rest/adAccounts/${adAccountId}/creatives/${encoded}`,
     accessToken,
     { patch: { $set: { content: { textAd: { ...content.textAd, landingPage: newUrl } } } } },
+    { 'X-RestLi-Method': 'PARTIAL_UPDATE' },
+  );
+}
+
+/**
+ * Retag the LinkedIn POST a `content.reference` creative points to (Harsha's
+ * ask, sponsored-content slice — `retagCreativeUtm`'s text-ad path only covers
+ * creatives that carry a destination directly).
+ *
+ * `contentLandingPage` (the post's CTA-button destination) is the ONLY post
+ * field LinkedIn's own Posts API docs list as updatable via PARTIAL_UPDATE
+ * (learn.microsoft.com/linkedin/marketing/.../posts-api — alongside
+ * `commentary`, `contentCallToActionLabel`, `lifecycleState`, `adContext`).
+ * It's a TOP-LEVEL field, unlike `content.textAd` — so the deep-merge trap
+ * that broke the creative retag (LinkedIn replacing the whole nested object)
+ * does not apply here; no sibling fields need to be echoed back.
+ *
+ * What this does NOT cover: an article post's own link
+ * (`content.article.source` — not in the updatable-fields list, so presumed
+ * locked after publish) or a post with no CTA button configured at all (no
+ * `contentLandingPage` to merge into). Both are reported as
+ * NO_RETAGGABLE_DESTINATION rather than silently skipped or guessed at — same
+ * "needs a human" principle the audit tool already applies to unreadable ads.
+ */
+export async function retagPostUtm(
+  accessToken: string,
+  postUrn: string,
+  campaign: string,
+): Promise<LinkedInAdsApiResult & { alreadyTagged?: boolean }> {
+  const encoded = encodeURIComponent(postUrn);
+  const getResult = await makeRequest('GET', `/rest/posts/${encoded}`, accessToken);
+  if (!getResult.success) return getResult;
+
+  const currentUrl: string | undefined = (getResult.data as any)?.contentLandingPage;
+  if (!currentUrl) {
+    return {
+      success: false,
+      error: 'NO_RETAGGABLE_DESTINATION — this post has no landing-page/CTA destination set '
+        + '(e.g. an article post\'s own link, or a post with no call-to-action button). '
+        + 'LinkedIn does not expose those for edit after publish; a human needs to look.',
+    };
+  }
+
+  const campaignForUtm = resolveCampaignForUtm({ campaign_id: campaign });
+  const newUrl = appendLinkedInUtm(currentUrl, campaignForUtm);
+  if (newUrl === currentUrl) {
+    return { success: true, alreadyTagged: true };
+  }
+
+  return makeRequest(
+    'POST',
+    `/rest/posts/${encoded}`,
+    accessToken,
+    { patch: { $set: { contentLandingPage: newUrl } } },
     { 'X-RestLi-Method': 'PARTIAL_UPDATE' },
   );
 }
