@@ -7,10 +7,16 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
-import { rankMemoriesByRelevance } from '../utils/memoryRanking';
+import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { computeTermination } from './agentMode/core/agentStep';
+import {
+  downloadBrandLogoToS3,
+  getPersistedBrandLogoUrlForUser,
+  missingBrandLogoToolResult,
+  promptRequestsLogo,
+} from './agentMode/brandLogo';
 import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
@@ -2744,14 +2750,13 @@ export class AgentModeService {
               console.error('Failed to backfill account memory embedding:', e)
             );
           });
-          if (relevantMemories.length > 0) {
-            const memoryLines = relevantMemories.map(
-              (m: any) => `- [${m.category}] ${m.content}`
-            );
-            messages.push({
-              role: 'assistant',
-              content: `Account Memory (facts from previous sessions):\n${memoryLines.join('\n')}`
-            });
+          const accountMemoryMessage = buildMemoryContextMessage(
+            'Account Memory (facts from previous sessions):',
+            relevantMemories,
+            new Date()
+          );
+          if (accountMemoryMessage) {
+            messages.push({ role: 'assistant', content: accountMemoryMessage });
           }
         }
 
@@ -2765,14 +2770,13 @@ export class AgentModeService {
                 console.error('Failed to backfill org memory embedding:', e)
               );
             });
-            if (relevantOrgMemories.length > 0) {
-              const orgMemoryLines = relevantOrgMemories.map(
-                (m: any) => `- [${m.category}] ${m.content}`
-              );
-              messages.push({
-                role: 'assistant',
-                content: `Organization Memory (shared facts for "${org.name}"):\n${orgMemoryLines.join('\n')}`
-              });
+            const orgMemoryMessage = buildMemoryContextMessage(
+              `Organization Memory (shared facts for "${org.name}"):`,
+              relevantOrgMemories,
+              new Date()
+            );
+            if (orgMemoryMessage) {
+              messages.push({ role: 'assistant', content: orgMemoryMessage });
             }
           }
         }
@@ -11811,40 +11815,18 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
       console.log('Inferring brand tokens...');
       const suggestedBrandTokens = inferBrandTokens(detailedTokens);
 
-      // Process brand identity: download logo and upload to S3
+      // Process brand identity: download logo and upload to S3. Extracted to
+      // services/agentMode/brandLogo.ts (ENG-326); behavior pinned by
+      // agentModeService.extractCSSFromURL.logo.test.ts.
       const brandIdentity = extractedCSS.brandIdentity || { logoUrl: null, brandName: null, tagline: null, favicon: null };
-      let s3LogoUrl: string | null = null;
-
-      if (brandIdentity.logoUrl) {
-        try {
-          console.log(`Downloading logo from ${brandIdentity.logoUrl}...`);
-          const logoResponse = await axios.get(brandIdentity.logoUrl, {
-            responseType: 'arraybuffer',
-            timeout: 15000,
-          });
-          const contentType = logoResponse.headers['content-type'] || '';
-          // Skip SVG since brand guidelines doesn't accept it
-          if (!contentType.includes('svg')) {
-            const ext = contentType.includes('png') ? 'png' : contentType.includes('gif') ? 'gif' : 'jpg';
-            const filename = `logo.${ext}`;
-            const { uploadFileToS3WithPath } = await import('../utils/s3Utils');
-            const uploadResult = await uploadFileToS3WithPath(
-              Buffer.from(logoResponse.data as ArrayBuffer),
-              filename,
-              contentType,
-              `users/${userId}/brand/logo`
-            );
-            if (uploadResult.success && uploadResult.url) {
-              s3LogoUrl = uploadResult.url;
-              console.log(`Logo uploaded to S3: ${s3LogoUrl}`);
-            }
-          } else {
-            console.log('Skipping SVG logo (not supported by brand guidelines)');
-          }
-        } catch (logoErr: any) {
-          console.warn('Failed to download/upload logo:', logoErr.message);
-        }
-      }
+      const logoDownload = brandIdentity.logoUrl
+        ? await downloadBrandLogoToS3(brandIdentity.logoUrl, userId)
+        : null;
+      // Non-uploaded outcomes fall back to surfacing the raw discovered URL
+      // below (`s3LogoUrl || brandIdentity.logoUrl`) — unchanged extraction
+      // behavior; only the deterministic PERSIST path treats them differently.
+      const s3LogoUrl: string | null =
+        logoDownload?.status === 'uploaded' ? logoDownload.url : null;
 
       // Format detailed tokens as JSON string for Emma to save to KB if needed
       const detailedTokensJSON = JSON.stringify({
@@ -15341,7 +15323,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       case 'TARGETING':
         if (action === 'SEARCH') {
           if (!params.q) throw new Error('TARGETING SEARCH requires "params.q" (search query).');
-          if (!params.type) throw new Error('TARGETING SEARCH requires "params.type" (adinterest | adbehavior | addemographics).');
+          if (!params.type) throw new Error('TARGETING SEARCH requires "params.type" (adinterest | adbehavior | addemographics | adgeolocation).');
         }
         break;
 
@@ -15623,7 +15605,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return this.manageMetaCustomAudiences(userId, action as any, account_id, params);
 
       case 'TARGETING':
-        return this.searchAdTargeting(userId, account_id, params.q, params.type);
+        return this.searchAdTargeting(userId, account_id, params.q, params.type, params.location_types);
 
       case 'PAGE':
         return this.listMetaPages(userId, account_id);
@@ -15824,12 +15806,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     userId: string,
     account_id: string,
     q: string,
-    type: string = 'adTargetingCategory'
+    type: string = 'adTargetingCategory',
+    locationTypes?: string[]
   ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
 
-      const searchResult = await metaService.searchTargeting(accountId, accessToken, q, type);
+      const searchResult = await metaService.searchTargeting(accountId, accessToken, q, type, locationTypes);
       const results = Array.isArray(searchResult) ? searchResult : [];
 
       return {
@@ -20451,6 +20434,27 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     try {
+      // ENG-326: branded text-to-image asks must composite the account's REAL
+      // persisted logo — never one the model invents. When the prompt asks for
+      // a logo and the model didn't pass logo_image, prefer the persisted
+      // brand logo (AC-2); when none is persisted, ask the user / point at
+      // brand config instead of generating (AC-3). Edits (inputImages) are
+      // out of scope — the source images already carry the branding.
+      if (
+        !logoImage &&
+        (!Array.isArray(inputImages) || inputImages.length === 0) &&
+        promptRequestsLogo(prompt)
+      ) {
+        const persistedLogo = await getPersistedBrandLogoUrlForUser(userId);
+        if (!persistedLogo) {
+          return missingBrandLogoToolResult();
+        }
+        logoImage = persistedLogo;
+        console.log(
+          `AgentMode: generate_image prompt asks for a logo — compositing the persisted brand logo (${persistedLogo})`
+        );
+      }
+
       // Import the image generation service
       const { imageService } = await import('./imageGeneration');
 
@@ -23669,9 +23673,42 @@ ${formatRequirements ? `\nFormat Requirements:\n${formatRequirements}` : ''}
 
 Please generate a complete, professional HTML document that properly formats and presents this content.`;
 
-      // Generate HTML using LLMService
+      // Generate HTML using LLMService.
+      // The final render is a single long-running LLM call; on Bedrock it can hit
+      // the 5-minute requestTimeout and throw. Without a retry, one transient
+      // timeout discards ALL completed upstream work (steps 1-3), which is exactly
+      // the systemic failure reported in ENG-203. Retry the render step with
+      // exponential backoff on transient errors (timeouts / 5xx / network) so a
+      // single blip no longer loses the report. Terminal errors (invalid args,
+      // auth, content-filter) are not retried — an identical call would just fail
+      // again.
       console.log(`AgentMode: Generating HTML ${isEmail ? 'email' : 'file'} with LLMService (Claude model)`);
-      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
+      const maxRenderAttempts = 3;
+      let htmlContent = '';
+      for (let attempt = 1; attempt <= maxRenderAttempts; attempt++) {
+        try {
+          htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
+          break;
+        } catch (renderError) {
+          const isLastAttempt = attempt === maxRenderAttempts;
+          const isTransient = isTransientLLMError(renderError);
+          if (isLastAttempt || !isTransient) {
+            // Distinguish exhaustion from a terminal error. If every attempt hit a
+            // transient timeout, the render likely can't finish inside the per-call
+            // budget deterministically (e.g. an oversized report) — retrying the same
+            // call won't help, and this is the signal that would justify streaming/
+            // chunking the render (ENG-203 follow-up). Log it distinctly so these are
+            // greppable and separable from one-off blips and terminal errors.
+            if (isLastAttempt && isTransient) {
+              console.error(`AgentMode: HTML render exhausted all ${maxRenderAttempts} attempts on a transient error (session ${sessionId}); render may be deterministically over the per-call timeout:`, renderError instanceof Error ? renderError.message : renderError);
+            }
+            throw renderError;
+          }
+          const backoffMs = 1000 * Math.pow(2, attempt - 1);
+          console.warn(`AgentMode: HTML render attempt ${attempt}/${maxRenderAttempts} failed with a transient error, retrying in ${backoffMs}ms:`, renderError instanceof Error ? renderError.message : renderError);
+          await this.sleep(backoffMs);
+        }
+      }
 
       if (!htmlContent || htmlContent.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -27831,12 +27868,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
-    entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION';
+    entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
     action: string;
     [key: string]: any;
   }): Promise<any> {
     try {
       const { customer_id, entity_type, action } = args;
+
+      if (entity_type === 'BIDDING_STRATEGY' && action === 'LIST') {
+        const biddingStrategies = await googleAdsService.listBiddingStrategies(userId, customer_id);
+        return { success: true, biddingStrategies };
+      }
 
       if (entity_type === 'CAMPAIGN') {
         if (action === 'LIST') {
@@ -27859,8 +27901,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, message: 'Campaign removed' };
         }
         if (action === 'CREATE') {
-          if (!args.budget_resource_name || !args.name || !args.type || !args.bidding_strategy) {
-            return { success: false, error: 'name, type, budget_resource_name, and bidding_strategy are required to create a campaign' };
+          if (!args.budget_resource_name || !args.name || !args.type || (!args.bidding_strategy && !args.bidding_strategy_resource_name)) {
+            return { success: false, error: 'name, type, budget_resource_name, and a bidding strategy (bidding_strategy for a standard strategy, or bidding_strategy_resource_name for a portfolio/shared strategy) are required to create a campaign' };
+          }
+          if (args.bidding_strategy && args.bidding_strategy_resource_name) {
+            return { success: false, error: 'Provide either bidding_strategy (standard) or bidding_strategy_resource_name (portfolio/shared), not both.' };
           }
           if (args.bidding_strategy === 'TARGET_CPA' && !args.bidding_strategy_target) {
             return { success: false, error: 'TARGET_CPA requires bidding_strategy_target (CPA value in account currency, e.g. 20 for $20). Ask the user for their target CPA before proceeding.' };
@@ -27873,6 +27918,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             type: args.type,
             budgetResourceName: args.budget_resource_name,
             biddingStrategy: args.bidding_strategy,
+            biddingStrategyResourceName: args.bidding_strategy_resource_name,
             biddingStrategyTarget: args.bidding_strategy_target,
             cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
             locationTargetIds: args.location_target_ids || [],
@@ -27888,6 +27934,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             name: args.name,
             status: args.status,
             biddingStrategy: args.bidding_strategy,
+            biddingStrategyResourceName: args.bidding_strategy_resource_name,
             biddingStrategyTarget: args.bidding_strategy_target,
             cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
             budgetResourceName: args.budget_resource_name,

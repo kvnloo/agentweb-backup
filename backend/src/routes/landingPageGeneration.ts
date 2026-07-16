@@ -17,6 +17,7 @@ import {
   deleteLandingPageByRecord,
   updateLandingPageGtm,
   BrandContext,
+  buildBrandContextFromUser,
   GeneratedLandingPage,
   getDeploymentStatus,
   getPreviewDeploymentUrl,
@@ -38,6 +39,7 @@ import {
   canUserEditLandingPage,
 } from "../services/v0Service";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
+import { MISSING_BRAND_LOGO_ERROR } from "../services/agentMode/brandLogo";
 import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
 
 const router = Router();
@@ -280,12 +282,13 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
 
     // Org-level create gating: in an org, only the org owner or a listed
     // editor (when landingPages sharing is enabled) may generate new pages.
+    // The org record is also the brand source for org members below.
     const caller = await userDb.getUserById(userId);
+    const callerOrg = caller?.orgId ? await orgDb.getOrgById(caller.orgId) : null;
     if (caller?.orgId) {
-      const org = await orgDb.getOrgById(caller.orgId);
       const allowed = canManageOrgFeature(
         { userId, orgId: caller.orgId, orgRole: caller.orgRole as "owner" | "member" | undefined },
-        org,
+        callerOrg,
         "landingPages",
       );
       if (!allowed) {
@@ -337,51 +340,28 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
 
     const pageName = name || prompt.slice(0, 60);
 
-    // Fetch brand guidelines + market strategy for maximum context
-    let brandContext: BrandContext = {};
-    let userSiteMode: "unified" | "separate" | undefined;
-    try {
-      const user = await userDb.getUserById(userId);
-      userSiteMode = user?.landingSiteMode;
-      if (user?.brandGuidelines) {
-        const bg = user.brandGuidelines;
-        const bd = (bg as any).brandData || {};
-        brandContext = {
-          brandName: bd.brandName,
-          primaryColor: bd.primaryColor,
-          primaryColorEnd: bd.primaryColorEnd,
-          isGradient: bd.isGradient,
-          secondaryColor: bd.secondaryColor,
-          fontFamily: bd.fontFamily,
-          tagline: bd.tagline,
-          toneOfVoice: bd.toneOfVoice,
-          brandPersonality: bd.brandPersonality,
-          keyMessages: bd.keyMessages,
-          brandValues: bd.brandValues,
-          targetAudience: bd.targetAudience,
-          founders: bd.founders,
-        };
+    // Brand guidelines + market strategy for maximum context. The shared
+    // projection resolves the persisted brand logo attachments-first and
+    // org-aware — an org member's brand (incl. the uploaded logo) lives on
+    // the ORG record (ENG-326). Pure projection off records already loaded.
+    const brandContext: BrandContext = buildBrandContextFromUser(
+      caller,
+      callerOrg?.brandGuidelines,
+    );
+    const userSiteMode: "unified" | "separate" | undefined = caller?.landingSiteMode;
 
-        // Get logo URL from attachments
-        if ((bg as any).attachments && Array.isArray((bg as any).attachments)) {
-          const logo = (bg as any).attachments.find(
-            (a: any) => a.type === "logo" && a.url
-          );
-          if (logo) {
-            brandContext.logoUrl = logo.url;
-          }
-        }
-      }
-
-      // Pull market strategy for richer landing page copy
-      if (user?.marketStrategy) {
-        const ms = user.marketStrategy;
-        brandContext.businessOverview = ms.businessOverview;
-        brandContext.icp = ms.icp;
-        brandContext.competitors = ms.competitors;
-      }
-    } catch (error) {
-      console.error("[LP GENERATION] Failed to fetch brand guidelines, continuing without:", error);
+    // ENG-326 AC-3: landing pages are BRANDED assets — without a persisted
+    // logo v0 renders an invented/approximate wordmark, the exact defect the
+    // issue names. Point the user at brand config instead of generating.
+    // Gate BEFORE any side effect (lead-list flip, site-mode lock).
+    if (!brandContext.logoUrl) {
+      return res.status(422).json({
+        error: MISSING_BRAND_LOGO_ERROR,
+        message:
+          "No brand logo is saved in Brand Guidelines. Upload your logo in brand config " +
+          "(Brand Guidelines), then generate again — landing pages are never generated " +
+          "with an invented or approximate logo.",
+      });
     }
 
     // Auto-enable public access on the lead list so the landing page form works
@@ -720,39 +700,23 @@ router.post("/generated/:id/duplicate", async (req, res: Response) => {
     const { name } = req.body;
     const newName = name || `${original.name} (copy)`;
 
-    // Re-generate using the original prompt + full brand context
-    let brandContext: BrandContext = {};
-    try {
-      const user = await userDb.getUserById(userId);
-      if (user?.brandGuidelines) {
-        const bg = user.brandGuidelines;
-        const bd = (bg as any).brandData || {};
-        brandContext = {
-          brandName: bd.brandName,
-          primaryColor: bd.primaryColor,
-          primaryColorEnd: bd.primaryColorEnd,
-          isGradient: bd.isGradient,
-          secondaryColor: bd.secondaryColor,
-          fontFamily: bd.fontFamily,
-          tagline: bd.tagline,
-          toneOfVoice: bd.toneOfVoice,
-          brandPersonality: bd.brandPersonality,
-          keyMessages: bd.keyMessages,
-          brandValues: bd.brandValues,
-          targetAudience: bd.targetAudience,
-          founders: bd.founders,
-        };
-        if ((bg as any).attachments && Array.isArray((bg as any).attachments)) {
-          const logo = (bg as any).attachments.find((a: any) => a.type === "logo" && a.url);
-          if (logo) brandContext.logoUrl = logo.url;
-        }
-      }
-      if (user?.marketStrategy) {
-        brandContext.businessOverview = user.marketStrategy.businessOverview;
-        brandContext.icp = user.marketStrategy.icp;
-        brandContext.competitors = user.marketStrategy.competitors;
-      }
-    } catch {}
+    // Re-generate using the original prompt + full brand context (shared
+    // ENG-326 projection — org-aware, persisted logo attachments-first).
+    const user = await userDb.getUserById(userId);
+    const org = user?.orgId ? await orgDb.getOrgById(user.orgId) : null;
+    const brandContext = buildBrandContextFromUser(user, org?.brandGuidelines);
+
+    // ENG-326 AC-3: duplicating re-generates the page — same gate as
+    // /generate. Without a persisted logo v0 would invent a wordmark.
+    if (!brandContext.logoUrl) {
+      return res.status(422).json({
+        error: MISSING_BRAND_LOGO_ERROR,
+        message:
+          "No brand logo is saved in Brand Guidelines. Upload your logo in brand config " +
+          "(Brand Guidelines), then duplicate again — landing pages are never generated " +
+          "with an invented or approximate logo.",
+      });
+    }
 
     const result = await generateLandingPage(userId, original.prompt, newName, brandContext);
     res.status(201).json(result);
