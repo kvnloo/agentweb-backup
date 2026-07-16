@@ -550,6 +550,16 @@ export async function updateCampaign(
       currencyCode: params.unit_cost_currency || 'USD',
     };
   }
+  // ENG-367: this override was previously dropped entirely -- LinkedIn re-validates
+  // runSchedule.start on every UPDATE (even status-only ones), so a DRAFT campaign
+  // whose start had elapsed could never be updated, including archived, because we
+  // never gave the caller a way to correct the stale stored value.
+  const scheduleStart = params.runSchedule?.start ?? params.run_schedule_start;
+  if (scheduleStart !== undefined) {
+    setFields.runSchedule = { start: scheduleStart };
+    const scheduleEnd = params.runSchedule?.end ?? params.run_schedule_end;
+    if (scheduleEnd !== undefined) setFields.runSchedule.end = scheduleEnd;
+  }
 
   return makeRequest(
     'POST',

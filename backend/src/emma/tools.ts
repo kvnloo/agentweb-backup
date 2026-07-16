@@ -1234,7 +1234,9 @@ REQUIRED PARAMS PER ENTITY + ACTION:
     Other required: name, status, campaignGroup (full URN), objectiveType (WEBSITE_VISIT|BRAND_AWARENESS|ENGAGEMENT|VIDEO_VIEWS|LEAD_GENERATION|WEBSITE_CONVERSIONS — omit entirely for DYNAMIC/JOBS campaigns), costType (CPM|CPC|CPV), unitCost, targeting_include (array)
     targeting_include format: array of { "facet_urn": "urn:li:adTargetingFacet:locations", "values": ["urn:li:geo:103644278"] }
     ALWAYS use targeting_include/targeting_exclude — never construct targetingCriteria manually
-  CAMPAIGN UPDATE: campaign_id + fields to update
+  CAMPAIGN UPDATE: campaign_id + fields to update. If the ad set was created with a runSchedule.start that has since elapsed,
+    LinkedIn re-validates it on EVERY update (even status-only ones like archiving) and rejects with the old stored value --
+    pass a future runSchedule (or run_schedule_start) alongside whatever else you're changing to get past this.
   CREATIVE LIST: params.campaign_id required
   CREATIVE CREATE: campaign_id + one of: post_urn (sponsored content/event/article/document), headline+description+landing_page (text ad), inmail_content_urn (message/conversation ad), vast_tag_url (VAST video). Optional: pre_event_registration_image (event ads). Lead Gen ad: also pass leadgen_form_urn + cta_label_type to attach an existing Lead Gen Form.
   CREATIVE CREATE_INLINE: Dark post only. Required: campaign_id, commentary, image_urn OR video_urn OR document_urn OR carousel_cards. Lead Gen ad (LEAD_GENERATION campaign): also pass leadgen_form_urn (adForm URN) + cta_label_type (e.g. SIGN_UP) to attach an existing Lead Gen Form.

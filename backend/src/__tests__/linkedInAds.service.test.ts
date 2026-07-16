@@ -256,6 +256,35 @@ describe('updateCampaign', () => {
       })
     );
   });
+
+  // ENG-367: a supplied runSchedule.start override was silently dropped -- updateCampaign
+  // never read it into setFields, so LinkedIn always re-validated against the OLD stored
+  // start time and rejected any update (including archiving) on a DRAFT ad set whose start
+  // had elapsed. This was OUR bug, not a LinkedIn API limitation.
+  it('includes a runSchedule.start override in the patch (object form)', async () => {
+    await svc.updateCampaign(ACCESS_TOKEN, ACCOUNT_ID, 'camp-1', {
+      status: 'ARCHIVED',
+      runSchedule: { start: 1784300000000 },
+    });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.patch.$set.runSchedule).toEqual({ start: 1784300000000 });
+    expect(call.data.patch.$set.status).toBe('ARCHIVED');
+  });
+
+  it('includes a runSchedule.start override in the patch (snake_case form)', async () => {
+    await svc.updateCampaign(ACCESS_TOKEN, ACCOUNT_ID, 'camp-1', {
+      run_schedule_start: 1784300000000,
+      run_schedule_end: 1784400000000,
+    });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.patch.$set.runSchedule).toEqual({ start: 1784300000000, end: 1784400000000 });
+  });
+
+  it('omits runSchedule from the patch when not supplied (no unintended field)', async () => {
+    await svc.updateCampaign(ACCESS_TOKEN, ACCOUNT_ID, 'camp-1', { status: 'PAUSED' });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.patch.$set).not.toHaveProperty('runSchedule');
+  });
 });
 
 describe('createCreative', () => {
