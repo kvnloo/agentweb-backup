@@ -8,6 +8,12 @@ jest.mock('../mcp/client/mcpClientService', () => ({
 jest.mock('axios');
 import axios from 'axios';
 
+// slackService instantiates a Slack WebClient at import time (which reads
+// axios.defaults). Because this suite auto-mocks axios, axios.defaults is
+// undefined and the real WebClient constructor throws while the agentMode
+// module graph loads. Stub slackService so the suite can load.
+jest.mock('../services/slackService', () => ({}));
+
 //Mock the dependencies
 jest.mock('../services/metaService', () => ({
   metaService: {
