@@ -127,12 +127,17 @@ describe('scheduleDb.claimAbandonedRun', () => {
 });
 
 describe('scheduleDb.getInFlightSchedules', () => {
-  it('queries active scheduled_chat schedules that hold a lease', async () => {
-    mockDynamoDB.query.mockReturnValue(
-      ok({ Items: [{ scheduleId: 'sched-1', runInFlight: { runId: 'run-1' } }] })
-    );
+  it('queries both active and paused scheduled_chat schedules that hold a lease, merged', async () => {
+    mockDynamoDB.query
+      .mockReturnValueOnce(ok({ Items: [{ scheduleId: 'active-1', runInFlight: { runId: 'run-1' } }] }))
+      .mockReturnValueOnce(ok({ Items: [{ scheduleId: 'paused-1', runInFlight: { runId: 'run-2' } }] }));
+
     const result = await scheduleDb.getInFlightSchedules();
-    expect(result).toHaveLength(1);
+
+    expect(result).toHaveLength(2);
+    expect(result.map((r: any) => r.scheduleId).sort()).toEqual(['active-1', 'paused-1']);
+    const statusesQueried = mockDynamoDB.query.mock.calls.map((c: any[]) => c[0].ExpressionAttributeValues[':status']).sort();
+    expect(statusesQueried).toEqual(['active', 'paused']);
     const params = mockDynamoDB.query.mock.calls[0][0];
     expect(params.IndexName).toBe('StatusStartTimeIndex');
     expect(params.FilterExpression).toContain('attribute_exists(runInFlight)');

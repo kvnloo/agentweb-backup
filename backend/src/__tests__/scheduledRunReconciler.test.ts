@@ -77,6 +77,7 @@ function scheduleWithLease(overrides: any = {}, leaseOverrides: any = {}) {
     scheduleId: 'sched-1',
     scheduleName: 'Daily ICP Lead Finder',
     userId: 'user-1',
+    status: 'active',
     keywords: ['icp'],
     requiredFunctionCalls: ['enrich_leads'],
     zeroAssistantRetryCount: 0,
@@ -161,6 +162,24 @@ describe('reconcileStaleScheduledRuns', () => {
     expect(result.reconciled).toBe(1);
     // requeue argument is null (over cap) → lease cleared without rescheduling.
     expect(mockScheduleDb.claimAbandonedRun).toHaveBeenCalledWith('sched-1', 'run-abc', null);
+    expect(mockScheduleDb.addRunResult).toHaveBeenCalledTimes(1);
+    expect(mockScheduleDb.addRunResult.mock.calls[0][1]).not.toHaveProperty('requeuedAt');
+  });
+
+  it('recovers a PAUSED schedule (runCount-limited) without requeuing it', async () => {
+    // A runCount-limited schedule auto-pauses at dispatch; its abandoned final run
+    // must still be recovered (lease cleared + session annotated + failure
+    // recorded) but NOT rescheduled.
+    const paused = scheduleWithLease({ status: 'paused' });
+    mockScheduleDb.getInFlightSchedules.mockResolvedValue([paused]);
+
+    const result = await reconcileStaleScheduledRuns(NOW);
+
+    expect(result.reconciled).toBe(1);
+    // requeue argument is null → lease cleared, not rescheduled.
+    expect(mockScheduleDb.claimAbandonedRun).toHaveBeenCalledWith('sched-1', 'run-abc', null);
+    // But the session is still annotated and a failure result is still written.
+    expect(mockChatbotDb.addMessageToSession).toHaveBeenCalledTimes(1);
     expect(mockScheduleDb.addRunResult).toHaveBeenCalledTimes(1);
     expect(mockScheduleDb.addRunResult.mock.calls[0][1]).not.toHaveProperty('requeuedAt');
   });
