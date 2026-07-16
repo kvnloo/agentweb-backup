@@ -564,6 +564,19 @@ describe('createCampaign — portfolio / shared bidding strategy', () => {
     expect(create.targetSpend).toBeUndefined();
     expect(res.resourceName).toBe('customers/123/campaigns/9');
   });
+
+  it('rejects an unrecognized bidding_strategy on create without sending an incomplete mutate', async () => {
+    await expect(
+      service.createCampaign('user-123', '1234567890', {
+        name: 'Bogus Strategy Campaign',
+        type: 'SEARCH',
+        budgetResourceName: 'customers/123/campaignBudgets/1',
+        biddingStrategy: 'NOT_A_REAL_STRATEGY' as any,
+        locationTargetIds: [],
+      }),
+    ).rejects.toThrow('Unsupported bidding_strategy');
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
 });
 
 describe('listCampaigns', () => {
@@ -886,7 +899,19 @@ describe('updateCampaign — TARGET_SPEND (Maximize Clicks)', () => {
       service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
         biddingStrategy: 'TARGET_SPEND',
       }),
-    ).rejects.toThrow('requires cpc_bid_ceiling_micros');
+    ).rejects.toThrow('cpc_bid_ceiling_micros');
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
+  it('rejects TARGET_SPEND with a zero or negative cpc bid ceiling (Google rejects 0 as TOO_LOW)', async () => {
+    for (const ceiling of [0, -5]) {
+      await expect(
+        service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+          biddingStrategy: 'TARGET_SPEND',
+          cpcBidCeilingMicros: ceiling,
+        }),
+      ).rejects.toThrow('cpc_bid_ceiling_micros');
+    }
     expect(mockAxiosPost).not.toHaveBeenCalled();
   });
 
