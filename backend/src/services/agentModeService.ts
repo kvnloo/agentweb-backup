@@ -7,7 +7,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
-import { rankMemoriesByRelevance } from '../utils/memoryRanking';
+import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { computeTermination } from './agentMode/core/agentStep';
@@ -2750,14 +2750,13 @@ export class AgentModeService {
               console.error('Failed to backfill account memory embedding:', e)
             );
           });
-          if (relevantMemories.length > 0) {
-            const memoryLines = relevantMemories.map(
-              (m: any) => `- [${m.category}] ${m.content}`
-            );
-            messages.push({
-              role: 'assistant',
-              content: `Account Memory (facts from previous sessions):\n${memoryLines.join('\n')}`
-            });
+          const accountMemoryMessage = buildMemoryContextMessage(
+            'Account Memory (facts from previous sessions):',
+            relevantMemories,
+            new Date()
+          );
+          if (accountMemoryMessage) {
+            messages.push({ role: 'assistant', content: accountMemoryMessage });
           }
         }
 
@@ -2771,14 +2770,13 @@ export class AgentModeService {
                 console.error('Failed to backfill org memory embedding:', e)
               );
             });
-            if (relevantOrgMemories.length > 0) {
-              const orgMemoryLines = relevantOrgMemories.map(
-                (m: any) => `- [${m.category}] ${m.content}`
-              );
-              messages.push({
-                role: 'assistant',
-                content: `Organization Memory (shared facts for "${org.name}"):\n${orgMemoryLines.join('\n')}`
-              });
+            const orgMemoryMessage = buildMemoryContextMessage(
+              `Organization Memory (shared facts for "${org.name}"):`,
+              relevantOrgMemories,
+              new Date()
+            );
+            if (orgMemoryMessage) {
+              messages.push({ role: 'assistant', content: orgMemoryMessage });
             }
           }
         }
