@@ -10,6 +10,8 @@ jest.mock('../services/googleAdsService', () => ({
     pauseCampaign: jest.fn().mockResolvedValue(undefined),
     resumeCampaign: jest.fn().mockResolvedValue(undefined),
     updateCampaign: jest.fn().mockResolvedValue(true),
+    // ENG-335 launch gate: default to no serving URLs so the gate is a no-op here.
+    getCampaignFinalUrls: jest.fn().mockResolvedValue([]),
     addKeywords: jest.fn().mockResolvedValue(undefined),
     addNegativeKeywords: jest.fn().mockResolvedValue(undefined),
     searchLocations: jest.fn().mockResolvedValue([
