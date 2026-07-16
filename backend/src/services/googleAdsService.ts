@@ -2,7 +2,7 @@ import axios from 'axios';
 import { getGoogleAdsCredentials } from '../utils/secretsManager';
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
-import { buildUtmSpec, mergeUtmIntoQueryString, mergeUtmIntoUrl, readUtmKeys } from '../utils/adUtm';
+import { buildUtmSpec, mergeUtmIntoQueryString, mergeUtmIntoUrl, readUtmKeys, utmKeysInQueryString, utmQueryString } from '../utils/adUtm';
 
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
 const TOKEN_REFRESH_URL = 'https://oauth2.googleapis.com/token';
@@ -1154,6 +1154,63 @@ export class GoogleAdsService {
 
     const success = await this.updateCampaign(userId, customerId, campaignResourceName, { finalUrlSuffix: merged });
     return { success };
+  }
+
+  /**
+   * Retag ONE existing PMax asset group that's missing UTMs (Harsha's ask,
+   * PMax slice — `retagAdUtm` only covers `ad_group_ad`, which a PMax campaign
+   * has none of). Deliberately single-target: never loop or accept a list.
+   *
+   * An asset group has no `final_url_suffix` field of its own (same reason
+   * `createAssetGroup` merges straight into `final_urls`) — but it DOES inherit
+   * the CAMPAIGN's `final_url_suffix` at delivery. So a key the campaign
+   * already supplies must be omitted here too, or the click URL carries it
+   * twice. No `content`: Google's docs mark `{creative}` unsupported on PMax
+   * (see `createAssetGroup`), so it's never added here either.
+   *
+   * UNVERIFIED against a live account: whether `asset_group.final_urls` is
+   * actually writable via UPDATE has not been confirmed the way the ad/campaign
+   * paths were — do not assume this works until it's been run live.
+   */
+  async retagAssetGroupUtm(
+    userId: string,
+    customerId: string,
+    assetGroupResourceName: string,
+  ): Promise<{ success: boolean; reason?: 'no_destination_url' }> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const rows = await this.search(
+      customerId,
+      accessToken,
+      `SELECT asset_group.final_urls, campaign.final_url_suffix `
+      + `FROM asset_group WHERE asset_group.resource_name = '${assetGroupResourceName}'`,
+      loginCustomerId,
+    );
+    const finalUrl = rows[0]?.assetGroup?.finalUrls?.[0];
+    if (!finalUrl) return { success: false, reason: 'no_destination_url' };
+
+    const urlKeys = readUtmKeys(finalUrl);
+    if (!urlKeys) return { success: false }; // unreadable — never risk a duplicate
+
+    const campaignSuffix: string | undefined = rows[0]?.campaign?.finalUrlSuffix;
+    const inheritedKeys = utmKeysInQueryString(campaignSuffix);
+    const omit = new Set<string>([...urlKeys, ...inheritedKeys]);
+
+    const spec = buildUtmSpec('google', { campaign: '{campaignid}' });
+    const additions = utmQueryString(spec, omit);
+    if (!additions) return { success: false }; // nothing missing
+
+    const hashIndex = finalUrl.indexOf('#');
+    const base = hashIndex === -1 ? finalUrl : finalUrl.slice(0, hashIndex);
+    const fragment = hashIndex === -1 ? '' : finalUrl.slice(hashIndex);
+    const queryIndex = base.indexOf('?');
+    const separator = queryIndex === -1 ? '?' : queryIndex === base.length - 1 ? '' : '&';
+    const newUrl = `${base}${separator}${additions}${fragment}`;
+
+    await this.mutate(customerId, accessToken, 'assetGroups', [{
+      update: { resourceName: assetGroupResourceName, finalUrls: [newUrl] },
+      updateMask: 'final_urls',
+    }], loginCustomerId);
+    return { success: true };
   }
 
   async removeAd(userId: string, customerId: string, adGroupAdResourceName: string): Promise<void> {

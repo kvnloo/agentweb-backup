@@ -479,3 +479,79 @@ describe('createAd — malformed destination URL must not abort ad creation', ()
     expect(create.ad.finalUrlSuffix).toBeUndefined();
   });
 });
+
+describe('retagAssetGroupUtm — single existing PMax asset group, on-demand retrofit (Harsha\'s ask)', () => {
+  it('returns success:false with a reason when the asset group has no destination URL', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
+    const result = await service.retagAssetGroupUtm('user-123', '1234567890', 'customers/123/assetGroups/1');
+    expect(result).toEqual({ success: false, reason: 'no_destination_url' });
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+  });
+
+  it('is a no-op when the URL already carries every key the spec would add', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          assetGroup: { finalUrls: ['https://example.com/?utm_source=a&utm_medium=b&utm_campaign=c'] },
+          campaign: {},
+        }],
+      },
+    });
+    const result = await service.retagAssetGroupUtm('user-123', '1234567890', 'customers/123/assetGroups/1');
+    expect(result).toEqual({ success: false });
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+  });
+
+  it('is a no-op when the CAMPAIGN suffix already supplies every key (inherited at delivery)', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          assetGroup: { finalUrls: ['https://example.com/'] },
+          campaign: { finalUrlSuffix: 'utm_source=a&utm_medium=b&utm_campaign=c' },
+        }],
+      },
+    });
+    const result = await service.retagAssetGroupUtm('user-123', '1234567890', 'customers/123/assetGroups/1');
+    expect(result).toEqual({ success: false });
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1); // never writes — campaign already covers it
+  });
+
+  it('does not touch anything when the URL is unreadable (never risk a duplicate)', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ assetGroup: { finalUrls: ['not a url'] }, campaign: {} }] },
+    });
+    const result = await service.retagAssetGroupUtm('user-123', '1234567890', 'customers/123/assetGroups/1');
+    expect(result).toEqual({ success: false });
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+  });
+
+  it('adds the missing UTMs into final_urls, with NO utm_content, on the happy path', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ assetGroup: { finalUrls: ['https://example.com/'] }, campaign: {} }] },
+    });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } }); // the mutate
+    const result = await service.retagAssetGroupUtm('user-123', '1234567890', 'customers/123/assetGroups/1');
+    expect(result).toEqual({ success: true });
+    const op = mutateOperation();
+    expect(op.update.resourceName).toBe('customers/123/assetGroups/1');
+    expect(op.update.finalUrls[0]).toBe('https://example.com/?utm_source=google&utm_medium=paid&utm_campaign={campaignid}');
+    expect(op.update.finalUrls[0]).not.toContain('utm_content');
+    expect(op.updateMask).toBe('final_urls');
+  });
+
+  it('does not duplicate a key already supplied by the CAMPAIGN suffix, adds only what\'s missing', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          assetGroup: { finalUrls: ['https://example.com/'] },
+          campaign: { finalUrlSuffix: 'utm_source=custom' },
+        }],
+      },
+    });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.retagAssetGroupUtm('user-123', '1234567890', 'customers/123/assetGroups/1');
+    const op = mutateOperation();
+    expect(op.update.finalUrls[0]).toBe('https://example.com/?utm_medium=paid&utm_campaign={campaignid}');
+    expect(op.update.finalUrls[0]).not.toContain('utm_source=google');
+  });
+});

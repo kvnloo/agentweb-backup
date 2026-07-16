@@ -8123,7 +8123,13 @@ ACTION MATRIX:
   CAMPAIGN_ASSET → ATTACH (campaign_resource_name, assets[{fieldType, assetResourceName?, text?}])
               fieldType values: BUSINESS_NAME (use text), LOGO, SQUARE_MARKETING_IMAGE, MARKETING_IMAGE (use assetResourceName)
               Note: brand guidelines are handled automatically in CAMPAIGN CREATE — use ATTACH only for adding additional campaign-level assets after campaign creation
-  ASSET_GROUP → CREATE
+  ASSET_GROUP → CREATE, RETAG_UTM (asset_group_resource_name)
+              RETAG_UTM (ENG-239 — retrofit UTMs onto a PMax asset group found untagged, e.g. via
+              audit_ad_utm_coverage): merges missing UTM keys directly into final_urls (asset groups have no
+              final_url_suffix field). No utm_content — {creative} is unsupported on Performance Max, per
+              Google's own docs. Also omits any key the CAMPAIGN's final_url_suffix already supplies, since an
+              asset group inherits that at delivery — never duplicates. Never call in a loop — single-target
+              only, one asset group per call.
   LOCATION    → SEARCH`,
     inputSchema: {
       type: 'object',
@@ -8144,7 +8150,8 @@ ACTION MATRIX:
         campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE and AD_GROUP LIST.' },
         final_url_suffix: { type: 'string', description: 'Campaign-level Final URL suffix (query params appended to all final URLs, e.g. "utm_source=google&utm_medium=cpc"). For CAMPAIGN UPDATE only.' },
         ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD LIST/ADD/ADD_NEGATIVE/REMOVE, AD LIST/CREATE, AD_GROUP UPDATE.' },
-        ad_resource_name: { type: 'string', description: 'AdGroupAd resource name. Required for AD UPDATE/REMOVE. Obtain from AD LIST.' },
+        ad_resource_name: { type: 'string', description: 'AdGroupAd resource name. Required for AD UPDATE/REMOVE/RETAG_UTM. Obtain from AD LIST.' },
+        asset_group_resource_name: { type: 'string', description: 'Asset group resource name. Required for ASSET_GROUP RETAG_UTM. Obtain from audit_ad_utm_coverage or a GAQL read on asset_group.' },
         brand_business_name: { type: 'string', description: 'Business name for PMax brand guidelines. Required for PERFORMANCE_MAX CAMPAIGN CREATE when brand guidelines are enforced.' },
         brand_logo_asset_resource_name: { type: 'string', description: 'Logo image asset resource name for PMax brand guidelines. Upload via ASSET UPLOAD first.' },
         criterion_resource_name: { type: 'string', description: 'Ad group criterion resource name. Required for KEYWORD REMOVE. Obtain from KEYWORD LIST.' },

@@ -28419,6 +28419,21 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return { success: true, assetGroupResourceName: assetGroup.resourceName };
       }
 
+      if (entity_type === 'ASSET_GROUP' && action === 'RETAG_UTM') {
+        // ENG-239 PMax retrofit: retags ONE existing asset group, never a list.
+        if (!args.asset_group_resource_name) return { success: false, error: 'asset_group_resource_name is required for ASSET_GROUP RETAG_UTM' };
+        const result = await googleAdsService.retagAssetGroupUtm(userId, customer_id, args.asset_group_resource_name);
+        if (!result.success) {
+          return {
+            success: false,
+            error: result.reason === 'no_destination_url'
+              ? 'This asset group has no destination URL to tag.'
+              : 'No change was made — the destination already carries every UTM key (directly or via the campaign\'s final_url_suffix), or the URL could not be read.',
+          };
+        }
+        return { success: true, message: 'Asset group retagged with UTMs' };
+      }
+
       return { success: false, error: `Unsupported entity_type=${entity_type} action=${action}` };
     } catch (error: any) {
       if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true };
