@@ -209,6 +209,7 @@ import {
   validateSender,
   senderSettingName,
   resolveSenderForSend,
+  normalizeSender,
 } from '../services/crmSenderService';
 import { MAILBOX_PROVIDERS, CrmSender, isMailboxSender } from '../services/crmSenderTypes';
 import { sendAsSender } from '../services/sendAsSender';
@@ -4947,6 +4948,15 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
       // Non-fatal — validateSender will reject mailbox senders if we can't confirm the account
     }
 
+    // Grandfather in senders that are unchanged from what's already persisted.
+    // The frontend always posts the FULL sender list on every save (not a diff),
+    // so without this, one stale sender (e.g. a disconnected account left over
+    // from before) would permanently block adding or editing ANY other sender —
+    // a real dead end with no recovery path (ENG-266 friction, found in live
+    // testing). Only senders that are new or genuinely modified get re-validated.
+    const existingConfig = await loadSenderConfig(userId);
+    const existingById = new Map(existingConfig.senders.map((s) => [s.id, s]));
+
     // Validate each sender
     for (const sender of senders) {
       if (!sender.email || !sender.fromName) {
@@ -4961,6 +4971,13 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
       if (sender.notes !== undefined && typeof sender.notes !== 'string') {
         return res.status(400).json({ message: 'Notes must be a string if provided' });
       }
+
+      const existing = sender.id ? existingById.get(sender.id) : undefined;
+      const unchanged = existing && JSON.stringify(normalizeSender(sender)) === JSON.stringify(existing);
+      if (unchanged) {
+        continue;
+      }
+
       const validation = validateSender(sender, userConnectedAccounts);
       if (!validation.ok) {
         return res.status(400).json({ message: validation.error });

@@ -1483,6 +1483,94 @@ describe('CRM Routes', () => {
 
       expect(mockResponse.status).toHaveBeenCalledWith(400);
     });
+
+    describe('ENG-266 friction fix: an unrelated stale sender must not block adding a new one', () => {
+      const findHandler = () =>
+        router.stack.find((r: any) => r.route?.path === '/sender-emails' && r.route?.methods?.post);
+
+      // A sender already persisted with a connectedAccountId that no longer
+      // resolves to any connected account (e.g. the account was disconnected,
+      // or never actually existed) — this is the exact shape that blocked a
+      // real "Use as Sender" click on test-env1.
+      const brokenStoredGmailSender = {
+        id: 'broken-1',
+        email: 'ghost@argusoft.com',
+        fromName: 'Ghost',
+        senderType: 'gmail',
+        connectedAccountId: 'ghost@argusoft.com',
+        gmailAccountId: 'ghost@argusoft.com',
+      };
+
+      it('FAIL: still rejects the save if the broken sender is itself modified in this request', async () => {
+        (settingsService.getSetting as jest.Mock).mockResolvedValue({
+          settingValue: JSON.stringify({ senders: [brokenStoredGmailSender], defaultSenderId: null }),
+        });
+
+        mockRequest.body = {
+          senders: [{ ...brokenStoredGmailSender, fromName: 'Ghost (edited)' }], // touched -> must re-validate
+        };
+
+        const handler = findHandler();
+        if (handler && handler.route) {
+          await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+        }
+
+        expect(mockResponse.status).toHaveBeenCalledWith(400);
+      });
+
+      it('FAIL: still rejects a genuinely new invalid sender even when the stale one is grandfathered', async () => {
+        (settingsService.getSetting as jest.Mock).mockResolvedValue({
+          settingValue: JSON.stringify({ senders: [brokenStoredGmailSender], defaultSenderId: null }),
+        });
+
+        mockRequest.body = {
+          senders: [
+            brokenStoredGmailSender, // unchanged -> grandfathered
+            { id: 'new-1', email: 'new@baldwin.com', fromName: 'New', senderType: 'outlook', connectedAccountId: 'does-not-exist' },
+          ],
+        };
+
+        const handler = findHandler();
+        if (handler && handler.route) {
+          await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+        }
+
+        expect(mockResponse.status).toHaveBeenCalledWith(400);
+      });
+
+      it('SUCCESS: saves when a new valid sender is added alongside an untouched broken one', async () => {
+        (settingsService.getSetting as jest.Mock).mockResolvedValue({
+          settingValue: JSON.stringify({ senders: [brokenStoredGmailSender], defaultSenderId: null }),
+        });
+        (settingsService.setSetting as jest.Mock).mockResolvedValue(undefined);
+        (userDb.getUserById as jest.Mock).mockResolvedValue({
+          connected_accounts: [
+            { platform: 'outlook', account_id: 'newnetlify@outlook.com', config: { email: 'newnetlify@outlook.com' } },
+          ],
+        });
+
+        mockRequest.body = {
+          senders: [
+            brokenStoredGmailSender, // unchanged -> grandfathered, does NOT block the save
+            {
+              id: 'new-1',
+              email: 'newnetlify@outlook.com',
+              fromName: 'New Netlify',
+              senderType: 'outlook',
+              connectedAccountId: 'newnetlify@outlook.com',
+            },
+          ],
+        };
+
+        const handler = findHandler();
+        if (handler && handler.route) {
+          await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+        }
+
+        expect(mockResponse.status).not.toHaveBeenCalledWith(400);
+        expect(settingsService.setSetting).toHaveBeenCalled();
+      });
+    });
   });
 
   describe('POST /api/crm/lists/:listId/leads/:leadId/send-email', () => {
