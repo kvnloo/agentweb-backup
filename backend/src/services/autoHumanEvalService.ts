@@ -13,6 +13,12 @@ export interface AutoHumanEvalInput {
   chatUrl?: string;
   originalRequest?: string;
   action?: HumanEvalAction;
+  /**
+   * Ad vs Organic Post use-case tag (ENG-90). Set it only when the enqueueing
+   * flow knows its use case; ambiguous flows omit it and the candidate is
+   * stored fail-open as 'uncategorized'.
+   */
+  category?: string;
 }
 
 function dedupeSettingKey(sourceKey: string): string {
@@ -52,6 +58,7 @@ export async function enqueueAutoHumanEval(
       chatUrl: input.chatUrl,
       originalRequest: input.originalRequest,
       action: input.action,
+      category: input.category,
     });
 
     await settingsService.setSetting(
