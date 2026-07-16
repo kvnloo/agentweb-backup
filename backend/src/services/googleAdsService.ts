@@ -1100,21 +1100,29 @@ export class GoogleAdsService {
 
   /**
    * Retag ONE existing, already-live ad that's missing UTMs (Harsha's ask —
-   * the audit tool can only find these, never fix them). Deliberately single-ad:
-   * never loop or accept a list, so there is no "bulk retag" surface.
+   * the audit tool can only find these, never fix them). Deliberately single-ad
+   * INPUT: never loop or accept a list. But the WRITE lands on that ad's
+   * CAMPAIGN, not the ad itself — see below — so retagging affects every ad
+   * under that campaign, not just the one named. Callers/tools must disclose
+   * this blast radius; it is bigger than the name suggests.
    *
-   * Reads the ad's current `final_urls` and delegates entirely to `updateAd`,
-   * which already does the whole computation (inherited-suffix read, AC4 merge)
-   * for the create AND edit paths. `success:false` here is ambiguous by design —
-   * it means either "already fully tagged" or "no write was safe to make" — the
-   * caller should not infer a specific reason from it.
+   * LIVE-VERIFIED 2026-07-16 against a real Google Ads account (customer
+   * 2883029950): an ad-level `UPDATE` of `final_url_suffix` is REJECTED —
+   * `IMMUTABLE_FIELD: Field 'ad.final_url_suffix' cannot be modified by
+   * 'UPDATE' operation` — even though the v24 `Ad` proto carries no IMMUTABLE
+   * annotation on this field (unlike the ad-type oneof fields, which do). The
+   * public proto and the live server's actual validation disagree; proto
+   * silence is not proof of mutability. `updateAd`'s finalUrl-based edit path
+   * (used at CREATE time, where this write is allowed) cannot be reused here.
    *
-   * `final_url_suffix` is NOT annotated IMMUTABLE in the v24 `Ad` proto
-   * (googleapis/google/ads/googleads/v24/resources/ad.proto) — unlike the
-   * ad-type oneof fields (text_ad, image_ad, etc.), which are. This is the
-   * mechanism the still-unverified-live edit path (ENG-239 handoff item #1)
-   * relies on; still worth a live confirmation, but it is not resting on a
-   * field the API's own schema calls immutable.
+   * CAMPAIGN-level `UPDATE` of `final_url_suffix`, by contrast, was confirmed
+   * live to succeed and read back correctly, and a newly-created ad under that
+   * campaign was confirmed to correctly INHERIT + MERGE (not overwrite) it —
+   * exactly the AC4 behavior `mergeUtmIntoQueryString` is designed for. So this
+   * reads the ad's final_url (for the AC4 omission check — never duplicate a
+   * key the destination already carries) and the campaign's CURRENT
+   * `final_url_suffix` (to merge into, not replace), then writes the merged
+   * value back to the CAMPAIGN.
    */
   async retagAdUtm(
     userId: string,
@@ -1125,12 +1133,26 @@ export class GoogleAdsService {
     const rows = await this.search(
       customerId,
       accessToken,
-      `SELECT ad_group_ad.ad.final_urls FROM ad_group_ad WHERE ad_group_ad.resource_name = '${adGroupAdResourceName}'`,
+      `SELECT ad_group_ad.ad.final_urls, campaign.resource_name, campaign.final_url_suffix `
+      + `FROM ad_group_ad WHERE ad_group_ad.resource_name = '${adGroupAdResourceName}'`,
       loginCustomerId,
     );
     const finalUrl = rows[0]?.adGroupAd?.ad?.finalUrls?.[0];
     if (!finalUrl) return { success: false, reason: 'no_destination_url' };
-    const success = await this.updateAd(userId, customerId, adGroupAdResourceName, { finalUrl });
+
+    const urlKeys = readUtmKeys(finalUrl);
+    // Unreadable destination — do not tag; it may already carry a utm_source
+    // that a naive merge would duplicate (same rule buildAdFinalUrlSuffix uses).
+    if (!urlKeys) return { success: false };
+
+    const campaignResourceName: string | undefined = rows[0]?.campaign?.resourceName;
+    const existingSuffix: string | undefined = rows[0]?.campaign?.finalUrlSuffix;
+    const spec = buildUtmSpec('google', { campaign: '{campaignid}', content: '{creative}' });
+    const merged = mergeUtmIntoQueryString(existingSuffix, spec, urlKeys);
+    const normalizedExisting = (existingSuffix || '').replace(/^[?&]+/, '').replace(/&+$/, '');
+    if (!campaignResourceName || merged === normalizedExisting) return { success: false };
+
+    const success = await this.updateCampaign(userId, customerId, campaignResourceName, { finalUrlSuffix: merged });
     return { success };
   }
 

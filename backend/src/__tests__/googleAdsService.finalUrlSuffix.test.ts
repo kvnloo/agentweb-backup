@@ -227,43 +227,101 @@ describe('updateAd — final_url_suffix (AC1: an edited ad keeps/gains its suffi
 });
 
 describe('retagAdUtm — single existing ad, on-demand retrofit (Harsha\'s ask)', () => {
+  // LIVE-VERIFIED 2026-07-16 against a real Google Ads account (customer 2883029950):
+  // ad-level UPDATE of final_url_suffix is REJECTED by the live API --
+  // "IMMUTABLE_FIELD: Field 'ad.final_url_suffix' cannot be modified by 'UPDATE'
+  // operation" -- even though the v24 Ad proto carries no IMMUTABLE annotation on
+  // this field. The proto and live server-side validation disagree; do not trust
+  // proto silence as proof of mutability again. CAMPAIGN-level UPDATE of
+  // final_url_suffix, by contrast, was confirmed live to succeed and read back
+  // correctly. retagAdUtm therefore writes at the CAMPAIGN level: it reads the
+  // ad's final_url (for the AC4 omission check) and the campaign's CURRENT
+  // final_url_suffix (to merge into, not replace), then writes the merged value
+  // back to the campaign. This means retagging affects EVERY ad under that
+  // campaign, not just the one the caller named -- callers/tools must disclose
+  // this blast radius.
+
   it('returns success:false with a reason when the ad has no destination URL', async () => {
     mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
     const result = await service.retagAdUtm('user-123', '1234567890', 'customers/123/adGroupAds/1');
     expect(result).toEqual({ success: false, reason: 'no_destination_url' });
-    expect(mockAxiosPost).toHaveBeenCalledTimes(1); // only the read — never reaches updateAd
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1); // only the read — never reaches updateCampaign
   });
 
-  it('is a no-op (success:false) when the destination already carries every UTM key', async () => {
+  it('is a no-op (success:false) when the campaign suffix already covers every key the ad needs', async () => {
     mockAxiosPost.mockResolvedValueOnce({
       data: {
         results: [{
-          adGroupAd: {
-            ad: { finalUrls: ['https://example.com/?utm_source=a&utm_medium=b&utm_campaign=c&utm_content=d&utm_term=e'] },
+          adGroupAd: { ad: { finalUrls: ['https://example.com/'] } },
+          campaign: {
+            resourceName: 'customers/1234567890/campaigns/9',
+            finalUrlSuffix: 'utm_source=a&utm_medium=b&utm_campaign=c&utm_content=d&utm_term=e',
           },
         }],
       },
     });
     const result = await service.retagAdUtm('user-123', '1234567890', 'customers/123/adGroupAds/1');
     expect(result).toEqual({ success: false });
-    expect(mockAxiosPost).toHaveBeenCalledTimes(1); // read only — updateAd's own mutate never fires
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1); // read only — no mutate fires
   });
 
-  it('adds the missing UTM suffix to an untagged ad (happy path)', async () => {
+  it('does not touch anything when the ad\'s final_url is unreadable (never risk a duplicate)', async () => {
     mockAxiosPost.mockResolvedValueOnce({
-      data: { results: [{ adGroupAd: { ad: { finalUrls: ['https://example.com/'] } } }] },
+      data: {
+        results: [{
+          adGroupAd: { ad: { finalUrls: ['not a url'] } },
+          campaign: { resourceName: 'customers/1234567890/campaigns/9', finalUrlSuffix: undefined },
+        }],
+      },
+    });
+    const result = await service.retagAdUtm('user-123', '1234567890', 'customers/123/adGroupAds/1');
+    expect(result).toEqual({ success: false });
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+  });
+
+  it('writes the merged suffix to the CAMPAIGN, not the ad (happy path)', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          adGroupAd: { ad: { finalUrls: ['https://example.com/'] } },
+          campaign: { resourceName: 'customers/1234567890/campaigns/9', finalUrlSuffix: undefined },
+        }],
+      },
     });
     mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } }); // the mutate
     const result = await service.retagAdUtm('user-123', '1234567890', 'customers/123/adGroupAds/1');
     expect(result).toEqual({ success: true });
     const op = mutateOperation();
-    expect(op.update.resourceName).toBe('customers/123/adGroupAds/1');
-    expect(op.update.ad.finalUrlSuffix).toBe(FULL_SUFFIX);
+    expect(op.update.resourceName).toBe('customers/1234567890/campaigns/9');
+    expect(op.update.finalUrlSuffix).toBe(FULL_SUFFIX);
+    expect(op.update).not.toHaveProperty('ad'); // never touches the ad resource
+  });
+
+  it('merges into the EXISTING campaign suffix rather than replacing it (AC4)', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          adGroupAd: { ad: { finalUrls: ['https://example.com/'] } },
+          campaign: { resourceName: 'customers/1234567890/campaigns/9', finalUrlSuffix: 'utm_source=custom&partner_id=1' },
+        }],
+      },
+    });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.retagAdUtm('user-123', '1234567890', 'customers/123/adGroupAds/1');
+    const op = mutateOperation();
+    expect(op.update.finalUrlSuffix).toBe(
+      'utm_source=custom&partner_id=1&utm_medium=paid&utm_campaign={campaignid}&utm_content={creative}',
+    );
   });
 
   it('reads exactly the resource name it was given (no destination-URL guessing)', async () => {
     mockAxiosPost.mockResolvedValueOnce({
-      data: { results: [{ adGroupAd: { ad: { finalUrls: ['https://example.com/'] } } }] },
+      data: {
+        results: [{
+          adGroupAd: { ad: { finalUrls: ['https://example.com/'] } },
+          campaign: { resourceName: 'customers/1234567890/campaigns/9', finalUrlSuffix: undefined },
+        }],
+      },
     });
     mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
     await service.retagAdUtm('user-123', '1234567890', 'customers/123/adGroupAds/42');

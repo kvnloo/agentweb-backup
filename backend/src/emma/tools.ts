@@ -8112,9 +8112,13 @@ ACTION MATRIX:
   KEYWORD     → LIST (ad_group_resource_name), ADD (ad_group_resource_name, keywords[]), ADD_NEGATIVE (keywords[], campaign_resource_name OR ad_group_resource_name), UPDATE (criterion_resource_name, status?, cpc_bid_micros?), REMOVE (criterion_resource_name)
   AD          → LIST (ad_group_resource_name), CREATE (ad_group_resource_name, type [RESPONSIVE_SEARCH_AD|RESPONSIVE_DISPLAY_AD], headlines[], descriptions[], final_url), UPDATE (ad_resource_name, status?), REMOVE (ad_resource_name), RETAG_UTM (ad_resource_name)
               NOTE: final_url, headlines, descriptions are ALL immutable after creation — to change any of these, REMOVE and recreate the ad
-              RETAG_UTM (ENG-239 — retrofit UTMs onto ONE existing ad found untagged, e.g. via audit_ad_utm_coverage): reads the ad's
-              current final_url and writes a UTM final_url_suffix if missing. This does NOT touch final_url/headlines/descriptions, so
-              it's safe on a live ad. Never call in a loop over multiple ads — single-target only, one ad per call.
+              RETAG_UTM (ENG-239 — retrofit UTMs onto an ad found untagged, e.g. via audit_ad_utm_coverage):
+              ⚠️ Live-verified: Google's API REJECTS a direct ad-level UTM write ("IMMUTABLE_FIELD" on
+              ad.final_url_suffix). So this writes the UTM suffix to the ad's CAMPAIGN instead, merged with
+              whatever the campaign already has (never overwrites existing tracking). This means the change
+              affects EVERY ad in that campaign, not just the one you named — tell the user this explicitly
+              before calling, the same way you would for any change with a wider blast radius than it sounds
+              like. Never call in a loop over multiple ads — single-target only, one ad per call.
   ASSET       → UPLOAD
   CAMPAIGN_ASSET → ATTACH (campaign_resource_name, assets[{fieldType, assetResourceName?, text?}])
               fieldType values: BUSINESS_NAME (use text), LOGO, SQUARE_MARKETING_IMAGE, MARKETING_IMAGE (use assetResourceName)
