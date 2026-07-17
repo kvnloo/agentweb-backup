@@ -752,18 +752,51 @@ const AWAITING_CONFIRMATION_PATTERNS: RegExp[] = [
   /\blet\s+me\s+know\b[^\n.?!]*\b(?:proceed|continue|go\s+ahead|move\s+forward|like\s+me\s+to)\b/i,
   // "Awaiting/wait for your confirmation/approval/go-ahead/sign-off/response before proceeding"
   /\b(?:await(?:ing)?|wait\s+for)\b[^\n.?!]*\b(?:confirmation|approval|sign-?off|go-?ahead|your\s+(?:go|response|reply|input|approval))\b/i,
-  // "confirm to proceed" / "confirm before I continue" / "please confirm before I proceed"
-  /\bconfirm\b[^\n.?!]*\b(?:to|before)\b[^\n.?!]*\b(?:proceed|continu)/i,
+  // "confirm to proceed" / "confirm before I continue/generate/build/send/deliver"
+  // (an explicit confirm-gate ahead of the deliverable action, not just "proceed")
+  /\bconfirm\b[^\n.?!]*\b(?:to|before)\b[^\n.?!]*\b(?:proceed|continu|generat|build|start|begin|send|creat|draft|deliver|run\b)/i,
+  // Numbered/lettered option prompt: "Reply 1 (…) or 2 (…)", "reply with option 2".
+  // Opus emitted this exact form ("Reply 1 … or 2 …") instead of "Reply go" (ENG-369).
+  /\breply\s+(?:with\s+)?(?:option\s+)?["'“]?\d\b/i,
+  // "please confirm one of these / the following / which option / your choice below"
+  /\bconfirm\b[^\n.?!]*\b(?:one of|which\b|the following|your\s+(?:choice|preference|selection)|these\b|option\b)/i,
+  // "get/need/require/request your confirmation", "awaiting your confirmation"
+  /\b(?:get|need|needs|require[sd]?|request(?:ing)?|await(?:ing)?)\s+(?:your\s+)?confirmation\b/i,
+  // "need you to confirm/decide/choose/pick/select …" (asks the human to make the call)
+  /\bneed\s+you\s+to\s+(?:confirm|decide|choose|pick|select|tell\s+me)\b/i,
+  // "pick/choose/select an option", "once you pick an option" — enumerated-choice halt
+  /\b(?:pick|choose|select)\s+(?:an?|one)\s+(?:option|of\b)/i,
   // "I'll pause here for your input", "pausing until you confirm", "holding off /
   // standing by until you reply / before proceeding". Anchored on a halt verb
   // FOLLOWED by an explicit wait-for-the-user object so a report that merely
   // mentions something being "paused" cannot trigger it.
   /\b(?:paus(?:e|ing|ed)|hold(?:ing)?\s+off|standing\s+by)\b[^\n.?!]*\b(?:your\s+(?:input|response|reply|confirmation|approval|go-?ahead|sign-?off)|you\s+(?:confirm|reply|respond|approve)|before\s+(?:proceed|continu))/i,
+  // Generic decision-solicitation: the turn ends by asking the HUMAN to choose a
+  // path rather than delivering. Opus emitted "How do you want to proceed?" +
+  // "Reply 1, 2, or 3" — a different phrasing every run — so these key on the
+  // structural act of handing the decision back to the user, not a fixed phrase.
+  // "How do you want / would you like / should you prefer …" to proceed/handle this
+  /\bhow\s+(?:do|would|should|shall)\s+you\s+(?:want|like|wish|prefer)\b/i,
+  // "how should I|we proceed", "how would you like me to proceed"
+  /\bhow\s+(?:should|shall|do|would)\s+(?:i|we|you\s+(?:want|like)\s+me)\b[^\n.?!]*\bproceed\b/i,
+  // "which option/one/approach/route/path … (do) you …" — pick-a-branch question
+  /\bwhich\s+(?:option|one|approach|route|path|of\s+(?:these|the))\b[^\n?!]*\byou\b/i,
+  // "would you prefer / would you rather …"
+  /\bwould\s+you\s+(?:prefer|rather)\b/i,
 ];
+
+// Markdown emphasis and inline code fences (**bold**, _italic_, `code`) split
+// words like "Reply **1**" so the pattern's \d never lands next to "Reply". The
+// model routinely bolds the option numbers, so strip emphasis/code markers (and
+// collapse the whitespace they leave behind) before the detector runs.
+function stripMarkdownEmphasis(content: string): string {
+  return content.replace(/[*_`~]+/g, '').replace(/[^\S\n]+/g, ' ');
+}
 
 export function scheduledRunAwaitsConfirmation(content: string): boolean {
   if (!content || typeof content !== 'string') return false;
-  return AWAITING_CONFIRMATION_PATTERNS.some((re) => re.test(content));
+  const normalized = stripMarkdownEmphasis(content);
+  return AWAITING_CONFIRMATION_PATTERNS.some((re) => re.test(normalized));
 }
 
 // The distinct reasons a scheduled run's latest turn needs one more
