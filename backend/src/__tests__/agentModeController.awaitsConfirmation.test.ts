@@ -37,6 +37,10 @@ describe('scheduledRunAwaitsConfirmation — unattended confirmation-halt detect
     'Awaiting your confirmation to proceed.',
     'I will wait for your approval before proceeding.',
     'Confirm to continue and I will generate the report.',
+    "I'll pause here for your input before continuing.",
+    'Pausing until you confirm the fallback plan.',
+    'Holding off before proceeding with the aggregate report.',
+    'Standing by for your reply before generating the report.',
   ];
 
   it.each(confirmationHalts)('fires on confirmation halt: %s', (text) => {
@@ -51,6 +55,9 @@ describe('scheduledRunAwaitsConfirmation — unattended confirmation-halt detect
     'Research complete across every event. Actionable items listed below.',
     "Event 2 — Bob: LinkedIn not accessible, flagged as actionable. All events covered.",
     'I generated the daily activity report using the best-effort aggregate approach.',
+    // "paused" mentioned as report content, NOT as a halt awaiting the user.
+    'The Meta ad campaign is currently paused; spend has stopped. Report complete.',
+    'Two leads paused their subscriptions this week. Full breakdown below.',
     '',
   ];
 
