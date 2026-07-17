@@ -27464,7 +27464,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'RETAG_UTM') {
           // ENG-239 retrofit: retags ONE existing creative, never a list.
-          // UNVERIFIED against a live account — see retagCreativeUtm's warning.
+          // LIVE-VERIFIED 2026-07-16 for textAd creatives — see retagCreativeUtm's docstring
+          // for the $set-is-not-a-deep-merge caveat and the content.reference delegation.
           if (!params.creative_id) throw new Error('RETAG_UTM requires creative_id');
           if (!params.campaign_id) throw new Error('RETAG_UTM requires campaign_id');
           const result = await linkedInAdsService.retagCreativeUtm(accessToken, accountId, params.creative_id, params.campaign_id);
@@ -28383,6 +28384,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               success: false,
               error: result.reason === 'no_destination_url'
                 ? 'This ad has no destination URL to tag.'
+                : result.reason === 'invalid_resource_name'
+                ? 'ad_resource_name is not a valid Google Ads resource name.'
                 : 'No change was made — the ad already carries every UTM key, or the campaign-level read needed to avoid clobbering existing tracking failed.',
             };
           }
@@ -28447,6 +28450,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             success: false,
             error: result.reason === 'no_destination_url'
               ? 'This asset group has no destination URL to tag.'
+              : result.reason === 'invalid_resource_name'
+              ? 'asset_group_resource_name is not a valid Google Ads resource name.'
               : 'No change was made — the destination already carries every UTM key (directly or via the campaign\'s final_url_suffix), or the URL could not be read.',
           };
         }

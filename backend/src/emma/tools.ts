@@ -861,14 +861,14 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
         },
         ad_id: {
           type: "string",
-          description: "Ad ID. Required for: AD UPDATE/DELETE."
+          description: "Ad ID. Required for: AD UPDATE/DELETE/COPY_AD/RETAG_UTM."
         },
         params: {
           type: "object",
           description: "Action-specific parameters. Required fields depend on entity_type + action (see tool description for the full matrix).",
           properties: {
             // --- Confirmation gate (write actions) ---
-            confirm: { type: "boolean", description: "Set to true ONLY after showing the user the resolved target (campaign/ad set/asset) returned by the first call and getting explicit approval. Required to actually execute CAMPAIGN/AD_SET/AD CREATE/UPDATE/DELETE/COPY_AD. Omit (or false) on the first call to preview the target." },
+            confirm: { type: "boolean", description: "Set to true ONLY after showing the user the resolved target (campaign/ad set/asset) returned by the first call and getting explicit approval. Required to actually execute CAMPAIGN/AD_SET/AD CREATE/UPDATE/DELETE/COPY_AD/RETAG_UTM. Omit (or false) on the first call to preview the target." },
 
             // --- Common ---
             name: { type: "string", description: "Entity name." },
@@ -1304,7 +1304,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
             status: { type: 'string', enum: ['ACTIVE', 'PAUSED', 'ARCHIVED', 'DRAFT', 'CANCELED', 'COMPLETED'], description: 'Entity status.' },
             campaign_group_id: { type: 'string', description: 'Campaign Group numeric ID. Used for CAMPAIGN LIST.' },
             campaignGroup: { type: 'string', description: 'Campaign Group URN (urn:li:sponsoredCampaignGroup:ID). Required for CAMPAIGN CREATE.' },
-            campaign_id: { type: 'string', description: 'Campaign ID. Required for CREATIVE LIST/CREATE and CAMPAIGN UPDATE. ALSO accepted — and strongly recommended — on POST/CREATE, INMAIL/CREATE_CONTENT and CONVERSATION_AD/CREATE_CONTENT: without it those destination URLs ship with no utm_campaign and their leads cannot be attributed. Omit it only if no campaign exists yet.' },
+            campaign_id: { type: 'string', description: 'Campaign ID. Required for CREATIVE LIST/CREATE, CREATIVE/RETAG_UTM (with creative_id), and CAMPAIGN UPDATE. ALSO accepted — and strongly recommended — on POST/CREATE, INMAIL/CREATE_CONTENT and CONVERSATION_AD/CREATE_CONTENT: without it those destination URLs ship with no utm_campaign and their leads cannot be attributed. Omit it only if no campaign exists yet.' },
             // Campaign
             objectiveType: { type: 'string', description: 'Campaign objective (WEBSITE_VISIT, BRAND_AWARENESS, ENGAGEMENT, VIDEO_VIEWS, LEAD_GENERATION, WEBSITE_CONVERSIONS). Omit entirely for DYNAMIC campaigns with format=JOBS.' },
             costType: { type: 'string', enum: ['CPM', 'CPC', 'CPV'], description: 'Bidding type.' },
