@@ -4310,4 +4310,18 @@ describe("isNonErrorBuildLine", () => {
     expect(isNonErrorBuildLine("Failed to compile.")).toBe(false);
     expect(isNonErrorBuildLine("Type error: Property 'x' does not exist on type 'Y'.")).toBe(false);
   });
+
+  it("does NOT silence a real error that merely mentions something deprecated (deprecation match is anchored)", () => {
+    expect(isNonErrorBuildLine("Error: Component uses a deprecated Context API — cannot compile")).toBe(false);
+    expect(isNonErrorBuildLine("error  no-deprecated  Use of deprecated rule 'X'")).toBe(false);
+    // A bare deprecation-warning line at line-start is still noise.
+    expect(isNonErrorBuildLine("Deprecation Warning: foo is deprecated")).toBe(true);
+  });
+
+  it("only treats ▲ banner lines as noise, not real ▲-prefixed errors", () => {
+    expect(isNonErrorBuildLine("▲ Vercel CLI 56.2.0")).toBe(true);
+    expect(isNonErrorBuildLine("▲ Next.js 16.2.6")).toBe(true);
+    expect(isNonErrorBuildLine("▲ Error: Build script exited with non-zero exit code")).toBe(false);
+    expect(isNonErrorBuildLine("▲ ENOENT: no such file or directory")).toBe(false);
+  });
 });
