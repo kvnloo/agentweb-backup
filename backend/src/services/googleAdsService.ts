@@ -867,10 +867,13 @@ export class GoogleAdsService {
       const rows = await this.search(
         customerId,
         accessToken,
-        `SELECT campaign.final_url_suffix FROM ad_group WHERE ad_group.resource_name = '${adGroupResourceName}'`,
+        `SELECT ad_group.final_url_suffix, campaign.final_url_suffix FROM ad_group WHERE ad_group.resource_name = '${adGroupResourceName}'`,
         loginCustomerId,
       );
-      return { ok: true, suffix: rows[0]?.campaign?.finalUrlSuffix || undefined };
+      // Ad group is more specific than campaign, so its own suffix (if set) is
+      // the one actually in effect — campaign's is only a fallback.
+      const suffix = rows[0]?.adGroup?.finalUrlSuffix || rows[0]?.campaign?.finalUrlSuffix || undefined;
+      return { ok: true, suffix };
     } catch (err: any) {
       console.warn(
         `[GoogleAds] could not read inherited final_url_suffix for ${adGroupResourceName}; skipping UTM suffix to avoid clobbering it:`,

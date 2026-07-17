@@ -441,6 +441,46 @@ describe('createAd — inherited campaign-level final_url_suffix (AC4)', () => {
     expect(suffix).toContain('utm_medium=paid');
   });
 
+  it('carries the AD GROUP\'s own suffix forward, not the campaign\'s, when both are set (Greptile)', async () => {
+    // Google resolves final_url_suffix by MOST SPECIFIC level: ad > ad group >
+    // campaign > account. An ad group's own suffix is more specific than its
+    // campaign's, so it's the one actually in effect — and the one an ad-level
+    // write would silently destroy if never read and carried forward.
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ adGroup: { finalUrlSuffix: 'adgroupparam=1' }, campaign: { finalUrlSuffix: 'campaignparam=1' } }] },
+    });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/1/adGroupAds/1~1' }] } });
+
+    await service.createAd('user-123', '1234567890', {
+      adGroupResourceName: 'customers/1234567890/adGroups/55',
+      type: 'RESPONSIVE_SEARCH_AD',
+      headlines: ['h'], descriptions: ['d'],
+      finalUrl: 'https://example.com',
+    });
+
+    const suffix = adGroupAdCreate().ad.finalUrlSuffix;
+    expect(suffix).toContain('adgroupparam=1');
+    expect(suffix).not.toContain('campaignparam=1');
+    expect(suffix).toContain('utm_source=google');
+  });
+
+  it('falls back to the campaign\'s suffix when the ad group has none of its own', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { results: [{ adGroup: {}, campaign: { finalUrlSuffix: 'campaignparam=1' } }] },
+    });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/1/adGroupAds/1~1' }] } });
+
+    await service.createAd('user-123', '1234567890', {
+      adGroupResourceName: 'customers/1234567890/adGroups/55',
+      type: 'RESPONSIVE_SEARCH_AD',
+      headlines: ['h'], descriptions: ['d'],
+      finalUrl: 'https://example.com',
+    });
+
+    const suffix = adGroupAdCreate().ad.finalUrlSuffix;
+    expect(suffix).toContain('campaignparam=1');
+  });
+
   it('writes no suffix when the inherited-suffix read fails — never clobber what we cannot see', async () => {
     // Fail-safe: losing attribution on one ad is recoverable; silently destroying a
     // client's campaign-level tracking is not.
