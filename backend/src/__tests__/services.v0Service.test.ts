@@ -2680,6 +2680,225 @@ export default function Page() {
     ];
     expect(() => validateV0Output(files)).not.toThrow();
   });
+
+  // ENG-374: v0 occasionally hallucinates a bare import of an internal Next.js concept as if
+  // it were an installable package — e.g. `import RootLayout from "layout"` — which is not a
+  // real npm package, not relative, not the @/ alias, and fails the build with "Module not
+  // found". Caught here (denylist of words that are never real bare package names, never a
+  // scope on npm) rather than trying to validate against the universe of legitimate
+  // dependencies, which would need constant upkeep and risks false-positiving on real ones.
+  describe("bad-import check (ENG-374)", () => {
+    it("FAIL: throws on a bare import of a never-a-real-package word", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `"use client"\n\nimport RootLayout from "layout"\n\nexport default function SyntheticV0PageForDeployment() {\n  return <RootLayout />\n}\n`
+        ),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(files)).toThrow(/bare import.*"layout"/i);
+    });
+
+    it("FAIL: catches it even when a separate, earlier .tsx file is otherwise valid", () => {
+      const files = [
+        makeFile("app/layout.tsx", VALID_TSX),
+        makeFile(
+          "app/page.tsx",
+          `import RootLayout from "layout"\nexport default function Page() { return <RootLayout />; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+    });
+
+    it("passes a legitimate relative import of a file literally named layout", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import Layout from "./layout"\nexport default function Page() { return <Layout />; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("passes a legitimate @/ alias import", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import { cn } from "@/lib/utils"\nexport default function Page() { return <div className={cn("a")} />; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("passes real npm package imports (react, next, clsx, etc.)", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import React from "react"\nimport Link from "next/link"\nimport clsx from "clsx"\nexport default function Page() { return <Link href="/">{clsx("a")}</Link>; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("passes a named import of a real package sharing no denylisted word", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          VALID_TSX + `\nimport { Something } from "some-real-package";`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("FAIL: catches a side-effect-only bare import (no `from` clause)", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX + `\nimport "layout";`),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(files)).toThrow(/"layout"/);
+    });
+
+    it("FAIL: catches a dynamic import() of a bare denylisted specifier", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          VALID_TSX + `\nasync function load() { const m = await import("layout"); return m; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(files)).toThrow(/"layout"/);
+    });
+
+    it("FAIL: catches a re-export from a bare denylisted specifier", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX + `\nexport { default } from "layout";`),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(files)).toThrow(/"layout"/);
+    });
+
+    it("FAIL: catches export * from a bare denylisted specifier", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX + `\nexport * from "styles";`),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(files)).toThrow(/"styles"/);
+    });
+
+    it("passes a dynamic import() of a real relative path", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          VALID_TSX + `\nasync function load() { const m = await import("./heavy-component"); return m; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("reports ALL bad imports across all files in a single error, not just the first", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import RootLayout from "layout"\nexport default function Page() { return <RootLayout />; }`
+        ),
+        makeFile(
+          "components/header.tsx",
+          `import Nav from "components"\nexport const Header = () => <Nav />;`
+        ),
+      ];
+      let error: V0OutputValidationError | undefined;
+      try {
+        validateV0Output(files);
+      } catch (e) {
+        error = e as V0OutputValidationError;
+      }
+      expect(error).toBeInstanceOf(V0OutputValidationError);
+      // Both offending files/specifiers must be named in the ONE thrown error — a single
+      // correction message to v0 should be able to fix both at once, not just the first.
+      expect(error!.message).toContain("app/page.tsx");
+      expect(error!.message).toContain('"layout"');
+      expect(error!.message).toContain("components/header.tsx");
+      expect(error!.message).toContain('"components"');
+    });
+
+    // Greptile review (PR #2121): a real import/export/dynamic-import statement can never
+    // legitimately appear inside a string, template literal, or comment — those are
+    // structurally distinct from executable code. So the scanner must ignore that content
+    // entirely: doing so cannot cause a false NEGATIVE (nothing worth stripping could have
+    // been a real import), only prevents false positives on legitimate example text/comments.
+    describe("ignores comments and string/template-literal content", () => {
+      it("does not false-positive on a JSX string showing example code (a coding-tutorial landing page)", () => {
+        const files = [
+          makeFile(
+            "app/page.tsx",
+            VALID_TSX + `\nexport function CodeExample() { return <pre>{\`import Header from "components"\`}</pre>; }`
+          ),
+        ];
+        expect(() => validateV0Output(files)).not.toThrow();
+      });
+
+      it("does not false-positive on a // line comment mentioning the pattern", () => {
+        const files = [
+          makeFile(
+            "app/page.tsx",
+            VALID_TSX + `\n// don't write import Foo from "layout", use a relative path`
+          ),
+        ];
+        expect(() => validateV0Output(files)).not.toThrow();
+      });
+
+      it("does not false-positive on a /* block comment */ mentioning the pattern", () => {
+        const files = [
+          makeFile(
+            "app/page.tsx",
+            VALID_TSX + `\n/* Example of what NOT to do: import Foo from "layout" */`
+          ),
+        ];
+        expect(() => validateV0Output(files)).not.toThrow();
+      });
+
+      it("does not false-positive on a double-quoted string containing the pattern", () => {
+        const files = [
+          makeFile(
+            "app/page.tsx",
+            VALID_TSX + `\nconst tip = "Avoid: import Foo from \\"layout\\"";`
+          ),
+        ];
+        expect(() => validateV0Output(files)).not.toThrow();
+      });
+
+      it("still catches a REAL bad import sitting right next to a comment mentioning the same pattern", () => {
+        const files = [
+          makeFile(
+            "app/page.tsx",
+            `// A comment mentioning import Foo from "layout" as an example\nimport RootLayout from "layout"\nexport default function Page() { return <RootLayout />; }`
+          ),
+        ];
+        // The comment's mention must NOT mask the real, separate bad import on the next line.
+        expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      });
+
+      it("does not hang or throw on escaped quotes inside a string", () => {
+        const files = [
+          makeFile(
+            "app/page.tsx",
+            VALID_TSX + `\nconst s = "it's a \\"test\\" string with import from \\"layout\\" inside";`
+          ),
+        ];
+        expect(() => validateV0Output(files)).not.toThrow();
+      });
+
+      it("does not false-positive on a template literal with an interpolated expression", () => {
+        const files = [
+          makeFile(
+            "app/page.tsx",
+            VALID_TSX + `\nconst name = "World"; const s = \`Hello \${name}, here's an import Foo from "app" example\`;`
+          ),
+        ];
+        expect(() => validateV0Output(files)).not.toThrow();
+      });
+    });
+  });
 });
 
 describe("V0OutputValidationError", () => {

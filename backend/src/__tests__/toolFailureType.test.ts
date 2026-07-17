@@ -33,9 +33,17 @@ describe('classifyToolFailureType', () => {
     it('classifies a policy_blocked errorClass', () => {
       expect(classifyToolFailureType('policy_blocked', 'blocked by gateway policy')).toBe('by_design');
     });
-    it('classifies run_local_agent_task scope rejection', () => {
+    it('classifies run_local_agent_task scope rejection (historical events)', () => {
       expect(
         classifyToolFailureType('Error', 'Task rejected: local agent may only be used for web browsing and data extraction'),
+      ).toBe('by_design');
+    });
+    it('classifies the local agent deprecation stub error (ENG-383) — retired-by-design, not a bug', () => {
+      expect(
+        classifyToolFailureType(
+          'Error',
+          'local_agent_deprecated: The local agent relay was retired in July 2026. For web research use you_search_web / you_search_news; other local-agent workloads are being replaced (see ENG-381).',
+        ),
       ).toBe('by_design');
     });
     it('classifies the LinkedIn anti-spam invitation delay', () => {

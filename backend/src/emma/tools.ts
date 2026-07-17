@@ -4928,13 +4928,23 @@ emmaToolRegistry.register({
           type: 'number',
           description: 'Maximum number of web results to return (default: 5, max: 10)',
           default: 5
+        },
+        freshness: {
+          type: 'string',
+          enum: ['day', 'week', 'month', 'year'],
+          description: "Optional You.com freshness window; use for time-scoped research like 'this week's discussions'."
+        },
+        include_domains: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional domain allowlist, e.g. ["reddit.com"] to restrict results to one site.'
         }
       },
       required: ["query"]
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.youSearchWeb(args.query, args.max_results || 10);
+    return await agentModeService.youSearchWeb(args.query, args.max_results || 10, args.freshness, args.include_domains);
   }
 });
 
