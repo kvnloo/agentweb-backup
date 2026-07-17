@@ -1150,7 +1150,13 @@ describe("POST /api/landing-pages/v0/generated/:id/gtm", () => {
       .send({ gtmContainerId: "GTM-TESTX1" });
 
     expect(res.status).toBe(422);
-    expect(res.body.error).toMatch(/no <head> or <body>/);
+    // Customer-facing message must be plain language, actionable, and must NEVER leak
+    // implementation details (layout.tsx / <head> / <body>) — the customer can't act on
+    // those and didn't do anything wrong. The technical reason is logged server-side only.
+    expect(res.body.error).toBe(
+      "We couldn't add tracking to this page automatically. Try regenerating the page, or contact support if this keeps happening.",
+    );
+    expect(res.body.error).not.toMatch(/layout\.tsx|<head>|<body>/);
     expect(mockAxios.put).not.toHaveBeenCalled();
     expect(mockUpdateLandingPageGtm).not.toHaveBeenCalled();
   });

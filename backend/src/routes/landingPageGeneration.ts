@@ -1776,11 +1776,19 @@ async function saveGtmForPage(
       // content to GitHub and still tell the caller "success" with the container ID they
       // asked for — a manual Add-GTM click that silently did nothing.
       if (!verifyGtmInjection(updatedContent, containerId)) {
+        // Log the precise technical reason for debugging, but never surface "layout.tsx" /
+        // "<head>" / "<body>" to the customer — they can't act on that, and it's not
+        // anything they did wrong. The message that reaches the UI must be something a
+        // non-technical marketer can actually read and act on.
+        console.error(
+          `[LP GENERATION] GTM ${containerId ? "injection" : "removal"} verification failed ` +
+          `for page ${page.id}: layout.tsx has no <head> or <body> tag to anchor on.`,
+        );
         throw Object.assign(
           new Error(
             containerId
-              ? "Could not inject GTM: this page's layout.tsx has no <head> or <body> tag to insert into."
-              : "Could not remove GTM: the layout still carries a GTM block after attempting removal.",
+              ? "We couldn't add tracking to this page automatically. Try regenerating the page, or contact support if this keeps happening."
+              : "We couldn't remove tracking from this page automatically. Try regenerating the page, or contact support if this keeps happening.",
           ),
           { httpStatus: 422 },
         );
