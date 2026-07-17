@@ -108,6 +108,7 @@ import { googleAdsService } from '../services/googleAdsService';
 import * as linkedInAdsService from '../services/linkedInAdsService';
 import { metaAdReadPort, googleAdReadPort, linkedInAdReadPort } from '../services/adUtmAuditAdapters';
 import { auditCampaigns } from '../services/adUtmAuditService';
+import { getAccountsWithOwnerIncludingOrgShared } from '../services/connectedAccountsDb';
 
 const USER = 'user-1';
 
@@ -708,6 +709,32 @@ describe('LinkedIn — listAdsForUtmAudit reads every shape appendLinkedInUtm wr
     const ads = await linkedInAdsService.listAdsForUtmAudit('li-token', ACCOUNT, '777');
     // LinkedIn has no native append field — inventing one would be a lie.
     expect(ads[0].appendField).toBeUndefined();
+  });
+
+  it('uses the stored access_token when token_expires_at was never recorded, instead of falsely reporting it expired (Greptile)', async () => {
+    // An account whose expiry was never populated (legacy row, or a race before
+    // the first refresh wrote it back) is NOT the same as "expired" — the access
+    // token itself may still be perfectly valid. The old check only returned the
+    // token early when token_expires_at was truthy AND in the future; a falsy
+    // token_expires_at fell through to "needs refresh", and with no refresh_token
+    // available would throw a false "access token expired" error, making the
+    // audit non-functional for these accounts.
+    (getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValueOnce([
+      {
+        userId: 'user-1',
+        platform: 'linkedin_ads',
+        account_id: '5550001',
+        account_name: 'LI Ads',
+        config: {
+          account_type: 'ad_account',
+          access_token: 'li-token-no-expiry',
+          // token_expires_at intentionally omitted
+        },
+      },
+    ]);
+    mockLi({ campaigns: [{ id: 777, name: 'LI Campaign' }], creatives: [] });
+
+    await expect(auditCampaigns('linkedin', USER, ACCOUNT, linkedInAdReadPort)).resolves.toBeDefined();
   });
 
   it('extracts carousel card landingPage AND contentLandingPage', async () => {

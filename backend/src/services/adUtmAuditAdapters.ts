@@ -118,7 +118,11 @@ async function linkedInAccessToken(userId: string, accountId: string): Promise<s
 
   const cfg = account.config as any;
   const bufferMs = 5 * 60 * 1000;
-  if (cfg.token_expires_at && cfg.token_expires_at > Date.now() + bufferMs) {
+  // A missing token_expires_at (legacy row, or a race before the first refresh
+  // wrote it back) means "unknown expiry", NOT "expired" -- the access_token
+  // may still be perfectly valid. Only force a refresh when we actually know
+  // it's expiring soon (Greptile).
+  if (!cfg.token_expires_at || cfg.token_expires_at > Date.now() + bufferMs) {
     return cfg.access_token;
   }
   if (!cfg.refresh_token) {
