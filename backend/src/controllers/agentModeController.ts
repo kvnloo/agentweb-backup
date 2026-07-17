@@ -749,11 +749,11 @@ const AWAITING_CONFIRMATION_PATTERNS: RegExp[] = [
   // "Do you want me to proceed" / "want me to continue"
   /\bwant\s+me\s+to\s+(?:go\s+ahead|proceed|continue|move\s+forward)\b/i,
   // "Let me know if/whether/how you'd like me to proceed/continue"
-  /\blet\s+me\s+know\b[^.?!]*\b(?:proceed|continue|go\s+ahead|move\s+forward|like\s+me\s+to)\b/i,
+  /\blet\s+me\s+know\b[^\n.?!]*\b(?:proceed|continue|go\s+ahead|move\s+forward|like\s+me\s+to)\b/i,
   // "Awaiting/wait for your confirmation/approval/go-ahead/sign-off/response before proceeding"
-  /\b(?:await(?:ing)?|wait\s+for)\b[^.?!]*\b(?:confirmation|approval|sign-?off|go-?ahead|your\s+(?:go|response|reply|input|approval))\b/i,
+  /\b(?:await(?:ing)?|wait\s+for)\b[^\n.?!]*\b(?:confirmation|approval|sign-?off|go-?ahead|your\s+(?:go|response|reply|input|approval))\b/i,
   // "confirm to proceed" / "confirm before I continue" / "please confirm before I proceed"
-  /\bconfirm\b[^.?!]*\b(?:to|before)\b[^.?!]*\b(?:proceed|continu)/i,
+  /\bconfirm\b[^\n.?!]*\b(?:to|before)\b[^\n.?!]*\b(?:proceed|continu)/i,
 ];
 
 export function scheduledRunAwaitsConfirmation(content: string): boolean {
