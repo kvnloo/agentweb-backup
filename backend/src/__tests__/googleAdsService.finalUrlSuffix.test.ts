@@ -174,55 +174,29 @@ describe('createAd — final_url_suffix generation (AC1)', () => {
   });
 });
 
-describe('updateAd — final_url_suffix (AC1: an edited ad keeps/gains its suffix)', () => {
-  it('sets ad.final_url_suffix (with mask) generated from a supplied finalUrl', async () => {
+describe('updateAd — status only (Greptile: finalUrl/finalUrlSuffix removed)', () => {
+  // `ad_group_ad.ad.final_url_suffix` is LIVE-VERIFIED IMMUTABLE on UPDATE (see
+  // retagAdUtm's docstring below) — Google rejects the write outright. updateAd
+  // used to attempt this anyway via a finalUrl/finalUrlSuffix param that was never
+  // actually reachable from any real caller (AD UPDATE only ever passes status).
+  // That dead, broken branch was removed rather than left as a landmine for a
+  // future caller trusting the (previously mocked-green) tests.
+  it('sets status', async () => {
     mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
-    await service.updateAd('user-123', '1234567890', 'customers/123/adGroupAds/1', {
-      finalUrl: 'https://example.com/',
-    });
-    const op = mockAxiosPost.mock.calls[0][1].operations[0];
-    expect(op.update.resourceName).toBe('customers/123/adGroupAds/1');
-    expect(op.update.ad.finalUrlSuffix).toBe(FULL_SUFFIX);
-    expect(op.updateMask).toContain('ad.final_url_suffix');
-  });
-
-  it('lets an explicit finalUrlSuffix win on update', async () => {
-    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
-    await service.updateAd('user-123', '1234567890', 'customers/123/adGroupAds/1', {
-      finalUrlSuffix: 'utm_source=explicit',
-    });
-    const op = mockAxiosPost.mock.calls[0][1].operations[0];
-    expect(op.update.ad.finalUrlSuffix).toBe('utm_source=explicit');
-    expect(op.updateMask).toContain('ad.final_url_suffix');
-  });
-
-  it('updates status and suffix together', async () => {
-    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
-    await service.updateAd('user-123', '1234567890', 'customers/123/adGroupAds/1', {
+    await service.updateAd('user-123', '1234567890', 'customers/123/adGroupAds/1~1', {
       status: 'PAUSED',
-      finalUrl: 'https://example.com/',
     });
     const op = mockAxiosPost.mock.calls[0][1].operations[0];
+    expect(op.update.resourceName).toBe('customers/123/adGroupAds/1~1');
     expect(op.update.status).toBe('PAUSED');
-    expect(op.update.ad.finalUrlSuffix).toBe(FULL_SUFFIX);
-    expect(op.updateMask).toContain('status');
-    expect(op.updateMask).toContain('ad.final_url_suffix');
-  });
-
-  it('emits no ad field when the finalUrl already has every UTM', async () => {
-    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
-    await service.updateAd('user-123', '1234567890', 'customers/123/adGroupAds/1', {
-      status: 'ENABLED',
-      finalUrl: 'https://example.com/?utm_source=a&utm_medium=b&utm_campaign=c&utm_content=d&utm_term=e',
-    });
-    const op = mockAxiosPost.mock.calls[0][1].operations[0];
     expect(op.update).not.toHaveProperty('ad');
-    expect(op.updateMask).not.toContain('ad.final_url_suffix');
+    expect(op.updateMask).toBe('status');
   });
 
-  it('still no-ops when neither status nor any URL info is provided', async () => {
-    await service.updateAd('user-123', '1234567890', 'customers/123/adGroupAds/1', {});
+  it('no-ops when status is not provided', async () => {
+    const result = await service.updateAd('user-123', '1234567890', 'customers/123/adGroupAds/1~1', {});
     expect(mockAxiosPost).not.toHaveBeenCalled();
+    expect(result).toBe(false);
   });
 });
 
@@ -246,6 +220,13 @@ describe('retagAdUtm — single existing ad, on-demand retrofit (Harsha\'s ask)'
     const result = await service.retagAdUtm('user-123', '1234567890', 'customers/123/adGroupAds/1');
     expect(result).toEqual({ success: false, reason: 'no_destination_url' });
     expect(mockAxiosPost).toHaveBeenCalledTimes(1); // only the read — never reaches updateCampaign
+  });
+
+  it('rejects a resource name carrying a quote before it ever reaches GAQL (injection guard, Greptile)', async () => {
+    const injected = "customers/123/adGroupAds/1' OR '1'='1";
+    const result = await service.retagAdUtm('user-123', '1234567890', injected);
+    expect(result).toEqual({ success: false, reason: 'invalid_resource_name' });
+    expect(mockAxiosPost).not.toHaveBeenCalled(); // never built into a GAQL string at all
   });
 
   it('is a no-op (success:false) when the campaign suffix already covers every key the ad needs', async () => {
@@ -390,6 +371,27 @@ describe('createAssetGroup — asset_group has no suffix field, so UTMs merge in
       'https://example.com/?utm_source=newsletter&utm_medium=paid&utm_campaign={campaignid}',
     );
   });
+
+  it('creates the asset group untagged rather than throwing when finalUrl is unparseable (Greptile)', async () => {
+    // Mirrors createAd's established behavior (see "createAd — malformed destination
+    // URL must not abort ad creation" below): tagging is a best-effort overlay, never
+    // the reason a whole PMax build (headlines, images, links — already assembled)
+    // gets thrown away. Google surfaces its own precise validation error for the URL.
+    mockAxiosPost.mockResolvedValueOnce(assetGroupBatchResponse());
+    await expect(service.createAssetGroup('user-123', '1234567890', {
+      name: 'AG',
+      campaignResourceName: 'customers/123/campaigns/1',
+      headlines: ['H1'],
+      longHeadlines: ['LH1'],
+      descriptions: ['D1'],
+      squareImageAssets: ['customers/123/assets/sq1'],
+      landscapeImageAssets: ['customers/123/assets/ls1'],
+      logoAssets: ['customers/123/assets/logo1'],
+      finalUrl: 'example.com',
+    })).resolves.toBeDefined();
+    const create = mockAxiosPost.mock.calls[0][1].mutateOperations[3].assetGroupOperation.create;
+    expect(create.finalUrls).toEqual(['example.com']);
+  });
 });
 
 /**
@@ -486,6 +488,13 @@ describe('retagAssetGroupUtm — single existing PMax asset group, on-demand ret
     const result = await service.retagAssetGroupUtm('user-123', '1234567890', 'customers/123/assetGroups/1');
     expect(result).toEqual({ success: false, reason: 'no_destination_url' });
     expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a resource name carrying a quote before it ever reaches GAQL (injection guard, Greptile)', async () => {
+    const injected = "customers/123/assetGroups/1' OR '1'='1";
+    const result = await service.retagAssetGroupUtm('user-123', '1234567890', injected);
+    expect(result).toEqual({ success: false, reason: 'invalid_resource_name' });
+    expect(mockAxiosPost).not.toHaveBeenCalled();
   });
 
   it('is a no-op when the URL already carries every key the spec would add', async () => {
