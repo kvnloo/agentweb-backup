@@ -2749,6 +2749,77 @@ export default function Page() {
       ];
       expect(() => validateV0Output(files)).not.toThrow();
     });
+
+    it("FAIL: catches a side-effect-only bare import (no `from` clause)", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX + `\nimport "layout";`),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(files)).toThrow(/"layout"/);
+    });
+
+    it("FAIL: catches a dynamic import() of a bare denylisted specifier", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          VALID_TSX + `\nasync function load() { const m = await import("layout"); return m; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(files)).toThrow(/"layout"/);
+    });
+
+    it("FAIL: catches a re-export from a bare denylisted specifier", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX + `\nexport { default } from "layout";`),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(files)).toThrow(/"layout"/);
+    });
+
+    it("FAIL: catches export * from a bare denylisted specifier", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX + `\nexport * from "styles";`),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(files)).toThrow(/"styles"/);
+    });
+
+    it("passes a dynamic import() of a real relative path", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          VALID_TSX + `\nasync function load() { const m = await import("./heavy-component"); return m; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("reports ALL bad imports across all files in a single error, not just the first", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import RootLayout from "layout"\nexport default function Page() { return <RootLayout />; }`
+        ),
+        makeFile(
+          "components/header.tsx",
+          `import Nav from "components"\nexport const Header = () => <Nav />;`
+        ),
+      ];
+      let error: V0OutputValidationError | undefined;
+      try {
+        validateV0Output(files);
+      } catch (e) {
+        error = e as V0OutputValidationError;
+      }
+      expect(error).toBeInstanceOf(V0OutputValidationError);
+      // Both offending files/specifiers must be named in the ONE thrown error — a single
+      // correction message to v0 should be able to fix both at once, not just the first.
+      expect(error!.message).toContain("app/page.tsx");
+      expect(error!.message).toContain('"layout"');
+      expect(error!.message).toContain("components/header.tsx");
+      expect(error!.message).toContain('"components"');
+    });
   });
 });
 

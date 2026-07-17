@@ -2712,30 +2712,45 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
     }
   }
 
-  // 6. Bad-import check (ENG-374): v0 occasionally hallucinates a default import of an
-  // internal Next.js concept as if it were an installable package, e.g.
-  // `import RootLayout from "layout"`. That specifier is not relative, not the `@/` alias,
-  // and not a real npm package — it fails the build with "Module not found". Denylisted to a
-  // small set of words that are never legitimate BARE (unscoped, non-relative) specifiers,
-  // rather than trying to validate against the universe of real dependencies — an allowlist
-  // would need constant upkeep and risks false-positiving as real packages change.
+  // 6. Bad-import check (ENG-374): v0 occasionally hallucinates an import of an internal
+  // Next.js concept as if it were an installable package, e.g. `import RootLayout from
+  // "layout"`. That specifier is not relative, not the `@/` alias, and not a real npm
+  // package — it fails the build with "Module not found". Denylisted to a small set of words
+  // that are never legitimate BARE (unscoped, non-relative) specifiers, rather than trying to
+  // validate against the universe of real dependencies — an allowlist would need constant
+  // upkeep and risks false-positiving as real packages change.
+  //
+  // Covers every import/export form v0 could hallucinate the bad specifier into, not just the
+  // `import X from "..."` shape actually observed: side-effect-only imports, dynamic
+  // `import("...")`, and `export ... from "..."` re-exports.
   const NEVER_REAL_BARE_IMPORT_SPECIFIERS = new Set(["layout", "page", "app", "components", "styles"]);
-  const importPattern = /^\s*import\s+[\w{},\s*]+\s+from\s+["']([^"']+)["']/gm;
+  const staticImportExportPattern = /\b(?:import|export)\s+(?:[\w*{}\s,]+from\s+)?["']([^"']+)["']/g;
+  const dynamicImportPattern = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g;
+
+  // Collected across ALL files before throwing, so a single correction message to v0 can name
+  // every offending import at once — reporting only the first found risks the retry fixing
+  // just that one and re-failing on the next, burning the limited retry budget.
+  const badImports: Array<{ path: string; specifier: string }> = [];
   for (const file of reactFiles) {
     const content = file.content.toString("utf-8");
-    for (const match of content.matchAll(importPattern)) {
-      const specifier = match[1];
-      // Relative (./,  ../) and the project's own @/ alias are legitimate regardless of
+    const specifiers = new Set<string>();
+    for (const match of content.matchAll(staticImportExportPattern)) specifiers.add(match[1]);
+    for (const match of content.matchAll(dynamicImportPattern)) specifiers.add(match[1]);
+    for (const specifier of specifiers) {
+      // Relative (./, ../) and the project's own @/ alias are legitimate regardless of
       // wording — only a BARE specifier (looks like a package name) is suspect here.
       if (specifier.startsWith(".") || specifier.startsWith("/") || specifier.startsWith("@")) continue;
       if (NEVER_REAL_BARE_IMPORT_SPECIFIERS.has(specifier.toLowerCase())) {
-        throw new V0OutputValidationError(
-          `File ${file.path} has a bare import of "${specifier}", which is not a real npm ` +
-          `package — likely a hallucinated import of an internal file (use a relative path ` +
-          `or the @/ alias instead)`
-        );
+        badImports.push({ path: file.path, specifier });
       }
     }
+  }
+  if (badImports.length > 0) {
+    const details = badImports.map((b) => `${b.path}: "${b.specifier}"`).join("; ");
+    throw new V0OutputValidationError(
+      `Bare import(s) of internal concepts that are not real npm packages — ${details} ` +
+      `(use a relative path or the @/ alias instead)`
+    );
   }
 
   console.log(`[V0 SERVICE] Output validation passed: ${tsxFiles.length} .tsx files, ${reactFiles.length} with React code`);
