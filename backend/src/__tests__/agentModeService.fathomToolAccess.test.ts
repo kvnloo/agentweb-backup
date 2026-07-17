@@ -77,6 +77,19 @@ describe('AgentModeService - Fathom Tool Access', () => {
     (AgentModeService as any).FOUNDATION_TOOLS = new Set(AgentModeService.DEFAULT_FOUNDATION_TOOLS);
   });
 
+  describe('Deprecated local agent tools are NOT foundation tools (ENG-383)', () => {
+    it('excludes run_local_agent_task and check_local_agent_status from DEFAULT_FOUNDATION_TOOLS', () => {
+      expect(AgentModeService.DEFAULT_FOUNDATION_TOOLS).not.toContain('run_local_agent_task');
+      expect(AgentModeService.DEFAULT_FOUNDATION_TOOLS).not.toContain('check_local_agent_status');
+    });
+
+    it('excludes them from the runtime FOUNDATION_TOOLS default set', () => {
+      const foundationTools = agentModeService.getFoundationToolNames();
+      expect(foundationTools.has('run_local_agent_task')).toBe(false);
+      expect(foundationTools.has('check_local_agent_status')).toBe(false);
+    });
+  });
+
   describe('Approach 1: Fathom tools in DEFAULT_FOUNDATION_TOOLS', () => {
     it('should include fathom_get_meetings in default foundation tools', () => {
       expect(AgentModeService.DEFAULT_FOUNDATION_TOOLS).toContain('fathom_get_meetings');
