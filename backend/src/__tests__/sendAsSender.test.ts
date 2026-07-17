@@ -72,6 +72,13 @@ describe('sendAsSender — FAIL cases', () => {
     ).rejects.toThrow(SenderSendError);
   });
 
+  it('throws instead of silently dropping bcc on a Resend sender (Resend has never supported bcc)', async () => {
+    await expect(
+      sendAsSender('u1', resendSender, { to: 'a@b.com', subject: 's', html: '<p>hi</p>', bcc: 'hidden@example.com' }),
+    ).rejects.toThrow(SenderSendError);
+    expect(mockResendSendEmail).not.toHaveBeenCalled();
+  });
+
   it('propagates a provider error (e.g. token revoked) rather than swallowing it', async () => {
     class FakeProviderError extends Error {}
     mockGetEmailProvider.mockReturnValue({

@@ -67,6 +67,12 @@ export async function sendAsSender(
   params: SendAsSenderParams,
 ): Promise<SendAsSenderResult> {
   if (sender.senderProvider === 'resend') {
+    // resendService has never supported bcc (checked as of this branch: neither the
+    // service nor any pre-existing caller ever wired it up) — fail loud instead of
+    // silently dropping recipients a caller believed were bcc'd.
+    if (params.bcc) {
+      throw new SenderSendError(sender, 'This Resend sender does not support bcc.');
+    }
     const from = sender.fromName ? `${sender.fromName} <${sender.email}>` : sender.email;
     const result = await resendService.sendEmail({
       from,
