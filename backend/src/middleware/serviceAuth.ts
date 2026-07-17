@@ -170,14 +170,10 @@ async function resolveFromSecretsManagerThenEnforce(
   res: Response,
   next: NextFunction
 ) {
-  // resolveSecretFromSecretsManager never rejects, but guard defensively so an
-  // unexpected throw can only ever fail open — never bubble a 500.
-  let expected: string | undefined;
-  try {
-    expected = await resolveSecretFromSecretsManager();
-  } catch {
-    expected = undefined;
-  }
+  // resolveSecretFromSecretsManager never rejects (it swallows every read /
+  // parse error and resolves undefined), so a missing/failed secret can only
+  // ever fail open here — never bubble a 500.
+  const expected = await resolveSecretFromSecretsManager();
 
   if (!expected) {
     warnScheduledChatsSecretUnset();
