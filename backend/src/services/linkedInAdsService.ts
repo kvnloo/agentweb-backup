@@ -1016,6 +1016,12 @@ export async function retagCreativeUtm(
   }
 
   const currentUrl: string | undefined = content.textAd.landingPage;
+  if (!currentUrl) {
+    return {
+      success: false,
+      error: 'NO_DESTINATION_URL — this text ad creative has no landing page to tag.',
+    };
+  }
   const campaignForUtm = resolveCampaignForUtm({ campaign_id: campaign });
   const newUrl = appendLinkedInUtm(currentUrl, campaignForUtm);
   if (newUrl === currentUrl) {

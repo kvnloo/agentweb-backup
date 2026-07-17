@@ -391,6 +391,20 @@ describe('retagCreativeUtm — single existing creative retrofit (Harsha\'s ask)
     expect(mockAxiosFn).toHaveBeenCalledTimes(1); // read only, no write attempted
   });
 
+  it('reports NO_DESTINATION_URL rather than alreadyTagged when the text ad has no landingPage at all (Greptile)', async () => {
+    // appendLinkedInUtm(undefined, campaign) returns undefined unchanged (its
+    // documented "missing URL passed through as-is" guard), so newUrl === currentUrl
+    // trivially holds for a creative with NO destination at all -- that must not be
+    // reported as "alreadyTagged" (implies tracking already works); there's simply
+    // nothing to tag, same as Google's { reason: 'no_destination_url' }.
+    mockGet({ content: { textAd: { headline: 'H', description: 'D' } } }); // no landingPage
+    const result = await svc.retagCreativeUtm(ACCESS_TOKEN, ACCOUNT_ID, 'creative-1', CAMPAIGN);
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('NO_DESTINATION_URL');
+    expect((result as any).alreadyTagged).toBeUndefined();
+    expect(mockAxiosFn).toHaveBeenCalledTimes(1); // read only, no write attempted
+  });
+
   it('retags an untagged text-ad creative (happy path)', async () => {
     mockGet({ content: { textAd: { headline: 'H', description: 'D', landingPage: 'https://example.com/' } } });
     mockAxiosFn.mockResolvedValueOnce({ data: {}, headers: {}, status: 200 }); // the PARTIAL_UPDATE write
