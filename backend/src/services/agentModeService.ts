@@ -15031,14 +15031,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
-      // Same reference-link extraction resolveUrlTags/updateAdViaCreativeSwap use:
-      // top-level link_data/video_data link, plus every carousel card's link.
-      const spec = creativeData.object_story_spec;
-      const linkUrls: string[] = [
-        spec.link_data?.link,
-        spec.video_data?.call_to_action?.value?.link,
-        ...(spec.link_data?.child_attachments?.map((c: any) => c.link) ?? []),
-      ].filter((u: any): u is string => Boolean(u));
+      // The audit's own extractor (read/write symmetry is the correctness bar
+      // there too) — a hand-rolled subset here previously missed link_url,
+      // single-item/per-card CTA links, and asset_feed_spec website_urls,
+      // letting the retag miss an existing utm_source on those paths and
+      // duplicate it (Greptile).
+      const linkUrls: string[] = MetaService.extractCreativeDestinationUrls(creativeData);
 
       const { urlTags, changed } = computeRetagUrlTags(creativeData.url_tags, linkUrls);
       if (!changed) {

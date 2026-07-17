@@ -1262,7 +1262,7 @@ export class MetaService {
    * Returns [] when nothing is extractable. The audit classes that `unreadable` and surfaces
    * it for a human — we never invent a placeholder URL.
    */
-  private static extractCreativeDestinationUrls(creative: any): string[] {
+  static extractCreativeDestinationUrls(creative: any): string[] {
     // Graph subfields arrive as plain objects, but tolerate an SDK node wrapper.
     const c = creative?._data ?? creative;
     if (!c || typeof c !== 'object') return [];
