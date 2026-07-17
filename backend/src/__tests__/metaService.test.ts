@@ -752,6 +752,75 @@ describe('MetaService', () => {
                 { id: '789', name: 'Frequent Travelers', type: 'behaviors' }
             ]);
         });
+
+        describe('geolocation search routing', () => {
+            let mockFetch: jest.SpyInstance;
+
+            beforeEach(() => {
+                mockFetch = jest.spyOn(global, 'fetch');
+            });
+
+            afterEach(() => {
+                mockFetch.mockRestore();
+            });
+
+            it('should route adgeolocation searches to the /search endpoint, not targetingsearch', async () => {
+                const mockGeoResults = [
+                    { key: '2418779', name: 'Palo Alto', type: 'city', region: 'California', region_id: 3847, country_code: 'US' }
+                ];
+                mockFetch.mockResolvedValue({
+                    ok: true,
+                    json: jest.fn().mockResolvedValue({ data: mockGeoResults })
+                });
+                const mockGetTargetingSearch = jest.fn();
+                (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                    getTargetingSearch: mockGetTargetingSearch,
+                }));
+
+                const result = await service.searchTargeting(mockAdAccountId, mockAccessToken, 'Palo Alto', 'adgeolocation');
+
+                // Must NOT go through the interest-oriented targetingsearch edge
+                expect(mockGetTargetingSearch).not.toHaveBeenCalled();
+                // Must hit the top-level /search endpoint with the geo type
+                expect(mockFetch).toHaveBeenCalledWith(
+                    expect.stringMatching(/\/search\?type=adgeolocation/)
+                );
+                expect(mockFetch).toHaveBeenCalledWith(
+                    expect.stringContaining('q=Palo%20Alto')
+                );
+                expect(result).toEqual(mockGeoResults);
+            });
+
+            it('should pass location_types through for adgeolocation searches', async () => {
+                mockFetch.mockResolvedValue({
+                    ok: true,
+                    json: jest.fn().mockResolvedValue({ data: [] })
+                });
+                (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                    getTargetingSearch: jest.fn(),
+                }));
+
+                await service.searchTargeting(mockAdAccountId, mockAccessToken, 'San Jose', 'adgeolocation', ['city']);
+
+                expect(mockFetch).toHaveBeenCalledWith(
+                    expect.stringContaining(`location_types=${encodeURIComponent(JSON.stringify(['city']))}`)
+                );
+            });
+
+            it('should throw when the /search endpoint returns an error for geolocation', async () => {
+                mockFetch.mockResolvedValue({
+                    ok: true,
+                    json: jest.fn().mockResolvedValue({ error: { message: 'Invalid location_types' } })
+                });
+                (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                    getTargetingSearch: jest.fn(),
+                }));
+
+                await expect(
+                    service.searchTargeting(mockAdAccountId, mockAccessToken, 'Nowhere', 'adgeolocation')
+                ).rejects.toThrow('Invalid location_types');
+            });
+        });
     });
 
     describe('Insights Operations', () => {

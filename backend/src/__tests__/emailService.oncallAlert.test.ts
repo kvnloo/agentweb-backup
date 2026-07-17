@@ -1,13 +1,12 @@
 // Unit tests for oncall alert functionality
 
-// Mock nodemailer before importing emailService
-const mockSendMail = jest.fn().mockResolvedValue({ messageId: 'test-message-id' });
-const mockTransporter = {
-  sendMail: mockSendMail
-};
+// ENG-164: SMTP is gone — mock resendService, the single send path.
+const mockSendMail = jest.fn().mockResolvedValue({ id: 'resend-email-id' });
 
-jest.mock('nodemailer', () => ({
-  createTransport: jest.fn(() => mockTransporter)
+jest.mock('../services/resendService', () => ({
+  resendService: {
+    sendEmail: (...args: any[]) => mockSendMail(...args),
+  },
 }));
 
 // Mock notionService
@@ -27,7 +26,6 @@ describe('EmailService - sendOncallAlert', () => {
     mockCreateOncallItem.mockClear();
     // Set default oncall email
     process.env.ONCALL_EMAIL_LIST = 'test@example.com,test2@example.com';
-    process.env.FROM_EMAIL = 'noreply@example.com';
     process.env.NODE_ENV = 'production';
   });
 
@@ -150,7 +148,7 @@ describe('EmailService - sendOncallAlert', () => {
   });
 
   it('should handle errors gracefully without throwing', async () => {
-    mockSendMail.mockRejectedValueOnce(new Error('SMTP error'));
+    mockSendMail.mockRejectedValueOnce(new Error('Resend API error: down'));
     mockCreateOncallItem.mockRejectedValueOnce(new Error('Notion error'));
 
     // Should not throw

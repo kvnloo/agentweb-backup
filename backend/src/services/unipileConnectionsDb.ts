@@ -38,7 +38,7 @@ export interface UnipileConnection {
   firstName: string;
   lastName: string;
   headline: string;
-  connectedAt: number;      // UNIX timestamp from Unipile created_at
+  connectedAt: number;      // epoch MILLISECONDS from Unipile created_at — do NOT multiply by 1000 (ENG-379)
   syncedAt: string;         // ISO — when this record was last written
 }
 

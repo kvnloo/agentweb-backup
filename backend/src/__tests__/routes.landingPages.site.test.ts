@@ -23,6 +23,8 @@ const mockUpsertEnvVar = jest.fn();
 const mockDeleteEnvVar = jest.fn();
 const mockTriggerDeploy = jest.fn();
 const mockUpdateLandingPageGtm = jest.fn();
+const mockListLandingPages = jest.fn();
+const mockUpdateLandingPageTrackingInstalled = jest.fn();
 jest.mock('../services/v0Service', () => {
   const actual = jest.requireActual('../services/v0Service');
   return {
@@ -33,6 +35,8 @@ jest.mock('../services/v0Service', () => {
     deleteEnvVar: (...a: any[]) => mockDeleteEnvVar(...a),
     triggerVercelDeployment: (...a: any[]) => mockTriggerDeploy(...a),
     updateLandingPageGtm: (...a: any[]) => mockUpdateLandingPageGtm(...a),
+    listLandingPages: (...a: any[]) => mockListLandingPages(...a),
+    updateLandingPageTrackingInstalled: (...a: any[]) => mockUpdateLandingPageTrackingInstalled(...a),
   };
 });
 
@@ -265,15 +269,90 @@ describe('POST /api/landing-pages/v0/site/gtm', () => {
       id: 'p1', userId: 'u1', vercelProjectId: 'vp1',
       githubRepoUrl: 'https://github.com/o/r', status: 'deployed',
     });
+    // A realistic layout with a real <head>/<body> to insert into. (A bare function body with
+    // neither has no anchor for the injection — see the dedicated 422 test below, which pins
+    // exactly that case as a real, correct failure rather than a false "success".)
+    const realisticLayout = [
+      'export default function Layout({ children }: { children: React.ReactNode }) {',
+      '  return (',
+      '    <html>',
+      '      <head></head>',
+      '      <body>{children}</body>',
+      '    </html>',
+      '  );',
+      '}',
+    ].join('\n');
     mockAxiosGet.mockResolvedValue({
-      data: { sha: 'sha1', content: Buffer.from('export default function(){return null}').toString('base64') },
+      data: { sha: 'sha1', content: Buffer.from(realisticLayout).toString('base64') },
     });
     mockAxiosPut.mockResolvedValue({ data: {} });
     mockUpdateLandingPageGtm.mockResolvedValue(undefined);
     mockTriggerDeploy.mockResolvedValue(undefined);
+    mockListLandingPages.mockResolvedValue([{ id: 'p1', userId: 'u1', siteId: 'p1' }]);
+    mockUpdateLandingPageTrackingInstalled.mockResolvedValue(undefined);
     const res = await request(app).post('/api/landing-pages/v0/site/gtm').send({ gtmContainerId: 'GTM-ABCD1' });
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ ok: true, gtmContainerId: 'GTM-ABCD1' });
     expect(mockUpdateLandingPageGtm).toHaveBeenCalled();
+    expect(mockUpdateLandingPageTrackingInstalled).toHaveBeenCalledWith('p1', true);
+  });
+
+  // ENG-334 follow-up (found by Greptile review on PR #964): setting GTM at the site level
+  // fixes the live root layout every sibling page inherits — so every sibling just became
+  // tracked too, not only the root page's own record. Sync trackingInstalled across all of
+  // them so the customer-portal warning badge doesn't stay stuck after the fix already landed.
+  it('syncs trackingInstalled to every page sharing the same siteId, not just the root', async () => {
+    mockResolveSiteForCaller.mockResolvedValue({
+      id: 'p1', userId: 'u1', vercelProjectId: 'vp1',
+      githubRepoUrl: 'https://github.com/o/r', status: 'deployed', siteId: 'p1',
+    });
+    const realisticLayout = [
+      'export default function Layout({ children }: { children: React.ReactNode }) {',
+      '  return ( <html><head></head><body>{children}</body></html> );',
+      '}',
+    ].join('\n');
+    mockAxiosGet.mockResolvedValue({
+      data: { sha: 'sha1', content: Buffer.from(realisticLayout).toString('base64') },
+    });
+    mockAxiosPut.mockResolvedValue({ data: {} });
+    mockUpdateLandingPageGtm.mockResolvedValue(undefined);
+    mockTriggerDeploy.mockResolvedValue(undefined);
+    mockListLandingPages.mockResolvedValue([
+      { id: 'p1', userId: 'u1', siteId: 'p1' },
+      { id: 'sub-1', userId: 'u1', siteId: 'p1' },
+      { id: 'sub-2', userId: 'u1', siteId: 'p1' },
+      { id: 'unrelated', userId: 'u1', siteId: 'unrelated' },
+    ]);
+    mockUpdateLandingPageTrackingInstalled.mockResolvedValue(undefined);
+
+    const res = await request(app).post('/api/landing-pages/v0/site/gtm').send({ gtmContainerId: 'GTM-ABCD1' });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateLandingPageTrackingInstalled).toHaveBeenCalledWith('p1', true);
+    expect(mockUpdateLandingPageTrackingInstalled).toHaveBeenCalledWith('sub-1', true);
+    expect(mockUpdateLandingPageTrackingInstalled).toHaveBeenCalledWith('sub-2', true);
+    expect(mockUpdateLandingPageTrackingInstalled).not.toHaveBeenCalledWith('unrelated', expect.anything());
+    expect(mockUpdateLandingPageTrackingInstalled).toHaveBeenCalledTimes(3);
+  });
+
+  // ENG-334 hardening: a layout with neither <head> nor <body> has no anchor for the
+  // injection to insert into. This used to silently report success (the exact bug the
+  // verification guard exists to catch); it must now fail loud with a clear, non-technical
+  // customer-facing message instead of a bare function body with no leg to plant that.
+  it('422s with a plain-language message when the layout has no <head> or <body> to insert into', async () => {
+    mockResolveSiteForCaller.mockResolvedValue({
+      id: 'p1', userId: 'u1', vercelProjectId: 'vp1',
+      githubRepoUrl: 'https://github.com/o/r', status: 'deployed',
+    });
+    mockAxiosGet.mockResolvedValue({
+      data: { sha: 'sha1', content: Buffer.from('export default function(){return null}').toString('base64') },
+    });
+    const res = await request(app).post('/api/landing-pages/v0/site/gtm').send({ gtmContainerId: 'GTM-ABCD1' });
+    expect(res.status).toBe(422);
+    expect(res.body.error).toBe(
+      "We couldn't add tracking to this page automatically. Try regenerating the page, or contact support if this keeps happening.",
+    );
+    expect(mockAxiosPut).not.toHaveBeenCalled();
+    expect(mockUpdateLandingPageGtm).not.toHaveBeenCalled();
   });
 });

@@ -737,7 +737,7 @@ REQUIRED PARAMS PER ENTITY + ACTION:
   AD CREATE:            name, creative_id (plus ad_set_id top-level param)
   AD COPY_AD:           ad_id = source ad ID. Optional params: name (new ad name), adset_id (target ad set; defaults to source ad's set), link_url (override destination URL), body, title, status (default PAUSED). Automatically copies images — no manual upload needed.
   CUSTOM_AUDIENCE CREATE: name, subtype (CUSTOM or LOOKALIKE)
-  TARGETING SEARCH:     q (search query), type (adinterest | adbehavior | addemographics)
+  TARGETING SEARCH:     q (search query), type (adinterest | adbehavior | addemographics | adgeolocation). For type=adgeolocation, results include a location key/region_id for use in ad set geo_locations; optionally pass location_types (e.g. ['city']).
 
 COPY_AD WORKFLOW (clone an existing ad with optional overrides):
   1. Use AD LIST to find the source ad and get its ad_id
@@ -935,7 +935,8 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
 
             // --- Targeting Search ---
             q: { type: "string", description: "Search query for targeting search." },
-            type: { type: "string", enum: ["adinterest", "adbehavior", "addemographics"], description: "Targeting category to search." },
+            type: { type: "string", enum: ["adinterest", "adbehavior", "addemographics", "adgeolocation"], description: "Targeting category to search. Use 'adgeolocation' to resolve geo-targeting locations (cities/regions/zips) into keys usable in ad set geo_locations." },
+            location_types: { type: "array", items: { type: "string" }, description: "For type='adgeolocation' only: restrict results to specific location kinds, e.g. ['city'], ['region'], ['zip'], ['country']." },
 
             // --- Dataset ---
             dataset_id: { type: "string", description: "Dataset ID. Required for DATASET GET_MATCH_QUALITY." }
@@ -3327,7 +3328,7 @@ emmaToolRegistry.register({
   name: 'get_lead_details',
   definition: {
     name: 'get_lead_details',
-    description: 'Get full details for a single lead including all fields, ICP match info, email drafts, and recent engagement history. Also returns `lead.enrichmentMetadata`: a per-field provenance map (keyed by field name, including custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) describing where each enriched value came from — `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile), `sourceUrl` and `sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt` (ISO timestamp). USE THIS to answer "where does this data come from / how accurate is it?" — cite the provider, source URL, and confidence rather than guessing. Each meta entry also carries `grounding`: "grounded" = verified against a real fetched source (safe to state plainly); "web-unverified" = from a web source that could not be confirmed; "ai-knowledge" = the AI asserted it from its own general knowledge with no source found. NEVER state a "web-unverified" or "ai-knowledge" value as established fact — flag it as unverified and name which (e.g. "unverified — from an unconfirmed web source" / "unverified — from AI general knowledge, no source found"), alongside the confidence. Fields with no entry in enrichmentMetadata were entered manually or imported, not enriched. Also returns `lead.linkedInConnectionStatus`: if the lead has a LinkedIn URL, this field indicates whether they are a 1st-degree connection (`isConnected: true/false`), and if connected, when they connected (`connectedAt` ISO string, `connectedAtTimestamp` UNIX seconds). Returns `null` if the lead has no LinkedIn URL. Use this to decide whether to send a connection invite vs. a direct message.',
+    description: 'Get full details for a single lead including all fields, ICP match info, email drafts, and recent engagement history. Also returns `lead.enrichmentMetadata`: a per-field provenance map (keyed by field name, including custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) describing where each enriched value came from — `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile), `sourceUrl` and `sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt` (ISO timestamp). USE THIS to answer "where does this data come from / how accurate is it?" — cite the provider, source URL, and confidence rather than guessing. Each meta entry also carries `grounding`: "grounded" = verified against a real fetched source (safe to state plainly); "web-unverified" = from a web source that could not be confirmed; "ai-knowledge" = the AI asserted it from its own general knowledge with no source found. NEVER state a "web-unverified" or "ai-knowledge" value as established fact — flag it as unverified and name which (e.g. "unverified — from an unconfirmed web source" / "unverified — from AI general knowledge, no source found"), alongside the confidence. Fields with no entry in enrichmentMetadata were entered manually or imported, not enriched. Also returns `lead.linkedInConnectionStatus`: if the lead has a LinkedIn URL, this field indicates whether they are a 1st-degree connection (`isConnected: true/false`), and if connected, when they connected (`connectedAt` ISO string, `connectedAtTimestamp` UNIX milliseconds). Returns `null` if the lead has no LinkedIn URL. Use this to decide whether to send a connection invite vs. a direct message.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -8060,8 +8061,10 @@ emmaToolRegistry.register({
 
 ACTION MATRIX:
   BUDGET      → LIST, CREATE (name, amount_micros, explicitly_shared?), UPDATE (budget_resource_name, amount_micros), REMOVE (budget_resource_name; must not be attached to any campaign)
-  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?), REMOVE (campaign_resource_name)
+  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy OR bidding_strategy_resource_name, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy? OR bidding_strategy_resource_name?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?), REMOVE (campaign_resource_name)
               For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
+              Bidding: pass bidding_strategy for a standard (embedded) strategy, OR bidding_strategy_resource_name to attach a portfolio/shared strategy (from BIDDING_STRATEGY LIST) — never both. Switching to a standard strategy detaches any portfolio strategy.
+  BIDDING_STRATEGY → LIST (portfolio/shared bidding strategies; returns resource_name for use as bidding_strategy_resource_name)
   AD_GROUP    → LIST (campaign_resource_name)
                CREATE (name, campaign_resource_name, type [SEARCH_STANDARD|DISPLAY_STANDARD], cpc_bid_micros?)
                UPDATE (ad_group_resource_name, name?, status?, cpc_bid_micros?, ad_rotation_mode?, target_cpa_micros?, target_roas?)
@@ -8079,16 +8082,17 @@ ACTION MATRIX:
       type: 'object',
       properties: {
         customer_id: { type: 'string', description: 'Google Ads customer ID (numeric, no dashes). Call list_connected_accounts(platform="google_ads") and use the "customer_id" field from the result (NOT the "id" field).' },
-        entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'CAMPAIGN_ASSET', 'ASSET_GROUP', 'LOCATION'] },
+        entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'CAMPAIGN_ASSET', 'ASSET_GROUP', 'LOCATION', 'BIDDING_STRATEGY'] },
         action: { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
         name: { type: 'string' },
         type: { type: 'string', description: 'Campaign type (SEARCH|DISPLAY|PERFORMANCE_MAX), ad group type (SEARCH_STANDARD|DISPLAY_STANDARD), or ad type for AD CREATE (RESPONSIVE_SEARCH_AD|RESPONSIVE_DISPLAY_AD).' },
         budget_resource_name: { type: 'string', description: 'From BUDGET CREATE. Required for CAMPAIGN CREATE.' },
         amount_micros: { type: 'number', description: 'Budget in micros. $10/day = 10000000.' },
         explicitly_shared: { type: 'boolean', description: 'Whether the budget is explicitly shared across campaigns. Optional for BUDGET CREATE.' },
-        bidding_strategy: { type: 'string', enum: ['MAXIMIZE_CONVERSIONS', 'TARGET_CPA', 'TARGET_ROAS', 'MAXIMIZE_CONVERSION_VALUE', 'TARGET_IMPRESSION_SHARE', 'MANUAL_CPC'] },
+        bidding_strategy: { type: 'string', enum: ['MAXIMIZE_CONVERSIONS', 'TARGET_CPA', 'TARGET_ROAS', 'MAXIMIZE_CONVERSION_VALUE', 'TARGET_IMPRESSION_SHARE', 'TARGET_SPEND', 'MANUAL_CPC'], description: 'A standard (embedded) bidding strategy. TARGET_SPEND = Maximize Clicks (optionally capped by cpc_bid_ceiling_micros). Mutually exclusive with bidding_strategy_resource_name.' },
+        bidding_strategy_resource_name: { type: 'string', description: 'Resource name of a portfolio/shared bidding strategy (from BIDDING_STRATEGY LIST) to attach on CAMPAIGN CREATE/UPDATE. Mutually exclusive with bidding_strategy.' },
         bidding_strategy_target: { type: 'number' },
-        cpc_bid_ceiling_micros: { type: 'number', description: 'Max CPC bid ceiling in micros for TARGET_IMPRESSION_SHARE campaigns. Default 100000000 (≈100 currency units). Pass a lower value to cap spend per click.' },
+        cpc_bid_ceiling_micros: { type: 'number', description: 'Max CPC bid ceiling in micros for TARGET_IMPRESSION_SHARE (default 100000000 ≈100 currency units) or TARGET_SPEND/Maximize Clicks campaigns. Pass a lower value to cap spend per click.' },
         location_target_ids: { type: 'array', items: { type: 'number' }, description: 'From LOCATION SEARCH.' },
         campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE and AD_GROUP LIST.' },
         final_url_suffix: { type: 'string', description: 'Campaign-level Final URL suffix (query params appended to all final URLs, e.g. "utm_source=google&utm_medium=cpc"). For CAMPAIGN UPDATE only.' },

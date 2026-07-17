@@ -2,35 +2,32 @@
  * Tests for `emailService.sendEmailStrict` — the non-silent variant used by
  * audited senders (e.g. the lifecycle drip executor).
  *
- * The regular `sendEmail` swallows transporter errors by design; `strict`
- * does not. These tests lock that contract so the drip audit log cannot
- * lie about a delivery that never happened.
+ * The regular `sendEmail` swallows send errors by design; `strict` does not.
+ * These tests lock that contract so the drip audit log cannot lie about a
+ * delivery that never happened.
+ *
+ * ENG-164: the SMTP transporter is gone — both variants now route through
+ * resendService, and the returned messageId is the Resend email id.
  */
 
-// Control the mocked nodemailer transporter from the tests so we can flip
-// between success and failure cases.
-const sendMailMock = jest.fn();
+const mockResendSendEmail = jest.fn();
 
-jest.mock("nodemailer", () => ({
-  createTransport: jest.fn(() => ({
-    sendMail: sendMailMock,
-    verify: jest.fn().mockResolvedValue(true),
-  })),
+jest.mock("../services/resendService", () => ({
+  resendService: {
+    sendEmail: (...args: any[]) => mockResendSendEmail(...args),
+  },
 }));
 
-process.env.SMTP_USER = "test-user";
-process.env.SMTP_PASS = "test-pass";
-process.env.FROM_EMAIL = "drip@example.com";
-
 import { emailService } from "../services/emailService";
+import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from "../config";
 
 describe("emailService.sendEmailStrict", () => {
   beforeEach(() => {
-    sendMailMock.mockReset();
+    mockResendSendEmail.mockReset();
   });
 
-  it("returns the real messageId on a successful send", async () => {
-    sendMailMock.mockResolvedValueOnce({ messageId: "smtp-abc-123" });
+  it("returns the real Resend id as messageId on a successful send", async () => {
+    mockResendSendEmail.mockResolvedValueOnce({ id: "resend-abc-123" });
 
     const result = await emailService.sendEmailStrict(
       "alice@example.com",
@@ -39,17 +36,17 @@ describe("emailService.sendEmailStrict", () => {
       "<p>html</p>",
     );
 
-    expect(result).toEqual({ messageId: "smtp-abc-123" });
-    expect(sendMailMock).toHaveBeenCalledTimes(1);
-    const opts = sendMailMock.mock.calls[0][0];
+    expect(result).toEqual({ messageId: "resend-abc-123" });
+    expect(mockResendSendEmail).toHaveBeenCalledTimes(1);
+    const opts = mockResendSendEmail.mock.calls[0][0];
     expect(opts.to).toBe("alice@example.com");
     expect(opts.subject).toBe("Hello");
-    expect(opts.from).toBe("drip@example.com");
+    expect(opts.from).toBe(`${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`);
     expect(opts.replyTo).toBe("support@agentweb.pro");
   });
 
-  it("throws when the transporter throws (does NOT swallow like sendEmail)", async () => {
-    sendMailMock.mockRejectedValueOnce(new Error("SMTP: connection refused"));
+  it("throws when the Resend send fails (does NOT swallow like sendEmail)", async () => {
+    mockResendSendEmail.mockRejectedValueOnce(new Error("Resend API error: boom"));
 
     await expect(
       emailService.sendEmailStrict(
@@ -58,14 +55,13 @@ describe("emailService.sendEmailStrict", () => {
         "text",
         "<p>html</p>",
       ),
-    ).rejects.toThrow("SMTP: connection refused");
+    ).rejects.toThrow("Resend API error: boom");
   });
 
-  it("throws when the transporter resolves without a messageId", async () => {
-    // Defensive — some transports can resolve with undefined/empty info.
-    // The audit row cannot honestly claim status='sent' without a real
-    // handle, so we refuse to proceed.
-    sendMailMock.mockResolvedValueOnce({} as any);
+  it("throws when Resend resolves without an id", async () => {
+    // Defensive — the audit row cannot honestly claim status='sent' without
+    // a real provider handle, so we refuse to proceed.
+    mockResendSendEmail.mockResolvedValueOnce({} as any);
 
     await expect(
       emailService.sendEmailStrict(
@@ -77,8 +73,8 @@ describe("emailService.sendEmailStrict", () => {
     ).rejects.toThrow(/no messageId/);
   });
 
-  it("throws when the transporter resolves with a non-string messageId", async () => {
-    sendMailMock.mockResolvedValueOnce({ messageId: null } as any);
+  it("throws when Resend resolves with a non-string id", async () => {
+    mockResendSendEmail.mockResolvedValueOnce({ id: 12345 } as any);
 
     await expect(
       emailService.sendEmailStrict(
@@ -88,5 +84,30 @@ describe("emailService.sendEmailStrict", () => {
         "<p>html</p>",
       ),
     ).rejects.toThrow(/no messageId/);
+  });
+
+  it("passes cc through to Resend", async () => {
+    mockResendSendEmail.mockResolvedValueOnce({ id: "resend-cc-1" });
+
+    await emailService.sendEmailStrict(
+      ["a@example.com", "b@example.com"],
+      "Subject",
+      "text",
+      "<p>html</p>",
+      "cc@example.com",
+    );
+
+    const opts = mockResendSendEmail.mock.calls[0][0];
+    expect(opts.to).toEqual(["a@example.com", "b@example.com"]);
+    expect(opts.cc).toBe("cc@example.com");
+  });
+
+  it("regular sendEmail still swallows failures (best-effort contract preserved)", async () => {
+    mockResendSendEmail.mockRejectedValueOnce(new Error("Resend API error: down"));
+
+    await expect(
+      emailService.sendEmail("bob@example.com", "Hi", "text", "<p>html</p>"),
+    ).resolves.toBeUndefined();
+    expect(mockResendSendEmail).toHaveBeenCalledTimes(1);
   });
 });
