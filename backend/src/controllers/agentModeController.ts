@@ -754,6 +754,11 @@ const AWAITING_CONFIRMATION_PATTERNS: RegExp[] = [
   /\b(?:await(?:ing)?|wait\s+for)\b[^\n.?!]*\b(?:confirmation|approval|sign-?off|go-?ahead|your\s+(?:go|response|reply|input|approval))\b/i,
   // "confirm to proceed" / "confirm before I continue" / "please confirm before I proceed"
   /\bconfirm\b[^\n.?!]*\b(?:to|before)\b[^\n.?!]*\b(?:proceed|continu)/i,
+  // "I'll pause here for your input", "pausing until you confirm", "holding off /
+  // standing by until you reply / before proceeding". Anchored on a halt verb
+  // FOLLOWED by an explicit wait-for-the-user object so a report that merely
+  // mentions something being "paused" cannot trigger it.
+  /\b(?:paus(?:e|ing|ed)|hold(?:ing)?\s+off|standing\s+by)\b[^\n.?!]*\b(?:your\s+(?:input|response|reply|confirmation|approval|go-?ahead|sign-?off)|you\s+(?:confirm|reply|respond|approve)|before\s+(?:proceed|continu))/i,
 ];
 
 export function scheduledRunAwaitsConfirmation(content: string): boolean {
