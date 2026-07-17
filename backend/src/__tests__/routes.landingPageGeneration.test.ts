@@ -864,7 +864,7 @@ describe("DELETE /api/landing-pages/v0/generated/:id", () => {
       name: "My Page",
       status: "draft",
     });
-    mockDeleteLandingPageByRecord.mockResolvedValueOnce(undefined);
+    mockDeleteLandingPageByRecord.mockResolvedValueOnce({});
 
     const res = await request(app).delete(
       "/api/landing-pages/v0/generated/page-1"
@@ -872,6 +872,31 @@ describe("DELETE /api/landing-pages/v0/generated/:id", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
+    expect(res.body.warning).toBeUndefined();
+  });
+
+  // ENG-375 hardening: a zero-match GitHub cleanup (or an outright cleanup failure) must
+  // still delete the record (never block on it) but now surfaces as a visible warning in
+  // the response instead of vanishing into a server-side console.log no one reads.
+  it("SUCCESS: still 200s when GitHub cleanup found nothing, but includes a warning", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "My Page",
+      status: "deployed",
+    });
+    mockDeleteLandingPageByRecord.mockResolvedValueOnce({
+      githubCleanupWarning:
+        "No GitHub files were found matching this page's route — the repo may already be clean, or cleanup could not locate them.",
+    });
+
+    const res = await request(app).delete(
+      "/api/landing-pages/v0/generated/page-1"
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.warning).toMatch(/No GitHub files were found/);
   });
 });
 

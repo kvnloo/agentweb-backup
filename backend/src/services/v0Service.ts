@@ -4221,9 +4221,15 @@ async function listRepoTree(
  * orphaned component with an unresolvable import still fails the build for EVERY page on
  * the site: "delete the broken page" did not actually unbreak the site.
  */
-async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promise<void> {
+/**
+ * Returns whether any files were actually found and removed under app/<slug>/. `false`
+ * means the tree had nothing matching that prefix — the caller decides whether that's
+ * worth surfacing (e.g. record.slug diverging from the route actually committed would
+ * silently no-op here with no other signal that cleanup did not happen).
+ */
+async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promise<boolean> {
   const match = githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
-  if (!match) return;
+  if (!match) return false;
   const [, owner, repo] = match;
   const repoFullName = `${owner}/${repo.replace(".git", "")}`;
 
@@ -4238,7 +4244,7 @@ async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promis
 
   if (toDelete.length === 0) {
     console.log(`[GITHUB] Nothing to remove for /${slug} in ${repoFullName}`);
-    return; // never push an empty commit — it would trigger a pointless rebuild
+    return false; // never push an empty commit — it would trigger a pointless rebuild
   }
 
   await commitFilesToRepoMain(
@@ -4249,6 +4255,7 @@ async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promis
   );
 
   console.log(`[GITHUB] Removed ${toDelete.length} file(s) under ${prefix} from ${repoFullName}`);
+  return true;
 }
 
 /**
@@ -4507,13 +4514,29 @@ export async function transferLandingPageOwner(id: string, newOwnerId: string): 
 /**
  * Delete a landing page given an already-fetched record (for org-share flows where
  * the caller may not be the owner). All pages are deletable.
+ *
+ * `githubCleanupWarning`, when present, means the DB record was archived successfully but
+ * the GitHub side either failed outright or found nothing matching `record.slug` to remove
+ * (e.g. the stored slug diverging from the route actually committed — see ENG-375). Either
+ * way the delete itself must never fail because of this; it's surfaced so a real occurrence
+ * is visible instead of silently logged where no one reads it.
  */
-export async function deleteLandingPageByRecord(record: GeneratedLandingPage): Promise<void> {
+export async function deleteLandingPageByRecord(
+  record: GeneratedLandingPage,
+): Promise<{ githubCleanupWarning?: string }> {
+  let githubCleanupWarning: string | undefined;
   if (record.githubRepoUrl && record.slug) {
     try {
-      await removePageFromGitHub(record.githubRepoUrl, record.slug);
+      const removed = await removePageFromGitHub(record.githubRepoUrl, record.slug);
+      if (!removed) {
+        githubCleanupWarning =
+          "No GitHub files were found matching this page's route — the repo may already be " +
+          "clean, or cleanup could not locate them.";
+      }
     } catch (err: any) {
       console.error("[V0 SERVICE] Failed to remove route from GitHub:", err.message);
+      githubCleanupWarning =
+        "GitHub cleanup failed; this page's files may still exist in the repo.";
     }
   }
 
@@ -4556,6 +4579,8 @@ export async function deleteLandingPageByRecord(record: GeneratedLandingPage): P
       slug: record.slug,
     });
   }
+
+  return { githubCleanupWarning };
 }
 
 /**
