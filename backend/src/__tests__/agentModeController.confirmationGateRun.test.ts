@@ -198,9 +198,8 @@ describe('runScheduledChat — confirmation-halt completion gate (ENG-369)', () 
 
     await runScheduledChat(reportSchedule, 'test-user-369', true);
 
-    // 1 initial + up to 2 continuations = 3. Must be well under maxAttempts(20).
+    // 1 initial + exactly 2 continuations = 3. Must be well under maxAttempts(20).
     const calls = mockWorker.runInWorker.mock.calls.length;
-    expect(calls).toBeGreaterThanOrEqual(2);
-    expect(calls).toBeLessThanOrEqual(3);
+    expect(calls).toBe(3);
   });
 });
