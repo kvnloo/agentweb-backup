@@ -1390,6 +1390,25 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(result.error).toBe('MISSING_OBJECT_STORY_SPEC');
       });
 
+      it('reports an error rather than alreadyTagged when a destination link is unparseable (Greptile)', async () => {
+        // computeRetagUrlTags returns changed:false for BOTH "genuinely already
+        // tagged" and "a link URL couldn't be read" -- collapsing them into the
+        // same alreadyTagged:true response would give an operator false
+        // confirmation that a malformed-destination ad is fully covered.
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'ad_123', creative: { creative_id: 'creative_1' } });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'creative_1',
+          object_story_spec: { page_id: 'page_1', link_data: { link: 'not a url' } },
+        });
+
+        const result = await agentModeService.retagMetaAdUtm('user123', 'ad_123');
+
+        expect(result.success).toBe(false);
+        expect((result as any).alreadyTagged).toBeUndefined();
+        expect(metaService.createAdCreative).not.toHaveBeenCalled();
+      });
+
       it('is a no-op when the ad already carries every UTM key (boundary)', async () => {
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
         (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'ad_123', creative: { creative_id: 'creative_1' } });

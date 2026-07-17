@@ -1886,13 +1886,17 @@ export const metaService = MetaService.getInstance();
 export function computeRetagUrlTags(
   currentUrlTags: string | undefined,
   linkUrls: string[],
-): { urlTags: string | undefined; changed: boolean } {
+): { urlTags: string | undefined; changed: boolean; unreadable?: boolean } {
   const omit = new Set<string>(utmKeysInQueryString(currentUrlTags));
   for (const url of linkUrls) {
     const keys = readUtmKeys(url);
     // Unreadable link → we cannot know what it already carries, so we do not
     // tag at all rather than risk a duplicate — same rule as resolveUrlTags.
-    if (!keys) return { urlTags: currentUrlTags, changed: false };
+    // `unreadable: true` distinguishes this from a genuine "already fully
+    // tagged" no-op: both return changed:false, but a caller that collapses
+    // them into the same alreadyTagged:true response gives false confirmation
+    // that a malformed-destination ad is actually covered (Greptile).
+    if (!keys) return { urlTags: currentUrlTags, changed: false, unreadable: true };
     for (const k of keys) omit.add(k);
   }
 

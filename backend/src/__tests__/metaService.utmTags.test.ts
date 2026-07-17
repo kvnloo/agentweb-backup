@@ -241,9 +241,13 @@ describe('computeRetagUrlTags — single existing ad retrofit (Harsha\'s ask)', 
     expect(result).toEqual({ urlTags: existing, changed: false });
   });
 
-  it('does not touch anything when a link URL is unparseable (never risk a duplicate)', () => {
+  it('does not touch anything when a link URL is unparseable (never risk a duplicate), and flags it as unreadable rather than a plain no-op (Greptile)', () => {
+    // changed:false alone is ambiguous -- it also means "genuinely already
+    // tagged". A caller collapsing both into alreadyTagged:true would tell an
+    // operator whose ad has a malformed destination that it's fully covered,
+    // when it was actually never verified at all.
     const result = computeRetagUrlTags('utm_source=meta', ['not a url']);
-    expect(result).toEqual({ urlTags: 'utm_source=meta', changed: false });
+    expect(result).toEqual({ urlTags: 'utm_source=meta', changed: false, unreadable: true });
   });
 
   it('builds the full UTM set when there is no existing url_tags and the link carries none (happy path)', () => {

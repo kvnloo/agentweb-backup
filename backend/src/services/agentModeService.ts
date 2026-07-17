@@ -15038,7 +15038,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // duplicate it (Greptile).
       const linkUrls: string[] = MetaService.extractCreativeDestinationUrls(creativeData);
 
-      const { urlTags, changed } = computeRetagUrlTags(creativeData.url_tags, linkUrls);
+      const { urlTags, changed, unreadable } = computeRetagUrlTags(creativeData.url_tags, linkUrls);
+      if (unreadable) {
+        return {
+          success: false,
+          message: 'Could not verify this ad\'s destination is fully tagged — one of its link URLs could not be read.',
+          error: 'UNREADABLE_DESTINATION_URL',
+        };
+      }
       if (!changed) {
         return { success: true, alreadyTagged: true };
       }
