@@ -401,6 +401,25 @@ describe('Google — listAdsForUtmAudit and final_url_suffix inheritance', () =>
     expect(ads[0].appendField).not.toContain('campaign-level');
   });
 
+  it('AD-GROUP INHERITANCE: an ad with no ad-level suffix inherits its AD GROUP\'s suffix, not just the campaign\'s (Greptile)', async () => {
+    // retagAdUtm/updateAd now correctly write and inherit ad-group-level
+    // final_url_suffix (the level between ad and campaign). The audit's
+    // appendField computation must read it too, or a healthy ad-group-tagged
+    // campaign gets reported as a false-positive "untagged".
+    mockGaql({
+      adRows: [
+        {
+          campaign: { id: '111', name: 'AdGroup Inherits' }, // no campaign-level suffix
+          adGroup: { finalUrlSuffix: GOOGLE_SUFFIX },
+          adGroupAd: { ad: { id: '5001', finalUrls: ['https://example.com/lp'] } }, // no ad-level suffix
+        },
+      ],
+    });
+
+    const ads = await googleAdsService.listAdsForUtmAudit(USER, CUSTOMER);
+    expect(ads[0].appendField).toBe(GOOGLE_SUFFIX);
+  });
+
   it('returns ALL of an ad\'s finalUrls, not just the first', async () => {
     mockGaql({
       adRows: [

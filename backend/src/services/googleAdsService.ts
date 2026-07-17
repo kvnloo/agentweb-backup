@@ -938,9 +938,10 @@ export class GoogleAdsService {
    * `asset_group.final_url_suffix` in GAQL would not merely be wrong, it would fail the whole
    * query and take the audit down with it.
    *
-   * Ad-group-level suffixes are not read: `buildAdFinalUrlSuffix` only ever inherits from the
-   * campaign, so an ad-group suffix is a location our writer does not use. It could only ever
-   * make the audit MORE lenient, never produce a false "untagged".
+   * AD-GROUP SUFFIX: `getInheritedFinalUrlSuffix` reads and inherits from the ad group level
+   * too (an ad group's own suffix is more specific than its campaign's), so the audit must
+   * read it as well — an ad-group-tagged campaign with no ad/campaign-level suffix would
+   * otherwise be a false "untagged".
    *
    * `destinationUrls` is the whole `finalUrls` array — every one of them must carry the UTMs,
    * not just `finalUrls[0]`.
@@ -962,7 +963,7 @@ export class GoogleAdsService {
     const where = campaignId && /^\d+$/.test(campaignId) ? ` WHERE campaign.id = ${campaignId}` : '';
 
     const adQuery =
-      'SELECT campaign.id, campaign.name, campaign.final_url_suffix, ' +
+      'SELECT campaign.id, campaign.name, campaign.final_url_suffix, ad_group.final_url_suffix, ' +
       'ad_group_ad.ad.id, ad_group_ad.ad.final_urls, ad_group_ad.ad.final_url_suffix ' +
       'FROM ad_group_ad' + where;
 
@@ -982,14 +983,16 @@ export class GoogleAdsService {
 
     const ads = adRows.map((r: any) => {
       const ad = r.adGroupAd?.ad ?? {};
+      const adGroup = r.adGroup ?? {};
       const campaign = r.campaign ?? {};
       return {
         adId: String(ad.id ?? ''),
         campaignId: campaign.id != null ? String(campaign.id) : '',
         campaignName: campaign.name ?? '',
         destinationUrls: urls(ad.finalUrls),
-        // Most-specific-wins: the ad's suffix REPLACES the campaign's, never appends to it.
-        appendField: ad.finalUrlSuffix || campaign.finalUrlSuffix || undefined,
+        // Most-specific-wins: ad > ad group > campaign — each level REPLACES the
+        // others, never appends to them.
+        appendField: ad.finalUrlSuffix || adGroup.finalUrlSuffix || campaign.finalUrlSuffix || undefined,
       };
     });
 
