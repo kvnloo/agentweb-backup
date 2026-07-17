@@ -1,19 +1,6 @@
 import { emailService } from '../services/emailService';
 
-// Mock nodemailer
-jest.mock('nodemailer', () => ({
-  createTransport: jest.fn(() => ({
-    sendMail: jest.fn().mockResolvedValue({ messageId: 'test-message-id' }),
-    verify: jest.fn().mockResolvedValue(true),
-  })),
-}));
-
 // Mock environment variables
-process.env.SMTP_HOST = 'test-smtp-host';
-process.env.SMTP_PORT = '587';
-process.env.SMTP_USER = 'test-user';
-process.env.SMTP_PASS = 'test-pass';
-process.env.FROM_EMAIL = 'test@example.com';
 process.env.CUSTOMER_FRONTEND_URL = 'https://customer.agentweb.pro';
 
 describe('EmailService', () => {
