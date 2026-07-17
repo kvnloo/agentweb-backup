@@ -131,14 +131,12 @@ async function resolveSecretFromSecretsManager(): Promise<string | undefined> {
       const value = extractSecretFromPayload(raw);
       smCache = { value, fetchedAt: Date.now() };
       return value;
-    } catch (err: any) {
+    } catch {
       // Fail open on SM errors — a Secrets Manager blip must not 401 the entire
-      // scheduled-chats system. Cache the miss so we don't hammer SM.
-      console.error(
-        `[serviceAuth] Could not read ${SCHEDULED_CHATS_SERVICE_SECRET_SM_ID} from ` +
-          `Secrets Manager — failing open (run-scheduled-chats stays unauthenticated ` +
-          `this TTL window): ${err?.code || err?.message || err}`
-      );
+      // scheduled-chats system. getSecret() already logs the underlying AWS
+      // cause, and the once-per-process warn (when no secret resolves) records
+      // the fail-open impact, so we don't emit a duplicate error line here.
+      // Cache the miss so we don't hammer SM.
       smCache = { value: undefined, fetchedAt: Date.now() };
       return undefined;
     } finally {
@@ -195,7 +193,12 @@ export function requireScheduledChatsServiceSecret(
   }
 
   // (b) No env override — resolve from Secrets Manager (cached, async).
-  return resolveFromSecretsManagerThenEnforce(req, res, next);
+  //     resolveFromSecretsManagerThenEnforce never rejects today, but Express 4
+  //     does not await a middleware's returned promise nor forward its
+  //     rejections — so .catch(next) guarantees any future regression surfaces
+  //     as a normal Express error instead of an unhandled rejection / hung
+  //     request.
+  return resolveFromSecretsManagerThenEnforce(req, res, next).catch(next);
 }
 
 /**
