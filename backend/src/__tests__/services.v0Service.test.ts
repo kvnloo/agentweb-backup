@@ -175,7 +175,7 @@ import {
   assertNoDuplicateInjectedRoutes,
 } from "../services/v0Service";
 
-import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord } from "../services/v0Service";
+import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord, getVercelBuildErrors, isNonErrorBuildLine } from "../services/v0Service";
 import { _resetV0UsageGuardForTest, guardedV0ChatCreate, hashV0Prompt } from "../services/v0UsageGuard";
 const { enqueueAutoHumanEval } = jest.requireMock("../services/autoHumanEvalService");
 
@@ -4030,5 +4030,65 @@ describe("v0Service - triggerVercelDeployment", () => {
     const body = mockAxiosPost.mock.calls[0][1];
     expect(body.target).toBeUndefined();
     expect(body.gitSource.ref).toBe("draft/session-12345678");
+  });
+});
+
+describe("getVercelBuildErrors — surface the real cause, not trailing noise", () => {
+  beforeEach(() => {
+    mockAxiosGet.mockReset();
+  });
+
+  it("returns the real build error and drops a trailing deprecation warning", async () => {
+    mockAxiosGet.mockResolvedValueOnce({
+      data: [
+        { type: "stderr", payload: { text: "Failed to compile." } },
+        { type: "stderr", payload: { text: "Module not found: Can't resolve '@/components/missing'" } },
+        { type: "stderr", payload: { text: '⚠ The "middleware" file convention is deprecated. Please use "proxy" instead.' } },
+      ],
+    });
+    const msg = await getVercelBuildErrors("dpl_1", "tok");
+    expect(msg).toContain("Failed to compile");
+    expect(msg).toContain("Module not found");
+    // The benign deprecation warning must NOT be surfaced as (part of) the error.
+    expect(msg).not.toMatch(/deprecated/i);
+  });
+
+  it("does not pass a deprecation warning / CLI banner off as the build error when no real error line was captured", async () => {
+    mockAxiosGet.mockResolvedValueOnce({
+      data: [
+        { type: "stderr", payload: { text: "Vercel CLI 56.2.0" } },
+        { type: "stderr", payload: { text: '⚠ The "middleware" file convention is deprecated. Please use "proxy" instead.' } },
+      ],
+    });
+    const msg = await getVercelBuildErrors("dpl_2", "tok");
+    // Raw output is still shown for context, but clearly labelled as NOT the cause.
+    expect(msg).toContain("No explicit build error was captured");
+    expect(msg).toContain("Vercel dashboard");
+  });
+
+  it("returns a clear message when there are no stderr/fatal events at all", async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: [{ type: "stdout", payload: { text: "Building..." } }] });
+    const msg = await getVercelBuildErrors("dpl_3", "tok");
+    expect(msg).toBe("Build failed — no error details available in logs.");
+  });
+
+  it("degrades to a safe message if the events request throws", async () => {
+    mockAxiosGet.mockRejectedValueOnce(new Error("network down"));
+    const msg = await getVercelBuildErrors("dpl_4", "tok");
+    expect(msg).toBe("Build failed — could not retrieve error details.");
+  });
+});
+
+describe("isNonErrorBuildLine", () => {
+  it("classifies CLI banner, warnings and deprecations as non-error noise", () => {
+    expect(isNonErrorBuildLine("Vercel CLI 56.2.0")).toBe(true);
+    expect(isNonErrorBuildLine('⚠ The "middleware" file convention is deprecated. Please use "proxy" instead.')).toBe(true);
+    expect(isNonErrorBuildLine("Warning: something minor")).toBe(true);
+  });
+
+  it("treats real build errors as meaningful (not noise)", () => {
+    expect(isNonErrorBuildLine("Module not found: Can't resolve '@/x'")).toBe(false);
+    expect(isNonErrorBuildLine("Failed to compile.")).toBe(false);
+    expect(isNonErrorBuildLine("Type error: Property 'x' does not exist on type 'Y'.")).toBe(false);
   });
 });
