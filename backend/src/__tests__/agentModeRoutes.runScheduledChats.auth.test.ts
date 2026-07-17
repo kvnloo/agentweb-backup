@@ -120,6 +120,16 @@ jest.mock('../services/voiceService', () => ({
   synthesizeSpeech: jest.fn(),
 }));
 
+// ENG-359: when the env override is unset, serviceAuth consults Secrets Manager.
+// Mock the SM helper to return a payload with no matching key so the "env unset"
+// rollout test deterministically fails open (no real AWS call, and no false 401
+// even once the real prod secret exists). Env-secret-set tests use the sync env
+// path and never read SM.
+jest.mock('../utils/secretsManager', () => ({
+  ...jest.requireActual('../utils/secretsManager'),
+  getSecret: jest.fn().mockResolvedValue('{}'),
+}));
+
 import express from 'express';
 import request from 'supertest';
 import agentModeRoutes from '../routes/agentMode';
