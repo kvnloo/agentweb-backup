@@ -554,4 +554,86 @@ describe('retagAssetGroupUtm — single existing PMax asset group, on-demand ret
     expect(op.update.finalUrls[0]).toBe('https://example.com/?utm_medium=paid&utm_campaign={campaignid}');
     expect(op.update.finalUrls[0]).not.toContain('utm_source=google');
   });
+
+  it('retags EVERY url in a multi-url PMax asset group, not just the first (data-loss regression)', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          assetGroup: { finalUrls: ['https://a.example.com/', 'https://b.example.com/'] },
+          campaign: {},
+        }],
+      },
+    });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } }); // the mutate
+    const result = await service.retagAssetGroupUtm('user-123', '1234567890', 'customers/123/assetGroups/1');
+    expect(result).toEqual({ success: true });
+    const op = mutateOperation();
+    expect(op.update.finalUrls).toEqual([
+      'https://a.example.com/?utm_source=google&utm_medium=paid&utm_campaign={campaignid}',
+      'https://b.example.com/?utm_source=google&utm_medium=paid&utm_campaign={campaignid}',
+    ]);
+    expect(op.updateMask).toBe('final_urls');
+  });
+
+  it('in a multi-url group, only retags urls missing keys and leaves already-tagged urls\' keys untouched', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          assetGroup: {
+            finalUrls: [
+              'https://a.example.com/?utm_source=a&utm_medium=b&utm_campaign=c',
+              'https://b.example.com/',
+            ],
+          },
+          campaign: {},
+        }],
+      },
+    });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    const result = await service.retagAssetGroupUtm('user-123', '1234567890', 'customers/123/assetGroups/1');
+    expect(result).toEqual({ success: true });
+    const op = mutateOperation();
+    expect(op.update.finalUrls).toEqual([
+      'https://a.example.com/?utm_source=a&utm_medium=b&utm_campaign=c',
+      'https://b.example.com/?utm_source=google&utm_medium=paid&utm_campaign={campaignid}',
+    ]);
+  });
+
+  it('in a multi-url group, leaves an unreadable url untouched (never risk a duplicate) but still retags the rest', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          assetGroup: { finalUrls: ['not a url', 'https://b.example.com/'] },
+          campaign: {},
+        }],
+      },
+    });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    const result = await service.retagAssetGroupUtm('user-123', '1234567890', 'customers/123/assetGroups/1');
+    expect(result).toEqual({ success: true });
+    const op = mutateOperation();
+    expect(op.update.finalUrls).toEqual([
+      'not a url',
+      'https://b.example.com/?utm_source=google&utm_medium=paid&utm_campaign={campaignid}',
+    ]);
+  });
+
+  it('is a no-op (no mutate call) when a multi-url group already has every key on every readable url', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          assetGroup: {
+            finalUrls: [
+              'https://a.example.com/?utm_source=a&utm_medium=b&utm_campaign=c',
+              'https://b.example.com/?utm_source=a&utm_medium=b&utm_campaign=c',
+            ],
+          },
+          campaign: {},
+        }],
+      },
+    });
+    const result = await service.retagAssetGroupUtm('user-123', '1234567890', 'customers/123/assetGroups/1');
+    expect(result).toEqual({ success: false });
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+  });
 });

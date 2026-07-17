@@ -1185,29 +1185,35 @@ export class GoogleAdsService {
       + `FROM asset_group WHERE asset_group.resource_name = '${assetGroupResourceName}'`,
       loginCustomerId,
     );
-    const finalUrl = rows[0]?.assetGroup?.finalUrls?.[0];
-    if (!finalUrl) return { success: false, reason: 'no_destination_url' };
-
-    const urlKeys = readUtmKeys(finalUrl);
-    if (!urlKeys) return { success: false }; // unreadable — never risk a duplicate
+    const finalUrls: string[] = rows[0]?.assetGroup?.finalUrls ?? [];
+    if (finalUrls.length === 0) return { success: false, reason: 'no_destination_url' };
 
     const campaignSuffix: string | undefined = rows[0]?.campaign?.finalUrlSuffix;
     const inheritedKeys = utmKeysInQueryString(campaignSuffix);
-    const omit = new Set<string>([...urlKeys, ...inheritedKeys]);
-
     const spec = buildUtmSpec('google', { campaign: '{campaignid}' });
-    const additions = utmQueryString(spec, omit);
-    if (!additions) return { success: false }; // nothing missing
 
-    const hashIndex = finalUrl.indexOf('#');
-    const base = hashIndex === -1 ? finalUrl : finalUrl.slice(0, hashIndex);
-    const fragment = hashIndex === -1 ? '' : finalUrl.slice(hashIndex);
-    const queryIndex = base.indexOf('?');
-    const separator = queryIndex === -1 ? '?' : queryIndex === base.length - 1 ? '' : '&';
-    const newUrl = `${base}${separator}${additions}${fragment}`;
+    let changed = false;
+    const retaggedUrls = finalUrls.map((finalUrl) => {
+      const urlKeys = readUtmKeys(finalUrl);
+      if (!urlKeys) return finalUrl; // unreadable — never risk a duplicate, leave as-is
+
+      const omit = new Set<string>([...urlKeys, ...inheritedKeys]);
+      const additions = utmQueryString(spec, omit);
+      if (!additions) return finalUrl; // this url is already fully tagged
+
+      const hashIndex = finalUrl.indexOf('#');
+      const base = hashIndex === -1 ? finalUrl : finalUrl.slice(0, hashIndex);
+      const fragment = hashIndex === -1 ? '' : finalUrl.slice(hashIndex);
+      const queryIndex = base.indexOf('?');
+      const separator = queryIndex === -1 ? '?' : queryIndex === base.length - 1 ? '' : '&';
+      changed = true;
+      return `${base}${separator}${additions}${fragment}`;
+    });
+
+    if (!changed) return { success: false }; // nothing missing on any url
 
     await this.mutate(customerId, accessToken, 'assetGroups', [{
-      update: { resourceName: assetGroupResourceName, finalUrls: [newUrl] },
+      update: { resourceName: assetGroupResourceName, finalUrls: retaggedUrls },
       updateMask: 'final_urls',
     }], loginCustomerId);
     return { success: true };
