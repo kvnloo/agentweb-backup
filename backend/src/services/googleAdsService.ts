@@ -568,6 +568,81 @@ export class GoogleAdsService {
     await this.mutate(customerId, accessToken, 'campaigns', [{ remove: campaignResourceName }], loginCustomerId);
   }
 
+  /**
+   * Validate a Google Ads resource name before it is interpolated into a GAQL WHERE
+   * clause (ENG-335). Unlike the other queries in this service, the ENG-335 lookups
+   * splice a caller-supplied value into the query, and that value ultimately originates
+   * from an LLM tool-call argument. Real resource names are only `customers/<n>/<segment>/<n>`,
+   * so we reject anything else rather than let a crafted string alter the query (e.g. one
+   * engineered to return zero rows and silently skip the creative-addition gate).
+   */
+  private assertResourceName(value: string, segment: 'campaigns' | 'adGroups'): void {
+    if (typeof value !== 'string' || !new RegExp(`^customers/\\d+/${segment}/\\d+$`).test(value)) {
+      throw new Error(`Invalid Google Ads ${segment} resource name`);
+    }
+  }
+
+  /**
+   * Collect the de-duplicated set of final URLs a campaign points at, across its
+   * (non-removed) responsive ads and PMax asset groups. Used by the pre-flight
+   * tracking gate (ENG-335) before a campaign is enabled/launched.
+   */
+  async getCampaignFinalUrls(userId: string, customerId: string, campaignResourceName: string): Promise<string[]> {
+    this.assertResourceName(campaignResourceName, 'campaigns');
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const urls = new Set<string>();
+
+    const adRows = await this.search(customerId, accessToken,
+      `SELECT ad_group_ad.ad.final_urls FROM ad_group_ad WHERE campaign.resource_name = '${campaignResourceName}' AND ad_group_ad.status != 'REMOVED'`,
+      loginCustomerId,
+    );
+    for (const r of adRows) {
+      for (const u of (r.adGroupAd?.ad?.finalUrls || [])) urls.add(u);
+    }
+
+    const assetGroupRows = await this.search(customerId, accessToken,
+      `SELECT asset_group.final_urls FROM asset_group WHERE campaign.resource_name = '${campaignResourceName}' AND asset_group.status != 'REMOVED'`,
+      loginCustomerId,
+    );
+    for (const r of assetGroupRows) {
+      for (const u of (r.assetGroup?.finalUrls || [])) urls.add(u);
+    }
+
+    return [...urls];
+  }
+
+  /**
+   * Current serving status of a campaign (e.g. 'ENABLED', 'PAUSED'), or null if
+   * the campaign can't be found. Used by the ENG-335 launch gate to decide whether
+   * adding a creative to it serves paid traffic instantly.
+   */
+  async getCampaignStatus(userId: string, customerId: string, campaignResourceName: string): Promise<string | null> {
+    this.assertResourceName(campaignResourceName, 'campaigns');
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const rows = await this.search(customerId, accessToken,
+      `SELECT campaign.status FROM campaign WHERE campaign.resource_name = '${campaignResourceName}'`,
+      loginCustomerId,
+    );
+    return rows[0]?.campaign?.status ?? null;
+  }
+
+  /**
+   * Resolve the parent campaign (resource name + current status) of an ad group.
+   * Returns null if the ad group can't be found. Used by the ENG-335 launch gate
+   * so a new ad added to a live campaign is checked before it serves.
+   */
+  async getAdGroupCampaign(userId: string, customerId: string, adGroupResourceName: string): Promise<{ campaignResourceName: string; campaignStatus: string } | null> {
+    this.assertResourceName(adGroupResourceName, 'adGroups');
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const rows = await this.search(customerId, accessToken,
+      `SELECT ad_group.campaign, campaign.status FROM ad_group WHERE ad_group.resource_name = '${adGroupResourceName}'`,
+      loginCustomerId,
+    );
+    const row = rows[0];
+    if (!row?.adGroup?.campaign) return null;
+    return { campaignResourceName: row.adGroup.campaign, campaignStatus: row.campaign?.status ?? '' };
+  }
+
   // ── Location search ───────────────────────────────────────────────────────
 
   async searchLocations(userId: string, customerId: string, query: string, locale: string = 'en'): Promise<{ id: string; name: string; countryCode: string; targetType: string }[]> {

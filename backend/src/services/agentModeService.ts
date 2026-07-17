@@ -121,6 +121,7 @@ import { linkedInOutreachService } from './linkedInOutreachService';
 import { twitterService } from './twitterService';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
+import { preflightTrackingGate } from './googleAdsTrackingPreflight';
 import { HubSpotService } from './hubspotService';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
@@ -27887,14 +27888,108 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     return response;
   }
 
+  /**
+   * Deterministic pre-flight tracking gate (ENG-335). Before a campaign is
+   * enabled/launched, fetch its final URLs and confirm each serves a detectable
+   * conversion-measurement mechanism (GA4 / GTM / Google Ads conversion snippet).
+   * Blocks the launch by default when any URL is unmeasured or unverifiable;
+   * an explicit `override_tracking_check` proceeds but is recorded. The per-URL
+   * result and the decision are persisted to the run record so a later report
+   * can state measurement status instead of a bare "0 conversions".
+   *
+   * Returns `{ proceed: false, blockResult }` when the launch must be blocked
+   * (caller returns blockResult verbatim), or `{ proceed: true }` to continue.
+   */
+  private async enforceGoogleAdsLaunchGate(
+    userId: string,
+    customerId: string,
+    campaignResourceName: string,
+    action: string,
+    override: boolean,
+    sessionId?: string,
+  ): Promise<{ proceed: boolean; blockResult?: any }> {
+    const finalUrls = await googleAdsService.getCampaignFinalUrls(userId, customerId, campaignResourceName);
+    // No serving URLs (e.g. a campaign with no ads yet) ⇒ nothing to gate.
+    if (finalUrls.length === 0) return { proceed: true };
+    return this.runGoogleAdsTrackingGate(customerId, campaignResourceName, action, override, sessionId, finalUrls);
+  }
+
+  /**
+   * ENG-335: adding a new ad or PMax asset group to an *already-ENABLED* campaign
+   * serves paid traffic to its final URL instantly — the same exposure as a launch.
+   * Gate the newly-added final URL(s) exactly like RESUME/UPDATE(ENABLED). Additions
+   * to a PAUSED/DRAFT campaign are not gated here; they are re-checked when that
+   * campaign is later enabled/resumed.
+   */
+  private async enforceGoogleAdsCreativeAdditionGate(
+    customerId: string,
+    campaignResourceName: string,
+    campaignStatus: string | null,
+    action: string,
+    override: boolean,
+    sessionId: string | undefined,
+    newFinalUrls: Array<string | undefined>,
+  ): Promise<{ proceed: boolean; blockResult?: any }> {
+    if (campaignStatus !== 'ENABLED') return { proceed: true };
+    const urls = newFinalUrls.filter((u): u is string => typeof u === 'string' && u.trim().length > 0);
+    if (urls.length === 0) return { proceed: true };
+    return this.runGoogleAdsTrackingGate(customerId, campaignResourceName, action, override, sessionId, urls);
+  }
+
+  /**
+   * Shared core of the tracking gate: run the deterministic pre-flight check over
+   * `finalUrls`, record the outcome (passed / blocked / overridden) on the run
+   * record, and return whether the caller may proceed.
+   */
+  private async runGoogleAdsTrackingGate(
+    customerId: string,
+    campaignResourceName: string,
+    action: string,
+    override: boolean,
+    sessionId: string | undefined,
+    finalUrls: string[],
+  ): Promise<{ proceed: boolean; blockResult?: any }> {
+    const gate = await preflightTrackingGate(finalUrls);
+    const urlResults = gate.results.map(r => ({ url: r.url, status: r.status, mechanisms: r.mechanisms, error: r.error }));
+
+    if (gate.ok) {
+      await chatbotDb.recordGoogleAdsMeasurementCheck(sessionId || '', {
+        customerId, campaignResourceName, action, outcome: 'passed', urlResults, checkedAt: new Date().toISOString(),
+      });
+      return { proceed: true };
+    }
+
+    if (override) {
+      await chatbotDb.recordGoogleAdsMeasurementCheck(sessionId || '', {
+        customerId, campaignResourceName, action, outcome: 'overridden', urlResults, checkedAt: new Date().toISOString(),
+      });
+      return { proceed: true };
+    }
+
+    await chatbotDb.recordGoogleAdsMeasurementCheck(sessionId || '', {
+      customerId, campaignResourceName, action, outcome: 'blocked', urlResults, checkedAt: new Date().toISOString(),
+    });
+    return {
+      proceed: false,
+      blockResult: {
+        success: false,
+        blocked: true,
+        reason: 'tracking_preflight',
+        error: gate.message,
+        trackingCheck: { measured: false, urlResults },
+      },
+    };
+  }
+
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
     entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
     action: string;
     [key: string]: any;
-  }): Promise<any> {
+  }, opts?: { sessionId?: string }): Promise<any> {
     try {
       const { customer_id, entity_type, action } = args;
+      const overrideTrackingCheck = args.override_tracking_check === true;
 
       if (entity_type === 'BIDDING_STRATEGY' && action === 'LIST') {
         const biddingStrategies = await googleAdsService.listBiddingStrategies(userId, customer_id);
@@ -27913,6 +28008,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'RESUME') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for RESUME action' };
+          const gate = await this.enforceGoogleAdsLaunchGate(userId, customer_id, args.campaign_resource_name, 'RESUME', overrideTrackingCheck, opts?.sessionId);
+          if (!gate.proceed) return gate.blockResult;
           await googleAdsService.resumeCampaign(userId, customer_id, args.campaign_resource_name);
           return { success: true, message: 'Campaign resumed' };
         }
@@ -27951,6 +28048,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for UPDATE action' };
+          // Enabling a campaign via UPDATE(status=ENABLED) is a launch — gate it like RESUME.
+          if (args.status === 'ENABLED') {
+            const gate = await this.enforceGoogleAdsLaunchGate(userId, customer_id, args.campaign_resource_name, 'UPDATE', overrideTrackingCheck, opts?.sessionId);
+            if (!gate.proceed) return gate.blockResult;
+          }
           const didUpdate = await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
             name: args.name,
             status: args.status,
@@ -28075,6 +28177,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!args.ad_group_resource_name || !args.type || !args.headlines || !args.descriptions || !args.final_url) {
             return { success: false, error: 'ad_group_resource_name, type, headlines, descriptions, and final_url are required to create an ad' };
           }
+          // ENG-335: an ad added to an already-live campaign serves paid traffic
+          // instantly — gate its final_url like a launch when the parent is ENABLED.
+          // Fail-open on a lookup/gate error: this is defence-in-depth (the RESUME /
+          // UPDATE→ENABLED gate is the hard guarantee), so a transient parent-status
+          // lookup failure must NOT break an otherwise-valid ad creation.
+          try {
+            const parent = await googleAdsService.getAdGroupCampaign(userId, customer_id, args.ad_group_resource_name);
+            if (parent) {
+              const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, parent.campaignResourceName, parent.campaignStatus, 'AD_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
+              if (!gate.proceed) return gate.blockResult;
+            }
+          } catch (gateErr) {
+            console.error('[ENG-335] AD_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
+          }
           let adType = args.type as string;
           if (adType === 'SEARCH') adType = 'RESPONSIVE_SEARCH_AD';
           else if (adType === 'DISPLAY') adType = 'RESPONSIVE_DISPLAY_AD';
@@ -28124,6 +28240,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             !args.descriptions || !args.square_image_assets || !args.landscape_image_assets ||
             !args.logo_assets || !args.final_url) {
           return { success: false, error: 'name, campaign_resource_name, headlines, long_headlines, descriptions, square_image_assets, landscape_image_assets, logo_assets, and final_url are required' };
+        }
+        // ENG-335: a PMax asset group added to an already-live campaign serves paid
+        // traffic instantly — gate its final_url like a launch when the parent is ENABLED.
+        // Fail-open on a lookup/gate error (see AD_CREATE above): defence-in-depth, so a
+        // transient campaign-status lookup failure must NOT break a valid asset-group create.
+        try {
+          const campaignStatus = await googleAdsService.getCampaignStatus(userId, customer_id, args.campaign_resource_name);
+          const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, args.campaign_resource_name, campaignStatus, 'ASSET_GROUP_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
+          if (!gate.proceed) return gate.blockResult;
+        } catch (gateErr) {
+          console.error('[ENG-335] ASSET_GROUP_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
         }
         const assetGroup = await googleAdsService.createAssetGroup(userId, customer_id, {
           name: args.name,
