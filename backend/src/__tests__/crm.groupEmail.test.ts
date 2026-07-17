@@ -462,6 +462,32 @@ describe('CRM Group Email Endpoints', () => {
         expect(response.failed).toBe(1);
       });
 
+      it('FAIL: surfaces the actual failure reason per address, not just a bare count', async () => {
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test-user-id' });
+        (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+          items: [{ leadId: '1', email: 'a@test.com' }],
+          lastEvaluatedKey: undefined,
+        });
+        (resendService.sendEmail as jest.Mock).mockRejectedValueOnce(
+          new Error('Gmail access was revoked. Please reconnect your Gmail account in Settings → Connected Accounts.'),
+        );
+
+        mockReq.body = {
+          senderEmail: 'me@test.com',
+          senderName: 'Me',
+          subject: 'Hi',
+          htmlContent: '<p>Hello</p>',
+        };
+
+        const handler = findHandler('/lists/:listId/group-email/send', 'post');
+        await handler!(mockReq, mockRes);
+
+        const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+        expect(response.failureReasons).toEqual([
+          { email: 'a@test.com', reason: expect.stringContaining('Gmail access was revoked') },
+        ]);
+      });
+
       it('SUCCESS: a mailbox sender under the cap sends via its real provider, not Resend', async () => {
         mailboxSenderConfig();
         mockGetEmailProvider.mockReturnValue({

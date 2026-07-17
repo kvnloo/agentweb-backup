@@ -368,6 +368,7 @@ router.post(
     let sent = 0;
     let failedCount = 0;
     const failedEmails: string[] = [];
+    const failureReasons: Array<{ email: string; reason: string }> = [];
 
     for (const email of validEmails) {
       try {
@@ -378,9 +379,11 @@ router.post(
         });
         sent++;
       } catch (err: any) {
-        console.error(`[sequences] Failed to send test email to ${email}:`, err.message || err);
+        const reason = err.message || String(err);
+        console.error(`[sequences] Failed to send test email to ${email}:`, reason);
         failedCount++;
         failedEmails.push(email);
+        failureReasons.push({ email, reason });
       }
     }
 
@@ -389,6 +392,7 @@ router.post(
       sent,
       failed: failedCount,
       failedEmails,
+      failureReasons,
     });
   },
 );

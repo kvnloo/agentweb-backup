@@ -5868,6 +5868,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     let sent = 0;
     let failed = 0;
     const failedEmails: string[] = [];
+    const failureReasons: Array<{ email: string; reason: string }> = [];
 
     for (const lead of eligibleLeads) {
       try {
@@ -5896,9 +5897,11 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
         });
         sent++;
       } catch (err: any) {
-        console.error(`Failed to send group email to ${lead.email}:`, err.message || err);
+        const reason = err.message || String(err);
+        console.error(`Failed to send group email to ${lead.email}:`, reason);
         failed++;
         failedEmails.push(lead.email);
+        failureReasons.push({ email: lead.email, reason });
       }
 
       // Emit progress
@@ -5912,6 +5915,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       sent,
       failed,
       failedEmails,
+      failureReasons,
       skippedUnsubscribed: skippedDoNotContact,
       skippedDoNotContact,
       skippedMissingVars,
@@ -5992,6 +5996,7 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
     let sent = 0;
     let failedCount = 0;
     const failedEmails: string[] = [];
+    const failureReasons: Array<{ email: string; reason: string }> = [];
 
     for (const email of validEmails) {
       try {
@@ -6003,14 +6008,17 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
         });
         sent++;
       } catch (err: any) {
-        console.error(`Failed to send test group email to ${email}:`, err.message || err);
+        const reason = err.message || String(err);
+        console.error(`Failed to send test group email to ${email}:`, reason);
         failedCount++;
         failedEmails.push(email);
+        failureReasons.push({ email, reason });
       }
     }
 
     return res.json({
       total: validEmails.length,
+      failureReasons,
       sent,
       failed: failedCount,
       failedEmails,
