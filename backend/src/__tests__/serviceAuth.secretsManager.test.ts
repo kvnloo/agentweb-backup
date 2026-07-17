@@ -161,6 +161,45 @@ describe('requireScheduledChatsServiceSecret — Secrets Manager path (ENG-359)'
       expect(next).toHaveBeenCalledTimes(1);
       expect(res.status).not.toHaveBeenCalled();
     });
+
+    it('SM returns an empty string → fail-open', async () => {
+      mockGetSecret.mockResolvedValue('');
+      const res = mockRes();
+      const next = jest.fn();
+      await requireScheduledChatsServiceSecret(mockReqWithHeader('x'), res, next);
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(res.status).not.toHaveBeenCalled();
+    });
+
+    it('SM returns a JSON scalar (not an object) → fail-open', async () => {
+      mockGetSecret.mockResolvedValue('"just-a-string"');
+      const res = mockRes();
+      const next = jest.fn();
+      await requireScheduledChatsServiceSecret(mockReqWithHeader('x'), res, next);
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(res.status).not.toHaveBeenCalled();
+    });
+
+    it('SM returns JSON null → fail-open', async () => {
+      mockGetSecret.mockResolvedValue('null');
+      const res = mockRes();
+      const next = jest.fn();
+      await requireScheduledChatsServiceSecret(mockReqWithHeader('x'), res, next);
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(res.status).not.toHaveBeenCalled();
+    });
+
+    it('SM rejects with a non-Error value → still fails open (error-string fallback)', async () => {
+      mockGetSecret.mockRejectedValue('bare-string-failure');
+      const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const res = mockRes();
+      const next = jest.fn();
+      await requireScheduledChatsServiceSecret(mockReqWithHeader(undefined), res, next);
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(res.status).not.toHaveBeenCalled();
+      expect(errSpy).toHaveBeenCalled();
+    });
   });
 
   describe('TTL cache', () => {
