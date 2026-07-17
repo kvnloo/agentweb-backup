@@ -149,7 +149,16 @@ async function defaultFetchHtml(url: string): Promise<string> {
       maxBodyLength: MAX_HTML_BYTES,
       maxRedirects: 0,
       validateStatus: (s: number) => s >= 200 && s < 400,
-      headers: { 'User-Agent': 'AgentWeb-TrackingPreflight/1.0' },
+      // Present as a real browser: we want the HTML a genuine visitor's browser is
+      // served, and a custom bot UA is far more likely to be handed a WAF/bot-challenge
+      // page (no tracking snippet ⇒ a false "unmeasured" block on a legitimately-tracked
+      // landing page). Accept-* headers mirror a normal navigation for the same reason.
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+          '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
     } as any) as any,
   });
 }
