@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-07-17',
     changes: [
+      'New: Send Campaigns and Sequences From a Connected Outlook / Microsoft 365 Mailbox',
+      '- Previously, a connected Outlook mailbox could only be used to send from Emma chat — campaigns and sequences always sent through your custom-domain sender instead',
+      '- Now, selecting a connected Outlook (or Gmail) mailbox as your sender works the same way for campaigns, sequence steps, and single-lead sends: the email leaves from your own mailbox, and a copy lands in your Sent folder',
+      '- Mailbox senders don\'t report opens or clicks (no tracking pixel), so a campaign sent this way is capped at 50 recipients — larger sends still need a custom-domain sender',
+      '- Bounced or rejected messages from a connected Outlook mailbox are now automatically detected and the lead is marked do-not-contact, the same protection your custom-domain senders already had via Resend',
+    ],
+  },
+  {
+    date: '2026-07-17',
+    changes: [
       'Retired: Local Agent Browser Fallback',
       '- The Local Agent (a relay to a real browser running on a local machine) has been retired and its tools no longer run',
       '- If an older skill or scheduled chat still tries to use it, Emma now gets a clear message explaining it was retired and pointing her at web search instead of silently failing',
@@ -46,6 +56,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Changed: Attaching a CRM List Republishes the Page',
       '- The code that saves leads lives inside the page itself, so changing the CRM list republishes your live page. It takes about a minute, and the dashboard now tells you before and after',
       '- Detaching a list now asks you to confirm, because it stops that page saving leads immediately',
+    ],
+  },
+  {
+    date: '2026-07-13',
+    changes: [
+      'Fixed: Sequences Now Stop When a Lead Engages',
+      '- If you set a sequence to stop once a lead opens, clicks, or replies, that setting was not being applied. The check behind it never ran, so a sequence would keep sending regardless',
+      '- Replies were not checked at all — the case where it stings most: a lead answers you, and the automated follow-ups keep arriving anyway',
+      '- All three now work, and you can choose whichever fits the campaign: stop on open, on click, or on reply',
+      '- Only engagement that happens AFTER a lead is enrolled counts, so an old open or click from an earlier campaign will not cut a new sequence short',
     ],
   },
   {

@@ -24,6 +24,12 @@ export interface Setting {
   description?: string;
   updatedAt: string;
   updatedBy: string;
+  /**
+   * Optional epoch-second DynamoDB TTL attribute. Only written when a caller opts in
+   * (e.g. oauthTokenSessionStore) — omitted for every other setting, preserving today's
+   * "settings live forever unless explicitly deleted" behavior exactly.
+   */
+  ttl?: number;
 }
 
 export interface PredefinedPlan {
@@ -76,16 +82,21 @@ export class SettingsService {
     }
   }
 
-  async setSetting(settingName: string, settingValue: string, description?: string, updatedBy: string = 'system'): Promise<Setting> {
+  async setSetting(settingName: string, settingValue: string, description?: string, updatedBy: string = 'system', ttl?: number): Promise<Setting> {
     try {
+      if (ttl !== undefined && !Number.isFinite(ttl)) {
+        throw new Error(`Invalid ttl for setting "${settingName}": must be a finite epoch-second number, got ${ttl}`);
+      }
+
       const timestamp = new Date().toISOString();
-      
+
       const setting: Setting = {
         settingName,
         settingValue,
         description,
         updatedAt: timestamp,
-        updatedBy
+        updatedBy,
+        ...(ttl !== undefined ? { ttl } : {}),
       };
 
       const params = {

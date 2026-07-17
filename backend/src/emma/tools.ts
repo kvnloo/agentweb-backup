@@ -3827,8 +3827,8 @@ emmaToolRegistry.register({
     description:
       'Send a one-off email to any recipient using the user\'s CONFIGURED email sender (set up in CRM → Senders). ' +
       'Use this for ad-hoc emails that are NOT tied to a CRM lead draft — e.g. "send an email to alice@example.com". ' +
-      'This does NOT require a connected Gmail account: it sends through the user\'s configured sender (a verified custom-domain sender, or a connected Gmail-account sender). ' +
-      'Prefer this over the `email` tool when the user has no connected Gmail account but has a configured sender. ' +
+      'This does NOT require a connected mailbox: it sends through the user\'s configured sender (a verified custom-domain sender, or a connected Gmail / Outlook mailbox sender). ' +
+      'Prefer this over the `email` tool when the user has no connected mailbox but has a configured sender. ' +
       'If no sender is configured, tell the user to open CRM, select a lead list, and click "Senders" to configure one. ' +
       'IMPORTANT about delivery: a successful result means the email was ACCEPTED for delivery by the provider, NOT that it reached the recipient\'s inbox. Do not claim guaranteed delivery — say it was "sent" or "queued for delivery". The provider cannot detect a well-formed but non-existent mailbox at send time; such messages bounce asynchronously to the sender\'s own inbox. Always double-check the recipient address with the user before sending if it looks suspicious. Malformed addresses are rejected before sending.',
     inputSchema: {
@@ -3857,7 +3857,7 @@ emmaToolRegistry.register({
         },
         sender_id: {
           type: 'string',
-          description: 'Optional sender to send from. Accepts the sender\'s email address, its from-name, the keyword "gmail" (to use the configured Gmail-account sender), or the internal id. Omit to use the user\'s default configured sender. If the value does not match any configured sender, the tool returns the list of available senders (each marked [gmail] or [resend]) — relay those options to the user rather than claiming no sender exists.'
+          description: 'Optional sender to send from. Accepts the sender\'s email address, its from-name, the keyword "gmail" or "outlook" (to use the corresponding connected-mailbox sender), or the internal id. Omit to use the user\'s default configured sender. If the value does not match any configured sender, the tool returns the list of available senders (each marked [gmail], [outlook] or [resend]) — relay those options to the user rather than claiming no sender exists.'
         }
       },
       required: ['to', 'subject']
@@ -5970,8 +5970,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    const { bootstrapEmailProviders, resolveEmailAccount } = await import('../services/emailProviderService');
-    const { GmailNotConnectedError, GmailTokenRevokedError, GmailQuotaError, GmailBodyTooLargeError, GmailSendNotAuthorizedError } = await import('../services/gmailService');
+    const { bootstrapEmailProviders, resolveEmailAccount, EmailProviderError } = await import('../services/emailProviderService');
 
     const userId = context?.userId;
     if (!userId) throw new Error('Missing user context');
@@ -6024,10 +6023,8 @@ emmaToolRegistry.register({
           return { error: `Unknown action "${args.action}". Valid actions: search, list, get, send.` };
       }
     } catch (err: any) {
-      if (err instanceof GmailBodyTooLargeError) return { error: err.message };
-      if (err instanceof GmailNotConnectedError || err instanceof GmailTokenRevokedError) return { error: err.message };
-      if (err instanceof GmailQuotaError) return { error: err.message };
-      if (err instanceof GmailSendNotAuthorizedError) return { error: err.message };
+      // Covers every provider (Gmail, Outlook, ...) — they all extend EmailProviderError.
+      if (err instanceof EmailProviderError) return { error: err.message };
       if (err.message?.includes('not found') || err.message?.includes('not an email account')) return { error: err.message };
       throw err;
     }

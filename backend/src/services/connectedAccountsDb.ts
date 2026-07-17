@@ -4,7 +4,7 @@ import { userDb, User } from './db';
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive';
 
 /**
  * Base OAuth configuration shared across all platforms
@@ -107,6 +107,29 @@ export interface GmailConfig extends BaseOAuthConfig {
   display_name?: string;   // User's display name from Google profile
   picture_url?: string;    // Profile picture URL
   granted_scopes: string[]; // Actual scopes granted (may differ from requested)
+}
+
+/**
+ * Outlook / Microsoft 365 OAuth configuration.
+ *
+ * Unlike Google, Microsoft ROTATES refresh tokens: every refresh returns a new
+ * refresh_token that must be persisted, or the connection dies after the first
+ * refresh. `refresh_token` is therefore required (offline_access grants it), and
+ * `needs_reconnect` is set when a refresh fails — same pattern as TwitterXConfig.
+ */
+export interface OutlookConfig extends BaseOAuthConfig {
+  account_type: 'outlook';
+  email: string;            // Mailbox address (used as account_id)
+  display_name?: string;    // From the Graph /me profile
+  granted_scopes: string[]; // Actual scopes granted (may differ from requested)
+  tenant_id?: string;       // Entra tenant the mailbox belongs to
+  needs_reconnect?: boolean; // set when a refresh fails; cleared on reconnect
+  // refresh_token is inherited optional from BaseOAuthConfig, but Outlook cannot
+  // function without one (offline_access grants it). outlookAuth refuses to store
+  // an account lacking one, and outlookService throws if it is ever missing.
+  // Watermark for outlookBounceMonitorCron (ENG-266 Part 3) — the last receivedDateTime
+  // scanned for NDRs, so each run only looks at mail since the previous one.
+  lastNdrCheckAt?: string;
 }
 
 /**
@@ -251,7 +274,7 @@ export interface TwitterXConfig extends BaseOAuthConfig {
   needs_reconnect?: boolean; // set when token refresh fails (revoked/expired refresh token); cleared on reconnect
 }
 
-export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig;
+export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig;
 
 /**
  * Per-connection engagement memory: a persona profile generated from LinkedIn data
@@ -602,19 +625,28 @@ export interface ConnectedAccountWithUser extends ConnectedAccount {
 }
 
 /**
- * Get a specific connected account by account_id and userId
- * Directly looks up the user to find the account, avoiding full table scan
+ * Get a specific connected account by account_id and userId.
+ * Directly looks up the user to find the account, avoiding full table scan.
+ *
+ * `platform` is optional and disambiguates accounts that share the same
+ * account_id across different platforms (e.g. a Gmail and a Google Drive
+ * connection under the same Google email). Omitting it preserves the
+ * pre-existing behavior of matching on account_id alone (first match wins).
  */
 export const getAccountById = async (
   accountId: string,
-  userId: string
+  userId: string,
+  platform?: PlatformType | PlatformType[]
 ): Promise<ConnectedAccountWithUser | null> => {
   try {
     const user = await userDb.getUserById(userId);
+    const platforms = platform === undefined ? null : ([] as PlatformType[]).concat(platform);
 
     if (user) {
       const accounts = normalizeAccounts((user as User).connected_accounts);
-      const account = accounts.find(acc => acc.account_id === accountId);
+      const account = accounts.find(
+        acc => acc.account_id === accountId && (platforms === null || platforms.includes(acc.platform))
+      );
 
       if (account) {
         return {
