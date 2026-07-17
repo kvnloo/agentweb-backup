@@ -25,6 +25,38 @@ and 409 the real owner for the ttl window).
 - An authenticated user generating on an `anon_` session pre-transfer would now 403 — but
   `getSession` already 403s that same read today, so no working client flow can hit it.
 
+## ENG-358: v0-credit alert dedupe at the intake gate — class clustering + Duplicate-state leak (2026-07-16)
+
+The hourly v0-credit alert filed a new Linear issue per occurrence (14 near-identical issues in 5
+days, ENG-292…350) and, after a manual dedupe pass, appended its recurrence comments to a canceled
+**Duplicate** (ENG-350) instead of the open canonical (ENG-337). Two root causes, both fixed at the
+ENG-240 intake gate:
+
+1. **Titles embed occurrence data.** `v0 credits LOW — $59.15 spendable` changes with every balance
+   move, so `fileAutoIssue`'s normalized-title fallback never matched and each occurrence filed
+   fresh. Fix: (a) alert-class clustering — the v0 filer now passes `"Alert Class": "v0-credits"` +
+   `"Alert Priority"` in its context; the gate matches candidates whose body carries the rendered
+   `Alert Class: <name>` line before any title comparison (same context-key mechanism as the
+   Session/Schedule idempotency keys), and escalates the open canonical in place (raise-only
+   priority + title refresh via new `linearService.escalateIssue`) on low→critical. (b) The title
+   norm is now amount-insensitive (`$58.51` ≡ `$59.15`) so pre-existing canonicals without the
+   class marker keep matching post-deploy.
+2. **Linear's Duplicate state has its own state type.** Verified live on ENG-350: `statusType:
+   "duplicate"` — NOT `"canceled"`. `listOpenIssuesByLabel` / `listOpenBugCanonicals` filtered with
+   a `nin: [completed, canceled]` blacklist, so duplicate-state issues stayed dedupe candidates and
+   absorbed recurrences. Both now WHITELIST open state types (`triage, backlog, unstarted,
+   started`), which also future-proofs against new closed-ish types.
+
+**Assumptions to validate**
+- The hourly re-fire itself (24h in-memory `lastAlerted` window not holding across prod
+  instances/worker restarts — observed 5+ alerts in one morning) is NOT fixed here; the gate now
+  makes re-fires converge on one issue, but each still sends an oncall email. If email cadence
+  matters, the window needs durable state (ENG-345 seam). Flagged on the Linear issue.
+- Priority mapping chosen: v0 `low` → High, `critical` → Urgent. Adjust in
+  `ALERT_PRIORITY_BY_LEVEL` (v0BillingService) if the board should rank ops alerts differently.
+- Amount-insensitive title normalization intentionally treats two auto-issue titles differing only
+  by a dollar figure as the same issue. No current Auto filer embeds amounts except the v0 alert.
+
 ## ENG-326 review hardening: org dead-ends, unverified persists, guard false negatives (2026-07-15)
 
 Senior review of the ENG-326 branch surfaced four real bugs in the first cut; all fixed with tests.
