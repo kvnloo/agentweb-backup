@@ -184,4 +184,17 @@ describe('AgentModeService.getLeadDetails – linkedInConnectionStatus', () => {
     expect(mockResolveUserOwnedAccountId).toHaveBeenCalledWith(userId);
     expect(mockGetConnection).not.toHaveBeenCalled();
   });
+
+  it('returns isConnected:false and does not throw when the fallback account lookup fails', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue(mockListNoAccount as any);
+    mockCrmDb.getLeadById.mockResolvedValue(baseLead as any);
+    mockResolveUserOwnedAccountId.mockRejectedValue(new Error('DynamoDB timeout'));
+
+    const result = await service.getLeadDetails(listId, leadId, userId);
+
+    expect(result.success).toBe(true);
+    expect(result.lead.linkedInConnectionStatus).toEqual({ isConnected: false });
+    expect(mockResolveUserOwnedAccountId).toHaveBeenCalledWith(userId);
+    expect(mockGetConnection).not.toHaveBeenCalled();
+  });
 });
