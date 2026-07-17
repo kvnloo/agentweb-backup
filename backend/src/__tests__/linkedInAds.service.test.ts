@@ -305,7 +305,7 @@ describe('createCreative', () => {
     expect(result.error).toContain('ad_account_id');
   });
 
-  it('attaches Lead Gen callToAction for a sponsored content lead gen creative', async () => {
+  it('attaches Lead Gen leadgenCallToAction for a sponsored content lead gen creative', async () => {
     await svc.createCreative(ACCESS_TOKEN, {
       campaign_id: 'camp-1',
       post_urn: 'urn:li:share:999',
@@ -314,9 +314,9 @@ describe('createCreative', () => {
       cta_label_type: 'SIGN_UP',
     });
     const call = mockAxiosFn.mock.calls[0][0];
-    expect(call.data.callToAction).toEqual({
-      target: 'urn:li:adForm:1016740005',
-      labelType: 'SIGN_UP',
+    expect(call.data.leadgenCallToAction).toEqual({
+      destination: 'urn:li:adForm:1016740005',
+      label: 'SIGN_UP',
     });
   });
 
@@ -397,7 +397,7 @@ describe('createCreativeInline', () => {
     expect(result.error).toContain('author_urn');
   });
 
-  it('attaches Lead Gen callToAction (target + labelType) for a lead gen creative', async () => {
+  it('attaches Lead Gen leadgenCallToAction (destination + label) for a lead gen creative', async () => {
     await svc.createCreativeInline(ACCESS_TOKEN, {
       ad_account_id: ACCOUNT_ID,
       campaign_id: 'camp-1',
@@ -408,9 +408,9 @@ describe('createCreativeInline', () => {
       cta_label_type: 'SIGN_UP',
     });
     const call = mockAxiosFn.mock.calls[0][0];
-    expect(call.data.creative.callToAction).toEqual({
-      target: 'urn:li:adForm:1016740005',
-      labelType: 'SIGN_UP',
+    expect(call.data.creative.leadgenCallToAction).toEqual({
+      destination: 'urn:li:adForm:1016740005',
+      label: 'SIGN_UP',
     });
   });
 
@@ -424,9 +424,9 @@ describe('createCreativeInline', () => {
       cta_label_type: 'download',
     });
     const call = mockAxiosFn.mock.calls[0][0];
-    expect(call.data.creative.callToAction).toEqual({
-      target: 'urn:li:adForm:1016740005',
-      labelType: 'DOWNLOAD',
+    expect(call.data.creative.leadgenCallToAction).toEqual({
+      destination: 'urn:li:adForm:1016740005',
+      label: 'DOWNLOAD',
     });
   });
 
@@ -454,7 +454,7 @@ describe('createCreativeInline', () => {
     expect(result.error).toContain('leadgen_form_urn');
   });
 
-  it('omits callToAction for a non-lead-gen creative', async () => {
+  it('omits leadgenCallToAction for a non-lead-gen creative', async () => {
     await svc.createCreativeInline(ACCESS_TOKEN, {
       ad_account_id: ACCOUNT_ID,
       campaign_id: 'camp-1',
@@ -462,7 +462,7 @@ describe('createCreativeInline', () => {
       image_urn: 'urn:li:image:img-1',
     });
     const call = mockAxiosFn.mock.calls[0][0];
-    expect(call.data.creative.callToAction).toBeUndefined();
+    expect(call.data.creative.leadgenCallToAction).toBeUndefined();
   });
 });
 
