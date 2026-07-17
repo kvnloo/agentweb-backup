@@ -79,29 +79,79 @@ export function detectTrackingSnippets(html: string): string[] {
   return [...found];
 }
 
-/* istanbul ignore next — network boundary; unit tests inject `fetchHtml` instead. */
+/** Max redirect hops to follow before giving up (→ 'unverifiable'). */
+const MAX_REDIRECTS = 5;
+
+export interface RedirectFetchDeps {
+  /** One HTTP GET that does NOT auto-follow redirects and surfaces 3xx as a resolved
+   *  response (so we can read Location and re-check SSRF ourselves). */
+  get: (url: string) => Promise<{ status: number; headers: Record<string, any>; data: any }>;
+  /** SSRF guard, run on every hop (start URL and each redirect target). */
+  assertPublic: (url: string) => Promise<void>;
+  maxRedirects?: number;
+}
+
+/**
+ * Fetch a URL's served HTML, following redirects MANUALLY and re-validating the
+ * SSRF guard on every hop. This is deliberately not `axios`'s built-in redirect
+ * following: axios only lets us vet the *pre-redirect* host, so a final URL that
+ * 302s to an internal/metadata endpoint would bypass the guard (the ENG-335
+ * security finding). Refusing all redirects (`maxRedirects:0`) closed that hole
+ * but false-blocked every measured page behind a normal apex→www / http→https /
+ * rebrand redirect — i.e. most real landing pages. Following hop-by-hop with a
+ * fresh `assertPublic` on each target keeps BOTH properties: SSRF-safe across
+ * redirects, and correct for legitimately-measured pages that redirect once.
+ *
+ * Pure and injectable (deps) so the redirect/SSRF behaviour is unit-testable
+ * without real network or DNS.
+ */
+export async function fetchHtmlFollowingRedirects(startUrl: string, deps: RedirectFetchDeps): Promise<string> {
+  const maxRedirects = deps.maxRedirects ?? MAX_REDIRECTS;
+  let url = startUrl;
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    await deps.assertPublic(url); // re-validate the resolved host at EVERY hop
+    const res = await deps.get(url);
+    if (res.status >= 200 && res.status < 300) {
+      return typeof res.data === 'string' ? res.data : String(res.data ?? '');
+    }
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers?.location ?? res.headers?.Location;
+      if (!location) throw new Error(`Redirect ${res.status} with no Location header`);
+      const next = new URL(String(location), url); // resolve relative Location against current URL
+      if (next.protocol !== 'http:' && next.protocol !== 'https:') {
+        throw new Error(`Refusing to follow non-http(s) redirect to ${next.protocol}`);
+      }
+      url = next.toString();
+      continue;
+    }
+    throw new Error(`Request failed with status code ${res.status}`);
+  }
+  throw new Error(`Too many redirects (>${maxRedirects})`);
+}
+
+/* istanbul ignore next — network boundary; unit tests inject `fetchHtml` (or exercise
+   fetchHtmlFollowingRedirects with fake deps) instead. */
 async function defaultFetchHtml(url: string): Promise<string> {
-  // The URL originates from campaign final URLs (agent/user-supplied), so guard
-  // against SSRF before the server-side fetch — mirrors uploadAsset / routes/crm.ts.
-  await assertPublicHostname(url);
   const MAX_HTML_BYTES = 5 * 1024 * 1024; // 5 MB is plenty for a landing page document
   // `as any` routes around the legacy @types/axios shim that omits maxContentLength /
-  // validateStatus (same workaround as googleAdsService.uploadAsset). Any non-2xx
-  // (a 4xx/5xx landing page) throws → surfaced as 'unverifiable' by checkUrlTracking.
-  // maxRedirects:0 — assertPublicHostname only vets the pre-redirect host, so a URL
-  // that 302s to an internal/metadata endpoint would bypass the SSRF guard if we
-  // followed it. A redirect therefore surfaces as non-2xx → 'unverifiable', mirroring
-  // routes/crm.ts and googleAdsService.uploadAsset.
-  const response = await axios.get(url, {
-    responseType: 'text',
-    timeout: 10000,
-    maxContentLength: MAX_HTML_BYTES,
-    maxBodyLength: MAX_HTML_BYTES,
-    maxRedirects: 0,
-    validateStatus: (s: number) => s >= 200 && s < 300,
-    headers: { 'User-Agent': 'AgentWeb-TrackingPreflight/1.0' },
-  } as any);
-  return typeof response.data === 'string' ? response.data : String(response.data ?? '');
+  // validateStatus (same workaround as googleAdsService.uploadAsset). maxRedirects:0 so
+  // axios never follows on its own — fetchHtmlFollowingRedirects does, re-running the SSRF
+  // guard on each hop. validateStatus accepts 3xx so we can read the Location header;
+  // any 4xx/5xx throws → surfaced as 'unverifiable' by checkUrlTracking.
+  return fetchHtmlFollowingRedirects(url, {
+    assertPublic: assertPublicHostname,
+    // `as any` on the result too: the legacy @types/axios shim types get() as a
+    // non-standard IPromise that doesn't structurally match our Promise<...> dep.
+    get: (u: string) => axios.get(u, {
+      responseType: 'text',
+      timeout: 10000,
+      maxContentLength: MAX_HTML_BYTES,
+      maxBodyLength: MAX_HTML_BYTES,
+      maxRedirects: 0,
+      validateStatus: (s: number) => s >= 200 && s < 400,
+      headers: { 'User-Agent': 'AgentWeb-TrackingPreflight/1.0' },
+    } as any) as any,
+  });
 }
 
 /**
