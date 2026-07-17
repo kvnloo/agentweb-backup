@@ -72,7 +72,7 @@ export class OutlookService implements IEmailService {
   // ── Token management ─────────────────────────────────────────────────────
 
   private async getValidAccessToken(userId: string, accountId: string): Promise<string> {
-    const account = await getAccountById(accountId, userId);
+    const account = await getAccountById(accountId, userId, 'outlook');
     if (!account) throw new OutlookNotConnectedError();
 
     const config = account.config as OutlookConfig;
@@ -158,7 +158,7 @@ export class OutlookService implements IEmailService {
   }
 
   private async assertCanSend(userId: string, accountId: string): Promise<void> {
-    const account = await getAccountById(accountId, userId);
+    const account = await getAccountById(accountId, userId, 'outlook');
     if (!account) throw new OutlookNotConnectedError();
     const config = account.config as OutlookConfig;
     const granted = config.granted_scopes || [];

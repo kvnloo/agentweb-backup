@@ -81,7 +81,7 @@ export class GmailService implements IEmailService {
   // ── Token management ─────────────────────────────────────────────────────
 
   private async getValidAccessToken(userId: string, accountId: string): Promise<string> {
-    const account = await getAccountById(accountId, userId);
+    const account = await getAccountById(accountId, userId, 'gmail');
     if (!account) throw new GmailNotConnectedError();
 
     const config = account.config as GmailConfig;
@@ -496,7 +496,7 @@ export class GmailService implements IEmailService {
    */
   async sendEmail(userId: string, accountId: string, params: SendEmailParams): Promise<SentEmailResult> {
     // Verify send scope was granted before touching the API
-    const account = await getAccountById(accountId, userId);
+    const account = await getAccountById(accountId, userId, 'gmail');
     if (!account) throw new GmailNotConnectedError();
     const config = account.config as GmailConfig;
     const hasSendScope = (config.granted_scopes || []).some(s => s.includes('gmail.send'));
