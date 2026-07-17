@@ -678,7 +678,7 @@ npm test
 
 These checks prevent CI failures and ensure code quality. The `npx tsc` command is especially important as it catches TypeScript type errors that may not be caught during development with hot reload.
 
-**CRITICAL:** Run `npm run typecheck` (or `npx tsc`) after **every** edit to any `.ts` file in the backend, including test files (`__tests__/*.test.ts`). Do not wait until all edits are done — verify compilation after each file change.
+**CRITICAL:** Run `npm run typecheck` after **every** edit to any `.ts` file in the backend, including test files (`__tests__/*.test.ts`). Do not wait until all edits are done — verify compilation after each file change.
 
 ## Commit Granularity
 
