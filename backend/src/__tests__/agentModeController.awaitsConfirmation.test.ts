@@ -41,6 +41,21 @@ describe('scheduledRunAwaitsConfirmation — unattended confirmation-halt detect
     'Pausing until you confirm the fallback plan.',
     'Holding off before proceeding with the aggregate report.',
     'Standing by for your reply before generating the report.',
+    // Exact phrasings a claude-opus-4-8 scheduled run emitted in the live ENG-369
+    // repro (these previously slipped past the detector — numbered-option menu,
+    // "please confirm one of these", "get your confirmation", "pick an option").
+    'Before I generate the report, please confirm one of these:',
+    'Before I build a maximum-granularity report, I need to flag a limitation and get your confirmation on scope.',
+    "Reply 1 (metadata-only report now) or 2 (report + file the feature request) and I'll build the full per-session table.",
+    'I can render all of them once you pick an option.',
+    'Please confirm before I generate the report.',
+    'I need you to decide which approach to use.',
+    // Second live Opus repro — a DIFFERENT phrasing, with markdown-bolded option
+    // numbers (which previously split "Reply **1**" so the digit never matched).
+    'How do you want to proceed?',
+    'Reply **1**, **2**, or **3** — I recommend option 3.',
+    'How would you like me to proceed with the report?',
+    'Which option would you prefer: the metadata table or the full export?',
   ];
 
   it.each(confirmationHalts)('fires on confirmation halt: %s', (text) => {
@@ -58,6 +73,13 @@ describe('scheduledRunAwaitsConfirmation — unattended confirmation-halt detect
     // "paused" mentioned as report content, NOT as a halt awaiting the user.
     'The Meta ad campaign is currently paused; spend has stopped. Report complete.',
     'Two leads paused their subscriptions this week. Full breakdown below.',
+    // The exact delivered-report ending from the passing (Gemini) live run — a
+    // finished report surfacing optional follow-ups must NOT fire the detector.
+    "👉 Next Step: Let me know if you need to filter this data by a specific user ID or if you'd like to analyze the token usage and costs for any particular session.",
+    // Benign mentions of "options", "choose", "reply", "confirmed" in finished reports.
+    'The report evaluates 3 pricing options the team is considering. Analysis complete.',
+    'The customer chose the annual plan; renewal is confirmed. Summary below.',
+    'Sent 12 replies across the 2 campaigns. Full log attached.',
     '',
   ];
 
