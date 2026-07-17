@@ -1,3 +1,30 @@
+## /generate session-ownership check (2026-07-16, ENG-346)
+
+Closed the pre-existing gap where `POST /api/agent-mode/generate` never compared `session.userId`
+to `req.user`: any authenticated user with someone else's sessionId could generate on that session.
+Check now sits BEFORE the ENG-147 idempotency claim + session-busy lock, so an unauthorized request
+touches no shared state (previously it would also have been able to squat the interactive idem claim
+and 409 the real owner for the ttl window).
+
+### Ownership audit of the session-parameterized agent-mode lanes (2026-07-16 snapshot)
+- Already checked: `getSession`, `verifiedGenerate` (strict), `uploadImageToSession`,
+  `updateSessionLlmModel`, `updateSessionTitle` (owner-or-admin), `getProgress` (owner or
+  delegated-admin-own-session). `transferSession` only mutates `anon_`-owned sessions.
+- `generateResponse` was the only GENERATE lane missing it — fixed here with the getSession
+  predicate (owner or admin; delegated tokens already resolve `req.user` to the target user).
+- **Still open**: `stopGeneration` (`POST /session/:sessionId/stop`) does no session read at all —
+  any authenticated user can cancel another user's in-flight run. Different verb + different
+  blast radius (adds a DB read to a fire-and-forget lane), filed separately as ENG-360.
+
+### Assumptions to validate
+- Raw (non-delegated) admins keep generate access for parity with every other session endpoint.
+  If the product stance becomes "admins must delegate to act on a user's session", tighten to the
+  `verifiedGenerate` strict predicate — one-line change, tests pin both lanes.
+- Error-precedence delta accepted: missing session is now 404 before the token-usage 429 read
+  (previously claim → lock → 429 → 404). No client observed depending on 429-before-404.
+- An authenticated user generating on an `anon_` session pre-transfer would now 403 — but
+  `getSession` already 403s that same read today, so no working client flow can hit it.
+
 ## ENG-358: v0-credit alert dedupe at the intake gate — class clustering + Duplicate-state leak (2026-07-16)
 
 The hourly v0-credit alert filed a new Linear issue per occurrence (14 near-identical issues in 5
