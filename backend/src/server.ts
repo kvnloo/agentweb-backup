@@ -396,6 +396,10 @@ const gracefulShutdown = async (signal: string) => {
   // 6. Close parent MCP clients after the drain (child has its own MCP instance)
   await agentModeService.shutdown();
 
+  // 6.5. Flush OTel spans (ENG-141) — best-effort, never rejects, no-op when
+  //      tracing is off. Deploy-killed runs are exactly the traces we need.
+  await (await import('./observability/tracing')).flushTelemetry();
+
   // 7. Clean exit
   process.exit(0);
 };
@@ -589,6 +593,25 @@ createTestAccount().then(async () => {
         console.log('[dripWorker] Initialized — running every 5 minutes');
       } catch (error) {
         console.error('[dripWorker] Failed to initialize:', error);
+      }
+
+      // ENG-324: Scheduled-run reconciler — crash-safe backstop for the drain.
+      // Recovers scheduled runs whose process died mid-flight (SIGTERM past the
+      // 10-min drain ceiling, SIGKILL, OOM) by requeuing any in-flight lease whose
+      // heartbeat has gone stale. Boot sweep reclaims runs orphaned by the PREVIOUS
+      // instance's death (the common deploy case); the interval catches the rest.
+      try {
+        const { reconcileStaleScheduledRuns, RECONCILE_INTERVAL_MS } = await import('./controllers/agentModeController');
+        cronJobRegistry.track('scheduledRunReconciler', reconcileStaleScheduledRuns())
+          .catch(e => console.error('[scheduledRunReconciler] Boot sweep error:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('scheduledRunReconciler', reconcileStaleScheduledRuns())
+            .catch(e => console.error('[scheduledRunReconciler] Sweep error:', e));
+        }, RECONCILE_INTERVAL_MS);
+        console.log(`[scheduledRunReconciler] Initialized — sweeping every ${Math.round(RECONCILE_INTERVAL_MS / 60000)} min`);
+      } catch (error) {
+        console.error('[scheduledRunReconciler] Failed to initialize:', error);
       }
 
       // Durable Landing-Page Poller — redeploy backstop for in-flight builds.

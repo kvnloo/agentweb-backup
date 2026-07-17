@@ -8,10 +8,16 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
-import { rankMemoriesByRelevance } from '../utils/memoryRanking';
+import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { computeTermination } from './agentMode/core/agentStep';
+import {
+  downloadBrandLogoToS3,
+  getPersistedBrandLogoUrlForUser,
+  missingBrandLogoToolResult,
+  promptRequestsLogo,
+} from './agentMode/brandLogo';
 import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
@@ -34,6 +40,12 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { recordUsage } from './usageRecorderService';
+import { meterUsageFromResponse } from '../utils/llmClients';
+import {
+  getModelPrice,
+  imageGenerationCostUsd,
+  videoGenerationCostUsd,
+} from '../utils/llmPricing';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
 import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmMutationEvents';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
@@ -114,6 +126,25 @@ import { HubSpotService } from './hubspotService';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
+import { computeRunVerdict } from '../loops/instances/agent-mode/runRecorder';
+// OTel spine (ENG-141) — inert no-ops unless exporter env config is present.
+import {
+  endChatSpan,
+  endInvokeAgentSpan,
+  getRunTraceId,
+  recordSpanError,
+  startInvokeAgentSpan,
+  startRunChildSpan,
+} from '../observability/tracing';
+import {
+  ATTR_GEN_AI_OPERATION_NAME,
+  ATTR_GEN_AI_PROVIDER_NAME,
+  ATTR_GEN_AI_REQUEST_MODEL,
+  ATTR_SESSION_ID,
+  GEN_AI_OP_CHAT,
+  SPAN_CHAT_PREFIX,
+  providerForModel,
+} from '../observability/semconv';
 import {
   AgentToolPolicyDecision,
   executeAgentToolThroughGateway,
@@ -260,15 +291,29 @@ function recordAgentModeRunStarted(
   runId: string,
   info: { llmModel?: string; sessionType?: string; userId?: string; sessionId?: string },
 ): void {
+  // OTel spine (ENG-141): the invoke_agent span opens here and closes in
+  // recordAgentModeRunCompleted/Failed — the run-telemetry lifecycle exactly.
+  // The traceId is bridged into the recorder's agent_run_started dimensions so
+  // Dev-AW-LoopEvents rows can be joined to Langfuse/Okareo traces by ID.
+  startInvokeAgentSpan(runId, info);
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
-  void recorder.runStarted(runId, info);
+  const traceId = getRunTraceId(runId);
+  void recorder.runStarted(runId, traceId ? { ...info, traceId } : info);
 }
 
 function recordAgentModeRunCompleted(
   runId: string,
   info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string; claimMismatch?: boolean },
 ): void {
+  endInvokeAgentSpan(runId, {
+    verdict: computeRunVerdict({
+      failed: false,
+      toolCalls: info.toolCalls ?? 0,
+      failedToolCalls: info.failedToolCalls ?? 0,
+      maxSameToolFailures: info.maxSameToolFailures,
+    }).verdict,
+  });
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runCompleted(runId, info);
@@ -296,6 +341,7 @@ function recordAgentModeRunFailed(
   runId: string,
   info: { error: unknown; toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
 ): void {
+  endInvokeAgentSpan(runId, { verdict: 'failed', error: info.error });
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runFailed(runId, info);
@@ -2445,41 +2491,21 @@ export class AgentModeService {
    * Prices are per 1M tokens (input/output).
    */
   private estimateCost(model: string, inputTokens: number, outputTokens: number, cacheReadTokens: number = 0, cacheWriteTokens: number = 0): number {
-    // Pricing per 1M tokens: [input, output]
-    const pricing: Record<string, [number, number]> = {
-      'anthropic.claude-sonnet-4-5-20250929-v1:0': [3, 15],
-      'anthropic.claude-sonnet-4-6': [3, 15],
-      'anthropic.claude-opus-4-6-v1': [15, 75],
-      'anthropic.claude-opus-4-8': [15, 75],
-      'gpt-5-chat-2': [2.5, 10],
-      'gpt-5.2-chat': [3, 12],
-      'gemini-3-pro-preview': [1.25, 10],
-      'gemini-3-flash-preview': [0.15, 0.6],
-      'gemini-3.1-pro-preview': [1.25, 10],
-      'gemini-3.1-flash-lite': [0.075, 0.3],
-      'gemini-3.5-flash': [0.15, 0.6],
-    };
-    const [inputPrice, outputPrice] = pricing[model] || [3, 15]; // Default to Sonnet pricing
-    // Cache reads are 10% of input price; cache writes are 125% of input price
-    const cacheReadPrice = inputPrice * 0.1;
-    const cacheWritePrice = inputPrice * 1.25;
+    // Single source of truth for rates: llmPricing.MODEL_PRICING (via getModelPrice).
+    // Unknown models fall back to Sonnet pricing here, preserving long-standing behavior.
+    const price = getModelPrice(model);
+    const inputPrice = price?.inPerM ?? 3;
+    const outputPrice = price?.outPerM ?? 15;
+    // Cache reads are 10% of input price; cache writes are 125% of input price.
+    const cacheReadPrice = price?.cacheReadPerM ?? inputPrice * 0.1;
+    const cacheWritePrice = price?.cacheWritePerM ?? inputPrice * 1.25;
     return (inputTokens * inputPrice + outputTokens * outputPrice
       + cacheReadTokens * cacheReadPrice + cacheWriteTokens * cacheWritePrice) / 1_000_000;
   }
 
-  /** Cost per image generation in USD (fixed per-generation pricing). */
+  /** Cost per image generation in USD (fixed per-generation pricing, sourced from llmPricing). */
   private estimateImageGenerationCost(model: string): number {
-    const pricing: Record<string, number> = {
-      'gpt-image-1': 0.04,
-      'gpt-image-2': 0.04,
-      'gemini-2.5-flash-image': 0.039,
-      'gemini-3-pro-image-preview': 0.039,
-      'gemini-3.1-flash-image': 0.039,
-      'gemini-3.1-flash-image-preview': 0.039,
-      'gen4_image': 0.05,
-      'gemini_2.5_flash': 0.04,
-    };
-    return pricing[model] ?? 0.04;
+    return imageGenerationCostUsd(model);
   }
 
   private isRetryableMediaToolError(error: unknown): boolean {
@@ -2535,18 +2561,8 @@ export class AgentModeService {
 
   /** Cost per video generation in USD. Veo bills per 8s clip, so longer videos cost proportionally more. */
   private estimateVideoGenerationCost(model: string, durationSeconds?: number): number {
-    const pricePerClip: Record<string, number> = {
-      'veo-3.1-generate-preview': 2.80,
-      'veo-3.1-fast-generate-preview': 1.40,
-      // Higgsfield Seedance — approximate per-clip cost; adjust to match billed Higgsfield rates.
-      'seedance-2.0': 0.50,
-    };
-    const clipPrice = pricePerClip[model] ?? 2.80;
-    const VEO_MAX_SECONDS = 8;
-    const clipCount = durationSeconds && durationSeconds > VEO_MAX_SECONDS
-      ? Math.ceil(durationSeconds / VEO_MAX_SECONDS)
-      : 1;
-    return clipPrice * clipCount;
+    // Per-clip rates sourced from llmPricing (single source of truth).
+    return videoGenerationCostUsd(model, durationSeconds);
   }
 
   /** Returns an onUsage callback that records LLM token usage for a named tool. */
@@ -2735,14 +2751,13 @@ export class AgentModeService {
               console.error('Failed to backfill account memory embedding:', e)
             );
           });
-          if (relevantMemories.length > 0) {
-            const memoryLines = relevantMemories.map(
-              (m: any) => `- [${m.category}] ${m.content}`
-            );
-            messages.push({
-              role: 'assistant',
-              content: `Account Memory (facts from previous sessions):\n${memoryLines.join('\n')}`
-            });
+          const accountMemoryMessage = buildMemoryContextMessage(
+            'Account Memory (facts from previous sessions):',
+            relevantMemories,
+            new Date()
+          );
+          if (accountMemoryMessage) {
+            messages.push({ role: 'assistant', content: accountMemoryMessage });
           }
         }
 
@@ -2756,14 +2771,13 @@ export class AgentModeService {
                 console.error('Failed to backfill org memory embedding:', e)
               );
             });
-            if (relevantOrgMemories.length > 0) {
-              const orgMemoryLines = relevantOrgMemories.map(
-                (m: any) => `- [${m.category}] ${m.content}`
-              );
-              messages.push({
-                role: 'assistant',
-                content: `Organization Memory (shared facts for "${org.name}"):\n${orgMemoryLines.join('\n')}`
-              });
+            const orgMemoryMessage = buildMemoryContextMessage(
+              `Organization Memory (shared facts for "${org.name}"):`,
+              relevantOrgMemories,
+              new Date()
+            );
+            if (orgMemoryMessage) {
+              messages.push({ role: 'assistant', content: orgMemoryMessage });
             }
           }
         }
@@ -2973,6 +2987,15 @@ export class AgentModeService {
         // Make LLM call (with backup model fallback on transient errors)
         const llmStart = Date.now();
         let response: any;
+        // OTel `chat` span (ENG-141): brackets the primary call AND the backup
+        // retry; the `finally` closes it with the FINAL model + usage attrs
+        // (response undefined there = both attempts threw → status ERROR).
+        const chatSpan = startRunChildSpan(agentRuntimeRunId, `${SPAN_CHAT_PREFIX} ${llmModel}`, {
+          [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OP_CHAT,
+          [ATTR_GEN_AI_REQUEST_MODEL]: llmModel,
+          [ATTR_GEN_AI_PROVIDER_NAME]: providerForModel(llmModel),
+          [ATTR_SESSION_ID]: sessionId,
+        });
         try {
           response = await this.callLLM(llmModel, trimmedMessages, {
             tools: filteredToolsCache,
@@ -3004,11 +3027,15 @@ export class AgentModeService {
                 usageContext: { userId, sessionId, feature: 'agent_task' }
               });
             } else {
+              recordSpanError(chatSpan, callError);
               throw callError;
             }
           } else {
+            recordSpanError(chatSpan, callError);
             throw callError;
           }
+        } finally {
+          endChatSpan(chatSpan, { model: llmModel, response, inputMessages: trimmedMessages });
         }
         const llmDurationMs = Date.now() - llmStart;
 
@@ -4275,10 +4302,6 @@ export class AgentModeService {
     // without a CRM lead+draft. Foundation so it is always offered alongside the
     // Gmail-only `email` tool.
     'send_email_from_sender',
-
-    // Local Agent Relay (Codex agent running on user's machine)
-    'run_local_agent_task',
-    'check_local_agent_status',
 
     // S3 overflow retrieval — always available so the LLM can read large tool
     // responses that were offloaded to S3 by the 10KB overflow mechanism.
@@ -6326,6 +6349,64 @@ export class AgentModeService {
   }
 
   /**
+   * Bound a describe_image vision LLM call so a slow or hung vision model fails
+   * fast instead of consuming the whole agent-mode generation wall-clock budget
+   * (ENG-294). Without this, a single un-bounded vision call can stall for the
+   * client's 5-minute per-request timeout — and with callLLM's internal retries
+   * plus the fallback model, one image could burn 10+ minutes and blow the run's
+   * GENERATION_TIMEOUT_MS (default 10 min). Reported by a CSV→CRM sync that OCR'd
+   * contact screenshots and timed out repeatedly (6 failed describe_image calls).
+   *
+   * The timeout REJECTS with a "timed out" error, which isRetryableMediaToolError()
+   * classifies as retryable — so a primary-model timeout routes to the fallback
+   * model rather than aborting the whole tool call. Set the timeout to exactly 0
+   * (via AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS=0) to disable the bound entirely.
+   *
+   * Parsing fails CLOSED: a malformed override (non-numeric like "90s", negative,
+   * or NaN) falls back to the default bound rather than silently disabling it —
+   * otherwise a typo would recreate the exact unbounded-call bug this exists to
+   * prevent. Only a clean, explicit 0 disables the timeout.
+   */
+  private static readonly DEFAULT_DESCRIBE_IMAGE_TIMEOUT_MS = 90000;
+
+  private async callVisionLLMWithTimeout(model: string, messages: any[], options: any): Promise<any> {
+    const timeoutMs = AgentModeService.resolveDescribeImageTimeoutMs();
+    if (timeoutMs <= 0) {
+      return this.callLLM(model, messages, options);
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`describe_image vision call to "${model}" timed out after ${timeoutMs}ms`)),
+        timeoutMs
+      );
+    });
+    try {
+      return await Promise.race([this.callLLM(model, messages, options), timeoutPromise]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Resolve the describe_image timeout (ms) from AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS.
+   * Fails closed: unset/empty/malformed/negative values yield the default bound; only
+   * a clean, explicit non-negative integer (including 0, which disables) is honored.
+   */
+  static resolveDescribeImageTimeoutMs(): number {
+    const raw = process.env.AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS;
+    if (raw === undefined || raw.trim() === '') {
+      return AgentModeService.DEFAULT_DESCRIBE_IMAGE_TIMEOUT_MS;
+    }
+    // Number() (not parseInt) so partial junk like "90s" becomes NaN instead of 90.
+    const parsed = Number(raw.trim());
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      return AgentModeService.DEFAULT_DESCRIBE_IMAGE_TIMEOUT_MS;
+    }
+    return parsed;
+  }
+
+  /**
    * Analyze an image with a vision-capable LLM.
    *
    * @param llmModel - Optional. When omitted (the agent-mode `describe_image` tool
@@ -6410,7 +6491,7 @@ export class AgentModeService {
       let primaryError: string | undefined;
       let response: any;
       try {
-        response = await this.callLLM(visionModelUsed, messages, {
+        response = await this.callVisionLLMWithTimeout(visionModelUsed, messages, {
           max_completion_tokens: 2000
         });
       } catch (primaryFailure: any) {
@@ -6425,7 +6506,7 @@ export class AgentModeService {
           primaryError
         );
         try {
-          response = await this.callLLM(fallbackModel, messages, {
+          response = await this.callVisionLLMWithTimeout(fallbackModel, messages, {
             max_completion_tokens: 2000
           });
         } catch (fallbackFailure: any) {
@@ -7155,24 +7236,13 @@ export class AgentModeService {
         }
       );
 
-      // Shadow usage metering (Ship 1): direct REST call, so observe the
-      // usageMetadata off the already-resolved response. Fire-and-forget +
-      // fail-open — never awaited, never throws.
-      try {
-        const usageMetadata = (apiResponse.data as any)?.usageMetadata;
-        if (usageMetadata) {
-          void recordUsage({
-            userId,
-            model: modelName,
-            provider: 'gemini',
-            feature: 'agent_task',
-            inputTokens: usageMetadata.promptTokenCount || 0,
-            outputTokens: usageMetadata.candidatesTokenCount || 0,
-            cacheReadTokens: usageMetadata.cachedContentTokenCount || 0,
-          });
-        }
-      } catch {
-        // Metering must never break the call.
+      // Usage metering (Ship 1): direct REST call — meter off the resolved response
+      // via the shared hook. Charges the user's cap (all-cost-to-user policy), fail-open.
+      if ((apiResponse.data as any)?.usageMetadata) {
+        meterUsageFromResponse(
+          { userId, model: modelName, provider: 'gemini', feature: 'agent_task' },
+          apiResponse.data
+        );
       }
 
       // Extract and format the response
@@ -9526,14 +9596,26 @@ export class AgentModeService {
         connectedAtTimestamp?: number;
       } | null = null;
       if (lead.linkedin) {
-        const accountId: string | null = (list as any).linkedInAccountId ?? null;
+        // Prefer the account explicitly assigned to the list; fall back to the
+        // user's own connected LinkedIn (Unipile) account. Most lists never get an
+        // account assigned (list.linkedInAccountId is null), so without this
+        // fallback every lead reports "not connected" even when the user is a
+        // genuine 1st-degree connection — the misinformation reported in ENG-376.
+        let accountId: string | null = (list as any).linkedInAccountId ?? null;
+        if (!accountId) {
+          const { linkedInOutreachService } = await import('./linkedInOutreachService');
+          accountId = await linkedInOutreachService.resolveUserOwnedAccountId(userId).catch(() => null);
+        }
         if (accountId) {
           const { getConnectionByProfileUrlAndAccount } = await import('./unipileConnectionsDb');
           const conn = await getConnectionByProfileUrlAndAccount(lead.linkedin as string, accountId).catch(() => null);
           linkedInConnectionStatus = conn
             ? {
+                // conn.connectedAt is already an epoch-millisecond timestamp
+                // (Unipile created_at), so it must NOT be multiplied by 1000 —
+                // doing so pushed the date ~56,000 years into the future (ENG-379).
                 isConnected: true,
-                connectedAt: new Date(conn.connectedAt * 1000).toISOString(),
+                connectedAt: new Date(conn.connectedAt).toISOString(),
                 connectedAtTimestamp: conn.connectedAt,
               }
             : { isConnected: false };
@@ -9664,7 +9746,7 @@ export class AgentModeService {
         emailDomain ? emailEventsDb.getEventsByEmailDomain(emailDomain).catch(() => []) : Promise.resolve([]),
       ]);
 
-      // connectedAt (UNIX seconds) keyed by normalized profile URL.
+      // connectedAt (epoch milliseconds) keyed by normalized profile URL.
       const connectedAtByUrl = new Map<string, number>();
       for (const c of connections as any[]) {
         const url = String(c?.publicProfileUrl || '').trim().toLowerCase();
@@ -9722,7 +9804,9 @@ export class AgentModeService {
           // when the most-recent engagement is an outbound touch sent after the
           // connection was accepted. A later inbound reply flips it back to
           // "needs follow-up" (awaitingReply) since we now owe the response.
-          const connectedAtMs = connectedAt * 1000;
+          // connectedAt is already epoch ms, matching last.at (getTime()); do NOT
+          // scale it — the old `* 1000` made the comparison always false (ENG-379).
+          const connectedAtMs = connectedAt;
           if (last && last.direction === 'outbound' && last.at > connectedAtMs) continue;
 
           const awaitingReply = !!last && last.direction === 'inbound';
@@ -11190,6 +11274,20 @@ ${emailDraftFormat === 'text'
         response_format: { type: 'json_object' }
       });
 
+      // Shadow-meter this direct Azure completion (bypasses callLLM). Burn-only, fail-open.
+      if ((completion as any)?.usage) {
+        meterUsageFromResponse(
+          {
+            userId,
+            sessionId,
+            model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
+            provider: 'azure-openai',
+            feature: 'email_draft',
+          },
+          completion
+        );
+      }
+
       const responseContent = completion.choices[0].message.content;
       if (!responseContent) {
         throw new Error('No content generated from LLM');
@@ -11290,6 +11388,14 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         max_tokens: 2048,
       } as any);
 
+      // Shadow-meter this direct Gemini completion (bypasses callLLM). Burn-only, fail-open.
+      if ((messageCompletion as any)?.usage) {
+        meterUsageFromResponse(
+          { userId, sessionId, model: 'gemini-3.5-flash', provider: 'gemini', feature: 'invite_message' },
+          messageCompletion
+        );
+      }
+
       const messageResponseContent = messageCompletion.choices[0].message.content;
       if (!messageResponseContent) {
         throw new Error('No message content generated from LLM');
@@ -11324,7 +11430,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         // guarantee — same trimInviteMessage() the inline send path uses, kept consistent.
         if (noteText.length > inviteCharLimit) {
           const { shortenInviteNoteToLimit } = await import('./inviteNoteShortener');
-          noteText = await shortenInviteNoteToLimit(geminiClient, noteText, inviteCharLimit, 2);
+          noteText = await shortenInviteNoteToLimit(geminiClient, noteText, inviteCharLimit, 2, userId, sessionId);
         }
         messageDraft = {
           content: LinkedInOutreachService.trimInviteMessage(noteText, inviteCharLimit),
@@ -11762,40 +11868,18 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
       console.log('Inferring brand tokens...');
       const suggestedBrandTokens = inferBrandTokens(detailedTokens);
 
-      // Process brand identity: download logo and upload to S3
+      // Process brand identity: download logo and upload to S3. Extracted to
+      // services/agentMode/brandLogo.ts (ENG-326); behavior pinned by
+      // agentModeService.extractCSSFromURL.logo.test.ts.
       const brandIdentity = extractedCSS.brandIdentity || { logoUrl: null, brandName: null, tagline: null, favicon: null };
-      let s3LogoUrl: string | null = null;
-
-      if (brandIdentity.logoUrl) {
-        try {
-          console.log(`Downloading logo from ${brandIdentity.logoUrl}...`);
-          const logoResponse = await axios.get(brandIdentity.logoUrl, {
-            responseType: 'arraybuffer',
-            timeout: 15000,
-          });
-          const contentType = logoResponse.headers['content-type'] || '';
-          // Skip SVG since brand guidelines doesn't accept it
-          if (!contentType.includes('svg')) {
-            const ext = contentType.includes('png') ? 'png' : contentType.includes('gif') ? 'gif' : 'jpg';
-            const filename = `logo.${ext}`;
-            const { uploadFileToS3WithPath } = await import('../utils/s3Utils');
-            const uploadResult = await uploadFileToS3WithPath(
-              Buffer.from(logoResponse.data as ArrayBuffer),
-              filename,
-              contentType,
-              `users/${userId}/brand/logo`
-            );
-            if (uploadResult.success && uploadResult.url) {
-              s3LogoUrl = uploadResult.url;
-              console.log(`Logo uploaded to S3: ${s3LogoUrl}`);
-            }
-          } else {
-            console.log('Skipping SVG logo (not supported by brand guidelines)');
-          }
-        } catch (logoErr: any) {
-          console.warn('Failed to download/upload logo:', logoErr.message);
-        }
-      }
+      const logoDownload = brandIdentity.logoUrl
+        ? await downloadBrandLogoToS3(brandIdentity.logoUrl, userId)
+        : null;
+      // Non-uploaded outcomes fall back to surfacing the raw discovered URL
+      // below (`s3LogoUrl || brandIdentity.logoUrl`) — unchanged extraction
+      // behavior; only the deterministic PERSIST path treats them differently.
+      const s3LogoUrl: string | null =
+        logoDownload?.status === 'uploaded' ? logoDownload.url : null;
 
       // Format detailed tokens as JSON string for Emma to save to KB if needed
       const detailedTokensJSON = JSON.stringify({
@@ -15292,7 +15376,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       case 'TARGETING':
         if (action === 'SEARCH') {
           if (!params.q) throw new Error('TARGETING SEARCH requires "params.q" (search query).');
-          if (!params.type) throw new Error('TARGETING SEARCH requires "params.type" (adinterest | adbehavior | addemographics).');
+          if (!params.type) throw new Error('TARGETING SEARCH requires "params.type" (adinterest | adbehavior | addemographics | adgeolocation).');
         }
         break;
 
@@ -15574,7 +15658,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return this.manageMetaCustomAudiences(userId, action as any, account_id, params);
 
       case 'TARGETING':
-        return this.searchAdTargeting(userId, account_id, params.q, params.type);
+        return this.searchAdTargeting(userId, account_id, params.q, params.type, params.location_types);
 
       case 'PAGE':
         return this.listMetaPages(userId, account_id);
@@ -15775,12 +15859,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     userId: string,
     account_id: string,
     q: string,
-    type: string = 'adTargetingCategory'
+    type: string = 'adTargetingCategory',
+    locationTypes?: string[]
   ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
 
-      const searchResult = await metaService.searchTargeting(accountId, accessToken, q, type);
+      const searchResult = await metaService.searchTargeting(accountId, accessToken, q, type, locationTypes);
       const results = Array.isArray(searchResult) ? searchResult : [];
 
       return {
@@ -19257,12 +19342,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   // Web search functionality
-  public async youSearchWeb(query: string, maxResults: number = 10): Promise<any> {
+  public async youSearchWeb(
+    query: string,
+    maxResults: number = 10,
+    freshness?: string,
+    includeDomains?: string[]
+  ): Promise<any> {
     return this.searchWithYou({
       toolName: 'you_search_web',
       query,
       maxResults,
       resultSource: 'web',
+      freshness,
+      includeDomains,
     });
   }
 
@@ -19324,6 +19416,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     maxResults: number;
     resultSource: SearchResultSource;
     freshness?: string;
+    includeDomains?: string[];
   }): Promise<any> {
     const { toolName, query, maxResults, resultSource } = params;
     try {
@@ -19344,6 +19437,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             maxResults: limitedMaxResults,
             resultSource,
             freshness: params.freshness,
+            includeDomains: params.includeDomains,
           });
           break;
         } catch (error) {
@@ -19557,6 +19651,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     maxResults: number;
     resultSource?: SearchResultSource;
     freshness?: string;
+    includeDomains?: string[];
   }) {
     const freshness = params.freshness || inferSearchFreshness(params.query);
     const provider = new YouSearchProvider();
@@ -19566,6 +19661,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       freshness,
       resultSource: params.resultSource || 'all',
       purpose: params.resultSource === 'news' ? 'news' : 'agent_research',
+      ...(params.includeDomains?.length ? { includeDomains: params.includeDomains } : {}),
     });
 
     console.log(`You.com Search returned ${response.results.length} ${params.resultSource || 'all'} results for query: "${params.query}"`);
@@ -20402,6 +20498,27 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     try {
+      // ENG-326: branded text-to-image asks must composite the account's REAL
+      // persisted logo — never one the model invents. When the prompt asks for
+      // a logo and the model didn't pass logo_image, prefer the persisted
+      // brand logo (AC-2); when none is persisted, ask the user / point at
+      // brand config instead of generating (AC-3). Edits (inputImages) are
+      // out of scope — the source images already carry the branding.
+      if (
+        !logoImage &&
+        (!Array.isArray(inputImages) || inputImages.length === 0) &&
+        promptRequestsLogo(prompt)
+      ) {
+        const persistedLogo = await getPersistedBrandLogoUrlForUser(userId);
+        if (!persistedLogo) {
+          return missingBrandLogoToolResult();
+        }
+        logoImage = persistedLogo;
+        console.log(
+          `AgentMode: generate_image prompt asks for a logo — compositing the persisted brand logo (${persistedLogo})`
+        );
+      }
+
       // Import the image generation service
       const { imageService } = await import('./imageGeneration');
 
@@ -20503,11 +20620,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       if (result.success && result.imageUrl) {
-        // Track generation cost (image APIs are billed per generation, not per token)
+        // Session cost accounting (agent-mode chat). The per-user burn shadow record is
+        // fired once at the generation SOURCE (imageService.generateImage) so every caller
+        // is metered exactly once — see llmPricing.imageGenerationCostUsd (ENG-200).
         const imageCost = this.estimateImageGenerationCost(imageModelUsed);
-        incrementUserTokenUsage(userId, 0, imageCost).catch((err) =>
-          console.error('AgentMode: Failed to track token usage for generateImage:', err)
-        );
         chatbotDb.addToolCostToSession(sessionId, imageCost, 'generateImage').catch((err) =>
           console.error('AgentMode: Failed to add image cost to session:', err)
         );
@@ -20646,11 +20762,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       if (result.success && result.videoUrl) {
-        // Track generation cost (video APIs are billed per 8s clip; longer videos cost more)
+        // Session cost accounting (agent-mode chat). The per-user burn shadow record is
+        // fired once at the generation SOURCE (videoService.generateVideo) so every caller
+        // is metered exactly once — see llmPricing.videoGenerationCostUsd (ENG-200).
         const videoCost = this.estimateVideoGenerationCost(videoModel || 'veo-3.1-generate-preview', durationSeconds);
-        incrementUserTokenUsage(userId, 0, videoCost).catch((err) =>
-          console.error('AgentMode: Failed to track token usage for generateVideo:', err)
-        );
         chatbotDb.addToolCostToSession(sessionId, videoCost, 'generateVideo').catch((err) =>
           console.error('AgentMode: Failed to add video cost to session:', err)
         );
@@ -21227,7 +21342,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         prompt,
         tone,
         depth,
-        focus_areas
+        focus_areas,
+        userId
       });
 
       if (!researchResult.success || !researchResult.markdownContent) {
@@ -21335,7 +21451,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           topic: researchTopic,
           prompt: requirements || undefined,
           tone: 'professional',
-          style
+          style,
+          userId
         });
 
         if (!researchResult.success || !researchResult.markdownContent) {
@@ -23620,9 +23737,42 @@ ${formatRequirements ? `\nFormat Requirements:\n${formatRequirements}` : ''}
 
 Please generate a complete, professional HTML document that properly formats and presents this content.`;
 
-      // Generate HTML using LLMService
+      // Generate HTML using LLMService.
+      // The final render is a single long-running LLM call; on Bedrock it can hit
+      // the 5-minute requestTimeout and throw. Without a retry, one transient
+      // timeout discards ALL completed upstream work (steps 1-3), which is exactly
+      // the systemic failure reported in ENG-203. Retry the render step with
+      // exponential backoff on transient errors (timeouts / 5xx / network) so a
+      // single blip no longer loses the report. Terminal errors (invalid args,
+      // auth, content-filter) are not retried — an identical call would just fail
+      // again.
       console.log(`AgentMode: Generating HTML ${isEmail ? 'email' : 'file'} with LLMService (Claude model)`);
-      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
+      const maxRenderAttempts = 3;
+      let htmlContent = '';
+      for (let attempt = 1; attempt <= maxRenderAttempts; attempt++) {
+        try {
+          htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
+          break;
+        } catch (renderError) {
+          const isLastAttempt = attempt === maxRenderAttempts;
+          const isTransient = isTransientLLMError(renderError);
+          if (isLastAttempt || !isTransient) {
+            // Distinguish exhaustion from a terminal error. If every attempt hit a
+            // transient timeout, the render likely can't finish inside the per-call
+            // budget deterministically (e.g. an oversized report) — retrying the same
+            // call won't help, and this is the signal that would justify streaming/
+            // chunking the render (ENG-203 follow-up). Log it distinctly so these are
+            // greppable and separable from one-off blips and terminal errors.
+            if (isLastAttempt && isTransient) {
+              console.error(`AgentMode: HTML render exhausted all ${maxRenderAttempts} attempts on a transient error (session ${sessionId}); render may be deterministically over the per-call timeout:`, renderError instanceof Error ? renderError.message : renderError);
+            }
+            throw renderError;
+          }
+          const backoffMs = 1000 * Math.pow(2, attempt - 1);
+          console.warn(`AgentMode: HTML render attempt ${attempt}/${maxRenderAttempts} failed with a transient error, retrying in ${backoffMs}ms:`, renderError instanceof Error ? renderError.message : renderError);
+          await this.sleep(backoffMs);
+        }
+      }
 
       if (!htmlContent || htmlContent.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -27651,7 +27801,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (llmTitles.length > 0) {
         try {
           const llmClient = await this.getClientForModel('gemini-2.5-flash');
-          const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, llmClient);
+          const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, llmClient, userId);
           for (let k = 0; k < llmIndices.length; k++) {
             const v = results[k];
             if (v && v !== 'NONE') leads[llmIndices[k]].company = v;
@@ -27782,12 +27932,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
-    entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION';
+    entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
     action: string;
     [key: string]: any;
   }): Promise<any> {
     try {
       const { customer_id, entity_type, action } = args;
+
+      if (entity_type === 'BIDDING_STRATEGY' && action === 'LIST') {
+        const biddingStrategies = await googleAdsService.listBiddingStrategies(userId, customer_id);
+        return { success: true, biddingStrategies };
+      }
 
       if (entity_type === 'CAMPAIGN') {
         if (action === 'LIST') {
@@ -27810,8 +27965,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, message: 'Campaign removed' };
         }
         if (action === 'CREATE') {
-          if (!args.budget_resource_name || !args.name || !args.type || !args.bidding_strategy) {
-            return { success: false, error: 'name, type, budget_resource_name, and bidding_strategy are required to create a campaign' };
+          if (!args.budget_resource_name || !args.name || !args.type || (!args.bidding_strategy && !args.bidding_strategy_resource_name)) {
+            return { success: false, error: 'name, type, budget_resource_name, and a bidding strategy (bidding_strategy for a standard strategy, or bidding_strategy_resource_name for a portfolio/shared strategy) are required to create a campaign' };
+          }
+          if (args.bidding_strategy && args.bidding_strategy_resource_name) {
+            return { success: false, error: 'Provide either bidding_strategy (standard) or bidding_strategy_resource_name (portfolio/shared), not both.' };
           }
           if (args.bidding_strategy === 'TARGET_CPA' && !args.bidding_strategy_target) {
             return { success: false, error: 'TARGET_CPA requires bidding_strategy_target (CPA value in account currency, e.g. 20 for $20). Ask the user for their target CPA before proceeding.' };
@@ -27824,6 +27982,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             type: args.type,
             budgetResourceName: args.budget_resource_name,
             biddingStrategy: args.bidding_strategy,
+            biddingStrategyResourceName: args.bidding_strategy_resource_name,
             biddingStrategyTarget: args.bidding_strategy_target,
             cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
             locationTargetIds: args.location_target_ids || [],
@@ -27835,14 +27994,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for UPDATE action' };
-          await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
+          const didUpdate = await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
             name: args.name,
             status: args.status,
             biddingStrategy: args.bidding_strategy,
+            biddingStrategyResourceName: args.bidding_strategy_resource_name,
             biddingStrategyTarget: args.bidding_strategy_target,
             cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
             budgetResourceName: args.budget_resource_name,
+            finalUrlSuffix: args.final_url_suffix,
           });
+          if (!didUpdate) return { success: false, error: 'This tool does not support updating the field(s) requested for CAMPAIGN — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Campaign updated' };
         }
       }
@@ -27885,7 +28047,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.ad_group_resource_name) return { success: false, error: 'ad_group_resource_name is required for UPDATE action' };
-          await googleAdsService.updateAdGroup(userId, customer_id, args.ad_group_resource_name, {
+          const didUpdateAdGroup = await googleAdsService.updateAdGroup(userId, customer_id, args.ad_group_resource_name, {
             name: args.name,
             status: args.status,
             cpcBidMicros: args.cpc_bid_micros,
@@ -27893,6 +28055,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             targetCpaMicros: args.target_cpa_micros,
             targetRoas: args.target_roas,
           });
+          if (!didUpdateAdGroup) return { success: false, error: 'This tool does not support updating the field(s) requested for AD_GROUP — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Ad group updated' };
         }
         if (action === 'REMOVE') {
@@ -27925,10 +28088,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.criterion_resource_name) return { success: false, error: 'criterion_resource_name is required for KEYWORD UPDATE' };
-          await googleAdsService.updateKeyword(userId, customer_id, args.criterion_resource_name, {
+          const didUpdateKeyword = await googleAdsService.updateKeyword(userId, customer_id, args.criterion_resource_name, {
             status: args.status,
             cpcBidMicros: args.cpc_bid_micros,
           });
+          if (!didUpdateKeyword) return { success: false, error: 'This tool does not support updating the field(s) requested for KEYWORD — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Keyword updated' };
         }
         if (action === 'REMOVE') {
@@ -27969,9 +28133,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD UPDATE' };
-          await googleAdsService.updateAd(userId, customer_id, args.ad_resource_name, {
+          const didUpdateAd = await googleAdsService.updateAd(userId, customer_id, args.ad_resource_name, {
             status: args.status,
           });
+          if (!didUpdateAd) return { success: false, error: 'This tool does not support updating the field(s) requested for AD — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Ad updated' };
         }
         if (action === 'REMOVE') {
@@ -28586,6 +28751,7 @@ function parseCompanyFromTitle(title: any): string | null {
 async function batchParseCompaniesFromTitlesWithLLM(
   titles: string[],
   llmClient: any,
+  userId?: string,
 ): Promise<string[]> {
   if (!Array.isArray(titles) || titles.length === 0) return [];
   if (!llmClient?.chat?.completions?.create) return titles.map(() => 'NONE');
@@ -28614,6 +28780,15 @@ async function batchParseCompaniesFromTitlesWithLLM(
       max_completion_tokens: Math.max(500, titles.length * 30),
       temperature: 0.1,
     });
+    // Shadow-meter this direct Gemini completion (bypasses callLLM). Burn-only, fail-open.
+    // Tokens are recorded even though gemini-2.5-flash may be unpriced (cost 0
+    // until a price row exists) — token visibility is still worth having.
+    if ((completion as any)?.usage) {
+      meterUsageFromResponse(
+        { userId, model: 'gemini-2.5-flash', provider: 'gemini', feature: 'title_company_parse' },
+        completion
+      );
+    }
     const raw = String(completion?.choices?.[0]?.message?.content ?? '').trim();
     // Gemini Flash often adds preamble / postamble / markdown fences despite
     // explicit instructions. Locate the widest `[ ... ]` substring instead of

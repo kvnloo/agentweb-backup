@@ -7,6 +7,7 @@ import { getAccountSummary } from '../services/accountSummaryService';
 import { dealDb, DealAuthError, DealNotFoundError, DEAL_STAGES, type DealStage } from '../services/dealDb';
 import { contactEventsDb, normalizeContactId } from '../services/contactEventsDb';
 import { chatbotDb } from '../services/chatbotService';
+import { incrementUserTokenUsage } from '../services/tokenUsageService';
 import { getExecutionsWithAssets } from '../routes/tasks';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
@@ -736,7 +737,7 @@ REQUIRED PARAMS PER ENTITY + ACTION:
   AD CREATE:            name, creative_id (plus ad_set_id top-level param)
   AD COPY_AD:           ad_id = source ad ID. Optional params: name (new ad name), adset_id (target ad set; defaults to source ad's set), link_url (override destination URL), body, title, status (default PAUSED). Automatically copies images — no manual upload needed.
   CUSTOM_AUDIENCE CREATE: name, subtype (CUSTOM or LOOKALIKE)
-  TARGETING SEARCH:     q (search query), type (adinterest | adbehavior | addemographics)
+  TARGETING SEARCH:     q (search query), type (adinterest | adbehavior | addemographics | adgeolocation). For type=adgeolocation, results include a location key/region_id for use in ad set geo_locations; optionally pass location_types (e.g. ['city']).
 
 COPY_AD WORKFLOW (clone an existing ad with optional overrides):
   1. Use AD LIST to find the source ad and get its ad_id
@@ -934,7 +935,8 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
 
             // --- Targeting Search ---
             q: { type: "string", description: "Search query for targeting search." },
-            type: { type: "string", enum: ["adinterest", "adbehavior", "addemographics"], description: "Targeting category to search." },
+            type: { type: "string", enum: ["adinterest", "adbehavior", "addemographics", "adgeolocation"], description: "Targeting category to search. Use 'adgeolocation' to resolve geo-targeting locations (cities/regions/zips) into keys usable in ad set geo_locations." },
+            location_types: { type: "array", items: { type: "string" }, description: "For type='adgeolocation' only: restrict results to specific location kinds, e.g. ['city'], ['region'], ['zip'], ['country']." },
 
             // --- Dataset ---
             dataset_id: { type: "string", description: "Dataset ID. Required for DATASET GET_MATCH_QUALITY." }
@@ -1222,8 +1224,8 @@ REQUIRED PARAMS PER ENTITY + ACTION:
     ALWAYS use targeting_include/targeting_exclude — never construct targetingCriteria manually
   CAMPAIGN UPDATE: campaign_id + fields to update
   CREATIVE LIST: params.campaign_id required
-  CREATIVE CREATE: campaign_id + one of: post_urn (sponsored content/event/article/document), headline+description+landing_page (text ad), inmail_content_urn (message/conversation ad), vast_tag_url (VAST video). Optional: pre_event_registration_image (event ads).
-  CREATIVE CREATE_INLINE: Dark post only. Required: campaign_id, commentary, image_urn OR video_urn OR document_urn OR carousel_cards.
+  CREATIVE CREATE: campaign_id + one of: post_urn (sponsored content/event/article/document), headline+description+landing_page (text ad), inmail_content_urn (message/conversation ad), vast_tag_url (VAST video). Optional: pre_event_registration_image (event ads). Lead Gen ad: also pass leadgen_form_urn + cta_label_type to attach an existing Lead Gen Form.
+  CREATIVE CREATE_INLINE: Dark post only. Required: campaign_id, commentary, image_urn OR video_urn OR document_urn OR carousel_cards. Lead Gen ad (LEAD_GENERATION campaign): also pass leadgen_form_urn (adForm URN) + cta_label_type (e.g. SIGN_UP) to attach an existing Lead Gen Form.
   CREATIVE CREATE_DYNAMIC: campaign_id, format (JOBS|SPOTLIGHT|FOLLOW_COMPANY). JOBS needs headline+button_label. SPOTLIGHT needs headline+call_to_action+landing_page+logo_urn (logo_urn is REQUIRED — upload logo with MEDIA/UPLOAD_IMAGE first). FOLLOW_COMPANY needs headline.
   TARGETING SEARCH: facet (URN like urn:li:adTargetingFacet:locations), query (optional — omit for facets without typeahead like seniorities/industries)
     Common facets: locations, titles (job titles — NOT jobTitles), seniorities, industries, functions, staffCountRanges, memberInterests, skills
@@ -1309,6 +1311,9 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
             vast_tag_url: { type: 'string', description: 'VAST tag URL for third-party video ads (e.g. from Innovid). Required for CREATIVE/CREATE VAST video.' },
             // Creative — Event Ad
             pre_event_registration_image: { type: 'string', description: 'Image URN for pre-event registration. Optional for event ad creatives.' },
+            // Creative — Lead Gen Form (LEAD_GENERATION campaigns)
+            leadgen_form_urn: { type: 'string', description: 'Existing Lead Gen Form adForm URN (e.g. urn:li:adForm:1016740005 or just the numeric id). REQUIRED for a Lead Gen creative in CREATIVE/CREATE or CREATIVE/CREATE_INLINE — sets leadgenCallToAction.destination. Must be paired with cta_label_type.' },
+            cta_label_type: { type: 'string', description: 'Lead Gen creative CTA button label (leadgenCallToAction.label), one of: APPLY, DOWNLOAD, VIEW_QUOTE, LEARN_MORE, SIGN_UP, SUBSCRIBE, REGISTER, REQUEST_DEMO, JOIN, ATTEND, UNLOCK_FULL_DOCUMENT. REQUIRED alongside leadgen_form_urn for Lead Gen creatives.' },
             // Creative — Dynamic Ad (Jobs / Spotlight / Follower)
             button_label: { type: 'string', description: 'CTA button text for Jobs dynamic ads (CREATIVE/CREATE_DYNAMIC format=JOBS).' },
             call_to_action: { type: 'string', description: 'CTA text for Spotlight/Follower dynamic ads.' },
@@ -3323,7 +3328,7 @@ emmaToolRegistry.register({
   name: 'get_lead_details',
   definition: {
     name: 'get_lead_details',
-    description: 'Get full details for a single lead including all fields, ICP match info, email drafts, and recent engagement history. Also returns `lead.enrichmentMetadata`: a per-field provenance map (keyed by field name, including custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) describing where each enriched value came from — `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile), `sourceUrl` and `sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt` (ISO timestamp). USE THIS to answer "where does this data come from / how accurate is it?" — cite the provider, source URL, and confidence rather than guessing. Each meta entry also carries `grounding`: "grounded" = verified against a real fetched source (safe to state plainly); "web-unverified" = from a web source that could not be confirmed; "ai-knowledge" = the AI asserted it from its own general knowledge with no source found. NEVER state a "web-unverified" or "ai-knowledge" value as established fact — flag it as unverified and name which (e.g. "unverified — from an unconfirmed web source" / "unverified — from AI general knowledge, no source found"), alongside the confidence. Fields with no entry in enrichmentMetadata were entered manually or imported, not enriched. Also returns `lead.linkedInConnectionStatus`: if the lead has a LinkedIn URL, this field indicates whether they are a 1st-degree connection (`isConnected: true/false`), and if connected, when they connected (`connectedAt` ISO string, `connectedAtTimestamp` UNIX seconds). Returns `null` if the lead has no LinkedIn URL. Use this to decide whether to send a connection invite vs. a direct message.',
+    description: 'Get full details for a single lead including all fields, ICP match info, email drafts, and recent engagement history. Also returns `lead.enrichmentMetadata`: a per-field provenance map (keyed by field name, including custom fields like `funding_stage`, `revenue_range`/`arr`, `tech_stack`) describing where each enriched value came from — `source` (web_search/api/linkedin/manual/llm), `provider` (e.g. apollo, llm_web_search, enrich.so, unipile), `sourceUrl` and `sourceQuote` for web-sourced values, `confidence` (high/medium/low), and `enrichedAt` (ISO timestamp). USE THIS to answer "where does this data come from / how accurate is it?" — cite the provider, source URL, and confidence rather than guessing. Each meta entry also carries `grounding`: "grounded" = verified against a real fetched source (safe to state plainly); "web-unverified" = from a web source that could not be confirmed; "ai-knowledge" = the AI asserted it from its own general knowledge with no source found. NEVER state a "web-unverified" or "ai-knowledge" value as established fact — flag it as unverified and name which (e.g. "unverified — from an unconfirmed web source" / "unverified — from AI general knowledge, no source found"), alongside the confidence. Fields with no entry in enrichmentMetadata were entered manually or imported, not enriched. Also returns `lead.linkedInConnectionStatus`: if the lead has a LinkedIn URL, this field indicates whether they are a 1st-degree connection (`isConnected: true/false`), and if connected, when they connected (`connectedAt` ISO string, `connectedAtTimestamp` UNIX milliseconds). Returns `null` if the lead has no LinkedIn URL. Use this to decide whether to send a connection invite vs. a direct message.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4923,13 +4928,23 @@ emmaToolRegistry.register({
           type: 'number',
           description: 'Maximum number of web results to return (default: 5, max: 10)',
           default: 5
+        },
+        freshness: {
+          type: 'string',
+          enum: ['day', 'week', 'month', 'year'],
+          description: "Optional You.com freshness window; use for time-scoped research like 'this week's discussions'."
+        },
+        include_domains: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional domain allowlist, e.g. ["reddit.com"] to restrict results to one site.'
         }
       },
       required: ["query"]
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.youSearchWeb(args.query, args.max_results || 10);
+    return await agentModeService.youSearchWeb(args.query, args.max_results || 10, args.freshness, args.include_domains);
   }
 });
 
@@ -6714,6 +6729,18 @@ emmaToolRegistry.register({
         acceptanceChecks: Array.isArray(args.acceptance_checks) ? args.acceptance_checks : undefined,
       }
     );
+
+    // Charge the coding agent's own LLM turns to the caller's monthly usage. This
+    // loop makes its own (often high-cost) LLM calls that the parent agent-mode
+    // meter never sees, so without this its spend escapes the per-user token/cost
+    // cap (ENG-200). Fire-and-forget + fail-open: never block/fail the tool result.
+    if (result.usageTotals && context?.userId) {
+      const { totalTokens, costUsd } = result.usageTotals;
+      incrementUserTokenUsage(context.userId, totalTokens, costUsd).catch((err: unknown) =>
+        console.error('coding_agent: failed to record per-user usage:', err)
+      );
+    }
+
     if (result.success) {
       return {
         success: true,
@@ -7039,7 +7066,13 @@ emmaToolRegistry.register({
     }
     const isDelegatedAdmin = isDelegate && !!adminEmail;
 
-    const results: Array<{ title: string; success: boolean; issueId?: string; error?: string; deduped?: boolean; url?: string; trackingUrl?: string }> = [];
+    const results: Array<{ title: string; success: boolean; issueId?: string; error?: string; deduped?: boolean; url?: string; trackingUrl?: string; canonicalUrl?: string }> = [];
+    // ENG-289: the reporting admin gets the canonical Linear link back in chat — but ONLY when they are
+    // an admin or in a delegated-admin session (someone who can actually open a Linear issue). External
+    // customers and ALL external-MCP callers never receive the internal link (preserves the leak guard:
+    // the tool result is JSON.stringified to external MCP clients and preserved into Agent Mode LLM context
+    // + persisted sidebar state). The internal team notification email always gets it regardless.
+    const reporterIsInternal = context?.externalMcp !== true && (user?.isAdmin === true || isDelegatedAdmin);
     // Public, user-facing board (what the customer can actually open). Per-result `url` is the
     // internal tracker (Linear/Notion) for the team email; `trackingUrl`/`userUrl` is the user's link.
     const FEATUREBASE_BOARD_URL = 'https://agentweb.featurebase.app/';
@@ -7144,7 +7177,7 @@ emmaToolRegistry.register({
             setTimeout(() => reject(new Error('Issue filing timed out after 30s')), INTAKE_TIMEOUT_MS)
           ),
         ]);
-        const result = { pageId: filed.pageId, url: filed.trackerUrl, tracker: filed.tracker, deduped: filed.deduped, userUrl: filed.userUrl };
+        const result = { pageId: filed.pageId, url: filed.trackerUrl, tracker: filed.tracker, deduped: filed.deduped, userUrl: filed.userUrl, canonicalUrl: reporterIsInternal ? filed.canonicalUrl : undefined };
 
         // Never email the customer — internal team + admin (if known) only.
         const emailRecipients = adminEmail
@@ -7173,6 +7206,7 @@ emmaToolRegistry.register({
                 ${isDelegatedAdmin && adminEmail ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Via delegation</strong></td><td style="padding: 6px 0;">${adminEmail}</td></tr>` : ''}
                 ${result.pageId ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Issue ID</strong></td><td style="padding: 6px 0; font-family: monospace;">AGW-${result.pageId}</td></tr>` : ''}
                 ${result.url ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>${result.tracker}</strong></td><td style="padding: 6px 0;"><a href="${result.url}" style="color: #4F46E5; font-weight: 600;">→ Open in ${result.tracker}</a></td></tr>` : ''}
+                ${filed.canonicalUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Linear canonical</strong></td><td style="padding: 6px 0;"><a href="${filed.canonicalUrl}" style="color: #4F46E5; font-weight: 600;">→ Open canonical in Linear</a></td></tr>` : ''}
                 ${issue.pageUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Page URL</strong></td><td style="padding: 6px 0;"><a href="${issue.pageUrl}" style="color: #4F46E5;">${issue.pageUrl}</a></td></tr>` : ''}
               </table>
 
@@ -7189,7 +7223,7 @@ emmaToolRegistry.register({
           replyTo: user.email,
         }).catch((e: any) => console.warn('[report_product_issues] notification email failed (non-critical):', e?.message));
 
-        results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}`, deduped: result.deduped === true, url: result.url || undefined, trackingUrl: result.userUrl || undefined });
+        results.push({ title: issue.title, success: true, issueId: `AGW-${result.pageId}`, deduped: result.deduped === true, url: result.url || undefined, trackingUrl: result.userUrl || undefined, canonicalUrl: result.canonicalUrl || undefined });
       } catch (err: any) {
         results.push({ title: issue.title, success: false, error: err.message });
       }
@@ -7217,6 +7251,15 @@ emmaToolRegistry.register({
     } else {
       summary = `All ${successCount} issue(s) have been reported and tracked. The engineering team has been notified.${linkLine}`;
     }
+
+    // Admins / delegated-admin sessions also get the canonical Linear link in chat (ENG-289) so they can
+    // track the eng issue directly. `canonicalUrl` is only populated on results[] for internal reporters
+    // (gated by reporterIsInternal above), so this stays empty for external customers + external-MCP callers.
+    const linearLinks = results
+      .map(r => (r.success ? r.canonicalUrl : undefined))
+      .filter((u): u is string => !!u);
+    if (linearLinks.length === 1) summary += ` Engineering is tracking this in Linear: ${linearLinks[0]}`;
+    else if (linearLinks.length > 1) summary += ` Engineering is tracking these in Linear: ${linearLinks.join(', ')}`;
 
     return {
       success: failCount === 0,
@@ -8025,8 +8068,10 @@ emmaToolRegistry.register({
 
 ACTION MATRIX:
   BUDGET      → LIST, CREATE (name, amount_micros, explicitly_shared?), UPDATE (budget_resource_name, amount_micros), REMOVE (budget_resource_name; must not be attached to any campaign)
-  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy?, bidding_strategy_target?, budget_resource_name?), REMOVE (campaign_resource_name)
+  CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy OR bidding_strategy_resource_name, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy? OR bidding_strategy_resource_name?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?), REMOVE (campaign_resource_name)
               For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
+              Bidding: pass bidding_strategy for a standard (embedded) strategy, OR bidding_strategy_resource_name to attach a portfolio/shared strategy (from BIDDING_STRATEGY LIST) — never both. Switching to a standard strategy detaches any portfolio strategy.
+  BIDDING_STRATEGY → LIST (portfolio/shared bidding strategies; returns resource_name for use as bidding_strategy_resource_name)
   AD_GROUP    → LIST (campaign_resource_name)
                CREATE (name, campaign_resource_name, type [SEARCH_STANDARD|DISPLAY_STANDARD], cpc_bid_micros?)
                UPDATE (ad_group_resource_name, name?, status?, cpc_bid_micros?, ad_rotation_mode?, target_cpa_micros?, target_roas?)
@@ -8044,18 +8089,20 @@ ACTION MATRIX:
       type: 'object',
       properties: {
         customer_id: { type: 'string', description: 'Google Ads customer ID (numeric, no dashes). Call list_connected_accounts(platform="google_ads") and use the "customer_id" field from the result (NOT the "id" field).' },
-        entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'CAMPAIGN_ASSET', 'ASSET_GROUP', 'LOCATION'] },
+        entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'CAMPAIGN_ASSET', 'ASSET_GROUP', 'LOCATION', 'BIDDING_STRATEGY'] },
         action: { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
         name: { type: 'string' },
         type: { type: 'string', description: 'Campaign type (SEARCH|DISPLAY|PERFORMANCE_MAX), ad group type (SEARCH_STANDARD|DISPLAY_STANDARD), or ad type for AD CREATE (RESPONSIVE_SEARCH_AD|RESPONSIVE_DISPLAY_AD).' },
         budget_resource_name: { type: 'string', description: 'From BUDGET CREATE. Required for CAMPAIGN CREATE.' },
         amount_micros: { type: 'number', description: 'Budget in micros. $10/day = 10000000.' },
         explicitly_shared: { type: 'boolean', description: 'Whether the budget is explicitly shared across campaigns. Optional for BUDGET CREATE.' },
-        bidding_strategy: { type: 'string', enum: ['MAXIMIZE_CONVERSIONS', 'TARGET_CPA', 'TARGET_ROAS', 'MAXIMIZE_CONVERSION_VALUE', 'TARGET_IMPRESSION_SHARE', 'MANUAL_CPC'] },
+        bidding_strategy: { type: 'string', enum: ['MAXIMIZE_CONVERSIONS', 'TARGET_CPA', 'TARGET_ROAS', 'MAXIMIZE_CONVERSION_VALUE', 'TARGET_IMPRESSION_SHARE', 'TARGET_SPEND', 'MANUAL_CPC'], description: 'A standard (embedded) bidding strategy. TARGET_SPEND = Maximize Clicks (optionally capped by cpc_bid_ceiling_micros). Mutually exclusive with bidding_strategy_resource_name.' },
+        bidding_strategy_resource_name: { type: 'string', description: 'Resource name of a portfolio/shared bidding strategy (from BIDDING_STRATEGY LIST) to attach on CAMPAIGN CREATE/UPDATE. Mutually exclusive with bidding_strategy.' },
         bidding_strategy_target: { type: 'number' },
-        cpc_bid_ceiling_micros: { type: 'number', description: 'Max CPC bid ceiling in micros for TARGET_IMPRESSION_SHARE campaigns. Default 100000000 (≈100 currency units). Pass a lower value to cap spend per click.' },
+        cpc_bid_ceiling_micros: { type: 'number', description: 'Max CPC bid ceiling in micros for TARGET_IMPRESSION_SHARE (default 100000000 ≈100 currency units) or TARGET_SPEND/Maximize Clicks campaigns. Pass a lower value to cap spend per click.' },
         location_target_ids: { type: 'array', items: { type: 'number' }, description: 'From LOCATION SEARCH.' },
         campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE and AD_GROUP LIST.' },
+        final_url_suffix: { type: 'string', description: 'Campaign-level Final URL suffix (query params appended to all final URLs, e.g. "utm_source=google&utm_medium=cpc"). For CAMPAIGN UPDATE only.' },
         ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD LIST/ADD/ADD_NEGATIVE/REMOVE, AD LIST/CREATE, AD_GROUP UPDATE.' },
         ad_resource_name: { type: 'string', description: 'AdGroupAd resource name. Required for AD UPDATE/REMOVE. Obtain from AD LIST.' },
         brand_business_name: { type: 'string', description: 'Business name for PMax brand guidelines. Required for PERFORMANCE_MAX CAMPAIGN CREATE when brand guidelines are enforced.' },

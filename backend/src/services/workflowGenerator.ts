@@ -1,5 +1,5 @@
 import yaml from 'js-yaml';
-import { getAzureClient } from '../utils/llmClients';
+import { getAzureClient, meterUsageFromResponse } from '../utils/llmClients';
 import { taskDb } from './db';
 import { Task } from '../types/task';
 
@@ -211,6 +211,13 @@ If creating a new task, provide a prompt that describes what the task should do.
     function_call: { name: 'generate_workflow' }
   });
 
+  meterUsageFromResponse({
+    userId,
+    model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
+    provider: 'azure',
+    feature: 'workflow_gen',
+  }, completion);
+
   const functionCall = completion.choices[0].message.function_call;
   if (!functionCall?.arguments) {
     throw new Error('No workflow definition generated');
@@ -272,6 +279,13 @@ export async function generateWorkflowFromDescription(
       temperature: 0.7,
       max_tokens: 150
     });
+
+    meterUsageFromResponse({
+      userId,
+      model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
+      provider: 'azure',
+      feature: 'workflow_explain',
+    }, explanation);
 
     return {
       yaml: yamlContent,

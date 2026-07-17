@@ -24,6 +24,11 @@ const mockGenerateContentStream = jest.fn();
 // Use manual mock from __mocks__ directory
 jest.mock('@google/genai');
 
+jest.mock('../services/usageRecorderService', () => ({ recordUsage: jest.fn(), meterUserUsage: jest.fn() }));
+import { recordUsage, meterUserUsage } from '../services/usageRecorderService';
+const mockRecordUsage = recordUsage as jest.Mock;
+const mockMeterUserUsage = meterUserUsage as jest.Mock;
+
 describe('ImageService', () => {
   let imageService: ImageService;
 
@@ -46,6 +51,52 @@ describe('ImageService', () => {
     } catch (e) {
       // If requireMock fails, the manual mock should still work
     }
+  });
+
+  describe('source cost metering (ENG-200)', () => {
+    it('records the image generation cost once at the source (burn-only, per-generation $)', async () => {
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue('test-api-key');
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue({ success: true, url: 'https://s3/img.png' });
+      mockGenerateContentStream.mockReturnValue({
+        [Symbol.asyncIterator]: async function* () {
+          yield {
+            candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: 'base64data' } }] } }],
+          };
+        },
+      });
+
+      const result = await imageService.generateImage({
+        prompt: 'a cat',
+        filename: 'cat.png',
+        userId: 'user123',
+        imageModel: 'gemini-3-pro-image-preview',
+        size: '16:9',
+      });
+
+      expect(result.success).toBe(true);
+      // image_generation now CHARGES the user's cap (meterUserUsage), not burn-only.
+      expect(mockMeterUserUsage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: 'user123',
+          model: 'gemini-3-pro-image-preview',
+          feature: 'image_generation',
+          costUsdOverride: 0.134, // per-image Pro rate from llmPricing
+        })
+      );
+    });
+
+    it('does not charge an image_generation cost when the model is invalid (no generation)', async () => {
+      const result = await imageService.generateImage({
+        prompt: 'x',
+        filename: 'x.png',
+        userId: 'u',
+        imageModel: 'not-a-real-model' as any,
+      });
+      expect(result.success).toBe(false);
+      expect(mockMeterUserUsage).not.toHaveBeenCalledWith(
+        expect.objectContaining({ feature: 'image_generation' })
+      );
+    });
   });
 
   describe('Model Selection Logic', () => {

@@ -13,6 +13,11 @@
 
 import { getModelPrice } from "../utils/llmPricing";
 import { usageRecordDb } from "./usageRecordDb";
+// tokenUsageService is lazy-required inside meterUserUsage (not statically imported):
+// it pulls in db.ts -> config/aws.ts, and usageRecorderService is imported very widely
+// (via llmClients). A static import would drag that whole graph into every consumer's
+// module-load, breaking suites that mock aws-sdk without a `config` (e.g. blog.test.ts)
+// and matching the existing lazy-load pattern in llmClients.ts.
 
 export interface RecordUsageContext {
   userId?: string;
@@ -27,6 +32,12 @@ export interface RecordUsageContext {
   cacheWriteTokens?: number;
   sessionId?: string;
   taskId?: string;
+  /**
+   * Explicit USD cost for calls that are NOT token-priced (image/video are billed
+   * per generation, so getModelPrice returns null and token-derived cost is 0).
+   * When set, it is recorded verbatim instead of computing cost from tokens.
+   */
+  costUsdOverride?: number;
 }
 
 /** Log at most one recorder failure per minute to avoid log spam on outages. */
@@ -73,13 +84,16 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
     const cacheReadTokens = Math.max(0, Math.round(ctx.cacheReadTokens || 0));
     const cacheWriteTokens = Math.max(0, Math.round(ctx.cacheWriteTokens || 0));
 
-    const costMicroUsd = computeCostMicroUsd(
-      ctx.model,
-      inputTokens,
-      outputTokens,
-      cacheReadTokens,
-      cacheWriteTokens
-    );
+    const costMicroUsd =
+      ctx.costUsdOverride != null
+        ? Math.max(0, Math.round(ctx.costUsdOverride * 1e6))
+        : computeCostMicroUsd(
+            ctx.model,
+            inputTokens,
+            outputTokens,
+            cacheReadTokens,
+            cacheWriteTokens
+          );
 
     await usageRecordDb.incrementUsage({
       userId,
@@ -104,6 +118,53 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
       );
     }
   }
+}
+
+/**
+ * Meter one LLM call BOTH ways for a direct-provider call site that spends a real
+ * user's tokens but bypasses callLLM (crm enrichment, growth-genius, workflow-gen,
+ * report-revision, invite-note shortening, …):
+ *   1. recordUsage()          — the shadow analytics table.
+ *   2. incrementUserTokenUsage — the enforced per-user monthly cap.
+ *
+ * Fire-and-forget + fail-open on both — metering must never fail or slow an LLM
+ * response. The cap charge is skipped when no user is attributable (a bare
+ * recordUsage under "system" still captures the platform overhead).
+ *
+ * Note: tokens feed the always-on token cap; cost feeds the cap in dollars but
+ * only blocks when ENFORCE_COST_CAP is enabled (observe-only by default).
+ */
+export function meterUserUsage(ctx: RecordUsageContext): void {
+  // Shadow analytics — records under "system" when userId is absent.
+  void recordUsage(ctx);
+
+  // Enforced per-user cap — only when a real user is attributable.
+  if (!ctx.userId) return;
+
+  const inputTokens = Math.max(0, Math.round(ctx.inputTokens || 0));
+  const outputTokens = Math.max(0, Math.round(ctx.outputTokens || 0));
+  const cacheReadTokens = Math.max(0, Math.round(ctx.cacheReadTokens || 0));
+  const cacheWriteTokens = Math.max(0, Math.round(ctx.cacheWriteTokens || 0));
+  const totalTokens = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+  // Honor an explicit dollar cost for calls that are NOT token-priced (image is
+  // billed per generation, video per clip). Without this, image/video would deduct
+  // $0 from the cap even though they're the largest costs — mirrors recordUsage.
+  const costUsd =
+    ctx.costUsdOverride != null
+      ? Math.max(0, ctx.costUsdOverride)
+      : computeCostMicroUsd(ctx.model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) /
+        1e6;
+
+  if (totalTokens <= 0 && costUsd <= 0) return;
+
+  // Lazy-required (see import-site note) to keep this module's static load graph light.
+  const { incrementUserTokenUsage } = require("./tokenUsageService") as typeof import("./tokenUsageService");
+  void incrementUserTokenUsage(ctx.userId, totalTokens, costUsd).catch((err: unknown) =>
+    console.error(
+      "[usageRecorder] meterUserUsage: failed to charge per-user cap:",
+      err instanceof Error ? err.message : err
+    )
+  );
 }
 
 /** Test hook: reset the error-log throttle. */

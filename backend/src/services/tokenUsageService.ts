@@ -8,8 +8,19 @@ export interface TokenUsageStatus {
   allowance: number | null; // null = unlimited
   bonus: number;
   effectiveAllowance: number | null; // allowance + bonus, null = unlimited
-  percentUsed: number; // 0-100+, 0 if unlimited
+  percentUsed: number; // 0-100+, 0 if unlimited (token dimension)
   month: string; // "YYYY-MM"
+  // Cost-based limit (per-user monthly LLM spend cap in USD). Independent of the
+  // token-count limit so that higher-cost models can be enabled without risking
+  // runaway per-user spend (ENG-200).
+  costUsed: number; // USD spent this month
+  costAllowance: number | null; // null = unlimited
+  costPercentUsed: number; // 0-100+, 0 if unlimited (cost dimension)
+  // Whether the cost cap is the ENFORCED gate right now (ENFORCE_COST_CAP). While
+  // false the dollar figures are observe-only — we're gathering spend data to
+  // decide the cost quota. UIs use this to know when a real cost denominator
+  // exists: the customer-facing meter only surfaces cost once this is true.
+  costEnforced: boolean;
 }
 
 /**
@@ -36,6 +47,16 @@ function getNextResetDate(): string {
   const now = new Date();
   const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
   return nextMonth.toISOString();
+}
+
+/**
+ * Percent of an allowance consumed. Returns 0 for an unlimited (null) allowance.
+ * For a zero allowance, any usage counts as 100% (fully consumed).
+ */
+function computePercentUsed(used: number, allowance: number | null): number {
+  if (allowance === null || allowance === undefined) return 0;
+  if (allowance > 0) return Math.round((used / allowance) * 100);
+  return used > 0 ? 100 : 0;
 }
 
 /**
@@ -68,22 +89,29 @@ export async function getUserTokenUsage(
  */
 export async function getUserTokenAllowance(
   userId: string
-): Promise<{ allowance: number | null; bonus: number; effectiveAllowance: number | null }> {
+): Promise<{
+  allowance: number | null;
+  bonus: number;
+  effectiveAllowance: number | null;
+  costAllowance: number | null;
+}> {
   const subscriptionTypeName = await getUserSubscriptionType(userId);
   const config = await getSubscriptionTypeConfig(subscriptionTypeName);
 
   const baseAllowance = config?.monthlyTokenAllowance ?? null;
+  const costAllowance = config?.monthlyCostAllowance ?? null;
   const user = await userDb.getUserById(userId);
   const bonus = user?.tokenAllowanceBonus || 0;
 
   if (baseAllowance === null || baseAllowance === undefined) {
-    return { allowance: null, bonus, effectiveAllowance: null };
+    return { allowance: null, bonus, effectiveAllowance: null, costAllowance };
   }
 
   return {
     allowance: baseAllowance,
     bonus,
     effectiveAllowance: baseAllowance + bonus,
+    costAllowance,
   };
 }
 
@@ -94,38 +122,81 @@ export async function getUserTokenAllowance(
 export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus> {
   const billingUserId = await resolveBillingUserId(userId);
   const usage = await getUserTokenUsage(billingUserId);
-  const { allowance, bonus, effectiveAllowance } = await getUserTokenAllowance(billingUserId);
+  const { allowance, bonus, effectiveAllowance, costAllowance } = await getUserTokenAllowance(
+    billingUserId
+  );
 
-  // Unlimited
-  if (effectiveAllowance === null) {
-    return {
-      allowed: true,
-      warning: false,
-      used: usage.totalTokens,
-      allowance,
-      bonus,
-      effectiveAllowance,
-      percentUsed: 0,
-      month: usage.month,
-    };
-  }
+  // Two independent limits: token-count and dollar cost. The cost dimension is
+  // what will eventually make higher-cost models (e.g. Fable) safe to enable — a
+  // token-count cap alone can't bound dollar spend.
+  //
+  // Cost enforcement is OFF by default (observe-only): we accumulate and surface
+  // per-user cost so we can gather real spend data before deciding to gate on it,
+  // but we do NOT block users on cost yet. Token-count remains the only hard gate.
+  // Per-model pricing is now normalized and accurate (ENG-207 — every model,
+  // including Fable, is priced from the shared llmPricing book), so the dollar
+  // figure is trustworthy. We still keep the cap observe-only until we've
+  // validated real per-user spend against the shadow book. Flip
+  // ENFORCE_COST_CAP=true to enable the cost cap; the enforcement path stays
+  // tested below.
+  const enforceCostCap = process.env.ENFORCE_COST_CAP === "true";
 
-  const percentUsed =
-    effectiveAllowance > 0
-      ? Math.round((usage.totalTokens / effectiveAllowance) * 100)
-      : usage.totalTokens > 0
-      ? 100
-      : 0;
+  const tokenPercentUsed = computePercentUsed(usage.totalTokens, effectiveAllowance);
+  const costPercentUsed = computePercentUsed(usage.totalCost, costAllowance);
+
+  const tokenAllowed = effectiveAllowance === null || tokenPercentUsed < 100;
+  const costAllowed = costAllowance === null || costPercentUsed < 100;
+  const allowed = tokenAllowed && (enforceCostCap ? costAllowed : true);
+
+  const tokenWarning = effectiveAllowance !== null && tokenPercentUsed >= 80 && tokenPercentUsed < 100;
+  // Only surface a cost warning to users when the cost cap is actually enforced —
+  // otherwise we'd nag about a limit that can't block them.
+  const costWarning =
+    enforceCostCap && costAllowance !== null && costPercentUsed >= 80 && costPercentUsed < 100;
 
   return {
-    allowed: percentUsed < 100,
-    warning: percentUsed >= 80 && percentUsed < 100,
+    allowed,
+    warning: allowed && (tokenWarning || costWarning),
     used: usage.totalTokens,
     allowance,
     bonus,
     effectiveAllowance,
-    percentUsed,
+    percentUsed: effectiveAllowance === null ? 0 : tokenPercentUsed,
     month: usage.month,
+    costUsed: usage.totalCost,
+    costAllowance,
+    costPercentUsed: costAllowance === null ? 0 : costPercentUsed,
+    costEnforced: enforceCostCap,
+  };
+}
+
+/**
+ * Given a usage status, determine whether a *block* was caused by the dollar cost
+ * cap rather than the token-count cap (ENG-200). Shared by the scheduled-chat
+ * block message (agentModeController) and its email (emailService) so both agree
+ * on the reason — a user with an unlimited token allowance can only be blocked by
+ * the cost cap, and the message must then read in dollars, not "0 / N/A tokens".
+ *
+ * Tolerant of partial status objects (the email caller passes a subset): a missing
+ * effectiveAllowance falls back to allowance, and missing percentages read as 0.
+ */
+export function deriveBlockedByCost(status: {
+  allowance?: number | null;
+  effectiveAllowance?: number | null;
+  percentUsed?: number;
+  costAllowance?: number | null;
+  costPercentUsed?: number;
+}): { costCapTriggered: boolean; tokenCapTriggered: boolean; blockedByCost: boolean } {
+  const costCapTriggered =
+    status.costAllowance != null && (status.costPercentUsed ?? 0) >= 100;
+  const effectiveTokenAllowance =
+    status.effectiveAllowance != null ? status.effectiveAllowance : status.allowance;
+  const tokenCapTriggered =
+    effectiveTokenAllowance != null && (status.percentUsed ?? 0) >= 100;
+  return {
+    costCapTriggered,
+    tokenCapTriggered,
+    blockedByCost: costCapTriggered && !tokenCapTriggered,
   };
 }
 

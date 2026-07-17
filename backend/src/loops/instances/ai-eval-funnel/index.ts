@@ -32,6 +32,7 @@ import {
   type LoopDigestTemplate,
   type SlackPosterLike,
 } from '../../core/digest/loopDigest';
+import { claimLoopDailyDigestPost } from '../../core/digest/dailyDigestClaim';
 import { createInstanceRunner } from '../../core/instanceRunner';
 import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
 import { InMemoryLearningStore } from '../../core/learning/inMemoryLearningStore';
@@ -166,7 +167,19 @@ const runner = createInstanceRunner({
     // Drain the gate's captured mutations and post a single digest Slack DM.
     if (drained === null) return;
     if (drained.length > 0 || result.eventsScanned > 0) {
-      await postDailyDigest(result, drained, ports.slack, manifest.approval.slackUserId);
+      await postDailyDigest(
+        result,
+        drained,
+        ports.slack,
+        manifest.approval.slackUserId,
+        (digestDate, slackUserId, runId) =>
+          claimLoopDailyDigestPost(ports.dynamo, {
+            loopId: AI_EVAL_LOOP_ID,
+            digestDate,
+            slackUserId,
+            runId,
+          }),
+      );
     }
   },
 });
@@ -190,7 +203,9 @@ const aiEvalDigestTemplate: LoopDigestTemplate<readonly Mutation[]> = {
   emptyBody: () => [
     `_No events in the last ${24 * 7}h window. Either traffic is dry or telemetry isn't reaching the table yet._`,
   ],
-  quietBody: () => [`_No rules fired — funnel is healthy._`],
+  quietBody: () => [
+    `_No rules fired this window. Treat this as no dispatchable finding, not proof the funnel is healthy._`,
+  ],
   findingsBody: (result, mutations) => {
     const lines = [`*Proposed fixes*`];
     for (let i = 0; i < mutations.length; i++) {
@@ -226,8 +241,11 @@ async function postDailyDigest(
   mutations: readonly Mutation[],
   slack: SlackPosterLike,
   slackUserId: string | undefined,
+  claimDigest?: (digestDate: string, slackUserId: string, runId: string) => Promise<boolean>,
 ): Promise<void> {
-  await postLoopDigest(result, slack, slackUserId, aiEvalDigestTemplate, mutations);
+  await postLoopDigest(result, slack, slackUserId, aiEvalDigestTemplate, mutations, {
+    claimDailyDigest: claimDigest,
+  });
 }
 
 /** Truncate the top-fix title for the Slack DM. Adds an ellipsis when cut. */

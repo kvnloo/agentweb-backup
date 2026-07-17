@@ -19,6 +19,18 @@ import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorker
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
+import { trackScheduledRun } from '../utils/scheduledRunTracker';
+import {
+  isRunStoreEnabled,
+  interactiveIdempotencyKey,
+  createSessionIdempotencyKey,
+  claimIdempotency,
+  releaseIdempotency,
+  recordIdempotencySessionId,
+  createRunRecord,
+  markRunTerminal,
+  IDEM_TTL_INTERACTIVE_S,
+} from '../services/agentMode/runStore';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
@@ -26,7 +38,7 @@ import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
 import { normalizeEmailList } from '../utils/validation';
 import { getAllowedSkills } from '../services/subscriptionService';
-import { checkTokenUsage } from '../services/tokenUsageService';
+import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
 import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 import { DynamoDB } from 'aws-sdk';
@@ -34,6 +46,21 @@ import { DynamoDB } from 'aws-sdk';
 const ZERO_ASSISTANT_REQUEUE_BASE_MS = 15 * 60 * 1000;
 const ZERO_ASSISTANT_REQUEUE_MAX_MS = 2 * 60 * 60 * 1000;
 const ZERO_ASSISTANT_MAX_REQUEUES = 3;
+
+// ENG-324: durable in-flight lease + reconciliation. The graceful-shutdown drain
+// only saves a run that finishes within DRAIN_CEILING_MS (10 min) of SIGTERM; a
+// longer run, a SIGKILL, or an OOM kills the process before its catch can persist
+// a failure/requeue, leaving the session at messageCount=2 with no run result.
+// A live run heartbeats its lease every HEARTBEAT_INTERVAL_MS; a surviving
+// instance's reconciler requeues any lease whose heartbeat is older than
+// LEASE_STALE_MS (i.e. the owning process died). LEASE_STALE_MS is heartbeat-based
+// (not startedAt-based) so a legitimately long run is never falsely reaped.
+const HEARTBEAT_INTERVAL_MS = 60 * 1000; // 1 min
+const LEASE_STALE_MS = 5 * 60 * 1000; // reap after 5 missed heartbeats
+export const RECONCILE_INTERVAL_MS = 2 * 60 * 1000; // reconciler sweep cadence
+// Per-process identity (mirrors the social executor's INSTANCE_ID) — stamped on
+// each lease so a rebooted instance can recognise/reclaim its own prior-life runs.
+const SCHEDULED_RUN_INSTANCE_ID: string = require('uuid').v4();
 
 // User-facing fallback shown when a scheduled run terminates with zero assistant
 // output (crash/timeout/context-limit). A silent, empty session reads as a total
@@ -100,7 +127,7 @@ export function releaseSessionGeneration(sessionId: string): void {
 const GENERATION_TIMEOUT_MS = parseInt(
   process.env.AGENT_MODE_GENERATION_TIMEOUT_MS || '600000',
   10
-); // 10 minutes default — local agent browser tasks need > 5 min
+); // 10 minutes default — long-running browser/research tasks need > 5 min
 
 async function withGenerationTimeout<T>(
   promise: Promise<T>,
@@ -688,6 +715,9 @@ const INCOMPLETE_WORK_PATTERNS: RegExp[] = [
   /\bhave\s*not\s+yet\s+(?:processed|completed|finished|researched)\b/i,
   /\b(?:remaining|other)\s+(?:events|leads|items|entities)\b[^.]*\b(?:were|was)?\s*not\s+(?:processed|completed|finished|researched|done)\b/i,
   /\bi\s+will\s+continue\b[^.]*\b(?:later|remaining|next)\b/i,
+  /\bi(?:\s+will|'ll|’ll)\s+(?:continue|proceed|move on|start|begin|work on)\b[^.]*\b(?:remaining|next|rest|step\s*\d+|phase|workflow)\b/i,
+  /\b(?:i|we)\s+(?:skipped|omitted)\b[^.]*\b(?:remaining|other|rest|events|leads|items|entities|steps?|workflow)\b/i,
+  /\b(?:i|we)\s+left\b[^.]*\b(?:remaining|other|rest|events|leads|items|entities|steps?|workflow)\b[^.]*\b(?:unfinished|incomplete|undone|unprocessed|unresearched)\b/i,
 ];
 
 export function scheduledRunSignalsIncompleteWork(content: string): boolean {
@@ -1247,6 +1277,13 @@ export async function runScheduledChat(
   let sessionId: string = '';
   let generatedSummary: string | undefined;
 
+  // ENG-324: durable in-flight lease. Set once the session exists (below), kept
+  // fresh by a heartbeat timer, and always cleared in `finally`. Skipped for test
+  // runs, which are never requeued.
+  const leaseRunId: string = preGeneratedRunId || require('uuid').v4();
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  let leaseAcquired = false;
+
   try {
     // Guard against orphaned schedules whose owning user no longer exists.
     // Without this, downstream calls (e.g. token-usage checks) throw
@@ -1404,12 +1441,21 @@ export async function runScheduledChat(
         );
       }
 
+      // A block can be caused by either the token-count cap or the dollar cost
+      // cap (ENG-200). When the cost cap is the trigger — which is the only reason
+      // a user with an unlimited token allowance can be blocked — render a
+      // cost-based message so it doesn't misleadingly read "0 tokens used".
+      const { blockedByCost } = deriveBlockedByCost(usageStatus);
+      const blockMessage = blockedByCost
+        ? `Scheduled chat cannot run: Monthly cost limit reached ($${(usageStatus.costUsed ?? 0).toFixed(2)} / $${(usageStatus.costAllowance ?? 0).toFixed(2)} spent this month).`
+        : `Scheduled chat cannot run: Monthly token limit reached (${usageStatus.used?.toLocaleString() ?? 0} / ${usageStatus.allowance?.toLocaleString() ?? 0} tokens used).`;
+
       const tokenLimitResult = {
         scheduleId: schedule.scheduleId,
         runId: require('uuid').v4(),
         status: 'failure' as const,
         passed: false,
-        actualResponse: `Scheduled chat cannot run: Monthly token limit reached (${usageStatus.used?.toLocaleString() ?? 0} / ${usageStatus.allowance?.toLocaleString() ?? 0} tokens used).`,
+        actualResponse: blockMessage,
         actualFunctionCalls: [],
         keywordMatches: [],
         keywordMisses: schedule.keywords || [],
@@ -1445,6 +1491,27 @@ export async function runScheduledChat(
       'scheduled' // sessionType
     );
     sessionId = testSession.sessionId;
+
+    // ENG-324: stamp the durable in-flight lease now that we have a session, and
+    // start heartbeating it. If this process dies during the (possibly long) LLM
+    // turn below, the reconciler will find this lease stale and requeue the run.
+    if (!isTest) {
+      try {
+        await scheduleDb.setRunInFlight(schedule.scheduleId, {
+          runId: leaseRunId,
+          sessionId,
+          startedAt: new Date().toISOString(),
+          instanceId: SCHEDULED_RUN_INSTANCE_ID,
+        });
+        leaseAcquired = true;
+        heartbeatTimer = setInterval(() => {
+          void scheduleDb.heartbeatRunInFlight(schedule.scheduleId, leaseRunId);
+        }, HEARTBEAT_INTERVAL_MS);
+        if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
+      } catch (leaseError) {
+        console.error(`Failed to set in-flight lease for schedule ${schedule.scheduleId}:`, leaseError);
+      }
+    }
 
     // Set the session title to the schedule name
     await chatbotDb.updateSessionTitle(sessionId, sessionTitle);
@@ -1580,25 +1647,13 @@ export async function runScheduledChat(
       }
     }
 
-    // Send oncall alert and Notion ticket if scheduled chat failed validation (not for test runs)
+    // Send oncall alert and Notion ticket if scheduled chat failed validation (not for test runs).
+    // Single-writer (ENG-240): file the tracked issue FIRST, THEN alert. The oncall path also files an
+    // issue, but by then it dedups onto this one via the shared Schedule/Session idempotency key — so
+    // the event yields exactly ONE issue, with the oncall alert landing as an occurrence comment
+    // instead of a second, near-identical twin.
     if (!finalResult.passed && !isTest) {
-      sendAgentModeOncallAlert({
-        subject: `Scheduled Chat Failed: ${schedule.scheduleName}`,
-        message: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
-        sessionId,
-        context: {
-          'Schedule ID': schedule.scheduleId,
-          'Schedule Name': schedule.scheduleName,
-          'User ID': userId,
-          'Attempts': finalResult.attempt,
-          'Execution Time (ms)': finalResult.executionTime,
-          'Function Call Misses': finalResult.functionCallMisses.join(', ') || 'none',
-          'Function Call Matches': finalResult.functionCallMatches.join(', ') || 'none',
-          'Keyword Misses': finalResult.keywordMisses.join(', ') || 'none',
-          'Timestamp': finalResult.createdAt
-        }
-      }).catch(err => console.error('Failed to send oncall alert for scheduled chat failure:', err));
-      fileAutoIssue({
+      void fileAutoIssue({
         title: `Scheduled Chat Failed: ${schedule.scheduleName}`,
         description: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
         source: 'Scheduled chat (validation)',
@@ -1610,7 +1665,31 @@ export async function runScheduledChat(
           'Session ID': sessionId,
           'Attempts': finalResult.attempt,
         }
-      }).catch(err => console.error('Failed to file scheduled-chat-failure issue:', err));
+      })
+        .catch(err => console.error('Failed to file scheduled-chat-failure issue:', err))
+        .then(() => sendAgentModeOncallAlert({
+          subject: `Scheduled Chat Failed: ${schedule.scheduleName}`,
+          message: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
+          sessionId,
+          // One alert per (user, schedule, errorClass) per hour — a flapping
+          // schedule cannot flood oncall (ENG-145/146 class). Gated so flag
+          // off = today's exact behavior.
+          ...(isRunStoreEnabled()
+            ? { dedupeKey: `scheduled_chat:${userId}:${schedule.scheduleId}:validation_failed`, dedupeWindowMs: 60 * 60 * 1000 }
+            : {}),
+          context: {
+            'Schedule ID': schedule.scheduleId,
+            'Schedule Name': schedule.scheduleName,
+            'User ID': userId,
+            'Attempts': finalResult.attempt,
+            'Execution Time (ms)': finalResult.executionTime,
+            'Function Call Misses': finalResult.functionCallMisses.join(', ') || 'none',
+            'Function Call Matches': finalResult.functionCallMatches.join(', ') || 'none',
+            'Keyword Misses': finalResult.keywordMisses.join(', ') || 'none',
+            'Timestamp': finalResult.createdAt
+          }
+        }))
+        .catch(err => console.error('Failed to send oncall alert for scheduled chat failure:', err));
     }
 
     // Also sync Research Reports execution for email campaigns
@@ -1769,31 +1848,13 @@ export async function runScheduledChat(
       // Continue even if saving fails - we still want to return the result
     }
 
-    // Send oncall alert and Notion ticket for scheduled chat exception (always, including test runs)
+    // Send oncall alert and Notion ticket for scheduled chat exception (always, including test runs).
+    // Single-writer (ENG-240): file the tracked issue FIRST, THEN alert, so the oncall path's own
+    // filing dedups onto this issue via the shared Schedule/Session idempotency key. A zero-output run
+    // used to trip BOTH filers and land two identical Linear issues <1s apart; now it lands one issue
+    // plus an occurrence comment.
     const originalMessage = (error as any)?.originalMessage;
-    sendAgentModeOncallAlert({
-      subject: zeroAssistantOutput
-        ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
-        : `Scheduled Chat Error: ${schedule.scheduleName}`,
-      message: zeroAssistantOutput
-        ? `Scheduled chat "${schedule.scheduleName}" terminated with zero assistant messages.${zeroAssistantRequeuedAt ? ` It was requeued for ${zeroAssistantRequeuedAt}.` : ''}\n\nError: ${errorMessage}`
-        : `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
-      sessionId: sessionId || undefined,
-      context: {
-        'Schedule ID': schedule.scheduleId,
-        'Schedule Name': schedule.scheduleName,
-        'User ID': userId,
-        'Is Test Run': isTest ? 'Yes' : 'No',
-        'Zero Assistant Output': zeroAssistantOutput ? 'Yes' : 'No',
-        ...(zeroAssistantRequeuedAt ? { 'Requeued At': zeroAssistantRequeuedAt } : {}),
-        'Error Message': errorMessage,
-        ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
-        'Error Stack': error instanceof Error ? (error.stack || 'No stack trace') : 'N/A',
-        'Execution Time (ms)': errorResult.executionTime,
-        'Timestamp': errorResult.createdAt
-      }
-    }).catch(err => console.error('Failed to send oncall alert for scheduled chat error:', err));
-    fileAutoIssue({
+    void fileAutoIssue({
       title: zeroAssistantOutput
         ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
         : `Scheduled Chat Error: ${schedule.scheduleName}`,
@@ -1813,11 +1874,193 @@ export async function runScheduledChat(
         'Error Message': errorMessage,
         ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
       }
-    }).catch(err => console.error('Failed to file scheduled-chat-error issue:', err));
+    })
+      .catch(err => console.error('Failed to file scheduled-chat-error issue:', err))
+      .then(() => sendAgentModeOncallAlert({
+        subject: zeroAssistantOutput
+          ? `Scheduled Chat Zero Assistant Output: ${schedule.scheduleName}`
+          : `Scheduled Chat Error: ${schedule.scheduleName}`,
+        message: zeroAssistantOutput
+          ? `Scheduled chat "${schedule.scheduleName}" terminated with zero assistant messages.${zeroAssistantRequeuedAt ? ` It was requeued for ${zeroAssistantRequeuedAt}.` : ''}\n\nError: ${errorMessage}`
+          : `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
+        // One alert per (user, schedule, errorClass) per hour (ENG-145/146
+        // class). Gated so flag off = today's exact behavior.
+        ...(isRunStoreEnabled()
+          ? { dedupeKey: `scheduled_chat:${userId}:${schedule.scheduleId}:${zeroAssistantOutput ? 'zero_output' : 'run_error'}`, dedupeWindowMs: 60 * 60 * 1000 }
+          : {}),
+        sessionId: sessionId || undefined,
+        context: {
+          'Schedule ID': schedule.scheduleId,
+          'Schedule Name': schedule.scheduleName,
+          'User ID': userId,
+          'Is Test Run': isTest ? 'Yes' : 'No',
+          'Zero Assistant Output': zeroAssistantOutput ? 'Yes' : 'No',
+          ...(zeroAssistantRequeuedAt ? { 'Requeued At': zeroAssistantRequeuedAt } : {}),
+          'Error Message': errorMessage,
+          ...(originalMessage ? { 'Original Error (Bedrock/API)': originalMessage } : {}),
+          'Error Stack': error instanceof Error ? (error.stack || 'No stack trace') : 'N/A',
+          'Execution Time (ms)': errorResult.executionTime,
+          'Timestamp': errorResult.createdAt
+        }
+      }))
+      .catch(err => console.error('Failed to send oncall alert for scheduled chat error:', err));
 
     // Return error result for error reporting
     return errorResult;
+  } finally {
+    // ENG-324: stop heartbeating and release the lease. Conditional on runId, so
+    // if the reconciler already reaped this run (heartbeat went stale), the clear
+    // no-ops and the requeue it wrote stands.
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    if (leaseAcquired) {
+      try {
+        await scheduleDb.clearRunInFlight(schedule.scheduleId, leaseRunId);
+      } catch (clearError) {
+        console.error(`Failed to clear in-flight lease for schedule ${schedule.scheduleId}:`, clearError);
+      }
+    }
   }
+}
+
+/**
+ * ENG-324: recover a single scheduled run whose owning process died mid-flight.
+ * Claims the stale lease atomically (single-winner across instances) and, if we
+ * win, requeues the schedule (respecting the zero-output requeue cap), annotates
+ * the orphaned session so it isn't silent, and records a failure run result.
+ * Returns true only if THIS caller performed the recovery.
+ */
+export async function recoverAbandonedScheduledRun(schedule: any, lease: any): Promise<boolean> {
+  const nowIso = new Date().toISOString();
+  const nextRetryCount = getZeroAssistantRetryCount(schedule) + 1;
+  // Only reschedule schedules that are still active. A runCount-limited schedule
+  // auto-pauses at dispatch, so requeuing it would resurrect a completed-quota
+  // schedule; a paused run is still recovered (lease cleared, session annotated,
+  // failure recorded) — just not rescheduled.
+  const isActive = schedule.status === 'active';
+  const overCap = nextRetryCount > ZERO_ASSISTANT_MAX_REQUEUES;
+  const willRequeue = isActive && !overCap;
+  const noRequeueReason = willRequeue ? '' : (!isActive ? `schedule is ${schedule.status}` : 'over requeue cap');
+  const requeuedAt = willRequeue
+    ? new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString()
+    : undefined;
+
+  // Atomic single-winner claim. If another instance already reaped this lease the
+  // conditional write fails and we return false without touching the session.
+  const won = await scheduleDb.claimAbandonedRun(
+    schedule.scheduleId,
+    lease.runId,
+    willRequeue
+      ? { nextRunTime: requeuedAt!, retryCount: nextRetryCount, sessionId: lease.sessionId || '', lastAt: nowIso }
+      : null
+  );
+  if (!won) return false;
+
+  // We own the recovery. Make the orphaned session self-explanatory (best-effort).
+  if (lease.sessionId) {
+    try {
+      await chatbotDb.addMessageToSession(lease.sessionId, {
+        role: 'assistant',
+        content: SCHEDULED_JOB_INCOMPLETE_MESSAGE,
+        timestamp: nowIso,
+        metadata: { timestamp: nowIso, isErrorMessage: true, jobIncomplete: true },
+      });
+      await chatbotDb.updateSessionError(
+        lease.sessionId,
+        'Scheduled run abandoned: the owning process terminated mid-run (recovered by reconciler).'
+      );
+    } catch (annotateError) {
+      console.error(`recoverAbandonedScheduledRun: failed to annotate session ${lease.sessionId}:`, annotateError);
+    }
+  }
+
+  // Persist a failure run result so the abandonment is visible in the UI, mirroring
+  // the shape the in-process catch writes for a caught zero-output run.
+  try {
+    await scheduleDb.addRunResult(schedule.scheduleId, {
+      scheduleId: schedule.scheduleId,
+      runId: lease.runId,
+      status: 'failure',
+      passed: false,
+      keywordMatches: [],
+      keywordMisses: schedule.keywords || [],
+      functionCallMatches: [],
+      functionCallMisses: schedule.requiredFunctionCalls || [],
+      executionTime: 0,
+      sessionId: lease.sessionId || '',
+      attempt: 0,
+      createdAt: nowIso,
+      zeroAssistantOutput: true,
+      abandoned: true,
+      ...(requeuedAt ? { requeuedAt } : {}),
+    });
+  } catch (resultError) {
+    console.error(`recoverAbandonedScheduledRun: failed to persist run result for ${schedule.scheduleId}:`, resultError);
+  }
+
+  console.error('Scheduled chat abandoned-run recovered by reconciler:', {
+    scheduleId: schedule.scheduleId,
+    scheduleName: schedule.scheduleName,
+    sessionId: lease.sessionId || 'N/A',
+    deadInstanceId: lease.instanceId,
+    heartbeatAt: lease.heartbeatAt,
+    requeued: willRequeue,
+    requeuedAt: requeuedAt || `N/A (${noRequeueReason})`,
+  });
+
+  // Surface to oncall (best-effort, never throws into the sweep).
+  void sendAgentModeOncallAlert({
+    subject: `Scheduled Chat Abandoned Run Recovered: ${schedule.scheduleName}`,
+    message: `A scheduled run for "${schedule.scheduleName}" was abandoned when its process died mid-run and has been ${willRequeue ? `requeued for ${requeuedAt}` : `left failed (${noRequeueReason})`}.`,
+    sessionId: lease.sessionId || undefined,
+    context: {
+      'Schedule ID': schedule.scheduleId,
+      'Schedule Name': schedule.scheduleName,
+      'User ID': schedule.userId,
+      'Session ID': lease.sessionId || 'N/A',
+      'Dead Instance': lease.instanceId || 'unknown',
+      'Last Heartbeat': lease.heartbeatAt || 'unknown',
+      'Requeued': willRequeue ? `Yes (${requeuedAt})` : `No (${noRequeueReason})`,
+      'Retry Count': String(nextRetryCount),
+    },
+  }).catch(err => console.error('Failed to send oncall alert for recovered abandoned run:', err));
+
+  return true;
+}
+
+/**
+ * ENG-324: sweep active scheduled-chat schedules for in-flight leases whose
+ * heartbeat has gone stale (owning process died) and recover each one. Safe to
+ * run concurrently on every instance — each recovery is a single-winner claim.
+ * `now` is injectable for deterministic tests.
+ */
+export async function reconcileStaleScheduledRuns(now: number = Date.now()): Promise<{ scanned: number; reconciled: number }> {
+  let schedules: any[] = [];
+  try {
+    schedules = await scheduleDb.getInFlightSchedules();
+  } catch (listError) {
+    console.error('reconcileStaleScheduledRuns: failed to list in-flight schedules:', listError);
+    return { scanned: 0, reconciled: 0 };
+  }
+
+  let reconciled = 0;
+  for (const schedule of schedules) {
+    const lease = schedule?.runInFlight;
+    if (!lease || !lease.runId) continue;
+    const heartbeatIso = lease.heartbeatAt || lease.startedAt;
+    const heartbeatMs = heartbeatIso ? new Date(heartbeatIso).getTime() : NaN;
+    // A fresh heartbeat means the run is alive and working (any duration) — skip.
+    if (Number.isFinite(heartbeatMs) && now - heartbeatMs <= LEASE_STALE_MS) continue;
+    try {
+      if (await recoverAbandonedScheduledRun(schedule, lease)) reconciled++;
+    } catch (recoverError) {
+      console.error(`reconcileStaleScheduledRuns: failed to recover schedule ${schedule.scheduleId}:`, recoverError);
+    }
+  }
+
+  if (reconciled > 0) {
+    console.log(`reconcileStaleScheduledRuns: recovered ${reconciled} abandoned scheduled run(s) of ${schedules.length} in-flight.`);
+  }
+  return { scanned: schedules.length, reconciled };
 }
 
 // Run one reflection turn (a real Emma turn in the same session, with full tool access)
@@ -2408,10 +2651,40 @@ export const agentModeController = {
 
   // Create new agent chat session
   async createSession(req: Request, res: Response) {
+    // Session-creation idempotency (ENG-147: one client "send" retried into
+    // ~30 create-session calls on 6/27). Hoisted so the catch block can
+    // release a held claim after an error unwinds.
+    let createIdemKeyHeld: string | undefined;
     try {
       const authReq = req as AuthenticatedRequest;
       const user = authReq.user as User;
-      const { portalType = 'agent', pageIdentifier = 'agent-mode', sessionType } = req.body;
+      const { portalType = 'agent', pageIdentifier = 'agent-mode', sessionType, idempotencyKey } = req.body;
+
+      // Cross-restart duplicate-submit lock, keyed by the client-provided
+      // idempotencyKey scoped to this user. The conditional idem#… put means
+      // exactly one of N concurrent duplicates creates a session; losers
+      // ATTACH to the winner's session once it's recorded, or get 409 while
+      // the winner is still in flight. No key (or flag off) = today's exact
+      // behavior — every call creates a fresh session.
+      if (isRunStoreEnabled() && typeof idempotencyKey === 'string' && idempotencyKey.length > 0) {
+        const idemKey = createSessionIdempotencyKey(user.userId, idempotencyKey);
+        const claim = await claimIdempotency(idemKey, uuidv4(), IDEM_TTL_INTERACTIVE_S);
+        if (!claim.claimed) {
+          if (claim.sessionId) {
+            const existing = await chatbotDb.getChatSession(claim.sessionId);
+            if (existing && existing.userId === user.userId) {
+              // Duplicate of a completed create — attach to the winner's session.
+              return res.status(200).json({ ...existing, idempotentReplay: true });
+            }
+          }
+          return res.status(409).json({
+            error: 'Duplicate submit',
+            message: 'This request was already submitted and is still being processed. Please retry in a moment.',
+            code: 'DUPLICATE_SUBMIT',
+          });
+        }
+        createIdemKeyHeld = idemKey;
+      }
 
       // Determine sessionType: if explicitly provided, use it; otherwise default to 'regular'
       // For ad image generation from Images page, sessionType should be 'image-generation'
@@ -2446,9 +2719,21 @@ export const agentModeController = {
       }
       const sessionWithModel = await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
 
+      // Stamp the winner's sessionId on the idem claim so duplicate losers
+      // attach to THIS session instead of getting 409 (best-effort by design —
+      // on failure losers 409 until the 10m ttl bounds the staleness).
+      if (createIdemKeyHeld) {
+        await recordIdempotencySessionId(createIdemKeyHeld, session.sessionId);
+      }
+
       res.status(201).json(sessionWithModel);
     } catch (error) {
       console.error('AgentMode: Create session error:', error);
+      // Release the claim so the client's retry is accepted — a failed create
+      // must not lock the user out for the idem ttl.
+      if (createIdemKeyHeld) {
+        await releaseIdempotency(createIdemKeyHeld);
+      }
       res.status(500).json({ error: 'Failed to create session' });
     }
   },
@@ -2536,6 +2821,10 @@ export const agentModeController = {
 
   // Generate AI response for marketing conversation
   async generateResponse(req: Request, res: Response) {
+    // Run-survival tracking (ENG-147) — hoisted so the catch block can mark
+    // the durable run record terminal after an error unwinds the inner finally.
+    let runSurvivalRunId: string | undefined;
+    let idemKeyHeld: string | undefined;
     try {
       const user = req.user as User;
       const { sessionId, llmModel, attachments, currentUrl, structuredContext, screenshot, audioInput } = req.body;
@@ -2555,10 +2844,58 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Session ID and user message are required' });
       }
 
+      // Session ownership (ENG-346). Deliberately BEFORE the idempotency claim
+      // and the session-busy lock: an unauthorized requester must not be able
+      // to create/hold an idem claim or trip the busy lock for someone else's
+      // session (a squatted claim would 409 the real owner for its ttl window).
+      // Owner-or-admin predicate, matching the other session-mutating
+      // endpoints (uploadImageToSession, updateSessionTitle,
+      // updateSessionLlmModel). Delegated tokens already resolve req.user to
+      // the TARGET user (middleware/auth.ts), so plain equality is
+      // delegation-safe.
+      // DELIBERATE: non-owner gets a distinct 403 (vs 404 for missing). This
+      // discloses that the sessionId exists, unlike the collapsed-404 style in
+      // getProgress/verify-session blocks. Accepted: sessionIds are
+      // non-enumerable UUIDs, the 403 matches the sibling endpoints above, and
+      // the ENG-346 acceptance contract pins 403 for the non-owner lane.
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+      if (session.userId !== user.userId && !user.isAdmin) {
+        return res.status(403).json({ error: 'Unauthorized access to session' });
+      }
+
+      // Cross-restart duplicate-submit lock (ENG-147: one question spawned ~30
+      // sessions). Claimed BEFORE the in-process Set: two layers, ONE concept —
+      // the conditional idem#sha256(sessionId+userMessage+llmModel) put dedupes
+      // duplicates across retries/restarts, the Set guards in-process
+      // concurrency. The loser gets the existing 409 shape + the in-flight runId.
+      if (isRunStoreEnabled()) {
+        runSurvivalRunId = uuidv4();
+        const idemKey = interactiveIdempotencyKey(sessionId, userMessage, llmModel || '');
+        const claim = await claimIdempotency(idemKey, runSurvivalRunId, IDEM_TTL_INTERACTIVE_S);
+        if (!claim.claimed) {
+          return res.status(409).json({
+            error: 'Session is busy',
+            message: 'A response is already being generated for this session. Please wait.',
+            code: 'SESSION_BUSY',
+            ...(claim.inFlightRunId ? { runId: claim.inFlightRunId } : {}),
+          });
+        }
+        idemKeyHeld = idemKey;
+      }
+
       // Reject concurrent requests for the same session. The claim is atomic
       // (check-and-set in one call) so two near-simultaneous requests can never
       // both proceed — exactly one wins, the other gets 409 SESSION_BUSY.
       if (!tryClaimSessionGeneration(sessionId)) {
+        // A DIFFERENT message on a busy session: give back the idem claim we
+        // just took so the user's retry (after the busy run finishes) is accepted.
+        if (idemKeyHeld) {
+          await releaseIdempotency(idemKeyHeld);
+          idemKeyHeld = undefined;
+        }
         return res.status(409).json({
           error: 'Session is busy',
           message: 'A response is already being generated for this session. Please wait.',
@@ -2577,15 +2914,23 @@ export const agentModeController = {
         });
       }
 
-      // Get session
-      const session = await chatbotDb.getChatSession(sessionId);
-      if (!session) {
-        return res.status(404).json({ error: 'Session not found' });
-      }
+      // (Session was fetched + ownership-checked above, before the locks.)
 
       // Clear old progress store (but keep active connections)
       // Don't call cleanupProgress here as it removes active SSE connections
       progressStore.delete(sessionId);
+
+      // Durable run record, minted ONCE at intake. NO-FALLBACK: creation
+      // failure aborts this request loudly (dedupe would lie without the
+      // record) — the session lock and idem claim release in finally/catch.
+      if (isRunStoreEnabled() && runSurvivalRunId) {
+        await createRunRecord({
+          runId: runSurvivalRunId,
+          kind: 'interactive',
+          sessionId,
+          userId: session.userId,
+        });
+      }
 
       // Cancel generation immediately when the client disconnects (e.g. Stop button aborts the fetch).
       // This fires before /stop reaches the backend and ensures the worker receives the cancel signal
@@ -2627,6 +2972,12 @@ export const agentModeController = {
           if (inFlight) {
             markProgressComplete(sessionId);
             res.json({ content: STILL_BUILDING_MESSAGE, stillBuilding: true });
+            // This request's lifecycle is over (it handed off to the detached
+            // build) — without a terminal mark the run record would sit
+            // status='running' for its whole 30d ttl. Best-effort by design.
+            if (runSurvivalRunId) {
+              void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'detached_still_building' });
+            }
             return;
           }
         } catch (reconnectErr) {
@@ -2682,6 +3033,12 @@ export const agentModeController = {
                 metadata: { timestamp: new Date().toISOString() },
               }).catch(() => {});
               res.json({ content: STILL_BUILDING_MESSAGE, stillBuilding: true });
+              // Same as the pre-generation reconnect above: the request ended
+              // by detaching — mark the run record terminal or it stays
+              // 'running' for 30d. Best-effort by design.
+              if (runSurvivalRunId) {
+                void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'detached_still_building' });
+              }
               return;
             }
           } catch (durErr) {
@@ -2753,11 +3110,44 @@ export const agentModeController = {
         ...(invalidations ? { invalidations } : {}),
         ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
+
+      // Terminal update is best-effort BY DESIGN: markRunTerminal retries once,
+      // then fires one deduped oncall alert — it can never retro-fail a chat
+      // that was already delivered above.
+      if (runSurvivalRunId) {
+        void markRunTerminal(runSurvivalRunId, 'completed');
+      }
       } finally {
         releaseSessionGeneration(sessionId);
+        // Terminal state reached (success OR error unwinding through here):
+        // release the submit-lock so an identical, legitimate resubmit is
+        // accepted. Best-effort — on failure the item expires via its 10m ttl.
+        if (idemKeyHeld) {
+          await releaseIdempotency(idemKeyHeld);
+          idemKeyHeld = undefined;
+        }
       }
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
+
+      // Run-survival: record the terminal state on the durable run record.
+      // Worker death = 'interrupted' (the honest state — tools may not have
+      // executed); anything else = 'failed'. Best-effort by design (see
+      // markRunTerminal) — never blocks the error response below. If
+      // createRunRecord itself threw, markRunTerminal is a conditional no-op.
+      if (runSurvivalRunId) {
+        const wasInterrupted = error instanceof Error && isWorkerShutdownError(error);
+        void markRunTerminal(
+          runSurvivalRunId,
+          wasInterrupted ? 'interrupted' : 'failed',
+          { finishReason: wasInterrupted ? 'worker_exit' : 'error' }
+        );
+      }
+
+      // No idem release here: every path that errors with the claim held runs
+      // through the inner finally first (releaseIdempotency never throws, and
+      // the pre-inner-try code between claim and lock is synchronous Set ops),
+      // so idemKeyHeld is always undefined by the time this catch runs.
 
       // Clean up progress store on error so session doesn't appear stuck in generating state
       const sessionId = req.body?.sessionId;
@@ -3664,9 +4054,34 @@ export const agentModeController = {
   },
 
   // Stop generation for a session
-  async stopGeneration(req: Request, res: Response) {
+  async stopGeneration(req: AuthenticatedRequest, res: Response) {
     try {
       const { sessionId } = req.params;
+      const user = req.user as User;
+
+      if (!user) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      // Session ownership (ENG-360). Previously this lane did no session read
+      // at all, so any authenticated user who learned another user's sessionId
+      // could cancel that user's in-flight generation and flip their SSE
+      // progress to complete. Same owner-or-admin predicate as the sibling
+      // session-mutating endpoints (updateSessionTitle, uploadImageToSession,
+      // updateSessionLlmModel) and the ENG-346 generateResponse check.
+      // Delegated tokens already resolve req.user to the TARGET user
+      // (middleware/auth.ts), so plain equality is delegation-safe. The public
+      // ishare lane (stopGenerationPublic, conversable token) remains the
+      // separate anon path.
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        // Was a silent { success: true } — a stop on a nonexistent session now
+        // fails loudly instead (ENG-360 AC-3).
+        return res.status(404).json({ error: 'Session not found' });
+      }
+      if (session.userId !== user.userId && !user.isAdmin) {
+        return res.status(403).json({ error: 'Unauthorized access to session' });
+      }
 
       // Signal cancellation
       requestCancel(sessionId);
@@ -4817,7 +5232,10 @@ export const agentModeController = {
           variableValuesUpdatedAt: nowIso
         };
 
-        runScheduledChat(scheduleToRun, user.userId, false).then(async (result) => {
+        // Track with the graceful-shutdown drain so a deploy/SIGTERM waits for
+        // this in-flight run (incl. its requeue/persist catch) instead of
+        // abandoning it mid-flight (ENG-324).
+        trackScheduledRun(runScheduledChat(scheduleToRun, user.userId, false).then(async (result) => {
           if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
             try {
               await scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
@@ -4848,7 +5266,7 @@ export const agentModeController = {
           }
         }).catch(async (runError) => {
           if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
-            scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
+            await scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
               variableValues: {},
               variableRequestStatus: 'pending',
               updatedAt: new Date().toISOString()
@@ -4857,7 +5275,7 @@ export const agentModeController = {
             });
           }
           console.error(`Error triggering scheduled chat after variable submission for ${scheduleToRun.scheduleName}:`, runError);
-        });
+        }));
       }
 
       res.json({
@@ -4986,7 +5404,10 @@ export const agentModeController = {
         variableValuesUpdatedAt: nowIso
       };
 
-      runScheduledChat(scheduleToRun, schedule.userId, false).then(async (result) => {
+      // Track with the graceful-shutdown drain so a deploy/SIGTERM waits for
+      // this in-flight run (incl. its requeue/persist catch) instead of
+      // abandoning it mid-flight (ENG-324).
+      trackScheduledRun(runScheduledChat(scheduleToRun, schedule.userId, false).then(async (result) => {
         if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
           try {
             await scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
@@ -5015,9 +5436,9 @@ export const agentModeController = {
             console.error('Error sending scheduled chat result email after public variable submit:', emailError);
           }
         }
-      }).catch((runError) => {
+      }).catch(async (runError) => {
         if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
-          scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
+          await scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
             variableValues: {},
             variableRequestStatus: 'pending',
             updatedAt: new Date().toISOString()
@@ -5026,7 +5447,7 @@ export const agentModeController = {
           });
         }
         console.error(`Error triggering scheduled chat after public variable submission for ${scheduleToRun.scheduleName}:`, runError);
-      });
+      }));
 
       return res.json({
         message: 'Variable values submitted successfully. Scheduled chat run started.',
@@ -5518,8 +5939,12 @@ export const agentModeController = {
           const accessTokenWasConsumed = typeof schedule.variableRequestAccessTokenConsumedAt === 'string' && schedule.variableRequestAccessTokenConsumedAt.length > 0;
           const shouldClearVariablesAfterRun = hasVariableRequestSentAt && accessTokenWasConsumed;
 
-          // Start the scheduled chat run asynchronously (don't await)
-          runScheduledChat(schedule, schedule.userId, false).then(async (result) => {
+          // Start the scheduled chat run asynchronously (don't await).
+          // Track with the graceful-shutdown drain so a deploy/SIGTERM waits for
+          // this in-flight run (incl. its requeue/persist catch) instead of
+          // abandoning it mid-flight — which left the session with only a kickoff
+          // message, no assistant output, and no run result (ENG-324).
+          trackScheduledRun(runScheduledChat(schedule, schedule.userId, false).then(async (result) => {
             // Decrement concurrent run counter when done
             currentConcurrentRuns--;
             if (scheduleVariables.length > 0 && shouldClearVariablesAfterRun) {
@@ -5573,7 +5998,7 @@ export const agentModeController = {
               }
             }
             // If result.sessionId is empty, the error email was already sent in runScheduledChat
-          }).catch((error) => {
+          }).catch(async (error) => {
             // Decrement concurrent run counter on error
             currentConcurrentRuns--;
 
@@ -5613,12 +6038,12 @@ export const agentModeController = {
               createdAt: new Date().toISOString()
             };
 
-            scheduleDb.addRunResult(schedule.scheduleId, errorResult).catch((saveError) => {
+            await scheduleDb.addRunResult(schedule.scheduleId, errorResult).catch((saveError) => {
               console.error(`Error saving failure run result for schedule ${schedule.scheduleName}:`, saveError);
             });
 
             // Send oncall alert for unhandled scheduled chat error (safety net)
-            sendAgentModeOncallAlert({
+            await sendAgentModeOncallAlert({
               subject: `Scheduled Chat Unhandled Error: ${schedule.scheduleName}`,
               message: `Scheduled chat "${schedule.scheduleName}" failed with an unhandled error in the fire-and-forget handler.\n\nError: ${error.message || 'Unknown error'}`,
               context: {
@@ -5634,8 +6059,8 @@ export const agentModeController = {
             // Send error notification email
             const emailNotifications = schedule.emailNotifications || [];
             if (emailNotifications.length > 0) {
-              import('../services/emailService').then(({ emailService }) => {
-                emailService.sendScheduledChatResultEmail(
+              await import('../services/emailService').then(({ emailService }) => {
+                return emailService.sendScheduledChatResultEmail(
                   emailNotifications,
                   schedule.scheduleName,
                   errorResult,
@@ -5647,7 +6072,7 @@ export const agentModeController = {
                 console.error('Error importing emailService:', importError);
               });
             }
-          });
+          }));
 
           results.push({
             scheduleId: schedule.scheduleId,

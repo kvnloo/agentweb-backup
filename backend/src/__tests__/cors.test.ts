@@ -179,6 +179,25 @@ describe('CORS Access-Control-Allow-Methods', () => {
     expect(res.headers['access-control-allow-origin']).toBeUndefined();
   });
 
+  // The top-nav UsageMeter's useTokenUsage hook cache-busts /api/subscription/usage
+  // with `Cache-Control: no-cache, no-store, must-revalidate` + `Pragma: no-cache`
+  // request headers. Cross-origin (app.agentweb.pro -> api.agentweb.pro), the browser
+  // preflights those headers; if they aren't in Access-Control-Allow-Headers the
+  // fetch fails and the meter silently never loads. Guard the allow-list.
+  it('should advertise Cache-Control and Pragma in Access-Control-Allow-Headers', async () => {
+    const res = await request(app)
+      .options('/api/subscription/usage')
+      .set('Origin', allowedOrigin)
+      .set('Access-Control-Request-Method', 'GET')
+      .set('Access-Control-Request-Headers', 'authorization,cache-control,pragma');
+
+    const headers = (res.headers['access-control-allow-headers'] || '').toLowerCase();
+    expect(headers).toContain('content-type');
+    expect(headers).toContain('authorization');
+    expect(headers).toContain('cache-control');
+    expect(headers).toContain('pragma');
+  });
+
   it('public endpoints should only advertise GET, POST, OPTIONS methods', async () => {
     const res = await request(app)
       .options('/api/lead-magnet/test')

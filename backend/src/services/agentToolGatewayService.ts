@@ -204,6 +204,17 @@ const TIMEOUT_FAILURE_THRESHOLD = 3;
 // 10-minute controller-bounded turn, so waiting for a 3rd is needlessly slow.
 const SESSION_TIMEOUT_FAILURE_THRESHOLD = 2;
 const EXPENSIVE_MEDIA_FAILURE_BUDGET = 2;
+// ENG-291 follow-up: cost-scoping get_chat_history (chatHistoryFailureScope) fixed the
+// hard-block of legitimate cheaper recovery calls, but it also removed the session-wide
+// protection the prior shared-'' scope provided: a model that keeps VARYING sync/limit/
+// window lands each attempt in a DIFFERENT cost bucket, so neither the per-scope session
+// timeout breaker (threshold 2 per bucket) nor the media budget (get_chat_history is not
+// a media tool) ever trips — and each timeout can burn a full ~10-minute controller-
+// bounded turn. Cap the TOTAL get_chat_history timeouts across ALL cost buckets in a
+// session with a coarse aggregate budget. Kept deliberately high (6) so the few genuine
+// reduced-request recovery paths (sync=false, smaller window/limit) still run before the
+// aggregate cap engages — only a sustained, multi-bucket timeout spiral trips it.
+const CHAT_HISTORY_FAILURE_BUDGET = 6;
 const MAX_TRACKED_RUNS = 500;
 const ERROR_KEY_LENGTH = 80;
 
@@ -233,19 +244,60 @@ function errorHead(error: unknown): string {
 // action without a recipient, e.g. search-people) returns '' — a single shared
 // scope, exactly preserving the prior per-tool behavior.
 //
-// send-invite/send-message/send-inmail identify the recipient by profile_url or
-// provider_id; accept-invitation/cancel-invitation identify it by invitation_id
-// (see agentModeService.ts). Read whichever this action actually carries so every
-// allowlisted action resolves to a real per-recipient scope instead of ''.
+// send-invite/send-message/send-inmail/get-profile/update-conversation-history
+// identify the recipient by profile_url or provider_id; accept-invitation/
+// cancel-invitation identify it by invitation_id (see agentModeService.ts). Read
+// whichever this action actually carries so every allowlisted action resolves to
+// a real per-recipient scope instead of ''.
+//
+// ENG-313: get-profile must be scoped too. When the model first calls get-profile
+// with only keywords (no profile_url/provider_id) it fails "Either profile_url or
+// provider_id is required" — an invalid_args fast-trip (threshold 2). Without a
+// recipient scope those two arg-less failures shared scope '' with a LATER,
+// corrected call that finally passed a valid profile_url, so the breaker blocked
+// the corrected call. Scoping get-profile by its target means the arg-less
+// failures (scope '') and the corrected call (scope = the profile URL) land in
+// different buckets, so a materially different, now-valid attempt is not blocked.
 const LINKEDIN_RECIPIENT_ACTIONS = new Set([
   'send-invite',
   'send-message',
   'send-inmail',
+  'get-profile',
+  'update-conversation-history',
   'cancel-invitation',
   'accept-invitation',
 ]);
 
+// ENG-291: get_chat_history (the Daily Satisfaction Score Report's data source)
+// is expensive in proportion to its request COST — a wide time window with a high
+// limit and sync=true (which generates satisfaction scores on the fly) can take
+// long enough to hit the tool timeout. When the report's heavy 24h/limit=1000/
+// sync=true call timed out twice, the SESSION-scoped timeout breaker tripped and
+// then hard-blocked EVERY later get_chat_history in the session — including the
+// legitimate recovery paths the report tried next (the same window with sync=false,
+// and a much smaller 6h window). The model was told "STOP retrying" and never got
+// to run the cheaper request that would have completed. Scope the breaker by the
+// request's cost signature (sync flag + limit + window-duration) — exactly like the
+// per-recipient LinkedIn scoping above — so a materially cheaper/smaller call lands
+// in a different bucket and is not blocked by an expensive call's timeouts. An
+// IDENTICAL heavy request still shares one scope, so a genuine retry spiral on the
+// same call is still caught.
+function chatHistoryFailureScope(args: unknown): string {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
+  const record = args as Record<string, unknown>;
+  const sync = record.sync === true || record.sync === 'true' ? '1' : '0';
+  const rawLimit = Number(record.limit);
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 1000) : 500;
+  const start = typeof record.start_time === 'string' ? Date.parse(record.start_time) : NaN;
+  const end = typeof record.end_time === 'string' ? Date.parse(record.end_time) : NaN;
+  const hours = Number.isFinite(start) && Number.isFinite(end) && end > start
+    ? Math.max(1, Math.round((end - start) / 3_600_000))
+    : 0;
+  return `sync=${sync}|limit=${limit}|hours=${hours}`;
+}
+
 function failureScope(toolName: string, args: unknown): string {
+  if (toolName === 'get_chat_history') return chatHistoryFailureScope(args);
   if (toolName !== 'linkedin_outreach') return '';
   if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
   const record = args as Record<string, unknown>;
@@ -376,6 +428,17 @@ function mediaFailureBudget(toolName: string): number | null {
   return EXPENSIVE_MEDIA_TOOLS.has(toolName) ? EXPENSIVE_MEDIA_FAILURE_BUDGET : null;
 }
 
+// The coarse tool-wide aggregate budget applied in findTrippedBudget. Extends the
+// expensive-media budget with get_chat_history's higher cross-bucket timeout cap
+// (ENG-291). Kept separate from mediaFailureBudget so shouldTrackInSessionScope's
+// media branch is unchanged — get_chat_history reaches the session bucket only via
+// its timeout branch, so this aggregate counts get_chat_history TIMEOUTS specifically,
+// not one-off arg errors.
+function aggregateFailureBudget(toolName: string): number | null {
+  if (toolName === 'get_chat_history') return CHAT_HISTORY_FAILURE_BUDGET;
+  return mediaFailureBudget(toolName);
+}
+
 function countToolFailures(runId: string, toolName: string): number {
   const counts = runFailureCounts.get(runId);
   if (!counts) return 0;
@@ -388,7 +451,7 @@ function countToolFailures(runId: string, toolName: string): number {
 }
 
 function findTrippedBudget(runId: string, toolName: string): { count: number; budget: number } | null {
-  const budget = mediaFailureBudget(toolName);
+  const budget = aggregateFailureBudget(toolName);
   if (budget == null) return null;
   const count = countToolFailures(runId, toolName);
   return count >= budget ? { count, budget } : null;

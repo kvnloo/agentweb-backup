@@ -8,6 +8,7 @@ import waitlistRoutes from "./routes/waitlist";
 import scheduleRoutes from "./routes/schedules";
 import adminRoutes from "./routes/admin";
 import adminUsageRoutes from "./routes/adminUsage";
+import mcpUsageAdminRoutes from "./routes/mcpUsageAdmin";
 import adminV0CreditsRoutes from "./routes/adminV0Credits";
 import internalUsageRoutes from "./routes/internalUsage";
 import configRouter from "./routes/config";
@@ -217,7 +218,11 @@ const corsOptions = {
   // OPTIONS is intentionally omitted — the cors middleware handles preflight (OPTIONS)
   // requests automatically. This list specifies allowed methods for actual requests.
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  // Cache-Control + Pragma are needed because the top-nav UsageMeter's
+  // useTokenUsage hook cache-busts /api/subscription/usage with those request
+  // headers; cross-origin (app.agentweb.pro -> api.agentweb.pro) the browser
+  // preflights them and, if absent here, blocks the fetch so the meter never loads.
+  allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "Pragma"],
   credentials: true,
 };
 
@@ -280,6 +285,7 @@ app.use("/api/waitlist", waitlistRoutes);
 app.use("/api/schedules", scheduleRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/admin", adminUsageRoutes);
+app.use("/api/admin", mcpUsageAdminRoutes);
 app.use("/api/admin", adminV0CreditsRoutes);
 app.use("/api/internal", internalUsageRoutes);
 app.use("/api/config", configRouter);

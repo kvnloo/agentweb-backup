@@ -1,8 +1,13 @@
 import {
   addIssueComment,
   createInternalLinearIssue,
+  escalateIssue,
   getEngineeringBugStats,
+  getIssueCommentsDetailed,
+  listOpenBugCanonicals,
   listOpenIssuesByLabel,
+  listRecentlyResolvedBugCanonicals,
+  reopenIssue,
   raiseIssueTriage,
   _resetLinearTeamCache,
 } from '../services/linearService';
@@ -226,13 +231,151 @@ describe('linearService.createInternalLinearIssue — triage fields + loud label
 describe('linearService.listOpenIssuesByLabel', () => {
   afterEach(() => jest.clearAllMocks());
 
-  it('queries open issues by a single label and maps id/identifier/title', async () => {
+  it('queries open issues by a single label and maps id/identifier/title/description', async () => {
     (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({
-      data: { issues: { nodes: [{ id: 'u1', identifier: 'ENG-1', title: 'Context limit reached' }] } },
+      data: { issues: { nodes: [{ id: 'u1', identifier: 'ENG-1', title: 'Context limit reached', description: '- Session ID: sess-1' }] } },
     }) } as any));
     const res = await listOpenIssuesByLabel('Auto');
-    expect(res).toEqual([{ identifier: 'ENG-1', issueId: 'u1', title: 'Context limit reached' }]);
+    expect(res).toEqual([{ identifier: 'ENG-1', issueId: 'u1', title: 'Context limit reached', description: '- Session ID: sess-1' }]);
+    // The description is fetched so the auto-issue dedup gate can match on the Session/Schedule ID (ENG-240).
+    expect(JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body).query).toContain('description');
     expect(JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body).variables.label).toBe('Auto');
+  });
+
+  it('defaults description to "" when Linear returns none', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({
+      data: { issues: { nodes: [{ id: 'u2', identifier: 'ENG-2', title: 't' }] } },
+    }) } as any));
+    const res = await listOpenIssuesByLabel('Auto');
+    expect(res[0].description).toBe('');
+  });
+
+  // ENG-358 root cause: Linear's "Duplicate" state has its OWN state type ("duplicate", verified
+  // live on ENG-350) — a blacklist of completed/canceled let duplicate-state issues stay dedupe
+  // candidates, so recurrence comments landed on a canceled Duplicate instead of the open
+  // canonical. The filter must WHITELIST open state types.
+  it('whitelists open state types so duplicate-state issues are never dedupe candidates (ENG-358)', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({
+      data: { issues: { nodes: [] } },
+    }) } as any));
+    await listOpenIssuesByLabel('Auto');
+    const query = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body).query;
+    expect(query).toMatch(/state:\s*\{\s*type:\s*\{\s*in:/);
+    for (const openType of ['triage', 'backlog', 'unstarted', 'started']) {
+      expect(query).toContain(`"${openType}"`);
+    }
+    expect(query).not.toContain('nin');
+  });
+});
+
+describe('linearService.listOpenBugCanonicals — open-state whitelist (ENG-358)', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  // Same leak class as listOpenIssuesByLabel: a bug canonical in the Duplicate state must never
+  // absorb new customer reports — the open canonical (or a fresh issue) must get them.
+  it('whitelists open state types so duplicate-state canonicals are excluded', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({
+      data: { issues: { nodes: [] } },
+    }) } as any));
+    await listOpenBugCanonicals();
+    const query = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body).query;
+    expect(query).toMatch(/state:\s*\{\s*type:\s*\{\s*in:/);
+    for (const openType of ['triage', 'backlog', 'unstarted', 'started']) {
+      expect(query).toContain(`"${openType}"`);
+    }
+    expect(query).not.toContain('nin');
+  });
+});
+
+describe('linearService.escalateIssue (ENG-358 — raise-only canonical escalation)', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  /** fetch mock: 1st call answers the priority query, 2nd the mutation. */
+  function mockEscalationFetch(currentPriority: number | null, mutationSuccess = true) {
+    let n = 0;
+    (global.fetch as any) = jest.fn(() => {
+      n += 1;
+      const body = n === 1
+        ? { data: { issue: currentPriority === null ? null : { priority: currentPriority } } }
+        : { data: { issueUpdate: { success: mutationSuccess } } };
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) } as any);
+    });
+  }
+
+  it('raises "No priority" (0) to the incoming priority and refreshes the title', async () => {
+    mockEscalationFetch(0);
+    const escalated = await escalateIssue('uuid-337', { title: 'v0 credits CRITICAL — $9.10 spendable', priority: 1 });
+    expect(escalated).toBe(true);
+    const mutation = JSON.parse((global.fetch as jest.Mock).mock.calls[1][1].body);
+    expect(mutation.variables.input).toEqual({ title: 'v0 credits CRITICAL — $9.10 spendable', priority: 1 });
+  });
+
+  it('raises a less severe priority (3 -> 1)', async () => {
+    mockEscalationFetch(3);
+    await expect(escalateIssue('uuid-337', { title: 't', priority: 1 })).resolves.toBe(true);
+  });
+
+  it('never downgrades: an equal or weaker incoming priority is a no-op (no mutation call)', async () => {
+    mockEscalationFetch(1);
+    const escalated = await escalateIssue('uuid-337', { title: 't', priority: 2 });
+    expect(escalated).toBe(false);
+    expect((global.fetch as jest.Mock)).toHaveBeenCalledTimes(1); // priority query only
+  });
+
+  it('throws when the issue is not found (callers best-effort it)', async () => {
+    mockEscalationFetch(null);
+    await expect(escalateIssue('uuid-missing', { title: 't', priority: 1 })).rejects.toThrow(/not found/i);
+  });
+
+  it('throws when the mutation reports failure', async () => {
+    mockEscalationFetch(0, false);
+    await expect(escalateIssue('uuid-337', { title: 't', priority: 1 })).rejects.toThrow(/escalation/i);
+  });
+});
+
+describe('linearService.listRecentlyResolvedBugCanonicals (ENG-240 reopen candidates)', () => {
+  beforeEach(() => { _resetLinearTeamCache(); });
+  afterEach(() => jest.clearAllMocks());
+
+  it('filters to completed/canceled Bug + Customer Reported issues and maps them', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({
+      data: { issues: { nodes: [{ id: 'uuid-179', identifier: 'ENG-179', title: 'Google Ads OAuth', description: 'old' }] } },
+    }) } as any));
+    const res = await listRecentlyResolvedBugCanonicals();
+    expect(res).toEqual([{ identifier: 'ENG-179', issueId: 'uuid-179', title: 'Google Ads OAuth', description: 'old' }]);
+    const body = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body);
+    expect(body.query).toContain('completed');
+    expect(body.query).toContain('canceled');
+    expect(body.variables.bug).toBe('Bug');
+    expect(body.variables.cust).toBe('Customer Reported');
+  });
+});
+
+describe('linearService.reopenIssue (ENG-240)', () => {
+  const TEAM_WITH_TODO = { data: { teams: { nodes: [{ id: 'team_eng', states: { nodes: [
+    { id: 'st_backlog', name: 'Backlog', type: 'backlog' },
+    { id: 'st_todo', name: 'Todo', type: 'unstarted' },
+    { id: 'st_done', name: 'Done', type: 'completed' },
+  ] }, labels: { nodes: [] } }] } } };
+  beforeEach(() => { _resetLinearTeamCache(); });
+  afterEach(() => jest.clearAllMocks());
+
+  it('moves a resolved issue to the named state', async () => {
+    let n = 0;
+    (global.fetch as any) = jest.fn(() => {
+      n += 1;
+      const body = n === 1 ? TEAM_WITH_TODO : { data: { issueUpdate: { success: true } } };
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) } as any);
+    });
+    await reopenIssue('uuid-179', 'Todo');
+    const updateCall = (global.fetch as jest.Mock).mock.calls.find(c => (c[1]?.body || '').includes('issueUpdate'));
+    const vars = JSON.parse(updateCall[1].body).variables;
+    expect(vars).toEqual({ id: 'uuid-179', stateId: 'st_todo' });
+  });
+
+  it('throws (never silently no-ops) when the state name is unknown', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(TEAM_WITH_TODO) } as any));
+    await expect(reopenIssue('uuid-179', 'Nonexistent')).rejects.toThrow(/state "Nonexistent" not found/);
   });
 });
 
@@ -250,6 +393,61 @@ describe('linearService.addIssueComment', () => {
   it('throws when commentCreate fails', async () => {
     (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { commentCreate: { success: false } } }) } as any));
     await expect(addIssueComment('uuid-1', 'x')).rejects.toThrow(/commentCreate failed/);
+  });
+});
+
+describe('linearService.getIssueCommentsDetailed (ENG-316)', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  it('returns body + createdAt per comment (the "most recent @Emma wins" contract needs the timestamp), tolerating null nodes/fields', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ data: { issue: { comments: { nodes: [
+        { body: 'first', createdAt: '2026-07-01T00:00:00.000Z' },
+        { body: null, createdAt: null },
+        null,
+      ], pageInfo: { hasNextPage: false } } } } }),
+    } as any));
+    const r = await getIssueCommentsDetailed('uuid-1');
+    expect(r).toEqual([
+      { body: 'first', createdAt: '2026-07-01T00:00:00.000Z' },
+      { body: '', createdAt: '' },
+      { body: '', createdAt: '' },
+    ]);
+    const body = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body);
+    expect(body.query).toContain('createdAt');
+    expect(body.variables).toEqual({ id: 'uuid-1' });
+    // Explicitly sized + ordered: Linear defaults connections to 50 nodes (the getTeamMeta trap) —
+    // an un-sized page would silently drop exactly the newest comments the resolve bridge needs.
+    expect(body.query).toContain('first: 250');
+    expect(body.query).toContain('orderBy: createdAt');
+    expect(body.query).toContain('hasNextPage');
+  });
+
+  it('flags truncation LOUDLY when the issue has >250 comments (hasNextPage) instead of silently dropping them', async () => {
+    const err = jest.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      (global.fetch as any) = jest.fn(() => Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ data: { issue: { comments: { nodes: [
+          { body: 'newest', createdAt: '2026-07-01T00:00:00.000Z' },
+        ], pageInfo: { hasNextPage: true } } } } }),
+      } as any));
+      const r = await getIssueCommentsDetailed('uuid-busy');
+      // Still returns the page it got — truncation degrades loudly, it does not throw.
+      expect(r).toEqual([{ body: 'newest', createdAt: '2026-07-01T00:00:00.000Z' }]);
+      expect(err).toHaveBeenCalledWith(expect.stringContaining('truncated'));
+      expect(err).toHaveBeenCalledWith(expect.stringContaining('uuid-busy'));
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  it('missing issue -> empty list', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { issue: null } }) } as any));
+    await expect(getIssueCommentsDetailed('nope')).resolves.toEqual([]);
   });
 });
 

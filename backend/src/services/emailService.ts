@@ -1,20 +1,18 @@
-import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
 
 import { resendService } from './resendService';
+import { deriveBlockedByCost } from './tokenUsageService';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { chatbotDb } from './chatbotService';
 import { settingsService } from './settingsService';
 
 dotenv.config();
 
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS
-  }
-});
+// ENG-164: the nodemailer Gmail SMTP transporter is gone. Every email leaves
+// through resendService; this is the default system sender for emails that
+// don't carry a customer-configured sender.
+const SYSTEM_FROM = `${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`;
+const SUPPORT_REPLY_TO = 'support@agentweb.pro';
 
 // Env var ONCALL_EMAIL_LIST takes highest priority for oncall alerts.
 async function getAlertEmails(settingKey: string, fallback: string[]): Promise<string[]> {
@@ -38,29 +36,28 @@ export const emailService = {
   },
 
   async sendEmail(to: string | string[], subject: string, text: string, html: string, cc?: string | string[]) {
-    const mailOptions = {
-      from: process.env.FROM_EMAIL,
-      replyTo: 'support@agentweb.pro',
-      to,
-      cc,
-      subject,
-      text,
-      html
-    };
-
     try {
-      await transporter.sendMail(mailOptions);
+      await resendService.sendEmail({
+        from: SYSTEM_FROM,
+        to,
+        cc,
+        subject,
+        text,
+        html,
+        replyTo: SUPPORT_REPLY_TO
+      });
       const toList = Array.isArray(to) ? to.join(', ') : to;
       const ccList = cc ? (Array.isArray(cc) ? cc.join(', ') : cc) : '';
       console.log('Email sent successfully to:', toList, cc ? `CC: ${ccList}` : '');
     } catch (error) {
       console.error('Error sending email:', error);
-      // Don't throw - just log the error
+      // Don't throw - best-effort by design. Callers that need delivery
+      // guarantees use sendEmailStrict.
     }
   },
 
   /**
-   * Strict variant — throws on transporter failure, returns the real provider
+   * Strict variant — throws on send failure, returns the real provider
    * messageId so the caller's audit row reflects ground truth. Use this for
    * any flow where "did this email actually leave the box?" has to be
    * answerable from the audit log (e.g. the drip executor).
@@ -78,22 +75,23 @@ export const emailService = {
     html: string,
     cc?: string | string[]
   ): Promise<{ messageId: string }> {
-    const mailOptions = {
-      from: process.env.FROM_EMAIL,
-      replyTo: 'support@agentweb.pro',
+    // resendService rejects on failure (ENG-164), so a send error propagates
+    // to the caller here without any extra handling.
+    const result = await resendService.sendEmail({
+      from: SYSTEM_FROM,
       to,
       cc,
       subject,
       text,
-      html
-    };
+      html,
+      replyTo: SUPPORT_REPLY_TO
+    });
 
-    const info = await transporter.sendMail(mailOptions);
-    const messageId = (info && typeof (info as any).messageId === 'string')
-      ? (info as any).messageId
+    const messageId = (result && typeof (result as any).id === 'string')
+      ? (result as any).id
       : null;
     if (!messageId) {
-      throw new Error('sendEmailStrict: transporter returned no messageId');
+      throw new Error('sendEmailStrict: Resend returned no messageId');
     }
     const toList = Array.isArray(to) ? to.join(', ') : to;
     const ccList = cc ? (Array.isArray(cc) ? cc.join(', ') : cc) : '';
@@ -103,8 +101,8 @@ export const emailService = {
 
   async sendInvitation(email: string) {
     const mailOptions = {
-      from: process.env.FROM_EMAIL,
-      replyTo: 'support@agentweb.pro',
+      from: SYSTEM_FROM,
+      replyTo: SUPPORT_REPLY_TO,
       to: email,
       subject: 'Welcome to AgentWeb - Your Invitation',
       html: `
@@ -136,7 +134,7 @@ export const emailService = {
     };
 
     try {
-      await transporter.sendMail(mailOptions);
+      await resendService.sendEmail(mailOptions);
       console.log('Invitation email sent successfully to:', email);
     } catch (error) {
       console.error('Error sending invitation email:', error);
@@ -405,7 +403,7 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
 
       const subject = `Welcome! You've subscribed to ${taskName}`;
 
-      // Determine email sender configuration with fallback to account-level (same as sendTaskExecutionEmail)
+      // Determine email sender configuration: task-level -> account-level -> system default
       let emailSender = task.emailSender;
       let fromName = task.fromName;
 
@@ -417,22 +415,17 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
         }
       }
 
-      if (emailSender && fromName) {
-        // Use Resend service for custom email sender (task-level or account-level)
-        const from = `${fromName} <${emailSender}>`;
-        const resendResult = await resendService.sendEmail({
-          from,
-          to: email,
-          subject,
-          html: welcomeHtml,
-          text: welcomeText
-        });
-        console.log(`Subscriber welcome email sent via Resend to: ${email} from: ${from}`, resendResult?.id ? `(ID: ${resendResult.id})` : '');
-      } else {
-        // Use default SMTP service
-        await this.sendEmail(email, subject, welcomeText, welcomeHtml);
-        console.log(`Subscriber welcome email sent via SMTP to: ${email}`);
-      }
+      const hasCustomSender = Boolean(emailSender && fromName);
+      const from = hasCustomSender ? `${fromName} <${emailSender}>` : SYSTEM_FROM;
+      const resendResult = await resendService.sendEmail({
+        from,
+        to: email,
+        subject,
+        html: welcomeHtml,
+        text: welcomeText,
+        ...(hasCustomSender ? {} : { replyTo: SUPPORT_REPLY_TO })
+      });
+      console.log(`Subscriber welcome email sent via Resend to: ${email} from: ${from}`, resendResult?.id ? `(ID: ${resendResult.id})` : '');
     } catch (error) {
       console.error("Error sending subscriber welcome email:", error);
       // Don't throw - just log the error so subscription still succeeds
@@ -594,11 +587,7 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
           const subject = `${task.name} - ${currentDate}`;
           const text = `Task Report: ${task.name}\n\nView the HTML report in the email body.${!task.sendHtmlReportOnly ? `\n\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}` : ''}`;
 
-          // Check if task has custom email sender configured
-          let resendEmailId = null;
-          let senderType: 'SMTP' | 'resend' = 'SMTP';
-
-          // Determine email sender configuration with fallback to account-level
+          // Determine email sender configuration: task-level -> account-level -> system default
           let emailSender = task.emailSender;
           let fromName = task.fromName;
 
@@ -610,25 +599,18 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
             }
           }
 
-          if (emailSender && fromName) {
-            // Use Resend service for custom email sender (task-level or account-level)
-            const from = `${fromName} <${emailSender}>`;
-            const resendResult = await resendService.sendEmail({
-              from,
-              to: toEmail,
-              subject,
-              html: simplifiedHtml,
-              text
-            });
-            resendEmailId = resendResult?.id || null;
-            senderType = 'resend';
-            console.log(`HTML-only task execution email sent via Resend to: ${toEmail} from: ${from}`, resendEmailId ? `(ID: ${resendEmailId})` : '');
-          } else {
-            // Use default SMTP service
-            await this.sendEmail(toEmail, subject, text, simplifiedHtml);
-            senderType = 'SMTP';
-            console.log(`HTML-only task execution email sent via SMTP to: ${toEmail}`);
-          }
+          const hasCustomSender = Boolean(emailSender && fromName);
+          const from = hasCustomSender ? `${fromName} <${emailSender}>` : SYSTEM_FROM;
+          const resendResult = await resendService.sendEmail({
+            from,
+            to: toEmail,
+            subject,
+            html: simplifiedHtml,
+            text,
+            ...(hasCustomSender ? {} : { replyTo: SUPPORT_REPLY_TO })
+          });
+          const resendEmailId = resendResult?.id || null;
+          console.log(`HTML-only task execution email sent via Resend to: ${toEmail} from: ${from}`, resendEmailId ? `(ID: ${resendEmailId})` : '');
 
           // Add email history to subscriber
           try {
@@ -639,10 +621,10 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
               status: 'sent',
               taskExecutionId: executionId,
               htmlContentUrl: htmlContentUrl,
-              senderType: senderType,
+              senderType: 'resend',
               emailId: resendEmailId || undefined
             });
-            console.log(`Added email history for subscriber: ${toEmail}`, resendEmailId ? `(Resend ID: ${resendEmailId})` : '(SMTP)');
+            console.log(`Added email history for subscriber: ${toEmail}`, resendEmailId ? `(Resend ID: ${resendEmailId})` : '');
           } catch (historyError) {
             console.error(`Failed to add email history for ${toEmail}:`, historyError);
             // Don't throw error, email was sent successfully
@@ -787,11 +769,7 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
       const subject = `AgentWeb - Task Run Results: ${task.name}`;
       const text = `Task: ${task.name}\nStatus: ${execution.status.toUpperCase()}${!task.sendHtmlReportOnly ? `\nManage task and history at: ${customerFrontendUrl}/tasks/${task.taskId}` : ''}`;
 
-      // Check if task has custom email sender configured
-      let resendEmailId = null;
-      let senderType: 'SMTP' | 'resend' = 'SMTP';
-
-      // Determine email sender configuration with fallback to account-level
+      // Determine email sender configuration: task-level -> account-level -> system default
       let emailSender = task.emailSender;
       let fromName = task.fromName;
 
@@ -803,25 +781,18 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
         }
       }
 
-      if (emailSender && fromName) {
-        // Use Resend service for custom email sender (task-level or account-level)
-        const from = `${fromName} <${emailSender}>`;
-        const resendResult = await resendService.sendEmail({
-          from,
-          to: toEmail,
-          subject,
-          html,
-          text
-        });
-        resendEmailId = resendResult?.id || null;
-        senderType = 'resend';
-        console.log(`Task execution email sent via Resend to: ${toEmail} from: ${from}`, resendEmailId ? `(ID: ${resendEmailId})` : '');
-      } else {
-        // Use default SMTP service
-        await this.sendEmail(toEmail, subject, text, html);
-        senderType = 'SMTP';
-        console.log(`Task execution email sent via SMTP to: ${toEmail}`);
-      }
+      const hasCustomSender = Boolean(emailSender && fromName);
+      const from = hasCustomSender ? `${fromName} <${emailSender}>` : SYSTEM_FROM;
+      const resendResult = await resendService.sendEmail({
+        from,
+        to: toEmail,
+        subject,
+        html,
+        text,
+        ...(hasCustomSender ? {} : { replyTo: SUPPORT_REPLY_TO })
+      });
+      const resendEmailId = resendResult?.id || null;
+      console.log(`Task execution email sent via Resend to: ${toEmail} from: ${from}`, resendEmailId ? `(ID: ${resendEmailId})` : '');
 
       // Add email history to subscriber
       try {
@@ -832,10 +803,10 @@ Unsubscribe from future updates: ${customerFrontendUrl}/unsubscribe?taskId=${tas
           status: 'sent',
           taskExecutionId: executionId,
           htmlContentUrl: htmlContentUrl,
-          senderType: senderType,
+          senderType: 'resend',
           emailId: resendEmailId || undefined
         });
-        console.log(`Added email history for subscriber: ${toEmail}`, resendEmailId ? `(Resend ID: ${resendEmailId})` : '(SMTP)');
+        console.log(`Added email history for subscriber: ${toEmail}`, resendEmailId ? `(Resend ID: ${resendEmailId})` : '');
       } catch (historyError) {
         console.error(`Failed to add email history for ${toEmail}:`, historyError);
         // Don't throw error, email was sent successfully
@@ -954,7 +925,15 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     toEmails: string | string[],
     scheduleName: string,
     scheduleId: string,
-    usageStatus: { used: number; allowance: number | null; percentUsed?: number }
+    usageStatus: {
+      used: number;
+      allowance: number | null;
+      percentUsed?: number;
+      effectiveAllowance?: number | null;
+      costUsed?: number;
+      costAllowance?: number | null;
+      costPercentUsed?: number;
+    }
   ) {
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
@@ -967,8 +946,21 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
         minute: '2-digit'
       });
 
-      const usedFormatted = usageStatus.used.toLocaleString();
-      const allowanceFormatted = usageStatus.allowance != null ? usageStatus.allowance.toLocaleString() : 'N/A';
+      // A block can be caused by either the token-count cap or the dollar cost cap
+      // (ENG-200). When the cost cap is the trigger — the only reason a user with an
+      // unlimited token allowance can be blocked — render a cost-based message so it
+      // doesn't misleadingly read "N/A tokens".
+      const { blockedByCost } = deriveBlockedByCost(usageStatus);
+
+      const limitLabel = blockedByCost ? 'Monthly Cost Limit Reached' : 'Monthly Token Limit Reached';
+      const limitReasonText = blockedByCost ? 'monthly cost limit' : 'monthly token limit';
+      const usageLine = blockedByCost
+        ? `<strong>Spend:</strong> $${(usageStatus.costUsed ?? 0).toFixed(2)} / $${(usageStatus.costAllowance ?? 0).toFixed(2)} spent this month.`
+        : `<strong>Usage:</strong> ${usageStatus.used.toLocaleString()} / ${usageStatus.allowance != null ? usageStatus.allowance.toLocaleString() : 'N/A'} tokens used this month.`;
+      const usageLineText = blockedByCost
+        ? `Spend: $${(usageStatus.costUsed ?? 0).toFixed(2)} / $${(usageStatus.costAllowance ?? 0).toFixed(2)} spent this month.`
+        : `Usage: ${usageStatus.used.toLocaleString()} / ${usageStatus.allowance != null ? usageStatus.allowance.toLocaleString() : 'N/A'} tokens used this month.`;
+      const allowanceResetNoun = blockedByCost ? 'cost allowance' : 'token allowance';
 
       const html = `
         <html>
@@ -993,16 +985,16 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
             </div>
             <div class="content">
               <div class="error-section">
-                <h3>⚠️ Monthly Token Limit Reached</h3>
+                <h3>⚠️ ${limitLabel}</h3>
                 <p style="margin: 0; line-height: 1.6;">
                   Your scheduled chat <strong>"${scheduleName}"</strong> was scheduled to run at <strong>${currentDate}</strong>,
-                  but it cannot execute because you have reached your monthly token limit.
+                  but it cannot execute because you have reached your ${limitReasonText}.
                 </p>
                 <p style="margin: 10px 0 0 0; line-height: 1.6;">
-                  <strong>Usage:</strong> ${usedFormatted} / ${allowanceFormatted} tokens used this month.
+                  ${usageLine}
                 </p>
                 <p style="margin: 10px 0 0 0; line-height: 1.6;">
-                  Your token allowance resets at the start of each billing period. To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
+                  Your ${allowanceResetNoun} resets at the start of each billing period. To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
                 </p>
               </div>
             </div>
@@ -1020,18 +1012,18 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       const text = `
 Scheduled Chat Error: ${scheduleName}
 
-Your scheduled chat "${scheduleName}" was scheduled to run at ${currentDate}, but it cannot execute because you have reached your monthly token limit.
+Your scheduled chat "${scheduleName}" was scheduled to run at ${currentDate}, but it cannot execute because you have reached your ${limitReasonText}.
 
-Usage: ${usedFormatted} / ${allowanceFormatted} tokens used this month.
+${usageLineText}
 
-Your token allowance resets at the start of each billing period. To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
+Your ${allowanceResetNoun} resets at the start of each billing period. To continue using scheduled chats, please upgrade your plan or wait for your allowance to reset.
 
 ---
 This is an automated email from your scheduled chat.
 Manage your schedules: ${customerFrontendUrl}/agent-mode
       `;
 
-      const subject = `❌ Scheduled Chat Error: ${scheduleName} - Monthly Token Limit Reached`;
+      const subject = `❌ Scheduled Chat Error: ${scheduleName} - ${limitLabel}`;
 
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       await this.sendEmail(emailList, subject, text, html);

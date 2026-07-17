@@ -1,3 +1,473 @@
+## ENG-383: local agent relay tools deprecated to stubs (2026-07-17)
+
+The local agent relay (ngrok tunnel to a Codex agent on a Mac) is permanently dead — ngrok account
+suspended (ERR_NGROK_6008) and the host machine is gone (ENG-381/ENG-383). `run_local_agent_task` +
+`check_local_agent_status` are now fail-fast deprecation stubs in `src/emma/localAgentTools.ts`
+(registered so legacy/forced calls get `local_agent_deprecated: …` instead of "tool not found"; no
+network/SM/S3), and both were removed from `DEFAULT_FOUNDATION_TOOLS` and the chatbot customer tool
+list. NOTE: the runtime foundation list is DB-overridable — AW-Settings (Dev- prefixed in dev) key
+`foundation_tools`, loaded in `AgentModeService.initialize()` (per service init, not per request) —
+so the prod setting row must also be updated (data-side, outside this PR). Replacement for web
+research is `you_search_web` (this PR adds optional `freshness` + `include_domains` params for the
+Reddit-digest repoint); full workload replacement tracked in ENG-381.
+`src/scripts/patch-skills-remove-local-agent.ts` strips the tools from all skills' toolNames.
+
+## ENG-164 phase 1: nodemailer Gmail SMTP path deleted — backend email is Resend-only (2026-07-16)
+
+The 2026-07-02 buy-vs-build audit verdict, executed. `emailService` no longer owns a Gmail SMTP
+transporter; every backend email leaves through `resendService`.
+
+1. **Fix-first (AC-2): `resendService` failures now propagate.** Previously `retryWithBackoff`
+   returned `null` after exhausted/non-retryable failures, `performSend` returned `null` when the
+   API key was missing, and the send queue could only resolve — so a caller could not tell a dropped
+   email from a sent one. Now the queue rejects the failed item's promise (and keeps processing later
+   items), non-retryable 4xx errors reject immediately, and a missing key throws instead of turning
+   every send into a no-op.
+2. **SMTP branches deleted.** `sendEmail` (best-effort, unchanged contract) and `sendEmailStrict`
+   (throws; `messageId` = Resend id) route through the system sender `AgentWeb
+   <hi@updates.agentweb.pro>` with replyTo `support@agentweb.pro`. The SMTP-vs-Resend dual paths in
+   `sendTaskExecutionEmail` / `sendSubscriberWelcomeEmail` collapsed into one send with task-level ->
+   account-level -> system-default sender fallback; history rows now always carry
+   `senderType: 'resend'` + the real Resend id.
+3. **Dependency dropped:** `nodemailer` + `@types/nodemailer` removed from package.json.
+
+### Assumptions to validate
+- **~20 existing `resendService.sendEmail` call sites keep their null-guards** (`if (!result)` in
+  crm.ts, admin.ts, agentModeService.ts, dripSequenceWorker.ts, sequences.ts…). Audited every site:
+  each is inside a try/catch whose failure handling matches (or improves on) the old null branch, so
+  the guards are now dead-but-harmless defense; left untouched to keep this PR one seam. Follow-up
+  cleanup can delete them.
+- **The only fire-and-forget call** (`emma/tools.ts` issue-report notification) already had a
+  `.catch()`, so the new rejection contract cannot produce an unhandled rejection there.
+- **`SMTP_USER`/`SMTP_PASS`/`FROM_EMAIL` env vars are now unread by the backend.** The Gmail secret
+  pair itself stays alive until agent-engine phase 2 (`email_utils.py` still uses smtplib) — that is
+  the explicitly-parked phase 2 issue, not a leftover.
+- **Default-sender task-report emails now come from `hi@updates.agentweb.pro`** (previously the Gmail
+  `FROM_EMAIL`) and failures in that path propagate to callers instead of silently logging — callers
+  were audited (controllers/tasks.ts, routes/slack.ts) and handle rejections.
+## /stop session-ownership check (2026-07-16, ENG-360)
+
+Closed the last open lane from the ENG-346 ownership audit: `POST /api/agent-mode/session/:sessionId/stop`
+(`stopGeneration`) did no session read at all — any authenticated user with someone else's sessionId could
+cancel their in-flight generation and flip their SSE progress to complete. Now: fetch session → 401 no user
+(defensive; route sits behind `router.use(authenticateToken)`) → 404 missing (was silent `{ success: true }`)
+→ 403 unless owner-or-admin (same predicate as updateSessionTitle / uploadImageToSession /
+updateSessionLlmModel and the ENG-346 generateResponse check; delegated tokens already resolve `req.user`
+to the target user). Public ishare lane (`stopGenerationPublic`, conversable token) untouched — it remains
+the anon stop path.
+
+### Assumptions to validate
+- No legitimate caller stops a session it doesn't own: the customer portal stops only the session it is
+  actively generating on (owner), delegated admins resolve to the target user, and anon/ishare users use the
+  public lane. If some flow stops an `anon_`-owned session through the authed endpoint pre-transfer, it now
+  gets 403 — none found in partner-portal; customer portal is a separate repo (grep found no such lane).
+- The 404-on-missing change is safe: stop is fire-and-forget in the UI; a 404 where a silent 200 used to be
+  should surface nothing user-visible (frontends don't branch on the stop response).
+## /generate session-ownership check (2026-07-16, ENG-346)
+
+Closed the pre-existing gap where `POST /api/agent-mode/generate` never compared `session.userId`
+to `req.user`: any authenticated user with someone else's sessionId could generate on that session.
+Check now sits BEFORE the ENG-147 idempotency claim + session-busy lock, so an unauthorized request
+touches no shared state (previously it would also have been able to squat the interactive idem claim
+and 409 the real owner for the ttl window).
+
+### Ownership audit of the session-parameterized agent-mode lanes (2026-07-16 snapshot)
+- Already checked: `getSession`, `verifiedGenerate` (strict), `uploadImageToSession`,
+  `updateSessionLlmModel`, `updateSessionTitle` (owner-or-admin), `getProgress` (owner or
+  delegated-admin-own-session). `transferSession` only mutates `anon_`-owned sessions.
+- `generateResponse` was the only GENERATE lane missing it — fixed here with the getSession
+  predicate (owner or admin; delegated tokens already resolve `req.user` to the target user).
+- **Still open**: `stopGeneration` (`POST /session/:sessionId/stop`) does no session read at all —
+  any authenticated user can cancel another user's in-flight run. Different verb + different
+  blast radius (adds a DB read to a fire-and-forget lane), filed separately as ENG-360.
+
+### Assumptions to validate
+- Raw (non-delegated) admins keep generate access for parity with every other session endpoint.
+  If the product stance becomes "admins must delegate to act on a user's session", tighten to the
+  `verifiedGenerate` strict predicate — one-line change, tests pin both lanes.
+- Error-precedence delta accepted: missing session is now 404 before the token-usage 429 read
+  (previously claim → lock → 429 → 404). No client observed depending on 429-before-404.
+- An authenticated user generating on an `anon_` session pre-transfer would now 403 — but
+  `getSession` already 403s that same read today, so no working client flow can hit it.
+
+## ENG-358: v0-credit alert dedupe at the intake gate — class clustering + Duplicate-state leak (2026-07-16)
+
+The hourly v0-credit alert filed a new Linear issue per occurrence (14 near-identical issues in 5
+days, ENG-292…350) and, after a manual dedupe pass, appended its recurrence comments to a canceled
+**Duplicate** (ENG-350) instead of the open canonical (ENG-337). Two root causes, both fixed at the
+ENG-240 intake gate:
+
+1. **Titles embed occurrence data.** `v0 credits LOW — $59.15 spendable` changes with every balance
+   move, so `fileAutoIssue`'s normalized-title fallback never matched and each occurrence filed
+   fresh. Fix: (a) alert-class clustering — the v0 filer now passes `"Alert Class": "v0-credits"` +
+   `"Alert Priority"` in its context; the gate matches candidates whose body carries the rendered
+   `Alert Class: <name>` line before any title comparison (same context-key mechanism as the
+   Session/Schedule idempotency keys), and escalates the open canonical in place (raise-only
+   priority + title refresh via new `linearService.escalateIssue`) on low→critical. (b) The title
+   norm is now amount-insensitive (`$58.51` ≡ `$59.15`) so pre-existing canonicals without the
+   class marker keep matching post-deploy.
+2. **Linear's Duplicate state has its own state type.** Verified live on ENG-350: `statusType:
+   "duplicate"` — NOT `"canceled"`. `listOpenIssuesByLabel` / `listOpenBugCanonicals` filtered with
+   a `nin: [completed, canceled]` blacklist, so duplicate-state issues stayed dedupe candidates and
+   absorbed recurrences. Both now WHITELIST open state types (`triage, backlog, unstarted,
+   started`), which also future-proofs against new closed-ish types.
+
+**Assumptions to validate**
+- The hourly re-fire itself (24h in-memory `lastAlerted` window not holding across prod
+  instances/worker restarts — observed 5+ alerts in one morning) is NOT fixed here; the gate now
+  makes re-fires converge on one issue, but each still sends an oncall email. If email cadence
+  matters, the window needs durable state (ENG-345 seam). Flagged on the Linear issue.
+- Priority mapping chosen: v0 `low` → High, `critical` → Urgent. Adjust in
+  `ALERT_PRIORITY_BY_LEVEL` (v0BillingService) if the board should rank ops alerts differently.
+- Amount-insensitive title normalization intentionally treats two auto-issue titles differing only
+  by a dollar figure as the same issue. No current Auto filer embeds amounts except the v0 alert.
+
+## ENG-326 review hardening: org dead-ends, unverified persists, guard false negatives (2026-07-15)
+
+Senior review of the ENG-326 branch surfaced four real bugs in the first cut; all fixed with tests.
+
+1. **Org accounts hit a dead end in both missing-logo gates.** `updateBrandGuidelines` and brand-config
+   uploads write the **ORG** record for org members, but the ad-image gate read `user.brandGuidelines`
+   only — so "upload your logo in brand config, then regenerate" could never be satisfied. The
+   ad-image trigger AND the landing-page routes now resolve brandGuidelines org-aware
+   (`resolveBrandGuidelinesForLoadedUser` / a `brandGuidelinesOverride` param on
+   `buildBrandContextFromUser`).
+2. **Unverified logo URLs are never persisted.** `downloadBrandLogoToS3` now returns a discriminated
+   outcome (`uploaded | svg | download-failed | upload-failed`). The onboarding step falls back to the
+   raw discovered URL only on `upload-failed` (bytes proven raster, just the S3 pin failed) — a dead /
+   hotlink-protected URL or an SVG served from an extensionless URL never becomes the canonical brand
+   asset. Emma-facing `extractCSSFromURL` output is unchanged (characterization suite untouched).
+3. **Landing pages got the missing half of AC-3.** `/generate` and `/generated/:id/duplicate` return
+   `422 { error: "missing_brand_logo" }` pointing at brand config when no logo resolves, BEFORE side
+   effects (lead-list public-access flip, site-mode lock). Previously v0 silently invented a wordmark.
+4. **Negation guard tightened.** The 0–40-char window swallowed positive asks ("no text, just our
+   logo", "Do not crop the logo"). Negators must now sit directly on the logo mention (≤2 whitelisted
+   filler words); `don't`/`do not` understood.
+
+### Assumptions to validate (delta over the section below)
+- **422 on logo-less landing-page generation is the intended UX** for the frontend — same reasoning as
+  the ad-image gate (Fangfang's brand-config guidance), but the portal UI may render the 422 as a
+  generic failure until it learns the `missing_brand_logo` code. Duplicate of a pre-gate page with no
+  persisted logo is now also blocked by design.
+- **`upload-failed` remote-URL fallback is safe**: the bytes were just downloaded successfully, so the
+  URL serves a real raster; if the site later takes it down we degrade the same way any hosted asset
+  does.
+
+## Brand logo never persisted during onboarding → random logos in assets (2026-07-15, ENG-326)
+
+Root cause (named by Fangfang on the 07-14 Argusoft night call): the whole logo pipeline EXISTED —
+cssExtractor discovery heuristics, a download+S3 block inside `extractCSSFromURL`, the
+`brandData.logoUrl` field on `update_brand_guidelines`, logo-preferring consumption in ad-image and
+v0 prompts — but the only thing connecting them during onboarding was a PROMPTED Emma session
+(`onboardingBrandBuildService`) that was merely *asked* to include `logoUrl` in its one
+`update_brand_guidelines` call. When she didn't, the account had no logo anywhere, and every
+downstream generator "helpfully" invented one (Gemini renders an approximate mark; the ad-image
+builder falls back to a typographic wordmark; v0 gets no Logo URL line at all).
+
+Fixes (all deterministic, none rely on the LLM volunteering):
+1. **`services/agentMode/brandLogo.ts`** — new module. The download+S3 block was extracted out of the
+   `agentModeService.extractCSSFromURL` monolith (characterization test pins the old behavior); adds
+   `ensureBrandLogoPersisted` (post-scrape onboarding step) and one shared logo resolver.
+2. **Brand build** runs `ensureBrandLogoPersisted` after every successful Emma session: no logo on the
+   account → discover on the company URL → pin to S3 → persist `brandData.logoUrl` + a `logo`
+   attachment via the same `updateBrandGuidelines` path Emma uses.
+3. **`generate_image`** — prompt asks for a logo + model passed no `logo_image` → inject the persisted
+   logo; none persisted → return an ask-the-user tool result pointing at brand config. Never invent.
+4. **Onboarding ad images** — no persisted logo → run fails with "upload your logo in brand config"
+   instead of shipping wordmark variants; with one, every variant composites it as a real image input.
+5. **Landing pages** — the two duplicated brand-context blocks in `routes/landingPageGeneration.ts`
+   collapsed into `v0Service.buildBrandContextFromUser`, which resolves the logo attachments-first
+   with a `brandData.logoUrl` fallback (the route previously read attachments ONLY, so a
+   scrape-persisted logo never reached v0).
+
+### Assumptions to validate
+- **Resolution precedence: attachments beat `brandData.logoUrl`.** Rationale: an explicit brand-config
+  upload (`routes/brand.ts`) writes ONLY an attachment, while `brandData.logoUrl` can hold a stale
+  scraped URL — what the user sees in brand config must be what generation composites. If Emma
+  re-scrapes and updates only `brandData.logoUrl`, the older auto-attachment still wins; acceptable
+  because the deterministic step writes both with the same URL.
+- **Failing the onboarding ad-image run on missing logo is the intended UX** (vs. generating wordmark
+  variants). Matches Fangfang's interim guidance ("upload/review the logo in brand config before image
+  creation") and AC-3, but it's a visible behavior change on accounts with undiscoverable logos.
+- **The `promptRequestsLogo` heuristic** (`/\blogos?\b/i` with a negation guard) is deliberately
+  narrow; prompts that mean the logo without saying "logo" ("with our brand mark") won't trigger the
+  gate. The model still passes `logo_image` explicitly on those per its tool description.
+
+## Resolve-bridge @Emma parrot: mention serialization pinned live + a PII hijack closed (2026-07-15, ENG-316)
+
+The resolve bridge now parrots the latest `@Emma <message>` comment on a bug canonical as the
+reporter resolution email. Three findings from the review/finalize pass worth keeping:
+
+### How a Linear mention ACTUALLY serializes (verified live, not guessed)
+Probe: created a comment on ENG-316 through Linear's own agent surface (it builds a genuine
+ProseMirror `suggestion_userMentions` node — confirmed via `comment.bodyData`), then read it back
+through the exact GraphQL field the service uses (`comments { nodes { body } }`). **A real
+workspace mention round-trips as plain `@displayName`** (`@harsha`) — no bracket/link markup at
+all. So plain-text `@emma` is the mainline matcher; the bracketed forms (`@[Emma](url)` /
+`[@Emma](url)`) never occur in raw bodies and are tolerated only for hand-written markdown. Also
+verified: `issue(id:)` accepts both UUID and identifier, and `comments(orderBy: createdAt)`
+returns **newest-first** (so `first: 250` overflow drops the oldest). Note: no "Emma" user exists
+in the workspace today (2026-07-15) — the convention works via plain-text `@emma` until one does.
+
+### The hijack class: intake comments carry CUSTOMER-controlled text
+Intake appends `Their report:\n<raw customer description>` to canonical comments, and customers
+address the agent as "@emma" in bug reports — so any anywhere-in-body mention matcher lets one
+customer's report (plus their email in the marker line) become EVERY reporter's resolution email.
+Closed twice over: the mention must be the comment's LEADING token (the documented `@Emma
+<message>` convention), and any comment carrying a `[reporter-ticket #N]` marker is excluded from
+parrot candidacy outright. Assumption to validate if intake formats ever change: intake-authored
+canonical comments always carry the reporter-ticket marker.
+
+### Linear's 50-node connection default, third sighting
+The un-sized `comments` connection silently caps at 50 — same trap `getTeamMeta` documents for
+states/labels. Any Linear connection query in this repo must be explicitly sized (250 max) with a
+loud `pageInfo.hasNextPage` log. Grep for un-sized connections when touching `linearService`.
+
+## Eval-queue Ad vs Organic Post categorization (2026-07-15, ENG-90)
+
+Matt's ask: reviewer feedback on an image differs by use case, so eval-queue items need an
+Ad / Organic Post classification he can see and filter on. Shipped the substrate: additive
+`HumanEvalCandidate.category` (`ad | organic_post | uncategorized`), a bold `*Category:*` tag in the
+Slack eval post, and an admin-only filterable `GET /api/human-eval/candidates`.
+
+### Call-site classification (traced every enqueue path)
+- `agentModeService.generateImage` auto-enqueue is the ONLY image enqueue path today. The
+  `generate_image` tool serves BOTH ad and organic asks with no hard flow signal in its inputs —
+  genuinely ambiguous, so it stays `uncategorized` rather than guessing from prompt text.
+- Emma `enqueue_human_eval` tool: flow unknown at enqueue; tool inputSchema deliberately untouched
+  (AgentMode prompt-surface change = Harsha's call). Follow-up filed as ENG-343.
+- v0 landing-page + lead-enrichment enqueues: not images — no category passed. The lead-enrichment
+  feedback rerun inherits the original candidate's category.
+- `onboardingAdImageService` calls `imageService.generateImage` directly and never enqueues eval
+  candidates, so it is not a categorization site today.
+
+### Assumptions to validate
+- Consequence of the no-guessing rule: every auto-enqueued image posts as Uncategorized until a flow
+  self-declares (ENG-343 is the unlock). The filter/display substrate is what this PR delivers.
+- Fail-open normalization (`unknown → uncategorized`) is correct on the WRITE path only — it protects
+  enqueueing. On the READ path a typo'd filter must 400, never coerce: reviewer caught that
+  `?category=ads` silently returned the uncategorized set with `success:true`. Strict
+  `parseHumanEvalCategoryFilter` now guards the list route (unknown status/reviewType also 400).
+- `listCandidates` is a paged scan capped at 20 pages (table is small, keyed by candidateId only).
+  If the queue ever exceeds ~20 scan pages, results silently truncate — a GSI on status/createdAt is
+  the eventual fix if listing becomes a hot surface.
+
+## Run-survival remainder shipped behind AGENT_RUN_STORE (2026-07-15, ENG-147)
+
+The 6/27 duplicate-session storm (one question → ~30 full agent runs, RCA on ENG-147) is now
+guarded at both storm seams, salvaged from closed PR #2006 and re-scoped against today's main per
+Harsha's 2026-07-14 comment: durable run records + idempotency submit-locks — a fresh, smaller PR.
+Everything is behind `AGENT_RUN_STORE=true`; flag absent = byte-identical behavior, pinned by
+BEHAVIOR-PRESERVING tests in every touched suite.
+
+### What shipped
+- `services/agentMode/runStore.ts` — one DynamoDB table (`AW-AgentRuns`, pk hash, PAY_PER_REQUEST)
+  with two item kinds: `run#<runId>` (30d ttl) and `idem#<key>` conditional-put submit-locks (10m
+  interactive). NO-FALLBACK create; best-effort terminal marks (retry once → one deduped alert),
+  conditional so a failed create never upserts a ttl-less phantom.
+- `createSession` accepts an optional client `idempotencyKey`: exactly one of N duplicates creates a
+  session; losers attach to the winner (200 + `idempotentReplay`) or get 409 `DUPLICATE_SUBMIT`
+  while it's in flight. Key is sha256-scoped by userId — no cross-user attach.
+- `/generate` claims `idem#sha256(sessionId|userMessage|llmModel)` BEFORE the in-process
+  `activeSessionGenerations` Set (two layers, one concept: cross-restart dedupe + in-process
+  concurrency; B2's atomic Set claim was already on main and is untouched). Loser gets the existing
+  409 `SESSION_BUSY` shape + the in-flight `runId`.
+- `runScheduledChat` failure sites: oncall alerts get `(user, schedule, errorClass)` keys with a
+  1h window — one flapping schedule cannot flood oncall.
+
+### Review fixes (same day, senior-review pass)
+- **DynamoDB TTL reaping is EVENTUAL, not a bound.** The original claim design relied on the native
+  TTL reaper to clear leaked locks; an expired item still exists (documented minutes-to-hours lag),
+  so a hard crash between claim and release could 409 identical resubmits far past the promised 10m.
+  Fixed: `claimIdempotency`'s conditional put is now `attribute_not_exists(pk) OR #ttl < :now` and
+  the loser-path read (`ConsistentRead: true`) treats an expired item as absent. Staleness is now
+  genuinely bounded by the ttl window regardless of reaper lag. **Do not write any future
+  `attribute_not_exists` claim that relies on the reaper.**
+- **The incident#<runId> dedupe lane was inert and got deleted.** Every production
+  `runScheduledChat` mints a fresh uuid (no `preGeneratedRunId` outside the isTest lane) and the
+  two filing sites are mutually exclusive per invocation, so `claimIncident` always won — a DDB
+  item kind with zero production effect, and the third filer (sendOncallAlert's own
+  `fileAutoIssue`) bypassed it anyway. The pre-existing ENG-240 sequenced search-gate remains the
+  real incident dedupe. Structural per-run dedupe, if wanted, means threading one runId through
+  `sendOncallAlert`'s filer + deciding loser semantics (occurrence comment / URL) — filed as a
+  follow-up Linear issue rather than shipping dead weight.
+- **Still-building early returns now mark run records terminal** (`completed` /
+  `detached_still_building`) instead of leaving `running` phantoms for the 30d ttl.
+
+### Assumptions to validate
+- The frontend does not yet SEND `idempotencyKey` on createSession — the backend seam is ready and
+  inert until the client half (disable-submit + key per send action) lands. Filed as follow-up.
+- Interactive idem ttl (10m) assumes no legitimate identical resubmit of the same message to the
+  same session within a run's lifetime; the lock releases at every terminal state, so only a
+  crash between claim and release leaves the (ttl-bounded) 10m window.
+- Enabling the flag requires the table (`create-tables.ts` now creates `AW-AgentRuns`) + manual TTL
+  enable on `ttl` — same manual step as UsageRecords/LoopEvents. With the flag on and the table
+  missing, `/generate` 500s loudly BY DESIGN (run records are core state, no silent fallback).
+  Correctness never depends on TTL enable (claims tolerate expired items); it only controls
+  storage growth.
+
+### Deliberately deferred (re-scope per Harsha's comment; each inert without the flag anyway)
+- Scheduled fire-window idempotency (`scheduledIdempotencyKey` exists in the store, unwired) +
+  scheduled durable run records.
+- The ishare/`generateSharedResponse` lane submit-lock (mirror of /generate).
+- Threading the run record's runId into worker telemetry (`agentRuntimeRunId` unification).
+- `createSessionWithPlan` idempotency — the route is public; anonymous callers can't be
+  user-scoped, needs a key-design decision.
+
+## Landing pages: the residual wedge + hang the first fix left behind (2026-07-13, ENG-287 follow-up)
+
+The 07-11 fix (PR #2066, below) correctly killed the sync-create 300s race. But the same failure
+CLASS was still reachable by other doors, and the sync→async switch introduced two regressions. An
+audit of the merged code found the following, each verified against the code and now fixed with tests.
+
+### The semantic bug underneath all of it
+A `succeeded` guard row records that the **chat was created** — NOT that a page was delivered. It was
+then reused unconditionally and forever: no TTL on `AW-V0Usage`, never clobbered, age-blind. So ANY
+post-create failure left the row behind and every retry reused the same dead chat. And because #2066
+deliberately removed the prompt from the key, retrying with a **different prompt** reused it too.
+
+### Wedges (a route that can never be built again)
+1. **Vercel build error RETURNS instead of throwing** (`addPageToExistingRepo`), so the catch that
+   frees the identity never ran. v0 emits code that will not compile → guard row stays `succeeded` →
+   every retry re-downloads the same broken version. Forever. Deterministic, and the user has no lever.
+2. **The DELETE route never freed the identity.** It calls `deleteLandingPageByRecord`;
+   `deleteLandingPage` (which did free it) is imported by that route and never used. Combined with the
+   prompt-free key, a surviving row **hijacks the next generation**: delete a page, regenerate the same
+   slug with a new prompt, get the OLD chat back — the new prompt is never sent to v0.
+3. **No backstop.** Now `V0_CHAT_REUSE_CEILING_MS` (45 min) bounds reuse even on paths nobody
+   anticipated, so "cannot wedge forever" is a guarantee rather than a hope.
+
+The fix draws the line explicitly (`isDeadEndV0Failure`): a **dead end** (v0 marked the version failed
+/ output will not validate / code will not build) frees the identity so the retry mints a fresh chat; a
+merely-**slow** generation keeps it so the retry RESUMES the same chat for free. Freeing on slowness
+would mint a second full-cost chat while the first is still generating — the exact orphan-chat credit
+burn this whole issue is about.
+
+### The original hang, still live
+`withRetry`'s default re-burns our synthetic 300s ceiling 3×. Four sites still used it —
+`downloadVersion` ×2 and the post-correction `getById` ×2 — and they sit INSIDE a 3-round validation
+loop: worst case **3 × 3 × 300s = 45 min**, worse than the 15-min hang that started this and past the
+MCP tool's own 25-min budget. Also, the "~16 min" poll budget bounded **sleeps, not wall-clock** (each
+status read was allowed 300s → a real ceiling near 3h, and the error message said 16 min). Now: an
+ABSOLUTE deadline (`V0_GENERATION_BUDGET_MS` 20 min), status polls bounded at 30s, and fail-fast at all
+four sites (5xx/network stay retryable).
+
+### Regressions introduced by the async switch
+- **First-page builds spent their whole generation in `draft`.** Async create returns in seconds and
+  the long poll moved into `deployLandingPage`, but the record was flipped to `draft` first — a status
+  `IN_FLIGHT_STATUSES`, the janitor, and route-reuse all ignore. Agent mode (10-min run timeout) could
+  not find the in-flight job, told the user it **FAILED**, and the retry built a **duplicate site**
+  (second repo, second Vercel project). That is the ENG-189 class, reopened. Now stays `generating`;
+  `deployLandingPage` accepts that status only for its own auto-deploy, so a user-initiated deploy
+  still refuses an actively-generating record.
+- **`deployLandingPage` rethrew a bare `new Error()`**, destroying `error.code`. It is the ONLY place
+  the first-page path reaches the version poll, so `generateFirstPage`'s dead-end branch was
+  unreachable **dead code** — the safety net did not exist. Code + cause now preserved.
+
+### Constants (coherent ladder)
+| constant | value | why |
+| -- | -- | -- |
+| `V0_STATUS_POLL_TIMEOUT_MS` | 30s | a status read is a cheap GET; 300s let wall-clock reach ~3h |
+| `V0_GENERATION_BUDGET_MS` | 20 min | ABSOLUTE deadline, threaded through the whole build (initial wait + every correction round) so it is spent ONCE. Computing it per call re-armed it, letting one build poll 3 × 20 min and outlive both ceilings below. |
+| `V0_RESERVATION_TTL_MS` | 20 min | unchanged; `reserved` now lives seconds (async create) |
+| `STUCK_CEILING_MS` | 30 min | janitor + route reuse; above the generation budget, so a live build is never swept |
+| `V0_CHAT_REUSE_CEILING_MS` | 45 min | > 2 generation budgets, so a resume-after-timeout retry always lands inside it |
+
+**The real transport ceiling is 15 min, not 25.** `mcp/server/httpClient.ts` installs a global undici
+dispatcher with `headersTimeout: 15 min`, and the backend sends no headers until the generation
+finishes — so `generate_landing_page`'s `timeoutMs: 25 min` can never be reached; the fetch aborts at
+15 min with `UND_ERR_HEADERS_TIMEOUT`. A generation in the 15–20 min window therefore always loses its
+MCP call even though the backend budget allows it. That is survivable — the durable/reconnect path
+(`findInFlightJobForSession`) and sub-page route-reuse both pick the build back up — but it means the
+in-band MCP call is NOT the thing that delivers a slow build, and nobody should size a constant
+against the 25-min number.
+
+### Also fixed
+- A long build **heartbeats `updatedAt`**, so the janitor cannot mark a LIVE build failed (which let a
+  retry run a second build into the same repo). This is why draft→generating and the heartbeat had to
+  land together.
+- `isStuck`/`isZombieInFlight` now measure from `updatedAt`, matching the janitor. Keyed on `createdAt`
+  they declared a long-but-progressing build dead, and `deliverStuckFailure` **burned its one-shot
+  completion claim** — so the real success could never be delivered afterwards. The page went live at a
+  URL the user was never given.
+- The **correction key gained an `attempt`** component. It was `(user, scope, chatId)`, so round 2
+  returned `{skipped:true}` and the loop re-downloaded the same broken zip: a 3-attempt self-heal that
+  was really 1. (Appended only when supplied, so chat-create keys stay byte-identical to prod rows.)
+- The post-correction version is **status-gated** rather than read raw off `latestVersion` — the exact
+  mistake `waitForCompletedV0Version` exists to prevent (shipping a half-generated page).
+
+### Sub-page builds died on `Module not found: '../components/landing/nav'` (found in manual test)
+
+Our bug, not v0's. `remapFilesForSubPage` rewrote exactly two import forms — the
+`@/components/*` alias and `./_components/*` inside component files. Plain **relative** imports were
+never touched, and v0 emits those too. They are correct at the repo root (`../components/landing/nav`
+from `app/page.tsx` = `components/landing/nav`), but we move the file to `app/<slug>/page.tsx`, where
+that same string means `app/components/landing/nav` — nonexistent — and the component itself has also
+moved into `_components/`. Wrong twice over. It looked intermittent only because it depended on
+whether v0 happened to emit alias-style or relative-style imports.
+
+Fix: resolve every relative import against the file's ORIGINAL directory and re-emit as `@/...`
+(always resolves from the repo root) BEFORE the alias pass, which then handles moved components
+uniformly. Also fixes the same latent break for `../lib/*`, `../hooks/*`, `../components/ui/*` — none
+of which move, and which nobody had hit yet.
+
+Worth noting how it surfaced: the ENG-287 fix is what let us *see* it. The Vercel build error now
+frees the route identity, so the retry minted a fresh chat. Pre-fix that route would have silently
+re-downloaded the same broken version forever.
+
+### Caught in adversarial review of THIS change (worth knowing about)
+- **A Vercel poll `timeout` is NOT a dead end.** `pollVercelDeployment` gives up after 5 min and also
+  degrades API flakiness to `timeout`. The first cut of this fix freed the identity on it — which
+  would have been the orphan double-spend it exists to prevent: a normal Next.js cold build outruns
+  the poll, the page goes live a minute later, and the user's retry mints a second full-cost chat and
+  pushes a second commit. Only `buildStatus === "error"` frees the identity.
+- **`setupVercelDeployErrorMock()` in the test suite does not test the build-error path.** Its
+  deployment carries no `meta.githubCommitSha`, so `pollVercelDeployment`'s SHA-match guard never
+  selects it and the poll falls through to `timeout`. Any test that wants a real build error must set
+  the SHA. (Pre-existing; the helper predates the SHA guard.)
+- **The guard must fail OPEN, both halves.** `canReuseChat` refuses to reuse a `succeeded` row with an
+  unreadable `createdAt` — so the reserve condition needs a matching
+  `attribute_not_exists(createdAt)` clause, because in DynamoDB a `<` against a missing attribute is
+  false. Without it the row matches nothing, the conditional put fails on every attempt, and the route
+  wedges forever: exactly the bug, reintroduced by the fix for it.
+- **Deleting an IN-FLIGHT page must not free its identity** — the archived record is invisible to
+  route-reuse, so the guard row is the only thing left deduping, and freeing it lets a second chat
+  build into the same repo concurrently.
+
+### iterate: the last sync v0 call (now fixed)
+
+`iterateLandingPage` was the last v0 call still sitting behind the 300s ceiling. A >300s iteration
+failed FOUR ways at once: v0 applied the edit and charged for it anyway; the record never incremented
+and stayed `deployed`; `deployLandingPage` then REFUSED it ("Cannot deploy a landing page with
+status: deployed"), stranding the edit inside v0; and the retry re-sent the same message with no
+guard, so v0 applied it TWICE.
+
+Async was blocked for a real reason: `deployLandingPage` reads "the latest completed version", so an
+iterate that returned before v0 published the new one would let the deploy ship the **pre-iteration**
+version and silently lose the user's edit — worse than failing. `waitForCompletedV0Version`'s
+`afterVersionId` guard is what unblocked it: we do not return until v0 publishes a version that is
+genuinely NOT the one we started from, so the hazard is structurally impossible.
+
+`pendingIteration {baseVersionId, messageHash}` is recorded the instant v0 ACCEPTS the send (before
+the wait). A retry of the same message resumes instead of re-sending; if v0 has since published a
+newer version, the edit landed and we adopt it. v0's own state is the source of truth, not a guess.
+
+Note what is deliberately NOT done: the status is not flipped to `generating` during an edit. The
+page is still live, and a crash mid-iterate would then let the janitor mark a LIVE page `failed`.
+
+### Still open
+- **The 15-min transport ceiling.** `mcp/server/httpClient.ts` sets a global undici
+  `headersTimeout: 15 min`, so any generation or iteration past that loses its in-band HTTP response
+  no matter what the backend budget says. The work still lands and the record is left correct
+  (deployable), so the user finishes from the portal — but the in-band call is not what delivers a
+  slow build. Removing this properly means returning 202 immediately and having the portal poll
+  (ENG-290 pattern 5) — a product change, not a bug fix.
+- `bestEffortPut` fails open on a Dynamo outage → a bounded double-spend across instances. Accepted
+  trade-off; the alternative is recreating the permanent wedge.
+- The DynamoDB `ConditionExpression` in `v0UsageGuard` is only asserted as a STRING in tests (the
+  DocumentClient is mocked) — it has never executed against a real table. If its semantics are wrong,
+  the symptom is the wedge it exists to prevent. Worth one real exercise against a dev table.
+
 ## Landing-page generation failing routinely (RankAI/Opsera/internal) — root cause + fix (2026-07-11, ENG-287/ENG-277)
 
 Matt reported the landing-page builder "keeps failing routinely" for RankAI (07-10); Opsera's urgent
@@ -146,6 +616,17 @@ Added `shipNotifyService` + `POST /api/integrations/featurebase/webhook`: when a
 - Voter list is fetched single-page (limit 100, warn on `nextCursor`) — fine at current board size.
 
 Rollout: create webhook in Featurebase Settings → Advanced → Webhooks (topic `post.updated`, nova version) pointing at prod, set `FEATUREBASE_WEBHOOK_SECRET` (value in the Featurebase dashboard per-webhook), redeploy. Kill switch: unset the env var (endpoint goes dark again). Per-user opt-out: `slackShipNotifyDisabled` on AW-Users.
+
+## OTel spine shipped — spans over the agent loop, dual-emit with the loops recorder (2026-07-02, ENG-141)
+
+Added `backend/src/observability/` (tracing.ts + semconv.ts) and three span sites: `invoke_agent` opens/closes exactly with the run-recorder lifecycle in `agentModeService` (verdict from `computeRunVerdict` on end), `chat` brackets the loop's `callLLM` including the backup-model retry, `execute_tool` wraps the gateway call inside `toolDispatch.runOne` (errorClass from `toolErrorClassifier`). Two direct OTLP/proto exporters — Langfuse (`LANGFUSE_OTEL_HOST`+`LANGFUSE_PUBLIC_KEY`+`LANGFUSE_SECRET_KEY`, Basic auth) and Okareo (`OKAREO_API_KEY`, api-key header) — each registered ONLY when its env config is present; no env = tracing off; no collector. `session.id` + `gen_ai.conversation.id` carry the Emma sessionId for Okareo sim-linking. DUAL-EMIT: `Dev-AW-LoopEvents` stays the policy/learning store; the bridge is by IDs only (`traceId` added to `agent_run_started` dimensions). Prompt/completion content capture is `AGENT_OTEL_CAPTURE_CONTENT`-flagged, default OFF.
+
+**Design choices to remember:** provider is module-private and NOT registered on the global OTel API, no context manager — parenting is explicit via a runId-keyed span registry (async-context propagation through a 24k-line monolith would be un-auditable). `gen_ai.*` names are pinned in `semconv.ts` because the upstream semconv is Development-status (renames must land in one file).
+
+**Assumptions to validate:**
+- Spans are produced in the WORKER process; `flushTelemetry()` runs in the parent's `gracefulShutdown`. The 2s BatchSpanProcessor delay + the worker drain window should export worker spans before the child is killed, but a worker SIGKILL <2s after a run ends can still drop that run's spans. If deploy-window traces go missing, add a bounded flush to the worker's per-run tail (next to `flushAgentRunRecorderSafe`).
+- Langfuse OTLP trace path is `{host}/api/public/otel/v1/traces` (signal-specific URL, since the exporter takes the full URL). Verify on first real export.
+- Okareo protobuf ingest accepts the `api-key` header form and links sims via `session.id`.
 
 ## Prod outage: partner-portal "Failed to load users" — full disk + nginx PrivateTmp trap (2026-06-26)
 

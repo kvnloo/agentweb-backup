@@ -84,3 +84,84 @@ export function rankMemoriesByRelevance<T extends RankableMemory>(
   scored.sort((x, y) => y.score - x.score);
   return scored.slice(0, Math.max(0, limit)).map((s) => s.memory);
 }
+
+const MS_PER_DAY = 86_400_000;
+
+export interface FormattableMemory {
+  category?: string;
+  content?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  [key: string]: any;
+}
+
+/**
+ * Human-readable age of a saved memory relative to `now`, e.g. "today", "yesterday",
+ * "4 days ago". Returns null when the timestamp is missing, unparseable (never "NaN days"),
+ * or in the future — a future saved-date labelled "today" would contradict its own stamp.
+ */
+export function describeMemoryAge(savedAtIso: string | undefined, now: Date): string | null {
+  if (!savedAtIso) return null;
+  const savedMs = Date.parse(savedAtIso);
+  if (Number.isNaN(savedMs)) return null;
+  // Compare UTC calendar dates, not raw 24h windows: the displayed saved-date is the UTC
+  // calendar date, so bucketing by elapsed hours would emit self-contradictory stamps like
+  // "(saved 2026-07-12, today)" around midnight — exactly when scheduled runs fire (ENG-305).
+  const savedDay = Date.parse(new Date(savedMs).toISOString().split('T')[0]);
+  const nowDay = Date.parse(new Date(now.getTime()).toISOString().split('T')[0]);
+  const days = Math.round((nowDay - savedDay) / MS_PER_DAY);
+  // A future saved-date (clock skew, or an updatedAt bumped ahead) would otherwise render as
+  // "(saved <future-date>, today)" — a self-contradiction. Fall back to the unstamped line.
+  if (days < 0) return null;
+  if (days === 0) return 'today';
+  if (days === 1) return 'yesterday';
+  return `${days} days ago`;
+}
+
+/**
+ * Render one stored memory as a context line, stamped with when it was saved.
+ *
+ * Memories are historical notes, not live state (ENG-305): without a recency signal the model
+ * treated a days-old operational note ("Instagram token expired — skip Instagram") as still
+ * true and silently skipped a configured channel, and reused stale dates baked into old
+ * memories. The saved-date + age prefix lets the model judge staleness and re-verify
+ * time-sensitive facts before acting. Falls back to an unstamped line when no timestamp
+ * exists so legacy memories still render.
+ */
+export function formatMemoryLine(memory: FormattableMemory, now: Date): string {
+  const category = memory.category ?? 'general';
+  const content = memory.content ?? '';
+  const savedAt = memory.updatedAt || memory.createdAt;
+  const age = describeMemoryAge(savedAt, now);
+  if (!savedAt || !age) {
+    return `- [${category}] ${content}`;
+  }
+  const savedDate = savedAt.split('T')[0];
+  return `- [${category}] (saved ${savedDate}, ${age}) ${content}`;
+}
+
+/**
+ * Caution appended to injected memory so the model treats it as historical, not live, state —
+ * the guard against a stale memory silently disabling a configured channel (ENG-305).
+ */
+export const MEMORY_STALENESS_NOTE =
+  'These are historical notes from previous sessions, not live state. Before acting on any ' +
+  'time-sensitive fact (e.g. a channel/account being disabled, a token or connection having ' +
+  'expired, or a specific date), re-verify the current state with the relevant tool rather ' +
+  'than assuming an older note still holds — never silently skip a configured action based on ' +
+  'a memory alone.';
+
+/**
+ * Build the memory-context message injected into the agent conversation: a header, one dated
+ * line per memory, and the staleness caution. Returns null when there are no memories so the
+ * caller can skip injecting an empty block.
+ */
+export function buildMemoryContextMessage(
+  header: string,
+  memories: FormattableMemory[],
+  now: Date
+): string | null {
+  if (!memories || memories.length === 0) return null;
+  const lines = memories.map((m) => formatMemoryLine(m, now));
+  return `${header}\n${lines.join('\n')}\n\n${MEMORY_STALENESS_NOTE}`;
+}

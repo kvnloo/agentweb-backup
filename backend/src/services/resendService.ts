@@ -33,7 +33,8 @@ interface ResendSendParams {
 interface QueuedEmailSend {
   id: number;
   params: ResendSendParams;
-  resolve: (value: any | null) => void;
+  resolve: (value: any) => void;
+  reject: (error: any) => void;
 }
 
 class ResendService {
@@ -126,15 +127,15 @@ class ResendService {
   private async retryWithBackoff<T>(
     operation: () => Promise<T>,
     operationName: string
-  ): Promise<T | null> {
+  ): Promise<T> {
     let lastError: any;
-    
+
     for (let attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
       try {
         return await operation();
       } catch (error: any) {
         lastError = error;
-        
+
         if (this.shouldRetry(attempt, error)) {
           const delay = this.BASE_DELAY * Math.pow(2, attempt - 1); // Exponential backoff
           console.log(`${operationName} failed with retryable error (attempt ${attempt}/${this.MAX_RETRIES}), retrying in ${delay}ms...`);
@@ -145,9 +146,27 @@ class ResendService {
         }
       }
     }
-    
-    console.error(`${operationName} failed after ${this.MAX_RETRIES} attempts:`, lastError);
-    return null;
+
+    // ENG-164: propagate instead of swallowing to null — callers must see failures.
+    console.error(`${operationName} failed permanently after ${this.MAX_RETRIES > 1 ? 'retries' : 'one attempt'}:`, lastError);
+    throw lastError;
+  }
+
+  /**
+   * Like retryWithBackoff, but preserves the legacy null-on-failure contract
+   * for the read/domain helpers (their callers branch on null/false/[]).
+   * Send operations must NOT use this — send failures propagate (ENG-164).
+   */
+  private async retryWithBackoffOrNull<T>(
+    operation: () => Promise<T>,
+    operationName: string
+  ): Promise<T | null> {
+    try {
+      return await this.retryWithBackoff(operation, operationName);
+    } catch {
+      // Final error already logged by retryWithBackoff.
+      return null;
+    }
   }
 
   private async processSendQueue() {
@@ -169,9 +188,16 @@ class ResendService {
         const recipient = Array.isArray(queueItem.params.to) ? queueItem.params.to.join(', ') : queueItem.params.to;
         console.log(`Processing Resend queue item #${queueItem.id} for: ${recipient} (remaining: ${this.sendQueue.length})`);
 
-        const result = await this.performSend(queueItem.params);
-        this.lastSendAt = Date.now();
-        queueItem.resolve(result);
+        // A failed send rejects its own promise; it must never kill the queue
+        // worker — later queued emails still get processed.
+        try {
+          const result = await this.performSend(queueItem.params);
+          queueItem.resolve(result);
+        } catch (error) {
+          queueItem.reject(error);
+        } finally {
+          this.lastSendAt = Date.now();
+        }
       }
     } finally {
       this.isQueueWorkerRunning = false;
@@ -184,12 +210,13 @@ class ResendService {
     }
   }
 
-  private enqueueSend(params: ResendSendParams): Promise<any | null> {
-    return new Promise((resolve) => {
+  private enqueueSend(params: ResendSendParams): Promise<any> {
+    return new Promise((resolve, reject) => {
       const queueItem: QueuedEmailSend = {
         id: ++this.queueItemId,
         params,
-        resolve
+        resolve,
+        reject
       };
       this.sendQueue.push(queueItem);
       console.log(`Queued Resend email #${queueItem.id}. Queue size: ${this.sendQueue.length}`);
@@ -210,8 +237,9 @@ class ResendService {
     await this.initializeResend();
 
     if (!this.resend) {
-      console.error('Resend service not initialized');
-      return null;
+      // ENG-164: fail loudly — a missing/unfetchable API key must not turn
+      // every send into a silent no-op.
+      throw new Error('Resend service not initialized — API key unavailable from Secrets Manager');
     }
 
     const emailOptions: any = {
@@ -266,15 +294,17 @@ class ResendService {
       `Email send to ${recipient}`
     );
 
-    if (result) {
-      console.log('Resend email sent successfully:', result);
-    } else {
-      console.error(`Failed to send email to ${recipient} after ${this.MAX_RETRIES} attempts`);
-    }
-
+    console.log('Resend email sent successfully:', result);
     return result;
   }
 
+  /**
+   * Send an email through the rate-limited queue.
+   *
+   * Failure contract (ENG-164): REJECTS on any failure — init failure,
+   * non-retryable API error, or exhausted retries. Never resolves `null`
+   * for a failed send; a resolved promise means Resend accepted the email.
+   */
   async sendEmail(params: ResendSendParams) {
     return this.enqueueSend(params);
   }
@@ -350,7 +380,7 @@ class ResendService {
       }>;
     }
 
-    const result = await this.retryWithBackoff<ResendEmailContent>(
+    const result = await this.retryWithBackoffOrNull<ResendEmailContent>(
       async () => {
         try {
           const response = await axios.get<ResendEmailContent>(
@@ -437,7 +467,7 @@ class ResendService {
       headers?: Record<string, string>;
     }
 
-    const result = await this.retryWithBackoff<ResendEmailContent>(
+    const result = await this.retryWithBackoffOrNull<ResendEmailContent>(
       async () => {
         try {
           // Try receiving endpoint first (as shown in user's example)
@@ -521,7 +551,7 @@ class ResendService {
       return null;
     }
 
-    const result = await this.retryWithBackoff(
+    const result = await this.retryWithBackoffOrNull(
       async () => {
         const { data, error } = await this.resend!.domains.create({ name });
         if (error) {
@@ -577,7 +607,7 @@ class ResendService {
       return null;
     }
 
-    const result = await this.retryWithBackoff(
+    const result = await this.retryWithBackoffOrNull(
       async () => {
         const { data, error } = await this.resend!.domains.get(domainId);
         if (error) {
@@ -619,7 +649,7 @@ class ResendService {
       return false;
     }
 
-    const result = await this.retryWithBackoff(
+    const result = await this.retryWithBackoffOrNull(
       async () => {
         const { data, error } = await this.resend!.domains.verify(domainId);
         if (error) {
@@ -645,7 +675,7 @@ class ResendService {
       return [];
     }
 
-    const result = await this.retryWithBackoff(
+    const result = await this.retryWithBackoffOrNull(
       async () => {
         const { data, error } = await this.resend!.domains.list();
         if (error) {

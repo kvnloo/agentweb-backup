@@ -21,6 +21,7 @@ import { isTransientLLMError } from '../utils/agentModeErrors';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
 import { incrementUserTokenUsage } from './tokenUsageService';
+import { computeCostMicroUsd } from './usageRecorderService';
 import { approvalDb } from './approvalDb';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -3540,39 +3541,17 @@ Be helpful, concise, and accurate. Focus on actionable growth marketing advice. 
 
 
 // Helper function to calculate token cost
-function calculateCost(
+export function calculateCost(
   promptTokens: number,
   completionTokens: number,
   model: string
 ): number {
-  // Azure OpenAI pricing per 1K tokens (as of 2024)
-  const prices = {
-    "gpt-4o": {
-      prompt: 0.025,
-      completion: 0.0125,
-    },
-    "gpt-4.1": {
-      prompt: 0.02,
-      completion: 0.005,
-    },
-  };
-
-  // Get model pricing or return 0 if model not found
-  let pricing;
-  const modelLower = model.toLowerCase();
-  if (modelLower.includes("gpt-4o")) {
-    pricing = prices["gpt-4o"];
-  } else if (modelLower.includes("gpt-4.1")) {
-    pricing = prices["gpt-4.1"];
-  } else {
-    console.log(`Unknown model ${model}, cost calculation not available`);
-    return 0;
-  }
-
-  return (
-    (promptTokens / 1000) * pricing.prompt +
-    (completionTokens / 1000) * pricing.completion
-  );
+  // Price from the single source of truth (llmPricing via computeCostMicroUsd)
+  // so chatbot cost stays consistent with the shadow usage book and ENG-207
+  // normalization. This replaced a stale hardcoded per-1K table whose gpt-4o
+  // prompt rate was 10x the published list price ($25/1M vs $2.50/1M), which
+  // silently overcharged Emma chatbot usage. Unknown models → 0 (unchanged).
+  return computeCostMicroUsd(model, promptTokens, completionTokens) / 1_000_000;
 }
 
 // Helper function to log token usage
@@ -4034,7 +4013,6 @@ export async function generateChatResponse(
           'report_product_issues',
           'get_temp_email', 'check_temp_inbox',
           'get_test_account', 'save_test_account', 'list_test_accounts',
-          'run_local_agent_task', 'check_local_agent_status',
         ] : []);
 
         if (isCustomerContext) {
