@@ -295,6 +295,28 @@ describe('retagAdUtm — single existing ad, on-demand retrofit (Harsha\'s ask)'
     );
   });
 
+  it('does NOT omit a key from the campaign suffix just because the targeted ad\'s own URL already has it (Greptile P1)', async () => {
+    // The campaign suffix applies to EVERY ad in the campaign, not just the one
+    // named. If the targeted ad's own URL happens to already carry utm_source,
+    // that must not gate the campaign-wide write -- omitting utm_source there
+    // would silently strip it from every SIBLING ad that doesn't have it on its
+    // own URL. Omission must be driven only by what the EXISTING campaign
+    // suffix itself already defines (mergeUtmIntoQueryString's own `present`),
+    // never by the single targeted ad's URL.
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          adGroupAd: { ad: { finalUrls: ['https://example.com/?utm_source=already-on-this-one-ad'] } },
+          campaign: { resourceName: 'customers/1234567890/campaigns/9', finalUrlSuffix: undefined },
+        }],
+      },
+    });
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.retagAdUtm('user-123', '1234567890', 'customers/123/adGroupAds/1');
+    const op = mutateOperation();
+    expect(op.update.finalUrlSuffix).toContain('utm_source=google');
+  });
+
   it('reads exactly the resource name it was given (no destination-URL guessing)', async () => {
     mockAxiosPost.mockResolvedValueOnce({
       data: {

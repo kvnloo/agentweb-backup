@@ -1144,15 +1144,20 @@ export class GoogleAdsService {
     const finalUrl = rows[0]?.adGroupAd?.ad?.finalUrls?.[0];
     if (!finalUrl) return { success: false, reason: 'no_destination_url' };
 
-    const urlKeys = readUtmKeys(finalUrl);
-    // Unreadable destination — do not tag; it may already carry a utm_source
-    // that a naive merge would duplicate (same rule buildAdFinalUrlSuffix uses).
-    if (!urlKeys) return { success: false };
+    // Unreadable destination — do not tag; we can't confirm this ad's URL is
+    // even a URL, so refuse rather than risk writing anything at all.
+    if (!readUtmKeys(finalUrl)) return { success: false };
 
     const campaignResourceName: string | undefined = rows[0]?.campaign?.resourceName;
     const existingSuffix: string | undefined = rows[0]?.campaign?.finalUrlSuffix;
     const spec = buildUtmSpec('google', { campaign: '{campaignid}', content: '{creative}' });
-    const merged = mergeUtmIntoQueryString(existingSuffix, spec, urlKeys);
+    // Greptile P1: omission must be driven ONLY by what the EXISTING campaign
+    // suffix already defines (mergeUtmIntoQueryString computes that internally
+    // from `existingSuffix`) — never by the targeted ad's own URL. The suffix
+    // applies to every ad in the campaign at click time; using one ad's URL as
+    // the omit mask either strips a key from sibling ads that never had it, or
+    // adds a key that duplicates onto one of this ad's OTHER final urls.
+    const merged = mergeUtmIntoQueryString(existingSuffix, spec);
     const normalizedExisting = (existingSuffix || '').replace(/^[?&]+/, '').replace(/&+$/, '');
     if (!campaignResourceName || merged === normalizedExisting) return { success: false };
 
