@@ -38,7 +38,7 @@ import {
   resolveLandingPageLiveUrl,
   canUserEditLandingPage,
 } from "../services/v0Service";
-import { injectGtmIntoLayout } from "../utils/gtmInjection";
+import { injectGtmIntoLayout, verifyGtmInjection } from "../utils/gtmInjection";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { MISSING_BRAND_LOGO_ERROR } from "../services/agentMode/brandLogo";
 import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
@@ -1770,6 +1770,21 @@ async function saveGtmForPage(
       // 2–3. Strip any existing GTM block and re-inject (idempotent). Shared with the
       //       auto-inject-at-generation path so both emit byte-identical output (ENG-334).
       const updatedContent = injectGtmIntoLayout(currentContent, containerId);
+
+      // Fail loud, not silent: a layout with neither <head> nor <body> to anchor on leaves
+      // injectGtmIntoLayout's insertion a no-op. Without this check we'd commit unchanged
+      // content to GitHub and still tell the caller "success" with the container ID they
+      // asked for — a manual Add-GTM click that silently did nothing.
+      if (!verifyGtmInjection(updatedContent, containerId)) {
+        throw Object.assign(
+          new Error(
+            containerId
+              ? "Could not inject GTM: this page's layout.tsx has no <head> or <body> tag to insert into."
+              : "Could not remove GTM: the layout still carries a GTM block after attempting removal.",
+          ),
+          { httpStatus: 422 },
+        );
+      }
 
       // 4. Commit updated layout.tsx to GitHub
       const base64New = Buffer.from(updatedContent, "utf-8").toString("base64");

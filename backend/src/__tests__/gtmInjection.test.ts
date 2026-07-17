@@ -17,6 +17,7 @@
 import {
   injectGtmIntoLayout,
   injectGtmIntoLayoutFiles,
+  verifyGtmInjection,
 } from '../utils/gtmInjection';
 
 // A layout in the shape v0 actually emits — has both <head> and <body>. This is the
@@ -105,5 +106,60 @@ describe('ENG-334 — injectGtmIntoLayoutFiles (files array passed to the GitHub
   it('reports not-installed when there is no layout file to inject into', () => {
     const files = [{ path: 'app/page.tsx', content: Buffer.from('x') }];
     expect(injectGtmIntoLayoutFiles(files, 'GTM-ABCD1')).toBe(false);
+  });
+
+  // A malformed layout with neither <head> nor <body> — a real, if rare, shape v0's
+  // unbounded generation could produce (e.g. a fragment-only component). Both insertion
+  // branches in injectGtmIntoLayout no-op on this input, so nothing is actually injected —
+  // but the OLD injectGtmIntoLayoutFiles returned `true` regardless, purely because a
+  // layout.tsx file existed and a containerId was supplied. That's a false "installed"
+  // signal: trackingInstalled=true gets persisted for a page that shipped with zero tracking.
+  it('reports NOT installed when the layout has neither <head> nor <body> to insert into', () => {
+    const fragmentOnlyLayout = `export default function RootLayout({ children }: { children: React.ReactNode }) {\n  return <>{children}</>;\n}\n`;
+    const files = [
+      { path: 'app/layout.tsx', content: Buffer.from(fragmentOnlyLayout) },
+    ];
+    const before = files[0].content.toString();
+    const injected = injectGtmIntoLayoutFiles(files, 'GTM-ABCD1');
+    expect(injected).toBe(false);
+    // Must not silently ship a half-mutated file — untouched on verification failure.
+    expect(files[0].content.toString()).toBe(before);
+  });
+});
+
+describe('ENG-334 — verifyGtmInjection (fail loud, not silent, on a broken insert)', () => {
+  it('is true for a normal successful injection', () => {
+    const out = injectGtmIntoLayout(V0_LAYOUT, 'GTM-ABCD1');
+    expect(verifyGtmInjection(out, 'GTM-ABCD1')).toBe(true);
+  });
+
+  it('is true for a normal successful removal (containerId "")', () => {
+    const injected = injectGtmIntoLayout(V0_LAYOUT, 'GTM-ABCD1');
+    const removed = injectGtmIntoLayout(injected, '');
+    expect(verifyGtmInjection(removed, '')).toBe(true);
+  });
+
+  it('is false when a containerId was requested but nothing was actually inserted', () => {
+    // Simulates the fragment-only-layout case: injectGtmIntoLayout no-ops, content unchanged.
+    const fragmentOnlyLayout = `export default function RootLayout({ children }: { children: React.ReactNode }) {\n  return <>{children}</>;\n}\n`;
+    expect(verifyGtmInjection(fragmentOnlyLayout, 'GTM-ABCD1')).toBe(false);
+  });
+
+  it('is false when removal was requested but a GTM block is still present', () => {
+    const injected = injectGtmIntoLayout(V0_LAYOUT, 'GTM-ABCD1');
+    // Removal was supposed to happen but didn't (simulated by NOT running the strip).
+    expect(verifyGtmInjection(injected, '')).toBe(false);
+  });
+
+  it('is scoped to OUR delimiter markers, not fooled by unrelated pre-existing text', () => {
+    // A layout whose own (unrelated) content happens to mention the exact loader URL string —
+    // e.g. v0-generated marketing copy about analytics tooling. A naive whole-file substring
+    // count would see 2 occurrences and wrongly report failure on a real, correct injection.
+    const layoutWithUnrelatedMention = V0_LAYOUT.replace(
+      '<link rel="icon" href="/favicon.ico" />',
+      '<link rel="icon" href="/favicon.ico" /><p>We use gtm.js?id=OTHER-THING for our own site</p>',
+    );
+    const out = injectGtmIntoLayout(layoutWithUnrelatedMention, 'GTM-ABCD1');
+    expect(verifyGtmInjection(out, 'GTM-ABCD1')).toBe(true);
   });
 });

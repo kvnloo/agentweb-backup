@@ -1133,6 +1133,27 @@ describe("POST /api/landing-pages/v0/generated/:id/gtm", () => {
     const headOpenTags = (committed.match(/\{\/\* Google Tag Manager \*\//g) || []).length;
     expect(headOpenTags).toBe(1);
   });
+
+  // ENG-334 risk hardening: a layout with neither <head> nor <body> defeats
+  // injectGtmIntoLayout's insertion (both branches no-op). Before the verification guard,
+  // this endpoint committed the UNCHANGED layout to GitHub and still returned
+  // {success:true, gtmContainerId}, silently lying to the caller. It must now fail loud.
+  it("FAIL: layout has neither <head> nor <body> to insert into → 422, nothing committed", async () => {
+    const fragmentOnlyLayout = `export default function RootLayout({ children }) {\n  return <>{children}</>;\n}\n`;
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE_WITH_REPO);
+    mockAxios.get.mockResolvedValueOnce({
+      data: { content: Buffer.from(fragmentOnlyLayout).toString("base64"), sha: "sha3" },
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/gtm")
+      .send({ gtmContainerId: "GTM-TESTX1" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toMatch(/no <head> or <body>/);
+    expect(mockAxios.put).not.toHaveBeenCalled();
+    expect(mockUpdateLandingPageGtm).not.toHaveBeenCalled();
+  });
 });
 
 // =============================================================================
