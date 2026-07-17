@@ -167,6 +167,19 @@ describe('ENG-335 launch gate — AD CREATE on a live campaign', () => {
     expect(googleAdsService.createAd).toHaveBeenCalled();
   });
 
+  it('fails open: a transient getAdGroupCampaign error does NOT break ad creation', async () => {
+    (googleAdsService.getAdGroupCampaign as jest.Mock).mockRejectedValue(new Error('transient GAQL 500'));
+
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890', entity_type: 'AD', action: 'CREATE', ad_group_resource_name: AD_GROUP,
+      type: 'SEARCH', headlines: ['h'], descriptions: ['d'], final_url: 'https://acme.com/compare',
+    }, { sessionId: 'sess-1' });
+
+    expect(result.success).toBe(true);
+    expect(googleAdsService.createAd).toHaveBeenCalled();
+    expect(preflightTrackingGate).not.toHaveBeenCalled();
+  });
+
   it('proceeds and records an override when adding to a live campaign with override_tracking_check=true', async () => {
     (googleAdsService.getAdGroupCampaign as jest.Mock).mockResolvedValue({ campaignResourceName: CAMPAIGN, campaignStatus: 'ENABLED' });
     (preflightTrackingGate as jest.Mock).mockResolvedValue(blockedGate);
@@ -205,6 +218,16 @@ describe('ENG-335 launch gate — ASSET_GROUP CREATE on a live campaign', () => 
 
   it('does NOT gate an asset group added to a PAUSED campaign', async () => {
     (googleAdsService.getCampaignStatus as jest.Mock).mockResolvedValue('PAUSED');
+
+    const result = await service.handleCallGoogleAdsApi('user-123', { ...validAssetGroupArgs }, { sessionId: 'sess-1' });
+
+    expect(result.success).toBe(true);
+    expect(preflightTrackingGate).not.toHaveBeenCalled();
+    expect(googleAdsService.createAssetGroup).toHaveBeenCalled();
+  });
+
+  it('fails open: a transient getCampaignStatus error does NOT break asset-group creation', async () => {
+    (googleAdsService.getCampaignStatus as jest.Mock).mockRejectedValue(new Error('transient GAQL 500'));
 
     const result = await service.handleCallGoogleAdsApi('user-123', { ...validAssetGroupArgs }, { sessionId: 'sess-1' });
 
