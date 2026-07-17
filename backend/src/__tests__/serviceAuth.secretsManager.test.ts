@@ -129,9 +129,14 @@ describe('requireScheduledChatsServiceSecret — Secrets Manager path (ENG-359)'
       expect(warnSpy).toHaveBeenCalledTimes(1);
     });
 
-    it('SM read throws → next() (fail-open, never 500) + error logged', async () => {
-      mockGetSecret.mockRejectedValue(new Error('SM unavailable'));
-      const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    it('SM read throws (as the real getSecret wraps it) → fail-open + warn once, never 500', async () => {
+      // The real getSecret catches AWS errors and re-throws
+      // `new Error('Failed to fetch secret: ...')` (dropping the AWS code), and
+      // logs the underlying cause itself — so serviceAuth just fails open and
+      // records the impact via its once-per-process warn.
+      mockGetSecret.mockRejectedValue(
+        new Error(`Failed to fetch secret: ${SCHEDULED_CHATS_SERVICE_SECRET_SM_ID}`)
+      );
       const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
 
       const res = mockRes();
@@ -140,7 +145,6 @@ describe('requireScheduledChatsServiceSecret — Secrets Manager path (ENG-359)'
 
       expect(next).toHaveBeenCalledTimes(1);
       expect(res.status).not.toHaveBeenCalled();
-      expect(errSpy).toHaveBeenCalled();
       expect(warnSpy).toHaveBeenCalledTimes(1);
     });
 
@@ -187,18 +191,6 @@ describe('requireScheduledChatsServiceSecret — Secrets Manager path (ENG-359)'
       await requireScheduledChatsServiceSecret(mockReqWithHeader('x'), res, next);
       expect(next).toHaveBeenCalledTimes(1);
       expect(res.status).not.toHaveBeenCalled();
-    });
-
-    it('SM rejects with a non-Error value → still fails open (error-string fallback)', async () => {
-      mockGetSecret.mockRejectedValue('bare-string-failure');
-      const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-      jest.spyOn(console, 'warn').mockImplementation(() => {});
-      const res = mockRes();
-      const next = jest.fn();
-      await requireScheduledChatsServiceSecret(mockReqWithHeader(undefined), res, next);
-      expect(next).toHaveBeenCalledTimes(1);
-      expect(res.status).not.toHaveBeenCalled();
-      expect(errSpy).toHaveBeenCalled();
     });
   });
 
@@ -255,7 +247,6 @@ describe('requireScheduledChatsServiceSecret — Secrets Manager path (ENG-359)'
     it('deleting the SM secret flips enforcement back to fail-open after the TTL', async () => {
       const nowSpy = jest.spyOn(Date, 'now');
       jest.spyOn(console, 'warn').mockImplementation(() => {});
-      jest.spyOn(console, 'error').mockImplementation(() => {});
 
       // t=0: SM has the secret → enforcing (missing header → 401).
       nowSpy.mockReturnValue(0);
@@ -266,8 +257,11 @@ describe('requireScheduledChatsServiceSecret — Secrets Manager path (ENG-359)'
       expect(res1.status).toHaveBeenCalledWith(401);
       expect(next1).not.toHaveBeenCalled();
 
-      // Secret deleted from SM (ResourceNotFoundException).
-      mockGetSecret.mockRejectedValue({ code: 'ResourceNotFoundException' });
+      // Secret deleted from SM: the real getSecret surfaces this as a wrapped
+      // `Failed to fetch secret` throw (ResourceNotFoundException → wrapped).
+      mockGetSecret.mockRejectedValue(
+        new Error(`Failed to fetch secret: ${SCHEDULED_CHATS_SERVICE_SECRET_SM_ID}`)
+      );
 
       // Past the TTL → re-read → now fails open (rollback lever, no redeploy).
       nowSpy.mockReturnValue(301_000);
