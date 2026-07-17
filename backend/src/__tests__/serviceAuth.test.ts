@@ -12,7 +12,16 @@
  *   (pre-ENG-347 behavior) so the backend's daily auto-deploy cannot break
  *   the manually-deployed agent-engine. Enforcement starts when the env var
  *   is set.
+ *
+ * ENG-359: when the env var is unset the middleware now consults AWS Secrets
+ * Manager before deciding. The SM helper is mocked here to return a payload
+ * with no matching key, so the "env unset" path deterministically fails open
+ * (no real AWS call, no dependence on whether the prod secret exists).
  */
+jest.mock('../utils/secretsManager', () => ({
+  getSecret: jest.fn().mockResolvedValue('{}'),
+}));
+
 import { Request, Response } from 'express';
 import {
   requireScheduledChatsServiceSecret,
@@ -107,15 +116,17 @@ describe('requireScheduledChatsServiceSecret (ENG-347)', () => {
     });
   });
 
-  describe('when the env secret is unset (pre-rollout, fail-open by design)', () => {
+  describe('when neither the env secret nor Secrets Manager resolves a secret (pre-rollout, fail-open by design)', () => {
     beforeEach(() => {
       delete process.env[SCHEDULED_CHATS_SERVICE_SECRET_ENV];
     });
 
-    it('passes the request through and warns exactly once per process', () => {
-      // Re-import a fresh module copy so the once-per-process warn flag is
-      // deterministically false here, independent of test ordering (a prior
-      // test hitting the unset path would otherwise have consumed the warn).
+    it('passes the request through and warns exactly once per process', async () => {
+      // Re-import a fresh module copy so the once-per-process warn flag AND the
+      // in-process SM cache start clean here, independent of test ordering (a
+      // prior test hitting the unset path would otherwise have consumed the
+      // warn / primed the cache). The top-level getSecret mock resolves to
+      // '{}' — no matching key — so the SM path fails open.
       jest.resetModules();
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const fresh = require('../middleware/serviceAuth') as typeof import('../middleware/serviceAuth');
@@ -125,7 +136,7 @@ describe('requireScheduledChatsServiceSecret (ENG-347)', () => {
 
       const next1 = jest.fn();
       const res1 = mockRes();
-      freshMiddleware(mockReqWithHeader(undefined), res1, next1);
+      await freshMiddleware(mockReqWithHeader(undefined), res1, next1);
       expect(next1).toHaveBeenCalledTimes(1);
       expect(res1.status).not.toHaveBeenCalled();
       expect(warnSpy).toHaveBeenCalledTimes(1);
@@ -134,7 +145,7 @@ describe('requireScheduledChatsServiceSecret (ENG-347)', () => {
       // Second unauthenticated request: still passes, but no repeat warning
       // (agent-engine polls this endpoint continuously — no log flooding).
       const next2 = jest.fn();
-      freshMiddleware(mockReqWithHeader(undefined), mockRes(), next2);
+      await freshMiddleware(mockReqWithHeader(undefined), mockRes(), next2);
       expect(next2).toHaveBeenCalledTimes(1);
       expect(warnSpy).toHaveBeenCalledTimes(1);
     });
