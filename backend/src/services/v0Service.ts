@@ -3426,9 +3426,31 @@ async function pollVercelDeployment(
 }
 
 /**
- * Fetch build error messages from Vercel deployment events.
+ * A stderr line that is NOT the build failure itself: the Vercel CLI version
+ * banner and deprecation/warning notices. These trail real build output, so
+ * naively surfacing the last stderr lines can present a benign warning (e.g.
+ * "the middleware file convention is deprecated") AS the build error, masking
+ * the actual cause. Exported for testing.
  */
-async function getVercelBuildErrors(deploymentId: string, vercelToken: string): Promise<string> {
+export function isNonErrorBuildLine(line: string): boolean {
+  const l = line.trim();
+  return (
+    /^vercel cli\b/i.test(l) ||
+    /^[⚠▲►]/.test(l) ||
+    /\bdeprecat/i.test(l) ||
+    /^warn(ing)?\b/i.test(l)
+  );
+}
+
+/**
+ * Fetch build error messages from Vercel deployment events.
+ *
+ * Prefers lines that carry an actual failure signal over trailing CLI/warning
+ * noise; when the logs contain ONLY noise (no explicit error line), says so
+ * rather than dressing a deprecation warning up as the build error. Exported
+ * for testing.
+ */
+export async function getVercelBuildErrors(deploymentId: string, vercelToken: string): Promise<string> {
   try {
     const headers = { Authorization: `Bearer ${vercelToken}` };
     const eventsRes = await axios.get<any>(
@@ -3447,8 +3469,23 @@ async function getVercelBuildErrors(deploymentId: string, vercelToken: string): 
       }
     }
 
-    // Return the last 30 error lines (most relevant)
-    return errorLines.slice(-30).join("\n") || "Build failed — no error details available in logs.";
+    if (errorLines.length === 0) {
+      return "Build failed — no error details available in logs.";
+    }
+
+    // Drop CLI-banner/warning noise so the real failure isn't buried under (or
+    // impersonated by) a trailing deprecation notice.
+    const meaningful = errorLines.filter((l) => !isNonErrorBuildLine(l));
+    if (meaningful.length === 0) {
+      // Only noise was captured — don't pass a warning off as the cause.
+      return (
+        errorLines.slice(-30).join("\n") +
+        "\n(No explicit build error was captured in the logs — only warnings/CLI output. Check the Vercel dashboard for the full build log.)"
+      );
+    }
+
+    // Return the last 30 meaningful error lines (most relevant).
+    return meaningful.slice(-30).join("\n");
   } catch (err: any) {
     console.error("[V0 SERVICE] Error fetching build logs:", err.message);
     return "Build failed — could not retrieve error details.";
