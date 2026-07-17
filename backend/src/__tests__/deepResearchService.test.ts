@@ -354,10 +354,55 @@ describe('DeepResearchService', () => {
     it('should use correct polling parameters', () => {
       const maxPollAttempts = 120; // 20 minutes max (120 * 10 seconds)
       const pollIntervalMs = 10000; // 10 seconds
-      
+
       const totalTimeoutMinutes = (maxPollAttempts * pollIntervalMs) / 1000 / 60;
-      
+
       expect(totalTimeoutMinutes).toBe(20);
+    });
+  });
+
+  // ENG-351: deep research reports must cite the source of every quoted number inline,
+  // directly next to the figure — matching the Claude/Gemini inline-citation style —
+  // rather than only collecting sources in a separate references section.
+  describe('Inline Source Citations', () => {
+    const mockGoogleGenAI = require('@google/genai').GoogleGenAI;
+    let createMock: jest.Mock;
+
+    beforeEach(() => {
+      mockGetSecret.mockResolvedValue('test-api-key');
+
+      const completedInteraction = {
+        id: 'interaction-1',
+        status: 'completed',
+        outputs: [{ text: '# Title\n\nReport body content.' }],
+      };
+      createMock = jest.fn().mockResolvedValue(completedInteraction);
+      mockGoogleGenAI.mockImplementation(() => ({
+        interactions: {
+          create: createMock,
+          get: jest.fn().mockResolvedValue(completedInteraction),
+        },
+      }));
+    });
+
+    it('instructs the research agent to cite quoted numbers inline', async () => {
+      await deepResearchService.performDeepResearch({
+        topic: 'AI market size',
+        depth: 'comprehensive',
+      });
+
+      const input = (createMock.mock.calls[0][0] as { input: string }).input;
+      expect(input).toContain('inline');
+      expect(input).toMatch(/Claude and Gemini/i);
+    });
+
+    it('adds the inline-citation instruction regardless of depth', async () => {
+      await deepResearchService.performDeepResearch({
+        topic: 'AI market size',
+      });
+
+      const input = (createMock.mock.calls[0][0] as { input: string }).input;
+      expect(input).toContain('inline');
     });
   });
 });
