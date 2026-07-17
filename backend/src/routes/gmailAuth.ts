@@ -50,7 +50,12 @@ router.get('/init', authenticateToken, async (req: any, res) => {
       state,
       access_type: 'offline',       // required to receive refresh_token
       prompt: 'consent',            // always return refresh_token even on re-auth
-      include_granted_scopes: 'true',
+      // Deliberately omitted: include_granted_scopes. Gmail shares its OAuth client_id
+      // with Google Drive/YouTube/Ads (same GCP project — see getGmailCredentials()).
+      // Setting this to 'true' makes Google fold in scopes the user granted to those
+      // OTHER integrations under the same client, so a user connecting only Gmail sees
+      // Drive/Sheets/Ads permissions on the consent screen too. Omitting it scopes the
+      // request (and the resulting token) to exactly what's listed in integrations.ts.
     });
 
     const url = `${config.authorizationUrl}?${params.toString()}`;

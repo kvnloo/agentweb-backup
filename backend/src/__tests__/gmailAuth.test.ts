@@ -110,6 +110,12 @@ describe('Gmail OAuth Routes', () => {
       expect(scope).toContain('gmail.readonly');
       expect(scope).toContain('userinfo.email');
     });
+
+    it('does not request include_granted_scopes, so Google does not fold in scopes granted to other integrations sharing this OAuth client (e.g. Google Drive)', async () => {
+      const res = await request(app).get('/api/oauth/gmail/init');
+      const url = new URL(res.body.url);
+      expect(url.searchParams.get('include_granted_scopes')).not.toBe('true');
+    });
   });
 
   // ── GET /callback ────────────────────────────────────────────────────────
