@@ -235,6 +235,21 @@ export async function getV0Credits(options?: {
 /** Re-alert at most once per level within this window (a redeploy re-alerting once is acceptable). */
 export const V0_ALERT_REALERT_WINDOW_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Stable dedupe class for the intake gate (ENG-358): every v0 balance alert carries
+ * `"Alert Class": V0_ALERT_CLASS` in its context, so occurrences cluster onto ONE open
+ * canonical Linear issue regardless of the dollar amount / warn level in the subject —
+ * the intake gate matches this class before any title comparison. Without it, every
+ * balance change filed a fresh issue (14 near-identical issues in 5 days, ENG-292…350).
+ */
+export const V0_ALERT_CLASS = "v0-credits";
+
+/** Warn level -> intake `"Alert Priority"` (Linear: critical -> Urgent, low -> High). */
+const ALERT_PRIORITY_BY_LEVEL: Record<Exclude<V0WarnLevel, "ok">, string> = {
+  critical: "urgent",
+  low: "high",
+};
+
 export type V0AlertTransport = (
   subject: string,
   message: string,
@@ -319,6 +334,10 @@ export async function checkAndAlert(options?: {
       "Monthly remaining": `$${dto.monthly.remaining.toFixed(2)} / $${dto.monthly.total.toFixed(2)}`,
       "Warn level": level,
       "Fetched at": dto.fetchedAt,
+      // Intake-gate clustering keys (ENG-358): dedupe every occurrence onto the one open
+      // canonical; escalate (low -> critical) in place instead of filing a new issue.
+      "Alert Class": V0_ALERT_CLASS,
+      "Alert Priority": ALERT_PRIORITY_BY_LEVEL[level],
     });
   } catch (error) {
     // Logged loudly, never thrown out of the hourly cron. State is NOT

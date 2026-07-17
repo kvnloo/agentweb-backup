@@ -399,6 +399,21 @@ describe('v0BillingService', () => {
       expect(message).toContain('top up v0 credits');
     });
 
+    // ENG-358: the alert context must carry the intake gate's clustering keys so every occurrence
+    // dedupes onto the ONE open canonical regardless of the balance in the subject line.
+    it('low alert context carries Alert Class "v0-credits" + Alert Priority "high" (ENG-358)', async () => {
+      await checkAndAlert({ transport });
+      const context = transport.mock.calls[0][2];
+      expect(context).toMatchObject({ 'Alert Class': 'v0-credits', 'Alert Priority': 'high' });
+    });
+
+    it('critical alert context escalates Alert Priority to "urgent" under the same Alert Class (ENG-358)', async () => {
+      mockV0Api({ billing: billingAtLevel('critical') });
+      await checkAndAlert({ transport });
+      const context = transport.mock.calls[0][2];
+      expect(context).toMatchObject({ 'Alert Class': 'v0-credits', 'Alert Priority': 'urgent' });
+    });
+
     it('does not re-fire for the same level within the 24h window', async () => {
       await checkAndAlert({ transport });
 

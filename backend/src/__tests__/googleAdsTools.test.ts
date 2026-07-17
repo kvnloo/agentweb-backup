@@ -4,6 +4,7 @@ jest.mock('../services/googleAdsService', () => ({
       { id: '1', name: 'Test', status: 'ENABLED', type: 'SEARCH', resourceName: 'customers/123/campaigns/1' },
     ]),
     listBudgets: jest.fn().mockResolvedValue([{ resourceName: 'customers/123/campaignBudgets/1', name: 'Test Budget', amountMicros: '10000000', explicitlyShared: false, referenceCount: 1 }]),
+    listBiddingStrategies: jest.fn().mockResolvedValue([{ resourceName: 'customers/123/biddingStrategies/555', id: '555', name: 'Portfolio tCPA', type: 'TARGET_CPA', status: 'ENABLED' }]),
     createBudget: jest.fn().mockResolvedValue({ resourceName: 'customers/123/campaignBudgets/1' }),
     createCampaign: jest.fn().mockResolvedValue({ resourceName: 'customers/123/campaigns/1' }),
     pauseCampaign: jest.fn().mockResolvedValue(undefined),
@@ -187,6 +188,68 @@ describe('handleCallGoogleAdsApi', () => {
       '1234567890',
       'customers/123/campaigns/1',
       expect.objectContaining({ finalUrlSuffix: 'utm_source=google&utm_medium=cpc' })
+    );
+  });
+
+  it('handles BIDDING_STRATEGY LIST via listBiddingStrategies service method', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'BIDDING_STRATEGY',
+      action: 'LIST',
+    });
+    expect(result.success).toBe(true);
+    expect(result.biddingStrategies).toHaveLength(1);
+    expect(result.biddingStrategies[0].resourceName).toBe('customers/123/biddingStrategies/555');
+  });
+
+  it('forwards bidding_strategy_resource_name (portfolio) on CAMPAIGN CREATE', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'CREATE',
+      name: 'Portfolio Campaign',
+      type: 'SEARCH',
+      budget_resource_name: 'customers/123/campaignBudgets/1',
+      bidding_strategy_resource_name: 'customers/123/biddingStrategies/555',
+    });
+    expect(result.success).toBe(true);
+    expect(googleAdsService.createCampaign).toHaveBeenCalledWith(
+      'user-123',
+      '1234567890',
+      expect.objectContaining({ biddingStrategyResourceName: 'customers/123/biddingStrategies/555' }),
+    );
+  });
+
+  it('rejects CAMPAIGN CREATE with both bidding_strategy and bidding_strategy_resource_name', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'CREATE',
+      name: 'Conflicting Campaign',
+      type: 'SEARCH',
+      budget_resource_name: 'customers/123/campaignBudgets/1',
+      bidding_strategy: 'MANUAL_CPC',
+      bidding_strategy_resource_name: 'customers/123/biddingStrategies/555',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/not both/i);
+    expect(googleAdsService.createCampaign).not.toHaveBeenCalled();
+  });
+
+  it('forwards bidding_strategy_resource_name (portfolio) on CAMPAIGN UPDATE', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'UPDATE',
+      campaign_resource_name: 'customers/123/campaigns/1',
+      bidding_strategy_resource_name: 'customers/123/biddingStrategies/555',
+    });
+    expect(result.success).toBe(true);
+    expect(googleAdsService.updateCampaign).toHaveBeenCalledWith(
+      'user-123',
+      '1234567890',
+      'customers/123/campaigns/1',
+      expect.objectContaining({ biddingStrategyResourceName: 'customers/123/biddingStrategies/555' }),
     );
   });
 
