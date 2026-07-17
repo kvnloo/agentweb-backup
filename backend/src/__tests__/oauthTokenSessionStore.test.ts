@@ -13,6 +13,8 @@ jest.mock('../services/settingsService', () => ({
   },
 }));
 
+const ttlArgOf = (call: any[]) => call[4];
+
 const mockGet = settingsService.getSetting as jest.Mock;
 const mockSet = settingsService.setSetting as jest.Mock;
 const mockDelete = settingsService.deleteSetting as jest.Mock;
@@ -99,6 +101,44 @@ describe('oauthTokenSessionStore — abandoned popups must not accumulate token 
   it('does not put the session id in the KEY (it is a secret, checked on read)', async () => {
     const sessionId = await storeTokenSession('u1', 'outlook', tokens, profile);
     expect([...table.keys()].some((k) => k.includes(sessionId))).toBe(false);
+  });
+});
+
+// Greptile (PR review, ENG-266): app-level `expires` alone means an abandoned popup's row
+// physically outlives its own "expiry" in DynamoDB forever unless the same user retries the
+// same provider. Writing a real DynamoDB TTL attribute closes that — DynamoDB deletes the
+// row itself once every session in it is actually expired.
+describe('oauthTokenSessionStore — DynamoDB TTL attribute', () => {
+  it('passes a ttl to setSetting matching the furthest-out session expiry', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-07-13T10:00:00Z'));
+    await storeTokenSession('u1', 'outlook', tokens, profile);
+    jest.useRealTimers();
+
+    const ttl = ttlArgOf(mockSet.mock.calls[0]);
+    const expectedTtl = Math.floor(new Date('2026-07-13T10:10:00Z').getTime() / 1000); // TTL is 10 min
+    expect(ttl).toBe(expectedTtl);
+  });
+
+  it('advances the ttl to the newest session when a second popup is opened later', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-07-13T10:00:00Z'));
+    await storeTokenSession('u1', 'outlook', tokens, profile);
+
+    jest.setSystemTime(new Date('2026-07-13T10:05:00Z'));
+    await storeTokenSession('u1', 'outlook', tokens, profile);
+    jest.useRealTimers();
+
+    const ttl = ttlArgOf(mockSet.mock.calls[mockSet.mock.calls.length - 1]);
+    const expectedTtl = Math.floor(new Date('2026-07-13T10:15:00Z').getTime() / 1000);
+    expect(ttl).toBe(expectedTtl);
+  });
+
+  it('does not call setSetting with a ttl when the row is emptied (deleteSetting path)', async () => {
+    const id = await storeTokenSession('u1', 'outlook', tokens, profile);
+    mockSet.mockClear();
+    await retrieveTokenSession(id, 'u1', 'outlook');
+
+    expect(mockDelete).toHaveBeenCalledWith('oauth_token_session_outlook_u1');
+    expect(mockSet).not.toHaveBeenCalled();
   });
 });
 

@@ -91,11 +91,18 @@ const writeRow = async (row: SessionRow): Promise<void> => {
     await settingsService.deleteSetting(settingName(row.userId, row.provider)).catch(() => undefined);
     return;
   }
+  // DynamoDB TTL attribute (Greptile, ENG-266 review): without this, an abandoned popup's
+  // row is only pruned by our own read/write code — if the user never retries that
+  // provider, the row (and its refresh token) physically outlives its own `expires` value
+  // forever. Set the TTL to the furthest-out session's expiry so DynamoDB never deletes a
+  // row while a still-live sibling session exists.
+  const furthestExpiry = Math.max(...row.sessions.map((s) => s.expires));
   await settingsService.setSetting(
     settingName(row.userId, row.provider),
     JSON.stringify(row),
     `Transient ${row.provider} OAuth token session`,
     'system',
+    Math.floor(furthestExpiry / 1000),
   );
 };
 
