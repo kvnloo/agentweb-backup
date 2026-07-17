@@ -2,6 +2,7 @@ import {
   detectTrackingSnippets,
   checkUrlTracking,
   preflightTrackingGate,
+  fetchHtmlFollowingRedirects,
   TRACKING_MECHANISMS,
 } from '../services/googleAdsTrackingPreflight';
 
@@ -65,6 +66,77 @@ describe('googleAdsTrackingPreflight — checkUrlTracking', () => {
     const result = await checkUrlTracking('https://example.com/503', { fetchHtml });
     expect(result.status).toBe('unverifiable');
     expect(result.error).toMatch(/503/);
+  });
+});
+
+describe('googleAdsTrackingPreflight — fetchHtmlFollowingRedirects', () => {
+  const ok = (data: string) => ({ status: 200, headers: {}, data });
+  const redirect = (location: string, status = 308) => ({ status, headers: { location }, data: '' });
+
+  it('returns the body directly when there is no redirect', async () => {
+    const get = jest.fn().mockResolvedValue(ok('<html>measured G-AAAA111111</html>'));
+    const assertPublic = jest.fn().mockResolvedValue(undefined);
+    const html = await fetchHtmlFollowingRedirects('https://a.com', { get, assertPublic });
+    expect(html).toContain('G-AAAA111111');
+    expect(assertPublic).toHaveBeenCalledTimes(1);
+  });
+
+  it('follows a 308 to another public host and returns the final 200 body', async () => {
+    const get = jest.fn()
+      .mockResolvedValueOnce(redirect('https://www.hireemma.ai/'))
+      .mockResolvedValueOnce(ok('<script src="/gtag/js?id=G-KKJE0Q33LF"></script>'));
+    const assertPublic = jest.fn().mockResolvedValue(undefined);
+    const html = await fetchHtmlFollowingRedirects('https://agentweb.pro', { get, assertPublic });
+    expect(html).toContain('G-KKJE0Q33LF');
+    // SSRF guard re-run on BOTH the start URL and the redirect target.
+    expect(assertPublic).toHaveBeenNthCalledWith(1, 'https://agentweb.pro');
+    expect(assertPublic).toHaveBeenNthCalledWith(2, 'https://www.hireemma.ai/');
+  });
+
+  it('resolves a relative Location against the current URL', async () => {
+    const get = jest.fn()
+      .mockResolvedValueOnce(redirect('/final', 301))
+      .mockResolvedValueOnce(ok('done'));
+    const assertPublic = jest.fn().mockResolvedValue(undefined);
+    await fetchHtmlFollowingRedirects('https://a.com/start', { get, assertPublic });
+    expect(get).toHaveBeenNthCalledWith(2, 'https://a.com/final');
+  });
+
+  it('re-runs the SSRF guard on the redirect target (blocks redirect-to-internal)', async () => {
+    const get = jest.fn().mockResolvedValue(redirect('http://169.254.169.254/latest/meta-data/'));
+    const assertPublic = jest.fn()
+      .mockResolvedValueOnce(undefined) // start URL is public
+      .mockRejectedValueOnce(new Error('URL resolves to a private/internal address'));
+    await expect(fetchHtmlFollowingRedirects('https://a.com', { get, assertPublic }))
+      .rejects.toThrow(/private\/internal/);
+  });
+
+  it('throws (not measured) when redirects exceed the cap', async () => {
+    const get = jest.fn().mockResolvedValue(redirect('https://a.com/loop'));
+    const assertPublic = jest.fn().mockResolvedValue(undefined);
+    await expect(fetchHtmlFollowingRedirects('https://a.com', { get, assertPublic, maxRedirects: 2 }))
+      .rejects.toThrow(/too many redirects/i);
+  });
+
+  it('throws on a 3xx with no Location header', async () => {
+    const get = jest.fn().mockResolvedValue({ status: 302, headers: {}, data: '' });
+    const assertPublic = jest.fn().mockResolvedValue(undefined);
+    await expect(fetchHtmlFollowingRedirects('https://a.com', { get, assertPublic }))
+      .rejects.toThrow(/no Location header/);
+  });
+
+  it('refuses to follow a non-http(s) redirect', async () => {
+    const get = jest.fn().mockResolvedValue(redirect('file:///etc/passwd'));
+    const assertPublic = jest.fn().mockResolvedValue(undefined);
+    await expect(fetchHtmlFollowingRedirects('https://a.com', { get, assertPublic }))
+      .rejects.toThrow(/non-http/);
+  });
+
+  it('surfaces a 4xx/5xx as a thrown error (→ unverifiable)', async () => {
+    const get = jest.fn().mockResolvedValue({ status: 404, headers: {}, data: '' });
+    const assertPublic = jest.fn().mockResolvedValue(undefined);
+    await expect(fetchHtmlFollowingRedirects('https://a.com', { get, assertPublic }))
+      .rejects.toThrow(/status code 404/);
   });
 });
 
