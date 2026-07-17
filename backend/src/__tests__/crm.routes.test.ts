@@ -1365,7 +1365,9 @@ describe('CRM Routes', () => {
       expect(mockResponse.json).toHaveBeenCalledWith({
         senders: [],
         defaultSenderId: null,
+        defaultLinkedInAccountId: null,
         connectedGmailAccounts: [],
+        connectedEmailAccounts: [],
       });
     });
 
