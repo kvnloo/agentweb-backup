@@ -28158,12 +28158,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           }
           // ENG-335: an ad added to an already-live campaign serves paid traffic
           // instantly — gate its final_url like a launch when the parent is ENABLED.
-          {
+          // Fail-open on a lookup/gate error: this is defence-in-depth (the RESUME /
+          // UPDATE→ENABLED gate is the hard guarantee), so a transient parent-status
+          // lookup failure must NOT break an otherwise-valid ad creation.
+          try {
             const parent = await googleAdsService.getAdGroupCampaign(userId, customer_id, args.ad_group_resource_name);
             if (parent) {
               const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, parent.campaignResourceName, parent.campaignStatus, 'AD_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
               if (!gate.proceed) return gate.blockResult;
             }
+          } catch (gateErr) {
+            console.error('[ENG-335] AD_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
           }
           let adType = args.type as string;
           if (adType === 'SEARCH') adType = 'RESPONSIVE_SEARCH_AD';
@@ -28217,10 +28222,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         // ENG-335: a PMax asset group added to an already-live campaign serves paid
         // traffic instantly — gate its final_url like a launch when the parent is ENABLED.
-        {
+        // Fail-open on a lookup/gate error (see AD_CREATE above): defence-in-depth, so a
+        // transient campaign-status lookup failure must NOT break a valid asset-group create.
+        try {
           const campaignStatus = await googleAdsService.getCampaignStatus(userId, customer_id, args.campaign_resource_name);
           const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, args.campaign_resource_name, campaignStatus, 'ASSET_GROUP_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
           if (!gate.proceed) return gate.blockResult;
+        } catch (gateErr) {
+          console.error('[ENG-335] ASSET_GROUP_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
         }
         const assetGroup = await googleAdsService.createAssetGroup(userId, customer_id, {
           name: args.name,
