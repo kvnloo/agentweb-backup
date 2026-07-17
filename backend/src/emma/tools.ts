@@ -1311,8 +1311,8 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
             // Creative — Event Ad
             pre_event_registration_image: { type: 'string', description: 'Image URN for pre-event registration. Optional for event ad creatives.' },
             // Creative — Lead Gen Form (LEAD_GENERATION campaigns)
-            leadgen_form_urn: { type: 'string', description: 'Existing Lead Gen Form adForm URN (e.g. urn:li:adForm:1016740005 or just the numeric id). REQUIRED for a Lead Gen creative in CREATIVE/CREATE or CREATIVE/CREATE_INLINE — sets callToAction.target. Must be paired with cta_label_type.' },
-            cta_label_type: { type: 'string', description: 'Lead Gen creative CTA button label type (callToAction.labelType), e.g. SIGN_UP, DOWNLOAD, LEARN_MORE, REGISTER, SUBSCRIBE, REQUEST_DEMO. REQUIRED alongside leadgen_form_urn for Lead Gen creatives.' },
+            leadgen_form_urn: { type: 'string', description: 'Existing Lead Gen Form adForm URN (e.g. urn:li:adForm:1016740005 or just the numeric id). REQUIRED for a Lead Gen creative in CREATIVE/CREATE or CREATIVE/CREATE_INLINE — sets leadgenCallToAction.destination. Must be paired with cta_label_type.' },
+            cta_label_type: { type: 'string', description: 'Lead Gen creative CTA button label (leadgenCallToAction.label), one of: APPLY, DOWNLOAD, VIEW_QUOTE, LEARN_MORE, SIGN_UP, SUBSCRIBE, REGISTER, REQUEST_DEMO, JOIN, ATTEND, UNLOCK_FULL_DOCUMENT. REQUIRED alongside leadgen_form_urn for Lead Gen creatives.' },
             // Creative — Dynamic Ad (Jobs / Spotlight / Follower)
             button_label: { type: 'string', description: 'CTA button text for Jobs dynamic ads (CREATIVE/CREATE_DYNAMIC format=JOBS).' },
             call_to_action: { type: 'string', description: 'CTA text for Spotlight/Follower dynamic ads.' },

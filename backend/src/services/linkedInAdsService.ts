@@ -588,19 +588,21 @@ export async function createPost(
 // ─── Creative ─────────────────────────────────────────────────────────────────
 
 /**
- * Build the Creative-level `callToAction` object required for Lead Gen ads.
- * LinkedIn rejects a Lead Gen creative unless BOTH callToAction.target (the Lead Gen
- * Form's adForm URN) and callToAction.labelType (e.g. SIGN_UP, DOWNLOAD) are present.
+ * Build the Creative-level `leadgenCallToAction` object required for Lead Gen ads.
+ * LinkedIn rejects a Lead Gen creative unless BOTH leadgenCallToAction.destination (the
+ * Lead Gen Form's adForm URN) and leadgenCallToAction.label (e.g. SIGN_UP, DOWNLOAD) are
+ * present. (The API input field is `leadgenCallToAction {destination,label}`; LinkedIn maps
+ * it internally to the `Creative/callToAction/target`+`labelType` path seen in its errors.)
  * Accepts the adForm URN with or without the `urn:li:adForm:` prefix.
  *
  * Returns:
- *  - { callToAction } when both a form URN and a label type are provided
+ *  - { leadgenCallToAction } when both a form URN and a label type are provided
  *  - { error } when only one of the two is provided (both are required together)
  *  - {} when neither is provided (a normal, non-lead-gen creative)
  */
 function buildLeadGenCallToAction(
   params: Record<string, any>
-): { callToAction?: { target: string; labelType: string }; error?: string } {
+): { leadgenCallToAction?: { destination: string; label: string }; error?: string } {
   const rawForm = params.leadgen_form_urn ?? params.lead_gen_form_urn ?? params.ad_form_urn;
   const rawLabel = params.cta_label_type ?? params.call_to_action_label_type;
   if (!rawForm && !rawLabel) return {};
@@ -611,8 +613,8 @@ function buildLeadGenCallToAction(
     return { error: 'Lead Gen creative requires cta_label_type (e.g. SIGN_UP, DOWNLOAD) alongside leadgen_form_urn.' };
   }
   const form = String(rawForm).trim();
-  const target = form.startsWith('urn:li:adForm:') ? form : `urn:li:adForm:${form}`;
-  return { callToAction: { target, labelType: String(rawLabel).trim().toUpperCase() } };
+  const destination = form.startsWith('urn:li:adForm:') ? form : `urn:li:adForm:${form}`;
+  return { leadgenCallToAction: { destination, label: String(rawLabel).trim().toUpperCase() } };
 }
 
 export async function listCreatives(
@@ -678,10 +680,10 @@ export async function createCreative(
     return { success: false, error: 'CREATIVE CREATE requires either post_urn, vast_tag_url, headline (text ad), or inmail_content_urn' };
   }
 
-  // Lead Gen creatives must carry a callToAction linking an existing Lead Gen Form.
+  // Lead Gen creatives must carry a leadgenCallToAction linking an existing Lead Gen Form.
   const cta = buildLeadGenCallToAction(params);
   if (cta.error) return { success: false, error: cta.error };
-  if (cta.callToAction) body.callToAction = cta.callToAction;
+  if (cta.leadgenCallToAction) body.leadgenCallToAction = cta.leadgenCallToAction;
 
   const adAccountId = params.ad_account_id;
   if (!adAccountId) return { success: false, error: 'CREATIVE CREATE requires ad_account_id' };
@@ -737,7 +739,7 @@ export async function createCreativeInline(
 
   const campaignUrn = params.campaign_id.startsWith('urn:') ? params.campaign_id : `urn:li:sponsoredCampaign:${params.campaign_id}`;
 
-  // Lead Gen creatives must carry a callToAction linking an existing Lead Gen Form.
+  // Lead Gen creatives must carry a leadgenCallToAction linking an existing Lead Gen Form.
   const cta = buildLeadGenCallToAction(params);
   if (cta.error) return { success: false, error: cta.error };
 
@@ -746,7 +748,7 @@ export async function createCreativeInline(
       inlineContent: { post },
       campaign: campaignUrn,
       intendedStatus: params.status || 'ACTIVE',
-      ...(cta.callToAction ? { callToAction: cta.callToAction } : {}),
+      ...(cta.leadgenCallToAction ? { leadgenCallToAction: cta.leadgenCallToAction } : {}),
     },
   };
 
