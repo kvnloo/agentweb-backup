@@ -10,6 +10,12 @@ jest.mock('../services/googleAdsService', () => ({
     pauseCampaign: jest.fn().mockResolvedValue(undefined),
     resumeCampaign: jest.fn().mockResolvedValue(undefined),
     updateCampaign: jest.fn().mockResolvedValue(true),
+    // ENG-335 launch gate: default to no serving URLs and a PAUSED parent so the
+    // gate (and the ad/asset-group creative-addition gate) are no-ops here — these
+    // tests cover the underlying create paths, not the launch gate itself.
+    getCampaignFinalUrls: jest.fn().mockResolvedValue([]),
+    getCampaignStatus: jest.fn().mockResolvedValue('PAUSED'),
+    getAdGroupCampaign: jest.fn().mockResolvedValue({ campaignResourceName: 'customers/123/campaigns/1', campaignStatus: 'PAUSED' }),
     addKeywords: jest.fn().mockResolvedValue(undefined),
     addNegativeKeywords: jest.fn().mockResolvedValue(undefined),
     searchLocations: jest.fn().mockResolvedValue([

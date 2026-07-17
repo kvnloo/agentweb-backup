@@ -8071,6 +8071,7 @@ ACTION MATRIX:
   CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy OR bidding_strategy_resource_name, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy? OR bidding_strategy_resource_name?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?), REMOVE (campaign_resource_name)
               For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
               Bidding: pass bidding_strategy for a standard (embedded) strategy, OR bidding_strategy_resource_name to attach a portfolio/shared strategy (from BIDDING_STRATEGY LIST) — never both. Switching to a standard strategy detaches any portfolio strategy.
+              LAUNCH GATE: RESUME (or UPDATE with status=ENABLED) enables a campaign — this runs a pre-flight tracking check on the campaign's final URLs. If any URL lacks a detectable GA4/GTM/Google Ads conversion snippet the launch is BLOCKED (result has blocked=true and names the unmeasured URLs). Relay that to the user and help them fix tracking; only pass override_tracking_check=true if they explicitly choose to launch anyway.
   BIDDING_STRATEGY → LIST (portfolio/shared bidding strategies; returns resource_name for use as bidding_strategy_resource_name)
   AD_GROUP    → LIST (campaign_resource_name)
                CREATE (name, campaign_resource_name, type [SEARCH_STANDARD|DISPLAY_STANDARD], cpc_bid_micros?)
@@ -8112,6 +8113,7 @@ ACTION MATRIX:
         keywords: { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, matchType: { type: 'string', enum: ['BROAD', 'PHRASE', 'EXACT'] } }, required: ['text', 'matchType'] }, description: 'Keywords for ADD or ADD_NEGATIVE action.' },
         query: { type: 'string', description: 'Location search query.' },
         status: { type: 'string', enum: ['ENABLED', 'PAUSED'], description: 'Entity status for CREATE or UPDATE.' },
+        override_tracking_check: { type: 'boolean', description: 'Enabling/launching a campaign (CAMPAIGN RESUME, or UPDATE with status=ENABLED) runs a deterministic pre-flight tracking check: each final URL must serve a detectable GA4/GTM/Google Ads conversion snippet, or the launch is BLOCKED (blocked=true, reason="tracking_preflight"). Only set this to true to launch anyway after the user has explicitly confirmed they accept unmeasured/server-side tracking — the override is recorded on the run record. Never set it on your own.' },
         cpc_bid_micros: { type: 'number', description: 'CPC bid in micros for AD_GROUP CREATE or UPDATE.' },
         ad_rotation_mode: { type: 'string', enum: ['OPTIMIZE', 'ROTATE_FOREVER'], description: 'Ad rotation mode for AD_GROUP UPDATE.' },
         target_cpa_micros: { type: 'number', description: 'Ad-group-level target CPA in micros for AD_GROUP UPDATE. Overrides campaign-level target.' },
@@ -8132,7 +8134,7 @@ ACTION MATRIX:
     },
   },
   execute: async (args: any, context: any) => {
-    return await agentModeService.handleCallGoogleAdsApi(context?.userId || context?.agentUserId, args);
+    return await agentModeService.handleCallGoogleAdsApi(context?.userId || context?.agentUserId, args, { sessionId: context?.sessionId });
   },
 });
 
