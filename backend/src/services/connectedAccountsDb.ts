@@ -428,6 +428,46 @@ export const getAccountsByUserIdIncludingOrgShared = async (userId: string): Pro
 };
 
 /**
+ * Count connected accounts of a given platform that ORG TEAMMATES have connected
+ * but NOT shared with the org (so the caller cannot see or use them). Used to turn
+ * an otherwise-opaque "0 accounts connected" result into an actionable message:
+ * the account IS connected somewhere in the org, it just needs to be shared.
+ *
+ * This is the confirmed cause of ENG-368 — a Google Ads account was connected by
+ * one org member but left private, so another member's agent session got 0 results
+ * from list_connected_accounts and dead-ended on a generic connection error.
+ *
+ * Excludes the caller's own accounts and any already shared with the org (those are
+ * already visible via getAccountsByUserIdIncludingOrgShared). Returns 0 when the
+ * user has no org. Reveals only a COUNT — never account ids, names, or tokens — so
+ * it stays consistent with the org's existing collaborative visibility model.
+ */
+export const countUnsharedOrgAccountsByPlatform = async (
+  callerUserId: string,
+  platform: PlatformType
+): Promise<number> => {
+  const { orgDb } = await import('./db');
+
+  const user = await userDb.getUserById(callerUserId);
+  if (!user || !(user as User).orgId) {
+    return 0;
+  }
+
+  const members = await orgDb.getOrgMembers((user as User).orgId!);
+  let count = 0;
+  for (const member of members) {
+    if (member.userId === callerUserId) continue;
+    const memberAccounts = normalizeAccounts(member.connected_accounts);
+    for (const account of memberAccounts) {
+      if (account.platform === platform && !account.sharedWithOrg) {
+        count++;
+      }
+    }
+  }
+  return count;
+};
+
+/**
  * Get a specific connected account by platform
  */
 export const getAccountByPlatform = async (
