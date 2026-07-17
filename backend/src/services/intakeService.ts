@@ -495,6 +495,21 @@ export interface FileAutoIssueParams {
   notionContext?: Record<string, any>;
 }
 
+/**
+ * Alert-class clustering (ENG-358): recurring threshold/balance alerts carry a stable class in
+ * context (e.g. `"Alert Class": "v0-credits"`). The class is rendered into the created issue's
+ * body via contextLines and matched by containment, so every occurrence lands on the ONE open
+ * canonical no matter how the numbers in the title move — never per occurrence. Same mechanism
+ * as the Session/Schedule idempotency keys above, checked FIRST because it is the sharper signal.
+ *
+ * `"Alert Priority"` (urgent|high|medium|low) sets the created canonical's priority and, on a
+ * match, escalates the open canonical in place (raise-only priority + title refresh via
+ * linearService.escalateIssue) — a warn-level escalation must surface on the SAME issue, not
+ * file a new one.
+ */
+const ALERT_CLASS_CONTEXT_KEY = 'Alert Class';
+const ALERT_PRIORITY_CONTEXT_KEY = 'Alert Priority';
+
 export interface FiledAutoResult {
   pageId: string;
   /** Link to the filed item (Linear issue or Notion page), for alert emails. */
@@ -521,16 +536,39 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
     return { pageId: o.pageId, url: o.notionUrl, deduped: false, tracker: 'Notion' };
   }
 
-  const { listOpenIssuesByLabel, addIssueComment, createInternalLinearIssue } = await import('./linearService');
-  const norm = (s: string) => (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  const { listOpenIssuesByLabel, addIssueComment, createInternalLinearIssue, escalateIssue } = await import('./linearService');
+  // Amount-insensitive title normalization (ENG-358): dollar amounts in a recurring alert's title
+  // are occurrence data, not identity — "v0 credits LOW — $58.51 spendable" and "… $59.15 …" are
+  // the same issue. Collapsing amounts also lets pre-ENG-358 open canonicals (no class marker in
+  // their body yet) keep matching new classed occurrences instead of spawning a parallel canonical.
+  const norm = (s: string) => (s || '').trim().toLowerCase().replace(/\$[\d,]+(?:\.\d+)?/g, '$').replace(/\s+/g, ' ');
   const open = await listOpenIssuesByLabel('Auto', 50);
-  // Dedup gate (ENG-240). One failure event must never spawn 2-3 issues, whichever filer reacts to it:
-  //  1. Idempotency key — an open Auto issue already carrying this event's Session/Schedule ID owns it.
+  // Dedup gate (ENG-240 / ENG-358). One failure event must never spawn 2-3 issues, and a recurring
+  // alert must never file per occurrence, whichever filer reacts to it:
+  //  1. Alert class — an open Auto issue whose body carries this alert's `Alert Class: <name>`
+  //     line owns EVERY occurrence of the class (source × errorClass clustering), regardless of
+  //     the numbers in the title. listOpenIssuesByLabel is open-state-whitelisted, so a canceled
+  //     or Duplicate canonical can never absorb the signal (the ENG-350 failure mode).
+  //  2. Idempotency key — an open Auto issue already carrying this event's Session/Schedule ID owns it.
   //     Two filers (scheduled-chat + oncall) reacting to the same run, or a second analyzer re-filing
   //     the same session days later, both land on that one issue as an occurrence comment.
-  //  2. Fallback — normalized-title match, for recurring auto-issues that carry no id context.
+  //  3. Fallback — normalized-title match, for recurring auto-issues that carry no id context.
+  const rawClass = p.notionContext?.[ALERT_CLASS_CONTEXT_KEY];
+  const alertClass = rawClass === undefined || rawClass === null ? '' : String(rawClass).trim();
+  // Both writer (contextLines above) and matcher live in this file; the bullet prefix is left out
+  // of the needle because Linear normalizes "- " bullets to "* " in stored descriptions. The match
+  // is anchored at end-of-line so a class name that is a prefix of another ("v0-credits" vs
+  // "v0-credits-backup") can never cross-match — the writer always emits the class as the last
+  // thing on its own line.
+  const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const classNeedle = alertClass
+    ? new RegExp(`${escapeRegExp(`${ALERT_CLASS_CONTEXT_KEY}: ${alertClass}`)}\\s*$`, 'm')
+    : null;
+  const rawPriority = p.notionContext?.[ALERT_PRIORITY_CONTEXT_KEY];
+  const priority = rawPriority ? LINEAR_PRIORITY[String(rawPriority).trim().toLowerCase()] : undefined;
   const idKeys = idempotencyKeys(p.notionContext);
   const match =
+    (classNeedle ? open.find((i) => classNeedle.test(i.description || '')) : undefined) ||
     (idKeys.length ? open.find((i) => idKeys.some((k) => (i.description || '').includes(k))) : undefined) ||
     open.find((i) => norm(i.title) === norm(p.title));
   if (match) {
@@ -538,6 +576,17 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
       await addIssueComment(match.issueId, [`Recurred on ${new Date().toISOString().slice(0, 10)}.`, ...contextLines(p.notionContext)].join('\n'));
     } catch (e) {
       console.warn('[intake] auto recur-comment failed:', e instanceof Error ? e.message : e);
+    }
+    // Escalation (ENG-358 contract #3): a more severe occurrence (low -> critical) raises the open
+    // canonical's priority and refreshes its title in place. Raise-only inside escalateIssue, so
+    // routine same-level occurrences churn nothing. Best-effort: the occurrence comment + dedupe
+    // result stand even if the escalation write hiccups (next occurrence retries).
+    if (priority) {
+      try {
+        await escalateIssue(match.issueId, { title: p.title, priority });
+      } catch (e) {
+        console.warn('[intake] auto alert escalation failed:', e instanceof Error ? e.message : e);
+      }
     }
     return { pageId: match.identifier, url: `${LINEAR_ISSUE_BASE}/${match.identifier}`, deduped: true, tracker: 'Linear' };
   }
@@ -552,6 +601,9 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
     title: p.title,
     description: body,
     labelNames: ['Auto', ...(p.extraLabels || [])],
+    // Classed alerts land with a real priority so the canonical never sits at "No priority"
+    // (ENG-350 did). Absent the context key, behavior is unchanged.
+    ...(priority ? { priority } : {}),
   });
   return { pageId: li.identifier, url: li.url, deduped: false, tracker: 'Linear' };
 }
