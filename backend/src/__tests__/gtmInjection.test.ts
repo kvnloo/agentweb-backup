@@ -127,6 +127,30 @@ describe('ENG-334 — injectGtmIntoLayoutFiles (files array passed to the GitHub
   });
 });
 
+describe('ENG-334 — injectGtmIntoLayout size guard (regex-safety hardening)', () => {
+  // A real Next.js layout.tsx is a few KB. GitHub's own Contents API caps single-file writes
+  // at 1MB (see CONTENTS_API_LIMIT in landingPageGeneration.ts). The non-greedy [\s\S]*? used
+  // to strip/locate GTM blocks isn't catastrophic-backtracking-prone (a single wildcard between
+  // two literal anchors, not nested/ambiguous quantifiers), but there's no reason to ever run
+  // it against an unbounded blob — bail out before touching the regex at all.
+  it('leaves an oversized layout untouched instead of running the regex on it', () => {
+    // Padded with a real <head>/<body> layout so injection WOULD normally succeed —
+    // isolates the guard's own effect from the separate "no anchor to insert into" case.
+    const huge = V0_LAYOUT + '// padding\n'.repeat(70_000); // well over 500KB
+    expect(huge.length).toBeGreaterThan(500_000);
+    const out = injectGtmIntoLayout(huge, 'GTM-ABCD1');
+    expect(out).toBe(huge); // untouched — no insertion attempted, size guard tripped first
+  });
+
+  it('a layout right at the boundary (under the cap) still injects normally', () => {
+    // Padding comfortably under the cap so this isn't a boundary-off-by-one test —
+    // just confirms the guard doesn't clip legitimate, realistically-sized layouts.
+    const padded = V0_LAYOUT + '// padding\n'.repeat(1000); // ~11KB, nowhere near 500KB
+    const out = injectGtmIntoLayout(padded, 'GTM-ABCD1');
+    expect(verifyGtmInjection(out, 'GTM-ABCD1')).toBe(true);
+  });
+});
+
 describe('ENG-334 — verifyGtmInjection (fail loud, not silent, on a broken insert)', () => {
   it('is true for a normal successful injection', () => {
     const out = injectGtmIntoLayout(V0_LAYOUT, 'GTM-ABCD1');

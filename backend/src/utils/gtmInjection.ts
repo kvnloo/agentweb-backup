@@ -11,13 +11,26 @@
  */
 
 /**
+ * A real Next.js layout.tsx is a few KB. GitHub's own Contents API caps single-file writes at
+ * 1MB (see CONTENTS_API_LIMIT in landingPageGeneration.ts). There's no legitimate layout this
+ * large; bail out before running any regex against it rather than trust an unbounded blob.
+ */
+const MAX_LAYOUT_SIZE_BYTES = 500_000;
+
+/**
  * Inject (or strip) the GTM head + noscript snippets in a Next.js root layout's source.
  *
  * Pure and idempotent: it ALWAYS strips any existing GTM block first, then re-injects only
  * when `containerId` is non-empty. That makes it safe to run repeatedly (never duplicates —
  * ENG-334 criterion 5) and doubles as the "remove GTM" path when `containerId` is "".
+ *
+ * Returns the content untouched, unmodified, if it exceeds MAX_LAYOUT_SIZE_BYTES — the caller's
+ * verifyGtmInjection check then naturally reports this as a failed injection (fail loud), same
+ * as any other layout shape the insertion can't handle.
  */
 export function injectGtmIntoLayout(currentContent: string, containerId: string): string {
+  if (currentContent.length > MAX_LAYOUT_SIZE_BYTES) return currentContent;
+
   const gtmHeadSnippet =
     `        {/* Google Tag Manager */}\n` +
     `        <script dangerouslySetInnerHTML={{ __html: \`(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src='https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);})(window,document,'script','dataLayer','${containerId}');\` }} />\n` +
