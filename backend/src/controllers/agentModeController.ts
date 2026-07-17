@@ -725,23 +725,80 @@ export function scheduledRunSignalsIncompleteWork(content: string): boolean {
   return INCOMPLETE_WORK_PATTERNS.some((re) => re.test(content));
 }
 
-// Whole-response completion-gate check for scheduled runs. A turn signals
-// unfinished work if EITHER:
-//   (a) the run was truncated because it exhausted its step budget
+// Deterministic detector for the ENG-369 failure mode: a scheduled/unattended
+// run that halted to ask a HUMAN to confirm/approve before proceeding, when no
+// human is present to answer — so the task dead-ends with no deliverable.
+//
+// The canonical case: the agent finds the requested approach infeasible (e.g.
+// "maximum granularity is impossible — no per-session transcript tool"), then
+// ends its turn with "Reply 'go' to proceed with the best-effort approach"
+// instead of just proceeding. In an automated run nobody replies.
+//
+// It must NOT fire on a finished report that merely surfaces actionable
+// next-steps for the user ("connect Bob's LinkedIn next run") — those are a
+// valid terminal state. The patterns therefore anchor strictly on an explicit
+// request for permission/confirmation TO PROCEED, not on generic mentions of
+// the user or of follow-up actions.
+const AWAITING_CONFIRMATION_PATTERNS: RegExp[] = [
+  // "Reply 'go'", "Reply go to proceed", "reply with yes/proceed/confirm"
+  /\breply\s+(?:with\s+)?["'“]?\s*(?:go|yes|ok|okay|proceed|confirm|approved?)\b/i,
+  // "Should/Shall/May/Can/Do/Would I|we proceed|continue|go ahead|move forward"
+  /\b(?:should|shall|may|can|do|would)\s+(?:i|we)\s+(?:go\s+ahead|proceed|continue|move\s+forward)\b/i,
+  // "Would you like me to proceed/continue/go ahead"
+  /\bwould\s+you\s+like\s+me\s+to\s+(?:go\s+ahead|proceed|continue|move\s+forward)\b/i,
+  // "Do you want me to proceed" / "want me to continue"
+  /\bwant\s+me\s+to\s+(?:go\s+ahead|proceed|continue|move\s+forward)\b/i,
+  // "Let me know if/whether/how you'd like me to proceed/continue"
+  /\blet\s+me\s+know\b[^.?!]*\b(?:proceed|continue|go\s+ahead|move\s+forward|like\s+me\s+to)\b/i,
+  // "Awaiting/wait for your confirmation/approval/go-ahead/sign-off/response before proceeding"
+  /\b(?:await(?:ing)?|wait\s+for)\b[^.?!]*\b(?:confirmation|approval|sign-?off|go-?ahead|your\s+(?:go|response|reply|input|approval))\b/i,
+  // "confirm to proceed" / "confirm before I continue" / "please confirm before I proceed"
+  /\bconfirm\b[^.?!]*\b(?:to|before)\b[^.?!]*\b(?:proceed|continu)/i,
+];
+
+export function scheduledRunAwaitsConfirmation(content: string): boolean {
+  if (!content || typeof content !== 'string') return false;
+  return AWAITING_CONFIRMATION_PATTERNS.some((re) => re.test(content));
+}
+
+// The distinct reasons a scheduled run's latest turn needs one more
+// continuation before it can be considered finished. null = no continuation
+// needed. Ordered by precedence when more than one signal is present.
+export type ScheduledContinuationReason = 'budget' | 'confirmation' | 'unfinished';
+
+// Classify why (if at all) a scheduled run's latest turn needs a continuation:
+//   (a) 'budget' — the run was truncated because it exhausted its step budget
 //       (truncatedByStepBudget) — the ENG-244 root cause. This is a
 //       deterministic STATE flag set by generateSessionResponse whenever the
 //       tool loop hits maxIterations, so it fires whether the final content is
 //       the canned "reached the maximum steps" apology OR the model's own
 //       partial text (the model usually complies with the "wrap up" nudge and
-//       writes non-report text, so text-pattern matching alone misses it); or
-//   (b) the final text explicitly admits it left work unfinished
+//       writes non-report text, so text-pattern matching alone misses it);
+//   (b) 'confirmation' — the turn halted to ask a human to confirm/approve
+//       before proceeding, with no human present to answer (ENG-369); or
+//   (c) 'unfinished' — the final text explicitly admits it left work unfinished
 //       (scheduledRunSignalsIncompleteWork).
+// Budget truncation takes precedence (it is a hard state signal); a
+// confirmation halt takes precedence over a plain unfinished-work admission so
+// the continuation message can be tailored to "proceed best-effort".
+export function classifyScheduledContinuation(response: {
+  content?: string;
+  truncatedByStepBudget?: boolean;
+}): ScheduledContinuationReason | null {
+  if (response?.truncatedByStepBudget === true) return 'budget';
+  const content = response?.content || '';
+  if (scheduledRunAwaitsConfirmation(content)) return 'confirmation';
+  if (scheduledRunSignalsIncompleteWork(content)) return 'unfinished';
+  return null;
+}
+
+// Whole-response completion-gate check for scheduled runs — true when the latest
+// turn needs one more continuation for any of the reasons above.
 export function scheduledRunSignalsIncompleteResponse(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
 }): boolean {
-  if (response?.truncatedByStepBudget === true) return true;
-  return scheduledRunSignalsIncompleteWork(response?.content || '');
+  return classifyScheduledContinuation(response) !== null;
 }
 
 // Common function to run verified chat with work plan, keywords, and function call verification
@@ -903,11 +960,11 @@ export async function runVerifiedChat(
   // Set when the completion gate asks for one more continuation turn; the next
   // iteration uses a "finish the unfinished entities" continuation message.
   let completionGateContinue = false;
-  // True when that continuation was triggered because the prior turn was cut off at
-  // its step budget (truncatedByStepBudget) rather than admitting unfinished work.
-  // Lets the continuation message be tailored so a merely-truncated turn is not
-  // wrongly told it "indicated" unfinished work (ENG-244).
-  let completionGateBudgetTruncated = false;
+  // Why the pending continuation was triggered, so the continuation message can
+  // be tailored to the cause: 'budget' (cut off at its step budget, ENG-244),
+  // 'confirmation' (halted asking a human to confirm before proceeding, ENG-369),
+  // or 'unfinished' (admitted it left per-entity work undone).
+  let completionGateReason: ScheduledContinuationReason = 'unfinished';
 
   while (attempt < maxAttempts) {
     attempt++;
@@ -917,22 +974,31 @@ export async function runVerifiedChat(
       let userMessage = startingMessage;
 
       if (completionGateContinue) {
-        // Completion-gate continuation. The prior turn either admitted unfinished
-        // work OR was cut off at its step budget; tailor the message to which, so a
-        // merely-truncated turn is not falsely told it "indicated" unfinished work
-        // (which could prompt it to argue instead of synthesizing) — ENG-244.
+        // Completion-gate continuation. Tailor the message to why the prior turn
+        // needed continuing, so a merely-truncated turn is not falsely told it
+        // "indicated" unfinished work (ENG-244), and a confirmation halt is told
+        // to proceed best-effort rather than to "finish remaining entities" (ENG-369).
         completionGateContinue = false;
-        userMessage = completionGateBudgetTruncated
-          ? 'The previous run was cut short because it exhausted its processing-step ' +
-            'budget before it could produce the final deliverable. Using the data ' +
-            'already gathered, produce the final consolidated report now. Surface any ' +
-            'entities you could not fully research as actionable next steps.'
+        userMessage =
+          completionGateReason === 'budget'
+            ? 'The previous run was cut short because it exhausted its processing-step ' +
+              'budget before it could produce the final deliverable. Using the data ' +
+              'already gathered, produce the final consolidated report now. Surface any ' +
+              'entities you could not fully research as actionable next steps.'
+          : completionGateReason === 'confirmation'
+            ? 'Your previous response paused to ask for confirmation or approval before ' +
+              'proceeding, but this is an automated run with no human present to reply. ' +
+              'Do NOT wait for confirmation. Proceed now with the best-effort approach you ' +
+              'described: complete the task using the most reasonable available method, ' +
+              'produce the final deliverable, and clearly note any assumptions or ' +
+              'limitations you had to make. Never end an automated run by asking the user ' +
+              'to reply before continuing.'
           : 'Your previous response indicated some entities/steps were not finished. ' +
             'Complete ALL remaining per-entity work now (research, filtering, approval ' +
             'checks, drafts) for every entity that is not finished and not genuinely ' +
             'blocked. Do not stop early. Then produce the final consolidated report, ' +
             'surfacing any genuinely blocked items as actionable next steps.';
-        completionGateBudgetTruncated = false;
+        completionGateReason = 'unfinished';
         const continuationResponse = await generateSessionResponse(
           sessionId,
           userMessage,
@@ -949,14 +1015,15 @@ export async function runVerifiedChat(
           ...continuationToolCalls.map((call: any) => call.name).filter(Boolean)
         );
         // Re-evaluate the gate against the continuation's own output.
+        const continuationReason = classifyScheduledContinuation(continuationResponse);
         if (
           completionGateContinuationsUsed < completionGateMaxContinuations &&
           attempt < maxAttempts &&
-          scheduledRunSignalsIncompleteResponse(continuationResponse)
+          continuationReason !== null
         ) {
           completionGateContinuationsUsed++;
           completionGateContinue = true;
-          completionGateBudgetTruncated = continuationResponse.truncatedByStepBudget === true;
+          completionGateReason = continuationReason;
           await waitForVerifiedChatRetry(attempt);
           continue;
         }
@@ -1096,19 +1163,20 @@ export async function runVerifiedChat(
       // requirements are met but the latest turn admits it left work unfinished,
       // spend one more continuation turn instead of returning success — unless we
       // still have attempts left AND haven't exhausted the continuation budget.
+      const responseContinuationReason = classifyScheduledContinuation(response);
       if (
         allRequirementsMet &&
         completionGate &&
         completionGateContinuationsUsed < completionGateMaxContinuations &&
         attempt < maxAttempts &&
-        scheduledRunSignalsIncompleteResponse(response)
+        responseContinuationReason !== null
       ) {
         completionGateContinuationsUsed++;
         console.log(
-          `AgentMode runVerifiedChat: completion gate triggered (continuation ${completionGateContinuationsUsed}/${completionGateMaxContinuations}) — latest turn admitted unfinished work for session ${sessionId}`
+          `AgentMode runVerifiedChat: completion gate triggered (continuation ${completionGateContinuationsUsed}/${completionGateMaxContinuations}, reason=${responseContinuationReason}) for session ${sessionId}`
         );
         completionGateContinue = true;
-        completionGateBudgetTruncated = response.truncatedByStepBudget === true;
+        completionGateReason = responseContinuationReason;
         await waitForVerifiedChatRetry(attempt);
         continue;
       }
