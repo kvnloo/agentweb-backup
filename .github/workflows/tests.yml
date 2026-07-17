@@ -208,6 +208,9 @@ jobs:
     if: github.event.pull_request.draft == false && needs.detect-changes.outputs.backend == 'true' && needs.backend-tests-a.result == 'success' && needs.backend-tests-b.result == 'success' && needs.greptile-review.result == 'success'
     runs-on: ubuntu-latest
     environment: staging
+    concurrency:
+      group: backend-staging-deploy
+      cancel-in-progress: false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
