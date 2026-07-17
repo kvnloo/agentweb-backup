@@ -4335,6 +4335,29 @@ export async function updateLandingPageGtm(
 }
 
 /**
+ * Update the `trackingInstalled` signal (ENG-334) on a single page record. Split out from
+ * `updateLandingPageGtm` because a GTM change at the site level (saveGtmForPage) affects
+ * EVERY page sharing that site's root layout, not just the one record `gtmContainerId` was
+ * written to — callers loop this across siblings rather than calling it once per-page.
+ */
+export async function updateLandingPageTrackingInstalled(
+  id: string,
+  trackingInstalled: boolean,
+): Promise<void> {
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      UpdateExpression: "SET trackingInstalled = :t, updatedAt = :now",
+      ExpressionAttributeValues: {
+        ":t": trackingInstalled,
+        ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
+}
+
+/**
  * Persist the state needed to revert the most recent publish. Overwrites any
  * prior `lastPublish` — only the latest publish is revertable (single-step).
  */

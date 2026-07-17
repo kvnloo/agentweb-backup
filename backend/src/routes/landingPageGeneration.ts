@@ -37,6 +37,7 @@ import {
   resolveLockedSiteMode,
   resolveLandingPageLiveUrl,
   canUserEditLandingPage,
+  updateLandingPageTrackingInstalled,
 } from "../services/v0Service";
 import { injectGtmIntoLayout, verifyGtmInjection } from "../utils/gtmInjection";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
@@ -1818,6 +1819,29 @@ async function saveGtmForPage(
 
   // 5. Persist gtmContainerId in DynamoDB
   await updateLandingPageGtm(page.id, page.userId, containerId);
+
+  // The layout we just committed is the SHARED root layout every page on this site inherits
+  // — so every sibling page (root + subpages) just became tracked (or untracked) on the live
+  // site, not just `page`. Sync trackingInstalled across all of them so the customer-portal
+  // warning badge doesn't stay stuck forever after the user correctly fixes it via Site
+  // Settings (a real gap this shipped with: the advice was always correct, only our own
+  // stored flag went stale). Best-effort per page — a sync failure must never undo the
+  // GitHub commit that already succeeded, so failures are logged and skipped, not thrown.
+  const siteId = page.siteId ?? page.id;
+  try {
+    const siblings = await listLandingPages(page.userId);
+    await Promise.all(
+      siblings
+        .filter((p) => (p.siteId ?? p.id) === siteId)
+        .map((p) =>
+          updateLandingPageTrackingInstalled(p.id, !!containerId).catch((err: any) => {
+            console.error(`[LP GENERATION] Failed to sync trackingInstalled for page ${p.id}: ${err.message}`);
+          }),
+        ),
+    );
+  } catch (err: any) {
+    console.error(`[LP GENERATION] Failed to list sibling pages for trackingInstalled sync: ${err.message}`);
+  }
 
   // Trigger Vercel re-deploy if we have a project ID
   const vercelProjectId = await resolveVercelProjectId(page);
