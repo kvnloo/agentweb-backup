@@ -265,8 +265,21 @@ describe('POST /api/landing-pages/v0/site/gtm', () => {
       id: 'p1', userId: 'u1', vercelProjectId: 'vp1',
       githubRepoUrl: 'https://github.com/o/r', status: 'deployed',
     });
+    // A realistic layout with a real <head>/<body> to insert into. (A bare function body with
+    // neither has no anchor for the injection — see the dedicated 422 test below, which pins
+    // exactly that case as a real, correct failure rather than a false "success".)
+    const realisticLayout = [
+      'export default function Layout({ children }: { children: React.ReactNode }) {',
+      '  return (',
+      '    <html>',
+      '      <head></head>',
+      '      <body>{children}</body>',
+      '    </html>',
+      '  );',
+      '}',
+    ].join('\n');
     mockAxiosGet.mockResolvedValue({
-      data: { sha: 'sha1', content: Buffer.from('export default function(){return null}').toString('base64') },
+      data: { sha: 'sha1', content: Buffer.from(realisticLayout).toString('base64') },
     });
     mockAxiosPut.mockResolvedValue({ data: {} });
     mockUpdateLandingPageGtm.mockResolvedValue(undefined);
@@ -275,5 +288,26 @@ describe('POST /api/landing-pages/v0/site/gtm', () => {
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ ok: true, gtmContainerId: 'GTM-ABCD1' });
     expect(mockUpdateLandingPageGtm).toHaveBeenCalled();
+  });
+
+  // ENG-334 hardening: a layout with neither <head> nor <body> has no anchor for the
+  // injection to insert into. This used to silently report success (the exact bug the
+  // verification guard exists to catch); it must now fail loud with a clear, non-technical
+  // customer-facing message instead of a bare function body with no leg to plant that.
+  it('422s with a plain-language message when the layout has no <head> or <body> to insert into', async () => {
+    mockResolveSiteForCaller.mockResolvedValue({
+      id: 'p1', userId: 'u1', vercelProjectId: 'vp1',
+      githubRepoUrl: 'https://github.com/o/r', status: 'deployed',
+    });
+    mockAxiosGet.mockResolvedValue({
+      data: { sha: 'sha1', content: Buffer.from('export default function(){return null}').toString('base64') },
+    });
+    const res = await request(app).post('/api/landing-pages/v0/site/gtm').send({ gtmContainerId: 'GTM-ABCD1' });
+    expect(res.status).toBe(422);
+    expect(res.body.error).toBe(
+      "We couldn't add tracking to this page automatically. Try regenerating the page, or contact support if this keeps happening.",
+    );
+    expect(mockAxiosPut).not.toHaveBeenCalled();
+    expect(mockUpdateLandingPageGtm).not.toHaveBeenCalled();
   });
 });
