@@ -428,8 +428,10 @@ export const getAccountsByUserIdIncludingOrgShared = async (userId: string): Pro
 };
 
 /**
- * Count connected accounts of a given platform that ORG TEAMMATES have connected
- * but NOT shared with the org (so the caller cannot see or use them). Used to turn
+ * Count DISTINCT ORG TEAMMATES who have a connected account of a given platform
+ * that is NOT shared with the org (so the caller cannot see or use it). Counting
+ * teammates rather than accounts keeps the caller-facing "N teammates" message
+ * accurate when a single teammate has multiple unshared accounts. Used to turn
  * an otherwise-opaque "0 accounts connected" result into an actionable message:
  * the account IS connected somewhere in the org, it just needs to be shared.
  *
@@ -454,17 +456,18 @@ export const countUnsharedOrgAccountsByPlatform = async (
   }
 
   const members = await orgDb.getOrgMembers((user as User).orgId!);
-  let count = 0;
+  const teammatesWithUnshared = new Set<string>();
   for (const member of members) {
     if (member.userId === callerUserId) continue;
     const memberAccounts = normalizeAccounts(member.connected_accounts);
-    for (const account of memberAccounts) {
-      if (account.platform === platform && !account.sharedWithOrg) {
-        count++;
-      }
+    const hasUnshared = memberAccounts.some(
+      account => account.platform === platform && !account.sharedWithOrg
+    );
+    if (hasUnshared) {
+      teammatesWithUnshared.add(member.userId);
     }
   }
-  return count;
+  return teammatesWithUnshared.size;
 };
 
 /**
