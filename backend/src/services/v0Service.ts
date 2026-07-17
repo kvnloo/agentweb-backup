@@ -3517,8 +3517,13 @@ export function isNonErrorBuildLine(line: string): boolean {
   const l = line.trim();
   return (
     /^vercel cli\b/i.test(l) ||
-    /^[⚠▲►]/.test(l) ||
-    /\bdeprecat/i.test(l) ||
+    // Vercel/Next.js use ▲ as a general-purpose prefix — including on REAL errors
+    // (e.g. "▲ Error: …"). Only treat it as noise on their banner lines.
+    /^▲\s+(vercel|next\.js)\b/i.test(l) ||
+    /^[⚠►]/.test(l) ||
+    // Anchored to line-start: a bare "Deprecation Warning: …" line is noise, but a
+    // real error that merely mentions something deprecated must NOT be silenced.
+    /^deprecation\b/i.test(l) ||
     /^warn(ing)?\b/i.test(l)
   );
 }
