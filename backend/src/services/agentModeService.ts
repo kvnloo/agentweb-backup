@@ -4363,10 +4363,12 @@ export class AgentModeService {
     // them — without force-merging, loadFoundationTools strips them in prod so
     // `fathom_get_onboarding_context` (and the other Fathom tools) are "not
     // available", tanking goalCompletion on any Fathom onboarding/meeting
-    // request (ENG-280). They stay reachable even when a connected Fathom
-    // account is missing, so the tool itself returns the "connect Fathom in
-    // Settings → Connected Accounts" guidance instead of a generic
-    // tool-not-available error.
+    // request (ENG-280). `fathom_get_meetings`/`fathom_get_transcript` stay
+    // reachable even when a connected Fathom account is missing, so those tools
+    // return the "connect Fathom in Settings → Connected Accounts" guidance
+    // instead of a generic tool-not-available error. `fathom_get_onboarding_context`
+    // reads a separate admin-curated ingestion pipeline (fathomOnboardingIngestions)
+    // and has no connection check by design.
     'fathom_get_meetings',
     'fathom_get_transcript',
     'fathom_get_onboarding_context',
