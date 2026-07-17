@@ -4302,10 +4302,6 @@ export class AgentModeService {
     // Gmail-only `email` tool.
     'send_email_from_sender',
 
-    // Local Agent Relay (Codex agent running on user's machine)
-    'run_local_agent_task',
-    'check_local_agent_status',
-
     // S3 overflow retrieval — always available so the LLM can read large tool
     // responses that were offloaded to S3 by the 10KB overflow mechanism.
     // Without these, the LLM sees the "[Full response stored at S3 key: ...]"
