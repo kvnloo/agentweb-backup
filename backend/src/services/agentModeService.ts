@@ -19299,12 +19299,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   // Web search functionality
-  public async youSearchWeb(query: string, maxResults: number = 10): Promise<any> {
+  public async youSearchWeb(
+    query: string,
+    maxResults: number = 10,
+    freshness?: string,
+    includeDomains?: string[]
+  ): Promise<any> {
     return this.searchWithYou({
       toolName: 'you_search_web',
       query,
       maxResults,
       resultSource: 'web',
+      freshness,
+      includeDomains,
     });
   }
 
@@ -19366,6 +19373,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     maxResults: number;
     resultSource: SearchResultSource;
     freshness?: string;
+    includeDomains?: string[];
   }): Promise<any> {
     const { toolName, query, maxResults, resultSource } = params;
     try {
@@ -19386,6 +19394,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             maxResults: limitedMaxResults,
             resultSource,
             freshness: params.freshness,
+            includeDomains: params.includeDomains,
           });
           break;
         } catch (error) {
@@ -19599,6 +19608,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     maxResults: number;
     resultSource?: SearchResultSource;
     freshness?: string;
+    includeDomains?: string[];
   }) {
     const freshness = params.freshness || inferSearchFreshness(params.query);
     const provider = new YouSearchProvider();
@@ -19608,6 +19618,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       freshness,
       resultSource: params.resultSource || 'all',
       purpose: params.resultSource === 'news' ? 'news' : 'agent_research',
+      ...(params.includeDomains?.length ? { includeDomains: params.includeDomains } : {}),
     });
 
     console.log(`You.com Search returned ${response.results.length} ${params.resultSource || 'all'} results for query: "${params.query}"`);
