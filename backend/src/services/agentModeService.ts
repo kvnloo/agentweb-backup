@@ -4303,10 +4303,6 @@ export class AgentModeService {
     // Gmail-only `email` tool.
     'send_email_from_sender',
 
-    // Local Agent Relay (Codex agent running on user's machine)
-    'run_local_agent_task',
-    'check_local_agent_status',
-
     // S3 overflow retrieval — always available so the LLM can read large tool
     // responses that were offloaded to S3 by the 10KB overflow mechanism.
     // Without these, the LLM sees the "[Full response stored at S3 key: ...]"
@@ -9595,14 +9591,26 @@ export class AgentModeService {
         connectedAtTimestamp?: number;
       } | null = null;
       if (lead.linkedin) {
-        const accountId: string | null = (list as any).linkedInAccountId ?? null;
+        // Prefer the account explicitly assigned to the list; fall back to the
+        // user's own connected LinkedIn (Unipile) account. Most lists never get an
+        // account assigned (list.linkedInAccountId is null), so without this
+        // fallback every lead reports "not connected" even when the user is a
+        // genuine 1st-degree connection — the misinformation reported in ENG-376.
+        let accountId: string | null = (list as any).linkedInAccountId ?? null;
+        if (!accountId) {
+          const { linkedInOutreachService } = await import('./linkedInOutreachService');
+          accountId = await linkedInOutreachService.resolveUserOwnedAccountId(userId).catch(() => null);
+        }
         if (accountId) {
           const { getConnectionByProfileUrlAndAccount } = await import('./unipileConnectionsDb');
           const conn = await getConnectionByProfileUrlAndAccount(lead.linkedin as string, accountId).catch(() => null);
           linkedInConnectionStatus = conn
             ? {
+                // conn.connectedAt is already an epoch-millisecond timestamp
+                // (Unipile created_at), so it must NOT be multiplied by 1000 —
+                // doing so pushed the date ~56,000 years into the future (ENG-379).
                 isConnected: true,
-                connectedAt: new Date(conn.connectedAt * 1000).toISOString(),
+                connectedAt: new Date(conn.connectedAt).toISOString(),
                 connectedAtTimestamp: conn.connectedAt,
               }
             : { isConnected: false };
@@ -9733,7 +9741,7 @@ export class AgentModeService {
         emailDomain ? emailEventsDb.getEventsByEmailDomain(emailDomain).catch(() => []) : Promise.resolve([]),
       ]);
 
-      // connectedAt (UNIX seconds) keyed by normalized profile URL.
+      // connectedAt (epoch milliseconds) keyed by normalized profile URL.
       const connectedAtByUrl = new Map<string, number>();
       for (const c of connections as any[]) {
         const url = String(c?.publicProfileUrl || '').trim().toLowerCase();
@@ -9791,7 +9799,9 @@ export class AgentModeService {
           // when the most-recent engagement is an outbound touch sent after the
           // connection was accepted. A later inbound reply flips it back to
           // "needs follow-up" (awaitingReply) since we now owe the response.
-          const connectedAtMs = connectedAt * 1000;
+          // connectedAt is already epoch ms, matching last.at (getTime()); do NOT
+          // scale it — the old `* 1000` made the comparison always false (ENG-379).
+          const connectedAtMs = connectedAt;
           if (last && last.direction === 'outbound' && last.at > connectedAtMs) continue;
 
           const awaitingReply = !!last && last.direction === 'inbound';
@@ -19290,12 +19300,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   // Web search functionality
-  public async youSearchWeb(query: string, maxResults: number = 10): Promise<any> {
+  public async youSearchWeb(
+    query: string,
+    maxResults: number = 10,
+    freshness?: string,
+    includeDomains?: string[]
+  ): Promise<any> {
     return this.searchWithYou({
       toolName: 'you_search_web',
       query,
       maxResults,
       resultSource: 'web',
+      freshness,
+      includeDomains,
     });
   }
 
@@ -19357,6 +19374,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     maxResults: number;
     resultSource: SearchResultSource;
     freshness?: string;
+    includeDomains?: string[];
   }): Promise<any> {
     const { toolName, query, maxResults, resultSource } = params;
     try {
@@ -19377,6 +19395,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             maxResults: limitedMaxResults,
             resultSource,
             freshness: params.freshness,
+            includeDomains: params.includeDomains,
           });
           break;
         } catch (error) {
@@ -19590,6 +19609,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     maxResults: number;
     resultSource?: SearchResultSource;
     freshness?: string;
+    includeDomains?: string[];
   }) {
     const freshness = params.freshness || inferSearchFreshness(params.query);
     const provider = new YouSearchProvider();
@@ -19599,6 +19619,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       freshness,
       resultSource: params.resultSource || 'all',
       purpose: params.resultSource === 'news' ? 'news' : 'agent_research',
+      ...(params.includeDomains?.length ? { includeDomains: params.includeDomains } : {}),
     });
 
     console.log(`You.com Search returned ${response.results.length} ${params.resultSource || 'all'} results for query: "${params.query}"`);

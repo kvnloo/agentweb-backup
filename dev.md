@@ -1,3 +1,127 @@
+## ENG-383: local agent relay tools deprecated to stubs (2026-07-17)
+
+The local agent relay (ngrok tunnel to a Codex agent on a Mac) is permanently dead — ngrok account
+suspended (ERR_NGROK_6008) and the host machine is gone (ENG-381/ENG-383). `run_local_agent_task` +
+`check_local_agent_status` are now fail-fast deprecation stubs in `src/emma/localAgentTools.ts`
+(registered so legacy/forced calls get `local_agent_deprecated: …` instead of "tool not found"; no
+network/SM/S3), and both were removed from `DEFAULT_FOUNDATION_TOOLS` and the chatbot customer tool
+list. NOTE: the runtime foundation list is DB-overridable — AW-Settings (Dev- prefixed in dev) key
+`foundation_tools`, loaded in `AgentModeService.initialize()` (per service init, not per request) —
+so the prod setting row must also be updated (data-side, outside this PR). Replacement for web
+research is `you_search_web` (this PR adds optional `freshness` + `include_domains` params for the
+Reddit-digest repoint); full workload replacement tracked in ENG-381.
+`src/scripts/patch-skills-remove-local-agent.ts` strips the tools from all skills' toolNames.
+
+## ENG-164 phase 1: nodemailer Gmail SMTP path deleted — backend email is Resend-only (2026-07-16)
+
+The 2026-07-02 buy-vs-build audit verdict, executed. `emailService` no longer owns a Gmail SMTP
+transporter; every backend email leaves through `resendService`.
+
+1. **Fix-first (AC-2): `resendService` failures now propagate.** Previously `retryWithBackoff`
+   returned `null` after exhausted/non-retryable failures, `performSend` returned `null` when the
+   API key was missing, and the send queue could only resolve — so a caller could not tell a dropped
+   email from a sent one. Now the queue rejects the failed item's promise (and keeps processing later
+   items), non-retryable 4xx errors reject immediately, and a missing key throws instead of turning
+   every send into a no-op.
+2. **SMTP branches deleted.** `sendEmail` (best-effort, unchanged contract) and `sendEmailStrict`
+   (throws; `messageId` = Resend id) route through the system sender `AgentWeb
+   <hi@updates.agentweb.pro>` with replyTo `support@agentweb.pro`. The SMTP-vs-Resend dual paths in
+   `sendTaskExecutionEmail` / `sendSubscriberWelcomeEmail` collapsed into one send with task-level ->
+   account-level -> system-default sender fallback; history rows now always carry
+   `senderType: 'resend'` + the real Resend id.
+3. **Dependency dropped:** `nodemailer` + `@types/nodemailer` removed from package.json.
+
+### Assumptions to validate
+- **~20 existing `resendService.sendEmail` call sites keep their null-guards** (`if (!result)` in
+  crm.ts, admin.ts, agentModeService.ts, dripSequenceWorker.ts, sequences.ts…). Audited every site:
+  each is inside a try/catch whose failure handling matches (or improves on) the old null branch, so
+  the guards are now dead-but-harmless defense; left untouched to keep this PR one seam. Follow-up
+  cleanup can delete them.
+- **The only fire-and-forget call** (`emma/tools.ts` issue-report notification) already had a
+  `.catch()`, so the new rejection contract cannot produce an unhandled rejection there.
+- **`SMTP_USER`/`SMTP_PASS`/`FROM_EMAIL` env vars are now unread by the backend.** The Gmail secret
+  pair itself stays alive until agent-engine phase 2 (`email_utils.py` still uses smtplib) — that is
+  the explicitly-parked phase 2 issue, not a leftover.
+- **Default-sender task-report emails now come from `hi@updates.agentweb.pro`** (previously the Gmail
+  `FROM_EMAIL`) and failures in that path propagate to callers instead of silently logging — callers
+  were audited (controllers/tasks.ts, routes/slack.ts) and handle rejections.
+## /stop session-ownership check (2026-07-16, ENG-360)
+
+Closed the last open lane from the ENG-346 ownership audit: `POST /api/agent-mode/session/:sessionId/stop`
+(`stopGeneration`) did no session read at all — any authenticated user with someone else's sessionId could
+cancel their in-flight generation and flip their SSE progress to complete. Now: fetch session → 401 no user
+(defensive; route sits behind `router.use(authenticateToken)`) → 404 missing (was silent `{ success: true }`)
+→ 403 unless owner-or-admin (same predicate as updateSessionTitle / uploadImageToSession /
+updateSessionLlmModel and the ENG-346 generateResponse check; delegated tokens already resolve `req.user`
+to the target user). Public ishare lane (`stopGenerationPublic`, conversable token) untouched — it remains
+the anon stop path.
+
+### Assumptions to validate
+- No legitimate caller stops a session it doesn't own: the customer portal stops only the session it is
+  actively generating on (owner), delegated admins resolve to the target user, and anon/ishare users use the
+  public lane. If some flow stops an `anon_`-owned session through the authed endpoint pre-transfer, it now
+  gets 403 — none found in partner-portal; customer portal is a separate repo (grep found no such lane).
+- The 404-on-missing change is safe: stop is fire-and-forget in the UI; a 404 where a silent 200 used to be
+  should surface nothing user-visible (frontends don't branch on the stop response).
+## /generate session-ownership check (2026-07-16, ENG-346)
+
+Closed the pre-existing gap where `POST /api/agent-mode/generate` never compared `session.userId`
+to `req.user`: any authenticated user with someone else's sessionId could generate on that session.
+Check now sits BEFORE the ENG-147 idempotency claim + session-busy lock, so an unauthorized request
+touches no shared state (previously it would also have been able to squat the interactive idem claim
+and 409 the real owner for the ttl window).
+
+### Ownership audit of the session-parameterized agent-mode lanes (2026-07-16 snapshot)
+- Already checked: `getSession`, `verifiedGenerate` (strict), `uploadImageToSession`,
+  `updateSessionLlmModel`, `updateSessionTitle` (owner-or-admin), `getProgress` (owner or
+  delegated-admin-own-session). `transferSession` only mutates `anon_`-owned sessions.
+- `generateResponse` was the only GENERATE lane missing it — fixed here with the getSession
+  predicate (owner or admin; delegated tokens already resolve `req.user` to the target user).
+- **Still open**: `stopGeneration` (`POST /session/:sessionId/stop`) does no session read at all —
+  any authenticated user can cancel another user's in-flight run. Different verb + different
+  blast radius (adds a DB read to a fire-and-forget lane), filed separately as ENG-360.
+
+### Assumptions to validate
+- Raw (non-delegated) admins keep generate access for parity with every other session endpoint.
+  If the product stance becomes "admins must delegate to act on a user's session", tighten to the
+  `verifiedGenerate` strict predicate — one-line change, tests pin both lanes.
+- Error-precedence delta accepted: missing session is now 404 before the token-usage 429 read
+  (previously claim → lock → 429 → 404). No client observed depending on 429-before-404.
+- An authenticated user generating on an `anon_` session pre-transfer would now 403 — but
+  `getSession` already 403s that same read today, so no working client flow can hit it.
+
+## ENG-358: v0-credit alert dedupe at the intake gate — class clustering + Duplicate-state leak (2026-07-16)
+
+The hourly v0-credit alert filed a new Linear issue per occurrence (14 near-identical issues in 5
+days, ENG-292…350) and, after a manual dedupe pass, appended its recurrence comments to a canceled
+**Duplicate** (ENG-350) instead of the open canonical (ENG-337). Two root causes, both fixed at the
+ENG-240 intake gate:
+
+1. **Titles embed occurrence data.** `v0 credits LOW — $59.15 spendable` changes with every balance
+   move, so `fileAutoIssue`'s normalized-title fallback never matched and each occurrence filed
+   fresh. Fix: (a) alert-class clustering — the v0 filer now passes `"Alert Class": "v0-credits"` +
+   `"Alert Priority"` in its context; the gate matches candidates whose body carries the rendered
+   `Alert Class: <name>` line before any title comparison (same context-key mechanism as the
+   Session/Schedule idempotency keys), and escalates the open canonical in place (raise-only
+   priority + title refresh via new `linearService.escalateIssue`) on low→critical. (b) The title
+   norm is now amount-insensitive (`$58.51` ≡ `$59.15`) so pre-existing canonicals without the
+   class marker keep matching post-deploy.
+2. **Linear's Duplicate state has its own state type.** Verified live on ENG-350: `statusType:
+   "duplicate"` — NOT `"canceled"`. `listOpenIssuesByLabel` / `listOpenBugCanonicals` filtered with
+   a `nin: [completed, canceled]` blacklist, so duplicate-state issues stayed dedupe candidates and
+   absorbed recurrences. Both now WHITELIST open state types (`triage, backlog, unstarted,
+   started`), which also future-proofs against new closed-ish types.
+
+**Assumptions to validate**
+- The hourly re-fire itself (24h in-memory `lastAlerted` window not holding across prod
+  instances/worker restarts — observed 5+ alerts in one morning) is NOT fixed here; the gate now
+  makes re-fires converge on one issue, but each still sends an oncall email. If email cadence
+  matters, the window needs durable state (ENG-345 seam). Flagged on the Linear issue.
+- Priority mapping chosen: v0 `low` → High, `critical` → Urgent. Adjust in
+  `ALERT_PRIORITY_BY_LEVEL` (v0BillingService) if the board should rank ops alerts differently.
+- Amount-insensitive title normalization intentionally treats two auto-issue titles differing only
+  by a dollar figure as the same issue. No current Auto filer embeds amounts except the v0 alert.
+
 ## ENG-326 review hardening: org dead-ends, unverified persists, guard false negatives (2026-07-15)
 
 Senior review of the ENG-326 branch surfaced four real bugs in the first cut; all fixed with tests.

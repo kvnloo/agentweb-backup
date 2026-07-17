@@ -160,13 +160,15 @@ export interface OpenCanonical {
  */
 export async function listOpenBugCanonicals(limit = 30): Promise<OpenCanonical[]> {
   const data = await linearGraphQL(
+    // Open-state WHITELIST (ENG-358): duplicate-state canonicals must never absorb new reports —
+    // see OPEN_STATE_TYPES below for the live-verified root cause.
     `query($team: String!, $bug: String!, $cust: String!, $limit: Int!) {
       issues(
         first: $limit,
         orderBy: createdAt,
         filter: {
           team: { key: { eq: $team } },
-          state: { type: { nin: ["completed", "canceled"] } },
+          state: { type: { in: ["triage", "backlog", "unstarted", "started"] } },
           and: [
             { labels: { name: { eq: $bug } } },
             { labels: { name: { eq: $cust } } }
@@ -346,7 +348,17 @@ export interface OpenIssue {
   description: string;
 }
 
-/** List OPEN issues carrying a given label (used for auto-issue dedup). Open-only. */
+/**
+ * State types a dedupe candidate may be in — a WHITELIST of Linear's open types. Deliberately not
+ * a completed/canceled blacklist: Linear's "Duplicate" state has its own state type ("duplicate",
+ * verified live on ENG-350, 2026-07-16), and under the old blacklist a canceled Duplicate stayed a
+ * dedupe candidate — recurrence comments landed on it instead of the open canonical (ENG-358).
+ * A whitelist also stays correct if Linear ever adds another closed-ish type.
+ */
+const OPEN_STATE_TYPES = ['triage', 'backlog', 'unstarted', 'started'] as const;
+const OPEN_STATE_TYPES_GQL = `[${OPEN_STATE_TYPES.map((t) => `"${t}"`).join(', ')}]`;
+
+/** List OPEN issues carrying a given label (used for auto-issue dedup). Open-only — see OPEN_STATE_TYPES. */
 export async function listOpenIssuesByLabel(labelName: string, limit = 50): Promise<OpenIssue[]> {
   const data = await linearGraphQL(
     `query($team: String!, $label: String!, $limit: Int!) {
@@ -355,7 +367,7 @@ export async function listOpenIssuesByLabel(labelName: string, limit = 50): Prom
         orderBy: createdAt,
         filter: {
           team: { key: { eq: $team } },
-          state: { type: { nin: ["completed", "canceled"] } },
+          state: { type: { in: ${OPEN_STATE_TYPES_GQL} } },
           labels: { name: { eq: $label } }
         }
       ) { nodes { id identifier title description } }
@@ -363,6 +375,37 @@ export async function listOpenIssuesByLabel(labelName: string, limit = 50): Prom
     { team: TEAM_KEY, label: labelName, limit },
   );
   return (data?.issues?.nodes || []).map((n: any) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }));
+}
+
+/**
+ * Raise-only escalation of an open canonical (ENG-358): when a recurring alert's severity rises
+ * (e.g. v0 credits low -> critical), the ONE open canonical is updated in place — priority raised
+ * and title refreshed to the latest occurrence's wording — instead of a new issue being filed.
+ * Returns false (no mutation at all) when the incoming priority does not beat the current one, so
+ * routine same-level occurrences never churn the issue. Throws on Linear failure; callers
+ * best-effort it (the occurrence comment + dedupe result must stand regardless).
+ */
+export async function escalateIssue(issueId: string, params: { title: string; priority: number }): Promise<boolean> {
+  const data = await linearGraphQL(
+    `query($id: String!) { issue(id: $id) { priority } }`,
+    { id: issueId },
+  );
+  const issue = data?.issue;
+  if (!issue) throw new Error('Linear issue not found for escalation');
+  const current: number = typeof issue.priority === 'number' ? issue.priority : 0;
+  // Linear priority: 1=Urgent … 4=Low, 0=None. Raise-only: only a strictly more severe incoming
+  // priority (numerically lower, or anything over "None") updates the canonical.
+  if (!(params.priority > 0 && (current === 0 || params.priority < current))) return false;
+  const res = await linearGraphQL(
+    `mutation($id: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $id, input: $input) { success }
+    }`,
+    { id: issueId, input: { title: params.title, priority: params.priority } },
+  );
+  if (!res?.issueUpdate?.success) {
+    throw new Error('Linear issueUpdate (escalation) failed');
+  }
+  return true;
 }
 
 /**

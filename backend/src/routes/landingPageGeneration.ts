@@ -37,7 +37,9 @@ import {
   resolveLockedSiteMode,
   resolveLandingPageLiveUrl,
   canUserEditLandingPage,
+  updateLandingPageTrackingInstalled,
 } from "../services/v0Service";
+import { injectGtmIntoLayout, verifyGtmInjection } from "../utils/gtmInjection";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { MISSING_BRAND_LOGO_ERROR } from "../services/agentMode/brandLogo";
 import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
@@ -671,8 +673,8 @@ router.delete("/generated/:id", async (req, res: Response) => {
       }
     }
 
-    await deleteLandingPageByRecord(page);
-    res.json({ success: true });
+    const { githubCleanupWarning } = await deleteLandingPageByRecord(page);
+    res.json({ success: true, ...(githubCleanupWarning ? { warning: githubCleanupWarning } : {}) });
   } catch (error: any) {
     console.error("[LP GENERATION] Error deleting page:", error);
     const status = error.message?.includes("not found") ? 404
@@ -1766,45 +1768,31 @@ async function saveGtmForPage(
       currentContent = Buffer.from(fileRes.data.content, "base64").toString("utf-8");
       fileSha = fileRes.data.sha;
 
-      // 2. Build GTM snippets
-      const gtmHeadSnippet =
-        `        {/* Google Tag Manager */}\n` +
-        `        <script dangerouslySetInnerHTML={{ __html: \`(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src='https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);})(window,document,'script','dataLayer','${containerId}');\` }} />\n` +
-        `        {/* End Google Tag Manager */}`;
+      // 2–3. Strip any existing GTM block and re-inject (idempotent). Shared with the
+      //       auto-inject-at-generation path so both emit byte-identical output (ENG-334).
+      const updatedContent = injectGtmIntoLayout(currentContent, containerId);
 
-      const gtmBodySnippet =
-        `        {/* Google Tag Manager (noscript) */}\n` +
-        `        <noscript dangerouslySetInnerHTML={{ __html: \`<iframe src="https://www.googletagmanager.com/ns.html?id=${containerId}" height="0" width="0" style="display:none;visibility:hidden"></iframe>\` }} />\n` +
-        `        {/* End Google Tag Manager (noscript) */}`;
-
-      // 3. Strip any existing GTM blocks (always, whether adding or removing)
-      let updatedContent = currentContent
-        .replace(/[ \t]*\{\/\* Google Tag Manager \*\/\}[\s\S]*?\{\/\* End Google Tag Manager \*\/\}\n?/g, "")
-        .replace(/[ \t]*\{\/\* Google Tag Manager \(noscript\) \*\/\}[\s\S]*?\{\/\* End Google Tag Manager \(noscript\) \*\/\}\n?/g, "");
-
-      // Only re-inject if we have a non-empty containerId
-      if (containerId) {
-        // Insert head snippet inside <head> (before </head> or before first child after <head>)
-        if (/<head[^>]*>/.test(updatedContent)) {
-          updatedContent = updatedContent.replace(
-            /(<head[^>]*>)/,
-            `$1\n${gtmHeadSnippet}`
-          );
-        } else {
-          // Fallback: insert before <body
-          updatedContent = updatedContent.replace(
-            /(<body[^>]*>)/,
-            `${gtmHeadSnippet}\n      $1`
-          );
-        }
-
-        // Insert noscript snippet immediately after <body ...>
-        if (/<body[^>]*>/.test(updatedContent)) {
-          updatedContent = updatedContent.replace(
-            /(<body[^>]*>)/,
-            `$1\n${gtmBodySnippet}`
-          );
-        }
+      // Fail loud, not silent: a layout with neither <head> nor <body> to anchor on leaves
+      // injectGtmIntoLayout's insertion a no-op. Without this check we'd commit unchanged
+      // content to GitHub and still tell the caller "success" with the container ID they
+      // asked for — a manual Add-GTM click that silently did nothing.
+      if (!verifyGtmInjection(updatedContent, containerId)) {
+        // Log the precise technical reason for debugging, but never surface "layout.tsx" /
+        // "<head>" / "<body>" to the customer — they can't act on that, and it's not
+        // anything they did wrong. The message that reaches the UI must be something a
+        // non-technical marketer can actually read and act on.
+        console.error(
+          `[LP GENERATION] GTM ${containerId ? "injection" : "removal"} verification failed ` +
+          `for page ${page.id}: layout.tsx has no <head> or <body> tag to anchor on.`,
+        );
+        throw Object.assign(
+          new Error(
+            containerId
+              ? "We couldn't add tracking to this page automatically. Try regenerating the page, or contact support if this keeps happening."
+              : "We couldn't remove tracking from this page automatically. Try regenerating the page, or contact support if this keeps happening.",
+          ),
+          { httpStatus: 422 },
+        );
       }
 
       // 4. Commit updated layout.tsx to GitHub
@@ -1831,6 +1819,29 @@ async function saveGtmForPage(
 
   // 5. Persist gtmContainerId in DynamoDB
   await updateLandingPageGtm(page.id, page.userId, containerId);
+
+  // The layout we just committed is the SHARED root layout every page on this site inherits
+  // — so every sibling page (root + subpages) just became tracked (or untracked) on the live
+  // site, not just `page`. Sync trackingInstalled across all of them so the customer-portal
+  // warning badge doesn't stay stuck forever after the user correctly fixes it via Site
+  // Settings (a real gap this shipped with: the advice was always correct, only our own
+  // stored flag went stale). Best-effort per page — a sync failure must never undo the
+  // GitHub commit that already succeeded, so failures are logged and skipped, not thrown.
+  const siteId = page.siteId ?? page.id;
+  try {
+    const siblings = await listLandingPages(page.userId);
+    await Promise.all(
+      siblings
+        .filter((p) => (p.siteId ?? p.id) === siteId)
+        .map((p) =>
+          updateLandingPageTrackingInstalled(p.id, !!containerId).catch((err: any) => {
+            console.error(`[LP GENERATION] Failed to sync trackingInstalled for page ${p.id}: ${err.message}`);
+          }),
+        ),
+    );
+  } catch (err: any) {
+    console.error(`[LP GENERATION] Failed to list sibling pages for trackingInstalled sync: ${err.message}`);
+  }
 
   // Trigger Vercel re-deploy if we have a project ID
   const vercelProjectId = await resolveVercelProjectId(page);

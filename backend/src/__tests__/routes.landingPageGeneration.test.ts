@@ -83,6 +83,7 @@ const mockListLandingPages = jest.fn();
 const mockDeleteLandingPage = jest.fn();
 const mockDeleteLandingPageByRecord = jest.fn();
 const mockUpdateLandingPageGtm = jest.fn();
+const mockUpdateLandingPageTrackingInstalled = jest.fn();
 const mockUpdateLandingPageContext = jest.fn();
 const mockResolveVercelProjectId = jest.fn();
 const mockTriggerVercelDeployment = jest.fn();
@@ -112,6 +113,7 @@ jest.mock("../services/v0Service", () => ({
   deleteLandingPage: (...args: any[]) => mockDeleteLandingPage(...args),
   deleteLandingPageByRecord: (...args: any[]) => mockDeleteLandingPageByRecord(...args),
   updateLandingPageGtm: (...args: any[]) => mockUpdateLandingPageGtm(...args),
+  updateLandingPageTrackingInstalled: (...args: any[]) => mockUpdateLandingPageTrackingInstalled(...args),
   updateLandingPageContext: (...args: any[]) => mockUpdateLandingPageContext(...args),
   resolveVercelProjectId: (...args: any[]) => mockResolveVercelProjectId(...args),
   triggerVercelDeployment: (...args: any[]) => mockTriggerVercelDeployment(...args),
@@ -862,7 +864,7 @@ describe("DELETE /api/landing-pages/v0/generated/:id", () => {
       name: "My Page",
       status: "draft",
     });
-    mockDeleteLandingPageByRecord.mockResolvedValueOnce(undefined);
+    mockDeleteLandingPageByRecord.mockResolvedValueOnce({});
 
     const res = await request(app).delete(
       "/api/landing-pages/v0/generated/page-1"
@@ -870,6 +872,31 @@ describe("DELETE /api/landing-pages/v0/generated/:id", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
+    expect(res.body.warning).toBeUndefined();
+  });
+
+  // ENG-375 hardening: a zero-match GitHub cleanup (or an outright cleanup failure) must
+  // still delete the record (never block on it) but now surfaces as a visible warning in
+  // the response instead of vanishing into a server-side console.log no one reads.
+  it("SUCCESS: still 200s when GitHub cleanup found nothing, but includes a warning", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "My Page",
+      status: "deployed",
+    });
+    mockDeleteLandingPageByRecord.mockResolvedValueOnce({
+      githubCleanupWarning:
+        "No GitHub files were found matching this page's route — the repo may already be clean, or cleanup could not locate them.",
+    });
+
+    const res = await request(app).delete(
+      "/api/landing-pages/v0/generated/page-1"
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.warning).toMatch(/No GitHub files were found/);
   });
 });
 
@@ -1096,6 +1123,8 @@ describe("POST /api/landing-pages/v0/generated/:id/gtm", () => {
     });
     mockAxios.put.mockResolvedValueOnce({ data: {} });
     mockUpdateLandingPageGtm.mockResolvedValueOnce(undefined);
+    mockListLandingPages.mockResolvedValueOnce([PAGE_WITH_REPO]);
+    mockUpdateLandingPageTrackingInstalled.mockResolvedValueOnce(undefined);
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generated/page-1/gtm")
@@ -1109,6 +1138,60 @@ describe("POST /api/landing-pages/v0/generated/:id/gtm", () => {
     const putCall = mockAxios.put.mock.calls[0][1] as any;
     expect(putCall.message).toContain("GTM-TESTX1");
     expect(putCall.sha).toBe("abc123sha");
+  });
+
+  // ENG-334 follow-up: the layout just committed is the SHARED root layout every page on
+  // this site inherits — every sibling page just became tracked on the live site too, not
+  // just the one the request named. trackingInstalled must sync across all of them, or the
+  // customer-portal warning badge stays stuck on siblings even after the fix landed.
+  it("SUCCESS: syncs trackingInstalled across every sibling page on the same site", async () => {
+    const root = { ...PAGE_WITH_REPO, id: "page-1", siteId: "page-1" };
+    const subpageA = { id: "sub-a", userId: "test-user-id", siteId: "page-1" };
+    const subpageB = { id: "sub-b", userId: "test-user-id", siteId: "page-1" };
+    const otherSite = { id: "other-1", userId: "test-user-id", siteId: "other-1" };
+
+    mockGetLandingPageById.mockResolvedValueOnce(root);
+    mockAxios.get.mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "sha-x" } });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockUpdateLandingPageGtm.mockResolvedValueOnce(undefined);
+    mockListLandingPages.mockResolvedValueOnce([root, subpageA, subpageB, otherSite]);
+    mockUpdateLandingPageTrackingInstalled.mockResolvedValue(undefined);
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/gtm")
+      .send({ gtmContainerId: "GTM-TESTX1" });
+
+    expect(res.status).toBe(200);
+    // Root + both subpages sharing siteId "page-1" get synced to true...
+    expect(mockUpdateLandingPageTrackingInstalled).toHaveBeenCalledWith("page-1", true);
+    expect(mockUpdateLandingPageTrackingInstalled).toHaveBeenCalledWith("sub-a", true);
+    expect(mockUpdateLandingPageTrackingInstalled).toHaveBeenCalledWith("sub-b", true);
+    // ...but a page belonging to a DIFFERENT site is never touched.
+    expect(mockUpdateLandingPageTrackingInstalled).not.toHaveBeenCalledWith("other-1", expect.anything());
+    expect(mockUpdateLandingPageTrackingInstalled).toHaveBeenCalledTimes(3);
+  });
+
+  // A per-page sync failure (e.g. a transient DynamoDB error on one sibling) must never
+  // undo the GitHub commit that already succeeded — the endpoint still reports success.
+  it("SUCCESS: a trackingInstalled sync failure on one sibling doesn't fail the request", async () => {
+    const root = { ...PAGE_WITH_REPO, id: "page-1", siteId: "page-1" };
+    const subpage = { id: "sub-a", userId: "test-user-id", siteId: "page-1" };
+
+    mockGetLandingPageById.mockResolvedValueOnce(root);
+    mockAxios.get.mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "sha-y" } });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockUpdateLandingPageGtm.mockResolvedValueOnce(undefined);
+    mockListLandingPages.mockResolvedValueOnce([root, subpage]);
+    mockUpdateLandingPageTrackingInstalled.mockImplementation((id: string) =>
+      id === "sub-a" ? Promise.reject(new Error("transient DynamoDB error")) : Promise.resolve(undefined),
+    );
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/gtm")
+      .send({ gtmContainerId: "GTM-TESTX1" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
   });
 
   it("SUCCESS: idempotent — strips existing GTM block before re-injecting", async () => {
@@ -1132,6 +1215,33 @@ describe("POST /api/landing-pages/v0/generated/:id/gtm", () => {
     // Old block is stripped — only one GTM head open-comment (not End/noscript variants)
     const headOpenTags = (committed.match(/\{\/\* Google Tag Manager \*\//g) || []).length;
     expect(headOpenTags).toBe(1);
+  });
+
+  // ENG-334 risk hardening: a layout with neither <head> nor <body> defeats
+  // injectGtmIntoLayout's insertion (both branches no-op). Before the verification guard,
+  // this endpoint committed the UNCHANGED layout to GitHub and still returned
+  // {success:true, gtmContainerId}, silently lying to the caller. It must now fail loud.
+  it("FAIL: layout has neither <head> nor <body> to insert into → 422, nothing committed", async () => {
+    const fragmentOnlyLayout = `export default function RootLayout({ children }) {\n  return <>{children}</>;\n}\n`;
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE_WITH_REPO);
+    mockAxios.get.mockResolvedValueOnce({
+      data: { content: Buffer.from(fragmentOnlyLayout).toString("base64"), sha: "sha3" },
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/gtm")
+      .send({ gtmContainerId: "GTM-TESTX1" });
+
+    expect(res.status).toBe(422);
+    // Customer-facing message must be plain language, actionable, and must NEVER leak
+    // implementation details (layout.tsx / <head> / <body>) — the customer can't act on
+    // those and didn't do anything wrong. The technical reason is logged server-side only.
+    expect(res.body.error).toBe(
+      "We couldn't add tracking to this page automatically. Try regenerating the page, or contact support if this keeps happening.",
+    );
+    expect(res.body.error).not.toMatch(/layout\.tsx|<head>|<body>/);
+    expect(mockAxios.put).not.toHaveBeenCalled();
+    expect(mockUpdateLandingPageGtm).not.toHaveBeenCalled();
   });
 });
 

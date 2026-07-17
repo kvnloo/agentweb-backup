@@ -5,6 +5,7 @@
 jest.mock('../services/usageRecordDb', () => ({
   usageRecordDb: {
     queryByUserDateRange: jest.fn(),
+    scanByDateRange: jest.fn(),
   },
 }));
 
@@ -19,9 +20,11 @@ import { userDb } from '../services/db';
 import {
   getUserUsageByModelDay,
   getUsageComparison,
+  getCostAggregation,
 } from '../services/usageAnalyticsService';
 
 const mockQuery = usageRecordDb.queryByUserDateRange as jest.Mock;
+const mockScan = usageRecordDb.scanByDateRange as jest.Mock;
 const mockGetUser = userDb.getUserById as jest.Mock;
 
 const row = (overrides: any = {}) => ({
@@ -47,6 +50,7 @@ describe('usageAnalyticsService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockQuery.mockResolvedValue([]);
+    mockScan.mockResolvedValue([]);
     mockGetUser.mockResolvedValue(null);
   });
 
@@ -281,6 +285,279 @@ describe('usageAnalyticsService', () => {
       const result = await getUsageComparison('user-1', '2026-05');
 
       expect(result.legacy).toEqual({ totalTokens: 0, costUsd: 0, source: 'history' });
+    });
+  });
+
+  // ENG-366 — admin cost aggregation (backend slice of ENG-353).
+  // Test → contract mapping (ENG-353 behavioral contract, HUMAN-WRITTEN):
+  //   assertion 2 (by-model totals = sum of underlying per-user stored costs, no
+  //     second pricing table) → 'aggregates by model…' + 'sums stored costMicroUsd…'
+  //   assertion 3 (window filtering) → 'passes the window through to the scan'
+  //   assertion 4, API half (empty window → explicit zeros, never NaN) →
+  //     'returns an explicit zero payload…'
+  describe('getCostAggregation', () => {
+    const aggRow = (overrides: any = {}) => ({
+      userId: 'user-1',
+      sk: '2026-06-02#gpt-5-chat-2#agent-chat',
+      date: '2026-06-02',
+      model: 'gpt-5-chat-2',
+      feature: 'agent-chat',
+      inputTokens: 1000,
+      outputTokens: 100,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      totalTokens: 1100,
+      costMicroUsd: 3500,
+      callCount: 3,
+      billingUserId: 'user-1',
+      updatedAt: '2026-06-02T01:00:00.000Z',
+      ttl: 1780000000,
+      ...overrides,
+    });
+
+    it('rejects a malformed start date without scanning', async () => {
+      await expect(getCostAggregation('June 1', '2026-06-30')).rejects.toThrow('YYYY-MM-DD');
+      expect(mockScan).not.toHaveBeenCalled();
+    });
+
+    it('rejects a malformed end date without scanning', async () => {
+      await expect(getCostAggregation('2026-06-01', '06-30-2026')).rejects.toThrow('YYYY-MM-DD');
+      expect(mockScan).not.toHaveBeenCalled();
+    });
+
+    it('rejects an inverted range without scanning', async () => {
+      await expect(getCostAggregation('2026-06-30', '2026-06-01')).rejects.toThrow(
+        'start must be <= end'
+      );
+      expect(mockScan).not.toHaveBeenCalled();
+    });
+
+    it('rejects an out-of-range topUsersLimit', async () => {
+      await expect(getCostAggregation('2026-06-01', '2026-06-30', 0)).rejects.toThrow(
+        'topUsersLimit'
+      );
+      await expect(getCostAggregation('2026-06-01', '2026-06-30', 101)).rejects.toThrow(
+        'topUsersLimit'
+      );
+      expect(mockScan).not.toHaveBeenCalled();
+    });
+
+    it('passes the window through to the scan (assertion 3: filtering is the data layer bound)', async () => {
+      await getCostAggregation('2026-06-01', '2026-06-30');
+      expect(mockScan).toHaveBeenCalledTimes(1);
+      expect(mockScan).toHaveBeenCalledWith('2026-06-01', '2026-06-30');
+    });
+
+    it('aggregates by model: totals equal the sum of underlying per-user stored costs (assertion 2)', async () => {
+      mockScan.mockResolvedValue([
+        aggRow({ userId: 'user-1', costMicroUsd: 3_500_000, callCount: 3 }),
+        aggRow({
+          userId: 'user-2',
+          sk: '2026-06-03#gpt-5-chat-2#emma',
+          date: '2026-06-03',
+          feature: 'emma',
+          costMicroUsd: 1_500_000,
+          inputTokens: 400,
+          outputTokens: 40,
+          totalTokens: 440,
+          callCount: 1,
+        }),
+        aggRow({
+          userId: 'user-1',
+          sk: '2026-06-02#anthropic.claude-opus-4-8#agent-chat',
+          model: 'anthropic.claude-opus-4-8',
+          costMicroUsd: 10_000_000,
+          callCount: 2,
+        }),
+      ]);
+
+      const result = await getCostAggregation('2026-06-01', '2026-06-30');
+
+      // Sorted by cost desc.
+      expect(result.byModel.map((m) => m.model)).toEqual([
+        'anthropic.claude-opus-4-8',
+        'gpt-5-chat-2',
+      ]);
+      const gpt = result.byModel[1];
+      expect(gpt.costMicroUsd).toBe(5_000_000); // 3.5M (user-1) + 1.5M (user-2)
+      expect(gpt.costUsd).toBe(5);
+      expect(gpt.callCount).toBe(4);
+      expect(gpt.inputTokens).toBe(1400);
+      const opus = result.byModel[0];
+      expect(opus.costMicroUsd).toBe(10_000_000);
+      expect(opus.costUsd).toBe(10);
+
+      // Overall totals are the sum over every row.
+      expect(result.totals.costMicroUsd).toBe(15_000_000);
+      expect(result.totals.costUsd).toBe(15);
+      expect(result.totals.callCount).toBe(6);
+    });
+
+    it('sums stored costMicroUsd only — tolerates rows with missing counters (no re-pricing)', async () => {
+      mockScan.mockResolvedValue([
+        aggRow({
+          costMicroUsd: undefined,
+          inputTokens: undefined,
+          outputTokens: undefined,
+          cacheReadTokens: undefined,
+          cacheWriteTokens: undefined,
+          totalTokens: undefined,
+          callCount: undefined,
+        }),
+      ]);
+
+      const result = await getCostAggregation('2026-06-01', '2026-06-30');
+
+      expect(result.totals.costMicroUsd).toBe(0);
+      expect(result.totals.costUsd).toBe(0);
+      expect(Number.isNaN(result.totals.costUsd)).toBe(false);
+      expect(result.byModel[0].costUsd).toBe(0);
+    });
+
+    it('builds the by-day series sorted by date then model', async () => {
+      mockScan.mockResolvedValue([
+        aggRow({
+          sk: '2026-06-03#gpt-5-chat-2#agent-chat',
+          date: '2026-06-03',
+          costMicroUsd: 2_000_000,
+        }),
+        aggRow({ costMicroUsd: 1_000_000 }), // 2026-06-02, gpt-5-chat-2
+        aggRow({
+          userId: 'user-2',
+          sk: '2026-06-02#gpt-5-chat-2#emma',
+          feature: 'emma',
+          costMicroUsd: 500_000,
+        }),
+        aggRow({
+          sk: '2026-06-02#anthropic.claude-opus-4-8#agent-chat',
+          model: 'anthropic.claude-opus-4-8',
+          costMicroUsd: 4_000_000,
+        }),
+      ]);
+
+      const result = await getCostAggregation('2026-06-01', '2026-06-30');
+
+      expect(
+        result.series.map((s) => [s.date, s.model, s.costMicroUsd])
+      ).toEqual([
+        ['2026-06-02', 'anthropic.claude-opus-4-8', 4_000_000],
+        ['2026-06-02', 'gpt-5-chat-2', 1_500_000], // user-1 + user-2 merged per (date, model)
+        ['2026-06-03', 'gpt-5-chat-2', 2_000_000],
+      ]);
+      expect(result.series[1].costUsd).toBe(1.5);
+    });
+
+    it('aggregates the secondary feature cut from the stored feature dimension', async () => {
+      mockScan.mockResolvedValue([
+        aggRow({ costMicroUsd: 1_000_000 }), // agent-chat
+        aggRow({
+          userId: 'user-2',
+          sk: '2026-06-02#gpt-5-chat-2#emma',
+          feature: 'emma',
+          costMicroUsd: 3_000_000,
+        }),
+      ]);
+
+      const result = await getCostAggregation('2026-06-01', '2026-06-30');
+
+      expect(result.byFeature.map((f) => [f.feature, f.costMicroUsd])).toEqual([
+        ['emma', 3_000_000],
+        ['agent-chat', 1_000_000],
+      ]);
+    });
+
+    it('ranks top users by spend with a per-model breakdown, enriched with email', async () => {
+      mockScan.mockResolvedValue([
+        aggRow({ userId: 'user-1', costMicroUsd: 1_000_000 }),
+        aggRow({
+          userId: 'user-1',
+          sk: '2026-06-02#anthropic.claude-opus-4-8#agent-chat',
+          model: 'anthropic.claude-opus-4-8',
+          costMicroUsd: 6_000_000,
+        }),
+        aggRow({
+          userId: 'user-2',
+          sk: '2026-06-02#gpt-5-chat-2#emma',
+          feature: 'emma',
+          costMicroUsd: 2_000_000,
+        }),
+      ]);
+      mockGetUser.mockImplementation(async (id: string) =>
+        id === 'user-1' ? { userId: 'user-1', email: 'one@example.com' } : null
+      );
+
+      const result = await getCostAggregation('2026-06-01', '2026-06-30');
+
+      expect(result.topUsers).toHaveLength(2);
+      expect(result.topUsers[0].userId).toBe('user-1');
+      expect(result.topUsers[0].costMicroUsd).toBe(7_000_000);
+      expect(result.topUsers[0].email).toBe('one@example.com');
+      expect(result.topUsers[0].byModel.map((m) => m.model)).toEqual([
+        'anthropic.claude-opus-4-8',
+        'gpt-5-chat-2',
+      ]);
+      expect(result.topUsers[1].userId).toBe('user-2');
+      expect(result.topUsers[1].email).toBeNull();
+    });
+
+    it('limits top users to topUsersLimit and only enriches the returned ones', async () => {
+      mockScan.mockResolvedValue([
+        aggRow({ userId: 'user-1', costMicroUsd: 1_000_000 }),
+        aggRow({
+          userId: 'user-2',
+          sk: '2026-06-02#gpt-5-chat-2#emma',
+          feature: 'emma',
+          costMicroUsd: 3_000_000,
+        }),
+        aggRow({
+          userId: 'user-3',
+          sk: '2026-06-02#gpt-5-chat-2#seo',
+          feature: 'seo',
+          costMicroUsd: 2_000_000,
+        }),
+      ]);
+
+      const result = await getCostAggregation('2026-06-01', '2026-06-30', 2);
+
+      expect(result.topUsers.map((u) => u.userId)).toEqual(['user-2', 'user-3']);
+      expect(mockGetUser).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps the user row when email enrichment fails (best-effort, non-critical)', async () => {
+      mockScan.mockResolvedValue([aggRow({ costMicroUsd: 1_000_000 })]);
+      mockGetUser.mockRejectedValue(new Error('dynamo down'));
+
+      const result = await getCostAggregation('2026-06-01', '2026-06-30');
+
+      expect(result.topUsers).toHaveLength(1);
+      expect(result.topUsers[0].email).toBeNull();
+      expect(result.topUsers[0].costMicroUsd).toBe(1_000_000);
+    });
+
+    it('returns an explicit zero payload for an empty window — no NaN, no undefined (assertion 4, API half)', async () => {
+      mockScan.mockResolvedValue([]);
+
+      const result = await getCostAggregation('2026-06-01', '2026-06-30');
+
+      expect(result).toEqual({
+        start: '2026-06-01',
+        end: '2026-06-30',
+        totals: {
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          totalTokens: 0,
+          callCount: 0,
+          costMicroUsd: 0,
+          costUsd: 0,
+        },
+        byModel: [],
+        series: [],
+        byFeature: [],
+        topUsers: [],
+      });
+      expect(mockGetUser).not.toHaveBeenCalled();
     });
   });
 });

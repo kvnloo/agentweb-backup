@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-07-14
+// Last updated: 2026-07-17
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,15 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-07-17',
+    changes: [
+      'Retired: Local Agent Browser Fallback',
+      '- The Local Agent (a relay to a real browser running on a local machine) has been retired and its tools no longer run',
+      '- If an older skill or scheduled chat still tries to use it, Emma now gets a clear message explaining it was retired and pointing her at web search instead of silently failing',
+      '- For web research and page lookups, Emma uses her built-in web search; workloads that genuinely needed the local browser are being migrated to replacements',
+    ],
+  },
   {
     date: '2026-07-15',
     changes: [

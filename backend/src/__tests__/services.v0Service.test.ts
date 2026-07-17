@@ -175,7 +175,7 @@ import {
   assertNoDuplicateInjectedRoutes,
 } from "../services/v0Service";
 
-import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord } from "../services/v0Service";
+import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord, getVercelBuildErrors, isNonErrorBuildLine } from "../services/v0Service";
 import { _resetV0UsageGuardForTest, guardedV0ChatCreate, hashV0Prompt } from "../services/v0UsageGuard";
 const { enqueueAutoHumanEval } = jest.requireMock("../services/autoHumanEvalService");
 
@@ -186,6 +186,36 @@ async function createMinimalV0Zip(): Promise<Buffer> {
     "app/page.tsx",
     Buffer.from("export default function Page() { return <main>Hi</main>; }"),
   );
+  return zip.toBuffer();
+}
+
+// ENG-334: a v0 zip that INCLUDES its own app/layout.tsx — the common case the old
+// scaffold-only fallback missed. Used to prove GTM is injected into v0's real layout.
+const V0_ZIP_LAYOUT = `import type { Metadata } from "next";
+import "./globals.css";
+
+export const metadata: Metadata = { title: "Compare", description: "" };
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <head>
+        <link rel="icon" href="/favicon.ico" />
+      </head>
+      <body>{children}</body>
+    </html>
+  );
+}
+`;
+
+async function createV0ZipWithLayout(): Promise<Buffer> {
+  const AdmZip = (await import("adm-zip")).default;
+  const zip = new AdmZip();
+  zip.addFile(
+    "app/page.tsx",
+    Buffer.from("export default function Page() { return <main>Hi</main>; }"),
+  );
+  zip.addFile("app/layout.tsx", Buffer.from(V0_ZIP_LAYOUT));
   return zip.toBuffer();
 }
 
@@ -1715,6 +1745,143 @@ describe("v0Service - deployLandingPage", () => {
       "sub-page"
     );
   });
+
+  // ---------------------------------------------------------------------------
+  // ENG-334: GTM auto-injection wiring — record.gtmContainerId flows through the
+  // push path into the files array pushed to GitHub, and the tracking signal is
+  // persisted. The pure util is covered elsewhere; these pin the WIRING, so a
+  // wiring regression can't ship with all tests green (acceptance criteria 1 & 4).
+  // ---------------------------------------------------------------------------
+
+  // Wire up a full happy-path deploy (GitHub push + Vercel deploy) so the run
+  // reaches the push and the tracking-signal DynamoDB update.
+  function wireHappyPathDeploy() {
+    mockAxiosGet.mockImplementation((url: string) => {
+      if (url.includes("/git/ref/heads/main")) {
+        return Promise.resolve({ data: { object: { sha: "base-sha" } } });
+      }
+      if (url === "https://api.github.com/repos/AgentWebPro/repo") {
+        return Promise.resolve({ data: { id: 12345 } });
+      }
+      if (url.includes("/v6/deployments")) {
+        return Promise.resolve({
+          data: { deployments: [{ uid: "dpl_1", readyState: "READY", meta: { githubCommitSha: "commit-sha" } }] },
+        });
+      }
+      if (url.includes("/v9/projects/prj_1")) {
+        return Promise.resolve({ data: { targets: { production: { alias: ["demo.vercel.app"] } } } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    mockAxiosPost.mockImplementation((url: string) => {
+      if (url.includes("/orgs/TestOrg/repos")) {
+        return Promise.resolve({ data: { name: "repo", full_name: "AgentWebPro/repo", html_url: "https://github.com/AgentWebPro/repo" } });
+      }
+      if (url.includes("/git/blobs")) {
+        return Promise.resolve({ data: { sha: `blob-${mockAxiosPost.mock.calls.length}` } });
+      }
+      if (url.includes("/git/trees")) {
+        return Promise.resolve({ data: { sha: "tree-sha" } });
+      }
+      if (url.includes("/git/commits")) {
+        return Promise.resolve({ data: { sha: "commit-sha" } });
+      }
+      if (url === "https://api.vercel.com/v10/projects") {
+        return Promise.resolve({ data: { id: "prj_1", name: "demo", targets: { production: { alias: ["demo.vercel.app"] } } } });
+      }
+      if (url === "https://api.vercel.com/v13/deployments") {
+        return Promise.resolve({ data: { uid: "dpl_1" } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    mockAxiosPatch.mockResolvedValue({ data: {} });
+  }
+
+  // Decode the base64 blob bodies POSTed to GitHub — this is the exact `files`
+  // array content that lands in the repo at the initial commit.
+  function pushedLayoutBlob(): string | undefined {
+    return mockAxiosPost.mock.calls
+      .filter((c) => typeof c[0] === "string" && c[0].includes("/git/blobs"))
+      .map((c) => Buffer.from(c[1].content, "base64").toString("utf8"))
+      .find((content) => content.includes("RootLayout"));
+  }
+
+  function pushedTrackingSignal(): boolean | undefined {
+    const call = mockUpdate.mock.calls.find(
+      (c) => c[0]?.ExpressionAttributeValues && ":trackingInstalled" in c[0].ExpressionAttributeValues,
+    );
+    return call?.[0].ExpressionAttributeValues[":trackingInstalled"];
+  }
+
+  it("SUCCESS (criterion 1): a site with gtmContainerId pushes an app/layout.tsx carrying the GTM snippet and records trackingInstalled=true", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page-1",
+            userId: "user-1",
+            name: "Compare Landing Page",
+            prompt: "Build a compare landing page",
+            status: "draft",
+            v0ChatId: "chat_1",
+            iterations: 0,
+            gtmContainerId: "GTM-TEST99",
+          },
+        }),
+    });
+    mockChatsGetById.mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+    // The zip carries v0's OWN layout.tsx — the case the scaffold-only fallback missed.
+    mockChatsDownloadVersion.mockResolvedValueOnce(await createV0ZipWithLayout());
+    wireHappyPathDeploy();
+
+    const result = await deployLandingPage("page-1", "user-1");
+
+    expect(result.status).toBe("deployed");
+    // The layout blob actually pushed to GitHub carries the customer's GTM container —
+    // no manual "Add GTM" step, and it was v0's own layout, not a scaffold.
+    const layout = pushedLayoutBlob();
+    expect(layout).toBeDefined();
+    expect(layout).toContain("https://www.googletagmanager.com/ns.html?id=GTM-TEST99");
+    expect(layout).toContain("'GTM-TEST99'");
+    expect(layout).toContain('rel="icon"'); // v0's original layout content preserved
+    // The tracking signal is persisted, detectable without reading the generated code.
+    expect(pushedTrackingSignal()).toBe(true);
+  });
+
+  it("SUCCESS (criterion 4): a site with NO gtmContainerId still deploys, but pushes NO GTM tag and records trackingInstalled=false", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page-1",
+            userId: "user-1",
+            name: "Untracked Landing Page",
+            prompt: "Build an untracked landing page",
+            status: "draft",
+            v0ChatId: "chat_1",
+            iterations: 0,
+            // gtmContainerId intentionally absent
+          },
+        }),
+    });
+    mockChatsGetById.mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+    mockChatsDownloadVersion.mockResolvedValueOnce(await createV0ZipWithLayout());
+    wireHappyPathDeploy();
+
+    const result = await deployLandingPage("page-1", "user-1");
+
+    expect(result.status).toBe("deployed");
+    // No fallback to AgentWeb's platform GA4 — the pushed layout carries no tag at all.
+    const layout = pushedLayoutBlob();
+    expect(layout).toBeDefined();
+    expect(layout).not.toContain("googletagmanager.com");
+    // Every pushed file is untracked, and the "no tracking installed" signal is persisted.
+    const anyTagPushed = mockAxiosPost.mock.calls
+      .filter((c) => typeof c[0] === "string" && c[0].includes("/git/blobs"))
+      .some((c) => Buffer.from(c[1].content, "base64").toString("utf8").includes("googletagmanager.com"));
+    expect(anyTagPushed).toBe(false);
+    expect(pushedTrackingSignal()).toBe(false);
+  });
 });
 
 // =============================================================================
@@ -2320,7 +2487,7 @@ describe("v0Service - deleteLandingPage", () => {
 
     await expect(
       deleteLandingPage("page-1", "user-1")
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ githubCleanupWarning: undefined });
     // deleteLandingPage now does a soft-delete (archive) via update, not a hard delete
     expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
@@ -2342,7 +2509,7 @@ describe("v0Service - deleteLandingPage", () => {
 
     await expect(
       deleteLandingPage("root-fail", "user-1")
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ githubCleanupWarning: undefined });
     expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 
@@ -2363,7 +2530,7 @@ describe("v0Service - deleteLandingPage", () => {
 
     await expect(
       deleteLandingPage("root-fail-deployed", "user-1")
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ githubCleanupWarning: undefined });
     expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 
@@ -2384,7 +2551,7 @@ describe("v0Service - deleteLandingPage", () => {
 
     await expect(
       deleteLandingPage("root-deployed", "user-1")
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ githubCleanupWarning: undefined });
     expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 });
@@ -2512,6 +2679,225 @@ export default function Page() {
       makeFile("components/header.tsx", `export const Header = () => <header>Hi</header>;`),
     ];
     expect(() => validateV0Output(files)).not.toThrow();
+  });
+
+  // ENG-374: v0 occasionally hallucinates a bare import of an internal Next.js concept as if
+  // it were an installable package — e.g. `import RootLayout from "layout"` — which is not a
+  // real npm package, not relative, not the @/ alias, and fails the build with "Module not
+  // found". Caught here (denylist of words that are never real bare package names, never a
+  // scope on npm) rather than trying to validate against the universe of legitimate
+  // dependencies, which would need constant upkeep and risks false-positiving on real ones.
+  describe("bad-import check (ENG-374)", () => {
+    it("FAIL: throws on a bare import of a never-a-real-package word", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `"use client"\n\nimport RootLayout from "layout"\n\nexport default function SyntheticV0PageForDeployment() {\n  return <RootLayout />\n}\n`
+        ),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(files)).toThrow(/bare import.*"layout"/i);
+    });
+
+    it("FAIL: catches it even when a separate, earlier .tsx file is otherwise valid", () => {
+      const files = [
+        makeFile("app/layout.tsx", VALID_TSX),
+        makeFile(
+          "app/page.tsx",
+          `import RootLayout from "layout"\nexport default function Page() { return <RootLayout />; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+    });
+
+    it("passes a legitimate relative import of a file literally named layout", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import Layout from "./layout"\nexport default function Page() { return <Layout />; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("passes a legitimate @/ alias import", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import { cn } from "@/lib/utils"\nexport default function Page() { return <div className={cn("a")} />; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("passes real npm package imports (react, next, clsx, etc.)", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import React from "react"\nimport Link from "next/link"\nimport clsx from "clsx"\nexport default function Page() { return <Link href="/">{clsx("a")}</Link>; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("passes a named import of a real package sharing no denylisted word", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          VALID_TSX + `\nimport { Something } from "some-real-package";`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("FAIL: catches a side-effect-only bare import (no `from` clause)", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX + `\nimport "layout";`),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(files)).toThrow(/"layout"/);
+    });
+
+    it("FAIL: catches a dynamic import() of a bare denylisted specifier", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          VALID_TSX + `\nasync function load() { const m = await import("layout"); return m; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(files)).toThrow(/"layout"/);
+    });
+
+    it("FAIL: catches a re-export from a bare denylisted specifier", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX + `\nexport { default } from "layout";`),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(files)).toThrow(/"layout"/);
+    });
+
+    it("FAIL: catches export * from a bare denylisted specifier", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX + `\nexport * from "styles";`),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(files)).toThrow(/"styles"/);
+    });
+
+    it("passes a dynamic import() of a real relative path", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          VALID_TSX + `\nasync function load() { const m = await import("./heavy-component"); return m; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("reports ALL bad imports across all files in a single error, not just the first", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import RootLayout from "layout"\nexport default function Page() { return <RootLayout />; }`
+        ),
+        makeFile(
+          "components/header.tsx",
+          `import Nav from "components"\nexport const Header = () => <Nav />;`
+        ),
+      ];
+      let error: V0OutputValidationError | undefined;
+      try {
+        validateV0Output(files);
+      } catch (e) {
+        error = e as V0OutputValidationError;
+      }
+      expect(error).toBeInstanceOf(V0OutputValidationError);
+      // Both offending files/specifiers must be named in the ONE thrown error — a single
+      // correction message to v0 should be able to fix both at once, not just the first.
+      expect(error!.message).toContain("app/page.tsx");
+      expect(error!.message).toContain('"layout"');
+      expect(error!.message).toContain("components/header.tsx");
+      expect(error!.message).toContain('"components"');
+    });
+
+    // Greptile review (PR #2121): a real import/export/dynamic-import statement can never
+    // legitimately appear inside a string, template literal, or comment — those are
+    // structurally distinct from executable code. So the scanner must ignore that content
+    // entirely: doing so cannot cause a false NEGATIVE (nothing worth stripping could have
+    // been a real import), only prevents false positives on legitimate example text/comments.
+    describe("ignores comments and string/template-literal content", () => {
+      it("does not false-positive on a JSX string showing example code (a coding-tutorial landing page)", () => {
+        const files = [
+          makeFile(
+            "app/page.tsx",
+            VALID_TSX + `\nexport function CodeExample() { return <pre>{\`import Header from "components"\`}</pre>; }`
+          ),
+        ];
+        expect(() => validateV0Output(files)).not.toThrow();
+      });
+
+      it("does not false-positive on a // line comment mentioning the pattern", () => {
+        const files = [
+          makeFile(
+            "app/page.tsx",
+            VALID_TSX + `\n// don't write import Foo from "layout", use a relative path`
+          ),
+        ];
+        expect(() => validateV0Output(files)).not.toThrow();
+      });
+
+      it("does not false-positive on a /* block comment */ mentioning the pattern", () => {
+        const files = [
+          makeFile(
+            "app/page.tsx",
+            VALID_TSX + `\n/* Example of what NOT to do: import Foo from "layout" */`
+          ),
+        ];
+        expect(() => validateV0Output(files)).not.toThrow();
+      });
+
+      it("does not false-positive on a double-quoted string containing the pattern", () => {
+        const files = [
+          makeFile(
+            "app/page.tsx",
+            VALID_TSX + `\nconst tip = "Avoid: import Foo from \\"layout\\"";`
+          ),
+        ];
+        expect(() => validateV0Output(files)).not.toThrow();
+      });
+
+      it("still catches a REAL bad import sitting right next to a comment mentioning the same pattern", () => {
+        const files = [
+          makeFile(
+            "app/page.tsx",
+            `// A comment mentioning import Foo from "layout" as an example\nimport RootLayout from "layout"\nexport default function Page() { return <RootLayout />; }`
+          ),
+        ];
+        // The comment's mention must NOT mask the real, separate bad import on the next line.
+        expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      });
+
+      it("does not hang or throw on escaped quotes inside a string", () => {
+        const files = [
+          makeFile(
+            "app/page.tsx",
+            VALID_TSX + `\nconst s = "it's a \\"test\\" string with import from \\"layout\\" inside";`
+          ),
+        ];
+        expect(() => validateV0Output(files)).not.toThrow();
+      });
+
+      it("does not false-positive on a template literal with an interpolated expression", () => {
+        const files = [
+          makeFile(
+            "app/page.tsx",
+            VALID_TSX + `\nconst name = "World"; const s = \`Hello \${name}, here's an import Foo from "app" example\`;`
+          ),
+        ];
+        expect(() => validateV0Output(files)).not.toThrow();
+      });
+    });
   });
 });
 
@@ -2863,7 +3249,7 @@ describe("v0Service - deleteLandingPageByRecord removes the whole page directory
   };
 
   it("deletes _components too, not just page.tsx (an orphan component bricks the site build)", async () => {
-    await deleteLandingPageByRecord({
+    const result = await deleteLandingPageByRecord({
       id: "p1",
       userId: "u1",
       slug: "pricing",
@@ -2876,6 +3262,8 @@ describe("v0Service - deleteLandingPageByRecord removes the whole page directory
       "app/pricing/_components/landing/nav.tsx",
       "app/pricing/page.tsx",
     ]);
+    // The normal, working case — files really were found and removed — carries no warning.
+    expect(result.githubCleanupWarning).toBeUndefined();
   });
 
   it("does not touch any OTHER page in the shared repo", async () => {
@@ -2894,7 +3282,7 @@ describe("v0Service - deleteLandingPageByRecord removes the whole page directory
   });
 
   it("commits nothing when the page directory is not in the repo", async () => {
-    await deleteLandingPageByRecord({
+    const result = await deleteLandingPageByRecord({
       id: "p1",
       userId: "u1",
       slug: "never-committed",
@@ -2905,6 +3293,22 @@ describe("v0Service - deleteLandingPageByRecord removes the whole page directory
 
     // Nothing to remove — do not push an empty commit and trigger a pointless rebuild.
     expect(deletedPaths()).toBeNull();
+  });
+
+  // ENG-375: a zero-match cleanup (e.g. record.slug diverging from the route actually
+  // committed) used to be a silent console.log with no other signal anywhere. It's now
+  // surfaced as a warning the DELETE route can return to the caller.
+  it("surfaces a warning when nothing matched the page's stored slug", async () => {
+    const result = await deleteLandingPageByRecord({
+      id: "p1",
+      userId: "u1",
+      slug: "never-committed",
+      name: "Ghost",
+      status: "failed",
+      githubRepoUrl: "https://github.com/o/r",
+    } as any);
+
+    expect(result.githubCleanupWarning).toMatch(/No GitHub files were found/);
   });
 
   it("a GitHub failure does not block the record delete (the page must still disappear)", async () => {
@@ -2920,6 +3324,21 @@ describe("v0Service - deleteLandingPageByRecord removes the whole page directory
         githubRepoUrl: "https://github.com/o/r",
       } as any),
     ).resolves.not.toThrow();
+  });
+
+  it("surfaces a warning (not a throw) when GitHub cleanup fails outright", async () => {
+    mockAxiosGet.mockRejectedValue(new Error("GitHub 500"));
+
+    const result = await deleteLandingPageByRecord({
+      id: "p1",
+      userId: "u1",
+      slug: "pricing",
+      name: "Pricing",
+      status: "deployed",
+      githubRepoUrl: "https://github.com/o/r",
+    } as any);
+
+    expect(result.githubCleanupWarning).toMatch(/GitHub cleanup failed/);
   });
 });
 
@@ -3830,5 +4249,79 @@ describe("v0Service - triggerVercelDeployment", () => {
     const body = mockAxiosPost.mock.calls[0][1];
     expect(body.target).toBeUndefined();
     expect(body.gitSource.ref).toBe("draft/session-12345678");
+  });
+});
+
+describe("getVercelBuildErrors — surface the real cause, not trailing noise", () => {
+  beforeEach(() => {
+    mockAxiosGet.mockReset();
+  });
+
+  it("returns the real build error and drops a trailing deprecation warning", async () => {
+    mockAxiosGet.mockResolvedValueOnce({
+      data: [
+        { type: "stderr", payload: { text: "Failed to compile." } },
+        { type: "stderr", payload: { text: "Module not found: Can't resolve '@/components/missing'" } },
+        { type: "stderr", payload: { text: '⚠ The "middleware" file convention is deprecated. Please use "proxy" instead.' } },
+      ],
+    });
+    const msg = await getVercelBuildErrors("dpl_1", "tok");
+    expect(msg).toContain("Failed to compile");
+    expect(msg).toContain("Module not found");
+    // The benign deprecation warning must NOT be surfaced as (part of) the error.
+    expect(msg).not.toMatch(/deprecated/i);
+  });
+
+  it("does not pass a deprecation warning / CLI banner off as the build error when no real error line was captured", async () => {
+    mockAxiosGet.mockResolvedValueOnce({
+      data: [
+        { type: "stderr", payload: { text: "Vercel CLI 56.2.0" } },
+        { type: "stderr", payload: { text: '⚠ The "middleware" file convention is deprecated. Please use "proxy" instead.' } },
+      ],
+    });
+    const msg = await getVercelBuildErrors("dpl_2", "tok");
+    // Raw output is still shown for context, but clearly labelled as NOT the cause.
+    expect(msg).toContain("No explicit build error was captured");
+    expect(msg).toContain("Vercel dashboard");
+  });
+
+  it("returns a clear message when there are no stderr/fatal events at all", async () => {
+    mockAxiosGet.mockResolvedValueOnce({ data: [{ type: "stdout", payload: { text: "Building..." } }] });
+    const msg = await getVercelBuildErrors("dpl_3", "tok");
+    expect(msg).toBe("Build failed — no error details available in logs.");
+  });
+
+  it("degrades to a safe message if the events request throws", async () => {
+    mockAxiosGet.mockRejectedValueOnce(new Error("network down"));
+    const msg = await getVercelBuildErrors("dpl_4", "tok");
+    expect(msg).toBe("Build failed — could not retrieve error details.");
+  });
+});
+
+describe("isNonErrorBuildLine", () => {
+  it("classifies CLI banner, warnings and deprecations as non-error noise", () => {
+    expect(isNonErrorBuildLine("Vercel CLI 56.2.0")).toBe(true);
+    expect(isNonErrorBuildLine('⚠ The "middleware" file convention is deprecated. Please use "proxy" instead.')).toBe(true);
+    expect(isNonErrorBuildLine("Warning: something minor")).toBe(true);
+  });
+
+  it("treats real build errors as meaningful (not noise)", () => {
+    expect(isNonErrorBuildLine("Module not found: Can't resolve '@/x'")).toBe(false);
+    expect(isNonErrorBuildLine("Failed to compile.")).toBe(false);
+    expect(isNonErrorBuildLine("Type error: Property 'x' does not exist on type 'Y'.")).toBe(false);
+  });
+
+  it("does NOT silence a real error that merely mentions something deprecated (deprecation match is anchored)", () => {
+    expect(isNonErrorBuildLine("Error: Component uses a deprecated Context API — cannot compile")).toBe(false);
+    expect(isNonErrorBuildLine("error  no-deprecated  Use of deprecated rule 'X'")).toBe(false);
+    // A bare deprecation-warning line at line-start is still noise.
+    expect(isNonErrorBuildLine("Deprecation Warning: foo is deprecated")).toBe(true);
+  });
+
+  it("only treats ▲ banner lines as noise, not real ▲-prefixed errors", () => {
+    expect(isNonErrorBuildLine("▲ Vercel CLI 56.2.0")).toBe(true);
+    expect(isNonErrorBuildLine("▲ Next.js 16.2.6")).toBe(true);
+    expect(isNonErrorBuildLine("▲ Error: Build script exited with non-zero exit code")).toBe(false);
+    expect(isNonErrorBuildLine("▲ ENOENT: no such file or directory")).toBe(false);
   });
 });

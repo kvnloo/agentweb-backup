@@ -4057,7 +4057,6 @@ export async function generateChatResponse(
           'report_product_issues',
           'get_temp_email', 'check_temp_inbox',
           'get_test_account', 'save_test_account', 'list_test_accounts',
-          'run_local_agent_task', 'check_local_agent_status',
         ] : []);
 
         if (isCustomerContext) {

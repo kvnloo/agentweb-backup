@@ -1,8 +1,10 @@
 import {
   addIssueComment,
   createInternalLinearIssue,
+  escalateIssue,
   getEngineeringBugStats,
   getIssueCommentsDetailed,
+  listOpenBugCanonicals,
   listOpenIssuesByLabel,
   listRecentlyResolvedBugCanonicals,
   reopenIssue,
@@ -246,6 +248,88 @@ describe('linearService.listOpenIssuesByLabel', () => {
     }) } as any));
     const res = await listOpenIssuesByLabel('Auto');
     expect(res[0].description).toBe('');
+  });
+
+  // ENG-358 root cause: Linear's "Duplicate" state has its OWN state type ("duplicate", verified
+  // live on ENG-350) — a blacklist of completed/canceled let duplicate-state issues stay dedupe
+  // candidates, so recurrence comments landed on a canceled Duplicate instead of the open
+  // canonical. The filter must WHITELIST open state types.
+  it('whitelists open state types so duplicate-state issues are never dedupe candidates (ENG-358)', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({
+      data: { issues: { nodes: [] } },
+    }) } as any));
+    await listOpenIssuesByLabel('Auto');
+    const query = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body).query;
+    expect(query).toMatch(/state:\s*\{\s*type:\s*\{\s*in:/);
+    for (const openType of ['triage', 'backlog', 'unstarted', 'started']) {
+      expect(query).toContain(`"${openType}"`);
+    }
+    expect(query).not.toContain('nin');
+  });
+});
+
+describe('linearService.listOpenBugCanonicals — open-state whitelist (ENG-358)', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  // Same leak class as listOpenIssuesByLabel: a bug canonical in the Duplicate state must never
+  // absorb new customer reports — the open canonical (or a fresh issue) must get them.
+  it('whitelists open state types so duplicate-state canonicals are excluded', async () => {
+    (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({
+      data: { issues: { nodes: [] } },
+    }) } as any));
+    await listOpenBugCanonicals();
+    const query = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body).query;
+    expect(query).toMatch(/state:\s*\{\s*type:\s*\{\s*in:/);
+    for (const openType of ['triage', 'backlog', 'unstarted', 'started']) {
+      expect(query).toContain(`"${openType}"`);
+    }
+    expect(query).not.toContain('nin');
+  });
+});
+
+describe('linearService.escalateIssue (ENG-358 — raise-only canonical escalation)', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  /** fetch mock: 1st call answers the priority query, 2nd the mutation. */
+  function mockEscalationFetch(currentPriority: number | null, mutationSuccess = true) {
+    let n = 0;
+    (global.fetch as any) = jest.fn(() => {
+      n += 1;
+      const body = n === 1
+        ? { data: { issue: currentPriority === null ? null : { priority: currentPriority } } }
+        : { data: { issueUpdate: { success: mutationSuccess } } };
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) } as any);
+    });
+  }
+
+  it('raises "No priority" (0) to the incoming priority and refreshes the title', async () => {
+    mockEscalationFetch(0);
+    const escalated = await escalateIssue('uuid-337', { title: 'v0 credits CRITICAL — $9.10 spendable', priority: 1 });
+    expect(escalated).toBe(true);
+    const mutation = JSON.parse((global.fetch as jest.Mock).mock.calls[1][1].body);
+    expect(mutation.variables.input).toEqual({ title: 'v0 credits CRITICAL — $9.10 spendable', priority: 1 });
+  });
+
+  it('raises a less severe priority (3 -> 1)', async () => {
+    mockEscalationFetch(3);
+    await expect(escalateIssue('uuid-337', { title: 't', priority: 1 })).resolves.toBe(true);
+  });
+
+  it('never downgrades: an equal or weaker incoming priority is a no-op (no mutation call)', async () => {
+    mockEscalationFetch(1);
+    const escalated = await escalateIssue('uuid-337', { title: 't', priority: 2 });
+    expect(escalated).toBe(false);
+    expect((global.fetch as jest.Mock)).toHaveBeenCalledTimes(1); // priority query only
+  });
+
+  it('throws when the issue is not found (callers best-effort it)', async () => {
+    mockEscalationFetch(null);
+    await expect(escalateIssue('uuid-missing', { title: 't', priority: 1 })).rejects.toThrow(/not found/i);
+  });
+
+  it('throws when the mutation reports failure', async () => {
+    mockEscalationFetch(0, false);
+    await expect(escalateIssue('uuid-337', { title: 't', priority: 1 })).rejects.toThrow(/escalation/i);
   });
 });
 
