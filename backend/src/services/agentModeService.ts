@@ -117,7 +117,7 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
   return undefined;
 }
 const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
-import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
+import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { twitterService } from './twitterService';
 import * as linkedInAdsService from './linkedInAdsService';
@@ -13775,7 +13775,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
         return this.listMetaAdsAds(userId, ad_set_id, account_id);
@@ -13791,6 +13791,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       case 'COPY_AD':
         if (!ad_id) throw new Error('ad_id (source_ad_id) is required for COPY_AD action');
         return this.copyMetaAdsAd(userId, ad_id, params, account_id);
+      case 'RETAG_UTM':
+        // ENG-239 retrofit: retags ONE existing ad, never a list. Swaps in a new
+        // creative -- the caller (Emma) must have already told the user this
+        // resets the ad's learning phase, per the RETAG_UTM tool description.
+        if (!ad_id) throw new Error('ad_id is required for RETAG_UTM action');
+        return this.retagMetaAdUtm(userId, ad_id, account_id);
       default:
         throw new Error(`Invalid action: ${action}`);
     }
@@ -14539,7 +14545,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * Keys that indicate a destination/creative content change rather than an ad-level change.
    * When these are present in params, we need to create a new creative and swap it.
    */
-  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets'];
+  // 'url_tags' lives on the creative, same as the others — an ad-level update
+  // silently drops it (see updateAd's params typing), so a UTM-only retag
+  // (ENG-239 retrofit, agentModeService.retagMetaAdUtm) must also go through
+  // the swap path. carriedUrlTags below already forwards it correctly.
+  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets', 'url_tags'];
 
   public async updateMetaAdsAd(userId: string, adId: string, params: any, account_id?: string): Promise<any> {
     try {
@@ -14983,6 +14993,75 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
+  /**
+   * Retag ONE existing, already-live Meta ad that's missing UTMs (Harsha's ask —
+   * the audit tool can only find these, never fix them). Deliberately single-ad:
+   * never loop or accept a list, so there is no "bulk retag" surface.
+   *
+   * Meta creatives are immutable for `url_tags`/`link_url`, so this reuses the
+   * SAME create-new-creative-then-swap machinery `updateAdViaCreativeSwap`
+   * already provides for other field changes — only `url_tags` changes here,
+   * the ad's existing destination is preserved untouched.
+   *
+   * Callers (the Emma tool) MUST tell the user before invoking this: swapping a
+   * live creative resets the ad's learning phase, which can hurt a paying
+   * client's performance. That is not enforced here — it belongs in the tool
+   * description Emma reads before deciding to call it.
+   */
+  public async retagMetaAdUtm(userId: string, adId: string, account_id?: string): Promise<any> {
+    try {
+      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+
+      const adData = await metaService.getAd(accessToken, adId);
+      const creativeId = adData?.creative?.creative_id || adData?.creative?.id;
+      if (!creativeId) {
+        return {
+          success: false,
+          message: 'Could not determine the current creative for this ad. The ad may not have a creative assigned.',
+          error: 'MISSING_CREATIVE'
+        };
+      }
+
+      const creativeData = await metaService.getAdCreative(accessToken, creativeId);
+      if (!creativeData?.object_story_spec) {
+        return {
+          success: false,
+          message: 'Could not read the current creative details. The creative may have been deleted or is in an unsupported format.',
+          error: 'MISSING_OBJECT_STORY_SPEC'
+        };
+      }
+
+      // The audit's own extractor (read/write symmetry is the correctness bar
+      // there too) — a hand-rolled subset here previously missed link_url,
+      // single-item/per-card CTA links, and asset_feed_spec website_urls,
+      // letting the retag miss an existing utm_source on those paths and
+      // duplicate it (Greptile).
+      const linkUrls: string[] = MetaService.extractCreativeDestinationUrls(creativeData);
+
+      const { urlTags, changed, unreadable } = computeRetagUrlTags(creativeData.url_tags, linkUrls);
+      if (unreadable) {
+        return {
+          success: false,
+          message: 'Could not verify this ad\'s destination is fully tagged — one of its link URLs could not be read.',
+          error: 'UNREADABLE_DESTINATION_URL',
+        };
+      }
+      if (!changed) {
+        return { success: true, alreadyTagged: true };
+      }
+
+      return await this.updateMetaAdsAd(userId, adId, { url_tags: urlTags }, account_id);
+    } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
+      console.error('AgentMode: Error retagging Meta ad UTMs:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to retag Meta ad UTMs.',
+        error: error.message
+      };
+    }
+  }
+
   public async uploadMetaAdsImage(userId: string, imageUrl: string, account_id?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
@@ -15371,6 +15450,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           throw new Error('AD DELETE requires "ad_id".');
         } else if (action === 'COPY_AD' && !ad_id) {
           throw new Error('AD COPY_AD requires "ad_id" (the source ad to copy).');
+        } else if (action === 'RETAG_UTM' && !ad_id) {
+          throw new Error('AD RETAG_UTM requires "ad_id".');
         }
         break;
 
@@ -15398,7 +15479,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   private static META_WRITE_ACTIONS: Record<string, string[]> = {
     CAMPAIGN: ['CREATE', 'UPDATE', 'DELETE'],
     AD_SET: ['CREATE', 'UPDATE', 'DELETE'],
-    AD: ['CREATE', 'UPDATE', 'DELETE', 'COPY_AD'],
+    AD: ['CREATE', 'UPDATE', 'DELETE', 'COPY_AD', 'RETAG_UTM'],
     // Account-level assets. CREATE publishes a creative; UPLOAD_USERS pushes PII
     // user data to Meta. UPLOAD_IMAGE/UPLOAD_VIDEO only stage assets (no publish),
     // and LIST is read-only — none of those need confirmation.
@@ -15530,6 +15611,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         target.target_ad_set = nameOf(adSet, targetAdSetId);
         target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
         lines.push(`Copy ad ${target.source_ad} into ad set ${target.target_ad_set}${target.campaign ? `, which belongs to campaign ${target.campaign}` : ''}.`);
+      } else if (action === 'RETAG_UTM') {
+        const ad = await resolveAd(ad_id);
+        target.ad = nameOf(ad, ad_id);
+        // Mandatory risk statement (Harsha's ENG-239 retrofit ask): retagging a
+        // Meta ad swaps in a new creative, which resets the ad's learning phase
+        // and can hurt a live client's performance. This must be part of what the
+        // user confirms, not just a code comment nobody reads before approving.
+        lines.push(`Retag ad ${target.ad} with UTMs. This creates a NEW creative and swaps the ad to it, `
+          + `which RESETS THE AD'S LEARNING PHASE and can hurt performance on a live client campaign.`);
       } else {
         const ad = await resolveAd(ad_id);
         const adSet = await resolveAdSet(ad?.adset_id);
@@ -27337,7 +27427,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!params.campaign_id) throw new Error('LIST creatives requires params.campaign_id');
           const result = await linkedInAdsService.listCreatives(accessToken, accountId, params.campaign_id);
           if (!result.success) throw new Error(result.error || 'Failed to list creatives');
-          return { success: true, creatives: result.data?.elements || [] };
+          const rawCreatives: any[] = result.data?.elements || [];
+          // ENG-239: a content.reference creative only carries a bare post URN
+          // pointer -- expand it with the referenced post's own fields
+          // (contentLandingPage etc) so a caller can see the actual destination
+          // without a manual follow-up POST/GET per creative. A failed read
+          // (e.g. deleted post) degrades to the bare creative rather than
+          // failing the whole LIST.
+          const creatives = await Promise.all(rawCreatives.map(async (creative) => {
+            const postUrn = creative?.content?.reference;
+            if (!postUrn) return creative;
+            const postResult = await linkedInAdsService.getPost(accessToken, postUrn);
+            return postResult.success ? { ...creative, referencedPost: postResult.data } : creative;
+          }));
+          return { success: true, creatives };
         }
         if (action === 'CREATE') {
           if (!params.campaign_id) throw new Error('CREATE creative requires params.campaign_id');
@@ -27364,6 +27467,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!result.success) throw new Error(result.error || 'Failed to create dynamic creative');
           return { success: true, message: 'Dynamic creative created', creative: result.data };
         }
+        if (action === 'RETAG_UTM') {
+          // ENG-239 retrofit: retags ONE existing creative, never a list.
+          // LIVE-VERIFIED 2026-07-16 for textAd creatives — see retagCreativeUtm's docstring
+          // for the $set-is-not-a-deep-merge caveat and the content.reference delegation.
+          if (!params.creative_id) throw new Error('RETAG_UTM requires creative_id');
+          if (!params.campaign_id) throw new Error('RETAG_UTM requires campaign_id');
+          const result = await linkedInAdsService.retagCreativeUtm(accessToken, accountId, params.creative_id, params.campaign_id);
+          if (!result.success) throw new Error(result.error || 'Failed to retag creative UTMs');
+          if (result.alreadyTagged) return { success: true, message: 'Creative already carries every UTM key — no change made.' };
+          return { success: true, message: 'Creative retagged with UTMs' };
+        }
         throw new Error(`Unknown action "${action}" for CREATIVE`);
       }
 
@@ -27379,6 +27493,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const postType = feedDistribution === 'MAIN_FEED' ? 'Company page post' : 'Dark post';
           const postUrl = postUrn ? `https://www.linkedin.com/feed/update/${encodeURIComponent(postUrn)}/` : undefined;
           return { success: true, message: `${postType} created. Use post_urn as reference in CREATIVE/CREATE.`, post_urn: postUrn, post_url: postUrl, post: result.data };
+        }
+        if (action === 'GET') {
+          if (!params.post_urn) throw new Error('POST GET requires params.post_urn');
+          const result = await linkedInAdsService.getPost(accessToken, params.post_urn);
+          if (!result.success) throw new Error(result.error || 'Failed to get post');
+          return { success: true, post: result.data };
         }
         throw new Error(`Unknown action "${action}" for POST`);
       }
@@ -28260,6 +28380,22 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           await googleAdsService.removeAd(userId, customer_id, args.ad_resource_name);
           return { success: true, message: 'Ad removed' };
         }
+        if (action === 'RETAG_UTM') {
+          // ENG-239 retrofit: retags ONE existing ad, never a list.
+          if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD RETAG_UTM' };
+          const result = await googleAdsService.retagAdUtm(userId, customer_id, args.ad_resource_name);
+          if (!result.success) {
+            return {
+              success: false,
+              error: result.reason === 'no_destination_url'
+                ? 'This ad has no destination URL to tag.'
+                : result.reason === 'invalid_resource_name'
+                ? 'ad_resource_name is not a valid Google Ads resource name.'
+                : 'No change was made — the ad already carries every UTM key, or the campaign-level read needed to avoid clobbering existing tracking failed.',
+            };
+          }
+          return { success: true, message: 'Ad retagged with UTMs' };
+        }
       }
 
       if (entity_type === 'CAMPAIGN_ASSET' && action === 'ATTACH') {
@@ -28308,6 +28444,23 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           finalUrl: args.final_url,
         });
         return { success: true, assetGroupResourceName: assetGroup.resourceName };
+      }
+
+      if (entity_type === 'ASSET_GROUP' && action === 'RETAG_UTM') {
+        // ENG-239 PMax retrofit: retags ONE existing asset group, never a list.
+        if (!args.asset_group_resource_name) return { success: false, error: 'asset_group_resource_name is required for ASSET_GROUP RETAG_UTM' };
+        const result = await googleAdsService.retagAssetGroupUtm(userId, customer_id, args.asset_group_resource_name);
+        if (!result.success) {
+          return {
+            success: false,
+            error: result.reason === 'no_destination_url'
+              ? 'This asset group has no destination URL to tag.'
+              : result.reason === 'invalid_resource_name'
+              ? 'asset_group_resource_name is not a valid Google Ads resource name.'
+              : 'No change was made — the destination already carries every UTM key (directly or via the campaign\'s final_url_suffix), or the URL could not be read.',
+          };
+        }
+        return { success: true, message: 'Asset group retagged with UTMs' };
       }
 
       return { success: false, error: `Unsupported entity_type=${entity_type} action=${action}` };

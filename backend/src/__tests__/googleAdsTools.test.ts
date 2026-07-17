@@ -38,6 +38,8 @@ jest.mock('../services/googleAdsService', () => ({
     uploadAsset: jest.fn().mockResolvedValue('customers/123/assets/1'),
     attachCampaignAssets: jest.fn().mockResolvedValue(undefined),
     createAssetGroup: jest.fn().mockResolvedValue({ resourceName: 'customers/123/assetGroups/1' }),
+    retagAdUtm: jest.fn().mockResolvedValue({ success: true }),
+    retagAssetGroupUtm: jest.fn().mockResolvedValue({ success: true }),
     queryReporting: jest.fn().mockResolvedValue([
       { campaign: { id: '1' }, metrics: { clicks: '100' } },
     ]),
@@ -467,6 +469,58 @@ describe('handleCallGoogleAdsApi', () => {
     });
     expect(result.success).toBe(true);
     expect(result.assetGroupResourceName).toBeDefined();
+  });
+
+  it('handles AD RETAG_UTM action', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'AD',
+      action: 'RETAG_UTM',
+      ad_resource_name: 'customers/1234567890/adGroupAds/1~1',
+    });
+    expect(result.success).toBe(true);
+    expect(googleAdsService.retagAdUtm).toHaveBeenCalledWith('user-123', '1234567890', 'customers/1234567890/adGroupAds/1~1');
+  });
+
+  it('AD RETAG_UTM requires ad_resource_name', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'AD',
+      action: 'RETAG_UTM',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('AD RETAG_UTM surfaces a no_destination_url reason distinctly', async () => {
+    (googleAdsService.retagAdUtm as jest.Mock).mockResolvedValueOnce({ success: false, reason: 'no_destination_url' });
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'AD',
+      action: 'RETAG_UTM',
+      ad_resource_name: 'customers/1234567890/adGroupAds/1~1',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('no destination URL');
+  });
+
+  it('handles ASSET_GROUP RETAG_UTM action', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'ASSET_GROUP',
+      action: 'RETAG_UTM',
+      asset_group_resource_name: 'customers/1234567890/assetGroups/1',
+    });
+    expect(result.success).toBe(true);
+    expect(googleAdsService.retagAssetGroupUtm).toHaveBeenCalledWith('user-123', '1234567890', 'customers/1234567890/assetGroups/1');
+  });
+
+  it('ASSET_GROUP RETAG_UTM requires asset_group_resource_name', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'ASSET_GROUP',
+      action: 'RETAG_UTM',
+    });
+    expect(result.success).toBe(false);
   });
 });
 

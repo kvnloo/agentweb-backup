@@ -22,13 +22,32 @@ export type LeadPriority = 'Low' | 'Medium' | 'High';
  * See backend/src/types/attribution.ts for AttributionTouch shape.
  */
 export interface LeadAttributionFields {
-  /** Captured once at first lead creation; never mutated afterward. */
+  /**
+   * Captured once at first lead creation; never mutated afterward.
+   *
+   * ⚠️ `firstTouch` IS NOT A PROXY FOR "ATTRIBUTED". Do not count it as one.
+   * The landing-page capture middleware always writes `timestamp` + `landingUrl`,
+   * and `normalizeAttribution` returns a touch for any of them — so a lead from a
+   * completely UNTAGGED ad, or from direct/organic traffic, still gets a truthy
+   * `firstTouch` with no `utm` inside it. That is correct (direct IS a channel),
+   * but it means `attribute_exists(firstTouch)` answers "did capture run?", NOT
+   * "do we know where this lead came from?".
+   *
+   * To count attributed leads, use `utmSource` (below) or `firstTouch.utm.source`.
+   * This matters right now: capture has never executed in production, so today
+   * ~0% of leads have a `firstTouch` at all. The moment it goes live that jumps to
+   * ~100% whether or not a single ad carries a UTM — and reading that as success
+   * would be wrong. (ENG-239; see eng-239-utm-attribution-handoff.md.)
+   */
   firstTouch?: AttributionTouch;
   /** Refreshed on any repeat touch with a new attribution payload. */
   lastTouch?: AttributionTouch;
   /**
    * Denormalized from firstTouch.utm.source for cheap channel-attribution
    * queries without scanning the blob. Explicit override wins.
+   *
+   * This — not `firstTouch` — is the field that means "attributed". It is set only
+   * when a real `utm_source` was captured, which is exactly why it exists.
    */
   utmSource?: string;
   /** Denormalized from firstTouch.utm.medium. */
