@@ -621,19 +621,28 @@ export interface ConnectedAccountWithUser extends ConnectedAccount {
 }
 
 /**
- * Get a specific connected account by account_id and userId
- * Directly looks up the user to find the account, avoiding full table scan
+ * Get a specific connected account by account_id and userId.
+ * Directly looks up the user to find the account, avoiding full table scan.
+ *
+ * `platform` is optional and disambiguates accounts that share the same
+ * account_id across different platforms (e.g. a Gmail and a Google Drive
+ * connection under the same Google email). Omitting it preserves the
+ * pre-existing behavior of matching on account_id alone (first match wins).
  */
 export const getAccountById = async (
   accountId: string,
-  userId: string
+  userId: string,
+  platform?: PlatformType | PlatformType[]
 ): Promise<ConnectedAccountWithUser | null> => {
   try {
     const user = await userDb.getUserById(userId);
+    const platforms = platform === undefined ? null : ([] as PlatformType[]).concat(platform);
 
     if (user) {
       const accounts = normalizeAccounts((user as User).connected_accounts);
-      const account = accounts.find(acc => acc.account_id === accountId);
+      const account = accounts.find(
+        acc => acc.account_id === accountId && (platforms === null || platforms.includes(acc.platform))
+      );
 
       if (account) {
         return {
