@@ -9609,8 +9609,11 @@ export class AgentModeService {
           const conn = await getConnectionByProfileUrlAndAccount(lead.linkedin as string, accountId).catch(() => null);
           linkedInConnectionStatus = conn
             ? {
+                // conn.connectedAt is already an epoch-millisecond timestamp
+                // (Unipile created_at), so it must NOT be multiplied by 1000 —
+                // doing so pushed the date ~56,000 years into the future (ENG-379).
                 isConnected: true,
-                connectedAt: new Date(conn.connectedAt * 1000).toISOString(),
+                connectedAt: new Date(conn.connectedAt).toISOString(),
                 connectedAtTimestamp: conn.connectedAt,
               }
             : { isConnected: false };
@@ -9741,7 +9744,7 @@ export class AgentModeService {
         emailDomain ? emailEventsDb.getEventsByEmailDomain(emailDomain).catch(() => []) : Promise.resolve([]),
       ]);
 
-      // connectedAt (UNIX seconds) keyed by normalized profile URL.
+      // connectedAt (epoch milliseconds) keyed by normalized profile URL.
       const connectedAtByUrl = new Map<string, number>();
       for (const c of connections as any[]) {
         const url = String(c?.publicProfileUrl || '').trim().toLowerCase();
@@ -9799,7 +9802,9 @@ export class AgentModeService {
           // when the most-recent engagement is an outbound touch sent after the
           // connection was accepted. A later inbound reply flips it back to
           // "needs follow-up" (awaitingReply) since we now owe the response.
-          const connectedAtMs = connectedAt * 1000;
+          // connectedAt is already epoch ms, matching last.at (getTime()); do NOT
+          // scale it — the old `* 1000` made the comparison always false (ENG-379).
+          const connectedAtMs = connectedAt;
           if (last && last.direction === 'outbound' && last.at > connectedAtMs) continue;
 
           const awaitingReply = !!last && last.direction === 'inbound';
