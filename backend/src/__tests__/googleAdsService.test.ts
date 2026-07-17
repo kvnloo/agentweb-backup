@@ -695,6 +695,19 @@ describe('getCampaignFinalUrls (ENG-335)', () => {
     const urls = await service.getCampaignFinalUrls('user-123', '1234567890', 'customers/123/campaigns/1');
     expect(urls).toEqual([]);
   });
+
+  it('rejects a crafted resource name before it reaches the GAQL query (no query issued)', async () => {
+    await expect(
+      service.getCampaignFinalUrls('user-123', '1234567890', "customers/123/campaigns/1' OR '1'='1"),
+    ).rejects.toThrow(/Invalid Google Ads campaigns resource name/);
+    await expect(
+      service.getCampaignStatus('user-123', '1234567890', 'not-a-resource-name'),
+    ).rejects.toThrow(/Invalid Google Ads campaigns resource name/);
+    await expect(
+      service.getAdGroupCampaign('user-123', '1234567890', "customers/123/adGroups/9'--"),
+    ).rejects.toThrow(/Invalid Google Ads adGroups resource name/);
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
 });
 
 describe('searchLocations', () => {
