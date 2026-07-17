@@ -139,6 +139,23 @@ describe('normalizeImageForVision', () => {
     consoleSpy.mockRestore();
   });
 
+  it('falls back to image/png when sharp cannot decode and the content-type is empty', async () => {
+    const buf = fakeBuffer(1500);
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const badInstance = {
+      metadata: jest.fn().mockRejectedValue(new Error('unsupported image format')),
+      png: jest.fn().mockReturnThis(),
+      toBuffer: jest.fn(),
+    };
+    sharp.mockReturnValue(badInstance);
+
+    const result = await normalize(buf, '');
+    // No usable label + decode failure must still yield a valid media type, not ''.
+    expect(result.buffer).toBe(buf);
+    expect(result.contentType).toBe('image/png');
+    consoleSpy.mockRestore();
+  });
+
   it('treats a missing/empty content-type as non-native and decodes via sharp', async () => {
     const buf = fakeBuffer(2048);
     const jpegInstance = {
