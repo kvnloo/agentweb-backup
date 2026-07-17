@@ -31,6 +31,50 @@ transporter; every backend email leaves through `resendService`.
 - **Default-sender task-report emails now come from `hi@updates.agentweb.pro`** (previously the Gmail
   `FROM_EMAIL`) and failures in that path propagate to callers instead of silently logging — callers
   were audited (controllers/tasks.ts, routes/slack.ts) and handle rejections.
+## /stop session-ownership check (2026-07-16, ENG-360)
+
+Closed the last open lane from the ENG-346 ownership audit: `POST /api/agent-mode/session/:sessionId/stop`
+(`stopGeneration`) did no session read at all — any authenticated user with someone else's sessionId could
+cancel their in-flight generation and flip their SSE progress to complete. Now: fetch session → 401 no user
+(defensive; route sits behind `router.use(authenticateToken)`) → 404 missing (was silent `{ success: true }`)
+→ 403 unless owner-or-admin (same predicate as updateSessionTitle / uploadImageToSession /
+updateSessionLlmModel and the ENG-346 generateResponse check; delegated tokens already resolve `req.user`
+to the target user). Public ishare lane (`stopGenerationPublic`, conversable token) untouched — it remains
+the anon stop path.
+
+### Assumptions to validate
+- No legitimate caller stops a session it doesn't own: the customer portal stops only the session it is
+  actively generating on (owner), delegated admins resolve to the target user, and anon/ishare users use the
+  public lane. If some flow stops an `anon_`-owned session through the authed endpoint pre-transfer, it now
+  gets 403 — none found in partner-portal; customer portal is a separate repo (grep found no such lane).
+- The 404-on-missing change is safe: stop is fire-and-forget in the UI; a 404 where a silent 200 used to be
+  should surface nothing user-visible (frontends don't branch on the stop response).
+## /generate session-ownership check (2026-07-16, ENG-346)
+
+Closed the pre-existing gap where `POST /api/agent-mode/generate` never compared `session.userId`
+to `req.user`: any authenticated user with someone else's sessionId could generate on that session.
+Check now sits BEFORE the ENG-147 idempotency claim + session-busy lock, so an unauthorized request
+touches no shared state (previously it would also have been able to squat the interactive idem claim
+and 409 the real owner for the ttl window).
+
+### Ownership audit of the session-parameterized agent-mode lanes (2026-07-16 snapshot)
+- Already checked: `getSession`, `verifiedGenerate` (strict), `uploadImageToSession`,
+  `updateSessionLlmModel`, `updateSessionTitle` (owner-or-admin), `getProgress` (owner or
+  delegated-admin-own-session). `transferSession` only mutates `anon_`-owned sessions.
+- `generateResponse` was the only GENERATE lane missing it — fixed here with the getSession
+  predicate (owner or admin; delegated tokens already resolve `req.user` to the target user).
+- **Still open**: `stopGeneration` (`POST /session/:sessionId/stop`) does no session read at all —
+  any authenticated user can cancel another user's in-flight run. Different verb + different
+  blast radius (adds a DB read to a fire-and-forget lane), filed separately as ENG-360.
+
+### Assumptions to validate
+- Raw (non-delegated) admins keep generate access for parity with every other session endpoint.
+  If the product stance becomes "admins must delegate to act on a user's session", tighten to the
+  `verifiedGenerate` strict predicate — one-line change, tests pin both lanes.
+- Error-precedence delta accepted: missing session is now 404 before the token-usage 429 read
+  (previously claim → lock → 429 → 404). No client observed depending on 429-before-404.
+- An authenticated user generating on an `anon_` session pre-transfer would now 403 — but
+  `getSession` already 403s that same read today, so no working client flow can hit it.
 
 ## ENG-358: v0-credit alert dedupe at the intake gate — class clustering + Duplicate-state leak (2026-07-16)
 
