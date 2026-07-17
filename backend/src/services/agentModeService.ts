@@ -9594,7 +9594,16 @@ export class AgentModeService {
         connectedAtTimestamp?: number;
       } | null = null;
       if (lead.linkedin) {
-        const accountId: string | null = (list as any).linkedInAccountId ?? null;
+        // Prefer the account explicitly assigned to the list; fall back to the
+        // user's own connected LinkedIn (Unipile) account. Most lists never get an
+        // account assigned (list.linkedInAccountId is null), so without this
+        // fallback every lead reports "not connected" even when the user is a
+        // genuine 1st-degree connection — the misinformation reported in ENG-376.
+        let accountId: string | null = (list as any).linkedInAccountId ?? null;
+        if (!accountId) {
+          const { linkedInOutreachService } = await import('./linkedInOutreachService');
+          accountId = await linkedInOutreachService.resolveUserOwnedAccountId(userId).catch(() => null);
+        }
         if (accountId) {
           const { getConnectionByProfileUrlAndAccount } = await import('./unipileConnectionsDb');
           const conn = await getConnectionByProfileUrlAndAccount(lead.linkedin as string, accountId).catch(() => null);
