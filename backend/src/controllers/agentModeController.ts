@@ -839,6 +839,72 @@ export function scheduledRunSignalsIncompleteResponse(response: {
   return classifyScheduledContinuation(response) !== null;
 }
 
+// LLM-judge fallback for the confirmation-halt case (ENG-369). The regex detector
+// (scheduledRunAwaitsConfirmation) is a cheap fast-path, but live claude-opus-4-8
+// runs proved it cannot keep up: the model invents a NEW phrasing of "stop and
+// ask the human" on nearly every run (numbered menus, "how do you want to
+// proceed?", "Reply 'all users' or name an account", …). A pattern list will
+// always trail the model. So when the regex says "no", we ask a cheap, fast model
+// the phrasing-independent question: did this turn defer the task to the user
+// instead of delivering? This runs at most once per scheduled turn (only when the
+// turn otherwise passes its requirements) and fails SAFE — any error/timeout falls
+// back to the regex verdict, so the judge can only ADD detections, never remove.
+const CONFIRMATION_JUDGE_MODEL = 'gemini-3.1-flash-lite';
+const CONFIRMATION_JUDGE_TIMEOUT_MS = 8000;
+const CONFIRMATION_JUDGE_SYSTEM = `You classify one message from an AUTOMATED, unattended run where NO human is available to reply.
+
+Decide whether the assistant's message DEFERS finishing the task — i.e. it stops short of delivering the result and instead asks the human to confirm, approve, choose, decide, or reply BEFORE it will produce the deliverable.
+
+Answer "yes" when the message, instead of delivering, does any of:
+- asks the user to confirm/approve or to choose before it proceeds
+- offers a numbered/lettered/quoted menu of options and tells the user to reply or pick one
+- ends by asking how to proceed, which scope/approach/account to use, or "do you want…"
+- says it is waiting for the user's input/decision before generating the result
+
+Answer "no" when the message actually DELIVERS the result (a report, analysis, or the actions it took) — even if it also notes limitations, assumptions, or optional follow-up "next steps" that do not block completion.
+
+Reply with ONLY one word: yes or no.`;
+
+export async function scheduledTurnDefersToUser(content: string): Promise<boolean> {
+  if (!content || typeof content !== 'string') return false;
+  // Fast path: the regex catches the common forms with zero LLM cost/latency.
+  if (scheduledRunAwaitsConfirmation(content)) return true;
+  try {
+    const llmPromise = agentModeService.callLLM(
+      CONFIRMATION_JUDGE_MODEL,
+      [
+        { role: 'system', content: CONFIRMATION_JUDGE_SYSTEM },
+        // The closing of the message is where a halt lives; cap input for cost.
+        { role: 'user', content: content.slice(-2500) },
+      ],
+      { temperature: 0, max_completion_tokens: 3 }
+    );
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('confirmation judge timed out')), CONFIRMATION_JUDGE_TIMEOUT_MS)
+    );
+    const res: any = await Promise.race([llmPromise, timeoutPromise]);
+    const raw = (res?.choices?.[0]?.message?.content ?? '').trim().toLowerCase();
+    return raw.startsWith('yes');
+  } catch {
+    return false; // fail-safe: never force a continuation on judge failure
+  }
+}
+
+// Async classifier used at the completion-gate decision points. Identical to the
+// sync classifier except the 'confirmation' case also consults the LLM judge when
+// the regex misses — so an unanticipated halt phrasing still triggers the
+// best-effort continuation instead of dead-ending.
+export async function classifyScheduledContinuationAsync(response: {
+  content?: string;
+  truncatedByStepBudget?: boolean;
+}): Promise<ScheduledContinuationReason | null> {
+  if (response?.truncatedByStepBudget === true) return 'budget';
+  const content = response?.content || '';
+  if (await scheduledTurnDefersToUser(content)) return 'confirmation';
+  if (scheduledRunSignalsIncompleteWork(content)) return 'unfinished';
+  return null;
+}
+
 // Common function to run verified chat with work plan, keywords, and function call verification
 // Used by both scheduled chat and verified-generate
 export async function runVerifiedChat(
@@ -1053,7 +1119,7 @@ export async function runVerifiedChat(
           ...continuationToolCalls.map((call: any) => call.name).filter(Boolean)
         );
         // Re-evaluate the gate against the continuation's own output.
-        const continuationReason = classifyScheduledContinuation(continuationResponse);
+        const continuationReason = await classifyScheduledContinuationAsync(continuationResponse);
         if (
           completionGateContinuationsUsed < completionGateMaxContinuations &&
           attempt < maxAttempts &&
@@ -1201,14 +1267,18 @@ export async function runVerifiedChat(
       // requirements are met but the latest turn admits it left work unfinished,
       // spend one more continuation turn instead of returning success — unless we
       // still have attempts left AND haven't exhausted the continuation budget.
-      const responseContinuationReason = classifyScheduledContinuation(response);
-      if (
+      // Only consult the classifier (which may make one cheap LLM-judge call) when
+      // the gate is actually eligible to fire — avoids any judge cost on the
+      // common path where completionGate is off or requirements are unmet.
+      const gateEligible =
         allRequirementsMet &&
         completionGate &&
         completionGateContinuationsUsed < completionGateMaxContinuations &&
-        attempt < maxAttempts &&
-        responseContinuationReason !== null
-      ) {
+        attempt < maxAttempts;
+      const responseContinuationReason = gateEligible
+        ? await classifyScheduledContinuationAsync(response)
+        : null;
+      if (gateEligible && responseContinuationReason !== null) {
         completionGateContinuationsUsed++;
         console.log(
           `AgentMode runVerifiedChat: completion gate triggered (continuation ${completionGateContinuationsUsed}/${completionGateMaxContinuations}, reason=${responseContinuationReason}) for session ${sessionId}`
