@@ -180,6 +180,33 @@ describe('countUnsharedOrgAccountsByPlatform (ENG-368)', () => {
     expect(await countUnsharedOrgAccountsByPlatform('user-a', 'google_ads')).toBe(1);
   });
 
+  it('counts a teammate with multiple unshared accounts as ONE teammate', async () => {
+    mockUsers['user-a'] = { userId: 'user-a', orgId: ORG_ID, connected_accounts: [] };
+    mockOrgMembers = [
+      { userId: 'user-a', connected_accounts: [] },
+      {
+        userId: 'user-b',
+        connected_accounts: [
+          makeAccount('9030368888', 'google_ads', false),
+          makeAccount('9030369999', 'google_ads', false),
+        ],
+      },
+    ];
+
+    expect(await countUnsharedOrgAccountsByPlatform('user-a', 'google_ads')).toBe(1);
+  });
+
+  it('counts distinct teammates each with an unshared account', async () => {
+    mockUsers['user-a'] = { userId: 'user-a', orgId: ORG_ID, connected_accounts: [] };
+    mockOrgMembers = [
+      { userId: 'user-a', connected_accounts: [] },
+      { userId: 'user-b', connected_accounts: [makeAccount('9030368888', 'google_ads', false)] },
+      { userId: 'user-c', connected_accounts: [makeAccount('9030369999', 'google_ads', false)] },
+    ];
+
+    expect(await countUnsharedOrgAccountsByPlatform('user-a', 'google_ads')).toBe(2);
+  });
+
   it('does NOT count teammate accounts that are already shared with the org', async () => {
     mockUsers['user-a'] = { userId: 'user-a', orgId: ORG_ID, connected_accounts: [] };
     mockOrgMembers = [
