@@ -2680,6 +2680,76 @@ export default function Page() {
     ];
     expect(() => validateV0Output(files)).not.toThrow();
   });
+
+  // ENG-374: v0 occasionally hallucinates a bare import of an internal Next.js concept as if
+  // it were an installable package — e.g. `import RootLayout from "layout"` — which is not a
+  // real npm package, not relative, not the @/ alias, and fails the build with "Module not
+  // found". Caught here (denylist of words that are never real bare package names, never a
+  // scope on npm) rather than trying to validate against the universe of legitimate
+  // dependencies, which would need constant upkeep and risks false-positiving on real ones.
+  describe("bad-import check (ENG-374)", () => {
+    it("FAIL: throws on a bare import of a never-a-real-package word", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `"use client"\n\nimport RootLayout from "layout"\n\nexport default function SyntheticV0PageForDeployment() {\n  return <RootLayout />\n}\n`
+        ),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(files)).toThrow(/bare import.*"layout"/i);
+    });
+
+    it("FAIL: catches it even when a separate, earlier .tsx file is otherwise valid", () => {
+      const files = [
+        makeFile("app/layout.tsx", VALID_TSX),
+        makeFile(
+          "app/page.tsx",
+          `import RootLayout from "layout"\nexport default function Page() { return <RootLayout />; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+    });
+
+    it("passes a legitimate relative import of a file literally named layout", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import Layout from "./layout"\nexport default function Page() { return <Layout />; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("passes a legitimate @/ alias import", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import { cn } from "@/lib/utils"\nexport default function Page() { return <div className={cn("a")} />; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("passes real npm package imports (react, next, clsx, etc.)", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import React from "react"\nimport Link from "next/link"\nimport clsx from "clsx"\nexport default function Page() { return <Link href="/">{clsx("a")}</Link>; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("passes a named import of a real package sharing no denylisted word", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          VALID_TSX + `\nimport { Something } from "some-real-package";`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+  });
 });
 
 describe("V0OutputValidationError", () => {
