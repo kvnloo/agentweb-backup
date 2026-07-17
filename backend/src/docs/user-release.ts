@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-30
+// Last updated: 2026-07-17
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,16 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-07-17',
+    changes: [
+      'New: Send Campaigns and Sequences From a Connected Outlook / Microsoft 365 Mailbox',
+      '- Previously, a connected Outlook mailbox could only be used to send from Emma chat — campaigns and sequences always sent through your custom-domain sender instead',
+      '- Now, selecting a connected Outlook (or Gmail) mailbox as your sender works the same way for campaigns, sequence steps, and single-lead sends: the email leaves from your own mailbox, and a copy lands in your Sent folder',
+      '- Mailbox senders don\'t report opens or clicks (no tracking pixel), so a campaign sent this way is capped at 50 recipients — larger sends still need a custom-domain sender',
+      '- Bounced or rejected messages from a connected Outlook mailbox are now automatically detected and the lead is marked do-not-contact, the same protection your custom-domain senders already had via Resend',
+    ],
+  },
   {
     date: '2026-07-13',
     changes: [
