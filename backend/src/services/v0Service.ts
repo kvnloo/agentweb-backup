@@ -4261,22 +4261,34 @@ async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promis
 /**
  * Delete a landing page. All pages are deletable (including the root).
  * Pages are soft-deleted (archived) and their route file is removed from GitHub.
+ *
+ * NOTE: not currently called anywhere — the DELETE route uses the sibling
+ * `deleteLandingPageByRecord` instead (see that function's own docstring). Kept in sync with
+ * it (including the `githubCleanupWarning` signal) so it isn't a silent trap if ever wired up.
  */
 export async function deleteLandingPage(
   id: string,
   userId: string
-): Promise<void> {
+): Promise<{ githubCleanupWarning?: string }> {
   const record = await getLandingPage(id, userId);
   if (!record) {
     throw new Error("Landing page not found");
   }
 
   // Remove route file from GitHub
+  let githubCleanupWarning: string | undefined;
   if (record.githubRepoUrl && record.slug) {
     try {
-      await removePageFromGitHub(record.githubRepoUrl, record.slug);
+      const removed = await removePageFromGitHub(record.githubRepoUrl, record.slug);
+      if (!removed) {
+        githubCleanupWarning =
+          "No GitHub files were found matching this page's route — the repo may already be " +
+          "clean, or cleanup could not locate them.";
+      }
     } catch (err: any) {
       console.error("[V0 SERVICE] Failed to remove route from GitHub:", err.message);
+      githubCleanupWarning =
+        "GitHub cleanup failed; this page's files may still exist in the repo.";
       // Continue with soft-delete even if GitHub cleanup fails
     }
   }
@@ -4307,6 +4319,8 @@ export async function deleteLandingPage(
     // would then pay for a fresh chat on its next build. (ENG-287 residual)
     slug: record.slug,
   });
+
+  return { githubCleanupWarning };
 }
 
 export async function updateLandingPageGtm(

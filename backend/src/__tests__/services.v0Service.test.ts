@@ -2487,7 +2487,7 @@ describe("v0Service - deleteLandingPage", () => {
 
     await expect(
       deleteLandingPage("page-1", "user-1")
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ githubCleanupWarning: undefined });
     // deleteLandingPage now does a soft-delete (archive) via update, not a hard delete
     expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
@@ -2509,7 +2509,7 @@ describe("v0Service - deleteLandingPage", () => {
 
     await expect(
       deleteLandingPage("root-fail", "user-1")
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ githubCleanupWarning: undefined });
     expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 
@@ -2530,7 +2530,7 @@ describe("v0Service - deleteLandingPage", () => {
 
     await expect(
       deleteLandingPage("root-fail-deployed", "user-1")
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ githubCleanupWarning: undefined });
     expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 
@@ -2551,7 +2551,7 @@ describe("v0Service - deleteLandingPage", () => {
 
     await expect(
       deleteLandingPage("root-deployed", "user-1")
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ githubCleanupWarning: undefined });
     expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 });
