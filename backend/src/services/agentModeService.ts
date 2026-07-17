@@ -4358,6 +4358,18 @@ export class AgentModeService {
     // other_skills, producing the transient "read_file_content
     // unavailable/failed" failure (ENG-152).
     'read_file_content',
+    // Meeting Intelligence (Fathom). Force-merged because the prod
+    // `foundation_tools` AW-Settings override predates these tools and omits
+    // them — without force-merging, loadFoundationTools strips them in prod so
+    // `fathom_get_onboarding_context` (and the other Fathom tools) are "not
+    // available", tanking goalCompletion on any Fathom onboarding/meeting
+    // request (ENG-280). They stay reachable even when a connected Fathom
+    // account is missing, so the tool itself returns the "connect Fathom in
+    // Settings → Connected Accounts" guidance instead of a generic
+    // tool-not-available error.
+    'fathom_get_meetings',
+    'fathom_get_transcript',
+    'fathom_get_onboarding_context',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
