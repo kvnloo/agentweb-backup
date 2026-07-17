@@ -2844,6 +2844,28 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Session ID and user message are required' });
       }
 
+      // Session ownership (ENG-346). Deliberately BEFORE the idempotency claim
+      // and the session-busy lock: an unauthorized requester must not be able
+      // to create/hold an idem claim or trip the busy lock for someone else's
+      // session (a squatted claim would 409 the real owner for its ttl window).
+      // Owner-or-admin predicate, matching the other session-mutating
+      // endpoints (uploadImageToSession, updateSessionTitle,
+      // updateSessionLlmModel). Delegated tokens already resolve req.user to
+      // the TARGET user (middleware/auth.ts), so plain equality is
+      // delegation-safe.
+      // DELIBERATE: non-owner gets a distinct 403 (vs 404 for missing). This
+      // discloses that the sessionId exists, unlike the collapsed-404 style in
+      // getProgress/verify-session blocks. Accepted: sessionIds are
+      // non-enumerable UUIDs, the 403 matches the sibling endpoints above, and
+      // the ENG-346 acceptance contract pins 403 for the non-owner lane.
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+      if (session.userId !== user.userId && !user.isAdmin) {
+        return res.status(403).json({ error: 'Unauthorized access to session' });
+      }
+
       // Cross-restart duplicate-submit lock (ENG-147: one question spawned ~30
       // sessions). Claimed BEFORE the in-process Set: two layers, ONE concept —
       // the conditional idem#sha256(sessionId+userMessage+llmModel) put dedupes
@@ -2892,11 +2914,7 @@ export const agentModeController = {
         });
       }
 
-      // Get session
-      const session = await chatbotDb.getChatSession(sessionId);
-      if (!session) {
-        return res.status(404).json({ error: 'Session not found' });
-      }
+      // (Session was fetched + ownership-checked above, before the locks.)
 
       // Clear old progress store (but keep active connections)
       // Don't call cleanupProgress here as it removes active SSE connections
@@ -4036,9 +4054,34 @@ export const agentModeController = {
   },
 
   // Stop generation for a session
-  async stopGeneration(req: Request, res: Response) {
+  async stopGeneration(req: AuthenticatedRequest, res: Response) {
     try {
       const { sessionId } = req.params;
+      const user = req.user as User;
+
+      if (!user) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      // Session ownership (ENG-360). Previously this lane did no session read
+      // at all, so any authenticated user who learned another user's sessionId
+      // could cancel that user's in-flight generation and flip their SSE
+      // progress to complete. Same owner-or-admin predicate as the sibling
+      // session-mutating endpoints (updateSessionTitle, uploadImageToSession,
+      // updateSessionLlmModel) and the ENG-346 generateResponse check.
+      // Delegated tokens already resolve req.user to the TARGET user
+      // (middleware/auth.ts), so plain equality is delegation-safe. The public
+      // ishare lane (stopGenerationPublic, conversable token) remains the
+      // separate anon path.
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        // Was a silent { success: true } — a stop on a nonexistent session now
+        // fails loudly instead (ENG-360 AC-3).
+        return res.status(404).json({ error: 'Session not found' });
+      }
+      if (session.userId !== user.userId && !user.isAdmin) {
+        return res.status(403).json({ error: 'Unauthorized access to session' });
+      }
 
       // Signal cancellation
       requestCancel(sessionId);
