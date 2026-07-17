@@ -21,7 +21,7 @@ jest.mock('../services/db', () => ({
   },
 }));
 
-import { getAccountsByUserIdIncludingOrgShared } from '../services/connectedAccountsDb';
+import { getAccountsByUserIdIncludingOrgShared, countUnsharedOrgAccountsByPlatform } from '../services/connectedAccountsDb';
 
 const ORG_ID = 'org-test-123';
 
@@ -154,5 +154,53 @@ describe('getAccountsByUserIdIncludingOrgShared', () => {
     const result = await getAccountsByUserIdIncludingOrgShared('user-a');
     expect(result).toHaveLength(1);
     expect(result[0].account_id).toBe('acc-own');
+  });
+});
+
+describe('countUnsharedOrgAccountsByPlatform (ENG-368)', () => {
+  it('returns 0 when the user does not exist', async () => {
+    expect(await countUnsharedOrgAccountsByPlatform('unknown-user', 'google_ads')).toBe(0);
+  });
+
+  it('returns 0 when the user has no orgId', async () => {
+    mockUsers['user-solo'] = {
+      userId: 'user-solo',
+      connected_accounts: [],
+    };
+    expect(await countUnsharedOrgAccountsByPlatform('user-solo', 'google_ads')).toBe(0);
+  });
+
+  it('counts a private google_ads account owned by an org teammate', async () => {
+    mockUsers['user-a'] = { userId: 'user-a', orgId: ORG_ID, connected_accounts: [] };
+    mockOrgMembers = [
+      { userId: 'user-a', connected_accounts: [] },
+      { userId: 'user-b', connected_accounts: [makeAccount('9030368888', 'google_ads', false)] },
+    ];
+
+    expect(await countUnsharedOrgAccountsByPlatform('user-a', 'google_ads')).toBe(1);
+  });
+
+  it('does NOT count teammate accounts that are already shared with the org', async () => {
+    mockUsers['user-a'] = { userId: 'user-a', orgId: ORG_ID, connected_accounts: [] };
+    mockOrgMembers = [
+      { userId: 'user-a', connected_accounts: [] },
+      { userId: 'user-b', connected_accounts: [makeAccount('9030368888', 'google_ads', true)] },
+    ];
+
+    expect(await countUnsharedOrgAccountsByPlatform('user-a', 'google_ads')).toBe(0);
+  });
+
+  it('does NOT count the caller\'s own private accounts, and ignores other platforms', async () => {
+    mockUsers['user-a'] = {
+      userId: 'user-a',
+      orgId: ORG_ID,
+      connected_accounts: [makeAccount('own-ga', 'google_ads', false)],
+    };
+    mockOrgMembers = [
+      { userId: 'user-a', connected_accounts: [makeAccount('own-ga', 'google_ads', false)] },
+      { userId: 'user-b', connected_accounts: [makeAccount('lk-private', 'linkedin', false)] },
+    ];
+
+    expect(await countUnsharedOrgAccountsByPlatform('user-a', 'google_ads')).toBe(0);
   });
 });
