@@ -88,7 +88,9 @@ describe('AgentModeService.getLeadDetails – linkedInConnectionStatus', () => {
       firstName:        'Jerry',
       lastName:         'Shan',
       headline:         'CEO',
-      connectedAt:      1746057600, // 2025-04-01T00:00:00.000Z
+      // Epoch MILLISECONDS (Unipile created_at), as stored in AW-UnipileConnections.
+      // The old code multiplied this by 1000, pushing the date ~56,000 years out (ENG-379).
+      connectedAt:      1746057600000, // 2025-05-01T00:00:00.000Z
       syncedAt:         '2026-04-01T01:00:00.000Z',
     });
 
@@ -98,9 +100,11 @@ describe('AgentModeService.getLeadDetails – linkedInConnectionStatus', () => {
     expect(result.lead.linkedInConnectionStatus).toBeDefined();
     expect(result.lead.linkedInConnectionStatus.isConnected).toBe(true);
     expect(result.lead.linkedInConnectionStatus.connectedAt).toBe(
-      new Date(1746057600 * 1000).toISOString()
+      new Date(1746057600000).toISOString()
     );
-    expect(result.lead.linkedInConnectionStatus.connectedAtTimestamp).toBe(1746057600);
+    // Sanity: the year must be sane, not ~58000 (regression guard for ENG-379).
+    expect(new Date(result.lead.linkedInConnectionStatus.connectedAt).getUTCFullYear()).toBe(2025);
+    expect(result.lead.linkedInConnectionStatus.connectedAtTimestamp).toBe(1746057600000);
     expect(mockGetConnection).toHaveBeenCalledWith(baseLead.linkedin, linkedInAccountId);
   });
 
@@ -160,7 +164,7 @@ describe('AgentModeService.getLeadDetails – linkedInConnectionStatus', () => {
       firstName:        'Jerry',
       lastName:         'Shan',
       headline:         'CEO',
-      connectedAt:      1746057600,
+      connectedAt:      1746057600000, // epoch ms — 2025-05-01T00:00:00.000Z
       syncedAt:         '2026-04-01T01:00:00.000Z',
     });
 
@@ -168,6 +172,9 @@ describe('AgentModeService.getLeadDetails – linkedInConnectionStatus', () => {
 
     expect(result.success).toBe(true);
     expect(result.lead.linkedInConnectionStatus.isConnected).toBe(true);
+    expect(result.lead.linkedInConnectionStatus.connectedAt).toBe(
+      new Date(1746057600000).toISOString()
+    );
     expect(mockResolveUserOwnedAccountId).toHaveBeenCalledWith(userId);
     expect(mockGetConnection).toHaveBeenCalledWith(baseLead.linkedin, fallbackAccountId);
   });
