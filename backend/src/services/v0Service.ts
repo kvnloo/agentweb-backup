@@ -2653,6 +2653,13 @@ export class V0OutputValidationError extends Error {
   }
 }
 
+// ENG-374: bare-import denylist and the patterns that extract an import/export specifier
+// from source text. Module-scoped (not rebuilt per validateV0Output call) — see that
+// function's check 6 for the detection logic and why a denylist was chosen over an allowlist.
+const NEVER_REAL_BARE_IMPORT_SPECIFIERS = new Set(["layout", "page", "app", "components", "styles"]);
+const STATIC_IMPORT_EXPORT_PATTERN = /\b(?:import|export)\s+(?:[\w*{}\s,]+from\s+)?["']([^"']+)["']/g;
+const DYNAMIC_IMPORT_PATTERN = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g;
+
 /**
  * Validate that unzipped v0 output contains actual React/Next.js code.
  * Rejects: empty output, markdown/prompts echoed back, files too small to be real code.
@@ -2722,11 +2729,10 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
   //
   // Covers every import/export form v0 could hallucinate the bad specifier into, not just the
   // `import X from "..."` shape actually observed: side-effect-only imports, dynamic
-  // `import("...")`, and `export ... from "..."` re-exports.
-  const NEVER_REAL_BARE_IMPORT_SPECIFIERS = new Set(["layout", "page", "app", "components", "styles"]);
-  const staticImportExportPattern = /\b(?:import|export)\s+(?:[\w*{}\s,]+from\s+)?["']([^"']+)["']/g;
-  const dynamicImportPattern = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g;
-
+  // `import("...")`, and `export ... from "..."` re-exports. Denylist and patterns are
+  // module-scoped constants (above) — matchAll does not mutate a regex's lastIndex, so the
+  // shared, hoisted regex objects are safe to reuse across calls.
+  //
   // Collected across ALL files before throwing, so a single correction message to v0 can name
   // every offending import at once — reporting only the first found risks the retry fixing
   // just that one and re-failing on the next, burning the limited retry budget.
@@ -2734,8 +2740,8 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
   for (const file of reactFiles) {
     const content = file.content.toString("utf-8");
     const specifiers = new Set<string>();
-    for (const match of content.matchAll(staticImportExportPattern)) specifiers.add(match[1]);
-    for (const match of content.matchAll(dynamicImportPattern)) specifiers.add(match[1]);
+    for (const match of content.matchAll(STATIC_IMPORT_EXPORT_PATTERN)) specifiers.add(match[1]);
+    for (const match of content.matchAll(DYNAMIC_IMPORT_PATTERN)) specifiers.add(match[1]);
     for (const specifier of specifiers) {
       // Relative (./, ../) and the project's own @/ alias are legitimate regardless of
       // wording — only a BARE specifier (looks like a package name) is suspect here.
