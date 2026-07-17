@@ -2487,7 +2487,7 @@ describe("v0Service - deleteLandingPage", () => {
 
     await expect(
       deleteLandingPage("page-1", "user-1")
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ githubCleanupWarning: undefined });
     // deleteLandingPage now does a soft-delete (archive) via update, not a hard delete
     expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
@@ -2509,7 +2509,7 @@ describe("v0Service - deleteLandingPage", () => {
 
     await expect(
       deleteLandingPage("root-fail", "user-1")
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ githubCleanupWarning: undefined });
     expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 
@@ -2530,7 +2530,7 @@ describe("v0Service - deleteLandingPage", () => {
 
     await expect(
       deleteLandingPage("root-fail-deployed", "user-1")
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ githubCleanupWarning: undefined });
     expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 
@@ -2551,7 +2551,7 @@ describe("v0Service - deleteLandingPage", () => {
 
     await expect(
       deleteLandingPage("root-deployed", "user-1")
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ githubCleanupWarning: undefined });
     expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 });
@@ -3030,7 +3030,7 @@ describe("v0Service - deleteLandingPageByRecord removes the whole page directory
   };
 
   it("deletes _components too, not just page.tsx (an orphan component bricks the site build)", async () => {
-    await deleteLandingPageByRecord({
+    const result = await deleteLandingPageByRecord({
       id: "p1",
       userId: "u1",
       slug: "pricing",
@@ -3043,6 +3043,8 @@ describe("v0Service - deleteLandingPageByRecord removes the whole page directory
       "app/pricing/_components/landing/nav.tsx",
       "app/pricing/page.tsx",
     ]);
+    // The normal, working case — files really were found and removed — carries no warning.
+    expect(result.githubCleanupWarning).toBeUndefined();
   });
 
   it("does not touch any OTHER page in the shared repo", async () => {
@@ -3061,7 +3063,7 @@ describe("v0Service - deleteLandingPageByRecord removes the whole page directory
   });
 
   it("commits nothing when the page directory is not in the repo", async () => {
-    await deleteLandingPageByRecord({
+    const result = await deleteLandingPageByRecord({
       id: "p1",
       userId: "u1",
       slug: "never-committed",
@@ -3072,6 +3074,22 @@ describe("v0Service - deleteLandingPageByRecord removes the whole page directory
 
     // Nothing to remove — do not push an empty commit and trigger a pointless rebuild.
     expect(deletedPaths()).toBeNull();
+  });
+
+  // ENG-375: a zero-match cleanup (e.g. record.slug diverging from the route actually
+  // committed) used to be a silent console.log with no other signal anywhere. It's now
+  // surfaced as a warning the DELETE route can return to the caller.
+  it("surfaces a warning when nothing matched the page's stored slug", async () => {
+    const result = await deleteLandingPageByRecord({
+      id: "p1",
+      userId: "u1",
+      slug: "never-committed",
+      name: "Ghost",
+      status: "failed",
+      githubRepoUrl: "https://github.com/o/r",
+    } as any);
+
+    expect(result.githubCleanupWarning).toMatch(/No GitHub files were found/);
   });
 
   it("a GitHub failure does not block the record delete (the page must still disappear)", async () => {
@@ -3087,6 +3105,21 @@ describe("v0Service - deleteLandingPageByRecord removes the whole page directory
         githubRepoUrl: "https://github.com/o/r",
       } as any),
     ).resolves.not.toThrow();
+  });
+
+  it("surfaces a warning (not a throw) when GitHub cleanup fails outright", async () => {
+    mockAxiosGet.mockRejectedValue(new Error("GitHub 500"));
+
+    const result = await deleteLandingPageByRecord({
+      id: "p1",
+      userId: "u1",
+      slug: "pricing",
+      name: "Pricing",
+      status: "deployed",
+      githubRepoUrl: "https://github.com/o/r",
+    } as any);
+
+    expect(result.githubCleanupWarning).toMatch(/GitHub cleanup failed/);
   });
 });
 
