@@ -521,11 +521,10 @@ CRITICAL QUALITY RULES (MUST FOLLOW):
    ✅ Either use real information from the research or omit the placeholder entirely.
    ✅ For bylines, use "Staff Writer" or omit - do NOT leave brackets.
 
-2. CLEAN UP ACADEMIC MARKERS, BUT PRESERVE INLINE SOURCE ATTRIBUTIONS FOR FIGURES
-   ❌ Remove bare academic markers: numbered footnotes like [1]/[12], trailing bibliography/"References" sections, orphaned "[Source]" placeholders
-   ✅ KEEP inline source attributions that sit next to a quoted number, statistic, or data point — e.g. a parenthetical like "(Gartner, 2025)" or a linked source right after the figure it backs. Do NOT strip these; they let readers trace each figure to its origin.
-   ✅ Preserve the inline-citation style of the research (source adjacent to the claim), matching Claude/Gemini outputs
-   ❌ Do NOT relocate these inline citations into a separate references section at the end
+2. REMOVE ALL CITATIONS AND REFERENCES
+   ❌ Remove: [1], [Source], (Author, Year), footnotes, reference links, bibliography sections
+   ✅ Keep the facts but remove the citation markers entirely
+   ✅ Write clean prose without academic-style references
 
 3. USE ONLY FACTS FROM THE RESEARCH (NO HALLUCINATION)
    ❌ NEVER invent company names, statistics, or examples not in the research

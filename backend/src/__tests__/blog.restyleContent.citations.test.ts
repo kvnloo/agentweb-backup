@@ -1,8 +1,9 @@
-// ENG-351: the deep-research → blog path pipes performDeepResearch output (which now
-// carries inline source citations next to quoted figures) through restyleContent. The
-// restyle prompt must NOT strip those inline attributions — it should only clean up bare
-// academic markers (numbered footnotes, trailing bibliographies) while keeping the source
-// sitting next to each figure, matching the Claude/Gemini inline-citation style.
+// ENG-351: inline source citations are required in RESEARCH/MEASUREMENT outputs (the
+// deep research report itself, analytics summaries, competitive research). A published
+// blog article is a different, polished deliverable — the deep-research → blog restyle
+// intentionally strips citation markers so the article reads as clean editorial prose.
+// The research report piped in still carries its inline citations; only the blog output
+// is citation-free. These tests lock in that the restyle prompt strips citations.
 
 jest.mock('../utils/secretsManager', () => ({
   getSecret: jest.fn().mockResolvedValue('test-api-key'),
@@ -19,7 +20,7 @@ jest.mock('../config', () => ({
 import { restyleContent } from '../controllers/blog';
 import { getGeminiClient } from '../utils/llmClients';
 
-describe('restyleContent — inline citation preservation (ENG-351)', () => {
+describe('restyleContent — blog articles are citation-free (ENG-351 scope decision)', () => {
   let generateContentMock: jest.Mock;
 
   beforeEach(() => {
@@ -39,27 +40,26 @@ describe('restyleContent — inline citation preservation (ENG-351)', () => {
 
   const getPrompt = (): string => generateContentMock.mock.calls[0][0].contents as string;
 
-  it('instructs the model to preserve inline source attributions next to figures', async () => {
+  it('instructs the model to remove all citations and references from the blog', async () => {
     await restyleContent('The market grew to $5B (Gartner, 2025).', 'AI market');
 
     const prompt = getPrompt();
-    expect(prompt).toMatch(/KEEP inline source attributions/i);
-    expect(prompt).toMatch(/Claude\/Gemini/i);
+    expect(prompt).toMatch(/REMOVE ALL CITATIONS AND REFERENCES/);
+    expect(prompt).toMatch(/remove the citation markers entirely/i);
   });
 
-  it('does not tell the model to remove ALL citations and references', async () => {
+  it('does not instruct the model to preserve inline attributions in the blog', async () => {
     await restyleContent('Revenue rose 12% (Statista).', 'revenue');
 
     const prompt = getPrompt();
-    expect(prompt).not.toMatch(/REMOVE ALL CITATIONS AND REFERENCES/);
-    expect(prompt).not.toMatch(/remove the citation markers entirely/i);
+    expect(prompt).not.toMatch(/KEEP inline source attributions/i);
   });
 
-  it('still strips bare academic markers and bibliography sections', async () => {
+  it('names parenthetical author-year citations among the markers to strip', async () => {
     await restyleContent('A fact [1] with a references section.', 'topic');
 
     const prompt = getPrompt();
+    expect(prompt).toMatch(/\(Author, Year\)/);
     expect(prompt).toMatch(/bibliography/i);
-    expect(prompt).toMatch(/\[1\]/);
   });
 });
