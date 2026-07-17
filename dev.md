@@ -1,3 +1,21 @@
+## /stop session-ownership check (2026-07-16, ENG-360)
+
+Closed the last open lane from the ENG-346 ownership audit: `POST /api/agent-mode/session/:sessionId/stop`
+(`stopGeneration`) did no session read at all — any authenticated user with someone else's sessionId could
+cancel their in-flight generation and flip their SSE progress to complete. Now: fetch session → 401 no user
+(defensive; route sits behind `router.use(authenticateToken)`) → 404 missing (was silent `{ success: true }`)
+→ 403 unless owner-or-admin (same predicate as updateSessionTitle / uploadImageToSession /
+updateSessionLlmModel and the ENG-346 generateResponse check; delegated tokens already resolve `req.user`
+to the target user). Public ishare lane (`stopGenerationPublic`, conversable token) untouched — it remains
+the anon stop path.
+
+### Assumptions to validate
+- No legitimate caller stops a session it doesn't own: the customer portal stops only the session it is
+  actively generating on (owner), delegated admins resolve to the target user, and anon/ishare users use the
+  public lane. If some flow stops an `anon_`-owned session through the authed endpoint pre-transfer, it now
+  gets 403 — none found in partner-portal; customer portal is a separate repo (grep found no such lane).
+- The 404-on-missing change is safe: stop is fire-and-forget in the UI; a 404 where a silent 200 used to be
+  should surface nothing user-visible (frontends don't branch on the stop response).
 ## /generate session-ownership check (2026-07-16, ENG-346)
 
 Closed the pre-existing gap where `POST /api/agent-mode/generate` never compared `session.userId`

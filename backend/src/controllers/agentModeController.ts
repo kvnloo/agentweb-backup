@@ -4054,9 +4054,34 @@ export const agentModeController = {
   },
 
   // Stop generation for a session
-  async stopGeneration(req: Request, res: Response) {
+  async stopGeneration(req: AuthenticatedRequest, res: Response) {
     try {
       const { sessionId } = req.params;
+      const user = req.user as User;
+
+      if (!user) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      // Session ownership (ENG-360). Previously this lane did no session read
+      // at all, so any authenticated user who learned another user's sessionId
+      // could cancel that user's in-flight generation and flip their SSE
+      // progress to complete. Same owner-or-admin predicate as the sibling
+      // session-mutating endpoints (updateSessionTitle, uploadImageToSession,
+      // updateSessionLlmModel) and the ENG-346 generateResponse check.
+      // Delegated tokens already resolve req.user to the TARGET user
+      // (middleware/auth.ts), so plain equality is delegation-safe. The public
+      // ishare lane (stopGenerationPublic, conversable token) remains the
+      // separate anon path.
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        // Was a silent { success: true } — a stop on a nonexistent session now
+        // fails loudly instead (ENG-360 AC-3).
+        return res.status(404).json({ error: 'Session not found' });
+      }
+      if (session.userId !== user.userId && !user.isAdmin) {
+        return res.status(403).json({ error: 'Unauthorized access to session' });
+      }
 
       // Signal cancellation
       requestCancel(sessionId);
