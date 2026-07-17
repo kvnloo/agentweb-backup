@@ -5009,7 +5009,7 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
           email: s.email.trim(),
           fromName: s.fromName.trim(),
           notes: s.notes ? s.notes.trim() : undefined,
-          senderProvider: s.senderType ?? 'resend',
+          senderProvider: s.senderProvider ?? s.senderType ?? 'resend',
           connectedAccountId: s.connectedAccountId ?? s.gmailAccountId,
         }),
       ),
