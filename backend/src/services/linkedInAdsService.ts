@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { INTEGRATION_CONFIG } from '../config/integrations';
-import { buildUtmSpec, mergeUtmIntoUrl } from '../utils/adUtm';
+import { buildUtmSpec, mergeUtmIntoUrl, readUtmKeys } from '../utils/adUtm';
 
 const LI_API_BASE = 'https://api.linkedin.com';
 const LI_API_VERSION = INTEGRATION_CONFIG.linkedinAds.apiVersion; // e.g. '202603'
@@ -1022,6 +1022,16 @@ export async function retagCreativeUtm(
       error: 'NO_DESTINATION_URL — this text ad creative has no landing page to tag.',
     };
   }
+  // appendLinkedInUtm passes an unparseable URL through UNCHANGED (its own
+  // documented guard), which would make newUrl === currentUrl below trivially
+  // true and falsely report alreadyTagged. Catch it here first, same "needs a
+  // human" verdict the audit tool already gives this URL (Greptile).
+  if (!readUtmKeys(currentUrl)) {
+    return {
+      success: false,
+      error: 'UNREADABLE_DESTINATION_URL — this creative\'s landing page could not be parsed as a URL.',
+    };
+  }
   const campaignForUtm = resolveCampaignForUtm({ campaign_id: campaign });
   const newUrl = appendLinkedInUtm(currentUrl, campaignForUtm);
   if (newUrl === currentUrl) {
@@ -1089,6 +1099,15 @@ export async function retagPostUtm(
       error: 'NO_RETAGGABLE_DESTINATION — this post has no landing-page/CTA destination set '
         + '(e.g. an article post\'s own link, or a post with no call-to-action button). '
         + 'LinkedIn does not expose those for edit after publish; a human needs to look.',
+    };
+  }
+  // Same guard as retagCreativeUtm: an unparseable contentLandingPage would
+  // otherwise trivially satisfy newUrl === currentUrl and falsely report
+  // alreadyTagged (Greptile).
+  if (!readUtmKeys(currentUrl)) {
+    return {
+      success: false,
+      error: 'UNREADABLE_DESTINATION_URL — this post\'s landing page could not be parsed as a URL.',
     };
   }
 

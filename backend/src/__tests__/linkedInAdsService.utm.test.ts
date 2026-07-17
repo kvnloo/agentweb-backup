@@ -391,6 +391,20 @@ describe('retagCreativeUtm — single existing creative retrofit (Harsha\'s ask)
     expect(mockAxiosFn).toHaveBeenCalledTimes(1); // read only, no write attempted
   });
 
+  it('reports an error rather than alreadyTagged when landingPage is a non-empty unparseable URL (Greptile)', async () => {
+    // appendLinkedInUtm swallows the new URL() exception and returns the
+    // malformed string unchanged (its documented "pass through untagged"
+    // guard for a bad USER url), so newUrl === currentUrl trivially holds --
+    // that must not be reported as "alreadyTagged" (confidently wrong; the
+    // audit tool would call this same URL "unreadable"), leaving a genuinely
+    // untagged ad stuck forever with no signal to a human.
+    mockGet({ content: { textAd: { headline: 'H', description: 'D', landingPage: 'not a url' } } });
+    const result = await svc.retagCreativeUtm(ACCESS_TOKEN, ACCOUNT_ID, 'creative-1', CAMPAIGN);
+    expect(result.success).toBe(false);
+    expect((result as any).alreadyTagged).toBeUndefined();
+    expect(mockAxiosFn).toHaveBeenCalledTimes(1); // read only, no write attempted
+  });
+
   it('reports NO_DESTINATION_URL rather than alreadyTagged when the text ad has no landingPage at all (Greptile)', async () => {
     // appendLinkedInUtm(undefined, campaign) returns undefined unchanged (its
     // documented "missing URL passed through as-is" guard), so newUrl === currentUrl
@@ -498,6 +512,14 @@ describe('retagPostUtm — sponsored-content post retrofit', () => {
     mockGet({ contentLandingPage: already });
     const result = await svc.retagPostUtm(ACCESS_TOKEN, 'urn:li:share:999', CAMPAIGN);
     expect(result).toEqual({ success: true, alreadyTagged: true });
+    expect(mockAxiosFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports an error rather than alreadyTagged when contentLandingPage is a non-empty unparseable URL (Greptile)', async () => {
+    mockGet({ contentLandingPage: 'not a url' });
+    const result = await svc.retagPostUtm(ACCESS_TOKEN, 'urn:li:share:999', CAMPAIGN);
+    expect(result.success).toBe(false);
+    expect((result as any).alreadyTagged).toBeUndefined();
     expect(mockAxiosFn).toHaveBeenCalledTimes(1);
   });
 
