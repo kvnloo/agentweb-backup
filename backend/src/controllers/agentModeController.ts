@@ -127,7 +127,7 @@ export function releaseSessionGeneration(sessionId: string): void {
 const GENERATION_TIMEOUT_MS = parseInt(
   process.env.AGENT_MODE_GENERATION_TIMEOUT_MS || '600000',
   10
-); // 10 minutes default — local agent browser tasks need > 5 min
+); // 10 minutes default — long-running browser/research tasks need > 5 min
 
 async function withGenerationTimeout<T>(
   promise: Promise<T>,

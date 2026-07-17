@@ -673,8 +673,8 @@ router.delete("/generated/:id", async (req, res: Response) => {
       }
     }
 
-    await deleteLandingPageByRecord(page);
-    res.json({ success: true });
+    const { githubCleanupWarning } = await deleteLandingPageByRecord(page);
+    res.json({ success: true, ...(githubCleanupWarning ? { warning: githubCleanupWarning } : {}) });
   } catch (error: any) {
     console.error("[LP GENERATION] Error deleting page:", error);
     const status = error.message?.includes("not found") ? 404

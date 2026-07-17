@@ -44,8 +44,10 @@ const UNINSTALLED_RE = /not available\b[\s\S]*install the required skill/i;
 // action was valid, the platform declined it — like "should delay"). "no results
 // found" = a benign empty result the tool recorded as a failure. "corrupted /
 // failed to parse pdf" = bad user input the tool correctly rejected.
+// "local_agent_deprecated" = the retired local-agent relay stubs (ENG-383)
+// refusing by design — a call to a deliberately retired tool is not a tool bug.
 const BY_DESIGN_RE =
-  /task rejected|matched forbidden pattern|may only be used for|should delay new invitation|already connected|required function calls have not been made|cannot mark steps as completed|cannot resend|recipient cannot be reached|no (?:search )?results found|corrupted or password-protected|failed to parse pdf/i;
+  /task rejected|matched forbidden pattern|may only be used for|local_agent_deprecated|should delay new invitation|already connected|required function calls have not been made|cannot mark steps as completed|cannot resend|recipient cannot be reached|no (?:search )?results found|corrupted or password-protected|failed to parse pdf/i;
 
 // "too long (N chars)" = an argument-length constraint (e.g. the LinkedIn 200/300
 // invite-note limit) — an arg validation, not a tool defect.
