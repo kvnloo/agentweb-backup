@@ -14,7 +14,8 @@ const CHAT = {
   readOnly: { model: 'opus', maxTurns: 30, allowedTools: ['Read', 'Grep', 'Bash(git log:*)'] },
   skillDenylist: ['claude-api', 'deep-research'],
   capabilityPrompt: 'Linear access: ... (persistent capability text)',
-  safetyPrompt: 'SAFETY — stay inside your worktree ... (compaction-proof guard)',
+  safetyPrompt: 'SAFETY — you are CONFINED to your own assigned repo ... (compaction-proof guard)',
+  watchPrompt: 'BACKGROUND WORK — end a waiting turn with [[WATCH: …]] ... (compaction-proof)',
 };
 function chatArgs(cap, sessionId, modelOverride) {
   const m = CHAT[cap] || {};
@@ -22,7 +23,7 @@ function chatArgs(cap, sessionId, modelOverride) {
   if (cap === 'readOnly') a.push('--allowedTools', (m.allowedTools || []).join(','));
   else {
     a.push('--dangerously-skip-permissions');
-    const appends = [CHAT.capabilityPrompt, CHAT.safetyPrompt].filter(Boolean);
+    const appends = [CHAT.capabilityPrompt, CHAT.safetyPrompt, CHAT.watchPrompt].filter(Boolean);
     if (appends.length) a.push('--append-system-prompt', appends.join('\n\n'));
   }
   const denied = (CHAT.skillDenylist || []).map((s) => `Skill(${s})`);
@@ -35,6 +36,7 @@ function chatArgs(cap, sessionId, modelOverride) {
 const appendedText = (a) => { const i = a.indexOf('--append-system-prompt'); return i >= 0 ? a[i + 1] : null; };
 const hasCapability = (a) => { const t = appendedText(a); return !!t && t.includes(CHAT.capabilityPrompt); };
 const hasSafetyGuard = (a) => { const t = appendedText(a); return !!t && t.includes(CHAT.safetyPrompt); };
+const hasWatchGuide = (a) => { const t = appendedText(a); return !!t && t.includes(CHAT.watchPrompt); };
 
 // helper: are all denylisted skills passed as `Skill(<name>)` after a --disallowedTools flag?
 const deniesSkills = (a, names) => {
@@ -54,7 +56,8 @@ console.log('chatArgs — heavyweight skills denied, the rest kept');
   ok(full.includes('--dangerously-skip-permissions'), 'full cap still has skip-permissions (unchanged)');
   ok(hasCapability(full), 'full cap appends the persistent capability to the system prompt (survives /compact)');
   ok(hasSafetyGuard(full), 'full cap appends the worktree-isolation safety guard (compaction-proof)');
-  ok(full.filter((x) => x === '--append-system-prompt').length === 1, 'capability + safety share ONE --append-system-prompt flag');
+  ok(hasWatchGuide(full), 'full cap appends the background-watch guide (compaction-proof)');
+  ok(full.filter((x) => x === '--append-system-prompt').length === 1, 'capability + safety + watch share ONE --append-system-prompt flag');
   ok(full.includes('--resume') && full[full.indexOf('--resume') + 1] === 'sess-123', 'resume sid still passed');
 
   // the denials come as separate values under ONE --disallowedTools, and --resume stays last
