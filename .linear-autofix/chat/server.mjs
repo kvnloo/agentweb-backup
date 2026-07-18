@@ -972,7 +972,7 @@ function resolveCwd(identifier, entry, emit) {
   return { cwd: agentRoot };
 }
 
-async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit = null, attachments = []) {
+async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit = null, attachments = [], promptOverride = null) {
   const emit = (e) => broadcast(identifier, { turnId, ...e });
   const m = CHAT[cap] || {};
   let tee = null;
@@ -1041,7 +1041,10 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
       ? `\n\n[The developer attached ${attachments.length} file${attachments.length === 1 ? '' : 's'}. View ${attachments.length === 1 ? 'it' : 'each'} with the Read tool (images render visually):]\n`
         + attachments.map((a) => `- ${a.path}`).join('\n')
       : '';
-    const promptMsg = (message || '(see the attached file(s))') + attachNote;
+    // promptOverride lets a turn SHOW the user's own words (turn_start above emits `message`) while the
+    // agent actually receives a different instruction — e.g. a typed "merge it" displays as-is but runs
+    // the full MERGE_MSG, so the natural-language trigger and the Merge button have the exact same effect.
+    const promptMsg = (promptOverride || message || '(see the attached file(s))') + attachNote;
     let resumeSid;
     let prompt;
     let usedCompact = false;
@@ -1381,7 +1384,20 @@ function startTurn(identifier, body) {
 
   const turnId = `t${Date.now()}-${++turnSeq}`;
   activeTurns.set(identifier, { child: null, cap, turnId, startedAt: new Date().toISOString(), lockPath });
-  runTurn(identifier, found.entry, cap, message, turnId, lockPath, null, attachments);
+  // Natural-language merge trigger: if this full-cap chat (ENG or standalone) has open PR(s) and the
+  // message is an EXPLICIT merge instruction, run the EXACT same MERGE_MSG the button runs — while still
+  // showing the user's own words. Classify async so the 202 stays instant; any classifier failure (or a
+  // non-explicit message) just runs a normal turn. See isMergeRequest for the strict no-false-fire gate.
+  (async () => {
+    let override = null;
+    try {
+      if (cap === 'full' && (found.entry.prs || []).filter(Boolean).length && message && await isMergeRequest(message)) {
+        override = MERGE_MSG;
+        log(`turn ${turnId} (${identifier}): explicit merge request → running the merge flow`);
+      }
+    } catch { /* classifier unavailable → normal turn */ }
+    runTurn(identifier, found.entry, cap, message, turnId, lockPath, null, attachments, override);
+  })();
   return { code: 202, body: { turnId, cap } };
 }
 
@@ -1502,6 +1518,27 @@ const MERGE_MSG = [
   '',
   'Bias hard toward finishing autonomously: pull the developer in ONLY for a genuine decision change — end your reply with `MERGE_BLOCKED: <what decision is needed, and the options>` (summarize Greptile\'s point so the developer can decide without re-reading the PR). Also use MERGE_BLOCKED if a PR simply cannot be made mergeable. When every open PR is merged, report the final state of each.',
 ].join('\n');
+
+// Natural-language merge trigger. A typed message runs the EXACT same MERGE_MSG flow as the button, but
+// ONLY on an EXPLICIT merge instruction — no false-fires. A cheap keyword gate skips the model on the vast
+// majority of messages; a strict haiku yes/no classifier then confirms (a question about merging, a
+// negation, a deferral, or "merge" used in another sense all resolve to NO). Fails safe to NO.
+const MERGE_KEYWORD = /\bmerg(e|es|ed|ing)\b|\bship\s+it\b/i;
+async function isMergeRequest(text) {
+  if (!MERGE_KEYWORD.test(text || '')) return false; // gate: most messages never reach the model
+  const instruction = [
+    'A developer sent this message in a chat about one or more GitHub pull requests. Decide whether it is an EXPLICIT instruction to MERGE the PR(s). Answer with exactly one word: yes or no.',
+    'Answer "yes" ONLY when the developer is clearly telling you to merge — including a conditional "merge it when CI is green" (you will wait, then merge). Examples: "merge it", "go ahead and merge this", "merge the PR", "ship it", "merge when green".',
+    'Answer "no" for anything else: a QUESTION about merging ("is it mergeable?", "can we merge?", "why won\'t it merge?"), a NEGATION/hold ("don\'t merge", "not yet", "hold off"), a DEFERRAL/uncertainty ("maybe later", "should we merge?", "I\'ll decide"), or "merge" used in another sense (a "merge conflict", "merge main into the branch", "rebase and merge the base"). When in any doubt, answer no.',
+    '',
+    'Message: ' + String(text).slice(0, 1000),
+  ].join('\n');
+  try {
+    const r = await claudeApiText(instruction, CHAT.polish?.model || 'claude-haiku-4-5-20251001', 8000, 4);
+    return r.ok && /^\s*yes\b/i.test(String(r.text || '').trim());
+  } catch { return false; } // classifier unavailable → NOT a merge (never fire on failure)
+}
+
 function startMergeTurn(identifier) {
   const found = findEntry(identifier);
   if (!found) return { code: 404, error: `no autofix record for ${identifier}` };
@@ -1510,10 +1547,10 @@ function startMergeTurn(identifier) {
   if (!(found.entry.prs || []).filter(Boolean).length) return { code: 400, error: 'this issue has no PRs to merge' };
   const lockPath = acquireFixLock(identifier);
   if (!lockPath) return { code: 409, error: 'another fix run holds the lock for this issue' };
-  const message = MERGE_MSG; // one autonomous prep+merge flow — no confirmation handshake
   const turnId = `t${Date.now()}-${++turnSeq}`;
   activeTurns.set(identifier, { child: null, cap: 'full', turnId, startedAt: new Date().toISOString(), lockPath });
-  runTurn(identifier, found.entry, 'full', message, turnId, lockPath);
+  // Show a short line, RUN the full MERGE_MSG (promptOverride) — identical to the natural-language trigger.
+  runTurn(identifier, found.entry, 'full', '⛙ Merge the open PR(s).', turnId, lockPath, null, [], MERGE_MSG);
   return { code: 202, body: { turnId, cap: 'full' } };
 }
 
