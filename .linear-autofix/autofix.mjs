@@ -83,6 +83,15 @@ export function kebab(s, max = 40) {
   return (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, max).replace(/-+$/, '') || 'bug';
 }
 
+// Branch prefix = the ASSIGNEE'S FIRST NAME (kebab-safe), so a branch reads as that person's work,
+// matching the commits + PR that are already attributed to them (e.g. `manan/eng-313-...`). Falls back
+// to `fallback` (config.branchPrefix, e.g. `autofix/`) when there's no resolvable assignee name.
+export function assigneeBranchPrefix(identity, fallback) {
+  const first = ((identity?.name || '').trim().split(/\s+/)[0] || '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return first ? `${first}/` : fallback;
+}
+
 // Fill {{TOKEN}} placeholders. Uses the FUNCTION form of replaceAll so `$` sequences in the
 // injected value (rife in code diffs: `$&`, `${x}`, `$1`, shell `$'...'`) are inserted literally
 // instead of being interpreted as special replacement patterns. Also the single place that owns
@@ -223,7 +232,7 @@ async function main() {
 
   const labelNames = (issue.labels?.nodes || []).map((l) => l.name.toLowerCase());
   const model = labelNames.some((n) => config.opusLabels.includes(n)) ? config.opusModel : config.defaultModel;
-  const branch = `${config.branchPrefix}${id.toLowerCase()}-${kebab(issue.title)}`;
+  const branch = `${assigneeBranchPrefix(identity, config.branchPrefix)}${id.toLowerCase()}-${kebab(issue.title)}`;
   const WT = path.resolve(agentRoot, config.worktreesDir, id);
 
   if (dryRun) {

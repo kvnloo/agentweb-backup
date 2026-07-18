@@ -351,9 +351,9 @@ async function attributionFor(identifier, entry) {
       new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000)),
     ]);
     const a = issue?.assignee;
-    if (a?.email) { const identity = resolveAssigneeIdentity(a); return { idEnv: gitIdentityEnv(identity), identity, email: a.email, who: `${a.email} (live)` }; }
+    if (a?.email) { const identity = resolveAssigneeIdentity(a); return { idEnv: gitIdentityEnv(identity), identity, email: a.email, assignee: { name: a.name || null, email: a.email }, live: true, who: `${a.email} (live)` }; }
   } catch { /* Linear unreachable — fall back to the pipeline-stored assignee below */ }
-  return { idEnv: entry?.assignee ? gitIdentityEnv(entry.assignee) : {}, identity: entry?.assignee || null, email: entry?.assigneeEmail || null, who: `${entry?.assigneeEmail || 'none'} (stored)` };
+  return { idEnv: entry?.assignee ? gitIdentityEnv(entry.assignee) : {}, identity: entry?.assignee || null, email: entry?.assigneeEmail || null, assignee: entry?.assignee || null, live: false, who: `${entry?.assigneeEmail || 'none'} (stored)` };
 }
 
 // The chat agent must touch Linear as the issue's ASSIGNEE — never via the shared/global LINEAR_API_KEY
@@ -1095,6 +1095,14 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
     // is down. Read-only turns never write, so they keep the plain env.
     const attr = cap === 'full' ? await attributionFor(identifier, entry) : null;
     if (attr) log(`turn ${turnId} (${identifier}): attributing commits/PRs to ${attr.who}`);
+    // Reassignment: Linear now shows a DIFFERENT assignee than we have stored. Future work already goes to
+    // them (agentEnv + applyWorktreeIdentity below both use the LIVE attr), but adopt it onto the entry too
+    // so the sidebar, the Linear-down fallback, and any new branch all reflect the new person. The past
+    // (existing branch name, already-authored commits/PRs) is immutable — only the future switches.
+    if (attr?.live && attr.assignee?.email && attr.assignee.email !== entry.assigneeEmail && !entry.standalone) {
+      const saved = updateIssueEntry(identifier, (e) => ({ ...e, assignee: attr.assignee, assigneeEmail: attr.assignee.email }));
+      if (saved) { entry.assignee = saved.assignee; entry.assigneeEmail = saved.assigneeEmail; log(`turn ${turnId} (${identifier}): reassigned → ${attr.assignee.name || attr.assignee.email}; all future work attributes to them`); }
+    }
     // Persist the CURRENT assignee's identity into each worktree's git config before the agent runs.
     // Doing it every full turn is what makes a reassignment take effect — the new assignee's name/email
     // overwrite the old in config.worktree, so this turn's (and any later manual) commits go by them.
