@@ -297,6 +297,20 @@ export const config = {
       'and its status/assignee/description and its related & linked issues, or use the repo helpers in ' +
       '.linear-autofix/linear.mjs (e.g. resolveIssue). Only if LINEAR_API_KEY is unset does the assignee ' +
       'have no key configured — then, and only then, say Linear is unavailable.',
+    // Hard safety rule, also pinned to the SYSTEM prompt (compaction-proof) on every full turn. A chat/
+    // pipeline agent runs inside an isolated git worktree; it once escaped into the MAIN checkout and ran
+    // `git checkout`, silently switching the whole repo's branch and breaking the running system. This
+    // keeps agents in their lane. (True isolation would need a container; this is the practical guard.)
+    safetyPrompt:
+      'SAFETY — stay inside your worktree. You are running in an ISOLATED git worktree (your current ' +
+      'working directory); all of your work happens here, on your own branch. You may run git freely ' +
+      'INSIDE your worktree (commit, push, and for the customer-portal sub-worktree too). But you MUST NOT: ' +
+      '(1) cd into, or run ANY git command against, the main checkout at /home/ec2-user/agentweb or any ' +
+      'OTHER worktree; (2) run `git checkout`/`git switch`/`git reset`/`git clean`/`git branch -D` anywhere ' +
+      'but your own worktree branch; (3) start, kill, or restart shared services (the preview proxy, the ' +
+      'chat server, poll/gc) — they are managed for you; the preview proxy already hot-reloads routes, so ' +
+      'never restart it. If anything OUTSIDE your worktree looks broken, REPORT it and stop — do not try to ' +
+      'fix it yourself. Violating this can corrupt the main repo and take down the whole system.',
     resumePipelineSession: false,    // default: curated fresh context (above). Set true to instead RESUME
                                      // the fixer's own Claude session on the first turn for raw native
                                      // memory — costs ~380k tokens of low-signal transcript reloaded every

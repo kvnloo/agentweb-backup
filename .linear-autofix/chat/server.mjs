@@ -568,11 +568,13 @@ function chatArgs(cap, sessionId, modelOverride) {
   if (cap === 'readOnly') a.push('--allowedTools', (m.allowedTools || []).join(','));
   else {
     a.push('--dangerously-skip-permissions');
-    // Persistent capabilities (e.g. "you can read Linear via LINEAR_API_KEY") go in the SYSTEM prompt, not
-    // the conversation — so no number of /compact passes can summarize them away. Full-access only: read-only
-    // turns can't run curl/node anyway (their Bash allowlist is git-only). Constant text → prompt cache stays
-    // warm across turns.
-    if (CHAT.capabilityPrompt) a.push('--append-system-prompt', CHAT.capabilityPrompt);
+    // Persistent capabilities + hard safety rules go in the SYSTEM prompt, not the conversation — so no
+    // number of /compact passes can summarize them away (verified: --append-system-prompt applies on
+    // resumed sessions too). Full-access only: read-only turns can't run curl/git-writes anyway. Constant
+    // text → prompt cache stays warm across turns. safetyPrompt keeps the agent inside its worktree (it
+    // once escaped into the main checkout and switched the repo's branch).
+    const appends = [CHAT.capabilityPrompt, CHAT.safetyPrompt].filter(Boolean);
+    if (appends.length) a.push('--append-system-prompt', appends.join('\n\n'));
   }
   // Deny only the reference-heavy skills (config.chat.skillDenylist) so they can't auto-load into a
   // chat session and get re-billed on every resumed turn — the bug that silently defeated /compact on
