@@ -279,6 +279,30 @@ function detectPrUrls(out) {
   return [...byUrl.values()];
 }
 
+// Background-watch markers the agent emits at the end of a turn (see config.chat.watchPrompt):
+//   [[WATCH: <reason>]]  → arm/re-arm a wake-up loop; the tick re-invokes the agent every cadence.
+//   [[WATCH_DONE]]       → the task is finished; stop waking. done wins over an also-present WATCH.
+function parseWatch(text) {
+  const t = text || '';
+  const done = /\[\[WATCH_DONE\]\]/i.test(t);
+  const m = t.match(/\[\[WATCH:\s*([^\]]*)\]\]/i);
+  return { done, reason: !done && m ? m[1].trim() : null };
+}
+// Remove the raw markers from text shown to the developer (the watch state drives the UI instead).
+function stripWatchMarkers(text) {
+  return (text || '').replace(/\[\[WATCH:\s*[^\]]*\]\]/gi, '').replace(/\[\[WATCH_DONE\]\]/gi, '').replace(/\n{3,}/g, '\n\n').trim();
+}
+// Is a watch record due to fire? Pure so it's unit-testable. `now`, `mem` (MemAvailable MB), and the
+// per-issue lock/active check are injected. Returns 'fire' | 'expired' | 'wait' | 'skip'.
+function watchDecision(watch, { now, memMB, minMemMB, busy }) {
+  if (!watch) return 'skip';
+  if (now >= watch.until) return 'expired';
+  if (now < watch.nextAt) return 'wait';
+  if (busy) return 'wait';               // a turn/preview op is already running for this issue
+  if (memMB != null && memMB < minMemMB) return 'skip'; // low memory — defer this whole tick
+  return 'fire';
+}
+
 // The system framing for a standalone chat turn (first turn / fresh retry). No autofix pipeline, no
 // Linear issue — a plain full-capability coding session in a dedicated worktree.
 function standaloneChatPrompt(entry, cwd, message, history = '') {
@@ -573,7 +597,7 @@ function chatArgs(cap, sessionId, modelOverride) {
     // resumed sessions too). Full-access only: read-only turns can't run curl/git-writes anyway. Constant
     // text → prompt cache stays warm across turns. safetyPrompt keeps the agent inside its worktree (it
     // once escaped into the main checkout and switched the repo's branch).
-    const appends = [CHAT.capabilityPrompt, CHAT.safetyPrompt].filter(Boolean);
+    const appends = [CHAT.capabilityPrompt, CHAT.safetyPrompt, CHAT.watchPrompt].filter(Boolean);
     if (appends.length) a.push('--append-system-prompt', appends.join('\n\n'));
   }
   // Deny only the reference-heavy skills (config.chat.skillDenylist) so they can't auto-load into a
@@ -1217,6 +1241,25 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
       }
     }
 
+    // Background watch (any full-cap chat — standalone OR ENG — babysitting a wait-then-act task like a
+    // merge). The agent ended the turn with a marker: [[WATCH_DONE]] (or a MERGE_BLOCKED escalation that
+    // now needs a human) clears the wake-up loop; [[WATCH: reason]] arms/re-arms it. `since`/`until` are
+    // preserved across re-arms so the 24h safety cap runs from the FIRST watch, not each cycle.
+    if (cap === 'full') {
+      const txtAll = (out.texts || []).join('\n');
+      const w = parseWatch(txtAll);
+      const blocked = /\bMERGE_BLOCKED\b/.test(txtAll);
+      const hadWatch = !!findEntry(identifier)?.entry?.watch;
+      if ((w.done || blocked) && hadWatch) {
+        updateIssueEntry(identifier, (e) => { const { watch, ...rest } = e; return rest; });
+        emit({ type: 'watch', state: 'done', blocked });
+      } else if (w.reason && !w.done && !blocked) {
+        const cad = CHAT.watch?.cadenceMs ?? 5 * 60 * 1000, maxMs = CHAT.watch?.maxMs ?? 24 * 60 * 60 * 1000, nextAt = Date.now() + cad;
+        updateIssueEntry(identifier, (e) => ({ ...e, watch: { goal: w.reason.slice(0, 300), nextAt, since: e.watch?.since || Date.now(), until: e.watch?.until || (Date.now() + maxMs), at: new Date().toISOString() } }));
+        emit({ type: 'watch', state: 'armed', goal: w.reason.slice(0, 300), nextAt });
+      }
+    }
+
     if (out.timedOut) emit({ type: 'error', error: `timed out after ${Math.round(m.timeoutMs / 60000)} min (killed)` });
     else if (!out.result && !aborted(identifier, turnId)) emit({ type: 'error', error: `claude exited without a result${out.stderr ? `: ${out.stderr.slice(-300)}` : ''}` });
     else if (out.result?.is_error) emit({ type: 'error', error: `turn ended abnormally (${out.result.subtype || 'error'})${out.result.result ? `: ${String(out.result.result).slice(0, 300)}` : ''}` });
@@ -1224,7 +1267,7 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
     updateChatState(identifier, (cs) => {
       cs.messages.push({
         role: 'assistant', cap, at: new Date().toISOString(),
-        text: out.texts.join('\n\n').slice(0, 50000) || '(no reply)',
+        text: stripWatchMarkers(out.texts.join('\n\n')).slice(0, 50000) || '(no reply)',
         turns: out.result?.num_turns, ms: out.result?.duration_ms,
         cost: out.result?.total_cost_usd ?? null, // per-turn $ for the bubble footer (survives reload)
         tokens: turnTokens(out.result?.usage), // per-turn token totals for the bubble footer (survives reload)
@@ -1445,8 +1488,9 @@ const MERGE_MSG = [
   '   - **Passed WITH optional/non-blocking suggestions** (Greptile approved but still left "nit"/"consider"/"suggestion" comments): its pass already unblocks the merge, so these are NOT required. You cannot apply them for free — ANY new commit re-triggers CI and a fresh Greptile review, and the PR stays blocked until they re-pass, so a code change always costs another full verification cycle. So: apply a suggestion pre-merge ONLY if it is quick, clearly safe, and genuinely worth another CI+Greptile round; otherwise merge as-is and capture the rest as a follow-up (a note in a PR comment, or a new Linear issue). Never delay or loop the merge on optional polish.',
   '   Greptile re-reviews on each new commit; if it stalls, re-trigger it by commenting `@greptile review` on the PR. Repeat the fix→re-review loop until Greptile passes or you hit a decision change.',
   '5. When a PR has all checks green, Greptile has passed, and it is mergeable, **MERGE IT IMMEDIATELY: `gh pr merge <n> --merge`** — a merge commit; NEVER `--delete-branch`; NEVER `--admin` or any bypass of the block. Do not wait for confirmation; merging is the goal.',
+  '6. **Waiting = register a watch, never block.** CI here runs 20+ min and Greptile drips comments one at a time — do NOT sit blocking on `gh pr checks --watch`/`sleep`. Instead, do everything actionable NOW (kick a rebase, fix a failure, answer a mechanical Greptile point, re-trigger a review), then end your reply with `[[WATCH: <one line — e.g. "PR #2084: Backend tests running, will merge when green">]]`. You will be automatically re-invoked in a few minutes to check again and take the next action. Keep looping that way across the whole rebase→CI→Greptile→merge cascade. End with `[[WATCH_DONE]]` once every PR is merged.',
   '',
-  'If the PRs depend on each other, handle them in the right order (merging one advances the base, so the next will fall behind — re-sync it with `gh pr update-branch`, which re-triggers its CI + a fresh Greptile review; that is expected, just ride it out and merge it when it goes green again). You ARE authorized to run `gh pr ready`, `gh pr update-branch`, `gh pr checks`, to comment for a Greptile re-review, to commit, AND to `gh pr merge --merge` for this task — this overrides the earlier note about not pushing/merging.',
+  'If the PRs depend on each other, handle them in the right order (merging one advances the base, so the next will fall behind — re-sync it with `gh pr update-branch`, which re-triggers its CI + a fresh Greptile review; that is expected, just ride it out via [[WATCH]] and merge it when it goes green again). You ARE authorized to run `gh pr ready`, `gh pr update-branch`, `gh pr checks`, to comment for a Greptile re-review, to commit, AND to `gh pr merge --merge` for this task — this overrides the earlier note about not pushing/merging.',
   '',
   'Bias hard toward finishing autonomously: pull the developer in ONLY for a genuine decision change — end your reply with `MERGE_BLOCKED: <what decision is needed, and the options>` (summarize Greptile\'s point so the developer can decide without re-reading the PR). Also use MERGE_BLOCKED if a PR simply cannot be made mergeable. When every open PR is merged, report the final state of each.',
 ].join('\n');
@@ -1848,10 +1892,67 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
   });
 }
 
+// ── Autonomous background watch (config.chat.watch) ──────────────────────────────────────────────────
+// A chat with a persisted `watch` (armed by a [[WATCH]] marker) has no free-running process of its own;
+// this in-server tick re-invokes it every cadence until it finishes (or hits the cap). Memory-gated and
+// strictly one-at-a-time, so N concurrent watched PRs can never stampede the box. Watches live in
+// state.json, so a server restart transparently resumes them.
+function availMemMB() {
+  try { const m = readFileSync('/proc/meminfo', 'utf8').match(/^MemAvailable:\s+(\d+)\s+kB/m); return m ? Math.round(+m[1] / 1024) : null; }
+  catch { return null; }
+}
+const WATCH_CONTINUE_MSG = (goal) => [
+  '**Background wake-up.** You earlier registered a watch and are being automatically re-invoked to continue it — this entire conversation is intact, so pick up exactly where you left off.',
+  `Your goal / what you are waiting for: ${goal}`,
+  'Check the current state NOW — once, do NOT block on `--watch`/`sleep`. If it is ready, take the next action (merge, or the next step). If it is still not ready, end with `[[WATCH: <updated one-line status>]]` and you will be woken again. When the whole task is finished, end with `[[WATCH_DONE]]`. If it now needs a human decision, end with `MERGE_BLOCKED: <what is needed>` (that also stops the wake-ups).',
+].join('\n');
+function fireWatchTurn(identifier, watch) {
+  const found = findEntry(identifier);
+  if (!found) return;
+  if (activeTurns.has(identifier)) return;                 // a turn is already running for this issue
+  if (capabilityOf(found.entry).level !== 'full') return;  // a watch that can't act (no push) is pointless
+  const lockPath = acquireFixLock(identifier);
+  if (!lockPath) return;                                   // another process (pipeline/gc) holds the lock
+  const turnId = `t${Date.now()}-${++turnSeq}`;
+  activeTurns.set(identifier, { child: null, cap: 'full', turnId, startedAt: new Date().toISOString(), lockPath });
+  log(`watch: waking ${identifier} — ${watch.goal}`);
+  runTurn(identifier, found.entry, 'full', WATCH_CONTINUE_MSG(watch.goal), turnId, lockPath);
+}
+function watchTick() {
+  const cfg = CHAT.watch || {};
+  if (cfg.enabled === false) return;
+  const minMemMB = cfg.minMemMB ?? 3000;
+  const memMB = availMemMB();
+  if (memMB != null && memMB < minMemMB) { log(`watch: low memory (${memMB}MB < ${minMemMB}) — deferring tick`); return; }
+  const now = Date.now();
+  let state; try { state = loadState(); } catch { return; }
+  for (const entry of Object.values(state)) {
+    if (!entry?.watch || !entry.identifier) continue;
+    const d = watchDecision(entry.watch, { now, memMB, minMemMB, busy: activeTurns.has(entry.identifier) });
+    if (d === 'expired') {
+      updateIssueEntry(entry.identifier, (e) => { const { watch, ...rest } = e; return rest; });
+      broadcast(entry.identifier, { type: 'watch', state: 'expired' });
+      log(`watch: ${entry.identifier} hit the ${Math.round((cfg.maxMs || 0) / 3600000)}h cap — stopped`);
+      continue;
+    }
+    if (d !== 'fire') continue;
+    // Pre-advance nextAt so a turn that crashes or forgets to re-arm can't immediately re-fire; a healthy
+    // turn re-arms (or clears) the watch itself via its [[WATCH]]/[[WATCH_DONE]] handling.
+    updateIssueEntry(entry.identifier, (e) => (e.watch ? { ...e, watch: { ...e.watch, nextAt: now + (cfg.cadenceMs || 5 * 60 * 1000) } } : e));
+    fireWatchTurn(entry.identifier, entry.watch);
+    return; // ONE per tick — serialize to keep memory/CPU bounded across many watched PRs
+  }
+}
+
 server.listen(CHAT.port || 8790, CHAT.bind || '127.0.0.1', () => {
   log(`listening on http://${CHAT.bind || '127.0.0.1'}:${CHAT.port || 8790} (fix ${fixEnabled() ? 'ENABLED' : 'disabled'})`);
   log(`tunnel: ssh -L ${CHAT.port || 8790}:localhost:${CHAT.port || 8790} ec2-user@<ip>`);
   // Verify the per-assignee GitHub tokens + Linear keys map to the right owner on boot (non-blocking;
   // logs to chat.log). Catches a swapped/expired credential before it silently mis-attributes.
   try { spawn('node', [path.join(BASE, 'check-creds.mjs')], { stdio: 'inherit' }); } catch { /* best-effort */ }
+  // Resume/drive background watches (merge-when-green, etc.) — see config.chat.watch.
+  if ((CHAT.watch?.enabled) !== false) {
+    setInterval(watchTick, CHAT.watch?.tickMs || 60 * 1000);
+    log(`watch: tick ${Math.round((CHAT.watch?.tickMs || 60000) / 1000)}s · cadence ${Math.round((CHAT.watch?.cadenceMs || 3e5) / 6e4)}m · cap ${Math.round((CHAT.watch?.maxMs || 864e5) / 36e5)}h`);
+  }
 });

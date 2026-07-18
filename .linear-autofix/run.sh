@@ -38,6 +38,12 @@ fi
 node "$HERE/poll.mjs" >>"$HERE/poll.log" 2>&1
 node "$HERE/gc.mjs"   >>"$HERE/poll.log" 2>&1   # remove worktrees whose issue is Done/Canceled
 
+# Keep the chat server alive. It hosts the chat UI AND drives the autonomous merge WATCH loop (re-invokes
+# a chat every few minutes until its PR merges), so it must never stay down. `start` is a no-op when it's
+# already running and revives it after a crash/reboot — so persisted watches always resume. Never aborts
+# the cycle (|| true) on a transient health-check miss.
+bash "$HERE/chat/run-chat.sh" start >>"$HERE/poll.log" 2>&1 || true
+
 # Verify each per-assignee GitHub token + Linear key still maps to the right person (catches a
 # swapped/expired credential before it mis-attributes). Throttled to ~hourly so we don't hammer the APIs.
 CREDMARK="$HERE/.credcheck.stamp"

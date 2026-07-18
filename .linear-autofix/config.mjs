@@ -302,15 +302,44 @@ export const config = {
     // `git checkout`, silently switching the whole repo's branch and breaking the running system. This
     // keeps agents in their lane. (True isolation would need a container; this is the practical guard.)
     safetyPrompt:
-      'SAFETY — stay inside your worktree. You are running in an ISOLATED git worktree (your current ' +
-      'working directory); all of your work happens here, on your own branch. You may run git freely ' +
-      'INSIDE your worktree (commit, push, and for the customer-portal sub-worktree too). But you MUST NOT: ' +
-      '(1) cd into, or run ANY git command against, the main checkout at /home/ec2-user/agentweb or any ' +
-      'OTHER worktree; (2) run `git checkout`/`git switch`/`git reset`/`git clean`/`git branch -D` anywhere ' +
-      'but your own worktree branch; (3) start, kill, or restart shared services (the preview proxy, the ' +
-      'chat server, poll/gc) — they are managed for you; the preview proxy already hot-reloads routes, so ' +
-      'never restart it. If anything OUTSIDE your worktree looks broken, REPORT it and stop — do not try to ' +
-      'fix it yourself. Violating this can corrupt the main repo and take down the whole system.',
+      'SAFETY — you are CONFINED to your own assigned repo. You are running inside ONE isolated git ' +
+      'worktree (your current working directory), checked out on your own branch. Make ALL of your code ' +
+      'and git changes THERE and only there. Inside your own worktree you have FULL git freedom — add, ' +
+      'commit, push, `git checkout -- <file>` to discard a file, `git reset` to unstage, and the same in ' +
+      'its customer-portal sub-worktree. What you must NEVER do is leave your assigned repo: (1) do NOT cd ' +
+      'into — or run any git or file-changing command against — the shared main checkout at ' +
+      '/home/ec2-user/agentweb, or any OTHER bug\'s worktree; (2) do NOT switch your worktree to a ' +
+      'different branch (`git checkout <branch>` / `git switch`), and never run `git reset --hard`, ' +
+      '`git clean`, or `git branch -D` outside your own worktree; (3) do NOT start, kill, or restart shared ' +
+      'services (the preview proxy, chat server, poll/gc) — they are managed for you (the proxy hot-reloads ' +
+      'its routes, so restarting it only breaks things). If anything OUTSIDE your worktree looks broken, ' +
+      'REPORT it and stop — do not try to fix it. Escaping your assigned repo can corrupt the shared repo ' +
+      'and take down the whole system for everyone.',
+    // Autonomous background "watch": a chat has NO free-running execution between turns (each `claude -p`
+    // exits when the turn ends). So a task that must WAIT for something (CI to finish, a PR to become
+    // mergeable) can't be done in one turn. Instead the agent ends a waiting turn with a `[[WATCH: …]]`
+    // marker; the server persists it on the entry and an in-process tick re-invokes the agent every
+    // `cadenceMs` until it emits `[[WATCH_DONE]]` (or MERGE_BLOCKED, or the `maxMs` cap). This is what
+    // lets "merge this PR when it's green" run for hours unattended, surviving laptop-close AND restarts
+    // (the watch lives in state.json). Memory-gated + serialized so it can never contribute to an OOM.
+    watch: {
+      enabled: true,
+      cadenceMs: 5 * 60 * 1000,        // recheck a waiting task every ~5 min
+      maxMs: 24 * 60 * 60 * 1000,      // safety cap: auto-stop (and notify) a watch after 24h
+      minMemMB: 3000,                  // skip a tick entirely if available RAM is below this (never add to OOM pressure)
+      tickMs: 60 * 1000,               // how often the server scans state for a due watch (fires at most one/tick)
+    },
+    // Pinned to the system prompt (compaction-proof) on every full turn — teaches the agent HOW to wait.
+    watchPrompt:
+      'BACKGROUND WORK — you do NOT keep running between turns (each turn is a fresh process that exits ' +
+      'when you stop responding). So NEVER claim you are "polling in the background" or will "wait and get ' +
+      'back to you" — you literally cannot. Instead, when a task needs you to WAIT for something and then ' +
+      'act (CI to finish, a PR to become mergeable, a review to re-run), do whatever you can check NOW, ' +
+      'then end your reply with a line `[[WATCH: <one line — what you are waiting for>]]`. You will be ' +
+      'automatically re-invoked in a few minutes, with this entire conversation intact, to check again and ' +
+      'act. Repeat that until the goal is fully met, then end with `[[WATCH_DONE]]` to stop the wake-ups. ' +
+      'Never sit blocking on `gh ... --watch`, `sleep`, or a poll loop — register a `[[WATCH]]` and END the ' +
+      'turn; that is how waiting works here.',
     resumePipelineSession: false,    // default: curated fresh context (above). Set true to instead RESUME
                                      // the fixer's own Claude session on the first turn for raw native
                                      // memory — costs ~380k tokens of low-signal transcript reloaded every
