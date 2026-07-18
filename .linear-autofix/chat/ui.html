@@ -806,25 +806,17 @@ function renderPreviewBar() {
   if ($('pv-btn')) $('pv-btn').onclick = () => previewAction(pvAction);
   if ($('merge-btn')) $('merge-btn').onclick = startMerge;
 }
-async function mergePost(confirm) {
-  const r = await fetch(`/api/issues/${S.sel}/chat/merge`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ confirm }),
-  });
+async function mergePost() {
+  const r = await fetch(`/api/issues/${S.sel}/chat/merge`, { method: 'POST' });
   if (!r.ok) { const e = await r.json().catch(() => ({})); addSys('⚠ ' + (e.error || `merge request failed (${r.status})`), 'err'); S.mergePhase = null; renderPreviewBar(); }
 }
+// One autonomous flow — no confirmation handshake. Prep + merge happen in the same turn: sync with base,
+// fix CI, drive Greptile to a pass, then merge the moment it's green. Only a MERGE_BLOCKED decision stops it.
 function startMerge() {
   if (S.busy || S.mergePhase) return;
-  S.mergePhase = 'prep'; renderPreviewBar();
-  addSys('⛙ Preparing PR(s) for merge — syncing with the base, fixing CI, and waiting for green…', 'sys');
-  mergePost(false);
-}
-function openMergeConfirm() {
-  const n = (S.detail?.entry?.prs || []).filter(Boolean).length;
-  const body = `<div class="pempty" style="color:var(--text);font-size:13px">All checks passed. Merge ${n} PR${n > 1 ? 's' : ''} now? This runs <code>gh pr merge --merge</code> on ${n > 1 ? 'each PR' : 'the PR'}.</div>`
-    + `<div class="mrow"><button class="btn" id="mc-cancel">Cancel</button><button class="btn on" id="mc-go">Confirm merge</button></div>`;
-  openCmd('Ready to merge', body);
-  $('mc-cancel').onclick = () => { closeCmd(); };
-  $('mc-go').onclick = () => { closeCmd(); S.mergePhase = 'merge'; renderPreviewBar(); mergePost(true); };
+  S.mergePhase = 'merge'; renderPreviewBar();
+  addSys('⛙ Merging PR(s) — syncing with base, fixing CI, driving Greptile to a pass, then merging when green. No confirmation needed.', 'sys');
+  mergePost();
 }
 async function previewAction(action) {
   const r = await fetch(`/api/issues/${S.sel}/preview`, {
@@ -1204,9 +1196,8 @@ function handleEvent(e) {
       // Auto-send the next queued message once the turn ends — unless it was stopped on purpose
       // (Esc/Stop set queuePaused, so a deliberate stop doesn't fire the rest of the queue).
       if (!S.queuePaused && S.queue.length) drainNext();
-      // Merge handshake: after the prep turn, if the agent signalled it's green, ask for confirmation.
-      if (S.mergePhase === 'prep') { S.mergePhase = null; renderPreviewBar(); if (/\bMERGE_READY\b/.test(S.lastResult)) openMergeConfirm(); }
-      else if (S.mergePhase === 'merge') { S.mergePhase = null; renderPreviewBar(); }
+      // Merge runs as ONE autonomous turn (prep + merge) — no confirmation handshake. Just clear the phase.
+      if (S.mergePhase) { S.mergePhase = null; renderPreviewBar(); }
       break;
   }
 }
