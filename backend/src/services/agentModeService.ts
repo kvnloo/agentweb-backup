@@ -14106,9 +14106,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      // Only forward the read-options bag when the caller actually supplied a campaign_id
-      // filter or an explicit fields selection — a plain list-all call stays byte-identical
-      // to before (behavior-preserving, ENG-398).
+      // Only forward the read-options bag when the caller supplied a campaign_id filter or
+      // an explicit fields selection; otherwise call listCampaigns the same 2-arg way as
+      // before. This preserves the CALL CONVENTION for a plain list-all — it does NOT keep
+      // the response payload identical: listCampaigns now defaults to the richer
+      // CAMPAIGN_READ_FIELDS (budget/bid config: daily_budget, lifetime_budget,
+      // budget_remaining, bid_strategy), the intended ENG-398 change, for every plain LIST
+      // caller regardless of this branch.
       const hasSelector = Boolean(options.campaignId || options.fields);
       const campaigns = (hasSelector
         ? await metaService.listCampaigns(accountId, accessToken, options)
@@ -14164,8 +14168,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       // Only forward the read-options bag when the caller supplied an ad_set_id target or an
-      // explicit fields selection — a plain (optionally campaign-filtered) list stays
-      // byte-identical to before (behavior-preserving, ENG-398).
+      // explicit fields selection; otherwise call listAdSets with just the (optional)
+      // campaignId, exactly as before. This preserves the CALL CONVENTION, NOT the response
+      // payload: listAdSets now defaults to the richer AD_SET_READ_FIELDS (optimization_goal,
+      // billing_event, destination_type, promoted_object, bid_strategy), the intended
+      // ENG-398 change, for every plain LIST caller regardless of this branch.
       const hasSelector = Boolean(options.adSetId || options.fields);
       const adSets = (hasSelector
         ? await metaService.listAdSets(accountId, accessToken, campaignId, options)
