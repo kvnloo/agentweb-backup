@@ -2653,6 +2653,47 @@ export class V0OutputValidationError extends Error {
   }
 }
 
+// ENG-374: bare-import denylist and the patterns that extract an import/export specifier
+// from source text. Module-scoped (not rebuilt per validateV0Output call) — see that
+// function's check 6 for the detection logic and why a denylist was chosen over an allowlist.
+const NEVER_REAL_BARE_IMPORT_SPECIFIERS = new Set(["layout", "page", "app", "components", "styles"]);
+const STATIC_IMPORT_EXPORT_PATTERN = /\b(?:import|export)\s+(?:[\w*{}\s,]+from\s+)?["']([^"']+)["']/g;
+const DYNAMIC_IMPORT_PATTERN = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g;
+
+// Template literals and comments only — deliberately NOT single/double-quoted strings. A real
+// import specifier IS a plain quoted string ('layout' or "layout"), so blanket-stripping every
+// quoted string would strip the exact thing the detector needs to find, breaking detection
+// entirely. Template literals and comments have no such conflict: per the ES module spec an
+// import specifier can never be a template literal (`import x from \`layout\`` is a syntax
+// error, not valid JS), and obviously never lives inside a comment — so stripping those two is
+// unambiguous and cannot hide a genuine bad import, only prevents false-positiving on example
+// code shown as JSX text or a comment that happens to mention the pattern.
+//
+// One alternation, one left-to-right pass: matches whichever of template literal / line
+// comment / block comment starts first at each position, consuming the WHOLE construct
+// (including any nested quotes, `//`, or `/*` inside it) before the scan continues. That
+// ordering is what makes a `//` inside a template literal safe — it's consumed as part of the
+// template match, so the line-comment alternative never gets a chance to misfire on it.
+//
+// Known, accepted limitation: regex literals (e.g. `/https:\/\//`) are not specially
+// tokenized — full JS lexing is out of scope for a narrow validation heuristic. Landing-page
+// component code essentially never contains regex literals, and even a mishandled one can only
+// affect scanning of code adjacent to it, not create a false NEGATIVE on a real import far
+// from it.
+const STRIP_TEMPLATES_AND_COMMENTS_PATTERN =
+  /`(?:\\.|[^`\\])*`|\/\/[^\n]*|\/\*[\s\S]*?\*\//g;
+
+/**
+ * Remove the CONTENTS of template literals and comments from source text before scanning for
+ * import statements (ENG-374 follow-up, Greptile review PR #2121). See
+ * STRIP_TEMPLATES_AND_COMMENTS_PATTERN's comment for why this — and specifically not regular
+ * quoted strings — is safe: it cannot hide a genuine bad import, only prevents
+ * false-positiving on example code or a comment that happens to mention the pattern.
+ */
+function stripTemplatesAndComments(content: string): string {
+  return content.replace(STRIP_TEMPLATES_AND_COMMENTS_PATTERN, " ");
+}
+
 /**
  * Validate that unzipped v0 output contains actual React/Next.js code.
  * Rejects: empty output, markdown/prompts echoed back, files too small to be real code.
@@ -2710,6 +2751,46 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
         );
       }
     }
+  }
+
+  // 6. Bad-import check (ENG-374): v0 occasionally hallucinates an import of an internal
+  // Next.js concept as if it were an installable package, e.g. `import RootLayout from
+  // "layout"`. That specifier is not relative, not the `@/` alias, and not a real npm
+  // package — it fails the build with "Module not found". Denylisted to a small set of words
+  // that are never legitimate BARE (unscoped, non-relative) specifiers, rather than trying to
+  // validate against the universe of real dependencies — an allowlist would need constant
+  // upkeep and risks false-positiving as real packages change.
+  //
+  // Covers every import/export form v0 could hallucinate the bad specifier into, not just the
+  // `import X from "..."` shape actually observed: side-effect-only imports, dynamic
+  // `import("...")`, and `export ... from "..."` re-exports. Denylist and patterns are
+  // module-scoped constants (above) — matchAll does not mutate a regex's lastIndex, so the
+  // shared, hoisted regex objects are safe to reuse across calls.
+  //
+  // Collected across ALL files before throwing, so a single correction message to v0 can name
+  // every offending import at once — reporting only the first found risks the retry fixing
+  // just that one and re-failing on the next, burning the limited retry budget.
+  const badImports: Array<{ path: string; specifier: string }> = [];
+  for (const file of reactFiles) {
+    const content = stripTemplatesAndComments(file.content.toString("utf-8"));
+    const specifiers = new Set<string>();
+    for (const match of content.matchAll(STATIC_IMPORT_EXPORT_PATTERN)) specifiers.add(match[1]);
+    for (const match of content.matchAll(DYNAMIC_IMPORT_PATTERN)) specifiers.add(match[1]);
+    for (const specifier of specifiers) {
+      // Relative (./, ../) and the project's own @/ alias are legitimate regardless of
+      // wording — only a BARE specifier (looks like a package name) is suspect here.
+      if (specifier.startsWith(".") || specifier.startsWith("/") || specifier.startsWith("@")) continue;
+      if (NEVER_REAL_BARE_IMPORT_SPECIFIERS.has(specifier.toLowerCase())) {
+        badImports.push({ path: file.path, specifier });
+      }
+    }
+  }
+  if (badImports.length > 0) {
+    const details = badImports.map((b) => `${b.path}: "${b.specifier}"`).join("; ");
+    throw new V0OutputValidationError(
+      `Bare import(s) of internal concepts that are not real npm packages — ${details} ` +
+      `(use a relative path or the @/ alias instead)`
+    );
   }
 
   console.log(`[V0 SERVICE] Output validation passed: ${tsxFiles.length} .tsx files, ${reactFiles.length} with React code`);
@@ -3426,9 +3507,36 @@ async function pollVercelDeployment(
 }
 
 /**
- * Fetch build error messages from Vercel deployment events.
+ * A stderr line that is NOT the build failure itself: the Vercel CLI version
+ * banner and deprecation/warning notices. These trail real build output, so
+ * naively surfacing the last stderr lines can present a benign warning (e.g.
+ * "the middleware file convention is deprecated") AS the build error, masking
+ * the actual cause. Exported for testing.
  */
-async function getVercelBuildErrors(deploymentId: string, vercelToken: string): Promise<string> {
+export function isNonErrorBuildLine(line: string): boolean {
+  const l = line.trim();
+  return (
+    /^vercel cli\b/i.test(l) ||
+    // Vercel/Next.js use ▲ as a general-purpose prefix — including on REAL errors
+    // (e.g. "▲ Error: …"). Only treat it as noise on their banner lines.
+    /^▲\s+(vercel|next\.js)\b/i.test(l) ||
+    /^[⚠►]/.test(l) ||
+    // Anchored to line-start: a bare "Deprecation Warning: …" line is noise, but a
+    // real error that merely mentions something deprecated must NOT be silenced.
+    /^deprecation\b/i.test(l) ||
+    /^warn(ing)?\b/i.test(l)
+  );
+}
+
+/**
+ * Fetch build error messages from Vercel deployment events.
+ *
+ * Prefers lines that carry an actual failure signal over trailing CLI/warning
+ * noise; when the logs contain ONLY noise (no explicit error line), says so
+ * rather than dressing a deprecation warning up as the build error. Exported
+ * for testing.
+ */
+export async function getVercelBuildErrors(deploymentId: string, vercelToken: string): Promise<string> {
   try {
     const headers = { Authorization: `Bearer ${vercelToken}` };
     const eventsRes = await axios.get<any>(
@@ -3447,8 +3555,23 @@ async function getVercelBuildErrors(deploymentId: string, vercelToken: string): 
       }
     }
 
-    // Return the last 30 error lines (most relevant)
-    return errorLines.slice(-30).join("\n") || "Build failed — no error details available in logs.";
+    if (errorLines.length === 0) {
+      return "Build failed — no error details available in logs.";
+    }
+
+    // Drop CLI-banner/warning noise so the real failure isn't buried under (or
+    // impersonated by) a trailing deprecation notice.
+    const meaningful = errorLines.filter((l) => !isNonErrorBuildLine(l));
+    if (meaningful.length === 0) {
+      // Only noise was captured — don't pass a warning off as the cause.
+      return (
+        errorLines.slice(-30).join("\n") +
+        "\n(No explicit build error was captured in the logs — only warnings/CLI output. Check the Vercel dashboard for the full build log.)"
+      );
+    }
+
+    // Return the last 30 meaningful error lines (most relevant).
+    return meaningful.slice(-30).join("\n");
   } catch (err: any) {
     console.error("[V0 SERVICE] Error fetching build logs:", err.message);
     return "Build failed — could not retrieve error details.";
@@ -4221,9 +4344,15 @@ async function listRepoTree(
  * orphaned component with an unresolvable import still fails the build for EVERY page on
  * the site: "delete the broken page" did not actually unbreak the site.
  */
-async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promise<void> {
+/**
+ * Returns whether any files were actually found and removed under app/<slug>/. `false`
+ * means the tree had nothing matching that prefix — the caller decides whether that's
+ * worth surfacing (e.g. record.slug diverging from the route actually committed would
+ * silently no-op here with no other signal that cleanup did not happen).
+ */
+async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promise<boolean> {
   const match = githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
-  if (!match) return;
+  if (!match) return false;
   const [, owner, repo] = match;
   const repoFullName = `${owner}/${repo.replace(".git", "")}`;
 
@@ -4238,7 +4367,7 @@ async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promis
 
   if (toDelete.length === 0) {
     console.log(`[GITHUB] Nothing to remove for /${slug} in ${repoFullName}`);
-    return; // never push an empty commit — it would trigger a pointless rebuild
+    return false; // never push an empty commit — it would trigger a pointless rebuild
   }
 
   await commitFilesToRepoMain(
@@ -4249,27 +4378,40 @@ async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promis
   );
 
   console.log(`[GITHUB] Removed ${toDelete.length} file(s) under ${prefix} from ${repoFullName}`);
+  return true;
 }
 
 /**
  * Delete a landing page. All pages are deletable (including the root).
  * Pages are soft-deleted (archived) and their route file is removed from GitHub.
+ *
+ * NOTE: not currently called anywhere — the DELETE route uses the sibling
+ * `deleteLandingPageByRecord` instead (see that function's own docstring). Kept in sync with
+ * it (including the `githubCleanupWarning` signal) so it isn't a silent trap if ever wired up.
  */
 export async function deleteLandingPage(
   id: string,
   userId: string
-): Promise<void> {
+): Promise<{ githubCleanupWarning?: string }> {
   const record = await getLandingPage(id, userId);
   if (!record) {
     throw new Error("Landing page not found");
   }
 
   // Remove route file from GitHub
+  let githubCleanupWarning: string | undefined;
   if (record.githubRepoUrl && record.slug) {
     try {
-      await removePageFromGitHub(record.githubRepoUrl, record.slug);
+      const removed = await removePageFromGitHub(record.githubRepoUrl, record.slug);
+      if (!removed) {
+        githubCleanupWarning =
+          "No GitHub files were found matching this page's route — the repo may already be " +
+          "clean, or cleanup could not locate them.";
+      }
     } catch (err: any) {
       console.error("[V0 SERVICE] Failed to remove route from GitHub:", err.message);
+      githubCleanupWarning =
+        "GitHub cleanup failed; this page's files may still exist in the repo.";
       // Continue with soft-delete even if GitHub cleanup fails
     }
   }
@@ -4300,6 +4442,8 @@ export async function deleteLandingPage(
     // would then pay for a fresh chat on its next build. (ENG-287 residual)
     slug: record.slug,
   });
+
+  return { githubCleanupWarning };
 }
 
 export async function updateLandingPageGtm(
@@ -4507,13 +4651,29 @@ export async function transferLandingPageOwner(id: string, newOwnerId: string): 
 /**
  * Delete a landing page given an already-fetched record (for org-share flows where
  * the caller may not be the owner). All pages are deletable.
+ *
+ * `githubCleanupWarning`, when present, means the DB record was archived successfully but
+ * the GitHub side either failed outright or found nothing matching `record.slug` to remove
+ * (e.g. the stored slug diverging from the route actually committed — see ENG-375). Either
+ * way the delete itself must never fail because of this; it's surfaced so a real occurrence
+ * is visible instead of silently logged where no one reads it.
  */
-export async function deleteLandingPageByRecord(record: GeneratedLandingPage): Promise<void> {
+export async function deleteLandingPageByRecord(
+  record: GeneratedLandingPage,
+): Promise<{ githubCleanupWarning?: string }> {
+  let githubCleanupWarning: string | undefined;
   if (record.githubRepoUrl && record.slug) {
     try {
-      await removePageFromGitHub(record.githubRepoUrl, record.slug);
+      const removed = await removePageFromGitHub(record.githubRepoUrl, record.slug);
+      if (!removed) {
+        githubCleanupWarning =
+          "No GitHub files were found matching this page's route — the repo may already be " +
+          "clean, or cleanup could not locate them.";
+      }
     } catch (err: any) {
       console.error("[V0 SERVICE] Failed to remove route from GitHub:", err.message);
+      githubCleanupWarning =
+        "GitHub cleanup failed; this page's files may still exist in the repo.";
     }
   }
 
@@ -4556,6 +4716,8 @@ export async function deleteLandingPageByRecord(record: GeneratedLandingPage): P
       slug: record.slug,
     });
   }
+
+  return { githubCleanupWarning };
 }
 
 /**

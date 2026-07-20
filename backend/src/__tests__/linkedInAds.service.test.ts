@@ -256,6 +256,35 @@ describe('updateCampaign', () => {
       })
     );
   });
+
+  // ENG-367: a supplied runSchedule.start override was silently dropped -- updateCampaign
+  // never read it into setFields, so LinkedIn always re-validated against the OLD stored
+  // start time and rejected any update (including archiving) on a DRAFT ad set whose start
+  // had elapsed. This was OUR bug, not a LinkedIn API limitation.
+  it('includes a runSchedule.start override in the patch (object form)', async () => {
+    await svc.updateCampaign(ACCESS_TOKEN, ACCOUNT_ID, 'camp-1', {
+      status: 'ARCHIVED',
+      runSchedule: { start: 1784300000000 },
+    });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.patch.$set.runSchedule).toEqual({ start: 1784300000000 });
+    expect(call.data.patch.$set.status).toBe('ARCHIVED');
+  });
+
+  it('includes a runSchedule.start override in the patch (snake_case form)', async () => {
+    await svc.updateCampaign(ACCESS_TOKEN, ACCOUNT_ID, 'camp-1', {
+      run_schedule_start: 1784300000000,
+      run_schedule_end: 1784400000000,
+    });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.patch.$set.runSchedule).toEqual({ start: 1784300000000, end: 1784400000000 });
+  });
+
+  it('omits runSchedule from the patch when not supplied (no unintended field)', async () => {
+    await svc.updateCampaign(ACCESS_TOKEN, ACCOUNT_ID, 'camp-1', { status: 'PAUSED' });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.patch.$set).not.toHaveProperty('runSchedule');
+  });
 });
 
 describe('createCreative', () => {
@@ -289,8 +318,12 @@ describe('createCreative', () => {
     expect(call.data.content.textAd).toMatchObject({
       headline: 'Click Here',
       description: 'Ad copy',
-      landingPage: 'https://example.com',
     });
+    // ENG-239: the text-ad landing page is now UTM-tagged at create time (campaign_id
+    // is in scope here). See linkedInAdsService.utm.test.ts for full coverage.
+    expect(call.data.content.textAd.landingPage).toBe(
+      'https://example.com?utm_source=linkedin&utm_medium=paid&utm_campaign=camp-1'
+    );
   });
 
   it('returns error when no creative type provided', async () => {
@@ -826,7 +859,10 @@ describe('createDynamicCreative', () => {
     const body = mockAxiosFn.mock.calls[0][0].data;
     expect(body.content.spotlight.headline).toBe('See our work');
     expect(body.content.spotlight.callToAction).toBe('Visit Now');
-    expect(body.content.spotlight.landingPage).toBe('https://example.com');
+    // ENG-239: the spotlight landing page is now UTM-tagged at create time.
+    expect(body.content.spotlight.landingPage).toBe(
+      'https://example.com?utm_source=linkedin&utm_medium=paid&utm_campaign=camp-1'
+    );
     expect(body.content.spotlight.description).toBe('Award-winning agency');
     expect(body.content.spotlight.logo).toBe('urn:li:image:logo-1');
   });

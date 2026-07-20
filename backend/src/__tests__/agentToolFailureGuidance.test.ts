@@ -7,9 +7,11 @@
  *    model never burns a retry counting characters (see linkedInOutreachService
  *    .trimInviteMessage and crm.draftInviteNote.trim.test.ts).
  *  - run_local_agent_task rejections must tell the model what to use instead
- *    of just echoing the forbidden regex (55% observed failure rate).
+ *    of a dead end. ENG-383 (2026-07): the local agent relay is retired, so the
+ *    "rejection" is now the permanent deprecation error — it must still name
+ *    the replacement tool.
  */
-import { validateBrowserTask } from '../emma/localAgentTools';
+import { LOCAL_AGENT_DEPRECATION_ERROR } from '../emma/localAgentTools';
 import '../emma/tools';
 import { emmaToolRegistry } from '../emma/registry';
 
@@ -40,30 +42,22 @@ describe('linkedin_outreach invite limit guidance', () => {
   });
 });
 
-describe('run_local_agent_task rejection guidance', () => {
-  it('names alternative tools when a forbidden pattern is matched', () => {
-    const rejection = validateBrowserTask('run the npm install command on the repo');
-    expect(rejection).not.toBeNull();
-    expect(rejection).toContain('coding_agent');
-    expect(rejection).toContain('search_web');
-    expect(rejection).toContain('READ-ONLY web browsing');
+describe('run_local_agent_task deprecation guidance (ENG-383)', () => {
+  it('every call fails with an error that names the replacement tool, not a dead end', async () => {
+    const result = await emmaToolRegistry.execute(
+      'run_local_agent_task',
+      { task: 'Visit https://example.com and extract the page title' },
+      { userId: 'u1' },
+    );
+    expect(result.success).toBe(false);
+    expect(result.error).toBe(LOCAL_AGENT_DEPRECATION_ERROR);
+    expect(result.error).toContain('search_web');
   });
 
-  it('explains what a valid task looks like when no browsing intent is found', () => {
-    const rejection = validateBrowserTask('summarize our Q2 strategy');
-    expect(rejection).not.toBeNull();
-    expect(rejection).toContain('no URL or web-browsing intent');
-    expect(rejection).toContain('restate the task with the specific URL');
-  });
-
-  it('still accepts a legitimate browsing task', () => {
-    const rejection = validateBrowserTask('Visit https://example.com and extract the page title');
-    expect(rejection).toBeNull();
-  });
-
-  it('still blocks credential-related tasks', () => {
-    const rejection = validateBrowserTask('browse to https://example.com and enter my password');
-    expect(rejection).not.toBeNull();
-    expect(rejection).toContain('cannot run commands');
+  it('the tool description itself steers the model away before it even calls', () => {
+    const definition = emmaToolRegistry.getTool('run_local_agent_task')?.definition as any;
+    expect(definition).toBeDefined();
+    expect(definition.description).toMatch(/^DEPRECATED \(2026-07\):/);
+    expect(definition.description).toContain('you_search_web');
   });
 });

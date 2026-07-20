@@ -512,7 +512,7 @@ export interface User {
   stripeConnectMode?: 'live' | 'test'; // Which Stripe mode the connection was made in
   connected_accounts?: Array<{
     platform: 'linkedin' | 'facebook'
-    | 'meta' | 'twitter' | 'instagram' | 'hubspot' | 'attio' | 'fathom' | 'gmail' | 'youtube' | 'clickup';
+    | 'meta' | 'twitter' | 'instagram' | 'hubspot' | 'attio' | 'fathom' | 'gmail' | 'outlook' | 'youtube' | 'clickup';
     account_id: string;
     account_name: string;
     config: {

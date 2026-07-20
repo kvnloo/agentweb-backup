@@ -30,7 +30,7 @@ emmaToolRegistry.register({
         },
         platform: {
           type: 'string',
-          enum: ['linkedin', 'unipile', 'linkedin_ads', 'meta', 'instagram', 'gmail', 'youtube', 'fathom'],
+          enum: ['linkedin', 'unipile', 'linkedin_ads', 'meta', 'instagram', 'gmail', 'outlook', 'youtube', 'fathom'],
           description:
             'Optional. Highlight a specific platform card after navigating ' +
             'so the user knows exactly which button to click.',

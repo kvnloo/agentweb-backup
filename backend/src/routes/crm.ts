@@ -204,6 +204,16 @@ router.use(enrichSoSubRouter);
 // its own express.raw body parser before HMAC verification — keep this
 // mounted before any global JSON body parser if we add one in the future.
 import apolloSubRouter from './crmApollo';
+import {
+  loadSenderConfig,
+  serializeSender,
+  validateSender,
+  senderSettingName,
+  resolveSenderForSend,
+  normalizeSender,
+} from '../services/crmSenderService';
+import { MAILBOX_PROVIDERS, CrmSender, isMailboxSender } from '../services/crmSenderTypes';
+import { sendAsSender } from '../services/sendAsSender';
 router.use(apolloSubRouter);
 
 const normalizeAlertEvents = (alertEvents: any) => {
@@ -220,20 +230,10 @@ const normalizeAlertEvents = (alertEvents: any) => {
 };
 
 const getCrmSenderIds = async (userId: string) => {
-  const settingName = `crm_sender_emails_${userId}`;
-  const setting = await settingsService.getSetting(settingName);
-  if (!setting?.settingValue) {
-    return [];
-  }
-  try {
-    const config = JSON.parse(setting.settingValue);
-    const senders = Array.isArray(config?.senders) ? config.senders : [];
-    return senders.map((sender: any) => sender.id).filter(Boolean);
-  } catch (error) {
-    console.error('Error parsing CRM sender emails:', error);
-    return [];
-  }
+  const config = await loadSenderConfig(userId);
+  return config.senders.map((sender) => sender.id).filter(Boolean);
 };
+
 
 const normalizeSenderId = (senderId: any) => {
   if (senderId === null || senderId === undefined || senderId === '') {
@@ -4881,40 +4881,44 @@ router.get('/sender-emails', async (req: Request, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const settingName = `crm_sender_emails_${userId}`;
-    const setting = await settingsService.getSetting(settingName);
-
-    // Fetch connected Gmail accounts so the frontend can offer them as sender options
-    let connectedGmailAccounts: Array<{ account_id: string; account_name: string; email: string }> = [];
+    // Connected mailboxes the frontend can offer as sender options.
+    // `connectedEmailAccounts` covers every mailbox provider; `connectedGmailAccounts`
+    // is kept so the existing portal build keeps working until it migrates.
+    let connectedEmailAccounts: Array<{ account_id: string; account_name: string; email: string; platform: string }> = [];
     try {
       const user = await userDb.getUserById(userId);
-      connectedGmailAccounts = (user?.connected_accounts || [])
-        .filter((a: any) => a.platform === 'gmail')
+      connectedEmailAccounts = (user?.connected_accounts || [])
+        .filter((a: any) => MAILBOX_PROVIDERS.includes(a.platform))
         .map((a: any) => ({
           account_id: a.account_id,
           account_name: a.account_name,
           email: a.config?.email || a.account_id,
+          platform: a.platform,
         }));
     } catch (_) {
       // Non-fatal — proceed without connected accounts
     }
+    const connectedGmailAccounts = connectedEmailAccounts
+      .filter((a) => a.platform === 'gmail')
+      .map(({ platform, ...rest }) => rest);
 
-    if (!setting) {
-      return res.json({ senders: [], defaultSenderId: null, connectedGmailAccounts });
-    }
+    const config = await loadSenderConfig(userId);
 
-    try {
-      const config = JSON.parse(setting.settingValue);
-      res.json({
-        senders: config.senders || [],
-        defaultSenderId: config.defaultSenderId || null,
-        defaultLinkedInAccountId: config.defaultLinkedInAccountId || null,
-        connectedGmailAccounts,
-      });
-    } catch (parseError) {
-      console.error('Error parsing CRM sender emails:', parseError);
-      res.json({ senders: [], defaultSenderId: null, defaultLinkedInAccountId: null, connectedGmailAccounts });
-    }
+    // Emit both shapes: the legacy keys (senderType / gmailAccountId) so the
+    // current portal keeps rendering, and the neutral ones the new UI reads.
+    const senders = config.senders.map((s) => ({
+      ...serializeSender(s),
+      senderProvider: s.senderProvider,
+      connectedAccountId: s.connectedAccountId,
+    }));
+
+    res.json({
+      senders,
+      defaultSenderId: config.defaultSenderId,
+      defaultLinkedInAccountId: config.defaultLinkedInAccountId,
+      connectedEmailAccounts,
+      connectedGmailAccounts,
+    });
   } catch (error: any) {
     console.error('Error fetching CRM sender emails:', error);
     res.status(500).json({ message: error.message || 'Failed to fetch CRM sender emails' });
@@ -4942,6 +4946,26 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'Senders must be an array' });
     }
 
+    // Mailbox senders are validated against the user's connected accounts: the
+    // provider sends as the authenticated mailbox, so a mismatched From would be
+    // silently ignored on the wire. Reject it here, where we can say so.
+    let userConnectedAccounts: any[] = [];
+    try {
+      const user = await userDb.getUserById(userId);
+      userConnectedAccounts = user?.connected_accounts || [];
+    } catch (_) {
+      // Non-fatal — validateSender will reject mailbox senders if we can't confirm the account
+    }
+
+    // Grandfather in senders that are unchanged from what's already persisted.
+    // The frontend always posts the FULL sender list on every save (not a diff),
+    // so without this, one stale sender (e.g. a disconnected account left over
+    // from before) would permanently block adding or editing ANY other sender —
+    // a real dead end with no recovery path (ENG-266 friction, found in live
+    // testing). Only senders that are new or genuinely modified get re-validated.
+    const existingConfig = await loadSenderConfig(userId);
+    const existingById = new Map(existingConfig.senders.map((s) => [s.id, s]));
+
     // Validate each sender
     for (const sender of senders) {
       if (!sender.email || !sender.fromName) {
@@ -4956,12 +4980,16 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
       if (sender.notes !== undefined && typeof sender.notes !== 'string') {
         return res.status(400).json({ message: 'Notes must be a string if provided' });
       }
-      // Gmail sender validation
-      if (sender.senderType !== undefined && sender.senderType !== 'gmail') {
-        return res.status(400).json({ message: `Invalid senderType: ${sender.senderType}` });
+
+      const existing = sender.id ? existingById.get(sender.id) : undefined;
+      const unchanged = existing && JSON.stringify(normalizeSender(sender)) === JSON.stringify(existing);
+      if (unchanged) {
+        continue;
       }
-      if (sender.senderType === 'gmail' && !sender.gmailAccountId) {
-        return res.status(400).json({ message: 'Gmail senders must include gmailAccountId' });
+
+      const validation = validateSender(sender, userConnectedAccounts);
+      if (!validation.ok) {
+        return res.status(400).json({ message: validation.error });
       }
     }
 
@@ -4982,15 +5010,18 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
       }
     }
 
-    const settingName = `crm_sender_emails_${userId}`;
+    const settingName = senderSettingName(userId);
     const config: any = {
-      senders: senders.map((s: any, index: number) => ({
-        id: s.id || index.toString(),
-        email: s.email.trim(),
-        fromName: s.fromName.trim(),
-        notes: s.notes ? s.notes.trim() : undefined,
-        ...(s.senderType === 'gmail' ? { senderType: 'gmail', gmailAccountId: s.gmailAccountId } : {}),
-      })),
+      senders: senders.map((s: any, index: number) =>
+        serializeSender({
+          id: s.id || index.toString(),
+          email: s.email.trim(),
+          fromName: s.fromName.trim(),
+          notes: s.notes ? s.notes.trim() : undefined,
+          senderProvider: s.senderProvider ?? s.senderType ?? 'resend',
+          connectedAccountId: s.connectedAccountId ?? s.gmailAccountId,
+        }),
+      ),
       defaultSenderId: defaultSenderId || (senders.length > 0 ? senders[0].id || '0' : null),
       defaultLinkedInAccountId: defaultLinkedInAccountId || null
     };
@@ -5212,7 +5243,7 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId, leadId } = req.params;
-    const { senderEmail, senderName, subject, htmlContent, textContent } = req.body;
+    const { senderId, senderEmail, senderName, subject, htmlContent, textContent } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -5239,18 +5270,28 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    // Send email via Resend
-    const from = `${senderName} <${senderEmail}>`;
-    const result = await resendService.sendEmail({
-      from,
-      to: lead.email,
-      subject,
-      html: htmlContent,
-      text: textContent
-    });
+    // ENG-266 Part 3: route through the sender's real provider. If senderId/senderEmail
+    // don't resolve to a configured sender (an older client, or an ad-hoc address),
+    // fall back to a synthesized resend sender from the raw fields — same as before.
+    const resolvedSender = await resolveSenderForSend(userId, senderId, senderEmail);
+    const sender: CrmSender = resolvedSender ?? {
+      id: '__adhoc__',
+      email: senderEmail,
+      fromName: senderName,
+      senderProvider: 'resend',
+    };
 
-    if (!result) {
-      return res.status(500).json({ message: 'Failed to send email via Resend' });
+    let sendResult;
+    try {
+      sendResult = await sendAsSender(userId, sender, {
+        to: lead.email,
+        subject,
+        html: htmlContent,
+        text: textContent,
+      });
+    } catch (error: any) {
+      console.error('Error sending email:', error);
+      return res.status(500).json({ message: error.message || 'Failed to send email' });
     }
 
     // Remove the email draft after successfully sending
@@ -5260,7 +5301,7 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
 
     res.json({
       message: 'Email sent successfully',
-      emailId: result.id
+      emailId: sendResult.messageId
     });
   } catch (error: any) {
     console.error('Error sending email:', error);
@@ -5278,7 +5319,7 @@ router.post('/lists/:listId/leads/:leadId/reply-email', async (req: Request, res
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId, leadId } = req.params;
-    const { senderEmail, senderName, subject, htmlContent, messageId } = req.body;
+    const { senderId, senderEmail, senderName, subject, htmlContent, messageId } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -5305,23 +5346,33 @@ router.post('/lists/:listId/leads/:leadId/reply-email', async (req: Request, res
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    // Send reply email via Resend with In-Reply-To header
-    const from = `${senderName} <${senderEmail}>`;
-    const result = await resendService.sendEmail({
-      from,
-      to: lead.email,
-      subject,
-      html: htmlContent,
-      inReplyTo: messageId
-    });
+    // ENG-266 Part 3: route through the sender's real provider, same fallback as send-email.
+    // messageId here is best-effort (see sendAsSender's replyToMessageId docs) — it only
+    // "worked" as an RFC In-Reply-To before because every send was hardcoded to Resend.
+    const resolvedSender = await resolveSenderForSend(userId, senderId, senderEmail);
+    const sender: CrmSender = resolvedSender ?? {
+      id: '__adhoc__',
+      email: senderEmail,
+      fromName: senderName,
+      senderProvider: 'resend',
+    };
 
-    if (!result) {
-      return res.status(500).json({ message: 'Failed to send reply email via Resend' });
+    let sendResult;
+    try {
+      sendResult = await sendAsSender(userId, sender, {
+        to: lead.email,
+        subject,
+        html: htmlContent,
+        replyToMessageId: messageId,
+      });
+    } catch (error: any) {
+      console.error('Error sending reply email:', error);
+      return res.status(500).json({ message: error.message || 'Failed to send reply email' });
     }
 
     res.json({
       message: 'Reply email sent successfully',
-      emailId: result.id
+      emailId: sendResult.messageId
     });
   } catch (error: any) {
     console.error('Error sending reply email:', error);
@@ -5732,7 +5783,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { socketId, senderEmail, senderName, subject, htmlContent, textContent, leadIds, unsubscribeFooterHtml, includeUndeliverable, includeUndeliverableEmails } = req.body;
+    const { socketId, senderId, senderEmail, senderName, subject, htmlContent, textContent, leadIds, unsubscribeFooterHtml, includeUndeliverable, includeUndeliverableEmails } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -5741,6 +5792,17 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     if (!senderEmail || !senderName || !subject || !htmlContent) {
       return res.status(400).json({ message: 'senderEmail, senderName, subject, and htmlContent are required' });
     }
+
+    // ENG-266 Part 3: route through the sender's real provider. senderId is preferred and
+    // unambiguous; senderEmail is the legacy fallback for older clients — falls back to a
+    // synthesized resend sender if nothing configured matches (same as before).
+    const resolvedSender = await resolveSenderForSend(userId, senderId, senderEmail);
+    const sender: CrmSender = resolvedSender ?? {
+      id: '__adhoc__',
+      email: senderEmail,
+      fromName: senderName,
+      senderProvider: 'resend',
+    };
 
     const list = await crmDb.getLeadListById(listId);
     if (!list) {
@@ -5799,12 +5861,23 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
 
     const total = eligibleLeads.length;
 
+    // ENG-266 Part 3: a mailbox send (Gmail/Graph) has no shared queue like Resend's, and
+    // budgets ~600ms/send (round-trip + throttle) — 50 leads keeps one HTTP request
+    // comfortably inside a 60s ALB timeout. Reject up front rather than partway through.
+    const MAILBOX_SENDER_LEAD_CAP = 50;
+    if (isMailboxSender(sender) && total > MAILBOX_SENDER_LEAD_CAP) {
+      return res.status(400).json({
+        message: `Sending from a connected mailbox is limited to ${MAILBOX_SENDER_LEAD_CAP} recipients per campaign. This list has ${total} eligible leads.`,
+        code: 'MAILBOX_SENDER_LEAD_CAP_EXCEEDED',
+      });
+    }
+
     const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
-    const from = `${senderName} <${senderEmail}>`;
 
     let sent = 0;
     let failed = 0;
     const failedEmails: string[] = [];
+    const failureReasons: Array<{ email: string; reason: string }> = [];
 
     for (const lead of eligibleLeads) {
       try {
@@ -5825,24 +5898,19 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
         });
         personalizedHtml = injectUnsubscribeUrl(personalizedHtml, unsubscribeUrl, unsubscribeFooterHtml);
 
-        const result = await resendService.sendEmail({
-          from,
+        await sendAsSender(userId, sender, {
           to: lead.email,
           subject: personalizedSubject,
           html: personalizedHtml,
           text: personalizedText,
         });
-
-        if (result && result.id) {
-          sent++;
-        } else {
-          failed++;
-          failedEmails.push(lead.email);
-        }
+        sent++;
       } catch (err: any) {
-        console.error(`Failed to send group email to ${lead.email}:`, err.message || err);
+        const reason = err.message || String(err);
+        console.error(`Failed to send group email to ${lead.email}:`, reason);
         failed++;
         failedEmails.push(lead.email);
+        failureReasons.push({ email: lead.email, reason });
       }
 
       // Emit progress
@@ -5856,6 +5924,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       sent,
       failed,
       failedEmails,
+      failureReasons,
       skippedUnsubscribed: skippedDoNotContact,
       skippedDoNotContact,
       skippedMissingVars,
@@ -5876,7 +5945,7 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { senderEmail, senderName, subject, htmlContent, textContent, recipients, unsubscribeFooterHtml } = req.body;
+    const { senderId, senderEmail, senderName, subject, htmlContent, textContent, recipients, unsubscribeFooterHtml } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -5922,37 +5991,43 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
       : testBanner + testBaseHtml;
     // Wire up unsubscribe URL with the real portal domain
     const testHtml = injectUnsubscribeUrl(withBanner, testUnsubscribeUrl, unsubscribeFooterHtml);
-    const from = `${senderName} <${senderEmail}>`;
+
+    // ENG-266 Part 3: route through the sender's real provider (same fallback as the
+    // other send sites). No lead cap here — test sends are inherently small.
+    const resolvedSender = await resolveSenderForSend(userId, senderId, senderEmail);
+    const sender: CrmSender = resolvedSender ?? {
+      id: '__adhoc__',
+      email: senderEmail,
+      fromName: senderName,
+      senderProvider: 'resend',
+    };
 
     let sent = 0;
     let failedCount = 0;
     const failedEmails: string[] = [];
+    const failureReasons: Array<{ email: string; reason: string }> = [];
 
     for (const email of validEmails) {
       try {
-        const result = await resendService.sendEmail({
-          from,
+        await sendAsSender(userId, sender, {
           to: email.trim(),
           subject: `[TEST] ${subject}`,
           html: testHtml,
           text: textContent,
         });
-
-        if (result && result.id) {
-          sent++;
-        } else {
-          failedCount++;
-          failedEmails.push(email);
-        }
+        sent++;
       } catch (err: any) {
-        console.error(`Failed to send test group email to ${email}:`, err.message || err);
+        const reason = err.message || String(err);
+        console.error(`Failed to send test group email to ${email}:`, reason);
         failedCount++;
         failedEmails.push(email);
+        failureReasons.push({ email, reason });
       }
     }
 
     return res.json({
       total: validEmails.length,
+      failureReasons,
       sent,
       failed: failedCount,
       failedEmails,
