@@ -1,3 +1,13 @@
+## ENG-409: default customer-bug assignee changed Harshit → Manan (2026-07-20)
+
+Directed by Harsha. Customer-filed bug canonicals (`fileBugReport` in `services/intakeService.ts`)
+now default-assign to **Manan Varma** (`cabadf7c-b95d-4455-b9ec-df11d5d83f5f`) instead of Harshit
+Shah (`4c29baa4-…`). The assignee is the hardcoded constant `BUG_DEFAULT_ASSIGNEE_ID` — confirmed
+there is NO `LINEAR_BUG_DEFAULT_ASSIGNEE_ID` env override in the code (an earlier line in this file
+claimed one; corrected). Behaviour is otherwise unchanged: bugs still land in Todo with the same
+funnel-derived priority; feature requests and auto/telemetry issues stay unassigned.
+`intakeService.funnelTriage.test.ts` now pins the Manan UUID.
+
 ## ENG-383: local agent relay tools deprecated to stubs (2026-07-17)
 
 The local agent relay (ngrok tunnel to a Codex agent on a Mac) is permanently dead — ngrok account
@@ -532,7 +542,7 @@ Argusoft reported auto-generated Linear bugs whose descriptions say "Priority: H
 `createInternalLinearIssue` (linearService) set only teamId/title/description/labelIds + stateId=Backlog — never `priority`/`assigneeId`. Emma's `report_product_issues` accepts a `priority: High|Medium|Low` param but only rendered it as description text via `issueContext['Priority']` → `contextLines()`. The legacy Notion path (`createOncallItem`) set an Owner + Move-to-Current-Sprint, so the Linear migration had silently regressed triage visibility.
 
 ### Fix
-`FileUserIssueParams.priority` (text) is now mapped onto the Linear priority field in `fileBugReport` (urgent=1/high=2/medium=3/low=4; absent/unknown → Medium — bugs never arrive "No priority" per the board doc). High+ additionally lands `startInTodo` + default bug assignee (Harshit, env override `LINEAR_BUG_DEFAULT_ASSIGNEE_ID`). `getTeamMeta` resolves `todoStateId`; `createInternalLinearIssue` gained optional `priority`/`assigneeId`/`startInTodo`.
+`FileUserIssueParams.priority` (text) is now mapped onto the Linear priority field in `fileBugReport` (urgent=1/high=2/medium=3/low=4; absent/unknown → Medium — bugs never arrive "No priority" per the board doc). High+ additionally lands `startInTodo` + default bug assignee (Manan as of 2026-07-20 / ENG-409; a hardcoded `BUG_DEFAULT_ASSIGNEE_ID` constant — there is NO `LINEAR_BUG_DEFAULT_ASSIGNEE_ID` env override in the code). `getTeamMeta` resolves `todoStateId`; `createInternalLinearIssue` gained optional `priority`/`assigneeId`/`startInTodo`.
 
 ### Assumptions to validate
 - Dup-grouped High re-reports do NOT escalate the existing canonical's priority/state (kept out of scope; the reporter-count modifier in the board doc may want this later).
