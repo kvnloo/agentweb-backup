@@ -2,6 +2,7 @@ import axios from 'axios';
 import { getGoogleAdsCredentials } from '../utils/secretsManager';
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
+import { buildUtmSpec, mergeUtmIntoQueryString, mergeUtmIntoUrl, readUtmKeys, utmKeysInQueryString, utmQueryString } from '../utils/adUtm';
 
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
 const TOKEN_REFRESH_URL = 'https://oauth2.googleapis.com/token';
@@ -568,6 +569,81 @@ export class GoogleAdsService {
     await this.mutate(customerId, accessToken, 'campaigns', [{ remove: campaignResourceName }], loginCustomerId);
   }
 
+  /**
+   * Validate a Google Ads resource name before it is interpolated into a GAQL WHERE
+   * clause (ENG-335). Unlike the other queries in this service, the ENG-335 lookups
+   * splice a caller-supplied value into the query, and that value ultimately originates
+   * from an LLM tool-call argument. Real resource names are only `customers/<n>/<segment>/<n>`,
+   * so we reject anything else rather than let a crafted string alter the query (e.g. one
+   * engineered to return zero rows and silently skip the creative-addition gate).
+   */
+  private assertResourceName(value: string, segment: 'campaigns' | 'adGroups'): void {
+    if (typeof value !== 'string' || !new RegExp(`^customers/\\d+/${segment}/\\d+$`).test(value)) {
+      throw new Error(`Invalid Google Ads ${segment} resource name`);
+    }
+  }
+
+  /**
+   * Collect the de-duplicated set of final URLs a campaign points at, across its
+   * (non-removed) responsive ads and PMax asset groups. Used by the pre-flight
+   * tracking gate (ENG-335) before a campaign is enabled/launched.
+   */
+  async getCampaignFinalUrls(userId: string, customerId: string, campaignResourceName: string): Promise<string[]> {
+    this.assertResourceName(campaignResourceName, 'campaigns');
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const urls = new Set<string>();
+
+    const adRows = await this.search(customerId, accessToken,
+      `SELECT ad_group_ad.ad.final_urls FROM ad_group_ad WHERE campaign.resource_name = '${campaignResourceName}' AND ad_group_ad.status != 'REMOVED'`,
+      loginCustomerId,
+    );
+    for (const r of adRows) {
+      for (const u of (r.adGroupAd?.ad?.finalUrls || [])) urls.add(u);
+    }
+
+    const assetGroupRows = await this.search(customerId, accessToken,
+      `SELECT asset_group.final_urls FROM asset_group WHERE campaign.resource_name = '${campaignResourceName}' AND asset_group.status != 'REMOVED'`,
+      loginCustomerId,
+    );
+    for (const r of assetGroupRows) {
+      for (const u of (r.assetGroup?.finalUrls || [])) urls.add(u);
+    }
+
+    return [...urls];
+  }
+
+  /**
+   * Current serving status of a campaign (e.g. 'ENABLED', 'PAUSED'), or null if
+   * the campaign can't be found. Used by the ENG-335 launch gate to decide whether
+   * adding a creative to it serves paid traffic instantly.
+   */
+  async getCampaignStatus(userId: string, customerId: string, campaignResourceName: string): Promise<string | null> {
+    this.assertResourceName(campaignResourceName, 'campaigns');
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const rows = await this.search(customerId, accessToken,
+      `SELECT campaign.status FROM campaign WHERE campaign.resource_name = '${campaignResourceName}'`,
+      loginCustomerId,
+    );
+    return rows[0]?.campaign?.status ?? null;
+  }
+
+  /**
+   * Resolve the parent campaign (resource name + current status) of an ad group.
+   * Returns null if the ad group can't be found. Used by the ENG-335 launch gate
+   * so a new ad added to a live campaign is checked before it serves.
+   */
+  async getAdGroupCampaign(userId: string, customerId: string, adGroupResourceName: string): Promise<{ campaignResourceName: string; campaignStatus: string } | null> {
+    this.assertResourceName(adGroupResourceName, 'adGroups');
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const rows = await this.search(customerId, accessToken,
+      `SELECT ad_group.campaign, campaign.status FROM ad_group WHERE ad_group.resource_name = '${adGroupResourceName}'`,
+      loginCustomerId,
+    );
+    const row = rows[0];
+    if (!row?.adGroup?.campaign) return null;
+    return { campaignResourceName: row.adGroup.campaign, campaignStatus: row.campaign?.status ?? '' };
+  }
+
   // ── Location search ───────────────────────────────────────────────────────
 
   async searchLocations(userId: string, customerId: string, query: string, locale: string = 'en'): Promise<{ id: string; name: string; countryCode: string; targetType: string }[]> {
@@ -735,6 +811,88 @@ export class GoogleAdsService {
 
   // ── Ads ──────────────────────────────────────────────────────────────────
 
+  /**
+   * ENG-239 — the Google `final_url_suffix` Emma stamps on an ad so leads from it
+   * reach the CRM with attribution. Returns `undefined` when nothing should be
+   * written (so the caller omits the field rather than sending an empty one).
+   *
+   * `final_url_suffix` is a native field on the `Ad` (`ad_group_ad.ad.final_url_suffix`),
+   * appended to the destination URL by Google at click time and shown in the ad's
+   * URL options — which is what makes AC1 ("verifiable in the platform's ad
+   * settings") hold literally. The generated value uses ValueTrack macros
+   * (`{campaignid}`, `{creative}`) that reach the API un-encoded and resolve per
+   * click. An explicit caller-supplied suffix wins verbatim; otherwise any UTM key
+   * the user already put on `finalUrl` is omitted (AC4), and when every key is
+   * already present `utmQueryString` returns "" → we return `undefined`.
+   */
+  private buildAdFinalUrlSuffix(opts: {
+    finalUrl?: string;
+    explicitSuffix?: string;
+    /** The suffix this ad would otherwise inherit from its campaign. */
+    inheritedSuffix?: string;
+  }): string | undefined {
+    if (opts.explicitSuffix) return opts.explicitSuffix;
+    if (!opts.finalUrl) return undefined;
+    // If we cannot read the destination URL we do not tag it: it may well already
+    // carry a utm_source (`example.com?utm_source=news` fails `new URL()` for want of
+    // a scheme), and appending a second one would corrupt the attribution. Nor do we
+    // throw — Google should reject a bad URL with its own precise error, not ours.
+    const urlKeys = readUtmKeys(opts.finalUrl);
+    if (!urlKeys) return undefined;
+    const spec = buildUtmSpec('google', { campaign: '{campaignid}', content: '{creative}' });
+    // Carry the campaign's suffix forward — an ad-level suffix REPLACES it, so not
+    // doing so would silently destroy the client's own tracking (AC4).
+    const merged = mergeUtmIntoQueryString(opts.inheritedSuffix, spec, urlKeys);
+    return merged || undefined;
+  }
+
+  /**
+   * The `final_url_suffix` an ad in this ad group would inherit from its campaign.
+   *
+   * Google resolves the suffix by most-specific level (ad > ad group > campaign >
+   * account) and the winner REPLACES the others — they are not concatenated. So we
+   * must know what we would be replacing before we write at ad level.
+   *
+   * Returns `{ ok: false }` if the read fails. Callers then write no generated
+   * suffix at all: losing attribution on one ad is recoverable, silently destroying
+   * a client's campaign-level tracking is not.
+   */
+  private async getInheritedFinalUrlSuffix(
+    customerId: string,
+    accessToken: string,
+    adGroupResourceName: string,
+    loginCustomerId?: string,
+  ): Promise<{ ok: true; suffix?: string } | { ok: false }> {
+    try {
+      const rows = await this.search(
+        customerId,
+        accessToken,
+        `SELECT ad_group.final_url_suffix, campaign.final_url_suffix FROM ad_group WHERE ad_group.resource_name = '${adGroupResourceName}'`,
+        loginCustomerId,
+      );
+      // Ad group is more specific than campaign, so its own suffix (if set) is
+      // the one actually in effect — campaign's is only a fallback.
+      const suffix = rows[0]?.adGroup?.finalUrlSuffix || rows[0]?.campaign?.finalUrlSuffix || undefined;
+      return { ok: true, suffix };
+    } catch (err: any) {
+      console.warn(
+        `[GoogleAds] could not read inherited final_url_suffix for ${adGroupResourceName}; skipping UTM suffix to avoid clobbering it:`,
+        err?.message || err,
+      );
+      return { ok: false };
+    }
+  }
+
+  /**
+   * Google Ads resource names are always `[A-Za-z0-9_/~-]+` — no quotes, no
+   * whitespace. Both retag entry points interpolate their resource name
+   * argument directly into a GAQL string literal, so this guard closes that
+   * injection vector before the value ever reaches a query (Greptile).
+   */
+  private isValidGoogleAdsResourceName(name: string): boolean {
+    return /^[A-Za-z0-9_/~-]+$/.test(name);
+  }
+
   async listAds(userId: string, customerId: string, adGroupResourceName: string): Promise<any[]> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const results = await this.search(customerId, accessToken,
@@ -752,6 +910,110 @@ export class GoogleAdsService {
     }));
   }
 
+  /**
+   * Read every destination the UTM audit must judge for this account (ENG-239 AC3).
+   * STRICTLY READ-ONLY.
+   *
+   * TWO resource types, because our tagger writes to two:
+   *
+   *   1. `ad_group_ad` — a normal ad. Tagged via the ad's native `final_url_suffix`
+   *      (`buildAdFinalUrlSuffix`), which Google appends to the final URL at click time.
+   *
+   *   2. `asset_group` — a Performance Max campaign. A PMax campaign has NO ad_group_ads at
+   *      all; its destinations live on `asset_group.final_urls`. Reading only ad_group_ad would
+   *      see zero ads for such a campaign and the audit would report it `tagged: true`
+   *      VACUOUSLY — a clean bill of health for a campaign we never actually looked at. That
+   *      is worse than a false "untagged": the team trusts the report and skips a client who
+   *      has no attribution at all.
+   *
+   * INHERITANCE — the thing that must not be got wrong: Google resolves `final_url_suffix`
+   * most-specific-wins (ad > ad group > campaign > account) and the winner REPLACES the
+   * others; they are NEVER concatenated. So an ad's effective suffix is its own if set, else
+   * the campaign's. Concatenating (or ignoring the campaign level) would report a properly
+   * tagged campaign as untagged — a false positive the team would act on.
+   *
+   * ASSET-GROUP SUFFIX: an asset group has NO `final_url_suffix` field of its own (that is
+   * precisely why `createAssetGroup` merges the UTMs straight into `final_urls` — see :1072).
+   * Its append field is therefore the CAMPAIGN's suffix and nothing else. Selecting
+   * `asset_group.final_url_suffix` in GAQL would not merely be wrong, it would fail the whole
+   * query and take the audit down with it.
+   *
+   * AD-GROUP SUFFIX: `getInheritedFinalUrlSuffix` reads and inherits from the ad group level
+   * too (an ad group's own suffix is more specific than its campaign's), so the audit must
+   * read it as well — an ad-group-tagged campaign with no ad/campaign-level suffix would
+   * otherwise be a false "untagged".
+   *
+   * `destinationUrls` is the whole `finalUrls` array — every one of them must carry the UTMs,
+   * not just `finalUrls[0]`.
+   */
+  async listAdsForUtmAudit(
+    userId: string,
+    customerId: string,
+    campaignId?: string,
+  ): Promise<Array<{
+    adId: string;
+    campaignId: string;
+    campaignName: string;
+    destinationUrls: string[];
+    appendField?: string;
+  }>> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+
+    // Campaign ids are numeric; the guard keeps a caller-supplied value out of the GAQL text.
+    const where = campaignId && /^\d+$/.test(campaignId) ? ` WHERE campaign.id = ${campaignId}` : '';
+
+    const adQuery =
+      'SELECT campaign.id, campaign.name, campaign.final_url_suffix, ad_group.final_url_suffix, ' +
+      'ad_group_ad.ad.id, ad_group_ad.ad.final_urls, ad_group_ad.ad.final_url_suffix ' +
+      'FROM ad_group_ad' + where;
+
+    // NOTE: no `asset_group.final_url_suffix` — that field does not exist on the resource.
+    const assetGroupQuery =
+      'SELECT campaign.id, campaign.name, campaign.final_url_suffix, ' +
+      'asset_group.id, asset_group.final_urls ' +
+      'FROM asset_group' + where;
+
+    const [adRows, assetGroupRows] = await Promise.all([
+      this.search(customerId, accessToken, adQuery, loginCustomerId),
+      this.search(customerId, accessToken, assetGroupQuery, loginCustomerId),
+    ]);
+
+    const urls = (value: any): string[] =>
+      (Array.isArray(value) ? value : []).filter((u: any) => typeof u === 'string' && u.trim());
+
+    const ads = adRows.map((r: any) => {
+      const ad = r.adGroupAd?.ad ?? {};
+      const adGroup = r.adGroup ?? {};
+      const campaign = r.campaign ?? {};
+      return {
+        adId: String(ad.id ?? ''),
+        campaignId: campaign.id != null ? String(campaign.id) : '',
+        campaignName: campaign.name ?? '',
+        destinationUrls: urls(ad.finalUrls),
+        // Most-specific-wins: ad > ad group > campaign — each level REPLACES the
+        // others, never appends to them.
+        appendField: ad.finalUrlSuffix || adGroup.finalUrlSuffix || campaign.finalUrlSuffix || undefined,
+      };
+    });
+
+    const assetGroups = assetGroupRows.map((r: any) => {
+      const assetGroup = r.assetGroup ?? {};
+      const campaign = r.campaign ?? {};
+      return {
+        // Namespaced so an asset group is never mistaken for an ad id in the report — the two
+        // are different resources and are actioned differently.
+        adId: `assetGroup/${assetGroup.id ?? ''}`,
+        campaignId: campaign.id != null ? String(campaign.id) : '',
+        campaignName: campaign.name ?? '',
+        destinationUrls: urls(assetGroup.finalUrls),
+        // Campaign level ONLY — an asset group has no suffix field of its own.
+        appendField: campaign.finalUrlSuffix || undefined,
+      };
+    });
+
+    return [...ads, ...assetGroups];
+  }
+
   async createAd(userId: string, customerId: string, params: {
     adGroupResourceName: string;
     type: 'RESPONSIVE_SEARCH_AD' | 'RESPONSIVE_DISPLAY_AD';
@@ -759,6 +1021,8 @@ export class GoogleAdsService {
     descriptions: string[];
     finalUrl: string;
     imageAssetResourceNames?: string[];
+    /** ENG-239: explicit UTM/tracking suffix; wins over the auto-generated one. */
+    finalUrlSuffix?: string;
   }): Promise<{ resourceName: string }> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
 
@@ -786,16 +1050,46 @@ export class GoogleAdsService {
       throw new Error(`Unsupported ad type "${params.type}". Use RESPONSIVE_SEARCH_AD or RESPONSIVE_DISPLAY_AD.`);
     }
 
+    // Read what this ad would inherit from its campaign BEFORE writing at ad level —
+    // an ad-level suffix replaces the campaign's outright (ENG-239 AC4).
+    const inherited = await this.getInheritedFinalUrlSuffix(
+      customerId, accessToken, params.adGroupResourceName, loginCustomerId,
+    );
+    const finalUrlSuffix = inherited.ok
+      ? this.buildAdFinalUrlSuffix({
+          finalUrl: params.finalUrl,
+          explicitSuffix: params.finalUrlSuffix,
+          inheritedSuffix: inherited.suffix,
+        })
+      : params.finalUrlSuffix; // read failed → only an explicitly-supplied suffix is safe to write
+
     const data = await this.mutate(customerId, accessToken, 'adGroupAds', [{
       create: {
         adGroup: params.adGroupResourceName,
         status: 'ENABLED',
-        ad: { ...adContent, finalUrls: [params.finalUrl] },
+        ad: {
+          ...adContent,
+          finalUrls: [params.finalUrl],
+          ...(finalUrlSuffix ? { finalUrlSuffix } : {}),
+        },
       },
     }], loginCustomerId);
     return { resourceName: data.results[0].resourceName };
   }
 
+  /**
+   * `finalUrl`/`finalUrlSuffix` params were removed (ENG-239 follow-up):
+   * `ad_group_ad.ad.final_url_suffix` is LIVE-VERIFIED IMMUTABLE on UPDATE —
+   * Google rejects it with `IMMUTABLE_FIELD: Field 'ad.final_url_suffix' cannot
+   * be modified by 'UPDATE' operation`, even though the v24 proto carries no
+   * IMMUTABLE annotation on the field. This path was never reachable from any
+   * real caller (the AD UPDATE dispatcher only ever passes `status`), so no
+   * behavior changes for real traffic — this only removes dead code whose own
+   * unit tests were asserting on a write Google's live API always rejects. A
+   * suffix can still be set at CREATE time (`createAd`, which uses a `create`
+   * mutate op — Google's immutability rule is UPDATE-only) or via `retagAdUtm`,
+   * which correctly writes at the CAMPAIGN level instead.
+   */
   async updateAd(userId: string, customerId: string, adGroupAdResourceName: string, params: {
     status?: 'ENABLED' | 'PAUSED';
   }): Promise<boolean> {
@@ -806,6 +1100,141 @@ export class GoogleAdsService {
     if (updateMask.length === 0) return false;
     await this.mutate(customerId, accessToken, 'adGroupAds', [{ update, updateMask: updateMask.join(',') }], loginCustomerId);
     return true;
+  }
+
+  /**
+   * Retag ONE existing, already-live ad that's missing UTMs (Harsha's ask —
+   * the audit tool can only find these, never fix them). Deliberately single-ad
+   * INPUT: never loop or accept a list. But the WRITE lands on that ad's
+   * CAMPAIGN, not the ad itself — see below — so retagging affects every ad
+   * under that campaign, not just the one named. Callers/tools must disclose
+   * this blast radius; it is bigger than the name suggests.
+   *
+   * LIVE-VERIFIED 2026-07-16 against a real Google Ads account (customer
+   * 2883029950): an ad-level `UPDATE` of `final_url_suffix` is REJECTED —
+   * `IMMUTABLE_FIELD: Field 'ad.final_url_suffix' cannot be modified by
+   * 'UPDATE' operation` — even though the v24 `Ad` proto carries no IMMUTABLE
+   * annotation on this field (unlike the ad-type oneof fields, which do). The
+   * public proto and the live server's actual validation disagree; proto
+   * silence is not proof of mutability. `updateAd`'s finalUrl-based edit path
+   * (used at CREATE time, where this write is allowed) cannot be reused here.
+   *
+   * CAMPAIGN-level `UPDATE` of `final_url_suffix`, by contrast, was confirmed
+   * live to succeed and read back correctly, and a newly-created ad under that
+   * campaign was confirmed to correctly INHERIT + MERGE (not overwrite) it —
+   * exactly the AC4 behavior `mergeUtmIntoQueryString` is designed for. So this
+   * reads the ad's final_url (for the AC4 omission check — never duplicate a
+   * key the destination already carries) and the campaign's CURRENT
+   * `final_url_suffix` (to merge into, not replace), then writes the merged
+   * value back to the CAMPAIGN.
+   */
+  async retagAdUtm(
+    userId: string,
+    customerId: string,
+    adGroupAdResourceName: string,
+  ): Promise<{ success: boolean; reason?: 'no_destination_url' | 'invalid_resource_name' }> {
+    if (!this.isValidGoogleAdsResourceName(adGroupAdResourceName)) {
+      return { success: false, reason: 'invalid_resource_name' };
+    }
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const rows = await this.search(
+      customerId,
+      accessToken,
+      `SELECT ad_group_ad.ad.final_urls, campaign.resource_name, campaign.final_url_suffix `
+      + `FROM ad_group_ad WHERE ad_group_ad.resource_name = '${adGroupAdResourceName}'`,
+      loginCustomerId,
+    );
+    const finalUrl = rows[0]?.adGroupAd?.ad?.finalUrls?.[0];
+    if (!finalUrl) return { success: false, reason: 'no_destination_url' };
+
+    // Unreadable destination — do not tag; we can't confirm this ad's URL is
+    // even a URL, so refuse rather than risk writing anything at all.
+    if (!readUtmKeys(finalUrl)) return { success: false };
+
+    const campaignResourceName: string | undefined = rows[0]?.campaign?.resourceName;
+    const existingSuffix: string | undefined = rows[0]?.campaign?.finalUrlSuffix;
+    const spec = buildUtmSpec('google', { campaign: '{campaignid}', content: '{creative}' });
+    // Greptile P1: omission must be driven ONLY by what the EXISTING campaign
+    // suffix already defines (mergeUtmIntoQueryString computes that internally
+    // from `existingSuffix`) — never by the targeted ad's own URL. The suffix
+    // applies to every ad in the campaign at click time; using one ad's URL as
+    // the omit mask either strips a key from sibling ads that never had it, or
+    // adds a key that duplicates onto one of this ad's OTHER final urls.
+    const merged = mergeUtmIntoQueryString(existingSuffix, spec);
+    const normalizedExisting = (existingSuffix || '').replace(/^[?&]+/, '').replace(/&+$/, '');
+    if (!campaignResourceName || merged === normalizedExisting) return { success: false };
+
+    const success = await this.updateCampaign(userId, customerId, campaignResourceName, { finalUrlSuffix: merged });
+    return { success };
+  }
+
+  /**
+   * Retag ONE existing PMax asset group that's missing UTMs (Harsha's ask,
+   * PMax slice — `retagAdUtm` only covers `ad_group_ad`, which a PMax campaign
+   * has none of). Deliberately single-target: never loop or accept a list.
+   *
+   * An asset group has no `final_url_suffix` field of its own (same reason
+   * `createAssetGroup` merges straight into `final_urls`) — but it DOES inherit
+   * the CAMPAIGN's `final_url_suffix` at delivery. So a key the campaign
+   * already supplies must be omitted here too, or the click URL carries it
+   * twice. No `content`: Google's docs mark `{creative}` unsupported on PMax
+   * (see `createAssetGroup`), so it's never added here either.
+   *
+   * LIVE-VERIFIED 2026-07-17: `asset_group.final_urls` is writable via UPDATE.
+   * That same live run caught a real bug — `updateMask: 'final_urls'` replaces
+   * the whole array, so writing back only the first URL silently dropped every
+   * other URL a multi-URL PMax asset group had. Fixed by retagging every URL
+   * in the array independently and writing the full array back; confirmed live
+   * against a real 2-URL asset group that both URLs survive and get tagged.
+   */
+  async retagAssetGroupUtm(
+    userId: string,
+    customerId: string,
+    assetGroupResourceName: string,
+  ): Promise<{ success: boolean; reason?: 'no_destination_url' | 'invalid_resource_name' }> {
+    if (!this.isValidGoogleAdsResourceName(assetGroupResourceName)) {
+      return { success: false, reason: 'invalid_resource_name' };
+    }
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const rows = await this.search(
+      customerId,
+      accessToken,
+      `SELECT asset_group.final_urls, campaign.final_url_suffix `
+      + `FROM asset_group WHERE asset_group.resource_name = '${assetGroupResourceName}'`,
+      loginCustomerId,
+    );
+    const finalUrls: string[] = rows[0]?.assetGroup?.finalUrls ?? [];
+    if (finalUrls.length === 0) return { success: false, reason: 'no_destination_url' };
+
+    const campaignSuffix: string | undefined = rows[0]?.campaign?.finalUrlSuffix;
+    const inheritedKeys = utmKeysInQueryString(campaignSuffix);
+    const spec = buildUtmSpec('google', { campaign: '{campaignid}' });
+
+    let changed = false;
+    const retaggedUrls = finalUrls.map((finalUrl) => {
+      const urlKeys = readUtmKeys(finalUrl);
+      if (!urlKeys) return finalUrl; // unreadable — never risk a duplicate, leave as-is
+
+      const omit = new Set<string>([...urlKeys, ...inheritedKeys]);
+      const additions = utmQueryString(spec, omit);
+      if (!additions) return finalUrl; // this url is already fully tagged
+
+      const hashIndex = finalUrl.indexOf('#');
+      const base = hashIndex === -1 ? finalUrl : finalUrl.slice(0, hashIndex);
+      const fragment = hashIndex === -1 ? '' : finalUrl.slice(hashIndex);
+      const queryIndex = base.indexOf('?');
+      const separator = queryIndex === -1 ? '?' : queryIndex === base.length - 1 ? '' : '&';
+      changed = true;
+      return `${base}${separator}${additions}${fragment}`;
+    });
+
+    if (!changed) return { success: false }; // nothing missing on any url
+
+    await this.mutate(customerId, accessToken, 'assetGroups', [{
+      update: { resourceName: assetGroupResourceName, finalUrls: retaggedUrls },
+      updateMask: 'final_urls',
+    }], loginCustomerId);
+    return { success: true };
   }
 
   async removeAd(userId: string, customerId: string, adGroupAdResourceName: string): Promise<void> {
@@ -957,6 +1386,27 @@ export class GoogleAdsService {
     addImageAssets(params.logoAssets, 'LOGO');
     if (params.videoAssets) addImageAssets(params.videoAssets, 'YOUTUBE_VIDEO');
 
+    // ENG-239: PMax asset groups have no `final_url_suffix` field (unlike Ad and
+    // Campaign), so the per-asset-group way to tag the destination is to merge the
+    // UTMs straight into `final_urls`. `mergeUtmIntoUrl` is per-key, so a UTM the
+    // user already set is left untouched (AC4); ValueTrack macros pass through
+    // un-encoded and resolve at click time.
+    //
+    // No `content` here: Google's own developer docs mark `{creative}` unsupported
+    // for Performance Max (developers.google.com/google-ads/api/performance-max/
+    // valuetrack) -- it never resolves on a PMax asset group, so emitting it would
+    // bake literal, permanently-unresolved text into every click URL. Same fallback
+    // LinkedIn already uses for a macro it can't supply.
+    // Tagging is a best-effort overlay; it must never be the reason a whole PMax
+    // build (headlines, images, links — already assembled at this point) gets
+    // thrown away. Google surfaces its own precise validation error for a bad URL.
+    let finalUrlWithUtm: string;
+    try {
+      finalUrlWithUtm = mergeUtmIntoUrl(params.finalUrl, buildUtmSpec('google', { campaign: '{campaignid}' }));
+    } catch {
+      finalUrlWithUtm = params.finalUrl;
+    }
+
     const assetGroupOp = {
       assetGroupOperation: {
         create: {
@@ -964,7 +1414,7 @@ export class GoogleAdsService {
           name: params.name,
           campaign: params.campaignResourceName,
           status: 'PAUSED',
-          finalUrls: [params.finalUrl],
+          finalUrls: [finalUrlWithUtm],
         },
       },
     };

@@ -106,6 +106,12 @@ jest.mock('../services/resendService', () => ({
     sendEmail: jest.fn(),
   }
 }));
+
+const mockGetEmailProvider = jest.fn();
+jest.mock('../services/emailProviderService', () => ({
+  getEmailProvider: (...args: any[]) => mockGetEmailProvider(...args),
+  bootstrapEmailProviders: jest.fn().mockResolvedValue(undefined),
+}));
 jest.mock('../services/enrichSoLeadValidation', () => ({
   validateLeadEmailInBackground: jest.fn(),
   validateLeadsInBackground: jest.fn(),
@@ -1359,7 +1365,9 @@ describe('CRM Routes', () => {
       expect(mockResponse.json).toHaveBeenCalledWith({
         senders: [],
         defaultSenderId: null,
+        defaultLinkedInAccountId: null,
         connectedGmailAccounts: [],
+        connectedEmailAccounts: [],
       });
     });
 
@@ -1476,6 +1484,94 @@ describe('CRM Routes', () => {
       }
 
       expect(mockResponse.status).toHaveBeenCalledWith(400);
+    });
+
+    describe('ENG-266 friction fix: an unrelated stale sender must not block adding a new one', () => {
+      const findHandler = () =>
+        router.stack.find((r: any) => r.route?.path === '/sender-emails' && r.route?.methods?.post);
+
+      // A sender already persisted with a connectedAccountId that no longer
+      // resolves to any connected account (e.g. the account was disconnected,
+      // or never actually existed) — this is the exact shape that blocked a
+      // real "Use as Sender" click on test-env1.
+      const brokenStoredGmailSender = {
+        id: 'broken-1',
+        email: 'ghost@argusoft.com',
+        fromName: 'Ghost',
+        senderType: 'gmail',
+        connectedAccountId: 'ghost@argusoft.com',
+        gmailAccountId: 'ghost@argusoft.com',
+      };
+
+      it('FAIL: still rejects the save if the broken sender is itself modified in this request', async () => {
+        (settingsService.getSetting as jest.Mock).mockResolvedValue({
+          settingValue: JSON.stringify({ senders: [brokenStoredGmailSender], defaultSenderId: null }),
+        });
+
+        mockRequest.body = {
+          senders: [{ ...brokenStoredGmailSender, fromName: 'Ghost (edited)' }], // touched -> must re-validate
+        };
+
+        const handler = findHandler();
+        if (handler && handler.route) {
+          await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+        }
+
+        expect(mockResponse.status).toHaveBeenCalledWith(400);
+      });
+
+      it('FAIL: still rejects a genuinely new invalid sender even when the stale one is grandfathered', async () => {
+        (settingsService.getSetting as jest.Mock).mockResolvedValue({
+          settingValue: JSON.stringify({ senders: [brokenStoredGmailSender], defaultSenderId: null }),
+        });
+
+        mockRequest.body = {
+          senders: [
+            brokenStoredGmailSender, // unchanged -> grandfathered
+            { id: 'new-1', email: 'new@baldwin.com', fromName: 'New', senderType: 'outlook', connectedAccountId: 'does-not-exist' },
+          ],
+        };
+
+        const handler = findHandler();
+        if (handler && handler.route) {
+          await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+        }
+
+        expect(mockResponse.status).toHaveBeenCalledWith(400);
+      });
+
+      it('SUCCESS: saves when a new valid sender is added alongside an untouched broken one', async () => {
+        (settingsService.getSetting as jest.Mock).mockResolvedValue({
+          settingValue: JSON.stringify({ senders: [brokenStoredGmailSender], defaultSenderId: null }),
+        });
+        (settingsService.setSetting as jest.Mock).mockResolvedValue(undefined);
+        (userDb.getUserById as jest.Mock).mockResolvedValue({
+          connected_accounts: [
+            { platform: 'outlook', account_id: 'newnetlify@outlook.com', config: { email: 'newnetlify@outlook.com' } },
+          ],
+        });
+
+        mockRequest.body = {
+          senders: [
+            brokenStoredGmailSender, // unchanged -> grandfathered, does NOT block the save
+            {
+              id: 'new-1',
+              email: 'newnetlify@outlook.com',
+              fromName: 'New Netlify',
+              senderType: 'outlook',
+              connectedAccountId: 'newnetlify@outlook.com',
+            },
+          ],
+        };
+
+        const handler = findHandler();
+        if (handler && handler.route) {
+          await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+        }
+
+        expect(mockResponse.status).not.toHaveBeenCalledWith(400);
+        expect(settingsService.setSetting).toHaveBeenCalled();
+      });
     });
   });
 
@@ -1648,6 +1744,211 @@ describe('CRM Routes', () => {
           message: expect.stringContaining('either htmlContent or textContent'),
         })
       );
+    });
+
+    it('ENG-266 Part 3: routes a mailbox (outlook) sender through its real provider instead of refusing it', async () => {
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
+      const mockLead = { leadId: 'lead1', listId: 'list1', email: 'lead@example.com' };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (crmDb.updateLead as jest.Mock).mockResolvedValue({ ...mockLead, emailDraft: null });
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify({
+          senders: [{ id: 'ol-1', email: 'hunter@baldwin.com', fromName: 'Hunter', senderType: 'outlook', connectedAccountId: 'acct-1' }],
+        }),
+      });
+      mockGetEmailProvider.mockReturnValue({
+        sendEmail: jest.fn().mockResolvedValue({ messageId: 'ol-msg-1', threadId: '' }),
+      });
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1' };
+      mockRequest.body = {
+        senderId: 'ol-1',
+        senderEmail: 'hunter@baldwin.com',
+        senderName: 'Hunter',
+        subject: 'Test Subject',
+        htmlContent: '<p>Test content</p>',
+      };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads/:leadId/send-email' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      // Not routed through Resend at all — the whole point of ENG-266 Part 3.
+      expect(resendService.sendEmail).not.toHaveBeenCalled();
+      expect(mockResponse.status).not.toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalled();
+    });
+
+    it('returns 500 (not a silent success) when the resolved provider throws', async () => {
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
+      const mockLead = { leadId: 'lead1', listId: 'list1', email: 'lead@example.com' };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (resendService.sendEmail as jest.Mock).mockResolvedValue(null); // Resend "failed"
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1' };
+      mockRequest.body = {
+        senderEmail: 'sender@example.com',
+        senderName: 'Sender Name',
+        subject: 'Test Subject',
+        htmlContent: '<p>Test content</p>',
+      };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads/:leadId/send-email' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(500);
+    });
+  });
+
+  describe('POST /api/crm/lists/:listId/leads/:leadId/reply-email', () => {
+    const findHandler = () =>
+      router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads/:leadId/reply-email' && r.route?.methods?.post
+      );
+
+    it('should return 400 if a required field is missing', async () => {
+      mockRequest.params = { listId: 'list1', leadId: 'lead1' };
+      mockRequest.body = {
+        senderEmail: 'sender@example.com',
+        senderName: 'Sender Name',
+        subject: 'Re: Hi',
+        // missing htmlContent and messageId
+      };
+
+      const handler = findHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+    });
+
+    it('should return 404 if the lead is not found', async () => {
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(null);
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1' };
+      mockRequest.body = {
+        senderEmail: 'sender@example.com',
+        senderName: 'Sender Name',
+        subject: 'Re: Hi',
+        htmlContent: '<p>reply</p>',
+        messageId: 'orig-msg-1',
+      };
+
+      const handler = findHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(404);
+    });
+
+    it('returns 500 (not a silent success) when the resolved provider throws', async () => {
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
+      const mockLead = { leadId: 'lead1', listId: 'list1', email: 'lead@example.com' };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (resendService.sendEmail as jest.Mock).mockResolvedValue(null); // Resend "failed"
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1' };
+      mockRequest.body = {
+        senderEmail: 'sender@example.com',
+        senderName: 'Sender Name',
+        subject: 'Re: Hi',
+        htmlContent: '<p>reply</p>',
+        messageId: 'orig-msg-1',
+      };
+
+      const handler = findHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(500);
+    });
+
+    it('sends the reply via Resend with inReplyTo mapped from messageId (unconfigured/ad-hoc sender)', async () => {
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
+      const mockLead = { leadId: 'lead1', listId: 'list1', email: 'lead@example.com' };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'reply-id-1' });
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1' };
+      mockRequest.body = {
+        senderEmail: 'sender@example.com',
+        senderName: 'Sender Name',
+        subject: 'Re: Hi',
+        htmlContent: '<p>reply</p>',
+        messageId: 'orig-msg-1',
+      };
+
+      const handler = findHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(resendService.sendEmail).toHaveBeenCalledWith(
+        expect.objectContaining({
+          from: 'Sender Name <sender@example.com>',
+          to: 'lead@example.com',
+          subject: 'Re: Hi',
+          html: '<p>reply</p>',
+          inReplyTo: 'orig-msg-1',
+        }),
+      );
+      expect(mockResponse.json).toHaveBeenCalledWith(
+        expect.objectContaining({ emailId: 'reply-id-1' }),
+      );
+    });
+
+    it('ENG-266 Part 3: routes a mailbox (outlook) sender through its real provider instead of refusing it', async () => {
+      const mockList = { listId: 'list1', name: 'Test List', userId: 'test-user-id' };
+      const mockLead = { leadId: 'lead1', listId: 'list1', email: 'lead@example.com' };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify({
+          senders: [{ id: 'ol-1', email: 'hunter@baldwin.com', fromName: 'Hunter', senderType: 'outlook', connectedAccountId: 'acct-1' }],
+        }),
+      });
+      mockGetEmailProvider.mockReturnValue({
+        sendEmail: jest.fn().mockResolvedValue({ messageId: 'ol-msg-1', threadId: '' }),
+      });
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1' };
+      mockRequest.body = {
+        senderId: 'ol-1',
+        senderEmail: 'hunter@baldwin.com',
+        senderName: 'Hunter',
+        subject: 'Re: Hi',
+        htmlContent: '<p>reply</p>',
+        messageId: 'orig-msg-1',
+      };
+
+      const handler = findHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(resendService.sendEmail).not.toHaveBeenCalled();
+      expect(mockResponse.status).not.toHaveBeenCalledWith(400);
+      expect(mockResponse.status).not.toHaveBeenCalledWith(500);
+      expect(mockResponse.json).toHaveBeenCalled();
     });
   });
 

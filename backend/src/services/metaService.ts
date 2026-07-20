@@ -3,6 +3,7 @@ import axios from 'axios';
 import { MetaAdAccount, MetaPage } from '../types/meta';
 import { INTEGRATION_CONFIG } from '../config/integrations';
 import { getMetaCredentials } from '../utils/secretsManager';
+import { buildUtmSpec, readUtmKeys, utmQueryString, mergeUtmIntoQueryString, utmKeysInQueryString } from '../utils/adUtm';
 
 export interface MetaAdsCampaignParams {
   name: string;
@@ -916,6 +917,60 @@ export class MetaService {
   }
 
   /**
+   * Resolve the creative-level `url_tags` (UTM append rules) for a creative (ENG-239).
+   *
+   * An explicitly-supplied `params.url_tags` always wins and is returned verbatim —
+   * this both honours a caller who hand-authored tracking and preserves the
+   * carried-over `url_tags` on a creative swap (agentModeService's carriedUrlTags).
+   *
+   * Otherwise we auto-generate Emma's UTM set (utm_source=meta, utm_medium=paid,
+   * utm_campaign / utm_content as Meta click-time macros).
+   *
+   * AC4 trap: Meta APPENDS `url_tags` to the destination link at delivery, so if the
+   * link already carries e.g. `utm_source`, emitting it again produces a duplicate
+   * param on the click URL. We therefore omit any UTM key the reference URL already
+   * carries; if it carries them all, `utmQueryString` returns "" and we return
+   * undefined so the caller writes no `url_tags` field at all.
+   *
+   * AC4 reference URL: `url_tags` is creative-level and Meta applies it to EVERY link
+   * on the creative, but there is only one tag string. We reference `params.link_url`
+   * (the single-image/video link, and the carousel fallback link at :989). Carousels
+   * may omit the top-level link and rely on per-card `child_attachments[].link` (:992),
+   * so when `link_url` is absent we fall back to the first card's `link_url`. If no
+   * reference URL exists at all, we omit nothing and emit the full set.
+   */
+  private static resolveUrlTags(params: MetaAdsAdCreativeParams): string | undefined {
+    if (params.url_tags) {
+      return params.url_tags;
+    }
+
+    // `url_tags` is creative-level: Meta appends the SAME string to EVERY link on the
+    // creative (the top-level link and every carousel card). So a key must be omitted
+    // if ANY of those links already carries it — emitting it would give that link the
+    // param twice, and a duplicated utm_source corrupts the very attribution this
+    // feature exists to produce. The cost is that a card the user tagged only
+    // partially may stay under-tagged; that is strictly better than a duplicate.
+    const linkUrls = [
+      params.link_url,
+      ...(params.carousel_cards?.map((c) => c.link_url) ?? []),
+    ].filter((u): u is string => Boolean(u));
+
+    const omit = new Set<string>();
+    for (const url of linkUrls) {
+      const keys = readUtmKeys(url);
+      // Unreadable link → we cannot know what it already carries, so we do not tag at
+      // all rather than risk a duplicate. Meta still rejects the bad URL with its own
+      // (precise) error; tagging must never be the thing that breaks an ad build.
+      if (!keys) return undefined;
+      for (const k of keys) omit.add(k);
+    }
+
+    const spec = buildUtmSpec('meta', { campaign: '{{campaign.id}}', content: '{{ad.id}}' });
+    const tags = utmQueryString(spec, omit);
+    return tags || undefined;
+  }
+
+  /**
    * Create a new ad creative (Supports Image, Video, Carousel)
    */
   public async createAdCreative(adAccountId: string, accessToken: string, params: MetaAdsAdCreativeParams) {
@@ -1030,9 +1085,11 @@ export class MetaService {
         [AdCreative.Fields.name]: params.name,
         [AdCreative.Fields.object_story_spec]: objectStorySpec
       };
-      // Preserve UTM/tracking append rules so a link_url swap doesn't strip them.
-      if (params.url_tags) {
-        creativeParams.url_tags = params.url_tags;
+      // Auto-generate UTM append rules when the caller supplies none (ENG-239), and
+      // preserve an explicit value so a link_url swap doesn't strip them.
+      const urlTags = MetaService.resolveUrlTags(params);
+      if (urlTags) {
+        creativeParams.url_tags = urlTags;
       }
 
       this.log(`Creating ad creative in account: ${adAccountId}`, creativeParams);
@@ -1139,9 +1196,11 @@ export class MetaService {
       [AdCreative.Fields.object_story_spec]: objectStorySpec,
       asset_feed_spec: assetFeedSpec,
     };
-    // Preserve UTM/tracking append rules so a link_url swap doesn't strip them.
-    if (params.url_tags) {
-      creativeParams.url_tags = params.url_tags;
+    // Auto-generate UTM append rules when the caller supplies none (ENG-239), and
+    // preserve an explicit value so a link_url swap doesn't strip them.
+    const urlTags = MetaService.resolveUrlTags(params);
+    if (urlTags) {
+      creativeParams.url_tags = urlTags;
     }
 
     this.log(`Creating placement-customized ad creative in account: ${adAccountId}`, creativeParams);
@@ -1175,6 +1234,118 @@ export class MetaService {
       return ads.map((a: any) => a._data);
     } catch (error) {
       return this.handleError(error, 'listAds');
+    }
+  }
+
+  /**
+   * Every destination URL on a creative (ENG-239 AC3, read side).
+   *
+   * This is the exact mirror of `createAdCreative` / `createPlacementCustomizedCreative`'s
+   * write sites, plus `creative.link_url` (which Meta populates and Ads Manager writes
+   * directly). Read/write symmetry is the correctness bar: a location we fail to read is
+   * a healthy ad reported as "untagged", and acting on that means swapping a live creative
+   * and resetting its learning phase.
+   *
+   *   creative.link_url                                             (top-level / Ads Manager)
+   *   object_story_spec.link_data.link                              (single image; carousel fallback :1044)
+   *   object_story_spec.link_data.call_to_action.value.link         (:1058, :1071)
+   *   object_story_spec.link_data.child_attachments[].link          (carousel cards :1047)
+   *   object_story_spec.link_data.child_attachments[].call_to_action.value.link  (per-card CTA :1055)
+   *   object_story_spec.video_data.call_to_action.value.link        (:1029)
+   *   asset_feed_spec.link_urls[].website_url                       (placement-customized :1174)
+   *
+   * Deliberately NOT read: `link_data.caption`. The writer sets it to the link URL, but it is
+   * a DISPLAY field — Ads Manager routinely holds a bare domain ("example.com") there, which
+   * `readUtmKeys` cannot parse, and one unparseable URL marks the whole ad unreadable. It is
+   * never a click destination, so reading it would only manufacture noise.
+   *
+   * Returns [] when nothing is extractable. The audit classes that `unreadable` and surfaces
+   * it for a human — we never invent a placeholder URL.
+   */
+  static extractCreativeDestinationUrls(creative: any): string[] {
+    // Graph subfields arrive as plain objects, but tolerate an SDK node wrapper.
+    const c = creative?._data ?? creative;
+    if (!c || typeof c !== 'object') return [];
+
+    const urls: string[] = [];
+    const push = (u: unknown) => {
+      if (typeof u === 'string' && u.trim()) urls.push(u.trim());
+    };
+
+    push(c.link_url);
+
+    const oss = c.object_story_spec ?? {};
+
+    const linkData = oss.link_data ?? {};
+    push(linkData.link);
+    push(linkData.call_to_action?.value?.link);
+    for (const card of Array.isArray(linkData.child_attachments) ? linkData.child_attachments : []) {
+      push(card?.link);
+      push(card?.call_to_action?.value?.link);
+    }
+
+    push(oss.video_data?.call_to_action?.value?.link);
+
+    const linkUrls = c.asset_feed_spec?.link_urls;
+    for (const entry of Array.isArray(linkUrls) ? linkUrls : []) {
+      push(entry?.website_url);
+    }
+
+    return [...new Set(urls)];
+  }
+
+  /**
+   * Read every ad's destination URLs and creative-level `url_tags` for the UTM audit
+   * (ENG-239 AC3). STRICTLY READ-ONLY.
+   *
+   * Mirrors `listAds`: same SDK edge, same `effective_status` filter, so an ad paused at
+   * campaign/adset level is audited rather than silently omitted (an omitted ad reads as a
+   * vacuously-tagged campaign — a false negative that hides missing attribution).
+   *
+   * `campaignId` scopes the read to one campaign via Meta's `filtering` param; the caller
+   * ALSO filters client-side, so a filter the API ignores can never attribute another
+   * campaign's ads to this one.
+   */
+  public async listAdsForUtmAudit(
+    adAccountId: string,
+    accessToken: string,
+    campaignId?: string,
+  ): Promise<Array<{ adId: string; campaignId: string; destinationUrls: string[]; urlTags?: string }>> {
+    try {
+      this.initApi(accessToken);
+      const account = new AdAccount(`act_${adAccountId}`);
+      const fields = [
+        'id',
+        'campaign_id',
+        'creative{id,link_url,url_tags,object_story_spec,asset_feed_spec}',
+      ];
+      const params: Record<string, any> = {
+        effective_status: [
+          'ACTIVE', 'PAUSED', 'CAMPAIGN_PAUSED', 'ADSET_PAUSED',
+          'PENDING_REVIEW', 'DISAPPROVED', 'PREAPPROVED',
+          'PENDING_BILLING_INFO', 'IN_PROCESS', 'WITH_ISSUES'
+        ],
+      };
+      if (campaignId) {
+        params.filtering = [{ field: 'campaign.id', operator: 'IN', value: [campaignId] }];
+      }
+      this.log(`Listing ads for UTM audit in account: ${adAccountId}`, { fields, campaignId });
+      const ads = await account.getAds(fields, params);
+      return ads.map((a: any) => {
+        const data = a._data ?? a;
+        const creative = data.creative;
+        const urlTags = (creative?._data ?? creative)?.url_tags;
+        return {
+          adId: String(data.id),
+          campaignId: data.campaign_id != null ? String(data.campaign_id) : '',
+          destinationUrls: MetaService.extractCreativeDestinationUrls(creative),
+          urlTags: typeof urlTags === 'string' && urlTags.trim() ? urlTags : undefined,
+        };
+      });
+    } catch (error) {
+      // handleError always throws — a failed read must never look like "no ads"
+      // (which the audit would report as a vacuously tagged, healthy account).
+      return this.handleError(error, 'listAdsForUtmAudit') as never;
     }
   }
 
@@ -1695,3 +1866,44 @@ export class MetaService {
 }
 
 export const metaService = MetaService.getInstance();
+
+/**
+ * Compute the `url_tags` an existing, already-live ad should carry after a
+ * single-ad UTM retrofit (Harsha's ask — the audit tool can only find campaigns
+ * missing UTMs, never fix them).
+ *
+ * Mirrors `resolveUrlTags`'s algorithm (a key already on ANY reference link URL
+ * is never duplicated into `url_tags`) but operates on primitives instead of a
+ * full `MetaAdsAdCreativeParams`, since a retrofit only has what it read back
+ * from an existing creative, not a caller-supplied params object.
+ *
+ * `changed:false` means nothing should be written — either every required key
+ * is already present (on `currentUrlTags` or any link URL), or a link URL could
+ * not be parsed and we refuse to risk a duplicate. The caller (the creative-swap
+ * retrofit) uses `changed` to skip the API call entirely rather than diffing
+ * strings, which would be fooled by a normalized leading `?`/`&` on the input.
+ */
+export function computeRetagUrlTags(
+  currentUrlTags: string | undefined,
+  linkUrls: string[],
+): { urlTags: string | undefined; changed: boolean; unreadable?: boolean } {
+  const omit = new Set<string>(utmKeysInQueryString(currentUrlTags));
+  for (const url of linkUrls) {
+    const keys = readUtmKeys(url);
+    // Unreadable link → we cannot know what it already carries, so we do not
+    // tag at all rather than risk a duplicate — same rule as resolveUrlTags.
+    // `unreadable: true` distinguishes this from a genuine "already fully
+    // tagged" no-op: both return changed:false, but a caller that collapses
+    // them into the same alreadyTagged:true response gives false confirmation
+    // that a malformed-destination ad is actually covered (Greptile).
+    if (!keys) return { urlTags: currentUrlTags, changed: false, unreadable: true };
+    for (const k of keys) omit.add(k);
+  }
+
+  const spec = buildUtmSpec('meta', { campaign: '{{campaign.id}}', content: '{{ad.id}}' });
+  const merged = mergeUtmIntoQueryString(currentUrlTags, spec, omit);
+  const normalizedCurrent = (currentUrlTags || '').replace(/^[?&]+/, '').replace(/&+$/, '');
+
+  if (merged === normalizedCurrent) return { urlTags: currentUrlTags, changed: false };
+  return { urlTags: merged || undefined, changed: true };
+}

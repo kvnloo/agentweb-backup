@@ -1,3 +1,17 @@
+## ENG-383: local agent relay tools deprecated to stubs (2026-07-17)
+
+The local agent relay (ngrok tunnel to a Codex agent on a Mac) is permanently dead — ngrok account
+suspended (ERR_NGROK_6008) and the host machine is gone (ENG-381/ENG-383). `run_local_agent_task` +
+`check_local_agent_status` are now fail-fast deprecation stubs in `src/emma/localAgentTools.ts`
+(registered so legacy/forced calls get `local_agent_deprecated: …` instead of "tool not found"; no
+network/SM/S3), and both were removed from `DEFAULT_FOUNDATION_TOOLS` and the chatbot customer tool
+list. NOTE: the runtime foundation list is DB-overridable — AW-Settings (Dev- prefixed in dev) key
+`foundation_tools`, loaded in `AgentModeService.initialize()` (per service init, not per request) —
+so the prod setting row must also be updated (data-side, outside this PR). Replacement for web
+research is `you_search_web` (this PR adds optional `freshness` + `include_domains` params for the
+Reddit-digest repoint); full workload replacement tracked in ENG-381.
+`src/scripts/patch-skills-remove-local-agent.ts` strips the tools from all skills' toolNames.
+
 ## ENG-164 phase 1: nodemailer Gmail SMTP path deleted — backend email is Resend-only (2026-07-16)
 
 The 2026-07-02 buy-vs-build audit verdict, executed. `emailService` no longer owns a Gmail SMTP

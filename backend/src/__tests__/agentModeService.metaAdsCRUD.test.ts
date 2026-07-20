@@ -26,10 +26,17 @@ jest.mock('../services/metaService', () => ({
     getPageInstagramActor: jest.fn()
   },
   // Static helper used by the agent layer to decide whether IG actor resolution is needed.
+  // extractCreativeDestinationUrls is the real (pure) implementation, same reasoning as
+  // computeRetagUrlTags below — it's already unit-tested elsewhere, and stubbing it here
+  // would defeat the point of testing retagMetaAdUtm's actual link-extraction coverage.
   MetaService: {
     placementTokenTargetsInstagram: (token: string) =>
-      ['feed', 'story', 'stories', 'reels', 'instagram_feed', 'instagram_story', 'instagram_reels', 'explore'].includes(String(token).toLowerCase())
-  }
+      ['feed', 'story', 'stories', 'reels', 'instagram_feed', 'instagram_story', 'instagram_reels', 'explore'].includes(String(token).toLowerCase()),
+    extractCreativeDestinationUrls: jest.requireActual('../services/metaService').MetaService.extractCreativeDestinationUrls,
+  },
+  // Real (pure) implementation — already unit-tested in metaService.utmTags.test.ts.
+  // Using the real thing here tests retagMetaAdUtm's actual decision logic, not a stub.
+  computeRetagUrlTags: jest.requireActual('../services/metaService').computeRetagUrlTags,
 }));
 
 jest.mock('../services/db', () => ({
@@ -1357,6 +1364,120 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
 
         expect(result.success).toBe(false);
         expect(result.message).toBe('Ad not found');
+      });
+    });
+
+    describe('retagMetaAdUtm — single existing ad retrofit (Harsha\'s ask)', () => {
+      it('errors when the ad has no creative assigned', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'ad_123' });
+
+        const result = await agentModeService.retagMetaAdUtm('user123', 'ad_123');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toBe('MISSING_CREATIVE');
+        expect(metaService.getAdCreative).not.toHaveBeenCalled();
+      });
+
+      it('errors when the creative has no object_story_spec (unsupported/deleted creative)', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'ad_123', creative: { creative_id: 'creative_1' } });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_1' });
+
+        const result = await agentModeService.retagMetaAdUtm('user123', 'ad_123');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toBe('MISSING_OBJECT_STORY_SPEC');
+      });
+
+      it('reports an error rather than alreadyTagged when a destination link is unparseable (Greptile)', async () => {
+        // computeRetagUrlTags returns changed:false for BOTH "genuinely already
+        // tagged" and "a link URL couldn't be read" -- collapsing them into the
+        // same alreadyTagged:true response would give an operator false
+        // confirmation that a malformed-destination ad is fully covered.
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'ad_123', creative: { creative_id: 'creative_1' } });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'creative_1',
+          object_story_spec: { page_id: 'page_1', link_data: { link: 'not a url' } },
+        });
+
+        const result = await agentModeService.retagMetaAdUtm('user123', 'ad_123');
+
+        expect(result.success).toBe(false);
+        expect((result as any).alreadyTagged).toBeUndefined();
+        expect(metaService.createAdCreative).not.toHaveBeenCalled();
+      });
+
+      it('is a no-op when the ad already carries every UTM key (boundary)', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'ad_123', creative: { creative_id: 'creative_1' } });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'creative_1',
+          url_tags: 'utm_source=meta&utm_medium=paid&utm_campaign={{campaign.id}}&utm_content={{ad.id}}',
+          object_story_spec: { page_id: 'page_1', link_data: { link: 'https://acme.com/' } },
+        });
+
+        const result = await agentModeService.retagMetaAdUtm('user123', 'ad_123');
+
+        expect(result).toEqual({ success: true, alreadyTagged: true });
+        expect(metaService.createAdCreative).not.toHaveBeenCalled();
+        expect(metaService.updateAd).not.toHaveBeenCalled();
+      });
+
+      it('does not duplicate utm_source when the only existing UTM is on a per-card CTA link (Greptile)', async () => {
+        // A carousel card's destination can live on card.call_to_action.value.link
+        // instead of card.link — extractCreativeDestinationUrls (the audit's own
+        // reader) covers this path; the retag's omit-set computation must too, or
+        // it will add utm_source=meta on top of the utm_source already baked into
+        // this card's real destination link, producing a duplicate at delivery.
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'ad_123', creative: { creative_id: 'creative_1' } });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'creative_1',
+          object_story_spec: {
+            page_id: 'page_1',
+            link_data: {
+              child_attachments: [
+                { call_to_action: { value: { link: 'https://acme.com/card1?utm_source=existing&utm_medium=paid&utm_campaign={{campaign.id}}&utm_content={{ad.id}}' } } },
+              ],
+            },
+          },
+        });
+
+        const result = await agentModeService.retagMetaAdUtm('user123', 'ad_123');
+
+        expect(result).toEqual({ success: true, alreadyTagged: true });
+        expect(metaService.createAdCreative).not.toHaveBeenCalled();
+      });
+
+      it('retags an untagged ad by swapping in a new creative with the merged url_tags (happy path)', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock)
+          .mockResolvedValueOnce({ id: 'ad_123', creative: { creative_id: 'creative_1' } })
+          .mockResolvedValue({
+            id: 'ad_123',
+            creative: { creative_id: 'creative_2', object_story_spec: { page_id: 'page_1', link_data: { link: 'https://acme.com/' } } },
+          });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'creative_1',
+          name: 'My Creative',
+          object_story_spec: { page_id: 'page_1', link_data: { link: 'https://acme.com/', message: 'Hi', name: 'Title' } },
+        });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative_2' });
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.retagMetaAdUtm('user123', 'ad_123');
+
+        expect(result.success).toBe(true);
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({
+            url_tags: 'utm_source=meta&utm_medium=paid&utm_campaign={{campaign.id}}&utm_content={{ad.id}}',
+            link_url: 'https://acme.com/', // destination untouched — only url_tags changes
+          }),
+        );
       });
     });
   });

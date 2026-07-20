@@ -62,6 +62,7 @@ const AVAILABLE_CONNECTED_ACCOUNTS = [
   { id: 'instagram', label: 'Instagram Business' },
   { id: 'twitter', label: 'Twitter/X' },
   { id: 'gmail', label: 'Gmail' },
+  { id: 'outlook', label: 'Outlook / Microsoft 365' },
   { id: 'youtube', label: 'YouTube' },
   { id: 'fathom', label: 'Fathom' },
   { id: 'hubspot', label: 'HubSpot' },
