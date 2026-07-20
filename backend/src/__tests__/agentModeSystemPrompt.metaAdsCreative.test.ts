@@ -28,4 +28,14 @@ describe('AgentMode system prompt - Meta ad creative extraction source guidance'
   it('keeps the no-fabrication rule for empty ad results', () => {
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('never fabricate, estimate, or invent ad copy');
   });
+
+  // ENG-382 was a keyword/category research task ("catalog 100 winning B2B ads
+  // across these keywords"), NOT a single-company lookup. The guidance must
+  // route that broad research shape to discovery via `query`/`niche` too, so
+  // the agent doesn't conclude discovery is company-only and fall back to
+  // scraping.
+  it('routes broad keyword/theme research (not tied to one company) to the discovery source', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('keyword/theme/category research that is NOT tied to one company');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('Do NOT force a `company_name` when the task is broad keyword research');
+  });
 });
