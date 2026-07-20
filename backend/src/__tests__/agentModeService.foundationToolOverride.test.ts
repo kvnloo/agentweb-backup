@@ -76,28 +76,19 @@ const STALE_PROD_OVERRIDE = [
   'wait_seconds',
 ];
 
-// A representative sample of DEFAULT-only tools the stale override omits — none of
-// these are in MANDATORY, so pre-fix they were stripped in prod.
-const STRIPPED_DEFAULT_ONLY_TOOLS = [
-  'update_brand_guidelines',
-  'update_market_strategy',
-  'search_knowledge_base',
-  'list_knowledge_base_files',
-  'read_knowledge_base_files',
-  'save_work_plan',
-  'list_predefined_work_plans',
-  'launch_predefined_work_plan',
-  'save_org_memory',
-  'delete_org_memory',
-  'list_scheduled_chats',
-  'manage_scheduled_chat',
-  'slack_list_channels',
-  'slack_send_message',
-  'search_leads',
-  'get_user_profile',
-  'run_local_agent_task',
-  'create_skill',
-];
+// Derive the DEFAULT-only tools the stale override strips, straight from the live
+// DEFAULT/MANDATORY sets — anything shipped in DEFAULT that is neither in the
+// override nor in MANDATORY. Computed (not hardcoded) so the test can never drift
+// as DEFAULT_FOUNDATION_TOOLS evolves (e.g. tools added/removed on main).
+const strippedDefaultOnlyTools = (): string[] => {
+  const overrideSet = new Set(STALE_PROD_OVERRIDE);
+  const mandatorySet = new Set(
+    (AgentModeService as any).MANDATORY_FOUNDATION_TOOLS as string[]
+  );
+  return AgentModeService.DEFAULT_FOUNDATION_TOOLS.filter(
+    (t) => !overrideSet.has(t) && !mandatorySet.has(t)
+  );
+};
 
 describe('AgentModeService - foundation_tools override is additive (ENG-404)', () => {
   let agentModeService: AgentModeService;
@@ -124,7 +115,11 @@ describe('AgentModeService - foundation_tools override is additive (ENG-404)', (
     await agentModeService.loadFoundationTools();
     const tools = agentModeService.getFoundationToolNames();
 
-    for (const name of STRIPPED_DEFAULT_ONLY_TOOLS) {
+    const stripped = strippedDefaultOnlyTools();
+    // Sanity: the stale override really does omit a meaningful set of defaults,
+    // otherwise this test would be vacuously true.
+    expect(stripped.length).toBeGreaterThan(5);
+    for (const name of stripped) {
       expect(tools.has(name)).toBe(true);
     }
   });
