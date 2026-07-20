@@ -14100,7 +14100,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta ad campaigns.',
-        error: error.message
+        error: error.message,
+        details: error.structuredError
       };
     }
   }
