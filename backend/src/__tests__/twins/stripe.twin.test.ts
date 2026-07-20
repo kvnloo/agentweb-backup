@@ -6,11 +6,13 @@
  *
  *     npm run test:twins -- --testPathPattern=stripe
  *
- * It provisions a live Arga Stripe twin (needs `arga login` on the box) and
- * points the real Stripe SDK at it THROUGH our production seam
- * (`createStripeClient` honoring `STRIPE_API_BASE`). If the Arga CLI is not
- * authenticated/available, the whole suite SKIPS with a clear message — a dev
- * without Arga is never blocked, and this never gates a merge.
+ * REUSABLE-TWIN PATTERN (ENG-402): this suite no longer provisions a fresh twin
+ * per run. It reads the coordinates of a persistent twin from `.env.twins.json`
+ * (created once by `npm run test:twins:setup`) and points the real Stripe SDK at
+ * it THROUGH our production seam (`createStripeClient` honoring `STRIPE_API_BASE`).
+ * State is reset to baseline before each test for isolation. When no reusable
+ * twin is configured, the whole suite SKIPS with a clear message — a dev without
+ * a twin is never blocked, and this never gates a merge.
  *
  * Why twins and not `jest.mock('stripe')`: every assertion here depends on
  * STATE the twin actually keeps (a subscription that stays canceled across
@@ -18,14 +20,13 @@
  * mock can only return what its author already believed — which is exactly
  * how wrong-shape assumptions get frozen into the suite.
  */
-import { execFileSync } from 'child_process';
 import Stripe from 'stripe';
 import { createStripeClient } from '../../services/stripeClientFactory';
-import { resolveTwinRunner } from './twinAvailability';
+import { getTwin, resetTwinToBaseline, resolveTwinSession } from './twinSession';
 
-// Arga CLI + free-plan validation-run quota (shared guard). SKIPS cleanly when
-// Arga is unauthenticated OR the monthly quota is exhausted — never red, never a gate.
-const { arga: ARGA, skipReason } = resolveTwinRunner();
+// Reusable twin (from `.env.twins.json`). SKIPS cleanly when none is configured —
+// never red, never a gate.
+const { config: twinConfig, skipReason } = resolveTwinSession('stripe');
 const describeTwin = skipReason ? describe.skip : describe;
 if (skipReason) {
   // eslint-disable-next-line no-console
@@ -34,47 +35,25 @@ if (skipReason) {
   );
 }
 
-interface TwinRun {
-  runId: string;
-  baseUrl: string;
-}
-
-function provisionStripeTwin(bin: string): TwinRun {
-  const out = execFileSync(
-    bin,
-    ['previews', 'twins', 'provision', '--twins', 'stripe', '--ttl', '10', '--wait', '--timeout', '180', '--json'],
-    { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }
-  );
-  const json = JSON.parse(out);
-  const twin = json.twins?.stripe;
-  if (json.status !== 'ready' || !twin?.base_url) {
-    throw new Error(`Stripe twin not ready: ${out.slice(0, 500)}`);
-  }
-  return { runId: json.run_id, baseUrl: twin.base_url };
-}
-
-function teardownTwin(bin: string, runId: string): void {
-  try {
-    execFileSync(bin, ['previews', 'twins', 'teardown', runId], { stdio: 'ignore' });
-  } catch {
-    /* twin auto-expires on its 10-min TTL regardless */
-  }
-}
-
 describeTwin('Stripe twin — real API behavior our jest.mock cannot express', () => {
-  let twin: TwinRun;
   let stripe: Stripe;
   const savedBase = process.env.STRIPE_API_BASE;
 
   beforeAll(() => {
-    twin = provisionStripeTwin(ARGA as string);
+    const twin = getTwin('stripe');
+    if (!twin) throw new Error('stripe twin missing from .env.twins.json despite non-skip resolution');
     // Drive the SDK through OUR production seam — this is the code under test.
     process.env.STRIPE_API_BASE = twin.baseUrl;
     stripe = createStripeClient('sk_test_twin');
-  }, 200_000);
+  });
+
+  // Reset the reusable twin to its baseline seed state before each test so
+  // state-mutating tests are isolated (best-effort: a failed reset warns, not crashes).
+  beforeEach(() => {
+    if (twinConfig) resetTwinToBaseline(twinConfig.runId);
+  });
 
   afterAll(() => {
-    if (twin) teardownTwin(ARGA as string, twin.runId);
     if (savedBase === undefined) delete process.env.STRIPE_API_BASE;
     else process.env.STRIPE_API_BASE = savedBase;
   });

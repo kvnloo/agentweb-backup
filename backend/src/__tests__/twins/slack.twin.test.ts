@@ -6,17 +6,16 @@
  *
  *     npm run test:twins -- --testPathPattern=slack
  *
- * It provisions a live Arga Slack twin (needs `arga login` on the box) and points
- * our real `slackService` WebClient at it THROUGH our production seam
- * (`resolveSlackApiUrl` honoring `SLACK_API_BASE`). Because the WebClient is a
- * module-load-time singleton, we set the env and (re)require the service inside
- * `beforeAll` so the client is built against the twin.
+ * REUSABLE-TWIN PATTERN (ENG-402): this suite no longer provisions a fresh twin
+ * per run. It reads the coordinates of a persistent twin from `.env.twins.json`
+ * (created once by `npm run test:twins:setup`) and points our real `slackService`
+ * WebClient at it THROUGH our production seam (`resolveSlackApiUrl` honoring
+ * `SLACK_API_BASE`). Because the WebClient is a module-load-time singleton, we set
+ * the env and (re)require the service inside `beforeAll` so the client is built
+ * against the twin. State is reset to baseline before each test for isolation.
  *
- * SKIPS cleanly (never red, never a merge gate) when the twin cannot be
- * provisioned: Arga not authenticated, OR the free-plan monthly validation-run
- * quota is exhausted (provisioning is metered against it — `arga whoami` reports
- * "Validation runs: N/10 remaining"). A dev without Arga — or an account out of
- * runs — is never blocked. Any OTHER provisioning failure throws (fails loud).
+ * SKIPS cleanly (never red, never a merge gate) when no reusable twin is
+ * configured. Any OTHER failure inside the suite throws (fails loud).
  *
  * Why a twin and not `jest.mock('@slack/web-api')`: every assertion here depends
  * on STATE the twin actually keeps (a message that persists across calls) or on
@@ -24,13 +23,12 @@
  * A hand mock can only return what its author already believed — exactly how a
  * wrong-shape assumption gets frozen into the suite.
  */
-import { execFileSync } from 'child_process';
 import axios from 'axios';
-import { resolveTwinRunner } from './twinAvailability';
+import { getTwin, resetTwinToBaseline, resolveTwinSession, TwinCoords } from './twinSession';
 
-// Arga CLI + free-plan validation-run quota (shared guard). SKIPS cleanly when
-// Arga is unauthenticated or the monthly quota is exhausted — never red, never a gate.
-const { arga: ARGA, skipReason } = resolveTwinRunner();
+// Reusable twin (from `.env.twins.json`). SKIPS cleanly when none is configured —
+// never red, never a gate.
+const { config: twinConfig, skipReason } = resolveTwinSession('slack');
 const describeTwin = skipReason ? describe.skip : describe;
 if (skipReason) {
   // eslint-disable-next-line no-console
@@ -39,60 +37,13 @@ if (skipReason) {
   );
 }
 
-interface SlackTwin {
-  runId: string;
-  /** Public base URL; Slack methods are served at `<baseUrl>/api/<method>`. */
-  baseUrl: string;
-  /** Admin base URL (no `pub-` prefix); Bearer `proxyToken`. */
-  adminUrl: string;
-  /** Seeded bot token that carries `chat:write` (`xoxb-…`). */
-  botToken: string;
-  /** JWT bearer for the twin's `/admin/*` endpoints. */
-  proxyToken: string;
-}
-
-function provisionSlackTwin(bin: string): SlackTwin {
-  const out = execFileSync(
-    bin,
-    ['previews', 'twins', 'provision', '--twins', 'slack', '--ttl', '10', '--wait', '--timeout', '180', '--json'],
-    { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 },
-  );
-  const json = JSON.parse(out);
-  const twin = json.twins?.slack;
-  if (json.status !== 'ready' || !twin?.base_url || !twin?.admin_url) {
-    throw new Error(`Slack twin not ready: ${out.slice(0, 500)}`);
-  }
-  const botToken = twin.env_vars?.SLACK_BOT_TOKEN;
-  if (!botToken) {
-    throw new Error(`Slack twin missing seeded SLACK_BOT_TOKEN: ${out.slice(0, 500)}`);
-  }
-  if (!json.proxy_token) {
-    throw new Error(`Slack twin missing proxy_token for admin API: ${out.slice(0, 500)}`);
-  }
-  return {
-    runId: json.run_id,
-    baseUrl: twin.base_url,
-    adminUrl: twin.admin_url,
-    botToken,
-    proxyToken: json.proxy_token,
-  };
-}
-
-function teardownTwin(bin: string, runId: string): void {
-  try {
-    execFileSync(bin, ['previews', 'twins', 'teardown', runId], { stdio: 'ignore' });
-  } catch {
-    /* twin auto-expires on its 10-min TTL regardless */
-  }
-}
-
 /**
  * Revoke a Slack OAuth scope on the live twin, mid-session, via its admin API.
  * The effect is verified by the subsequent Slack call failing with missing_scope,
  * not by this response — the twin returns 200 here even though the scope is now
  * disabled (matching how the config is applied server-side).
  */
-async function revokeScope(twin: SlackTwin, scope: string): Promise<void> {
+async function revokeScope(twin: TwinCoords, scope: string): Promise<void> {
   await axios.patch(
     `${twin.adminUrl}/admin/config`,
     { disabled_scopes: [scope] },
@@ -103,14 +54,18 @@ async function revokeScope(twin: SlackTwin, scope: string): Promise<void> {
 type SlackService = typeof import('../../services/slackService');
 
 describeTwin('Slack twin — real API behavior our jest.mock cannot express', () => {
-  let twin: SlackTwin;
+  let twin: TwinCoords;
   let slackService: SlackService;
   let channelId: string;
   const savedBase = process.env.SLACK_API_BASE;
   const savedToken = process.env.SLACK_BOT_TOKEN;
 
   beforeAll(async () => {
-    twin = provisionSlackTwin(ARGA as string);
+    const coords = getTwin('slack');
+    if (!coords || !coords.adminUrl || !coords.proxyToken || !coords.botToken) {
+      throw new Error('slack twin missing required coords (baseUrl/adminUrl/proxyToken/botToken) in .env.twins.json');
+    }
+    twin = coords;
 
     // Drive our WebClient through OUR production seam — this is the code under test.
     // The WebClient joins the method onto slackApiUrl, so it must end in `/api/`
@@ -131,8 +86,14 @@ describeTwin('Slack twin — real API behavior our jest.mock cannot express', ()
     channelId = channels[0].id;
   }, 200_000);
 
+  // Reset the reusable twin to its baseline seed state before each test so
+  // state-mutating tests (posting messages, revoking scopes) are isolated
+  // (best-effort: a failed reset warns, not crashes).
+  beforeEach(() => {
+    if (twinConfig) resetTwinToBaseline(twinConfig.runId);
+  });
+
   afterAll(() => {
-    if (twin) teardownTwin(ARGA as string, twin.runId);
     if (savedBase === undefined) delete process.env.SLACK_API_BASE;
     else process.env.SLACK_API_BASE = savedBase;
     if (savedToken === undefined) delete process.env.SLACK_BOT_TOKEN;
@@ -152,8 +113,9 @@ describeTwin('Slack twin — real API behavior our jest.mock cannot express', ()
     expect(messages.some((m) => m.text.includes(marker))).toBe(true);
   }, 60_000);
 
-  // AC3 — kept LAST: it revokes chat:write on the shared twin, which must not
-  // affect earlier tests.
+  // AC3 — kept LAST: it revokes chat:write on the twin. With per-test baseline
+  // resets this is isolated regardless of order, but the ordering is retained for
+  // clarity (the revoke happens after the happy-path post/read-back).
   it('AC3: revoking chat:write mid-session surfaces missing_scope to the caller (no swallow, no fallback)', async () => {
     // Revoke chat:write on the live twin, mid-session.
     await revokeScope(twin, 'chat:write');
