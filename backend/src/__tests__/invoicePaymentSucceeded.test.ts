@@ -181,4 +181,34 @@ describe('invoice.payment_succeeded handler', () => {
     const updateCall = (userDb.updateUser as jest.Mock).mock.calls[0][1];
     expect(updateCall.stripe_subscription_id).toBeUndefined();
   });
+
+  // ─── ENG-405: writes current_period_end from a Basil-shaped subscription ───
+  it('writes current_period_end from a Basil-shaped subscription (item-level, absent root)', async () => {
+    const mockUser = {
+      userId: 'user-basil',
+      stripe_customer_id: 'cus_basil',
+      stripe_subscription_id: 'sub_basil',
+      subscription_status: 'active',
+    };
+    (userDb.scanWithFilter as jest.Mock).mockResolvedValue([mockUser]);
+    (userDb.updateUser as jest.Mock).mockResolvedValue(undefined);
+    // Basil shape: period end on items.data[0], absent at the root.
+    mockSubscriptionsRetrieve.mockResolvedValue({
+      id: 'sub_basil',
+      status: 'active',
+      items: { data: [{ current_period_end: 1735689600, price: { id: 'price_x' } }] },
+    });
+
+    await handleInvoicePaymentSucceeded({
+      customer: 'cus_basil',
+      subscription: 'sub_basil',
+    });
+
+    expect(userDb.updateUser).toHaveBeenCalledWith(
+      'user-basil',
+      expect.objectContaining({
+        current_period_end: new Date(1735689600 * 1000).toISOString(),
+      })
+    );
+  });
 });
