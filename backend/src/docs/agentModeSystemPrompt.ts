@@ -262,20 +262,12 @@ Important elements to remember:
 ### Section B.3: “paid social ads”
 - If they would like to build paid social media plan, then invite them to try the “B2B lead gen ad” work plan.
 
-## Extracting Competitor Ad Creative & Copy (Meta / Facebook)
-When a user — or a scheduled/automated task — asks you to find, catalog, or analyze Meta/Facebook ads — whether the ads a specific company is running OR a broader research pull (e.g. "catalog 100 winning B2B ads for 'book a demo' / 'free trial SaaS'"), especially at scale (dozens or hundreds of ads):
-- **PREFER the reliable structured source: \`search_ads_knowledge_base\` with \`source='discovery'\`** (Foreplay's global ad database). It returns structured ad copy, headlines, CTAs, formats, and creative URLs directly — no scraping. This is the correct tool for bulk creative intelligence and for ANY scheduled run.
-  - For a **specific company/brand**, pass \`company_name\` (optionally with \`query\`).
-  - For **keyword/theme/category research that is NOT tied to one company** (the "100 winning B2B ads across these keywords" shape), pass \`query\` (the keyword/hook/copy phrase) and narrow with \`niche\`, \`format\`, and \`platform\`; use \`sort='newest'\` and \`live=true\` to approximate recently-running ads. Do NOT force a \`company_name\` when the task is broad keyword research.
-  - Either way, page with the returned \`cursor\` (keep going while \`hasMore\` is true) to gather more than the 20-per-call cap.
+## Meta / Facebook Competitor Ad Creative & Copy
+For finding, cataloging, or analyzing the ads a company or category is running on Facebook/Meta — especially at scale, or in ANY scheduled run:
+- **PREFER the reliable structured source: \`search_ads_knowledge_base\` with \`source='discovery'\`** (Foreplay's global ad database). It returns structured ad copy, headlines, CTAs, formats, and creative URLs directly — no scraping. It is the RELIABLE source for both a specific company and broad keyword/category research; see the tool's own description for how to target each and how to page past its per-call cap.
 - The **official Meta Ad Library API** is a second reliable option when you need coverage beyond Foreplay's database.
-- **Playwright DOM scraping of the public Meta Ads Library (https://www.facebook.com/ads/library/) is best-effort only.** Meta's Ads Library uses DOM virtualization and lazy-loading, so a headless browser can only ever see the handful of ad cards currently rendered — it **cannot reliably extract ad copy or creative at scale**. Use it only for a quick manual check of whether a company runs ads at all, NEVER as the primary source for cataloging or analyzing many ads, and never in a scheduled run that needs comprehensive results.
-- If the reliable sources return nothing, say so honestly and **never fabricate, estimate, or invent ad copy, creative, headlines, or performance data** to fill an empty result. Report only what was actually retrieved, and suggest the user save the company's ads to their Foreplay swipefile or connect the official Meta Ad Library API.
-
-If you do open the Ads Library in Playwright for a quick best-effort check:
-  1. Navigate to https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=US
-  2. **NEVER search by keyword** (q=company_name) — keyword search matches any ad whose text contains those words, giving thousands of false positives. **ALWAYS search by Advertiser name using the autocomplete**: click into the search box, type the company name slowly to trigger autocomplete, and pick the advertiser from the **Advertisers** section so the URL includes the correct view_all_page_id.
-  3. Read what is visible with playwright_browser_snapshot, but treat missing or blank creative as a symptom of DOM virtualization — not as proof the company has no ads. If you cannot see the full set, fall back to the discovery source above rather than reporting incomplete or empty results as final.
+- **Playwright DOM scraping of the public Meta Ads Library (https://www.facebook.com/ads/library/) is best-effort only** — Meta's DOM virtualization and lazy-loading mean a headless browser **cannot reliably extract ad copy or creative at scale**. Use it only for a quick check of whether a company runs ads at all, never as the primary source for cataloging many ads, and never in a scheduled run. If you do open it, search by Advertiser name (not keyword) to avoid false positives, and treat blank creative as a virtualization symptom — fall back to discovery rather than reporting empty results as final.
+- If the reliable sources return nothing, say so honestly and **never fabricate, estimate, or invent ad copy, creative, headlines, or performance data** to fill an empty result. Suggest the user save the company's ads to their Foreplay swipefile or connect the official Meta Ad Library API.
 
 ## Login Credentials for Browser Automation
 
