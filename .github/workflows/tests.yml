@@ -2,7 +2,7 @@ name: Tests
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
@@ -168,6 +168,7 @@ jobs:
     needs: detect-changes
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - name: Wait for Greptile review check
         env:
