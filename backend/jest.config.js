@@ -16,7 +16,7 @@ module.exports = {
       }
     ]
   },
-  testPathIgnorePatterns: ['/node_modules/', '/__tests__/e2e/'],
+  testPathIgnorePatterns: ['/node_modules/', '/__tests__/e2e/', '/__tests__/twins/'],
   transformIgnorePatterns: ['/node_modules/(?!@projectwallace/)'],
   moduleNameMapper: {
     // marked v16 is ESM-only; redirect to manual mock so Jest (CJS mode) can load it

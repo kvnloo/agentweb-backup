@@ -28,6 +28,7 @@ import {
   ContactRef,
 } from '../services/dealDb';
 import Stripe from 'stripe';
+import { createStripeClient } from '../services/stripeClientFactory';
 import {
   buildBuiltInPresets,
   validateCreateInput,
@@ -66,7 +67,7 @@ const d1StripeSecretKey = process.env.STRIPE_SECRET_KEY;
 
 const enrichmentConfigDeps = buildConfigServiceDeps();
 const d1StripeClient = d1StripeSecretKey
-  ? new Stripe(d1StripeSecretKey, { apiVersion: '2025-05-28.basil' as any })
+  ? createStripeClient(d1StripeSecretKey)
   : null;
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
