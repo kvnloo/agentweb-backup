@@ -105,9 +105,8 @@
   .lstate.st-canceled .dot { background: var(--red); }
   .lstate.st-triage .dot { background: var(--orange); }
   .lstate.st-backlog .dot, .lstate.st-unstarted .dot { background: var(--gray); }
-  /* Linear priority chip — outlined, coloured by urgency (Urgent/High/Medium/Low). Shown in place of the summary. */
-  .prio { font-size: 10px; padding: 1px 7px; border-radius: 9px; border: 1px solid currentColor; font-weight: 600; flex-shrink: 0; }
-  .prio.p-urgent { color: var(--red); } .prio.p-high { color: var(--orange); } .prio.p-med { color: var(--amber); } .prio.p-low { color: var(--dim); }
+  /* Linear priority chip — neutral/outlined, same look as the status chip (no urgency colours). */
+  .prio { font-size: 10px; padding: 1px 7px; border-radius: 9px; border: 1px solid var(--border); color: var(--dim); font-weight: 600; flex-shrink: 0; }
   .issue .time { margin-left: auto; color: var(--dim); font-size: 11px; }
   .issue .summ { color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
   .badge { font-size: 10px; padding: 1px 7px; border-radius: 9px; color: #0d0f13; font-weight: 600; flex-shrink: 0; }
