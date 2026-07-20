@@ -19,33 +19,18 @@
  * how wrong-shape assumptions get frozen into the suite.
  */
 import { execFileSync } from 'child_process';
-import * as path from 'path';
 import Stripe from 'stripe';
 import { createStripeClient } from '../../services/stripeClientFactory';
+import { resolveTwinRunner } from './twinAvailability';
 
-// ── Locate the Arga CLI and decide whether the suite can run ────────────────
-function resolveArga(): string | null {
-  const candidates = [
-    'arga',
-    path.join(process.env.HOME || '', '.local/bin/arga'),
-  ];
-  for (const bin of candidates) {
-    try {
-      execFileSync(bin, ['whoami'], { stdio: 'ignore' });
-      return bin;
-    } catch {
-      /* try next */
-    }
-  }
-  return null;
-}
-
-const ARGA = resolveArga();
-const describeTwin = ARGA ? describe : describe.skip;
-if (!ARGA) {
+// Arga CLI + free-plan validation-run quota (shared guard). SKIPS cleanly when
+// Arga is unauthenticated OR the monthly quota is exhausted — never red, never a gate.
+const { arga: ARGA, skipReason } = resolveTwinRunner();
+const describeTwin = skipReason ? describe.skip : describe;
+if (skipReason) {
   // eslint-disable-next-line no-console
   console.warn(
-    '[stripe.twin] Arga CLI not authenticated (run `arga login`) — skipping twin suite.'
+    `[stripe.twin] SKIPPED — ${skipReason}. This suite is opt-in and never gates a merge.`,
   );
 }
 
