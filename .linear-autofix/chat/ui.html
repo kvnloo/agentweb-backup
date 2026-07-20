@@ -95,6 +95,14 @@
   .issue .row1 { display: flex; align-items: center; gap: 8px; }
   .issue .id { font-weight: 600; }
   .issue .assignee { color: var(--dim); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  /* Linear workflow-state chip — outlined (vs the solid autofix-outcome badge) with a category-coloured dot. */
+  .lstate { font-size: 10px; padding: 1px 7px 1px 6px; border-radius: 9px; border: 1px solid var(--border); color: var(--dim); display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; flex-shrink: 0; }
+  .lstate .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--gray); flex-shrink: 0; }
+  .lstate.st-started .dot { background: var(--amber); }
+  .lstate.st-completed .dot { background: var(--green); }
+  .lstate.st-canceled .dot { background: var(--red); }
+  .lstate.st-triage .dot { background: var(--orange); }
+  .lstate.st-backlog .dot, .lstate.st-unstarted .dot { background: var(--gray); }
   .issue .time { margin-left: auto; color: var(--dim); font-size: 11px; }
   .issue .summ { color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
   .badge { font-size: 10px; padding: 1px 7px; border-radius: 9px; color: #0d0f13; font-weight: 600; }
@@ -477,6 +485,13 @@ const OUTCOME_BADGE = {
   blocked: ['blocked','b-orange'], recovery_failed: ['crashed','b-red'], setup_failed: ['setup failed','b-red'],
 };
 const badge = (o) => { const [t, c] = OUTCOME_BADGE[o] || [o, 'b-gray']; return `<span class="badge ${c}">${esc(t)}</span>`; };
+// The issue's live Linear workflow state (auto-refreshed from Linear by the poller). Outlined chip with a
+// dot coloured by the state's category, so you can tell at a glance whether it's In Progress / Done / etc.
+const lstate = (name, type) => {
+  if (!name) return '';
+  const cls = 'st-' + String(type || '').replace(/[^a-z]/gi, '').toLowerCase();
+  return `<span class="lstate ${cls}" title="Linear status: ${esc(name)}"><span class="dot"></span>${esc(name)}</span>`;
+};
 const rel = (iso) => {
   if (!iso) return '';
   const m = Math.round((Date.now() - new Date(iso)) / 60000);
@@ -563,7 +578,7 @@ function issueRow(i) {
     : '';
   return `
     <a class="issue ${i.identifier === S.sel ? 'sel' : ''}" data-id="${i.identifier}" href="#${encodeURIComponent(i.identifier)}">
-      <div class="row1"><span class="id">${esc(i.identifier)}</span>${badge(i.outcome)}${who}
+      <div class="row1"><span class="id">${esc(i.identifier)}</span>${badge(i.outcome)}${lstate(i.linearState, i.linearStateType)}${who}
         ${i.chat.busy ? '<span class="busydot"></span>' : ''}<span class="time">${rel(i.at)}</span></div>
       <div class="summ">${esc(i.summary || i.title || i.branch || '')}</div>
     </a>`;
@@ -771,7 +786,9 @@ function renderHeader(d) {
     return;
   }
   $('h-id').textContent = d.identifier + (d.linear?.title ? ` — ${d.linear.title}` : '');
-  $('h-badges').innerHTML = badge(e.outcome) + (e.triage ? ` <span class="badge b-gray">${esc(e.triage)}</span>` : '');
+  $('h-badges').innerHTML = badge(e.outcome)
+    + (d.linear?.stateName ? ' ' + lstate(d.linear.stateName, d.linear.stateType) : (e.linearState ? ' ' + lstate(e.linearState, e.linearStateType) : ''))
+    + (e.triage ? ` <span class="badge b-gray">${esc(e.triage)}</span>` : '');
   const prs = (e.prs || []).map((p) => `<a href="${esc(p.url || p)}" target="_blank">PR (${esc(p.repo || 'repo')})</a>`).join(' ');
   $('h-meta').innerHTML = [
     e.branch ? `<span>⎇ ${esc(e.branch)}</span>` : '',

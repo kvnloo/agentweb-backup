@@ -10,7 +10,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { config } from './config.mjs';
-import { listNewBugs, listForcedBugs, listStaleInProgress, resolveIssue, addComment, findStateId, moveIssue } from './linear.mjs';
+import { listNewBugs, listForcedBugs, listStaleInProgress, resolveIssue, addComment, findStateId, moveIssue, linearStatePatch } from './linear.mjs';
 import { assigneeRefreshPatch } from './git-identity.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -138,33 +138,36 @@ async function scanRevisions() {
   }
 }
 
-// Keep each issue's stored assignee in sync with its CURRENT Linear assignee, so the chat sidebar shows
-// the real owner. A card is often assigned to a person only AFTER the bot fixes it, so the pickup-time
-// snapshot (usually unassigned) would otherwise show no owner forever. READS use the default key (the
-// poller sees every assignee's issues). RMW against a fresh read + apply only the patch fields, so this
-// can't clobber entries the chat server touches concurrently (new standalone chats, PR links, watches).
-async function refreshAssignees() {
-  const patches = {}; // uuid -> { assignee, assigneeEmail }
+// Keep each issue's stored assignee AND Linear workflow state in sync with Linear, so the chat sidebar
+// shows the real owner and a live status chip. A card is often assigned to a person only AFTER the bot
+// fixes it (pickup-time snapshot = unassigned), and its state moves as humans work it — without this the
+// sidebar would show the stale pickup-time values forever. READS use the default key (the poller sees
+// every assignee's issues). One Linear read per entry produces both patches. RMW against a fresh read +
+// apply only the patch fields, so this can't clobber entries the chat server touches concurrently (new
+// standalone chats, PR links, watches).
+async function refreshFromLinear() {
+  const patches = {}; // uuid -> { assignee?, assigneeEmail?, linearState?, linearStateType? }
   for (const [uuid, entry] of Object.entries(loadState())) {
     if (!entry.identifier || entry.standalone) continue;
     let issue;
     try { issue = await resolveIssue(entry.identifier); } catch { continue; }
-    const patch = assigneeRefreshPatch(entry, issue.assignee);
-    if (patch) patches[uuid] = patch;
+    const patch = { ...(assigneeRefreshPatch(entry, issue.assignee) || {}), ...(linearStatePatch(entry, issue.state) || {}) };
+    if (Object.keys(patch).length) patches[uuid] = patch;
   }
   const ids = Object.keys(patches);
   if (!ids.length) return;
   const fresh = loadState();
   for (const [uuid, patch] of Object.entries(patches)) if (fresh[uuid]) Object.assign(fresh[uuid], patch);
   saveState(fresh);
-  log(`refreshed assignee on ${ids.length} issue(s) to match Linear`);
+  log(`refreshed assignee/state on ${ids.length} issue(s) to match Linear`);
 }
 
 async function main() {
   if (!process.env.LINEAR_API_KEY) { console.error('[poll] LINEAR_API_KEY not set'); process.exit(2); }
-  // One-off backfill: pull every issue's current Linear assignee into state.json and exit. Safe to run
-  // any time (independent of AUTOFIX_RUN_ENABLED — it only reads Linear and writes assignee fields).
-  if (process.argv.includes('--refresh-assignees')) { await refreshAssignees(); return; }
+  // One-off backfill: pull every issue's current Linear assignee + workflow state into state.json and
+  // exit. Safe to run any time (independent of AUTOFIX_RUN_ENABLED — it only reads Linear). The
+  // --refresh-assignees alias is kept so existing tooling/muscle-memory still works.
+  if (process.argv.includes('--refresh-from-linear') || process.argv.includes('--refresh-assignees')) { await refreshFromLinear(); return; }
   // The poller runs ONLY on the designated runner (the EC2 box sets this in its .env).
   if (process.env.AUTOFIX_RUN_ENABLED !== '1') {
     console.error('[poll] refusing to run: AUTOFIX_RUN_ENABLED != 1 (fixes are EC2-only; set it in .linear-autofix/.env on the designated runner)');
@@ -173,7 +176,7 @@ async function main() {
   await processNewBugs();
   await recoverStale();
   await scanRevisions();
-  await refreshAssignees();
+  await refreshFromLinear();
 }
 
 main().catch((e) => { console.error('[poll] fatal:', e); process.exit(1); });

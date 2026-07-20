@@ -146,6 +146,8 @@ function listIssues() {
         standalone: e.standalone || false,
         ownerName: e.ownerName || null,
         assigneeName: e.assignee?.name || null, // Linear assignee — shown in the sidebar so it's clear who owns the issue
+        linearState: e.linearState || null,     // Linear workflow state name (e.g. "In Progress") — sidebar status chip
+        linearStateType: e.linearStateType || null, // its category (backlog/unstarted/started/completed/canceled/triage) — chip colour
         outcome: e.outcome,
         triage: e.triage || null,
         branch: e.branch || null,
@@ -336,6 +338,7 @@ async function fetchLinear(identifier) {
       description: issue.description || '',
       url: issue.url,
       stateName: issue.state?.name || null,
+      stateType: issue.state?.type || null,
       comments: (issue.comments?.nodes || []).map((c) => ({ author: c.user?.name || 'someone', body: c.body, at: c.createdAt })),
     };
   } catch { return null; }

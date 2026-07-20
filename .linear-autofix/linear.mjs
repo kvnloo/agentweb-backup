@@ -51,6 +51,20 @@ export function useAssigneeLinearKey(assignee, log = () => {}) {
 }
 export function clearAssigneeLinearKey() { attributionKey = null; }
 
+// Reconcile a stored state entry's Linear workflow state (Backlog / Todo / In Progress / In Review /
+// Done / Canceled) with the issue's CURRENT state, returning a { linearState, linearStateType } patch —
+// or null when nothing changed. The poller calls this each cycle so the chat sidebar shows a live status
+// chip. `type` is Linear's category (backlog/unstarted/started/completed/canceled/triage) — it drives the
+// chip colour. Never blanks a known state on a transient/absent read; skips standalone chats (not issues).
+export function linearStatePatch(entry, liveState) {
+  if (!entry || entry.standalone) return null;
+  const name = (liveState?.name || '').trim();
+  if (!name) return null; // no live state (or no name) — keep whatever we already have
+  const type = liveState?.type || null;
+  if ((entry.linearState || null) === name && (entry.linearStateType || null) === type) return null; // current
+  return { linearState: name, linearStateType: type };
+}
+
 // Accepts a human identifier ("LIN-123") or a raw issue UUID.
 export async function resolveIssue(ref) {
   const m = /^([A-Za-z]+)-(\d+)$/.exec(ref.trim());
