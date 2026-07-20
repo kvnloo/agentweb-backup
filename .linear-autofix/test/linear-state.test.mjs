@@ -2,7 +2,7 @@
 // In Progress / In Review / Done / Canceled) into the state entry so the chat sidebar shows a live
 // status chip. Auto-refreshed by the poller each cycle (same mechanism as the assignee sync).
 // Run: node test/linear-state.test.mjs
-import { linearStatePatch } from '../linear.mjs';
+import { linearStatePatch, linearTitlePatch } from '../linear.mjs';
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log(`  ✅ ${m}`); } else { fail++; console.log(`  ❌ ${m}`); } };
@@ -40,6 +40,22 @@ console.log('linearStatePatch');
   // Name is trimmed; a missing type is stored as null (not undefined) so equality checks are stable.
   const p3 = linearStatePatch({ identifier: 'ENG-9' }, { name: '  Backlog  ' });
   ok(p3 && p3.linearState === 'Backlog' && p3.linearStateType === null, 'name trimmed; absent type → null');
+}
+
+// linearTitlePatch mirrors the issue's current Linear title into `linearTitle` so the sidebar row can
+// show it on hover (the row itself shows only id/state/priority). Same reconcile shape as the others.
+console.log('\nlinearTitlePatch');
+{
+  ok(linearTitlePatch({ identifier: 'ENG-368' }, 'Google Ads account not registering')?.linearTitle === 'Google Ads account not registering',
+    'no stored title → patch fills it in');
+  ok(linearTitlePatch({ identifier: 'ENG-368', linearTitle: 'Old title' }, 'New title')?.linearTitle === 'New title',
+    'title changed → patch updates');
+  ok(linearTitlePatch({ identifier: 'ENG-368', linearTitle: 'Same' }, 'Same') === null, 'unchanged title → null');
+  ok(linearTitlePatch({ identifier: 'ENG-368', linearTitle: 'Keep me' }, '') === null, 'empty live title → null (keep)');
+  ok(linearTitlePatch({ identifier: 'ENG-368', linearTitle: 'Keep me' }, '   ') === null, 'whitespace-only live title → null (keep)');
+  ok(linearTitlePatch({ identifier: 'ENG-9' }, '  Trim me  ')?.linearTitle === 'Trim me', 'title is trimmed');
+  ok(linearTitlePatch({ identifier: 'CHAT-3', standalone: true }, 'x') === null, 'standalone chat → null (keeps its own name)');
+  ok(linearTitlePatch(null, 'x') === null, 'null entry → null');
 }
 
 console.log(fail ? `\n❌ ${fail} FAILED — ${pass} passed, ${fail} failed` : `\n✅ ALL PASSED — ${pass} passed, 0 failed`);
