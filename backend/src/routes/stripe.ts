@@ -1,5 +1,6 @@
 import express, { Request, Response } from "express";
 import Stripe from "stripe";
+import { createStripeClient } from "../services/stripeClientFactory";
 import dotenv from "dotenv";
 import { waitlistDb, WaitlistEntry } from "../services/waitlistDb"; // Import waitlistDb and WaitlistEntry
 import { authenticateToken, requireAdmin, AuthenticatedRequest } from "../middleware/auth";
@@ -26,9 +27,7 @@ function getStripe(): Stripe | null {
   if (stripeClient) return stripeClient;
   const key = process.env.STRIPE_SECRET_KEY;
   if (!key) return null;
-  stripeClient = new Stripe(key, {
-    apiVersion: "2025-05-28.basil",
-  });
+  stripeClient = createStripeClient(key);
   return stripeClient;
 }
 

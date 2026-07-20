@@ -5,6 +5,7 @@
  * All monetary values are in cents.
  */
 import Stripe from 'stripe';
+import { createStripeClient } from './stripeClientFactory';
 import dotenv from 'dotenv';
 import { userDb } from './db';
 import { paymentHistoryDb, PaymentHistoryRecord } from './paymentHistoryDb';
@@ -23,7 +24,7 @@ function getStripe(): Stripe {
   if (!_stripe) {
     const key = process.env.STRIPE_SECRET_KEY;
     if (!key) throw new Error('Missing STRIPE_SECRET_KEY');
-    _stripe = new Stripe(key, { apiVersion: '2025-05-28.basil' as any });
+    _stripe = createStripeClient(key);
   }
   return _stripe;
 }
