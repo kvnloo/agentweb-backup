@@ -17365,6 +17365,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     options: {
       maxResults?: number;
       companyName?: string;
+      cursor?: string;
       format?: string[];
       platform?: string[];
       niche?: string[];
@@ -17398,6 +17399,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const result = await searchForeplayDiscoveryAds(foreplayToken, {
         query: effectiveQuery,
         limit,
+        cursor: options.cursor,
         format: options.format,
         platform: options.platform,
         niche: options.niche,
@@ -17432,7 +17434,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         results,
         totalResults: results.length,
         hasMore: !!result.cursor,
-        note: 'Each result costs 1 Foreplay credit. Discovery searches Foreplay\'s full database of millions of ads, not just your saved swipefile.'
+        cursor: result.cursor,
+        note: 'Each result costs 1 Foreplay credit. Discovery searches Foreplay\'s full database of millions of ads, not just your saved swipefile.' + (result.cursor ? ' More results are available — call this tool again with the returned cursor to fetch the next page.' : '')
       };
     } catch (error) {
       console.error('AgentMode: Error searching Foreplay discovery:', error);
