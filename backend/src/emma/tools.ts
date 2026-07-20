@@ -894,6 +894,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
             start_time: { type: "string", description: "ISO 8601 start datetime." },
             end_time: { type: "string", description: "ISO 8601 end datetime. Required with lifetime_budget." },
             promoted_object: { type: "object", description: "Promoted object (e.g., { page_id: 'ID' } or { pixel_id: 'ID', custom_event_type: 'PURCHASE' })." },
+            destination_type: { type: "string", description: "Conversion location for the ad set. Defaults to 'WEBSITE' for website traffic/conversion goals (LINK_CLICKS, LANDING_PAGE_VIEWS, OFFSITE_CONVERSIONS, VALUE) so the ad-level Destination is explicitly set. Pass explicitly for other destinations: 'ON_AD' (instant lead forms), 'MESSENGER', 'APP'." },
 
             // --- Creative ---
             page_id: { type: "string", description: "Facebook Page ID (from list_meta_pages or PAGE LIST)." },
