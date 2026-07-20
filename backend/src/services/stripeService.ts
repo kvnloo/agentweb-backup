@@ -1,4 +1,5 @@
 import Stripe from 'stripe';
+import { createStripeClient } from './stripeClientFactory';
 import dotenv from 'dotenv';
 import { userDb } from './db';
 import { getTierConfig, DEFAULT_PAGES } from './subscriptionService';
@@ -16,9 +17,7 @@ function getStripeOrThrow(): Stripe {
     if (!key) {
       throw new Error('Stripe SDK not initialized. Missing STRIPE_SECRET_KEY.');
     }
-    _stripe = new Stripe(key, {
-      apiVersion: '2025-05-28.basil' as any,
-    });
+    _stripe = createStripeClient(key);
   }
   return _stripe;
 }
