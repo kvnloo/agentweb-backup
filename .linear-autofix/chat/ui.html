@@ -25,8 +25,12 @@
   #side { width: 290px; min-width: 290px; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
   #side h1 { font-size: 15px; padding: 14px 16px 6px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   #side h1 > span:first-child { margin-right: auto; } /* title left, control buttons clustered right */
-  #sideToggle, #sideOpen, #sidePosToggle { background: var(--panel2); color: var(--dim); border: 1px solid var(--border); border-radius: 7px; cursor: pointer; font-size: 15px; line-height: 1; padding: 4px 9px; }
-  #sideToggle:hover, #sideOpen:hover, #sidePosToggle:hover { border-color: var(--accent); color: var(--text); }
+  #sideToggle, #sideOpen, #sidePosToggle, #filterBtn { background: var(--panel2); color: var(--dim); border: 1px solid var(--border); border-radius: 7px; cursor: pointer; font-size: 15px; line-height: 1; padding: 4px 9px; }
+  #sideToggle:hover, #sideOpen:hover, #sidePosToggle:hover, #filterBtn:hover { border-color: var(--accent); color: var(--text); }
+  /* Filter button: funnel icon, highlighted with a count badge when any facet is selected. */
+  #filterBtn { display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; }
+  #filterBtn.active { border-color: var(--accent); color: var(--text); }
+  #filterBtn .fcount { background: var(--accent); color: #0d0f13; font-size: 10px; font-weight: 700; border-radius: 8px; padding: 0 5px; line-height: 15px; }
   /* Move the whole sidebar to the right (persisted). row-reverse flips the two flex children; the
      side border and the floating ☰ reopener move with it so the layout stays consistent. */
   body.side-right { flex-direction: row-reverse; }
@@ -42,7 +46,7 @@
      #side so they beat the ID-specificity base styles (e.g. `#side .sub`). */
   body.side-rail #side { width: 74px; min-width: 74px; }
   body.side-rail #side h1 { justify-content: center; padding: 12px 4px; }
-  body.side-rail #side h1 > span, body.side-rail #side .sub, body.side-rail #side #searchWrap, body.side-rail #sidePosToggle { display: none; }
+  body.side-rail #side h1 > span, body.side-rail #side .sub, body.side-rail #side #searchWrap, body.side-rail #sidePosToggle, body.side-rail #filterBtn { display: none; }
   body.side-rail #side #issues { padding: 2px 0; }
   body.side-rail #side .issue { padding: 9px 6px; margin: 0; border-radius: 0; text-align: center; border-left: 2px solid transparent; }
   body.side-rail #side .issue.sel { border-left-color: var(--accent); }
@@ -89,6 +93,18 @@
   .popmenu .pmi:hover { background: var(--panel2); }
   .popmenu .pmi.danger { color: var(--red); }
   .popmenu .pmsep { height: 1px; background: var(--border); margin: 4px 6px; }
+  /* Multi-select filter popover (reuses .popmenu). Grouped, scrollable, checkbox rows that don't close on click. */
+  .filtpop { min-width: 200px; max-height: 70vh; overflow-y: auto; }
+  .filtpop .pmhead { display: flex; align-items: center; justify-content: space-between; }
+  .filtpop .fclear { text-transform: none; letter-spacing: 0; font-weight: 600; color: var(--accent); cursor: pointer; }
+  .filtpop .fclear:hover { text-decoration: underline; }
+  .filtpop .fmglabel { padding: 8px 12px 3px; font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--dim); }
+  .filtpop .fmi { padding: 6px 12px; font-size: 13px; color: var(--text); cursor: pointer; border-radius: 6px; display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+  .filtpop .fmi:hover { background: var(--panel2); }
+  .filtpop .fmck { width: 14px; height: 14px; border: 1px solid var(--border); border-radius: 4px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; color: #0d0f13; }
+  .filtpop .fmi.on .fmck { background: var(--accent); border-color: var(--accent); }
+  .filtpop .fmi.on .fmck::before { content: '✓'; }
+  .filtpop .fmempty { padding: 10px 12px; font-size: 12px; color: var(--dim); }
   .issue { display: block; padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer; color: inherit; text-decoration: none; } /* an <a> so Ctrl/⌘/middle-click opens the issue in a new tab */
   .issue:hover { background: var(--panel2); }
   .issue.sel { background: var(--panel2); border-left: 3px solid var(--accent); padding-left: 11px; }
@@ -356,7 +372,7 @@
 </head>
 <body>
   <div id="side">
-    <h1><span>🔧 Autofix</span><button id="sidePosToggle" title="Move sidebar to the other side">⇄</button><button id="sideToggle" title="Collapse to rail (Ctrl+B)">‹</button></h1>
+    <h1><span>🔧 Autofix</span><button id="filterBtn" title="Filter by assignee, state & priority"><svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor" aria-hidden="true"><path d="M1.5 2h13a.5.5 0 0 1 .38.82L10 9v4.5a.5.5 0 0 1-.28.45l-3 1.5A.5.5 0 0 1 6 15.5V9L1.12 2.82A.5.5 0 0 1 1.5 2z"/></svg></button><button id="sidePosToggle" title="Move sidebar to the other side">⇄</button><button id="sideToggle" title="Collapse to rail (Ctrl+B)">‹</button></h1>
     <div class="sub"><span id="count"></span><span id="showAll">show all</span></div>
     <div id="searchWrap">
       <input id="search" type="text" placeholder="Search ID, name or summary…" autocomplete="off" spellcheck="false" />
@@ -499,6 +515,70 @@ const lstate = (name, type) => {
 // Linear priority as a small coloured chip: 1=urgent, 2=high, 3=medium, 4=low (0/none/null → nothing).
 const PRIO = { 1: ['Urgent', 'p-urgent'], 2: ['High', 'p-high'], 3: ['Medium', 'p-med'], 4: ['Low', 'p-low'] };
 const prio = (p) => { const x = PRIO[p]; return x ? `<span class="prio ${x[1]}" title="Priority: ${x[0]}">${esc(x[0])}</span>` : ''; };
+
+// ---------- sidebar filter (multi-select across Assignee / State / Priority) ----------
+// Within a facet the selected values are OR'd; across facets they're AND'd (standard filter semantics).
+// Priorities collapse null/0 into a single "No priority" key so they filter as one bucket.
+const prioKey = (p) => (p === 1 || p === 2 || p === 3 || p === 4) ? String(p) : 'none';
+const prioLabel = (k) => k === 'none' ? 'No priority' : (PRIO[k]?.[0] || k);
+const filterActiveCount = () => S.filter.assignee.length + S.filter.state.length + S.filter.priority.length;
+// Distinct facet values across ALL current issues (not the filtered subset — options must stay stable).
+function filterOptions() {
+  const issues = S.issues.filter((i) => !i.standalone);
+  const uniq = (arr) => [...new Set(arr)];
+  return {
+    assignee: uniq(issues.map((i) => i.assigneeName).filter(Boolean)).sort(),
+    state: uniq(issues.map((i) => i.linearState).filter(Boolean)).sort(),
+    priority: uniq(issues.map((i) => prioKey(i.priority))).sort((a, b) => ['1', '2', '3', '4', 'none'].indexOf(a) - ['1', '2', '3', '4', 'none'].indexOf(b)),
+  };
+}
+function matchFilter(i) {
+  const f = S.filter;
+  if (f.assignee.length && !f.assignee.includes(i.assigneeName)) return false;
+  if (f.state.length && !f.state.includes(i.linearState)) return false;
+  if (f.priority.length && !f.priority.includes(prioKey(i.priority))) return false;
+  return true;
+}
+function saveFilter() { try { localStorage.setItem('sideFilter', JSON.stringify(S.filter)); } catch { /* private mode */ } }
+function toggleFilter(facet, val) {
+  const arr = S.filter[facet]; const idx = arr.indexOf(val);
+  if (idx >= 0) arr.splice(idx, 1); else arr.push(val);
+  saveFilter(); lastIssuesJson = ''; renderIssues(); updateFilterBtn();
+}
+function clearFilter() { S.filter = { assignee: [], state: [], priority: [] }; saveFilter(); lastIssuesJson = ''; renderIssues(); updateFilterBtn(); }
+function updateFilterBtn() {
+  const b = $('filterBtn'); if (!b) return;
+  const n = filterActiveCount();
+  b.classList.toggle('active', n > 0);
+  const c = b.querySelector('.fcount'); if (c) c.remove();
+  if (n > 0) { const s = document.createElement('span'); s.className = 'fcount'; s.textContent = n; b.appendChild(s); }
+}
+function buildFilterPop() {
+  const opts = filterOptions();
+  const group = (label, facet, values, labelFn) => values.length
+    ? `<div class="fmglabel">${esc(label)}</div>` + values.map((v) =>
+        `<div class="fmi ${S.filter[facet].includes(v) ? 'on' : ''}" data-facet="${facet}" data-val="${esc(String(v))}"><span class="fmck"></span>${esc(labelFn ? labelFn(v) : v)}</div>`).join('')
+    : '';
+  const body = group('Assignee', 'assignee', opts.assignee) + group('State', 'state', opts.state) + group('Priority', 'priority', opts.priority, prioLabel);
+  const active = filterActiveCount();
+  return `<div class="pmhead"><span>Filter</span>${active ? '<span class="fclear">Clear all</span>' : ''}</div>` + (body || '<div class="fmempty">No issues to filter yet.</div>');
+}
+function openFilter(anchorEl) {
+  closeMenu();
+  const m = document.createElement('div'); m.className = 'popmenu filtpop';
+  const render = () => {
+    m.innerHTML = buildFilterPop();
+    for (const el of m.querySelectorAll('.fmi')) el.onclick = (e) => { e.stopPropagation(); toggleFilter(el.dataset.facet, el.dataset.val); render(); };
+    const c = m.querySelector('.fclear'); if (c) c.onclick = (e) => { e.stopPropagation(); clearFilter(); render(); };
+  };
+  render();
+  document.body.appendChild(m);
+  const r = anchorEl.getBoundingClientRect();
+  m.style.top = Math.min(r.bottom + 4, window.innerHeight - m.offsetHeight - 8) + 'px';
+  m.style.left = Math.min(r.left, window.innerWidth - m.offsetWidth - 8) + 'px';
+  S.menu = m;
+  setTimeout(() => document.addEventListener('mousedown', onMenuOutside, true), 0);
+}
 const rel = (iso) => {
   if (!iso) return '';
   const m = Math.round((Date.now() - new Date(iso)) / 60000);
@@ -536,8 +616,9 @@ function stampStats(bubbleEl, tok, cost) {
   bubbleEl.appendChild(el);
 }
 
-const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true, picker: null, lastEsc: 0, slash: null, cmd: null, mergePhase: null, lastResult: '', lastTokens: null, lastCost: null, lastMs: null, compacting: false, lastSent: '', escArmed: 0, escText: '', queue: [], queuePaused: false, attachments: [], collapsed: {} };
+const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true, picker: null, lastEsc: 0, slash: null, cmd: null, mergePhase: null, lastResult: '', lastTokens: null, lastCost: null, lastMs: null, compacting: false, lastSent: '', escArmed: 0, escText: '', queue: [], queuePaused: false, attachments: [], collapsed: {}, filter: { assignee: [], state: [], priority: [] } };
 try { S.collapsed = JSON.parse(localStorage.getItem('secCollapsed')) || {}; } catch { /* private mode */ }
+try { const f = JSON.parse(localStorage.getItem('sideFilter')); if (f) S.filter = { assignee: f.assignee || [], state: f.state || [], priority: f.priority || [] }; } catch { /* private mode */ }
 const COMMANDS = [
   { name: '/status', desc: 'Session & fix status' },
   { name: '/context', desc: 'Context window usage' },
@@ -562,7 +643,7 @@ async function loadIssues() {
     const r = await (await fetch('/api/issues')).json();
     S.issues = r.issues || [];
     // Skip DOM churn when nothing changed (also keeps click targets stable).
-    const j = JSON.stringify(S.issues) + S.showAll + S.search + S.sel;
+    const j = JSON.stringify(S.issues) + S.showAll + S.search + S.sel + JSON.stringify(S.filter);
     if (j !== lastIssuesJson) { lastIssuesJson = j; renderIssues(); }
   } catch { /* server briefly down */ }
 }
@@ -605,11 +686,14 @@ function renderIssues() {
   let list = q ? S.issues : (S.showAll ? S.issues : S.issues.filter((i) => i.active));
   if (q) list = list.filter((i) => `${i.identifier} ${i.linearTitle || ''} ${i.summary || ''} ${i.title || ''} ${i.branch || ''} ${i.assigneeName || ''}`.toLowerCase().includes(q));
   const chats = list.filter((i) => i.standalone);
-  const issues = list.filter((i) => !i.standalone);
-  $('count').textContent = `${list.length} item${list.length === 1 ? '' : 's'}${q ? ' matched' : S.showAll ? '' : ' active'}`;
+  // The multi-select filter (assignee/state/priority) narrows the ENG issues; chats have no such fields.
+  let issues = list.filter((i) => !i.standalone);
+  if (filterActiveCount()) issues = issues.filter(matchFilter);
+  const shown = chats.length + issues.length;
+  $('count').textContent = `${shown} item${shown === 1 ? '' : 's'}${q ? ' matched' : filterActiveCount() ? ' filtered' : S.showAll ? '' : ' active'}`;
   $('showAll').textContent = S.showAll ? 'active only' : 'show all';
   $('searchClear').style.display = S.search ? 'block' : 'none';
-  const empty = q ? `No matches for “${esc(S.search.trim())}”.` : 'Nothing yet — start a chat, or wait for issues.';
+  const empty = q ? `No matches for “${esc(S.search.trim())}”.` : filterActiveCount() ? 'No tasks match the filter.' : 'Nothing yet — start a chat, or wait for issues.';
   const html = section('chats', 'Chats', chats.map(chatRow)) + section('issues', 'Issues', issues.map(issueRow));
   $('issues').innerHTML = html || `<div style="padding:16px;color:var(--dim)">${empty}</div>`;
   // Collapsible sections (persisted).
@@ -737,6 +821,8 @@ async function changeOwnerMenu(anchorEl, id) {
   }))]);
 }
 $('newChat').onclick = (ev) => newChatMenu(ev.currentTarget);
+$('filterBtn').onclick = (ev) => openFilter(ev.currentTarget);
+updateFilterBtn(); // reflect any persisted filter on load
 $('showAll').onclick = () => { S.showAll = !S.showAll; lastIssuesJson = ''; renderIssues(); };
 $('search').addEventListener('input', (ev) => { S.search = ev.target.value; lastIssuesJson = ''; renderIssues(); });
 $('searchClear').onclick = () => { S.search = ''; $('search').value = ''; $('search').focus(); lastIssuesJson = ''; renderIssues(); };
