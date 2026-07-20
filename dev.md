@@ -1,3 +1,27 @@
+## ENG-415: Meta ad sets set destination_type=WEBSITE for website goals (2026-07-20)
+
+Found during RankAI ad review (Matt request via Harsha). Every ad set in RankAI's account
+(26242538088719416) had `destination_type=UNDEFINED`, so the ad-level Destination read as "not
+selected" in Ads Manager even though the creative link + LEAD pixel fire fine. Root cause: the
+backend never set `destination_type` anywhere (`grep destination_type` → 0 hits) —
+`metaService.createAdSet` mapped a fixed whitelist without it and `createMetaAdsAdSet` never derived
+one.
+
+Fix (deterministic, additive): `createMetaAdsAdSet` defaults `destination_type='WEBSITE'` when the
+caller omits it AND `optimization_goal` ∈ `META_WEBSITE_OPTIMIZATION_GOALS`
+(LINK_CLICKS / LANDING_PAGE_VIEWS / OFFSITE_CONVERSIONS / VALUE); an explicit caller value always
+wins; non-website goals (engagement/reach/app/instant-form) are untouched. `metaService.createAdSet`
+forwards `destination_type` only when present (literal key — not guaranteed on the SDK `AdSet.Fields`
+enum), and the Emma tool schema exposes it.
+
+Assumptions / non-goals: (1) the `url_tags` / "URL Parameters" half was ALREADY shipped in ENG-239
+(`metaService.resolveUrlTags` auto-sets `url_tags` on new creatives) — the RankAI ads that show UTMs
+baked into the link predate it (magnet) or were built by the 07-19 raw-Graph-API rebuild (the `-conv`
+pair), so they never hit the fixed path; new Emma ads are already correct. (2) `utm_source` value
+convention (meta vs facebook) stays a Session:Taste call in ENG-327. (3) Backfilling the live RankAI
+ads is a separate real-money action (rebuilding existing-post ads would drop social proof) — not in
+this PR.
+
 ## ENG-409: default customer-bug assignee changed Harshit → Manan (2026-07-20)
 
 Directed by Harsha. Customer-filed bug canonicals (`fileBugReport` in `services/intakeService.ts`)
