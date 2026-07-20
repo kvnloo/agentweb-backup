@@ -232,6 +232,35 @@ describe('AgentModeService.twitterManagePost', () => {
     expect(res.success).toBe(true);
   });
 
+  // ── ENG-413 AC#3: surface the X ApiResponseError body, not a bare 403 ──
+  it('surfaces the X ApiResponseError title/detail instead of a bare "code 403"', async () => {
+    // Mirror twitter-api-v2 ApiResponseError: terse .message, real payload on .data, status on .code.
+    const apiErr = Object.assign(new Error('Request failed with code 403'), {
+      code: 403,
+      data: {
+        title: 'Forbidden',
+        detail: 'Your client app is not configured with the appropriate oauth1 app permissions for this endpoint.',
+        type: 'about:blank',
+      },
+    });
+    mockPostTweet.mockRejectedValueOnce(apiErr);
+    const res = await service.twitterManagePost('u', { action: 'reply', text: 'hi', in_reply_to_tweet_id: '123' });
+    expect(res.success).toBe(false);
+    expect(res.error).toContain('Forbidden');
+    expect(res.error).toContain('appropriate oauth1 app permissions');
+    expect(res.error).not.toBe('Request failed with code 403');
+  });
+
+  it('surfaces the read-only reconnect guard error verbatim', async () => {
+    mockPostTweet.mockRejectedValueOnce(
+      new Error('Your X account @harshmoney123 is connected read-only — it is missing the "tweet.write" permission needed for this action. Reconnect it with write permission in Settings → Connected Accounts.')
+    );
+    const res = await service.twitterManagePost('u', { action: 'reply', text: 'hi', in_reply_to_tweet_id: '123' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/read-only/);
+    expect(res.error).toMatch(/reconnect/i);
+  });
+
   it('post_thread forwards the tweets array', async () => {
     const res = await service.twitterManagePost('u', { action: 'post_thread', tweets: ['a', 'b'] });
     expect(mockPostThread).toHaveBeenCalledWith(OWNER, 'tw1', ['a', 'b']);
