@@ -1048,7 +1048,7 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
       : '';
     // promptOverride lets a turn SHOW the user's own words (turn_start above emits `message`) while the
     // agent actually receives a different instruction — e.g. a typed "merge it" displays as-is but runs
-    // the full MERGE_MSG, so the natural-language trigger and the Merge button have the exact same effect.
+    // the full mergeMsg, so the natural-language trigger and the Merge button have the exact same effect.
     const promptMsg = (promptOverride || message || '(see the attached file(s))') + attachNote;
     let resumeSid;
     let prompt;
@@ -1390,14 +1390,14 @@ function startTurn(identifier, body) {
   const turnId = `t${Date.now()}-${++turnSeq}`;
   activeTurns.set(identifier, { child: null, cap, turnId, startedAt: new Date().toISOString(), lockPath });
   // Natural-language merge trigger: if this full-cap chat (ENG or standalone) has open PR(s) and the
-  // message is an EXPLICIT merge instruction, run the EXACT same MERGE_MSG the button runs — while still
+  // message is an EXPLICIT merge instruction, run the EXACT same mergeMsg the button runs — while still
   // showing the user's own words. Classify async so the 202 stays instant; any classifier failure (or a
   // non-explicit message) just runs a normal turn. See isMergeRequest for the strict no-false-fire gate.
   (async () => {
     let override = null;
     try {
       if (cap === 'full' && (found.entry.prs || []).filter(Boolean).length && message && await isMergeRequest(message)) {
-        override = MERGE_MSG;
+        override = mergeMsg(found.entry);
         log(`turn ${turnId} (${identifier}): explicit merge request → running the merge flow`);
       }
     } catch { /* classifier unavailable → normal turn */ }
@@ -1504,27 +1504,47 @@ const RECONCILE_MSG = (repoKeys) => [
 // NO confirmation handshake (removed deliberately: it blocked autonomy); the ONLY thing that stops it is
 // a genuine decision change (MERGE_BLOCKED). Self-authorizes the gh actions, overriding the standard
 // "don't push/merge" note in the session.
-const MERGE_MSG = [
-  '**Merge PR(s).** Get every open PR on this issue mergeable and MERGE it — fully autonomously. There is NO confirmation step: the moment a PR\'s gates are green you are authorized to merge it immediately, without asking anyone.',
-  '',
-  'For each open PR on this issue (list them with `gh pr list --state open` in each repo):',
-  '1. If it is a draft, mark it ready: `gh pr ready <n>`.',
-  '2. Sync its branch with the base branch: `gh pr update-branch <n>` (or merge the latest base in), resolving any conflicts.',
-  '3. Check CI: `gh pr checks <n>`. If any check is failing, read the failing logs (`gh run view <run-id> --log-failed`), fix the code, and commit — your commit auto-pushes. Repeat until every check passes.',
-  '4. **Greptile review is a required, merge-blocking gate.** Greptile is an automated code reviewer (a bot) that posts a review on every PR; the branch protection keeps the PR **BLOCKED until Greptile gives a passing/approving review**. Inspect it with `gh pr view <n> --json reviews,statusCheckRollup` (and `gh pr checks <n>` — Greptile may also surface as a status check). When Greptile requests changes or flags issues, read its full review, then **classify each point** so this stays autonomous:',
-  '   - **Mechanical / clear-cut fixes** (bugs it caught, missing null checks, typos, obviously-correct suggestions with no judgment call): just fix them yourself, commit (auto-pushes), and let Greptile re-review. Do NOT come back to the developer for these — keep going.',
-  '   - **Decision changes** (Greptile is questioning an approach, a product/UX/behavior choice, a tradeoff, or anything where a reasonable person could disagree and the "right" answer needs the developer): do NOT guess. Stop and surface it (see MERGE_BLOCKED below) with a crisp summary of exactly what decision is needed.',
-  '   - **Passed WITH optional/non-blocking suggestions** (Greptile approved but still left "nit"/"consider"/"suggestion" comments): its pass already unblocks the merge, so these are NOT required. You cannot apply them for free — ANY new commit re-triggers CI and a fresh Greptile review, and the PR stays blocked until they re-pass, so a code change always costs another full verification cycle. So: apply a suggestion pre-merge ONLY if it is quick, clearly safe, and genuinely worth another CI+Greptile round; otherwise merge as-is and capture the rest as a follow-up (a note in a PR comment, or a new Linear issue). Never delay or loop the merge on optional polish.',
-  '   Greptile re-reviews on each new commit; if it stalls, re-trigger it by commenting `@greptile review` on the PR. Repeat the fix→re-review loop until Greptile passes or you hit a decision change.',
-  '5. When a PR has all checks green, Greptile has passed, and it is mergeable, **MERGE IT IMMEDIATELY: `gh pr merge <n> --merge`** — a merge commit; NEVER `--delete-branch`; NEVER `--admin` or any bypass of the block. Do not wait for confirmation; merging is the goal.',
-  '6. **Waiting = register a watch, never block.** CI here runs 20+ min and Greptile drips comments one at a time — do NOT sit blocking on `gh pr checks --watch`/`sleep`. Instead, do everything actionable NOW (kick a rebase, fix a failure, answer a mechanical Greptile point, re-trigger a review), then end your reply with `[[WATCH: <one line — e.g. "PR #2084: Backend tests running, will merge when green">]]`. You will be automatically re-invoked in a few minutes to check again and take the next action. Keep looping that way across the whole rebase→CI→Greptile→merge cascade. End with `[[WATCH_DONE]]` once every PR is merged.',
-  '',
-  'If the PRs depend on each other, handle them in the right order (merging one advances the base, so the next will fall behind — re-sync it with `gh pr update-branch`, which re-triggers its CI + a fresh Greptile review; that is expected, just ride it out via [[WATCH]] and merge it when it goes green again). You ARE authorized to run `gh pr ready`, `gh pr update-branch`, `gh pr checks`, to comment for a Greptile re-review, to commit, AND to `gh pr merge --merge` for this task — this overrides the earlier note about not pushing/merging.',
-  '',
-  'Bias hard toward finishing autonomously: pull the developer in ONLY for a genuine decision change — end your reply with `MERGE_BLOCKED: <what decision is needed, and the options>` (summarize Greptile\'s point so the developer can decide without re-reading the PR). Also use MERGE_BLOCKED if a PR simply cannot be made mergeable. When every open PR is merged, report the final state of each.',
-].join('\n');
+// The PR URL(s) this chat opened, from the entry. This chat === these specific PR(s); the merge flow
+// must operate ONLY on them and must never discover/merge other repo PRs.
+function entryPrUrls(entry) {
+  return (entry?.prs || []).filter(Boolean).map((p) => (typeof p === 'string' ? p : p?.url)).filter(Boolean);
+}
+const prShortRef = (url) => { const m = /\/pull\/(\d+)/.exec(url || ''); return m ? `#${m[1]}` : url; };
 
-// Natural-language merge trigger. A typed message runs the EXACT same MERGE_MSG flow as the button, but
+// Autonomous merge prompt, scoped to EXACTLY this chat's PR(s). It names the PR URLs explicitly and
+// forbids `gh pr list`/any repo-wide discovery, so the agent merges only the current PR(s) — not every
+// open PR in the repo. Everything else (rebase → CI → Greptile gate → merge, driven by the [[WATCH]]
+// loop) is unchanged.
+function mergeMsg(entry) {
+  const urls = entryPrUrls(entry);
+  const list = urls.map((u) => `- ${u}`).join('\n') || '- (this chat has no recorded PR — do NOT go looking for one; end with MERGE_BLOCKED explaining there is no PR to merge)';
+  return [
+    '**Merge THIS chat\'s PR(s).** Get the specific PR(s) below mergeable and MERGE — fully autonomously. There is NO confirmation step: the moment a PR\'s gates are green you are authorized to merge it immediately, without asking anyone.',
+    '',
+    'The ONLY PR(s) you may act on are exactly these (this chat owns them):',
+    list,
+    '',
+    '**Scope — critical:** operate ONLY on the PR(s) listed above, addressing each by its URL. Do NOT run `gh pr list` or otherwise discover, touch, ready, update, or merge ANY other open PR in the repo — even if it looks related. If a command needs a PR argument, pass one of the URLs above.',
+    '',
+    'For each PR URL above (call it `<pr>`):',
+    '1. If it is a draft, mark it ready: `gh pr ready <pr>`.',
+    '2. Sync its branch with the base branch: `gh pr update-branch <pr>` (or merge the latest base in), resolving any conflicts.',
+    '3. Check CI: `gh pr checks <pr>`. If any check is failing, read the failing logs (`gh run view <run-id> --log-failed`), fix the code, and commit — your commit auto-pushes. Repeat until every check passes.',
+    '4. **Greptile review is a required, merge-blocking gate.** Greptile is an automated code reviewer (a bot) that posts a review on every PR; the branch protection keeps the PR **BLOCKED until Greptile gives a passing/approving review**. Inspect it with `gh pr view <pr> --json reviews,statusCheckRollup` (and `gh pr checks <pr>` — Greptile may also surface as a status check). When Greptile requests changes or flags issues, read its full review, then **classify each point** so this stays autonomous:',
+    '   - **Mechanical / clear-cut fixes** (bugs it caught, missing null checks, typos, obviously-correct suggestions with no judgment call): just fix them yourself, commit (auto-pushes), and let Greptile re-review. Do NOT come back to the developer for these — keep going.',
+    '   - **Decision changes** (Greptile is questioning an approach, a product/UX/behavior choice, a tradeoff, or anything where a reasonable person could disagree and the "right" answer needs the developer): do NOT guess. Stop and surface it (see MERGE_BLOCKED below) with a crisp summary of exactly what decision is needed.',
+    '   - **Passed WITH optional/non-blocking suggestions** (Greptile approved but still left "nit"/"consider"/"suggestion" comments): its pass already unblocks the merge, so these are NOT required. You cannot apply them for free — ANY new commit re-triggers CI and a fresh Greptile review, and the PR stays blocked until they re-pass, so a code change always costs another full verification cycle. So: apply a suggestion pre-merge ONLY if it is quick, clearly safe, and genuinely worth another CI+Greptile round; otherwise merge as-is and capture the rest as a follow-up (a note in a PR comment, or a new Linear issue). Never delay or loop the merge on optional polish.',
+    '   Greptile re-reviews on each new commit; if it stalls, re-trigger it by commenting `@greptile review` on the PR. Repeat the fix→re-review loop until Greptile passes or you hit a decision change.',
+    '5. When a PR has all checks green, Greptile has passed, and it is mergeable, **MERGE IT IMMEDIATELY: `gh pr merge <pr> --merge`** — a merge commit; NEVER `--delete-branch`; NEVER `--admin` or any bypass of the block. Do not wait for confirmation; merging is the goal.',
+    '6. **Waiting = register a watch, never block.** CI here runs 20+ min and Greptile drips comments one at a time — do NOT sit blocking on `gh pr checks --watch`/`sleep`. Instead, do everything actionable NOW (kick a rebase, fix a failure, answer a mechanical Greptile point, re-trigger a review), then end your reply with `[[WATCH: <one line — e.g. "PR #2084: Backend tests running, will merge when green">]]`. You will be automatically re-invoked in a few minutes to check again and take the next action. Keep looping that way across the whole rebase→CI→Greptile→merge cascade. End with `[[WATCH_DONE]]` once the PR(s) above are merged.',
+    '',
+    'If the PR(s) above depend on each other, handle them in the right order (merging one advances the base, so the next will fall behind — re-sync it with `gh pr update-branch`, which re-triggers its CI + a fresh Greptile review; that is expected, just ride it out via [[WATCH]] and merge it when it goes green again). You ARE authorized to run `gh pr ready`, `gh pr update-branch`, `gh pr checks`, to comment for a Greptile re-review, to commit, AND to `gh pr merge --merge` for this task — this overrides the earlier note about not pushing/merging.',
+    '',
+    'Bias hard toward finishing autonomously: pull the developer in ONLY for a genuine decision change — end your reply with `MERGE_BLOCKED: <what decision is needed, and the options>` (summarize Greptile\'s point so the developer can decide without re-reading the PR). Also use MERGE_BLOCKED if a PR simply cannot be made mergeable. When the PR(s) above are merged, report the final state of each.',
+  ].join('\n');
+}
+
+// Natural-language merge trigger. A typed message runs the EXACT same mergeMsg flow as the button, but
 // ONLY on an EXPLICIT merge instruction — no false-fires. A cheap keyword gate skips the model on the vast
 // majority of messages; a strict haiku yes/no classifier then confirms (a question about merging, a
 // negation, a deferral, or "merge" used in another sense all resolve to NO). Fails safe to NO.
@@ -1554,8 +1574,9 @@ function startMergeTurn(identifier) {
   if (!lockPath) return { code: 409, error: 'another fix run holds the lock for this issue' };
   const turnId = `t${Date.now()}-${++turnSeq}`;
   activeTurns.set(identifier, { child: null, cap: 'full', turnId, startedAt: new Date().toISOString(), lockPath });
-  // Show a short line, RUN the full MERGE_MSG (promptOverride) — identical to the natural-language trigger.
-  runTurn(identifier, found.entry, 'full', '⛙ Merge the open PR(s).', turnId, lockPath, null, [], MERGE_MSG);
+  // Show a short line naming the PR(s), RUN the scoped mergeMsg (promptOverride) — identical to the NL trigger.
+  const disp = entryPrUrls(found.entry).map(prShortRef).join(', ');
+  runTurn(identifier, found.entry, 'full', `⛙ Merge ${disp || 'this chat’s PR'}.`, turnId, lockPath, null, [], mergeMsg(found.entry));
   return { code: 202, body: { turnId, cap: 'full' } };
 }
 
