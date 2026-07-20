@@ -25786,19 +25786,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       // When a platform-specific lookup finds nothing the caller can access, the
       // account may still be connected by an org teammate who never shared it (the
-      // confirmed ENG-368 case: a private Google Ads account owned by another member).
-      // Surface that as an actionable message instead of a bare "0 accounts" that
-      // makes the agent dead-end on an opaque connection error.
+      // ENG-368 case: a private Google Ads account owned by another member). Rather
+      // than inspect teammates' private accounts to confirm — which would disclose
+      // the existence of an account its owner deliberately kept private — surface
+      // the possibility unconditionally, phrased as a hint. The agent can then guide
+      // the user to the fix without the tool ever revealing whether such an account
+      // exists, keeping the org's privacy model intact.
       let message = `Found ${accounts.length} connected account(s)`;
       if (accounts.length === 0 && platform && platform !== 'all') {
-        const { countUnsharedOrgAccountsByPlatform } = await import('./connectedAccountsDb');
-        const unsharedCount = await countUnsharedOrgAccountsByPlatform(userId, platform as any);
-        if (unsharedCount > 0) {
-          const teammates = unsharedCount === 1
-            ? 'a teammate in your organization has'
-            : `${unsharedCount} teammates in your organization have`;
-          message = `Found 0 ${platform} account(s) available to you. However, ${teammates} a ${platform} account connected but not shared with the org, so it can't be used here. Ask the account owner to open Settings → Connected Accounts and click "Share with org" for that ${platform} account (or connect ${platform} under this account directly).`;
-        }
+        message = `Found 0 ${platform} account(s) available to you. If a teammate in your organization has connected ${platform} but hasn't shared it, they'll need to open Settings → Connected Accounts and click "Share with org" — otherwise, connect ${platform} under this account directly.`;
       }
 
       return {
