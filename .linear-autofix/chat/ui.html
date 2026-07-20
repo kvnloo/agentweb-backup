@@ -93,8 +93,11 @@
   .issue:hover { background: var(--panel2); }
   .issue.sel { background: var(--panel2); border-left: 3px solid var(--accent); padding-left: 11px; }
   .issue .row1 { display: flex; align-items: center; gap: 8px; }
-  .issue .id { font-weight: 600; }
+  .issue .id { font-weight: 600; white-space: nowrap; flex-shrink: 0; } /* never let "ENG-368" wrap */
   .issue .assignee { color: var(--dim); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  /* Second line under the id: Linear-state chip + summary (keeps row1 uncrowded). */
+  .issue .row2 { display: flex; align-items: center; gap: 6px; margin-top: 3px; min-width: 0; }
+  .issue .row2 .summ { margin-top: 0; min-width: 0; }
   /* Linear workflow-state chip — outlined (vs the solid autofix-outcome badge) with a category-coloured dot. */
   .lstate { font-size: 10px; padding: 1px 7px 1px 6px; border-radius: 9px; border: 1px solid var(--border); color: var(--dim); display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; flex-shrink: 0; }
   .lstate .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--gray); flex-shrink: 0; }
@@ -105,7 +108,7 @@
   .lstate.st-backlog .dot, .lstate.st-unstarted .dot { background: var(--gray); }
   .issue .time { margin-left: auto; color: var(--dim); font-size: 11px; }
   .issue .summ { color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
-  .badge { font-size: 10px; padding: 1px 7px; border-radius: 9px; color: #0d0f13; font-weight: 600; }
+  .badge { font-size: 10px; padding: 1px 7px; border-radius: 9px; color: #0d0f13; font-weight: 600; flex-shrink: 0; }
   .b-green { background: var(--green); } .b-amber { background: var(--amber); } .b-red { background: var(--red); }
   .b-gray { background: var(--gray); } .b-orange { background: var(--orange); }
   .b-blue { background: var(--blue); animation: pulse 1.5s infinite; }
@@ -570,17 +573,17 @@ function chatRow(i) {
       <div class="summ">${i.ownerName ? esc(i.ownerName) : 'standalone workspace'}</div>
     </a>`;
 }
-// An ENG-issue row: id + outcome badge + Linear assignee (first name) + summary. The assignee chip makes
-// it clear at a glance who owns the issue; the full name is on hover.
+// An ENG-issue row. Line 1: id + autofix-outcome badge + assignee (first name) + time — kept uncrowded.
+// Line 2: the live Linear-state chip + summary. The assignee chip shows who owns it (full name on hover).
 function issueRow(i) {
   const who = i.assigneeName
     ? `<span class="assignee" title="Assignee: ${esc(i.assigneeName)}">👤 ${esc(i.assigneeName.split(/\s+/)[0])}</span>`
     : '';
   return `
     <a class="issue ${i.identifier === S.sel ? 'sel' : ''}" data-id="${i.identifier}" href="#${encodeURIComponent(i.identifier)}">
-      <div class="row1"><span class="id">${esc(i.identifier)}</span>${badge(i.outcome)}${lstate(i.linearState, i.linearStateType)}${who}
+      <div class="row1"><span class="id">${esc(i.identifier)}</span>${badge(i.outcome)}${who}
         ${i.chat.busy ? '<span class="busydot"></span>' : ''}<span class="time">${rel(i.at)}</span></div>
-      <div class="summ">${esc(i.summary || i.title || i.branch || '')}</div>
+      <div class="row2">${lstate(i.linearState, i.linearStateType)}<span class="summ">${esc(i.summary || i.title || i.branch || '')}</span></div>
     </a>`;
 }
 function section(key, label, rowsHtml) {
