@@ -43,6 +43,19 @@ export interface AttributionUpdate {
  * A lead is considered "already backfilled" when it has any attribution signal
  * on it. Idempotent runs just skip these. Callers that want to force-refresh
  * should pass `{ force: true }`.
+ *
+ * ⚠️ "Any signal" includes a BARE `firstTouch` — one holding only `timestamp` +
+ * `landingUrl`, with no `utm` inside it. The landing-page capture middleware writes
+ * exactly that for a direct/organic visitor, so such a lead counts as populated here
+ * and is SKIPPED. That is defensible (the lead's own earliest touch really was
+ * direct, and the contract is "earliest signal wins"), but be aware of the
+ * consequence: once landing-page capture is live in production, essentially every
+ * new lead carries a `firstTouch`, so this backfill becomes a no-op for them. If you
+ * run it expecting it to fill in attribution for recent leads, it will not. Pass
+ * `{ force: true }` if that is genuinely what you want.
+ *
+ * See LeadAttributionFields in ./leadSchema.ts — `firstTouch` is not a proxy for
+ * "attributed"; `utmSource` is.
  */
 export function isLeadAttributionAlreadyPopulated(
   lead: BackfillAttributionLead

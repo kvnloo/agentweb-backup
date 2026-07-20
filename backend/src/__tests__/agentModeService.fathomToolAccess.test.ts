@@ -77,6 +77,19 @@ describe('AgentModeService - Fathom Tool Access', () => {
     (AgentModeService as any).FOUNDATION_TOOLS = new Set(AgentModeService.DEFAULT_FOUNDATION_TOOLS);
   });
 
+  describe('Deprecated local agent tools are NOT foundation tools (ENG-383)', () => {
+    it('excludes run_local_agent_task and check_local_agent_status from DEFAULT_FOUNDATION_TOOLS', () => {
+      expect(AgentModeService.DEFAULT_FOUNDATION_TOOLS).not.toContain('run_local_agent_task');
+      expect(AgentModeService.DEFAULT_FOUNDATION_TOOLS).not.toContain('check_local_agent_status');
+    });
+
+    it('excludes them from the runtime FOUNDATION_TOOLS default set', () => {
+      const foundationTools = agentModeService.getFoundationToolNames();
+      expect(foundationTools.has('run_local_agent_task')).toBe(false);
+      expect(foundationTools.has('check_local_agent_status')).toBe(false);
+    });
+  });
+
   describe('Approach 1: Fathom tools in DEFAULT_FOUNDATION_TOOLS', () => {
     it('should include fathom_get_meetings in default foundation tools', () => {
       expect(AgentModeService.DEFAULT_FOUNDATION_TOOLS).toContain('fathom_get_meetings');
@@ -103,6 +116,40 @@ describe('AgentModeService - Fathom Tool Access', () => {
       expect(tools.has('fathom_get_meetings')).toBe(true);
       expect(tools.has('fathom_get_transcript')).toBe(true);
       expect(tools.has('fathom_get_onboarding_context')).toBe(true);
+    });
+
+    // ENG-280: production had a stale `foundation_tools` AW-Settings override
+    // (set before the Fathom tools existed) that did NOT list the Fathom tools.
+    // Because loadFoundationTools merges the DB override only with
+    // MANDATORY_FOUNDATION_TOOLS, the Fathom tools were stripped in prod and
+    // `fathom_get_onboarding_context` became unreachable for the session. The
+    // Fathom tools must be force-merged so no stale config can strip them.
+    it('should keep Fathom tools available even when a stale DB override omits them', async () => {
+      const mockSettingsService = require('../services/settingsService');
+      mockSettingsService.settingsService.getSetting = jest.fn().mockResolvedValue({
+        settingValue: JSON.stringify([
+          'install_skills',
+          'list_available_skills',
+          'resolve_skill',
+          'you_search_web',
+          'perform_data_analysis',
+          'notify_session',
+          'wait_seconds',
+        ]),
+      });
+
+      await agentModeService.loadFoundationTools();
+      const tools = agentModeService.getFoundationToolNames();
+      expect(tools.has('fathom_get_meetings')).toBe(true);
+      expect(tools.has('fathom_get_transcript')).toBe(true);
+      expect(tools.has('fathom_get_onboarding_context')).toBe(true);
+    });
+
+    it('should include Fathom tools in MANDATORY_FOUNDATION_TOOLS', () => {
+      const mandatory = (AgentModeService as any).MANDATORY_FOUNDATION_TOOLS as string[];
+      expect(mandatory).toContain('fathom_get_meetings');
+      expect(mandatory).toContain('fathom_get_transcript');
+      expect(mandatory).toContain('fathom_get_onboarding_context');
     });
   });
 

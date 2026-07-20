@@ -6,6 +6,7 @@ function inferPlatformFromReason(reason: string | undefined): string | null {
   const r = reason.toLowerCase();
   if (r.includes('youtube'))                                   return 'youtube';
   if (r.includes('gmail') || r.includes('google mail'))       return 'gmail';
+  if (r.includes('outlook') || r.includes('microsoft 365') || r.includes('office 365')) return 'outlook';
   if (r.includes('instagram'))                                 return 'instagram';
   if (r.includes('meta') || r.includes('facebook'))           return 'meta';
   if (r.includes('outreach') || r.includes('unipile'))        return 'unipile';
@@ -19,6 +20,7 @@ const PLATFORM_LABELS: Record<string, string> = {
   linkedin: 'LinkedIn',
   linkedin_ads: 'LinkedIn Ads',
   gmail: 'Gmail',
+  outlook: 'Outlook / Microsoft 365',
   youtube: 'YouTube',
   meta: 'Meta Marketing',
   instagram: 'Instagram',
@@ -40,12 +42,13 @@ emmaToolRegistry.register({
       properties: {
         platform: {
           type: 'string',
-          enum: ['linkedin', 'linkedin_ads', 'gmail', 'youtube', 'meta', 'instagram', 'fathom', 'unipile'],
+          enum: ['linkedin', 'linkedin_ads', 'gmail', 'outlook', 'youtube', 'meta', 'instagram', 'fathom', 'unipile'],
           description:
             'Which platform to connect. ' +
             '"linkedin" → LinkedIn personal profile; ' +
             '"linkedin_ads" → LinkedIn Ads account; ' +
             '"gmail" → Gmail / Google account; ' +
+            '"outlook" → Outlook / Microsoft 365 mailbox; ' +
             '"youtube" → YouTube channel; ' +
             '"meta" → Facebook / Meta Ads; ' +
             '"instagram" → Instagram business account; ' +

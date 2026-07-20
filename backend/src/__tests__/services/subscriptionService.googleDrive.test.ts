@@ -74,6 +74,7 @@ describe('getAllAvailableConnectedAccounts', () => {
       'unipile',
       'meta',
       'gmail',
+      'outlook',
       'youtube',
       'fathom',
       'instagram',
@@ -87,9 +88,9 @@ describe('getAllAvailableConnectedAccounts', () => {
     }
   });
 
-  it('returns exactly 12 items', () => {
+  it('returns exactly 13 items', () => {
     const result = getAllAvailableConnectedAccounts();
-    expect(result).toHaveLength(12);
+    expect(result).toHaveLength(13);
   });
 
   it('does not include unexpected platforms', () => {
@@ -99,6 +100,7 @@ describe('getAllAvailableConnectedAccounts', () => {
       'unipile',
       'meta',
       'gmail',
+      'outlook',
       'youtube',
       'fathom',
       'instagram',
