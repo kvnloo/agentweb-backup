@@ -757,4 +757,54 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(calledWith.targeting.targeting_automation.advantage_audience).toBe(0);
     });
   });
+
+  describe('destination_type defaulting in createMetaAdsAdSet (ENG-415)', () => {
+    const websiteGoalParams = {
+      name: 'Ad Set',
+      campaign_id: 'camp_123',
+      billing_event: 'IMPRESSIONS',
+      daily_budget: 10,
+      targeting: { geo_locations: { countries: ['US'] } }
+    };
+
+    beforeEach(() => {
+      (metaService.createAdSet as jest.Mock).mockResolvedValue({ id: 'adset_new', name: 'Ad Set' });
+    });
+
+    it('defaults destination_type=WEBSITE for a website traffic goal (LINK_CLICKS)', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_TRAFFIC' });
+      await service.createMetaAdsAdSet('user123', { ...websiteGoalParams, optimization_goal: 'LINK_CLICKS' });
+      const calledWith = (metaService.createAdSet as jest.Mock).mock.calls[0][2];
+      expect(calledWith.destination_type).toBe('WEBSITE');
+    });
+
+    it('defaults destination_type=WEBSITE for a website conversion goal (OFFSITE_CONVERSIONS)', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_LEADS' });
+      await service.createMetaAdsAdSet('user123', {
+        ...websiteGoalParams,
+        optimization_goal: 'OFFSITE_CONVERSIONS',
+        promoted_object: { pixel_id: 'px_1', custom_event_type: 'LEAD' }
+      });
+      const calledWith = (metaService.createAdSet as jest.Mock).mock.calls[0][2];
+      expect(calledWith.destination_type).toBe('WEBSITE');
+    });
+
+    it('does NOT set destination_type for a non-website goal (POST_ENGAGEMENT)', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_ENGAGEMENT' });
+      await service.createMetaAdsAdSet('user123', { ...websiteGoalParams, optimization_goal: 'POST_ENGAGEMENT' });
+      const calledWith = (metaService.createAdSet as jest.Mock).mock.calls[0][2];
+      expect(calledWith.destination_type).toBeUndefined();
+    });
+
+    it('respects an explicit destination_type and does not override it', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_TRAFFIC' });
+      await service.createMetaAdsAdSet('user123', {
+        ...websiteGoalParams,
+        optimization_goal: 'LINK_CLICKS',
+        destination_type: 'ON_AD'
+      });
+      const calledWith = (metaService.createAdSet as jest.Mock).mock.calls[0][2];
+      expect(calledWith.destination_type).toBe('ON_AD');
+    });
+  });
 });
