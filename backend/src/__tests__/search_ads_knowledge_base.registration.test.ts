@@ -21,6 +21,15 @@ describe('search_ads_knowledge_base tool registration', () => {
     expect(description).toMatch(/hasMore/);
   });
 
+  it('documents how to target a specific company vs. a broad keyword sweep', () => {
+    // ENG-382 was keyword/category research, not a single-company lookup. These
+    // per-argument mechanics live here (tool description), not in the always-on
+    // system prompt.
+    expect(description).toMatch(/company_name/);
+    expect(description).toMatch(/broad keyword/i);
+    expect(description).toMatch(/do NOT force company_name/i);
+  });
+
   it('exposes a cursor input so the agent can page through discovery results', () => {
     const props = emmaToolRegistry.getTool('search_ads_knowledge_base')!.definition.inputSchema.properties;
     expect(props.cursor).toBeTruthy();

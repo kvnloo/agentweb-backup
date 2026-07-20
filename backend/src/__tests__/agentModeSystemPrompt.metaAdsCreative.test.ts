@@ -30,12 +30,20 @@ describe('AgentMode system prompt - Meta ad creative extraction source guidance'
   });
 
   // ENG-382 was a keyword/category research task ("catalog 100 winning B2B ads
-  // across these keywords"), NOT a single-company lookup. The guidance must
-  // route that broad research shape to discovery via `query`/`niche` too, so
-  // the agent doesn't conclude discovery is company-only and fall back to
-  // scraping.
-  it('routes broad keyword/theme research (not tied to one company) to the discovery source', () => {
-    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('keyword/theme/category research that is NOT tied to one company');
-    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('Do NOT force a `company_name` when the task is broad keyword research');
+  // across these keywords"), NOT a single-company lookup. The prompt keeps only
+  // the routing rule (discovery covers "both a specific company and broad
+  // keyword/category research"); the mechanics of HOW to target each live in
+  // the tool description, not the always-on system prompt — see
+  // search_ads_knowledge_base.registration.test.ts.
+  it('routes both single-company and broad keyword/category research to the discovery source', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('both a specific company and broad keyword/category research');
+  });
+
+  // Keep the always-on prompt lean: the per-argument mechanics (company_name vs
+  // query, niche/format/sort, cursor paging) belong in the tool description, not
+  // duplicated in the global system prompt.
+  it('does not carry per-argument discovery mechanics in the always-on system prompt', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).not.toContain("sort='newest'");
+    expect(AGENT_MODE_SYSTEM_PROMPT).not.toContain('page with the returned');
   });
 });
