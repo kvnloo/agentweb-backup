@@ -4450,7 +4450,18 @@ export class AgentModeService {
       if (setting?.settingValue) {
         const toolNames: string[] = JSON.parse(setting.settingValue);
         if (Array.isArray(toolNames) && toolNames.length > 0) {
-          const merged = [...new Set([...toolNames, ...AgentModeService.MANDATORY_FOUNDATION_TOOLS])];
+          // The DB override is ADDITIVE, not a replacement: always union
+          // DEFAULT_FOUNDATION_TOOLS so a stale/drifted override can never strip
+          // a tool the code ships as a default. A prod `foundation_tools` row
+          // that predated newer tools was silently dropping every DEFAULT-only
+          // tool (Fathom, knowledge base, scheduled chats, Slack, org-memory
+          // writes, …), each surfacing as a separate "tool not available" bug
+          // (ENG-280, ENG-404). MANDATORY stays in the union as the hard floor.
+          const merged = [...new Set([
+            ...AgentModeService.DEFAULT_FOUNDATION_TOOLS,
+            ...toolNames,
+            ...AgentModeService.MANDATORY_FOUNDATION_TOOLS,
+          ])];
           AgentModeService.FOUNDATION_TOOLS = new Set(merged);
           console.log(`AgentMode: Loaded ${merged.length} foundation tools from DB`);
           return;
@@ -4466,7 +4477,14 @@ export class AgentModeService {
    * Update foundation tools in DB and refresh the in-memory set.
    */
   public async updateFoundationTools(toolNames: string[], updatedBy: string): Promise<string[]> {
-    const unique = [...new Set([...toolNames, ...AgentModeService.MANDATORY_FOUNDATION_TOOLS])];
+    // Additive on top of DEFAULT (see loadFoundationTools): the override can add
+    // tools but can never remove a shipped default, so no future edit can
+    // reintroduce the ENG-404 stripping. MANDATORY is the hard floor.
+    const unique = [...new Set([
+      ...AgentModeService.DEFAULT_FOUNDATION_TOOLS,
+      ...toolNames,
+      ...AgentModeService.MANDATORY_FOUNDATION_TOOLS,
+    ])];
     await settingsService.setSetting(
       AgentModeService.FOUNDATION_TOOLS_SETTING,
       JSON.stringify(unique),
