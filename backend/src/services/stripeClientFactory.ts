@@ -29,8 +29,10 @@ export function createStripeClient(
   extraOpts: Stripe.StripeConfig = {}
 ): Stripe {
   const config: Stripe.StripeConfig = {
-    apiVersion: STRIPE_API_VERSION as any,
     ...extraOpts,
+    // apiVersion last: the factory is the canonical version source, so a
+    // caller's extraOpts must never silently override the pinned version.
+    apiVersion: STRIPE_API_VERSION as any,
   };
 
   const base = process.env.STRIPE_API_BASE;

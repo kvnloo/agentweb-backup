@@ -44,6 +44,13 @@ describe('createStripeClient', () => {
       expect((client as any).getApiField('stripeAccount')).toBe('acct_123');
       expect((client as any).getApiField('host')).toBe('api.stripe.com');
     });
+
+    it('keeps the canonical apiVersion even if extraOpts tries to override it', () => {
+      const client = createStripeClient('sk_test_dummy', {
+        apiVersion: '2020-08-27' as any,
+      });
+      expect((client as any).getApiField('version')).toBe(STRIPE_API_VERSION);
+    });
   });
 
   describe('STRIPE_API_BASE set outside production — test seam', () => {
