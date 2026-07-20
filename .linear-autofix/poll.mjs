@@ -10,7 +10,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { config } from './config.mjs';
-import { listNewBugs, listForcedBugs, listStaleInProgress, resolveIssue, addComment, findStateId, moveIssue, linearStatePatch } from './linear.mjs';
+import { listNewBugs, listForcedBugs, listStaleInProgress, resolveIssue, addComment, findStateId, moveIssue, linearStatePatch, linearPriorityPatch, linearTitlePatch } from './linear.mjs';
 import { assigneeRefreshPatch } from './git-identity.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -151,7 +151,7 @@ async function refreshFromLinear() {
     if (!entry.identifier || entry.standalone) continue;
     let issue;
     try { issue = await resolveIssue(entry.identifier); } catch { continue; }
-    const patch = { ...(assigneeRefreshPatch(entry, issue.assignee) || {}), ...(linearStatePatch(entry, issue.state) || {}) };
+    const patch = { ...(assigneeRefreshPatch(entry, issue.assignee) || {}), ...(linearStatePatch(entry, issue.state) || {}), ...(linearPriorityPatch(entry, issue.priority) || {}), ...(linearTitlePatch(entry, issue.title) || {}) };
     if (Object.keys(patch).length) patches[uuid] = patch;
   }
   const ids = Object.keys(patches);
@@ -159,7 +159,7 @@ async function refreshFromLinear() {
   const fresh = loadState();
   for (const [uuid, patch] of Object.entries(patches)) if (fresh[uuid]) Object.assign(fresh[uuid], patch);
   saveState(fresh);
-  log(`refreshed assignee/state on ${ids.length} issue(s) to match Linear`);
+  log(`refreshed assignee/state/priority on ${ids.length} issue(s) to match Linear`);
 }
 
 async function main() {

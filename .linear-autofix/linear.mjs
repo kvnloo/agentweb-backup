@@ -65,6 +65,29 @@ export function linearStatePatch(entry, liveState) {
   return { linearState: name, linearStateType: type };
 }
 
+// Reconcile a stored state entry's Linear priority with the issue's CURRENT priority, returning a
+// { priority } patch or null. Linear priority is 0=none, 1=urgent, 2=high, 3=medium, 4=low; 0 is a REAL
+// value (an explicitly-cleared priority), so it's synced too — only a missing/non-numeric live priority
+// is treated as "unknown" and left alone. Skips standalone chats (not Linear issues).
+export function linearPriorityPatch(entry, priority) {
+  if (!entry || entry.standalone) return null;
+  if (typeof priority !== 'number') return null; // no live priority — keep whatever we already have
+  if ((entry.priority ?? null) === priority) return null; // unchanged
+  return { priority };
+}
+
+// Reconcile a stored entry's cached Linear title with the issue's CURRENT title, returning a
+// { linearTitle } patch or null. Kept in `linearTitle` (not `title`, which a standalone chat uses for its
+// own name) so the sidebar can reveal the real task title on hover. Skips standalone chats; never blanks
+// a cached title on an empty read.
+export function linearTitlePatch(entry, title) {
+  if (!entry || entry.standalone) return null;
+  const t = (title || '').trim();
+  if (!t) return null; // no live title — keep whatever we already have
+  if ((entry.linearTitle || null) === t) return null; // unchanged
+  return { linearTitle: t };
+}
+
 // Accepts a human identifier ("LIN-123") or a raw issue UUID.
 export async function resolveIssue(ref) {
   const m = /^([A-Za-z]+)-(\d+)$/.exec(ref.trim());

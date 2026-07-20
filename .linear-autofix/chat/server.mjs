@@ -148,6 +148,8 @@ function listIssues() {
         assigneeName: e.assignee?.name || null, // Linear assignee — shown in the sidebar so it's clear who owns the issue
         linearState: e.linearState || null,     // Linear workflow state name (e.g. "In Progress") — sidebar status chip
         linearStateType: e.linearStateType || null, // its category (backlog/unstarted/started/completed/canceled/triage) — chip colour
+        priority: typeof e.priority === 'number' ? e.priority : null, // Linear priority 0..4 — sidebar priority chip (null = unknown)
+        linearTitle: e.linearTitle || null,      // the issue's Linear title — shown as the sidebar row's hover tooltip
         outcome: e.outcome,
         triage: e.triage || null,
         branch: e.branch || null,
