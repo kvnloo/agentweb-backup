@@ -141,7 +141,7 @@ function featurebaseSafeContext(ctx?: Record<string, any>): Record<string, any> 
  * Engineering"): Retention -> Urgent, Setup/Activated -> High, Sales/Parked/unknown -> Medium.
  */
 const BUG_CANONICAL_STATE = 'Todo';
-const BUG_DEFAULT_ASSIGNEE_ID = '4c29baa4-7778-42d9-8b35-045e4d9ec0b0'; // Harshit Shah — default bug owner
+const BUG_DEFAULT_ASSIGNEE_ID = 'cabadf7c-b95d-4455-b9ec-df11d5d83f5f'; // Manan Varma — default bug owner (changed from Harshit 2026-07-20, ENG-409)
 const BUG_PRIORITY = { URGENT: 1, HIGH: 2, MEDIUM: 3 } as const; // Linear priority enum (1=Urgent … 4=Low)
 const BUG_PRIORITY_BY_COARSE_TAG: Record<string, number> = {
   Retention: BUG_PRIORITY.URGENT,
