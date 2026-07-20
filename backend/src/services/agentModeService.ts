@@ -4246,6 +4246,13 @@ export class AgentModeService {
     // other_skills (ENG-152).
     'read_file_content',
 
+    // Image analysis — the visual analog of read_file_content. Always available
+    // so an attached screenshot/image can be read immediately, regardless of
+    // which page the user is on. Previously only injected on the `images` page,
+    // so a user attaching a UI screenshot elsewhere got "describe_image not
+    // available" and Emma had to ask them to type out what was on screen (ENG-260).
+    'describe_image',
+
     // Work Plans (Emma's execution planning system)
     'create_work_plan',
     'modify_work_plan',
@@ -4356,6 +4363,12 @@ export class AgentModeService {
     // other_skills, producing the transient "read_file_content
     // unavailable/failed" failure (ENG-152).
     'read_file_content',
+    // Image analysis. Force-merged for the same reason as read_file_content: the
+    // prod `foundation_tools` AW-Settings override omits DEFAULT-only additions,
+    // so without this an attached screenshot could not be analyzed unless the user
+    // happened to be on the `images` page — Emma returned "describe_image not
+    // available" and had to ask the user to type out what was on screen (ENG-260).
+    'describe_image',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
