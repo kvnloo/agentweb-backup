@@ -51,6 +51,10 @@ const mockListDms = jest.fn();
 const mockGetDmConversation = jest.fn();
 const mockBookmarkTweet = jest.fn();
 const mockGetBookmarks = jest.fn();
+const mockGetOwnedLists = jest.fn();
+const mockGetListMembers = jest.fn();
+const mockGetListTweets = jest.fn();
+const mockResolveOwnedListIdByName = jest.fn();
 const mockBlockUser = jest.fn();
 const mockUnblockUser = jest.fn();
 const mockMuteUser = jest.fn();
@@ -83,6 +87,10 @@ jest.mock('../services/twitterService', () => ({
     getDmConversation: (...a: any[]) => mockGetDmConversation(...a),
     bookmarkTweet: (...a: any[]) => mockBookmarkTweet(...a),
     getBookmarks: (...a: any[]) => mockGetBookmarks(...a),
+    getOwnedLists: (...a: any[]) => mockGetOwnedLists(...a),
+    getListMembers: (...a: any[]) => mockGetListMembers(...a),
+    getListTweets: (...a: any[]) => mockGetListTweets(...a),
+    resolveOwnedListIdByName: (...a: any[]) => mockResolveOwnedListIdByName(...a),
     blockUser: (...a: any[]) => mockBlockUser(...a),
     unblockUser: (...a: any[]) => mockUnblockUser(...a),
     muteUser: (...a: any[]) => mockMuteUser(...a),
@@ -386,6 +394,10 @@ describe('AgentModeService.twitterOutreach', () => {
     mockGetDmConversation.mockResolvedValue([{ id: 'dm_ev1', text: 'hello' }]);
     mockBookmarkTweet.mockResolvedValue({ bookmarked: true });
     mockGetBookmarks.mockResolvedValue([{ id: 'bm1', text: 'bookmarked tweet' }]);
+    mockGetOwnedLists.mockResolvedValue([{ id: 'L1', name: 'Engagement 101' }]);
+    mockGetListMembers.mockResolvedValue([{ id: 'm1', username: 'member1', name: 'Member One' }]);
+    mockGetListTweets.mockResolvedValue([{ id: 'lt1', text: 'list tweet', author_id: 'a1', author_handle: 'author1' }]);
+    mockResolveOwnedListIdByName.mockResolvedValue('L1');
     mockBlockUser.mockResolvedValue({ blocking: true });
     mockUnblockUser.mockResolvedValue({ blocking: false });
     mockMuteUser.mockResolvedValue({ muting: true });
@@ -597,6 +609,66 @@ describe('AgentModeService.twitterOutreach', () => {
     expect(mockGetBookmarks).toHaveBeenCalledWith(OWNER, 'tw1');
     expect(res.success).toBe(true);
     expect(res.data).toHaveLength(1);
+  });
+
+  // ── X Lists (read) ──
+  it('list_owned_lists calls getOwnedLists and returns lists with id + name', async () => {
+    const res = await service.twitterOutreach('u', { action: 'list_owned_lists' });
+    expect(mockGetOwnedLists).toHaveBeenCalledWith(OWNER, 'tw1');
+    expect(res.success).toBe(true);
+    expect(res.data[0]).toEqual(expect.objectContaining({ id: 'L1', name: 'Engagement 101' }));
+  });
+
+  it('get_list_members with x_list_id calls getListMembers and returns member handles', async () => {
+    const res = await service.twitterOutreach('u', { action: 'get_list_members', x_list_id: 'L1' });
+    expect(mockGetListMembers).toHaveBeenCalledWith(OWNER, 'tw1', 'L1');
+    expect(mockResolveOwnedListIdByName).not.toHaveBeenCalled();
+    expect(res.success).toBe(true);
+    expect(res.data[0].username).toBe('member1');
+  });
+
+  it('get_list_members without x_list_id or list_name errors and never calls the service', async () => {
+    const res = await service.twitterOutreach('u', { action: 'get_list_members' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/x_list_id or list_name/i);
+    expect(mockGetListMembers).not.toHaveBeenCalled();
+  });
+
+  it('get_list_tweets with x_list_id returns tweets with author handle + text + id', async () => {
+    const res = await service.twitterOutreach('u', { action: 'get_list_tweets', x_list_id: 'L1' });
+    expect(mockGetListTweets).toHaveBeenCalledWith(OWNER, 'tw1', 'L1', undefined);
+    expect(mockResolveOwnedListIdByName).not.toHaveBeenCalled();
+    expect(res.success).toBe(true);
+    expect(res.data[0]).toEqual(expect.objectContaining({ id: 'lt1', text: 'list tweet', author_handle: 'author1' }));
+  });
+
+  it('get_list_tweets resolves list_name to an id, then fetches that list\'s tweets', async () => {
+    mockResolveOwnedListIdByName.mockResolvedValue('L42');
+    const res = await service.twitterOutreach('u', { action: 'get_list_tweets', list_name: 'Engagement 101' });
+    expect(mockResolveOwnedListIdByName).toHaveBeenCalledWith(OWNER, 'tw1', 'Engagement 101');
+    expect(mockGetListTweets).toHaveBeenCalledWith(OWNER, 'tw1', 'L42', undefined);
+    expect(res.success).toBe(true);
+  });
+
+  it('get_list_tweets passes max_results when provided', async () => {
+    await service.twitterOutreach('u', { action: 'get_list_tweets', x_list_id: 'L1', max_results: 25 });
+    expect(mockGetListTweets).toHaveBeenCalledWith(OWNER, 'tw1', 'L1', 25);
+  });
+
+  it('get_list_tweets without x_list_id or list_name errors and never calls the service', async () => {
+    const res = await service.twitterOutreach('u', { action: 'get_list_tweets' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/x_list_id or list_name/i);
+    expect(mockGetListTweets).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a missing-scope reconnect error from a list action (never a silent empty result)', async () => {
+    mockGetListTweets.mockRejectedValueOnce(new Error(
+      'Your X account is missing the "list.read" permission needed to read X Lists. Go to Settings → Connected Accounts and reconnect your X account to grant List access.'
+    ));
+    const res = await service.twitterOutreach('u', { action: 'get_list_tweets', x_list_id: 'L1' });
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/list\.read|reconnect/i);
   });
 
   it('block calls blockUser with handle', async () => {

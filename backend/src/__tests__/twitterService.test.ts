@@ -30,6 +30,9 @@ const mockUserByUsername = jest.fn();
 const mockListDmEvents = jest.fn();
 const mockDeleteTweet = jest.fn();
 const mockUserTimeline = jest.fn();
+const mockListsOwned = jest.fn();
+const mockListMembers = jest.fn();
+const mockListTweets = jest.fn();
 const mockRefreshOAuth2Token = jest.fn();
 
 // Records how TwitterApi was constructed so tests can assert which token was used.
@@ -66,6 +69,9 @@ jest.mock('twitter-api-v2', () => ({
         listDmEvents: (...a: any[]) => mockListDmEvents(...a),
         deleteTweet: (...a: any[]) => mockDeleteTweet(...a),
         userTimeline: (...a: any[]) => mockUserTimeline(...a),
+        listsOwned: (...a: any[]) => mockListsOwned(...a),
+        listMembers: (...a: any[]) => mockListMembers(...a),
+        listTweets: (...a: any[]) => mockListTweets(...a),
       },
     };
   }),
@@ -156,6 +162,81 @@ describe('TwitterService.postTweet — validation', () => {
     const sent = mockTweet.mock.calls[0][0];
     expect(sent.length).toBeLessThanOrEqual(280);
     expect(sent.endsWith('word')).toBe(true); // no partial word at the end
+  });
+});
+
+// ─── X Lists (read) — owned lists / members / tweets, and scope errors ─────────
+describe('TwitterService X Lists (read)', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+  });
+
+  it('getOwnedLists returns each list with id + name (from listsOwned)', async () => {
+    mockListsOwned.mockResolvedValue({ data: { data: [
+      { id: 'L1', name: 'Engagement 101' },
+      { id: 'L2', name: 'Prospects' },
+    ] } });
+    const lists = await twitterService.getOwnedLists(OWNER, ACCOUNT_ID);
+    // Owned lists are keyed off the authed user's numeric id (from account config).
+    expect(mockListsOwned).toHaveBeenCalledWith('12345', expect.any(Object));
+    expect(lists).toEqual([
+      { id: 'L1', name: 'Engagement 101' },
+      { id: 'L2', name: 'Prospects' },
+    ]);
+  });
+
+  it('getListMembers returns member users (with handles) for a list id', async () => {
+    mockListMembers.mockResolvedValue({ data: { data: [
+      { id: 'u1', username: 'alice', name: 'Alice' },
+      { id: 'u2', username: 'bob', name: 'Bob' },
+    ] } });
+    const members = await twitterService.getListMembers(OWNER, ACCOUNT_ID, 'L1');
+    expect(mockListMembers).toHaveBeenCalledWith('L1', expect.any(Object));
+    expect(members.map((m: any) => m.username)).toEqual(['alice', 'bob']);
+  });
+
+  it('getListMembers rejects an empty list id', async () => {
+    await expect(twitterService.getListMembers(OWNER, ACCOUNT_ID, '   ')).rejects.toThrow(/x_list_id.*required/i);
+  });
+
+  it('getListTweets returns id + text + author handle (merged from the author_id expansion)', async () => {
+    mockListTweets.mockResolvedValue({ data: {
+      data: [
+        { id: 't1', text: 'hello world', author_id: 'a1', created_at: '2026-07-17T00:00:00Z' },
+        { id: 't2', text: 'second tweet', author_id: 'a2' },
+      ],
+      includes: { users: [{ id: 'a1', username: 'author_one', name: 'Author One' }] },
+    } });
+    const tweets = await twitterService.getListTweets(OWNER, ACCOUNT_ID, 'L1');
+    expect(mockListTweets).toHaveBeenCalledWith('L1', expect.any(Object));
+    expect(tweets[0]).toEqual(expect.objectContaining({ id: 't1', text: 'hello world', author_handle: 'author_one' }));
+    // A tweet whose author is not in `includes` still returns cleanly with a null handle — never throws.
+    expect(tweets[1]).toEqual(expect.objectContaining({ id: 't2', text: 'second tweet', author_handle: null }));
+  });
+
+  it('getListTweets rejects an empty list id', async () => {
+    await expect(twitterService.getListTweets(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/x_list_id.*required/i);
+  });
+
+  it('maps a 403 (missing list.read scope) to a clear reconnect error — not a silent empty result', async () => {
+    mockListsOwned.mockRejectedValue(Object.assign(new Error('Forbidden'), { code: 403 }));
+    await expect(twitterService.getOwnedLists(OWNER, ACCOUNT_ID)).rejects.toThrow(/list\.read|reconnect/i);
+  });
+
+  it('resolveOwnedListIdByName matches a list name case-insensitively', async () => {
+    mockListsOwned.mockResolvedValue({ data: { data: [
+      { id: 'L1', name: 'Engagement 101' },
+      { id: 'L2', name: 'Prospects' },
+    ] } });
+    const id = await twitterService.resolveOwnedListIdByName(OWNER, ACCOUNT_ID, 'engagement 101');
+    expect(id).toBe('L1');
+  });
+
+  it('resolveOwnedListIdByName throws (naming the available lists) when there is no match', async () => {
+    mockListsOwned.mockResolvedValue({ data: { data: [{ id: 'L2', name: 'Prospects' }] } });
+    await expect(
+      twitterService.resolveOwnedListIdByName(OWNER, ACCOUNT_ID, 'Engagement 101')
+    ).rejects.toThrow(/No owned X List named.*Prospects/i);
   });
 });
 
