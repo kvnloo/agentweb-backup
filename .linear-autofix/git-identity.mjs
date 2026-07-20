@@ -27,6 +27,25 @@ export function resolveAssigneeIdentity(assignee) {
   return { name, email };
 }
 
+// Reconcile a stored state-entry's assignee with the issue's CURRENT Linear assignee, returning a
+// { assignee, assigneeEmail } patch to apply — or null when nothing needs to change. Cards are often
+// assigned to a person only AFTER the bot fixes them, so the pickup-time snapshot the sidebar shows
+// goes stale; the poller calls this each cycle to keep it live. Never downgrades a known assignee to
+// null on a transient/absent Linear assignee, and skips standalone chats (owner-driven, not assigned).
+export function assigneeRefreshPatch(entry, liveAssignee) {
+  if (!entry || entry.standalone) return null;
+  const email = (liveAssignee?.email || '').trim();
+  if (!email) return null; // no live assignee (or no email) — keep whatever we already have
+  // Prefer the resolved identity (respects config.assigneeGitIdentity overrides, matching the pipeline's
+  // own write) and fall back to the raw Linear name so the sidebar still shows a name if resolution is off.
+  const identity = resolveAssigneeIdentity(liveAssignee)
+    || { name: (liveAssignee.name || liveAssignee.displayName || '').trim() || null, email };
+  const sameEmail = (entry.assigneeEmail || '').trim().toLowerCase() === email.toLowerCase();
+  const sameName = (entry.assignee?.name || null) === (identity.name || null);
+  if (sameEmail && sameName) return null; // already current — no needless write
+  return { assignee: identity, assigneeEmail: email };
+}
+
 // The GIT_AUTHOR_* / GIT_COMMITTER_* env pairs for an identity — author AND committer both,
 // so the commit is fully attributed to the assignee (not just the "authored by" line).
 export function gitIdentityEnv(identity) {
