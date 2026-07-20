@@ -25789,12 +25789,21 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // ENG-368 case: a private Google Ads account owned by another member). Rather
       // than inspect teammates' private accounts to confirm — which would disclose
       // the existence of an account its owner deliberately kept private — surface
-      // the possibility unconditionally, phrased as a hint. The agent can then guide
-      // the user to the fix without the tool ever revealing whether such an account
-      // exists, keeping the org's privacy model intact.
+      // that possibility as a hint, but ONLY when the caller actually belongs to an
+      // org. A solo user has no teammates, so the "ask a teammate to share" wording
+      // would be confusing; they get a plain connect prompt instead. We check only
+      // the caller's own orgId (never teammates' accounts), so the org privacy model
+      // stays intact. Any uncertainty (missing user) falls back to the plain message.
       let message = `Found ${accounts.length} connected account(s)`;
       if (accounts.length === 0 && platform && platform !== 'all') {
-        message = `Found 0 ${platform} account(s) available to you. If a teammate in your organization has connected ${platform} but hasn't shared it, they'll need to open Settings → Connected Accounts and click "Share with org" — otherwise, connect ${platform} under this account directly.`;
+        const { userDb } = await import('./db');
+        const caller = await userDb.getUserById(userId);
+        const callerInOrg = !!(caller && (caller as any).orgId);
+        if (callerInOrg) {
+          message = `Found 0 ${platform} account(s) available to you. If a teammate in your organization has connected ${platform} but hasn't shared it, they'll need to open Settings → Connected Accounts and click "Share with org" — otherwise, connect ${platform} under this account directly.`;
+        } else {
+          message = `Found 0 ${platform} account(s). Connect ${platform} in Settings → Connected Accounts to continue.`;
+        }
       }
 
       return {
