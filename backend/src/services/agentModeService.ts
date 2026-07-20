@@ -4246,6 +4246,13 @@ export class AgentModeService {
     // other_skills (ENG-152).
     'read_file_content',
 
+    // Image analysis — the visual analog of read_file_content. Always available
+    // so an attached screenshot/image can be read immediately, regardless of
+    // which page the user is on. Previously only injected on the `images` page,
+    // so a user attaching a UI screenshot elsewhere got "describe_image not
+    // available" and Emma had to ask them to type out what was on screen (ENG-260).
+    'describe_image',
+
     // Work Plans (Emma's execution planning system)
     'create_work_plan',
     'modify_work_plan',
@@ -4356,6 +4363,12 @@ export class AgentModeService {
     // other_skills, producing the transient "read_file_content
     // unavailable/failed" failure (ENG-152).
     'read_file_content',
+    // Image analysis. Force-merged for the same reason as read_file_content: the
+    // prod `foundation_tools` AW-Settings override omits DEFAULT-only additions,
+    // so without this an attached screenshot could not be analyzed unless the user
+    // happened to be on the `images` page — Emma returned "describe_image not
+    // available" and had to ask the user to type out what was on screen (ENG-260).
+    'describe_image',
     // Meeting Intelligence (Fathom). Force-merged because the prod
     // `foundation_tools` AW-Settings override predates these tools and omits
     // them — without force-merging, loadFoundationTools strips them in prod so
@@ -14100,7 +14113,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta ad campaigns.',
-        error: error.message
+        error: error.message,
+        details: error.structuredError
       };
     }
   }
@@ -17364,6 +17378,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     options: {
       maxResults?: number;
       companyName?: string;
+      cursor?: string;
       format?: string[];
       platform?: string[];
       niche?: string[];
@@ -17397,6 +17412,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const result = await searchForeplayDiscoveryAds(foreplayToken, {
         query: effectiveQuery,
         limit,
+        cursor: options.cursor,
         format: options.format,
         platform: options.platform,
         niche: options.niche,
@@ -17431,7 +17447,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         results,
         totalResults: results.length,
         hasMore: !!result.cursor,
-        note: 'Each result costs 1 Foreplay credit. Discovery searches Foreplay\'s full database of millions of ads, not just your saved swipefile.'
+        cursor: result.cursor,
+        note: 'Each result costs 1 Foreplay credit. Discovery searches Foreplay\'s full database of millions of ads, not just your saved swipefile.' + (result.cursor ? ' More results are available — call this tool again with the returned cursor to fetch the next page.' : '')
       };
     } catch (error) {
       console.error('AgentMode: Error searching Foreplay discovery:', error);

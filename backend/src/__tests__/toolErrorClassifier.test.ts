@@ -62,6 +62,10 @@ describe('classifyToolErrorClass', () => {
     expect(classifyToolErrorClass(err('Request failed with status code 502'))).toBe('upstream_5xx');
     expect(classifyToolErrorClass(err('Internal Server Error'))).toBe('upstream_5xx');
     expect(classifyToolErrorClass(err('503 Service Unavailable'))).toBe('upstream_5xx');
+    // ENG-394: Meta Graph transient (code 1/2) generic body — NO HTTP status in the
+    // string. Regression: previously fell through to legacy 'Error' → non-retryable,
+    // so the campaign-listing fallback told the model to give up on a recoverable blip.
+    expect(classifyToolErrorClass(err('An unexpected error has occurred. Please retry your request later.'))).toBe('upstream_5xx');
   });
 
   it('classifies gateway errors by error name', () => {
