@@ -57,6 +57,25 @@ describe('describeXApiError', () => {
     expect(describeXApiError({ weird: true })).toBe('Unknown error');
   });
 
+  it('returns "Unknown error" for null / undefined without throwing', () => {
+    // Exercises the `e?.data` nullish short-circuit — a nullish error must not
+    // blow up the surfacing helper.
+    expect(describeXApiError(null)).toBe('Unknown error');
+    expect(describeXApiError(undefined)).toBe('Unknown error');
+  });
+
+  it('surfaces errors[].title and skips null / non-string error entries', () => {
+    // A null entry and a numeric-`message` entry must be dropped (not stringified),
+    // while a title-only entry is still surfaced via the message→detail→title fallback.
+    const err = makeApiResponseError(401, {
+      errors: [null, { title: 'Rate limit exceeded' }, { message: 9999 }] as any,
+    });
+    const msg = describeXApiError(err);
+    expect(msg).toContain('Rate limit exceeded'); // title-only entry surfaced
+    expect(msg).not.toContain('9999'); // numeric message entry dropped, not stringified
+    expect(msg).toContain('401');
+  });
+
   it('omits the HTTP-status prefix when code is not numeric', () => {
     const err = Object.assign(new Error('x'), { data: { title: 'Bad Request' } });
     const msg = describeXApiError(err);
