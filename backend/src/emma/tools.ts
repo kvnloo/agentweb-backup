@@ -5072,7 +5072,7 @@ emmaToolRegistry.register({
   name: "search_ads_knowledge_base",
   definition: {
     name: "search_ads_knowledge_base",
-    description: "Search Foreplay ad library. Defaults to the user's saved swipefile + boards (free). Set source='discovery' to search Foreplay's global database of millions of ads — use this for competitive intelligence or finding ads from a specific company. IMPORTANT: discovery mode costs 1 Foreplay credit per result — keep max_results small (5–10). For finding a specific company's currently-running Meta ads, use source='discovery' with company_name. Do NOT use search_knowledge_base for Foreplay ad searches. IMPORTANT: This does NOT search the public Meta/Facebook Ads Library — for that, use Playwright to browse https://www.facebook.com/ads/library/.",
+    description: "Search Foreplay ad library. Defaults to the user's saved swipefile + boards (free). Set source='discovery' to search Foreplay's global database of millions of ads — use this for competitive intelligence or finding ads from a specific company. IMPORTANT: discovery mode costs 1 Foreplay credit per result and returns at most 20 ads per call (max_results is capped at 20). For finding a specific company's currently-running Meta ads, or for cataloging/analyzing many ads at scale, this is the RELIABLE source. Targeting: for a SPECIFIC company/brand, pass company_name (optionally with query); for BROAD keyword/theme/category research NOT tied to one company (e.g. cataloging 100 winning B2B ads for 'book a demo'), pass query with niche/format/platform and use sort='newest' + live=true — do NOT force company_name for broad keyword research. To retrieve MORE than 20 ads (e.g. cataloging 100 ads for a scheduled run), page through results: the response returns a `cursor` and `hasMore` — call this tool again with the same filters plus the returned `cursor` to fetch the next page, and repeat until hasMore is false. Do NOT use search_knowledge_base for Foreplay ad searches. NOTE: This does NOT scrape the public Meta/Facebook Ads Library UI. Playwright DOM scraping of https://www.facebook.com/ads/library/ is best-effort only — Meta's DOM virtualization + lazy-loading make it unable to reliably extract ad copy/creative at scale — so prefer source='discovery' (or the official Meta Ad Library API) for any bulk or scheduled ad-creative extraction.",
     inputSchema: {
       type: "object",
       properties: {
@@ -5093,6 +5093,10 @@ emmaToolRegistry.register({
           type: "number",
           description: "Max results to return. Default 5 for swipefile, 10 for discovery (max 20).",
           default: 5
+        },
+        cursor: {
+          type: "string",
+          description: "Pagination cursor for source='discovery'. Omit for the first page; to fetch the next page, pass the `cursor` value returned by the previous call (repeat the same filters). Keep paging while `hasMore` is true to retrieve more than one page (e.g. cataloging many ads)."
         },
         format: {
           type: "array",
@@ -5128,6 +5132,7 @@ emmaToolRegistry.register({
         {
           maxResults: args.max_results || 10,
           companyName: args.company_name,
+          cursor: args.cursor,
           format: args.format,
           platform: args.platform,
           niche: args.niche,
