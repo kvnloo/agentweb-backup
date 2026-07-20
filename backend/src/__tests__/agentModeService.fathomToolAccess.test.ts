@@ -117,6 +117,40 @@ describe('AgentModeService - Fathom Tool Access', () => {
       expect(tools.has('fathom_get_transcript')).toBe(true);
       expect(tools.has('fathom_get_onboarding_context')).toBe(true);
     });
+
+    // ENG-280: production had a stale `foundation_tools` AW-Settings override
+    // (set before the Fathom tools existed) that did NOT list the Fathom tools.
+    // Because loadFoundationTools merges the DB override only with
+    // MANDATORY_FOUNDATION_TOOLS, the Fathom tools were stripped in prod and
+    // `fathom_get_onboarding_context` became unreachable for the session. The
+    // Fathom tools must be force-merged so no stale config can strip them.
+    it('should keep Fathom tools available even when a stale DB override omits them', async () => {
+      const mockSettingsService = require('../services/settingsService');
+      mockSettingsService.settingsService.getSetting = jest.fn().mockResolvedValue({
+        settingValue: JSON.stringify([
+          'install_skills',
+          'list_available_skills',
+          'resolve_skill',
+          'you_search_web',
+          'perform_data_analysis',
+          'notify_session',
+          'wait_seconds',
+        ]),
+      });
+
+      await agentModeService.loadFoundationTools();
+      const tools = agentModeService.getFoundationToolNames();
+      expect(tools.has('fathom_get_meetings')).toBe(true);
+      expect(tools.has('fathom_get_transcript')).toBe(true);
+      expect(tools.has('fathom_get_onboarding_context')).toBe(true);
+    });
+
+    it('should include Fathom tools in MANDATORY_FOUNDATION_TOOLS', () => {
+      const mandatory = (AgentModeService as any).MANDATORY_FOUNDATION_TOOLS as string[];
+      expect(mandatory).toContain('fathom_get_meetings');
+      expect(mandatory).toContain('fathom_get_transcript');
+      expect(mandatory).toContain('fathom_get_onboarding_context');
+    });
   });
 
   describe('Approach 2: Meeting Intelligence built-in skill', () => {

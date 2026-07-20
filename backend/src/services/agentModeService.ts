@@ -4356,6 +4356,20 @@ export class AgentModeService {
     // other_skills, producing the transient "read_file_content
     // unavailable/failed" failure (ENG-152).
     'read_file_content',
+    // Meeting Intelligence (Fathom). Force-merged because the prod
+    // `foundation_tools` AW-Settings override predates these tools and omits
+    // them — without force-merging, loadFoundationTools strips them in prod so
+    // `fathom_get_onboarding_context` (and the other Fathom tools) are "not
+    // available", tanking goalCompletion on any Fathom onboarding/meeting
+    // request (ENG-280). `fathom_get_meetings`/`fathom_get_transcript` stay
+    // reachable even when a connected Fathom account is missing, so those tools
+    // return the "connect Fathom in Settings → Connected Accounts" guidance
+    // instead of a generic tool-not-available error. `fathom_get_onboarding_context`
+    // reads a separate admin-curated ingestion pipeline (fathomOnboardingIngestions)
+    // and has no connection check by design.
+    'fathom_get_meetings',
+    'fathom_get_transcript',
+    'fathom_get_onboarding_context',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
@@ -4434,7 +4448,18 @@ export class AgentModeService {
       if (setting?.settingValue) {
         const toolNames: string[] = JSON.parse(setting.settingValue);
         if (Array.isArray(toolNames) && toolNames.length > 0) {
-          const merged = [...new Set([...toolNames, ...AgentModeService.MANDATORY_FOUNDATION_TOOLS])];
+          // The DB override is ADDITIVE, not a replacement: always union
+          // DEFAULT_FOUNDATION_TOOLS so a stale/drifted override can never strip
+          // a tool the code ships as a default. A prod `foundation_tools` row
+          // that predated newer tools was silently dropping every DEFAULT-only
+          // tool (Fathom, knowledge base, scheduled chats, Slack, org-memory
+          // writes, …), each surfacing as a separate "tool not available" bug
+          // (ENG-280, ENG-404). MANDATORY stays in the union as the hard floor.
+          const merged = [...new Set([
+            ...AgentModeService.DEFAULT_FOUNDATION_TOOLS,
+            ...toolNames,
+            ...AgentModeService.MANDATORY_FOUNDATION_TOOLS,
+          ])];
           AgentModeService.FOUNDATION_TOOLS = new Set(merged);
           console.log(`AgentMode: Loaded ${merged.length} foundation tools from DB`);
           return;
@@ -4450,7 +4475,14 @@ export class AgentModeService {
    * Update foundation tools in DB and refresh the in-memory set.
    */
   public async updateFoundationTools(toolNames: string[], updatedBy: string): Promise<string[]> {
-    const unique = [...new Set([...toolNames, ...AgentModeService.MANDATORY_FOUNDATION_TOOLS])];
+    // Additive on top of DEFAULT (see loadFoundationTools): the override can add
+    // tools but can never remove a shipped default, so no future edit can
+    // reintroduce the ENG-404 stripping. MANDATORY is the hard floor.
+    const unique = [...new Set([
+      ...AgentModeService.DEFAULT_FOUNDATION_TOOLS,
+      ...toolNames,
+      ...AgentModeService.MANDATORY_FOUNDATION_TOOLS,
+    ])];
     await settingsService.setSetting(
       AgentModeService.FOUNDATION_TOOLS_SETTING,
       JSON.stringify(unique),
