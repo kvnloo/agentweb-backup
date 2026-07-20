@@ -29,11 +29,9 @@ jest.mock('../utils/secretsManager', () => ({
 
 const mockGetAccountsByUserIdIncludingOrgShared = jest.fn();
 const mockIsTokenValid = jest.fn();
-const mockCountUnsharedOrgAccountsByPlatform = jest.fn();
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserIdIncludingOrgShared: (...args: any[]) => mockGetAccountsByUserIdIncludingOrgShared(...args),
   isTokenValid: (...args: any[]) => mockIsTokenValid(...args),
-  countUnsharedOrgAccountsByPlatform: (...args: any[]) => mockCountUnsharedOrgAccountsByPlatform(...args),
 }));
 
 const mockGetStatusesForAccounts = jest.fn();
@@ -134,37 +132,27 @@ describe('AgentModeService.listConnectedAccounts', () => {
     expect(gmailAccount.is_active).toBe(true);
   });
 
-  it('ENG-368: returns an actionable message when a google_ads account is connected by an org teammate but not shared', async () => {
+  it('ENG-368: returns an actionable hint for an empty platform-specific result, without inspecting teammates\' private accounts', async () => {
     // Caller has no accessible google_ads account of their own or org-shared.
+    // The message must not reveal whether a teammate actually has one — it is a
+    // static hint that guides the user to "Share with org" or connecting their own.
     mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([]);
-    mockCountUnsharedOrgAccountsByPlatform.mockResolvedValue(1);
 
     const result = await service.listConnectedAccounts('user-1', 'google_ads');
 
     expect(result.success).toBe(true);
     expect(result.accounts).toHaveLength(0);
-    expect(mockCountUnsharedOrgAccountsByPlatform).toHaveBeenCalledWith('user-1', 'google_ads');
-    expect(result.message).toMatch(/not shared with the org/i);
     expect(result.message).toMatch(/Share with org/i);
+    expect(result.message).toMatch(/google_ads/);
   });
 
-  it('ENG-368: keeps the plain "0 accounts" message when no org teammate has an unshared account', async () => {
-    mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([]);
-    mockCountUnsharedOrgAccountsByPlatform.mockResolvedValue(0);
-
-    const result = await service.listConnectedAccounts('user-1', 'google_ads');
-
-    expect(result.accounts).toHaveLength(0);
-    expect(result.message).toBe('Found 0 connected account(s)');
-  });
-
-  it('ENG-368: does not run the unshared-teammate check for platform="all"', async () => {
+  it('ENG-368: keeps the plain "0 accounts" message for platform="all"', async () => {
     mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([]);
 
     const result = await service.listConnectedAccounts('user-1', 'all');
 
     expect(result.accounts).toHaveLength(0);
-    expect(mockCountUnsharedOrgAccountsByPlatform).not.toHaveBeenCalled();
+    expect(result.message).toBe('Found 0 connected account(s)');
   });
 
   it('surfaces a connected google_ads account with its customer_id and currency', async () => {
