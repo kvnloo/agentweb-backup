@@ -13769,7 +13769,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async manageMetaAdsCampaigns(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
-        return this.listMetaAdsCampaignsNew(userId, account_id);
+        // Thread the campaign_id filter and any explicit fields selection so the caller can
+        // read budget/bid config and target a single campaign (ENG-398).
+        return this.listMetaAdsCampaignsNew(userId, account_id, { campaignId: campaign_id, fields: params?.fields });
       case 'CREATE':
         return this.createMetaAdsCampaign(userId, { ...params, account_id });
       case 'UPDATE':
@@ -13787,7 +13789,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async manageMetaAdsAdSets(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, ad_set_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
-        return this.listMetaAdsAdSets(userId, campaign_id, account_id);
+        // Thread the ad_set_id target and any explicit fields selection so the caller can
+        // read optimization_goal / promoted_object / etc. for a single ad set (ENG-398).
+        return this.listMetaAdsAdSets(userId, campaign_id, account_id, { adSetId: ad_set_id, fields: params?.fields });
       case 'CREATE':
         // Explicitly pass account_id in args for createMetaAdsAdSet as it expects it in the args object
         return this.createMetaAdsAdSet(userId, { ...params, account_id, campaign_id });
@@ -14095,10 +14099,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async listMetaAdsCampaignsNew(userId: string, account_id?: string): Promise<any> {
+  public async listMetaAdsCampaignsNew(
+    userId: string,
+    account_id?: string,
+    options: { campaignId?: string; fields?: string | string[] } = {}
+  ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const campaigns = (await metaService.listCampaigns(accountId, accessToken)) || [];
+      // Only forward the read-options bag when the caller actually supplied a campaign_id
+      // filter or an explicit fields selection — a plain list-all call stays byte-identical
+      // to before (behavior-preserving, ENG-398).
+      const hasSelector = Boolean(options.campaignId || options.fields);
+      const campaigns = (hasSelector
+        ? await metaService.listCampaigns(accountId, accessToken, options)
+        : await metaService.listCampaigns(accountId, accessToken)) || [];
       const totalCount = Array.isArray(campaigns) ? campaigns.length : 0;
 
       return {
@@ -14141,10 +14155,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async listMetaAdsAdSets(userId: string, campaignId?: string, account_id?: string): Promise<any> {
+  public async listMetaAdsAdSets(
+    userId: string,
+    campaignId?: string,
+    account_id?: string,
+    options: { adSetId?: string; fields?: string | string[] } = {}
+  ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const adSets = (await metaService.listAdSets(accountId, accessToken, campaignId)) || [];
+      // Only forward the read-options bag when the caller supplied an ad_set_id target or an
+      // explicit fields selection — a plain (optionally campaign-filtered) list stays
+      // byte-identical to before (behavior-preserving, ENG-398).
+      const hasSelector = Boolean(options.adSetId || options.fields);
+      const adSets = (hasSelector
+        ? await metaService.listAdSets(accountId, accessToken, campaignId, options)
+        : await metaService.listAdSets(accountId, accessToken, campaignId)) || [];
       const totalCount = Array.isArray(adSets) ? adSets.length : 0;
 
       return {
