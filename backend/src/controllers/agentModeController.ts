@@ -763,6 +763,12 @@ export async function runVerifiedChat(
     // before returning success. Default off so other callers are unaffected.
     completionGate?: boolean;
     completionGateMaxContinuations?: number;
+    // ENG-396: opt-in "full autonomy" (from the schedule). When true, a headless
+    // turn that hits a blocking AskUserQuestion AUTO-TAKES Emma's recommended
+    // option (logged as delegation) and continues, instead of parking — including
+    // for IMMUTABLE questions. This is a deliberate, default-off WAIVER of the
+    // human protection on irreversible decisions (owner opted in per-schedule).
+    fullAutonomy?: boolean;
   }
 ): Promise<{
   success: boolean;
@@ -795,8 +801,15 @@ export async function runVerifiedChat(
     maxAttempts = 20,
     attachments = [],
     completionGate = false,
-    completionGateMaxContinuations = 2
+    completionGateMaxContinuations = 2,
+    fullAutonomy = false
   } = params;
+
+  // ENG-396: bound how many times a single full-autonomy run may auto-take a
+  // question, so a model that keeps re-asking cannot loop until maxAttempts. Once
+  // exhausted, the run parks (falls back to the safe default).
+  let autoTakesUsed = 0;
+  const MAX_AUTO_TAKES = 3;
 
   // Tracks how many completion-gate continuation turns we've already spent, so a
   // model that keeps admitting "not finished" can't loop indefinitely.
@@ -1055,19 +1068,51 @@ export async function runVerifiedChat(
 
       allActualFunctionCallsForReporting.push(...actualFunctionCalls);
 
-      // ENG-396: headless park. If this turn left an unanswered blocking
-      // AskUserQuestion, a scheduled/headless run must NOT proceed on a guess —
-      // stop here and report a parked outcome. A human answers it later in an
-      // interactive session; the immutable consumer gate (checkQuestionGate)
-      // stays the hard backstop for the write itself. Re-read from the DB (the
-      // tool handler persisted the question via updateSessionAskUserQuestion) so
-      // we never read a stale in-memory blank. Full-autonomy/delegated auto-take
-      // is intentionally NOT done here — that waives the human protection on
-      // irreversible decisions and is a product-owner decision (deferred).
+      // ENG-396: this turn may have left an unanswered blocking AskUserQuestion.
+      // Re-read from the DB (the tool handler persisted it via
+      // updateSessionAskUserQuestion) so we never read a stale in-memory blank.
       const postTurnSession = await chatbotDb.getChatSession(sessionId);
       if (postTurnSession?.pendingUserQuestion?.status === 'awaiting') {
+        const pending = postTurnSession.pendingUserQuestion;
+
+        // Full autonomy (opt-in, per-schedule): AUTO-TAKE Emma's recommended
+        // option instead of parking — including for IMMUTABLE questions. This is
+        // a deliberate WAIVER of the human protection on irreversible decisions;
+        // the owner accepted that risk by turning the schedule autonomous. It is
+        // NOT a blind default: resolveInboundAnswer records it as a delegation on
+        // the RECOMMENDED option with rationale, and the consumer gate then admits
+        // the write through the same seam a human answer would. Bounded by
+        // MAX_AUTO_TAKES so a re-asking model can't loop.
+        if (fullAutonomy && autoTakesUsed < MAX_AUTO_TAKES) {
+          autoTakesUsed++;
+          const answered = resolveInboundAnswer(pending, { delegated: true }, new Date().toISOString());
+          await chatbotDb.updateSessionAskUserQuestion(sessionId, answered);
+          const chosen = answered.options.find(o => o.id === answered.answer!.optionId);
+          console.log(
+            `AgentMode runVerifiedChat: full-autonomy auto-take on session ${sessionId} — question ${pending.questionId} → "${chosen?.label}" (delegation); continuing`
+          );
+          // Breadcrumb in history so Emma sees the decision and resumes without
+          // re-asking (best-effort; the persisted answer is the source of truth).
+          try {
+            await chatbotDb.addMessageToSession(sessionId, {
+              role: 'user',
+              content: `[Full autonomy] Proceed with "${chosen?.label}"${answered.answer?.rationale ? ` — ${answered.answer.rationale}` : ''}.`,
+              timestamp: new Date().toISOString(),
+              metadata: { timestamp: new Date().toISOString(), autoDelegatedAnswer: true, questionId: pending.questionId } as any,
+            });
+          } catch (breadcrumbError) {
+            console.error('Failed to persist full-autonomy auto-take breadcrumb:', breadcrumbError);
+          }
+          await waitForVerifiedChatRetry(attempt);
+          continue;
+        }
+
+        // Default (not autonomous, or auto-take budget exhausted): PARK. A
+        // scheduled/headless run must NOT proceed on a guess — stop and report a
+        // parked outcome. A human answers it later in an interactive session; the
+        // immutable consumer gate stays the hard backstop for the write itself.
         console.log(
-          `AgentMode runVerifiedChat: parking session ${sessionId} — blocking user question (${postTurnSession.pendingUserQuestion.questionId}) awaiting a selection; run will not proceed on a guess`
+          `AgentMode runVerifiedChat: parking session ${sessionId} — blocking user question (${pending.questionId}) awaiting a selection; run will not proceed on a guess`
         );
         return {
           success: false,
@@ -1603,7 +1648,11 @@ export async function runScheduledChat(
       llmModel: schedule.llmModel || defaultModel,
       // Deterministic backstop for multi-entity scheduled runs (PR #1941 follow-up):
       // if the run admits it left work unfinished, auto-continue before finishing.
-      completionGate: true
+      completionGate: true,
+      // ENG-396: opt-in per-schedule full autonomy — auto-take Emma's recommended
+      // option on a blocking question instead of parking (waives the human gate on
+      // irreversible decisions; default off).
+      fullAutonomy: schedule.fullAutonomy === true
     });
 
     // ENG-396: the run parked on a blocking AskUserQuestion with no human present.
