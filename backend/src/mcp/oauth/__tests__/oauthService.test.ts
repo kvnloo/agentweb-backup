@@ -304,6 +304,31 @@ describe('McpOAuthService', () => {
       expect(storedItem.accessToken).toBeUndefined();
       expect(storedItem.refreshToken).toBeUndefined();
     });
+
+    it('should set the DynamoDB TTL (expiresAt) to the refresh-token lifetime, not the access-token lifetime', async () => {
+      // Regression for ENG-455: expiresAt doubles as the DynamoDB TTL attribute,
+      // and the refresh token lives in the SAME item. If expiresAt is set to the
+      // 1-hour access-token expiry, DynamoDB TTL deletes the whole record (refresh
+      // token included) within ~a day, so overnight refreshes fail and the MCP
+      // server shows "not connected". The record must survive as long as the
+      // refresh token is valid.
+      const nowSec = Math.floor(Date.now() / 1000);
+      await service.createTokenPair({
+        clientId: 'client-123',
+        userId: 'user-456',
+        scope: 'mcp:tools',
+      });
+
+      const storedItem = mockPut.mock.calls[0][0].Item;
+      // TTL attribute must reflect the 30-day refresh lifetime, not 1 hour.
+      expect(storedItem.expiresAt).toBeGreaterThanOrEqual(nowSec + 86400 * 30 - 10);
+      expect(storedItem.expiresAt).toBeLessThanOrEqual(nowSec + 86400 * 30 + 10);
+      // refreshExpiresAt stays at the 30-day refresh lifetime.
+      expect(storedItem.refreshExpiresAt).toBeGreaterThanOrEqual(nowSec + 86400 * 30 - 10);
+      // Access-token validity is tracked separately at 1 hour.
+      expect(storedItem.accessTokenExpiresAt).toBeGreaterThanOrEqual(nowSec + 3590);
+      expect(storedItem.accessTokenExpiresAt).toBeLessThanOrEqual(nowSec + 3610);
+    });
   });
 
   describe('validateAccessToken', () => {
@@ -374,6 +399,51 @@ describe('McpOAuthService', () => {
 
       const result = await service.validateAccessToken(rawToken);
       expect(result).toBeNull();
+    });
+
+    it('should return null when the access token has expired even though the record TTL (expiresAt) is far in the future', async () => {
+      // ENG-455: with the fix, expiresAt is the 30-day record/refresh lifetime,
+      // so access-token expiry must be enforced via accessTokenExpiresAt.
+      const rawToken = crypto.randomBytes(48).toString('hex');
+      const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+      const nowSec = Math.floor(Date.now() / 1000);
+
+      mockGet.mockReturnValueOnce({
+        promise: jest.fn().mockResolvedValue({
+          Item: {
+            tokenHash,
+            userId: 'user-456',
+            accessTokenExpiresAt: nowSec - 60, // access token expired 1 min ago
+            expiresAt: nowSec + 86400 * 30, // record still alive (refresh lifetime)
+            revoked: false,
+          },
+        }),
+      });
+
+      const result = await service.validateAccessToken(rawToken);
+      expect(result).toBeNull();
+    });
+
+    it('should validate against expiresAt for legacy records without accessTokenExpiresAt', async () => {
+      // Backward compat: tokens issued before the ENG-455 fix only have expiresAt.
+      const rawToken = crypto.randomBytes(48).toString('hex');
+      const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+      const nowSec = Math.floor(Date.now() / 1000);
+
+      mockGet.mockReturnValueOnce({
+        promise: jest.fn().mockResolvedValue({
+          Item: {
+            tokenHash,
+            userId: 'user-456',
+            expiresAt: nowSec + 3600, // legacy: expiresAt IS the access-token expiry
+            revoked: false,
+          },
+        }),
+      });
+
+      const result = await service.validateAccessToken(rawToken);
+      expect(result).toBeDefined();
+      expect(result!.userId).toBe('user-456');
     });
   });
 
