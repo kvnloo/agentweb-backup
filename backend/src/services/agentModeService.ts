@@ -6607,6 +6607,8 @@ export class AgentModeService {
       return_scenes?: boolean;
       start_time?: string;
       end_time?: string;
+      /** Attributable user — charges this describe_video LLM spend to their cap (ENG-200). */
+      userId?: string;
     }
   ): Promise<any> {
     let tempDirPath: string | null = null;
@@ -6645,11 +6647,11 @@ export class AgentModeService {
         };
       }
 
-      // Metered Gemini client (Ship 1 shadow metering). describeVideo has no
-      // userId in its signature, so usage attributes to "system" for now —
-      // follow-up: thread userId from the tool-dispatch / emmaApi callers.
+      // Metered Gemini client. Charges this describe_video LLM spend to the
+      // attributable user's cap when one is threaded in (ENG-200); absorbed under
+      // "system" only when no userId is available.
       const { getGeminiClient } = await import('../utils/llmClients');
-      aiClient = await getGeminiClient({ feature: 'agent_task' }, geminiApiKey.trim());
+      aiClient = await getGeminiClient({ userId: options?.userId, feature: 'agent_task' }, geminiApiKey.trim());
 
       const modelName = 'gemini-3-flash-preview';
 
