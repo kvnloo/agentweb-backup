@@ -16,6 +16,7 @@ import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoUrlForUser,
   missingBrandLogoToolResult,
+  promptCreatesLogo,
   promptRequestsLogo,
 } from './agentMode/brandLogo';
 import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
@@ -20644,10 +20645,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // brand logo (AC-2); when none is persisted, ask the user / point at
       // brand config instead of generating (AC-3). Edits (inputImages) are
       // out of scope — the source images already carry the branding.
+      //
+      // ENG-393: this gate is for COMPOSITING an existing brand logo, not for
+      // CREATING one. A prompt that asks to design a brand-new logo from
+      // scratch ("create a logo for X") must NOT be gated — an account with no
+      // logo yet legitimately wants to generate its first one, and blocking
+      // that also blocks landing-page generation. Let creation asks through;
+      // compositing asks ("add our logo to this banner") still gate.
       if (
         !logoImage &&
         (!Array.isArray(inputImages) || inputImages.length === 0) &&
-        promptRequestsLogo(prompt)
+        promptRequestsLogo(prompt) &&
+        !promptCreatesLogo(prompt)
       ) {
         const persistedLogo = await getPersistedBrandLogoUrlForUser(userId);
         if (!persistedLogo) {

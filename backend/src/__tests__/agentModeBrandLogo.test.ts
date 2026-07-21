@@ -32,6 +32,7 @@ import {
   getPersistedBrandLogoUrl,
   getPersistedBrandLogoUrlForUser,
   missingBrandLogoToolResult,
+  promptCreatesLogo,
   promptRequestsLogo,
 } from '../services/agentMode/brandLogo';
 
@@ -163,6 +164,48 @@ describe('promptRequestsLogo', () => {
     expect(promptRequestsLogo('no text, just our logo front and center')).toBe(true);
     expect(promptRequestsLogo('Do not crop the logo')).toBe(true);
     expect(promptRequestsLogo('skip the border, add the logo')).toBe(true);
+  });
+});
+
+describe('promptCreatesLogo (ENG-393 — logo CREATION vs COMPOSITING)', () => {
+  it('detects prompts asking to CREATE a brand-new logo from scratch', () => {
+    // These are first-logo asks: the account has no logo yet and legitimately
+    // wants generate_image to design one. They must NOT hit the missing-logo
+    // gate (which exists to stop the model inventing a copy of a logo the
+    // brand already owns — not to block designing a first logo).
+    expect(promptCreatesLogo('Create a logo for AgentCapX, a modern fintech brand')).toBe(true);
+    expect(promptCreatesLogo('Design a minimalist logo for my startup')).toBe(true);
+    expect(promptCreatesLogo('Make me a clean logo, blue and white')).toBe(true);
+    expect(promptCreatesLogo('Generate a new logo, modern and bold')).toBe(true);
+    expect(promptCreatesLogo('I need a logo for our coffee shop')).toBe(true);
+    expect(promptCreatesLogo('come up with a logo concept')).toBe(true);
+  });
+
+  it('detects logo-noun creation phrases (logo for / logo design / logo concept)', () => {
+    expect(promptCreatesLogo('a logo for AgentCapX')).toBe(true);
+    expect(promptCreatesLogo('logo design for a coffee shop')).toBe(true);
+    expect(promptCreatesLogo('sketch some logo options')).toBe(true);
+    expect(promptCreatesLogo('logo concepts from scratch')).toBe(true);
+  });
+
+  it('does NOT treat compositing an EXISTING brand logo as creation (still gates)', () => {
+    // These place/feature the account's real logo on a larger design — the
+    // ENG-326 gate must still fire for them. A false-positive here would let
+    // the model invent a fake copy of the brand's real logo (AC-2/AC-3 hole).
+    expect(promptCreatesLogo('Launch banner with our logo top-left')).toBe(false);
+    expect(promptCreatesLogo('Event cover featuring the company logo')).toBe(false);
+    expect(promptCreatesLogo('Place the company logo on the cover')).toBe(false);
+    expect(promptCreatesLogo('Add our brand logo to this launch banner')).toBe(false);
+    expect(promptCreatesLogo('Social banner with the brand logo')).toBe(false);
+    // "generate an image WITH our logo" is compositing, not logo creation.
+    expect(promptCreatesLogo('generate an image with our logo in the corner')).toBe(false);
+  });
+
+  it('ignores prompts that do not mention a logo, and empty/nullish input', () => {
+    expect(promptCreatesLogo('Create a product launch graphic')).toBe(false);
+    expect(promptCreatesLogo('A clean poster, no logo')).toBe(false);
+    expect(promptCreatesLogo('')).toBe(false);
+    expect(promptCreatesLogo(undefined as any)).toBe(false);
   });
 });
 
