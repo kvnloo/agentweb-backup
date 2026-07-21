@@ -17,8 +17,13 @@ describe('stripCitationMarkers', () => {
     expect(stripCitationMarkers('')).toBe('');
     expect(stripCitationMarkers(undefined as any)).toBe(undefined);
   });
-  it('does not touch non-cite double-brace text or partial markers', () => {
-    expect(stripCitationMarkers('use {{name}} template and {{cite:}} incomplete')).toBe('use {{name}} template and {{cite:}} incomplete');
+  it('also removes malformed cite tokens the model might emit', () => {
+    expect(stripCitationMarkers('growth {{cite:2a}} rate')).toBe('growth rate');
+    expect(stripCitationMarkers('value {{cite:}} here')).toBe('value here');
+    expect(stripCitationMarkers('bare {{cite}} token')).toBe('bare token');
+  });
+  it('never touches other {{...}} template variables', () => {
+    expect(stripCitationMarkers('Hi {{name}}, see {{citation}} and {{cite_ref}}')).toBe('Hi {{name}}, see {{citation}} and {{cite_ref}}');
   });
 });
 
