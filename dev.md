@@ -1,3 +1,42 @@
+## ENG-114: durable MCP session store so sessions resolve across instances (2026-07-21)
+
+MCP Streamable-HTTP sessions lived only in a per-process `Map` in `mcp/server/mcpServer.ts`. On a
+multi-instance deploy without sticky routing, a tool call that lands on an instance which did not
+create the session gets a 404 → the SDK client auto-reinitializes (the ENG-97 fix). That is
+transparent but costs an extra round-trip each time the LB bounces (churn). This is the durable fix.
+
+**Key SDK constraints I verified by spiking `@modelcontextprotocol/sdk@1.25` before designing:**
+- The live `StreamableHTTPServerTransport` cannot be shared across instances — only the small
+  session *metadata* (agentUserId, isInternal) can.
+- The protocol layer (`Server`) refuses ANY request before an `initialize` handshake — a bare
+  `tools/call` on a fresh transport 400s in BOTH stateful and stateless mode. So naive stateless
+  mode does NOT serve a post-init call either.
+- Priming the Node/Express-wrapper transport with synthetic `req`/`res` is unreliable (the hono
+  wrapper rejects fake IncomingMessage/ServerResponse). But the `WebStandardStreamableHTTPServerTransport`
+  primes cleanly with synthetic `Request` objects (init + `notifications/initialized`), after which
+  it serves the real request. That is the mechanism `mcpSessionRehydration.ts` uses.
+
+**Design (all behind `MCP_SESSION_STORE`, default `memory` = single-instance, byte-for-byte
+unchanged):**
+- `mcpSessionStore.ts`: `McpSessionStore` interface + `InMemoryMcpSessionStore` (default) +
+  `DynamoMcpSessionStore` (`AW-MCPSessions`, `ttl` epoch-seconds native TTL + read-time expiry check
+  for consistent cross-instance eviction; throttled touch writes). Follows the AW-OAuthSessions /
+  AW-MCPOAuth* pattern.
+- `mcpServer.ts`: persists metadata on init, touches on activity, evicts on DELETE, and — for a
+  session unknown locally but present in the shared store — rehydrates + serves it (no client 404).
+  A same-principal IDOR guard means one caller can never be handed another user's session (the
+  session id is a bearer capability; external sessions require a matching authenticated userId,
+  internal sessions require an internal caller). With the in-memory store the store mirrors the local
+  map, so the rehydrate branch never fires and behavior is identical to before.
+
+**Scoped boundary (named, not silent):** rehydration covers the POST tool-call path (what AC #1
+specifies). The GET SSE server→client notification stream still 404s cross-instance and the client
+reconnects (best-effort) — deferred as a follow-up. Rehydrated transports are created per request
+and closed immediately (memory strictly bounded — no cross-instance transport accumulation); a
+local rehydrated-transport cache to skip re-priming is a possible later optimization.
+
+**Rollback:** unset `MCP_SESSION_STORE` (or leave it default) → in-memory store → prior behavior.
+
 ## ENG-413: X posting fails silently — 3 code gaps made a read-only grant undiagnosable (2026-07-20)
 
 The live 403 (Reply Guy scheduled chat, all `twitter_manage_post` replies 403'd while reads worked)
