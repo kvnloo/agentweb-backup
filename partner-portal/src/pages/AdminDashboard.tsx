@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { useAdmin } from "../contexts/AdminContext";
 import { Link as RouterLink, useSearchParams } from "react-router-dom";
 import {
@@ -927,6 +927,10 @@ export default function AdminDashboard() {
   const [costBreakdownData, setCostBreakdownData] = useState<OrgUsageRollup | null>(null);
   const [costBreakdownLoading, setCostBreakdownLoading] = useState(false);
   const [costBreakdownError, setCostBreakdownError] = useState<string | null>(null);
+  // Monotonic token to ignore stale org-rollup responses: if the admin switches
+  // user/month before a request returns, a slower earlier response must not
+  // overwrite the current selection's data (Greptile).
+  const costBreakdownReqRef = useRef(0);
   // Table vs bar-chart view for the cost-breakdown modal — remembered per-admin.
   const [costBreakdownView, setCostBreakdownView] = useState<"table" | "bars">(
     () => (typeof window !== "undefined" && localStorage.getItem("costBreakdownView") === "bars" ? "bars" : "table")
@@ -1111,6 +1115,8 @@ export default function AdminDashboard() {
 
   // Fetch the per-model LLM cost burn for a user over a calendar month (YYYY-MM).
   const fetchCostBreakdown = async (userId: string, month: string) => {
+    const reqId = ++costBreakdownReqRef.current;
+    const isStale = () => reqId !== costBreakdownReqRef.current;
     setCostBreakdownLoading(true);
     setCostBreakdownError(null);
     try {
@@ -1120,13 +1126,15 @@ export default function AdminDashboard() {
         buildApiUrl(`/api/admin/users/${userId}/usage/org-rollup`),
         { headers: { Authorization: `Bearer ${token}` }, params: { month } }
       );
+      if (isStale()) return; // a newer request superseded this one
       setCostBreakdownData(response.data);
     } catch (error: any) {
+      if (isStale()) return;
       console.error('Error loading cost breakdown:', error);
       setCostBreakdownData(null);
       setCostBreakdownError(error.response?.data?.message || 'Failed to load cost breakdown');
     } finally {
-      setCostBreakdownLoading(false);
+      if (!isStale()) setCostBreakdownLoading(false);
     }
   };
 

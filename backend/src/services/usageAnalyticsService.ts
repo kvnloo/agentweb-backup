@@ -532,13 +532,13 @@ export async function getUserOrgUsageRollup(
     }
   }
 
-  // Burn per member (parallel; a per-member query failure yields no rows, never
-  // fails the whole rollup — this is a read-only admin analytics path).
+  // Burn per member (parallel). A per-member query failure must NOT be swallowed
+  // into empty rows: that would silently understate org burn and inflate coverage
+  // (Greptile). Let it reject so the whole rollup fails loud — the route returns
+  // 500 and the admin sees "failed to load" rather than confidently-wrong numbers.
   const perMember = await Promise.all(
     memberUsers.map(async (m) => {
-      const rows = await usageRecordDb
-        .queryByUserDateRange(m.userId, start, end)
-        .catch(() => [] as UsageRecordRow[]);
+      const rows = await usageRecordDb.queryByUserDateRange(m.userId, start, end);
       return { user: m, rows, agg: aggregateBurn(rows) };
     })
   );

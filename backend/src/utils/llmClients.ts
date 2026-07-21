@@ -468,12 +468,22 @@ async function* meterGeminiStream(
 /**
  * Metered Gemini client (lazy-imports @google/genai like all existing call sites).
  * models.generateContent and models.generateContentStream are wrapped.
+ *
+ * Pass `opts.metered = false` to get the raw client when the caller meters the
+ * response itself via meterUsageFromResponse — needed to both CHARGE (not just
+ * record) and avoid double-recording, since the wrapper here is record-only.
  */
-export async function getGeminiClient(meterCtx: MeterContext, apiKey?: string): Promise<any> {
+export async function getGeminiClient(
+  meterCtx: MeterContext,
+  apiKey?: string,
+  opts?: { metered?: boolean }
+): Promise<any> {
   const { GoogleGenAI } = await import("@google/genai");
   const key = (apiKey ?? process.env.GEMINI_API_KEY ?? "").trim();
   if (!key) throw new Error("GEMINI_API_KEY not set");
   const client: any = new GoogleGenAI({ apiKey: key });
+
+  if (opts?.metered === false) return client;
 
   if (typeof client.models?.generateContent === "function") {
     const origGenerate = client.models.generateContent.bind(client.models);
