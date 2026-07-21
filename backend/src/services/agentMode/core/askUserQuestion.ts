@@ -251,3 +251,53 @@ export function selectedPayload(question: PendingUserQuestion): Record<string, u
   if (question.status !== 'answered' || !question.answer) return undefined;
   return question.options.find((o) => o.id === question.answer!.optionId)?.payload;
 }
+
+export type QuestionGateOutcome =
+  | { allowed: true; answer: AskUserQuestionAnswer; payload?: Record<string, unknown> }
+  | { allowed: false; reason: string };
+
+/**
+ * The consumer guard — the load-bearing half of Option A. A write to an
+ * IMMUTABLE parameter (e.g. the Meta campaign objective, ENG-400) calls this
+ * with the session's FRESH pendingUserQuestion before it executes. It ALLOWS
+ * only when a matching question has been answered by a HUMAN.
+ *
+ * This is the seam where the RankAI incident's same-turn `[ask, create]` bundle
+ * dies: a question emitted in the same turn can only ever be `'awaiting'` (only
+ * an inbound user message in a LATER run flips it to `'answered'`), so a
+ * bundled create is blocked; a create with no prior ask is blocked (no pending);
+ * and an answer the model somehow forged is blocked (answeredBy must be
+ * user/delegation). The consumer must re-read the session from the DB (tool
+ * handlers already do — see getChatSession usage) so it never reads a stale
+ * in-memory blank.
+ *
+ * SCOPING (avoids the over-blocking / angry-users failure mode): this is only
+ * ever CALLED by writes to immutable parameters. Reversible Meta ops (pause,
+ * budget edit) never call it and are never gated. The guard itself is
+ * parameter-agnostic; the consumer decides when it applies.
+ *
+ * @param pending    session.pendingUserQuestion, read fresh from the DB
+ * @param questionId when provided, the pending question must match this id
+ *                   (correlation); omit to accept any answered question
+ */
+export function checkQuestionGate(
+  pending: PendingUserQuestion | null | undefined,
+  questionId?: string,
+): QuestionGateOutcome {
+  if (!pending) {
+    return { allowed: false, reason: 'No question has been asked yet — the choice must be made first.' };
+  }
+  if (questionId && pending.questionId !== questionId) {
+    return {
+      allowed: false,
+      reason: `The pending question (${pending.questionId}) does not match the expected question (${questionId}).`,
+    };
+  }
+  if (pending.status !== 'answered' || !pending.answer) {
+    return { allowed: false, reason: 'The question is still awaiting a selection.' };
+  }
+  if (pending.answer.answeredBy !== 'user' && pending.answer.answeredBy !== 'delegation') {
+    return { allowed: false, reason: 'The answer was not attributable to a human selection.' };
+  }
+  return { allowed: true, answer: pending.answer, payload: selectedPayload(pending) };
+}
