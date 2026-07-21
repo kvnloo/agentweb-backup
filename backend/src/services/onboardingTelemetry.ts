@@ -39,6 +39,7 @@ export const ONBOARDING_TELEMETRY_EVENTS = {
   voiceSessionReady: "voice_session_ready",
   voiceFirstAudio: "voice_first_audio",
   voiceTurnCompleted: "voice_turn_completed",
+  voiceTurnRecovery: "voice_turn_recovery",
   voiceInterrupted: "voice_interrupted",
   voiceSessionFailed: "voice_session_failed",
   voiceIssueReported: "voice_issue_reported",

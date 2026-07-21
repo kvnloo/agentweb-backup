@@ -17,6 +17,7 @@ import { registerIo } from './services/sessionSockets';
 import {
   startLiveSession,
   sendAudioChunk,
+  sendAudioStreamEnd,
   sendTextTurn,
   closeLiveSession,
   hasLiveSession,
@@ -212,6 +213,13 @@ io.on('connection', (socket: Socket) => {
   socket.on('live:audio', ({ sessionId, chunk }: { sessionId: string; chunk: string }) => {
     console.log(`[liveVoice] live:audio received for session ${sessionId}, hasSession=${hasLiveSession(sessionId)}`);
     sendAudioChunk(sessionId, chunk).catch((err) => {
+      socket.emit('live:error', { sessionId, error: err?.message });
+    });
+  });
+
+  socket.on('live:audio-stream-end', ({ sessionId }: { sessionId: string }) => {
+    console.warn(`[liveVoice] live:audio-stream-end received for session ${sessionId}`);
+    sendAudioStreamEnd(sessionId).catch((err) => {
       socket.emit('live:error', { sessionId, error: err?.message });
     });
   });

@@ -71,6 +71,7 @@ export const onboardingManifest: LoopManifest<NormalizedEvent, LlmAnalystProposa
     'voice_session_ready',
     'voice_first_audio',
     'voice_turn_completed',
+    'voice_turn_recovery',
     'voice_interrupted',
     'voice_session_failed',
     'voice_issue_reported',

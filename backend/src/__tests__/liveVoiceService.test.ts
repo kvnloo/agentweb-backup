@@ -14,6 +14,7 @@
 const mockLiveConnect = jest.fn();
 const mockSessionSendClientContent = jest.fn();
 const mockSessionSendRealtimeInput = jest.fn();
+const mockSessionSendToolResponse = jest.fn();
 const mockSessionClose = jest.fn();
 
 jest.mock('@google/genai', () => ({
@@ -35,6 +36,7 @@ jest.mock('../services/onboardingTelemetry', () => ({
     voiceSessionReady: 'voice_session_ready',
     voiceFirstAudio: 'voice_first_audio',
     voiceTurnCompleted: 'voice_turn_completed',
+    voiceTurnRecovery: 'voice_turn_recovery',
     voiceInterrupted: 'voice_interrupted',
     voiceSessionFailed: 'voice_session_failed',
   },
@@ -76,6 +78,7 @@ function makeMockSession() {
   return {
     sendClientContent: mockSessionSendClientContent,
     sendRealtimeInput: mockSessionSendRealtimeInput,
+    sendToolResponse: mockSessionSendToolResponse,
     close: mockSessionClose,
   };
 }
@@ -96,6 +99,7 @@ function makeCallbacks() {
 import {
   startLiveSession,
   sendAudioChunk,
+  sendAudioStreamEnd,
   sendTextTurn,
   closeLiveSession,
   hasLiveSession,
@@ -251,6 +255,18 @@ describe('sendAudioChunk', () => {
 
   it('throws if session does not exist', async () => {
     await expect(sendAudioChunk('no-such-session', 'abc=')).rejects.toThrow();
+  });
+});
+
+describe('sendAudioStreamEnd', () => {
+  it('flushes a stalled automatic-VAD turn without closing the live session', async () => {
+    makeCallbacks();
+    await startLiveSession('session-stalled-turn', 'socket-1', jest.fn(), 'test-user-id');
+
+    await sendAudioStreamEnd('session-stalled-turn');
+
+    expect(mockSessionSendRealtimeInput).toHaveBeenCalledWith({ audioStreamEnd: true });
+    expect(hasLiveSession('session-stalled-turn')).toBe(true);
   });
 });
 
@@ -910,6 +926,33 @@ describe('tool call surfacing', () => {
       Object.assign(makeCallbacks(), cbs);
       return Promise.resolve(mockSession);
     });
+  });
+
+  it('returns a bounded error to Gemini when a live tool never finishes', async () => {
+    jest.useFakeTimers();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-tool-timeout', 'socket-1', jest.fn(), 'test-user-id');
+    mockExecuteTool.mockReturnValue(new Promise(() => {}));
+
+    callbacks['onmessage']?.({
+      toolCall: {
+        functionCalls: [{ id: 'fc-timeout', name: 'read_brand_guidelines', args: {} }],
+      },
+    });
+
+    await jest.advanceTimersByTimeAsync(12_000);
+    await Promise.resolve();
+
+    expect(mockSessionSendToolResponse).toHaveBeenCalledWith({
+      functionResponses: [
+        expect.objectContaining({
+          id: 'fc-timeout',
+          name: 'read_brand_guidelines',
+          response: expect.objectContaining({ error: expect.stringMatching(/timed out/i) }),
+        }),
+      ],
+    });
+    jest.useRealTimers();
   });
 
   it('includes toolCalls in live:turn-complete payload when tools ran', async () => {
