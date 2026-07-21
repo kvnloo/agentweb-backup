@@ -45,10 +45,12 @@ export function buildCitationIndexBlock(batch: Citation[]): string {
   );
 }
 
-// Matches a {{cite:N}} / {{cite:N,M}} inline-citation marker (tolerant of internal whitespace),
-// together with any run of spaces/tabs immediately preceding it, so removing the marker collapses
-// "$5.2B {{cite:2}}." cleanly to "$5.2B." instead of leaving a dangling space before punctuation.
-const CITE_MARKER_STRIP = /[ \t]*\{\{\s*cite\s*:\s*\d+(?:\s*,\s*\d+)*\s*\}\}/gi;
+// Matches any {{cite ...}} inline-citation token — the well-formed {{cite:N}} / {{cite:N,M}} AND
+// malformed variants the model might emit (e.g. {{cite:2a}}, {{cite:}}, {{cite}}) — together with any
+// run of spaces/tabs immediately preceding it, so removal collapses "$5.2B {{cite:2}}." cleanly to
+// "$5.2B." with no dangling space. `cite\b` + `[^{}]*` keeps it scoped to cite tokens only: it never
+// touches other {{...}} template variables like {{name}} or {{citation}}, and can't span across braces.
+const CITE_MARKER_STRIP = /[ \t]*\{\{\s*cite\b[^{}]*\}\}/gi;
 
 /**
  * ENG-351: strip {{cite:N}} inline-citation markers out of assistant text for any surface that is
