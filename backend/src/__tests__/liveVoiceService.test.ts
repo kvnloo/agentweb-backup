@@ -141,6 +141,15 @@ describe('startLiveSession', () => {
     expect(hasLiveSession('session-1')).toBe(true);
   });
 
+  it('signals the browser only after the Gemini Live session is ready', async () => {
+    makeCallbacks();
+    const emitFn = jest.fn();
+
+    await startLiveSession('session-ready', 'socket-ready', emitFn, 'test-user-id');
+
+    expect(emitFn).toHaveBeenCalledWith('live:ready', { sessionId: 'session-ready' });
+  });
+
   it('directs Emma to use a neutral accent', async () => {
     makeCallbacks();
 

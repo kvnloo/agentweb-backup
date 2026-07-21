@@ -411,6 +411,7 @@ export async function startLiveSession(
   // Pass history via system prompt on fresh starts. Code-1000 resumptions already
   // carry Gemini's own in-memory context, so historyContext is not passed there.
   await openGeminiSession(sessionId, entry, undefined, historyContext || undefined);
+  emitFn('live:ready', { sessionId });
 }
 
 /**
