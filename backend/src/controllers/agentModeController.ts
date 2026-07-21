@@ -13,7 +13,7 @@ import { settingsService } from '../services/settingsService';
 import { workPlanService } from '../services/workPlanService';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { resolveInboundAnswer, AskUserQuestionError } from '../services/agentMode/core/askUserQuestion';
+import { resolveInboundAnswer, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
@@ -780,6 +780,11 @@ export async function runVerifiedChat(
   }>;
   attempts: number;
   workPlanCompleted: boolean;
+  // ENG-396: set when a headless turn left an unanswered blocking AskUserQuestion.
+  // The run stopped without proceeding on a guess; a human must answer it. The
+  // scheduled caller maps this to a `pending_user_input` outcome and notifies.
+  parked?: boolean;
+  pendingUserQuestion?: PendingUserQuestion;
 }> {
   const {
     sessionId,
@@ -1049,6 +1054,41 @@ export async function runVerifiedChat(
       const actualFunctionCalls = toolCalls.map((call: any) => call.name).filter(Boolean);
 
       allActualFunctionCallsForReporting.push(...actualFunctionCalls);
+
+      // ENG-396: headless park. If this turn left an unanswered blocking
+      // AskUserQuestion, a scheduled/headless run must NOT proceed on a guess —
+      // stop here and report a parked outcome. A human answers it later in an
+      // interactive session; the immutable consumer gate (checkQuestionGate)
+      // stays the hard backstop for the write itself. Re-read from the DB (the
+      // tool handler persisted the question via updateSessionAskUserQuestion) so
+      // we never read a stale in-memory blank. Full-autonomy/delegated auto-take
+      // is intentionally NOT done here — that waives the human protection on
+      // irreversible decisions and is a product-owner decision (deferred).
+      const postTurnSession = await chatbotDb.getChatSession(sessionId);
+      if (postTurnSession?.pendingUserQuestion?.status === 'awaiting') {
+        console.log(
+          `AgentMode runVerifiedChat: parking session ${sessionId} — blocking user question (${postTurnSession.pendingUserQuestion.questionId}) awaiting a selection; run will not proceed on a guess`
+        );
+        return {
+          success: false,
+          parked: true,
+          pendingUserQuestion: postTurnSession.pendingUserQuestion,
+          content: allContent,
+          toolCalls: allToolCalls,
+          keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
+          keywordMisses: remainingKeywords,
+          functionCallMatches: [],
+          functionCallMisses: requiredFunctions.map(f => f.functionName),
+          functionStatus: requiredFunctions.map(reqFunc => ({
+            functionName: reqFunc.functionName,
+            requiredCount: reqFunc.minCount,
+            actualCount: countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting),
+            met: false,
+          })),
+          attempts: attempt,
+          workPlanCompleted: false,
+        };
+      }
 
       // Check work plan status
       const workPlan = response.workPlan;
