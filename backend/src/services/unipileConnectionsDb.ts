@@ -181,9 +181,27 @@ export async function getLatestConnectedAt(accountId: string): Promise<number | 
   return item?.connectedAt ?? null;
 }
 
-/** Normalize a LinkedIn URL to lowercase with trailing slash for consistent GSI keys. */
+/**
+ * Normalize a LinkedIn URL to a canonical GSI key: `https://www.linkedin.com/in/<slug>/`.
+ *
+ * Canonicalizes scheme (http→https), www, query string and fragment so a lead URL
+ * matches the cached connection key regardless of how it was entered. The sync cron
+ * stores Unipile's `https://www.linkedin.com/in/<slug>/` form; before this, a lead
+ * saved as `http://www.linkedin.com/in/<slug>` (or without `www.`) normalized to a
+ * different key and never matched its own cached 1st-degree connection, so
+ * get_lead_details reported `isConnected: false` for real connections (ENG-377).
+ *
+ * The trailing slash is preserved to stay byte-identical with keys already persisted
+ * in AW-UnipileConnections (which were written with the trailing slash).
+ */
 export function normalizeLinkedInUrl(url: string): string {
-  let u = url.trim().toLowerCase();
-  if (!u.endsWith('/')) u += '/';
-  return u;
+  if (!url || typeof url !== 'string') return '';
+  const trimmed = url.trim().toLowerCase();
+  if (!trimmed) return '';
+  const u = trimmed
+    .replace(/^https?:\/\/(?:www\.)?/, 'https://www.') // canonical scheme + www
+    .split('?')[0]                                     // drop query (originalSubdomain etc.)
+    .split('#')[0]                                     // drop fragment
+    .replace(/\/+$/, '');                              // drop any trailing slashes
+  return u + '/';
 }

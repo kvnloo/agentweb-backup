@@ -26,6 +26,11 @@ export interface MetaAdsAdSetParams {
   targeting: any;
   status?: string;
   promoted_object?: any;
+  // Conversion location for the ad set (e.g. 'WEBSITE', 'ON_AD' for instant forms, 'MESSENGER',
+  // 'APP'). When omitted Meta stores UNDEFINED and the ad-level Destination reads as "not selected"
+  // in Ads Manager (ENG-415). agentModeService.createMetaAdsAdSet defaults this to 'WEBSITE' for
+  // website optimization goals.
+  destination_type?: string;
 }
 
 export interface MetaPlacementAsset {
@@ -930,6 +935,10 @@ export class MetaService {
       if (params.start_time !== undefined) adSetParams[AdSet.Fields.start_time] = params.start_time;
       if (params.end_time !== undefined) adSetParams[AdSet.Fields.end_time] = params.end_time;
       if (params.promoted_object !== undefined) adSetParams[AdSet.Fields.promoted_object] = params.promoted_object;
+      // Conversion location (ENG-415). Literal key — Meta accepts 'destination_type' directly and it
+      // is not guaranteed to exist on the SDK's AdSet.Fields enum across versions. Emitted only when
+      // present so the payload is byte-identical to before when the caller passes nothing.
+      if (params.destination_type !== undefined) adSetParams['destination_type'] = params.destination_type;
 
       // Defensive: Ensure no 'id' or other accidental fields
       delete adSetParams.id;
