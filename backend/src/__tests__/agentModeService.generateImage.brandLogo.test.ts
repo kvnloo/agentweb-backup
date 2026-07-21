@@ -148,6 +148,38 @@ describe('AgentModeService.generateImage — persisted brand-logo gate (ENG-326)
     expect(mockImageService.generateImage).toHaveBeenCalled();
   });
 
+  // ENG-393: pure text-to-image LOGO CREATION (first logo, no persisted logo,
+  // no logo_image, no inputImages) must NOT hit the missing_brand_logo gate.
+  // userDb.getUserById returns undefined here → if the gate wrongly fired it
+  // would resolve "no persisted logo" and return missing_brand_logo. Success +
+  // generation therefore proves the gate did NOT fire for a creation ask.
+  it('generates a first logo from scratch instead of gating (ENG-393)', async () => {
+    const result = await call('Create a logo for AgentCapX, a modern fintech brand');
+
+    expect(result.success).toBe(true);
+    expect(result.error).not.toBe('missing_brand_logo');
+    expect(mockImageService.generateImage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        prompt: 'Create a logo for AgentCapX, a modern fintech brand',
+        // No invented brand logo injected on the creation path.
+        logoImage: undefined,
+      }),
+    );
+  });
+
+  it('still gates COMPOSITING an existing brand logo when none is persisted (ENG-326 preserved)', async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: 'user123',
+      brandGuidelines: { brandData: { brandName: 'Acme' } },
+    });
+
+    const result = await call('Add our brand logo to this launch banner');
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('missing_brand_logo');
+    expect(mockImageService.generateImage).not.toHaveBeenCalled();
+  });
+
   it('falls back to the attachments logo asset for the injection (canonical store)', async () => {
     userDb.getUserById.mockResolvedValue({
       userId: 'user123',
