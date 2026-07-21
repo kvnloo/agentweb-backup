@@ -45,6 +45,23 @@ export function buildCitationIndexBlock(batch: Citation[]): string {
   );
 }
 
+// Matches a {{cite:N}} / {{cite:N,M}} inline-citation marker (tolerant of internal whitespace),
+// together with any run of spaces/tabs immediately preceding it, so removing the marker collapses
+// "$5.2B {{cite:2}}." cleanly to "$5.2B." instead of leaving a dangling space before punctuation.
+const CITE_MARKER_STRIP = /[ \t]*\{\{\s*cite\s*:\s*\d+(?:\s*,\s*\d+)*\s*\}\}/gi;
+
+/**
+ * ENG-351: strip {{cite:N}} inline-citation markers out of assistant text for any surface that is
+ * NOT the customer-portal React chat (emails, Slack, digests, plain-text copies, etc.). The markers
+ * are only meaningful to the frontend rehypeCite renderer, which turns them into source chips;
+ * everywhere else they must be removed so readers never see literal "{{cite:2}}" garbage. No-ops on
+ * text without markers, so it is safe to call on any string (including hardcoded/system messages).
+ */
+export function stripCitationMarkers(text: string): string {
+  if (!text || typeof text !== 'string') return text;
+  return text.replace(CITE_MARKER_STRIP, '');
+}
+
 /** Extract the bare host (lowercased, no leading `www.`) from a URL; '' if unparseable. */
 export function domainFromUrl(rawUrl: string): string {
   try {
