@@ -45,10 +45,12 @@ export function buildCitationIndexBlock(batch: Citation[]): string {
   );
 }
 
-// Matches a {{cite:N}} / {{cite:N,M}} inline-citation marker (tolerant of internal whitespace),
-// together with any run of spaces/tabs immediately preceding it, so removing the marker collapses
-// "$5.2B {{cite:2}}." cleanly to "$5.2B." instead of leaving a dangling space before punctuation.
-const CITE_MARKER_STRIP = /[ \t]*\{\{\s*cite\s*:\s*\d+(?:\s*,\s*\d+)*\s*\}\}/gi;
+// Matches any {{cite ...}} inline-citation token — the well-formed {{cite:N}} / {{cite:N,M}} AND
+// malformed variants the model might emit (e.g. {{cite:2a}}, {{cite:}}, {{cite}}) — together with any
+// run of spaces/tabs immediately preceding it, so removal collapses "$5.2B {{cite:2}}." cleanly to
+// "$5.2B." with no dangling space. `cite\b` + `[^{}]*` keeps it scoped to cite tokens only: it never
+// touches other {{...}} template variables like {{name}} or {{citation}}, and can't span across braces.
+const CITE_MARKER_STRIP = /[ \t]*\{\{\s*cite\b[^{}]*\}\}/gi;
 
 /**
  * ENG-351: strip {{cite:N}} inline-citation markers out of assistant text for any surface that is
@@ -60,6 +62,51 @@ const CITE_MARKER_STRIP = /[ \t]*\{\{\s*cite\s*:\s*\d+(?:\s*,\s*\d+)*\s*\}\}/gi;
 export function stripCitationMarkers(text: string): string {
   if (!text || typeof text !== 'string') return text;
   return text.replace(CITE_MARKER_STRIP, '');
+}
+
+export type CitationRenderFormat = 'text' | 'markdown';
+
+// Well-formed {{cite:N}} / {{cite:N,M}} marker with its ids captured, plus any leading spaces/tabs
+// so the resolved source sits cleanly adjacent to the figure.
+const CITE_MARKER_RESOLVE = /[ \t]*\{\{\s*cite\s*:\s*(\d+(?:\s*,\s*\d+)*)\s*\}\}/gi;
+
+/**
+ * ENG-351: resolve {{cite:N}} markers to a readable source adjacent to the figure, using this
+ * message's citations — "(Grand View Research)" for `text`, or "([Grand View Research](https://…))"
+ * for `markdown` (which Slack's markdown→mrkdwn converter turns into a clickable link). A marker
+ * citing several sources lists each, comma-separated. Unresolvable ids and any malformed {{cite…}}
+ * token are dropped, so the output never contains a raw marker; with no/empty citations this reduces
+ * to plain stripping. Used on non-React surfaces (email, Slack) that carry the citation metadata.
+ */
+export function renderCitationMarkers(
+  text: string,
+  citations: Citation[] | undefined,
+  format: CitationRenderFormat = 'text',
+): string {
+  if (!text || typeof text !== 'string') return text;
+  const byId = new Map((citations || []).map((c) => [c.id, c]));
+  const resolved = text.replace(CITE_MARKER_RESOLVE, (_full, idsRaw: string) => {
+    const cits = idsRaw
+      .replace(/\s+/g, '')
+      .split(',')
+      .filter(Boolean)
+      .map((n) => byId.get(parseInt(n, 10)))
+      .filter((c): c is Citation => Boolean(c));
+    if (!cits.length) return ''; // id has no matching source → drop the marker rather than invent one
+    const parts = cits.map((c) => {
+      const label = c.siteName || c.domain || '';
+      const safe = /^https?:\/\//i.test(c.url) ? c.url : '';
+      if (format === 'markdown' && safe) {
+        // Encode the chars that would break a markdown []() destination (spaces, parens).
+        const mdUrl = safe.replace(/ /g, '%20').replace(/\(/g, '%28').replace(/\)/g, '%29');
+        return `[${label}](${mdUrl})`;
+      }
+      return label;
+    });
+    return ` (${parts.join(', ')})`;
+  });
+  // Belt-and-suspenders: strip any leftover malformed cite token so a raw marker never survives.
+  return resolved.replace(CITE_MARKER_STRIP, '');
 }
 
 /** Extract the bare host (lowercased, no leading `www.`) from a URL; '' if unparseable. */
