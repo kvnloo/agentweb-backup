@@ -96,7 +96,12 @@ export function renderCitationMarkers(
     const parts = cits.map((c) => {
       const label = c.siteName || c.domain || '';
       const safe = /^https?:\/\//i.test(c.url) ? c.url : '';
-      return format === 'markdown' && safe ? `[${label}](${safe})` : label;
+      if (format === 'markdown' && safe) {
+        // Encode the chars that would break a markdown []() destination (spaces, parens).
+        const mdUrl = safe.replace(/ /g, '%20').replace(/\(/g, '%28').replace(/\)/g, '%29');
+        return `[${label}](${mdUrl})`;
+      }
+      return label;
     });
     return ` (${parts.join(', ')})`;
   });

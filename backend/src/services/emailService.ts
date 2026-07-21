@@ -5,13 +5,20 @@ import { deriveBlockedByCost } from './tokenUsageService';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { chatbotDb } from './chatbotService';
 import { settingsService } from './settingsService';
-import { Citation, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
+import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
 
-// ENG-351: resolve {{cite:N}} markers in Emma's text to readable "(Source)" attributions, using the
+// ENG-351: resolve {{cite:N}} markers in Emma's text to inline source attributions, using the
 // citation metadata on the session's last assistant message. Email has no chip renderer, so this
-// gives recipients the source of each figure inline as plain text. Falls back to plain stripping if
-// the session/citation lookup fails or the session has none, so a raw marker never reaches an inbox.
-async function resolveEmmaCitationsForEmail(text: string, sessionId?: string): Promise<string> {
+// gives recipients the source of each figure inline. Use `format: 'markdown'` for bodies rendered
+// through marked() (the source becomes a clickable link); keep the default `'text'` — "(Source)" —
+// for HTML-escaped or truncated previews, where a markdown link would show as escaped literal text.
+// Falls back to plain stripping if the session/citation lookup fails or the session has none, so a
+// raw marker never reaches an inbox.
+async function resolveEmmaCitationsForEmail(
+  text: string,
+  sessionId?: string,
+  format: CitationRenderFormat = 'text',
+): Promise<string> {
   if (!text || typeof text !== 'string') return text;
   if (!sessionId) return stripCitationMarkers(text);
   try {
@@ -27,7 +34,7 @@ async function resolveEmmaCitationsForEmail(text: string, sessionId?: string): P
         }
       }
     }
-    return renderCitationMarkers(text, citations, 'text');
+    return renderCitationMarkers(text, citations, format);
   } catch {
     return stripCitationMarkers(text);
   }
@@ -1189,9 +1196,10 @@ Schedule ID: ${scheduleId}
       const { marked } = await import('marked');
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
-      // ENG-351: email has no citation-chip renderer — resolve {{cite:N}} markers to inline
-      // "(Source)" attributions (falls back to stripping) so recipients can trace each figure.
-      result = { ...result, actualResponse: await resolveEmmaCitationsForEmail(result.actualResponse || '', result.sessionId) };
+      // ENG-351: resolve {{cite:N}} markers to inline sources so recipients can trace each figure.
+      // 'markdown' → the HTML body (marked()) renders clickable source links; the plain-text body
+      // shows the same as "[Source](url)". Falls back to stripping.
+      result = { ...result, actualResponse: await resolveEmmaCitationsForEmail(result.actualResponse || '', result.sessionId, 'markdown') };
 
       // Create an interactive share for the session so user can access without login
       let sessionUrl = `${customerFrontendUrl}/agent-mode/${result.sessionId}`;
@@ -1355,8 +1363,9 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       const { marked } = await import('marked');
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
-      // ENG-351: resolve {{cite:N}} markers to inline "(Source)" attributions (falls back to strip).
-      content = await resolveEmmaCitationsForEmail(content, sessionId);
+      // ENG-351: resolve {{cite:N}} markers to inline sources; 'markdown' → clickable links in the
+      // marked()-rendered HTML body. Falls back to stripping.
+      content = await resolveEmmaCitationsForEmail(content, sessionId, 'markdown');
 
       // Create or reuse interactive share so recipients can view without login
       let sessionUrl = `${customerFrontendUrl}/agent-mode/${sessionId}`;
