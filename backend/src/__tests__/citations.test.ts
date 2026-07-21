@@ -1,5 +1,34 @@
 // ENG-351 Phase 1/2 — citation registry accumulated from Emma's web-search tool results.
-import { CitationRegistry, buildCitationIndexBlock, domainFromUrl, prettySiteName, stripCitationMarkers, WEB_SEARCH_TOOL_NAMES } from '../utils/citations';
+import { Citation, CitationRegistry, buildCitationIndexBlock, domainFromUrl, prettySiteName, renderCitationMarkers, stripCitationMarkers, WEB_SEARCH_TOOL_NAMES } from '../utils/citations';
+
+describe('renderCitationMarkers', () => {
+  const cites: Citation[] = [
+    { id: 1, url: 'https://www.grandviewresearch.com/report', domain: 'grandviewresearch.com', siteName: 'Grand View Research' },
+    { id: 2, url: 'https://statista.com/x', domain: 'statista.com', siteName: 'Statista' },
+  ];
+  it('resolves a marker to inline (Source) text', () => {
+    expect(renderCitationMarkers('reach $163B by 2030 {{cite:1}}.', cites, 'text')).toBe('reach $163B by 2030 (Grand View Research).');
+  });
+  it('resolves a multi-id marker to a comma-separated list', () => {
+    expect(renderCitationMarkers('grew 14% {{cite:1,2}}', cites, 'text')).toBe('grew 14% (Grand View Research, Statista)');
+  });
+  it('renders markdown links for the markdown format (Slack/email)', () => {
+    expect(renderCitationMarkers('$5B {{cite:2}}', cites, 'markdown')).toBe('$5B ([Statista](https://statista.com/x))');
+  });
+  it('encodes spaces/parens in the markdown link destination so it does not break', () => {
+    const tricky: Citation[] = [{ id: 1, url: 'https://ex.com/a (b) c', domain: 'ex.com', siteName: 'Ex' }];
+    expect(renderCitationMarkers('v {{cite:1}}', tricky, 'markdown')).toBe('v ([Ex](https://ex.com/a%20%28b%29%20c))');
+  });
+  it('drops an unresolvable id rather than inventing a source', () => {
+    expect(renderCitationMarkers('mystery figure {{cite:9}} here', cites, 'text')).toBe('mystery figure here');
+  });
+  it('drops malformed cite tokens and leaves other {{...}} variables', () => {
+    expect(renderCitationMarkers('a {{cite:2a}} b {{name}}', cites, 'text')).toBe('a b {{name}}');
+  });
+  it('falls back to stripping when there are no citations', () => {
+    expect(renderCitationMarkers('x {{cite:1}} y', [], 'text')).toBe('x y');
+  });
+});
 
 describe('stripCitationMarkers', () => {
   it('removes a single marker and the space before it (no dangling space before punctuation)', () => {
@@ -17,8 +46,13 @@ describe('stripCitationMarkers', () => {
     expect(stripCitationMarkers('')).toBe('');
     expect(stripCitationMarkers(undefined as any)).toBe(undefined);
   });
-  it('does not touch non-cite double-brace text or partial markers', () => {
-    expect(stripCitationMarkers('use {{name}} template and {{cite:}} incomplete')).toBe('use {{name}} template and {{cite:}} incomplete');
+  it('also removes malformed cite tokens the model might emit', () => {
+    expect(stripCitationMarkers('growth {{cite:2a}} rate')).toBe('growth rate');
+    expect(stripCitationMarkers('value {{cite:}} here')).toBe('value here');
+    expect(stripCitationMarkers('bare {{cite}} token')).toBe('bare token');
+  });
+  it('never touches other {{...}} template variables', () => {
+    expect(stripCitationMarkers('Hi {{name}}, see {{citation}} and {{cite_ref}}')).toBe('Hi {{name}}, see {{citation}} and {{cite_ref}}');
   });
 });
 
