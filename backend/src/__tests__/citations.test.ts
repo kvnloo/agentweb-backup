@@ -1,5 +1,5 @@
-// ENG-351 Phase 1 — citation registry accumulated from Emma's web-search tool results.
-import { CitationRegistry, domainFromUrl, prettySiteName, WEB_SEARCH_TOOL_NAMES } from '../utils/citations';
+// ENG-351 Phase 1/2 — citation registry accumulated from Emma's web-search tool results.
+import { CitationRegistry, buildCitationIndexBlock, domainFromUrl, prettySiteName, WEB_SEARCH_TOOL_NAMES } from '../utils/citations';
 
 describe('domainFromUrl', () => {
   it('strips protocol and leading www', () => {
@@ -27,6 +27,22 @@ describe('WEB_SEARCH_TOOL_NAMES', () => {
     expect(WEB_SEARCH_TOOL_NAMES.has('you_search_news')).toBe(true);
     expect(WEB_SEARCH_TOOL_NAMES.has('google_search_web')).toBe(true);
     expect(WEB_SEARCH_TOOL_NAMES.has('search_tool_response')).toBe(false);
+  });
+});
+
+describe('buildCitationIndexBlock', () => {
+  it('returns empty string for an empty batch', () => {
+    expect(buildCitationIndexBlock([])).toBe('');
+  });
+  it('maps each source id to a {{cite:N}} marker line', () => {
+    const block = buildCitationIndexBlock([
+      { id: 2, url: 'https://x.com', domain: 'grandviewresearch.com', siteName: 'Grand View Research' },
+      { id: 5, url: 'https://y.com', domain: 'statista.com', siteName: 'Statista' },
+    ]);
+    expect(block).toContain('{{cite:2}} = Grand View Research (grandviewresearch.com)');
+    expect(block).toContain('{{cite:5}} = Statista (statista.com)');
+    expect(block).toContain('INLINE CITATIONS');
+    expect(block.endsWith('\n\n')).toBe(true); // separated from the search body it is prepended to
   });
 });
 
@@ -67,6 +83,17 @@ describe('CitationRegistry', () => {
     const cites = reg.list();
     expect(cites.map((c) => c.domain)).toEqual(['a.com', 'b.com']);
     expect(cites.map((c) => c.id)).toEqual([1, 2]);
+  });
+
+  it('returns the batch with global ids, reusing ids for urls seen in a prior search (Phase 2)', () => {
+    const reg = new CitationRegistry();
+    const batch1 = reg.registerSearchResults([{ url: 'https://a.com', title: 'A' }, { url: 'https://b.com', title: 'B' }]);
+    expect(batch1.map((c) => [c.id, c.domain])).toEqual([[1, 'a.com'], [2, 'b.com']]);
+
+    // Second search: b.com repeats (keeps id 2), c.com is new (id 3).
+    const batch2 = reg.registerSearchResults([{ url: 'https://b.com', title: 'B again' }, { url: 'https://c.com', title: 'C' }]);
+    expect(batch2.map((c) => [c.id, c.domain])).toEqual([[2, 'b.com'], [3, 'c.com']]);
+    expect(reg.list().map((c) => c.id)).toEqual([1, 2, 3]);
   });
 
   it('skips entries without a usable http(s) url or parseable host', () => {
