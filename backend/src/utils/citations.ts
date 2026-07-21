@@ -1,13 +1,18 @@
 // ENG-351 Phase 1 — structured citation registry for Emma chat messages.
 //
-// Emma's web-search tool (`search_tool_response`) returns structured results
-// ({title, url, snippet, publishedDate}). This module distills the sources a
-// single assistant message actually consulted into a de-duplicated, stably-numbered
-// `Citation[]` that rides on the message metadata, so the frontend can render the
-// ChatGPT-style "Sources" pill + panel from real data (not text the model typed).
+// Emma's web-search tools (you_search_web / you_search_news / google_search_web) return
+// structured results ({title, url, snippet, publishedDate}). This module accumulates the
+// sources a single assistant message actually consulted into a de-duplicated, stably-numbered
+// `Citation[]` that rides on the message metadata, so the frontend can render the ChatGPT-style
+// "Sources" pill + panel from real data (not text the model typed).
 //
-// The stable per-message `id` is also the anchor Phase 2 will use: Emma will cite a
-// figure with that id (e.g. [[cite:2]]) and the frontend maps it back to the source.
+// IMPORTANT: web-search results are trimmed to `{}` by extractMinimalToolResult before they
+// reach `metadata.toolCalls` (storage minimization), so the registry CANNOT be rebuilt from
+// toolCalls after the fact. It must be fed the full results at tool-dispatch time — hence the
+// stateful `CitationRegistry` accumulated across a message's search calls.
+//
+// The stable per-message `id` is also the anchor Phase 2 uses: Emma cites a figure with that id
+// (e.g. {{cite:2}}) and the frontend maps it back to the source.
 
 export interface Citation {
   /** Stable 1-based id within this message; the anchor Phase 2 inline markers reference. */
@@ -22,16 +27,8 @@ export interface Citation {
   publishedDate?: string;
 }
 
-// A tool-call entry as attached to assistant message metadata.
-interface ToolCallLike {
-  name?: string;
-  result?: any;
-}
-
-// Tool names whose results carry web sources. `search_tool_response` is Emma's
-// web-search tool; kept as an explicit allowlist so unrelated tools that happen to
-// return a `results` array are never mistaken for citations.
-const SOURCE_BEARING_TOOLS = new Set(['search_tool_response']);
+/** The web-search tools whose results carry citable web sources. */
+export const WEB_SEARCH_TOOL_NAMES = new Set(['you_search_web', 'you_search_news', 'google_search_web']);
 
 /** Extract the bare host (lowercased, no leading `www.`) from a URL; '' if unparseable. */
 export function domainFromUrl(rawUrl: string): string {
@@ -44,14 +41,13 @@ export function domainFromUrl(rawUrl: string): string {
 }
 
 /**
- * Best-effort readable site name from a domain: drop the TLD, split the registrable
- * label on separators, and Title-Case it. e.g. "grandviewresearch.com" -> "Grandviewresearch",
+ * Best-effort readable site name from a domain: drop the TLD, split the registrable label on
+ * separators, and Title-Case it. e.g. "grandviewresearch.com" -> "Grandviewresearch",
  * "search-console.google.com" -> "Search Console Google". Falls back to the raw domain.
  */
 export function prettySiteName(domain: string): string {
   if (!domain) return '';
   const labels = domain.split('.');
-  // Drop a trailing TLD (and a 2-char ccTLD's SLD like .co.uk) to get the meaningful part.
   const meaningful = labels.length > 2 && labels[labels.length - 1].length <= 3 && labels[labels.length - 2].length <= 3
     ? labels.slice(0, -2)
     : labels.slice(0, -1);
@@ -63,8 +59,8 @@ export function prettySiteName(domain: string): string {
   return words.join(' ') || domain;
 }
 
-// Normalize a URL for de-duplication: strip the hash and any trailing slash so the same
-// page cited twice collapses to one entry. Falls back to the trimmed raw string.
+// Normalize a URL for de-duplication: strip the hash and any trailing slash so the same page
+// cited twice collapses to one entry. Falls back to the trimmed raw string.
 function dedupeKey(rawUrl: string): string {
   try {
     const u = new URL(rawUrl);
@@ -78,31 +74,28 @@ function dedupeKey(rawUrl: string): string {
 }
 
 /**
- * Build the de-duplicated, stably-numbered citation registry for one assistant message
- * from its tool calls. Order is first-seen across the message's searches. Entries without a
- * usable http(s) url are skipped.
+ * Accumulates the de-duplicated, stably-numbered web sources consulted across ONE assistant
+ * message's search calls. Fed the full search results at tool-dispatch time (before they are
+ * trimmed for storage). First-seen order; entries without a usable http(s) url are skipped.
  */
-export function buildCitationRegistry(toolCalls: ToolCallLike[] | undefined | null): Citation[] {
-  if (!Array.isArray(toolCalls) || toolCalls.length === 0) return [];
+export class CitationRegistry {
+  private byKey = new Map<string, Citation>();
+  private nextId = 1;
 
-  const byKey = new Map<string, Citation>();
-  let nextId = 1;
-
-  for (const call of toolCalls) {
-    if (!call || !SOURCE_BEARING_TOOLS.has(call.name || '')) continue;
-    const results = call.result?.results;
-    if (!Array.isArray(results)) continue;
+  /** Register the `results` array of a web-search tool call. Non-arrays are ignored. */
+  registerSearchResults(results: unknown): void {
+    if (!Array.isArray(results)) return;
 
     for (const r of results) {
       const url = typeof r?.url === 'string' ? r.url.trim() : '';
       if (!url || !/^https?:\/\//i.test(url)) continue;
 
       const key = dedupeKey(url);
-      if (byKey.has(key)) continue;
+      if (this.byKey.has(key)) continue;
 
       const domain = domainFromUrl(url);
-      byKey.set(key, {
-        id: nextId++,
+      this.byKey.set(key, {
+        id: this.nextId++,
         url,
         domain,
         siteName: prettySiteName(domain),
@@ -113,5 +106,12 @@ export function buildCitationRegistry(toolCalls: ToolCallLike[] | undefined | nu
     }
   }
 
-  return [...byKey.values()];
+  /** The de-duplicated citations, in first-seen order. */
+  list(): Citation[] {
+    return [...this.byKey.values()];
+  }
+
+  get size(): number {
+    return this.byKey.size;
+  }
 }

@@ -1,10 +1,5 @@
-// ENG-351 Phase 1 — citation registry built from Emma's search tool calls.
-import { buildCitationRegistry, domainFromUrl, prettySiteName } from '../utils/citations';
-
-const searchCall = (results: any[]) => ({
-  name: 'search_tool_response',
-  result: { success: true, query: 'q', results },
-});
+// ENG-351 Phase 1 — citation registry accumulated from Emma's web-search tool results.
+import { CitationRegistry, domainFromUrl, prettySiteName, WEB_SEARCH_TOOL_NAMES } from '../utils/citations';
 
 describe('domainFromUrl', () => {
   it('strips protocol and leading www', () => {
@@ -26,29 +21,32 @@ describe('prettySiteName', () => {
   });
 });
 
-describe('buildCitationRegistry', () => {
-  it('returns [] for no/empty/non-array tool calls', () => {
-    expect(buildCitationRegistry(undefined)).toEqual([]);
-    expect(buildCitationRegistry(null)).toEqual([]);
-    expect(buildCitationRegistry([])).toEqual([]);
+describe('WEB_SEARCH_TOOL_NAMES', () => {
+  it('covers the three web-search tools and excludes the S3 slice-reader', () => {
+    expect(WEB_SEARCH_TOOL_NAMES.has('you_search_web')).toBe(true);
+    expect(WEB_SEARCH_TOOL_NAMES.has('you_search_news')).toBe(true);
+    expect(WEB_SEARCH_TOOL_NAMES.has('google_search_web')).toBe(true);
+    expect(WEB_SEARCH_TOOL_NAMES.has('search_tool_response')).toBe(false);
   });
+});
 
-  it('ignores tool calls that are not source-bearing search calls', () => {
-    const calls = [
-      { name: 'get_seo_metrics', result: { results: [{ url: 'https://x.com', title: 'x' }] } },
-      { name: 'generate_image', result: { imageUrl: 'https://img.com/a.png' } },
-    ];
-    expect(buildCitationRegistry(calls)).toEqual([]);
+describe('CitationRegistry', () => {
+  it('starts empty and ignores non-array / missing results', () => {
+    const reg = new CitationRegistry();
+    reg.registerSearchResults(undefined);
+    reg.registerSearchResults(null);
+    reg.registerSearchResults('nope' as any);
+    expect(reg.size).toBe(0);
+    expect(reg.list()).toEqual([]);
   });
 
   it('extracts structured sources and assigns stable 1-based ids', () => {
-    const calls = [
-      searchCall([
-        { url: 'https://www.grandviewresearch.com/report', title: 'CRM Market To Reach $163B', snippet: 's1', publishedDate: '2025-01-01' },
-        { url: 'https://www.statista.com/crm', title: 'CRM stats' },
-      ]),
-    ];
-    const cites = buildCitationRegistry(calls);
+    const reg = new CitationRegistry();
+    reg.registerSearchResults([
+      { url: 'https://www.grandviewresearch.com/report', title: 'CRM Market To Reach $163B', snippet: 's1', publishedDate: '2025-01-01' },
+      { url: 'https://www.statista.com/crm', title: 'CRM stats' },
+    ]);
+    const cites = reg.list();
     expect(cites).toHaveLength(2);
     expect(cites[0]).toMatchObject({
       id: 1,
@@ -62,25 +60,23 @@ describe('buildCitationRegistry', () => {
     expect(cites[1].snippet).toBeUndefined();
   });
 
-  it('de-duplicates the same url across multiple searches (hash/trailing slash ignored)', () => {
-    const calls = [
-      searchCall([{ url: 'https://a.com/x/', title: 'A' }]),
-      searchCall([{ url: 'https://a.com/x#section', title: 'A dup' }, { url: 'https://b.com', title: 'B' }]),
-    ];
-    const cites = buildCitationRegistry(calls);
+  it('de-duplicates the same url ACROSS multiple search calls (hash/trailing slash ignored)', () => {
+    const reg = new CitationRegistry();
+    reg.registerSearchResults([{ url: 'https://a.com/x/', title: 'A' }]);
+    reg.registerSearchResults([{ url: 'https://a.com/x#section', title: 'A dup' }, { url: 'https://b.com', title: 'B' }]);
+    const cites = reg.list();
     expect(cites.map((c) => c.domain)).toEqual(['a.com', 'b.com']);
     expect(cites.map((c) => c.id)).toEqual([1, 2]);
   });
 
   it('skips entries without a usable http(s) url', () => {
-    const calls = [
-      searchCall([
-        { title: 'no url' },
-        { url: 'ftp://x.com/file', title: 'wrong scheme' },
-        { url: 'https://ok.com', title: 'ok' },
-      ]),
-    ];
-    const cites = buildCitationRegistry(calls);
+    const reg = new CitationRegistry();
+    reg.registerSearchResults([
+      { title: 'no url' },
+      { url: 'ftp://x.com/file', title: 'wrong scheme' },
+      { url: 'https://ok.com', title: 'ok' },
+    ]);
+    const cites = reg.list();
     expect(cites).toHaveLength(1);
     expect(cites[0]).toMatchObject({ id: 1, domain: 'ok.com' });
   });

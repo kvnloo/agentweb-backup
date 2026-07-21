@@ -27,6 +27,7 @@
 
 import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
 import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
+import { CitationRegistry, WEB_SEARCH_TOOL_NAMES } from '../../../utils/citations';
 import { appendRetryabilityGuidance } from './errorRetryability';
 // OTel spine (ENG-141). Direct imports, NOT ports: both are pure/inert without
 // exporter env config (spans become no-ops), so they don't entangle the module
@@ -221,6 +222,8 @@ export interface ExecutePreparedToolsInput {
   messages: any[];
   /** the cumulative toolCalls ledger — MUTATED in place (entries pushed) */
   toolCallsLedger: any[];
+  /** ENG-351: per-message citation registry — MUTATED in place (web-search sources registered) */
+  citationRegistry?: CitationRegistry;
   // ---- run/iteration context ----
   iteration: number;
   agentRuntimeRunId: string;
@@ -291,6 +294,7 @@ export async function executePreparedTools(
     toolCalls: responseToolCalls,
     messages,
     toolCallsLedger: toolCalls,
+    citationRegistry,
     iteration,
     agentRuntimeRunId,
     sessionId,
@@ -686,6 +690,13 @@ export async function executePreparedTools(
             console.error('AgentMode: Failed to upload playwright screenshot to S3:', e);
           }
         }
+      }
+
+      // ENG-351: harvest web-search sources into the per-message citation registry from the
+      // FULL result here — extractMinimalToolResult below trims search results to {} for storage,
+      // so this is the only place the structured sources are still available.
+      if (citationRegistry && WEB_SEARCH_TOOL_NAMES.has(toolCall.function.name)) {
+        citationRegistry.registerSearchResults(processedResult?.results);
       }
 
       const minimalResult = ports.extractMinimalToolResult(processedResult, toolCall.function.name);
