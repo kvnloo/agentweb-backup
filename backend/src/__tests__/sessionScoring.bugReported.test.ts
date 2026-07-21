@@ -121,7 +121,25 @@ describe('SessionScoring - bug reported during session', () => {
 
   it('DEFAULT_SCORING_SYSTEM_PROMPT does not infer drafting from pasted third-party text alone', () => {
     expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('Do not infer a draft/reply task from a bare pasted third-party message');
-    expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('Do not score that as reversed sender/recipient direction');
+    expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('do NOT score it as reversed sender/recipient direction');
+  });
+
+  // ENG-392: clarifying an ambiguous pasted message (per the Drafting Direction
+  // Guard) is CORRECT behavior and must count as full goal completion — the
+  // general judge previously penalized it as "asked for clarification instead
+  // of drafting", diverging from the named judges that rewarded it.
+
+  it('DEFAULT_SCORING_SYSTEM_PROMPT treats clarify-and-offer-options on a pasted message as full goal completion', () => {
+    expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('Treat this clarify-and-offer-options response as full goal completion');
+  });
+
+  it('DEFAULT_SCORING_SYSTEM_PROMPT does not penalize asking for clarification instead of drafting', () => {
+    expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('do NOT lower goalCompletion or the overall score for "asking for clarification instead of drafting"');
+    expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('failing to draft a suggested response');
+  });
+
+  it('DEFAULT_SCORING_SYSTEM_PROMPT only penalizes when a draft was already explicitly requested', () => {
+    expect(DEFAULT_SCORING_SYSTEM_PROMPT).toContain('Only penalize goalCompletion here if the user had ALREADY explicitly asked for a draft/reply');
   });
 
   // SUCCESS: verify the tool call appears in the serialized conversation and prompt passes through

@@ -1,4 +1,4 @@
-import { getLinkedInCredentials, getLinkedInAdsSecrets, getMetaCredentials, getGmailCredentials, getYouTubeCredentials, getFathomCredentials, getClickUpCredentials, getHubSpotCredentials, getAttioCredentials, getGoogleAdsCredentials, getTwitterCredentials } from '../utils/secretsManager';
+import { getLinkedInCredentials, getLinkedInAdsSecrets, getMetaCredentials, getGmailCredentials, getOutlookCredentials, getYouTubeCredentials, getFathomCredentials, getClickUpCredentials, getHubSpotCredentials, getAttioCredentials, getGoogleAdsCredentials, getTwitterCredentials } from '../utils/secretsManager';
 import { MetaConfig } from '../types/meta';
 
 // Graph API version for Auth/Token exchange - decoupled from SDK version
@@ -83,6 +83,22 @@ export const INTEGRATION_CONFIG = {
       'https://www.googleapis.com/auth/calendar.events',
       'https://www.googleapis.com/auth/userinfo.email',
       'https://www.googleapis.com/auth/userinfo.profile',
+    ],
+  },
+  outlook: {
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/outlook/callback`,
+    // 'common' = multitenant + personal accounts. The Entra app registration must be
+    // multitenant too, or only our own tenant can ever consent.
+    authorizationUrl: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize',
+    tokenUrl: 'https://login.microsoftonline.com/common/oauth2/v2.0/token',
+    profileUrl: 'https://graph.microsoft.com/v1.0/me',
+    sendMailUrl: 'https://graph.microsoft.com/v1.0/me/sendMail',
+    scopes: [
+      'https://graph.microsoft.com/Mail.Send',
+      // Mail.Read backs reply threading, and NDR/bounce detection (ENG-266 Part 3).
+      'https://graph.microsoft.com/Mail.Read',
+      'https://graph.microsoft.com/User.Read',
+      'offline_access',
     ],
   },
 
@@ -366,6 +382,47 @@ export async function getGmailConfig(): Promise<GmailOAuthConfig> {
   };
   gmailConfigCacheExpiresAt = Date.now() + GMAIL_CONFIG_CACHE_TTL_MS;
   return cachedGmailConfig;
+}
+
+// Outlook / Microsoft 365 configuration interface
+export interface OutlookOAuthConfig {
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+  scopes: string[];
+  authorizationUrl: string;
+  tokenUrl: string;
+  profileUrl: string;
+  sendMailUrl: string;
+}
+
+// Module-level cache — avoids hitting Secrets Manager on every Graph API call
+let cachedOutlookConfig: OutlookOAuthConfig | null = null;
+let outlookConfigCacheExpiresAt = 0;
+const OUTLOOK_CONFIG_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Returns Outlook / Microsoft 365 OAuth configuration.
+ * Credentials come from AWS Secrets Manager (dev/AgentWeb/Microsoft/Outlook or prod/...).
+ * Result is cached for 5 minutes to avoid per-request Secrets Manager calls.
+ */
+export async function getOutlookConfig(): Promise<OutlookOAuthConfig> {
+  if (cachedOutlookConfig && Date.now() < outlookConfigCacheExpiresAt) {
+    return cachedOutlookConfig;
+  }
+  const credentials = await getOutlookCredentials();
+  cachedOutlookConfig = {
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    redirectUri: INTEGRATION_CONFIG.outlook.redirectUri,
+    scopes: INTEGRATION_CONFIG.outlook.scopes,
+    authorizationUrl: INTEGRATION_CONFIG.outlook.authorizationUrl,
+    tokenUrl: INTEGRATION_CONFIG.outlook.tokenUrl,
+    profileUrl: INTEGRATION_CONFIG.outlook.profileUrl,
+    sendMailUrl: INTEGRATION_CONFIG.outlook.sendMailUrl,
+  };
+  outlookConfigCacheExpiresAt = Date.now() + OUTLOOK_CONFIG_CACHE_TTL_MS;
+  return cachedOutlookConfig;
 }
 
 // Google Drive OAuth configuration

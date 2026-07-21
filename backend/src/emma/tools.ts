@@ -1,5 +1,8 @@
 import { agentModeService } from '../services/agentModeService';
 import { emmaToolRegistry } from './registry';
+import { auditCampaigns } from '../services/adUtmAuditService';
+import type { AdPlatform } from '../utils/adUtm';
+import { metaAdReadPort, googleAdReadPort, linkedInAdReadPort } from '../services/adUtmAuditAdapters';
 import { accountMemoryDb, orgMemoryDb, userDb } from '../services/db';
 import { crmDb } from '../services/db';
 import { askCrm, AskCrmLead } from '../services/askCrmService';
@@ -709,7 +712,7 @@ ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
   AD_SET        → LIST, CREATE, UPDATE, DELETE
   AD_CREATIVE   → LIST, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
-  AD            → LIST, CREATE, UPDATE, DELETE, COPY_AD
+  AD            → LIST, CREATE, UPDATE, DELETE, COPY_AD, RETAG_UTM
   CUSTOM_AUDIENCE → LIST, CREATE, UPLOAD_USERS
   TARGETING     → SEARCH
   PAGE          → LIST
@@ -728,7 +731,16 @@ REQUIRED IDs PER ACTION:
   AD CREATE               → ad_set_id required
   AD UPDATE/DELETE        → ad_id required
   AD COPY_AD              → ad_id (source ad to copy) required
+  AD RETAG_UTM            → ad_id required
   TARGETING SEARCH        → params.q and params.type required
+
+AD RETAG_UTM (ENG-239 — retrofit UTMs onto ONE existing ad that's missing them):
+  Only for ads that already exist and were found untagged, e.g. via audit_ad_utm_coverage. Never call this
+  in a loop over multiple ads — it is a single-target action, one ad per call, always. Retagging swaps in a
+  NEW creative for the ad, which RESETS THE AD'S LEARNING PHASE and can hurt performance on a live client
+  campaign. You MUST tell the user this cost explicitly before calling — do not call it as a quiet "fix" in
+  the middle of another task. The normal confirmation flow (see above) will also surface this same warning,
+  but say it yourself first regardless.
 
 REQUIRED PARAMS PER ENTITY + ACTION:
   CAMPAIGN CREATE:      name, objective, special_ad_categories (e.g. ["NONE"])
@@ -832,7 +844,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
         },
         action: {
           type: "string",
-          enum: ["LIST", "CREATE", "UPDATE", "DELETE", "COPY_AD", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
+          enum: ["LIST", "CREATE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
           description: "The operation to perform. Must be valid for the chosen entity_type."
         },
         account_id: {
@@ -849,14 +861,14 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
         },
         ad_id: {
           type: "string",
-          description: "Ad ID. Required for: AD UPDATE/DELETE."
+          description: "Ad ID. Required for: AD UPDATE/DELETE/COPY_AD/RETAG_UTM."
         },
         params: {
           type: "object",
           description: "Action-specific parameters. Required fields depend on entity_type + action (see tool description for the full matrix).",
           properties: {
             // --- Confirmation gate (write actions) ---
-            confirm: { type: "boolean", description: "Set to true ONLY after showing the user the resolved target (campaign/ad set/asset) returned by the first call and getting explicit approval. Required to actually execute CAMPAIGN/AD_SET/AD CREATE/UPDATE/DELETE/COPY_AD. Omit (or false) on the first call to preview the target." },
+            confirm: { type: "boolean", description: "Set to true ONLY after showing the user the resolved target (campaign/ad set/asset) returned by the first call and getting explicit approval. Required to actually execute CAMPAIGN/AD_SET/AD CREATE/UPDATE/DELETE/COPY_AD/RETAG_UTM. Omit (or false) on the first call to preview the target." },
 
             // --- Common ---
             name: { type: "string", description: "Entity name." },
@@ -1142,8 +1154,8 @@ ACTION MATRIX (entity_type → supported actions):
   AD_ACCOUNT      → LIST
   CAMPAIGN_GROUP  → LIST, CREATE, UPDATE
   CAMPAIGN        → LIST, CREATE, UPDATE
-  CREATIVE        → LIST, CREATE, CREATE_INLINE, CREATE_DYNAMIC
-  POST            → CREATE
+  CREATIVE        → LIST, CREATE, CREATE_INLINE, CREATE_DYNAMIC, RETAG_UTM
+  POST            → CREATE, GET (post_urn)
   TARGETING       → LIST_FACETS, SEARCH, ESTIMATE_REACH
   MEDIA           → UPLOAD_IMAGE, UPLOAD_VIDEO, UPLOAD_DOCUMENT
   INMAIL          → CREATE_CONTENT, SEND_TEST
@@ -1222,11 +1234,22 @@ REQUIRED PARAMS PER ENTITY + ACTION:
     Other required: name, status, campaignGroup (full URN), objectiveType (WEBSITE_VISIT|BRAND_AWARENESS|ENGAGEMENT|VIDEO_VIEWS|LEAD_GENERATION|WEBSITE_CONVERSIONS — omit entirely for DYNAMIC/JOBS campaigns), costType (CPM|CPC|CPV), unitCost, targeting_include (array)
     targeting_include format: array of { "facet_urn": "urn:li:adTargetingFacet:locations", "values": ["urn:li:geo:103644278"] }
     ALWAYS use targeting_include/targeting_exclude — never construct targetingCriteria manually
-  CAMPAIGN UPDATE: campaign_id + fields to update
+  CAMPAIGN UPDATE: campaign_id + fields to update. If the ad set was created with a runSchedule.start that has since elapsed,
+    LinkedIn re-validates it on EVERY update (even status-only ones like archiving) and rejects with the old stored value --
+    pass a future runSchedule (or run_schedule_start) alongside whatever else you're changing to get past this.
   CREATIVE LIST: params.campaign_id required
   CREATIVE CREATE: campaign_id + one of: post_urn (sponsored content/event/article/document), headline+description+landing_page (text ad), inmail_content_urn (message/conversation ad), vast_tag_url (VAST video). Optional: pre_event_registration_image (event ads). Lead Gen ad: also pass leadgen_form_urn + cta_label_type to attach an existing Lead Gen Form.
   CREATIVE CREATE_INLINE: Dark post only. Required: campaign_id, commentary, image_urn OR video_urn OR document_urn OR carousel_cards. Lead Gen ad (LEAD_GENERATION campaign): also pass leadgen_form_urn (adForm URN) + cta_label_type (e.g. SIGN_UP) to attach an existing Lead Gen Form.
   CREATIVE CREATE_DYNAMIC: campaign_id, format (JOBS|SPOTLIGHT|FOLLOW_COMPANY). JOBS needs headline+button_label. SPOTLIGHT needs headline+call_to_action+landing_page+logo_urn (logo_urn is REQUIRED — upload logo with MEDIA/UPLOAD_IMAGE first). FOLLOW_COMPANY needs headline.
+  CREATIVE RETAG_UTM (ENG-239 — retrofit UTMs onto ONE existing creative found untagged, e.g. via audit_ad_utm_coverage):
+    Requires creative_id + campaign_id. Single-target only, one creative per call — never loop over multiple.
+    If it fails, tell the user plainly rather than retrying blindly.
+    TEXT_AD creatives: retags the creative directly.
+    Sponsored-content (post-reference) creatives: retags the underlying LinkedIn POST's CTA-button destination
+    (contentLandingPage) instead — the only post field LinkedIn allows editing after publish. This does NOT
+    cover an article post's own link, or any post with no CTA button configured; those return
+    NO_RETAGGABLE_DESTINATION. Tell the user this plainly rather than treating it as a generic failure — it
+    means a human needs to look, not that the call is broken.
   TARGETING SEARCH: facet (URN like urn:li:adTargetingFacet:locations), query (optional — omit for facets without typeahead like seniorities/industries)
     Common facets: locations, titles (job titles — NOT jobTitles), seniorities, industries, functions, staffCountRanges, memberInterests, skills
   TARGETING ESTIMATE_REACH: targeting_include (array of { facet_urn, values } — SAME shape as CAMPAIGN CREATE; resolve value URNs via TARGETING SEARCH first). Optional targeting_exclude. Returns { active, total }; total is 0 when the audience is under the 300-member minimum. ALWAYS run this before CAMPAIGN CREATE to confirm reach ≥ 300.
@@ -1239,7 +1262,19 @@ REQUIRED PARAMS PER ENTITY + ACTION:
   CONVERSATION_AD CREATE_CONTENT: conversation_ad_urn, body (message text), buttons (array of { text, action: OPEN_URL|SEND_MESSAGE, url? }). Optional: subject, footer.
   CONVERSATION_AD SET_FIRST_CONTENT: conversation_ad_urn, first_content_urn
 
-POST/CREATE params: commentary (text), feed_distribution (NONE=dark post|MAIN_FEED=company page). Media: image_urn | video_urn | document_urn | article_url+article_title+article_description+thumbnail_urn | carousel_cards.
+POST/CREATE params: commentary (text), feed_distribution (NONE=dark post|MAIN_FEED=company page), campaign_id (OPTIONAL but STRONGLY RECOMMENDED — see UTM ATTRIBUTION below). Media: image_urn | video_urn | document_urn | article_url+article_title+article_description+thumbnail_urn | carousel_cards.
+POST/GET params: post_urn (required). Reads a post/share's own stored fields (commentary, content, contentLandingPage, etc) — use this to inspect
+  the actual destination of a sponsored-content creative, since CREATIVE LIST only returns the bare content.reference URN pointer for those, never
+  the post's own fields.
+
+UTM ATTRIBUTION — pass campaign_id to the CONTENT actions too:
+  POST/CREATE, INMAIL/CREATE_CONTENT and CONVERSATION_AD/CREATE_CONTENT accept an OPTIONAL campaign_id.
+  Emma stamps utm_source/utm_medium/utm_campaign onto every destination URL so leads from the ad can be
+  attributed back to it. But these three actions author content BEFORE it is attached to a campaign, so
+  without campaign_id the landing pages are left UNTAGGED and their leads arrive in the CRM with no source.
+  You almost always created the campaign first, so you HAVE the id — pass it. If you genuinely do not have
+  one yet, omit it: an untagged URL is correct, a fabricated utm_campaign is not.
+  (CREATIVE/CREATE and CREATIVE/CREATE_DYNAMIC already require campaign_id, so those tag automatically.)
 
 BUDGET FORMAT: decimal string e.g. "10.00" = $10.00 (NOT micro-currency)
 SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
@@ -1253,7 +1288,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
         },
         action: {
           type: 'string',
-          enum: ['LIST', 'CREATE', 'CREATE_INLINE', 'CREATE_DYNAMIC', 'UPDATE', 'LIST_FACETS', 'SEARCH', 'ESTIMATE_REACH', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'UPLOAD_DOCUMENT', 'INIT_VIDEO_UPLOAD', 'FINALIZE_VIDEO', 'CREATE_CONTENT', 'SEND_TEST', 'SET_FIRST_CONTENT'],
+          enum: ['LIST', 'GET', 'CREATE', 'CREATE_INLINE', 'CREATE_DYNAMIC', 'RETAG_UTM', 'UPDATE', 'LIST_FACETS', 'SEARCH', 'ESTIMATE_REACH', 'UPLOAD_IMAGE', 'UPLOAD_VIDEO', 'UPLOAD_DOCUMENT', 'INIT_VIDEO_UPLOAD', 'FINALIZE_VIDEO', 'CREATE_CONTENT', 'SEND_TEST', 'SET_FIRST_CONTENT'],
           description: 'The operation to perform. Must be valid for the chosen entity_type.'
         },
         account_id: {
@@ -1269,7 +1304,7 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
             status: { type: 'string', enum: ['ACTIVE', 'PAUSED', 'ARCHIVED', 'DRAFT', 'CANCELED', 'COMPLETED'], description: 'Entity status.' },
             campaign_group_id: { type: 'string', description: 'Campaign Group numeric ID. Used for CAMPAIGN LIST.' },
             campaignGroup: { type: 'string', description: 'Campaign Group URN (urn:li:sponsoredCampaignGroup:ID). Required for CAMPAIGN CREATE.' },
-            campaign_id: { type: 'string', description: 'Campaign ID. Required for CREATIVE LIST/CREATE and CAMPAIGN UPDATE.' },
+            campaign_id: { type: 'string', description: 'Campaign ID. Required for CREATIVE LIST/CREATE, CREATIVE/RETAG_UTM (with creative_id), and CAMPAIGN UPDATE. ALSO accepted — and strongly recommended — on POST/CREATE, INMAIL/CREATE_CONTENT and CONVERSATION_AD/CREATE_CONTENT: without it those destination URLs ship with no utm_campaign and their leads cannot be attributed. Omit it only if no campaign exists yet.' },
             // Campaign
             objectiveType: { type: 'string', description: 'Campaign objective (WEBSITE_VISIT, BRAND_AWARENESS, ENGAGEMENT, VIDEO_VIEWS, LEAD_GENERATION, WEBSITE_CONVERSIONS). Omit entirely for DYNAMIC campaigns with format=JOBS.' },
             costType: { type: 'string', enum: ['CPM', 'CPC', 'CPV'], description: 'Bidding type.' },
@@ -1301,8 +1336,10 @@ SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
             },
             // Creative
             type: { type: 'string', enum: ['TEXT_AD', 'SPONSORED_UPDATES', 'SPONSORED_INMAILS', 'DYNAMIC'], description: 'Campaign/creative type.' },
+            creative_id: { type: 'string', description: 'Creative ID or URN. Required for CREATIVE/RETAG_UTM (with campaign_id). Obtain from CREATIVE LIST or audit_ad_utm_coverage.' },
             format: { type: 'string', description: 'Campaign or creative format. DYNAMIC campaigns: JOBS|SPOTLIGHT|FOLLOW_COMPANY. Event campaigns: SPONSORED_UPDATE_EVENT.' },
             reference: { type: 'string', description: 'Post URN for SPONSORED_UPDATES creatives.' },
+            post_urn: { type: 'string', description: 'Post/share URN (urn:li:share:... or urn:li:ugcPost:...). Required for POST/GET. Also accepted as an alias for reference/post_urn on CREATIVE/CREATE.' },
             // Creative — text ad
             headline: { type: 'string', description: 'Text ad headline. Required for CREATIVE/CREATE text ads.' },
             description: { type: 'string', description: 'Text ad description.' },
@@ -3827,8 +3864,8 @@ emmaToolRegistry.register({
     description:
       'Send a one-off email to any recipient using the user\'s CONFIGURED email sender (set up in CRM → Senders). ' +
       'Use this for ad-hoc emails that are NOT tied to a CRM lead draft — e.g. "send an email to alice@example.com". ' +
-      'This does NOT require a connected Gmail account: it sends through the user\'s configured sender (a verified custom-domain sender, or a connected Gmail-account sender). ' +
-      'Prefer this over the `email` tool when the user has no connected Gmail account but has a configured sender. ' +
+      'This does NOT require a connected mailbox: it sends through the user\'s configured sender (a verified custom-domain sender, or a connected Gmail / Outlook mailbox sender). ' +
+      'Prefer this over the `email` tool when the user has no connected mailbox but has a configured sender. ' +
       'If no sender is configured, tell the user to open CRM, select a lead list, and click "Senders" to configure one. ' +
       'IMPORTANT about delivery: a successful result means the email was ACCEPTED for delivery by the provider, NOT that it reached the recipient\'s inbox. Do not claim guaranteed delivery — say it was "sent" or "queued for delivery". The provider cannot detect a well-formed but non-existent mailbox at send time; such messages bounce asynchronously to the sender\'s own inbox. Always double-check the recipient address with the user before sending if it looks suspicious. Malformed addresses are rejected before sending.',
     inputSchema: {
@@ -3857,7 +3894,7 @@ emmaToolRegistry.register({
         },
         sender_id: {
           type: 'string',
-          description: 'Optional sender to send from. Accepts the sender\'s email address, its from-name, the keyword "gmail" (to use the configured Gmail-account sender), or the internal id. Omit to use the user\'s default configured sender. If the value does not match any configured sender, the tool returns the list of available senders (each marked [gmail] or [resend]) — relay those options to the user rather than claiming no sender exists.'
+          description: 'Optional sender to send from. Accepts the sender\'s email address, its from-name, the keyword "gmail" or "outlook" (to use the corresponding connected-mailbox sender), or the internal id. Omit to use the user\'s default configured sender. If the value does not match any configured sender, the tool returns the list of available senders (each marked [gmail], [outlook] or [resend]) — relay those options to the user rather than claiming no sender exists.'
         }
       },
       required: ['to', 'subject']
@@ -4928,13 +4965,23 @@ emmaToolRegistry.register({
           type: 'number',
           description: 'Maximum number of web results to return (default: 5, max: 10)',
           default: 5
+        },
+        freshness: {
+          type: 'string',
+          enum: ['day', 'week', 'month', 'year'],
+          description: "Optional You.com freshness window; use for time-scoped research like 'this week's discussions'."
+        },
+        include_domains: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional domain allowlist, e.g. ["reddit.com"] to restrict results to one site.'
         }
       },
       required: ["query"]
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.youSearchWeb(args.query, args.max_results || 10);
+    return await agentModeService.youSearchWeb(args.query, args.max_results || 10, args.freshness, args.include_domains);
   }
 });
 
@@ -5025,7 +5072,7 @@ emmaToolRegistry.register({
   name: "search_ads_knowledge_base",
   definition: {
     name: "search_ads_knowledge_base",
-    description: "Search Foreplay ad library. Defaults to the user's saved swipefile + boards (free). Set source='discovery' to search Foreplay's global database of millions of ads — use this for competitive intelligence or finding ads from a specific company. IMPORTANT: discovery mode costs 1 Foreplay credit per result — keep max_results small (5–10). For finding a specific company's currently-running Meta ads, use source='discovery' with company_name. Do NOT use search_knowledge_base for Foreplay ad searches. IMPORTANT: This does NOT search the public Meta/Facebook Ads Library — for that, use Playwright to browse https://www.facebook.com/ads/library/.",
+    description: "Search Foreplay ad library. Defaults to the user's saved swipefile + boards (free). Set source='discovery' to search Foreplay's global database of millions of ads — use this for competitive intelligence or finding ads from a specific company. IMPORTANT: discovery mode costs 1 Foreplay credit per result and returns at most 20 ads per call (max_results is capped at 20). For finding a specific company's currently-running Meta ads, or for cataloging/analyzing many ads at scale, this is the RELIABLE source. Targeting: for a SPECIFIC company/brand, pass company_name (optionally with query); for BROAD keyword/theme/category research NOT tied to one company (e.g. cataloging 100 winning B2B ads for 'book a demo'), pass query with niche/format/platform and use sort='newest' + live=true — do NOT force company_name for broad keyword research. To retrieve MORE than 20 ads (e.g. cataloging 100 ads for a scheduled run), page through results: the response returns a `cursor` and `hasMore` — call this tool again with the same filters plus the returned `cursor` to fetch the next page, and repeat until hasMore is false. Do NOT use search_knowledge_base for Foreplay ad searches. NOTE: This does NOT scrape the public Meta/Facebook Ads Library UI. Playwright DOM scraping of https://www.facebook.com/ads/library/ is best-effort only — Meta's DOM virtualization + lazy-loading make it unable to reliably extract ad copy/creative at scale — so prefer source='discovery' (or the official Meta Ad Library API) for any bulk or scheduled ad-creative extraction.",
     inputSchema: {
       type: "object",
       properties: {
@@ -5046,6 +5093,10 @@ emmaToolRegistry.register({
           type: "number",
           description: "Max results to return. Default 5 for swipefile, 10 for discovery (max 20).",
           default: 5
+        },
+        cursor: {
+          type: "string",
+          description: "Pagination cursor for source='discovery'. Omit for the first page; to fetch the next page, pass the `cursor` value returned by the previous call (repeat the same filters). Keep paging while `hasMore` is true to retrieve more than one page (e.g. cataloging many ads)."
         },
         format: {
           type: "array",
@@ -5081,6 +5132,7 @@ emmaToolRegistry.register({
         {
           maxResults: args.max_results || 10,
           companyName: args.company_name,
+          cursor: args.cursor,
           format: args.format,
           platform: args.platform,
           niche: args.niche,
@@ -5960,8 +6012,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    const { bootstrapEmailProviders, resolveEmailAccount } = await import('../services/emailProviderService');
-    const { GmailNotConnectedError, GmailTokenRevokedError, GmailQuotaError, GmailBodyTooLargeError, GmailSendNotAuthorizedError } = await import('../services/gmailService');
+    const { bootstrapEmailProviders, resolveEmailAccount, EmailProviderError } = await import('../services/emailProviderService');
 
     const userId = context?.userId;
     if (!userId) throw new Error('Missing user context');
@@ -6014,10 +6065,8 @@ emmaToolRegistry.register({
           return { error: `Unknown action "${args.action}". Valid actions: search, list, get, send.` };
       }
     } catch (err: any) {
-      if (err instanceof GmailBodyTooLargeError) return { error: err.message };
-      if (err instanceof GmailNotConnectedError || err instanceof GmailTokenRevokedError) return { error: err.message };
-      if (err instanceof GmailQuotaError) return { error: err.message };
-      if (err instanceof GmailSendNotAuthorizedError) return { error: err.message };
+      // Covers every provider (Gmail, Outlook, ...) — they all extend EmailProviderError.
+      if (err instanceof EmailProviderError) return { error: err.message };
       if (err.message?.includes('not found') || err.message?.includes('not an email account')) return { error: err.message };
       throw err;
     }
@@ -8064,19 +8113,33 @@ ACTION MATRIX:
   CAMPAIGN    → LIST, CREATE (name, type, budget_resource_name, bidding_strategy OR bidding_strategy_resource_name, location_target_ids?, brand_business_name?, brand_logo_asset_resource_name?), PAUSE, RESUME, UPDATE (campaign_resource_name, name?, status?, bidding_strategy? OR bidding_strategy_resource_name?, bidding_strategy_target?, budget_resource_name?, final_url_suffix?), REMOVE (campaign_resource_name)
               For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
               Bidding: pass bidding_strategy for a standard (embedded) strategy, OR bidding_strategy_resource_name to attach a portfolio/shared strategy (from BIDDING_STRATEGY LIST) — never both. Switching to a standard strategy detaches any portfolio strategy.
+              LAUNCH GATE: RESUME (or UPDATE with status=ENABLED) enables a campaign — this runs a pre-flight tracking check on the campaign's final URLs. If any URL lacks a detectable GA4/GTM/Google Ads conversion snippet the launch is BLOCKED (result has blocked=true and names the unmeasured URLs). Relay that to the user and help them fix tracking; only pass override_tracking_check=true if they explicitly choose to launch anyway.
   BIDDING_STRATEGY → LIST (portfolio/shared bidding strategies; returns resource_name for use as bidding_strategy_resource_name)
   AD_GROUP    → LIST (campaign_resource_name)
                CREATE (name, campaign_resource_name, type [SEARCH_STANDARD|DISPLAY_STANDARD], cpc_bid_micros?)
                UPDATE (ad_group_resource_name, name?, status?, cpc_bid_micros?, ad_rotation_mode?, target_cpa_micros?, target_roas?)
                REMOVE (ad_group_resource_name)
   KEYWORD     → LIST (ad_group_resource_name), ADD (ad_group_resource_name, keywords[]), ADD_NEGATIVE (keywords[], campaign_resource_name OR ad_group_resource_name), UPDATE (criterion_resource_name, status?, cpc_bid_micros?), REMOVE (criterion_resource_name)
-  AD          → LIST (ad_group_resource_name), CREATE (ad_group_resource_name, type [RESPONSIVE_SEARCH_AD|RESPONSIVE_DISPLAY_AD], headlines[], descriptions[], final_url), UPDATE (ad_resource_name, status?), REMOVE (ad_resource_name)
+  AD          → LIST (ad_group_resource_name), CREATE (ad_group_resource_name, type [RESPONSIVE_SEARCH_AD|RESPONSIVE_DISPLAY_AD], headlines[], descriptions[], final_url), UPDATE (ad_resource_name, status?), REMOVE (ad_resource_name), RETAG_UTM (ad_resource_name)
               NOTE: final_url, headlines, descriptions are ALL immutable after creation — to change any of these, REMOVE and recreate the ad
+              RETAG_UTM (ENG-239 — retrofit UTMs onto an ad found untagged, e.g. via audit_ad_utm_coverage):
+              Writes the UTM suffix to the ad's CAMPAIGN, not the ad — Google's API rejects a direct ad-level
+              write on an existing ad. Merges with whatever the campaign already has (never overwrites existing
+              tracking). This means the change affects EVERY ad in that campaign, not just the one you named —
+              tell the user this explicitly before calling, the same way you would for any change with a wider
+              blast radius than it sounds like. Never call in a loop over multiple ads — single-target only,
+              one ad per call.
   ASSET       → UPLOAD
   CAMPAIGN_ASSET → ATTACH (campaign_resource_name, assets[{fieldType, assetResourceName?, text?}])
               fieldType values: BUSINESS_NAME (use text), LOGO, SQUARE_MARKETING_IMAGE, MARKETING_IMAGE (use assetResourceName)
               Note: brand guidelines are handled automatically in CAMPAIGN CREATE — use ATTACH only for adding additional campaign-level assets after campaign creation
-  ASSET_GROUP → CREATE
+  ASSET_GROUP → CREATE, RETAG_UTM (asset_group_resource_name)
+              RETAG_UTM (ENG-239 — retrofit UTMs onto a PMax asset group found untagged, e.g. via
+              audit_ad_utm_coverage): merges missing UTM keys directly into final_urls (asset groups have no
+              final_url_suffix field). No utm_content — {creative} is unsupported on Performance Max, per
+              Google's own docs. Also omits any key the CAMPAIGN's final_url_suffix already supplies, since an
+              asset group inherits that at delivery — never duplicates. Never call in a loop — single-target
+              only, one asset group per call.
   LOCATION    → SEARCH`,
     inputSchema: {
       type: 'object',
@@ -8097,7 +8160,8 @@ ACTION MATRIX:
         campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE and AD_GROUP LIST.' },
         final_url_suffix: { type: 'string', description: 'Campaign-level Final URL suffix (query params appended to all final URLs, e.g. "utm_source=google&utm_medium=cpc"). For CAMPAIGN UPDATE only.' },
         ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD LIST/ADD/ADD_NEGATIVE/REMOVE, AD LIST/CREATE, AD_GROUP UPDATE.' },
-        ad_resource_name: { type: 'string', description: 'AdGroupAd resource name. Required for AD UPDATE/REMOVE. Obtain from AD LIST.' },
+        ad_resource_name: { type: 'string', description: 'AdGroupAd resource name. Required for AD UPDATE/REMOVE/RETAG_UTM. Obtain from AD LIST.' },
+        asset_group_resource_name: { type: 'string', description: 'Asset group resource name. Required for ASSET_GROUP RETAG_UTM. Obtain from audit_ad_utm_coverage or a GAQL read on asset_group.' },
         brand_business_name: { type: 'string', description: 'Business name for PMax brand guidelines. Required for PERFORMANCE_MAX CAMPAIGN CREATE when brand guidelines are enforced.' },
         brand_logo_asset_resource_name: { type: 'string', description: 'Logo image asset resource name for PMax brand guidelines. Upload via ASSET UPLOAD first.' },
         criterion_resource_name: { type: 'string', description: 'Ad group criterion resource name. Required for KEYWORD REMOVE. Obtain from KEYWORD LIST.' },
@@ -8105,6 +8169,7 @@ ACTION MATRIX:
         keywords: { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, matchType: { type: 'string', enum: ['BROAD', 'PHRASE', 'EXACT'] } }, required: ['text', 'matchType'] }, description: 'Keywords for ADD or ADD_NEGATIVE action.' },
         query: { type: 'string', description: 'Location search query.' },
         status: { type: 'string', enum: ['ENABLED', 'PAUSED'], description: 'Entity status for CREATE or UPDATE.' },
+        override_tracking_check: { type: 'boolean', description: 'Enabling/launching a campaign (CAMPAIGN RESUME, or UPDATE with status=ENABLED) runs a deterministic pre-flight tracking check: each final URL must serve a detectable GA4/GTM/Google Ads conversion snippet, or the launch is BLOCKED (blocked=true, reason="tracking_preflight"). Only set this to true to launch anyway after the user has explicitly confirmed they accept unmeasured/server-side tracking — the override is recorded on the run record. Never set it on your own.' },
         cpc_bid_micros: { type: 'number', description: 'CPC bid in micros for AD_GROUP CREATE or UPDATE.' },
         ad_rotation_mode: { type: 'string', enum: ['OPTIMIZE', 'ROTATE_FOREVER'], description: 'Ad rotation mode for AD_GROUP UPDATE.' },
         target_cpa_micros: { type: 'number', description: 'Ad-group-level target CPA in micros for AD_GROUP UPDATE. Overrides campaign-level target.' },
@@ -8125,7 +8190,7 @@ ACTION MATRIX:
     },
   },
   execute: async (args: any, context: any) => {
-    return await agentModeService.handleCallGoogleAdsApi(context?.userId || context?.agentUserId, args);
+    return await agentModeService.handleCallGoogleAdsApi(context?.userId || context?.agentUserId, args, { sessionId: context?.sessionId });
   },
 });
 
@@ -8577,5 +8642,102 @@ emmaToolRegistry.register({
   execute: async (args: any, context?: any) => {
     if (!context?.userId) return { success: false, message: 'Authentication required' };
     return agentModeService.updateGoogleSheet(args.url_or_id, args.range, args.data, context.userId);
+  },
+});
+
+/**
+ * ENG-239 AC3 — "Existing campaigns are not silently modified; a report/tool lists
+ * campaigns lacking UTMs so the team can opt in per client."
+ *
+ * This is the report. It is STRICTLY READ-ONLY: it audits through an AdReadPort that
+ * exposes no write method, so Emma cannot modify a campaign through this tool. Fixing
+ * an untagged campaign stays a deliberate, per-campaign act by a human, which is what
+ * the AC's "not silently" is protecting — on Meta, re-tagging means swapping the
+ * creative, and that resets the ad's learning phase.
+ */
+const AD_UTM_AUDIT_PORTS = Object.assign(Object.create(null), {
+  meta: metaAdReadPort,
+  google: googleAdReadPort,
+  linkedin: linkedInAdReadPort,
+}) as Record<string, typeof metaAdReadPort>;
+
+emmaToolRegistry.register({
+  name: 'audit_ad_utm_coverage',
+  definition: {
+    name: 'audit_ad_utm_coverage',
+    description:
+      "READ-ONLY. Lists which of an ad account's campaigns are missing UTM tracking on their " +
+      'destination URLs, so leads from them can be attributed back to the ad that produced them. ' +
+      'This tool NEVER modifies a campaign, ad, or URL — it only reports. Use it to decide which ' +
+      'clients to opt in to UTM tagging.\n\n' +
+      'A campaign counts as tagged only if EVERY ad under it carries utm_source, utm_medium and ' +
+      'utm_campaign (utm_content is not required — LinkedIn cannot supply it).\n\n' +
+      'Two kinds of problem are reported SEPARATELY and must not be conflated:\n' +
+      '  • untaggedAdIds  — ads definitely missing a UTM key. Safe to act on.\n' +
+      '  • unreadableAdIds — ads whose destination URL could not be read. These need a HUMAN to ' +
+      'look; do NOT assume they are untagged and do not "fix" them blindly.\n\n' +
+      "Get account_id from list_connected_accounts for the platform.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        platform: {
+          type: 'string',
+          enum: ['meta', 'google', 'linkedin'],
+          description: 'Which ad platform to audit.',
+        },
+        account_id: {
+          type: 'string',
+          description:
+            'The ad account id on that platform (Meta ad account id, Google customer id, or LinkedIn ad account id).',
+        },
+      },
+      required: ['platform', 'account_id'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) {
+      throw new Error('Missing user context');
+    }
+    const platform = String(args?.platform || '').trim();
+    const port = AD_UTM_AUDIT_PORTS[platform];
+    if (!port) {
+      throw new Error(
+        `Unsupported platform "${args?.platform}". Use one of: meta, google, linkedin.`,
+      );
+    }
+    const accountId = String(args?.account_id || '').trim();
+    if (!accountId) {
+      throw new Error('account_id is required — get it from list_connected_accounts.');
+    }
+
+    const campaigns = await auditCampaigns(
+      platform as AdPlatform,
+      context.userId,
+      accountId,
+      port,
+    );
+
+    const needingAction = campaigns.filter((c) => !c.tagged);
+    const unreadableCount = campaigns.reduce((n, c) => n + c.unreadableAdIds.length, 0);
+
+    // Say the unreadable count out loud. Silently folding it into "untagged" would send
+    // someone to swap a creative we never actually managed to read.
+    const message = needingAction.length === 0
+      ? `✅ All ${campaigns.length} campaign(s) on ${platform} carry UTM tracking. Nothing to opt in.`
+      : `${needingAction.length} of ${campaigns.length} campaign(s) on ${platform} need attention.` +
+        (unreadableCount > 0
+          ? ` ${unreadableCount} ad(s) were unreadable — their destination URL could not be parsed, so they need review by a human rather than an automatic fix.`
+          : '');
+
+    return {
+      success: true,
+      message,
+      platform,
+      accountId,
+      totalCampaigns: campaigns.length,
+      campaignsNeedingAction: needingAction.length,
+      unreadableAdCount: unreadableCount,
+      campaigns,
+    };
   },
 });

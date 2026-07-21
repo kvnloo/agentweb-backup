@@ -1,3 +1,84 @@
+## ENG-413: X posting fails silently — 3 code gaps made a read-only grant undiagnosable (2026-07-20)
+
+The live 403 (Reply Guy scheduled chat, all `twitter_manage_post` replies 403'd while reads worked)
+is NOT a code bug — the X Developer App for `clientId` in SM `prod/AgentWeb/Twitter` is set to
+"Read" under *User authentication settings → App permissions*, so X caps the OAuth2 token to read
+regardless of the `tweet.write` we request. That flip (→ "Read and write" + reconnect) is Harsha's
+manual portal change, tracked separately. This PR fixes the three CODE gaps that made the broken
+write path fail *silently*:
+
+1. **Granted-scope persistence** (`routes/twitterAuth.ts`): finalize stored the requested
+   `TWITTER_SCOPES` constant, so the DB claimed `tweet.write` on a token that can't write. Now
+   stores the GRANTED `scope` from the `loginWithOAuth2` token response (twitter-api-v2 types it as
+   `TOAuth2Scope[]`; a `normalizeGrantedScopes` helper also tolerates a space-delimited string).
+2. **Pre-write scope guard** (`services/twitterService.ts`): `getClient`/`withRetryOn401` gained an
+   optional `requiredScope`; every write method (tweet/reply/quote/delete/retweet/like + outreach
+   follow/dm/block/mute/bookmark) now declares its write scope, and the guard throws a clear
+   "connected read-only — reconnect with write permission" error (naming `@handle`) BEFORE any X
+   call when the granted scopes are known and lack it. Assumption: it only blocks when `config.scopes`
+   is a non-empty array (legacy accounts, which stored the full requested list, and unknown/empty
+   scopes defer to X so nothing is bricked). Reads are never guarded.
+3. **X error body surfaced** (`utils/twitterErrors.ts` → both AgentMode twitter catches): the catch
+   collapsed the failure to `error.message` (a bare `Request failed with code 403`), dropping
+   twitter-api-v2 `ApiResponseError.data` (X's real `title`/`detail`/`errors`). `describeXApiError`
+   duck-types on `.data` (works across mock/module boundaries) and surfaces the real payload + HTTP
+   status. Lives in its own util module (not twitterService) because the AgentMode twitter tests
+   fully mock `twitterService`/`connectedAccountsDb` — a helper there would be undefined under mock.
+
+Behaviour-preserving on the success path: a write with `tweet.write` granted still posts unchanged.
+
+## ENG-393: generate_image `missing_brand_logo` no longer blocks first-logo CREATION (2026-07-20)
+
+Customer bug (AgentCapX, no logo on brand guidelines): `generate_image` on the pure text-to-image
+path returned `missing_brand_logo`, blocking a user from generating their FIRST logo — which also
+blocks landing-page generation (needs a logo). Root cause: the ENG-326 gate in
+`agentModeService.generateImage` fires whenever `promptRequestsLogo(prompt)` is true and no logo is
+persisted (no `logo_image`/inputImages). That gate is meant for COMPOSITING an existing brand logo
+("add our logo to this banner") — but "create a logo for X" also mentions "logo", so it over-fired
+on CREATION.
+
+Fix: added `promptCreatesLogo(prompt)` to `services/agentMode/brandLogo.ts` (a pure discriminator:
+creation-verb-directly-modifying-"logo" + logo-noun creation phrases like "logo for", "logo
+design", "logo from scratch"). The gate now also requires `!promptCreatesLogo(prompt)`, so creation
+asks pass through and generate, while compositing asks still gate (composite the persisted logo →
+AC-2, or ask the user when none is persisted → AC-3). Behavior-preserving for ENG-326: all existing
+`agentModeService.generateImage.brandLogo` + `agentModeBrandLogo` tests stay green.
+
+Assumption (no human AC on the issue): intent is "text-to-image logo creation must not require an
+existing logo" without reopening the ENG-326 invented-logo hole — so I split creation vs
+compositing rather than dropping the gate outright (dropping it entirely would regress the shipped
+ENG-326 AC-2/AC-3 tests). Flagged this assumption on the Linear issue. Extreme non-real inputs
+(e.g. "don't create a logo") are out of scope — you wouldn't call generate_image to NOT make one.
+
+Env note (worktree only, not shipped): the primary checkout's shared `node_modules` predates
+origin/main's `@opentelemetry/*` and `twitter-api-v2` deps, so tests/typecheck against main need
+those installed (done at the worktree-root `node_modules` via upward resolution; the primary tree
+is never touched).
+
+## ENG-409: default customer-bug assignee changed Harshit → Manan (2026-07-20)
+
+Directed by Harsha. Customer-filed bug canonicals (`fileBugReport` in `services/intakeService.ts`)
+now default-assign to **Manan Varma** (`cabadf7c-b95d-4455-b9ec-df11d5d83f5f`) instead of Harshit
+Shah (`4c29baa4-…`). The assignee is the hardcoded constant `BUG_DEFAULT_ASSIGNEE_ID` — confirmed
+there is NO `LINEAR_BUG_DEFAULT_ASSIGNEE_ID` env override in the code (an earlier line in this file
+claimed one; corrected). Behaviour is otherwise unchanged: bugs still land in Todo with the same
+funnel-derived priority; feature requests and auto/telemetry issues stay unassigned.
+`intakeService.funnelTriage.test.ts` now pins the Manan UUID.
+
+## ENG-383: local agent relay tools deprecated to stubs (2026-07-17)
+
+The local agent relay (ngrok tunnel to a Codex agent on a Mac) is permanently dead — ngrok account
+suspended (ERR_NGROK_6008) and the host machine is gone (ENG-381/ENG-383). `run_local_agent_task` +
+`check_local_agent_status` are now fail-fast deprecation stubs in `src/emma/localAgentTools.ts`
+(registered so legacy/forced calls get `local_agent_deprecated: …` instead of "tool not found"; no
+network/SM/S3), and both were removed from `DEFAULT_FOUNDATION_TOOLS` and the chatbot customer tool
+list. NOTE: the runtime foundation list is DB-overridable — AW-Settings (Dev- prefixed in dev) key
+`foundation_tools`, loaded in `AgentModeService.initialize()` (per service init, not per request) —
+so the prod setting row must also be updated (data-side, outside this PR). Replacement for web
+research is `you_search_web` (this PR adds optional `freshness` + `include_domains` params for the
+Reddit-digest repoint); full workload replacement tracked in ENG-381.
+`src/scripts/patch-skills-remove-local-agent.ts` strips the tools from all skills' toolNames.
+
 ## ENG-164 phase 1: nodemailer Gmail SMTP path deleted — backend email is Resend-only (2026-07-16)
 
 The 2026-07-02 buy-vs-build audit verdict, executed. `emailService` no longer owns a Gmail SMTP
@@ -518,7 +599,7 @@ Argusoft reported auto-generated Linear bugs whose descriptions say "Priority: H
 `createInternalLinearIssue` (linearService) set only teamId/title/description/labelIds + stateId=Backlog — never `priority`/`assigneeId`. Emma's `report_product_issues` accepts a `priority: High|Medium|Low` param but only rendered it as description text via `issueContext['Priority']` → `contextLines()`. The legacy Notion path (`createOncallItem`) set an Owner + Move-to-Current-Sprint, so the Linear migration had silently regressed triage visibility.
 
 ### Fix
-`FileUserIssueParams.priority` (text) is now mapped onto the Linear priority field in `fileBugReport` (urgent=1/high=2/medium=3/low=4; absent/unknown → Medium — bugs never arrive "No priority" per the board doc). High+ additionally lands `startInTodo` + default bug assignee (Harshit, env override `LINEAR_BUG_DEFAULT_ASSIGNEE_ID`). `getTeamMeta` resolves `todoStateId`; `createInternalLinearIssue` gained optional `priority`/`assigneeId`/`startInTodo`.
+`FileUserIssueParams.priority` (text) is now mapped onto the Linear priority field in `fileBugReport` (urgent=1/high=2/medium=3/low=4; absent/unknown → Medium — bugs never arrive "No priority" per the board doc). High+ additionally lands `startInTodo` + default bug assignee (Manan as of 2026-07-20 / ENG-409; a hardcoded `BUG_DEFAULT_ASSIGNEE_ID` constant — there is NO `LINEAR_BUG_DEFAULT_ASSIGNEE_ID` env override in the code). `getTeamMeta` resolves `todoStateId`; `createInternalLinearIssue` gained optional `priority`/`assigneeId`/`startInTodo`.
 
 ### Assumptions to validate
 - Dup-grouped High re-reports do NOT escalate the existing canonical's priority/state (kept out of scope; the reporter-count modifier in the board doc may want this later).

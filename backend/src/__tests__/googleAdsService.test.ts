@@ -667,6 +667,49 @@ describe('pauseCampaign / resumeCampaign', () => {
   });
 });
 
+describe('getCampaignFinalUrls (ENG-335)', () => {
+  it('collects and de-duplicates final URLs across ads and asset groups', async () => {
+    // First search: ad_group_ad final_urls. Second search: asset_group final_urls.
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [
+        { adGroupAd: { ad: { finalUrls: ['https://acme.com/lp', 'https://acme.com/pricing'] } } },
+        { adGroupAd: { ad: { finalUrls: ['https://acme.com/lp'] } } }, // duplicate
+      ] } })
+      .mockResolvedValueOnce({ data: { results: [
+        { assetGroup: { finalUrls: ['https://acme.com/pmax'] } },
+      ] } });
+
+    const urls = await service.getCampaignFinalUrls('user-123', '1234567890', 'customers/123/campaigns/1');
+    expect(urls.sort()).toEqual([
+      'https://acme.com/lp', 'https://acme.com/pmax', 'https://acme.com/pricing',
+    ]);
+    // Query filters by the campaign resource name and excludes REMOVED entities.
+    expect(mockAxiosPost.mock.calls[0][1].query).toContain("campaign.resource_name = 'customers/123/campaigns/1'");
+    expect(mockAxiosPost.mock.calls[0][1].query).toContain("!= 'REMOVED'");
+  });
+
+  it('returns an empty array when the campaign has no ads or asset groups', async () => {
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [] } })
+      .mockResolvedValueOnce({ data: { results: [] } });
+    const urls = await service.getCampaignFinalUrls('user-123', '1234567890', 'customers/123/campaigns/1');
+    expect(urls).toEqual([]);
+  });
+
+  it('rejects a crafted resource name before it reaches the GAQL query (no query issued)', async () => {
+    await expect(
+      service.getCampaignFinalUrls('user-123', '1234567890', "customers/123/campaigns/1' OR '1'='1"),
+    ).rejects.toThrow(/Invalid Google Ads campaigns resource name/);
+    await expect(
+      service.getCampaignStatus('user-123', '1234567890', 'not-a-resource-name'),
+    ).rejects.toThrow(/Invalid Google Ads campaigns resource name/);
+    await expect(
+      service.getAdGroupCampaign('user-123', '1234567890', "customers/123/adGroups/9'--"),
+    ).rejects.toThrow(/Invalid Google Ads adGroups resource name/);
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+});
+
 describe('searchLocations', () => {
   it('returns location suggestions', async () => {
     mockAxiosPost.mockResolvedValueOnce({
@@ -727,8 +770,25 @@ describe('addNegativeKeywords', () => {
   });
 });
 
+/**
+ * ENG-239: createAd now issues a GAQL read for the campaign's inherited
+ * final_url_suffix before mutating (an ad-level suffix REPLACES the campaign's, so
+ * we must carry it forward rather than destroy it). `search` posts `{ query }` and
+ * `mutate` posts `{ operations }`, so locate the mutate by body shape, not index.
+ */
+function mutateBody(): any {
+  const call = mockAxiosPost.mock.calls.find((c: any) => c[1]?.operations);
+  if (!call) throw new Error('no mutate call was made');
+  return call[1];
+}
+/** Stub the inherited-suffix read: campaign has no suffix of its own. */
+function mockNoInheritedSuffix() {
+  mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ campaign: {} }] } });
+}
+
 describe('createAd (Responsive Search Ad)', () => {
   it('creates RSA with headlines and descriptions', async () => {
+    mockNoInheritedSuffix();
     mockAxiosPost.mockResolvedValueOnce({
       data: { results: [{ resourceName: 'customers/123/adGroupAds/1' }] },
     });
@@ -739,7 +799,7 @@ describe('createAd (Responsive Search Ad)', () => {
       descriptions: ['Description 1', 'Description 2'],
       finalUrl: 'https://example.com',
     });
-    const body = mockAxiosPost.mock.calls[0][1];
+    const body = mutateBody();
     expect(body.operations[0].create.ad.responsiveSearchAd.headlines).toHaveLength(3);
     expect(body.operations[0].create.ad.finalUrls[0]).toBe('https://example.com');
   });
@@ -760,6 +820,7 @@ describe('addNegativeKeywords — adGroup level', () => {
 
 describe('createAd — Responsive Display Ad', () => {
   it('creates RDA with image assets', async () => {
+    mockNoInheritedSuffix();
     mockAxiosPost.mockResolvedValueOnce({
       data: { results: [{ resourceName: 'customers/123/adGroupAds/2' }] },
     });
@@ -771,7 +832,7 @@ describe('createAd — Responsive Display Ad', () => {
       finalUrl: 'https://example.com',
       imageAssetResourceNames: ['customers/123/assets/1'],
     });
-    const body = mockAxiosPost.mock.calls[0][1];
+    const body = mutateBody();
     expect(body.operations[0].create.ad.responsiveDisplayAd).toBeDefined();
     expect(body.operations[0].create.ad.responsiveDisplayAd.marketingImages).toHaveLength(1);
   });
@@ -1068,7 +1129,12 @@ describe('createAssetGroup', () => {
     // Asset group is after text assets (index 3)
     expect(body.mutateOperations[3].assetGroupOperation.create.name).toBe('My Asset Group');
     expect(body.mutateOperations[3].assetGroupOperation.create.campaign).toBe('customers/123/campaigns/1');
-    expect(body.mutateOperations[3].assetGroupOperation.create.finalUrls[0]).toBe('https://example.com');
+    // ENG-239: asset_group has no final_url_suffix field, so Emma merges the UTMs
+    // straight into final_urls (ValueTrack macros pass through un-encoded). No
+    // utm_content: Google's docs mark {creative} unsupported on Performance Max.
+    expect(body.mutateOperations[3].assetGroupOperation.create.finalUrls[0]).toBe(
+      'https://example.com?utm_source=google&utm_medium=paid&utm_campaign={campaignid}',
+    );
   });
 
   it('retries without LOGO links on BRAND_ASSETS_NOT_LINKED_AT_CAMPAIGN_LEVEL error', async () => {

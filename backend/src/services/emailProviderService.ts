@@ -1,15 +1,65 @@
 import { getAccountById } from './connectedAccountsDb';
-import { EmailSummary, EmailDetail, EmailBatchResult } from './gmailService';
+
+// ── Shared email result types ──────────────────────────────────────────────
+// These live here, not in a provider implementation. They used to be imported
+// from gmailService, which made the provider-agnostic module depend on one
+// concrete provider — that does not survive a second provider (ENG-302).
+// gmailService re-exports them, so existing importers keep working.
+
+export interface EmailSummary {
+  id: string;
+  threadId: string;
+  subject: string;
+  from: string;
+  date: string;
+  snippet: string;
+}
+
+export interface EmailDetail extends EmailSummary {
+  to: string;
+  body: string;
+  hasAttachments: boolean;
+}
+
+/** Result for each entry in a batch get — either full detail or a per-message error. */
+export type EmailBatchResult = EmailDetail | { id: string; error: string };
+
+// ── Provider errors ────────────────────────────────────────────────────────
+
+/**
+ * Base class for every email provider's user-facing errors.
+ *
+ * Callers used to enumerate the Gmail error classes by name, which meant a second
+ * provider's errors silently fell through to the generic handler. Catch this
+ * instead — new providers are then covered for free.
+ */
+export class EmailProviderError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EmailProviderError';
+  }
+}
 
 // ── Shared send types ──────────────────────────────────────────────────────
 
+/**
+ * Parameters for sending through a customer's connected mailbox (Gmail / Outlook).
+ *
+ * Note what is NOT here: there is no `from`. The provider sends as the authenticated
+ * mailbox, so a caller-supplied From would be silently discarded on the wire — which is
+ * why a mailbox sender's address is validated at save time instead (crmSenderService).
+ *
+ * resendService has its own, deliberately different `ResendSendParams` (ENG-302): Resend
+ * relays on our behalf and therefore DOES need an explicit `from`, carries `html` and
+ * `text` separately, and means something different by "reply to".
+ */
 export interface SendEmailParams {
   to: string | string[];
   subject: string;
   body: string;
   cc?: string | string[];
   bcc?: string | string[];
-  replyToMessageId?: string; // message ID to reply to (sets thread + headers)
+  replyToMessageId?: string; // provider-native message handle (NOT an RFC Message-ID)
   isHtml?: boolean;          // true = text/html body, false (default) = text/plain
 }
 
@@ -29,9 +79,9 @@ export interface IEmailService {
 
 // ── Supported email platforms ──────────────────────────────────────────────
 
-export type EmailPlatform = 'gmail'; // extend as new providers are added
+export type EmailPlatform = 'gmail' | 'outlook';
 
-export const EMAIL_PLATFORMS: EmailPlatform[] = ['gmail'];
+export const EMAIL_PLATFORMS: EmailPlatform[] = ['gmail', 'outlook'];
 
 // ── Provider registry ──────────────────────────────────────────────────────
 
@@ -77,13 +127,28 @@ export async function resolveEmailAccount(
 }
 
 // ── Lazy provider bootstrap ───────────────────────────────────────────────
-// Import and register Gmail provider on first use (avoids circular imports at module load)
+// Register providers on first use (avoids circular imports at module load).
+//
+// The promise is memoized rather than guarded by a boolean: the previous version
+// set `bootstrapped = true` BEFORE awaiting the dynamic import, so a second
+// concurrent caller returned immediately and then read an empty registry (ENG-300).
 
-let bootstrapped = false;
+let bootstrapPromise: Promise<void> | null = null;
 
 export async function bootstrapEmailProviders(): Promise<void> {
-  if (bootstrapped) return;
-  bootstrapped = true;
-  const { gmailService } = await import('./gmailService');
-  registerEmailProvider('gmail', gmailService);
+  if (!bootstrapPromise) {
+    bootstrapPromise = (async () => {
+      const [{ gmailService }, { outlookService }] = await Promise.all([
+        import('./gmailService'),
+        import('./outlookService'),
+      ]);
+      registerEmailProvider('gmail', gmailService);
+      registerEmailProvider('outlook', outlookService);
+    })().catch((error) => {
+      // Don't cache a failed bootstrap — let the next caller retry.
+      bootstrapPromise = null;
+      throw error;
+    });
+  }
+  return bootstrapPromise;
 }
