@@ -21,6 +21,10 @@ import {
   closeLiveSession,
   hasLiveSession,
 } from './services/liveVoiceService';
+import {
+  ONBOARDING_TELEMETRY_EVENTS,
+  recordOnboardingEvent,
+} from './services/onboardingTelemetry';
 
 dotenv.config();
 
@@ -225,6 +229,50 @@ io.on('connection', (socket: Socket) => {
   socket.on('live:close', ({ sessionId }: { sessionId: string }) => {
     closeLiveSession(sessionId);
     socket.data.liveSessions?.delete(sessionId);
+  });
+
+  socket.on('live:report-issue', async ({
+    sessionId,
+    phase,
+    breadcrumbs,
+  }: {
+    sessionId: string;
+    phase?: string;
+    breadcrumbs?: unknown[];
+  }) => {
+    try {
+      if (!sessionId || !socket.data.liveSessions?.has(sessionId)) {
+        throw new Error('No active voice session for this report');
+      }
+      const userId = getLiveUserId();
+      const safePhase = typeof phase === 'string' ? phase.slice(0, 40) : 'unknown';
+      const safeBreadcrumbs = Array.isArray(breadcrumbs)
+        ? JSON.stringify(breadcrumbs.slice(-25)).slice(0, 2_500)
+        : '[]';
+
+      console.warn('[voiceOnboardingTelemetry] tester reported an issue', {
+        sessionId,
+        userId,
+        phase: safePhase,
+        breadcrumbs: safeBreadcrumbs,
+      });
+      await recordOnboardingEvent(
+        userId,
+        ONBOARDING_TELEMETRY_EVENTS.voiceIssueReported,
+        {
+          sessionId,
+          phase: safePhase,
+          breadcrumbs: safeBreadcrumbs,
+        },
+      );
+      socket.emit('live:report-received', { sessionId });
+    } catch (err: any) {
+      console.error('[voiceOnboardingTelemetry] report failed', err?.message);
+      socket.emit('live:report-error', {
+        sessionId,
+        error: 'Could not save this report. Try again.',
+      });
+    }
   });
 
   // Handle chat messages

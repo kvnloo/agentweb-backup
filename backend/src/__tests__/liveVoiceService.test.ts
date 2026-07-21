@@ -24,6 +24,22 @@ jest.mock('@google/genai', () => ({
   })),
   Modality: { AUDIO: 'AUDIO', TEXT: 'TEXT' },
   MediaResolution: { MEDIA_RESOLUTION_MEDIUM: 'MEDIA_RESOLUTION_MEDIUM' },
+  StartSensitivity: { START_SENSITIVITY_LOW: 'START_SENSITIVITY_LOW' },
+  EndSensitivity: { END_SENSITIVITY_LOW: 'END_SENSITIVITY_LOW' },
+  ActivityHandling: { START_OF_ACTIVITY_INTERRUPTS: 'START_OF_ACTIVITY_INTERRUPTS' },
+}));
+
+jest.mock('../services/onboardingTelemetry', () => ({
+  ONBOARDING_TELEMETRY_EVENTS: {
+    voiceSessionStarted: 'voice_session_started',
+    voiceSessionReady: 'voice_session_ready',
+    voiceFirstAudio: 'voice_first_audio',
+    voiceTurnCompleted: 'voice_turn_completed',
+    voiceInterrupted: 'voice_interrupted',
+    voiceSessionFailed: 'voice_session_failed',
+  },
+  recordOnboardingEvent: jest.fn().mockResolvedValue(undefined),
+  recordOnboardingFailure: jest.fn().mockResolvedValue(undefined),
 }));
 
 const mockAddMessageToSession = jest.fn();
@@ -168,6 +184,22 @@ describe('startLiveSession', () => {
     expect(connectionConfig.systemInstruction.parts[0].text).toContain('General American English');
   });
 
+  it('allows a natural pause before committing the user turn', async () => {
+    makeCallbacks();
+
+    await startLiveSession('session-natural-pause', 'socket-pause', jest.fn(), 'test-user-id');
+
+    const detection = mockLiveConnect.mock.calls[0][0].config
+      .realtimeInputConfig.automaticActivityDetection;
+    expect(detection).toEqual(expect.objectContaining({
+      disabled: false,
+      startOfSpeechSensitivity: 'START_SENSITIVITY_LOW',
+      endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
+    }));
+    expect(detection.prefixPaddingMs).toBeGreaterThanOrEqual(150);
+    expect(detection.silenceDurationMs).toBeGreaterThanOrEqual(1_000);
+  });
+
   it('starting a second session for the same sessionId replaces the old one', async () => {
     const emitFn = jest.fn();
     makeCallbacks();
@@ -257,6 +289,20 @@ describe('sendTextTurn', () => {
 // ---------------------------------------------------------------------------
 
 describe('incoming audio relay', () => {
+  it('tells the browser to clear buffered speech when Gemini confirms an interruption', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-interrupted', 'socket-1', emitFn, 'test-user-id');
+
+    callbacks['onmessage']?.({
+      serverContent: { interrupted: true },
+    });
+
+    expect(emitFn).toHaveBeenCalledWith('live:interrupted', {
+      sessionId: 'session-interrupted',
+    });
+  });
+
   it('emits live:audio event when Gemini returns inline audio data', async () => {
     const emitFn = jest.fn();
     const callbacks = makeCallbacks();
