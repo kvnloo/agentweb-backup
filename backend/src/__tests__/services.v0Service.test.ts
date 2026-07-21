@@ -3083,6 +3083,35 @@ export default function Page() {
           collectMissingInternalImports([mk("app/foo.tsx", `import Bar from "./bar"`)])
         ).toEqual([{ path: "app/foo.tsx", specifier: "./bar" }]);
       });
+
+      it("flags a MISSING dynamic import (await import(...))", () => {
+        // DYNAMIC_IMPORT_PATTERN is scanned too — a dangling `await import("@/...")` is just
+        // as unresolvable at build time as a static one.
+        const result = collectMissingInternalImports([
+          mk(
+            "app/page.tsx",
+            `export default async function P() { const m = await import("@/components/missing-dynamic"); return m; }`
+          ),
+        ]);
+        expect(result).toEqual([
+          { path: "app/page.tsx", specifier: "@/components/missing-dynamic" },
+        ]);
+      });
+
+      it("scans a .ts (non-.tsx) importer for dangling imports", () => {
+        // Both extensions are scanned — a plain .ts module with a dangling relative/@ import
+        // fails the build the same way a .tsx one does.
+        const result = collectMissingInternalImports([
+          mk(
+            "lib/data.ts",
+            `import { helper } from "./helpers"\nimport C from "@/components/gone"\nexport const x = helper;`
+          ),
+        ]);
+        expect(result).toEqual([
+          { path: "lib/data.ts", specifier: "./helpers" },
+          { path: "lib/data.ts", specifier: "@/components/gone" },
+        ]);
+      });
     });
   });
 });
