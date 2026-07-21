@@ -12,8 +12,12 @@ describe('renderCitationMarkers', () => {
   it('resolves a multi-id marker to a comma-separated list', () => {
     expect(renderCitationMarkers('grew 14% {{cite:1,2}}', cites, 'text')).toBe('grew 14% (Grand View Research, Statista)');
   });
-  it('renders markdown links for the markdown format (Slack)', () => {
+  it('renders markdown links for the markdown format (Slack/email)', () => {
     expect(renderCitationMarkers('$5B {{cite:2}}', cites, 'markdown')).toBe('$5B ([Statista](https://statista.com/x))');
+  });
+  it('encodes spaces/parens in the markdown link destination so it does not break', () => {
+    const tricky: Citation[] = [{ id: 1, url: 'https://ex.com/a (b) c', domain: 'ex.com', siteName: 'Ex' }];
+    expect(renderCitationMarkers('v {{cite:1}}', tricky, 'markdown')).toBe('v ([Ex](https://ex.com/a%20%28b%29%20c))');
   });
   it('drops an unresolvable id rather than inventing a source', () => {
     expect(renderCitationMarkers('mystery figure {{cite:9}} here', cites, 'text')).toBe('mystery figure here');
