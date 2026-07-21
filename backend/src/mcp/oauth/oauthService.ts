@@ -57,7 +57,13 @@ export interface OAuthTokenRecord {
   userId: string;
   clientId: string;
   scope: string;
-  expiresAt: number; // epoch seconds (DynamoDB TTL)
+  // DynamoDB TTL attribute for the whole record. Because the refresh token lives
+  // in this same item, this MUST track the refresh-token lifetime — not the short
+  // access-token lifetime — otherwise DynamoDB TTL deletes the refresh token early
+  // and overnight refreshes fail (ENG-455). Access-token validity is tracked by
+  // accessTokenExpiresAt below.
+  expiresAt: number; // epoch seconds (DynamoDB TTL == refresh lifetime)
+  accessTokenExpiresAt?: number; // epoch seconds — when the access token stops being valid
   refreshExpiresAt: number;
   revoked: boolean;
   createdAt: string;
@@ -280,7 +286,10 @@ export class McpOAuthService {
       userId: params.userId,
       clientId: params.clientId,
       scope: params.scope,
-      expiresAt: nowSec + ACCESS_TOKEN_TTL_SEC,
+      // The DynamoDB TTL (expiresAt) keeps the record alive for the full refresh
+      // lifetime so the refresh token survives beyond the 1-hour access token.
+      expiresAt: nowSec + REFRESH_TOKEN_TTL_SEC,
+      accessTokenExpiresAt: nowSec + ACCESS_TOKEN_TTL_SEC,
       refreshExpiresAt: nowSec + REFRESH_TOKEN_TTL_SEC,
       revoked: false,
       createdAt: new Date().toISOString(),
@@ -315,7 +324,11 @@ export class McpOAuthService {
     if (record.revoked) return null;
 
     const nowSec = Math.floor(Date.now() / 1000);
-    if (record.expiresAt <= nowSec) return null;
+    // Access-token expiry is tracked by accessTokenExpiresAt. Fall back to
+    // expiresAt for legacy records issued before ENG-455 (where expiresAt was
+    // the access-token expiry rather than the record/refresh lifetime).
+    const accessExpiresAt = record.accessTokenExpiresAt ?? record.expiresAt;
+    if (accessExpiresAt <= nowSec) return null;
 
     return record;
   }

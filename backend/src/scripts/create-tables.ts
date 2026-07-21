@@ -1642,7 +1642,9 @@ const createMcpOAuthCodesTable = async () => {
   }
 };
 
-// Create MCP OAuth Tokens table (access + refresh tokens, TTL on expiresAt)
+// Create MCP OAuth Tokens table (access + refresh tokens; DynamoDB TTL on
+// expiresAt, which tracks the refresh-token lifetime so the refresh token is not
+// deleted while the short-lived access token expires — see ENG-455)
 const createMcpOAuthTokensTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: `${TABLE_PREFIX}AW-MCPOAuthTokens`,
