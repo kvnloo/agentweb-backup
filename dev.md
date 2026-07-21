@@ -1,3 +1,31 @@
+## ENG-156: Typed tool registry — Zod-schema-per-tool seam at the gateway boundary (2026-07-21)
+
+First slice of the parity-gap fix from `backend/docs/AGENTMODE_MIGRATION.md` ("typed tool registry
+❌"). Stands up a `TypedToolRegistry` (`backend/src/services/agentMode/toolRegistry.ts`) — one Zod
+schema per tool + a Zod→`AgentToolContractIssue` mapper — plus the boundary seam
+`validateToolArgsAtBoundary`, and migrates the first batch of tools (`registeredTools.ts`).
+
+Investigation / assumptions:
+- The gateway boundary is called at exactly TWO sites: the injected dispatch port in
+  `core/toolDispatch.ts` (wired from `agentModeService.ts`) and `agentModeService.executeTool`. Both
+  now route through `validateToolArgsAtBoundary` instead of `validateAndRepairToolArgs` directly.
+- The `AGENT_TOOL_GATEWAY_ENFORCE` flag stays OFF; this seam is orthogonal to policy enforcement — it
+  only changes which validator runs for a *registered* tool.
+- **Behavior-preserving because of design, not luck:** the migrated schemas are `.strict()` and
+  non-transforming, so the set of inputs Zod accepts is exactly the set the legacy validator accepts
+  unchanged; anything the legacy validator would *repair* (alias `search_query→query`, scalar
+  `"5"→5`, key-variant `max-results→max_results`, `null` optionals, JSON stringify) is an input Zod
+  rejects, and on Zod-reject the boundary falls back to the legacy validator. A 42-case parity battery
+  pins `validateToolArgsAtBoundary` ≡ `validateAndRepairToolArgs` for the three migrated tools. The
+  seam is therefore a *provable no-op today*; the intended behavior change (schema absorbs a repair,
+  drop that tool's fallback) is a later gated slice, one PR per tool batch.
+- First batch = foundation read tools only (`you_search_web` / `you_search_news` /
+  `google_search_web`) — pure `read` effect, tiny arg surface, safest to prove the seam. `readOnlyHint`
+  is recorded on each for a future safe-parallel-dispatch slice.
+- `zod` was installed only transitively (3.25.76, hoisted via `@modelcontextprotocol/sdk` +
+  `@langchain/*`). Declared it as a direct dep (`^3.25.76`) so a future hoist to v4 can't silently
+  break these v3 schemas; lockfile updated with the single root-dependency edge.
+
 ## ENG-413: X posting fails silently — 3 code gaps made a read-only grant undiagnosable (2026-07-20)
 
 The live 403 (Reply Guy scheduled chat, all `twitter_manage_post` replies 403'd while reads worked)
