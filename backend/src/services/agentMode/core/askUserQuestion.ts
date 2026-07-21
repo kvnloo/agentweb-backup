@@ -228,6 +228,73 @@ export function applyAnswer(
   };
 }
 
+/** The raw structured selection a client posts on the /generate body. */
+export interface InboundAnswerBody {
+  /** When present, MUST match the pending question's id (stale-card guard). */
+  questionId?: string;
+  /** The picked option's id. Required for a direct pick; ignored for delegation. */
+  optionId?: string;
+  /** True when the user clicked "Let Emma decide" (delegation). */
+  delegated?: boolean;
+}
+
+/**
+ * Resolve an inbound structured selection (from the /generate answer channel)
+ * against the session's pending question, returning the answered question to
+ * persist. Throws AskUserQuestionError on any invalid input.
+ *
+ * The load-bearing property: `answeredBy` is DERIVED here from the `delegated`
+ * flag — it is never read off the client body. A client therefore cannot forge
+ * `'model'` (the type has no such value anyway), so the barrier that the RankAI
+ * incident defeated holds: only a real inbound selection produces an answer.
+ *
+ * Delegation ("Let Emma decide") always resolves to the RECOMMENDED option and
+ * carries its `why` as the logged rationale; a stray `optionId` on a delegated
+ * body is ignored so a delegation click can never become a silent different
+ * choice. A direct pick MUST name a real option.
+ */
+export function resolveInboundAnswer(
+  pending: PendingUserQuestion | null | undefined,
+  body: InboundAnswerBody,
+  at: string,
+): PendingUserQuestion {
+  if (!pending) {
+    throw new AskUserQuestionError('No pending question to answer');
+  }
+  if (pending.status === 'answered') {
+    throw new AskUserQuestionError('Question already answered — cannot re-answer');
+  }
+  if (body.questionId && body.questionId !== pending.questionId) {
+    throw new AskUserQuestionError(
+      `Answer questionId (${body.questionId}) does not match pending question (${pending.questionId})`,
+    );
+  }
+
+  const delegated = body.delegated === true;
+  if (delegated) {
+    const recommended = pending.options.find((o) => o.id === pending.recommendedOptionId);
+    return applyAnswer(pending, {
+      optionId: pending.recommendedOptionId,
+      delegated: true,
+      answeredBy: 'delegation',
+      rationale: recommended?.why
+        ? `Delegated to Emma's recommendation — ${recommended.why}`
+        : "Delegated to Emma's recommendation",
+      at,
+    });
+  }
+
+  if (typeof body.optionId !== 'string' || body.optionId.trim() === '') {
+    throw new AskUserQuestionError('A direct selection must include an optionId');
+  }
+  return applyAnswer(pending, {
+    optionId: body.optionId,
+    delegated: false,
+    answeredBy: 'user',
+    at,
+  });
+}
+
 /**
  * Headless/scheduled policy: may a run with no live human auto-take the
  * recommended option? Only when the parameter is REVERSIBLE and the session

@@ -13,6 +13,7 @@ import { settingsService } from '../services/settingsService';
 import { workPlanService } from '../services/workPlanService';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
+import { resolveInboundAnswer, AskUserQuestionError } from '../services/agentMode/core/askUserQuestion';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
@@ -2827,7 +2828,7 @@ export const agentModeController = {
     let idemKeyHeld: string | undefined;
     try {
       const user = req.user as User;
-      const { sessionId, llmModel, attachments, currentUrl, structuredContext, screenshot, audioInput } = req.body;
+      const { sessionId, llmModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer } = req.body;
       let { userMessage } = req.body;
 
       // If the request contains audio, transcribe it to text first
@@ -2864,6 +2865,37 @@ export const agentModeController = {
       }
       if (session.userId !== user.userId && !user.isAdmin) {
         return res.status(403).json({ error: 'Unauthorized access to session' });
+      }
+
+      // ENG-396: structured AskUserQuestion answer channel. When the chat card
+      // posts a selection, resolve it against the session's pending question and
+      // persist the ANSWERED state BEFORE the run starts, so the consumer gate
+      // (checkQuestionGate — e.g. the Meta objective write, ENG-400) reads a
+      // human-attributed answer from the DB rather than parsing it from prose.
+      // Placed before the idempotency/session locks so a bad selection returns
+      // cleanly with no lock to release. answeredBy is derived server-side inside
+      // resolveInboundAnswer — the client cannot forge who answered.
+      if (questionAnswer) {
+        try {
+          const answered = resolveInboundAnswer(
+            session.pendingUserQuestion,
+            {
+              questionId: questionAnswer.questionId,
+              optionId: questionAnswer.optionId,
+              delegated: questionAnswer.delegated === true,
+            },
+            new Date().toISOString(),
+          );
+          await chatbotDb.updateSessionAskUserQuestion(sessionId, answered);
+        } catch (err) {
+          if (err instanceof AskUserQuestionError) {
+            // Stale/duplicate/invalid selection (e.g. the card was already
+            // answered, or the questionId no longer matches). 409 so the client
+            // can refresh the session and re-render the current question state.
+            return res.status(409).json({ error: err.message, code: 'ASK_USER_QUESTION_INVALID' });
+          }
+          throw err;
+        }
       }
 
       // Cross-restart duplicate-submit lock (ENG-147: one question spawned ~30
