@@ -1196,9 +1196,21 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
     runWaterfall: (input) => pureRunWaterfall(input, {
       fetchApolloOrg: async (lead) => {
         if (!isApolloServiceReady()) return null;
-        const domain = lead.emailDomain || (lead.email ? lead.email.split('@')[1]?.trim() || null : null) || extractDomain(lead.website);
+        // Prefer the website domain (strongest company signal), then the
+        // business emailDomain, then the raw email domain. Mirrors fetchApolloPerson.
+        const domain = extractDomain(lead.website) || lead.emailDomain || extractDomain(lead.email) || null;
         if (!domain) {
           console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:org] SKIP no domain`);
+          return null;
+        }
+        // Personal / institutional domains (gmail, yahoo, .edu, .gov, .ac.*) are
+        // NOT company domains: matchOrg would return the free-mail provider or the
+        // university as the "company" (e.g. alum.mit.edu → MIT, yahoo.com → Yahoo),
+        // which is never the lead's actual employer. Skip so LinkedIn/person data
+        // becomes the source of truth for company. Mirrors the guard in
+        // fetchApolloPerson below.
+        if (CrmEnrichmentService.isPersonalEmailDomain(`x@${domain}`)) {
+          console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:org] SKIP personal/institutional domain=${domain}`);
           return null;
         }
         console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:org] matchOrg domain=${domain}`);
