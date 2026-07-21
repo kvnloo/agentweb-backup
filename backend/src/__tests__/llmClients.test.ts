@@ -1073,6 +1073,19 @@ describe('getGeminiClient', () => {
     process.env.GEMINI_API_KEY = 'test-gemini-key';
   });
 
+  it('metered:false returns a raw (un-metered) client so the caller can charge once', async () => {
+    // describeVideo needs to CHARGE (not just record), so it meters the response
+    // itself via meterUsageFromResponse; the client must not also auto-record (ENG-200).
+    const client: any = await getGeminiClient(meterCtx, undefined, { metered: false });
+    getUnderlyingGeminiGenerate(client).mockResolvedValue({
+      text: 'hi',
+      usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 2 },
+    });
+    await client.models.generateContent({ model: 'gemini-3.5-flash', contents: 'x' });
+    await flush();
+    expect(mockRecordUsage).not.toHaveBeenCalled();
+  });
+
   it('records generateContent usageMetadata and returns the response unmodified', async () => {
     const client: any = await getGeminiClient(meterCtx);
     const sdkResponse = {

@@ -75,6 +75,24 @@ describe('getUserOrgUsageRollup', () => {
     await expect(getUserOrgUsageRollup('missing', '2026-07')).rejects.toThrow('User not found');
   });
 
+  it('fails loud (does NOT silently zero a member) when a member burn query rejects', async () => {
+    // A DynamoDB throttle on one member must reject the whole rollup rather than
+    // return an incomplete-but-successful payload that understates org burn (Greptile).
+    const owner = user({ userId: 'owner', orgId: 'org1', orgRole: 'owner', tokenUsage: { month: '2026-07', totalTokens: 0, totalCost: 5, resetDate: '' } });
+    const member = user({ userId: 'member', orgId: 'org1', orgRole: 'member' });
+    mockGetUser.mockImplementation(async (id: string) => (id === 'owner' ? owner : member));
+    mockGetOrg.mockResolvedValue({ orgId: 'org1', name: 'Org', ownerUserId: 'owner' });
+    mockGetMembers.mockResolvedValue([owner, member]);
+    mockQuery.mockImplementation(async (id: string) => {
+      if (id === 'member') throw new Error('ProvisionedThroughputExceeded');
+      return [row({ userId: 'owner', costMicroUsd: 1_000_000 })];
+    });
+
+    await expect(getUserOrgUsageRollup('owner', '2026-07')).rejects.toThrow(
+      'ProvisionedThroughputExceeded'
+    );
+  });
+
   it('solo user: rolls up only their own burn against their own counter', async () => {
     mockGetUser.mockResolvedValue(
       user({ userId: 'solo', tokenUsage: { month: '2026-07', totalTokens: 0, totalCost: 4, resetDate: '' } })
