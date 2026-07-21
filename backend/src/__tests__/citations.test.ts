@@ -1,5 +1,26 @@
 // ENG-351 Phase 1/2 — citation registry accumulated from Emma's web-search tool results.
-import { CitationRegistry, buildCitationIndexBlock, domainFromUrl, prettySiteName, WEB_SEARCH_TOOL_NAMES } from '../utils/citations';
+import { CitationRegistry, buildCitationIndexBlock, domainFromUrl, prettySiteName, stripCitationMarkers, WEB_SEARCH_TOOL_NAMES } from '../utils/citations';
+
+describe('stripCitationMarkers', () => {
+  it('removes a single marker and the space before it (no dangling space before punctuation)', () => {
+    expect(stripCitationMarkers('The market will reach $163B by 2030 {{cite:2}}.')).toBe('The market will reach $163B by 2030.');
+  });
+  it('removes multi-id and whitespace-tolerant markers, collapsing the leading space', () => {
+    expect(stripCitationMarkers('CAGR is ~14.6% {{cite:2,5}} per year')).toBe('CAGR is ~14.6% per year');
+    expect(stripCitationMarkers('value {{ cite : 3 , 7 }} here')).toBe('value here');
+  });
+  it('removes every marker in a longer body', () => {
+    expect(stripCitationMarkers('A {{cite:1}} and B {{cite:2}} and C {{cite:3}}')).toBe('A and B and C');
+  });
+  it('is a no-op on text without markers and on empty/invalid input', () => {
+    expect(stripCitationMarkers('no markers here (Google Search Console)')).toBe('no markers here (Google Search Console)');
+    expect(stripCitationMarkers('')).toBe('');
+    expect(stripCitationMarkers(undefined as any)).toBe(undefined);
+  });
+  it('does not touch non-cite double-brace text or partial markers', () => {
+    expect(stripCitationMarkers('use {{name}} template and {{cite:}} incomplete')).toBe('use {{name}} template and {{cite:}} incomplete');
+  });
+});
 
 describe('domainFromUrl', () => {
   it('strips protocol and leading www', () => {
