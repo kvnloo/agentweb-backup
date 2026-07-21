@@ -2695,8 +2695,8 @@ function stripTemplatesAndComments(content: string): string {
 }
 
 // ENG-384: module paths the deploy pipeline ALWAYS materialises into the final commit, even
-// when v0's zip omits them — the scaffold block (~line 3156, added `if (!hasFile(...))`) and
-// injectLeadCaptureAttribution. The missing-import check below runs on v0's raw download, so a
+// when v0's zip omits them — the tsconfig scaffold block (the `if (!hasFile(...))` injections)
+// and injectLeadCaptureAttribution. The missing-import check below runs on v0's raw download, so a
 // legitimate import of one of these must not be flagged just because this particular zip left
 // it out. Extensionless, repo-root-relative — compared against a resolved import target.
 const GUARANTEED_SCAFFOLD_MODULE_PATHS = new Set([
@@ -2728,7 +2728,7 @@ const NON_MODULE_IMPORT_EXTENSION = /\.(css|scss|sass|less|styl|json|svg|png|jpe
  * reference anything it didn't deliver" question, answerable before any remap/scaffold step.
  *
  * Resolution follows this codebase's fixed generated-repo convention `@/* -> ./*` (see the
- * scaffold tsconfig ~line 3181): `@/x/y` -> repo-root `x/y`; a relative specifier resolves
+ * tsconfig scaffold block's `paths` mapping): `@/x/y` -> repo-root `x/y`; a relative specifier resolves
  * against the importing file's directory. Extension/`index` probing reuses `moduleExists`.
  *
  * Conservative by construction — anything it cannot judge (bare packages, non-JS assets,
