@@ -22,6 +22,7 @@ import {
   canAutoTakeInHeadless,
   selectedPayload,
   checkQuestionGate,
+  renderQuestionPrompt,
   AskUserQuestionError,
   type AskUserQuestionOption,
   type AskUserQuestionInput,
@@ -351,6 +352,28 @@ describe('checkQuestionGate — the consumer guard (Option A safety, the scary c
 
   it('accepts any answered question when no questionId is supplied', () => {
     expect(checkQuestionGate(answered('leads')).allowed).toBe(true);
+  });
+});
+
+describe('renderQuestionPrompt — text fallback', () => {
+  it('renders the question, numbered options, and marks the recommended one', () => {
+    const text = renderQuestionPrompt(awaitingQuestion());
+    expect(text).toContain('Which Meta campaign objective?');
+    expect(text).toMatch(/1\. Leads —/);
+    expect(text).toMatch(/⭐ Recommended: 162 LEAD events/);
+    expect(text).toMatch(/Let Emma decide/); // allowEmmaDecide true → delegation footer
+  });
+
+  it('omits the delegation footer when allowEmmaDecide is false', () => {
+    const text = renderQuestionPrompt(awaitingQuestion({ allowEmmaDecide: false }));
+    expect(text).not.toMatch(/Let Emma decide/);
+    expect(text).toMatch(/Pick an option above to continue/);
+  });
+
+  it('carries no instruction on how to answer (model cannot self-resolve)', () => {
+    const text = renderQuestionPrompt(awaitingQuestion());
+    expect(text).not.toMatch(/confirm\s*[:=]\s*true/i);
+    expect(text.toLowerCase()).not.toMatch(/call .* again/);
   });
 });
 
