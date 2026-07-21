@@ -5,7 +5,7 @@ import { ChatPromptTemplate } from '@langchain/core/prompts';
 import { JsonOutputParser } from '@langchain/core/output_parsers';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { extractJson, JsonExtractError } from '../services/util/extractJson';
-import { recordUsage } from '../services/usageRecorderService';
+import { meterUserUsage } from '../services/usageRecorderService';
 
 export type OutputFormat = 'json' | 'xml';
 
@@ -133,12 +133,20 @@ export class LLMService {
   }
 
   /**
-   * Shadow-meter a completed call. ALWAYS fired (regardless of onUsage), never
-   * awaited, never throws — metering can't fail or slow a response.
+   * Meter a completed call. ALWAYS fired (regardless of onUsage), never awaited,
+   * never throws — metering can't fail or slow a response.
+   *
+   * Routes through meterUserUsage (not a bare recordUsage): the shadow burn is
+   * always recorded, AND the per-user cost cap is charged whenever a real userId
+   * is attributable (org members resolve to the owner via incrementUserTokenUsage).
+   * With no userId the call degrades to a burn-only record under "system", so
+   * platform/background spend stays absorbed. This closes the ENG-200 gap where
+   * high-volume LLMService features (enrichment, etc.) recorded burn but never
+   * deducted from any quota.
    */
   private meterUsage(usage: LLMUsageData, usageContext?: LLMUsageContext): void {
     try {
-      void recordUsage({
+      meterUserUsage({
         userId: usageContext?.userId,
         sessionId: usageContext?.sessionId,
         model: usage.model,

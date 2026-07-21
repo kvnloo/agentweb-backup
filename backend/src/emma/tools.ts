@@ -4422,7 +4422,8 @@ emmaToolRegistry.register({
       return_transcript: args.return_transcript,
       return_scenes: args.return_scenes,
       start_time: args.start_time,
-      end_time: args.end_time
+      end_time: args.end_time,
+      userId: context?.userId // charge this describe_video spend to the caller (ENG-200)
     });
   }
 });
