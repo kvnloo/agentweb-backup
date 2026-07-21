@@ -1300,7 +1300,8 @@ export async function runScheduledChat(
 ): Promise<{
   scheduleId: string;
   runId: string;
-  status: 'success' | 'failure';
+  // ENG-396: 'pending_user_input' when the run parked on a blocking AskUserQuestion.
+  status: 'success' | 'failure' | 'pending_user_input';
   passed: boolean;
   actualResponse: string;
   actualFunctionCalls: string[];
@@ -1313,6 +1314,8 @@ export async function runScheduledChat(
   attempt: number;
   createdAt: string;
   summary?: string;
+  // Present only on a parked run — links the pending question for the UI.
+  pendingQuestionId?: string;
 }> {
   const now = new Date();
   let sessionId: string = '';
@@ -1602,6 +1605,55 @@ export async function runScheduledChat(
       // if the run admits it left work unfinished, auto-continue before finishing.
       completionGate: true
     });
+
+    // ENG-396: the run parked on a blocking AskUserQuestion with no human present.
+    // It did NOT proceed on a guess. Record a `pending_user_input` outcome and
+    // notify the owner so they can make the choice; this is NOT a failure, so we
+    // early-return BEFORE the oncall/auto-issue path. `sessionId: ''` reuses the
+    // established convention (see error/token paths) so the orchestrator/callers
+    // skip their normal result email — the paused email below carries the link.
+    if (result.parked && result.pendingUserQuestion) {
+      const scheduleUser = await userDb.getUserById(userId);
+      const notifyEmails = (schedule.emailNotifications && schedule.emailNotifications.length > 0)
+        ? schedule.emailNotifications
+        : (scheduleUser?.email ? [scheduleUser.email] : []);
+      if (notifyEmails.length > 0) {
+        await emailService.sendScheduledChatPausedForInputEmail(
+          notifyEmails,
+          schedule.scheduleName,
+          schedule.scheduleId,
+          result.pendingUserQuestion.question,
+          sessionId
+        );
+      }
+
+      const parkedResult = {
+        scheduleId: schedule.scheduleId,
+        runId: preGeneratedRunId || require('uuid').v4(),
+        status: 'pending_user_input' as const,
+        passed: false,
+        actualResponse: result.content,
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: [],
+        functionCallMatches: [],
+        functionCallMisses: [],
+        functionCallDetails: {},
+        executionTime: Date.now() - now.getTime(),
+        // Empty on purpose — suppresses the callers' result email (the paused
+        // email already notified). The pending question id links back for the UI.
+        sessionId: '',
+        pendingQuestionId: result.pendingUserQuestion.questionId,
+        attempt: result.attempts,
+        createdAt: new Date().toISOString(),
+      };
+      try {
+        await scheduleDb.addRunResult(schedule.scheduleId, parkedResult);
+      } catch (error) {
+        console.error('Error saving parked run result:', error);
+      }
+      return parkedResult;
+    }
 
     if (!isTest && process.env.NODE_ENV !== 'test') {
       const hasAssistantMessage = await sessionHasAssistantMessage(sessionId);

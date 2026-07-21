@@ -1139,6 +1139,79 @@ Schedule ID: ${scheduleId}
     }
   },
 
+  // ENG-396: a scheduled/headless run paused because Emma emitted a blocking
+  // AskUserQuestion (e.g. an immutable Meta campaign objective) and there was no
+  // human present to answer it. The run did NOT proceed on a guess — it is waiting
+  // for the owner to make a choice. Deliberately decision-agnostic: the specific
+  // options live in the chat, so this wording is stable regardless of the question.
+  async sendScheduledChatPausedForInputEmail(
+    toEmails: string | string[],
+    scheduleName: string,
+    scheduleId: string,
+    question: string,
+    sessionId?: string
+  ) {
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const openUrl = `${customerFrontendUrl}/agent-mode${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ''}`;
+      const currentDate = new Date().toLocaleDateString('en-US', {
+        year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+      });
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 760px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); }
+            .header { background-color: #f9a825; color: white; padding: 20px; border-radius: 8px 8px 0 0; }
+            .content { padding: 20px; }
+            .question { margin: 12px 0; padding: 14px 16px; background-color: #fff8e1; border-left: 4px solid #f9a825; border-radius: 4px; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #f9a825; color: white !important; padding: 10px 18px; text-decoration: none; border-radius: 4px; margin-top: 10px; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h2 style="margin: 0;">Emma needs your input to continue</h2>
+              <p style="margin: 6px 0 0 0; opacity: 0.92;">${scheduleName}</p>
+            </div>
+            <div class="content">
+              <p>Your scheduled run on ${currentDate} paused because Emma needs you to make a choice before continuing. She did not proceed on a guess.</p>
+              <div class="question">${question}</div>
+              <p>Open the chat to see the options and choose, and the run will pick up from there.</p>
+              <a class="button" href="${openUrl}">Open chat to decide</a>
+            </div>
+            <div class="footer" style="color: #6c757d; font-size: 13px;">Schedule ID: ${scheduleId}</div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `
+Emma needs your input to continue: ${scheduleName}
+
+Your scheduled run on ${currentDate} paused because Emma needs you to make a choice before continuing. She did not proceed on a guess.
+
+${question}
+
+Open the chat to see the options and choose, and the run will pick up from there:
+${openUrl}
+
+Schedule ID: ${scheduleId}
+      `;
+
+      const subject = `🟡 Emma needs your input: ${scheduleName}`;
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      await this.sendEmail(emailList, subject, text, html);
+      console.log(`Scheduled chat paused-for-input email sent to recipients: ${emailList.join(', ')}`);
+    } catch (error) {
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      console.error(`Error sending scheduled chat paused-for-input emails to ${emailList.join(', ')}:`, error);
+    }
+  },
+
   async sendScheduledChatResultEmail(
     toEmails: string | string[],
     scheduleName: string,
