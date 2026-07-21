@@ -2243,13 +2243,17 @@ export class AgentModeService {
    *
    * This decodes the actual bytes with sharp: if they are already a native format it
    * just corrects the label (no re-encode); otherwise it re-encodes to PNG so the
-   * bytes always match a supported media type. On any decode failure it returns the
-   * input unchanged (best effort) rather than throwing.
+   * bytes always match a supported media type. Animated inputs (animated AVIF/HEIC)
+   * re-encode to their first frame — enough to describe a logo.
+   *
+   * On a decode failure it returns the input unchanged (best effort) but sets
+   * `undecodable: true` so the caller can fast-fail with re-upload guidance instead
+   * of burning vision retries on bytes no vision API can read either (ENG-370).
    */
   private static async normalizeImageForVision(
     buffer: Buffer,
     contentType: string
-  ): Promise<{ buffer: Buffer; contentType: string }> {
+  ): Promise<{ buffer: Buffer; contentType: string; undecodable?: boolean; detectedFormat?: string }> {
     let ct = (contentType || '').toLowerCase().trim();
     if (ct === 'image/jpg') ct = 'image/jpeg';
     if (AgentModeService.VISION_NATIVE_MEDIA_TYPES.has(ct)) {
@@ -2267,22 +2271,27 @@ export class AgentModeService {
       const detected = metadata.format ? sharpFormatToMedia[metadata.format] : undefined;
       if (detected) {
         // Bytes are already vision-native; only the content-type header was wrong/missing.
-        return { buffer, contentType: detected };
+        return { buffer, contentType: detected, detectedFormat: metadata.format };
       }
       // Genuinely unsupported encoding (heic/heif/avif/tiff/bmp/svg/...). Convert to PNG.
+      // sharp(buffer) reads only the first frame by default, so animated inputs
+      // collapse to a single describable frame here (no `{ animated: true }`).
       const png = await sharp(buffer).png().toBuffer();
       console.log(
         `AgentMode: normalizeImageForVision converted "${ct || 'unknown'}" (sharp format "${metadata.format}") to image/png, ${png.length} bytes`
       );
-      return { buffer: png, contentType: 'image/png' };
+      return { buffer: png, contentType: 'image/png', detectedFormat: metadata.format };
     } catch (err) {
       console.error(
         'AgentMode: normalizeImageForVision failed to decode/convert image; using original:',
         err instanceof Error ? err.message : err
       );
+      // sharp could not decode the bytes at all — a corrupt file or a codec even
+      // sharp lacks. The vision APIs decode a strict subset of what sharp handles,
+      // so they cannot read it either. Flag it undecodable so the caller fast-fails.
       // Only fall back to a native default when we have no usable label at all, so a
       // missing/empty content-type never yields a `data:;base64,...` URI (ENG-370).
-      return { buffer, contentType: contentType || 'image/png' };
+      return { buffer, contentType: contentType || 'image/png', undecodable: true };
     }
   }
 
@@ -6518,6 +6527,22 @@ export class AgentModeService {
           // matches the bytes. Fixes HEIC/AVIF/TIFF/BMP/SVG logos and mislabeled or
           // octet-stream content-types that otherwise fail silently downstream (ENG-370).
           const normalized = await AgentModeService.normalizeImageForVision(imageBuffer, contentType);
+          if (normalized.undecodable) {
+            // sharp could not decode these bytes, so no vision API can either.
+            // Fast-fail with actionable re-upload guidance instead of burning vision
+            // retries and agent workarounds on an unreadable file (ENG-370).
+            console.warn(
+              `AgentMode: describeImage could not decode uploaded image (content-type "${contentType || 'none'}"); fast-failing with re-upload guidance`
+            );
+            return {
+              success: false,
+              retryable: false,
+              message:
+                `The uploaded file could not be read as an image${contentType ? ` (its content type was "${contentType}")` : ''} — ` +
+                'it may be corrupted or in a format that cannot be decoded. Please re-upload the logo as a PNG or JPEG and try again.',
+              error: 'Image could not be decoded',
+            };
+          }
           imageBuffer = normalized.buffer;
           finalContentType = normalized.contentType;
           // Auto-resize if image exceeds 4MB to stay under Bedrock's 5MB limit
@@ -6610,7 +6635,10 @@ export class AgentModeService {
       console.error('AgentMode: Error describing image:', error);
       return {
         success: false,
-        message: 'Failed to analyze image. Please check that the URL is accessible and contains a valid image.',
+        retryable: false,
+        message:
+          'Failed to analyze the image. It may be inaccessible or in a format that cannot be read. ' +
+          'Please re-upload the logo as a PNG or JPEG and try again.',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
