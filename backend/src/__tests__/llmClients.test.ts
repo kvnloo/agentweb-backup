@@ -404,6 +404,22 @@ describe('getOpenAIClient / getAzureClient', () => {
     expect(mockRecordUsage).not.toHaveBeenCalled();
   });
 
+  it('metered:false returns an UN-metered client (no auto-record) so the caller can meter once', async () => {
+    // Sites that meter explicitly via meterUsageFromResponse (growthGenius,
+    // workflowGen, reportRevision) must NOT also auto-record, or burn is counted
+    // twice (ENG-200). metered:false skips the wrap.
+    const OpenAICtor = jest.requireMock('openai').default as jest.Mock;
+    const chatCreate = jest
+      .fn()
+      .mockResolvedValue({ model: 'gpt-5-chat-2', usage: { prompt_tokens: 5, completion_tokens: 4 } });
+    OpenAICtor.mockImplementationOnce(() => ({ chat: { completions: { create: chatCreate } } }));
+
+    const client: any = getAzureClient(meterCtx, 'gpt-5-chat-2', { metered: false });
+    await client.chat.completions.create({ model: 'gpt-5-chat-2' });
+    await flush();
+    expect(mockRecordUsage).not.toHaveBeenCalled();
+  });
+
   it('wraps chat even when the client exposes no embeddings surface', async () => {
     // Some SDK shapes / test doubles only implement chat.completions. Wrapping
     // must not throw on the missing embeddings surface, and chat stays metered.
@@ -1055,6 +1071,19 @@ describe('getGeminiClient', () => {
     jest.clearAllMocks();
     mockRecordUsage.mockResolvedValue(undefined);
     process.env.GEMINI_API_KEY = 'test-gemini-key';
+  });
+
+  it('metered:false returns a raw (un-metered) client so the caller can charge once', async () => {
+    // describeVideo needs to CHARGE (not just record), so it meters the response
+    // itself via meterUsageFromResponse; the client must not also auto-record (ENG-200).
+    const client: any = await getGeminiClient(meterCtx, undefined, { metered: false });
+    getUnderlyingGeminiGenerate(client).mockResolvedValue({
+      text: 'hi',
+      usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 2 },
+    });
+    await client.models.generateContent({ model: 'gemini-3.5-flash', contents: 'x' });
+    await flush();
+    expect(mockRecordUsage).not.toHaveBeenCalled();
   });
 
   it('records generateContent usageMetadata and returns the response unmodified', async () => {

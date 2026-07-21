@@ -5,19 +5,29 @@
 const mockCreate = jest.fn();
 jest.mock('openai', () =>
   jest.fn().mockImplementation(() => ({
-    // embedText now goes through the metered llmClients factory, which wraps
-    // chat.completions.create and embeddings.create at construction time.
+    // embedText requests an UN-metered client (metered:false) and meters the
+    // response itself via meterUsageFromResponse, so the SDK client is raw here.
     chat: { completions: { create: jest.fn() } },
     embeddings: { create: mockCreate },
   }))
 );
 
+// Keep the real getOpenAIClient (returns the mocked SDK client) but spy on the
+// explicit meter so we can assert embedText charges the user.
+jest.mock('../utils/llmClients', () => ({
+  ...jest.requireActual('../utils/llmClients'),
+  meterUsageFromResponse: jest.fn(),
+}));
+
 // Shadow metering is fire-and-forget; mock it so tests never touch the recorder.
 jest.mock('../services/usageRecorderService', () => ({
   recordUsage: jest.fn().mockResolvedValue(undefined),
+  meterUserUsage: jest.fn(),
 }));
 
 import { embedText } from '../utils/embeddings';
+import { meterUsageFromResponse } from '../utils/llmClients';
+const mockMeter = meterUsageFromResponse as jest.Mock;
 
 describe('embedText', () => {
   beforeEach(() => {
@@ -42,6 +52,27 @@ describe('embedText', () => {
       await embedText('hi', { userId: 'u-9', feature: 'kb_index' })
     ).toEqual([0.4]);
     expect(mockCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it('CHARGES the caller: meters the embedding response with the userId (ENG-200)', async () => {
+    const response = { data: [{ embedding: [0.5] }], usage: { prompt_tokens: 12, total_tokens: 12 } };
+    mockCreate.mockResolvedValue(response);
+    await embedText('index me', { userId: 'u-42', feature: 'kb_index' });
+    // meterUsageFromResponse records AND deducts (userId present) — not shadow-only.
+    expect(mockMeter).toHaveBeenCalledTimes(1);
+    expect(mockMeter).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: 'u-42', feature: 'kb_index' }),
+      response
+    );
+  });
+
+  it('absorbs (no charge) when no userId is attributable — still records under system', async () => {
+    mockCreate.mockResolvedValue({ data: [{ embedding: [0.6] }], usage: { prompt_tokens: 3 } });
+    await embedText('platform text'); // no meterCtx → no userId
+    expect(mockMeter).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: undefined }),
+      expect.anything()
+    );
   });
 
   it('returns null (does not throw) when the API call fails', async () => {
