@@ -1,10 +1,39 @@
 import { WebClient } from "@slack/web-api";
 
+/**
+ * ENG-402 seam: resolve the Slack API base URL the WebClient should target.
+ *
+ * Default (env var unset) → `undefined`, i.e. the real Slack API — behavior-preserving.
+ * When `SLACK_API_BASE` is set it points the client at a test twin / mock server so the
+ * Slack surface can be exercised without hitting production Slack.
+ *
+ * Fail-loud guard: this override exists ONLY for testing. If `SLACK_API_BASE` is ever set
+ * while `NODE_ENV === 'production'` we throw at boot rather than silently talk to a
+ * non-Slack host — no silent swallow, no fallback path.
+ */
+export function resolveSlackApiUrl(
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const base = env.SLACK_API_BASE;
+  if (!base) return undefined;
+  if (env.NODE_ENV === "production") {
+    throw new Error(
+      `[slackService] SLACK_API_BASE is set ("${base}") while NODE_ENV=production. ` +
+        `This env var only exists to point the Slack client at a test twin/mock and must ` +
+        `never be configured in production. Unset SLACK_API_BASE to boot.`,
+    );
+  }
+  return base;
+}
+
 // Initialize Slack Web API client
 let slackClient: WebClient | null = null;
 
 if (process.env.SLACK_BOT_TOKEN) {
-  slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+  const slackApiUrl = resolveSlackApiUrl();
+  slackClient = slackApiUrl
+    ? new WebClient(process.env.SLACK_BOT_TOKEN, { slackApiUrl })
+    : new WebClient(process.env.SLACK_BOT_TOKEN);
 } else {
   console.warn("⚠️ SLACK_BOT_TOKEN not found in environment variables. Slack integration will not work.");
 }
