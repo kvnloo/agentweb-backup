@@ -2694,6 +2694,92 @@ function stripTemplatesAndComments(content: string): string {
   return content.replace(STRIP_TEMPLATES_AND_COMMENTS_PATTERN, " ");
 }
 
+// ENG-384: module paths the deploy pipeline ALWAYS materialises into the final commit, even
+// when v0's zip omits them — the scaffold block (~line 3156, added `if (!hasFile(...))`) and
+// injectLeadCaptureAttribution. The missing-import check below runs on v0's raw download, so a
+// legitimate import of one of these must not be flagged just because this particular zip left
+// it out. Extensionless, repo-root-relative — compared against a resolved import target.
+const GUARANTEED_SCAFFOLD_MODULE_PATHS = new Set([
+  "lib/utils",
+  "app/layout",
+  "middleware",
+  "domainMap",
+]);
+
+// ENG-384: import specifiers whose extension marks them as a NON-JS/TS asset (stylesheet,
+// data, image, font, media). These are not resolved as JS/TS modules — a missing stylesheet is
+// a different failure class, and `./globals.css` is scaffold-provided, so treating it as a
+// module would false-positive. Only extensionless / .ts(x) / .js(x) specifiers are checked.
+const NON_MODULE_IMPORT_EXTENSION = /\.(css|scss|sass|less|styl|json|svg|png|jpe?g|gif|webp|avif|ico|bmp|woff2?|ttf|otf|eot|mp4|webm|mov|mp3|wav|txt|md|mdx|wasm|glb|gltf)$/i;
+
+/**
+ * ENG-384: collect internal imports that reference a file v0 never actually generated.
+ *
+ * The failure this catches (distinct from ENG-374's bare-import denylist): v0 emits a
+ * SYNTACTICALLY legitimate intra-project import — a relative path or the `@/` alias — pointing
+ * at a component it forgot to include in the zip. e.g. `compare-page.tsx` imports
+ * `@/components/compare-table`, but no `compare-table.tsx` exists. The alias resolves correctly;
+ * the target simply does not exist, so `next build` dies with "Module not found". ENG-374's
+ * denylist structurally cannot see this — the specifier is exactly how a real import looks.
+ *
+ * Runs against v0's OWN output (downloaded with `includeDefaultFiles: true`, so shadcn `ui/`
+ * primitives, `lib/utils`, layout, etc. are present), plus GUARANTEED_SCAFFOLD_MODULE_PATHS for
+ * the few files the caller injects later — this is the self-contained "does v0's deliverable
+ * reference anything it didn't deliver" question, answerable before any remap/scaffold step.
+ *
+ * Resolution follows this codebase's fixed generated-repo convention `@/* -> ./*` (see the
+ * scaffold tsconfig ~line 3181): `@/x/y` -> repo-root `x/y`; a relative specifier resolves
+ * against the importing file's directory. Extension/`index` probing reuses `moduleExists`.
+ *
+ * Conservative by construction — anything it cannot judge (bare packages, non-JS assets,
+ * specifiers escaping the repo root) is skipped, so it can only ever flag an import that is
+ * genuinely unresolvable within v0's self-contained output. Pure and exported for direct
+ * unit testing of the resolution logic, separate from the throw trigger in validateV0Output.
+ */
+export function collectMissingInternalImports(
+  files: Array<{ path: string; content: Buffer }>
+): Array<{ path: string; specifier: string }> {
+  const existingPaths = new Set(files.map((f) => f.path));
+  const missing: Array<{ path: string; specifier: string }> = [];
+
+  for (const file of files) {
+    if (!file.path.endsWith(".tsx") && !file.path.endsWith(".ts")) continue;
+
+    const fileDir = path.posix.dirname(file.path);
+    const content = stripTemplatesAndComments(file.content.toString("utf-8"));
+    const specifiers = new Set<string>();
+    for (const match of content.matchAll(STATIC_IMPORT_EXPORT_PATTERN)) specifiers.add(match[1]);
+    for (const match of content.matchAll(DYNAMIC_IMPORT_PATTERN)) specifiers.add(match[1]);
+
+    for (const specifier of specifiers) {
+      const isRelative = specifier.startsWith("./") || specifier.startsWith("../");
+      const isAlias = specifier.startsWith("@/");
+      // Only intra-project imports are ours to resolve. Bare package specifiers are left to
+      // ENG-374's denylist; a scoped `@scope/pkg` (not `@/`) is a real npm package.
+      if (!isRelative && !isAlias) continue;
+      // Non-JS/TS asset imports (css/json/images/…) are not module-resolved here.
+      if (NON_MODULE_IMPORT_EXTENSION.test(specifier)) continue;
+
+      // Resolve to a repo-root-relative, extensionless module path.
+      const target = isAlias
+        ? specifier.slice(2)
+        : path.posix.normalize(path.posix.join(fileDir, specifier));
+
+      // Escapes the repo root (or is absolute) — we cannot say what it points at; skip rather
+      // than emit a confident false positive.
+      if (target.startsWith("..") || target.startsWith("/") || target === "" || target === ".") continue;
+
+      const normalized = target.replace(/\/+$/, "");
+      if (GUARANTEED_SCAFFOLD_MODULE_PATHS.has(normalized)) continue;
+      if (moduleExists(normalized, existingPaths)) continue;
+
+      missing.push({ path: file.path, specifier });
+    }
+  }
+
+  return missing;
+}
+
 /**
  * Validate that unzipped v0 output contains actual React/Next.js code.
  * Rejects: empty output, markdown/prompts echoed back, files too small to be real code.
@@ -2790,6 +2876,21 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
     throw new V0OutputValidationError(
       `Bare import(s) of internal concepts that are not real npm packages — ${details} ` +
       `(use a relative path or the @/ alias instead)`
+    );
+  }
+
+  // 7. Missing-file check (ENG-384): v0 sometimes references an intra-project file it never
+  // generated — a relative or `@/`-aliased import (syntactically a perfectly real import, so
+  // check 6 structurally cannot catch it) that resolves to no file in what v0 actually shipped.
+  // `next build` then dies with "Module not found". Collected across ALL files before throwing
+  // (mirroring check 6) so ONE correction message can name every missing file and v0 can
+  // regenerate them all in a single retry round, rather than burning the budget one at a time.
+  const missingImports = collectMissingInternalImports(files);
+  if (missingImports.length > 0) {
+    const details = missingImports.map((m) => `${m.path}: "${m.specifier}"`).join("; ");
+    throw new V0OutputValidationError(
+      `Import(s) reference a file that was not generated — ${details}. ` +
+      `Generate the missing component/module file(s) so every import resolves.`
     );
   }
 
