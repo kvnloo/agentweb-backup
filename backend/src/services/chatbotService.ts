@@ -23,6 +23,7 @@ import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
 import { incrementUserTokenUsage } from './tokenUsageService';
 import { computeCostMicroUsd } from './usageRecorderService';
 import { approvalDb } from './approvalDb';
+import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -192,6 +193,11 @@ export interface ChatSession {
     autocomplete?: boolean; // When true, Emma MUST complete each step before responding to the user
   };
   contextLimitReported?: boolean; // True once a context-limit issue report has been auto-filed
+  // ENG-396: the single structured question Emma is currently blocked on (if any).
+  // Persisted so the answer is read STRUCTURALLY by the next tool call (never
+  // re-parsed from prose) and so an unanswered gate survives run boundaries as a
+  // parked pending_user_input state. Mirrors the workPlan persistence pattern.
+  pendingUserQuestion?: PendingUserQuestion;
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
@@ -2648,6 +2654,45 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session result endpoint metadata:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * ENG-396: persist (or clear) the session's blocking AskUserQuestion.
+   * Pass a PendingUserQuestion to set it (status 'awaiting' when posed,
+   * 'answered' once the user selects); pass null to clear it after the
+   * consumer has read the answer. Mirrors updateSessionWorkPlan — a targeted
+   * SET/REMOVE so subsequent tool calls read session.pendingUserQuestion
+   * directly rather than parsing prose.
+   */
+  async updateSessionAskUserQuestion(
+    sessionId: string,
+    pendingUserQuestion: PendingUserQuestion | null,
+  ): Promise<ChatSession> {
+    const params = pendingUserQuestion
+      ? {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: "SET pendingUserQuestion = :pendingUserQuestion, adminListPartition = :adminListPartition",
+          ExpressionAttributeValues: {
+            ":pendingUserQuestion": pendingUserQuestion,
+            ":adminListPartition": "all",
+          },
+          ReturnValues: "ALL_NEW",
+        }
+      : {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: "REMOVE pendingUserQuestion",
+          ReturnValues: "ALL_NEW",
+        };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session AskUserQuestion:", error);
       throw error;
     }
   }

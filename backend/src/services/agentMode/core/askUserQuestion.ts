@@ -1,0 +1,253 @@
+/**
+ * AskUserQuestion primitive (ENG-396) — a structured, blocking option-select
+ * prompt Emma can emit in chat. Modeled on Claude Code's AskUserQuestion.
+ *
+ * WHY THIS EXISTS (incident 2026-07-19, sessions e2fd937d… / ecae640e…):
+ * RankAI Meta campaigns launched optimizing for LANDING_PAGE_VIEWS — an
+ * IMMUTABLE Meta parameter (campaign objective) that no human ever chose. Emma
+ * DEFAULTED it (creation idx=20), then DEFEATED its own confirmation gate by
+ * re-issuing the create with `confirm:true` inside the SAME turn (idx=205), so
+ * the loop's post-dispatch halt (`collectConfirmationPrompt` → break) fired only
+ * AFTER the live mutation had run. Because the objective is immutable, the fix
+ * was a full clone-and-kill rebuild (repair session). See
+ * memory/ note + the ticket for the full trace.
+ *
+ * The two structural lessons this module encodes:
+ *   1. A gate keyed on a flag the MODEL controls (`confirm:true`) is not a
+ *      barrier. An answer is only trustworthy when it is attributable to an
+ *      inbound USER action — never to a model-emitted argument. This module
+ *      makes that a TYPE-LEVEL invariant: `answeredBy` is `'user' | 'delegation'`
+ *      only. There is deliberately NO `'model'` — the model cannot construct a
+ *      valid answer, so the run cannot self-resolve the question.
+ *   2. A recommendation is the product. Exactly ONE option is flagged
+ *      Recommended with a one-line why, and every option carries the concrete
+ *      machine `payload` it implies so a selection DETERMINISTICALLY sets the
+ *      parameter — no re-inference, no drift (the LEADS→TRAFFIC flip between
+ *      idx=202 and idx=205 was re-inference drift).
+ *
+ * This module is PURE (no I/O). Persistence lives in chatbotService
+ * (`updateSessionAskUserQuestion`); loop/tool wiring lives in agentModeService;
+ * the structured answer channel lives in the /generate controller. Scope is
+ * deliberately minimal (no generic requires_structured_choice framework) — the
+ * first and only consumer is the Meta campaign-objective gate (ENG-400).
+ */
+
+/** One selectable option on the card. */
+export interface AskUserQuestionOption {
+  /** Stable id the frontend returns on selection (never re-parsed from prose). */
+  id: string;
+  /** Short button label, e.g. "Leads". */
+  label: string;
+  /** One-line consequence of picking this option. */
+  consequence: string;
+  /** Exactly one option in a question is recommended, with a one-line `why`. */
+  recommended?: boolean;
+  /** One-line justification, REQUIRED on the recommended option (the product). */
+  why?: string;
+  /** Concrete machine parameters this option implies. The consumer applies this
+   *  verbatim so selection is deterministic (no model re-inference). */
+  payload?: Record<string, unknown>;
+}
+
+export type AskUserQuestionStatus = 'awaiting' | 'answered';
+
+/** Who supplied the answer. Deliberately excludes the model — see file header. */
+export type AskUserQuestionAnsweredBy = 'user' | 'delegation';
+
+export interface AskUserQuestionAnswer {
+  /** The chosen option's id. */
+  optionId: string;
+  /** True when reached via "Let Emma decide" (delegation), false on direct pick. */
+  delegated: boolean;
+  /** 'user' = explicit human selection; 'delegation' = explicit delegation click
+   *  or a policy-permitted headless auto-take of the recommendation. */
+  answeredBy: AskUserQuestionAnsweredBy;
+  /** For delegated answers: why the recommended option was taken (logged). */
+  rationale?: string;
+  /** ISO timestamp the answer landed. */
+  at: string;
+}
+
+export interface PendingUserQuestion {
+  /** Correlates the card, the persisted state, and the inbound selection. */
+  questionId: string;
+  /** The question text shown on the card. */
+  question: string;
+  /** 2–4 options; exactly one recommended. */
+  options: AskUserQuestionOption[];
+  /** Id of the single recommended option (redundant with the flag, kept in sync
+   *  by construction so consumers/headless auto-take need not re-scan options). */
+  recommendedOptionId: string;
+  /** True when the parameter is IRREVERSIBLE (e.g. Meta campaign objective).
+   *  Headless/scheduled runs must PARK such questions and never auto-take. */
+  immutable: boolean;
+  /** When true, the card shows a "Let Emma decide" delegation button. */
+  allowEmmaDecide: boolean;
+  status: AskUserQuestionStatus;
+  createdAt: string;
+  /** Present only once status === 'answered'. */
+  answer?: AskUserQuestionAnswer;
+}
+
+/** Input shape a tool/consumer passes to construct a question (pre-validation). */
+export interface AskUserQuestionInput {
+  questionId: string;
+  question: string;
+  options: AskUserQuestionOption[];
+  immutable?: boolean;
+  allowEmmaDecide?: boolean;
+  createdAt: string;
+}
+
+export class AskUserQuestionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AskUserQuestionError';
+  }
+}
+
+const MIN_OPTIONS = 2;
+const MAX_OPTIONS = 4;
+
+/**
+ * Validate the option set and return the single recommended option's id.
+ * Throws AskUserQuestionError on any structural violation. Kept separate so the
+ * tool handler can validate before persisting and the tests can assert each rule.
+ */
+export function resolveRecommendedOptionId(options: AskUserQuestionOption[]): string {
+  if (!Array.isArray(options) || options.length < MIN_OPTIONS || options.length > MAX_OPTIONS) {
+    throw new AskUserQuestionError(
+      `AskUserQuestion requires ${MIN_OPTIONS}–${MAX_OPTIONS} options, got ${Array.isArray(options) ? options.length : 'none'}`,
+    );
+  }
+
+  const ids = new Set<string>();
+  for (const opt of options) {
+    if (!opt || typeof opt.id !== 'string' || opt.id.trim() === '') {
+      throw new AskUserQuestionError('Each option needs a non-empty id');
+    }
+    if (ids.has(opt.id)) {
+      throw new AskUserQuestionError(`Duplicate option id: ${opt.id}`);
+    }
+    ids.add(opt.id);
+    if (typeof opt.label !== 'string' || opt.label.trim() === '') {
+      throw new AskUserQuestionError(`Option ${opt.id} needs a non-empty label`);
+    }
+    if (typeof opt.consequence !== 'string' || opt.consequence.trim() === '') {
+      throw new AskUserQuestionError(`Option ${opt.id} needs a one-line consequence`);
+    }
+  }
+
+  const recommended = options.filter((o) => o.recommended === true);
+  if (recommended.length !== 1) {
+    // The recommendation is the whole product — never zero, never ambiguous.
+    throw new AskUserQuestionError(
+      `Exactly one option must be recommended, got ${recommended.length}`,
+    );
+  }
+  if (typeof recommended[0].why !== 'string' || recommended[0].why.trim() === '') {
+    throw new AskUserQuestionError('The recommended option needs a one-line `why`');
+  }
+  return recommended[0].id;
+}
+
+/**
+ * Construct a validated PendingUserQuestion in the `awaiting` state. This is the
+ * ONLY sanctioned way to create one — it guarantees the exactly-one-recommended
+ * invariant and keeps recommendedOptionId in sync with the flag.
+ */
+export function buildPendingUserQuestion(input: AskUserQuestionInput): PendingUserQuestion {
+  if (typeof input.questionId !== 'string' || input.questionId.trim() === '') {
+    throw new AskUserQuestionError('questionId is required');
+  }
+  if (typeof input.question !== 'string' || input.question.trim() === '') {
+    throw new AskUserQuestionError('question text is required');
+  }
+  const recommendedOptionId = resolveRecommendedOptionId(input.options);
+  return {
+    questionId: input.questionId,
+    question: input.question,
+    options: input.options,
+    recommendedOptionId,
+    immutable: input.immutable === true,
+    allowEmmaDecide: input.allowEmmaDecide === true,
+    status: 'awaiting',
+    createdAt: input.createdAt,
+  };
+}
+
+/** Fields an inbound answer supplies (from the /generate structured channel). */
+export interface ApplyAnswerInput {
+  optionId: string;
+  delegated: boolean;
+  answeredBy: AskUserQuestionAnsweredBy;
+  rationale?: string;
+  at: string;
+}
+
+/**
+ * Transition an awaiting question to answered. Enforces every invariant that
+ * the incident violated:
+ *   - the question must still be awaiting (no double-answer / no re-answer of a
+ *     resolved gate — the idx=205 same-turn re-issue would be rejected here);
+ *   - the optionId must be a real option;
+ *   - answeredBy must be 'user' or 'delegation' (the type already forbids
+ *     'model', but we re-check defensively against untyped call sites);
+ *   - a delegated answer must resolve to the recommended option (delegation
+ *     means "take Emma's recommendation", never a silent different choice).
+ * Returns a NEW question object (does not mutate the input).
+ */
+export function applyAnswer(
+  question: PendingUserQuestion,
+  input: ApplyAnswerInput,
+): PendingUserQuestion {
+  if (question.status === 'answered') {
+    throw new AskUserQuestionError('Question already answered — cannot re-answer');
+  }
+  if (input.answeredBy !== 'user' && input.answeredBy !== 'delegation') {
+    // The model can never be the answerer — this is the core barrier.
+    throw new AskUserQuestionError(`Invalid answeredBy: ${String(input.answeredBy)}`);
+  }
+  const option = question.options.find((o) => o.id === input.optionId);
+  if (!option) {
+    throw new AskUserQuestionError(`Unknown optionId: ${input.optionId}`);
+  }
+  if (input.delegated && input.optionId !== question.recommendedOptionId) {
+    throw new AskUserQuestionError('Delegated answers must select the recommended option');
+  }
+  return {
+    ...question,
+    status: 'answered',
+    answer: {
+      optionId: input.optionId,
+      delegated: input.delegated,
+      answeredBy: input.answeredBy,
+      rationale: input.rationale,
+      at: input.at,
+    },
+  };
+}
+
+/**
+ * Headless/scheduled policy: may a run with no live human auto-take the
+ * recommended option? Only when the parameter is REVERSIBLE and the session
+ * explicitly allows delegation. Immutable parameters (the ENG-396 case) must
+ * ALWAYS park as pending_user_input and notify — never auto-pick. This is the
+ * codified form of the repair session's manual "Never guess a pixel ID" rule.
+ */
+export function canAutoTakeInHeadless(
+  question: PendingUserQuestion,
+  sessionAllowsDelegation: boolean,
+): boolean {
+  return !question.immutable && question.allowEmmaDecide && sessionAllowsDelegation;
+}
+
+/**
+ * Resolve the answer's concrete machine payload for the consumer to apply
+ * verbatim (deterministic — no model re-inference). Returns undefined if the
+ * question is unanswered or the selected option carried no payload.
+ */
+export function selectedPayload(question: PendingUserQuestion): Record<string, unknown> | undefined {
+  if (question.status !== 'answered' || !question.answer) return undefined;
+  return question.options.find((o) => o.id === question.answer!.optionId)?.payload;
+}
