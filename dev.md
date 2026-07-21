@@ -1,3 +1,30 @@
+## ENG-278: Private-S3 images render blank in generated HTML reports (2026-07-21)
+
+Root cause: `create_html_file` uploads whatever `<img src>` the LLM writes. When those srcs point at
+our own bucket (`agentweb-user-files`), the object is private, so a browser rendering the report
+fetches the URL anonymously and gets a 403 → blank image. There was no path to embed the bytes.
+
+Fix (documents only): after the LLM renders the HTML and before the S3 upload, scan `<img src>` for
+URLs that resolve to a key in our bucket, fetch the bytes server-side via the S3 SDK
+(`getS3ObjectAsBuffer`, credentialed — reaches private objects a public fetch can't), and rewrite the
+src to a `data:<mime>;base64,...` URI. Core transform is a pure module (`utils/inlineS3Images.ts`)
+parameterised by an injected fetcher, so it unit-tests with a mocked S3 (no network).
+
+Assumptions / scope decisions:
+- **Emails are NOT inlined** — the email system prompt mandates absolute https:// image URLs; many
+  clients strip or size-limit base64. Inlining runs only for `documentType==='document'`.
+- **Best-effort, degrade to the pre-existing behaviour**: a per-image fetch failure is logged
+  (`failed` counter) and leaves the original URL — it never fails HTML creation (which previously
+  succeeded, just with a blank image). The whole inline step is also wrapped so it can never break
+  `create_html_file`.
+- **Bucket detection** reuses `extractS3KeyFromUrl` (virtual-hosted + path style) against
+  `AWS_S3_BUCKET` (default `agentweb-user-files`). Non-our-bucket / third-party / relative image srcs
+  and existing `data:` URIs are left untouched — behaviour-preserving when there's nothing to inline.
+- MIME: prefer an `image/*` ContentType on the object; else infer from the URL extension.
+- Deferred (not needed to fix the bug): a per-image byte cap for pathologically large images, and
+  extending inlining to `update_html_file`. Noted for follow-up if huge-report HTML size becomes a
+  concern.
+
 ## ENG-413: X posting fails silently — 3 code gaps made a read-only grant undiagnosable (2026-07-20)
 
 The live 403 (Reply Guy scheduled chat, all `twitter_manage_post` replies 403'd while reads worked)
