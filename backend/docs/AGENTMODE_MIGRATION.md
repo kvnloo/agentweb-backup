@@ -74,7 +74,7 @@ Baseline = `origin/harsha/swarm` at commit 47e3594c (post reliability-v1 #1882).
 - ✅ Learning-loop gate built (Slack-reaction ApprovalGate stamps `shippedAt`) — ⚠️ OFF by default
 - ✅ Fragility fixes shipped (worker-crash lock, concurrent-claim race, O(n²) trim, SSE zombie, alert flood) — #1882
 - 🟡 Small composable core loop — **IN PROGRESS** (characterization harness + core scaffold + termination + tool-dispatch boundary extracted)
-- ❌ Typed tool registry at the boundary (gateway exists; not yet a typed-registry abstraction — `core/types.ts` defines the target interface)
+- 🟡 Typed tool registry at the boundary — **IN PROGRESS** (ENG-156: `TypedToolRegistry` + `validateToolArgsAtBoundary` seam live at the gateway boundary; first read-tool batch migrated to Zod schemas, behavior-preserving via legacy fallback — `core/types.ts` still the north-star interface to converge on)
 - ❌ Idempotent / resumable runs keyed by run id (runId threaded for telemetry only)
 - ❌ Streaming as an explicit contract
 
@@ -220,3 +220,25 @@ snapshot job adds one without touching the chat path.
   Monolith 24,213 → **23,895 (−318 net — first net-negative slice)**; core prod 279 → 801. Seams 2/6.
   Left inline: counter-flush DB calls, onProgress events, anti-loop detection (loop-state, later seams).
   **Outcome: GREEN.** Branch `swarm/agentmode-core-dispatch` → PR vs `harsha/swarm` (not merged).
+- **2026-07-21 · Typed tool registry seam (ENG-156, slice 1)** — stood up the typed-tool-registry
+  boundary the parity checklist was missing. New pure modules `services/agentMode/toolRegistry.ts`
+  (`TypedToolRegistry` + `validateToolArgsAtBoundary` + Zod→`AgentToolContractIssue` mapper) and
+  `services/agentMode/registeredTools.ts` (first migrated batch: the three foundation read tools
+  `you_search_web` / `you_search_news` / `google_search_web`, one `.strict()` Zod schema each,
+  `readOnlyHint` recorded for a future parallel-dispatch slice). Wired LIVE at both gateway-boundary
+  call sites in the monolith (the injected dispatch port + `executeTool`) by swapping
+  `validateAndRepairToolArgs` → `validateToolArgsAtBoundary` (2 call sites; the now-orphaned import
+  removed). Registered tool → Zod (authoritative on accept); Zod-reject or unregistered → legacy
+  `validateAndRepairToolArgs` stays authoritative, so alias/scalar/JSON repairs are untouched.
+  **Behavior-preserving proof:** because the migrated schemas are `.strict()` + non-transforming,
+  every input Zod accepts the legacy validator also accepts unchanged, and every input the legacy
+  validator would repair Zod rejects (→ legacy runs) — pinned by a 42-case parity battery asserting
+  `validateToolArgsAtBoundary` ≡ `validateAndRepairToolArgs` across clean / missing / empty /
+  wrong-type / alias / coercion / unknown-key / key-variant / null / enum-miss / non-object inputs
+  for all three tools. `npx tsc` clean on the change (pre-existing OTel/twitter-api-v2 module-resolution
+  errors are worktree-node_modules artifacts, unrelated). Registry + parity + gateway suites green
+  (53 registry, gateway suite unchanged). Declared `zod ^3.25.76` as a direct dependency (was only
+  transitive). Monolith net ≈ 0 (2 call sites swapped, 1 import removed). Seam is live but currently
+  a provable no-op for the migrated tools; the intentional behavior change (schema takes over a repair,
+  drop the per-tool fallback) is the next slice, one PR per tool batch.
+  Follow-up: **ENG-156 slice 2** — migrate the next tool batch and start retiring per-tool ad-hoc repair.
