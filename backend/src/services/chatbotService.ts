@@ -17,6 +17,7 @@ import { getGCSPPrivateKey, getSecret } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService } from './agentModeService';
 import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
+import { Citation } from '../utils/citations';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
@@ -136,6 +137,7 @@ export interface ChatMessage {
     };
     kind?: string;                      // Stable marker for system messages (e.g. 'image-generated')
     imageFilename?: string;             // Filename when kind === 'image-generated'
+    citations?: Citation[];             // ENG-351: de-duplicated web sources this message consulted (ChatGPT-style Sources UI)
   };
 }
 
