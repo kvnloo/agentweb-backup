@@ -296,12 +296,18 @@ function wrapOpenAICompatible(client: OpenAI, provider: string, ctx: MeterContex
   return client;
 }
 
-/** Metered OpenAI direct client. */
+/**
+ * Metered OpenAI direct client. Pass `opts.metered = false` to get the raw client
+ * when the caller meters the response itself (meterUsageFromResponse) — otherwise
+ * the factory's auto-record plus an explicit meter would double-count (ENG-200).
+ */
 export function getOpenAIClient(
   meterCtx: MeterContext,
-  options?: ConstructorParameters<typeof OpenAI>[0]
+  options?: ConstructorParameters<typeof OpenAI>[0],
+  opts?: { metered?: boolean }
 ): OpenAI {
   const client = new OpenAI(options ?? { apiKey: process.env.OPENAI_API_KEY });
+  if (opts?.metered === false) return client;
   return wrapOpenAICompatible(client, "openai", meterCtx);
 }
 
