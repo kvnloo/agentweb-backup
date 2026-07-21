@@ -1771,3 +1771,68 @@ describe('ImageService', () => {
   });
 });
 
+describe('ImageService.getAzureImageConfig (ENG-410 endpoint migration)', () => {
+  // The legacy endpoint lived in departed co-founder Rui's personal Azure account.
+  const LEGACY_ENDPOINT = 'https://ai-ruiwangwarm7085ai345967089938.services.ai.azure.com';
+  const mockGetSecret = secretsManager.getSecret as jest.Mock;
+  const ORIG_ENV = process.env.NODE_ENV;
+  let svc: ImageService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    svc = new ImageService();
+    process.env.NODE_ENV = 'production';
+  });
+  afterEach(() => {
+    process.env.NODE_ENV = ORIG_ENV;
+  });
+
+  it('legacy raw-key secret → key + legacy endpoint (behaviour-preserving)', async () => {
+    mockGetSecret.mockResolvedValue('rawkey123');
+    const cfg = await (svc as any).getAzureImageConfig('gpt-image-1');
+    expect(cfg).toEqual({ apiKey: 'rawkey123', endpoint: LEGACY_ENDPOINT });
+    expect(mockGetSecret).toHaveBeenCalledWith('prod/AgentWeb/Azure/Image');
+  });
+
+  it('JSON secret → apiKey + endpoint, trailing slash stripped', async () => {
+    mockGetSecret.mockResolvedValue(
+      JSON.stringify({ apiKey: 'newkey', endpoint: 'https://agentweb-imagegen-prod.cognitiveservices.azure.com/' }),
+    );
+    const cfg = await (svc as any).getAzureImageConfig('gpt-image-2');
+    expect(cfg).toEqual({
+      apiKey: 'newkey',
+      endpoint: 'https://agentweb-imagegen-prod.cognitiveservices.azure.com',
+    });
+  });
+
+  it('JSON secret with "key" alias also works', async () => {
+    mockGetSecret.mockResolvedValue(JSON.stringify({ key: 'aliaskey', endpoint: 'https://x.azure.com' }));
+    const cfg = await (svc as any).getAzureImageConfig('gpt-image-1');
+    expect(cfg).toEqual({ apiKey: 'aliaskey', endpoint: 'https://x.azure.com' });
+  });
+
+  it('JSON secret without endpoint → falls back to legacy endpoint', async () => {
+    mockGetSecret.mockResolvedValue(JSON.stringify({ apiKey: 'k' }));
+    const cfg = await (svc as any).getAzureImageConfig('gpt-image-1');
+    expect(cfg.endpoint).toBe(LEGACY_ENDPOINT);
+    expect(cfg.apiKey).toBe('k');
+  });
+
+  it('JSON secret missing apiKey → throws', async () => {
+    mockGetSecret.mockResolvedValue(JSON.stringify({ endpoint: 'https://x.azure.com' }));
+    await expect((svc as any).getAzureImageConfig('gpt-image-1')).rejects.toThrow(/missing "apiKey"/);
+  });
+
+  it('empty secret → throws', async () => {
+    mockGetSecret.mockResolvedValue('');
+    await expect((svc as any).getAzureImageConfig('gpt-image-1')).rejects.toThrow(/empty/);
+  });
+
+  it('development environment uses the dev secret name', async () => {
+    process.env.NODE_ENV = 'development';
+    mockGetSecret.mockResolvedValue('k');
+    await (svc as any).getAzureImageConfig('gpt-image-1');
+    expect(mockGetSecret).toHaveBeenCalledWith('dev/AgentWeb/Azure/Image');
+  });
+});
+
