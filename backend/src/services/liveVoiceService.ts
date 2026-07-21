@@ -24,7 +24,7 @@ import { meterUserUsage } from './usageRecorderService';
 // ---------------------------------------------------------------------------
 
 export const LIVE_MODEL = 'models/gemini-3.1-flash-live-preview';
-const LIVE_VOICE_NAME = 'Zephyr';
+const LIVE_VOICE_NAME = 'Kore';
 
 /**
  * System prompt that instructs Gemini to use emotion tags for expressive TTS.
@@ -32,6 +32,7 @@ const LIVE_VOICE_NAME = 'Zephyr';
  * are interpreted by Gemini 3.1 Flash's voice director layer.
  */
 const LIVE_SYSTEM_PROMPT = `You are Emma, an expert marketing assistant having a voice conversation.
+Speak with a neutral General American English accent.
 Respond naturally and conversationally — keep answers concise and direct.
 Be warm and friendly, enthusiastic about good news, thoughtful when analyzing data, encouraging when motivating the user, and concerned when flagging problems.`;
 

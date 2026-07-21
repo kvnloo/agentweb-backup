@@ -124,7 +124,7 @@ describe('startLiveSession', () => {
           speechConfig: expect.objectContaining({
             voiceConfig: expect.objectContaining({
               prebuiltVoiceConfig: expect.objectContaining({
-                voiceName: expect.any(String),
+                voiceName: 'Kore',
               }),
             }),
           }),
@@ -139,6 +139,24 @@ describe('startLiveSession', () => {
     );
 
     expect(hasLiveSession('session-1')).toBe(true);
+  });
+
+  it('directs Emma to use a neutral accent', async () => {
+    makeCallbacks();
+
+    await startLiveSession('session-neutral-accent', 'socket-accent', jest.fn(), 'test-user-id');
+
+    const connectionConfig = mockLiveConnect.mock.calls[0][0].config;
+    expect(connectionConfig.systemInstruction.parts[0].text).toContain('neutral');
+  });
+
+  it('directs Emma to use General American English', async () => {
+    makeCallbacks();
+
+    await startLiveSession('session-american-english', 'socket-american', jest.fn(), 'test-user-id');
+
+    const connectionConfig = mockLiveConnect.mock.calls[0][0].config;
+    expect(connectionConfig.systemInstruction.parts[0].text).toContain('General American English');
   });
 
   it('starting a second session for the same sessionId replaces the old one', async () => {
