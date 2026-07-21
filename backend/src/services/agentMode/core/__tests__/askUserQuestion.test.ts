@@ -19,6 +19,7 @@ import {
   resolveRecommendedOptionId,
   buildPendingUserQuestion,
   applyAnswer,
+  resolveInboundAnswer,
   canAutoTakeInHeadless,
   selectedPayload,
   checkQuestionGate,
@@ -393,5 +394,82 @@ describe('selectedPayload — deterministic parameter apply', () => {
 
   it('returns undefined while still awaiting', () => {
     expect(selectedPayload(awaitingQuestion())).toBeUndefined();
+  });
+});
+
+describe('resolveInboundAnswer — the /generate structured answer channel', () => {
+  const AT = '2026-07-21T00:05:00.000Z';
+
+  it('FAIL: rejects when there is no pending question', () => {
+    expect(() => resolveInboundAnswer(null, { optionId: 'leads' }, AT)).toThrow(AskUserQuestionError);
+    expect(() => resolveInboundAnswer(undefined, { optionId: 'leads' }, AT)).toThrow(/no pending question/i);
+  });
+
+  it('FAIL: rejects re-answering an already-answered question', () => {
+    const answered = applyAnswer(awaitingQuestion(), {
+      optionId: 'leads',
+      delegated: false,
+      answeredBy: 'user',
+      at: AT,
+    });
+    expect(() => resolveInboundAnswer(answered, { optionId: 'traffic' }, AT)).toThrow(/already answered/i);
+  });
+
+  it('FAIL: rejects a questionId that does not match the pending question (stale card)', () => {
+    expect(() =>
+      resolveInboundAnswer(awaitingQuestion(), { questionId: 'q-stale', optionId: 'leads' }, AT),
+    ).toThrow(/does not match/i);
+  });
+
+  it('FAIL: a direct selection with no optionId is rejected (a pick must name an option)', () => {
+    expect(() => resolveInboundAnswer(awaitingQuestion(), { delegated: false }, AT)).toThrow(
+      /must include an optionId/i,
+    );
+  });
+
+  it('FAIL: a direct selection of an unknown optionId is rejected', () => {
+    expect(() => resolveInboundAnswer(awaitingQuestion(), { optionId: 'nope' }, AT)).toThrow(
+      /unknown optionId/i,
+    );
+  });
+
+  it('resolves a direct user pick → answered by "user", never delegated', () => {
+    const answered = resolveInboundAnswer(awaitingQuestion(), { questionId: 'q-objective-1', optionId: 'traffic' }, AT);
+    expect(answered.status).toBe('answered');
+    expect(answered.answer).toMatchObject({
+      optionId: 'traffic',
+      delegated: false,
+      answeredBy: 'user',
+      at: AT,
+    });
+    expect(answered.answer?.rationale).toBeUndefined();
+  });
+
+  it('resolves a delegation (no optionId) → takes the recommended option, answeredBy "delegation", with a logged rationale', () => {
+    const answered = resolveInboundAnswer(awaitingQuestion(), { delegated: true }, AT);
+    expect(answered.answer).toMatchObject({
+      optionId: 'leads', // the recommended option
+      delegated: true,
+      answeredBy: 'delegation',
+      at: AT,
+    });
+    expect(answered.answer?.rationale).toContain('162 LEAD events'); // the recommended why, logged
+  });
+
+  it('delegation IGNORES a client-supplied optionId and still resolves to the recommendation', () => {
+    // A delegation click must never become a silent different choice, even if the
+    // body carries a stray optionId — it always maps to the recommended option.
+    const answered = resolveInboundAnswer(awaitingQuestion(), { delegated: true, optionId: 'traffic' }, AT);
+    expect(answered.answer?.optionId).toBe('leads');
+    expect(answered.answer?.answeredBy).toBe('delegation');
+  });
+
+  it('the resolved answer passes checkQuestionGate (end-to-end: selection → gate allows the consumer)', () => {
+    const answered = resolveInboundAnswer(awaitingQuestion(), { optionId: 'leads' }, AT);
+    const gate = checkQuestionGate(answered, 'q-objective-1');
+    expect(gate.allowed).toBe(true);
+    if (gate.allowed) {
+      expect(gate.payload).toEqual({ objective: 'OUTCOME_LEADS', optimization_goal: 'OFFSITE_CONVERSIONS' });
+    }
   });
 });
