@@ -1694,14 +1694,26 @@ export class AgentModeService {
                 }
 
                 const usage = data.usage || {};
+                // A max_tokens stop with a tool_use block means the tool call
+                // was truncated mid-argument (e.g. create_html_file's large
+                // content_draft), so its JSON is incomplete and would fail
+                // schema validation with a dropped required arg — the ENG-403
+                // "content_draft is required" retry loop. Do NOT surface it as a
+                // completed tool_calls finish; report finish_reason='length'
+                // with no tool_calls so the main loop's max-tokens continuation
+                // path asks the model to continue.
+                const truncatedToolCall = data.stop_reason === 'max_tokens' && !!toolCalls;
                 return {
                   choices: [{
                     message: {
                       role: 'assistant',
                       content: messageContent || null,
-                      ...(toolCalls && { tool_calls: toolCalls }),
+                      ...(toolCalls && !truncatedToolCall && { tool_calls: toolCalls }),
                     },
-                    finish_reason: data.stop_reason === 'tool_use' ? 'tool_calls' : 'stop',
+                    finish_reason: data.stop_reason === 'max_tokens'
+                      ? 'length'
+                      : (data.stop_reason === 'tool_use' ? 'tool_calls' : 'stop'),
+                    stop_reason: data.stop_reason,
                   }],
                   usage: {
                     prompt_tokens: usage.input_tokens || 0,
@@ -1888,6 +1900,15 @@ export class AgentModeService {
 
             const stopReason: string = response.stopReason || '';
 
+            // A max_tokens stop with a tool_use block means the tool call was
+            // truncated mid-argument (e.g. create_html_file's content_draft),
+            // so its JSON is incomplete and would fail schema validation with a
+            // dropped required arg — the ENG-403 "content_draft is required"
+            // retry loop. Do NOT surface it as a completed tool_calls finish;
+            // report finish_reason='length' with no tool_calls so the main
+            // loop's max-tokens continuation path asks the model to continue.
+            const truncatedToolCall = stopReason === 'max_tokens' && !!toolCalls;
+
             // Convert response to OpenAI format
             return {
               id: `bedrock-${Date.now()}`,
@@ -1899,9 +1920,9 @@ export class AgentModeService {
                 message: {
                   role: 'assistant',
                   content: messageContent,
-                  tool_calls: toolCalls,
+                  tool_calls: truncatedToolCall ? null : toolCalls,
                 },
-                finish_reason: toolCalls ? 'tool_calls' : (stopReason === 'max_tokens' ? 'length' : 'stop'),
+                finish_reason: stopReason === 'max_tokens' ? 'length' : (toolCalls ? 'tool_calls' : 'stop'),
                 stop_reason: stopReason || (toolCalls ? 'tool_use' : 'end_turn'),
               }],
               usage: {
