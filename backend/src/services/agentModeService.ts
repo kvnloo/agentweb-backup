@@ -26622,7 +26622,48 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // persisting — see unipileProfileService.ts.
           const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
           const profileResult = await getUnipileProfileService().getProfile(target, account_id);
-          return { success: true, data: profileResult.rawData };
+          const raw = profileResult.rawData;
+
+          // The global profile cache strips is_relationship / connected_at because
+          // they are viewer-relative (ENG-440) — so on a cache hit the blob carries
+          // no connection state at all. Re-derive it for THIS account from our
+          // per-account AW-UnipileConnections cache (the authoritative ENG-377 path)
+          // so the agent's invite-vs-DM decision has a correct, non-leaked signal.
+          //
+          // IMPORTANT: overlay onto a SHALLOW COPY. `raw` is the object held in the
+          // profile cache (LRU/DDB row) — mutating it in place would persist this
+          // viewer's connection state back into the shared cache and re-introduce the
+          // very cross-viewer leak this fix closes.
+          if (raw && typeof raw === 'object') {
+            const profileUrl =
+              raw.public_profile_url ||
+              (raw.public_identifier
+                ? `https://www.linkedin.com/in/${raw.public_identifier}`
+                : (isUrl ? target : null));
+            let conn: { connectedAt?: number } | null = null;
+            if (profileUrl) {
+              const { getConnectionByProfileUrlAndAccount } = await import('./unipileConnectionsDb');
+              conn = await getConnectionByProfileUrlAndAccount(profileUrl, account_id).catch(() => null);
+            }
+            // Reconcile as a union: connected if our per-account cache has a row OR the
+            // live blob already said so (a cold call may still carry is_relationship;
+            // a cache hit carries neither). A `true` from either source wins — directly
+            // countering the false-negative in reporter-ticket #135 (is_relationship
+            // false while LinkedIn's send-time check said FIRST_DEGREE).
+            const isConnected = !!conn || raw.is_relationship === true;
+            const data = {
+              ...raw,
+              is_relationship: isConnected,
+              // conn.connectedAt is already epoch-ms (Unipile created_at) — do NOT
+              // multiply by 1000 (ENG-379). Prefer the authoritative cache timestamp;
+              // otherwise leave whatever the live blob carried untouched.
+              ...(conn && typeof conn.connectedAt === 'number'
+                ? { connected_at: conn.connectedAt }
+                : {}),
+            };
+            return { success: true, data };
+          }
+          return { success: true, data: raw };
         }
 
         case 'list-connections': {
