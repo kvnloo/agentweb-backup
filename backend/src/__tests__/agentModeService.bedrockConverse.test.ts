@@ -1,4 +1,4 @@
-import { AgentModeService } from '../services/agentModeService';
+import { AgentModeService, AGENT_MODE_MAX_OUTPUT_TOKENS } from '../services/agentModeService';
 
 // Mock dependencies
 jest.mock('../services/db', () => ({
@@ -523,6 +523,35 @@ describe('AgentModeService - Bedrock Converse message conversion', () => {
         function: { name: 'web_search', arguments: '{"query":"cats"}' },
       }]);
       expect(result.choices[0].finish_reason).toBe('tool_calls');
+    });
+
+    it('should request an output-token budget large enough for big tool-call arguments (ENG-403)', async () => {
+      const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
+
+      await (agentModeService as any).callLLM(
+        'anthropic.claude-sonnet-4-6',
+        [{ role: 'system', content: 'S' }, { role: 'user', content: 'Create an on-brand HTML one-pager' }]
+      );
+
+      const input = (ConverseCommand as jest.Mock).mock.calls[0][0];
+      // A ~30-40K char content_draft is ~10-13K output tokens; the old 12384 cap
+      // truncated the create_html_file tool call, dropping content_draft and
+      // triggering a "Missing required argument content_draft" validation loop.
+      expect(input.inferenceConfig.maxTokens).toBe(AGENT_MODE_MAX_OUTPUT_TOKENS);
+      expect(AGENT_MODE_MAX_OUTPUT_TOKENS).toBeGreaterThanOrEqual(32000);
+    });
+
+    it('should honor an explicit max_completion_tokens override', async () => {
+      const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
+
+      await (agentModeService as any).callLLM(
+        'anthropic.claude-sonnet-4-6',
+        [{ role: 'system', content: 'S' }, { role: 'user', content: 'Hi' }],
+        { max_completion_tokens: 2000 }
+      );
+
+      const input = (ConverseCommand as jest.Mock).mock.calls[0][0];
+      expect(input.inferenceConfig.maxTokens).toBe(2000);
     });
 
     it('should handle max_tokens stop reason', async () => {
