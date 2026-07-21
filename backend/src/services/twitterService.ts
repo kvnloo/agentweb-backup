@@ -636,6 +636,109 @@ export class TwitterService {
     });
   }
 
+  // ─── X Lists (read) ────────────────────────────────────────────────────────────
+  // The X List read endpoints (owned_lists / list members / list tweets) require the
+  // `list.read` OAuth scope. Accounts connected before that scope was added to the
+  // connect flow get HTTP 403 from X. withRetryOn401 only handles 401 (token refresh),
+  // so mapListScopeError converts a 403 into an explicit reconnect-needed error —
+  // mirroring the needs_reconnect convention — so Emma surfaces a clear message
+  // instead of a silent empty result.
+  private mapListScopeError(err: unknown): never {
+    if (typeof err === 'object' && err !== null && (err as any).code === 403) {
+      throw new Error(
+        'Your X account is missing the "list.read" permission needed to read X Lists. ' +
+        'Go to Settings → Connected Accounts and reconnect your X account to grant List access.'
+      );
+    }
+    throw err as Error;
+  }
+
+  /**
+   * List the connected account's owned X Lists (GET /2/users/:id/owned_lists).
+   * Returns each list with id + name (+ counts) so a caller can resolve a list by name.
+   */
+  async getOwnedLists(ownerUserId: string, accountId: string): Promise<any[]> {
+    const myId = await this.getMyTwitterUserId(ownerUserId, accountId);
+    try {
+      return await this.withRetryOn401(ownerUserId, accountId, async (client) => {
+        const res: any = await client.v2.listsOwned(myId, {
+          'list.fields': ['member_count', 'follower_count', 'private', 'description'],
+        });
+        return res?.data?.data ?? res?.data ?? [];
+      });
+    } catch (err) {
+      return this.mapListScopeError(err);
+    }
+  }
+
+  /**
+   * List members of an X List (GET /2/lists/:id/members). Returns user objects
+   * (id, name, username) so a caller gets member handles.
+   */
+  async getListMembers(ownerUserId: string, accountId: string, listId: string): Promise<any[]> {
+    if (!listId || listId.trim() === '') throw new Error('x_list_id is required for get-list-members');
+    try {
+      return await this.withRetryOn401(ownerUserId, accountId, async (client) => {
+        const res: any = await client.v2.listMembers(listId.trim(), {
+          'user.fields': ['username', 'name', 'description', 'public_metrics'],
+        });
+        return res?.data?.data ?? res?.data ?? [];
+      });
+    } catch (err) {
+      return this.mapListScopeError(err);
+    }
+  }
+
+  /**
+   * Fetch recent tweets posted in an X List (GET /2/lists/:id/tweets). Each tweet is
+   * returned with its author handle (resolved from the author_id expansion) plus text
+   * and id — enough to pick reply targets for the reply-guy schedule.
+   */
+  async getListTweets(ownerUserId: string, accountId: string, listId: string, maxResults?: number): Promise<any[]> {
+    if (!listId || listId.trim() === '') throw new Error('x_list_id is required for get-list-tweets');
+    try {
+      return await this.withRetryOn401(ownerUserId, accountId, async (client) => {
+        const res: any = await client.v2.listTweets(listId.trim(), {
+          max_results: this.clampMaxResults(maxResults, 1, 10),
+          'tweet.fields': ['public_metrics', 'created_at', 'author_id'],
+          expansions: ['author_id'],
+          'user.fields': ['username', 'name'],
+        } as any);
+        const tweets: any[] = res?.data?.data ?? res?.data ?? [];
+        const users: any[] = res?.data?.includes?.users ?? res?.includes?.users ?? [];
+        const userById = new Map<string, any>(users.map((u: any) => [u.id, u]));
+        return tweets.map((t: any) => ({
+          id: t.id,
+          text: t.text,
+          author_id: t.author_id ?? null,
+          author_handle: userById.get(t.author_id)?.username ?? null,
+          author_name: userById.get(t.author_id)?.name ?? null,
+          created_at: t.created_at ?? null,
+          public_metrics: t.public_metrics ?? null,
+        }));
+      });
+    } catch (err) {
+      return this.mapListScopeError(err);
+    }
+  }
+
+  /**
+   * Resolve one of the connected account's owned X Lists by (case-insensitive) name
+   * to its list id. Throws a clear error naming the available lists when there is no
+   * match, so passing a list name never silently reads the wrong list.
+   */
+  async resolveOwnedListIdByName(ownerUserId: string, accountId: string, name: string): Promise<string> {
+    const clean = (name ?? '').trim().toLowerCase();
+    if (!clean) throw new Error('list_name is required to resolve a list by name');
+    const lists = await this.getOwnedLists(ownerUserId, accountId);
+    const match = lists.find((l: any) => (l?.name ?? '').trim().toLowerCase() === clean);
+    if (!match?.id) {
+      const available = lists.map((l: any) => l?.name).filter(Boolean).join(', ') || '(none)';
+      throw new Error(`No owned X List named "${name}". Available lists: ${available}.`);
+    }
+    return match.id as string;
+  }
+
   // ─── Quote tweet ─────────────────────────────────────────────────────────────
 
   /** Post a quote tweet — retweet with added commentary. Trimmed to 280 chars. */
