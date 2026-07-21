@@ -582,7 +582,7 @@ emmaToolRegistry.register({
   name: 'twitter_outreach',
   definition: {
     name: 'twitter_outreach',
-    description: `Manage X (Twitter) people and outreach interactions using a connected X account. Use this for profile lookup, follows, DMs, user search, bookmarks, and account management (block/mute).
+    description: `Manage X (Twitter) people and outreach interactions using a connected X account. Use this for profile lookup, follows, DMs, user search, bookmarks, reading X Lists, and account management (block/mute).
 
 To find the account_id, call list_connected_accounts(platform='twitter'). account_id is optional when the user has exactly one X account connected.
 
@@ -599,6 +599,9 @@ Actions:
 - get_dm_conversation: Get DM history with a specific user. Requires handle.
 - bookmark: Bookmark a tweet. Requires tweet_id.
 - get_bookmarks: Retrieve the authenticated user's bookmarked tweets.
+- list_owned_lists: List the connected account's own X Lists (id + name). Use this to resolve an X List name (e.g. "Engagement 101") to a list id.
+- get_list_members: List the members of an X List (returns member handles). Requires x_list_id, or pass list_name to resolve an owned list by name.
+- get_list_tweets: Get recent tweets posted in an X List (each with author handle, text, and tweet id). Requires x_list_id, or pass list_name to resolve an owned list by name. Optional max_results (default 10, max 100).
 - block: Block a user by handle. Requires handle. CRITICAL: Always get explicit user approval before blocking.
 - unblock: Unblock a user by handle. Requires handle. CRITICAL: Always get explicit user approval before unblocking.
 - mute: Mute a user by handle. Requires handle. CRITICAL: Always get explicit user approval before muting.
@@ -615,6 +618,7 @@ For CRM logging of sent DMs, optionally pass list_id, lead_id and lead_email.`,
             'search_tweets', 'get_user_tweets',
             'send_dm', 'list_dms', 'get_dm_conversation',
             'bookmark', 'get_bookmarks',
+            'list_owned_lists', 'get_list_members', 'get_list_tweets',
             'block', 'unblock', 'mute', 'unmute',
           ],
           description: 'The X outreach action to perform.'
@@ -645,11 +649,19 @@ For CRM logging of sent DMs, optionally pass list_id, lead_id and lead_email.`,
         },
         max_results: {
           type: 'number',
-          description: 'Maximum results to return. Optional for search_tweets and get_user_tweets (default 10, max 100).'
+          description: 'Maximum results to return. Optional for search_tweets, get_user_tweets, and get_list_tweets (default 10, max 100).'
+        },
+        x_list_id: {
+          type: 'string',
+          description: 'X List ID. Provide for get_list_members and get_list_tweets. Get it from list_owned_lists. (Distinct from list_id, which is a CRM lead list.) If omitted, pass list_name to resolve one of your own lists by name.'
+        },
+        list_name: {
+          type: 'string',
+          description: 'Name of one of your own X Lists (e.g. "Engagement 101"). Optional convenience for get_list_members / get_list_tweets — resolved to a list id via your owned lists. Ignored when x_list_id is provided.'
         },
         list_id: {
           type: 'string',
-          description: 'CRM lead list ID. Optional — provide with lead_id and lead_email to log the sent DM to CRM history.'
+          description: 'CRM lead list ID. Optional — provide with lead_id and lead_email to log the sent DM to CRM history. NOTE: this is a CRM list, NOT an X List — for X Lists use x_list_id.'
         },
         lead_id: {
           type: 'string',
