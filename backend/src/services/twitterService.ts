@@ -110,8 +110,14 @@ export class TwitterService {
    * attempting a refresh with a known-dead refresh token.
    * If a pre-emptive refresh fails, stamps needs_reconnect so Emma can surface
    * a clear reconnect message instead of a raw API error.
+   *
+   * `requiredScope` is the OAuth2 write scope a mutating action needs (e.g.
+   * `tweet.write`). When set, a pre-write capability guard fails loud BEFORE any
+   * X round-trip if the account's GRANTED scopes don't include it — turning the
+   * opaque, silent X 403 (read-only Developer App) into an actionable reconnect
+   * prompt naming the account.
    */
-  async getClient(ownerUserId: string, accountId: string): Promise<TwitterApi> {
+  async getClient(ownerUserId: string, accountId: string, requiredScope?: string): Promise<TwitterApi> {
     const account = await this.resolveAccount(ownerUserId, accountId);
     const config = account.config as TwitterXConfig;
 
@@ -120,6 +126,21 @@ export class TwitterService {
       throw new Error(
         'Your X account needs to be reconnected. Go to Settings → Connected Accounts and reconnect your X account.'
       );
+    }
+
+    // Pre-write capability guard. Only blocks when the granted scopes are known
+    // (a non-empty array recorded at connect time) and demonstrably lack the
+    // write scope — so a read-only grant is caught, while a legacy account with
+    // no recorded scopes defers to X (whose real error is now surfaced, not
+    // swallowed). This never fires for read actions (requiredScope undefined).
+    if (requiredScope) {
+      const granted = config.scopes;
+      if (Array.isArray(granted) && granted.length > 0 && !granted.includes(requiredScope)) {
+        throw new Error(
+          `Your X account @${config.username ?? 'your account'} is connected read-only — it is missing the "${requiredScope}" permission needed for this action. ` +
+          'Reconnect it with write permission in Settings → Connected Accounts.'
+        );
+      }
     }
 
     let accessToken = config.access_token;
@@ -269,9 +290,10 @@ export class TwitterService {
   private async withRetryOn401<T>(
     ownerUserId: string,
     accountId: string,
-    fn: (client: TwitterApi) => Promise<T>
+    fn: (client: TwitterApi) => Promise<T>,
+    requiredScope?: string
   ): Promise<T> {
-    const client = await this.getClient(ownerUserId, accountId);
+    const client = await this.getClient(ownerUserId, accountId, requiredScope);
     const isXAuthError = (e: unknown): boolean =>
       typeof e === 'object' && e !== null && (e as any).code === 401;
 
@@ -334,7 +356,8 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, (client) =>
       opts?.inReplyToTweetId
         ? client.v2.reply(finalText, opts.inReplyToTweetId!).then((r: any) => ({ id: r.data.id, text: r.data.text }))
-        : client.v2.tweet(finalText).then((r: any) => ({ id: r.data.id, text: r.data.text }))
+        : client.v2.tweet(finalText).then((r: any) => ({ id: r.data.id, text: r.data.text })),
+      'tweet.write'
     );
   }
 
@@ -384,7 +407,7 @@ export class TwitterService {
         throw new Error(`Could not resolve X handle "@${handle}"`);
       }
       return client.v2.sendDmToParticipant(user.data.id, { text: finalText });
-    });
+    }, 'dm.write');
   }
 
   /**
@@ -422,7 +445,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.deleteTweet(tweetId.trim());
       return { deleted: res?.data?.deleted ?? false };
-    });
+    }, 'tweet.write');
   }
 
   // ─── Private helpers for actions that need the authed user's own Twitter ID ──
@@ -459,7 +482,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.follow(myId, targetId);
       return res?.data ?? res;
-    });
+    }, 'follows.write');
   }
 
   /**
@@ -472,7 +495,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.unfollow(myId, targetId);
       return res?.data ?? res;
-    });
+    }, 'follows.write');
   }
 
   // ─── List followers / following ───────────────────────────────────────────────
@@ -542,7 +565,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.like(myId, tweetId.trim());
       return res?.data ?? res;
-    });
+    }, 'like.write');
   }
 
   /** Unlike a tweet. */
@@ -552,7 +575,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.unlike(myId, tweetId.trim());
       return res?.data ?? res;
-    });
+    }, 'like.write');
   }
 
   // ─── Retweet / unretweet ─────────────────────────────────────────────────────
@@ -564,7 +587,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.retweet(myId, tweetId.trim());
       return res?.data ?? res;
-    });
+    }, 'tweet.write');
   }
 
   /** Undo a retweet. */
@@ -574,7 +597,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.unretweet(myId, tweetId.trim());
       return res?.data ?? res;
-    });
+    }, 'tweet.write');
   }
 
   // ─── User tweets timeline ────────────────────────────────────────────────────
@@ -602,7 +625,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.bookmark(tweetId.trim());
       return res?.data ?? res;
-    });
+    }, 'bookmark.write');
   }
 
   /** Retrieve the authed user's bookmarked tweets. */
@@ -611,6 +634,109 @@ export class TwitterService {
       const res: any = await client.v2.bookmarks();
       return res?.data?.data ?? res?.data ?? [];
     });
+  }
+
+  // ─── X Lists (read) ────────────────────────────────────────────────────────────
+  // The X List read endpoints (owned_lists / list members / list tweets) require the
+  // `list.read` OAuth scope. Accounts connected before that scope was added to the
+  // connect flow get HTTP 403 from X. withRetryOn401 only handles 401 (token refresh),
+  // so mapListScopeError converts a 403 into an explicit reconnect-needed error —
+  // mirroring the needs_reconnect convention — so Emma surfaces a clear message
+  // instead of a silent empty result.
+  private mapListScopeError(err: unknown): never {
+    if (typeof err === 'object' && err !== null && (err as any).code === 403) {
+      throw new Error(
+        'Your X account is missing the "list.read" permission needed to read X Lists. ' +
+        'Go to Settings → Connected Accounts and reconnect your X account to grant List access.'
+      );
+    }
+    throw err as Error;
+  }
+
+  /**
+   * List the connected account's owned X Lists (GET /2/users/:id/owned_lists).
+   * Returns each list with id + name (+ counts) so a caller can resolve a list by name.
+   */
+  async getOwnedLists(ownerUserId: string, accountId: string): Promise<any[]> {
+    const myId = await this.getMyTwitterUserId(ownerUserId, accountId);
+    try {
+      return await this.withRetryOn401(ownerUserId, accountId, async (client) => {
+        const res: any = await client.v2.listsOwned(myId, {
+          'list.fields': ['member_count', 'follower_count', 'private', 'description'],
+        });
+        return res?.data?.data ?? res?.data ?? [];
+      });
+    } catch (err) {
+      return this.mapListScopeError(err);
+    }
+  }
+
+  /**
+   * List members of an X List (GET /2/lists/:id/members). Returns user objects
+   * (id, name, username) so a caller gets member handles.
+   */
+  async getListMembers(ownerUserId: string, accountId: string, listId: string): Promise<any[]> {
+    if (!listId || listId.trim() === '') throw new Error('x_list_id is required for get-list-members');
+    try {
+      return await this.withRetryOn401(ownerUserId, accountId, async (client) => {
+        const res: any = await client.v2.listMembers(listId.trim(), {
+          'user.fields': ['username', 'name', 'description', 'public_metrics'],
+        });
+        return res?.data?.data ?? res?.data ?? [];
+      });
+    } catch (err) {
+      return this.mapListScopeError(err);
+    }
+  }
+
+  /**
+   * Fetch recent tweets posted in an X List (GET /2/lists/:id/tweets). Each tweet is
+   * returned with its author handle (resolved from the author_id expansion) plus text
+   * and id — enough to pick reply targets for the reply-guy schedule.
+   */
+  async getListTweets(ownerUserId: string, accountId: string, listId: string, maxResults?: number): Promise<any[]> {
+    if (!listId || listId.trim() === '') throw new Error('x_list_id is required for get-list-tweets');
+    try {
+      return await this.withRetryOn401(ownerUserId, accountId, async (client) => {
+        const res: any = await client.v2.listTweets(listId.trim(), {
+          max_results: this.clampMaxResults(maxResults, 1, 10),
+          'tweet.fields': ['public_metrics', 'created_at', 'author_id'],
+          expansions: ['author_id'],
+          'user.fields': ['username', 'name'],
+        } as any);
+        const tweets: any[] = res?.data?.data ?? res?.data ?? [];
+        const users: any[] = res?.data?.includes?.users ?? res?.includes?.users ?? [];
+        const userById = new Map<string, any>(users.map((u: any) => [u.id, u]));
+        return tweets.map((t: any) => ({
+          id: t.id,
+          text: t.text,
+          author_id: t.author_id ?? null,
+          author_handle: userById.get(t.author_id)?.username ?? null,
+          author_name: userById.get(t.author_id)?.name ?? null,
+          created_at: t.created_at ?? null,
+          public_metrics: t.public_metrics ?? null,
+        }));
+      });
+    } catch (err) {
+      return this.mapListScopeError(err);
+    }
+  }
+
+  /**
+   * Resolve one of the connected account's owned X Lists by (case-insensitive) name
+   * to its list id. Throws a clear error naming the available lists when there is no
+   * match, so passing a list name never silently reads the wrong list.
+   */
+  async resolveOwnedListIdByName(ownerUserId: string, accountId: string, name: string): Promise<string> {
+    const clean = (name ?? '').trim().toLowerCase();
+    if (!clean) throw new Error('list_name is required to resolve a list by name');
+    const lists = await this.getOwnedLists(ownerUserId, accountId);
+    const match = lists.find((l: any) => (l?.name ?? '').trim().toLowerCase() === clean);
+    if (!match?.id) {
+      const available = lists.map((l: any) => l?.name).filter(Boolean).join(', ') || '(none)';
+      throw new Error(`No owned X List named "${name}". Available lists: ${available}.`);
+    }
+    return match.id as string;
   }
 
   // ─── Quote tweet ─────────────────────────────────────────────────────────────
@@ -623,7 +749,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.quote(finalText, quotedTweetId.trim());
       return { id: res.data.id, text: res.data.text };
-    });
+    }, 'tweet.write');
   }
 
   // ─── Engagement lookup ────────────────────────────────────────────────────────
@@ -668,7 +794,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.block(myId, targetId);
       return res?.data ?? res;
-    });
+    }, 'block.write');
   }
 
   /** Unblock a user by handle. Requires block.write scope. */
@@ -679,7 +805,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.unblock(myId, targetId);
       return res?.data ?? res;
-    });
+    }, 'block.write');
   }
 
   // ─── Mute / unmute ───────────────────────────────────────────────────────────
@@ -692,7 +818,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.mute(myId, targetId);
       return res?.data ?? res;
-    });
+    }, 'mute.write');
   }
 
   /** Unmute a user by handle. Requires mute.write scope. */
@@ -703,7 +829,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.unmute(myId, targetId);
       return res?.data ?? res;
-    });
+    }, 'mute.write');
   }
 
   // ─── Tweet metrics ───────────────────────────────────────────────────────────

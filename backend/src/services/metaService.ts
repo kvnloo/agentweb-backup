@@ -115,6 +115,54 @@ export class MetaService {
   }
 
   /**
+   * Config fields readable on a Campaign / Ad Set via the Graph API GET. These are the
+   * allow-lists the marketing wrapper honors for CAMPAIGN / AD_SET LIST + GET `fields`.
+   * They include the fields that actually define what an ad set optimizes for
+   * (optimization_goal, billing_event, destination_type, promoted_object, bid_strategy)
+   * and the campaign budget/bid fields — none of which the wrapper could read before
+   * (ENG-398). A field outside the allow-list is rejected LOUDLY (see resolveReadFields),
+   * never silently dropped, so a caller learns its request was wrong instead of getting a
+   * quietly-incomplete payload (feedback-avoid-fallbacks).
+   */
+  private static readonly CAMPAIGN_READ_FIELDS = [
+    'id', 'name', 'status', 'objective',
+    'daily_budget', 'lifetime_budget', 'budget_remaining',
+    'bid_strategy', 'start_time', 'stop_time',
+  ] as const;
+
+  private static readonly AD_SET_READ_FIELDS = [
+    'id', 'name', 'status', 'campaign_id',
+    'optimization_goal', 'billing_event', 'destination_type', 'promoted_object', 'bid_strategy',
+    'daily_budget', 'lifetime_budget', 'start_time', 'end_time', 'targeting',
+  ] as const;
+
+  /**
+   * Resolve a caller-supplied `fields` selection against the readable allow-list.
+   * - undefined / empty  -> returns null, signalling "use the default field list".
+   * - a comma string or a string[] -> trimmed, validated, and returned as string[].
+   * Throws LOUDLY if any requested field is not in `allowed` — never silently reduces
+   * the selection to the supported subset (that silent reduction is the ENG-398 bug).
+   */
+  private resolveReadFields(
+    requested: string | string[] | undefined | null,
+    allowed: readonly string[],
+    entityLabel: string
+  ): string[] | null {
+    if (requested === undefined || requested === null) return null;
+    const list = Array.isArray(requested) ? requested : String(requested).split(',');
+    const cleaned = list.map(f => f.trim()).filter(Boolean);
+    if (cleaned.length === 0) return null;
+    const unsupported = cleaned.filter(f => !allowed.includes(f));
+    if (unsupported.length > 0) {
+      throw new Error(
+        `Unsupported ${entityLabel} field(s): ${unsupported.join(', ')}. ` +
+        `Supported fields: ${allowed.join(', ')}.`
+      );
+    }
+    return cleaned;
+  }
+
+  /**
    * Handle SDK errors
    */
   private handleError(error: any, context?: string): void {
@@ -718,13 +766,35 @@ export class MetaService {
   }
 
   /**
-   * List campaigns for an ad account
+   * List campaigns for an ad account.
+   *
+   * `options.fields` selects which config fields to read (validated against the
+   * allow-list; unsupported fields throw loudly). When omitted, the default list now
+   * includes budget/bid config (daily_budget, lifetime_budget, budget_remaining,
+   * bid_strategy) so a plain LIST can actually see what the campaign is set to spend —
+   * previously invisible (ENG-398). `options.campaignId` fetches that one campaign
+   * directly (the Graph edge has no id filter) and returns it as a one-element list so
+   * LIST semantics are preserved.
    */
-  public async listCampaigns(adAccountId: string, accessToken: string) {
+  public async listCampaigns(
+    adAccountId: string,
+    accessToken: string,
+    options: { campaignId?: string; fields?: string | string[] } = {}
+  ) {
+    // Validate the requested fields BEFORE any API round-trip so an unsupported field is
+    // a loud, dependency-free error rather than a silently-reduced payload.
+    const fields =
+      this.resolveReadFields(options.fields, MetaService.CAMPAIGN_READ_FIELDS, 'campaign') ??
+      [...MetaService.CAMPAIGN_READ_FIELDS];
     try {
       this.initApi(accessToken);
+      if (options.campaignId) {
+        this.log(`Fetching single campaign ${options.campaignId}`, { fields });
+        const campaign = new Campaign(options.campaignId);
+        const result = await campaign.get(fields);
+        return [result._data];
+      }
       const account = new AdAccount(`act_${adAccountId}`);
-      const fields = ['id', 'name', 'status', 'objective', 'start_time', 'stop_time'];
       this.log(`Listing campaigns for account: ${adAccountId}`, { fields });
       const campaigns = await account.getCampaigns(fields);
       return campaigns.map((c: any) => c._data);
@@ -798,13 +868,35 @@ export class MetaService {
   }
 
   /**
-   * List ad sets for an ad account
+   * List ad sets for an ad account.
+   *
+   * `options.fields` selects which config fields to read (validated; unsupported fields
+   * throw loudly). When omitted, the default list now includes the fields that define
+   * what the ad set optimizes for — optimization_goal, billing_event, destination_type,
+   * promoted_object, bid_strategy — which the wrapper previously could not read despite
+   * being able to WRITE them on CREATE (ENG-398, verify-after-write). `options.adSetId`
+   * fetches that one ad set directly and returns it as a one-element list, preserving
+   * LIST semantics. The legacy `campaignId` positional filter is unchanged.
    */
-  public async listAdSets(adAccountId: string, accessToken: string, campaignId?: string) {
+  public async listAdSets(
+    adAccountId: string,
+    accessToken: string,
+    campaignId?: string,
+    options: { adSetId?: string; fields?: string | string[] } = {}
+  ) {
+    // Validate requested fields BEFORE any API round-trip (loud, never silently reduced).
+    const fields =
+      this.resolveReadFields(options.fields, MetaService.AD_SET_READ_FIELDS, 'ad set') ??
+      [...MetaService.AD_SET_READ_FIELDS];
     try {
       this.initApi(accessToken);
+      if (options.adSetId) {
+        this.log(`Fetching single ad set ${options.adSetId}`, { fields });
+        const adSet = new AdSet(options.adSetId);
+        const result = await adSet.get(fields);
+        return [result._data];
+      }
       const account = new AdAccount(`act_${adAccountId}`);
-      const fields = ['id', 'name', 'status', 'campaign_id', 'daily_budget', 'lifetime_budget', 'start_time', 'end_time', 'targeting'];
       const params = campaignId ? { campaign_id: campaignId } : {};
       this.log(`Listing ad sets for account: ${adAccountId}`, { fields, ...params });
       const adSets = await account.getAdSets(fields, params);

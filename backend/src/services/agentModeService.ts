@@ -16,6 +16,7 @@ import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoUrlForUser,
   missingBrandLogoToolResult,
+  promptCreatesLogo,
   promptRequestsLogo,
 } from './agentMode/brandLogo';
 import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
@@ -120,6 +121,7 @@ const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { twitterService } from './twitterService';
+import { describeXApiError } from '../utils/twitterErrors';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
 import { preflightTrackingGate } from './googleAdsTrackingPreflight';
@@ -13770,7 +13772,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async manageMetaAdsCampaigns(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
-        return this.listMetaAdsCampaignsNew(userId, account_id);
+        // Thread the campaign_id filter and any explicit fields selection so the caller can
+        // read budget/bid config and target a single campaign (ENG-398).
+        return this.listMetaAdsCampaignsNew(userId, account_id, { campaignId: campaign_id, fields: params?.fields });
       case 'CREATE':
         return this.createMetaAdsCampaign(userId, { ...params, account_id });
       case 'UPDATE':
@@ -13788,7 +13792,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async manageMetaAdsAdSets(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, ad_set_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
-        return this.listMetaAdsAdSets(userId, campaign_id, account_id);
+        // Thread the ad_set_id target and any explicit fields selection so the caller can
+        // read optimization_goal / promoted_object / etc. for a single ad set (ENG-398).
+        return this.listMetaAdsAdSets(userId, campaign_id, account_id, { adSetId: ad_set_id, fields: params?.fields });
       case 'CREATE':
         // Explicitly pass account_id in args for createMetaAdsAdSet as it expects it in the args object
         return this.createMetaAdsAdSet(userId, { ...params, account_id, campaign_id });
@@ -14096,10 +14102,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async listMetaAdsCampaignsNew(userId: string, account_id?: string): Promise<any> {
+  public async listMetaAdsCampaignsNew(
+    userId: string,
+    account_id?: string,
+    options: { campaignId?: string; fields?: string | string[] } = {}
+  ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const campaigns = (await metaService.listCampaigns(accountId, accessToken)) || [];
+      // Only forward the read-options bag when the caller supplied a campaign_id filter or
+      // an explicit fields selection; otherwise call listCampaigns the same 2-arg way as
+      // before. This preserves the CALL CONVENTION for a plain list-all — it does NOT keep
+      // the response payload identical: listCampaigns now defaults to the richer
+      // CAMPAIGN_READ_FIELDS (budget/bid config: daily_budget, lifetime_budget,
+      // budget_remaining, bid_strategy), the intended ENG-398 change, for every plain LIST
+      // caller regardless of this branch.
+      const hasSelector = Boolean(options.campaignId || options.fields);
+      const campaigns = (hasSelector
+        ? await metaService.listCampaigns(accountId, accessToken, options)
+        : await metaService.listCampaigns(accountId, accessToken)) || [];
       const totalCount = Array.isArray(campaigns) ? campaigns.length : 0;
 
       return {
@@ -14142,10 +14162,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async listMetaAdsAdSets(userId: string, campaignId?: string, account_id?: string): Promise<any> {
+  public async listMetaAdsAdSets(
+    userId: string,
+    campaignId?: string,
+    account_id?: string,
+    options: { adSetId?: string; fields?: string | string[] } = {}
+  ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const adSets = (await metaService.listAdSets(accountId, accessToken, campaignId)) || [];
+      // Only forward the read-options bag when the caller supplied an ad_set_id target or an
+      // explicit fields selection; otherwise call listAdSets with just the (optional)
+      // campaignId, exactly as before. This preserves the CALL CONVENTION, NOT the response
+      // payload: listAdSets now defaults to the richer AD_SET_READ_FIELDS (optimization_goal,
+      // billing_event, destination_type, promoted_object, bid_strategy), the intended
+      // ENG-398 change, for every plain LIST caller regardless of this branch.
+      const hasSelector = Boolean(options.adSetId || options.fields);
+      const adSets = (hasSelector
+        ? await metaService.listAdSets(accountId, accessToken, campaignId, options)
+        : await metaService.listAdSets(accountId, accessToken, campaignId)) || [];
       const totalCount = Array.isArray(adSets) ? adSets.length : 0;
 
       return {
@@ -20654,10 +20688,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // brand logo (AC-2); when none is persisted, ask the user / point at
       // brand config instead of generating (AC-3). Edits (inputImages) are
       // out of scope — the source images already carry the branding.
+      //
+      // ENG-393: this gate is for COMPOSITING an existing brand logo, not for
+      // CREATING one. A prompt that asks to design a brand-new logo from
+      // scratch ("create a logo for X") must NOT be gated — an account with no
+      // logo yet legitimately wants to generate its first one, and blocking
+      // that also blocks landing-page generation. Let creation asks through;
+      // compositing asks ("add our logo to this banner") still gate.
       if (
         !logoImage &&
         (!Array.isArray(inputImages) || inputImages.length === 0) &&
-        promptRequestsLogo(prompt)
+        promptRequestsLogo(prompt) &&
+        !promptCreatesLogo(prompt)
       ) {
         const persistedLogo = await getPersistedBrandLogoUrlForUser(userId);
         if (!persistedLogo) {
@@ -27185,7 +27227,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      // Surface X's real ApiResponseError payload (title/detail/errors) instead of
+      // collapsing to a bare "Request failed with code 403" — see describeXApiError.
+      const errorMessage = describeXApiError(error);
       console.error('AgentMode: twitter_manage_post failed:', errorMessage);
       return { success: false, message: 'Twitter action failed', error: errorMessage };
     }
@@ -27194,7 +27238,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   async twitterOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
-    const { text, handle, recipient_handle, query, max_results, tweet_id, list_id, lead_id, lead_email } = args;
+    const { text, handle, recipient_handle, query, max_results, tweet_id, x_list_id, list_name, list_id, lead_id, lead_email } = args;
     console.log(`[AgentMode] twitterOutreach called: action=${action}, account_id=${account_id}`);
 
     const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
@@ -27325,6 +27369,27 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: result };
         }
 
+        case 'list-owned-lists': {
+          const result = await twitterService.getOwnedLists(ownerUserId, account_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-list-members': {
+          const listId = x_list_id
+            || (list_name ? await twitterService.resolveOwnedListIdByName(ownerUserId, account_id, list_name) : undefined);
+          if (!listId) throw new Error('x_list_id or list_name is required for get_list_members');
+          const result = await twitterService.getListMembers(ownerUserId, account_id, listId);
+          return { success: true, data: result };
+        }
+
+        case 'get-list-tweets': {
+          const listId = x_list_id
+            || (list_name ? await twitterService.resolveOwnedListIdByName(ownerUserId, account_id, list_name) : undefined);
+          if (!listId) throw new Error('x_list_id or list_name is required for get_list_tweets');
+          const result = await twitterService.getListTweets(ownerUserId, account_id, listId, max_results);
+          return { success: true, data: result };
+        }
+
         case 'block': {
           const target = handle || recipient_handle;
           if (!target) throw new Error('handle is required for block');
@@ -27359,13 +27424,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             'search-tweets', 'get-user-tweets',
             'send-dm', 'list-dms', 'get-dm-conversation',
             'bookmark', 'get-bookmarks',
+            'list-owned-lists', 'get-list-members', 'get-list-tweets',
             'block', 'unblock', 'mute', 'unmute',
           ];
           throw new Error(`Unsupported twitter_outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
         }
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      // Surface X's real ApiResponseError payload (title/detail/errors) instead of
+      // collapsing to a bare "Request failed with code 403" — see describeXApiError.
+      const errorMessage = describeXApiError(error);
       console.error('AgentMode: twitter_outreach failed:', errorMessage);
       return { success: false, message: 'Twitter outreach action failed', error: errorMessage };
     }

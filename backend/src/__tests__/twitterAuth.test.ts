@@ -132,6 +132,50 @@ describe('POST /finalize', () => {
   });
 });
 
+describe('POST /finalize — granted-scope persistence (ENG-413 AC#1)', () => {
+  it('persists the GRANTED scopes from the token response, not the requested constant', async () => {
+    await request(app).get('/api/oauth/twitter/init');
+    // X granted a read-only token (Developer App set to "Read"), narrower than requested.
+    mockLoginWithOAuth2.mockResolvedValueOnce({
+      accessToken: 'acc-tok',
+      refreshToken: 'ref-tok',
+      expiresIn: 7200,
+      scope: ['tweet.read', 'users.read'],
+      client: { v2: { me: (...a: any[]) => mockMe(...a) } },
+    });
+    const res = await request(app).post('/api/oauth/twitter/finalize').send({ code: 'C1', state: 'ST8' });
+    expect(res.status).toBe(200);
+    const cfg = mockCreateAccount.mock.calls[0][2].config;
+    expect(cfg.scopes).toEqual(['tweet.read', 'users.read']);
+    // The bug: the DB used to claim tweet.write on a token that cannot write.
+    expect(cfg.scopes).not.toContain('tweet.write');
+  });
+
+  it('parses a space-delimited scope string into an array', async () => {
+    await request(app).get('/api/oauth/twitter/init');
+    mockLoginWithOAuth2.mockResolvedValueOnce({
+      accessToken: 'a',
+      refreshToken: 'r',
+      expiresIn: 7200,
+      scope: 'tweet.read tweet.write users.read offline.access',
+      client: { v2: { me: (...a: any[]) => mockMe(...a) } },
+    });
+    const res = await request(app).post('/api/oauth/twitter/finalize').send({ code: 'C1', state: 'ST8' });
+    expect(res.status).toBe(200);
+    const cfg = mockCreateAccount.mock.calls[0][2].config;
+    expect(cfg.scopes).toEqual(['tweet.read', 'tweet.write', 'users.read', 'offline.access']);
+  });
+
+  it('stores an empty array (never the requested constant) when the response omits scope', async () => {
+    await request(app).get('/api/oauth/twitter/init');
+    // default mock returns no `scope` field
+    const res = await request(app).post('/api/oauth/twitter/finalize').send({ code: 'C1', state: 'ST8' });
+    expect(res.status).toBe(200);
+    const cfg = mockCreateAccount.mock.calls[0][2].config;
+    expect(cfg.scopes).toEqual([]);
+  });
+});
+
 describe('POST /reconnect', () => {
   it('returns an authorization url', async () => {
     const res = await request(app).post('/api/oauth/twitter/reconnect');
