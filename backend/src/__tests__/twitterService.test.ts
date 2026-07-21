@@ -102,7 +102,14 @@ const makeAccount = (overrides: any = {}) => ({
     access_token: 'access-old',
     refresh_token: 'refresh-old',
     token_expires_at: Date.now() + 60 * 60 * 1000, // valid: 1h out
-    scopes: ['tweet.read', 'tweet.write', 'dm.read', 'dm.write', 'users.read', 'offline.access'],
+    // Fully-granted account (X Developer App = "Read and write"): every write
+    // scope present, so the ENG-413 pre-write guard is a no-op for these fixtures.
+    scopes: [
+      'tweet.read', 'tweet.write', 'users.read',
+      'follows.read', 'follows.write', 'like.read', 'like.write',
+      'bookmark.read', 'bookmark.write', 'dm.read', 'dm.write',
+      'block.read', 'block.write', 'mute.read', 'mute.write', 'offline.access',
+    ],
     ...overrides,
   },
   created_at: '2026-06-23T00:00:00.000Z',
@@ -1008,5 +1015,89 @@ describe('TwitterService.getClient — concurrent refresh deduplication', () => 
       expect.anything(), expect.anything(), expect.anything(),
       expect.objectContaining({ needs_reconnect: true })
     );
+  });
+});
+
+// ─── Pre-write scope guard (ENG-413 AC#2) ─────────────────────────────────────
+describe('TwitterService — pre-write scope guard', () => {
+  it('blocks a reply write when granted scopes lack tweet.write and never calls the X endpoint', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ scopes: ['tweet.read', 'users.read'] }),
+    ]);
+    await expect(
+      twitterService.postTweet(OWNER, ACCOUNT_ID, 'hello', { inReplyToTweetId: '123' })
+    ).rejects.toThrow(/read-only|reconnect|write permission/i);
+    // Core AC assertion: the X write endpoint is never hit.
+    expect(mockReply).not.toHaveBeenCalled();
+    expect(mockTweet).not.toHaveBeenCalled();
+  });
+
+  it('names the account handle and the fix in the guard error', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ username: 'harshmoney123', scopes: ['tweet.read', 'users.read'] }),
+    ]);
+    await expect(
+      twitterService.postTweet(OWNER, ACCOUNT_ID, 'hi', { inReplyToTweetId: '9' })
+    ).rejects.toThrow(/@harshmoney123/);
+  });
+
+  it('falls back to a generic handle in the guard error when username is missing (malformed/legacy record)', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ username: undefined, scopes: ['tweet.read', 'users.read'] }),
+    ]);
+    await expect(
+      twitterService.postTweet(OWNER, ACCOUNT_ID, 'hi', { inReplyToTweetId: '9' })
+    ).rejects.toThrow(/@your account is connected read-only/);
+  });
+
+  it('blocks a plain tweet write when granted scopes lack tweet.write', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ scopes: ['tweet.read', 'users.read'] }),
+    ]);
+    await expect(twitterService.postTweet(OWNER, ACCOUNT_ID, 'hello')).rejects.toThrow(/write permission/i);
+    expect(mockTweet).not.toHaveBeenCalled();
+  });
+
+  it('blocks a like when granted scopes lack like.write (guard fires before the X call)', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ scopes: ['tweet.read', 'tweet.write', 'users.read'] }),
+    ]);
+    // The scope-guard error (not a "client.v2.like is not a function" error) proves
+    // the guard short-circuits before any X endpoint is reached.
+    await expect(twitterService.likeTweet(OWNER, ACCOUNT_ID, 'tw1')).rejects.toThrow(/like\.write/);
+  });
+
+  it('allows a reply write when tweet.write IS granted (behavior-preserving)', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ scopes: ['tweet.read', 'tweet.write', 'users.read'] }),
+    ]);
+    const res = await twitterService.postTweet(OWNER, ACCOUNT_ID, 'a reply', { inReplyToTweetId: '555' });
+    expect(mockReply).toHaveBeenCalledWith('a reply', '555');
+    expect(res.id).toBe('222');
+  });
+
+  it('never blocks a read action (search) even on a read-only account', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ scopes: ['tweet.read', 'users.read'] }),
+    ]);
+    mockSearch.mockResolvedValue({ data: { data: [{ id: 's1', text: 'found' }] } });
+    const res = await twitterService.searchTweets(OWNER, ACCOUNT_ID, 'agentweb');
+    expect(mockSearch).toHaveBeenCalled();
+    expect(res).toHaveLength(1);
+  });
+
+  it('defers to X (does not pre-block) when the account has no recorded scopes (legacy)', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount({ scopes: undefined })]);
+    const res = await twitterService.postTweet(OWNER, ACCOUNT_ID, 'legacy');
+    // Guard is skipped for unknown scopes → the write proceeds to the mocked X client.
+    expect(mockTweet).toHaveBeenCalled();
+    expect(res.id).toBe('111');
+  });
+
+  it('defers to X (does not pre-block) when recorded scopes is an empty array', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount({ scopes: [] })]);
+    const res = await twitterService.postTweet(OWNER, ACCOUNT_ID, 'empty-scopes');
+    expect(mockTweet).toHaveBeenCalled();
+    expect(res.id).toBe('111');
   });
 });
