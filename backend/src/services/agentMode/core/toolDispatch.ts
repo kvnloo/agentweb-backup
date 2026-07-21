@@ -27,7 +27,7 @@
 
 import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
 import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
-import { CitationRegistry, WEB_SEARCH_TOOL_NAMES } from '../../../utils/citations';
+import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../../../utils/citations';
 import { appendRetryabilityGuidance } from './errorRetryability';
 // OTel spine (ENG-141). Direct imports, NOT ports: both are pure/inert without
 // exporter env config (spans become no-ops), so they don't entangle the module
@@ -695,8 +695,9 @@ export async function executePreparedTools(
       // ENG-351: harvest web-search sources into the per-message citation registry from the
       // FULL result here — extractMinimalToolResult below trims search results to {} for storage,
       // so this is the only place the structured sources are still available.
+      let citationBatch: Citation[] = [];
       if (citationRegistry && WEB_SEARCH_TOOL_NAMES.has(toolCall.function.name)) {
-        citationRegistry.registerSearchResults(processedResult?.results);
+        citationBatch = citationRegistry.registerSearchResults(processedResult?.results);
       }
 
       const minimalResult = ports.extractMinimalToolResult(processedResult, toolCall.function.name);
@@ -752,6 +753,12 @@ export async function executePreparedTools(
         toolContent = `Screenshot captured. URL: ${(processedResult as any).screenshotUrl}\n\n${ports.extractToolContent(result)}`;
       } else {
         toolContent = ports.extractToolContent(result);
+      }
+
+      // ENG-351 Phase 2: prepend the {{cite:N}} id→source map so the model can cite each
+      // figure inline. Prepend so it survives the large-response truncation/S3 path below.
+      if (citationBatch.length > 0 && typeof toolContent === 'string') {
+        toolContent = buildCitationIndexBlock(citationBatch) + toolContent;
       }
 
       // Large response: upload full content to S3 (search_tool_response retrieves later),

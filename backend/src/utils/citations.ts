@@ -30,6 +30,21 @@ export interface Citation {
 /** The web-search tools whose results carry citable web sources. */
 export const WEB_SEARCH_TOOL_NAMES = new Set(['you_search_web', 'you_search_news', 'google_search_web']);
 
+/**
+ * ENG-351 Phase 2: a compact id→source map prepended to a web-search tool result so the model
+ * can cite each figure inline with a {{cite:N}} marker whose N matches the message's registry id.
+ * Prepended (not appended) so it survives any downstream truncation of large search results.
+ */
+export function buildCitationIndexBlock(batch: Citation[]): string {
+  if (!batch.length) return '';
+  const lines = batch.map((c) => `  {{cite:${c.id}}} = ${c.siteName || c.domain} (${c.domain})`).join('\n');
+  return (
+    `[INLINE CITATIONS — for every quoted number, statistic, or data point you take from a source below, ` +
+    `place its marker immediately after the figure, e.g. "$5.2B {{cite:${batch[0].id}}}". ` +
+    `Use ONLY these exact ids; never invent one:\n${lines}\n]\n\n`
+  );
+}
+
 /** Extract the bare host (lowercased, no leading `www.`) from a URL; '' if unparseable. */
 export function domainFromUrl(rawUrl: string): string {
   try {
@@ -82,9 +97,16 @@ export class CitationRegistry {
   private byKey = new Map<string, Citation>();
   private nextId = 1;
 
-  /** Register the `results` array of a web-search tool call. Non-arrays are ignored. */
-  registerSearchResults(results: unknown): void {
-    if (!Array.isArray(results)) return;
+  /**
+   * Register the `results` array of ONE web-search tool call. Returns the batch's citations
+   * (with their stable global ids, whether newly assigned or previously seen) so the caller
+   * can show the model the id→source map for THIS search. Non-arrays yield an empty batch.
+   */
+  registerSearchResults(results: unknown): Citation[] {
+    if (!Array.isArray(results)) return [];
+
+    const batch: Citation[] = [];
+    const seenInBatch = new Set<string>();
 
     for (const r of results) {
       const url = typeof r?.url === 'string' ? r.url.trim() : '';
@@ -94,18 +116,26 @@ export class CitationRegistry {
       if (!domain) continue; // unparseable host (e.g. "https://") — skip rather than show an empty pill
 
       const key = dedupeKey(url);
-      if (this.byKey.has(key)) continue;
-
-      this.byKey.set(key, {
-        id: this.nextId++,
-        url,
-        domain,
-        siteName: prettySiteName(domain),
-        ...(typeof r.title === 'string' && r.title.trim() ? { title: r.title.trim() } : {}),
-        ...(typeof r.snippet === 'string' && r.snippet.trim() ? { snippet: r.snippet.trim() } : {}),
-        ...(typeof r.publishedDate === 'string' && r.publishedDate ? { publishedDate: r.publishedDate } : {}),
-      });
+      let cit = this.byKey.get(key);
+      if (!cit) {
+        cit = {
+          id: this.nextId++,
+          url,
+          domain,
+          siteName: prettySiteName(domain),
+          ...(typeof r.title === 'string' && r.title.trim() ? { title: r.title.trim() } : {}),
+          ...(typeof r.snippet === 'string' && r.snippet.trim() ? { snippet: r.snippet.trim() } : {}),
+          ...(typeof r.publishedDate === 'string' && r.publishedDate ? { publishedDate: r.publishedDate } : {}),
+        };
+        this.byKey.set(key, cit);
+      }
+      if (!seenInBatch.has(key)) {
+        seenInBatch.add(key);
+        batch.push(cit);
+      }
     }
+
+    return batch;
   }
 
   /** The de-duplicated citations, in first-seen order. */
