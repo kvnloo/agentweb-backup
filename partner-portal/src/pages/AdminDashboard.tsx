@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { useAdmin } from "../contexts/AdminContext";
 import { Link as RouterLink, useSearchParams } from "react-router-dom";
 import {
@@ -61,6 +61,7 @@ import ResultEndpointsTab from "../components/admin/ResultEndpointsTab";
 import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
 import CrmTab from "../components/admin/CrmTab";
 import V0CreditsCard from "../components/admin/V0CreditsCard";
+import CostBreakdownBody, { OrgUsageRollup } from "../components/admin/CostBreakdownBody";
 import RevenueTab from "../components/admin/RevenueTab";
 import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
@@ -315,41 +316,6 @@ interface User {
   orgName?: string;
   isOrgOwner?: boolean;
   orgShareAnalyticsWithOrg?: boolean;
-}
-
-// Per-(day, model, feature) shadow-usage row returned by
-// GET /api/admin/users/:userId/usage/by-model-day (see backend adminUsage.ts).
-// costUsd here is the GROSS burn — every metered AND burn-only LLM call — not the
-// amount deducted from the user's quota.
-interface UsageByModelDayRow {
-  date: string;
-  model: string;
-  feature: string;
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheWriteTokens: number;
-  totalTokens: number;
-  callCount: number;
-  costMicroUsd: number;
-  costUsd: number;
-}
-
-interface UsageByModelDay {
-  userId: string;
-  start: string;
-  end: string;
-  rows: UsageByModelDayRow[];
-  totals: {
-    inputTokens: number;
-    outputTokens: number;
-    cacheReadTokens: number;
-    cacheWriteTokens: number;
-    totalTokens: number;
-    callCount: number;
-    costMicroUsd: number;
-    costUsd: number;
-  };
 }
 
 // Caption paired with a hover-help info icon. Used to explain the burn / deduction
@@ -958,9 +924,13 @@ export default function AdminDashboard() {
   // Per-user LLM cost breakdown modal (burn, from the shadow-usage table)
   const [costBreakdownUser, setCostBreakdownUser] = useState<User | null>(null);
   const [costBreakdownMonth, setCostBreakdownMonth] = useState<string>("");
-  const [costBreakdownData, setCostBreakdownData] = useState<UsageByModelDay | null>(null);
+  const [costBreakdownData, setCostBreakdownData] = useState<OrgUsageRollup | null>(null);
   const [costBreakdownLoading, setCostBreakdownLoading] = useState(false);
   const [costBreakdownError, setCostBreakdownError] = useState<string | null>(null);
+  // Monotonic token to ignore stale org-rollup responses: if the admin switches
+  // user/month before a request returns, a slower earlier response must not
+  // overwrite the current selection's data (Greptile).
+  const costBreakdownReqRef = useRef(0);
   // Table vs bar-chart view for the cost-breakdown modal — remembered per-admin.
   const [costBreakdownView, setCostBreakdownView] = useState<"table" | "bars">(
     () => (typeof window !== "undefined" && localStorage.getItem("costBreakdownView") === "bars" ? "bars" : "table")
@@ -1145,23 +1115,26 @@ export default function AdminDashboard() {
 
   // Fetch the per-model LLM cost burn for a user over a calendar month (YYYY-MM).
   const fetchCostBreakdown = async (userId: string, month: string) => {
+    const reqId = ++costBreakdownReqRef.current;
+    const isStale = () => reqId !== costBreakdownReqRef.current;
     setCostBreakdownLoading(true);
     setCostBreakdownError(null);
     try {
-      const start = `${month}-01`;
-      // 31 always sorts at/after the real month end; days that don't exist have no rows.
-      const end = `${month}-31`;
+      // Org-aware rollup: gross burn summed across all org members, reconciled
+      // against the OWNER's quota counter (see backend usageAnalyticsService).
       const response = await axios.get(
-        buildApiUrl(`/api/admin/users/${userId}/usage/by-model-day`),
-        { headers: { Authorization: `Bearer ${token}` }, params: { start, end } }
+        buildApiUrl(`/api/admin/users/${userId}/usage/org-rollup`),
+        { headers: { Authorization: `Bearer ${token}` }, params: { month } }
       );
+      if (isStale()) return; // a newer request superseded this one
       setCostBreakdownData(response.data);
     } catch (error: any) {
+      if (isStale()) return;
       console.error('Error loading cost breakdown:', error);
       setCostBreakdownData(null);
       setCostBreakdownError(error.response?.data?.message || 'Failed to load cost breakdown');
     } finally {
-      setCostBreakdownLoading(false);
+      if (!isStale()) setCostBreakdownLoading(false);
     }
   };
 
@@ -1173,15 +1146,6 @@ export default function AdminDashboard() {
     setCostBreakdownMonth(new Date().toISOString().slice(0, 7));
   };
 
-  // Amount deducted from a user's quota for a given month (YYYY-MM). This is the
-  // "counted" cost — only metered (non-burn-only) calls — vs the gross burn shown
-  // by the breakdown endpoint. Current month comes from tokenUsage; past months
-  // from tokenUsageHistory.
-  const deductedCostForMonth = (user: User, month: string): number => {
-    if (user.tokenUsage?.month === month) return user.tokenUsage?.totalCost ?? 0;
-    const hist = user.tokenUsageHistory?.find((h) => h.month === month);
-    return hist?.totalCost ?? 0;
-  };
 
   // (Re)load the breakdown whenever the target user or selected month changes.
   useEffect(() => {
@@ -6803,178 +6767,13 @@ export default function AdminDashboard() {
             <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}><CircularProgress /></Box>
           ) : costBreakdownError ? (
             <Typography color="error" variant="body2" sx={{ py: 2 }}>{costBreakdownError}</Typography>
-          ) : costBreakdownData ? (() => {
-            const burn = costBreakdownData.totals.costUsd;
-            const deducted = costBreakdownUser ? deductedCostForMonth(costBreakdownUser, costBreakdownMonth) : 0;
-            const absorbed = Math.max(0, burn - deducted);
-            // Policy: every LLM call with a real userId is charged to the user, so
-            // absorbed should be ~$0. A non-trivial value flags spend still escaping
-            // the cap (a metering leak) — surface it in red as a monitor.
-            const isLeaking = absorbed > 0.005;
-            // Aggregate the per-(day, model, feature) rows up to per-model totals.
-            const byModel: Record<string, { model: string; callCount: number; totalTokens: number; costUsd: number }> = {};
-            costBreakdownData.rows.forEach((r) => {
-              const m = byModel[r.model] || (byModel[r.model] = { model: r.model, callCount: 0, totalTokens: 0, costUsd: 0 });
-              m.callCount += r.callCount;
-              m.totalTokens += r.totalTokens;
-              m.costUsd += r.costUsd;
-            });
-            const modelRows = Object.values(byModel).sort((a, b) => b.costUsd - a.costUsd);
-            // rows come back sorted by (date, model) asc, so rows[0] is the earliest
-            // burn we have on record for this window — used to signal "tracking since".
-            const earliestTracked = costBreakdownData.rows.length ? costBreakdownData.rows[0].date : null;
-            // Burn (shadow table) and the deducted counter are separate pipelines; the
-            // counter predates per-call burn tracking, so burn can legitimately read
-            // lower than what's counted to quota during the ramp-up window.
-            const burnLagsDeducted = modelRows.length > 0 && burn + 0.005 < deducted;
-            // Overall cost quota (bars view): deducted spend vs the tier's cap — the
-            // same figure the enforcement gate checks. Null cap = unlimited (no bar).
-            const costAllowance = subscriptionTypeCostAllowanceMap[costBreakdownUser?.subscriptionType || "Basic"] ?? null;
-            const quotaPct = costAllowance != null && costAllowance > 0 ? (deducted / costAllowance) * 100 : null;
-            const quotaColor = quotaPct == null ? "grey.500" : quotaPct >= 100 ? "error.main" : quotaPct >= 80 ? "warning.main" : "success.main";
-            return (
-              <>
-                <Grid container spacing={2} sx={{ mb: 2 }}>
-                  <Grid item xs={4}>
-                    <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 1.5 }}>
-                      <HelpCaption
-                        label="Burned (gross)"
-                        help="Burn = the real dollar cost of every LLM call this user generated this month — including calls the platform absorbs. This is what it actually costs us to serve them, before any quota accounting."
-                      />
-                      <Typography variant="h6" sx={{ fontVariantNumeric: "tabular-nums" }}>${burn.toFixed(2)}</Typography>
-                      <Typography variant="caption" color="text.secondary">all LLM calls this user generated</Typography>
-                    </Box>
-                  </Grid>
-                  <Grid item xs={4}>
-                    <Box sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 1.5 }}>
-                      <HelpCaption
-                        label="Counted to quota"
-                        help="Deduction = the portion of burn charged against the user's monthly cost cap. Some calls are metered burn-only (platform-absorbed) and never deduct, so this is usually ≤ gross burn."
-                      />
-                      <Typography variant="h6" sx={{ fontVariantNumeric: "tabular-nums" }}>${deducted.toFixed(2)}</Typography>
-                      <Typography variant="caption" color="text.secondary">deducted from their cost cap</Typography>
-                    </Box>
-                  </Grid>
-                  <Grid item xs={4}>
-                    <Box
-                      data-testid="absorbed-card"
-                      data-leaking={isLeaking ? "true" : "false"}
-                      sx={{
-                        border: 1,
-                        borderColor: isLeaking ? "error.main" : "divider",
-                        bgcolor: isLeaking ? "error.50" : "transparent",
-                        borderRadius: 1,
-                        p: 1.5,
-                      }}
-                    >
-                      <HelpCaption
-                        label={isLeaking ? "⚠ Absorbed by platform" : "Absorbed by platform"}
-                        help="Burn the platform ate — gross burn minus what was counted to quota. Policy is to charge every call with a real userId to the user, so this should read ~$0. A non-zero value means spend is still escaping the cap (a metering leak) or predates the charge-all rollout."
-                      />
-                      <Typography
-                        variant="h6"
-                        sx={{ fontVariantNumeric: "tabular-nums" }}
-                        color={isLeaking ? "error.main" : "text.primary"}
-                      >
-                        ${absorbed.toFixed(2)}
-                      </Typography>
-                      <Typography variant="caption" color={isLeaking ? "error.main" : "text.secondary"}>
-                        {isLeaking ? "spend escaping the cap — investigate" : "fully charged (no leak)"}
-                      </Typography>
-                    </Box>
-                  </Grid>
-                </Grid>
-                {costBreakdownView === "bars" && (
-                  costAllowance != null ? (
-                    <Box sx={{ mb: 2 }}>
-                      <Box sx={{ display: "flex", justifyContent: "space-between", mb: 0.5 }}>
-                        <Typography variant="body2" fontWeight={600}>Monthly cost quota</Typography>
-                        <Typography variant="body2" sx={{ fontVariantNumeric: "tabular-nums" }}>
-                          ${deducted.toFixed(2)} / ${costAllowance.toFixed(2)} ({Math.round(quotaPct ?? 0)}%)
-                        </Typography>
-                      </Box>
-                      <Tooltip title={`${Math.round(quotaPct ?? 0)}% of the monthly cost cap consumed (deducted spend vs cap)`}>
-                        <Box sx={{ height: 12, borderRadius: 6, bgcolor: "grey.200", overflow: "hidden" }}>
-                          <Box sx={{ height: "100%", width: `${Math.min(100, quotaPct ?? 0)}%`, bgcolor: quotaColor, transition: "width .3s" }} />
-                        </Box>
-                      </Tooltip>
-                    </Box>
-                  ) : (
-                    <Alert severity="info" sx={{ mb: 2 }}>
-                      This user's tier has no cost cap (unlimited) — no quota bar. Per-model spend share is shown below.
-                    </Alert>
-                  )
-                )}
-                {modelRows.length === 0 ? (
-                  <Alert severity="info" sx={{ mb: 1 }}>
-                    No per-model burn has been recorded for this month yet. Burn is captured per LLM
-                    call from usage records, so an empty view means no metered calls landed in this
-                    window (or this environment hasn't generated traffic yet). The “Counted to quota”
-                    figure above comes from a separate running counter and may still be non-zero.
-                  </Alert>
-                ) : (
-                  <>
-                    {burnLagsDeducted && (
-                      <Alert severity="info" sx={{ mb: 1 }}>
-                        Recorded burn{earliestTracked ? ` (tracked from ${earliestTracked})` : ""} is lower than
-                        the amount counted to this user's quota. Per-call burn tracking is newer than the quota
-                        counter, so earlier usage isn't reflected here yet; “Absorbed by platform” shows $0
-                        until burn catches up.
-                      </Alert>
-                    )}
-                    {costBreakdownView === "bars" ? (
-                      <Box data-testid="cost-breakdown-bars">
-                        <Typography variant="caption" color="text.secondary">Spend share by model (of ${burn.toFixed(2)} gross burn)</Typography>
-                        {modelRows.map((m) => {
-                          const share = burn > 0 ? (m.costUsd / burn) * 100 : 0;
-                          return (
-                            <Box key={m.model} sx={{ mt: 1 }}>
-                              <Box sx={{ display: "flex", justifyContent: "space-between" }}>
-                                <Typography variant="caption" sx={{ fontFamily: "monospace" }}>{m.model}</Typography>
-                                <Typography variant="caption" sx={{ fontVariantNumeric: "tabular-nums" }}>
-                                  ${m.costUsd.toFixed(4)} ({share.toFixed(1)}%)
-                                </Typography>
-                              </Box>
-                              <Box sx={{ height: 8, borderRadius: 4, bgcolor: "grey.100", overflow: "hidden" }}>
-                                <Box sx={{ height: "100%", width: `${Math.max(share, 0.5)}%`, bgcolor: "primary.main" }} />
-                              </Box>
-                            </Box>
-                          );
-                        })}
-                      </Box>
-                    ) : (
-                    <Table size="small">
-                    <TableHead>
-                      <TableRow>
-                        <TableCell>Model</TableCell>
-                        <TableCell align="right">Calls</TableCell>
-                        <TableCell align="right">Tokens</TableCell>
-                        <TableCell align="right">Burn</TableCell>
-                      </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {modelRows.map((m) => (
-                        <TableRow key={m.model}>
-                          <TableCell>{m.model}</TableCell>
-                          <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>{m.callCount.toLocaleString()}</TableCell>
-                          <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>{m.totalTokens.toLocaleString()}</TableCell>
-                          <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>${m.costUsd.toFixed(4)}</TableCell>
-                        </TableRow>
-                      ))}
-                      <TableRow>
-                        <TableCell sx={{ fontWeight: 600 }}>Total</TableCell>
-                        <TableCell align="right" sx={{ fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>{costBreakdownData.totals.callCount.toLocaleString()}</TableCell>
-                        <TableCell align="right" sx={{ fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>{costBreakdownData.totals.totalTokens.toLocaleString()}</TableCell>
-                        <TableCell align="right" sx={{ fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>${burn.toFixed(4)}</TableCell>
-                      </TableRow>
-                    </TableBody>
-                  </Table>
-                    )}
-                  </>
-                )}
-              </>
-            );
-          })() : (
+          ) : costBreakdownData ? (
+            <CostBreakdownBody
+              rollup={costBreakdownData}
+              view={costBreakdownView}
+              costAllowanceMap={subscriptionTypeCostAllowanceMap}
+            />
+          ) : (
             <Typography variant="body2" color="text.secondary" sx={{ py: 2 }}>No data.</Typography>
           )}
         </DialogContent>

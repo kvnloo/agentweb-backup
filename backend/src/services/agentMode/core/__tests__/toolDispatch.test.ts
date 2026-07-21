@@ -18,6 +18,7 @@ import {
   type ExecutePreparedToolsInput,
   type ToolDispatchPorts,
 } from '../toolDispatch';
+import { CitationRegistry } from '../../../../utils/citations';
 // ENG-105 wiring: the REAL output-contract validator + the REAL extractToolContent
 // (now a monolith-free util) + the REAL error classifier, so this suite proves the
 // production port — not a hand-copied mirror — downgrades empty output and tags it
@@ -173,6 +174,34 @@ describe('executePreparedTools', () => {
     await executePreparedTools(input);
 
     expect(input.messages[0].content).toContain('Retryable: yes');
+  });
+
+  it('ENG-351: harvests web-search sources into the citation registry (deduped, numbered)', async () => {
+    const ports = makePorts({
+      executePreparedAgentTool: async (i: any) =>
+        i.toolName === 'you_search_web'
+          ? {
+              success: true,
+              results: [
+                { url: 'https://www.grandviewresearch.com/report', title: 'CRM $163B', snippet: 's1' },
+                { url: 'https://statista.com/crm', title: 'CRM stats' },
+              ],
+            }
+          : { success: true },
+    });
+    const citationRegistry = new CitationRegistry();
+    const input = makeInput(
+      [toolCall('a', 'you_search_web', '{}'), toolCall('b', 'send_email', '{}')],
+      ports,
+      { citationRegistry },
+    );
+
+    await executePreparedTools(input);
+
+    const cites = citationRegistry.list();
+    expect(cites.map((c) => c.domain)).toEqual(['grandviewresearch.com', 'statista.com']);
+    expect(cites.map((c) => c.id)).toEqual([1, 2]);
+    expect(cites[0]).toMatchObject({ title: 'CRM $163B', snippet: 's1' });
   });
 
   it('marks an auth tool error as NOT retryable and tells the model to stop (ENG-124)', async () => {

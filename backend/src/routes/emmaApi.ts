@@ -195,7 +195,7 @@ router.post('/describe-media', async (req: Request, res: Response) => {
     const { type, url, prompt, llm_model, return_transcript, return_scenes, start_time, end_time } = req.body;
     let result;
     if (type === 'video') {
-      result = await svc.describeVideo(url, prompt, { return_transcript, return_scenes, start_time, end_time });
+      result = await svc.describeVideo(url, prompt, { return_transcript, return_scenes, start_time, end_time, userId: userId(req) });
     } else {
       result = await svc.describeImage(llm_model || 'gpt-4o', url, prompt);
     }

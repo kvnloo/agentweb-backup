@@ -1,4 +1,5 @@
 import { WebClient } from "@slack/web-api";
+import { stripCitationMarkers } from "../utils/citations";
 
 /**
  * ENG-402 seam: resolve the Slack API base URL the WebClient should target.
@@ -1114,7 +1115,9 @@ export async function postThreadResponse(
     throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
   }
 
-  const mrkdwnContent = markdownToMrkdwn(markdownContent);
+  // ENG-351: Slack has no citation-chip renderer, so drop any {{cite:N}} markers Emma emitted —
+  // otherwise they would show as literal garbage in the thread. No-op on non-Emma/fallback strings.
+  const mrkdwnContent = markdownToMrkdwn(stripCitationMarkers(markdownContent));
 
   // Split into chunks if too long
   const chunks: string[] = [];

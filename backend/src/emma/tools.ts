@@ -730,6 +730,11 @@ ACTION MATRIX (entity_type → supported actions):
   PAGE          → LIST
   DATASET       → LIST, GET_MATCH_QUALITY
 
+READING CONFIG (LIST) — read what a campaign/ad set is actually set to optimize for (use to verify after a CREATE/UPDATE):
+  AD_SET LIST returns optimization_goal, billing_event, destination_type, promoted_object (pixel_id + custom_event_type), bid_strategy, and budgets per ad set. Pass ad_set_id to read a single ad set; pass campaign_id to scope to one campaign's ad sets.
+  CAMPAIGN LIST returns objective plus daily_budget / lifetime_budget / budget_remaining / bid_strategy. Pass campaign_id to read a single campaign.
+  Optional params.fields (comma-separated) narrows the read to specific supported fields. Requesting an unsupported field returns a loud error — it is never silently dropped.
+
 DATASET USAGE:
   LIST              → Returns all pixels and their associated datasets (server event data sources) for the ad account
   GET_MATCH_QUALITY → Returns Event Match Quality (EMQ) scores per event type for a specific dataset. Requires params.dataset_id.
@@ -906,6 +911,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
             start_time: { type: "string", description: "ISO 8601 start datetime." },
             end_time: { type: "string", description: "ISO 8601 end datetime. Required with lifetime_budget." },
             promoted_object: { type: "object", description: "Promoted object (e.g., { page_id: 'ID' } or { pixel_id: 'ID', custom_event_type: 'PURCHASE' })." },
+            destination_type: { type: "string", description: "Conversion location for the ad set. Defaults to 'WEBSITE' for website traffic/conversion goals (LINK_CLICKS, LANDING_PAGE_VIEWS, OFFSITE_CONVERSIONS, VALUE) so the ad-level Destination is explicitly set. Pass explicitly for other destinations: 'ON_AD' (instant lead forms), 'MESSENGER', 'APP'." },
 
             // --- Creative ---
             page_id: { type: "string", description: "Facebook Page ID (from list_meta_pages or PAGE LIST)." },
@@ -4416,7 +4422,8 @@ emmaToolRegistry.register({
       return_transcript: args.return_transcript,
       return_scenes: args.return_scenes,
       start_time: args.start_time,
-      end_time: args.end_time
+      end_time: args.end_time,
+      userId: context?.userId // charge this describe_video spend to the caller (ENG-200)
     });
   }
 });
