@@ -568,6 +568,36 @@ describe('AgentModeService - Bedrock Converse message conversion', () => {
 
       expect(result.choices[0].finish_reason).toBe('length');
     });
+
+    it('should NOT surface a max_tokens-truncated tool call as a completed tool_calls finish (ENG-403)', async () => {
+      // A create_html_file call whose large content_draft was cut off mid-argument:
+      // Converse returns a toolUse block but stopReason='max_tokens'. Surfacing this
+      // as finish_reason='tool_calls' sends an incomplete/invalid tool call to schema
+      // validation, which drops the required content_draft and loops with
+      // "Missing required argument content_draft". It must instead be reported as a
+      // truncation (finish_reason='length', no tool_calls) so the main loop's
+      // max-tokens continuation path handles it.
+      mockBedrockSend.mockResolvedValue({
+        output: {
+          message: {
+            role: 'assistant',
+            content: [
+              { toolUse: { toolUseId: 'tc_html', name: 'create_html_file', input: { title: 'One Pager' } } },
+            ],
+          },
+        },
+        usage: { inputTokens: 100, outputTokens: 32000 },
+        stopReason: 'max_tokens',
+      });
+
+      const result = await (agentModeService as any).callLLM(
+        'anthropic.claude-sonnet-4-6',
+        [{ role: 'system', content: 'S' }, { role: 'user', content: 'Create an on-brand HTML one-pager' }]
+      );
+
+      expect(result.choices[0].finish_reason).toBe('length');
+      expect(result.choices[0].message.tool_calls).toBeFalsy();
+    });
   });
 
   describe('sanitizeSchemaForBedrock', () => {
