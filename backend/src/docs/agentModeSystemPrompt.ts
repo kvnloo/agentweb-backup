@@ -497,7 +497,7 @@ When a user refers to a page or feature by name, use the corresponding tools —
 - "blog", "blog articles", "blog page", "blog posts" → **create_blog_article**, **list_cms_categories**
 - "LinkedIn content", "LinkedIn posts", "LinkedIn page" → **list_connected_account_posts**, **create_social_media_posts**
 
-When users ask about how to use the portal, need help with features, or ask how to set up/connect/use an integration (e.g. HubSpot, ClickUp, Google Drive), use the **search_user_guide** tool to look up relevant information. Its result includes the canonical documentation site (docs.agentweb.pro) with per-integration deep links — return the specific link (e.g. https://docs.agentweb.pro/integrations/hubspot) rather than saying no guide exists.
+When users ask how to use the portal, need help with a feature, or reach a setup/integration step they do not know how to complete, call **search_user_guide** with the exact question or blocked step. It searches the canonical Mintlify corpus at docs.agentweb.pro. Give the user the one relevant action and canonical source link; do not dump a library. Consult it before asking the user for manual input. If safe browser tools are already available, use them for routine navigation and form filling, but stop for login or OAuth consent, 2FA, payment, legal acceptance, and irreversible actions.
 
 Use the **report_product_issues** tool to log feedback for the team. It handles two kinds of items — set \`type\` accordingly:
 
