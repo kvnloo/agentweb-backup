@@ -166,6 +166,31 @@ export async function getS3ObjectAsString(
   throw lastError;
 }
 
+/**
+ * Download an S3 object and return its raw bytes plus stored content type.
+ *
+ * Used for binary assets (images) that must be read server-side even when the
+ * bucket is private — e.g. inlining a private-S3 image into an HTML report as a
+ * base64 data URI (ENG-278). Unlike a public `<img src>` fetch, this uses the
+ * S3 SDK with the server's credentials, so private objects are reachable.
+ *
+ * Throws on any S3 error (missing object, access denied, network) so callers can
+ * decide how to degrade — it never returns a partial/empty buffer as if it were a
+ * successful read.
+ */
+export async function getS3ObjectAsBuffer(
+  key: string,
+  bucket: string = DEFAULT_BUCKET,
+): Promise<{ buffer: Buffer; contentType?: string }> {
+  const result = await s3.getObject({ Bucket: bucket, Key: key }).promise();
+  const body = result.Body;
+  if (body === undefined || body === null) {
+    throw new Error(`S3 object ${bucket}/${key} returned an empty body`);
+  }
+  const buffer = Buffer.isBuffer(body) ? body : Buffer.from(body as any);
+  return { buffer, contentType: result.ContentType };
+}
+
 export interface S3UploadResult {
   success: boolean;
   url?: string;

@@ -23960,6 +23960,25 @@ Please generate a complete, professional HTML document that properly formats and
         throw new Error('LLM did not generate HTML content');
       }
 
+      // Inline any private-S3 images as base64 data URIs so they always render
+      // (ENG-278). Images hosted in our private bucket render blank via a plain
+      // <img src> because the browser fetches them anonymously and gets a 403.
+      // Documents only — emails are left as absolute URLs (email clients strip or
+      // size-limit base64), matching the email system prompt. Best-effort: an
+      // inlining failure never blocks HTML creation.
+      if (!isEmail) {
+        try {
+          const { inlineS3ImagesAsDataUris, createDefaultS3ImageFetcher } = await import('../utils/inlineS3Images');
+          const inlineResult = await inlineS3ImagesAsDataUris(htmlContent, createDefaultS3ImageFetcher());
+          if (inlineResult.inlined > 0 || inlineResult.failed > 0) {
+            console.log(`AgentMode: Inlined ${inlineResult.inlined} private-S3 image(s) as data URIs (${inlineResult.failed} failed) in HTML file`);
+          }
+          htmlContent = inlineResult.html;
+        } catch (inlineError) {
+          console.warn('AgentMode: S3 image inlining step failed, proceeding with original HTML:', inlineError);
+        }
+      }
+
       // Upload to S3
       const { uploadFileToS3 } = await import('../utils/s3Utils');
       const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
