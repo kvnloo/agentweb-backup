@@ -110,8 +110,14 @@ export class TwitterService {
    * attempting a refresh with a known-dead refresh token.
    * If a pre-emptive refresh fails, stamps needs_reconnect so Emma can surface
    * a clear reconnect message instead of a raw API error.
+   *
+   * `requiredScope` is the OAuth2 write scope a mutating action needs (e.g.
+   * `tweet.write`). When set, a pre-write capability guard fails loud BEFORE any
+   * X round-trip if the account's GRANTED scopes don't include it — turning the
+   * opaque, silent X 403 (read-only Developer App) into an actionable reconnect
+   * prompt naming the account.
    */
-  async getClient(ownerUserId: string, accountId: string): Promise<TwitterApi> {
+  async getClient(ownerUserId: string, accountId: string, requiredScope?: string): Promise<TwitterApi> {
     const account = await this.resolveAccount(ownerUserId, accountId);
     const config = account.config as TwitterXConfig;
 
@@ -120,6 +126,21 @@ export class TwitterService {
       throw new Error(
         'Your X account needs to be reconnected. Go to Settings → Connected Accounts and reconnect your X account.'
       );
+    }
+
+    // Pre-write capability guard. Only blocks when the granted scopes are known
+    // (a non-empty array recorded at connect time) and demonstrably lack the
+    // write scope — so a read-only grant is caught, while a legacy account with
+    // no recorded scopes defers to X (whose real error is now surfaced, not
+    // swallowed). This never fires for read actions (requiredScope undefined).
+    if (requiredScope) {
+      const granted = config.scopes;
+      if (Array.isArray(granted) && granted.length > 0 && !granted.includes(requiredScope)) {
+        throw new Error(
+          `Your X account @${config.username ?? 'your account'} is connected read-only — it is missing the "${requiredScope}" permission needed for this action. ` +
+          'Reconnect it with write permission in Settings → Connected Accounts.'
+        );
+      }
     }
 
     let accessToken = config.access_token;
@@ -269,9 +290,10 @@ export class TwitterService {
   private async withRetryOn401<T>(
     ownerUserId: string,
     accountId: string,
-    fn: (client: TwitterApi) => Promise<T>
+    fn: (client: TwitterApi) => Promise<T>,
+    requiredScope?: string
   ): Promise<T> {
-    const client = await this.getClient(ownerUserId, accountId);
+    const client = await this.getClient(ownerUserId, accountId, requiredScope);
     const isXAuthError = (e: unknown): boolean =>
       typeof e === 'object' && e !== null && (e as any).code === 401;
 
@@ -334,7 +356,8 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, (client) =>
       opts?.inReplyToTweetId
         ? client.v2.reply(finalText, opts.inReplyToTweetId!).then((r: any) => ({ id: r.data.id, text: r.data.text }))
-        : client.v2.tweet(finalText).then((r: any) => ({ id: r.data.id, text: r.data.text }))
+        : client.v2.tweet(finalText).then((r: any) => ({ id: r.data.id, text: r.data.text })),
+      'tweet.write'
     );
   }
 
@@ -384,7 +407,7 @@ export class TwitterService {
         throw new Error(`Could not resolve X handle "@${handle}"`);
       }
       return client.v2.sendDmToParticipant(user.data.id, { text: finalText });
-    });
+    }, 'dm.write');
   }
 
   /**
@@ -422,7 +445,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.deleteTweet(tweetId.trim());
       return { deleted: res?.data?.deleted ?? false };
-    });
+    }, 'tweet.write');
   }
 
   // ─── Private helpers for actions that need the authed user's own Twitter ID ──
@@ -459,7 +482,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.follow(myId, targetId);
       return res?.data ?? res;
-    });
+    }, 'follows.write');
   }
 
   /**
@@ -472,7 +495,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.unfollow(myId, targetId);
       return res?.data ?? res;
-    });
+    }, 'follows.write');
   }
 
   // ─── List followers / following ───────────────────────────────────────────────
@@ -542,7 +565,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.like(myId, tweetId.trim());
       return res?.data ?? res;
-    });
+    }, 'like.write');
   }
 
   /** Unlike a tweet. */
@@ -552,7 +575,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.unlike(myId, tweetId.trim());
       return res?.data ?? res;
-    });
+    }, 'like.write');
   }
 
   // ─── Retweet / unretweet ─────────────────────────────────────────────────────
@@ -564,7 +587,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.retweet(myId, tweetId.trim());
       return res?.data ?? res;
-    });
+    }, 'tweet.write');
   }
 
   /** Undo a retweet. */
@@ -574,7 +597,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.unretweet(myId, tweetId.trim());
       return res?.data ?? res;
-    });
+    }, 'tweet.write');
   }
 
   // ─── User tweets timeline ────────────────────────────────────────────────────
@@ -602,7 +625,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.bookmark(tweetId.trim());
       return res?.data ?? res;
-    });
+    }, 'bookmark.write');
   }
 
   /** Retrieve the authed user's bookmarked tweets. */
@@ -726,7 +749,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.quote(finalText, quotedTweetId.trim());
       return { id: res.data.id, text: res.data.text };
-    });
+    }, 'tweet.write');
   }
 
   // ─── Engagement lookup ────────────────────────────────────────────────────────
@@ -771,7 +794,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.block(myId, targetId);
       return res?.data ?? res;
-    });
+    }, 'block.write');
   }
 
   /** Unblock a user by handle. Requires block.write scope. */
@@ -782,7 +805,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.unblock(myId, targetId);
       return res?.data ?? res;
-    });
+    }, 'block.write');
   }
 
   // ─── Mute / unmute ───────────────────────────────────────────────────────────
@@ -795,7 +818,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.mute(myId, targetId);
       return res?.data ?? res;
-    });
+    }, 'mute.write');
   }
 
   /** Unmute a user by handle. Requires mute.write scope. */
@@ -806,7 +829,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.unmute(myId, targetId);
       return res?.data ?? res;
-    });
+    }, 'mute.write');
   }
 
   // ─── Tweet metrics ───────────────────────────────────────────────────────────
