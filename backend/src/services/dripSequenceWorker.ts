@@ -17,6 +17,7 @@ import { linkedInOutreachService } from './linkedInOutreachService';
 import { crmDb, userDb } from './db';
 import { emailEventsDb } from './emailEventsDb';
 import { isDoNotContact } from '../utils/leadContactStatus';
+import { classifyEngagementEvent } from '../utils/emailEngagementGuard';
 import { substituteVariables, injectUnsubscribeUrl, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { loadSenderConfig as loadCrmSenderConfig } from './crmSenderService';
 import { CrmSender } from './crmSenderTypes';
@@ -309,12 +310,32 @@ async function checkExitConditions(
         const at = e.createdAt ? new Date(e.createdAt).getTime() : NaN;
         if (!Number.isFinite(at) || at <= enrolledAt) return false;
 
-        if (wanted.includes('opened') && e.eventType === 'email.opened') return true;
-        if (wanted.includes('clicked') && e.eventType === 'email.clicked') return true;
         // An inbound reply is stored as email.received, with leadEmail set to the SENDER
-        // (i.e. the lead) — see emailEventsDb.extractLeadEmail.
+        // (i.e. the lead) — see emailEventsDb.extractLeadEmail. A reply has no false-positive
+        // mode (a machine cannot write one), so it is always trusted.
         if (wanted.includes('replied') && e.eventType === 'email.received') return true;
-        return false;
+
+        // Opens and clicks CAN be machine-generated — corporate link scanners (Microsoft
+        // Safe Links, Proofpoint, Mimecast, Barracuda) click every link on delivery, and
+        // email-security prefetch opens tracking pixels before a human ever sees the mail.
+        // Only count them when they look like a real human, never a scanner (ENG-325). The
+        // guard filters on positive machine evidence only (scanner UA / pre-send timing), so
+        // legitimate opens — including Gmail's GoogleImageProxy — still exit as before.
+        const isOpen = wanted.includes('opened') && e.eventType === 'email.opened';
+        const isClick = wanted.includes('clicked') && e.eventType === 'email.clicked';
+        if (!isOpen && !isClick) return false;
+
+        const verdict = classifyEngagementEvent(e);
+        if (verdict.isScanner) {
+          const gap = verdict.gapMs === null ? 'unknown' : `${(verdict.gapMs / 1000).toFixed(1)}s`;
+          console.log(
+            `[dripWorker] Enrollment ${enrollment.enrollmentId} ignored engagement exit: ` +
+            `lead ${enrollment.leadEmail} "${e.eventType}" looks automated ` +
+            `(reason=${verdict.reason}; gapFromSend=${gap}; userAgent=${verdict.userAgent ?? 'none'}) — not exiting`,
+          );
+          return false;
+        }
+        return true;
       });
 
       if (trigger) {
