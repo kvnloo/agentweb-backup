@@ -137,7 +137,7 @@ export class TwitterService {
       const granted = config.scopes;
       if (Array.isArray(granted) && granted.length > 0 && !granted.includes(requiredScope)) {
         throw new Error(
-          `Your X account @${config.username} is connected read-only — it is missing the "${requiredScope}" permission needed for this action. ` +
+          `Your X account @${config.username ?? 'your account'} is connected read-only — it is missing the "${requiredScope}" permission needed for this action. ` +
           'Reconnect it with write permission in Settings → Connected Accounts.'
         );
       }

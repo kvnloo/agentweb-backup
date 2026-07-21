@@ -1041,6 +1041,15 @@ describe('TwitterService — pre-write scope guard', () => {
     ).rejects.toThrow(/@harshmoney123/);
   });
 
+  it('falls back to a generic handle in the guard error when username is missing (malformed/legacy record)', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ username: undefined, scopes: ['tweet.read', 'users.read'] }),
+    ]);
+    await expect(
+      twitterService.postTweet(OWNER, ACCOUNT_ID, 'hi', { inReplyToTweetId: '9' })
+    ).rejects.toThrow(/@your account is connected read-only/);
+  });
+
   it('blocks a plain tweet write when granted scopes lack tweet.write', async () => {
     mockGetAccountsByUserId.mockResolvedValue([
       makeAccount({ scopes: ['tweet.read', 'users.read'] }),
