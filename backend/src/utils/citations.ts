@@ -75,16 +75,19 @@ export function prettySiteName(domain: string): string {
 }
 
 // Normalize a URL for de-duplication: strip the hash and any trailing slash so the same page
-// cited twice collapses to one entry. Falls back to the trimmed raw string.
+// cited twice collapses to one entry. The URL parser already lowercases the scheme and host
+// (which are case-insensitive); the path and query are left untouched because they ARE
+// case-sensitive — lowercasing them would wrongly merge distinct pages like /report/US and
+// /report/us into one citation id. Falls back to the trimmed raw string.
 function dedupeKey(rawUrl: string): string {
   try {
     const u = new URL(rawUrl);
     u.hash = '';
     let s = u.toString();
     if (s.endsWith('/')) s = s.slice(0, -1);
-    return s.toLowerCase();
+    return s;
   } catch {
-    return rawUrl.trim().toLowerCase();
+    return rawUrl.trim();
   }
 }
 

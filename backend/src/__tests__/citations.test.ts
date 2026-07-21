@@ -96,6 +96,18 @@ describe('CitationRegistry', () => {
     expect(reg.list().map((c) => c.id)).toEqual([1, 2, 3]);
   });
 
+  it('keeps case-sensitive paths distinct but dedups case-insensitive hosts (Greptile P1)', () => {
+    const reg = new CitationRegistry();
+    reg.registerSearchResults([
+      { url: 'https://example.com/report/US', title: 'US' },
+      { url: 'https://example.com/report/us', title: 'lower' }, // different page — must NOT merge
+      { url: 'https://EXAMPLE.com/report/US', title: 'host case' }, // same page (host case) — must merge
+    ]);
+    const cites = reg.list();
+    expect(cites).toHaveLength(2);
+    expect(cites.map((c) => c.url)).toEqual(['https://example.com/report/US', 'https://example.com/report/us']);
+  });
+
   it('skips entries without a usable http(s) url or parseable host', () => {
     const reg = new CitationRegistry();
     reg.registerSearchResults([
