@@ -48,7 +48,10 @@ const sharp = require('sharp') as jest.Mock;
 const fakeBuffer = (size: number) => Buffer.alloc(size, 0x42);
 
 // Private static helper; access it via a typed alias.
-const normalize = (buffer: Buffer, contentType: string): Promise<{ buffer: Buffer; contentType: string }> =>
+const normalize = (
+  buffer: Buffer,
+  contentType: string
+): Promise<{ buffer: Buffer; contentType: string; undecodable?: boolean; detectedFormat?: string }> =>
   (AgentModeService as any).normalizeImageForVision(buffer, contentType);
 
 describe('normalizeImageForVision', () => {
@@ -168,5 +171,59 @@ describe('normalizeImageForVision', () => {
     const result = await normalize(buf, '');
     expect(result.contentType).toBe('image/jpeg');
     expect(result.buffer).toBe(buf);
+  });
+
+  // ENG-370 caveat resolution: signal an undecodable file so the caller can
+  // fast-fail with re-upload guidance instead of retrying vision on garbage bytes.
+  it('flags undecodable:true when sharp cannot decode the bytes', async () => {
+    const buf = fakeBuffer(1500);
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const badInstance = {
+      metadata: jest.fn().mockRejectedValue(new Error('unsupported image format')),
+      png: jest.fn().mockReturnThis(),
+      toBuffer: jest.fn(),
+    };
+    sharp.mockReturnValue(badInstance);
+
+    const result = await normalize(buf, 'application/octet-stream');
+    expect(result.undecodable).toBe(true);
+    consoleSpy.mockRestore();
+  });
+
+  it('does not flag undecodable when the bytes decode successfully', async () => {
+    const buf = fakeBuffer(2048);
+    const pngInstance = {
+      metadata: jest.fn().mockResolvedValue({ format: 'png' }),
+      png: jest.fn().mockReturnThis(),
+      toBuffer: jest.fn(),
+    };
+    sharp.mockReturnValue(pngInstance);
+
+    const result = await normalize(buf, 'application/octet-stream');
+    expect(result.undecodable).toBeFalsy();
+    expect(result.detectedFormat).toBe('png');
+  });
+
+  // Animated inputs (animated AVIF/HEIC) must collapse to their FIRST frame:
+  // sharp() is constructed with the buffer only — never `{ animated: true }` —
+  // so .png() emits a single describable frame rather than a multi-frame strip.
+  it('re-encodes an animated AVIF to a single first-frame PNG (no animated option)', async () => {
+    const original = fakeBuffer(6000);
+    const converted = fakeBuffer(2200);
+    const animatedInstance = {
+      metadata: jest.fn().mockResolvedValue({ format: 'avif', pages: 5 }),
+      png: jest.fn().mockReturnThis(),
+      toBuffer: jest.fn().mockResolvedValue(converted),
+    };
+    sharp.mockReturnValue(animatedInstance);
+
+    const result = await normalize(original, 'image/avif');
+    expect(result.contentType).toBe('image/png');
+    expect(result.buffer).toBe(converted);
+    // sharp must be called with just the buffer — no { animated: true } second arg.
+    expect(sharp).toHaveBeenCalledWith(original);
+    for (const call of sharp.mock.calls) {
+      expect(call.length).toBe(1);
+    }
   });
 });
