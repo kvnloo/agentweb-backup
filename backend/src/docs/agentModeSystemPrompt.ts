@@ -8,7 +8,6 @@
 // Reusable team context block — inject wherever Emma needs to know who is on the AgentWeb team.
 // Used in: Slack session system prompts. Can be extended to email, onboarding, etc.
 export const ABOUT_AGENTWEB_TEAM = `AGENTWEB TEAM — answer questions about these people directly, without asking for more context:
-- Rui Wang (CTO) — also referred to as "Rui"
 - Harsha Vankayalapati (CEO) — also referred to as "Harsha"
 - Fangfang Tan (CPO) — also referred to as "Fangfang"
 - Matthew Wilmer (CMO) — also referred to as "Matt"
