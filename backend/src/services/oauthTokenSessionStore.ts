@@ -28,7 +28,7 @@ import { settingsService } from './settingsService';
 
 const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
-export type OAuthProvider = 'gmail' | 'outlook';
+export type OAuthProvider = 'gmail' | 'outlook' | 'hubspot' | 'fathom';
 
 export interface OAuthTokens {
   access_token: string;
@@ -44,10 +44,9 @@ export interface OAuthProfile {
   tenant_id?: string;
 }
 
-interface StoredSession {
+interface StoredSession<T = unknown> {
   sessionId: string; // the bearer secret /connect must present
-  tokens: OAuthTokens;
-  profile: OAuthProfile;
+  data: T; // opaque per-provider payload — the tokens plus whatever else /connect needs
   expires: number;
 }
 
@@ -116,11 +115,10 @@ const secretsMatch = (a: string, b: string): boolean => {
   return crypto.timingSafeEqual(bufA, bufB);
 };
 
-export async function storeTokenSession(
+export async function storeOAuthSession<T>(
   userId: string,
   provider: OAuthProvider,
-  tokens: OAuthTokens,
-  profile: OAuthProfile,
+  data: T,
 ): Promise<string> {
   const now = Date.now();
   const sessionId = crypto.randomBytes(32).toString('hex');
@@ -134,8 +132,7 @@ export async function storeTokenSession(
 
   row.sessions.push({
     sessionId,
-    tokens,
-    profile,
+    data,
     expires: now + TOKEN_SESSION_TTL_MS,
   });
 
@@ -155,11 +152,11 @@ export async function storeTokenSession(
  * Only the matching session is consumed — concurrent popups for the same provider do not
  * invalidate each other. Expired siblings are pruned on the way through.
  */
-export async function retrieveTokenSession(
+export async function retrieveOAuthSession<T>(
   sessionId: string,
   userId: string,
   provider: OAuthProvider,
-): Promise<{ tokens: OAuthTokens; profile: OAuthProfile } | null> {
+): Promise<T | null> {
   if (!sessionId) return null;
 
   const now = Date.now();
@@ -178,5 +175,31 @@ export async function retrieveTokenSession(
     return null;
   }
 
-  return { tokens: match.tokens, profile: match.profile };
+  return match.data as T;
+}
+
+/**
+ * Gmail/Outlook flavour: the payload is the `{ tokens, profile }` pair these two routes
+ * store. Kept as a thin wrapper over the generic primitive above so those routes (and this
+ * store's test suite) are unchanged while other providers store their own payload shapes.
+ */
+export async function storeTokenSession(
+  userId: string,
+  provider: OAuthProvider,
+  tokens: OAuthTokens,
+  profile: OAuthProfile,
+): Promise<string> {
+  return storeOAuthSession(userId, provider, { tokens, profile });
+}
+
+export async function retrieveTokenSession(
+  sessionId: string,
+  userId: string,
+  provider: OAuthProvider,
+): Promise<{ tokens: OAuthTokens; profile: OAuthProfile } | null> {
+  return retrieveOAuthSession<{ tokens: OAuthTokens; profile: OAuthProfile }>(
+    sessionId,
+    userId,
+    provider,
+  );
 }
