@@ -5006,7 +5006,8 @@ export const agentModeController = {
         variables,
         variableValues,
         frequencyIntervalDays,
-        selfImprove
+        selfImprove,
+        fullAutonomy
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -5074,6 +5075,10 @@ export const agentModeController = {
         emailNotifications: [] as string[],
         dailyDigest: scheduleFrequency === 'hourly' ? (req.body.dailyDigest || false) : false, // Only allow daily digest for hourly schedules
         selfImprove: selfImprove === true, // When on, a reflection turn after each run may improve the prompt
+        // ENG-396: when on, a headless run auto-takes Emma's recommended option on a
+        // blocking question (incl. immutable) instead of parking — an opt-in waiver
+        // of the human gate on irreversible decisions. Default off.
+        fullAutonomy: fullAutonomy === true,
         status: 'active',
         nextRunTime: scheduledNextRunTime,
         createdAt: now.toISOString(),
@@ -5189,7 +5194,8 @@ export const agentModeController = {
         variables,
         variableValues,
         frequencyIntervalDays,
-        selfImprove
+        selfImprove,
+        fullAutonomy
       } = req.body;
 
       // Verify schedule exists and belongs to user (before validation so we can merge)
@@ -5254,6 +5260,8 @@ export const agentModeController = {
         emailNotifications: normalizeEmailList(emailNotifications !== undefined ? emailNotifications : (existingSchedule.emailNotifications || [])),
         dailyDigest: effectiveScheduleFrequency === 'hourly' ? (dailyDigest !== undefined ? dailyDigest : (existingSchedule.dailyDigest || false)) : false,
         selfImprove: selfImprove !== undefined ? (selfImprove === true) : ((existingSchedule as any).selfImprove || false),
+        // ENG-396: opt-in full autonomy (auto-take on blocking questions). Partial-update safe.
+        fullAutonomy: fullAutonomy !== undefined ? (fullAutonomy === true) : ((existingSchedule as any).fullAutonomy || false),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
