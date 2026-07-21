@@ -320,6 +320,13 @@ export interface AzureClientOverrides {
   endpoint?: string;
   apiKey?: string;
   apiVersion?: string;
+  /**
+   * When false, return the raw (UN-metered) client — the caller meters the call
+   * itself via meterUsageFromResponse. Use this to avoid DOUBLE-recording: the
+   * factory's auto-record plus an explicit meterUsageFromResponse on the same
+   * response would count the burn twice (ENG-200). Defaults to true (auto-meter).
+   */
+  metered?: boolean;
 }
 
 export function getAzureClient(
@@ -338,6 +345,9 @@ export function getAzureClient(
     defaultQuery: { "api-version": apiVersion },
     defaultHeaders: { "api-key": apiKey },
   });
+  // metered:false → caller meters explicitly (meterUsageFromResponse); returning
+  // the wrapped client too would double-record the same response.
+  if (overrides?.metered === false) return client;
   return wrapOpenAICompatible(client, "azure-openai", meterCtx);
 }
 

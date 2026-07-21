@@ -404,6 +404,22 @@ describe('getOpenAIClient / getAzureClient', () => {
     expect(mockRecordUsage).not.toHaveBeenCalled();
   });
 
+  it('metered:false returns an UN-metered client (no auto-record) so the caller can meter once', async () => {
+    // Sites that meter explicitly via meterUsageFromResponse (growthGenius,
+    // workflowGen, reportRevision) must NOT also auto-record, or burn is counted
+    // twice (ENG-200). metered:false skips the wrap.
+    const OpenAICtor = jest.requireMock('openai').default as jest.Mock;
+    const chatCreate = jest
+      .fn()
+      .mockResolvedValue({ model: 'gpt-5-chat-2', usage: { prompt_tokens: 5, completion_tokens: 4 } });
+    OpenAICtor.mockImplementationOnce(() => ({ chat: { completions: { create: chatCreate } } }));
+
+    const client: any = getAzureClient(meterCtx, 'gpt-5-chat-2', { metered: false });
+    await client.chat.completions.create({ model: 'gpt-5-chat-2' });
+    await flush();
+    expect(mockRecordUsage).not.toHaveBeenCalled();
+  });
+
   it('wraps chat even when the client exposes no embeddings surface', async () => {
     // Some SDK shapes / test doubles only implement chat.completions. Wrapping
     // must not throw on the missing embeddings surface, and chat stays metered.
