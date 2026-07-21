@@ -130,6 +130,40 @@ export function promptRequestsLogo(prompt: string): boolean {
 }
 
 /**
+ * Does this prompt ask to CREATE a brand-new logo from scratch (design one),
+ * as opposed to placing/compositing an EXISTING brand logo onto a larger
+ * design?
+ *
+ * ENG-393: an account with no persisted logo legitimately wants generate_image
+ * to design a FIRST logo. The `missing_brand_logo` gate below exists to stop
+ * the model inventing a fake copy of a logo the brand already owns — NOT to
+ * block designing a first logo. Both a creation ask ("create a logo for X")
+ * and a compositing ask ("add our logo to this banner") match
+ * `promptRequestsLogo` (they mention "logo") with no `logo_image`/inputImages,
+ * so the gate over-fired on creation. This discriminator lets creation asks
+ * through while compositing asks still gate.
+ *
+ * Matched (creation):
+ *   - a creation verb (create/design/make/generate/…) directly modifying
+ *     "logo" through a small whitelist of fillers ("make me a clean logo"), and
+ *   - creation-signalling logo noun-phrases ("logo for <brand>", "logo design",
+ *     "logo concept", "logo mockup/options/variations", "logo from scratch").
+ *
+ * NOT matched (compositing — still gates): "add our logo to this banner",
+ * "banner with the company logo", "generate an image with our logo" — these
+ * place an existing logo and must not be treated as creating a new one.
+ */
+const CREATE_LOGO_RE =
+  /\b(?:create|design|generate|make|build|draw|produce|craft|develop|render|sketch|come\s+up\s+with|need|want|give\s+(?:me|us))(?:\s+(?:me|us|a|an|any|some|one|new|another|fresh|custom|modern|minimal(?:ist)?|simple|clean|professional|unique|brand|company|the|first|initial|our|my|your|cool|sleek|bold|elegant|creative|original))*\s+logos?\b/i;
+const LOGO_NOUN_CREATE_RE =
+  /\blogos?\s+(?:for\b|designs?\b|concepts?\b|ideas?\b|mockups?\b|options?\b|variations?\b|from\s+scratch\b)/i;
+
+export function promptCreatesLogo(prompt: string): boolean {
+  if (!isNonEmptyString(prompt)) return false;
+  return CREATE_LOGO_RE.test(prompt) || LOGO_NOUN_CREATE_RE.test(prompt);
+}
+
+/**
  * The AC-3 tool result: the model must ask the user for their real logo (or
  * point them at brand config) instead of generating with an invented one.
  */

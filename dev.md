@@ -27,6 +27,34 @@ write path fail *silently*:
 
 Behaviour-preserving on the success path: a write with `tweet.write` granted still posts unchanged.
 
+## ENG-393: generate_image `missing_brand_logo` no longer blocks first-logo CREATION (2026-07-20)
+
+Customer bug (AgentCapX, no logo on brand guidelines): `generate_image` on the pure text-to-image
+path returned `missing_brand_logo`, blocking a user from generating their FIRST logo — which also
+blocks landing-page generation (needs a logo). Root cause: the ENG-326 gate in
+`agentModeService.generateImage` fires whenever `promptRequestsLogo(prompt)` is true and no logo is
+persisted (no `logo_image`/inputImages). That gate is meant for COMPOSITING an existing brand logo
+("add our logo to this banner") — but "create a logo for X" also mentions "logo", so it over-fired
+on CREATION.
+
+Fix: added `promptCreatesLogo(prompt)` to `services/agentMode/brandLogo.ts` (a pure discriminator:
+creation-verb-directly-modifying-"logo" + logo-noun creation phrases like "logo for", "logo
+design", "logo from scratch"). The gate now also requires `!promptCreatesLogo(prompt)`, so creation
+asks pass through and generate, while compositing asks still gate (composite the persisted logo →
+AC-2, or ask the user when none is persisted → AC-3). Behavior-preserving for ENG-326: all existing
+`agentModeService.generateImage.brandLogo` + `agentModeBrandLogo` tests stay green.
+
+Assumption (no human AC on the issue): intent is "text-to-image logo creation must not require an
+existing logo" without reopening the ENG-326 invented-logo hole — so I split creation vs
+compositing rather than dropping the gate outright (dropping it entirely would regress the shipped
+ENG-326 AC-2/AC-3 tests). Flagged this assumption on the Linear issue. Extreme non-real inputs
+(e.g. "don't create a logo") are out of scope — you wouldn't call generate_image to NOT make one.
+
+Env note (worktree only, not shipped): the primary checkout's shared `node_modules` predates
+origin/main's `@opentelemetry/*` and `twitter-api-v2` deps, so tests/typecheck against main need
+those installed (done at the worktree-root `node_modules` via upward resolution; the primary tree
+is never touched).
+
 ## ENG-409: default customer-bug assignee changed Harshit → Manan (2026-07-20)
 
 Directed by Harsha. Customer-filed bug canonicals (`fileBugReport` in `services/intakeService.ts`)
