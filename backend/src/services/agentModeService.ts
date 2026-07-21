@@ -178,7 +178,8 @@ import {
   ALLOWED_DATE_PRESETS,
   META_OBJ_GOAL_MAP,
   META_GOAL_BILLING_MAP,
-  META_GOAL_BID_STRATEGY_MAP
+  META_GOAL_BID_STRATEGY_MAP,
+  META_WEBSITE_OPTIMIZATION_GOALS
 } from '../utils/metaConstants';
 
 // Initialize Azure OpenAI client for direct chat completion (same as blog.ts)
@@ -14353,6 +14354,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           }
         };
         console.log('[MetaAdSet] Auto-set targeting_automation.advantage_audience=0 (Meta requires this field)');
+      }
+
+      // Conversion location (ENG-415): default destination_type=WEBSITE for website
+      // traffic/conversion goals so the ad-level Destination is explicitly "Website" in Ads Manager
+      // rather than UNDEFINED (the "not selected" symptom). An explicit caller value always wins;
+      // non-website goals (engagement/reach/app installs, instant-form lead goals) are left untouched.
+      if (args.destination_type === undefined &&
+          META_WEBSITE_OPTIMIZATION_GOALS.includes(args.optimization_goal)) {
+        args.destination_type = 'WEBSITE';
       }
 
       // Convert all currencies to cents
