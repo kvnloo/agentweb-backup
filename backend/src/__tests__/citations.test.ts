@@ -1,5 +1,30 @@
 // ENG-351 Phase 1/2 — citation registry accumulated from Emma's web-search tool results.
-import { CitationRegistry, buildCitationIndexBlock, domainFromUrl, prettySiteName, stripCitationMarkers, WEB_SEARCH_TOOL_NAMES } from '../utils/citations';
+import { Citation, CitationRegistry, buildCitationIndexBlock, domainFromUrl, prettySiteName, renderCitationMarkers, stripCitationMarkers, WEB_SEARCH_TOOL_NAMES } from '../utils/citations';
+
+describe('renderCitationMarkers', () => {
+  const cites: Citation[] = [
+    { id: 1, url: 'https://www.grandviewresearch.com/report', domain: 'grandviewresearch.com', siteName: 'Grand View Research' },
+    { id: 2, url: 'https://statista.com/x', domain: 'statista.com', siteName: 'Statista' },
+  ];
+  it('resolves a marker to inline (Source) text', () => {
+    expect(renderCitationMarkers('reach $163B by 2030 {{cite:1}}.', cites, 'text')).toBe('reach $163B by 2030 (Grand View Research).');
+  });
+  it('resolves a multi-id marker to a comma-separated list', () => {
+    expect(renderCitationMarkers('grew 14% {{cite:1,2}}', cites, 'text')).toBe('grew 14% (Grand View Research, Statista)');
+  });
+  it('renders markdown links for the markdown format (Slack)', () => {
+    expect(renderCitationMarkers('$5B {{cite:2}}', cites, 'markdown')).toBe('$5B ([Statista](https://statista.com/x))');
+  });
+  it('drops an unresolvable id rather than inventing a source', () => {
+    expect(renderCitationMarkers('mystery figure {{cite:9}} here', cites, 'text')).toBe('mystery figure here');
+  });
+  it('drops malformed cite tokens and leaves other {{...}} variables', () => {
+    expect(renderCitationMarkers('a {{cite:2a}} b {{name}}', cites, 'text')).toBe('a b {{name}}');
+  });
+  it('falls back to stripping when there are no citations', () => {
+    expect(renderCitationMarkers('x {{cite:1}} y', [], 'text')).toBe('x y');
+  });
+});
 
 describe('stripCitationMarkers', () => {
   it('removes a single marker and the space before it (no dangling space before punctuation)', () => {
