@@ -301,6 +301,13 @@ export function resolveInboundAnswer(
  * explicitly allows delegation. Immutable parameters (the ENG-396 case) must
  * ALWAYS park as pending_user_input and notify — never auto-pick. This is the
  * codified form of the repair session's manual "Never guess a pixel ID" rule.
+ *
+ * NOT YET WIRED. The headless path (runScheduledChat) currently parks on ANY
+ * awaiting question unconditionally — auto-take is deliberately deferred: it
+ * waives the human protection on irreversible decisions, which is a product-owner
+ * (Harsha) call. This function is the ready seam for that follow-up (a per-schedule
+ * "full autonomy" toggle would supply `sessionAllowsDelegation`); it is kept
+ * tested and documented rather than reconstructed later.
  */
 export function canAutoTakeInHeadless(
   question: PendingUserQuestion,
