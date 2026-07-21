@@ -73,6 +73,18 @@ async function withLiveTimeout<T>(promise: Promise<T>, timeoutMs: number, label:
   }
 }
 
+function stableToolExecutionKey(toolName: string, args: unknown): string {
+  const stableStringify = (value: unknown): string => {
+    if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+    if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object).sort().map((key) => (
+      `${JSON.stringify(key)}:${stableStringify(object[key])}`
+    )).join(',')}}`;
+  };
+  return `${toolName}:${stableStringify(args)}`;
+}
+
 /**
  * System prompt that instructs Gemini to use emotion tags for expressive TTS.
  * Tags like [warm], [excited], [thoughtful], [encouraging], [concerned], [pause]
@@ -112,6 +124,8 @@ interface LiveEntry {
   pendingArtifacts: LiveArtifact[];
   /** Tool call records for the current turn — surfaced in chat UI as collapsible "Used N tools" block */
   pendingToolCalls: Array<{ id: string; name: string; arguments: any; result?: any; error?: string; narrative?: string }>;
+  /** Session-scoped dedupe for potentially mutating tools, including executions still in flight. */
+  toolExecutions: Map<string, { promise: Promise<any>; settled: boolean }>;
   /** Latest resumption handle from Gemini — used to reconnect transparently after code 1000 close */
   resumptionHandle?: string;
   /** Cached function declarations so reconnects reuse the same tool config without reloading */
@@ -504,6 +518,7 @@ export async function startLiveSession(
     toolContextText: '',
     pendingArtifacts: [],
     pendingToolCalls: [],
+    toolExecutions: new Map(),
     functionDeclarations,
     startedAt,
     turnCount: 0,
@@ -526,8 +541,11 @@ export async function startLiveSession(
  * Send a base64-encoded audio chunk from the browser microphone to Gemini.
  * Uses sendRealtimeInput (streaming audio API) with the actual browser format (webm/opus).
  */
-export async function sendAudioChunk(sessionId: string, base64Chunk: string): Promise<void> {
+export async function sendAudioChunk(sessionId: string, base64Chunk: string, socketId: string): Promise<void> {
   const entry = getEntry(sessionId);
+  if (entry.socketId !== socketId) {
+    throw new Error(`No active live session for ${sessionId}`);
+  }
   if (!entry.session) return; // Gemini session still opening — drop chunk
   entry.session.sendRealtimeInput({
     audio: {
@@ -560,8 +578,11 @@ export async function sendAudioStreamEnd(sessionId: string, socketId: string): P
 /**
  * Send a text message from the browser to Gemini (text-input mode when live model is active).
  */
-export async function sendTextTurn(sessionId: string, text: string): Promise<void> {
+export async function sendTextTurn(sessionId: string, text: string, socketId: string): Promise<void> {
   const entry = getEntry(sessionId);
+  if (entry.socketId !== socketId) {
+    throw new Error(`No active live session for ${sessionId}`);
+  }
   if (!entry.session) return; // Gemini session still opening
   entry.pendingUserText = text;
   entry.lastUserActivityAt = Date.now();
@@ -649,9 +670,10 @@ Tool result: ${resultJson}`;
 /**
  * Close the Gemini Live session for the given sessionId.
  */
-export function closeLiveSession(sessionId: string): void {
+export function closeLiveSession(sessionId: string, socketId?: string): void {
   const entry = activeSessions.get(sessionId);
   if (!entry) return;
+  if (socketId && entry.socketId !== socketId) return;
   try {
     entry.session.close();
   } catch {
@@ -843,48 +865,76 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
     const responses: any[] = await Promise.all(
       functionCalls.map(async (fc) => {
         let responseContent: Record<string, unknown>;
+        const toolName = fc.name!;
+        const toolArgs = fc.args ?? {};
+        const isOnboardingSafe = ONBOARDING_LIVE_TOOLS.has(toolName);
         try {
-          const execution = agentModeService.executeTool(
-            LIVE_MODEL,
-            fc.name!,
-            fc.args ?? {},
-            entry.userId,
-            sessionId,
-            false,
+          let execution: Promise<any>;
+          if (isOnboardingSafe) {
+            execution = agentModeService.executeTool(
+              LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false,
+            );
+          } else {
+            const executionKey = stableToolExecutionKey(toolName, toolArgs);
+            let trackedExecution = entry.toolExecutions.get(executionKey);
+            if (!trackedExecution) {
+              trackedExecution = {
+                promise: Promise.resolve().then(() => agentModeService.executeTool(
+                  LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false,
+                )),
+                settled: false,
+              };
+              trackedExecution.promise.then(
+                () => { trackedExecution!.settled = true; },
+                () => { trackedExecution!.settled = true; },
+              );
+              entry.toolExecutions.set(executionKey, trackedExecution);
+            }
+            execution = trackedExecution.promise;
+          }
+          const result = await withLiveTimeout(
+            execution,
+            LIVE_TOOL_TIMEOUT_MS,
+            `Live tool ${toolName}`,
           );
-          // A Promise timeout cannot cancel the underlying tool. Apply the
-          // bounded wait only to the onboarding read/UI-handoff allowlist;
-          // mutating tools must finish once so Gemini cannot retry them while
-          // the first execution is still producing side effects.
-          const result = ONBOARDING_LIVE_TOOLS.has(fc.name!)
-            ? await withLiveTimeout(
-              execution,
-              LIVE_TOOL_TIMEOUT_MS,
-              `Live tool ${fc.name}`,
-            )
-            : await execution;
           const text = typeof result === 'string' ? result : JSON.stringify(result);
           responseContent = { result: text };
           // Append tool result to separate context (saved to DynamoDB for LLM context,
           // but NOT included in the assistant chat bubble shown to the user)
-          entry.toolContextText += `\n[Tool: ${fc.name}]\n${text}`;
+          entry.toolContextText += `\n[Tool: ${toolName}]\n${text}`;
           // Summarize result in natural language and extract artifacts in one LLM call
           if (!entry.pendingArtifacts) entry.pendingArtifacts = [];
           const seenUrls = new Set(entry.pendingArtifacts.map(a => a.url));
           const resultObj = typeof result === 'object' && result !== null
             ? result as Record<string, unknown>
             : { result: text };
-          const narrative = await summarizeToolResult(fc.name!, fc.args ?? {}, resultObj, seenUrls, entry.pendingArtifacts);
+          const narrative = await summarizeToolResult(toolName, toolArgs, resultObj, seenUrls, entry.pendingArtifacts);
           // Record for UI display (collapsible "Used N tools" block, like other models)
           if (!entry.pendingToolCalls) entry.pendingToolCalls = [];
-          entry.pendingToolCalls.push({ id: fc.id || fc.name!, name: fc.name!, arguments: fc.args ?? {}, result, narrative });
+          entry.pendingToolCalls.push({ id: fc.id || toolName, name: toolName, arguments: toolArgs, result, narrative });
         } catch (err: any) {
-          console.error(`[liveVoiceService] Tool "${fc.name}" failed:`, err?.message);
-          responseContent = { error: err?.message ?? 'Tool execution failed' };
-          if (!entry.pendingToolCalls) entry.pendingToolCalls = [];
-          entry.pendingToolCalls.push({ id: fc.id || fc.name!, name: fc.name!, arguments: fc.args ?? {}, error: err?.message ?? 'Tool execution failed' });
+          const message = err?.message ?? 'Tool execution failed';
+          const isStillRunning = !isOnboardingSafe && /timed out/i.test(message);
+          if (isStillRunning) {
+            responseContent = {
+              status: 'in_progress',
+              message: `${toolName} is still running. Do not retry this action.`,
+            };
+            if (!entry.pendingToolCalls) entry.pendingToolCalls = [];
+            entry.pendingToolCalls.push({
+              id: fc.id || toolName,
+              name: toolName,
+              arguments: toolArgs,
+              result: responseContent,
+            });
+          } else {
+            console.error(`[liveVoiceService] Tool "${toolName}" failed:`, message);
+            responseContent = { error: message };
+            if (!entry.pendingToolCalls) entry.pendingToolCalls = [];
+            entry.pendingToolCalls.push({ id: fc.id || toolName, name: toolName, arguments: toolArgs, error: message });
+          }
         }
-        return { id: fc.id, name: fc.name!, response: responseContent } as any;
+        return { id: fc.id, name: toolName, response: responseContent } as any;
       })
     );
 
@@ -923,6 +973,9 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
     entry.toolContextText = '';
     entry.pendingArtifacts = [];
     entry.pendingToolCalls = [];
+    for (const [executionKey, execution] of entry.toolExecutions) {
+      if (execution.settled) entry.toolExecutions.delete(executionKey);
+    }
     entry.currentTurnFirstAudioAt = undefined;
     entry.lastUserActivityAt = undefined;
 

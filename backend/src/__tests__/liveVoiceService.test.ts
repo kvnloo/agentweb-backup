@@ -276,7 +276,7 @@ describe('sendAudioChunk', () => {
     makeCallbacks();
     await startLiveSession('session-audio', 'socket-1', emitFn, 'test-user-id');
 
-    await sendAudioChunk('session-audio', 'SGVsbG8=');
+    await sendAudioChunk('session-audio', 'SGVsbG8=', 'socket-1');
 
     expect(mockSessionSendRealtimeInput).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -289,7 +289,16 @@ describe('sendAudioChunk', () => {
   });
 
   it('throws if session does not exist', async () => {
-    await expect(sendAudioChunk('no-such-session', 'abc=')).rejects.toThrow();
+    await expect(sendAudioChunk('no-such-session', 'abc=', 'socket-1')).rejects.toThrow();
+  });
+
+  it('rejects audio from a socket that does not own the session', async () => {
+    makeCallbacks();
+    await startLiveSession('session-owned-audio', 'socket-owner', jest.fn(), 'test-user-id');
+
+    await expect(
+      sendAudioChunk('session-owned-audio', 'abc=', 'socket-attacker'),
+    ).rejects.toThrow(/active live session/i);
   });
 });
 
@@ -325,7 +334,7 @@ describe('sendTextTurn', () => {
     makeCallbacks();
     await startLiveSession('session-text', 'socket-1', emitFn, 'test-user-id');
 
-    await sendTextTurn('session-text', 'What is my ad spend this month?');
+    await sendTextTurn('session-text', 'What is my ad spend this month?', 'socket-1');
 
     expect(mockSessionSendClientContent).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -341,7 +350,16 @@ describe('sendTextTurn', () => {
   });
 
   it('throws if session does not exist', async () => {
-    await expect(sendTextTurn('ghost-session', 'hello')).rejects.toThrow();
+    await expect(sendTextTurn('ghost-session', 'hello', 'socket-1')).rejects.toThrow();
+  });
+
+  it('rejects text from a socket that does not own the session', async () => {
+    makeCallbacks();
+    await startLiveSession('session-owned-text', 'socket-owner', jest.fn(), 'test-user-id');
+
+    await expect(
+      sendTextTurn('session-owned-text', 'hello', 'socket-attacker'),
+    ).rejects.toThrow(/active live session/i);
   });
 });
 
@@ -742,6 +760,18 @@ describe('closeLiveSession', () => {
   it('is a no-op for unknown sessionId', () => {
     expect(() => closeLiveSession('does-not-exist')).not.toThrow();
   });
+
+  it('does not let stale socket cleanup close a replacement session', async () => {
+    makeCallbacks();
+    await startLiveSession('session-replaced', 'socket-old', jest.fn(), 'test-user-id');
+    await startLiveSession('session-replaced', 'socket-new', jest.fn(), 'test-user-id');
+
+    closeLiveSession('session-replaced', 'socket-old');
+    expect(hasLiveSession('session-replaced')).toBe(true);
+
+    closeLiveSession('session-replaced', 'socket-new');
+    expect(hasLiveSession('session-replaced')).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1020,15 +1050,36 @@ describe('tool call surfacing', () => {
     });
 
     await jest.advanceTimersByTimeAsync(12_000);
-    expect(mockSessionSendToolResponse).not.toHaveBeenCalled();
-
-    resolveTool({ post_url: 'https://linkedin.com/post/123' });
-    await jest.runAllTimersAsync();
-
     expect(mockSessionSendToolResponse).toHaveBeenCalledWith({
       functionResponses: [
         expect.objectContaining({
           id: 'fc-mutation',
+          name: 'post_on_connected_account',
+          response: expect.objectContaining({ status: 'in_progress' }),
+        }),
+      ],
+    });
+    mockSessionSendToolResponse.mockClear();
+
+    callbacks['onmessage']?.({
+      toolCall: {
+        functionCalls: [{
+          id: 'fc-mutation-retry',
+          name: 'post_on_connected_account',
+          args: { content: 'Hello' },
+        }],
+      },
+    });
+
+    resolveTool({ post_url: 'https://linkedin.com/post/123' });
+    await jest.runAllTimersAsync();
+
+    expect(mockExecuteTool).toHaveBeenCalledTimes(1);
+
+    expect(mockSessionSendToolResponse).toHaveBeenCalledWith({
+      functionResponses: [
+        expect.objectContaining({
+          id: 'fc-mutation-retry',
           name: 'post_on_connected_account',
           response: expect.objectContaining({ result: expect.any(String) }),
         }),

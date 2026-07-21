@@ -164,7 +164,7 @@ io.on('connection', (socket: Socket) => {
     // Clean up any live voice sessions owned by this socket
     socket.data.liveSessions?.forEach((sessionId: string) => {
       if (hasLiveSession(sessionId)) {
-        closeLiveSession(sessionId);
+        closeLiveSession(sessionId, socket.id);
       }
     });
   });
@@ -211,6 +211,7 @@ io.on('connection', (socket: Socket) => {
       await startLiveSession(sessionId, socket.id, liveEmit, userId, toolProfile);
       console.log(`[liveVoice] live:start completed for session ${sessionId}`);
     } catch (err: any) {
+      socket.data.liveSessions?.delete(sessionId);
       console.error(`[liveVoice] live:start error for session ${sessionId}:`, err?.message);
       socket.emit('live:error', { sessionId, error: err?.message ?? 'Failed to start live session' });
     }
@@ -218,7 +219,7 @@ io.on('connection', (socket: Socket) => {
 
   socket.on('live:audio', ({ sessionId, chunk }: { sessionId: string; chunk: string }) => {
     console.log(`[liveVoice] live:audio received for session ${sessionId}, hasSession=${hasLiveSession(sessionId)}`);
-    sendAudioChunk(sessionId, chunk).catch((err) => {
+    sendAudioChunk(sessionId, chunk, socket.id).catch((err) => {
       socket.emit('live:error', { sessionId, error: err?.message });
     });
   });
@@ -237,7 +238,7 @@ io.on('connection', (socket: Socket) => {
   socket.on('live:text', async ({ sessionId, text }: { sessionId: string; text: string }) => {
     try {
       console.log(`[liveVoice] live:text received for session ${sessionId}, hasSession=${hasLiveSession(sessionId)}`);
-      await sendTextTurn(sessionId, text);
+      await sendTextTurn(sessionId, text, socket.id);
     } catch (err: any) {
       console.error(`[liveVoice] live:text error for session ${sessionId}:`, err?.message);
       socket.emit('live:error', { sessionId, error: err?.message });
@@ -245,7 +246,7 @@ io.on('connection', (socket: Socket) => {
   });
 
   socket.on('live:close', ({ sessionId }: { sessionId: string }) => {
-    closeLiveSession(sessionId);
+    closeLiveSession(sessionId, socket.id);
     socket.data.liveSessions?.delete(sessionId);
   });
 
