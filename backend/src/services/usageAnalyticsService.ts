@@ -428,6 +428,8 @@ export interface OrgUsageRollup {
   isOrg: boolean;
   ownerUserId: string;
   ownerEmail: string | null;
+  /** The OWNER's subscription tier — the org's cost cap is keyed on this, not the member's. */
+  ownerSubscriptionType: string | null;
   selectedIsOwner: boolean;
   selectedRole: "owner" | "member" | null;
   /** Total real burn across all members (shadow table). */
@@ -573,6 +575,7 @@ export async function getUserOrgUsageRollup(
     isOrg,
     ownerUserId: ownerUser.userId,
     ownerEmail: ownerUser.email ?? null,
+    ownerSubscriptionType: ownerUser.subscriptionType ?? null,
     selectedIsOwner,
     selectedRole,
     grossBurnUsd,

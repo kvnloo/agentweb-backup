@@ -101,6 +101,7 @@ describe('getUserOrgUsageRollup', () => {
       email: 'owner@org.com',
       orgId: 'org1',
       orgRole: 'owner',
+      subscriptionType: 'Pro',
       tokenUsage: { month: '2026-07', totalTokens: 0, totalCost: 100, resetDate: '' },
     });
     const member = user({
@@ -127,6 +128,7 @@ describe('getUserOrgUsageRollup', () => {
     expect(r.isOrg).toBe(true);
     expect(r.ownerUserId).toBe('owner');
     expect(r.ownerEmail).toBe('owner@org.com');
+    expect(r.ownerSubscriptionType).toBe('Pro'); // org cap keyed on the OWNER's tier
     expect(r.selectedIsOwner).toBe(false);
     expect(r.selectedRole).toBe('member');
     // Org gross burn = owner $10 + member $30 = $40.
