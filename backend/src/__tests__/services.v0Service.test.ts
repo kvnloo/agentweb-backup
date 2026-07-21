@@ -151,6 +151,7 @@ import {
   listLandingPages,
   deleteLandingPage,
   validateV0Output,
+  collectMissingInternalImports,
   V0OutputValidationError,
   BrandContext,
   remapFilesForSubPage,
@@ -2791,6 +2792,9 @@ export default function Page() {
           "app/page.tsx",
           VALID_TSX + `\nasync function load() { const m = await import("./heavy-component"); return m; }`
         ),
+        // ENG-384: the target file must exist, else the missing-file check (check 7) rightly
+        // flags it — this test's point is only that a RELATIVE specifier isn't a denylisted bare word.
+        makeFile("app/heavy-component.tsx", `export default function H() { return null; }`),
       ];
       expect(() => validateV0Output(files)).not.toThrow();
     });
@@ -2896,6 +2900,188 @@ export default function Page() {
           ),
         ];
         expect(() => validateV0Output(files)).not.toThrow();
+      });
+    });
+  });
+
+  // ENG-384: v0 sometimes references an intra-project file it never generated — a
+  // syntactically legitimate relative or `@/` import pointing at a component missing from the
+  // zip (e.g. `@/components/compare-table` with no compare-table.tsx). The alias resolves
+  // correctly; the file simply is not there, so `next build` fails "Module not found". This is
+  // the OPPOSITE shape from ENG-374's bare-import denylist, which structurally cannot see it.
+  describe("missing-file import check (ENG-384)", () => {
+    it("FAIL: flags an @/ import of a component that was never generated", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX),
+        makeFile(
+          "components/compare-page.tsx",
+          `import CompareTable from "@/components/compare-table"\nexport default function Compare() { return <CompareTable />; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(files)).toThrow(/not generated/i);
+      expect(() => validateV0Output(files)).toThrow(/@\/components\/compare-table/);
+    });
+
+    it("FAIL: flags a relative import of a sibling file that was never generated", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX),
+        makeFile(
+          "components/compare-page.tsx",
+          `import CompareTable from "./compare-table"\nexport default function Compare() { return <CompareTable />; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).toThrow(/compare-table/);
+    });
+
+    it("passes when the @/ import DOES resolve to a generated file (any tried extension)", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX),
+        makeFile(
+          "components/compare-page.tsx",
+          `import CompareTable from "@/components/compare-table"\nimport CompareHero from "@/components/compare-hero"\nexport default function Compare() { return <><CompareHero /><CompareTable /></>; }`
+        ),
+        makeFile("components/compare-table.tsx", `export default function T() { return <table />; }`),
+        makeFile("components/compare-hero.tsx", `export default function H() { return <div />; }`),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("passes an @/ import resolved via an index file inside a directory", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX),
+        makeFile(
+          "components/widget.tsx",
+          `import { thing } from "@/lib/helpers"\nexport default function W() { return <div>{thing}</div>; }`
+        ),
+        makeFile("lib/helpers/index.ts", `export const thing = 1;`),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("passes an @/ import of a scaffold-provided file even when v0 omits it from the zip", () => {
+      // lib/utils, app/layout, middleware, domainMap are injected by the deploy pipeline later,
+      // so a legitimate import of one must never be flagged just because this zip lacks it.
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import { cn } from "@/lib/utils"\nimport "@/middleware"\nexport default function Page() { return <div className={cn("a")} />; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("passes a component importing a shadcn ui primitive present via includeDefaultFiles", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import { Button } from "@/components/ui/button"\nexport default function Page() { return <Button />; }`
+        ),
+        makeFile("components/ui/button.tsx", `export function Button() { return <button />; }`),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("does NOT flag non-JS asset imports (css/json/images)", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import "./styles.css"\nimport data from "@/data/config.json"\nimport logo from "@/assets/logo.svg"\n${VALID_TSX}`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("does NOT flag bare package imports (left to ENG-374 / real dependency resolution)", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import React from "react"\nimport { motion } from "framer-motion"\nimport { Icon } from "@radix-ui/react-icons"\n${VALID_TSX}`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("does NOT flag an import that escapes the repo root (unknowable)", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import shared from "../../shared/thing"\n${VALID_TSX}`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("reports ALL missing files across all components in a single aggregated error", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX),
+        makeFile(
+          "components/a.tsx",
+          `import X from "@/components/missing-x"\nexport default function A() { return <X />; }`
+        ),
+        makeFile(
+          "components/b.tsx",
+          `import Y from "./missing-y"\nexport default function B() { return <Y />; }`
+        ),
+      ];
+      let error: V0OutputValidationError | undefined;
+      try {
+        validateV0Output(files);
+      } catch (e) {
+        error = e as V0OutputValidationError;
+      }
+      expect(error).toBeInstanceOf(V0OutputValidationError);
+      expect(error!.message).toContain("components/a.tsx");
+      expect(error!.message).toContain('"@/components/missing-x"');
+      expect(error!.message).toContain("components/b.tsx");
+      expect(error!.message).toContain('"./missing-y"');
+    });
+
+    // Direct unit tests of the pure resolution helper — the resolution logic is the
+    // false-positive-prone part, so it is verified in isolation from the throw trigger.
+    describe("collectMissingInternalImports (resolution logic)", () => {
+      const mk = (path: string, content: string) => ({ path, content: Buffer.from(content) });
+
+      it("returns the exact missing (path, specifier) for a dangling @/ import", () => {
+        const result = collectMissingInternalImports([
+          mk("components/compare-page.tsx", `import T from "@/components/compare-table"`),
+        ]);
+        expect(result).toEqual([
+          { path: "components/compare-page.tsx", specifier: "@/components/compare-table" },
+        ]);
+      });
+
+      it("returns empty when every relative/@ import resolves", () => {
+        const result = collectMissingInternalImports([
+          mk("app/page.tsx", `import H from "@/components/hero"\nimport B from "./page-bits"`),
+          mk("components/hero.tsx", `export default function H() { return null; }`),
+          mk("app/page-bits.ts", `export default 1;`),
+        ]);
+        expect(result).toEqual([]);
+      });
+
+      it("ignores content inside comments and template literals", () => {
+        const result = collectMissingInternalImports([
+          mk(
+            "app/page.tsx",
+            `// import Ghost from "@/components/ghost"\nconst s = \`import Ghost from "@/components/ghost"\`;\nexport default function P() { return null; }`
+          ),
+        ]);
+        expect(result).toEqual([]);
+      });
+
+      it("resolves a relative import against the importing file's own directory", () => {
+        // "./bar" from components/foo.tsx means components/bar — present, so NOT missing.
+        expect(
+          collectMissingInternalImports([
+            mk("components/foo.tsx", `import Bar from "./bar"`),
+            mk("components/bar.tsx", `export default function Bar() { return null; }`),
+          ])
+        ).toEqual([]);
+        // ...but the same specifier from app/foo.tsx means app/bar — absent, so missing.
+        expect(
+          collectMissingInternalImports([mk("app/foo.tsx", `import Bar from "./bar"`)])
+        ).toEqual([{ path: "app/foo.tsx", specifier: "./bar" }]);
       });
     });
   });
