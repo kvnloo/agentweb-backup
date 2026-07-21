@@ -127,6 +127,10 @@ beforeEach(() => {
   jest.clearAllMocks();
 });
 
+afterEach(() => {
+  jest.useRealTimers();
+});
+
 // ---------------------------------------------------------------------------
 // startLiveSession
 // ---------------------------------------------------------------------------
@@ -176,6 +180,9 @@ describe('startLiveSession', () => {
   it('loads only onboarding-safe tools for the onboarding profile', async () => {
     makeCallbacks();
     mockGetAvailableTools.mockReturnValueOnce([
+      { type: 'function', function: { name: 'publish_blog_article', parameters: { type: 'object' } } },
+    ]);
+    mockGetFilteredTools.mockResolvedValueOnce([
       { type: 'function', function: { name: 'list_connected_accounts', parameters: { type: 'object' } } },
       { type: 'function', function: { name: 'connect_account', parameters: { type: 'object' } } },
       { type: 'function', function: { name: 'publish_blog_article', parameters: { type: 'object' } } },
@@ -194,7 +201,8 @@ describe('startLiveSession', () => {
       'list_connected_accounts',
       'connect_account',
     ]);
-    expect(mockGetFilteredTools).not.toHaveBeenCalled();
+    expect(mockGetFilteredTools).toHaveBeenCalledWith('test-user-id');
+    expect(mockGetAvailableTools).not.toHaveBeenCalled();
   });
 
   it('directs Emma to use a neutral accent', async () => {
@@ -290,10 +298,20 @@ describe('sendAudioStreamEnd', () => {
     makeCallbacks();
     await startLiveSession('session-stalled-turn', 'socket-1', jest.fn(), 'test-user-id');
 
-    await sendAudioStreamEnd('session-stalled-turn');
+    await sendAudioStreamEnd('session-stalled-turn', 'socket-1');
 
     expect(mockSessionSendRealtimeInput).toHaveBeenCalledWith({ audioStreamEnd: true });
     expect(hasLiveSession('session-stalled-turn')).toBe(true);
+  });
+
+  it('rejects a stream-end request from a socket that does not own the session', async () => {
+    makeCallbacks();
+    await startLiveSession('session-owned-turn', 'socket-owner', jest.fn(), 'test-user-id');
+
+    await expect(
+      sendAudioStreamEnd('session-owned-turn', 'socket-attacker'),
+    ).rejects.toThrow(/active live session/i);
+    expect(mockSessionSendRealtimeInput).not.toHaveBeenCalledWith({ audioStreamEnd: true });
   });
 });
 
@@ -980,6 +998,42 @@ describe('tool call surfacing', () => {
       ],
     });
     jest.useRealTimers();
+  });
+
+  it('does not timeout and retry a non-cancellable mutating tool', async () => {
+    jest.useFakeTimers();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-mutating-tool', 'socket-1', jest.fn(), 'test-user-id');
+    let resolveTool!: (value: { post_url: string }) => void;
+    mockExecuteTool.mockReturnValue(new Promise((resolve) => {
+      resolveTool = resolve;
+    }));
+
+    callbacks['onmessage']?.({
+      toolCall: {
+        functionCalls: [{
+          id: 'fc-mutation',
+          name: 'post_on_connected_account',
+          args: { content: 'Hello' },
+        }],
+      },
+    });
+
+    await jest.advanceTimersByTimeAsync(12_000);
+    expect(mockSessionSendToolResponse).not.toHaveBeenCalled();
+
+    resolveTool({ post_url: 'https://linkedin.com/post/123' });
+    await jest.runAllTimersAsync();
+
+    expect(mockSessionSendToolResponse).toHaveBeenCalledWith({
+      functionResponses: [
+        expect.objectContaining({
+          id: 'fc-mutation',
+          name: 'post_on_connected_account',
+          response: expect.objectContaining({ result: expect.any(String) }),
+        }),
+      ],
+    });
   });
 
   it('includes toolCalls in live:turn-complete payload when tools ran', async () => {

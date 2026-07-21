@@ -224,8 +224,12 @@ io.on('connection', (socket: Socket) => {
   });
 
   socket.on('live:audio-stream-end', ({ sessionId }: { sessionId: string }) => {
+    if (!sessionId || !socket.data.liveSessions?.has(sessionId)) {
+      socket.emit('live:error', { sessionId, error: 'No active voice session' });
+      return;
+    }
     console.warn(`[liveVoice] live:audio-stream-end received for session ${sessionId}`);
-    sendAudioStreamEnd(sessionId).catch((err) => {
+    sendAudioStreamEnd(sessionId, socket.id).catch((err) => {
       socket.emit('live:error', { sessionId, error: err?.message });
     });
   });

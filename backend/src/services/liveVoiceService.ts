@@ -270,13 +270,9 @@ async function loadGeminiFunctionDeclarations(
   toolProfile: LiveToolProfile,
 ): Promise<any[]> {
   try {
-    // The onboarding profile is a fixed allowlist of read-only discovery and
-    // UI-handoff tools. Reading all registered definitions avoids the slower
-    // per-session skill/subscription resolution that dominates cold start;
-    // the allowlist below is the tighter capability boundary.
-    const rawTools = toolProfile === 'onboarding'
-      ? agentModeService.getAvailableTools()
-      : await agentModeService.getFilteredTools(userId);
+    // Subscription/foundation filtering remains the user capability boundary.
+    // The onboarding profile only narrows that already-authorized set.
+    const rawTools = await agentModeService.getFilteredTools(userId);
     const profileTools = toolProfile === 'onboarding'
       ? rawTools.filter((tool) => ONBOARDING_LIVE_TOOLS.has(tool?.function?.name))
       : rawTools;
@@ -545,8 +541,11 @@ export async function sendAudioChunk(sessionId: string, base64Chunk: string): Pr
  * Flush a microphone stream that automatic VAD failed to commit. Gemini allows
  * the stream to reopen when the next audio chunk arrives.
  */
-export async function sendAudioStreamEnd(sessionId: string): Promise<void> {
+export async function sendAudioStreamEnd(sessionId: string, socketId: string): Promise<void> {
   const entry = getEntry(sessionId);
+  if (entry.socketId !== socketId) {
+    throw new Error(`No active live session for ${sessionId}`);
+  }
   if (!entry.session) return;
   entry.lastUserActivityAt = Date.now();
   entry.session.sendRealtimeInput({ audioStreamEnd: true });
@@ -845,18 +844,25 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
       functionCalls.map(async (fc) => {
         let responseContent: Record<string, unknown>;
         try {
-          const result = await withLiveTimeout(
-            agentModeService.executeTool(
-              LIVE_MODEL,
-              fc.name!,
-              fc.args ?? {},
-              entry.userId,
-              sessionId,
-              false,
-            ),
-            LIVE_TOOL_TIMEOUT_MS,
-            `Live tool ${fc.name}`,
+          const execution = agentModeService.executeTool(
+            LIVE_MODEL,
+            fc.name!,
+            fc.args ?? {},
+            entry.userId,
+            sessionId,
+            false,
           );
+          // A Promise timeout cannot cancel the underlying tool. Apply the
+          // bounded wait only to the onboarding read/UI-handoff allowlist;
+          // mutating tools must finish once so Gemini cannot retry them while
+          // the first execution is still producing side effects.
+          const result = ONBOARDING_LIVE_TOOLS.has(fc.name!)
+            ? await withLiveTimeout(
+              execution,
+              LIVE_TOOL_TIMEOUT_MS,
+              `Live tool ${fc.name}`,
+            )
+            : await execution;
           const text = typeof result === 'string' ? result : JSON.stringify(result);
           responseContent = { result: text };
           // Append tool result to separate context (saved to DynamoDB for LLM context,
