@@ -117,6 +117,17 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
   return undefined;
 }
 const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
+
+// Max output tokens for agent-mode LLM turns. Must be large enough to hold a
+// single big tool-call argument (e.g. create_html_file's content_draft, which
+// can be a 30-40K char / ~10-13K token HTML document). The previous 12384 cap
+// truncated such tool calls mid-argument; the provider then returned a tool_use
+// block with content_draft missing, which the gateway rejected as "Missing
+// required argument content_draft", looping until the anti-loop breaker tripped
+// (ENG-403). 32000 is within every supported Bedrock/Vertex Claude model's
+// output ceiling. Models only emit what they need, so raising the cap does not
+// increase normal-turn cost.
+export const AGENT_MODE_MAX_OUTPUT_TOKENS = 32000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { twitterService } from './twitterService';
@@ -1619,7 +1630,7 @@ export class AgentModeService {
 
                 const body: any = {
                   anthropic_version: 'vertex-2023-10-16',
-                  max_tokens: params.max_completion_tokens || 12384,
+                  max_tokens: params.max_completion_tokens || AGENT_MODE_MAX_OUTPUT_TOKENS,
                   messages: merged,
                 };
                 if (systemParts.length > 0) body.system = systemParts.join('\n');
@@ -1825,7 +1836,7 @@ export class AgentModeService {
               messages,
               ...(toolConfig && { toolConfig }),
               inferenceConfig: {
-                maxTokens: params.max_completion_tokens || 12384,
+                maxTokens: params.max_completion_tokens || AGENT_MODE_MAX_OUTPUT_TOKENS,
                 ...(params.temperature !== undefined && { temperature: params.temperature }),
               },
             });
@@ -3001,7 +3012,7 @@ export class AgentModeService {
           response = await this.callLLM(llmModel, trimmedMessages, {
             tools: filteredToolsCache,
             tool_choice: 'auto',
-            max_completion_tokens: 12384,
+            max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
             temperature: 0.1,
             usageContext: { userId, sessionId, feature: 'agent_task' }
           });
@@ -3023,7 +3034,7 @@ export class AgentModeService {
               response = await this.callLLM(llmModel, trimmedMessages, {
                 tools: filteredToolsCache,
                 tool_choice: 'auto',
-                max_completion_tokens: 12384,
+                max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
                 temperature: 0.1,
                 usageContext: { userId, sessionId, feature: 'agent_task' }
               });
