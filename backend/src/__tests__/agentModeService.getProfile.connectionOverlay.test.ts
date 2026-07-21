@@ -38,12 +38,13 @@ describe('AgentModeService.linkedinOutreach get-profile — connection overlay (
   const userId = 'user-1';
   const accountId = 'unipile-acc-1';
 
-  /** Wire the cached profile service to return a given rawData blob. */
-  function stubProfile(rawData: any) {
+  /** Wire the cached profile service to return a given rawData blob.
+   *  fromCache defaults to true (cache hit); pass false to model a live response. */
+  function stubProfile(rawData: any, fromCache = true) {
     mockGetService.mockReturnValue({
       getProfile: jest.fn().mockResolvedValue({
         rawData,
-        fromCache: true,
+        fromCache,
         found: true,
         checkedAt: '2026-07-21T00:00:00.000Z',
       }),
@@ -111,9 +112,13 @@ describe('AgentModeService.linkedinOutreach get-profile — connection overlay (
     expect(res.data).not.toHaveProperty('connected_at');
   });
 
-  it('keeps is_relationship:true from a live blob even when the per-account cache has no row (union)', async () => {
-    // Cold call: live blob still carries is_relationship; connections cache lags.
-    stubProfile({ public_identifier: 'julia', first_name: 'Julia', is_relationship: true });
+  it('keeps is_relationship:true from a LIVE blob even when the per-account cache has no row (union)', async () => {
+    // Cold call (fromCache:false): live blob legitimately carries this viewer's
+    // is_relationship; connections cache lags.
+    stubProfile(
+      { public_identifier: 'julia', first_name: 'Julia', is_relationship: true, connected_at: 1780001882000 },
+      false,
+    );
     mockGetConnection.mockResolvedValue(null);
 
     const res = await service.linkedinOutreach(userId, {
@@ -123,6 +128,46 @@ describe('AgentModeService.linkedinOutreach get-profile — connection overlay (
     });
 
     expect(res.data.is_relationship).toBe(true);
+    // A live response's own connected_at is retained when we have no cache row.
+    expect(res.data.connected_at).toBe(1780001882000);
+  });
+
+  it('discards stale is_relationship/connected_at from a legacy cache-hit row (no cross-viewer leak)', async () => {
+    // A row persisted BEFORE the strip fix still carries another viewer's state.
+    // On a cache hit we must NOT trust it — only the per-account cache decides.
+    stubProfile(
+      { public_identifier: 'leaky', first_name: 'Leaky', is_relationship: true, connected_at: 999000000000 },
+      true, // fromCache
+    );
+    mockGetConnection.mockResolvedValue(null); // this viewer has no connection row
+
+    const res = await service.linkedinOutreach(userId, {
+      action: 'get-profile',
+      profile_url: 'https://www.linkedin.com/in/leaky/',
+      account_id: accountId,
+    });
+
+    // The leaked true/timestamp must be dropped, not passed through.
+    expect(res.data.is_relationship).toBe(false);
+    expect(res.data).not.toHaveProperty('connected_at');
+  });
+
+  it('overrides a legacy cache-hit is_relationship with the authoritative per-account cache', async () => {
+    // Legacy row says false, but THIS account is genuinely connected per our cache.
+    stubProfile(
+      { public_identifier: 'realconn', first_name: 'Real', is_relationship: false, connected_at: 111000000000 },
+      true, // fromCache
+    );
+    mockGetConnection.mockResolvedValue({ accountId, connectedAt: 1777170167000 });
+
+    const res = await service.linkedinOutreach(userId, {
+      action: 'get-profile',
+      profile_url: 'https://www.linkedin.com/in/realconn/',
+      account_id: accountId,
+    });
+
+    expect(res.data.is_relationship).toBe(true);
+    expect(res.data.connected_at).toBe(1777170167000); // authoritative, not the legacy 111...
   });
 
   it('builds the lookup URL from public_identifier when called by provider_id', async () => {
