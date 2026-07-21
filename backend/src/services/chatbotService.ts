@@ -17,7 +17,7 @@ import { getGCSPPrivateKey, getSecret } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService } from './agentModeService';
 import { AGENT_MODE_SYSTEM_PROMPT, EMMA_SIDEBAR_ADDENDUM, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
-import { Citation } from '../utils/citations';
+import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES } from '../utils/citations';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
@@ -4178,6 +4178,9 @@ export async function generateChatResponse(
     let iteration = 0;
     const MAX_ITERATIONS = 10;
     const toolCalls: any[] = []; // Track tool calls for response
+    // ENG-351: accumulate the web sources this sidebar response consults, so the
+    // Sources UI works on the Emma sidebar too (same registry as Agent Mode).
+    const citationRegistry = new CitationRegistry();
     let finalAssistantMessage = '';
     let finalUsageData: any = null;
 
@@ -4307,6 +4310,10 @@ export async function generateChatResponse(
           if (isDelegatedAdmin && adminEmail) extraContext.adminEmail = adminEmail;
           const result = await agentModeService.executeTool(response.model, toolCall.function.name, functionArgs, userId!, sessionId, false, Object.keys(extraContext).length ? extraContext : undefined);
           console.log(`[generateChatResponse] Tool ${toolCall.function.name} executed successfully`);
+          // ENG-351: harvest web-search sources into the citation registry.
+          if (WEB_SEARCH_TOOL_NAMES.has(toolCall.function.name)) {
+            citationRegistry.registerSearchResults((result as any)?.results);
+          }
           toolCalls.push({ id: toolCall.id, name: toolCall.function.name, arguments: functionArgs, result });
           const toolContent = typeof result === 'string' ? result : JSON.stringify(result);
           messages.push({ role: 'tool', tool_call_id: toolCall.id, name: toolCall.function.name, content: toolContent, metadata: { timestamp: new Date().toISOString() } });
@@ -4353,7 +4360,8 @@ export async function generateChatResponse(
       portalType,
       iterationTimings,
       memoryUsage,
-      toolCalls: toolCalls.length > 0 ? toolCalls : undefined // Include tool calls if any
+      toolCalls: toolCalls.length > 0 ? toolCalls : undefined, // Include tool calls if any
+      citations: citationRegistry.size > 0 ? citationRegistry.list() : undefined // ENG-351: web sources for the Sources UI
     };
 
     // Add final assistant message

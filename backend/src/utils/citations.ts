@@ -90,10 +90,12 @@ export class CitationRegistry {
       const url = typeof r?.url === 'string' ? r.url.trim() : '';
       if (!url || !/^https?:\/\//i.test(url)) continue;
 
+      const domain = domainFromUrl(url);
+      if (!domain) continue; // unparseable host (e.g. "https://") — skip rather than show an empty pill
+
       const key = dedupeKey(url);
       if (this.byKey.has(key)) continue;
 
-      const domain = domainFromUrl(url);
       this.byKey.set(key, {
         id: this.nextId++,
         url,

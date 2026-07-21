@@ -69,11 +69,12 @@ describe('CitationRegistry', () => {
     expect(cites.map((c) => c.id)).toEqual([1, 2]);
   });
 
-  it('skips entries without a usable http(s) url', () => {
+  it('skips entries without a usable http(s) url or parseable host', () => {
     const reg = new CitationRegistry();
     reg.registerSearchResults([
       { title: 'no url' },
       { url: 'ftp://x.com/file', title: 'wrong scheme' },
+      { url: 'https://', title: 'no host' },
       { url: 'https://ok.com', title: 'ok' },
     ]);
     const cites = reg.list();
