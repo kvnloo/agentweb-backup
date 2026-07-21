@@ -21,6 +21,7 @@ import {
   applyAnswer,
   canAutoTakeInHeadless,
   selectedPayload,
+  checkQuestionGate,
   AskUserQuestionError,
   type AskUserQuestionOption,
   type AskUserQuestionInput,
@@ -282,6 +283,74 @@ describe('canAutoTakeInHeadless — scheduled/headless policy', () => {
   it('does not auto-take when the card omits the delegation button', () => {
     const q = awaitingQuestion({ immutable: false, allowEmmaDecide: false });
     expect(canAutoTakeInHeadless(q, true)).toBe(false);
+  });
+});
+
+describe('checkQuestionGate — the consumer guard (Option A safety, the scary cases)', () => {
+  function answered(optionId = 'leads'): PendingUserQuestion {
+    return applyAnswer(awaitingQuestion(), {
+      optionId,
+      delegated: false,
+      answeredBy: 'user',
+      at: '2026-07-21T00:01:00.000Z',
+    });
+  }
+
+  it('ALLOWS a human-answered question and returns the deterministic payload', () => {
+    const outcome = checkQuestionGate(answered('leads'), 'q-objective-1');
+    expect(outcome.allowed).toBe(true);
+    if (outcome.allowed) {
+      expect(outcome.answer.answeredBy).toBe('user');
+      expect(outcome.payload).toEqual({ objective: 'OUTCOME_LEADS', optimization_goal: 'OFFSITE_CONVERSIONS' });
+    }
+  });
+
+  it('ALLOWS a delegation-answered question', () => {
+    const delegated = applyAnswer(awaitingQuestion(), {
+      optionId: 'leads',
+      delegated: true,
+      answeredBy: 'delegation',
+      at: '2026-07-21T00:01:00.000Z',
+    });
+    expect(checkQuestionGate(delegated).allowed).toBe(true);
+  });
+
+  it('BLOCKS a direct write with no prior ask (no pending question)', () => {
+    const outcome = checkQuestionGate(undefined);
+    expect(outcome.allowed).toBe(false);
+    if (!outcome.allowed) expect(outcome.reason).toMatch(/No question has been asked/);
+  });
+
+  it('BLOCKS the same-turn [ask, create] bundle — a same-turn ask can only be awaiting', () => {
+    // The ask tool persists the question 'awaiting'; a create bundled in the
+    // SAME turn sees exactly this state. It can never be 'answered' in-turn
+    // because only a later user message flips it. This is the incident (idx=205).
+    const outcome = checkQuestionGate(awaitingQuestion(), 'q-objective-1');
+    expect(outcome.allowed).toBe(false);
+    if (!outcome.allowed) expect(outcome.reason).toMatch(/awaiting a selection/);
+  });
+
+  it('BLOCKS a mismatched questionId (wrong correlation)', () => {
+    const outcome = checkQuestionGate(answered('leads'), 'q-some-other-question');
+    expect(outcome.allowed).toBe(false);
+    if (!outcome.allowed) expect(outcome.reason).toMatch(/does not match the expected question/);
+  });
+
+  it('BLOCKS a forged non-human answer (defense in depth vs applyAnswer)', () => {
+    // applyAnswer cannot construct this, but the guard must independently reject
+    // any answer whose answeredBy is not user/delegation.
+    const forged: PendingUserQuestion = {
+      ...awaitingQuestion(),
+      status: 'answered',
+      answer: { optionId: 'traffic', delegated: false, answeredBy: 'model' as any, at: 'x' },
+    };
+    const outcome = checkQuestionGate(forged);
+    expect(outcome.allowed).toBe(false);
+    if (!outcome.allowed) expect(outcome.reason).toMatch(/not attributable to a human/);
+  });
+
+  it('accepts any answered question when no questionId is supplied', () => {
+    expect(checkQuestionGate(answered('leads')).allowed).toBe(true);
   });
 });
 
