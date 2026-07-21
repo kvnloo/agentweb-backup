@@ -122,7 +122,8 @@
     "unipile-node-sdk": "^1.9.3",
     "uuid": "^11.1.0",
     "v0-sdk": "^0.16.4",
-    "xlsx": "^0.18.5"
+    "xlsx": "^0.18.5",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.7",

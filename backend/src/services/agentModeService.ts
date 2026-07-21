@@ -154,8 +154,12 @@ import {
   evaluateAgentToolPolicy,
   summarizeAgentToolPolicyFlags,
   summarizeAgentToolPolicyModes,
-  validateAndRepairToolArgs,
 } from './agentToolGatewayService';
+// ENG-156: typed-tool-registry boundary. Registered tools validate via their Zod
+// schema (authoritative on accept); everything else falls through to
+// validateAndRepairToolArgs. Provably behavior-preserving for the migrated tools
+// (see agentModeToolRegistry.test.ts parity battery).
+import { validateToolArgsAtBoundary } from './agentMode/toolRegistry';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
 import { validateToolOutputContract } from '../utils/toolOutputContract';
@@ -3254,7 +3258,8 @@ export class AgentModeService {
           mediaAssetsProducedThisRun,
           ports: {
             evaluateAgentToolPolicy,
-            validateAndRepairToolArgs,
+            // ENG-156: route arg validation through the typed-registry boundary.
+            validateAndRepairToolArgs: validateToolArgsAtBoundary,
             getToolInputSchema: (toolName: string) => {
               const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
               return toolDefinition?.function?.parameters || toolDefinition?.inputSchema;
@@ -6156,7 +6161,7 @@ export class AgentModeService {
       isAdmin: extraContext?.isDelegatedAdmin === true,
       enforce: process.env.AGENT_TOOL_GATEWAY_ENFORCE === 'true',
     });
-    const contractResult = validateAndRepairToolArgs({
+    const contractResult = validateToolArgsAtBoundary({
       toolName,
       args,
       inputSchema,
