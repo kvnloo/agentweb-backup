@@ -33,7 +33,9 @@ export class GrowthGeniusService {
     return getAzureClient(
       { userId, feature: 'growth_genius' },
       process.env.AZURE_OPENAI_DEPLOYMENT_GROWTH_GENIUS || 'gpt-5-chat-2',
-      { apiVersion: process.env.AZURE_OPENAI_API_VERSION_GROWTH_GENIUS || '2025-01-01-preview' }
+      // Un-metered: this service meters each call explicitly via
+      // meterUsageFromResponse; auto-metering here would double-record (ENG-200).
+      { apiVersion: process.env.AZURE_OPENAI_API_VERSION_GROWTH_GENIUS || '2025-01-01-preview', metered: false }
     );
   }
 

@@ -18,6 +18,7 @@ import {
   getUserUsageByModelDay,
   getUsageComparison,
   getCostAggregation,
+  getUserOrgUsageRollup,
 } from "../services/usageAnalyticsService";
 
 const router = express.Router();
@@ -77,6 +78,39 @@ router.get(
       console.error("[adminUsage] comparison failed:", error);
       return res.status(500).json({
         message: "Failed to load usage comparison",
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  }
+);
+
+/**
+ * Org-aware cost rollup for the admin per-user cost modal (ENG-200 follow-up).
+ * Given the clicked user, rolls gross burn across all org members and reconciles
+ * it against the org OWNER's quota counter — the fix for the member "false leak"
+ * and owner "burn lags" display bugs. Solo users get a single-user rollup.
+ */
+router.get(
+  "/users/:userId/usage/org-rollup",
+  authenticateToken,
+  isAdmin,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const { userId } = req.params as { userId: string };
+      const month = String(req.query.month || "");
+
+      if (!MONTH_RE.test(month)) {
+        return res
+          .status(400)
+          .json({ message: "month query param is required (YYYY-MM)" });
+      }
+
+      const result = await getUserOrgUsageRollup(userId, month);
+      return res.json(result);
+    } catch (error) {
+      console.error("[adminUsage] org-rollup failed:", error);
+      return res.status(500).json({
+        message: "Failed to load org usage rollup",
         error: error instanceof Error ? error.message : "Unknown error",
       });
     }
