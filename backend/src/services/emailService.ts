@@ -5,6 +5,7 @@ import { deriveBlockedByCost } from './tokenUsageService';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { chatbotDb } from './chatbotService';
 import { settingsService } from './settingsService';
+import { stripCitationMarkers } from '../utils/citations';
 
 dotenv.config();
 
@@ -1162,6 +1163,10 @@ Schedule ID: ${scheduleId}
       const { marked } = await import('marked');
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
+      // ENG-351: email has no citation-chip renderer — strip {{cite:N}} markers from Emma's
+      // response so recipients never see literal marker garbage in the HTML or plain-text body.
+      result = { ...result, actualResponse: stripCitationMarkers(result.actualResponse || '') };
+
       // Create an interactive share for the session so user can access without login
       let sessionUrl = `${customerFrontendUrl}/agent-mode/${result.sessionId}`;
       try {
@@ -1324,6 +1329,9 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       const { marked } = await import('marked');
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
+      // ENG-351: strip {{cite:N}} markers — email has no citation-chip renderer.
+      content = stripCitationMarkers(content);
+
       // Create or reuse interactive share so recipients can view without login
       let sessionUrl = `${customerFrontendUrl}/agent-mode/${sessionId}`;
       try {
@@ -1421,6 +1429,14 @@ Sent via AgentWeb: ${customerFrontendUrl}
   ) {
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+
+      // ENG-351: strip {{cite:N}} markers from each run's response preview — email has no
+      // citation-chip renderer, so the markers would otherwise show as literal garbage.
+      todaysResults = (todaysResults || []).map((r) =>
+        r && typeof r.actualResponse === 'string'
+          ? { ...r, actualResponse: stripCitationMarkers(r.actualResponse) }
+          : r
+      );
 
       const displayDate = customDate || new Date();
       const currentDate = displayDate.toLocaleDateString('en-US', {
@@ -1633,6 +1649,9 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       const { sessionId, userEmail, channelName, originalMessage, emmaResponse, receivedAt, senderDisplayName } = params;
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
+      // ENG-351: strip {{cite:N}} markers — email has no citation-chip renderer.
+      const emmaResponseText = stripCitationMarkers(emmaResponse);
+
       let sessionUrl = `${customerFrontendUrl}/agent-mode/${sessionId}`;
       try {
         const { chatbotDb } = await import('./chatbotService');
@@ -1700,7 +1719,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
 
               <div class="section">
                 <div class="section-title">Emma's Draft Response</div>
-                <div class="response-box">${this.escapeHtml(emmaResponse)}</div>
+                <div class="response-box">${this.escapeHtml(emmaResponseText)}</div>
               </div>
             </div>
             <div class="footer">
@@ -1724,7 +1743,7 @@ Original Message from ${senderDisplayName || 'Unknown'}:
 ${originalMessage}
 
 Emma's Draft Response:
-${emmaResponse}
+${emmaResponseText}
 
 View Session: ${sessionUrl}`;
 
