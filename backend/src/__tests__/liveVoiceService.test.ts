@@ -59,12 +59,15 @@ jest.mock('../utils/secretsManager', () => ({
 }));
 
 const mockExecuteTool = jest.fn();
+const mockGetFilteredTools = jest.fn().mockResolvedValue([]);
+const mockGetAvailableTools = jest.fn().mockReturnValue([]);
 const mockCallLLM = jest.fn().mockResolvedValue({
   choices: [{ message: { content: '{"narrative":"Tool completed successfully.","artifacts":[]}' } }],
 });
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
-    getFilteredTools: jest.fn().mockResolvedValue([]),
+    getFilteredTools: mockGetFilteredTools,
+    getAvailableTools: mockGetAvailableTools,
     executeTool: mockExecuteTool,
     callLLM: mockCallLLM,
   },
@@ -168,6 +171,30 @@ describe('startLiveSession', () => {
     await startLiveSession('session-ready', 'socket-ready', emitFn, 'test-user-id');
 
     expect(emitFn).toHaveBeenCalledWith('live:ready', { sessionId: 'session-ready' });
+  });
+
+  it('loads only onboarding-safe tools for the onboarding profile', async () => {
+    makeCallbacks();
+    mockGetAvailableTools.mockReturnValueOnce([
+      { type: 'function', function: { name: 'list_connected_accounts', parameters: { type: 'object' } } },
+      { type: 'function', function: { name: 'connect_account', parameters: { type: 'object' } } },
+      { type: 'function', function: { name: 'publish_blog_article', parameters: { type: 'object' } } },
+    ]);
+
+    await startLiveSession(
+      'session-onboarding-tools',
+      'socket-onboarding-tools',
+      jest.fn(),
+      'test-user-id',
+      'onboarding',
+    );
+
+    const declarations = mockLiveConnect.mock.calls[0][0].config.tools[0].functionDeclarations;
+    expect(declarations.map((tool: { name: string }) => tool.name)).toEqual([
+      'list_connected_accounts',
+      'connect_account',
+    ]);
+    expect(mockGetFilteredTools).not.toHaveBeenCalled();
   });
 
   it('directs Emma to use a neutral accent', async () => {

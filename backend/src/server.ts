@@ -191,7 +191,13 @@ io.on('connection', (socket: Socket) => {
     return decoded.delegateAccess?.targetUserId || decoded.userId;
   }
 
-  socket.on('live:start', async ({ sessionId }: { sessionId: string }) => {
+  socket.on('live:start', async ({
+    sessionId,
+    toolProfile = 'default',
+  }: {
+    sessionId: string;
+    toolProfile?: 'default' | 'onboarding';
+  }) => {
     try {
       // For conversable sockets, enforce that the sessionId matches what was auth'd
       if (socket.data.conversableSessionId && socket.data.conversableSessionId !== sessionId) {
@@ -202,7 +208,7 @@ io.on('connection', (socket: Socket) => {
       // Track which live sessions this socket owns (for disconnect cleanup)
       if (!socket.data.liveSessions) socket.data.liveSessions = new Set<string>();
       socket.data.liveSessions.add(sessionId);
-      await startLiveSession(sessionId, socket.id, liveEmit, userId);
+      await startLiveSession(sessionId, socket.id, liveEmit, userId, toolProfile);
       console.log(`[liveVoice] live:start completed for session ${sessionId}`);
     } catch (err: any) {
       console.error(`[liveVoice] live:start error for session ${sessionId}:`, err?.message);

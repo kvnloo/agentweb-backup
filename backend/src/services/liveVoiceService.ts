@@ -41,6 +41,20 @@ export const LIVE_MODEL = 'models/gemini-3.1-flash-live-preview';
 const LIVE_VOICE_NAME = 'Kore';
 const LIVE_TOOL_TIMEOUT_MS = 12_000;
 const LIVE_TOOL_SUMMARY_TIMEOUT_MS = 5_000;
+export type LiveToolProfile = 'default' | 'onboarding';
+
+const ONBOARDING_LIVE_TOOLS = new Set([
+  'list_connected_accounts',
+  'connect_account',
+  'read_brand_guidelines',
+  'get_lead_lists',
+  'get_leads',
+  'search_leads',
+  'get_leads_needing_followup',
+  'analyze_crm_data',
+  'search_user_guide',
+  'search_knowledge_base',
+]);
 
 async function withLiveTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   let timeout: NodeJS.Timeout | undefined;
@@ -251,13 +265,27 @@ function sanitizeSchema(schema: any): any {
  * Load and convert agent mode tools for this user into Gemini Live format.
  * Returns an empty array on error (voice still works without tools).
  */
-async function loadGeminiFunctionDeclarations(userId: string): Promise<any[]> {
+async function loadGeminiFunctionDeclarations(
+  userId: string,
+  toolProfile: LiveToolProfile,
+): Promise<any[]> {
   try {
-    const rawTools = await agentModeService.getFilteredTools(userId);
-    const declarations = rawTools
+    // The onboarding profile is a fixed allowlist of read-only discovery and
+    // UI-handoff tools. Reading all registered definitions avoids the slower
+    // per-session skill/subscription resolution that dominates cold start;
+    // the allowlist below is the tighter capability boundary.
+    const rawTools = toolProfile === 'onboarding'
+      ? agentModeService.getAvailableTools()
+      : await agentModeService.getFilteredTools(userId);
+    const profileTools = toolProfile === 'onboarding'
+      ? rawTools.filter((tool) => ONBOARDING_LIVE_TOOLS.has(tool?.function?.name))
+      : rawTools;
+    const declarations = profileTools
       .map(toGeminiFunctionDeclaration)
       .filter((d): d is any => d !== null);
-    console.log(`[liveVoiceService] Loaded ${declarations.length}/${rawTools.length} tools for Gemini Live`);
+    console.log(
+      `[liveVoiceService] Loaded ${declarations.length}/${rawTools.length} tools for Gemini Live (${toolProfile})`,
+    );
     return declarations;
   } catch (err: any) {
     console.warn('[liveVoiceService] Failed to load tools for Gemini Live:', err?.message);
@@ -445,7 +473,8 @@ export async function startLiveSession(
   sessionId: string,
   socketId: string,
   emitFn: EmitFn,
-  userId: string
+  userId: string,
+  toolProfile: LiveToolProfile = 'default',
 ): Promise<void> {
   const startedAt = Date.now();
   void recordOnboardingEvent(
@@ -460,7 +489,7 @@ export async function startLiveSession(
 
   // Load tools and prior history in parallel
   const [functionDeclarations, historyContext] = await Promise.all([
-    loadGeminiFunctionDeclarations(userId),
+    loadGeminiFunctionDeclarations(userId, toolProfile),
     loadHistoryForSystemPrompt(sessionId),
   ]);
 
