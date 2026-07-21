@@ -64,6 +64,46 @@ export function stripCitationMarkers(text: string): string {
   return text.replace(CITE_MARKER_STRIP, '');
 }
 
+export type CitationRenderFormat = 'text' | 'markdown';
+
+// Well-formed {{cite:N}} / {{cite:N,M}} marker with its ids captured, plus any leading spaces/tabs
+// so the resolved source sits cleanly adjacent to the figure.
+const CITE_MARKER_RESOLVE = /[ \t]*\{\{\s*cite\s*:\s*(\d+(?:\s*,\s*\d+)*)\s*\}\}/gi;
+
+/**
+ * ENG-351: resolve {{cite:N}} markers to a readable source adjacent to the figure, using this
+ * message's citations — "(Grand View Research)" for `text`, or "([Grand View Research](https://…))"
+ * for `markdown` (which Slack's markdown→mrkdwn converter turns into a clickable link). A marker
+ * citing several sources lists each, comma-separated. Unresolvable ids and any malformed {{cite…}}
+ * token are dropped, so the output never contains a raw marker; with no/empty citations this reduces
+ * to plain stripping. Used on non-React surfaces (email, Slack) that carry the citation metadata.
+ */
+export function renderCitationMarkers(
+  text: string,
+  citations: Citation[] | undefined,
+  format: CitationRenderFormat = 'text',
+): string {
+  if (!text || typeof text !== 'string') return text;
+  const byId = new Map((citations || []).map((c) => [c.id, c]));
+  const resolved = text.replace(CITE_MARKER_RESOLVE, (_full, idsRaw: string) => {
+    const cits = idsRaw
+      .replace(/\s+/g, '')
+      .split(',')
+      .filter(Boolean)
+      .map((n) => byId.get(parseInt(n, 10)))
+      .filter((c): c is Citation => Boolean(c));
+    if (!cits.length) return ''; // id has no matching source → drop the marker rather than invent one
+    const parts = cits.map((c) => {
+      const label = c.siteName || c.domain || '';
+      const safe = /^https?:\/\//i.test(c.url) ? c.url : '';
+      return format === 'markdown' && safe ? `[${label}](${safe})` : label;
+    });
+    return ` (${parts.join(', ')})`;
+  });
+  // Belt-and-suspenders: strip any leftover malformed cite token so a raw marker never survives.
+  return resolved.replace(CITE_MARKER_STRIP, '');
+}
+
 /** Extract the bare host (lowercased, no leading `www.`) from a URL; '' if unparseable. */
 export function domainFromUrl(rawUrl: string): string {
   try {
