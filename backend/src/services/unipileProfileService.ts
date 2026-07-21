@@ -143,6 +143,12 @@ const VIEWER_RELATIVE_FIELDS = [
   'is_open_profile',
   'is_invitation_pending',
   'connection_degree',
+  // ENG-440: "am I connected to this person / when did I connect" is viewer-
+  // relative too. Left unstripped, a cache row cold-populated by a non-connected
+  // viewer serves is_relationship:false to a viewer who IS a 1st-degree
+  // connection, and the agent branches invite-vs-DM on the wrong signal.
+  'is_relationship',
+  'connected_at',
 ] as const;
 
 function stripViewerRelativeFields(raw: any): any {

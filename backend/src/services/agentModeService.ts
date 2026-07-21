@@ -26639,7 +26639,62 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // persisting — see unipileProfileService.ts.
           const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
           const profileResult = await getUnipileProfileService().getProfile(target, account_id);
-          return { success: true, data: profileResult.rawData };
+          const raw = profileResult.rawData;
+
+          // The global profile cache strips is_relationship / connected_at because
+          // they are viewer-relative (ENG-440) — so on a cache hit a freshly-written
+          // blob carries no connection state at all (and a pre-change legacy row may
+          // carry another viewer's, which we discard below). Re-derive it for THIS
+          // account from our per-account AW-UnipileConnections cache (the authoritative
+          // ENG-377 path) so the agent's invite-vs-DM decision has a correct signal.
+          //
+          // IMPORTANT: overlay onto a SHALLOW COPY. `raw` is the object held in the
+          // profile cache (LRU/DDB row) — mutating it in place would persist this
+          // viewer's connection state back into the shared cache and re-introduce the
+          // very cross-viewer leak this fix closes.
+          if (raw && typeof raw === 'object') {
+            const profileUrl =
+              raw.public_profile_url ||
+              (raw.public_identifier
+                ? `https://www.linkedin.com/in/${raw.public_identifier}`
+                : (isUrl ? target : null));
+            let conn: { connectedAt?: number } | null = null;
+            if (profileUrl) {
+              const { getConnectionByProfileUrlAndAccount } = await import('./unipileConnectionsDb');
+              conn = await getConnectionByProfileUrlAndAccount(profileUrl, account_id).catch(() => null);
+            }
+            // Drop any is_relationship / connected_at that came off `raw` before
+            // re-deriving. New cache writes already strip these, but rows persisted
+            // BEFORE this change (30-day TTL) can still carry another viewer's stale
+            // values — a spread of `raw` would leak them until the row expires. Only a
+            // LIVE response (`!fromCache`) legitimately carries this viewer's own state.
+            const {
+              is_relationship: rawRelationship,
+              connected_at: rawConnectedAt,
+              ...viewerIndependentRaw
+            } = raw;
+            // Reconcile as a union: connected if our per-account cache has a row OR a
+            // LIVE blob said so. A `true` from either source wins — directly countering
+            // the false-negative in reporter-ticket #135 (is_relationship false while
+            // LinkedIn's send-time check said FIRST_DEGREE). On a cache hit we trust only
+            // `conn`, never the (possibly cross-viewer) cached is_relationship.
+            const isConnected =
+              !!conn || (!profileResult.fromCache && rawRelationship === true);
+            const data = {
+              ...viewerIndependentRaw,
+              is_relationship: isConnected,
+              // conn.connectedAt is already epoch-ms (Unipile created_at) — do NOT
+              // multiply by 1000 (ENG-379). Prefer the authoritative cache timestamp;
+              // otherwise keep the raw timestamp ONLY from a live response.
+              ...(conn && typeof conn.connectedAt === 'number'
+                ? { connected_at: conn.connectedAt }
+                : !profileResult.fromCache && typeof rawConnectedAt === 'number'
+                  ? { connected_at: rawConnectedAt }
+                  : {}),
+            };
+            return { success: true, data };
+          }
+          return { success: true, data: raw };
         }
 
         case 'list-connections': {
