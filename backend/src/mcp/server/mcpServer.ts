@@ -12,6 +12,12 @@ import {
   McpClientType,
   recordMcpConnectionAttempt,
 } from '../../services/mcpUsageEventsService';
+import {
+  McpSessionStore,
+  McpSessionRecord,
+  createMcpSessionStore,
+} from './mcpSessionStore';
+import { rehydrateAndServe } from './mcpSessionRehydration';
 
 // Rate limiter for MCP requests authenticated via aw_* API keys
 const mcpRateLimiter = new RateLimiter();
@@ -162,18 +168,31 @@ function setMcpAuthChallenge(res: Response, baseUrl: string, error?: string) {
   res.setHeader("WWW-Authenticate", buildMcpAuthChallenge(baseUrl, error));
 }
 
-export function setupMcpServer(app: express.Express) {
-  // Map to store sessions with their transports and last activity timestamp
+export function setupMcpServer(
+  app: express.Express,
+  // Durable session-metadata store (ENG-114). Defaults to the in-memory store
+  // (single-instance, behavior-preserving); `MCP_SESSION_STORE=dynamo` selects
+  // the shared DynamoDB store so sessions resolve across instances. Injectable
+  // for tests.
+  sessionStore: McpSessionStore = createMcpSessionStore(SESSION_TIMEOUT_MS),
+) {
+  // Map to store sessions with their transports and last activity timestamp.
+  // Holds the LIVE, process-local transports; the durable metadata mirror lives
+  // in `sessionStore`.
   const sessions = new Map<string, SessionEntry>();
 
   /**
-   * Update the last activity timestamp for a session
+   * Update the last activity timestamp for a session, in the local map and in
+   * the shared store (best-effort; a store failure never breaks the request).
    */
   const touchSession = (sessionId: string) => {
     const session = sessions.get(sessionId);
     if (session) {
       session.lastActivity = Date.now();
     }
+    void sessionStore.touch(sessionId).catch((err) => {
+      console.error(`[MCP] Session store touch failed for ${sessionId}:`, err);
+    });
   };
 
   /**
@@ -302,6 +321,19 @@ export function setupMcpServer(app: express.Express) {
               clientType: sharedState.clientType,
               userAgent: sharedState.userAgent,
             });
+            // Persist the minimal metadata another instance needs to rehydrate
+            // this session (ENG-114). Best-effort: a store failure only forfeits
+            // cross-instance durability (→ the client falls back to a reinit),
+            // never the session itself.
+            void sessionStore
+              .set({
+                sessionId: newSessionId,
+                agentUserId: sharedState.agentUserId,
+                isInternal: sharedState.isInternal,
+              })
+              .catch((err) => {
+                console.error(`[MCP] Session store persist failed for ${newSessionId}:`, err);
+              });
             if (!sharedState.isInternal) {
               void recordMcpConnectionAttempt({
                 userId: sharedState.agentUserId,
@@ -336,11 +368,45 @@ export function setupMcpServer(app: express.Express) {
         await transport.handleRequest(req, res, req.body);
         return;
       } else if (sessionId) {
-        // Session ID provided but unknown to this server instance.
-        // This happens when the server restarts (in-memory sessions Map is wiped)
-        // or when a session is cleaned up by cleanupStaleSessions while the client
-        // still has the old ID cached.
-        //
+        // Session ID provided but unknown to THIS instance's local transport map.
+        // Two cases:
+        //  (a) Multi-instance deploy (MCP_SESSION_STORE=dynamo): the session was
+        //      initialized on another instance. Rehydrate it locally from the
+        //      shared store and serve the request — no client-visible 404/reinit
+        //      round-trip (ENG-114 AC #1).
+        //  (b) Single-instance / genuine miss (server restart wiped the map, the
+        //      session was cleaned up as stale, or the default in-memory store
+        //      has no record): fall through to 404 so the SDK auto-reinitializes.
+        //      With the in-memory store the store mirrors the local map, so this
+        //      is always case (b) — behavior is unchanged.
+        let rehydrated: McpSessionRecord | null = null;
+        try {
+          rehydrated = await sessionStore.get(sessionId);
+        } catch (err) {
+          console.error(`[MCP] Session store lookup failed for ${sessionId}:`, err);
+        }
+
+        // The session id is a bearer capability. Only rehydrate for the SAME
+        // principal that owns the session — never hand one caller another user's
+        // session (IDOR guard). Internal (backend-to-backend) sessions require an
+        // internal caller; external sessions require a matching authenticated user.
+        const reqUserId = (req as any)._agentApiUserId as string | undefined;
+        const reqIsInternal = (req as any)._mcpIsInternal === true;
+        const samePrincipal = rehydrated
+          ? rehydrated.isInternal
+            ? reqIsInternal
+            : !!rehydrated.agentUserId && rehydrated.agentUserId === reqUserId
+          : false;
+
+        if (rehydrated && samePrincipal) {
+          console.log(`[MCP-SERVER-DEBUG] Rehydrating cross-instance session ${sessionId}`);
+          await rehydrateAndServe(req, res, sessionId, rehydrated, req.body);
+          void sessionStore.touch(sessionId).catch(() => {
+            /* best-effort ttl refresh */
+          });
+          return;
+        }
+
         // Return 404 (not 400) so the StreamableHTTPClientTransport in the MCP SDK
         // treats this as "session expired" and automatically re-initializes a new
         // session on the next request. Returning 400 caused the SDK to treat the
@@ -436,7 +502,13 @@ export function setupMcpServer(app: express.Express) {
       return;
     }
     if (!sessions.has(sessionId)) {
-      // Already gone — idempotent success rather than error.
+      // Not live on this instance. Still evict it from the shared store so
+      // termination is globally consistent (ENG-114 AC #3), then succeed
+      // idempotently — the caller asked to terminate a session that is already
+      // gone here.
+      await sessionStore.delete(sessionId).catch((err) => {
+        console.error(`[MCP] Session store delete failed for ${sessionId}:`, err);
+      });
       res.status(204).send();
       return;
     }
@@ -445,6 +517,10 @@ export function setupMcpServer(app: express.Express) {
     try {
       const transport = sessions.get(sessionId)!.transport;
       await transport.handleRequest(req, res);
+      // Evict from the shared store too so no other instance rehydrates it.
+      await sessionStore.delete(sessionId).catch((err) => {
+        console.error(`[MCP] Session store delete failed for ${sessionId}:`, err);
+      });
     } catch (error) {
       console.error('[MCP] Error handling session termination:', error);
       if (!res.headersSent) {
