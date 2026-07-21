@@ -16,6 +16,13 @@ import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
 import { enqueueAutoHumanEval } from '../services/autoHumanEvalService';
+import { v4 as uuidv4 } from 'uuid';
+import {
+  buildPendingUserQuestion,
+  renderQuestionPrompt,
+  AskUserQuestionError,
+  type AskUserQuestionOption,
+} from '../services/agentMode/core/askUserQuestion';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -86,6 +93,108 @@ emmaToolRegistry.register({
       slackMessageTs: candidate.slackMessageTs,
     };
   }
+});
+
+// ENG-396: AskUserQuestion — a structured, BLOCKING option-select prompt. Emma
+// emits it to force a human choice on an immutable/irreversible parameter (first
+// consumer: the Meta campaign objective, ENG-400) before building. It returns
+// awaitingUserConfirmation:true so the agent loop HALTS (see collectConfirmationPrompt);
+// the answer is persisted structurally on the session and only an inbound USER
+// selection resolves it — the model cannot self-answer. NOTE: exposure is
+// feature-flagged OFF until the whole feature (answer channel + card) ships;
+// registering the handler here is inert until the tool is added to the exposed set.
+emmaToolRegistry.register({
+  name: 'ask_user_question',
+  definition: {
+    name: 'ask_user_question',
+    description: `Ask the user a structured, blocking multiple-choice question and STOP until they pick. Use this ONLY for a decision that is high-stakes or IRREVERSIBLE and that the user (not you) must own — e.g. an immutable Meta campaign objective. Do NOT use it for routine confirmations or reversible choices.
+
+Provide 2–4 options, each with a one-line \`consequence\`. EXACTLY ONE option must be marked recommended:true with a one-line \`why\` grounded in real signal from this session (e.g. "162 LEAD events fired on your pixel in the last 30d") — the recommendation is the point. Optionally set allow_emma_decide:true to offer a "Let Emma decide" delegation button (proceeds with the recommended option, logged).
+
+After you call this the run BLOCKS: you will NOT be able to answer it yourself and no further action executes until the user selects. Do not restate the options as prose asking for a "yes/confirm" — emit this tool instead.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: 'The question to ask, e.g. "Which Meta campaign objective? It cannot be changed after launch."' },
+        options: {
+          type: 'array',
+          minItems: 2,
+          maxItems: 4,
+          description: '2–4 options; exactly one with recommended:true and a one-line why.',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Optional stable id; auto-generated from position if omitted.' },
+              label: { type: 'string', description: 'Short button label, e.g. "Leads".' },
+              consequence: { type: 'string', description: 'One-line consequence of choosing this option.' },
+              recommended: { type: 'boolean', description: 'Set true on EXACTLY ONE option.' },
+              why: { type: 'string', description: 'One-line justification. REQUIRED on the recommended option.' },
+              payload: { type: 'object', description: 'The concrete machine parameters this option implies (applied verbatim by the consumer — no re-inference).' },
+            },
+            required: ['label', 'consequence'],
+          },
+        },
+        immutable: { type: 'boolean', description: 'True if the parameter is irreversible (e.g. Meta objective). Immutable questions never auto-resolve in headless runs.' },
+        allow_emma_decide: { type: 'boolean', description: 'Offer a "Let Emma decide" delegation button that takes the recommended option.' },
+      },
+      required: ['question', 'options'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const sessionId = context?.sessionId;
+    if (!sessionId) {
+      return { success: false, message: 'ask_user_question requires an active session.' };
+    }
+    // Normalize incoming options: assign a stable id when the model omitted one.
+    const options: AskUserQuestionOption[] = Array.isArray(args.options)
+      ? args.options.map((o: any, i: number) => ({
+          id: typeof o?.id === 'string' && o.id.trim() !== '' ? o.id : `option-${i + 1}`,
+          label: o?.label,
+          consequence: o?.consequence,
+          recommended: o?.recommended === true,
+          why: o?.why,
+          payload: o?.payload,
+        }))
+      : [];
+
+    let question;
+    try {
+      question = buildPendingUserQuestion({
+        questionId: uuidv4(),
+        question: args.question,
+        options,
+        immutable: args.immutable === true,
+        allowEmmaDecide: args.allow_emma_decide === true,
+        createdAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      if (err instanceof AskUserQuestionError) {
+        // Surface the validation problem so the model can fix and re-emit.
+        return { success: false, message: `Invalid ask_user_question: ${err.message}` };
+      }
+      throw err;
+    }
+
+    // Persist as the single active question (supersedes any prior awaiting one).
+    await chatbotDb.updateSessionAskUserQuestion(sessionId, question);
+
+    const prompt = renderQuestionPrompt(question);
+    // awaitingUserConfirmation halts the loop; type + options let the chat card
+    // render and the frontend post back a structured selection. No field tells
+    // the model how to answer — only a user selection can resolve it.
+    return {
+      success: true,
+      awaitingUserConfirmation: true,
+      type: 'ask_user_question',
+      questionId: question.questionId,
+      question: question.question,
+      options: question.options,
+      recommendedOptionId: question.recommendedOptionId,
+      allowEmmaDecide: question.allowEmmaDecide,
+      confirmationPrompt: prompt,
+      summary: prompt,
+    };
+  },
 });
 
 function outputFieldNames(outputFields: unknown): string[] {

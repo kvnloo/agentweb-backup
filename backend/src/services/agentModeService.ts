@@ -4819,7 +4819,7 @@ export class AgentModeService {
     // per-tool minimizers below drop unknown fields — without this, the frontend
     // (tool card "Awaiting your confirmation", panel teardown) never sees the flag.
     if (result && result.awaitingUserConfirmation === true) {
-      return {
+      const base = {
         success: true,
         requiresConfirmation: true,
         awaitingUserConfirmation: true,
@@ -4827,6 +4827,21 @@ export class AgentModeService {
         confirmationDetail: result.confirmationDetail,
         summary: result.summary,
       };
+      // ENG-396: also preserve the structured AskUserQuestion payload so the chat
+      // card can render its options and the frontend can post back a structured
+      // selection. Without this the per-tool minimizers drop these unknown fields.
+      if (result.type === 'ask_user_question') {
+        return {
+          ...base,
+          type: 'ask_user_question',
+          questionId: result.questionId,
+          question: result.question,
+          options: result.options,
+          recommendedOptionId: result.recommendedOptionId,
+          allowEmmaDecide: result.allowEmmaDecide,
+        };
+      }
+      return base;
     }
 
     // For playwright screenshots, result has already been processed (base64 → S3 URL)

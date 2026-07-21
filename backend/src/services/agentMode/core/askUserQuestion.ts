@@ -252,6 +252,25 @@ export function selectedPayload(question: PendingUserQuestion): Record<string, u
   return question.options.find((o) => o.id === question.answer!.optionId)?.payload;
 }
 
+/**
+ * Render the question + options as a plain-text prompt. This is the fallback
+ * shown/fed when the structured card can't render (and the string the loop's
+ * confirmation-halt surfaces). The structured `options` on the tool result
+ * drive the interactive card; this text is the accessible mirror. Deliberately
+ * carries NO instruction on how to answer — the model must not be able to
+ * self-resolve; only an inbound user selection does.
+ */
+export function renderQuestionPrompt(question: PendingUserQuestion): string {
+  const lines = question.options.map((o, i) => {
+    const base = `${i + 1}. ${o.label} — ${o.consequence}`;
+    return o.recommended ? `${base}\n   ⭐ Recommended: ${o.why}` : base;
+  });
+  const footer = question.allowEmmaDecide
+    ? '\n\nPick an option above, or choose "Let Emma decide" to go with the recommendation.'
+    : '\n\nPick an option above to continue.';
+  return `${question.question}\n\n${lines.join('\n')}${footer}`;
+}
+
 export type QuestionGateOutcome =
   | { allowed: true; answer: AskUserQuestionAnswer; payload?: Record<string, unknown> }
   | { allowed: false; reason: string };
