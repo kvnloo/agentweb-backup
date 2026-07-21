@@ -48,7 +48,11 @@ jobs:
   backend-tests-a:
     name: Backend tests (agentMode)
     needs: detect-changes
-    if: needs.detect-changes.outputs.backend == 'true'
+    # Skip the heavy suite while the PR is a draft: intermediate pushes to a
+    # draft (e.g. the autofix pipeline's re-fix/revise commits) shouldn't burn
+    # ~26 runner-min they can't gate a merge with. Flipping the PR to Ready
+    # fires `ready_for_review` (see triggers) → one authoritative full run.
+    if: needs.detect-changes.outputs.backend == 'true' && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     # Distinct group from backend-tests-b so the two still run in parallel; a
     # newer commit on the same PR cancels this job's superseded run.
@@ -86,7 +90,9 @@ jobs:
   backend-tests-b:
     name: Backend tests (all other + coverage)
     needs: detect-changes
-    if: needs.detect-changes.outputs.backend == 'true'
+    # Same draft gate as backend-tests-a (see above): drafts skip the heavy
+    # suite; the run happens once the PR is marked Ready for review.
+    if: needs.detect-changes.outputs.backend == 'true' && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     # Distinct group from backend-tests-a so the two still run in parallel; a
     # newer commit on the same PR cancels this job's superseded run.
