@@ -20,7 +20,6 @@ import {
   buildPendingUserQuestion,
   applyAnswer,
   resolveInboundAnswer,
-  canAutoTakeInHeadless,
   selectedPayload,
   checkQuestionGate,
   renderQuestionPrompt,
@@ -263,28 +262,6 @@ describe('applyAnswer — the barrier', () => {
         at: '2026-07-21T00:01:00.000Z',
       }),
     ).toThrow(/Delegated answers must select the recommended option/);
-  });
-});
-
-describe('canAutoTakeInHeadless — scheduled/headless policy', () => {
-  it('FAIL: never auto-takes an immutable question, even with delegation allowed', () => {
-    const q = awaitingQuestion({ immutable: true, allowEmmaDecide: true });
-    expect(canAutoTakeInHeadless(q, true)).toBe(false);
-  });
-
-  it('auto-takes a reversible question when delegation is allowed by session and card', () => {
-    const q = awaitingQuestion({ immutable: false, allowEmmaDecide: true });
-    expect(canAutoTakeInHeadless(q, true)).toBe(true);
-  });
-
-  it('does not auto-take when the session disallows delegation', () => {
-    const q = awaitingQuestion({ immutable: false, allowEmmaDecide: true });
-    expect(canAutoTakeInHeadless(q, false)).toBe(false);
-  });
-
-  it('does not auto-take when the card omits the delegation button', () => {
-    const q = awaitingQuestion({ immutable: false, allowEmmaDecide: false });
-    expect(canAutoTakeInHeadless(q, true)).toBe(false);
   });
 });
 

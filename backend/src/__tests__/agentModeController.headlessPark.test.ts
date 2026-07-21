@@ -159,3 +159,104 @@ describe('runVerifiedChat — headless park on a blocking question (ENG-396)', (
     expect(result.success).toBe(true);
   });
 });
+
+describe('runVerifiedChat — full-autonomy auto-take (ENG-396 Version B)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
+    (mockChatbotDb as any).updateSessionAskUserQuestion = jest.fn().mockResolvedValue(undefined as any);
+    mockChatbotDb.addMessageToSession.mockResolvedValue(undefined as any);
+    mockChatbotDb.addMessagesToSession.mockResolvedValue(undefined as any);
+    mockChatbotDb.updateSessionTitle.mockResolvedValue(undefined as any);
+    mockAgentModeService.getDefaultModel.mockResolvedValue('default-model');
+    mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('system prompt');
+    mockAgentModeService.generateSessionTitle.mockResolvedValue('Title');
+    mockWorkerService.runInWorker.mockResolvedValue({
+      content: 'Which objective should I optimize for?',
+      toolCalls: [{ name: 'ask_user_question', result: { awaitingUserConfirmation: true } }],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [],
+    } as any);
+  });
+
+  it('with fullAutonomy, AUTO-TAKES the recommended option (even immutable) and continues instead of parking', async () => {
+    // First read returns the awaiting immutable question; after the auto-take
+    // persists an answer, subsequent reads return the answered question so the
+    // run proceeds and completes rather than re-asking forever.
+    let persisted = awaitingQuestion();
+    (mockChatbotDb as any).updateSessionAskUserQuestion = jest.fn(async (_sid: string, q: any) => { persisted = q; });
+    mockChatbotDb.getChatSession.mockImplementation(async () => ({ ...baseSession, pendingUserQuestion: persisted } as any));
+
+    const result = await runVerifiedChat({
+      sessionId: 'session-1',
+      userId: 'user-1',
+      startingMessage: 'Build and launch my Meta campaigns.',
+      keywords: [],
+      requiredFunctions: [],
+      maxAttempts: 5,
+      attachments: [],
+      fullAutonomy: true,
+    });
+
+    // Did not park — it auto-answered and carried on.
+    expect((result as any).parked).toBeFalsy();
+    // The auto-take recorded a delegation answer on the RECOMMENDED option.
+    expect((mockChatbotDb as any).updateSessionAskUserQuestion).toHaveBeenCalled();
+    expect(persisted.status).toBe('answered');
+    expect(persisted.answer).toMatchObject({ optionId: 'leads', delegated: true, answeredBy: 'delegation' });
+    expect(persisted.answer?.rationale).toContain('162 LEAD events');
+    // A history breadcrumb was written so Emma resumes without re-asking.
+    expect(mockChatbotDb.addMessageToSession).toHaveBeenCalledWith(
+      'session-1',
+      expect.objectContaining({ metadata: expect.objectContaining({ autoDelegatedAnswer: true }) }),
+    );
+    // It ran more than one turn (continued after the auto-take).
+    expect(mockWorkerService.runInWorker.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  it('without fullAutonomy, still PARKS (default safe behavior) even though a toggle exists', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue({ ...baseSession, pendingUserQuestion: awaitingQuestion() } as any);
+
+    const result = await runVerifiedChat({
+      sessionId: 'session-1',
+      userId: 'user-1',
+      startingMessage: 'Build and launch my Meta campaigns.',
+      keywords: [],
+      requiredFunctions: [],
+      maxAttempts: 5,
+      attachments: [],
+      fullAutonomy: false,
+    });
+
+    expect((result as any).parked).toBe(true);
+    expect((mockChatbotDb as any).updateSessionAskUserQuestion).not.toHaveBeenCalled();
+  });
+
+  it('bounds auto-takes: a model that keeps re-asking eventually parks instead of looping forever', async () => {
+    // Every read returns a fresh awaiting question (a new id each time) — simulating
+    // a model that re-asks after every auto-take. The run must not loop to maxAttempts.
+    let n = 0;
+    (mockChatbotDb as any).updateSessionAskUserQuestion = jest.fn().mockResolvedValue(undefined);
+    mockChatbotDb.getChatSession.mockImplementation(async () => {
+      n++;
+      return { ...baseSession, pendingUserQuestion: { ...awaitingQuestion(), questionId: `q-${n}` } } as any;
+    });
+
+    const result = await runVerifiedChat({
+      sessionId: 'session-1',
+      userId: 'user-1',
+      startingMessage: 'Build and launch my Meta campaigns.',
+      keywords: [],
+      requiredFunctions: [],
+      maxAttempts: 20,
+      attachments: [],
+      fullAutonomy: true,
+    });
+
+    // After the bounded number of auto-takes it parks rather than running to maxAttempts.
+    expect((result as any).parked).toBe(true);
+    expect((mockChatbotDb as any).updateSessionAskUserQuestion.mock.calls.length).toBe(3); // MAX_AUTO_TAKES
+    expect(mockWorkerService.runInWorker.mock.calls.length).toBeLessThan(20);
+  });
+});
