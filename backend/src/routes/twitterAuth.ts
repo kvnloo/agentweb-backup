@@ -13,6 +13,19 @@ const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
 const TWITTER_SCOPES = INTEGRATION_CONFIG.twitter.scopes;
 const getRedirectUri = (): string => INTEGRATION_CONFIG.twitter.redirectUri;
 
+// The OAuth2 token response returns the scopes X actually GRANTED, which are
+// narrower than what we requested when the X Developer App is configured
+// read-only. Persist the granted set (not the requested TWITTER_SCOPES
+// constant) so connectedAccountsDb reflects real capability and the pre-write
+// scope guard can detect a read-only grant instead of failing with an opaque
+// 403. The library types `scope` as string[]; normalize defensively in case a
+// raw space-delimited string ever comes through.
+const normalizeGrantedScopes = (scope: unknown): string[] => {
+  if (Array.isArray(scope)) return scope.map(String).filter(Boolean);
+  if (typeof scope === 'string') return scope.split(/\s+/).filter(Boolean);
+  return [];
+};
+
 // ── PKCE session store (server-side, one-time use) ──────────────────────────
 // Holds the codeVerifier produced at /init keyed by the OAuth state, so it can
 // be retrieved at /finalize to complete the PKCE exchange. Mirrors the gmailAuth
@@ -116,7 +129,7 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
 
   try {
     const app = await twitterService.getAppClient();
-    const { client, accessToken, refreshToken, expiresIn } = await app.loginWithOAuth2({
+    const { client, accessToken, refreshToken, expiresIn, scope } = await app.loginWithOAuth2({
       code,
       codeVerifier,
       redirectUri: getRedirectUri(),
@@ -132,7 +145,8 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
       access_token: accessToken,
       refresh_token: refreshToken || '',
       token_expires_at: Date.now() + (expiresIn ?? 7200) * 1000,
-      scopes: TWITTER_SCOPES,
+      // GRANTED scopes from the token response — not the requested TWITTER_SCOPES.
+      scopes: normalizeGrantedScopes(scope),
     };
 
     const account = await createAccount(userId, 'twitter', {

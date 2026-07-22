@@ -16,6 +16,7 @@ import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoUrlForUser,
   missingBrandLogoToolResult,
+  promptCreatesLogo,
   promptRequestsLogo,
 } from './agentMode/brandLogo';
 import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
@@ -37,9 +38,8 @@ import { skillService } from './skillService';
 import { extractVariables } from '../utils/templateParser';
 import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
-import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
-import { recordUsage } from './usageRecorderService';
+import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
 import {
   getModelPrice,
@@ -55,6 +55,7 @@ import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
 import { SearchResultSource } from '../search/searchProvider';
+import { CitationRegistry } from '../utils/citations';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -120,6 +121,7 @@ const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { twitterService } from './twitterService';
+import { describeXApiError } from '../utils/twitterErrors';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
 import { preflightTrackingGate } from './googleAdsTrackingPreflight';
@@ -176,7 +178,8 @@ import {
   ALLOWED_DATE_PRESETS,
   META_OBJ_GOAL_MAP,
   META_GOAL_BILLING_MAP,
-  META_GOAL_BID_STRATEGY_MAP
+  META_GOAL_BID_STRATEGY_MAP,
+  META_WEBSITE_OPTIMIZATION_GOALS
 } from '../utils/metaConstants';
 
 // Initialize Azure OpenAI client for direct chat completion (same as blog.ts)
@@ -2426,7 +2429,12 @@ export class AgentModeService {
         try {
           const usage: any = (res as any)?.usage;
           if (usage) {
-            void recordUsage({
+            // ENG-200: meter the main agent turn — record shadow burn AND charge
+            // the per-user cost cap when a real user is attributable (org members
+            // resolve to the owner). Cost (incl. cache tokens) is computed once
+            // here; no separate deduction path exists for this call, so this is
+            // the single charge point. No userId → burn-only "system" record.
+            meterUserUsage({
               userId: usageContext?.userId,
               sessionId: usageContext?.sessionId,
               model,
@@ -2566,14 +2574,17 @@ export class AgentModeService {
     return videoGenerationCostUsd(model, durationSeconds);
   }
 
-  /** Returns an onUsage callback that records LLM token usage for a named tool. */
-  private makeToolUsageCallback(userId: string, sessionId: string | undefined, toolName: string): (usage: LLMUsageData) => void {
+  /**
+   * Returns an onUsage callback that attributes a tool's LLM cost to the session
+   * for per-tool cost display. It does NOT deduct from the per-user cap: the
+   * deduction happens once at the metering chokepoint (llmService.meterUsage,
+   * which these tools call via generateHTML/generateJSONContent). Charging here
+   * too would double-charge content-gen tools (ENG-200).
+   */
+  private makeToolUsageCallback(sessionId: string | undefined, toolName: string): (usage: LLMUsageData) => void {
     return (usage) => {
-      const cost = this.estimateCost(usage.model, usage.inputTokens, usage.outputTokens);
-      incrementUserTokenUsage(userId, usage.totalTokens, cost).catch((err) =>
-        console.error(`AgentMode: Failed to track token usage for ${toolName} tool:`, err)
-      );
       if (sessionId) {
+        const cost = this.estimateCost(usage.model, usage.inputTokens, usage.outputTokens);
         chatbotDb.addToolCostToSession(sessionId, cost, toolName).catch((err) =>
           console.error(`AgentMode: Failed to add ${toolName} cost to session:`, err)
         );
@@ -2792,7 +2803,7 @@ export class AgentModeService {
       if ((currentSession?.pageIdentifier || '').toLowerCase().includes('slack')) {
         messages.push({
           role: 'assistant',
-          content: `[AgentWeb Team] I know all four team members: Rui Wang is the CTO (also called Rui), Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately.`
+          content: `[AgentWeb Team] I know the team members: Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately.`
         });
       }
 
@@ -2826,6 +2837,9 @@ export class AgentModeService {
       _toolCallsForTelemetry = toolCalls;
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
+      // ENG-351: accumulates the web sources this message consults across all its search
+      // calls, into a de-duplicated, stably-numbered registry for the Sources UI.
+      const citationRegistry = new CitationRegistry();
       const iterationTimings: { iteration: number; llmDurationMs: number; toolNames: string[] }[] = [];
 
       // Remember initial message count to slice response messages later
@@ -3231,6 +3245,7 @@ export class AgentModeService {
           toolCalls: responseMessage.tool_calls,
           messages: messages as any[],
           toolCallsLedger: toolCalls,
+          citationRegistry,
           iteration,
           agentRuntimeRunId,
           sessionId,
@@ -3528,12 +3543,17 @@ export class AgentModeService {
             durationMs: endTime - startTime
           };
 
+          // ENG-351: the web sources this message consulted, de-duplicated and
+          // stably-numbered by the citation registry, for the Sources UI.
+          const citations = citationRegistry.list();
+
           lastMessage.metadata = {
             ...lastMessage.metadata,
             timestamp: new Date().toISOString(),
             iterationTimings,
             memoryUsage,
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
+            ...(citations.length > 0 ? { citations } : {}),
           };
         }
       }
@@ -4233,6 +4253,7 @@ export class AgentModeService {
     'read_market_strategy',
 
     // Knowledge Base & Research
+    'search_user_guide',
     'search_knowledge_base',
     'list_knowledge_base_files',
     'read_knowledge_base_files',
@@ -4268,6 +4289,7 @@ export class AgentModeService {
     'search_leads',           // CRM teaser
     'get_lead_lists',         // Lead management teaser
     'list_connected_accounts', // Social/ads integration teaser
+    'connect_account',        // Read-only UI handoff when a required account is absent
 
     'get_user_profile',         // Account info teaser
     'get_account_status',       // Self account status (plan, usage, api-key count) — wraps /api/auth/me, no args
@@ -4333,6 +4355,13 @@ export class AgentModeService {
     'resolve_skill',
     'you_search_web',
     'you_search_news',
+    // Product documentation is core infrastructure for both chat and live
+    // voice. Keep it available even if a stale settings override omits it.
+    'search_user_guide',
+    // Connection handoff is UI infrastructure, not an optional skill. The tool
+    // only asks the current page to open the existing OAuth dialog; it does not
+    // grant consent or connect an account by itself.
+    'connect_account',
     // S3 overflow retrieval is infrastructure, not a skill: whenever a tool result
     // is offloaded to S3 the model is handed a "[Full response stored at S3 key: ...]"
     // pointer and MUST be able to resolve it. A DB `foundation_tools` setting that
@@ -6597,6 +6626,8 @@ export class AgentModeService {
       return_scenes?: boolean;
       start_time?: string;
       end_time?: string;
+      /** Attributable user — charges this describe_video LLM spend to their cap (ENG-200). */
+      userId?: string;
     }
   ): Promise<any> {
     let tempDirPath: string | null = null;
@@ -6635,11 +6666,12 @@ export class AgentModeService {
         };
       }
 
-      // Metered Gemini client (Ship 1 shadow metering). describeVideo has no
-      // userId in its signature, so usage attributes to "system" for now —
-      // follow-up: thread userId from the tool-dispatch / emmaApi callers.
+      // Un-metered Gemini client: the wrapped factory only RECORDS burn, so to
+      // actually CHARGE describe_video spend to the user's cap we meter the
+      // response ourselves via meterUsageFromResponse below (ENG-200). No userId
+      // → that meter degrades to a burn-only "system" record (absorbed).
       const { getGeminiClient } = await import('../utils/llmClients');
-      aiClient = await getGeminiClient({ feature: 'agent_task' }, geminiApiKey.trim());
+      aiClient = await getGeminiClient({ userId: options?.userId, feature: 'agent_task' }, geminiApiKey.trim(), { metered: false });
 
       const modelName = 'gemini-3-flash-preview';
 
@@ -6805,6 +6837,13 @@ export class AgentModeService {
         model: modelName,
         contents
       });
+
+      // Charge (record + deduct when a userId is present; absorb under "system"
+      // otherwise). The client above is un-metered, so this is the single meter.
+      meterUsageFromResponse(
+        { userId: options?.userId, model: modelName, provider: 'gemini', feature: 'agent_task' },
+        response
+      );
 
       const rawText = response.text;
 
@@ -13769,7 +13808,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async manageMetaAdsCampaigns(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
-        return this.listMetaAdsCampaignsNew(userId, account_id);
+        // Thread the campaign_id filter and any explicit fields selection so the caller can
+        // read budget/bid config and target a single campaign (ENG-398).
+        return this.listMetaAdsCampaignsNew(userId, account_id, { campaignId: campaign_id, fields: params?.fields });
       case 'CREATE':
         return this.createMetaAdsCampaign(userId, { ...params, account_id });
       case 'UPDATE':
@@ -13787,7 +13828,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async manageMetaAdsAdSets(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, ad_set_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
-        return this.listMetaAdsAdSets(userId, campaign_id, account_id);
+        // Thread the ad_set_id target and any explicit fields selection so the caller can
+        // read optimization_goal / promoted_object / etc. for a single ad set (ENG-398).
+        return this.listMetaAdsAdSets(userId, campaign_id, account_id, { adSetId: ad_set_id, fields: params?.fields });
       case 'CREATE':
         // Explicitly pass account_id in args for createMetaAdsAdSet as it expects it in the args object
         return this.createMetaAdsAdSet(userId, { ...params, account_id, campaign_id });
@@ -14095,10 +14138,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async listMetaAdsCampaignsNew(userId: string, account_id?: string): Promise<any> {
+  public async listMetaAdsCampaignsNew(
+    userId: string,
+    account_id?: string,
+    options: { campaignId?: string; fields?: string | string[] } = {}
+  ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const campaigns = (await metaService.listCampaigns(accountId, accessToken)) || [];
+      // Only forward the read-options bag when the caller supplied a campaign_id filter or
+      // an explicit fields selection; otherwise call listCampaigns the same 2-arg way as
+      // before. This preserves the CALL CONVENTION for a plain list-all — it does NOT keep
+      // the response payload identical: listCampaigns now defaults to the richer
+      // CAMPAIGN_READ_FIELDS (budget/bid config: daily_budget, lifetime_budget,
+      // budget_remaining, bid_strategy), the intended ENG-398 change, for every plain LIST
+      // caller regardless of this branch.
+      const hasSelector = Boolean(options.campaignId || options.fields);
+      const campaigns = (hasSelector
+        ? await metaService.listCampaigns(accountId, accessToken, options)
+        : await metaService.listCampaigns(accountId, accessToken)) || [];
       const totalCount = Array.isArray(campaigns) ? campaigns.length : 0;
 
       return {
@@ -14141,10 +14198,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async listMetaAdsAdSets(userId: string, campaignId?: string, account_id?: string): Promise<any> {
+  public async listMetaAdsAdSets(
+    userId: string,
+    campaignId?: string,
+    account_id?: string,
+    options: { adSetId?: string; fields?: string | string[] } = {}
+  ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const adSets = (await metaService.listAdSets(accountId, accessToken, campaignId)) || [];
+      // Only forward the read-options bag when the caller supplied an ad_set_id target or an
+      // explicit fields selection; otherwise call listAdSets with just the (optional)
+      // campaignId, exactly as before. This preserves the CALL CONVENTION, NOT the response
+      // payload: listAdSets now defaults to the richer AD_SET_READ_FIELDS (optimization_goal,
+      // billing_event, destination_type, promoted_object, bid_strategy), the intended
+      // ENG-398 change, for every plain LIST caller regardless of this branch.
+      const hasSelector = Boolean(options.adSetId || options.fields);
+      const adSets = (hasSelector
+        ? await metaService.listAdSets(accountId, accessToken, campaignId, options)
+        : await metaService.listAdSets(accountId, accessToken, campaignId)) || [];
       const totalCount = Array.isArray(adSets) ? adSets.length : 0;
 
       return {
@@ -14319,6 +14390,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           }
         };
         console.log('[MetaAdSet] Auto-set targeting_automation.advantage_audience=0 (Meta requires this field)');
+      }
+
+      // Conversion location (ENG-415): default destination_type=WEBSITE for website
+      // traffic/conversion goals so the ad-level Destination is explicitly "Website" in Ads Manager
+      // rather than UNDEFINED (the "not selected" symptom). An explicit caller value always wins;
+      // non-website goals (engagement/reach/app installs, instant-form lead goals) are left untouched.
+      if (args.destination_type === undefined &&
+          META_WEBSITE_OPTIMIZATION_GOALS.includes(args.optimization_goal)) {
+        args.destination_type = 'WEBSITE';
       }
 
       // Convert all currencies to cents
@@ -20644,10 +20724,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // brand logo (AC-2); when none is persisted, ask the user / point at
       // brand config instead of generating (AC-3). Edits (inputImages) are
       // out of scope — the source images already carry the branding.
+      //
+      // ENG-393: this gate is for COMPOSITING an existing brand logo, not for
+      // CREATING one. A prompt that asks to design a brand-new logo from
+      // scratch ("create a logo for X") must NOT be gated — an account with no
+      // logo yet legitimately wants to generate its first one, and blocking
+      // that also blocks landing-page generation. Let creation asks through;
+      // compositing asks ("add our logo to this banner") still gate.
       if (
         !logoImage &&
         (!Array.isArray(inputImages) || inputImages.length === 0) &&
-        promptRequestsLogo(prompt)
+        promptRequestsLogo(prompt) &&
+        !promptCreatesLogo(prompt)
       ) {
         const persistedLogo = await getPersistedBrandLogoUrlForUser(userId);
         if (!persistedLogo) {
@@ -23891,7 +23979,7 @@ Please generate a complete, professional HTML document that properly formats and
       let htmlContent = '';
       for (let attempt = 1; attempt <= maxRenderAttempts; attempt++) {
         try {
-          htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
+          htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
           break;
         } catch (renderError) {
           const isLastAttempt = attempt === maxRenderAttempts;
@@ -24098,7 +24186,7 @@ Please:
 
       // Generate enhanced HTML template using LLMService
       console.log('AgentMode: Generating HTML email template with Claude model');
-      enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'), { userId, sessionId, feature: 'content_gen' });
+      enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(sessionId, 'createHtmlTemplate'), { userId, sessionId, feature: 'content_gen' });
 
       if (!enhancedHtml || enhancedHtml.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -24255,7 +24343,7 @@ ${strippedHtml}`;
       const parsed = await llmService.generateJsonRobust<{ variables?: Array<{ name?: string; anchor?: string; isArray?: boolean }> }>(
         systemPrompt,
         userPrompt,
-        this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'),
+        this.makeToolUsageCallback(sessionId, 'createHtmlTemplate'),
         { userId, sessionId, feature: 'content_gen' },
       );
       if (parsed && Array.isArray(parsed.variables)) {
@@ -25453,7 +25541,7 @@ IMPORTANT:
 IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly.`}`;
 
       // Generate content using LangChain with appropriate format
-      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(userId, sessionId, 'generateBookContent'), { userId, sessionId, feature: 'content_gen' });
+      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(sessionId, 'generateBookContent'), { userId, sessionId, feature: 'content_gen' });
 
       // Extract content from JSON
       if (!contentData.content) {
@@ -26560,7 +26648,62 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // persisting — see unipileProfileService.ts.
           const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
           const profileResult = await getUnipileProfileService().getProfile(target, account_id);
-          return { success: true, data: profileResult.rawData };
+          const raw = profileResult.rawData;
+
+          // The global profile cache strips is_relationship / connected_at because
+          // they are viewer-relative (ENG-440) — so on a cache hit a freshly-written
+          // blob carries no connection state at all (and a pre-change legacy row may
+          // carry another viewer's, which we discard below). Re-derive it for THIS
+          // account from our per-account AW-UnipileConnections cache (the authoritative
+          // ENG-377 path) so the agent's invite-vs-DM decision has a correct signal.
+          //
+          // IMPORTANT: overlay onto a SHALLOW COPY. `raw` is the object held in the
+          // profile cache (LRU/DDB row) — mutating it in place would persist this
+          // viewer's connection state back into the shared cache and re-introduce the
+          // very cross-viewer leak this fix closes.
+          if (raw && typeof raw === 'object') {
+            const profileUrl =
+              raw.public_profile_url ||
+              (raw.public_identifier
+                ? `https://www.linkedin.com/in/${raw.public_identifier}`
+                : (isUrl ? target : null));
+            let conn: { connectedAt?: number } | null = null;
+            if (profileUrl) {
+              const { getConnectionByProfileUrlAndAccount } = await import('./unipileConnectionsDb');
+              conn = await getConnectionByProfileUrlAndAccount(profileUrl, account_id).catch(() => null);
+            }
+            // Drop any is_relationship / connected_at that came off `raw` before
+            // re-deriving. New cache writes already strip these, but rows persisted
+            // BEFORE this change (30-day TTL) can still carry another viewer's stale
+            // values — a spread of `raw` would leak them until the row expires. Only a
+            // LIVE response (`!fromCache`) legitimately carries this viewer's own state.
+            const {
+              is_relationship: rawRelationship,
+              connected_at: rawConnectedAt,
+              ...viewerIndependentRaw
+            } = raw;
+            // Reconcile as a union: connected if our per-account cache has a row OR a
+            // LIVE blob said so. A `true` from either source wins — directly countering
+            // the false-negative in reporter-ticket #135 (is_relationship false while
+            // LinkedIn's send-time check said FIRST_DEGREE). On a cache hit we trust only
+            // `conn`, never the (possibly cross-viewer) cached is_relationship.
+            const isConnected =
+              !!conn || (!profileResult.fromCache && rawRelationship === true);
+            const data = {
+              ...viewerIndependentRaw,
+              is_relationship: isConnected,
+              // conn.connectedAt is already epoch-ms (Unipile created_at) — do NOT
+              // multiply by 1000 (ENG-379). Prefer the authoritative cache timestamp;
+              // otherwise keep the raw timestamp ONLY from a live response.
+              ...(conn && typeof conn.connectedAt === 'number'
+                ? { connected_at: conn.connectedAt }
+                : !profileResult.fromCache && typeof rawConnectedAt === 'number'
+                  ? { connected_at: rawConnectedAt }
+                  : {}),
+            };
+            return { success: true, data };
+          }
+          return { success: true, data: raw };
         }
 
         case 'list-connections': {
@@ -27175,7 +27318,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      // Surface X's real ApiResponseError payload (title/detail/errors) instead of
+      // collapsing to a bare "Request failed with code 403" — see describeXApiError.
+      const errorMessage = describeXApiError(error);
       console.error('AgentMode: twitter_manage_post failed:', errorMessage);
       return { success: false, message: 'Twitter action failed', error: errorMessage };
     }
@@ -27184,7 +27329,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   async twitterOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
-    const { text, handle, recipient_handle, query, max_results, tweet_id, list_id, lead_id, lead_email } = args;
+    const { text, handle, recipient_handle, query, max_results, tweet_id, x_list_id, list_name, list_id, lead_id, lead_email } = args;
     console.log(`[AgentMode] twitterOutreach called: action=${action}, account_id=${account_id}`);
 
     const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
@@ -27315,6 +27460,27 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: result };
         }
 
+        case 'list-owned-lists': {
+          const result = await twitterService.getOwnedLists(ownerUserId, account_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-list-members': {
+          const listId = x_list_id
+            || (list_name ? await twitterService.resolveOwnedListIdByName(ownerUserId, account_id, list_name) : undefined);
+          if (!listId) throw new Error('x_list_id or list_name is required for get_list_members');
+          const result = await twitterService.getListMembers(ownerUserId, account_id, listId);
+          return { success: true, data: result };
+        }
+
+        case 'get-list-tweets': {
+          const listId = x_list_id
+            || (list_name ? await twitterService.resolveOwnedListIdByName(ownerUserId, account_id, list_name) : undefined);
+          if (!listId) throw new Error('x_list_id or list_name is required for get_list_tweets');
+          const result = await twitterService.getListTweets(ownerUserId, account_id, listId, max_results);
+          return { success: true, data: result };
+        }
+
         case 'block': {
           const target = handle || recipient_handle;
           if (!target) throw new Error('handle is required for block');
@@ -27349,13 +27515,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             'search-tweets', 'get-user-tweets',
             'send-dm', 'list-dms', 'get-dm-conversation',
             'bookmark', 'get-bookmarks',
+            'list-owned-lists', 'get-list-members', 'get-list-tweets',
             'block', 'unblock', 'mute', 'unmute',
           ];
           throw new Error(`Unsupported twitter_outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
         }
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      // Surface X's real ApiResponseError payload (title/detail/errors) instead of
+      // collapsing to a bare "Request failed with code 403" — see describeXApiError.
+      const errorMessage = describeXApiError(error);
       console.error('AgentMode: twitter_outreach failed:', errorMessage);
       return { success: false, message: 'Twitter outreach action failed', error: errorMessage };
     }

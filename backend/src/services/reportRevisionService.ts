@@ -36,7 +36,9 @@ export class ReportRevisionService {
     return getAzureClient(
       { userId, feature: 'report_revision' },
       process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
-      { apiVersion: process.env.AZURE_OPENAI_API_VERSION_AGENT_MODE || '2025-01-01-preview' }
+      // Un-metered: metered explicitly via meterUsageFromResponse; auto-metering
+      // here would double-record the same response (ENG-200).
+      { apiVersion: process.env.AZURE_OPENAI_API_VERSION_AGENT_MODE || '2025-01-01-preview', metered: false }
     );
   }
 

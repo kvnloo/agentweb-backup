@@ -296,12 +296,18 @@ function wrapOpenAICompatible(client: OpenAI, provider: string, ctx: MeterContex
   return client;
 }
 
-/** Metered OpenAI direct client. */
+/**
+ * Metered OpenAI direct client. Pass `opts.metered = false` to get the raw client
+ * when the caller meters the response itself (meterUsageFromResponse) — otherwise
+ * the factory's auto-record plus an explicit meter would double-count (ENG-200).
+ */
 export function getOpenAIClient(
   meterCtx: MeterContext,
-  options?: ConstructorParameters<typeof OpenAI>[0]
+  options?: ConstructorParameters<typeof OpenAI>[0],
+  opts?: { metered?: boolean }
 ): OpenAI {
   const client = new OpenAI(options ?? { apiKey: process.env.OPENAI_API_KEY });
+  if (opts?.metered === false) return client;
   return wrapOpenAICompatible(client, "openai", meterCtx);
 }
 
@@ -320,6 +326,13 @@ export interface AzureClientOverrides {
   endpoint?: string;
   apiKey?: string;
   apiVersion?: string;
+  /**
+   * When false, return the raw (UN-metered) client — the caller meters the call
+   * itself via meterUsageFromResponse. Use this to avoid DOUBLE-recording: the
+   * factory's auto-record plus an explicit meterUsageFromResponse on the same
+   * response would count the burn twice (ENG-200). Defaults to true (auto-meter).
+   */
+  metered?: boolean;
 }
 
 export function getAzureClient(
@@ -338,6 +351,9 @@ export function getAzureClient(
     defaultQuery: { "api-version": apiVersion },
     defaultHeaders: { "api-key": apiKey },
   });
+  // metered:false → caller meters explicitly (meterUsageFromResponse); returning
+  // the wrapped client too would double-record the same response.
+  if (overrides?.metered === false) return client;
   return wrapOpenAICompatible(client, "azure-openai", meterCtx);
 }
 
@@ -452,12 +468,22 @@ async function* meterGeminiStream(
 /**
  * Metered Gemini client (lazy-imports @google/genai like all existing call sites).
  * models.generateContent and models.generateContentStream are wrapped.
+ *
+ * Pass `opts.metered = false` to get the raw client when the caller meters the
+ * response itself via meterUsageFromResponse — needed to both CHARGE (not just
+ * record) and avoid double-recording, since the wrapper here is record-only.
  */
-export async function getGeminiClient(meterCtx: MeterContext, apiKey?: string): Promise<any> {
+export async function getGeminiClient(
+  meterCtx: MeterContext,
+  apiKey?: string,
+  opts?: { metered?: boolean }
+): Promise<any> {
   const { GoogleGenAI } = await import("@google/genai");
   const key = (apiKey ?? process.env.GEMINI_API_KEY ?? "").trim();
   if (!key) throw new Error("GEMINI_API_KEY not set");
   const client: any = new GoogleGenAI({ apiKey: key });
+
+  if (opts?.metered === false) return client;
 
   if (typeof client.models?.generateContent === "function") {
     const origGenerate = client.models.generateContent.bind(client.models);

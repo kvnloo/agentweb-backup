@@ -10,7 +10,7 @@ import { userDb } from '../services/db';
 import { canViewItem, canEditItem, isFeatureEffectivelyEnabled } from '../services/orgShareService';
 import { emailService } from '../services/emailService';
 import { Storage, Bucket } from '@google-cloud/storage';
-import { getAzureClient } from '../utils/llmClients';
+import { getAzureClient, meterUsageFromResponse } from '../utils/llmClients';
 import axios from 'axios';
 import AWS from 'aws-sdk';
 import { dynamodb } from '../config/aws';
@@ -1357,13 +1357,19 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
     Based on the above information, provide ONLY the updated markdown content for the knowledge base. Do not include any explanations, notes, or additional text. Output only the markdown content that should replace the current knowledge base content.`;
 
     // Call OpenAI to get the updated content
-    const openai = getAzureClient({ userId, feature: 'task_kb_update' }, process.env.AZURE_OPENAI_DEPLOYMENT);
+    // Un-metered client + explicit meter below: a real userId means this spend
+    // must be charged to that user's cap (tokens + cost), not just recorded (ENG-200).
+    const openai = getAzureClient({ userId, feature: 'task_kb_update' }, process.env.AZURE_OPENAI_DEPLOYMENT, { metered: false });
     const completion = await openai.chat.completions.create({
       messages: [{ role: "user", content: prompt }],
       model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
       temperature: 0.4,
       max_tokens: 32768,
     });
+    meterUsageFromResponse(
+      { userId, model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4', provider: 'azure-openai', feature: 'task_kb_update' },
+      completion
+    );
 
     const updatedContent = completion.choices[0].message.content || '';
 

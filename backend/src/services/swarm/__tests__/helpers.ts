@@ -29,7 +29,7 @@ export const HARSHA: NotionUser = {
 
 export const RUI: NotionUser = {
   id: RUI_USER_ID,
-  email: 'ruiwangwarm@gmail.com',
+  email: 'rui@example.com',
 };
 
 export const OTHER_USER: NotionUser = {
