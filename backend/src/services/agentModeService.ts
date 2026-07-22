@@ -129,6 +129,28 @@ const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 // output ceiling. Models only emit what they need, so raising the cap does not
 // increase normal-turn cost.
 export const AGENT_MODE_MAX_OUTPUT_TOKENS = 32000;
+
+// Max size of a NON-HTML content_draft that create_html_file will attempt to
+// render into HTML in a single internal LLM call. The render (llmService
+// generateHTML) has a hard 5-minute per-call Bedrock timeout, retried 3x — an
+// oversized rough draft can't finish inside that budget and burns ~15 min before
+// failing (ENG-472). Above this we fail fast with actionable guidance instead.
+// Already-complete HTML drafts bypass the render entirely (see
+// isCompleteHtmlDocument) and are NOT subject to this cap.
+export const CREATE_HTML_RENDER_MAX_DRAFT_CHARS = 60000;
+
+// A create_html_file content_draft that is already a complete HTML document does
+// not need the internal HTML-generation LLM call — re-rendering HTML->HTML is
+// wasted cost/latency, risks the model altering the user's content, and is the
+// exact case that deterministically times out on large drafts (ENG-472). Detect
+// a self-contained document: an opening doctype/<html> AND a closing </html>.
+export function isCompleteHtmlDocument(draft: string): boolean {
+  if (typeof draft !== 'string') return false;
+  const s = draft.trim().toLowerCase();
+  const hasOpen = s.startsWith('<!doctype html') || s.startsWith('<html') || s.includes('<html');
+  const hasClose = s.includes('</html>');
+  return hasOpen && hasClose;
+}
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { twitterService } from './twitterService';
@@ -23908,6 +23930,46 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       }
 
       const isEmail = documentType === 'email';
+
+      // ENG-472 #1 — Passthrough: when the draft is already a complete HTML
+      // document, skip the internal render LLM call and upload it verbatim.
+      // Re-rendering HTML->HTML wastes an expensive call, risks the model
+      // altering the content, and is exactly what times out on large drafts.
+      // Email is excluded: the email render applies email-client-safety
+      // transforms (table layout, inline styles) that a generic HTML document
+      // may lack, so emails always go through the render path.
+      if (!isEmail && isCompleteHtmlDocument(contentDraft)) {
+        console.log('AgentMode: create_html_file — draft is already complete HTML, uploading directly (skipping render)');
+        const { uploadFileToS3 } = await import('../utils/s3Utils');
+        const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
+        const uploadResult = await uploadFileToS3(contentDraft, filename, userId, 'text/html');
+        if (!uploadResult.success || !uploadResult.url) {
+          throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        }
+        return {
+          success: true,
+          s3_url: uploadResult.url,
+          filename,
+          title,
+          document_type: documentType,
+          rendered: false,
+          message: 'HTML file created successfully'
+        };
+      }
+
+      // ENG-472 #2 — Fail fast: a draft that must be rendered but is larger than
+      // the render step can finish inside its 5-minute per-call budget would burn
+      // ~15 minutes across retries before failing. Return actionable guidance
+      // immediately instead. (Complete-HTML drafts already returned above and are
+      // not size-limited.)
+      if (contentDraft.length > CREATE_HTML_RENDER_MAX_DRAFT_CHARS) {
+        console.warn(`AgentMode: create_html_file — draft too large to render in one file (${contentDraft.length} chars > ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS})`);
+        return {
+          success: false,
+          message: 'Draft too large to render into a single HTML file',
+          error: `content_draft is too large to render into one HTML file in a single pass (${contentDraft.length} characters, limit ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS}). Either provide the draft as a complete, self-contained HTML document (which is saved directly without limit), or split it into smaller sections and create multiple files.`
+        };
+      }
 
       // Use Claude model by default (check for Claude in model name)
       const defaultClaudeModel = 'anthropic.claude-sonnet-4-6';
