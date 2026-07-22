@@ -165,7 +165,7 @@ mcpToolRegistry.register({
   name: 'emma_create_session',
   definition: {
     name: 'emma_create_session',
-    description: 'Create a new Emma chat session — the entry point for delegating marketing/growth work to Emma, a full GTM (go-to-market) automation agent. Emma operates capabilities these MCP tools do not expose directly: paid social ads (including Meta/Facebook/Instagram), organic social posting, CRM and lead engagement, content and blogs, landing pages, and multi-step work plans. Delegate such requests via emma_send_message rather than assuming they are unsupported; if a prerequisite is missing (e.g. an unconnected account), Emma reports it and guides the user to connect it.',
+    description: 'Create a new Emma chat session — the entry point for delegating marketing and growth work to Emma, a full GTM (go-to-market) automation agent. Emma runs capabilities these MCP tools do not expose directly, spanning paid advertising campaigns, organic social media, CRM and lead engagement, content and blogs, landing pages, and multi-step work plans. Delegate marketing/growth requests to Emma via emma_send_message rather than assuming they are unsupported; if a prerequisite is missing (e.g. an unconnected account), Emma reports it and guides the user to connect it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -184,7 +184,7 @@ mcpToolRegistry.register({
   name: 'emma_send_message',
   definition: {
     name: 'emma_send_message',
-    description: 'Send a message to an Emma chat session and get a response. Delegate the user\'s marketing/growth request in natural language and Emma executes it end to end — across paid social ads (including Meta), organic social, CRM and lead engagement, content, landing pages, and multi-step work plans. If a prerequisite is missing (e.g. an unconnected ad account), Emma reports it and explains how to connect it — relay that guidance rather than concluding the capability is unavailable.',
+    description: 'Send a message to an Emma chat session and get a response. Delegate the user\'s marketing or growth request in natural language and Emma executes it end to end — spanning paid advertising campaigns, organic social, CRM and lead engagement, content, landing pages, and multi-step work plans. If a prerequisite is missing (e.g. an unconnected ad account), Emma reports it and explains how to connect it — relay that guidance rather than concluding the capability is unavailable.',
     inputSchema: {
       type: 'object',
       properties: {

@@ -321,9 +321,16 @@ describe('apiTools', () => {
 
   // ─── Emma delegation capability discovery (ENG-257) ──────────────────
   // External MCP clients (e.g. Claude) only see these tool descriptions —
-  // there is no Meta/ads tool in the external set. If the delegation tools
-  // don't advertise Emma's Meta/social-ads capability, the client hallucinates
-  // that "Emma cannot connect to Meta" and refuses instead of delegating.
+  // there is no advertising/ads tool in the external set, so ad work happens
+  // by delegating to Emma. If the delegation tools don't advertise Emma's
+  // advertising capability, the client hallucinates that the capability is
+  // unsupported and refuses instead of delegating.
+  //
+  // Assertions are platform-agnostic ON PURPOSE: the description must describe
+  // the capability CATEGORY (paid advertising) and the delegate-don't-deny
+  // principle, NOT enumerate platforms (Meta/LinkedIn/…). Adding a new ad
+  // platform must not require editing this prose — so this test forbids relying
+  // on a specific platform name.
   describe('emma delegation capability discovery', () => {
     const getDesc = (name: string) => {
       const def = mcpToolRegistry.getToolDefinitions().find((d: any) => d.name === name);
@@ -331,18 +338,29 @@ describe('apiTools', () => {
       return def!.description as string;
     };
 
-    it('emma_send_message description advertises Meta/paid-ads capability so clients delegate instead of denying it', () => {
+    it('emma_send_message advertises the paid-advertising capability CATEGORY and tells clients to delegate, not deny', () => {
       const desc = getDesc('emma_send_message').toLowerCase();
-      expect(desc).toContain('meta');
-      expect(desc).toContain('ad'); // "ads" / "ad campaigns"
-      // Must instruct the client to delegate rather than assume it's unsupported
+      expect(desc).toContain('advertis');        // "paid advertising" (category, not a platform)
+      expect(desc).toContain('delegate');         // route the request to Emma
+      expect(desc).toMatch(/unsupported|unavailable/); // don't-deny guidance
+    });
+
+    it('emma_create_session signals Emma is a full GTM agent to delegate marketing work to', () => {
+      const desc = getDesc('emma_create_session').toLowerCase();
+      expect(desc).toContain('gtm');
+      expect(desc).toContain('advertis');         // capability breadth, platform-agnostic
       expect(desc).toContain('delegate');
     });
 
-    it('emma_create_session description signals Emma is a full GTM agent to delegate marketing work to', () => {
-      const desc = getDesc('emma_create_session').toLowerCase();
-      expect(desc).toContain('gtm');
-      expect(desc).toContain('emma');
+    it('descriptions do NOT hardcode a specific ad platform name (future-proof / maintainability guard)', () => {
+      // Enumerating platforms means editing prose every time one is added/removed.
+      // The category term ("advertising") must carry the meaning instead.
+      for (const name of ['emma_create_session', 'emma_send_message']) {
+        const desc = getDesc(name).toLowerCase();
+        for (const platform of ['meta', 'facebook', 'instagram', 'linkedin', 'tiktok', 'google ads']) {
+          expect(desc).not.toContain(platform);
+        }
+      }
     });
   });
 
