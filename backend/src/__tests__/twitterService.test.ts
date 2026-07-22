@@ -30,6 +30,9 @@ const mockUserByUsername = jest.fn();
 const mockListDmEvents = jest.fn();
 const mockDeleteTweet = jest.fn();
 const mockUserTimeline = jest.fn();
+const mockListsOwned = jest.fn();
+const mockListMembers = jest.fn();
+const mockListTweets = jest.fn();
 const mockRefreshOAuth2Token = jest.fn();
 
 // Records how TwitterApi was constructed so tests can assert which token was used.
@@ -66,6 +69,9 @@ jest.mock('twitter-api-v2', () => ({
         listDmEvents: (...a: any[]) => mockListDmEvents(...a),
         deleteTweet: (...a: any[]) => mockDeleteTweet(...a),
         userTimeline: (...a: any[]) => mockUserTimeline(...a),
+        listsOwned: (...a: any[]) => mockListsOwned(...a),
+        listMembers: (...a: any[]) => mockListMembers(...a),
+        listTweets: (...a: any[]) => mockListTweets(...a),
       },
     };
   }),
@@ -102,7 +108,14 @@ const makeAccount = (overrides: any = {}) => ({
     access_token: 'access-old',
     refresh_token: 'refresh-old',
     token_expires_at: Date.now() + 60 * 60 * 1000, // valid: 1h out
-    scopes: ['tweet.read', 'tweet.write', 'dm.read', 'dm.write', 'users.read', 'offline.access'],
+    // Fully-granted account (X Developer App = "Read and write"): every write
+    // scope present, so the ENG-413 pre-write guard is a no-op for these fixtures.
+    scopes: [
+      'tweet.read', 'tweet.write', 'users.read',
+      'follows.read', 'follows.write', 'like.read', 'like.write',
+      'bookmark.read', 'bookmark.write', 'dm.read', 'dm.write',
+      'block.read', 'block.write', 'mute.read', 'mute.write', 'offline.access',
+    ],
     ...overrides,
   },
   created_at: '2026-06-23T00:00:00.000Z',
@@ -156,6 +169,81 @@ describe('TwitterService.postTweet — validation', () => {
     const sent = mockTweet.mock.calls[0][0];
     expect(sent.length).toBeLessThanOrEqual(280);
     expect(sent.endsWith('word')).toBe(true); // no partial word at the end
+  });
+});
+
+// ─── X Lists (read) — owned lists / members / tweets, and scope errors ─────────
+describe('TwitterService X Lists (read)', () => {
+  beforeEach(() => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount()]);
+  });
+
+  it('getOwnedLists returns each list with id + name (from listsOwned)', async () => {
+    mockListsOwned.mockResolvedValue({ data: { data: [
+      { id: 'L1', name: 'Engagement 101' },
+      { id: 'L2', name: 'Prospects' },
+    ] } });
+    const lists = await twitterService.getOwnedLists(OWNER, ACCOUNT_ID);
+    // Owned lists are keyed off the authed user's numeric id (from account config).
+    expect(mockListsOwned).toHaveBeenCalledWith('12345', expect.any(Object));
+    expect(lists).toEqual([
+      { id: 'L1', name: 'Engagement 101' },
+      { id: 'L2', name: 'Prospects' },
+    ]);
+  });
+
+  it('getListMembers returns member users (with handles) for a list id', async () => {
+    mockListMembers.mockResolvedValue({ data: { data: [
+      { id: 'u1', username: 'alice', name: 'Alice' },
+      { id: 'u2', username: 'bob', name: 'Bob' },
+    ] } });
+    const members = await twitterService.getListMembers(OWNER, ACCOUNT_ID, 'L1');
+    expect(mockListMembers).toHaveBeenCalledWith('L1', expect.any(Object));
+    expect(members.map((m: any) => m.username)).toEqual(['alice', 'bob']);
+  });
+
+  it('getListMembers rejects an empty list id', async () => {
+    await expect(twitterService.getListMembers(OWNER, ACCOUNT_ID, '   ')).rejects.toThrow(/x_list_id.*required/i);
+  });
+
+  it('getListTweets returns id + text + author handle (merged from the author_id expansion)', async () => {
+    mockListTweets.mockResolvedValue({ data: {
+      data: [
+        { id: 't1', text: 'hello world', author_id: 'a1', created_at: '2026-07-17T00:00:00Z' },
+        { id: 't2', text: 'second tweet', author_id: 'a2' },
+      ],
+      includes: { users: [{ id: 'a1', username: 'author_one', name: 'Author One' }] },
+    } });
+    const tweets = await twitterService.getListTweets(OWNER, ACCOUNT_ID, 'L1');
+    expect(mockListTweets).toHaveBeenCalledWith('L1', expect.any(Object));
+    expect(tweets[0]).toEqual(expect.objectContaining({ id: 't1', text: 'hello world', author_handle: 'author_one' }));
+    // A tweet whose author is not in `includes` still returns cleanly with a null handle — never throws.
+    expect(tweets[1]).toEqual(expect.objectContaining({ id: 't2', text: 'second tweet', author_handle: null }));
+  });
+
+  it('getListTweets rejects an empty list id', async () => {
+    await expect(twitterService.getListTweets(OWNER, ACCOUNT_ID, '')).rejects.toThrow(/x_list_id.*required/i);
+  });
+
+  it('maps a 403 (missing list.read scope) to a clear reconnect error — not a silent empty result', async () => {
+    mockListsOwned.mockRejectedValue(Object.assign(new Error('Forbidden'), { code: 403 }));
+    await expect(twitterService.getOwnedLists(OWNER, ACCOUNT_ID)).rejects.toThrow(/list\.read|reconnect/i);
+  });
+
+  it('resolveOwnedListIdByName matches a list name case-insensitively', async () => {
+    mockListsOwned.mockResolvedValue({ data: { data: [
+      { id: 'L1', name: 'Engagement 101' },
+      { id: 'L2', name: 'Prospects' },
+    ] } });
+    const id = await twitterService.resolveOwnedListIdByName(OWNER, ACCOUNT_ID, 'engagement 101');
+    expect(id).toBe('L1');
+  });
+
+  it('resolveOwnedListIdByName throws (naming the available lists) when there is no match', async () => {
+    mockListsOwned.mockResolvedValue({ data: { data: [{ id: 'L2', name: 'Prospects' }] } });
+    await expect(
+      twitterService.resolveOwnedListIdByName(OWNER, ACCOUNT_ID, 'Engagement 101')
+    ).rejects.toThrow(/No owned X List named.*Prospects/i);
   });
 });
 
@@ -1008,5 +1096,89 @@ describe('TwitterService.getClient — concurrent refresh deduplication', () => 
       expect.anything(), expect.anything(), expect.anything(),
       expect.objectContaining({ needs_reconnect: true })
     );
+  });
+});
+
+// ─── Pre-write scope guard (ENG-413 AC#2) ─────────────────────────────────────
+describe('TwitterService — pre-write scope guard', () => {
+  it('blocks a reply write when granted scopes lack tweet.write and never calls the X endpoint', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ scopes: ['tweet.read', 'users.read'] }),
+    ]);
+    await expect(
+      twitterService.postTweet(OWNER, ACCOUNT_ID, 'hello', { inReplyToTweetId: '123' })
+    ).rejects.toThrow(/read-only|reconnect|write permission/i);
+    // Core AC assertion: the X write endpoint is never hit.
+    expect(mockReply).not.toHaveBeenCalled();
+    expect(mockTweet).not.toHaveBeenCalled();
+  });
+
+  it('names the account handle and the fix in the guard error', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ username: 'harshmoney123', scopes: ['tweet.read', 'users.read'] }),
+    ]);
+    await expect(
+      twitterService.postTweet(OWNER, ACCOUNT_ID, 'hi', { inReplyToTweetId: '9' })
+    ).rejects.toThrow(/@harshmoney123/);
+  });
+
+  it('falls back to a generic handle in the guard error when username is missing (malformed/legacy record)', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ username: undefined, scopes: ['tweet.read', 'users.read'] }),
+    ]);
+    await expect(
+      twitterService.postTweet(OWNER, ACCOUNT_ID, 'hi', { inReplyToTweetId: '9' })
+    ).rejects.toThrow(/@your account is connected read-only/);
+  });
+
+  it('blocks a plain tweet write when granted scopes lack tweet.write', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ scopes: ['tweet.read', 'users.read'] }),
+    ]);
+    await expect(twitterService.postTweet(OWNER, ACCOUNT_ID, 'hello')).rejects.toThrow(/write permission/i);
+    expect(mockTweet).not.toHaveBeenCalled();
+  });
+
+  it('blocks a like when granted scopes lack like.write (guard fires before the X call)', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ scopes: ['tweet.read', 'tweet.write', 'users.read'] }),
+    ]);
+    // The scope-guard error (not a "client.v2.like is not a function" error) proves
+    // the guard short-circuits before any X endpoint is reached.
+    await expect(twitterService.likeTweet(OWNER, ACCOUNT_ID, 'tw1')).rejects.toThrow(/like\.write/);
+  });
+
+  it('allows a reply write when tweet.write IS granted (behavior-preserving)', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ scopes: ['tweet.read', 'tweet.write', 'users.read'] }),
+    ]);
+    const res = await twitterService.postTweet(OWNER, ACCOUNT_ID, 'a reply', { inReplyToTweetId: '555' });
+    expect(mockReply).toHaveBeenCalledWith('a reply', '555');
+    expect(res.id).toBe('222');
+  });
+
+  it('never blocks a read action (search) even on a read-only account', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([
+      makeAccount({ scopes: ['tweet.read', 'users.read'] }),
+    ]);
+    mockSearch.mockResolvedValue({ data: { data: [{ id: 's1', text: 'found' }] } });
+    const res = await twitterService.searchTweets(OWNER, ACCOUNT_ID, 'agentweb');
+    expect(mockSearch).toHaveBeenCalled();
+    expect(res).toHaveLength(1);
+  });
+
+  it('defers to X (does not pre-block) when the account has no recorded scopes (legacy)', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount({ scopes: undefined })]);
+    const res = await twitterService.postTweet(OWNER, ACCOUNT_ID, 'legacy');
+    // Guard is skipped for unknown scopes → the write proceeds to the mocked X client.
+    expect(mockTweet).toHaveBeenCalled();
+    expect(res.id).toBe('111');
+  });
+
+  it('defers to X (does not pre-block) when recorded scopes is an empty array', async () => {
+    mockGetAccountsByUserId.mockResolvedValue([makeAccount({ scopes: [] })]);
+    const res = await twitterService.postTweet(OWNER, ACCOUNT_ID, 'empty-scopes');
+    expect(mockTweet).toHaveBeenCalled();
+    expect(res.id).toBe('111');
   });
 });

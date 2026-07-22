@@ -181,7 +181,7 @@ mkdir -p "$CLAUDE_MEMORY_DIR"
 cp "$APP_DIR/test-env/claude-memory/"*.md "$CLAUDE_MEMORY_DIR/"
 chown -R ec2-user:ec2-user /home/ec2-user/.claude
 
-sudo -u ec2-user git config --global user.name "Rui Wang"
+sudo -u ec2-user git config --global user.name "john-the-dev"
 sudo -u ec2-user git config --global user.email "52230987+john-the-dev@users.noreply.github.com"
 echo "$GITHUB_PAT" | sudo -u ec2-user gh auth login --with-token
 

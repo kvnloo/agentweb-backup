@@ -106,6 +106,13 @@ describe('AgentModeService - foundation_tools override is additive (ENG-404)', (
     (AgentModeService as any).FOUNDATION_TOOLS = new Set(AgentModeService.DEFAULT_FOUNDATION_TOOLS);
   });
 
+  it('always exposes the canonical product-guide search to normal and live voice sessions', () => {
+    expect(AgentModeService.DEFAULT_FOUNDATION_TOOLS).toContain('search_user_guide');
+    expect((AgentModeService as any).MANDATORY_FOUNDATION_TOOLS).toContain(
+      'search_user_guide'
+    );
+  });
+
   it('keeps every DEFAULT-only tool available when a stale override omits them', async () => {
     const mockSettingsService = require('../services/settingsService');
     mockSettingsService.settingsService.getSetting = jest.fn().mockResolvedValue({

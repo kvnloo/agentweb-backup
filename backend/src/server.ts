@@ -17,10 +17,15 @@ import { registerIo } from './services/sessionSockets';
 import {
   startLiveSession,
   sendAudioChunk,
+  sendAudioStreamEnd,
   sendTextTurn,
   closeLiveSession,
   hasLiveSession,
 } from './services/liveVoiceService';
+import {
+  ONBOARDING_TELEMETRY_EVENTS,
+  recordOnboardingEvent,
+} from './services/onboardingTelemetry';
 
 dotenv.config();
 
@@ -159,7 +164,7 @@ io.on('connection', (socket: Socket) => {
     // Clean up any live voice sessions owned by this socket
     socket.data.liveSessions?.forEach((sessionId: string) => {
       if (hasLiveSession(sessionId)) {
-        closeLiveSession(sessionId);
+        closeLiveSession(sessionId, socket.id);
       }
     });
   });
@@ -186,7 +191,13 @@ io.on('connection', (socket: Socket) => {
     return decoded.delegateAccess?.targetUserId || decoded.userId;
   }
 
-  socket.on('live:start', async ({ sessionId }: { sessionId: string }) => {
+  socket.on('live:start', async ({
+    sessionId,
+    toolProfile = 'default',
+  }: {
+    sessionId: string;
+    toolProfile?: 'default' | 'onboarding';
+  }) => {
     try {
       // For conversable sockets, enforce that the sessionId matches what was auth'd
       if (socket.data.conversableSessionId && socket.data.conversableSessionId !== sessionId) {
@@ -197,9 +208,10 @@ io.on('connection', (socket: Socket) => {
       // Track which live sessions this socket owns (for disconnect cleanup)
       if (!socket.data.liveSessions) socket.data.liveSessions = new Set<string>();
       socket.data.liveSessions.add(sessionId);
-      await startLiveSession(sessionId, socket.id, liveEmit, userId);
+      await startLiveSession(sessionId, socket.id, liveEmit, userId, toolProfile);
       console.log(`[liveVoice] live:start completed for session ${sessionId}`);
     } catch (err: any) {
+      socket.data.liveSessions?.delete(sessionId);
       console.error(`[liveVoice] live:start error for session ${sessionId}:`, err?.message);
       socket.emit('live:error', { sessionId, error: err?.message ?? 'Failed to start live session' });
     }
@@ -207,7 +219,18 @@ io.on('connection', (socket: Socket) => {
 
   socket.on('live:audio', ({ sessionId, chunk }: { sessionId: string; chunk: string }) => {
     console.log(`[liveVoice] live:audio received for session ${sessionId}, hasSession=${hasLiveSession(sessionId)}`);
-    sendAudioChunk(sessionId, chunk).catch((err) => {
+    sendAudioChunk(sessionId, chunk, socket.id).catch((err) => {
+      socket.emit('live:error', { sessionId, error: err?.message });
+    });
+  });
+
+  socket.on('live:audio-stream-end', ({ sessionId }: { sessionId: string }) => {
+    if (!sessionId || !socket.data.liveSessions?.has(sessionId)) {
+      socket.emit('live:error', { sessionId, error: 'No active voice session' });
+      return;
+    }
+    console.warn(`[liveVoice] live:audio-stream-end received for session ${sessionId}`);
+    sendAudioStreamEnd(sessionId, socket.id).catch((err) => {
       socket.emit('live:error', { sessionId, error: err?.message });
     });
   });
@@ -215,7 +238,7 @@ io.on('connection', (socket: Socket) => {
   socket.on('live:text', async ({ sessionId, text }: { sessionId: string; text: string }) => {
     try {
       console.log(`[liveVoice] live:text received for session ${sessionId}, hasSession=${hasLiveSession(sessionId)}`);
-      await sendTextTurn(sessionId, text);
+      await sendTextTurn(sessionId, text, socket.id);
     } catch (err: any) {
       console.error(`[liveVoice] live:text error for session ${sessionId}:`, err?.message);
       socket.emit('live:error', { sessionId, error: err?.message });
@@ -223,8 +246,52 @@ io.on('connection', (socket: Socket) => {
   });
 
   socket.on('live:close', ({ sessionId }: { sessionId: string }) => {
-    closeLiveSession(sessionId);
+    closeLiveSession(sessionId, socket.id);
     socket.data.liveSessions?.delete(sessionId);
+  });
+
+  socket.on('live:report-issue', async ({
+    sessionId,
+    phase,
+    breadcrumbs,
+  }: {
+    sessionId: string;
+    phase?: string;
+    breadcrumbs?: unknown[];
+  }) => {
+    try {
+      if (!sessionId || !socket.data.liveSessions?.has(sessionId)) {
+        throw new Error('No active voice session for this report');
+      }
+      const userId = getLiveUserId();
+      const safePhase = typeof phase === 'string' ? phase.slice(0, 40) : 'unknown';
+      const safeBreadcrumbs = Array.isArray(breadcrumbs)
+        ? JSON.stringify(breadcrumbs.slice(-25)).slice(0, 2_500)
+        : '[]';
+
+      console.warn('[voiceOnboardingTelemetry] tester reported an issue', {
+        sessionId,
+        userId,
+        phase: safePhase,
+        breadcrumbs: safeBreadcrumbs,
+      });
+      await recordOnboardingEvent(
+        userId,
+        ONBOARDING_TELEMETRY_EVENTS.voiceIssueReported,
+        {
+          sessionId,
+          phase: safePhase,
+          breadcrumbs: safeBreadcrumbs,
+        },
+      );
+      socket.emit('live:report-received', { sessionId });
+    } catch (err: any) {
+      console.error('[voiceOnboardingTelemetry] report failed', err?.message);
+      socket.emit('live:report-error', {
+        sessionId,
+        error: 'Could not save this report. Try again.',
+      });
+    }
   });
 
   // Handle chat messages

@@ -101,7 +101,7 @@ For frontend and other changes, follow the existing testing strategy section bel
 
 ## CRITICAL: Working Directory Rule
 
-**NEVER navigate outside or reference files outside the current working directory.** The user has multiple clones of the same repo locally. Always use the working directory from the environment (shown in `<env>`) as the base path for ALL file operations. Do not hardcode or assume paths like `/Users/ruiwang/Documents/GitHub/agentweb/` — always use the actual working directory (e.g. `/Users/ruiwang/Documents/GitHub/agentweb3/`). Referencing the wrong clone will silently edit the wrong files.
+**NEVER navigate outside or reference files outside the current working directory.** The user has multiple clones of the same repo locally. Always use the working directory from the environment (shown in `<env>`) as the base path for ALL file operations. Do not hardcode or assume paths like `/Users/<you>/code/agentweb/` — always use the actual working directory (e.g. `/Users/<you>/code/agentweb3/`). Referencing the wrong clone will silently edit the wrong files.
 
 ## Core Architecture
 

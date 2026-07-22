@@ -113,6 +113,66 @@ const MAX_MESSAGES_FOR_SCORING = 50;
 const MIN_USER_MESSAGES = 1;
 
 /**
+ * Standalone greetings / pleasantries that carry no task or question. Kept
+ * deliberately small and exact-match — a greeting-only session is excluded from
+ * satisfaction scoring (ENG-168), so this set biases toward NOT matching: any
+ * substantive user turn falls through and the session is scored normally.
+ * Values are the normalized form produced by `normalizeForGreeting` (lowercased,
+ * punctuation/emoji stripped, whitespace collapsed).
+ */
+const GREETING_PHRASES = new Set<string>([
+  "hi", "hii", "hiii", "hiya", "high", "hey", "heya", "heyy", "hello", "helo",
+  "hullo", "hey there", "hi there", "hello there", "hey emma", "hi emma",
+  "hello emma", "yo", "sup", "wassup", "whats up", "whatsup", "howdy",
+  "greetings", "hola", "gm", "good morning", "good afternoon", "good evening",
+  "good day", "morning", "afternoon", "evening",
+]);
+
+/**
+ * Normalize a user message for greeting matching: lowercase, drop everything
+ * that is not a letter/digit/space (punctuation, emoji), then collapse runs of
+ * whitespace. E.g. "Hi 👋" → "hi", "Good morning!" → "good morning".
+ */
+function normalizeForGreeting(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * True when a session is greeting-only / no-goal-stated: the user exchanged
+ * pleasantries but never stated a task or asked a question. Such sessions have
+ * no goal to complete, so the LLM judge scores goalCompletion low (≈3/5) purely
+ * as a scoring artifact — dragging the satisfaction cohort down with no
+ * actionable fault (ENG-168). We treat them like the existing skip cases
+ * (sub-threshold / in-flight sessions) and exclude them from scoring.
+ *
+ * Conservative by design: EVERY user turn must normalize to a recognized
+ * greeting for the session to qualify. Any substantive turn — a request, a
+ * question, or any text not in `GREETING_PHRASES` — returns false so the
+ * session is scored normally. Erring toward scoring avoids silently hiding a
+ * genuinely unsatisfied session.
+ */
+export function isGreetingOnlySession(messages: ChatMessage[] = []): boolean {
+  const userTexts = (messages || [])
+    .filter((m: any) => m.role === "user")
+    .map((m: any) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")));
+
+  if (userTexts.length === 0) return false;
+
+  let sawGreeting = false;
+  for (const raw of userTexts) {
+    const norm = normalizeForGreeting(raw);
+    if (norm === "") continue; // non-substantive (e.g. emoji-only) — not a goal
+    if (!GREETING_PHRASES.has(norm)) return false; // substantive content → scorable
+    sawGreeting = true;
+  }
+  return sawGreeting;
+}
+
+/**
  * Whether the session has produced at least one real assistant turn — i.e. the
  * model actually responded with text or invoked a tool.
  *
@@ -393,6 +453,14 @@ export async function scoreSessionWithJudgeIfNeeded(
     return null;
   }
 
+  // Greeting-only / no-goal-stated session: no goal to complete, so the judge
+  // scores it low on goalCompletion as a pure scoring artifact. Exclude it from
+  // the satisfaction cohort (ENG-168) — same skip-and-return-null treatment as
+  // sub-threshold and in-flight sessions.
+  if (isGreetingOnlySession(session.messages)) {
+    return null;
+  }
+
   // No assistant turn yet: skip if still in-flight, flag as failed if stale.
   let result: ScoringResult;
   if (!hasAssistantTurn(session.messages)) {
@@ -453,6 +521,14 @@ export async function scoreSessionIfNeeded(
     (m: any) => m.role === "user"
   );
   if (userMessages.length < MIN_USER_MESSAGES) {
+    return null;
+  }
+
+  // Greeting-only / no-goal-stated session: no goal to complete, so the judge
+  // scores it low on goalCompletion as a pure scoring artifact. Exclude it from
+  // the satisfaction cohort (ENG-168) — same skip-and-return-null treatment as
+  // sub-threshold and in-flight sessions.
+  if (isGreetingOnlySession(session.messages)) {
     return null;
   }
 
