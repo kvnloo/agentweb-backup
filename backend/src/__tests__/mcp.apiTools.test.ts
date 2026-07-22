@@ -320,17 +320,18 @@ describe('apiTools', () => {
   });
 
   // ─── Emma delegation capability discovery (ENG-257) ──────────────────
-  // External MCP clients (e.g. Claude) only see these tool descriptions —
-  // there is no advertising/ads tool in the external set, so ad work happens
-  // by delegating to Emma. If the delegation tools don't advertise Emma's
-  // advertising capability, the client hallucinates that the capability is
-  // unsupported and refuses instead of delegating.
+  // External MCP clients (e.g. Claude) only see these tool descriptions, and
+  // there is no ads/marketing execution tool in the external set — that work
+  // happens by delegating to Emma. If the delegation tools don't tell the client
+  // to hand marketing/growth requests to Emma, it pre-judges feasibility from the
+  // visible tools and hallucinates that the capability is unsupported.
   //
-  // Assertions are platform-agnostic ON PURPOSE: the description must describe
-  // the capability CATEGORY (paid advertising) and the delegate-don't-deny
-  // principle, NOT enumerate platforms (Meta/LinkedIn/…). Adding a new ad
-  // platform must not require editing this prose — so this test forbids relying
-  // on a specific platform name.
+  // The fix is a GENERAL delegation directive, NOT a capability catalogue: the
+  // description must NOT enumerate Emma's capabilities (platforms OR feature list).
+  // Enumerations undersell (anything not listed gets denied) and go stale as Emma
+  // gains skills — verified live: an enumerated list under-delegated a non-listed
+  // capability (SEO) while the general directive delegated it. So these assertions
+  // check the delegate/don't-pre-judge/don't-deny contract and FORBID enumeration.
   describe('emma delegation capability discovery', () => {
     const getDesc = (name: string) => {
       const def = mcpToolRegistry.getToolDefinitions().find((d: any) => d.name === name);
@@ -338,27 +339,32 @@ describe('apiTools', () => {
       return def!.description as string;
     };
 
-    it('emma_send_message advertises the paid-advertising capability CATEGORY and tells clients to delegate, not deny', () => {
+    it('emma_send_message tells the client to delegate and NOT pre-judge feasibility, and not to deny it itself', () => {
       const desc = getDesc('emma_send_message').toLowerCase();
-      expect(desc).toContain('advertis');        // "paid advertising" (category, not a platform)
-      expect(desc).toContain('delegate');         // route the request to Emma
-      expect(desc).toMatch(/unsupported|unavailable/); // don't-deny guidance
+      expect(desc).toContain('delegate');                 // route the request to Emma
+      expect(desc).toMatch(/pre-judge|feasib|determine/); // let Emma decide, don't guess
+      expect(desc).toMatch(/unsupported|unavailable/);    // don't-deny guidance
     });
 
     it('emma_create_session signals Emma is a full GTM agent to delegate marketing work to', () => {
       const desc = getDesc('emma_create_session').toLowerCase();
       expect(desc).toContain('gtm');
-      expect(desc).toContain('advertis');         // capability breadth, platform-agnostic
       expect(desc).toContain('delegate');
+      expect(desc).toMatch(/feasib|pre-judge|determine/);
     });
 
-    it('descriptions do NOT hardcode a specific ad platform name (future-proof / maintainability guard)', () => {
-      // Enumerating platforms means editing prose every time one is added/removed.
-      // The category term ("advertising") must carry the meaning instead.
+    it('descriptions do NOT enumerate capabilities — no platform names, no feature catalogue (maintainability / no-undersell guard)', () => {
+      // A capability list means editing prose on every new skill/platform AND
+      // undersells anything omitted. The general delegation directive must carry
+      // the meaning instead. Forbid specific platforms and enumerated feature nouns.
+      const forbidden = [
+        'meta', 'facebook', 'instagram', 'linkedin', 'tiktok', 'google ads', // platforms
+        'crm', 'landing page', 'blog', 'work plan', 'seo',                    // feature catalogue
+      ];
       for (const name of ['emma_create_session', 'emma_send_message']) {
         const desc = getDesc(name).toLowerCase();
-        for (const platform of ['meta', 'facebook', 'instagram', 'linkedin', 'tiktok', 'google ads']) {
-          expect(desc).not.toContain(platform);
+        for (const term of forbidden) {
+          expect(desc).not.toContain(term);
         }
       }
     });
