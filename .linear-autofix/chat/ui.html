@@ -616,7 +616,7 @@ function stampStats(bubbleEl, tok, cost) {
   bubbleEl.appendChild(el);
 }
 
-const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true, picker: null, lastEsc: 0, slash: null, cmd: null, mergePhase: null, lastResult: '', lastTokens: null, lastCost: null, lastMs: null, compacting: false, lastSent: '', escArmed: 0, escText: '', queue: [], queuePaused: false, attachments: [], collapsed: {}, filter: { assignee: [], state: [], priority: [] } };
+const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true, picker: null, lastEsc: 0, slash: null, cmd: null, mergePhase: null, lastResult: '', lastTokens: null, lastCost: null, lastMs: null, compacting: false, lastSent: '', escArmed: 0, escText: '', queue: [], queuePaused: false, attachments: [], collapsed: {}, drafts: {}, filter: { assignee: [], state: [], priority: [] } };
 try { S.collapsed = JSON.parse(localStorage.getItem('secCollapsed')) || {}; } catch { /* private mode */ }
 try { const f = JSON.parse(localStorage.getItem('sideFilter')); if (f) S.filter = { assignee: f.assignee || [], state: f.state || [], priority: f.priority || [] }; } catch { /* private mode */ }
 const COMMANDS = [
@@ -757,6 +757,7 @@ async function closeChatFromList(id) {
 }
 // Reset the main view after the open chat is closed (by Delete or the agent's [[CLOSE_CHAT]]).
 function deselectClosed(id) {
+  delete S.drafts[id]; // the chat is gone — don't keep its unsent draft around
   S.sel = null; S.detail = null; document.title = 'Autofix';
   if (location.hash.slice(1) === id) history.replaceState(null, '', location.pathname + location.search);
   $('empty').style.display = ''; $('hdr').style.display = 'none'; $('chat').style.display = 'none'; $('composer').style.display = 'none';
@@ -829,6 +830,7 @@ $('searchClear').onclick = () => { S.search = ''; $('search').value = ''; $('sea
 
 // ---------- selection / detail ----------
 async function select(id) {
+  saveDraft(); // stash the unsent composer text under the issue we're leaving
   S.sel = id; S.curBubble = null; S.stick = true;
   S.scrollToSel = true; // scroll the sidebar list to this issue once it's rendered (open/refresh)
   S.queue = []; S.queuePaused = false; renderQueue(); // queued messages belong to the previously open issue
@@ -841,6 +843,7 @@ async function select(id) {
   lastIssuesJson = ''; renderIssues();
   $('empty').style.display = 'none';
   $('hdr').style.display = ''; $('chat').style.display = ''; $('composer').style.display = '';
+  $('input').value = S.drafts[id] || ''; autosize(); // restore this issue's own unsent draft (bars are unique per issue)
   $('h-id').textContent = id; $('h-badges').innerHTML = ''; $('h-meta').textContent = 'loading…';
   $('chat').innerHTML = '<div class="convoloader"><div class="spin"></div>Loading conversation…</div>'; // spinner until the detail arrives (renderAll replaces it)
   if (S.es) { S.es.close(); S.es = null; }
@@ -1385,6 +1388,13 @@ function beginDelete(index) {
 const COMPOSER_PLACEHOLDER = 'Ask about this fix, or tell the agent what to change…';
 // Clears whichever action bar is open. Only wipes the composer if we were editing (delete never
 // touches the composer, so cancelling a delete must not clobber text the user was typing).
+// Persist the composer's unsent text under the currently-open issue so switching issues
+// doesn't leak one draft onto another. Empty drafts are dropped to keep the map tidy.
+function saveDraft() {
+  if (!S.sel) return;
+  const v = $('input').value;
+  if (v) S.drafts[S.sel] = v; else delete S.drafts[S.sel];
+}
 function clearBars() {
   const wasEditing = !!S.editing;
   S.editing = null; S.deleting = null;
