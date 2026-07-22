@@ -395,7 +395,20 @@ async function fetchWebForGroupReal(
   if (!groupCfg) return null;
   const wtag = `[v3:${listId ? `${listId}:` : ''}${lead.leadId ?? lead.email ?? '?'}:web:${groupName}]`;
 
-  // 1. Cache check (shared across leads at the same canonical entity)
+  // 1. Build query from the group's searchTemplate. Done BEFORE the cache check
+  // so a signal-less query (e.g. a personal/institutional email whose domain we
+  // intentionally omit — ENG-433) short-circuits the whole tier, including the
+  // shared cache. The cache is keyed on the canonical entity (email domain), so
+  // for a university/free-mail domain it can hold a stale institution-as-company
+  // entry (e.g. cornell.edu → "Cornell University") populated before the guard;
+  // skipping here keeps that from being re-served.
+  const query = CrmEnrichmentService.applySearchTemplate(groupCfg.searchTemplate, lead);
+  if (!query || query === groupCfg.searchTemplate.replace(/\{\{[^}]+\}\}/g, '').trim().replace(/\s+/g, ' ')) {
+    console.log(`${wtag} SKIP no lead-specific signal in query`);
+    return null;
+  }
+
+  // 2. Cache check (shared across leads at the same canonical entity)
   try {
     const cached = await getRawDataFromCache(lead as any, groupName, false);
     if (cached) {
@@ -406,12 +419,6 @@ async function fetchWebForGroupReal(
     console.warn('[v3 deps] cache read failed:', (err as Error).message);
   }
 
-  // 2. Build query from the group's searchTemplate
-  const query = CrmEnrichmentService.applySearchTemplate(groupCfg.searchTemplate, lead);
-  if (!query || query === groupCfg.searchTemplate.replace(/\{\{[^}]+\}\}/g, '').trim().replace(/\s+/g, ' ')) {
-    console.log(`${wtag} SKIP no lead-specific signal in query`);
-    return null;
-  }
   console.log(`${wtag} query="${query.slice(0, 120)}"`);
 
   // 3. Google CSE — for company_technographic also run a job-postings query
