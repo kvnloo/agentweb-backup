@@ -5,6 +5,40 @@ import { deriveBlockedByCost } from './tokenUsageService';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { chatbotDb } from './chatbotService';
 import { settingsService } from './settingsService';
+import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
+
+// ENG-351: resolve {{cite:N}} markers in Emma's text to inline source attributions, using the
+// citation metadata on the session's last assistant message. Email has no chip renderer, so this
+// gives recipients the source of each figure inline. Use `format: 'markdown'` for bodies rendered
+// through marked() (the source becomes a clickable link); keep the default `'text'` — "(Source)" —
+// for HTML-escaped or truncated previews, where a markdown link would show as escaped literal text.
+// Falls back to plain stripping if the session/citation lookup fails or the session has none, so a
+// raw marker never reaches an inbox.
+async function resolveEmmaCitationsForEmail(
+  text: string,
+  sessionId?: string,
+  format: CitationRenderFormat = 'text',
+): Promise<string> {
+  if (!text || typeof text !== 'string') return text;
+  if (!sessionId) return stripCitationMarkers(text);
+  try {
+    const session = await chatbotDb.getChatSession(sessionId);
+    const msgs = session?.messages;
+    let citations: Citation[] | undefined;
+    if (Array.isArray(msgs)) {
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m: any = msgs[i];
+        if (m?.role === 'assistant' && Array.isArray(m?.metadata?.citations)) {
+          citations = m.metadata.citations;
+          break;
+        }
+      }
+    }
+    return renderCitationMarkers(text, citations, format);
+  } catch {
+    return stripCitationMarkers(text);
+  }
+}
 
 dotenv.config();
 
@@ -1235,6 +1269,11 @@ Schedule ID: ${scheduleId}
       const { marked } = await import('marked');
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
+      // ENG-351: resolve {{cite:N}} markers to inline sources so recipients can trace each figure.
+      // 'markdown' → the HTML body (marked()) renders clickable source links; the plain-text body
+      // shows the same as "[Source](url)". Falls back to stripping.
+      result = { ...result, actualResponse: await resolveEmmaCitationsForEmail(result.actualResponse || '', result.sessionId, 'markdown') };
+
       // Create an interactive share for the session so user can access without login
       let sessionUrl = `${customerFrontendUrl}/agent-mode/${result.sessionId}`;
       try {
@@ -1397,6 +1436,10 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       const { marked } = await import('marked');
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
+      // ENG-351: resolve {{cite:N}} markers to inline sources; 'markdown' → clickable links in the
+      // marked()-rendered HTML body. Falls back to stripping.
+      content = await resolveEmmaCitationsForEmail(content, sessionId, 'markdown');
+
       // Create or reuse interactive share so recipients can view without login
       let sessionUrl = `${customerFrontendUrl}/agent-mode/${sessionId}`;
       try {
@@ -1494,6 +1537,16 @@ Sent via AgentWeb: ${customerFrontendUrl}
   ) {
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+
+      // ENG-351: resolve {{cite:N}} markers in each run's response preview to inline "(Source)"
+      // attributions (falls back to stripping) — email has no citation-chip renderer.
+      todaysResults = await Promise.all(
+        (todaysResults || []).map(async (r) =>
+          r && typeof r.actualResponse === 'string'
+            ? { ...r, actualResponse: await resolveEmmaCitationsForEmail(r.actualResponse, r.sessionId) }
+            : r
+        )
+      );
 
       const displayDate = customDate || new Date();
       const currentDate = displayDate.toLocaleDateString('en-US', {
@@ -1706,6 +1759,9 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       const { sessionId, userEmail, channelName, originalMessage, emmaResponse, receivedAt, senderDisplayName } = params;
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
+      // ENG-351: resolve {{cite:N}} markers to inline "(Source)" attributions (falls back to strip).
+      const emmaResponseText = await resolveEmmaCitationsForEmail(emmaResponse, sessionId);
+
       let sessionUrl = `${customerFrontendUrl}/agent-mode/${sessionId}`;
       try {
         const { chatbotDb } = await import('./chatbotService');
@@ -1773,7 +1829,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
 
               <div class="section">
                 <div class="section-title">Emma's Draft Response</div>
-                <div class="response-box">${this.escapeHtml(emmaResponse)}</div>
+                <div class="response-box">${this.escapeHtml(emmaResponseText)}</div>
               </div>
             </div>
             <div class="footer">
@@ -1797,7 +1853,7 @@ Original Message from ${senderDisplayName || 'Unknown'}:
 ${originalMessage}
 
 Emma's Draft Response:
-${emmaResponse}
+${emmaResponseText}
 
 View Session: ${sessionUrl}`;
 

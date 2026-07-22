@@ -38,9 +38,8 @@ import { skillService } from './skillService';
 import { extractVariables } from '../utils/templateParser';
 import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
-import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
-import { recordUsage } from './usageRecorderService';
+import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
 import {
   getModelPrice,
@@ -56,6 +55,7 @@ import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
 import { SearchResultSource } from '../search/searchProvider';
+import { CitationRegistry } from '../utils/citations';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -118,6 +118,39 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
   return undefined;
 }
 const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
+
+// Max output tokens for agent-mode LLM turns. Must be large enough to hold a
+// single big tool-call argument (e.g. create_html_file's content_draft, which
+// can be a 30-40K char / ~10-13K token HTML document). The previous 12384 cap
+// truncated such tool calls mid-argument; the provider then returned a tool_use
+// block with content_draft missing, which the gateway rejected as "Missing
+// required argument content_draft", looping until the anti-loop breaker tripped
+// (ENG-403). 32000 is within every supported Bedrock/Vertex Claude model's
+// output ceiling. Models only emit what they need, so raising the cap does not
+// increase normal-turn cost.
+export const AGENT_MODE_MAX_OUTPUT_TOKENS = 32000;
+
+// Max size of a NON-HTML content_draft that create_html_file will attempt to
+// render into HTML in a single internal LLM call. The render (llmService
+// generateHTML) has a hard 5-minute per-call Bedrock timeout, retried 3x — an
+// oversized rough draft can't finish inside that budget and burns ~15 min before
+// failing (ENG-472). Above this we fail fast with actionable guidance instead.
+// Already-complete HTML drafts bypass the render entirely (see
+// isCompleteHtmlDocument) and are NOT subject to this cap.
+export const CREATE_HTML_RENDER_MAX_DRAFT_CHARS = 60000;
+
+// A create_html_file content_draft that is already a complete HTML document does
+// not need the internal HTML-generation LLM call — re-rendering HTML->HTML is
+// wasted cost/latency, risks the model altering the user's content, and is the
+// exact case that deterministically times out on large drafts (ENG-472). Detect
+// a self-contained document: an opening doctype/<html> AND a closing </html>.
+export function isCompleteHtmlDocument(draft: string): boolean {
+  if (typeof draft !== 'string') return false;
+  const s = draft.trim().toLowerCase();
+  const hasOpen = s.startsWith('<!doctype html') || s.startsWith('<html') || s.includes('<html');
+  const hasClose = s.includes('</html>');
+  return hasOpen && hasClose;
+}
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { twitterService } from './twitterService';
@@ -178,7 +211,8 @@ import {
   ALLOWED_DATE_PRESETS,
   META_OBJ_GOAL_MAP,
   META_GOAL_BILLING_MAP,
-  META_GOAL_BID_STRATEGY_MAP
+  META_GOAL_BID_STRATEGY_MAP,
+  META_WEBSITE_OPTIMIZATION_GOALS
 } from '../utils/metaConstants';
 
 // Initialize Azure OpenAI client for direct chat completion (same as blog.ts)
@@ -1621,7 +1655,7 @@ export class AgentModeService {
 
                 const body: any = {
                   anthropic_version: 'vertex-2023-10-16',
-                  max_tokens: params.max_completion_tokens || 12384,
+                  max_tokens: params.max_completion_tokens || AGENT_MODE_MAX_OUTPUT_TOKENS,
                   messages: merged,
                 };
                 if (systemParts.length > 0) body.system = systemParts.join('\n');
@@ -1685,14 +1719,26 @@ export class AgentModeService {
                 }
 
                 const usage = data.usage || {};
+                // A max_tokens stop with a tool_use block means the tool call
+                // was truncated mid-argument (e.g. create_html_file's large
+                // content_draft), so its JSON is incomplete and would fail
+                // schema validation with a dropped required arg — the ENG-403
+                // "content_draft is required" retry loop. Do NOT surface it as a
+                // completed tool_calls finish; report finish_reason='length'
+                // with no tool_calls so the main loop's max-tokens continuation
+                // path asks the model to continue.
+                const truncatedToolCall = data.stop_reason === 'max_tokens' && !!toolCalls;
                 return {
                   choices: [{
                     message: {
                       role: 'assistant',
                       content: messageContent || null,
-                      ...(toolCalls && { tool_calls: toolCalls }),
+                      ...(toolCalls && !truncatedToolCall && { tool_calls: toolCalls }),
                     },
-                    finish_reason: data.stop_reason === 'tool_use' ? 'tool_calls' : 'stop',
+                    finish_reason: data.stop_reason === 'max_tokens'
+                      ? 'length'
+                      : (data.stop_reason === 'tool_use' ? 'tool_calls' : 'stop'),
+                    stop_reason: data.stop_reason,
                   }],
                   usage: {
                     prompt_tokens: usage.input_tokens || 0,
@@ -1827,7 +1873,7 @@ export class AgentModeService {
               messages,
               ...(toolConfig && { toolConfig }),
               inferenceConfig: {
-                maxTokens: params.max_completion_tokens || 12384,
+                maxTokens: params.max_completion_tokens || AGENT_MODE_MAX_OUTPUT_TOKENS,
                 ...(params.temperature !== undefined && { temperature: params.temperature }),
               },
             });
@@ -1879,6 +1925,15 @@ export class AgentModeService {
 
             const stopReason: string = response.stopReason || '';
 
+            // A max_tokens stop with a tool_use block means the tool call was
+            // truncated mid-argument (e.g. create_html_file's content_draft),
+            // so its JSON is incomplete and would fail schema validation with a
+            // dropped required arg — the ENG-403 "content_draft is required"
+            // retry loop. Do NOT surface it as a completed tool_calls finish;
+            // report finish_reason='length' with no tool_calls so the main
+            // loop's max-tokens continuation path asks the model to continue.
+            const truncatedToolCall = stopReason === 'max_tokens' && !!toolCalls;
+
             // Convert response to OpenAI format
             return {
               id: `bedrock-${Date.now()}`,
@@ -1890,9 +1945,9 @@ export class AgentModeService {
                 message: {
                   role: 'assistant',
                   content: messageContent,
-                  tool_calls: toolCalls,
+                  tool_calls: truncatedToolCall ? null : toolCalls,
                 },
-                finish_reason: toolCalls ? 'tool_calls' : (stopReason === 'max_tokens' ? 'length' : 'stop'),
+                finish_reason: stopReason === 'max_tokens' ? 'length' : (toolCalls ? 'tool_calls' : 'stop'),
                 stop_reason: stopReason || (toolCalls ? 'tool_use' : 'end_turn'),
               }],
               usage: {
@@ -2228,6 +2283,77 @@ export class AgentModeService {
     return blocks.length > 0 ? blocks : [{ type: 'text', text: '.' }];
   }
 
+  /** Media types the Anthropic Messages / Bedrock Converse vision APIs decode natively. */
+  private static readonly VISION_NATIVE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+  /**
+   * Ensure an image buffer is in a format the vision APIs can actually decode, and
+   * that the returned content-type matches the real bytes (ENG-370).
+   *
+   * Uploaded logos frequently arrive as either (a) a format Claude/Bedrock cannot
+   * read — HEIC, AVIF, TIFF, BMP, SVG — or (b) a supported format mislabeled by S3
+   * with a generic/incorrect content-type (commonly `application/octet-stream` when
+   * the browser omits it). Both used to fail silently: the downstream block
+   * converters relabel an unknown type to `image/jpeg` WITHOUT re-encoding, so the
+   * declared media type no longer matches the bytes and the API returns 400; and a
+   * non-`image/*` content-type produced a data URI the `image/` regex dropped
+   * entirely, so the model never saw the image. describe_image would then burn many
+   * retries/workarounds and still fail.
+   *
+   * This decodes the actual bytes with sharp: if they are already a native format it
+   * just corrects the label (no re-encode); otherwise it re-encodes to PNG so the
+   * bytes always match a supported media type. Animated inputs (animated AVIF/HEIC)
+   * re-encode to their first frame — enough to describe a logo.
+   *
+   * On a decode failure it returns the input unchanged (best effort) but sets
+   * `undecodable: true` so the caller can fast-fail with re-upload guidance instead
+   * of burning vision retries on bytes no vision API can read either (ENG-370).
+   */
+  private static async normalizeImageForVision(
+    buffer: Buffer,
+    contentType: string
+  ): Promise<{ buffer: Buffer; contentType: string; undecodable?: boolean; detectedFormat?: string }> {
+    let ct = (contentType || '').toLowerCase().trim();
+    if (ct === 'image/jpg') ct = 'image/jpeg';
+    if (AgentModeService.VISION_NATIVE_MEDIA_TYPES.has(ct)) {
+      return { buffer, contentType: ct };
+    }
+    try {
+      const sharp = (await import('sharp')).default;
+      const metadata = await sharp(buffer).metadata();
+      const sharpFormatToMedia: Record<string, string> = {
+        jpeg: 'image/jpeg',
+        png: 'image/png',
+        gif: 'image/gif',
+        webp: 'image/webp',
+      };
+      const detected = metadata.format ? sharpFormatToMedia[metadata.format] : undefined;
+      if (detected) {
+        // Bytes are already vision-native; only the content-type header was wrong/missing.
+        return { buffer, contentType: detected, detectedFormat: metadata.format };
+      }
+      // Genuinely unsupported encoding (heic/heif/avif/tiff/bmp/svg/...). Convert to PNG.
+      // sharp(buffer) reads only the first frame by default, so animated inputs
+      // collapse to a single describable frame here (no `{ animated: true }`).
+      const png = await sharp(buffer).png().toBuffer();
+      console.log(
+        `AgentMode: normalizeImageForVision converted "${ct || 'unknown'}" (sharp format "${metadata.format}") to image/png, ${png.length} bytes`
+      );
+      return { buffer: png, contentType: 'image/png', detectedFormat: metadata.format };
+    } catch (err) {
+      console.error(
+        'AgentMode: normalizeImageForVision failed to decode/convert image; using original:',
+        err instanceof Error ? err.message : err
+      );
+      // sharp could not decode the bytes at all — a corrupt file or a codec even
+      // sharp lacks. The vision APIs decode a strict subset of what sharp handles,
+      // so they cannot read it either. Flag it undecodable so the caller fast-fails.
+      // Only fall back to a native default when we have no usable label at all, so a
+      // missing/empty content-type never yields a `data:;base64,...` URI (ENG-370).
+      return { buffer, contentType: contentType || 'image/png', undecodable: true };
+    }
+  }
+
   private llmModels: Record<string, LLMModelConfig> = {
     // List openai models - create client dynamically for each deployment
     // Azure OpenAI enforces a 128-tool limit per request
@@ -2428,7 +2554,12 @@ export class AgentModeService {
         try {
           const usage: any = (res as any)?.usage;
           if (usage) {
-            void recordUsage({
+            // ENG-200: meter the main agent turn — record shadow burn AND charge
+            // the per-user cost cap when a real user is attributable (org members
+            // resolve to the owner). Cost (incl. cache tokens) is computed once
+            // here; no separate deduction path exists for this call, so this is
+            // the single charge point. No userId → burn-only "system" record.
+            meterUserUsage({
               userId: usageContext?.userId,
               sessionId: usageContext?.sessionId,
               model,
@@ -2568,14 +2699,17 @@ export class AgentModeService {
     return videoGenerationCostUsd(model, durationSeconds);
   }
 
-  /** Returns an onUsage callback that records LLM token usage for a named tool. */
-  private makeToolUsageCallback(userId: string, sessionId: string | undefined, toolName: string): (usage: LLMUsageData) => void {
+  /**
+   * Returns an onUsage callback that attributes a tool's LLM cost to the session
+   * for per-tool cost display. It does NOT deduct from the per-user cap: the
+   * deduction happens once at the metering chokepoint (llmService.meterUsage,
+   * which these tools call via generateHTML/generateJSONContent). Charging here
+   * too would double-charge content-gen tools (ENG-200).
+   */
+  private makeToolUsageCallback(sessionId: string | undefined, toolName: string): (usage: LLMUsageData) => void {
     return (usage) => {
-      const cost = this.estimateCost(usage.model, usage.inputTokens, usage.outputTokens);
-      incrementUserTokenUsage(userId, usage.totalTokens, cost).catch((err) =>
-        console.error(`AgentMode: Failed to track token usage for ${toolName} tool:`, err)
-      );
       if (sessionId) {
+        const cost = this.estimateCost(usage.model, usage.inputTokens, usage.outputTokens);
         chatbotDb.addToolCostToSession(sessionId, cost, toolName).catch((err) =>
           console.error(`AgentMode: Failed to add ${toolName} cost to session:`, err)
         );
@@ -2794,7 +2928,7 @@ export class AgentModeService {
       if ((currentSession?.pageIdentifier || '').toLowerCase().includes('slack')) {
         messages.push({
           role: 'assistant',
-          content: `[AgentWeb Team] I know all four team members: Rui Wang is the CTO (also called Rui), Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately.`
+          content: `[AgentWeb Team] I know the team members: Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately.`
         });
       }
 
@@ -2828,6 +2962,9 @@ export class AgentModeService {
       _toolCallsForTelemetry = toolCalls;
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
+      // ENG-351: accumulates the web sources this message consults across all its search
+      // calls, into a de-duplicated, stably-numbered registry for the Sources UI.
+      const citationRegistry = new CitationRegistry();
       const iterationTimings: { iteration: number; llmDurationMs: number; toolNames: string[] }[] = [];
 
       // Remember initial message count to slice response messages later
@@ -3003,7 +3140,7 @@ export class AgentModeService {
           response = await this.callLLM(llmModel, trimmedMessages, {
             tools: filteredToolsCache,
             tool_choice: 'auto',
-            max_completion_tokens: 12384,
+            max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
             temperature: 0.1,
             usageContext: { userId, sessionId, feature: 'agent_task' }
           });
@@ -3025,7 +3162,7 @@ export class AgentModeService {
               response = await this.callLLM(llmModel, trimmedMessages, {
                 tools: filteredToolsCache,
                 tool_choice: 'auto',
-                max_completion_tokens: 12384,
+                max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
                 temperature: 0.1,
                 usageContext: { userId, sessionId, feature: 'agent_task' }
               });
@@ -3118,6 +3255,26 @@ export class AgentModeService {
         // Check stop reason to determine next action
         const finishReason = response.choices[0]?.finish_reason;
         const stopReason = response.choices[0]?.stop_reason;
+
+        // Provider-agnostic truncated-tool-call guard (ENG-403).
+        // When a turn is cut off by the output-token limit mid-tool-call, the
+        // tool_calls JSON is incomplete (e.g. create_html_file's content_draft is
+        // sliced off), so executing it fails schema validation with a dropped
+        // required arg and the model retries identically — the "content_draft is
+        // required" loop. The Bedrock/Vertex adapters already null their tool_calls
+        // and report finish_reason='length' on max_tokens; the raw OpenAI-SDK paths
+        // (Azure gpt-*, Gemini OpenAI-compat — the DEFAULT agent model) instead
+        // return finish_reason='length' with the partial tool_calls still attached.
+        // Drop them here so the truncated turn falls through to the bounded
+        // max-tokens continuation path below (which asks the model to continue)
+        // instead of executing a broken call. responseMessage was already pushed
+        // into `messages` by reference above, so this also removes the dangling
+        // tool_use from history — required, else the next request would be a
+        // malformed assistant tool_calls turn with no matching tool results.
+        if (finishReason === 'length' && responseMessage.tool_calls?.length) {
+          console.warn(`AgentMode: Dropping ${responseMessage.tool_calls.length} truncated tool call(s) (finish_reason=length) in session ${sessionId}; routing to max-tokens continuation`);
+          delete responseMessage.tool_calls;
+        }
 
         if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
           // No tool calls — check WHY the model stopped
@@ -3233,6 +3390,7 @@ export class AgentModeService {
           toolCalls: responseMessage.tool_calls,
           messages: messages as any[],
           toolCallsLedger: toolCalls,
+          citationRegistry,
           iteration,
           agentRuntimeRunId,
           sessionId,
@@ -3530,12 +3688,17 @@ export class AgentModeService {
             durationMs: endTime - startTime
           };
 
+          // ENG-351: the web sources this message consulted, de-duplicated and
+          // stably-numbered by the citation registry, for the Sources UI.
+          const citations = citationRegistry.list();
+
           lastMessage.metadata = {
             ...lastMessage.metadata,
             timestamp: new Date().toISOString(),
             iterationTimings,
             memoryUsage,
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
+            ...(citations.length > 0 ? { citations } : {}),
           };
         }
       }
@@ -4235,6 +4398,7 @@ export class AgentModeService {
     'read_market_strategy',
 
     // Knowledge Base & Research
+    'search_user_guide',
     'search_knowledge_base',
     'list_knowledge_base_files',
     'read_knowledge_base_files',
@@ -4270,6 +4434,7 @@ export class AgentModeService {
     'search_leads',           // CRM teaser
     'get_lead_lists',         // Lead management teaser
     'list_connected_accounts', // Social/ads integration teaser
+    'connect_account',        // Read-only UI handoff when a required account is absent
 
     'get_user_profile',         // Account info teaser
     'get_account_status',       // Self account status (plan, usage, api-key count) — wraps /api/auth/me, no args
@@ -4335,6 +4500,13 @@ export class AgentModeService {
     'resolve_skill',
     'you_search_web',
     'you_search_news',
+    // Product documentation is core infrastructure for both chat and live
+    // voice. Keep it available even if a stale settings override omits it.
+    'search_user_guide',
+    // Connection handoff is UI infrastructure, not an optional skill. The tool
+    // only asks the current page to open the existing OAuth dialog; it does not
+    // grant consent or connect an account by itself.
+    'connect_account',
     // S3 overflow retrieval is infrastructure, not a skill: whenever a tool result
     // is offloaded to S3 the model is handed a "[Full response stored at S3 key: ...]"
     // pointer and MUST be able to resolve it. A DB `foundation_tools` setting that
@@ -6505,11 +6677,35 @@ export class AgentModeService {
           const { presignS3Url, isS3Url } = await import('../utils/s3Utils');
           const fetchUrl = isS3Url(imageUrl) ? (presignS3Url(imageUrl) ?? imageUrl) : imageUrl;
           const imgResp = await axios.get<ArrayBuffer>(fetchUrl, { responseType: 'arraybuffer', timeout: 30000 });
-          // Normalize content-type: strip any charset/extra params and trim whitespace
-          const rawContentType = (imgResp.headers['content-type'] || 'image/png').split(';')[0].trim();
-          const contentType = rawContentType || 'image/png';
+          // Normalize content-type: strip any charset/extra params and trim whitespace.
+          // Do NOT default a missing/empty header to a native type here — that would
+          // short-circuit sharp detection and embed non-PNG bytes as image/png (ENG-370).
+          // Pass the raw/empty type through so normalizeImageForVision decodes via sharp.
+          const contentType = (imgResp.headers['content-type'] || '').split(';')[0].trim();
           let imageBuffer = Buffer.from(imgResp.data as ArrayBuffer);
           let finalContentType = contentType;
+          // Normalize to a vision-decodable format so the declared media type always
+          // matches the bytes. Fixes HEIC/AVIF/TIFF/BMP/SVG logos and mislabeled or
+          // octet-stream content-types that otherwise fail silently downstream (ENG-370).
+          const normalized = await AgentModeService.normalizeImageForVision(imageBuffer, contentType);
+          if (normalized.undecodable) {
+            // sharp could not decode these bytes, so no vision API can either.
+            // Fast-fail with actionable re-upload guidance instead of burning vision
+            // retries and agent workarounds on an unreadable file (ENG-370).
+            console.warn(
+              `AgentMode: describeImage could not decode uploaded image (content-type "${contentType || 'none'}"); fast-failing with re-upload guidance`
+            );
+            return {
+              success: false,
+              retryable: false,
+              message:
+                `The uploaded file could not be read as an image${contentType ? ` (its content type was "${contentType}")` : ''} — ` +
+                'it may be corrupted or in a format that cannot be decoded. Please re-upload the logo as a PNG or JPEG and try again.',
+              error: 'Image could not be decoded',
+            };
+          }
+          imageBuffer = normalized.buffer;
+          finalContentType = normalized.contentType;
           // Auto-resize if image exceeds 4MB to stay under Bedrock's 5MB limit
           if (imageBuffer.length > 4 * 1024 * 1024) {
             try {
@@ -6598,9 +6794,16 @@ export class AgentModeService {
 
     } catch (error) {
       console.error('AgentMode: Error describing image:', error);
+      // This is a catch-all: besides bad image bytes it also receives transient
+      // network/provider failures that escaped the vision-call fallback flow. Do
+      // NOT hard-code retryable:false here (that would make the agent give up on a
+      // request that could succeed on retry) and do not assert the file itself is
+      // the problem — only the undecodable-bytes fast-fail above is truly terminal.
       return {
         success: false,
-        message: 'Failed to analyze image. Please check that the URL is accessible and contains a valid image.',
+        message:
+          'Failed to analyze the image. It may be temporarily unavailable, inaccessible, or in a ' +
+          'format that cannot be read. If it is a logo file, try re-uploading it as a PNG or JPEG.',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
@@ -6614,6 +6817,8 @@ export class AgentModeService {
       return_scenes?: boolean;
       start_time?: string;
       end_time?: string;
+      /** Attributable user — charges this describe_video LLM spend to their cap (ENG-200). */
+      userId?: string;
     }
   ): Promise<any> {
     let tempDirPath: string | null = null;
@@ -6652,11 +6857,12 @@ export class AgentModeService {
         };
       }
 
-      // Metered Gemini client (Ship 1 shadow metering). describeVideo has no
-      // userId in its signature, so usage attributes to "system" for now —
-      // follow-up: thread userId from the tool-dispatch / emmaApi callers.
+      // Un-metered Gemini client: the wrapped factory only RECORDS burn, so to
+      // actually CHARGE describe_video spend to the user's cap we meter the
+      // response ourselves via meterUsageFromResponse below (ENG-200). No userId
+      // → that meter degrades to a burn-only "system" record (absorbed).
       const { getGeminiClient } = await import('../utils/llmClients');
-      aiClient = await getGeminiClient({ feature: 'agent_task' }, geminiApiKey.trim());
+      aiClient = await getGeminiClient({ userId: options?.userId, feature: 'agent_task' }, geminiApiKey.trim(), { metered: false });
 
       const modelName = 'gemini-3-flash-preview';
 
@@ -6822,6 +7028,13 @@ export class AgentModeService {
         model: modelName,
         contents
       });
+
+      // Charge (record + deduct when a userId is present; absorb under "system"
+      // otherwise). The client above is un-metered, so this is the single meter.
+      meterUsageFromResponse(
+        { userId: options?.userId, model: modelName, provider: 'gemini', feature: 'agent_task' },
+        response
+      );
 
       const rawText = response.text;
 
@@ -13786,7 +13999,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async manageMetaAdsCampaigns(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
-        return this.listMetaAdsCampaignsNew(userId, account_id);
+        // Thread the campaign_id filter and any explicit fields selection so the caller can
+        // read budget/bid config and target a single campaign (ENG-398).
+        return this.listMetaAdsCampaignsNew(userId, account_id, { campaignId: campaign_id, fields: params?.fields });
       case 'CREATE':
         return this.createMetaAdsCampaign(userId, { ...params, account_id });
       case 'UPDATE':
@@ -13804,7 +14019,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async manageMetaAdsAdSets(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, ad_set_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
-        return this.listMetaAdsAdSets(userId, campaign_id, account_id);
+        // Thread the ad_set_id target and any explicit fields selection so the caller can
+        // read optimization_goal / promoted_object / etc. for a single ad set (ENG-398).
+        return this.listMetaAdsAdSets(userId, campaign_id, account_id, { adSetId: ad_set_id, fields: params?.fields });
       case 'CREATE':
         // Explicitly pass account_id in args for createMetaAdsAdSet as it expects it in the args object
         return this.createMetaAdsAdSet(userId, { ...params, account_id, campaign_id });
@@ -14112,10 +14329,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async listMetaAdsCampaignsNew(userId: string, account_id?: string): Promise<any> {
+  public async listMetaAdsCampaignsNew(
+    userId: string,
+    account_id?: string,
+    options: { campaignId?: string; fields?: string | string[] } = {}
+  ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const campaigns = (await metaService.listCampaigns(accountId, accessToken)) || [];
+      // Only forward the read-options bag when the caller supplied a campaign_id filter or
+      // an explicit fields selection; otherwise call listCampaigns the same 2-arg way as
+      // before. This preserves the CALL CONVENTION for a plain list-all — it does NOT keep
+      // the response payload identical: listCampaigns now defaults to the richer
+      // CAMPAIGN_READ_FIELDS (budget/bid config: daily_budget, lifetime_budget,
+      // budget_remaining, bid_strategy), the intended ENG-398 change, for every plain LIST
+      // caller regardless of this branch.
+      const hasSelector = Boolean(options.campaignId || options.fields);
+      const campaigns = (hasSelector
+        ? await metaService.listCampaigns(accountId, accessToken, options)
+        : await metaService.listCampaigns(accountId, accessToken)) || [];
       const totalCount = Array.isArray(campaigns) ? campaigns.length : 0;
 
       return {
@@ -14158,10 +14389,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async listMetaAdsAdSets(userId: string, campaignId?: string, account_id?: string): Promise<any> {
+  public async listMetaAdsAdSets(
+    userId: string,
+    campaignId?: string,
+    account_id?: string,
+    options: { adSetId?: string; fields?: string | string[] } = {}
+  ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const adSets = (await metaService.listAdSets(accountId, accessToken, campaignId)) || [];
+      // Only forward the read-options bag when the caller supplied an ad_set_id target or an
+      // explicit fields selection; otherwise call listAdSets with just the (optional)
+      // campaignId, exactly as before. This preserves the CALL CONVENTION, NOT the response
+      // payload: listAdSets now defaults to the richer AD_SET_READ_FIELDS (optimization_goal,
+      // billing_event, destination_type, promoted_object, bid_strategy), the intended
+      // ENG-398 change, for every plain LIST caller regardless of this branch.
+      const hasSelector = Boolean(options.adSetId || options.fields);
+      const adSets = (hasSelector
+        ? await metaService.listAdSets(accountId, accessToken, campaignId, options)
+        : await metaService.listAdSets(accountId, accessToken, campaignId)) || [];
       const totalCount = Array.isArray(adSets) ? adSets.length : 0;
 
       return {
@@ -14336,6 +14581,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           }
         };
         console.log('[MetaAdSet] Auto-set targeting_automation.advantage_audience=0 (Meta requires this field)');
+      }
+
+      // Conversion location (ENG-415): default destination_type=WEBSITE for website
+      // traffic/conversion goals so the ad-level Destination is explicitly "Website" in Ads Manager
+      // rather than UNDEFINED (the "not selected" symptom). An explicit caller value always wins;
+      // non-website goals (engagement/reach/app installs, instant-form lead goals) are left untouched.
+      if (args.destination_type === undefined &&
+          META_WEBSITE_OPTIMIZATION_GOALS.includes(args.optimization_goal)) {
+        args.destination_type = 'WEBSITE';
       }
 
       // Convert all currencies to cents
@@ -23794,6 +24048,46 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
       const isEmail = documentType === 'email';
 
+      // ENG-472 #1 — Passthrough: when the draft is already a complete HTML
+      // document, skip the internal render LLM call and upload it verbatim.
+      // Re-rendering HTML->HTML wastes an expensive call, risks the model
+      // altering the content, and is exactly what times out on large drafts.
+      // Email is excluded: the email render applies email-client-safety
+      // transforms (table layout, inline styles) that a generic HTML document
+      // may lack, so emails always go through the render path.
+      if (!isEmail && isCompleteHtmlDocument(contentDraft)) {
+        console.log('AgentMode: create_html_file — draft is already complete HTML, uploading directly (skipping render)');
+        const { uploadFileToS3 } = await import('../utils/s3Utils');
+        const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
+        const uploadResult = await uploadFileToS3(contentDraft, filename, userId, 'text/html');
+        if (!uploadResult.success || !uploadResult.url) {
+          throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        }
+        return {
+          success: true,
+          s3_url: uploadResult.url,
+          filename,
+          title,
+          document_type: documentType,
+          rendered: false,
+          message: 'HTML file created successfully'
+        };
+      }
+
+      // ENG-472 #2 — Fail fast: a draft that must be rendered but is larger than
+      // the render step can finish inside its 5-minute per-call budget would burn
+      // ~15 minutes across retries before failing. Return actionable guidance
+      // immediately instead. (Complete-HTML drafts already returned above and are
+      // not size-limited.)
+      if (contentDraft.length > CREATE_HTML_RENDER_MAX_DRAFT_CHARS) {
+        console.warn(`AgentMode: create_html_file — draft too large to render in one file (${contentDraft.length} chars > ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS})`);
+        return {
+          success: false,
+          message: 'Draft too large to render into a single HTML file',
+          error: `content_draft is too large to render into one HTML file in a single pass (${contentDraft.length} characters, limit ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS}). Either provide the draft as a complete, self-contained HTML document (which is saved directly without limit), or split it into smaller sections and create multiple files.`
+        };
+      }
+
       // Use Claude model by default (check for Claude in model name)
       const defaultClaudeModel = 'anthropic.claude-sonnet-4-6';
 
@@ -23916,7 +24210,7 @@ Please generate a complete, professional HTML document that properly formats and
       let htmlContent = '';
       for (let attempt = 1; attempt <= maxRenderAttempts; attempt++) {
         try {
-          htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
+          htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
           break;
         } catch (renderError) {
           const isLastAttempt = attempt === maxRenderAttempts;
@@ -24123,7 +24417,7 @@ Please:
 
       // Generate enhanced HTML template using LLMService
       console.log('AgentMode: Generating HTML email template with Claude model');
-      enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'), { userId, sessionId, feature: 'content_gen' });
+      enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(sessionId, 'createHtmlTemplate'), { userId, sessionId, feature: 'content_gen' });
 
       if (!enhancedHtml || enhancedHtml.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -24280,7 +24574,7 @@ ${strippedHtml}`;
       const parsed = await llmService.generateJsonRobust<{ variables?: Array<{ name?: string; anchor?: string; isArray?: boolean }> }>(
         systemPrompt,
         userPrompt,
-        this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'),
+        this.makeToolUsageCallback(sessionId, 'createHtmlTemplate'),
         { userId, sessionId, feature: 'content_gen' },
       );
       if (parsed && Array.isArray(parsed.variables)) {
@@ -25478,7 +25772,7 @@ IMPORTANT:
 IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly.`}`;
 
       // Generate content using LangChain with appropriate format
-      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(userId, sessionId, 'generateBookContent'), { userId, sessionId, feature: 'content_gen' });
+      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(sessionId, 'generateBookContent'), { userId, sessionId, feature: 'content_gen' });
 
       // Extract content from JSON
       if (!contentData.content) {
@@ -26585,7 +26879,62 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // persisting — see unipileProfileService.ts.
           const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
           const profileResult = await getUnipileProfileService().getProfile(target, account_id);
-          return { success: true, data: profileResult.rawData };
+          const raw = profileResult.rawData;
+
+          // The global profile cache strips is_relationship / connected_at because
+          // they are viewer-relative (ENG-440) — so on a cache hit a freshly-written
+          // blob carries no connection state at all (and a pre-change legacy row may
+          // carry another viewer's, which we discard below). Re-derive it for THIS
+          // account from our per-account AW-UnipileConnections cache (the authoritative
+          // ENG-377 path) so the agent's invite-vs-DM decision has a correct signal.
+          //
+          // IMPORTANT: overlay onto a SHALLOW COPY. `raw` is the object held in the
+          // profile cache (LRU/DDB row) — mutating it in place would persist this
+          // viewer's connection state back into the shared cache and re-introduce the
+          // very cross-viewer leak this fix closes.
+          if (raw && typeof raw === 'object') {
+            const profileUrl =
+              raw.public_profile_url ||
+              (raw.public_identifier
+                ? `https://www.linkedin.com/in/${raw.public_identifier}`
+                : (isUrl ? target : null));
+            let conn: { connectedAt?: number } | null = null;
+            if (profileUrl) {
+              const { getConnectionByProfileUrlAndAccount } = await import('./unipileConnectionsDb');
+              conn = await getConnectionByProfileUrlAndAccount(profileUrl, account_id).catch(() => null);
+            }
+            // Drop any is_relationship / connected_at that came off `raw` before
+            // re-deriving. New cache writes already strip these, but rows persisted
+            // BEFORE this change (30-day TTL) can still carry another viewer's stale
+            // values — a spread of `raw` would leak them until the row expires. Only a
+            // LIVE response (`!fromCache`) legitimately carries this viewer's own state.
+            const {
+              is_relationship: rawRelationship,
+              connected_at: rawConnectedAt,
+              ...viewerIndependentRaw
+            } = raw;
+            // Reconcile as a union: connected if our per-account cache has a row OR a
+            // LIVE blob said so. A `true` from either source wins — directly countering
+            // the false-negative in reporter-ticket #135 (is_relationship false while
+            // LinkedIn's send-time check said FIRST_DEGREE). On a cache hit we trust only
+            // `conn`, never the (possibly cross-viewer) cached is_relationship.
+            const isConnected =
+              !!conn || (!profileResult.fromCache && rawRelationship === true);
+            const data = {
+              ...viewerIndependentRaw,
+              is_relationship: isConnected,
+              // conn.connectedAt is already epoch-ms (Unipile created_at) — do NOT
+              // multiply by 1000 (ENG-379). Prefer the authoritative cache timestamp;
+              // otherwise keep the raw timestamp ONLY from a live response.
+              ...(conn && typeof conn.connectedAt === 'number'
+                ? { connected_at: conn.connectedAt }
+                : !profileResult.fromCache && typeof rawConnectedAt === 'number'
+                  ? { connected_at: rawConnectedAt }
+                  : {}),
+            };
+            return { success: true, data };
+          }
+          return { success: true, data: raw };
         }
 
         case 'list-connections': {
@@ -27211,7 +27560,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   async twitterOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
-    const { text, handle, recipient_handle, query, max_results, tweet_id, list_id, lead_id, lead_email } = args;
+    const { text, handle, recipient_handle, query, max_results, tweet_id, x_list_id, list_name, list_id, lead_id, lead_email } = args;
     console.log(`[AgentMode] twitterOutreach called: action=${action}, account_id=${account_id}`);
 
     const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
@@ -27342,6 +27691,27 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: result };
         }
 
+        case 'list-owned-lists': {
+          const result = await twitterService.getOwnedLists(ownerUserId, account_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-list-members': {
+          const listId = x_list_id
+            || (list_name ? await twitterService.resolveOwnedListIdByName(ownerUserId, account_id, list_name) : undefined);
+          if (!listId) throw new Error('x_list_id or list_name is required for get_list_members');
+          const result = await twitterService.getListMembers(ownerUserId, account_id, listId);
+          return { success: true, data: result };
+        }
+
+        case 'get-list-tweets': {
+          const listId = x_list_id
+            || (list_name ? await twitterService.resolveOwnedListIdByName(ownerUserId, account_id, list_name) : undefined);
+          if (!listId) throw new Error('x_list_id or list_name is required for get_list_tweets');
+          const result = await twitterService.getListTweets(ownerUserId, account_id, listId, max_results);
+          return { success: true, data: result };
+        }
+
         case 'block': {
           const target = handle || recipient_handle;
           if (!target) throw new Error('handle is required for block');
@@ -27376,6 +27746,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             'search-tweets', 'get-user-tweets',
             'send-dm', 'list-dms', 'get-dm-conversation',
             'bookmark', 'get-bookmarks',
+            'list-owned-lists', 'get-list-members', 'get-list-tweets',
             'block', 'unblock', 'mute', 'unmute',
           ];
           throw new Error(`Unsupported twitter_outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);

@@ -205,6 +205,10 @@ export const INTEGRATION_CONFIG = {
     // follows.read/write required for follow/unfollow/list-followers/list-following actions.
     // like.read/write required for like-tweet/unlike-tweet actions.
     // bookmark.read/write required for bookmark/get-bookmarks actions.
+    // list.read required for list_owned_lists / get_list_members / get_list_tweets actions.
+    //   NOTE: adding this scope means X accounts connected BEFORE this change must be
+    //   reconnected to grant it — the list read handlers surface a clear reconnect
+    //   error (not a silent empty result) when the token lacks list.read.
     scopes: [
       'tweet.read',
       'tweet.write',
@@ -215,6 +219,7 @@ export const INTEGRATION_CONFIG = {
       'like.write',
       'bookmark.read',
       'bookmark.write',
+      'list.read',
       'dm.read',
       'dm.write',
       'block.read',

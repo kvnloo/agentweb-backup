@@ -214,7 +214,7 @@ codex: inspect failing tests in agentweb
 Example body:
 
 ```text
-codex: In /Users/ruiwang/Documents/GitHub/agentweb, run the test suite and fix the first failure. Do not push.
+codex: In /path/to/agentweb, run the test suite and fix the first failure. Do not push.
 ```
 
 ## Safety Notes

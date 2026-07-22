@@ -297,7 +297,7 @@ describe('Tier Migration', () => {
     });
 
     it('returns false for legitimate emails', () => {
-      expect(isBotEmail('ruiwangwarm@gmail.com')).toBe(false);
+      expect(isBotEmail('someuser@gmail.com')).toBe(false);
       expect(isBotEmail('test@example.com')).toBe(false);
       expect(isBotEmail('harsha@agentweb.pro')).toBe(false);
     });

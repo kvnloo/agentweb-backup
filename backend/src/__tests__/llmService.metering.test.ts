@@ -1,9 +1,11 @@
 /**
- * Tests for the shadow-metering integration in utils/llmService.ts:
+ * Tests for the metering integration in utils/llmService.ts:
  *  (a) extractUsage now surfaces cache_read / cache_creation token details
  *  (b) generate* accept an optional usageContext and existing call shapes still work
- *  (c) recordUsage is ALWAYS fired after a response (with or without onUsage),
- *      defaulting feature to 'unknown', and a recorder failure never breaks a call
+ *  (c) meterUserUsage is ALWAYS fired after a response (with or without onUsage),
+ *      defaulting feature to 'unknown', and a metering failure never breaks a call
+ *  (d) ENG-200: metering routes through meterUserUsage (not a bare recordUsage),
+ *      so a real userId charges the per-user cost cap; 'system' spend is absorbed
  */
 
 jest.mock('@langchain/openai', () => {
@@ -36,7 +38,7 @@ jest.mock('@aws-sdk/client-bedrock-runtime', () => ({
 }));
 
 jest.mock('../services/usageRecorderService', () => ({
-  recordUsage: jest.fn().mockResolvedValue(undefined),
+  meterUserUsage: jest.fn(),
 }));
 
 // Mock the Gemini SDK (dynamically imported inside generateJSONContentWithWebSearch).
@@ -47,10 +49,10 @@ jest.mock('@google/genai', () => ({
   })),
 }));
 
-import { recordUsage } from '../services/usageRecorderService';
+import { meterUserUsage } from '../services/usageRecorderService';
 import { LLMService } from '../utils/llmService';
 
-const mockRecordUsage = recordUsage as jest.Mock;
+const mockMeterUser = meterUserUsage as jest.Mock;
 const azureInvoke = (jest.requireMock('@langchain/openai') as any).__azureInvoke as jest.Mock;
 const bedrockInvoke = (jest.requireMock('@langchain/aws') as any).__bedrockInvoke as jest.Mock;
 
@@ -68,7 +70,7 @@ const aiMessage = (overrides: any = {}) => ({
 describe('llmService shadow metering', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockRecordUsage.mockResolvedValue(undefined);
+    mockMeterUser.mockReset();
     azureInvoke.mockResolvedValue(aiMessage());
     bedrockInvoke.mockResolvedValue(aiMessage());
   });
@@ -110,8 +112,8 @@ describe('llmService shadow metering', () => {
       const svc = new LLMService('gpt-4-test');
       await svc.generateRaw('sys', 'user');
 
-      expect(mockRecordUsage).toHaveBeenCalledTimes(1);
-      expect(mockRecordUsage).toHaveBeenCalledWith(
+      expect(mockMeterUser).toHaveBeenCalledTimes(1);
+      expect(mockMeterUser).toHaveBeenCalledWith(
         expect.objectContaining({
           model: 'gpt-4-test',
           provider: 'azure-openai',
@@ -133,7 +135,7 @@ describe('llmService shadow metering', () => {
         sessionId: 'sess-3',
       });
 
-      expect(mockRecordUsage).toHaveBeenCalledWith(
+      expect(mockMeterUser).toHaveBeenCalledWith(
         expect.objectContaining({ userId: 'user-9', feature: 'lead-magnet', sessionId: 'sess-3' })
       );
     });
@@ -150,7 +152,7 @@ describe('llmService shadow metering', () => {
 
       expect(result).toEqual({ ok: true });
       expect(onUsage).toHaveBeenCalledTimes(1);
-      expect(mockRecordUsage).toHaveBeenCalledWith(
+      expect(mockMeterUser).toHaveBeenCalledWith(
         expect.objectContaining({ userId: 'user-2', feature: 'workflow-gen' })
       );
     });
@@ -159,13 +161,13 @@ describe('llmService shadow metering', () => {
       azureInvoke.mockResolvedValue(aiMessage({ content: '{"a":1}' }));
       const svc = new LLMService('gpt-4-test');
       await svc.generateJsonRobust('sys', 'user');
-      expect(mockRecordUsage).toHaveBeenCalledTimes(1);
+      expect(mockMeterUser).toHaveBeenCalledTimes(1);
 
       azureInvoke.mockResolvedValue(
         aiMessage({ content: '<actual_html_content><html></html></actual_html_content>' })
       );
       await svc.generateHTML('sys', 'user');
-      expect(mockRecordUsage).toHaveBeenCalledTimes(2);
+      expect(mockMeterUser).toHaveBeenCalledTimes(2);
     });
 
     it('meters generateContent for both text and json formats', async () => {
@@ -176,7 +178,7 @@ describe('llmService shadow metering', () => {
         feature: 'content',
       });
       expect(text).toBe('plain text');
-      expect(mockRecordUsage).toHaveBeenCalledWith(
+      expect(mockMeterUser).toHaveBeenCalledWith(
         expect.objectContaining({ userId: 'user-3', feature: 'content' })
       );
     });
@@ -184,15 +186,38 @@ describe('llmService shadow metering', () => {
     it('uses provider "bedrock" for Claude models', async () => {
       const svc = new LLMService('anthropic.claude-sonnet-4-6');
       await svc.generateRaw('sys', 'user');
-      expect(mockRecordUsage).toHaveBeenCalledWith(
+      expect(mockMeterUser).toHaveBeenCalledWith(
         expect.objectContaining({ provider: 'bedrock', model: 'anthropic.claude-sonnet-4-6' })
+      );
+    });
+  });
+
+  describe('ENG-200: charges the per-user cap when a real user is attributable', () => {
+    it('routes through meterUserUsage (which charges), not a shadow-only recordUsage', async () => {
+      const svc = new LLMService('gpt-4-test');
+      await svc.generateRaw('sys', 'user', undefined, { userId: 'user-7', feature: 'enrichment' });
+      // meterUserUsage deducts from the cap whenever userId is present (org members
+      // resolve to the owner). Passing the real userId through IS the charge.
+      expect(mockMeterUser).toHaveBeenCalledTimes(1);
+      expect(mockMeterUser).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'user-7', feature: 'enrichment' })
+      );
+    });
+
+    it('still meters (burn-only, absorbed) when no userId is attributable — system spend', async () => {
+      const svc = new LLMService('gpt-4-test');
+      await svc.generateRaw('sys', 'user'); // no usageContext → no userId
+      // Fired with userId undefined → meterUserUsage records under "system" and does
+      // NOT deduct, so platform/background spend stays absorbed.
+      expect(mockMeterUser).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: undefined })
       );
     });
   });
 
   describe('fail-open (acceptance criterion: metering never breaks generation)', () => {
     it('returns the LLM response even when recordUsage throws synchronously', async () => {
-      mockRecordUsage.mockImplementation(() => {
+      mockMeterUser.mockImplementation(() => {
         throw new Error('recorder exploded');
       });
       const svc = new LLMService('gpt-4-test');
@@ -201,7 +226,7 @@ describe('llmService shadow metering', () => {
     });
 
     it('still invokes onUsage when the recorder fails', async () => {
-      mockRecordUsage.mockImplementation(() => {
+      mockMeterUser.mockImplementation(() => {
         throw new Error('recorder exploded');
       });
       const svc = new LLMService('gpt-4-test');
@@ -257,7 +282,7 @@ describe('llmService shadow metering', () => {
     it('records userId/sessionId undefined and feature "unknown" when usageContext is omitted', async () => {
       const svc = new LLMService('gpt-4-test');
       await svc.generateRaw('sys', 'user');
-      expect(mockRecordUsage).toHaveBeenCalledWith(
+      expect(mockMeterUser).toHaveBeenCalledWith(
         expect.objectContaining({
           userId: undefined,
           sessionId: undefined,
@@ -269,7 +294,7 @@ describe('llmService shadow metering', () => {
     it('defaults feature to "unknown" when usageContext present but feature omitted', async () => {
       const svc = new LLMService('gpt-4-test');
       await svc.generateRaw('sys', 'user', undefined, { userId: 'u1' });
-      expect(mockRecordUsage).toHaveBeenCalledWith(
+      expect(mockMeterUser).toHaveBeenCalledWith(
         expect.objectContaining({ userId: 'u1', feature: 'unknown', sessionId: undefined })
       );
     });
@@ -281,7 +306,7 @@ describe('llmService shadow metering', () => {
       const svc = new LLMService('gpt-4-test');
       const result = await svc.generateContent('sys', 'user', 'json', { feature: 'json-gen' });
       expect(result).toBe('{"k":"v"}');
-      expect(mockRecordUsage).toHaveBeenCalledWith(
+      expect(mockMeterUser).toHaveBeenCalledWith(
         expect.objectContaining({ feature: 'json-gen' })
       );
     });
@@ -295,7 +320,7 @@ describe('llmService shadow metering', () => {
       const out = await svc.generateJsonRobust('sys', 'user', onUsage, { feature: 'robust' });
       expect(out).toEqual({ good: true });
       expect(onUsage).toHaveBeenCalledTimes(1);
-      expect(mockRecordUsage).toHaveBeenCalledTimes(1);
+      expect(mockMeterUser).toHaveBeenCalledTimes(1);
     });
 
     it('retries once with a strict suffix when the first response is unparseable, then succeeds', async () => {
@@ -307,7 +332,7 @@ describe('llmService shadow metering', () => {
       expect(out).toEqual({ recovered: 1 });
       // Two invokes (original + strict retry); metered twice.
       expect(azureInvoke).toHaveBeenCalledTimes(2);
-      expect(mockRecordUsage).toHaveBeenCalledTimes(2);
+      expect(mockMeterUser).toHaveBeenCalledTimes(2);
       // Second call's system prompt must carry the strict suffix.
       const secondCallArgs = azureInvoke.mock.calls[1][0];
       const systemMsg = secondCallArgs[0];
@@ -491,7 +516,7 @@ describe('llmService shadow metering', () => {
       const svc = new LLMService('gemini-2.5-pro');
       const out = await svc.generateJSONContentWithWebSearch('sys', 'user', { feature: 'search' });
       expect(out).toEqual({ answer: 42 });
-      expect(mockRecordUsage).toHaveBeenCalledWith(
+      expect(mockMeterUser).toHaveBeenCalledWith(
         expect.objectContaining({
           provider: 'gemini',
           model: 'gemini-2.5-pro',
@@ -509,7 +534,7 @@ describe('llmService shadow metering', () => {
       const svc = new LLMService('gemini-2.5-flash');
       const out = await svc.generateJSONContentWithWebSearch('sys', 'user');
       expect(out).toEqual({ a: 1 });
-      expect(mockRecordUsage).toHaveBeenCalledWith(
+      expect(mockMeterUser).toHaveBeenCalledWith(
         expect.objectContaining({
           inputTokens: 0,
           outputTokens: 0,
@@ -566,7 +591,7 @@ describe('llmService shadow metering', () => {
       const svc = new LLMService('gpt-4-test');
       const out = await svc.generateJSONContentWithWebSearch('sys', 'user', { feature: 'web' });
       expect(out).toEqual({ city: 'sf' });
-      expect(mockRecordUsage).toHaveBeenCalledWith(
+      expect(mockMeterUser).toHaveBeenCalledWith(
         expect.objectContaining({
           provider: 'azure-openai',
           inputTokens: 50,
@@ -592,7 +617,7 @@ describe('llmService shadow metering', () => {
       const svc = new LLMService('gpt-4-test');
       const out = await svc.generateJSONContentWithWebSearch('sys', 'user');
       expect(out).toEqual({ part: 1 });
-      expect(mockRecordUsage).toHaveBeenCalledWith(
+      expect(mockMeterUser).toHaveBeenCalledWith(
         expect.objectContaining({ inputTokens: 0, outputTokens: 0 })
       );
     });
