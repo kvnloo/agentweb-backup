@@ -6705,12 +6705,16 @@ export class AgentModeService {
 
     } catch (error) {
       console.error('AgentMode: Error describing image:', error);
+      // This is a catch-all: besides bad image bytes it also receives transient
+      // network/provider failures that escaped the vision-call fallback flow. Do
+      // NOT hard-code retryable:false here (that would make the agent give up on a
+      // request that could succeed on retry) and do not assert the file itself is
+      // the problem — only the undecodable-bytes fast-fail above is truly terminal.
       return {
         success: false,
-        retryable: false,
         message:
-          'Failed to analyze the image. It may be inaccessible or in a format that cannot be read. ' +
-          'Please re-upload the logo as a PNG or JPEG and try again.',
+          'Failed to analyze the image. It may be temporarily unavailable, inaccessible, or in a ' +
+          'format that cannot be read. If it is a logo file, try re-uploading it as a PNG or JPEG.',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
