@@ -13,18 +13,77 @@
  *   without blocking the audio stream
  */
 
-import { GoogleGenAI, Modality, LiveServerMessage, Session, Transcription } from '@google/genai';
+import {
+  ActivityHandling,
+  EndSensitivity,
+  GoogleGenAI,
+  LiveServerMessage,
+  Modality,
+  Session,
+  StartSensitivity,
+  Transcription,
+} from '@google/genai';
 import { chatbotDb, ChatMessage } from './chatbotService';
 import { getSecret } from '../utils/secretsManager';
 import { agentModeService } from './agentModeService';
 import { meterUserUsage } from './usageRecorderService';
+import {
+  ONBOARDING_TELEMETRY_EVENTS,
+  recordOnboardingEvent,
+  recordOnboardingFailure,
+} from './onboardingTelemetry';
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 export const LIVE_MODEL = 'models/gemini-3.1-flash-live-preview';
-const LIVE_VOICE_NAME = 'Zephyr';
+const LIVE_VOICE_NAME = 'Kore';
+const LIVE_TOOL_TIMEOUT_MS = 12_000;
+const LIVE_TOOL_SUMMARY_TIMEOUT_MS = 5_000;
+export type LiveToolProfile = 'default' | 'onboarding';
+
+const ONBOARDING_LIVE_TOOLS = new Set([
+  'list_connected_accounts',
+  'connect_account',
+  'read_brand_guidelines',
+  'get_lead_lists',
+  'get_leads',
+  'search_leads',
+  'get_leads_needing_followup',
+  'analyze_crm_data',
+  'search_user_guide',
+  'search_knowledge_base',
+]);
+
+async function withLiveTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`${label} timed out after ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function stableToolExecutionKey(toolName: string, args: unknown): string {
+  const stableStringify = (value: unknown): string => {
+    if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+    if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object).sort().map((key) => (
+      `${JSON.stringify(key)}:${stableStringify(object[key])}`
+    )).join(',')}}`;
+  };
+  return `${toolName}:${stableStringify(args)}`;
+}
 
 /**
  * System prompt that instructs Gemini to use emotion tags for expressive TTS.
@@ -32,6 +91,7 @@ const LIVE_VOICE_NAME = 'Zephyr';
  * are interpreted by Gemini 3.1 Flash's voice director layer.
  */
 const LIVE_SYSTEM_PROMPT = `You are Emma, an expert marketing assistant having a voice conversation.
+Speak with a neutral General American English accent.
 Respond naturally and conversationally — keep answers concise and direct.
 Be warm and friendly, enthusiastic about good news, thoughtful when analyzing data, encouraging when motivating the user, and concerned when flagging problems.`;
 
@@ -64,10 +124,24 @@ interface LiveEntry {
   pendingArtifacts: LiveArtifact[];
   /** Tool call records for the current turn — surfaced in chat UI as collapsible "Used N tools" block */
   pendingToolCalls: Array<{ id: string; name: string; arguments: any; result?: any; error?: string; narrative?: string }>;
+  /** Session-scoped dedupe for potentially mutating tools, including executions still in flight. */
+  toolExecutions: Map<string, { promise: Promise<any>; settled: boolean }>;
   /** Latest resumption handle from Gemini — used to reconnect transparently after code 1000 close */
   resumptionHandle?: string;
   /** Cached function declarations so reconnects reuse the same tool config without reloading */
   functionDeclarations: any[];
+  /** Client-request to Gemini-ready latency anchor. */
+  startedAt: number;
+  /** Set after Gemini has accepted the setup configuration. */
+  readyAt?: number;
+  /** First assistant audio for this session, used to catch silent/stalled starts. */
+  firstAudioAt?: number;
+  /** First assistant audio for the current turn. Reset when the turn completes. */
+  currentTurnFirstAudioAt?: number;
+  /** Last user transcript/text timestamp, used for response-latency telemetry. */
+  lastUserActivityAt?: number;
+  /** Number of completed assistant turns in this live session. */
+  turnCount: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -205,13 +279,23 @@ function sanitizeSchema(schema: any): any {
  * Load and convert agent mode tools for this user into Gemini Live format.
  * Returns an empty array on error (voice still works without tools).
  */
-async function loadGeminiFunctionDeclarations(userId: string): Promise<any[]> {
+async function loadGeminiFunctionDeclarations(
+  userId: string,
+  toolProfile: LiveToolProfile,
+): Promise<any[]> {
   try {
+    // Subscription/foundation filtering remains the user capability boundary.
+    // The onboarding profile only narrows that already-authorized set.
     const rawTools = await agentModeService.getFilteredTools(userId);
-    const declarations = rawTools
+    const profileTools = toolProfile === 'onboarding'
+      ? rawTools.filter((tool) => ONBOARDING_LIVE_TOOLS.has(tool?.function?.name))
+      : rawTools;
+    const declarations = profileTools
       .map(toGeminiFunctionDeclaration)
       .filter((d): d is any => d !== null);
-    console.log(`[liveVoiceService] Loaded ${declarations.length}/${rawTools.length} tools for Gemini Live`);
+    console.log(
+      `[liveVoiceService] Loaded ${declarations.length}/${rawTools.length} tools for Gemini Live (${toolProfile})`,
+    );
     return declarations;
   } catch (err: any) {
     console.warn('[liveVoiceService] Failed to load tools for Gemini Live:', err?.message);
@@ -255,6 +339,18 @@ async function openGeminiSession(
       // Enable automatic transcription so transcripts are available in audio-only mode
       inputAudioTranscription: {},
       outputAudioTranscription: {},
+      // Harsha speaks in long, pause-heavy thoughts. Require sustained speech
+      // before barge-in and a full 1.2s pause before committing the turn.
+      realtimeInputConfig: {
+        automaticActivityDetection: {
+          disabled: false,
+          startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_LOW,
+          endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
+          prefixPaddingMs: 200,
+          silenceDurationMs: 1_200,
+        },
+        activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+      },
       // Wire in agent mode tools (sanitized for Gemini Live schema requirements)
       ...(entry.functionDeclarations.length > 0 ? { tools: [{ functionDeclarations: entry.functionDeclarations }] } : {}),
       // Request session resumption tokens so we can reconnect transparently after code 1000 closes
@@ -274,6 +370,12 @@ async function openGeminiSession(
         console.error(`[liveVoiceService] Gemini ERROR on session ${sessionId}:`, e.message, e);
         const currentEntry = activeSessions.get(sessionId);
         if (currentEntry) {
+          void recordOnboardingFailure(
+            currentEntry.userId,
+            ONBOARDING_TELEMETRY_EVENTS.voiceSessionFailed,
+            e.message,
+            { sessionId, source: 'gemini_error' },
+          );
           currentEntry.emitFn('live:error', { sessionId, error: e.message });
         }
       },
@@ -298,6 +400,12 @@ async function openGeminiSession(
 
         // Abnormal close or no handle — surface to client with reason
         activeSessions.delete(sessionId);
+        void recordOnboardingFailure(
+          currentEntry.userId,
+          ONBOARDING_TELEMETRY_EVENTS.voiceSessionFailed,
+          e.reason || `Gemini Live closed with code ${e.code}`,
+          { sessionId, source: 'gemini_close', closeCode: e.code },
+        );
         currentEntry.emitFn('live:closed', { sessionId, code: e.code, reason: e.reason });
       },
     },
@@ -375,8 +483,15 @@ export async function startLiveSession(
   sessionId: string,
   socketId: string,
   emitFn: EmitFn,
-  userId: string
+  userId: string,
+  toolProfile: LiveToolProfile = 'default',
 ): Promise<void> {
+  const startedAt = Date.now();
+  void recordOnboardingEvent(
+    userId,
+    ONBOARDING_TELEMETRY_EVENTS.voiceSessionStarted,
+    { sessionId },
+  );
   // Close any existing session for this sessionId
   if (activeSessions.has(sessionId)) {
     closeLiveSession(sessionId);
@@ -384,7 +499,7 @@ export async function startLiveSession(
 
   // Load tools and prior history in parallel
   const [functionDeclarations, historyContext] = await Promise.all([
-    loadGeminiFunctionDeclarations(userId),
+    loadGeminiFunctionDeclarations(userId, toolProfile),
     loadHistoryForSystemPrompt(sessionId),
   ]);
 
@@ -403,21 +518,34 @@ export async function startLiveSession(
     toolContextText: '',
     pendingArtifacts: [],
     pendingToolCalls: [],
+    toolExecutions: new Map(),
     functionDeclarations,
+    startedAt,
+    turnCount: 0,
   };
   activeSessions.set(sessionId, entry);
 
   // Pass history via system prompt on fresh starts. Code-1000 resumptions already
   // carry Gemini's own in-memory context, so historyContext is not passed there.
   await openGeminiSession(sessionId, entry, undefined, historyContext || undefined);
+  entry.readyAt = Date.now();
+  void recordOnboardingEvent(
+    userId,
+    ONBOARDING_TELEMETRY_EVENTS.voiceSessionReady,
+    { sessionId, readyLatencyMs: entry.readyAt - startedAt },
+  );
+  emitFn('live:ready', { sessionId });
 }
 
 /**
  * Send a base64-encoded audio chunk from the browser microphone to Gemini.
  * Uses sendRealtimeInput (streaming audio API) with the actual browser format (webm/opus).
  */
-export async function sendAudioChunk(sessionId: string, base64Chunk: string): Promise<void> {
+export async function sendAudioChunk(sessionId: string, base64Chunk: string, socketId: string): Promise<void> {
   const entry = getEntry(sessionId);
+  if (entry.socketId !== socketId) {
+    throw new Error(`No active live session for ${sessionId}`);
+  }
   if (!entry.session) return; // Gemini session still opening — drop chunk
   entry.session.sendRealtimeInput({
     audio: {
@@ -428,12 +556,36 @@ export async function sendAudioChunk(sessionId: string, base64Chunk: string): Pr
 }
 
 /**
+ * Flush a microphone stream that automatic VAD failed to commit. Gemini allows
+ * the stream to reopen when the next audio chunk arrives.
+ */
+export async function sendAudioStreamEnd(sessionId: string, socketId: string): Promise<void> {
+  const entry = getEntry(sessionId);
+  if (entry.socketId !== socketId) {
+    throw new Error(`No active live session for ${sessionId}`);
+  }
+  if (!entry.session) return;
+  entry.lastUserActivityAt = Date.now();
+  entry.session.sendRealtimeInput({ audioStreamEnd: true });
+  console.warn(`[liveVoiceService] Forced audio stream end for stalled turn ${sessionId}`);
+  void recordOnboardingEvent(
+    entry.userId,
+    ONBOARDING_TELEMETRY_EVENTS.voiceTurnRecovery,
+    { sessionId, turnNumber: entry.turnCount + 1 },
+  );
+}
+
+/**
  * Send a text message from the browser to Gemini (text-input mode when live model is active).
  */
-export async function sendTextTurn(sessionId: string, text: string): Promise<void> {
+export async function sendTextTurn(sessionId: string, text: string, socketId: string): Promise<void> {
   const entry = getEntry(sessionId);
+  if (entry.socketId !== socketId) {
+    throw new Error(`No active live session for ${sessionId}`);
+  }
   if (!entry.session) return; // Gemini session still opening
   entry.pendingUserText = text;
+  entry.lastUserActivityAt = Date.now();
   entry.session.sendClientContent({
     turns: [
       {
@@ -482,10 +634,14 @@ Tool arguments: ${argsJson}
 Tool result: ${resultJson}`;
 
   try {
-    const response = await agentModeService.callLLM(
-      ARTIFACT_EXTRACT_MODEL,
-      [{ role: 'user', content: prompt }],
-      { max_completion_tokens: 600, temperature: 0 },
+    const response = await withLiveTimeout(
+      agentModeService.callLLM(
+        ARTIFACT_EXTRACT_MODEL,
+        [{ role: 'user', content: prompt }],
+        { max_completion_tokens: 600, temperature: 0 },
+      ),
+      LIVE_TOOL_SUMMARY_TIMEOUT_MS,
+      `Live tool summary for ${toolName}`,
     );
     const text = (response as any)?.choices?.[0]?.message?.content?.trim() ?? '';
     const match = text.match(/\{[\s\S]*\}/);
@@ -514,9 +670,10 @@ Tool result: ${resultJson}`;
 /**
  * Close the Gemini Live session for the given sessionId.
  */
-export function closeLiveSession(sessionId: string): void {
+export function closeLiveSession(sessionId: string, socketId?: string): void {
   const entry = activeSessions.get(sessionId);
   if (!entry) return;
+  if (socketId && entry.socketId !== socketId) return;
   try {
     entry.session.close();
   } catch {
@@ -614,12 +771,45 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
   }
 
   const { emitFn } = entry;
+
+  if (message.serverContent?.interrupted) {
+    emitFn('live:interrupted', { sessionId });
+    void recordOnboardingEvent(
+      entry.userId,
+      ONBOARDING_TELEMETRY_EVENTS.voiceInterrupted,
+      { sessionId, turnNumber: entry.turnCount + 1 },
+    );
+  }
+
   const parts = message.serverContent?.modelTurn?.parts;
 
   if (parts) {
     for (const part of parts) {
       // Relay audio chunk to browser immediately (non-blocking)
       if (part.inlineData?.data) {
+        if (!entry.currentTurnFirstAudioAt) {
+          entry.currentTurnFirstAudioAt = Date.now();
+          const isSessionFirstAudio = !entry.firstAudioAt;
+          if (isSessionFirstAudio) entry.firstAudioAt = entry.currentTurnFirstAudioAt;
+          void recordOnboardingEvent(
+            entry.userId,
+            ONBOARDING_TELEMETRY_EVENTS.voiceFirstAudio,
+            {
+              sessionId,
+              turnNumber: entry.turnCount + 1,
+              isSessionFirstAudio,
+              startToFirstAudioMs: isSessionFirstAudio
+                ? entry.currentTurnFirstAudioAt - entry.startedAt
+                : 0,
+              readyToFirstAudioMs: isSessionFirstAudio
+                ? entry.currentTurnFirstAudioAt - (entry.readyAt ?? entry.startedAt)
+                : 0,
+              responseLatencyMs: entry.lastUserActivityAt
+                ? entry.currentTurnFirstAudioAt - entry.lastUserActivityAt
+                : 0,
+            },
+          );
+        }
         emitFn('live:audio', {
           sessionId,
           chunk: part.inlineData.data,
@@ -650,6 +840,7 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
   if (inputTranscript?.text) {
     console.log(`[liveVoiceService] inputTranscription for ${sessionId}: "${inputTranscript.text}"`);
     entry.pendingUserText += inputTranscript.text;
+    entry.lastUserActivityAt = Date.now();
     emitFn('live:user-transcript', { sessionId, text: inputTranscript.text });
   }
 
@@ -674,37 +865,76 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
     const responses: any[] = await Promise.all(
       functionCalls.map(async (fc) => {
         let responseContent: Record<string, unknown>;
+        const toolName = fc.name!;
+        const toolArgs = fc.args ?? {};
+        const isOnboardingSafe = ONBOARDING_LIVE_TOOLS.has(toolName);
         try {
-          const result = await agentModeService.executeTool(
-            LIVE_MODEL,
-            fc.name!,
-            fc.args ?? {},
-            entry.userId,
-            sessionId,
-            false,
+          let execution: Promise<any>;
+          if (isOnboardingSafe) {
+            execution = agentModeService.executeTool(
+              LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false,
+            );
+          } else {
+            const executionKey = stableToolExecutionKey(toolName, toolArgs);
+            let trackedExecution = entry.toolExecutions.get(executionKey);
+            if (!trackedExecution) {
+              trackedExecution = {
+                promise: Promise.resolve().then(() => agentModeService.executeTool(
+                  LIVE_MODEL, toolName, toolArgs, entry.userId, sessionId, false,
+                )),
+                settled: false,
+              };
+              trackedExecution.promise.then(
+                () => { trackedExecution!.settled = true; },
+                () => { trackedExecution!.settled = true; },
+              );
+              entry.toolExecutions.set(executionKey, trackedExecution);
+            }
+            execution = trackedExecution.promise;
+          }
+          const result = await withLiveTimeout(
+            execution,
+            LIVE_TOOL_TIMEOUT_MS,
+            `Live tool ${toolName}`,
           );
           const text = typeof result === 'string' ? result : JSON.stringify(result);
           responseContent = { result: text };
           // Append tool result to separate context (saved to DynamoDB for LLM context,
           // but NOT included in the assistant chat bubble shown to the user)
-          entry.toolContextText += `\n[Tool: ${fc.name}]\n${text}`;
+          entry.toolContextText += `\n[Tool: ${toolName}]\n${text}`;
           // Summarize result in natural language and extract artifacts in one LLM call
           if (!entry.pendingArtifacts) entry.pendingArtifacts = [];
           const seenUrls = new Set(entry.pendingArtifacts.map(a => a.url));
           const resultObj = typeof result === 'object' && result !== null
             ? result as Record<string, unknown>
             : { result: text };
-          const narrative = await summarizeToolResult(fc.name!, fc.args ?? {}, resultObj, seenUrls, entry.pendingArtifacts);
+          const narrative = await summarizeToolResult(toolName, toolArgs, resultObj, seenUrls, entry.pendingArtifacts);
           // Record for UI display (collapsible "Used N tools" block, like other models)
           if (!entry.pendingToolCalls) entry.pendingToolCalls = [];
-          entry.pendingToolCalls.push({ id: fc.id || fc.name!, name: fc.name!, arguments: fc.args ?? {}, result, narrative });
+          entry.pendingToolCalls.push({ id: fc.id || toolName, name: toolName, arguments: toolArgs, result, narrative });
         } catch (err: any) {
-          console.error(`[liveVoiceService] Tool "${fc.name}" failed:`, err?.message);
-          responseContent = { error: err?.message ?? 'Tool execution failed' };
-          if (!entry.pendingToolCalls) entry.pendingToolCalls = [];
-          entry.pendingToolCalls.push({ id: fc.id || fc.name!, name: fc.name!, arguments: fc.args ?? {}, error: err?.message ?? 'Tool execution failed' });
+          const message = err?.message ?? 'Tool execution failed';
+          const isStillRunning = !isOnboardingSafe && /timed out/i.test(message);
+          if (isStillRunning) {
+            responseContent = {
+              status: 'in_progress',
+              message: `${toolName} is still running. Do not retry this action.`,
+            };
+            if (!entry.pendingToolCalls) entry.pendingToolCalls = [];
+            entry.pendingToolCalls.push({
+              id: fc.id || toolName,
+              name: toolName,
+              arguments: toolArgs,
+              result: responseContent,
+            });
+          } else {
+            console.error(`[liveVoiceService] Tool "${toolName}" failed:`, message);
+            responseContent = { error: message };
+            if (!entry.pendingToolCalls) entry.pendingToolCalls = [];
+            entry.pendingToolCalls.push({ id: fc.id || toolName, name: toolName, arguments: toolArgs, error: message });
+          }
         }
-        return { id: fc.id, name: fc.name!, response: responseContent } as any;
+        return { id: fc.id, name: toolName, response: responseContent } as any;
       })
     );
 
@@ -724,6 +954,18 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
     const rawArtifacts: LiveArtifact[] = entry.pendingArtifacts ?? [];
     const artifacts = rawArtifacts.length > 0 ? [...rawArtifacts] : undefined;
     const toolCalls = (entry.pendingToolCalls ?? []).length > 0 ? [...entry.pendingToolCalls] : undefined;
+    entry.turnCount += 1;
+    void recordOnboardingEvent(
+      entry.userId,
+      ONBOARDING_TELEMETRY_EVENTS.voiceTurnCompleted,
+      {
+        sessionId,
+        turnNumber: entry.turnCount,
+        userCharacters: userText.length,
+        assistantCharacters: assistantText.length,
+        usedTools: Boolean(toolCalls?.length),
+      },
+    );
 
     // Reset for next turn before async work
     entry.currentTurnText = '';
@@ -731,6 +973,11 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
     entry.toolContextText = '';
     entry.pendingArtifacts = [];
     entry.pendingToolCalls = [];
+    for (const [executionKey, execution] of entry.toolExecutions) {
+      if (execution.settled) entry.toolExecutions.delete(executionKey);
+    }
+    entry.currentTurnFirstAudioAt = undefined;
+    entry.lastUserActivityAt = undefined;
 
     // Append artifact markdown to the assistant message so it persists in DynamoDB
     // and survives any subsequent session reload — no client-side re-apply needed.

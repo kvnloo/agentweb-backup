@@ -26,6 +26,18 @@ import { createRevisionExecutionFromSlack } from "../controllers/tasks";
 import { isSessionLimitError } from "../utils/agentModeErrors";
 import { sendAgentModeOncallAlert } from "../utils/agentModeAlerts";
 import { getEmmaBotUserId, handleLoopApprovalReaction } from "../services/loopSlackApprovalDispatcher";
+import { renderCitationMarkers } from "../utils/citations";
+
+// ENG-351: resolve Emma's {{cite:N}} markers to Slack-clickable source links. The citation metadata
+// rides on the response's last assistant message; render as markdown links, which postThreadResponse's
+// markdown→mrkdwn converter turns into "<url|Source>". Falls back to stripping when no citations.
+function citeForSlack(response: any): string {
+  const content: string = response?.content || '';
+  const citations = [...(response?.responseMessages || [])]
+    .reverse()
+    .find((m: any) => m?.role === 'assistant')?.metadata?.citations;
+  return renderCitationMarkers(content, Array.isArray(citations) ? citations : [], 'markdown');
+}
 
 const router = express.Router();
 
@@ -387,7 +399,7 @@ async function handleSlackSessionResponse(params: {
 
     // Post Emma's response to the Slack thread
     if (response.content) {
-      await postThreadResponse(channel, ts, response.content);
+      await postThreadResponse(channel, ts, citeForSlack(response));
     } else {
       // Generation succeeded but produced no text content — log and post a fallback so the
       // user gets feedback instead of silence. This can happen when the LLM returns only tool
@@ -1020,7 +1032,7 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               try {
                 const response = await generateSessionResponse(sessionId, formattedMessage, userId, llmModel, attachments);
                 if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
-                if (response.content) await postThreadResponse(channel, threadTs, response.content);
+                if (response.content) await postThreadResponse(channel, threadTs, citeForSlack(response));
               } catch (genError) {
                 console.error('❌ Error generating thread response:', genError);
                 if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);

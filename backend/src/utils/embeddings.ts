@@ -1,4 +1,4 @@
-import { getOpenAIClient } from './llmClients';
+import { getOpenAIClient, meterUsageFromResponse } from './llmClients';
 
 /**
  * Lightweight embeddings helper, intentionally free of AWS / secrets-manager side effects
@@ -26,8 +26,9 @@ const embeddingsClientOptions = {
  * Embed arbitrary text. Returns null on empty input or any failure, so callers can degrade
  * gracefully (e.g. fall back to recency-based retrieval) instead of failing the request.
  *
- * `meterCtx` is shadow-metering attribution only (Ship 1): when omitted, usage is
- * recorded under userId "system". It never affects the embedding call itself.
+ * `meterCtx` attributes the embedding spend: with a real userId it is charged to
+ * that user's cap (tokens + cost); with no userId it is absorbed under "system"
+ * (ENG-200). It never affects the embedding call itself.
  */
 export async function embedText(
   text: string,
@@ -35,15 +36,23 @@ export async function embedText(
 ): Promise<number[] | null> {
   try {
     if (!text || !text.trim()) return null;
+    const model = process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT || 'text-embedding-3-large';
+    // Un-metered client + explicit meter below so the spend is CHARGED (not just
+    // recorded) when a userId is present. metered:false avoids double-recording.
     const embeddingsClient = getOpenAIClient(
       { userId: meterCtx?.userId, feature: meterCtx?.feature || 'embeddings' },
       embeddingsClientOptions,
+      { metered: false },
     );
     const response = await embeddingsClient.embeddings.create({
-      model: `${process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT}`,
+      model,
       input: text,
       dimensions: 1536,
     });
+    meterUsageFromResponse(
+      { userId: meterCtx?.userId, model, provider: 'azure-openai', feature: meterCtx?.feature || 'embeddings' },
+      response,
+    );
     return response.data[0].embedding;
   } catch (error) {
     console.error('[embedText] Failed to embed text:', error);
