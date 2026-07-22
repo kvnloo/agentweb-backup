@@ -1187,7 +1187,11 @@ Schedule ID: ${scheduleId}
   ) {
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-      const openUrl = `${customerFrontendUrl}/agent-mode${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ''}`;
+      // Deep-link must use the PATH form `/agent-mode/<sessionId>` — the customer
+      // portal reads the session id from the route param (useParams), NOT from a
+      // `?sessionId=` query, so the query form would open a blank chat and the
+      // "Open chat to decide" button would dead-end away from the parked question.
+      const openUrl = `${customerFrontendUrl}/agent-mode${sessionId ? `/${encodeURIComponent(sessionId)}` : ''}`;
       const currentDate = new Date().toLocaleDateString('en-US', {
         year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
       });
