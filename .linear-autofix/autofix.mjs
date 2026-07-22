@@ -112,6 +112,10 @@ export function issueCommentsText(issue) {
 // stay in sync. `mcp` adds a strict MCP config (browser-verify only).
 export function claudeArgs({ model, maxTurns, mcp, skipPermissions = config.skipPermissions }) {
   const a = ['-p', '--output-format', 'json', '--model', model, '--max-turns', String(maxTurns)];
+  // Never stamp a "Co-Authored-By: Claude" / "Generated with Claude Code" trailer on commits or PRs —
+  // every fix is attributed SOLELY to the issue's assignee. This setting is the deterministic control
+  // (the prompt files also forbid it, but this removes it at the source regardless of the model).
+  a.push('--settings', '{"includeCoAuthoredBy":false}');
   if (mcp) a.push('--mcp-config', mcp, '--strict-mcp-config');
   if (skipPermissions) a.push('--dangerously-skip-permissions');
   else a.push('--permission-mode', 'acceptEdits');

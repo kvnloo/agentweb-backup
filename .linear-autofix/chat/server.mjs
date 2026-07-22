@@ -594,6 +594,9 @@ function handleEvents(identifier, req, res) {
 function chatArgs(cap, sessionId, modelOverride) {
   const m = CHAT[cap] || {};
   const a = ['-p', '--output-format', 'stream-json', '--verbose', '--model', modelOverride || m.model, '--max-turns', String(m.maxTurns)];
+  // Never stamp a "Co-Authored-By: Claude" / "Generated with Claude Code" trailer on commits or PRs the
+  // chat agent opens — commits are attributed solely to the issue's assignee (same as the pipeline).
+  a.push('--settings', '{"includeCoAuthoredBy":false}');
   if (cap === 'readOnly') a.push('--allowedTools', (m.allowedTools || []).join(','));
   else {
     a.push('--dangerously-skip-permissions');
