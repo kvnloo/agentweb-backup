@@ -13,6 +13,7 @@
  */
 import axios from 'axios';
 import Stripe from 'stripe';
+import { createStripeClient } from './stripeClientFactory';
 import { User, userDb } from './db';
 import { decryptConnectToken, encryptConnectToken, redactToken } from '../utils/stripeConnectCrypto';
 
@@ -184,8 +185,7 @@ export function getClientForUser(user: Partial<User> | null | undefined): Stripe
     console.warn('[StripeConnect] getClientForUser: STRIPE_SECRET_KEY not set');
     return null;
   }
-  return new Stripe(secret, {
-    apiVersion: '2025-05-28.basil' as any,
+  return createStripeClient(secret, {
     stripeAccount: user.stripeConnectedAccountId,
   });
 }

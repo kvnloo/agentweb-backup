@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { providerLabel } from './crmSenderTypes';
 import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
@@ -7,10 +8,17 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
-import { rankMemoriesByRelevance } from '../utils/memoryRanking';
+import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { computeTermination } from './agentMode/core/agentStep';
+import {
+  downloadBrandLogoToS3,
+  getPersistedBrandLogoUrlForUser,
+  missingBrandLogoToolResult,
+  promptCreatesLogo,
+  promptRequestsLogo,
+} from './agentMode/brandLogo';
 import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
@@ -30,9 +38,14 @@ import { skillService } from './skillService';
 import { extractVariables } from '../utils/templateParser';
 import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
-import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
-import { recordUsage } from './usageRecorderService';
+import { meterUserUsage } from './usageRecorderService';
+import { meterUsageFromResponse } from '../utils/llmClients';
+import {
+  getModelPrice,
+  imageGenerationCostUsd,
+  videoGenerationCostUsd,
+} from '../utils/llmPricing';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
 import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmMutationEvents';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
@@ -42,6 +55,7 @@ import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
 import { SearchResultSource } from '../search/searchProvider';
+import { CitationRegistry } from '../utils/citations';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -104,15 +118,69 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
   return undefined;
 }
 const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
-import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
+
+// Max output tokens for agent-mode LLM turns. Must be large enough to hold a
+// single big tool-call argument (e.g. create_html_file's content_draft, which
+// can be a 30-40K char / ~10-13K token HTML document). The previous 12384 cap
+// truncated such tool calls mid-argument; the provider then returned a tool_use
+// block with content_draft missing, which the gateway rejected as "Missing
+// required argument content_draft", looping until the anti-loop breaker tripped
+// (ENG-403). 32000 is within every supported Bedrock/Vertex Claude model's
+// output ceiling. Models only emit what they need, so raising the cap does not
+// increase normal-turn cost.
+export const AGENT_MODE_MAX_OUTPUT_TOKENS = 32000;
+
+// Max size of a NON-HTML content_draft that create_html_file will attempt to
+// render into HTML in a single internal LLM call. The render (llmService
+// generateHTML) has a hard 5-minute per-call Bedrock timeout, retried 3x — an
+// oversized rough draft can't finish inside that budget and burns ~15 min before
+// failing (ENG-472). Above this we fail fast with actionable guidance instead.
+// Already-complete HTML drafts bypass the render entirely (see
+// isCompleteHtmlDocument) and are NOT subject to this cap.
+export const CREATE_HTML_RENDER_MAX_DRAFT_CHARS = 60000;
+
+// A create_html_file content_draft that is already a complete HTML document does
+// not need the internal HTML-generation LLM call — re-rendering HTML->HTML is
+// wasted cost/latency, risks the model altering the user's content, and is the
+// exact case that deterministically times out on large drafts (ENG-472). Detect
+// a self-contained document: an opening doctype/<html> AND a closing </html>.
+export function isCompleteHtmlDocument(draft: string): boolean {
+  if (typeof draft !== 'string') return false;
+  const s = draft.trim().toLowerCase();
+  const hasOpen = s.startsWith('<!doctype html') || s.startsWith('<html') || s.includes('<html');
+  const hasClose = s.includes('</html>');
+  return hasOpen && hasClose;
+}
+import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { twitterService } from './twitterService';
+import { describeXApiError } from '../utils/twitterErrors';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
+import { preflightTrackingGate } from './googleAdsTrackingPreflight';
 import { HubSpotService } from './hubspotService';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
+import { computeRunVerdict } from '../loops/instances/agent-mode/runRecorder';
+// OTel spine (ENG-141) — inert no-ops unless exporter env config is present.
+import {
+  endChatSpan,
+  endInvokeAgentSpan,
+  getRunTraceId,
+  recordSpanError,
+  startInvokeAgentSpan,
+  startRunChildSpan,
+} from '../observability/tracing';
+import {
+  ATTR_GEN_AI_OPERATION_NAME,
+  ATTR_GEN_AI_PROVIDER_NAME,
+  ATTR_GEN_AI_REQUEST_MODEL,
+  ATTR_SESSION_ID,
+  GEN_AI_OP_CHAT,
+  SPAN_CHAT_PREFIX,
+  providerForModel,
+} from '../observability/semconv';
 import {
   AgentToolPolicyDecision,
   executeAgentToolThroughGateway,
@@ -143,7 +211,8 @@ import {
   ALLOWED_DATE_PRESETS,
   META_OBJ_GOAL_MAP,
   META_GOAL_BILLING_MAP,
-  META_GOAL_BID_STRATEGY_MAP
+  META_GOAL_BID_STRATEGY_MAP,
+  META_WEBSITE_OPTIMIZATION_GOALS
 } from '../utils/metaConstants';
 
 // Initialize Azure OpenAI client for direct chat completion (same as blog.ts)
@@ -259,15 +328,29 @@ function recordAgentModeRunStarted(
   runId: string,
   info: { llmModel?: string; sessionType?: string; userId?: string; sessionId?: string },
 ): void {
+  // OTel spine (ENG-141): the invoke_agent span opens here and closes in
+  // recordAgentModeRunCompleted/Failed — the run-telemetry lifecycle exactly.
+  // The traceId is bridged into the recorder's agent_run_started dimensions so
+  // Dev-AW-LoopEvents rows can be joined to Langfuse/Okareo traces by ID.
+  startInvokeAgentSpan(runId, info);
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
-  void recorder.runStarted(runId, info);
+  const traceId = getRunTraceId(runId);
+  void recorder.runStarted(runId, traceId ? { ...info, traceId } : info);
 }
 
 function recordAgentModeRunCompleted(
   runId: string,
   info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string; claimMismatch?: boolean },
 ): void {
+  endInvokeAgentSpan(runId, {
+    verdict: computeRunVerdict({
+      failed: false,
+      toolCalls: info.toolCalls ?? 0,
+      failedToolCalls: info.failedToolCalls ?? 0,
+      maxSameToolFailures: info.maxSameToolFailures,
+    }).verdict,
+  });
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runCompleted(runId, info);
@@ -295,6 +378,7 @@ function recordAgentModeRunFailed(
   runId: string,
   info: { error: unknown; toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
 ): void {
+  endInvokeAgentSpan(runId, { verdict: 'failed', error: info.error });
   const recorder = getAgentRunRecorderSafe();
   if (!recorder) return;
   void recorder.runFailed(runId, info);
@@ -656,6 +740,19 @@ function buildFindReason(filters: {
   return joined.length > 200 ? joined.slice(0, 197) + '...' : joined;
 }
 
+/**
+ * ENG-182: extract a LinkedIn public identifier from a profile URL, e.g.
+ * "https://www.linkedin.com/in/chang-liu?miniProfileUrn=..." -> "chang-liu".
+ * Strips query string, fragment, trailing slash and casing so it matches the
+ * public id the sent-invitation cache is keyed on. Returns null for anything
+ * that isn't a /in/{id} profile URL (e.g. a raw provider_id).
+ */
+function linkedInPublicIdFromUrl(url: string | undefined | null): string | null {
+  if (!url || typeof url !== 'string') return null;
+  const match = url.trim().toLowerCase().match(/\/in\/([^/?#]+)/);
+  return match ? match[1] : null;
+}
+
 
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
@@ -761,7 +858,7 @@ export class AgentModeService {
         description:
           'Access meeting recordings, transcripts, and action items from Fathom. ' +
           'Requires a connected Fathom account (Settings → Connected Accounts).',
-        toolNames: ['fathom_get_meetings', 'fathom_get_transcript'],
+        toolNames: ['fathom_get_meetings', 'fathom_get_transcript', 'fathom_get_onboarding_context'],
         category: 'tool_bundle',
       },
       {
@@ -1558,7 +1655,7 @@ export class AgentModeService {
 
                 const body: any = {
                   anthropic_version: 'vertex-2023-10-16',
-                  max_tokens: params.max_completion_tokens || 12384,
+                  max_tokens: params.max_completion_tokens || AGENT_MODE_MAX_OUTPUT_TOKENS,
                   messages: merged,
                 };
                 if (systemParts.length > 0) body.system = systemParts.join('\n');
@@ -1622,14 +1719,26 @@ export class AgentModeService {
                 }
 
                 const usage = data.usage || {};
+                // A max_tokens stop with a tool_use block means the tool call
+                // was truncated mid-argument (e.g. create_html_file's large
+                // content_draft), so its JSON is incomplete and would fail
+                // schema validation with a dropped required arg — the ENG-403
+                // "content_draft is required" retry loop. Do NOT surface it as a
+                // completed tool_calls finish; report finish_reason='length'
+                // with no tool_calls so the main loop's max-tokens continuation
+                // path asks the model to continue.
+                const truncatedToolCall = data.stop_reason === 'max_tokens' && !!toolCalls;
                 return {
                   choices: [{
                     message: {
                       role: 'assistant',
                       content: messageContent || null,
-                      ...(toolCalls && { tool_calls: toolCalls }),
+                      ...(toolCalls && !truncatedToolCall && { tool_calls: toolCalls }),
                     },
-                    finish_reason: data.stop_reason === 'tool_use' ? 'tool_calls' : 'stop',
+                    finish_reason: data.stop_reason === 'max_tokens'
+                      ? 'length'
+                      : (data.stop_reason === 'tool_use' ? 'tool_calls' : 'stop'),
+                    stop_reason: data.stop_reason,
                   }],
                   usage: {
                     prompt_tokens: usage.input_tokens || 0,
@@ -1764,7 +1873,7 @@ export class AgentModeService {
               messages,
               ...(toolConfig && { toolConfig }),
               inferenceConfig: {
-                maxTokens: params.max_completion_tokens || 12384,
+                maxTokens: params.max_completion_tokens || AGENT_MODE_MAX_OUTPUT_TOKENS,
                 ...(params.temperature !== undefined && { temperature: params.temperature }),
               },
             });
@@ -1816,6 +1925,15 @@ export class AgentModeService {
 
             const stopReason: string = response.stopReason || '';
 
+            // A max_tokens stop with a tool_use block means the tool call was
+            // truncated mid-argument (e.g. create_html_file's content_draft),
+            // so its JSON is incomplete and would fail schema validation with a
+            // dropped required arg — the ENG-403 "content_draft is required"
+            // retry loop. Do NOT surface it as a completed tool_calls finish;
+            // report finish_reason='length' with no tool_calls so the main
+            // loop's max-tokens continuation path asks the model to continue.
+            const truncatedToolCall = stopReason === 'max_tokens' && !!toolCalls;
+
             // Convert response to OpenAI format
             return {
               id: `bedrock-${Date.now()}`,
@@ -1827,9 +1945,9 @@ export class AgentModeService {
                 message: {
                   role: 'assistant',
                   content: messageContent,
-                  tool_calls: toolCalls,
+                  tool_calls: truncatedToolCall ? null : toolCalls,
                 },
-                finish_reason: toolCalls ? 'tool_calls' : (stopReason === 'max_tokens' ? 'length' : 'stop'),
+                finish_reason: stopReason === 'max_tokens' ? 'length' : (toolCalls ? 'tool_calls' : 'stop'),
                 stop_reason: stopReason || (toolCalls ? 'tool_use' : 'end_turn'),
               }],
               usage: {
@@ -2165,6 +2283,77 @@ export class AgentModeService {
     return blocks.length > 0 ? blocks : [{ type: 'text', text: '.' }];
   }
 
+  /** Media types the Anthropic Messages / Bedrock Converse vision APIs decode natively. */
+  private static readonly VISION_NATIVE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+  /**
+   * Ensure an image buffer is in a format the vision APIs can actually decode, and
+   * that the returned content-type matches the real bytes (ENG-370).
+   *
+   * Uploaded logos frequently arrive as either (a) a format Claude/Bedrock cannot
+   * read — HEIC, AVIF, TIFF, BMP, SVG — or (b) a supported format mislabeled by S3
+   * with a generic/incorrect content-type (commonly `application/octet-stream` when
+   * the browser omits it). Both used to fail silently: the downstream block
+   * converters relabel an unknown type to `image/jpeg` WITHOUT re-encoding, so the
+   * declared media type no longer matches the bytes and the API returns 400; and a
+   * non-`image/*` content-type produced a data URI the `image/` regex dropped
+   * entirely, so the model never saw the image. describe_image would then burn many
+   * retries/workarounds and still fail.
+   *
+   * This decodes the actual bytes with sharp: if they are already a native format it
+   * just corrects the label (no re-encode); otherwise it re-encodes to PNG so the
+   * bytes always match a supported media type. Animated inputs (animated AVIF/HEIC)
+   * re-encode to their first frame — enough to describe a logo.
+   *
+   * On a decode failure it returns the input unchanged (best effort) but sets
+   * `undecodable: true` so the caller can fast-fail with re-upload guidance instead
+   * of burning vision retries on bytes no vision API can read either (ENG-370).
+   */
+  private static async normalizeImageForVision(
+    buffer: Buffer,
+    contentType: string
+  ): Promise<{ buffer: Buffer; contentType: string; undecodable?: boolean; detectedFormat?: string }> {
+    let ct = (contentType || '').toLowerCase().trim();
+    if (ct === 'image/jpg') ct = 'image/jpeg';
+    if (AgentModeService.VISION_NATIVE_MEDIA_TYPES.has(ct)) {
+      return { buffer, contentType: ct };
+    }
+    try {
+      const sharp = (await import('sharp')).default;
+      const metadata = await sharp(buffer).metadata();
+      const sharpFormatToMedia: Record<string, string> = {
+        jpeg: 'image/jpeg',
+        png: 'image/png',
+        gif: 'image/gif',
+        webp: 'image/webp',
+      };
+      const detected = metadata.format ? sharpFormatToMedia[metadata.format] : undefined;
+      if (detected) {
+        // Bytes are already vision-native; only the content-type header was wrong/missing.
+        return { buffer, contentType: detected, detectedFormat: metadata.format };
+      }
+      // Genuinely unsupported encoding (heic/heif/avif/tiff/bmp/svg/...). Convert to PNG.
+      // sharp(buffer) reads only the first frame by default, so animated inputs
+      // collapse to a single describable frame here (no `{ animated: true }`).
+      const png = await sharp(buffer).png().toBuffer();
+      console.log(
+        `AgentMode: normalizeImageForVision converted "${ct || 'unknown'}" (sharp format "${metadata.format}") to image/png, ${png.length} bytes`
+      );
+      return { buffer: png, contentType: 'image/png', detectedFormat: metadata.format };
+    } catch (err) {
+      console.error(
+        'AgentMode: normalizeImageForVision failed to decode/convert image; using original:',
+        err instanceof Error ? err.message : err
+      );
+      // sharp could not decode the bytes at all — a corrupt file or a codec even
+      // sharp lacks. The vision APIs decode a strict subset of what sharp handles,
+      // so they cannot read it either. Flag it undecodable so the caller fast-fails.
+      // Only fall back to a native default when we have no usable label at all, so a
+      // missing/empty content-type never yields a `data:;base64,...` URI (ENG-370).
+      return { buffer, contentType: contentType || 'image/png', undecodable: true };
+    }
+  }
+
   private llmModels: Record<string, LLMModelConfig> = {
     // List openai models - create client dynamically for each deployment
     // Azure OpenAI enforces a 128-tool limit per request
@@ -2365,7 +2554,12 @@ export class AgentModeService {
         try {
           const usage: any = (res as any)?.usage;
           if (usage) {
-            void recordUsage({
+            // ENG-200: meter the main agent turn — record shadow burn AND charge
+            // the per-user cost cap when a real user is attributable (org members
+            // resolve to the owner). Cost (incl. cache tokens) is computed once
+            // here; no separate deduction path exists for this call, so this is
+            // the single charge point. No userId → burn-only "system" record.
+            meterUserUsage({
               userId: usageContext?.userId,
               sessionId: usageContext?.sessionId,
               model,
@@ -2431,41 +2625,21 @@ export class AgentModeService {
    * Prices are per 1M tokens (input/output).
    */
   private estimateCost(model: string, inputTokens: number, outputTokens: number, cacheReadTokens: number = 0, cacheWriteTokens: number = 0): number {
-    // Pricing per 1M tokens: [input, output]
-    const pricing: Record<string, [number, number]> = {
-      'anthropic.claude-sonnet-4-5-20250929-v1:0': [3, 15],
-      'anthropic.claude-sonnet-4-6': [3, 15],
-      'anthropic.claude-opus-4-6-v1': [15, 75],
-      'anthropic.claude-opus-4-8': [15, 75],
-      'gpt-5-chat-2': [2.5, 10],
-      'gpt-5.2-chat': [3, 12],
-      'gemini-3-pro-preview': [1.25, 10],
-      'gemini-3-flash-preview': [0.15, 0.6],
-      'gemini-3.1-pro-preview': [1.25, 10],
-      'gemini-3.1-flash-lite': [0.075, 0.3],
-      'gemini-3.5-flash': [0.15, 0.6],
-    };
-    const [inputPrice, outputPrice] = pricing[model] || [3, 15]; // Default to Sonnet pricing
-    // Cache reads are 10% of input price; cache writes are 125% of input price
-    const cacheReadPrice = inputPrice * 0.1;
-    const cacheWritePrice = inputPrice * 1.25;
+    // Single source of truth for rates: llmPricing.MODEL_PRICING (via getModelPrice).
+    // Unknown models fall back to Sonnet pricing here, preserving long-standing behavior.
+    const price = getModelPrice(model);
+    const inputPrice = price?.inPerM ?? 3;
+    const outputPrice = price?.outPerM ?? 15;
+    // Cache reads are 10% of input price; cache writes are 125% of input price.
+    const cacheReadPrice = price?.cacheReadPerM ?? inputPrice * 0.1;
+    const cacheWritePrice = price?.cacheWritePerM ?? inputPrice * 1.25;
     return (inputTokens * inputPrice + outputTokens * outputPrice
       + cacheReadTokens * cacheReadPrice + cacheWriteTokens * cacheWritePrice) / 1_000_000;
   }
 
-  /** Cost per image generation in USD (fixed per-generation pricing). */
+  /** Cost per image generation in USD (fixed per-generation pricing, sourced from llmPricing). */
   private estimateImageGenerationCost(model: string): number {
-    const pricing: Record<string, number> = {
-      'gpt-image-1': 0.04,
-      'gpt-image-2': 0.04,
-      'gemini-2.5-flash-image': 0.039,
-      'gemini-3-pro-image-preview': 0.039,
-      'gemini-3.1-flash-image': 0.039,
-      'gemini-3.1-flash-image-preview': 0.039,
-      'gen4_image': 0.05,
-      'gemini_2.5_flash': 0.04,
-    };
-    return pricing[model] ?? 0.04;
+    return imageGenerationCostUsd(model);
   }
 
   private isRetryableMediaToolError(error: unknown): boolean {
@@ -2521,28 +2695,21 @@ export class AgentModeService {
 
   /** Cost per video generation in USD. Veo bills per 8s clip, so longer videos cost proportionally more. */
   private estimateVideoGenerationCost(model: string, durationSeconds?: number): number {
-    const pricePerClip: Record<string, number> = {
-      'veo-3.1-generate-preview': 2.80,
-      'veo-3.1-fast-generate-preview': 1.40,
-      // Higgsfield Seedance — approximate per-clip cost; adjust to match billed Higgsfield rates.
-      'seedance-2.0': 0.50,
-    };
-    const clipPrice = pricePerClip[model] ?? 2.80;
-    const VEO_MAX_SECONDS = 8;
-    const clipCount = durationSeconds && durationSeconds > VEO_MAX_SECONDS
-      ? Math.ceil(durationSeconds / VEO_MAX_SECONDS)
-      : 1;
-    return clipPrice * clipCount;
+    // Per-clip rates sourced from llmPricing (single source of truth).
+    return videoGenerationCostUsd(model, durationSeconds);
   }
 
-  /** Returns an onUsage callback that records LLM token usage for a named tool. */
-  private makeToolUsageCallback(userId: string, sessionId: string | undefined, toolName: string): (usage: LLMUsageData) => void {
+  /**
+   * Returns an onUsage callback that attributes a tool's LLM cost to the session
+   * for per-tool cost display. It does NOT deduct from the per-user cap: the
+   * deduction happens once at the metering chokepoint (llmService.meterUsage,
+   * which these tools call via generateHTML/generateJSONContent). Charging here
+   * too would double-charge content-gen tools (ENG-200).
+   */
+  private makeToolUsageCallback(sessionId: string | undefined, toolName: string): (usage: LLMUsageData) => void {
     return (usage) => {
-      const cost = this.estimateCost(usage.model, usage.inputTokens, usage.outputTokens);
-      incrementUserTokenUsage(userId, usage.totalTokens, cost).catch((err) =>
-        console.error(`AgentMode: Failed to track token usage for ${toolName} tool:`, err)
-      );
       if (sessionId) {
+        const cost = this.estimateCost(usage.model, usage.inputTokens, usage.outputTokens);
         chatbotDb.addToolCostToSession(sessionId, cost, toolName).catch((err) =>
           console.error(`AgentMode: Failed to add ${toolName} cost to session:`, err)
         );
@@ -2565,7 +2732,7 @@ export class AgentModeService {
     excludeTools?: string[],
     screenshotUrl?: string,
     isDelegatedAccess: boolean = false
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string }> {
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
@@ -2721,14 +2888,13 @@ export class AgentModeService {
               console.error('Failed to backfill account memory embedding:', e)
             );
           });
-          if (relevantMemories.length > 0) {
-            const memoryLines = relevantMemories.map(
-              (m: any) => `- [${m.category}] ${m.content}`
-            );
-            messages.push({
-              role: 'assistant',
-              content: `Account Memory (facts from previous sessions):\n${memoryLines.join('\n')}`
-            });
+          const accountMemoryMessage = buildMemoryContextMessage(
+            'Account Memory (facts from previous sessions):',
+            relevantMemories,
+            new Date()
+          );
+          if (accountMemoryMessage) {
+            messages.push({ role: 'assistant', content: accountMemoryMessage });
           }
         }
 
@@ -2742,14 +2908,13 @@ export class AgentModeService {
                 console.error('Failed to backfill org memory embedding:', e)
               );
             });
-            if (relevantOrgMemories.length > 0) {
-              const orgMemoryLines = relevantOrgMemories.map(
-                (m: any) => `- [${m.category}] ${m.content}`
-              );
-              messages.push({
-                role: 'assistant',
-                content: `Organization Memory (shared facts for "${org.name}"):\n${orgMemoryLines.join('\n')}`
-              });
+            const orgMemoryMessage = buildMemoryContextMessage(
+              `Organization Memory (shared facts for "${org.name}"):`,
+              relevantOrgMemories,
+              new Date()
+            );
+            if (orgMemoryMessage) {
+              messages.push({ role: 'assistant', content: orgMemoryMessage });
             }
           }
         }
@@ -2763,7 +2928,7 @@ export class AgentModeService {
       if ((currentSession?.pageIdentifier || '').toLowerCase().includes('slack')) {
         messages.push({
           role: 'assistant',
-          content: `[AgentWeb Team] I know all four team members: Rui Wang is the CTO (also called Rui), Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately.`
+          content: `[AgentWeb Team] I know the team members: Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately.`
         });
       }
 
@@ -2797,6 +2962,9 @@ export class AgentModeService {
       _toolCallsForTelemetry = toolCalls;
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
+      // ENG-351: accumulates the web sources this message consults across all its search
+      // calls, into a de-duplicated, stably-numbered registry for the Sources UI.
+      const citationRegistry = new CitationRegistry();
       const iterationTimings: { iteration: number; llmDurationMs: number; toolNames: string[] }[] = [];
 
       // Remember initial message count to slice response messages later
@@ -2845,6 +3013,13 @@ export class AgentModeService {
       const MAX_EMPTY_SYNTHESIS_RETRIES = 1;
 
       let wasCancelled = false;
+      // ENG-244: set true when the loop exits because the step budget (maxIterations)
+      // was exhausted. This is the deterministic signal a long data-gathering
+      // scheduled run was truncated before it could emit the final deliverable —
+      // regardless of whether `content` holds the canned apology or the model's own
+      // partial text. The completion gate consumes this flag directly rather than
+      // pattern-matching the response text.
+      let truncatedByStepBudget = false;
       while (iteration < maxIterations) {
         // Check for cancellation before each iteration
         if (isCancelled?.()) {
@@ -2952,11 +3127,20 @@ export class AgentModeService {
         // Make LLM call (with backup model fallback on transient errors)
         const llmStart = Date.now();
         let response: any;
+        // OTel `chat` span (ENG-141): brackets the primary call AND the backup
+        // retry; the `finally` closes it with the FINAL model + usage attrs
+        // (response undefined there = both attempts threw → status ERROR).
+        const chatSpan = startRunChildSpan(agentRuntimeRunId, `${SPAN_CHAT_PREFIX} ${llmModel}`, {
+          [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OP_CHAT,
+          [ATTR_GEN_AI_REQUEST_MODEL]: llmModel,
+          [ATTR_GEN_AI_PROVIDER_NAME]: providerForModel(llmModel),
+          [ATTR_SESSION_ID]: sessionId,
+        });
         try {
           response = await this.callLLM(llmModel, trimmedMessages, {
             tools: filteredToolsCache,
             tool_choice: 'auto',
-            max_completion_tokens: 12384,
+            max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
             temperature: 0.1,
             usageContext: { userId, sessionId, feature: 'agent_task' }
           });
@@ -2978,16 +3162,20 @@ export class AgentModeService {
               response = await this.callLLM(llmModel, trimmedMessages, {
                 tools: filteredToolsCache,
                 tool_choice: 'auto',
-                max_completion_tokens: 12384,
+                max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
                 temperature: 0.1,
                 usageContext: { userId, sessionId, feature: 'agent_task' }
               });
             } else {
+              recordSpanError(chatSpan, callError);
               throw callError;
             }
           } else {
+            recordSpanError(chatSpan, callError);
             throw callError;
           }
+        } finally {
+          endChatSpan(chatSpan, { model: llmModel, response, inputMessages: trimmedMessages });
         }
         const llmDurationMs = Date.now() - llmStart;
 
@@ -3067,6 +3255,26 @@ export class AgentModeService {
         // Check stop reason to determine next action
         const finishReason = response.choices[0]?.finish_reason;
         const stopReason = response.choices[0]?.stop_reason;
+
+        // Provider-agnostic truncated-tool-call guard (ENG-403).
+        // When a turn is cut off by the output-token limit mid-tool-call, the
+        // tool_calls JSON is incomplete (e.g. create_html_file's content_draft is
+        // sliced off), so executing it fails schema validation with a dropped
+        // required arg and the model retries identically — the "content_draft is
+        // required" loop. The Bedrock/Vertex adapters already null their tool_calls
+        // and report finish_reason='length' on max_tokens; the raw OpenAI-SDK paths
+        // (Azure gpt-*, Gemini OpenAI-compat — the DEFAULT agent model) instead
+        // return finish_reason='length' with the partial tool_calls still attached.
+        // Drop them here so the truncated turn falls through to the bounded
+        // max-tokens continuation path below (which asks the model to continue)
+        // instead of executing a broken call. responseMessage was already pushed
+        // into `messages` by reference above, so this also removes the dangling
+        // tool_use from history — required, else the next request would be a
+        // malformed assistant tool_calls turn with no matching tool results.
+        if (finishReason === 'length' && responseMessage.tool_calls?.length) {
+          console.warn(`AgentMode: Dropping ${responseMessage.tool_calls.length} truncated tool call(s) (finish_reason=length) in session ${sessionId}; routing to max-tokens continuation`);
+          delete responseMessage.tool_calls;
+        }
 
         if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
           // No tool calls — check WHY the model stopped
@@ -3182,6 +3390,7 @@ export class AgentModeService {
           toolCalls: responseMessage.tool_calls,
           messages: messages as any[],
           toolCallsLedger: toolCalls,
+          citationRegistry,
           iteration,
           agentRuntimeRunId,
           sessionId,
@@ -3352,6 +3561,12 @@ export class AgentModeService {
 
       if (iteration >= maxIterations) {
         console.warn('AgentMode: Reached maximum tool execution iterations');
+        // ENG-244: flag the truncation for the completion gate BEFORE any
+        // content fallback. The model often complies with the "wrap up soon"
+        // nudge and emits its own partial text, so `content` is usually
+        // non-empty here and the canned apology below never runs — the flag,
+        // not the text, is what makes truncation reliably detectable.
+        truncatedByStepBudget = true;
         if (!content) {
           content = "I've reached the maximum number of processing steps for this request. Here's what was completed so far — please review and let me know if you'd like me to continue with any remaining items.";
         }
@@ -3473,12 +3688,17 @@ export class AgentModeService {
             durationMs: endTime - startTime
           };
 
+          // ENG-351: the web sources this message consulted, de-duplicated and
+          // stably-numbered by the citation registry, for the Sources UI.
+          const citations = citationRegistry.list();
+
           lastMessage.metadata = {
             ...lastMessage.metadata,
             timestamp: new Date().toISOString(),
             iterationTimings,
             memoryUsage,
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
+            ...(citations.length > 0 ? { citations } : {}),
           };
         }
       }
@@ -3508,6 +3728,7 @@ export class AgentModeService {
         sources,
         responseMessages,
         ...(wasCancelled ? { cancelled: true } : {}),
+        ...(truncatedByStepBudget ? { truncatedByStepBudget: true } : {}),
         ...(backupModelUsed ? { backupModelUsed: true, originalModel: originalLlmModel, backupModel: llmModel } : {})
       };
     } catch (error: any) {
@@ -4177,6 +4398,7 @@ export class AgentModeService {
     'read_market_strategy',
 
     // Knowledge Base & Research
+    'search_user_guide',
     'search_knowledge_base',
     'list_knowledge_base_files',
     'read_knowledge_base_files',
@@ -4189,6 +4411,13 @@ export class AgentModeService {
     // "read_file_content unavailable/failed" until the user manually installed
     // other_skills (ENG-152).
     'read_file_content',
+
+    // Image analysis — the visual analog of read_file_content. Always available
+    // so an attached screenshot/image can be read immediately, regardless of
+    // which page the user is on. Previously only injected on the `images` page,
+    // so a user attaching a UI screenshot elsewhere got "describe_image not
+    // available" and Emma had to ask them to type out what was on screen (ENG-260).
+    'describe_image',
 
     // Work Plans (Emma's execution planning system)
     'create_work_plan',
@@ -4205,6 +4434,7 @@ export class AgentModeService {
     'search_leads',           // CRM teaser
     'get_lead_lists',         // Lead management teaser
     'list_connected_accounts', // Social/ads integration teaser
+    'connect_account',        // Read-only UI handoff when a required account is absent
 
     'get_user_profile',         // Account info teaser
     'get_account_status',       // Self account status (plan, usage, api-key count) — wraps /api/auth/me, no args
@@ -4227,6 +4457,7 @@ export class AgentModeService {
     // Meeting Intelligence (Fathom)
     'fathom_get_meetings',
     'fathom_get_transcript',
+    'fathom_get_onboarding_context',
 
     // Coding Agent (sub-agent for code editing tasks)
     'coding_agent',
@@ -4246,10 +4477,6 @@ export class AgentModeService {
     // without a CRM lead+draft. Foundation so it is always offered alongside the
     // Gmail-only `email` tool.
     'send_email_from_sender',
-
-    // Local Agent Relay (Codex agent running on user's machine)
-    'run_local_agent_task',
-    'check_local_agent_status',
 
     // S3 overflow retrieval — always available so the LLM can read large tool
     // responses that were offloaded to S3 by the 10KB overflow mechanism.
@@ -4273,6 +4500,13 @@ export class AgentModeService {
     'resolve_skill',
     'you_search_web',
     'you_search_news',
+    // Product documentation is core infrastructure for both chat and live
+    // voice. Keep it available even if a stale settings override omits it.
+    'search_user_guide',
+    // Connection handoff is UI infrastructure, not an optional skill. The tool
+    // only asks the current page to open the existing OAuth dialog; it does not
+    // grant consent or connect an account by itself.
+    'connect_account',
     // S3 overflow retrieval is infrastructure, not a skill: whenever a tool result
     // is offloaded to S3 the model is handed a "[Full response stored at S3 key: ...]"
     // pointer and MUST be able to resolve it. A DB `foundation_tools` setting that
@@ -4303,6 +4537,26 @@ export class AgentModeService {
     // other_skills, producing the transient "read_file_content
     // unavailable/failed" failure (ENG-152).
     'read_file_content',
+    // Image analysis. Force-merged for the same reason as read_file_content: the
+    // prod `foundation_tools` AW-Settings override omits DEFAULT-only additions,
+    // so without this an attached screenshot could not be analyzed unless the user
+    // happened to be on the `images` page — Emma returned "describe_image not
+    // available" and had to ask the user to type out what was on screen (ENG-260).
+    'describe_image',
+    // Meeting Intelligence (Fathom). Force-merged because the prod
+    // `foundation_tools` AW-Settings override predates these tools and omits
+    // them — without force-merging, loadFoundationTools strips them in prod so
+    // `fathom_get_onboarding_context` (and the other Fathom tools) are "not
+    // available", tanking goalCompletion on any Fathom onboarding/meeting
+    // request (ENG-280). `fathom_get_meetings`/`fathom_get_transcript` stay
+    // reachable even when a connected Fathom account is missing, so those tools
+    // return the "connect Fathom in Settings → Connected Accounts" guidance
+    // instead of a generic tool-not-available error. `fathom_get_onboarding_context`
+    // reads a separate admin-curated ingestion pipeline (fathomOnboardingIngestions)
+    // and has no connection check by design.
+    'fathom_get_meetings',
+    'fathom_get_transcript',
+    'fathom_get_onboarding_context',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
@@ -4381,7 +4635,18 @@ export class AgentModeService {
       if (setting?.settingValue) {
         const toolNames: string[] = JSON.parse(setting.settingValue);
         if (Array.isArray(toolNames) && toolNames.length > 0) {
-          const merged = [...new Set([...toolNames, ...AgentModeService.MANDATORY_FOUNDATION_TOOLS])];
+          // The DB override is ADDITIVE, not a replacement: always union
+          // DEFAULT_FOUNDATION_TOOLS so a stale/drifted override can never strip
+          // a tool the code ships as a default. A prod `foundation_tools` row
+          // that predated newer tools was silently dropping every DEFAULT-only
+          // tool (Fathom, knowledge base, scheduled chats, Slack, org-memory
+          // writes, …), each surfacing as a separate "tool not available" bug
+          // (ENG-280, ENG-404). MANDATORY stays in the union as the hard floor.
+          const merged = [...new Set([
+            ...AgentModeService.DEFAULT_FOUNDATION_TOOLS,
+            ...toolNames,
+            ...AgentModeService.MANDATORY_FOUNDATION_TOOLS,
+          ])];
           AgentModeService.FOUNDATION_TOOLS = new Set(merged);
           console.log(`AgentMode: Loaded ${merged.length} foundation tools from DB`);
           return;
@@ -4397,7 +4662,14 @@ export class AgentModeService {
    * Update foundation tools in DB and refresh the in-memory set.
    */
   public async updateFoundationTools(toolNames: string[], updatedBy: string): Promise<string[]> {
-    const unique = [...new Set([...toolNames, ...AgentModeService.MANDATORY_FOUNDATION_TOOLS])];
+    // Additive on top of DEFAULT (see loadFoundationTools): the override can add
+    // tools but can never remove a shipped default, so no future edit can
+    // reintroduce the ENG-404 stripping. MANDATORY is the hard floor.
+    const unique = [...new Set([
+      ...AgentModeService.DEFAULT_FOUNDATION_TOOLS,
+      ...toolNames,
+      ...AgentModeService.MANDATORY_FOUNDATION_TOOLS,
+    ])];
     await settingsService.setSetting(
       AgentModeService.FOUNDATION_TOOLS_SETTING,
       JSON.stringify(unique),
@@ -6297,6 +6569,64 @@ export class AgentModeService {
   }
 
   /**
+   * Bound a describe_image vision LLM call so a slow or hung vision model fails
+   * fast instead of consuming the whole agent-mode generation wall-clock budget
+   * (ENG-294). Without this, a single un-bounded vision call can stall for the
+   * client's 5-minute per-request timeout — and with callLLM's internal retries
+   * plus the fallback model, one image could burn 10+ minutes and blow the run's
+   * GENERATION_TIMEOUT_MS (default 10 min). Reported by a CSV→CRM sync that OCR'd
+   * contact screenshots and timed out repeatedly (6 failed describe_image calls).
+   *
+   * The timeout REJECTS with a "timed out" error, which isRetryableMediaToolError()
+   * classifies as retryable — so a primary-model timeout routes to the fallback
+   * model rather than aborting the whole tool call. Set the timeout to exactly 0
+   * (via AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS=0) to disable the bound entirely.
+   *
+   * Parsing fails CLOSED: a malformed override (non-numeric like "90s", negative,
+   * or NaN) falls back to the default bound rather than silently disabling it —
+   * otherwise a typo would recreate the exact unbounded-call bug this exists to
+   * prevent. Only a clean, explicit 0 disables the timeout.
+   */
+  private static readonly DEFAULT_DESCRIBE_IMAGE_TIMEOUT_MS = 90000;
+
+  private async callVisionLLMWithTimeout(model: string, messages: any[], options: any): Promise<any> {
+    const timeoutMs = AgentModeService.resolveDescribeImageTimeoutMs();
+    if (timeoutMs <= 0) {
+      return this.callLLM(model, messages, options);
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`describe_image vision call to "${model}" timed out after ${timeoutMs}ms`)),
+        timeoutMs
+      );
+    });
+    try {
+      return await Promise.race([this.callLLM(model, messages, options), timeoutPromise]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Resolve the describe_image timeout (ms) from AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS.
+   * Fails closed: unset/empty/malformed/negative values yield the default bound; only
+   * a clean, explicit non-negative integer (including 0, which disables) is honored.
+   */
+  static resolveDescribeImageTimeoutMs(): number {
+    const raw = process.env.AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS;
+    if (raw === undefined || raw.trim() === '') {
+      return AgentModeService.DEFAULT_DESCRIBE_IMAGE_TIMEOUT_MS;
+    }
+    // Number() (not parseInt) so partial junk like "90s" becomes NaN instead of 90.
+    const parsed = Number(raw.trim());
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      return AgentModeService.DEFAULT_DESCRIBE_IMAGE_TIMEOUT_MS;
+    }
+    return parsed;
+  }
+
+  /**
    * Analyze an image with a vision-capable LLM.
    *
    * @param llmModel - Optional. When omitted (the agent-mode `describe_image` tool
@@ -6332,11 +6662,35 @@ export class AgentModeService {
           const { presignS3Url, isS3Url } = await import('../utils/s3Utils');
           const fetchUrl = isS3Url(imageUrl) ? (presignS3Url(imageUrl) ?? imageUrl) : imageUrl;
           const imgResp = await axios.get<ArrayBuffer>(fetchUrl, { responseType: 'arraybuffer', timeout: 30000 });
-          // Normalize content-type: strip any charset/extra params and trim whitespace
-          const rawContentType = (imgResp.headers['content-type'] || 'image/png').split(';')[0].trim();
-          const contentType = rawContentType || 'image/png';
+          // Normalize content-type: strip any charset/extra params and trim whitespace.
+          // Do NOT default a missing/empty header to a native type here — that would
+          // short-circuit sharp detection and embed non-PNG bytes as image/png (ENG-370).
+          // Pass the raw/empty type through so normalizeImageForVision decodes via sharp.
+          const contentType = (imgResp.headers['content-type'] || '').split(';')[0].trim();
           let imageBuffer = Buffer.from(imgResp.data as ArrayBuffer);
           let finalContentType = contentType;
+          // Normalize to a vision-decodable format so the declared media type always
+          // matches the bytes. Fixes HEIC/AVIF/TIFF/BMP/SVG logos and mislabeled or
+          // octet-stream content-types that otherwise fail silently downstream (ENG-370).
+          const normalized = await AgentModeService.normalizeImageForVision(imageBuffer, contentType);
+          if (normalized.undecodable) {
+            // sharp could not decode these bytes, so no vision API can either.
+            // Fast-fail with actionable re-upload guidance instead of burning vision
+            // retries and agent workarounds on an unreadable file (ENG-370).
+            console.warn(
+              `AgentMode: describeImage could not decode uploaded image (content-type "${contentType || 'none'}"); fast-failing with re-upload guidance`
+            );
+            return {
+              success: false,
+              retryable: false,
+              message:
+                `The uploaded file could not be read as an image${contentType ? ` (its content type was "${contentType}")` : ''} — ` +
+                'it may be corrupted or in a format that cannot be decoded. Please re-upload the logo as a PNG or JPEG and try again.',
+              error: 'Image could not be decoded',
+            };
+          }
+          imageBuffer = normalized.buffer;
+          finalContentType = normalized.contentType;
           // Auto-resize if image exceeds 4MB to stay under Bedrock's 5MB limit
           if (imageBuffer.length > 4 * 1024 * 1024) {
             try {
@@ -6381,7 +6735,7 @@ export class AgentModeService {
       let primaryError: string | undefined;
       let response: any;
       try {
-        response = await this.callLLM(visionModelUsed, messages, {
+        response = await this.callVisionLLMWithTimeout(visionModelUsed, messages, {
           max_completion_tokens: 2000
         });
       } catch (primaryFailure: any) {
@@ -6396,7 +6750,7 @@ export class AgentModeService {
           primaryError
         );
         try {
-          response = await this.callLLM(fallbackModel, messages, {
+          response = await this.callVisionLLMWithTimeout(fallbackModel, messages, {
             max_completion_tokens: 2000
           });
         } catch (fallbackFailure: any) {
@@ -6425,9 +6779,16 @@ export class AgentModeService {
 
     } catch (error) {
       console.error('AgentMode: Error describing image:', error);
+      // This is a catch-all: besides bad image bytes it also receives transient
+      // network/provider failures that escaped the vision-call fallback flow. Do
+      // NOT hard-code retryable:false here (that would make the agent give up on a
+      // request that could succeed on retry) and do not assert the file itself is
+      // the problem — only the undecodable-bytes fast-fail above is truly terminal.
       return {
         success: false,
-        message: 'Failed to analyze image. Please check that the URL is accessible and contains a valid image.',
+        message:
+          'Failed to analyze the image. It may be temporarily unavailable, inaccessible, or in a ' +
+          'format that cannot be read. If it is a logo file, try re-uploading it as a PNG or JPEG.',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
@@ -6441,6 +6802,8 @@ export class AgentModeService {
       return_scenes?: boolean;
       start_time?: string;
       end_time?: string;
+      /** Attributable user — charges this describe_video LLM spend to their cap (ENG-200). */
+      userId?: string;
     }
   ): Promise<any> {
     let tempDirPath: string | null = null;
@@ -6479,11 +6842,12 @@ export class AgentModeService {
         };
       }
 
-      // Metered Gemini client (Ship 1 shadow metering). describeVideo has no
-      // userId in its signature, so usage attributes to "system" for now —
-      // follow-up: thread userId from the tool-dispatch / emmaApi callers.
+      // Un-metered Gemini client: the wrapped factory only RECORDS burn, so to
+      // actually CHARGE describe_video spend to the user's cap we meter the
+      // response ourselves via meterUsageFromResponse below (ENG-200). No userId
+      // → that meter degrades to a burn-only "system" record (absorbed).
       const { getGeminiClient } = await import('../utils/llmClients');
-      aiClient = await getGeminiClient({ feature: 'agent_task' }, geminiApiKey.trim());
+      aiClient = await getGeminiClient({ userId: options?.userId, feature: 'agent_task' }, geminiApiKey.trim(), { metered: false });
 
       const modelName = 'gemini-3-flash-preview';
 
@@ -6649,6 +7013,13 @@ export class AgentModeService {
         model: modelName,
         contents
       });
+
+      // Charge (record + deduct when a userId is present; absorb under "system"
+      // otherwise). The client above is un-metered, so this is the single meter.
+      meterUsageFromResponse(
+        { userId: options?.userId, model: modelName, provider: 'gemini', feature: 'agent_task' },
+        response
+      );
 
       const rawText = response.text;
 
@@ -7126,24 +7497,13 @@ export class AgentModeService {
         }
       );
 
-      // Shadow usage metering (Ship 1): direct REST call, so observe the
-      // usageMetadata off the already-resolved response. Fire-and-forget +
-      // fail-open — never awaited, never throws.
-      try {
-        const usageMetadata = (apiResponse.data as any)?.usageMetadata;
-        if (usageMetadata) {
-          void recordUsage({
-            userId,
-            model: modelName,
-            provider: 'gemini',
-            feature: 'agent_task',
-            inputTokens: usageMetadata.promptTokenCount || 0,
-            outputTokens: usageMetadata.candidatesTokenCount || 0,
-            cacheReadTokens: usageMetadata.cachedContentTokenCount || 0,
-          });
-        }
-      } catch {
-        // Metering must never break the call.
+      // Usage metering (Ship 1): direct REST call — meter off the resolved response
+      // via the shared hook. Charges the user's cap (all-cost-to-user policy), fail-open.
+      if ((apiResponse.data as any)?.usageMetadata) {
+        meterUsageFromResponse(
+          { userId, model: modelName, provider: 'gemini', feature: 'agent_task' },
+          apiResponse.data
+        );
       }
 
       // Extract and format the response
@@ -7488,28 +7848,33 @@ export class AgentModeService {
   // Get CRM sender emails configuration
   public async getCrmSenders(userId: string): Promise<{
     success: boolean;
-    senders: Array<{ id: string; email: string; fromName: string; notes?: string; senderType?: 'gmail'; gmailAccountId?: string }>;
+    senders: Array<{
+      id: string;
+      email: string;
+      fromName: string;
+      notes?: string;
+      senderType?: 'gmail' | 'outlook';
+      gmailAccountId?: string;
+      senderProvider?: 'resend' | 'gmail' | 'outlook';
+      connectedAccountId?: string;
+    }>;
     defaultSenderId: string | null;
     error?: string;
   }> {
     try {
-      const { settingsService } = await import('./settingsService');
-      const settingName = `crm_sender_emails_${userId}`;
-      const setting = await settingsService.getSetting(settingName);
+      const { loadSenderConfig, serializeSender } = await import('./crmSenderService');
+      const config = await loadSenderConfig(userId);
 
-      if (!setting) {
-        return {
-          success: true,
-          senders: [],
-          defaultSenderId: null
-        };
-      }
-
-      const config = JSON.parse(setting.settingValue);
+      // Emit both shapes: legacy keys for callers that still branch on senderType,
+      // and the neutral ones for provider-aware code.
       return {
         success: true,
-        senders: config.senders || [],
-        defaultSenderId: config.defaultSenderId || null
+        senders: config.senders.map((s) => ({
+          ...serializeSender(s),
+          senderProvider: s.senderProvider,
+          connectedAccountId: s.connectedAccountId,
+        })),
+        defaultSenderId: config.defaultSenderId
       };
     } catch (error) {
       console.error('AgentMode: Error getting CRM senders:', error);
@@ -9492,14 +9857,26 @@ export class AgentModeService {
         connectedAtTimestamp?: number;
       } | null = null;
       if (lead.linkedin) {
-        const accountId: string | null = (list as any).linkedInAccountId ?? null;
+        // Prefer the account explicitly assigned to the list; fall back to the
+        // user's own connected LinkedIn (Unipile) account. Most lists never get an
+        // account assigned (list.linkedInAccountId is null), so without this
+        // fallback every lead reports "not connected" even when the user is a
+        // genuine 1st-degree connection — the misinformation reported in ENG-376.
+        let accountId: string | null = (list as any).linkedInAccountId ?? null;
+        if (!accountId) {
+          const { linkedInOutreachService } = await import('./linkedInOutreachService');
+          accountId = await linkedInOutreachService.resolveUserOwnedAccountId(userId).catch(() => null);
+        }
         if (accountId) {
           const { getConnectionByProfileUrlAndAccount } = await import('./unipileConnectionsDb');
           const conn = await getConnectionByProfileUrlAndAccount(lead.linkedin as string, accountId).catch(() => null);
           linkedInConnectionStatus = conn
             ? {
+                // conn.connectedAt is already an epoch-millisecond timestamp
+                // (Unipile created_at), so it must NOT be multiplied by 1000 —
+                // doing so pushed the date ~56,000 years into the future (ENG-379).
                 isConnected: true,
-                connectedAt: new Date(conn.connectedAt * 1000).toISOString(),
+                connectedAt: new Date(conn.connectedAt).toISOString(),
                 connectedAtTimestamp: conn.connectedAt,
               }
             : { isConnected: false };
@@ -9630,7 +10007,7 @@ export class AgentModeService {
         emailDomain ? emailEventsDb.getEventsByEmailDomain(emailDomain).catch(() => []) : Promise.resolve([]),
       ]);
 
-      // connectedAt (UNIX seconds) keyed by normalized profile URL.
+      // connectedAt (epoch milliseconds) keyed by normalized profile URL.
       const connectedAtByUrl = new Map<string, number>();
       for (const c of connections as any[]) {
         const url = String(c?.publicProfileUrl || '').trim().toLowerCase();
@@ -9688,7 +10065,9 @@ export class AgentModeService {
           // when the most-recent engagement is an outbound touch sent after the
           // connection was accepted. A later inbound reply flips it back to
           // "needs follow-up" (awaitingReply) since we now owe the response.
-          const connectedAtMs = connectedAt * 1000;
+          // connectedAt is already epoch ms, matching last.at (getTime()); do NOT
+          // scale it — the old `* 1000` made the comparison always false (ENG-379).
+          const connectedAtMs = connectedAt;
           if (last && last.direction === 'outbound' && last.at > connectedAtMs) continue;
 
           const awaitingReply = !!last && last.direction === 'inbound';
@@ -10517,8 +10896,16 @@ export class AgentModeService {
       }
 
       // Resolve sender: lead → list → account default → first available
-      // Use the list owner's sender config so org members can send using the owner's senders
-      const sendersResult = await this.getCrmSenders(list.userId || userId);
+      // Use the list owner's sender config so org members can send using the owner's senders.
+      //
+      // The owner's id is load-bearing beyond just reading the config: a mailbox sender's
+      // connected account lives on the OWNER's record, so the provider must be called with
+      // the owner's userId — otherwise getAccountById(accountId, actorUserId) finds nothing
+      // and the send fails with "account not connected" for a sender the UI happily offered.
+      // It also matters on the write side: a refreshed (and for Outlook, rotated) token must
+      // be persisted back onto the owner's account. See ENG-299.
+      const senderOwnerUserId = list.userId || userId;
+      const sendersResult = await this.getCrmSenders(senderOwnerUserId);
       if (!sendersResult.success || sendersResult.senders.length === 0) {
         return { success: false, message: 'No senders configured', error: 'No sender email is configured for this lead list. To set one up, select the lead list and click "Senders".' };
       }
@@ -10543,21 +10930,32 @@ export class AgentModeService {
 
       let emailId: string;
 
-      if ((sender as any).senderType === 'gmail') {
-        // Send via connected Gmail account
-        const gmailAccountId = (sender as any).gmailAccountId;
-        if (!gmailAccountId) {
-          return { success: false, message: 'Gmail sender misconfigured', error: 'Gmail sender is missing gmailAccountId' };
+      // Accept both shapes — see note in sendEmailFromConfiguredSender.
+      const leadSenderProvider: string = (sender as any).senderProvider || (sender as any).senderType || 'resend';
+
+      if (leadSenderProvider !== 'resend') {
+        // Send through the customer's own connected mailbox (Gmail / Outlook)
+        const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
+        if (!connectedAccountId) {
+          return {
+            success: false,
+            message: `${providerLabel(leadSenderProvider)} sender misconfigured`,
+            error: `The ${providerLabel(leadSenderProvider)} sender is missing its connected account id`,
+          };
         }
-        const { gmailService } = await import('./gmailService');
+        const { bootstrapEmailProviders, getEmailProvider } = await import('./emailProviderService');
+        await bootstrapEmailProviders();
+        const provider = getEmailProvider(leadSenderProvider);
         const body = draft.htmlContent || draft.textContent || '';
-        const gmailResult = await gmailService.sendEmail(userId, gmailAccountId, {
+        // senderOwnerUserId, not userId: the connected account belongs to whoever owns the
+        // sender config, and a refreshed/rotated token must be written back to them (ENG-299).
+        const sendResult = await provider.sendEmail(senderOwnerUserId, connectedAccountId, {
           to: lead.email,
           subject: draft.subject,
           body,
           isHtml: !!draft.htmlContent,
         });
-        emailId = gmailResult.messageId;
+        emailId = sendResult.messageId;
       } else {
         // Send via Resend (custom domain sender)
         const { resendService } = await import('./resendService');
@@ -10648,32 +11046,40 @@ export class AgentModeService {
       let sender: any = null;
       if (params.senderId) {
         // The model can't see internal sender IDs, so accept an id, an email
-        // address, a from-name (case-insensitive), or a sender-type keyword like
-        // "gmail" — whatever the user named ("send from my gmail sender").
+        // address, a from-name (case-insensitive), or a provider keyword like
+        // "gmail" / "outlook" — whatever the user named ("send from my outlook sender").
         const needle = params.senderId.trim().toLowerCase();
-        const wantsGmail = needle === 'gmail' || needle === 'gmail sender' || needle === 'my gmail' || needle === 'my gmail sender';
         sender = sendersResult.senders.find((s: any) =>
           s.id === params.senderId ||
           (s.email && s.email.toLowerCase() === needle) ||
           (s.fromName && s.fromName.toLowerCase() === needle)
         );
-        // Fall back to matching by sender type (e.g. the single Gmail-account sender).
-        if (!sender && wantsGmail) {
-          const gmailSenders = sendersResult.senders.filter((s: any) => s.senderType === 'gmail');
-          if (gmailSenders.length === 1) {
-            sender = gmailSenders[0];
-          } else if (gmailSenders.length > 1) {
-            const list = gmailSenders.map((s: any) => `${s.fromName} <${s.email}>`).join(', ');
-            return {
-              success: false,
-              message: 'Multiple Gmail senders',
-              error: `You have more than one Gmail sender: ${list}. Tell me which one to use by its email address.`,
-              availableSenders: gmailSenders.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: 'gmail' })),
-            };
+
+        // Fall back to matching by provider (e.g. the single connected-mailbox sender).
+        if (!sender) {
+          const wantedProvider = ['gmail', 'outlook'].find(
+            (p) => needle === p || needle === `${p} sender` || needle === `my ${p}` || needle === `my ${p} sender`,
+          );
+          if (wantedProvider) {
+            const matches = sendersResult.senders.filter(
+              (s: any) => (s.senderProvider || s.senderType) === wantedProvider,
+            );
+            if (matches.length === 1) {
+              sender = matches[0];
+            } else if (matches.length > 1) {
+              const list = matches.map((s: any) => `${s.fromName} <${s.email}>`).join(', ');
+              return {
+                success: false,
+                message: `Multiple ${wantedProvider} senders`,
+                error: `You have more than one ${wantedProvider} sender: ${list}. Tell me which one to use by its email address.`,
+                availableSenders: matches.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: wantedProvider })),
+              };
+            }
           }
         }
+
         if (!sender) {
-          const available = sendersResult.senders.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: s.senderType === 'gmail' ? 'gmail' : 'resend' }));
+          const available = sendersResult.senders.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: s.senderProvider || s.senderType || 'resend' }));
           const list = available.map((s: any) => `${s.fromName} <${s.email}> [${s.senderType}]`).join(', ');
           return {
             success: false,
@@ -10698,40 +11104,50 @@ export class AgentModeService {
 
       let emailId: string;
 
-      if ((sender as any).senderType === 'gmail') {
-        const gmailAccountId = (sender as any).gmailAccountId;
-        if (!gmailAccountId) {
-          return { success: false, message: 'Gmail sender misconfigured', error: 'Gmail sender is missing gmailAccountId' };
+      // Accept both shapes: senderProvider is the neutral field, senderType the legacy
+      // persisted key. A sender resolved outside loadSenderConfig may only carry the latter.
+      const senderProvider: string = (sender as any).senderProvider || (sender as any).senderType || 'resend';
+
+      if (senderProvider !== 'resend') {
+        const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
+        if (!connectedAccountId) {
+          return {
+            success: false,
+            message: `${providerLabel(senderProvider)} sender misconfigured`,
+            error: `The ${providerLabel(senderProvider)} sender is missing its connected account id`,
+          };
         }
-        const { gmailService } = await import('./gmailService');
+        const { bootstrapEmailProviders, getEmailProvider } = await import('./emailProviderService');
+        const label = providerLabel(senderProvider);
+        await bootstrapEmailProviders();
+        const provider = getEmailProvider(senderProvider);
         const body = htmlBody || textBody || '';
         try {
-          const gmailResult = await gmailService.sendEmail(userId, gmailAccountId, {
+          const sendResult = await provider.sendEmail(userId, connectedAccountId, {
             to,
             subject: params.subject,
             body,
             isHtml: !!htmlBody,
           });
-          emailId = gmailResult.messageId;
-        } catch (gmailErr: any) {
-          // Translate Gmail/OAuth failures into an actionable message that names
-          // the affected sender. Raw errors like "unauthorized_client" /
-          // "invalid_grant" are otherwise opaque and get mis-paraphrased by the LLM
-          // (e.g. "no Gmail account configured"). Nearly all of these are resolved
-          // by reconnecting the Gmail account in Settings → Connected Accounts.
-          const raw = gmailErr instanceof Error ? gmailErr.message : String(gmailErr);
+          emailId = sendResult.messageId;
+        } catch (providerErr: any) {
+          // Translate OAuth failures into an actionable message that names the
+          // affected sender. Raw errors like "unauthorized_client" / "invalid_grant"
+          // are otherwise opaque and get mis-paraphrased by the LLM (e.g. "no account
+          // configured"). Nearly all are resolved by reconnecting in Settings.
+          const raw = providerErr instanceof Error ? providerErr.message : String(providerErr);
           const needsReconnect = /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
           if (needsReconnect) {
             return {
               success: false,
-              message: 'Gmail sender needs reconnecting',
-              error: `Could not send from the Gmail sender ${sender.email} (${gmailAccountId}): ${raw}. Please reconnect this Gmail account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
+              message: `${label} sender needs reconnecting`,
+              error: `Could not send from the ${label} sender ${sender.email} (${connectedAccountId}): ${raw}. Please reconnect this account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
             };
           }
           return {
             success: false,
-            message: 'Gmail send failed',
-            error: `Could not send from the Gmail sender ${sender.email}: ${raw}`,
+            message: `${label} send failed`,
+            error: `Could not send from the ${label} sender ${sender.email}: ${raw}`,
           };
         }
       } else {
@@ -11119,6 +11535,20 @@ ${emailDraftFormat === 'text'
         response_format: { type: 'json_object' }
       });
 
+      // Shadow-meter this direct Azure completion (bypasses callLLM). Burn-only, fail-open.
+      if ((completion as any)?.usage) {
+        meterUsageFromResponse(
+          {
+            userId,
+            sessionId,
+            model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
+            provider: 'azure-openai',
+            feature: 'email_draft',
+          },
+          completion
+        );
+      }
+
       const responseContent = completion.choices[0].message.content;
       if (!responseContent) {
         throw new Error('No content generated from LLM');
@@ -11219,6 +11649,14 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         max_tokens: 2048,
       } as any);
 
+      // Shadow-meter this direct Gemini completion (bypasses callLLM). Burn-only, fail-open.
+      if ((messageCompletion as any)?.usage) {
+        meterUsageFromResponse(
+          { userId, sessionId, model: 'gemini-3.5-flash', provider: 'gemini', feature: 'invite_message' },
+          messageCompletion
+        );
+      }
+
       const messageResponseContent = messageCompletion.choices[0].message.content;
       if (!messageResponseContent) {
         throw new Error('No message content generated from LLM');
@@ -11253,7 +11691,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         // guarantee — same trimInviteMessage() the inline send path uses, kept consistent.
         if (noteText.length > inviteCharLimit) {
           const { shortenInviteNoteToLimit } = await import('./inviteNoteShortener');
-          noteText = await shortenInviteNoteToLimit(geminiClient, noteText, inviteCharLimit, 2);
+          noteText = await shortenInviteNoteToLimit(geminiClient, noteText, inviteCharLimit, 2, userId, sessionId);
         }
         messageDraft = {
           content: LinkedInOutreachService.trimInviteMessage(noteText, inviteCharLimit),
@@ -11691,40 +12129,18 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
       console.log('Inferring brand tokens...');
       const suggestedBrandTokens = inferBrandTokens(detailedTokens);
 
-      // Process brand identity: download logo and upload to S3
+      // Process brand identity: download logo and upload to S3. Extracted to
+      // services/agentMode/brandLogo.ts (ENG-326); behavior pinned by
+      // agentModeService.extractCSSFromURL.logo.test.ts.
       const brandIdentity = extractedCSS.brandIdentity || { logoUrl: null, brandName: null, tagline: null, favicon: null };
-      let s3LogoUrl: string | null = null;
-
-      if (brandIdentity.logoUrl) {
-        try {
-          console.log(`Downloading logo from ${brandIdentity.logoUrl}...`);
-          const logoResponse = await axios.get(brandIdentity.logoUrl, {
-            responseType: 'arraybuffer',
-            timeout: 15000,
-          });
-          const contentType = logoResponse.headers['content-type'] || '';
-          // Skip SVG since brand guidelines doesn't accept it
-          if (!contentType.includes('svg')) {
-            const ext = contentType.includes('png') ? 'png' : contentType.includes('gif') ? 'gif' : 'jpg';
-            const filename = `logo.${ext}`;
-            const { uploadFileToS3WithPath } = await import('../utils/s3Utils');
-            const uploadResult = await uploadFileToS3WithPath(
-              Buffer.from(logoResponse.data as ArrayBuffer),
-              filename,
-              contentType,
-              `users/${userId}/brand/logo`
-            );
-            if (uploadResult.success && uploadResult.url) {
-              s3LogoUrl = uploadResult.url;
-              console.log(`Logo uploaded to S3: ${s3LogoUrl}`);
-            }
-          } else {
-            console.log('Skipping SVG logo (not supported by brand guidelines)');
-          }
-        } catch (logoErr: any) {
-          console.warn('Failed to download/upload logo:', logoErr.message);
-        }
-      }
+      const logoDownload = brandIdentity.logoUrl
+        ? await downloadBrandLogoToS3(brandIdentity.logoUrl, userId)
+        : null;
+      // Non-uploaded outcomes fall back to surfacing the raw discovered URL
+      // below (`s3LogoUrl || brandIdentity.logoUrl`) — unchanged extraction
+      // behavior; only the deterministic PERSIST path treats them differently.
+      const s3LogoUrl: string | null =
+        logoDownload?.status === 'uploaded' ? logoDownload.url : null;
 
       // Format detailed tokens as JSON string for Emma to save to KB if needed
       const detailedTokensJSON = JSON.stringify({
@@ -11739,11 +12155,40 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         }
       }, null, 2);
 
+      // A site may render a completely different design under a dark color-scheme
+      // preference (ENG-285: rankai.ai is matte black with a purple accent under
+      // dark, near-white under light). The tokens above describe the site's
+      // DEFAULT render; when a distinct dark render exists, analyze it too and
+      // surface both so the caller can pick the intended brand theme.
+      let darkThemeTokens: any = null;
+      if (extractedCSS.themes?.hasDarkVariant && extractedCSS.themes.dark) {
+        try {
+          // Analyse the dark render with ITS OWN computed styles AND stylesheets —
+          // reusing the light render's stylesheets would blend light colours into
+          // the reported dark palette (ENG-285).
+          const darkCSS = {
+            ...extractedCSS,
+            computedElements: extractedCSS.themes.dark.computedElements,
+            stylesheets: extractedCSS.themes.dark.stylesheets,
+          };
+          const darkDetailed = await analyzeDesignTokens(darkCSS);
+          darkThemeTokens = {
+            ...inferBrandTokens(darkDetailed),
+            backgrounds: darkDetailed.colors.backgrounds.slice(0, 3),
+            text: darkDetailed.colors.text.slice(0, 3),
+          };
+          console.log(`Dark color-scheme variant detected for ${url}; extracted its palette too.`);
+        } catch (err) {
+          console.warn('Dark-variant token analysis failed; reporting default render only:', err);
+        }
+      }
+
       // Format summary for LLM
       const formattedSummary = this.formatCSSExtractionResult({
         url,
         suggestedBrandTokens,
         detailedTokens,
+        darkThemeTokens,
         brandIdentity: {
           logoUrl: s3LogoUrl || brandIdentity.logoUrl || null,
           brandName: brandIdentity.brandName || null,
@@ -11766,6 +12211,8 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         suggestedBrandTokens: enrichedBrandTokens,
         detailedTokens,
         detailedTokensJSON, // Emma can save this to KB using update_knowledge_base_file tool
+        hasDarkVariant: !!darkThemeTokens,
+        darkThemeTokens, // null unless the site renders a distinct dark theme
         formattedContent: formattedSummary
       };
     } catch (error: any) {
@@ -11782,7 +12229,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
    * Format CSS extraction result for LLM consumption
    */
   private formatCSSExtractionResult(data: any): string {
-    const { url, suggestedBrandTokens, detailedTokens, brandIdentity } = data;
+    const { url, suggestedBrandTokens, detailedTokens, brandIdentity, darkThemeTokens } = data;
 
     let formatted = `# CSS Extraction Results\n\n`;
     formatted += `**Source:** ${url}\n\n`;
@@ -11815,6 +12262,23 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
     formatted += `### Visual Effects\n`;
     formatted += `- **Primary Shadow:** ${suggestedBrandTokens.visualEffects.primaryShadow}\n`;
     formatted += `- **Border Radius:** ${suggestedBrandTokens.visualEffects.borderRadius}\n\n`;
+
+    // Dark color-scheme variant, when the site has one. The tokens above describe
+    // what the site serves a no-preference visitor; this is what a dark-mode
+    // visitor sees. Which one is "the brand" is a judgement call, so present both
+    // rather than silently choosing (ENG-285).
+    if (darkThemeTokens) {
+      formatted += `## Dark Theme Variant Detected\n\n`;
+      formatted += `This site renders a **distinct dark theme** under \`prefers-color-scheme: dark\`. `;
+      formatted += `The tokens above are its DEFAULT (light) render; the dark render is:\n\n`;
+      formatted += `- **Primary:** ${darkThemeTokens.colors.primary}\n`;
+      formatted += `- **Secondary:** ${darkThemeTokens.colors.secondary}\n`;
+      formatted += `- **Backgrounds:** ${(darkThemeTokens.backgrounds || []).join(', ') || 'Not detected'}\n`;
+      formatted += `- **Text:** ${(darkThemeTokens.text || []).join(', ') || 'Not detected'}\n`;
+      formatted += `- **Palette:** ${darkThemeTokens.colors.palette.join(', ')}\n\n`;
+      formatted += `⚠️ Confirm with the user which theme represents their brand before applying tokens — `;
+      formatted += `a site whose design is dark still serves the light render to visitors whose OS is set to light.\n\n`;
+    }
 
     // Summary of detailed tokens
     formatted += `## Detailed Analysis\n\n`;
@@ -13520,7 +13984,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async manageMetaAdsCampaigns(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
-        return this.listMetaAdsCampaignsNew(userId, account_id);
+        // Thread the campaign_id filter and any explicit fields selection so the caller can
+        // read budget/bid config and target a single campaign (ENG-398).
+        return this.listMetaAdsCampaignsNew(userId, account_id, { campaignId: campaign_id, fields: params?.fields });
       case 'CREATE':
         return this.createMetaAdsCampaign(userId, { ...params, account_id });
       case 'UPDATE':
@@ -13538,7 +14004,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async manageMetaAdsAdSets(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, ad_set_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
-        return this.listMetaAdsAdSets(userId, campaign_id, account_id);
+        // Thread the ad_set_id target and any explicit fields selection so the caller can
+        // read optimization_goal / promoted_object / etc. for a single ad set (ENG-398).
+        return this.listMetaAdsAdSets(userId, campaign_id, account_id, { adSetId: ad_set_id, fields: params?.fields });
       case 'CREATE':
         // Explicitly pass account_id in args for createMetaAdsAdSet as it expects it in the args object
         return this.createMetaAdsAdSet(userId, { ...params, account_id, campaign_id });
@@ -13571,7 +14039,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
         return this.listMetaAdsAds(userId, ad_set_id, account_id);
@@ -13587,6 +14055,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       case 'COPY_AD':
         if (!ad_id) throw new Error('ad_id (source_ad_id) is required for COPY_AD action');
         return this.copyMetaAdsAd(userId, ad_id, params, account_id);
+      case 'RETAG_UTM':
+        // ENG-239 retrofit: retags ONE existing ad, never a list. Swaps in a new
+        // creative -- the caller (Emma) must have already told the user this
+        // resets the ad's learning phase, per the RETAG_UTM tool description.
+        if (!ad_id) throw new Error('ad_id is required for RETAG_UTM action');
+        return this.retagMetaAdUtm(userId, ad_id, account_id);
       default:
         throw new Error(`Invalid action: ${action}`);
     }
@@ -13840,10 +14314,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async listMetaAdsCampaignsNew(userId: string, account_id?: string): Promise<any> {
+  public async listMetaAdsCampaignsNew(
+    userId: string,
+    account_id?: string,
+    options: { campaignId?: string; fields?: string | string[] } = {}
+  ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const campaigns = (await metaService.listCampaigns(accountId, accessToken)) || [];
+      // Only forward the read-options bag when the caller supplied a campaign_id filter or
+      // an explicit fields selection; otherwise call listCampaigns the same 2-arg way as
+      // before. This preserves the CALL CONVENTION for a plain list-all — it does NOT keep
+      // the response payload identical: listCampaigns now defaults to the richer
+      // CAMPAIGN_READ_FIELDS (budget/bid config: daily_budget, lifetime_budget,
+      // budget_remaining, bid_strategy), the intended ENG-398 change, for every plain LIST
+      // caller regardless of this branch.
+      const hasSelector = Boolean(options.campaignId || options.fields);
+      const campaigns = (hasSelector
+        ? await metaService.listCampaigns(accountId, accessToken, options)
+        : await metaService.listCampaigns(accountId, accessToken)) || [];
       const totalCount = Array.isArray(campaigns) ? campaigns.length : 0;
 
       return {
@@ -13858,7 +14346,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta ad campaigns.',
-        error: error.message
+        error: error.message,
+        details: error.structuredError
       };
     }
   }
@@ -13885,10 +14374,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async listMetaAdsAdSets(userId: string, campaignId?: string, account_id?: string): Promise<any> {
+  public async listMetaAdsAdSets(
+    userId: string,
+    campaignId?: string,
+    account_id?: string,
+    options: { adSetId?: string; fields?: string | string[] } = {}
+  ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const adSets = (await metaService.listAdSets(accountId, accessToken, campaignId)) || [];
+      // Only forward the read-options bag when the caller supplied an ad_set_id target or an
+      // explicit fields selection; otherwise call listAdSets with just the (optional)
+      // campaignId, exactly as before. This preserves the CALL CONVENTION, NOT the response
+      // payload: listAdSets now defaults to the richer AD_SET_READ_FIELDS (optimization_goal,
+      // billing_event, destination_type, promoted_object, bid_strategy), the intended
+      // ENG-398 change, for every plain LIST caller regardless of this branch.
+      const hasSelector = Boolean(options.adSetId || options.fields);
+      const adSets = (hasSelector
+        ? await metaService.listAdSets(accountId, accessToken, campaignId, options)
+        : await metaService.listAdSets(accountId, accessToken, campaignId)) || [];
       const totalCount = Array.isArray(adSets) ? adSets.length : 0;
 
       return {
@@ -14063,6 +14566,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           }
         };
         console.log('[MetaAdSet] Auto-set targeting_automation.advantage_audience=0 (Meta requires this field)');
+      }
+
+      // Conversion location (ENG-415): default destination_type=WEBSITE for website
+      // traffic/conversion goals so the ad-level Destination is explicitly "Website" in Ads Manager
+      // rather than UNDEFINED (the "not selected" symptom). An explicit caller value always wins;
+      // non-website goals (engagement/reach/app installs, instant-form lead goals) are left untouched.
+      if (args.destination_type === undefined &&
+          META_WEBSITE_OPTIMIZATION_GOALS.includes(args.optimization_goal)) {
+        args.destination_type = 'WEBSITE';
       }
 
       // Convert all currencies to cents
@@ -14335,7 +14847,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * Keys that indicate a destination/creative content change rather than an ad-level change.
    * When these are present in params, we need to create a new creative and swap it.
    */
-  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets'];
+  // 'url_tags' lives on the creative, same as the others — an ad-level update
+  // silently drops it (see updateAd's params typing), so a UTM-only retag
+  // (ENG-239 retrofit, agentModeService.retagMetaAdUtm) must also go through
+  // the swap path. carriedUrlTags below already forwards it correctly.
+  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets', 'url_tags'];
 
   public async updateMetaAdsAd(userId: string, adId: string, params: any, account_id?: string): Promise<any> {
     try {
@@ -14779,6 +15295,75 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
+  /**
+   * Retag ONE existing, already-live Meta ad that's missing UTMs (Harsha's ask —
+   * the audit tool can only find these, never fix them). Deliberately single-ad:
+   * never loop or accept a list, so there is no "bulk retag" surface.
+   *
+   * Meta creatives are immutable for `url_tags`/`link_url`, so this reuses the
+   * SAME create-new-creative-then-swap machinery `updateAdViaCreativeSwap`
+   * already provides for other field changes — only `url_tags` changes here,
+   * the ad's existing destination is preserved untouched.
+   *
+   * Callers (the Emma tool) MUST tell the user before invoking this: swapping a
+   * live creative resets the ad's learning phase, which can hurt a paying
+   * client's performance. That is not enforced here — it belongs in the tool
+   * description Emma reads before deciding to call it.
+   */
+  public async retagMetaAdUtm(userId: string, adId: string, account_id?: string): Promise<any> {
+    try {
+      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+
+      const adData = await metaService.getAd(accessToken, adId);
+      const creativeId = adData?.creative?.creative_id || adData?.creative?.id;
+      if (!creativeId) {
+        return {
+          success: false,
+          message: 'Could not determine the current creative for this ad. The ad may not have a creative assigned.',
+          error: 'MISSING_CREATIVE'
+        };
+      }
+
+      const creativeData = await metaService.getAdCreative(accessToken, creativeId);
+      if (!creativeData?.object_story_spec) {
+        return {
+          success: false,
+          message: 'Could not read the current creative details. The creative may have been deleted or is in an unsupported format.',
+          error: 'MISSING_OBJECT_STORY_SPEC'
+        };
+      }
+
+      // The audit's own extractor (read/write symmetry is the correctness bar
+      // there too) — a hand-rolled subset here previously missed link_url,
+      // single-item/per-card CTA links, and asset_feed_spec website_urls,
+      // letting the retag miss an existing utm_source on those paths and
+      // duplicate it (Greptile).
+      const linkUrls: string[] = MetaService.extractCreativeDestinationUrls(creativeData);
+
+      const { urlTags, changed, unreadable } = computeRetagUrlTags(creativeData.url_tags, linkUrls);
+      if (unreadable) {
+        return {
+          success: false,
+          message: 'Could not verify this ad\'s destination is fully tagged — one of its link URLs could not be read.',
+          error: 'UNREADABLE_DESTINATION_URL',
+        };
+      }
+      if (!changed) {
+        return { success: true, alreadyTagged: true };
+      }
+
+      return await this.updateMetaAdsAd(userId, adId, { url_tags: urlTags }, account_id);
+    } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
+      console.error('AgentMode: Error retagging Meta ad UTMs:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to retag Meta ad UTMs.',
+        error: error.message
+      };
+    }
+  }
+
   public async uploadMetaAdsImage(userId: string, imageUrl: string, account_id?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
@@ -15167,13 +15752,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           throw new Error('AD DELETE requires "ad_id".');
         } else if (action === 'COPY_AD' && !ad_id) {
           throw new Error('AD COPY_AD requires "ad_id" (the source ad to copy).');
+        } else if (action === 'RETAG_UTM' && !ad_id) {
+          throw new Error('AD RETAG_UTM requires "ad_id".');
         }
         break;
 
       case 'TARGETING':
         if (action === 'SEARCH') {
           if (!params.q) throw new Error('TARGETING SEARCH requires "params.q" (search query).');
-          if (!params.type) throw new Error('TARGETING SEARCH requires "params.type" (adinterest | adbehavior | addemographics).');
+          if (!params.type) throw new Error('TARGETING SEARCH requires "params.type" (adinterest | adbehavior | addemographics | adgeolocation).');
         }
         break;
 
@@ -15194,7 +15781,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   private static META_WRITE_ACTIONS: Record<string, string[]> = {
     CAMPAIGN: ['CREATE', 'UPDATE', 'DELETE'],
     AD_SET: ['CREATE', 'UPDATE', 'DELETE'],
-    AD: ['CREATE', 'UPDATE', 'DELETE', 'COPY_AD'],
+    AD: ['CREATE', 'UPDATE', 'DELETE', 'COPY_AD', 'RETAG_UTM'],
     // Account-level assets. CREATE publishes a creative; UPLOAD_USERS pushes PII
     // user data to Meta. UPLOAD_IMAGE/UPLOAD_VIDEO only stage assets (no publish),
     // and LIST is read-only — none of those need confirmation.
@@ -15326,6 +15913,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         target.target_ad_set = nameOf(adSet, targetAdSetId);
         target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
         lines.push(`Copy ad ${target.source_ad} into ad set ${target.target_ad_set}${target.campaign ? `, which belongs to campaign ${target.campaign}` : ''}.`);
+      } else if (action === 'RETAG_UTM') {
+        const ad = await resolveAd(ad_id);
+        target.ad = nameOf(ad, ad_id);
+        // Mandatory risk statement (Harsha's ENG-239 retrofit ask): retagging a
+        // Meta ad swaps in a new creative, which resets the ad's learning phase
+        // and can hurt a live client's performance. This must be part of what the
+        // user confirms, not just a code comment nobody reads before approving.
+        lines.push(`Retag ad ${target.ad} with UTMs. This creates a NEW creative and swaps the ad to it, `
+          + `which RESETS THE AD'S LEARNING PHASE and can hurt performance on a live client campaign.`);
       } else {
         const ad = await resolveAd(ad_id);
         const adSet = await resolveAdSet(ad?.adset_id);
@@ -15455,7 +16051,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return this.manageMetaCustomAudiences(userId, action as any, account_id, params);
 
       case 'TARGETING':
-        return this.searchAdTargeting(userId, account_id, params.q, params.type);
+        return this.searchAdTargeting(userId, account_id, params.q, params.type, params.location_types);
 
       case 'PAGE':
         return this.listMetaPages(userId, account_id);
@@ -15656,12 +16252,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     userId: string,
     account_id: string,
     q: string,
-    type: string = 'adTargetingCategory'
+    type: string = 'adTargetingCategory',
+    locationTypes?: string[]
   ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
 
-      const searchResult = await metaService.searchTargeting(accountId, accessToken, q, type);
+      const searchResult = await metaService.searchTargeting(accountId, accessToken, q, type, locationTypes);
       const results = Array.isArray(searchResult) ? searchResult : [];
 
       return {
@@ -17037,6 +17634,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     options: {
       maxResults?: number;
       companyName?: string;
+      cursor?: string;
       format?: string[];
       platform?: string[];
       niche?: string[];
@@ -17070,6 +17668,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const result = await searchForeplayDiscoveryAds(foreplayToken, {
         query: effectiveQuery,
         limit,
+        cursor: options.cursor,
         format: options.format,
         platform: options.platform,
         niche: options.niche,
@@ -17104,7 +17703,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         results,
         totalResults: results.length,
         hasMore: !!result.cursor,
-        note: 'Each result costs 1 Foreplay credit. Discovery searches Foreplay\'s full database of millions of ads, not just your saved swipefile.'
+        cursor: result.cursor,
+        note: 'Each result costs 1 Foreplay credit. Discovery searches Foreplay\'s full database of millions of ads, not just your saved swipefile.' + (result.cursor ? ' More results are available — call this tool again with the returned cursor to fetch the next page.' : '')
       };
     } catch (error) {
       console.error('AgentMode: Error searching Foreplay discovery:', error);
@@ -19138,12 +19738,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   // Web search functionality
-  public async youSearchWeb(query: string, maxResults: number = 10): Promise<any> {
+  public async youSearchWeb(
+    query: string,
+    maxResults: number = 10,
+    freshness?: string,
+    includeDomains?: string[]
+  ): Promise<any> {
     return this.searchWithYou({
       toolName: 'you_search_web',
       query,
       maxResults,
       resultSource: 'web',
+      freshness,
+      includeDomains,
     });
   }
 
@@ -19205,6 +19812,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     maxResults: number;
     resultSource: SearchResultSource;
     freshness?: string;
+    includeDomains?: string[];
   }): Promise<any> {
     const { toolName, query, maxResults, resultSource } = params;
     try {
@@ -19225,6 +19833,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             maxResults: limitedMaxResults,
             resultSource,
             freshness: params.freshness,
+            includeDomains: params.includeDomains,
           });
           break;
         } catch (error) {
@@ -19438,6 +20047,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     maxResults: number;
     resultSource?: SearchResultSource;
     freshness?: string;
+    includeDomains?: string[];
   }) {
     const freshness = params.freshness || inferSearchFreshness(params.query);
     const provider = new YouSearchProvider();
@@ -19447,6 +20057,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       freshness,
       resultSource: params.resultSource || 'all',
       purpose: params.resultSource === 'news' ? 'news' : 'agent_research',
+      ...(params.includeDomains?.length ? { includeDomains: params.includeDomains } : {}),
     });
 
     console.log(`You.com Search returned ${response.results.length} ${params.resultSource || 'all'} results for query: "${params.query}"`);
@@ -20068,11 +20679,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           };
         }
 
-        // External URL — plain fetch
+        // External URL — plain fetch. Send no-cache headers so scrapes (e.g.
+        // onboarding brand-build reading the user's live site) reflect the
+        // CURRENT content and never a stale CDN/intermediary copy.
         const response = await axios.get(normalizedFileUrl, {
           timeout: 30000,
           responseType: 'arraybuffer',
-          headers: { 'User-Agent': 'AgentWeb-Backend/1.0' },
+          headers: {
+            'User-Agent': 'AgentWeb-Backend/1.0',
+            'Cache-Control': 'no-cache',
+            Pragma: 'no-cache',
+          },
         });
         buffer = Buffer.from(response.data as ArrayBuffer);
         contentType = response.headers['content-type'] || '';
@@ -20277,6 +20894,35 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     try {
+      // ENG-326: branded text-to-image asks must composite the account's REAL
+      // persisted logo — never one the model invents. When the prompt asks for
+      // a logo and the model didn't pass logo_image, prefer the persisted
+      // brand logo (AC-2); when none is persisted, ask the user / point at
+      // brand config instead of generating (AC-3). Edits (inputImages) are
+      // out of scope — the source images already carry the branding.
+      //
+      // ENG-393: this gate is for COMPOSITING an existing brand logo, not for
+      // CREATING one. A prompt that asks to design a brand-new logo from
+      // scratch ("create a logo for X") must NOT be gated — an account with no
+      // logo yet legitimately wants to generate its first one, and blocking
+      // that also blocks landing-page generation. Let creation asks through;
+      // compositing asks ("add our logo to this banner") still gate.
+      if (
+        !logoImage &&
+        (!Array.isArray(inputImages) || inputImages.length === 0) &&
+        promptRequestsLogo(prompt) &&
+        !promptCreatesLogo(prompt)
+      ) {
+        const persistedLogo = await getPersistedBrandLogoUrlForUser(userId);
+        if (!persistedLogo) {
+          return missingBrandLogoToolResult();
+        }
+        logoImage = persistedLogo;
+        console.log(
+          `AgentMode: generate_image prompt asks for a logo — compositing the persisted brand logo (${persistedLogo})`
+        );
+      }
+
       // Import the image generation service
       const { imageService } = await import('./imageGeneration');
 
@@ -20378,11 +21024,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       if (result.success && result.imageUrl) {
-        // Track generation cost (image APIs are billed per generation, not per token)
+        // Session cost accounting (agent-mode chat). The per-user burn shadow record is
+        // fired once at the generation SOURCE (imageService.generateImage) so every caller
+        // is metered exactly once — see llmPricing.imageGenerationCostUsd (ENG-200).
         const imageCost = this.estimateImageGenerationCost(imageModelUsed);
-        incrementUserTokenUsage(userId, 0, imageCost).catch((err) =>
-          console.error('AgentMode: Failed to track token usage for generateImage:', err)
-        );
         chatbotDb.addToolCostToSession(sessionId, imageCost, 'generateImage').catch((err) =>
           console.error('AgentMode: Failed to add image cost to session:', err)
         );
@@ -20521,11 +21166,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       });
 
       if (result.success && result.videoUrl) {
-        // Track generation cost (video APIs are billed per 8s clip; longer videos cost more)
+        // Session cost accounting (agent-mode chat). The per-user burn shadow record is
+        // fired once at the generation SOURCE (videoService.generateVideo) so every caller
+        // is metered exactly once — see llmPricing.videoGenerationCostUsd (ENG-200).
         const videoCost = this.estimateVideoGenerationCost(videoModel || 'veo-3.1-generate-preview', durationSeconds);
-        incrementUserTokenUsage(userId, 0, videoCost).catch((err) =>
-          console.error('AgentMode: Failed to track token usage for generateVideo:', err)
-        );
         chatbotDb.addToolCostToSession(sessionId, videoCost, 'generateVideo').catch((err) =>
           console.error('AgentMode: Failed to add video cost to session:', err)
         );
@@ -21102,7 +21746,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         prompt,
         tone,
         depth,
-        focus_areas
+        focus_areas,
+        userId
       });
 
       if (!researchResult.success || !researchResult.markdownContent) {
@@ -21210,7 +21855,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           topic: researchTopic,
           prompt: requirements || undefined,
           tone: 'professional',
-          style
+          style,
+          userId
         });
 
         if (!researchResult.success || !researchResult.markdownContent) {
@@ -23387,6 +24033,46 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
       const isEmail = documentType === 'email';
 
+      // ENG-472 #1 — Passthrough: when the draft is already a complete HTML
+      // document, skip the internal render LLM call and upload it verbatim.
+      // Re-rendering HTML->HTML wastes an expensive call, risks the model
+      // altering the content, and is exactly what times out on large drafts.
+      // Email is excluded: the email render applies email-client-safety
+      // transforms (table layout, inline styles) that a generic HTML document
+      // may lack, so emails always go through the render path.
+      if (!isEmail && isCompleteHtmlDocument(contentDraft)) {
+        console.log('AgentMode: create_html_file — draft is already complete HTML, uploading directly (skipping render)');
+        const { uploadFileToS3 } = await import('../utils/s3Utils');
+        const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
+        const uploadResult = await uploadFileToS3(contentDraft, filename, userId, 'text/html');
+        if (!uploadResult.success || !uploadResult.url) {
+          throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        }
+        return {
+          success: true,
+          s3_url: uploadResult.url,
+          filename,
+          title,
+          document_type: documentType,
+          rendered: false,
+          message: 'HTML file created successfully'
+        };
+      }
+
+      // ENG-472 #2 — Fail fast: a draft that must be rendered but is larger than
+      // the render step can finish inside its 5-minute per-call budget would burn
+      // ~15 minutes across retries before failing. Return actionable guidance
+      // immediately instead. (Complete-HTML drafts already returned above and are
+      // not size-limited.)
+      if (contentDraft.length > CREATE_HTML_RENDER_MAX_DRAFT_CHARS) {
+        console.warn(`AgentMode: create_html_file — draft too large to render in one file (${contentDraft.length} chars > ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS})`);
+        return {
+          success: false,
+          message: 'Draft too large to render into a single HTML file',
+          error: `content_draft is too large to render into one HTML file in a single pass (${contentDraft.length} characters, limit ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS}). Either provide the draft as a complete, self-contained HTML document (which is saved directly without limit), or split it into smaller sections and create multiple files.`
+        };
+      }
+
       // Use Claude model by default (check for Claude in model name)
       const defaultClaudeModel = 'anthropic.claude-sonnet-4-6';
 
@@ -23495,9 +24181,42 @@ ${formatRequirements ? `\nFormat Requirements:\n${formatRequirements}` : ''}
 
 Please generate a complete, professional HTML document that properly formats and presents this content.`;
 
-      // Generate HTML using LLMService
+      // Generate HTML using LLMService.
+      // The final render is a single long-running LLM call; on Bedrock it can hit
+      // the 5-minute requestTimeout and throw. Without a retry, one transient
+      // timeout discards ALL completed upstream work (steps 1-3), which is exactly
+      // the systemic failure reported in ENG-203. Retry the render step with
+      // exponential backoff on transient errors (timeouts / 5xx / network) so a
+      // single blip no longer loses the report. Terminal errors (invalid args,
+      // auth, content-filter) are not retried — an identical call would just fail
+      // again.
       console.log(`AgentMode: Generating HTML ${isEmail ? 'email' : 'file'} with LLMService (Claude model)`);
-      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
+      const maxRenderAttempts = 3;
+      let htmlContent = '';
+      for (let attempt = 1; attempt <= maxRenderAttempts; attempt++) {
+        try {
+          htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
+          break;
+        } catch (renderError) {
+          const isLastAttempt = attempt === maxRenderAttempts;
+          const isTransient = isTransientLLMError(renderError);
+          if (isLastAttempt || !isTransient) {
+            // Distinguish exhaustion from a terminal error. If every attempt hit a
+            // transient timeout, the render likely can't finish inside the per-call
+            // budget deterministically (e.g. an oversized report) — retrying the same
+            // call won't help, and this is the signal that would justify streaming/
+            // chunking the render (ENG-203 follow-up). Log it distinctly so these are
+            // greppable and separable from one-off blips and terminal errors.
+            if (isLastAttempt && isTransient) {
+              console.error(`AgentMode: HTML render exhausted all ${maxRenderAttempts} attempts on a transient error (session ${sessionId}); render may be deterministically over the per-call timeout:`, renderError instanceof Error ? renderError.message : renderError);
+            }
+            throw renderError;
+          }
+          const backoffMs = 1000 * Math.pow(2, attempt - 1);
+          console.warn(`AgentMode: HTML render attempt ${attempt}/${maxRenderAttempts} failed with a transient error, retrying in ${backoffMs}ms:`, renderError instanceof Error ? renderError.message : renderError);
+          await this.sleep(backoffMs);
+        }
+      }
 
       if (!htmlContent || htmlContent.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -23683,7 +24402,7 @@ Please:
 
       // Generate enhanced HTML template using LLMService
       console.log('AgentMode: Generating HTML email template with Claude model');
-      enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'), { userId, sessionId, feature: 'content_gen' });
+      enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(sessionId, 'createHtmlTemplate'), { userId, sessionId, feature: 'content_gen' });
 
       if (!enhancedHtml || enhancedHtml.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -23840,7 +24559,7 @@ ${strippedHtml}`;
       const parsed = await llmService.generateJsonRobust<{ variables?: Array<{ name?: string; anchor?: string; isArray?: boolean }> }>(
         systemPrompt,
         userPrompt,
-        this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'),
+        this.makeToolUsageCallback(sessionId, 'createHtmlTemplate'),
         { userId, sessionId, feature: 'content_gen' },
       );
       if (parsed && Array.isArray(parsed.variables)) {
@@ -25038,7 +25757,7 @@ IMPORTANT:
 IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly.`}`;
 
       // Generate content using LangChain with appropriate format
-      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(userId, sessionId, 'generateBookContent'), { userId, sessionId, feature: 'content_gen' });
+      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(sessionId, 'generateBookContent'), { userId, sessionId, feature: 'content_gen' });
 
       // Extract content from JSON
       if (!contentData.content) {
@@ -25418,9 +26137,31 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         ? await linkedInOutreachService.getStatusesForAccounts(unipileAccountIds)
         : new Map<string, string>();
 
+      // When a platform-specific lookup finds nothing the caller can access, the
+      // account may still be connected by an org teammate who never shared it (the
+      // ENG-368 case: a private Google Ads account owned by another member). Rather
+      // than inspect teammates' private accounts to confirm — which would disclose
+      // the existence of an account its owner deliberately kept private — surface
+      // that possibility as a hint, but ONLY when the caller actually belongs to an
+      // org. A solo user has no teammates, so the "ask a teammate to share" wording
+      // would be confusing; they get a plain connect prompt instead. We check only
+      // the caller's own orgId (never teammates' accounts), so the org privacy model
+      // stays intact. Any uncertainty (missing user) falls back to the plain message.
+      let message = `Found ${accounts.length} connected account(s)`;
+      if (accounts.length === 0 && platform && platform !== 'all') {
+        const { userDb } = await import('./db');
+        const caller = await userDb.getUserById(userId);
+        const callerInOrg = !!(caller && (caller as any).orgId);
+        if (callerInOrg) {
+          message = `Found 0 ${platform} account(s) available to you. If a teammate in your organization has connected ${platform} but hasn't shared it, they'll need to open Settings → Connected Accounts and click "Share with org" — otherwise, connect ${platform} under this account directly.`;
+        } else {
+          message = `Found 0 ${platform} account(s). Connect ${platform} in Settings → Connected Accounts to continue.`;
+        }
+      }
+
       return {
         success: true,
-        message: `Found ${accounts.length} connected account(s)`,
+        message,
         accounts: await Promise.all(accounts.map(async acc => ({
           id: acc.account_id,
           platform: acc.platform,
@@ -26022,7 +26763,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   async linkedinOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
-    const { profile_url, provider_id, message } = args;
+    const { profile_url, provider_id, message, on_note_quota } = args;
     console.log(`[AgentMode] linkedinOutreach called: action=${action}, account_id=${account_id}`);
 
     // Write actions must use an account that is either owned by the calling user or
@@ -26123,7 +26864,62 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // persisting — see unipileProfileService.ts.
           const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
           const profileResult = await getUnipileProfileService().getProfile(target, account_id);
-          return { success: true, data: profileResult.rawData };
+          const raw = profileResult.rawData;
+
+          // The global profile cache strips is_relationship / connected_at because
+          // they are viewer-relative (ENG-440) — so on a cache hit a freshly-written
+          // blob carries no connection state at all (and a pre-change legacy row may
+          // carry another viewer's, which we discard below). Re-derive it for THIS
+          // account from our per-account AW-UnipileConnections cache (the authoritative
+          // ENG-377 path) so the agent's invite-vs-DM decision has a correct signal.
+          //
+          // IMPORTANT: overlay onto a SHALLOW COPY. `raw` is the object held in the
+          // profile cache (LRU/DDB row) — mutating it in place would persist this
+          // viewer's connection state back into the shared cache and re-introduce the
+          // very cross-viewer leak this fix closes.
+          if (raw && typeof raw === 'object') {
+            const profileUrl =
+              raw.public_profile_url ||
+              (raw.public_identifier
+                ? `https://www.linkedin.com/in/${raw.public_identifier}`
+                : (isUrl ? target : null));
+            let conn: { connectedAt?: number } | null = null;
+            if (profileUrl) {
+              const { getConnectionByProfileUrlAndAccount } = await import('./unipileConnectionsDb');
+              conn = await getConnectionByProfileUrlAndAccount(profileUrl, account_id).catch(() => null);
+            }
+            // Drop any is_relationship / connected_at that came off `raw` before
+            // re-deriving. New cache writes already strip these, but rows persisted
+            // BEFORE this change (30-day TTL) can still carry another viewer's stale
+            // values — a spread of `raw` would leak them until the row expires. Only a
+            // LIVE response (`!fromCache`) legitimately carries this viewer's own state.
+            const {
+              is_relationship: rawRelationship,
+              connected_at: rawConnectedAt,
+              ...viewerIndependentRaw
+            } = raw;
+            // Reconcile as a union: connected if our per-account cache has a row OR a
+            // LIVE blob said so. A `true` from either source wins — directly countering
+            // the false-negative in reporter-ticket #135 (is_relationship false while
+            // LinkedIn's send-time check said FIRST_DEGREE). On a cache hit we trust only
+            // `conn`, never the (possibly cross-viewer) cached is_relationship.
+            const isConnected =
+              !!conn || (!profileResult.fromCache && rawRelationship === true);
+            const data = {
+              ...viewerIndependentRaw,
+              is_relationship: isConnected,
+              // conn.connectedAt is already epoch-ms (Unipile created_at) — do NOT
+              // multiply by 1000 (ENG-379). Prefer the authoritative cache timestamp;
+              // otherwise keep the raw timestamp ONLY from a live response.
+              ...(conn && typeof conn.connectedAt === 'number'
+                ? { connected_at: conn.connectedAt }
+                : !profileResult.fromCache && typeof rawConnectedAt === 'number'
+                  ? { connected_at: rawConnectedAt }
+                  : {}),
+            };
+            return { success: true, data };
+          }
+          return { success: true, data: raw };
         }
 
         case 'list-connections': {
@@ -26175,10 +26971,95 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'send-invite': {
           if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
+
+          // ENG-182: cross-check the account's PENDING sent-invitation cache before
+          // spending a run's invite quota. A profile with an OUTSTANDING (sent but
+          // not-yet-accepted) invite is NOT a 1st-degree connection, so it slips past
+          // the already-connected guard inside sendInvitation and Unipile then rejects
+          // the resend with "Cannot resend yet" — which both wastes the run's quota and
+          // surfaces as a per-recipient tool failure. The cache (AW-UnipileSentInvitations)
+          // is refreshed every ~10 min by the connection-sync cron straight from Unipile's
+          // live sent feed, so it also reflects invites made outside this system.
+          //
+          // Look up via the publicProfileUrl GSI, matching the CRM path (crm.ts): both
+          // this URL and the cron's stored key are lowercased by normalizeLinkedInUrl, so
+          // the match is case-insensitive. We rebuild a CANONICAL /in/{publicId}/ URL from
+          // the parsed public id first, because normalizeLinkedInUrl does NOT strip query
+          // params (e.g. LinkedIn's ?miniProfileUrn tracking) — passing the raw URL through
+          // would miss. The cache is keyed by public id, so only a /in/{publicId} URL can be
+          // deduped; a raw provider_id invite falls through to the live send unchanged.
+          const invitePublicId = isUrl && profile_url ? linkedInPublicIdFromUrl(profile_url) : null;
+          const inviteCanonicalUrl = invitePublicId ? `https://www.linkedin.com/in/${invitePublicId}/` : null;
+          if (inviteCanonicalUrl) {
+            const { getSentInvitationByProfileUrlAndAccount } = await import('./unipileSentInvitationsDb');
+            const pending = await getSentInvitationByProfileUrlAndAccount(inviteCanonicalUrl, account_id).catch(() => null);
+            if (pending) {
+              console.log(`[AgentMode] send-invite: skipping ${profile_url} — invitation already pending (sent ${pending.sentAt ?? 'previously'})`);
+              return {
+                success: true,
+                alreadyInvited: true,
+                message: `A LinkedIn connection invitation is already pending for this profile (sent ${pending.sentAt ?? 'previously'}). Skipped to avoid a duplicate — no invite quota was used. Move on to the next lead.`,
+                data: { alreadyInvited: true, sentAt: pending.sentAt ?? null },
+              };
+            }
+          }
+
           // Premium accounts allow 300-char invites; free accounts 200.
           const inviteCharLimit = await linkedInOutreachService.getInviteCharLimitForAccount(userId, account_id);
-          const inviteResult = await linkedInOutreachService.sendInvitation(account_id, target, isUrl, message, inviteCharLimit);
-          return { success: true, data: inviteResult };
+          // Note-quota policy (ENG-213). Default to 'skip' — HOLD rather than silently
+          // drop a note the customer wrote. Only send note-less when the customer has
+          // explicitly authorized it via on_note_quota='send_without_note'.
+          const onNoteQuota: 'send_without_note' | 'skip' =
+            on_note_quota === 'send_without_note' ? 'send_without_note' : 'skip';
+          try {
+            const inviteResult = await linkedInOutreachService.sendInvitation(
+              account_id, target, isUrl, message, inviteCharLimit, { onNoteQuota },
+            );
+
+            // ENG-182: write the pending invite through to the cache immediately (mirrors
+            // the CRM route) so a subsequent run — before the next ~10-min sync cron — sees
+            // it and dedups via the check above. Best-effort: a cache write must never fail
+            // an invite that Unipile already accepted. (Written with the same lowercased
+            // publicProfileUrl the GSI reads, so the next lookup matches case-insensitively.)
+            if (invitePublicId) {
+              try {
+                const { upsertSentInvitation } = await import('./unipileSentInvitationsDb');
+                const { normalizeLinkedInUrl } = await import('./unipileConnectionsDb');
+                const nowIso = new Date().toISOString();
+                await upsertSentInvitation({
+                  accountId: account_id,
+                  invitedUserPublicId: invitePublicId,
+                  publicProfileUrl: normalizeLinkedInUrl(`https://www.linkedin.com/in/${invitePublicId}/`),
+                  invitationId: (inviteResult && (inviteResult.invitation_id || inviteResult.id)) || '',
+                  invitedUserName: '',
+                  invitationText: message ?? '',
+                  sentAt: nowIso,
+                  syncedAt: nowIso,
+                });
+              } catch (cacheErr) {
+                console.warn('[AgentMode] send-invite: failed to cache sent invitation (non-fatal):', cacheErr);
+              }
+            }
+
+            return { success: true, data: inviteResult };
+          } catch (inviteErr: any) {
+            if (inviteErr?.noteQuotaExceeded) {
+              // Decision gate — do NOT decide for the customer. Ask them, then re-call
+              // send-invite with on_note_quota. In a scheduled run there is no one to
+              // answer, so the agent stops here and the invite is simply left un-sent
+              // (the lead stays eligible); the customer resolves it by reopening the chat.
+              return {
+                success: false,
+                requiresDecision: true,
+                noteQuotaExceeded: true,
+                error:
+                  `This LinkedIn account's monthly quota for personalized invitation notes is spent, so the note "${message}" cannot be attached. ` +
+                  `Do NOT decide on your own — ask the user whether to send the connection request WITHOUT the note or skip this person. ` +
+                  `Then re-call send-invite with the same target plus on_note_quota="send_without_note" to send note-less, or leave it un-sent if they choose to skip.`,
+              };
+            }
+            throw inviteErr;
+          }
         }
 
         case 'send-message': {
@@ -26653,7 +27534,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      // Surface X's real ApiResponseError payload (title/detail/errors) instead of
+      // collapsing to a bare "Request failed with code 403" — see describeXApiError.
+      const errorMessage = describeXApiError(error);
       console.error('AgentMode: twitter_manage_post failed:', errorMessage);
       return { success: false, message: 'Twitter action failed', error: errorMessage };
     }
@@ -26662,7 +27545,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   async twitterOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
-    const { text, handle, recipient_handle, query, max_results, tweet_id, list_id, lead_id, lead_email } = args;
+    const { text, handle, recipient_handle, query, max_results, tweet_id, x_list_id, list_name, list_id, lead_id, lead_email } = args;
     console.log(`[AgentMode] twitterOutreach called: action=${action}, account_id=${account_id}`);
 
     const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
@@ -26793,6 +27676,27 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: result };
         }
 
+        case 'list-owned-lists': {
+          const result = await twitterService.getOwnedLists(ownerUserId, account_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-list-members': {
+          const listId = x_list_id
+            || (list_name ? await twitterService.resolveOwnedListIdByName(ownerUserId, account_id, list_name) : undefined);
+          if (!listId) throw new Error('x_list_id or list_name is required for get_list_members');
+          const result = await twitterService.getListMembers(ownerUserId, account_id, listId);
+          return { success: true, data: result };
+        }
+
+        case 'get-list-tweets': {
+          const listId = x_list_id
+            || (list_name ? await twitterService.resolveOwnedListIdByName(ownerUserId, account_id, list_name) : undefined);
+          if (!listId) throw new Error('x_list_id or list_name is required for get_list_tweets');
+          const result = await twitterService.getListTweets(ownerUserId, account_id, listId, max_results);
+          return { success: true, data: result };
+        }
+
         case 'block': {
           const target = handle || recipient_handle;
           if (!target) throw new Error('handle is required for block');
@@ -26827,13 +27731,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             'search-tweets', 'get-user-tweets',
             'send-dm', 'list-dms', 'get-dm-conversation',
             'bookmark', 'get-bookmarks',
+            'list-owned-lists', 'get-list-members', 'get-list-tweets',
             'block', 'unblock', 'mute', 'unmute',
           ];
           throw new Error(`Unsupported twitter_outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
         }
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      // Surface X's real ApiResponseError payload (title/detail/errors) instead of
+      // collapsing to a bare "Request failed with code 403" — see describeXApiError.
+      const errorMessage = describeXApiError(error);
       console.error('AgentMode: twitter_outreach failed:', errorMessage);
       return { success: false, message: 'Twitter outreach action failed', error: errorMessage };
     }
@@ -26976,7 +27883,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!params.campaign_id) throw new Error('LIST creatives requires params.campaign_id');
           const result = await linkedInAdsService.listCreatives(accessToken, accountId, params.campaign_id);
           if (!result.success) throw new Error(result.error || 'Failed to list creatives');
-          return { success: true, creatives: result.data?.elements || [] };
+          const rawCreatives: any[] = result.data?.elements || [];
+          // ENG-239: a content.reference creative only carries a bare post URN
+          // pointer -- expand it with the referenced post's own fields
+          // (contentLandingPage etc) so a caller can see the actual destination
+          // without a manual follow-up POST/GET per creative. A failed read
+          // (e.g. deleted post) degrades to the bare creative rather than
+          // failing the whole LIST.
+          const creatives = await Promise.all(rawCreatives.map(async (creative) => {
+            const postUrn = creative?.content?.reference;
+            if (!postUrn) return creative;
+            const postResult = await linkedInAdsService.getPost(accessToken, postUrn);
+            return postResult.success ? { ...creative, referencedPost: postResult.data } : creative;
+          }));
+          return { success: true, creatives };
         }
         if (action === 'CREATE') {
           if (!params.campaign_id) throw new Error('CREATE creative requires params.campaign_id');
@@ -27003,6 +27923,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!result.success) throw new Error(result.error || 'Failed to create dynamic creative');
           return { success: true, message: 'Dynamic creative created', creative: result.data };
         }
+        if (action === 'RETAG_UTM') {
+          // ENG-239 retrofit: retags ONE existing creative, never a list.
+          // LIVE-VERIFIED 2026-07-16 for textAd creatives — see retagCreativeUtm's docstring
+          // for the $set-is-not-a-deep-merge caveat and the content.reference delegation.
+          if (!params.creative_id) throw new Error('RETAG_UTM requires creative_id');
+          if (!params.campaign_id) throw new Error('RETAG_UTM requires campaign_id');
+          const result = await linkedInAdsService.retagCreativeUtm(accessToken, accountId, params.creative_id, params.campaign_id);
+          if (!result.success) throw new Error(result.error || 'Failed to retag creative UTMs');
+          if (result.alreadyTagged) return { success: true, message: 'Creative already carries every UTM key — no change made.' };
+          return { success: true, message: 'Creative retagged with UTMs' };
+        }
         throw new Error(`Unknown action "${action}" for CREATIVE`);
       }
 
@@ -27018,6 +27949,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const postType = feedDistribution === 'MAIN_FEED' ? 'Company page post' : 'Dark post';
           const postUrl = postUrn ? `https://www.linkedin.com/feed/update/${encodeURIComponent(postUrn)}/` : undefined;
           return { success: true, message: `${postType} created. Use post_urn as reference in CREATIVE/CREATE.`, post_urn: postUrn, post_url: postUrl, post: result.data };
+        }
+        if (action === 'GET') {
+          if (!params.post_urn) throw new Error('POST GET requires params.post_urn');
+          const result = await linkedInAdsService.getPost(accessToken, params.post_urn);
+          if (!result.success) throw new Error(result.error || 'Failed to get post');
+          return { success: true, post: result.data };
         }
         throw new Error(`Unknown action "${action}" for POST`);
       }
@@ -27441,7 +28378,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (llmTitles.length > 0) {
         try {
           const llmClient = await this.getClientForModel('gemini-2.5-flash');
-          const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, llmClient);
+          const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, llmClient, userId);
           for (let k = 0; k < llmIndices.length; k++) {
             const v = results[k];
             if (v && v !== 'NONE') leads[llmIndices[k]].company = v;
@@ -27570,14 +28507,113 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     return response;
   }
 
+  /**
+   * Deterministic pre-flight tracking gate (ENG-335). Before a campaign is
+   * enabled/launched, fetch its final URLs and confirm each serves a detectable
+   * conversion-measurement mechanism (GA4 / GTM / Google Ads conversion snippet).
+   * Blocks the launch by default when any URL is unmeasured or unverifiable;
+   * an explicit `override_tracking_check` proceeds but is recorded. The per-URL
+   * result and the decision are persisted to the run record so a later report
+   * can state measurement status instead of a bare "0 conversions".
+   *
+   * Returns `{ proceed: false, blockResult }` when the launch must be blocked
+   * (caller returns blockResult verbatim), or `{ proceed: true }` to continue.
+   */
+  private async enforceGoogleAdsLaunchGate(
+    userId: string,
+    customerId: string,
+    campaignResourceName: string,
+    action: string,
+    override: boolean,
+    sessionId?: string,
+  ): Promise<{ proceed: boolean; blockResult?: any }> {
+    const finalUrls = await googleAdsService.getCampaignFinalUrls(userId, customerId, campaignResourceName);
+    // No serving URLs (e.g. a campaign with no ads yet) ⇒ nothing to gate.
+    if (finalUrls.length === 0) return { proceed: true };
+    return this.runGoogleAdsTrackingGate(customerId, campaignResourceName, action, override, sessionId, finalUrls);
+  }
+
+  /**
+   * ENG-335: adding a new ad or PMax asset group to an *already-ENABLED* campaign
+   * serves paid traffic to its final URL instantly — the same exposure as a launch.
+   * Gate the newly-added final URL(s) exactly like RESUME/UPDATE(ENABLED). Additions
+   * to a PAUSED/DRAFT campaign are not gated here; they are re-checked when that
+   * campaign is later enabled/resumed.
+   */
+  private async enforceGoogleAdsCreativeAdditionGate(
+    customerId: string,
+    campaignResourceName: string,
+    campaignStatus: string | null,
+    action: string,
+    override: boolean,
+    sessionId: string | undefined,
+    newFinalUrls: Array<string | undefined>,
+  ): Promise<{ proceed: boolean; blockResult?: any }> {
+    if (campaignStatus !== 'ENABLED') return { proceed: true };
+    const urls = newFinalUrls.filter((u): u is string => typeof u === 'string' && u.trim().length > 0);
+    if (urls.length === 0) return { proceed: true };
+    return this.runGoogleAdsTrackingGate(customerId, campaignResourceName, action, override, sessionId, urls);
+  }
+
+  /**
+   * Shared core of the tracking gate: run the deterministic pre-flight check over
+   * `finalUrls`, record the outcome (passed / blocked / overridden) on the run
+   * record, and return whether the caller may proceed.
+   */
+  private async runGoogleAdsTrackingGate(
+    customerId: string,
+    campaignResourceName: string,
+    action: string,
+    override: boolean,
+    sessionId: string | undefined,
+    finalUrls: string[],
+  ): Promise<{ proceed: boolean; blockResult?: any }> {
+    const gate = await preflightTrackingGate(finalUrls);
+    const urlResults = gate.results.map(r => ({ url: r.url, status: r.status, mechanisms: r.mechanisms, error: r.error }));
+
+    if (gate.ok) {
+      await chatbotDb.recordGoogleAdsMeasurementCheck(sessionId || '', {
+        customerId, campaignResourceName, action, outcome: 'passed', urlResults, checkedAt: new Date().toISOString(),
+      });
+      return { proceed: true };
+    }
+
+    if (override) {
+      await chatbotDb.recordGoogleAdsMeasurementCheck(sessionId || '', {
+        customerId, campaignResourceName, action, outcome: 'overridden', urlResults, checkedAt: new Date().toISOString(),
+      });
+      return { proceed: true };
+    }
+
+    await chatbotDb.recordGoogleAdsMeasurementCheck(sessionId || '', {
+      customerId, campaignResourceName, action, outcome: 'blocked', urlResults, checkedAt: new Date().toISOString(),
+    });
+    return {
+      proceed: false,
+      blockResult: {
+        success: false,
+        blocked: true,
+        reason: 'tracking_preflight',
+        error: gate.message,
+        trackingCheck: { measured: false, urlResults },
+      },
+    };
+  }
+
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
-    entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION';
+    entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
     action: string;
     [key: string]: any;
-  }): Promise<any> {
+  }, opts?: { sessionId?: string }): Promise<any> {
     try {
       const { customer_id, entity_type, action } = args;
+      const overrideTrackingCheck = args.override_tracking_check === true;
+
+      if (entity_type === 'BIDDING_STRATEGY' && action === 'LIST') {
+        const biddingStrategies = await googleAdsService.listBiddingStrategies(userId, customer_id);
+        return { success: true, biddingStrategies };
+      }
 
       if (entity_type === 'CAMPAIGN') {
         if (action === 'LIST') {
@@ -27591,6 +28627,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'RESUME') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for RESUME action' };
+          const gate = await this.enforceGoogleAdsLaunchGate(userId, customer_id, args.campaign_resource_name, 'RESUME', overrideTrackingCheck, opts?.sessionId);
+          if (!gate.proceed) return gate.blockResult;
           await googleAdsService.resumeCampaign(userId, customer_id, args.campaign_resource_name);
           return { success: true, message: 'Campaign resumed' };
         }
@@ -27600,8 +28638,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, message: 'Campaign removed' };
         }
         if (action === 'CREATE') {
-          if (!args.budget_resource_name || !args.name || !args.type || !args.bidding_strategy) {
-            return { success: false, error: 'name, type, budget_resource_name, and bidding_strategy are required to create a campaign' };
+          if (!args.budget_resource_name || !args.name || !args.type || (!args.bidding_strategy && !args.bidding_strategy_resource_name)) {
+            return { success: false, error: 'name, type, budget_resource_name, and a bidding strategy (bidding_strategy for a standard strategy, or bidding_strategy_resource_name for a portfolio/shared strategy) are required to create a campaign' };
+          }
+          if (args.bidding_strategy && args.bidding_strategy_resource_name) {
+            return { success: false, error: 'Provide either bidding_strategy (standard) or bidding_strategy_resource_name (portfolio/shared), not both.' };
           }
           if (args.bidding_strategy === 'TARGET_CPA' && !args.bidding_strategy_target) {
             return { success: false, error: 'TARGET_CPA requires bidding_strategy_target (CPA value in account currency, e.g. 20 for $20). Ask the user for their target CPA before proceeding.' };
@@ -27614,6 +28655,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             type: args.type,
             budgetResourceName: args.budget_resource_name,
             biddingStrategy: args.bidding_strategy,
+            biddingStrategyResourceName: args.bidding_strategy_resource_name,
             biddingStrategyTarget: args.bidding_strategy_target,
             cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
             locationTargetIds: args.location_target_ids || [],
@@ -27625,14 +28667,22 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for UPDATE action' };
-          await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
+          // Enabling a campaign via UPDATE(status=ENABLED) is a launch — gate it like RESUME.
+          if (args.status === 'ENABLED') {
+            const gate = await this.enforceGoogleAdsLaunchGate(userId, customer_id, args.campaign_resource_name, 'UPDATE', overrideTrackingCheck, opts?.sessionId);
+            if (!gate.proceed) return gate.blockResult;
+          }
+          const didUpdate = await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
             name: args.name,
             status: args.status,
             biddingStrategy: args.bidding_strategy,
+            biddingStrategyResourceName: args.bidding_strategy_resource_name,
             biddingStrategyTarget: args.bidding_strategy_target,
             cpcBidCeilingMicros: args.cpc_bid_ceiling_micros,
             budgetResourceName: args.budget_resource_name,
+            finalUrlSuffix: args.final_url_suffix,
           });
+          if (!didUpdate) return { success: false, error: 'This tool does not support updating the field(s) requested for CAMPAIGN — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Campaign updated' };
         }
       }
@@ -27675,7 +28725,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.ad_group_resource_name) return { success: false, error: 'ad_group_resource_name is required for UPDATE action' };
-          await googleAdsService.updateAdGroup(userId, customer_id, args.ad_group_resource_name, {
+          const didUpdateAdGroup = await googleAdsService.updateAdGroup(userId, customer_id, args.ad_group_resource_name, {
             name: args.name,
             status: args.status,
             cpcBidMicros: args.cpc_bid_micros,
@@ -27683,6 +28733,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             targetCpaMicros: args.target_cpa_micros,
             targetRoas: args.target_roas,
           });
+          if (!didUpdateAdGroup) return { success: false, error: 'This tool does not support updating the field(s) requested for AD_GROUP — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Ad group updated' };
         }
         if (action === 'REMOVE') {
@@ -27715,10 +28766,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.criterion_resource_name) return { success: false, error: 'criterion_resource_name is required for KEYWORD UPDATE' };
-          await googleAdsService.updateKeyword(userId, customer_id, args.criterion_resource_name, {
+          const didUpdateKeyword = await googleAdsService.updateKeyword(userId, customer_id, args.criterion_resource_name, {
             status: args.status,
             cpcBidMicros: args.cpc_bid_micros,
           });
+          if (!didUpdateKeyword) return { success: false, error: 'This tool does not support updating the field(s) requested for KEYWORD — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Keyword updated' };
         }
         if (action === 'REMOVE') {
@@ -27744,6 +28796,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!args.ad_group_resource_name || !args.type || !args.headlines || !args.descriptions || !args.final_url) {
             return { success: false, error: 'ad_group_resource_name, type, headlines, descriptions, and final_url are required to create an ad' };
           }
+          // ENG-335: an ad added to an already-live campaign serves paid traffic
+          // instantly — gate its final_url like a launch when the parent is ENABLED.
+          // Fail-open on a lookup/gate error: this is defence-in-depth (the RESUME /
+          // UPDATE→ENABLED gate is the hard guarantee), so a transient parent-status
+          // lookup failure must NOT break an otherwise-valid ad creation.
+          try {
+            const parent = await googleAdsService.getAdGroupCampaign(userId, customer_id, args.ad_group_resource_name);
+            if (parent) {
+              const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, parent.campaignResourceName, parent.campaignStatus, 'AD_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
+              if (!gate.proceed) return gate.blockResult;
+            }
+          } catch (gateErr) {
+            console.error('[ENG-335] AD_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
+          }
           let adType = args.type as string;
           if (adType === 'SEARCH') adType = 'RESPONSIVE_SEARCH_AD';
           else if (adType === 'DISPLAY') adType = 'RESPONSIVE_DISPLAY_AD';
@@ -27759,15 +28825,32 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD UPDATE' };
-          await googleAdsService.updateAd(userId, customer_id, args.ad_resource_name, {
+          const didUpdateAd = await googleAdsService.updateAd(userId, customer_id, args.ad_resource_name, {
             status: args.status,
           });
+          if (!didUpdateAd) return { success: false, error: 'This tool does not support updating the field(s) requested for AD — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Ad updated' };
         }
         if (action === 'REMOVE') {
           if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD REMOVE' };
           await googleAdsService.removeAd(userId, customer_id, args.ad_resource_name);
           return { success: true, message: 'Ad removed' };
+        }
+        if (action === 'RETAG_UTM') {
+          // ENG-239 retrofit: retags ONE existing ad, never a list.
+          if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD RETAG_UTM' };
+          const result = await googleAdsService.retagAdUtm(userId, customer_id, args.ad_resource_name);
+          if (!result.success) {
+            return {
+              success: false,
+              error: result.reason === 'no_destination_url'
+                ? 'This ad has no destination URL to tag.'
+                : result.reason === 'invalid_resource_name'
+                ? 'ad_resource_name is not a valid Google Ads resource name.'
+                : 'No change was made — the ad already carries every UTM key, or the campaign-level read needed to avoid clobbering existing tracking failed.',
+            };
+          }
+          return { success: true, message: 'Ad retagged with UTMs' };
         }
       }
 
@@ -27793,6 +28876,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             !args.logo_assets || !args.final_url) {
           return { success: false, error: 'name, campaign_resource_name, headlines, long_headlines, descriptions, square_image_assets, landscape_image_assets, logo_assets, and final_url are required' };
         }
+        // ENG-335: a PMax asset group added to an already-live campaign serves paid
+        // traffic instantly — gate its final_url like a launch when the parent is ENABLED.
+        // Fail-open on a lookup/gate error (see AD_CREATE above): defence-in-depth, so a
+        // transient campaign-status lookup failure must NOT break a valid asset-group create.
+        try {
+          const campaignStatus = await googleAdsService.getCampaignStatus(userId, customer_id, args.campaign_resource_name);
+          const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, args.campaign_resource_name, campaignStatus, 'ASSET_GROUP_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
+          if (!gate.proceed) return gate.blockResult;
+        } catch (gateErr) {
+          console.error('[ENG-335] ASSET_GROUP_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
+        }
         const assetGroup = await googleAdsService.createAssetGroup(userId, customer_id, {
           name: args.name,
           campaignResourceName: args.campaign_resource_name,
@@ -27806,6 +28900,23 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           finalUrl: args.final_url,
         });
         return { success: true, assetGroupResourceName: assetGroup.resourceName };
+      }
+
+      if (entity_type === 'ASSET_GROUP' && action === 'RETAG_UTM') {
+        // ENG-239 PMax retrofit: retags ONE existing asset group, never a list.
+        if (!args.asset_group_resource_name) return { success: false, error: 'asset_group_resource_name is required for ASSET_GROUP RETAG_UTM' };
+        const result = await googleAdsService.retagAssetGroupUtm(userId, customer_id, args.asset_group_resource_name);
+        if (!result.success) {
+          return {
+            success: false,
+            error: result.reason === 'no_destination_url'
+              ? 'This asset group has no destination URL to tag.'
+              : result.reason === 'invalid_resource_name'
+              ? 'asset_group_resource_name is not a valid Google Ads resource name.'
+              : 'No change was made — the destination already carries every UTM key (directly or via the campaign\'s final_url_suffix), or the URL could not be read.',
+          };
+        }
+        return { success: true, message: 'Asset group retagged with UTMs' };
       }
 
       return { success: false, error: `Unsupported entity_type=${entity_type} action=${action}` };
@@ -28376,6 +29487,7 @@ function parseCompanyFromTitle(title: any): string | null {
 async function batchParseCompaniesFromTitlesWithLLM(
   titles: string[],
   llmClient: any,
+  userId?: string,
 ): Promise<string[]> {
   if (!Array.isArray(titles) || titles.length === 0) return [];
   if (!llmClient?.chat?.completions?.create) return titles.map(() => 'NONE');
@@ -28404,6 +29516,15 @@ async function batchParseCompaniesFromTitlesWithLLM(
       max_completion_tokens: Math.max(500, titles.length * 30),
       temperature: 0.1,
     });
+    // Shadow-meter this direct Gemini completion (bypasses callLLM). Burn-only, fail-open.
+    // Tokens are recorded even though gemini-2.5-flash may be unpriced (cost 0
+    // until a price row exists) — token visibility is still worth having.
+    if ((completion as any)?.usage) {
+      meterUsageFromResponse(
+        { userId, model: 'gemini-2.5-flash', provider: 'gemini', feature: 'title_company_parse' },
+        completion
+      );
+    }
     const raw = String(completion?.choices?.[0]?.message?.content ?? '').trim();
     // Gemini Flash often adds preamble / postamble / markdown fences despite
     // explicit instructions. Locate the widest `[ ... ]` substring instead of

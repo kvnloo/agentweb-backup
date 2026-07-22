@@ -1,26 +1,25 @@
 /**
- * Linear webhook route — resolve bridge + FB-synced issue enrichment (ENG-187 contract #4).
+ * Linear webhook route — Done-only resolve bridge + FB-synced issue enrichment.
  *
  * Contract under test:
- *   - HMAC-SHA256 signature (`linear-signature` over the raw payload bytes) is enforced for EVERY
- *     event type when LINEAR_WEBHOOK_SECRET is set — including the new Issue-creation branch
- *   - Issue CREATE carrying the "Featurebase" label (the FB->Linear sync's marker) -> funnel
- *     enrichment (intakeService.enrichFeaturebaseSyncedIssue) with the issue id + title
- *   - Issue CREATE without that label (our own bug canonicals / Auto issues) -> untouched
- *   - non-create actions / non-Issue types -> no enrichment
- *   - payload contract drift (labelIds present but no expanded `labels` array) -> LOUD error, no
- *     silent skip
- *   - enrichment errors return 200 (never crash the route — it also serves the resolve bridge)
- *   - the resolve bridge (completed transition -> notifyCanonicalResolved) is unchanged, and an
- *     issue created directly in a completed state routes to the bridge, not enrichment
+ *   - HMAC-SHA256 signature (`linear-signature` over the raw payload bytes) is enforced for every
+ *     event type when LINEAR_WEBHOOK_SECRET is set
+ *   - customer comms fire only on an Issue update that transitions into the configured Done state
+ *   - completed-type states that are not Done, already-Done edits, and Issue create events fire no
+ *     resolve bridge
+ *   - missing LINEAR_DONE_STATE_ID fails loud for Issue updates and never fires customer comms
+ *   - Issue create carrying the "Featurebase" label triggers funnel enrichment
+ *   - Featurebase enrichment errors return 200 so Linear does not retry-storm
  */
 import request from 'supertest';
 import express from 'express';
 import crypto from 'crypto';
 
 jest.mock('../services/intakeService', () => ({
-  notifyCanonicalResolved: jest.fn().mockResolvedValue({ ticketNumbers: [7] }),
-  enrichFeaturebaseSyncedIssue: jest.fn().mockResolvedValue({ labelNames: ['Status: Activation', 'Activated', 'Needs PM'] }),
+  notifyCanonicalResolved: jest.fn().mockResolvedValue({ ticketNumbers: [1, 2] }),
+  enrichFeaturebaseSyncedIssue: jest.fn().mockResolvedValue({
+    labelNames: ['Status: Activation', 'Activated', 'Needs PM'],
+  }),
 }));
 
 import integrationsRouter from '../routes/integrations';
@@ -33,13 +32,30 @@ app.use(express.json());
 app.use('/api/integrations', integrationsRouter);
 
 const SECRET = 'lin_whsec_test';
+const DONE_STATE_ID = 'b36918be-3026-4a37-b788-47eef453a581';
+const MERGED_STATE_ID = '11111111-1111-1111-1111-111111111111';
 const PATH = '/api/integrations/linear/webhook';
 
 function sign(body: string, secret = SECRET): string {
   return crypto.createHmac('sha256', secret).update(body).digest('hex');
 }
 
-/** An Issue-creation event as Featurebase's FB->Linear sync produces it (expanded labels array). */
+/** A transition INTO Done: state is Done and updatedFrom carries the prior non-Done stateId. */
+function transitionIntoDone(overrides: Record<string, any> = {}): any {
+  return {
+    type: 'Issue',
+    action: 'update',
+    data: {
+      id: 'issue-1',
+      title: 'A customer bug',
+      state: { id: DONE_STATE_ID, name: 'Done', type: 'completed' },
+    },
+    updatedFrom: { stateId: MERGED_STATE_ID },
+    ...overrides,
+  };
+}
+
+/** An Issue-creation event as Featurebase's FB->Linear sync produces it. */
 function fbCreateEvent(overrides: Record<string, any> = {}): any {
   return {
     action: 'create',
@@ -56,22 +72,135 @@ function fbCreateEvent(overrides: Record<string, any> = {}): any {
   };
 }
 
-async function post(body: any, opts: { sig?: string } = {}): Promise<request.Response> {
+async function post(body: any, opts: { sig?: string; unsigned?: boolean } = {}): Promise<request.Response> {
   const raw = typeof body === 'string' ? body : JSON.stringify(body);
-  return request(app)
-    .post(PATH)
-    .set('Content-Type', 'application/json')
-    .set('linear-signature', opts.sig ?? sign(raw))
-    .send(raw);
+  let req = request(app).post(PATH).set('Content-Type', 'application/json');
+  if (!opts.unsigned) {
+    req = req.set('linear-signature', opts.sig ?? sign(raw));
+  }
+  return req.send(raw);
 }
 
 const realSecret = process.env.LINEAR_WEBHOOK_SECRET;
+const realDoneId = process.env.LINEAR_DONE_STATE_ID;
 beforeEach(() => {
   jest.clearAllMocks();
   process.env.LINEAR_WEBHOOK_SECRET = SECRET;
+  process.env.LINEAR_DONE_STATE_ID = DONE_STATE_ID;
 });
 afterAll(() => {
-  process.env.LINEAR_WEBHOOK_SECRET = realSecret;
+  if (realSecret === undefined) delete process.env.LINEAR_WEBHOOK_SECRET;
+  else process.env.LINEAR_WEBHOOK_SECRET = realSecret;
+  if (realDoneId === undefined) delete process.env.LINEAR_DONE_STATE_ID;
+  else process.env.LINEAR_DONE_STATE_ID = realDoneId;
+});
+
+describe('POST /api/integrations/linear/webhook — Done-only transition gating', () => {
+  it('AC3: transition into Done fires the resolve bridge exactly once', async () => {
+    const res = await post(transitionIntoDone());
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, notified: 2, ticketNumbers: [1, 2] });
+    expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
+    expect(intake.notifyCanonicalResolved).toHaveBeenCalledWith('issue-1', 'A customer bug');
+    expect(intake.enrichFeaturebaseSyncedIssue).not.toHaveBeenCalled();
+  });
+
+  it('AC1: moving into Merged (started type) fires zero customer comms', async () => {
+    const res = await post({
+      type: 'Issue',
+      action: 'update',
+      data: { id: 'issue-1', title: 'x', state: { id: MERGED_STATE_ID, name: 'Merged', type: 'started' } },
+      updatedFrom: { stateId: 'some-backlog-id' },
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.notified).toBe(0);
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+  });
+
+  it('AC1: moving into Verifying (completed type, non-Done ID) fires nothing', async () => {
+    const res = await post({
+      type: 'Issue',
+      action: 'update',
+      data: {
+        id: 'issue-1',
+        title: 'x',
+        state: { id: 'verifying-state-id', name: 'Verifying', type: 'completed' },
+      },
+      updatedFrom: { stateId: MERGED_STATE_ID },
+    });
+    expect(res.body.notified).toBe(0);
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+  });
+
+  it('AC2: a title edit on an already-Done issue (no stateId in updatedFrom) fires nothing', async () => {
+    const res = await post(transitionIntoDone({ updatedFrom: { title: 'old title' } }));
+    expect(res.body.notified).toBe(0);
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+  });
+
+  it('AC2: an update with no updatedFrom at all fires nothing', async () => {
+    const ev = transitionIntoDone();
+    delete ev.updatedFrom;
+    const res = await post(ev);
+    expect(res.body.notified).toBe(0);
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+  });
+
+  it('action:create for a Done-state issue fires no resolve bridge because it is not a transition', async () => {
+    const res = await post(transitionIntoDone({ action: 'create', updatedFrom: undefined }));
+    expect(res.body.notified).toBe(0);
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+  });
+
+  it('AC4: a completed-type state whose ID is not the configured Done ID fires nothing', async () => {
+    const res = await post({
+      type: 'Issue',
+      action: 'update',
+      data: {
+        id: 'issue-1',
+        title: 'x',
+        state: { id: 'other-completed-id', name: 'Released', type: 'completed' },
+      },
+      updatedFrom: { stateId: MERGED_STATE_ID },
+    });
+    expect(res.body.notified).toBe(0);
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+  });
+
+  it('does not fire when updatedFrom.stateId already equals Done (Done -> Done no-op)', async () => {
+    const res = await post(transitionIntoDone({ updatedFrom: { stateId: DONE_STATE_ID } }));
+    expect(res.body.notified).toBe(0);
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+  });
+
+  it('ignores non-Issue events', async () => {
+    const res = await post(transitionIntoDone({ type: 'Comment' }));
+    expect(res.body.notified).toBe(0);
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/integrations/linear/webhook — config guard (AC5)', () => {
+  it('missing LINEAR_DONE_STATE_ID fails loud for Issue updates and never fires', async () => {
+    delete process.env.LINEAR_DONE_STATE_ID;
+    const res = await post(transitionIntoDone());
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(false);
+    expect(res.body.error).toMatch(/LINEAR_DONE_STATE_ID/);
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+  });
+
+  it('missing LINEAR_DONE_STATE_ID does not block Featurebase-synced issue creation enrichment', async () => {
+    delete process.env.LINEAR_DONE_STATE_ID;
+    const res = await post(fbCreateEvent());
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, enriched: true, labels: ['Status: Activation', 'Activated', 'Needs PM'] });
+    expect(intake.enrichFeaturebaseSyncedIssue).toHaveBeenCalledWith({
+      issueId: 'issue-uuid-1',
+      title: 'Add a disable Emma tips toggle',
+    });
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+  });
 });
 
 describe('POST /api/integrations/linear/webhook — FB-synced issue enrichment (ENG-187 #4)', () => {
@@ -111,9 +240,11 @@ describe('POST /api/integrations/linear/webhook — FB-synced issue enrichment (
     expect(intake.enrichFeaturebaseSyncedIssue).not.toHaveBeenCalled();
   });
 
-  it('Issue create with NO labels at all -> untouched, no error log', async () => {
+  it('Issue create with no labels at all -> untouched, no error log', async () => {
     const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-    const ev = fbCreateEvent({ data: { id: 'issue-uuid-3', title: 'plain', labelIds: [], labels: [], state: { type: 'backlog' } } });
+    const ev = fbCreateEvent({
+      data: { id: 'issue-uuid-3', title: 'plain', labelIds: [], labels: [], state: { type: 'backlog' } },
+    });
     const res = await post(ev);
     expect(res.status).toBe(200);
     expect(intake.enrichFeaturebaseSyncedIssue).not.toHaveBeenCalled();
@@ -121,7 +252,7 @@ describe('POST /api/integrations/linear/webhook — FB-synced issue enrichment (
     errSpy.mockRestore();
   });
 
-  it('Issue UPDATE with the Featurebase label -> no enrichment (creation-only)', async () => {
+  it('Issue update with the Featurebase label -> no enrichment (creation-only)', async () => {
     const res = await post(fbCreateEvent({ action: 'update' }));
     expect(res.status).toBe(200);
     expect(intake.enrichFeaturebaseSyncedIssue).not.toHaveBeenCalled();
@@ -133,7 +264,7 @@ describe('POST /api/integrations/linear/webhook — FB-synced issue enrichment (
     expect(intake.enrichFeaturebaseSyncedIssue).not.toHaveBeenCalled();
   });
 
-  it('payload contract drift (labelIds but NO expanded labels array) -> loud error, no silent skip', async () => {
+  it('payload contract drift (labelIds but no expanded labels array) -> loud error, no silent skip', async () => {
     const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
     const ev = fbCreateEvent();
     delete ev.data.labels;
@@ -144,7 +275,7 @@ describe('POST /api/integrations/linear/webhook — FB-synced issue enrichment (
     errSpy.mockRestore();
   });
 
-  it('enrichment throwing -> 200 ok:false (the route also serves the resolve bridge — never crash)', async () => {
+  it('enrichment throwing -> 200 ok:false (never crash the route)', async () => {
     const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
     intake.enrichFeaturebaseSyncedIssue.mockRejectedValueOnce(new Error('linear down'));
     const res = await post(fbCreateEvent());
@@ -154,25 +285,23 @@ describe('POST /api/integrations/linear/webhook — FB-synced issue enrichment (
   });
 });
 
-describe('POST /api/integrations/linear/webhook — resolve bridge unchanged (regression)', () => {
-  it('Issue update to a completed state still routes to notifyCanonicalResolved', async () => {
-    const ev = {
-      action: 'update',
-      type: 'Issue',
-      data: { id: 'issue-uuid-9', title: 'fixed bug', state: { id: 'st-done', name: 'Done', type: 'completed' } },
-    };
-    const res = await post(ev);
+describe('POST /api/integrations/linear/webhook — signature and error handling', () => {
+  it('valid signature -> transition into Done fires', async () => {
+    const res = await post(transitionIntoDone());
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ ok: true, notified: 1, ticketNumbers: [7] });
-    expect(intake.notifyCanonicalResolved).toHaveBeenCalledWith('issue-uuid-9', 'fixed bug');
-    expect(intake.enrichFeaturebaseSyncedIssue).not.toHaveBeenCalled();
+    expect(intake.notifyCanonicalResolved).toHaveBeenCalledTimes(1);
   });
 
-  it('Issue CREATED directly in a completed state -> bridge, not enrichment', async () => {
-    const ev = fbCreateEvent({ data: { id: 'issue-uuid-10', title: 't', labels: [{ id: 'lab-fb', name: 'Featurebase' }], state: { type: 'completed' } } });
-    const res = await post(ev);
+  it('wrong signature -> 401, never fires', async () => {
+    const res = await post(transitionIntoDone(), { sig: 'f'.repeat(64) });
+    expect(res.status).toBe(401);
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
+  });
+
+  it('malformed JSON with valid signature -> 200 ok:false (no throw, no retry storm)', async () => {
+    const res = await post('{not-json');
     expect(res.status).toBe(200);
-    expect(intake.notifyCanonicalResolved).toHaveBeenCalledWith('issue-uuid-10', 't');
-    expect(intake.enrichFeaturebaseSyncedIssue).not.toHaveBeenCalled();
+    expect(res.body.ok).toBe(false);
+    expect(intake.notifyCanonicalResolved).not.toHaveBeenCalled();
   });
 });

@@ -5,7 +5,7 @@ import { ChatPromptTemplate } from '@langchain/core/prompts';
 import { JsonOutputParser } from '@langchain/core/output_parsers';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { extractJson, JsonExtractError } from '../services/util/extractJson';
-import { recordUsage } from '../services/usageRecorderService';
+import { meterUserUsage } from '../services/usageRecorderService';
 
 export type OutputFormat = 'json' | 'xml';
 
@@ -41,7 +41,13 @@ export class LLMService {
   private isGemini: boolean;
   private provider: string;
 
-  constructor(modelName?: string, temperature: number = 0.8, maxTokens?: number) {
+  /**
+   * @param temperature Pass `null` to omit the parameter entirely and let the
+   *   deployment use its default. Some Azure deployments (e.g. gpt-5-chat-2)
+   *   reject ANY non-default temperature with a 400 `unsupported_value`, which
+   *   callers then swallow — silently disabling whatever they were doing.
+   */
+  constructor(modelName?: string, temperature: number | null = 0.8, maxTokens?: number) {
     const model = modelName || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
     this.modelName = model;
     this.isGemini = model.toLowerCase().includes('gemini');
@@ -83,7 +89,7 @@ export class LLMService {
         model: modelId,
         region,
         client: bedrockClient,
-        temperature,
+        ...(temperature === null ? {} : { temperature }),
         ...(maxTokens && { maxTokens }),
       });
     } else {
@@ -98,7 +104,7 @@ export class LLMService {
         azureOpenAIApiInstanceName: instanceName,
         azureOpenAIApiDeploymentName: model,
         azureOpenAIApiVersion: process.env.AZURE_OPENAI_API_VERSION || '2024-08-01-preview',
-        temperature,
+        ...(temperature === null ? {} : { temperature }),
         ...(maxTokens && { maxTokens }),
       });
     }
@@ -127,12 +133,20 @@ export class LLMService {
   }
 
   /**
-   * Shadow-meter a completed call. ALWAYS fired (regardless of onUsage), never
-   * awaited, never throws — metering can't fail or slow a response.
+   * Meter a completed call. ALWAYS fired (regardless of onUsage), never awaited,
+   * never throws — metering can't fail or slow a response.
+   *
+   * Routes through meterUserUsage (not a bare recordUsage): the shadow burn is
+   * always recorded, AND the per-user cost cap is charged whenever a real userId
+   * is attributable (org members resolve to the owner via incrementUserTokenUsage).
+   * With no userId the call degrades to a burn-only record under "system", so
+   * platform/background spend stays absorbed. This closes the ENG-200 gap where
+   * high-volume LLMService features (enrichment, etc.) recorded burn but never
+   * deducted from any quota.
    */
   private meterUsage(usage: LLMUsageData, usageContext?: LLMUsageContext): void {
     try {
-      void recordUsage({
+      meterUserUsage({
         userId: usageContext?.userId,
         sessionId: usageContext?.sessionId,
         model: usage.model,
@@ -537,7 +551,7 @@ The HTML must be a complete, well-formed HTML document with proper DOCTYPE, head
  */
 export function createLLMService(
   modelName?: string,
-  temperature: number = 0.8,
+  temperature: number | null = 0.8,
   maxTokens?: number
 ): LLMService {
   return new LLMService(modelName, temperature, maxTokens);

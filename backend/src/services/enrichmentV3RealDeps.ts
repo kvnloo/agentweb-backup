@@ -21,6 +21,7 @@ import { runWaterfall as pureRunWaterfall, type LLMFilledValue, type EnrichSoFet
 import { apolloAsyncRequestCacheKey, APOLLO_SCHEMA_VERSION } from './apolloCacheKeys';
 import { FIELD_GROUPS } from './enrichmentGroups';
 import { trimQuote } from '../utils/enrichedFieldValue';
+import { groundWebValue, companyNameMatches } from '../utils/enrichmentGrounding';
 import { waitForApolloAsyncResult } from './enrichmentWaterfall';
 import { STANDARD_ENRICHABLE_FIELDS } from './enrichmentConfigService';
 import {
@@ -39,6 +40,17 @@ import { getUnipileProfileService } from './unipileProfileServiceFactory';
 // `crmEnrichmentService.ts:260-261`). Overridable via env for cost tuning.
 const EXTRACT_MODEL      = process.env.CRM_ENRICH_V3_EXTRACT_MODEL      || 'gpt-5-chat-2';
 const CRITIC_MODEL       = process.env.CRM_ENRICH_V3_CRITIC_MODEL       || 'gpt-5-chat-2';
+// The default deployment (gpt-5-chat-2) rejects ANY non-default temperature with
+// a 400 `unsupported_value` — "Only the default (1) value is supported" — and the
+// critic's catch swallowed it, so the critic never ran at all. `null` omits the
+// parameter. Point CRM_ENRICH_V3_CRITIC_MODEL at a deployment that accepts a
+// custom temperature and set CRM_ENRICH_V3_CRITIC_TEMPERATURE=0 for a
+// deterministic judge.
+const CRITIC_TEMPERATURE: number | null =
+  process.env.CRM_ENRICH_V3_CRITIC_TEMPERATURE !== undefined &&
+  process.env.CRM_ENRICH_V3_CRITIC_TEMPERATURE !== ''
+    ? Number(process.env.CRM_ENRICH_V3_CRITIC_TEMPERATURE)
+    : null;
 // Model used for Tier 4 web extraction — must support web search tool.
 // Set to a Gemini model (e.g. "gemini-2.0-flash") for Google Search grounding,
 // or an Azure deployment of gpt-4o-search-preview for OpenAI web_search_preview.
@@ -470,8 +482,12 @@ async function fetchWebForGroupReal(
   // Build context = SERP + page bodies (truncated)
   let webContext = JSON.stringify(rawData.webResults, null, 2);
   if (pages.length > 0) {
+    // Keep a generous slice of each page so a funding/firmographic fact that
+    // sits lower on the page still lands in the grounding source and isn't
+    // false-dropped for being "unsourced" (ENG-122). Grounding matches against
+    // this full context (cheap string ops); only the LLM prompt is capped.
     const pageText = pages
-      .map(p => `--- ${p.title}\n${p.url}\n${p.text.slice(0, 4000)}`)
+      .map(p => `--- ${p.title}\n${p.url}\n${p.text.slice(0, 12000)}`)
       .join('\n\n');
     webContext += '\n\nPage contents:\n' + pageText;
   }
@@ -501,6 +517,138 @@ export function buildFieldGuidanceV3(fields: string[], configFieldsByName: Recor
   }).join('\n');
 }
 
+/**
+ * Classify each web-tier extracted value by how well it can be trusted, and drop
+ * only wrong-entity values — never drop merely for being unverifiable (ENG-122).
+ *
+ * For each field, sets `grounding`:
+ *  - 'grounded': the fact was found in the real fetched source (groundWebValue,
+ *    which is format-insensitive so "$100M" matches a page saying "$100 million").
+ *    Safe to state.
+ *  - 'web-unverified': the model cited a web source (has sourceUrl) but the quote
+ *    couldn't be matched to our captured source — e.g. a live-searched page we
+ *    didn't fetch. Kept, badged "Web — unverified".
+ *  - 'ai-knowledge': no groundable quote and no source URL → asserted from the
+ *    model's training memory. Kept ONLY when the company the model says it
+ *    describes matches the lead's company (companyNameMatches, which separates
+ *    "Slash" from "Slashy"); otherwise DROPPED as an unconfirmable/wrong entity.
+ *    Kept values are badged "AI knowledge — unverified".
+ *
+ * LinkedIn URL fields are exempt: rejectHallucinatedLinkedInUrls already
+ * citation-verifies them by slug-matching the URL against the source.
+ */
+export function classifyWebValues(
+  filled: Record<string, LLMFilledValue>,
+  opts: {
+    source: string;
+    leadCompany?: string;
+    claimedCompany?: string;
+    /** The model's alias-aware self-judgment of whether the company its answers
+     *  describe is the SAME real-world company as the lead's (accounting for
+     *  abbreviations, rebrands, legal names). From __entity_matches_lead__. */
+    claimedMatchesLead?: boolean;
+  },
+): Record<string, LLMFilledValue> {
+  const result: Record<string, LLMFilledValue> = {};
+  // Wrong-entity guard (ENG-122 AC#2): the model returns __entity_company__ =
+  // the company its firmographic/funding answers actually describe. If it isn't
+  // the lead's company, the web source is about a DIFFERENT, similarly-named
+  // company ("Quill Meetings" for "Quillwork AI"; "Slashy" for "Slash") — so
+  // every web value is wrong for this lead and is dropped, even when genuinely
+  // grounded in that wrong source.
+  //
+  // The company name check is a cheap, alias-BLIND token match, so on its own it
+  // would over-drop legitimate aliases ("IBM" vs "International Business
+  // Machines", a "Facebook" article for a "Meta" lead). The extraction model
+  // also returns an alias-AWARE __entity_matches_lead__. So we drop only when the
+  // tokens mismatch AND the model does NOT affirm it's the same company:
+  // __entity_matches_lead__ is authoritative in BOTH directions; the token match
+  // is only the fallback for when the model says nothing:
+  //   - model says false → wrong entity → drop (whatever the name says)
+  //   - model says true  → alias → keep   (rescues "Meta" ← a "Facebook" source)
+  //   - model silent     → fall back to the token match
+  // It cannot be a plain AND/OR of the two signals. A live trace showed the model
+  // echo the lead's own name into __entity_company__ ("Slashy") while answering
+  // __entity_matches_lead__=false; the parroted name satisfied the token match and
+  // silently overrode the explicit denial, so Slash's company/joinslash survived
+  // on a "Slashy" lead (ENG-122). A denial must beat a name the model may have
+  // simply repeated back to us.
+  const tokenMismatch =
+    !!opts.claimedCompany && !companyNameMatches(opts.leadCompany, opts.claimedCompany);
+  const wrongEntity =
+    opts.claimedMatchesLead === false ? true
+      : opts.claimedMatchesLead === true ? false
+        : tokenMismatch;
+  for (const [field, entry] of Object.entries(filled)) {
+    // LinkedIn URLs never ground against a source quote, so they skip the
+    // grounding classification below. But a COMPANY LinkedIn URL describes the
+    // company, so a wrong-entity source must not supply one: a "Slashy" lead
+    // was handed linkedin.com/company/joinslash — Slash's page (ENG-122).
+    // rejectHallucinatedLinkedInUrls cannot catch that, since the slug
+    // "joinslash" genuinely appears in the Slash source it was read from.
+    // Person-level LinkedIn identifies the person, not the company, and is
+    // verified separately — it stays exempt from this check.
+    if (/linkedin/i.test(field)) {
+      if (/company/i.test(field)) {
+        // Fail CLOSED. The wrong-entity guard above is fail-OPEN: tokenMismatch
+        // needs a claimedCompany, so an omitted __entity_company__ reads as "not
+        // contradicted" and the value survives. That is how a "Slashy" lead kept
+        // company/joinslash on a live run. A company LinkedIn URL asserts the
+        // lead's identity and has no grounding backstop, so keep it only when the
+        // source company is POSITIVELY confirmed — by the token match, or by the
+        // model's alias-aware affirm (which rescues "Meta" ← company/facebook).
+        // Same tri-state: an explicit denial beats an echoed name, an explicit
+        // affirm beats a token mismatch, and silence falls back to the token match
+        // (which, absent a claimedCompany, leaves the URL unconfirmed → dropped).
+        const companyConfirmed =
+          opts.claimedMatchesLead === false ? false
+            : opts.claimedMatchesLead === true ? true
+              : (!!opts.claimedCompany && companyNameMatches(opts.leadCompany, opts.claimedCompany));
+        console.log(
+          `[v3 deps] company LinkedIn "${entry.value}" field="${field}" ` +
+          `lead="${opts.leadCompany ?? ''}" claimed="${opts.claimedCompany ?? '∅'}" ` +
+          `matchesLead=${opts.claimedMatchesLead ?? '∅'} → ${companyConfirmed ? 'KEEP' : 'DROP'}`,
+        );
+        if (!companyConfirmed) continue;
+      }
+      result[field] = entry;
+      continue;
+    }
+    if (wrongEntity) {
+      console.warn(
+        `[v3 deps] Dropped web value "${entry.value}" for field "${field}" ` +
+        `— source describes "${opts.claimedCompany}" ≠ lead company "${opts.leadCompany ?? ''}" ` +
+        `(wrong-entity guard)`,
+      );
+      continue;
+    }
+    let grounding: 'grounded' | 'web-unverified' | 'ai-knowledge';
+    if (groundWebValue(entry.value, entry.sourceQuote, opts.source)) {
+      grounding = 'grounded';
+    } else if (typeof entry.sourceUrl === 'string' && entry.sourceUrl.trim()) {
+      grounding = 'web-unverified';
+    } else if (
+      companyNameMatches(opts.leadCompany, opts.claimedCompany) ||
+      opts.claimedMatchesLead === true
+    ) {
+      // Training-memory value (no source URL) whose company is confirmed — by the
+      // token match OR the model's alias-aware affirm. Keep it, badged
+      // ai-knowledge, rather than drop (ENG-122: don't lose training-memory data;
+      // and stay alias-consistent with the wrong-entity guard, e.g. "Meta"="Facebook").
+      grounding = 'ai-knowledge';
+    } else {
+      console.warn(
+        `[v3 deps] Dropped ungrounded web value "${entry.value}" for field "${field}" ` +
+        `— no source and company unconfirmed (lead="${opts.leadCompany ?? ''}" ` +
+        `claimed="${opts.claimedCompany ?? ''}"): anti-fabrication guard`,
+      );
+      continue;
+    }
+    result[field] = { ...entry, grounding };
+  }
+  return result;
+}
+
 export function rejectHallucinatedLinkedInUrls(
   filled: Record<string, LLMFilledValue>,
   sourceContext: string,
@@ -525,7 +673,7 @@ export function rejectHallucinatedLinkedInUrls(
   return result;
 }
 
-async function extractFieldsViaLLMReal(input: {
+export async function extractFieldsViaLLMReal(input: {
   tier: 'apollo' | 'web';
   sourceContext: string;
   fields: string[];
@@ -560,10 +708,15 @@ async function extractFieldsViaLLMReal(input: {
     ? `You extract structured CRM data for a given lead. Follow this priority order:\n` +
       `1. Extract from the provided web context if the information is clearly present.\n` +
       `2. If information is missing or insufficient, use your web search capability to look it up.\n` +
-      `3. If web search yields no result, use your own training knowledge if you are FULLY confident.\n` +
+      `3. If neither yields a result, you MAY use your own training knowledge, but only if you are FULLY confident.\n` +
       `4. If you do not know a value with confidence, return null for that field.\n` +
-      `NEVER guess, infer, or fabricate. For each field return an object ` +
-      `{"value": <string>, "sourceUrl": <url or null>, "sourceQuote": <short verbatim snippet or null>}. ` +
+      `NEVER guess, infer, or fabricate.\n` +
+      `PROVENANCE IS MANDATORY AND MUST BE TRUTHFUL — for each field return an object ` +
+      `{"value": <string>, "sourceUrl": <url or null>, "sourceQuote": <short verbatim snippet or null>}:\n` +
+      `- If the value comes from the provided context or a web page, copy a SHORT VERBATIM snippet that contains it into sourceQuote (do not paraphrase) and put the page URL in sourceUrl.\n` +
+      `- If the value comes ONLY from your own training memory (no source found), set BOTH sourceUrl and sourceQuote to null. Do NOT invent a quote or URL to make an unsourced value look sourced.\n` +
+      `Also return a top-level key "__entity_company__": the company name EXACTLY as written in the source you actually used (or in your memory) — copy it verbatim from the source, do NOT substitute or normalize it to the lead's company name. If the best source you found is about a differently-named company (e.g. the lead is "Quillwork AI" but the funding article is about "Quill Meetings"), report that different name so we can detect the mismatch — do not pretend it matches.\n` +
+      `Also return a top-level key "__entity_matches_lead__": a boolean — true ONLY if the company your answers describe is the SAME real-world company as the lead's company, accounting for abbreviations, rebrands, and legal names (e.g. "IBM" = "International Business Machines", "Meta" = "Facebook", "Slash Inc" = "Slash"). Return false if it is a different company that merely has a similar name (e.g. "Quill Meetings" is NOT "Quillwork AI", "Slashy" is NOT "Slash"). Be honest — this is used to discard data about the wrong company.\n` +
       `Return strict JSON only, no markdown. If you have no data for any field, return {} — never return explanations or apologies.\n` +
       `IMPORTANT — for linkedin_url: name alone is never sufficient to confirm a match (e.g. "John Smith" is too common). ` +
       `Use ALL available lead signals — email address, email domain, company name, job title, location — to verify the profile belongs to this specific person. ` +
@@ -576,10 +729,10 @@ async function extractFieldsViaLLMReal(input: {
 
   const userPrompt = isWebTier
     ? `Lead: ${leadContext}\n\n` +
-      `Source (${input.tier}):\n${input.sourceContext.slice(0, 16000)}\n\n` +
+      `Source (${input.tier}):\n${input.sourceContext.slice(0, 24000)}\n\n` +
       `Extract these fields (return one JSON object with these exact keys):\n${fieldGuide}\n\n` +
       `Return ONLY a JSON object like ` +
-      `{"field_name": {"value": "...", "sourceUrl": "...", "sourceQuote": "..."}, "other_field": null}. ` +
+      `{"field_name": {"value": "...", "sourceUrl": "...", "sourceQuote": "..."}, "other_field": null, "__entity_company__": "<company these answers describe>", "__entity_matches_lead__": true}. ` +
       `No prose. If nothing is found, return {}.`
     : `Lead: ${leadContext}\n\n` +
       `Source (${input.tier}):\n${input.sourceContext.slice(0, 16000)}\n\n` +
@@ -629,7 +782,30 @@ async function extractFieldsViaLLMReal(input: {
         missing.push(field);
       }
     }
-    const verified = rejectHallucinatedLinkedInUrls(filled, input.sourceContext);
+    let verified = rejectHallucinatedLinkedInUrls(filled, input.sourceContext);
+    // Web tier can surface funding/firmographic figures the model asserted from
+    // training memory or an unverifiable source (ENG-122). Classify each value by
+    // how well it grounds in the real fetched source and drop only wrong-entity
+    // fabrications (company mismatch); everything else is kept but badged.
+    if (isWebTier) {
+      const claimedCompany = typeof parsed?.__entity_company__ === 'string'
+        ? parsed.__entity_company__.trim()
+        : undefined;
+      // Alias-aware self-judgment. Accept a real boolean or a "true"/"false"
+      // string (LLMs sometimes stringify); anything else → undefined (unknown).
+      const rawMatch = parsed?.__entity_matches_lead__;
+      const claimedMatchesLead =
+        typeof rawMatch === 'boolean' ? rawMatch
+        : typeof rawMatch === 'string' ? (rawMatch.trim().toLowerCase() === 'true' ? true
+          : rawMatch.trim().toLowerCase() === 'false' ? false : undefined)
+        : undefined;
+      verified = classifyWebValues(verified, {
+        source: input.sourceContext,
+        leadCompany: input.lead.company,
+        claimedCompany,
+        claimedMatchesLead,
+      });
+    }
     const verifiedMissing = input.fields.filter(f => !(f in verified));
     console.log(`${ltag} DONE filled=[${Object.keys(verified).join(',')}] missing=[${verifiedMissing.join(',')}]`);
     return { filled: verified, missing: [...new Set([...missing, ...verifiedMissing])] };
@@ -665,19 +841,30 @@ async function runCriticReal(input: {
     `"contradicted", no matter how clearly the source states the value. Only treat the ` +
     `source as a match when the company name AND/OR domain plausibly refer to the lead's ` +
     `company. When identity is genuinely ambiguous, use "unsupported", not "supported".\n\n` +
+    `CRITICAL — person identity: for person-level claims (e.g. a personal LinkedIn ` +
+    `/in/ URL, job title, or role), the source must describe the SAME person as the ` +
+    `lead — the name must match AND the employer/role must be consistent with what is ` +
+    `already known about the lead. A namesake — someone who shares the lead's name but ` +
+    `has a different employer or title (e.g. the lead is "Founder at The Bridge" but the ` +
+    `source snippet shows "Senior System Administrator at a University") — is ` +
+    `"contradicted", even when the name matches exactly. Use the lead's name, title, and ` +
+    `company to judge person identity.\n\n` +
     `Return strict JSON: an object keyed by field name with one verdict string per field.`;
 
   const userPrompt =
     `Lead: ${JSON.stringify({
       email: input.lead.email,
+      firstName: input.lead.firstName,
+      lastName: input.lead.lastName,
       company: input.lead.company,
       website: input.lead.website,
+      title: input.lead.title,
     })}\n\n` +
     `Claims to verify:\n${JSON.stringify(claims, null, 2)}\n\n` +
     `Return ONLY JSON like {"field_a": "supported", "field_b": "contradicted"}.`;
 
   try {
-    const llm = createLLMService(CRITIC_MODEL, 0.0);
+    const llm = createLLMService(CRITIC_MODEL, CRITIC_TEMPERATURE);
     const parsed = await llm.generateJSONContent<Record<string, string>>(systemPrompt, userPrompt, 'json', undefined, { userId, feature: 'enrichment' });
     const verdicts: Record<string, any> = {};
     for (const claim of claims) {
@@ -688,7 +875,13 @@ async function runCriticReal(input: {
     }
     return { verdicts };
   } catch (err) {
-    console.warn('[v3 deps] critic failed:', (err as Error).message);
+    // Loud on purpose. This returns empty verdicts, which means every web-tier
+    // value sails through unchecked — the enrichment still reports ok=true. A
+    // 400 here went unnoticed long enough that the critic never ran once.
+    console.error(
+      `[v3 deps] CRITIC DISABLED — no verdicts, every web value passes unchecked. model=${CRITIC_MODEL} ` +
+      `temperature=${CRITIC_TEMPERATURE ?? 'default'}: ${(err as Error).message}`,
+    );
     return { verdicts: {} };
   }
 }
@@ -1370,9 +1563,11 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
             meta: {
               source: 'web_search',
               provider: 'llm_web_search',
-              confidence: 'medium',
+              // Grounded → trustworthy; ungrounded stays low for an "— unverified" badge (ENG-122).
+              confidence: entry.grounding === 'grounded' ? 'high' : 'low',
               ...(entry.sourceUrl ? { sourceUrl: entry.sourceUrl } : {}),
               ...(entry.sourceQuote ? { sourceQuote: entry.sourceQuote } : {}),
+              ...(entry.grounding ? { grounding: entry.grounding } : {}),
               enrichedAt: new Date().toISOString(),
             },
           });

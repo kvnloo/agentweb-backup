@@ -918,10 +918,17 @@ describe('AgentModeService - Skills', () => {
 
       const tools = agentModeService.getFoundationToolNames();
       const mandatoryTools = (AgentModeService as any).MANDATORY_FOUNDATION_TOOLS as string[];
-      expect(tools.size).toBe(new Set(['tool_a', 'tool_b', 'tool_c', ...mandatoryTools]).size);
+      // ENG-404: the override is additive on top of DEFAULT_FOUNDATION_TOOLS, so
+      // the active set is DEFAULT ∪ override ∪ MANDATORY — a stale override can
+      // never strip a shipped default.
+      expect(tools.size).toBe(
+        new Set([...AgentModeService.DEFAULT_FOUNDATION_TOOLS, 'tool_a', 'tool_b', 'tool_c', ...mandatoryTools]).size
+      );
       expect(tools.has('tool_a')).toBe(true);
       expect(tools.has('tool_b')).toBe(true);
       expect(tools.has('tool_c')).toBe(true);
+      // A DEFAULT-only tool absent from the override must still be present.
+      expect(tools.has('search_knowledge_base')).toBe(true);
       expect(tools.has('install_skills')).toBe(true);
       expect(tools.has('list_available_skills')).toBe(true);
       expect(tools.has('resolve_skill')).toBe(true);
@@ -1001,7 +1008,15 @@ describe('AgentModeService - Skills', () => {
       settingsService.setSetting = jest.fn().mockResolvedValue(undefined);
 
       const result = await agentModeService.updateFoundationTools(['tool_x', 'tool_y'], 'admin@test.com');
-      const expected = ['tool_x', 'tool_y', ...(AgentModeService as any).MANDATORY_FOUNDATION_TOOLS];
+      // ENG-404: persisted set is DEFAULT ∪ override ∪ MANDATORY (additive).
+      const expected = [
+        ...new Set([
+          ...AgentModeService.DEFAULT_FOUNDATION_TOOLS,
+          'tool_x',
+          'tool_y',
+          ...(AgentModeService as any).MANDATORY_FOUNDATION_TOOLS,
+        ]),
+      ];
 
       expect(result).toEqual(expected);
       expect(settingsService.setSetting).toHaveBeenCalledWith(
@@ -1024,7 +1039,15 @@ describe('AgentModeService - Skills', () => {
 
       const result = await agentModeService.updateFoundationTools(['tool_a', 'tool_a', 'tool_b'], 'admin@test.com');
 
-      expect(result).toEqual(['tool_a', 'tool_b', ...(AgentModeService as any).MANDATORY_FOUNDATION_TOOLS]);
+      // ENG-404: DEFAULT ∪ override ∪ MANDATORY, de-duplicated.
+      expect(result).toEqual([
+        ...new Set([
+          ...AgentModeService.DEFAULT_FOUNDATION_TOOLS,
+          'tool_a',
+          'tool_b',
+          ...(AgentModeService as any).MANDATORY_FOUNDATION_TOOLS,
+        ]),
+      ]);
     });
   });
 

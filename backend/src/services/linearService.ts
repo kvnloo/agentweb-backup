@@ -160,13 +160,15 @@ export interface OpenCanonical {
  */
 export async function listOpenBugCanonicals(limit = 30): Promise<OpenCanonical[]> {
   const data = await linearGraphQL(
+    // Open-state WHITELIST (ENG-358): duplicate-state canonicals must never absorb new reports —
+    // see OPEN_STATE_TYPES below for the live-verified root cause.
     `query($team: String!, $bug: String!, $cust: String!, $limit: Int!) {
       issues(
         first: $limit,
         orderBy: createdAt,
         filter: {
           team: { key: { eq: $team } },
-          state: { type: { nin: ["completed", "canceled"] } },
+          state: { type: { in: ["triage", "backlog", "unstarted", "started"] } },
           and: [
             { labels: { name: { eq: $bug } } },
             { labels: { name: { eq: $cust } } }
@@ -182,13 +184,36 @@ export async function listOpenBugCanonicals(limit = 30): Promise<OpenCanonical[]
   return nodes.map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }));
 }
 
-/** Read an issue's comment bodies (the resolve bridge parses `[reporter-ticket #N]` from these). */
-export async function getIssueComments(issueId: string): Promise<string[]> {
+/** An issue comment with its creation timestamp (ISO string), for order-sensitive consumers. */
+export interface IssueCommentDetail {
+  body: string;
+  createdAt: string;
+}
+
+/**
+ * Read an issue's comments WITH `createdAt`, so callers that need "the most recent comment" can
+ * decide by timestamp instead of relying on the API's list order. The resolve bridge reads this
+ * ONCE per resolve for both of its jobs: parsing the `[reporter-ticket #N <email>]` markers and
+ * picking the latest `@Emma` comment as the customer-facing resolution message (ENG-316).
+ *
+ * Explicitly sized + ordered: Linear defaults connections to 50 nodes — the same silent-truncation
+ * trap getTeamMeta documents — and a high-reporter canonical can carry more comments than that.
+ * 250 is Linear's max page size; `orderBy: createdAt` returns NEWEST-first (verified live
+ * 2026-07-15 against ENG-316), so an overflow drops the OLDEST comments and the @Emma resolution
+ * message — written right before the flip to Done — always survives. Overflow is loud because
+ * reporter-ticket markers deep in the dropped tail would otherwise silently miss their email.
+ */
+export async function getIssueCommentsDetailed(issueId: string): Promise<IssueCommentDetail[]> {
   const data = await linearGraphQL(
-    `query($id: String!) { issue(id: $id) { comments { nodes { body } } } }`,
+    `query($id: String!) { issue(id: $id) { comments(first: 250, orderBy: createdAt) { nodes { body createdAt } pageInfo { hasNextPage } } } }`,
     { id: issueId },
   );
-  return (data?.issue?.comments?.nodes || []).map((c: any) => c?.body || '');
+  if (data?.issue?.comments?.pageInfo?.hasNextPage) {
+    console.error(
+      `[linear] issue ${issueId} has >250 comments — the page is truncated and the OLDEST comments were dropped; reporter-ticket markers may be missing. Add pagination to getIssueCommentsDetailed.`,
+    );
+  }
+  return (data?.issue?.comments?.nodes || []).map((c: any) => ({ body: c?.body || '', createdAt: c?.createdAt || '' }));
 }
 
 /** Add a comment to a Linear issue (used to record additional reporters on a canonical). */
@@ -319,9 +344,21 @@ export interface OpenIssue {
   identifier: string;
   issueId: string;
   title: string;
+  /** Issue body — carries the structured Session/Schedule IDs the auto-issue dedup gate matches on. */
+  description: string;
 }
 
-/** List OPEN issues carrying a given label (used for auto-issue dedup). Open-only. */
+/**
+ * State types a dedupe candidate may be in — a WHITELIST of Linear's open types. Deliberately not
+ * a completed/canceled blacklist: Linear's "Duplicate" state has its own state type ("duplicate",
+ * verified live on ENG-350, 2026-07-16), and under the old blacklist a canceled Duplicate stayed a
+ * dedupe candidate — recurrence comments landed on it instead of the open canonical (ENG-358).
+ * A whitelist also stays correct if Linear ever adds another closed-ish type.
+ */
+const OPEN_STATE_TYPES = ['triage', 'backlog', 'unstarted', 'started'] as const;
+const OPEN_STATE_TYPES_GQL = `[${OPEN_STATE_TYPES.map((t) => `"${t}"`).join(', ')}]`;
+
+/** List OPEN issues carrying a given label (used for auto-issue dedup). Open-only — see OPEN_STATE_TYPES. */
 export async function listOpenIssuesByLabel(labelName: string, limit = 50): Promise<OpenIssue[]> {
   const data = await linearGraphQL(
     `query($team: String!, $label: String!, $limit: Int!) {
@@ -330,14 +367,99 @@ export async function listOpenIssuesByLabel(labelName: string, limit = 50): Prom
         orderBy: createdAt,
         filter: {
           team: { key: { eq: $team } },
-          state: { type: { nin: ["completed", "canceled"] } },
+          state: { type: { in: ${OPEN_STATE_TYPES_GQL} } },
           labels: { name: { eq: $label } }
         }
-      ) { nodes { id identifier title } }
+      ) { nodes { id identifier title description } }
     }`,
     { team: TEAM_KEY, label: labelName, limit },
   );
-  return (data?.issues?.nodes || []).map((n: any) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '' }));
+  return (data?.issues?.nodes || []).map((n: any) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }));
+}
+
+/**
+ * Raise-only escalation of an open canonical (ENG-358): when a recurring alert's severity rises
+ * (e.g. v0 credits low -> critical), the ONE open canonical is updated in place — priority raised
+ * and title refreshed to the latest occurrence's wording — instead of a new issue being filed.
+ * Returns false (no mutation at all) when the incoming priority does not beat the current one, so
+ * routine same-level occurrences never churn the issue. Throws on Linear failure; callers
+ * best-effort it (the occurrence comment + dedupe result must stand regardless).
+ */
+export async function escalateIssue(issueId: string, params: { title: string; priority: number }): Promise<boolean> {
+  const data = await linearGraphQL(
+    `query($id: String!) { issue(id: $id) { priority } }`,
+    { id: issueId },
+  );
+  const issue = data?.issue;
+  if (!issue) throw new Error('Linear issue not found for escalation');
+  const current: number = typeof issue.priority === 'number' ? issue.priority : 0;
+  // Linear priority: 1=Urgent … 4=Low, 0=None. Raise-only: only a strictly more severe incoming
+  // priority (numerically lower, or anything over "None") updates the canonical.
+  if (!(params.priority > 0 && (current === 0 || params.priority < current))) return false;
+  const res = await linearGraphQL(
+    `mutation($id: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $id, input: $input) { success }
+    }`,
+    { id: issueId, input: { title: params.title, priority: params.priority } },
+  );
+  if (!res?.issueUpdate?.success) {
+    throw new Error('Linear issueUpdate (escalation) failed');
+  }
+  return true;
+}
+
+/**
+ * List recently RESOLVED (completed/canceled) private bug canonicals — the reopen candidates for a
+ * regression / failed-retest report (ENG-240 contract #3). A new customer report that matches one of
+ * these must REOPEN the existing ticket, not file a brand-new canonical for a bug we already tracked.
+ * Same label pair as `listOpenBugCanonicals` (Bug + Customer Reported), ordered most-recently-updated
+ * first so freshly-closed tickets are the top candidates.
+ */
+export async function listRecentlyResolvedBugCanonicals(limit = 30): Promise<OpenCanonical[]> {
+  const data = await linearGraphQL(
+    `query($team: String!, $bug: String!, $cust: String!, $limit: Int!) {
+      issues(
+        first: $limit,
+        orderBy: updatedAt,
+        filter: {
+          team: { key: { eq: $team } },
+          state: { type: { in: ["completed", "canceled"] } },
+          and: [
+            { labels: { name: { eq: $bug } } },
+            { labels: { name: { eq: $cust } } }
+          ]
+        }
+      ) {
+        nodes { id identifier title description }
+      }
+    }`,
+    { team: TEAM_KEY, bug: 'Bug', cust: 'Customer Reported', limit },
+  );
+  const nodes: any[] = data?.issues?.nodes || [];
+  return nodes.map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }));
+}
+
+/**
+ * Reopen a resolved Linear issue by moving it to a live workflow state (default "Todo"). Used by the
+ * reopen-not-refile path (ENG-240 contract #3) when a regression / failed-retest report matches a Done
+ * canonical. An unknown state name throws (no silent no-op) so a reopen never quietly leaves the issue
+ * closed.
+ */
+export async function reopenIssue(issueId: string, stateName = 'Todo'): Promise<void> {
+  const meta = await getTeamMeta();
+  const stateId = meta.stateIds[stateName.toLowerCase()];
+  if (!stateId) {
+    throw new Error(`Linear reopen: state "${stateName}" not found in team ${TEAM_KEY}`);
+  }
+  const res = await linearGraphQL(
+    `mutation($id: String!, $stateId: String!) {
+      issueUpdate(id: $id, input: { stateId: $stateId }) { success }
+    }`,
+    { id: issueId, stateId },
+  );
+  if (!res?.issueUpdate?.success) {
+    throw new Error('Linear reopen (issueUpdate) failed');
+  }
 }
 
 export interface EngineeringBugStats {

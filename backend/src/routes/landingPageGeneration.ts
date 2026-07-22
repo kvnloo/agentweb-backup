@@ -17,6 +17,7 @@ import {
   deleteLandingPageByRecord,
   updateLandingPageGtm,
   BrandContext,
+  buildBrandContextFromUser,
   GeneratedLandingPage,
   getDeploymentStatus,
   getPreviewDeploymentUrl,
@@ -28,6 +29,7 @@ import {
   deleteEnvVar,
   updateLandingPageContext,
   updateLandingPageLeadList,
+  syncLeadCaptureFilesToRepo,
   recordLandingPagePublish,
   markLandingPagePublishReverted,
   INTEGRATIONS,
@@ -35,8 +37,11 @@ import {
   resolveLockedSiteMode,
   resolveLandingPageLiveUrl,
   canUserEditLandingPage,
+  updateLandingPageTrackingInstalled,
 } from "../services/v0Service";
+import { injectGtmIntoLayout, verifyGtmInjection } from "../utils/gtmInjection";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
+import { MISSING_BRAND_LOGO_ERROR } from "../services/agentMode/brandLogo";
 import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
 
 const router = Router();
@@ -279,12 +284,13 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
 
     // Org-level create gating: in an org, only the org owner or a listed
     // editor (when landingPages sharing is enabled) may generate new pages.
+    // The org record is also the brand source for org members below.
     const caller = await userDb.getUserById(userId);
+    const callerOrg = caller?.orgId ? await orgDb.getOrgById(caller.orgId) : null;
     if (caller?.orgId) {
-      const org = await orgDb.getOrgById(caller.orgId);
       const allowed = canManageOrgFeature(
         { userId, orgId: caller.orgId, orgRole: caller.orgRole as "owner" | "member" | undefined },
-        org,
+        callerOrg,
         "landingPages",
       );
       if (!allowed) {
@@ -336,51 +342,28 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
 
     const pageName = name || prompt.slice(0, 60);
 
-    // Fetch brand guidelines + market strategy for maximum context
-    let brandContext: BrandContext = {};
-    let userSiteMode: "unified" | "separate" | undefined;
-    try {
-      const user = await userDb.getUserById(userId);
-      userSiteMode = user?.landingSiteMode;
-      if (user?.brandGuidelines) {
-        const bg = user.brandGuidelines;
-        const bd = (bg as any).brandData || {};
-        brandContext = {
-          brandName: bd.brandName,
-          primaryColor: bd.primaryColor,
-          primaryColorEnd: bd.primaryColorEnd,
-          isGradient: bd.isGradient,
-          secondaryColor: bd.secondaryColor,
-          fontFamily: bd.fontFamily,
-          tagline: bd.tagline,
-          toneOfVoice: bd.toneOfVoice,
-          brandPersonality: bd.brandPersonality,
-          keyMessages: bd.keyMessages,
-          brandValues: bd.brandValues,
-          targetAudience: bd.targetAudience,
-          founders: bd.founders,
-        };
+    // Brand guidelines + market strategy for maximum context. The shared
+    // projection resolves the persisted brand logo attachments-first and
+    // org-aware — an org member's brand (incl. the uploaded logo) lives on
+    // the ORG record (ENG-326). Pure projection off records already loaded.
+    const brandContext: BrandContext = buildBrandContextFromUser(
+      caller,
+      callerOrg?.brandGuidelines,
+    );
+    const userSiteMode: "unified" | "separate" | undefined = caller?.landingSiteMode;
 
-        // Get logo URL from attachments
-        if ((bg as any).attachments && Array.isArray((bg as any).attachments)) {
-          const logo = (bg as any).attachments.find(
-            (a: any) => a.type === "logo" && a.url
-          );
-          if (logo) {
-            brandContext.logoUrl = logo.url;
-          }
-        }
-      }
-
-      // Pull market strategy for richer landing page copy
-      if (user?.marketStrategy) {
-        const ms = user.marketStrategy;
-        brandContext.businessOverview = ms.businessOverview;
-        brandContext.icp = ms.icp;
-        brandContext.competitors = ms.competitors;
-      }
-    } catch (error) {
-      console.error("[LP GENERATION] Failed to fetch brand guidelines, continuing without:", error);
+    // ENG-326 AC-3: landing pages are BRANDED assets — without a persisted
+    // logo v0 renders an invented/approximate wordmark, the exact defect the
+    // issue names. Point the user at brand config instead of generating.
+    // Gate BEFORE any side effect (lead-list flip, site-mode lock).
+    if (!brandContext.logoUrl) {
+      return res.status(422).json({
+        error: MISSING_BRAND_LOGO_ERROR,
+        message:
+          "No brand logo is saved in Brand Guidelines. Upload your logo in brand config " +
+          "(Brand Guidelines), then generate again — landing pages are never generated " +
+          "with an invented or approximate logo.",
+      });
     }
 
     // Auto-enable public access on the lead list so the landing page form works
@@ -690,8 +673,8 @@ router.delete("/generated/:id", async (req, res: Response) => {
       }
     }
 
-    await deleteLandingPageByRecord(page);
-    res.json({ success: true });
+    const { githubCleanupWarning } = await deleteLandingPageByRecord(page);
+    res.json({ success: true, ...(githubCleanupWarning ? { warning: githubCleanupWarning } : {}) });
   } catch (error: any) {
     console.error("[LP GENERATION] Error deleting page:", error);
     const status = error.message?.includes("not found") ? 404
@@ -719,39 +702,23 @@ router.post("/generated/:id/duplicate", async (req, res: Response) => {
     const { name } = req.body;
     const newName = name || `${original.name} (copy)`;
 
-    // Re-generate using the original prompt + full brand context
-    let brandContext: BrandContext = {};
-    try {
-      const user = await userDb.getUserById(userId);
-      if (user?.brandGuidelines) {
-        const bg = user.brandGuidelines;
-        const bd = (bg as any).brandData || {};
-        brandContext = {
-          brandName: bd.brandName,
-          primaryColor: bd.primaryColor,
-          primaryColorEnd: bd.primaryColorEnd,
-          isGradient: bd.isGradient,
-          secondaryColor: bd.secondaryColor,
-          fontFamily: bd.fontFamily,
-          tagline: bd.tagline,
-          toneOfVoice: bd.toneOfVoice,
-          brandPersonality: bd.brandPersonality,
-          keyMessages: bd.keyMessages,
-          brandValues: bd.brandValues,
-          targetAudience: bd.targetAudience,
-          founders: bd.founders,
-        };
-        if ((bg as any).attachments && Array.isArray((bg as any).attachments)) {
-          const logo = (bg as any).attachments.find((a: any) => a.type === "logo" && a.url);
-          if (logo) brandContext.logoUrl = logo.url;
-        }
-      }
-      if (user?.marketStrategy) {
-        brandContext.businessOverview = user.marketStrategy.businessOverview;
-        brandContext.icp = user.marketStrategy.icp;
-        brandContext.competitors = user.marketStrategy.competitors;
-      }
-    } catch {}
+    // Re-generate using the original prompt + full brand context (shared
+    // ENG-326 projection — org-aware, persisted logo attachments-first).
+    const user = await userDb.getUserById(userId);
+    const org = user?.orgId ? await orgDb.getOrgById(user.orgId) : null;
+    const brandContext = buildBrandContextFromUser(user, org?.brandGuidelines);
+
+    // ENG-326 AC-3: duplicating re-generates the page — same gate as
+    // /generate. Without a persisted logo v0 would invent a wordmark.
+    if (!brandContext.logoUrl) {
+      return res.status(422).json({
+        error: MISSING_BRAND_LOGO_ERROR,
+        message:
+          "No brand logo is saved in Brand Guidelines. Upload your logo in brand config " +
+          "(Brand Guidelines), then duplicate again — landing pages are never generated " +
+          "with an invented or approximate logo.",
+      });
+    }
 
     const result = await generateLandingPage(userId, original.prompt, newName, brandContext);
     res.status(201).json(result);
@@ -1801,45 +1768,31 @@ async function saveGtmForPage(
       currentContent = Buffer.from(fileRes.data.content, "base64").toString("utf-8");
       fileSha = fileRes.data.sha;
 
-      // 2. Build GTM snippets
-      const gtmHeadSnippet =
-        `        {/* Google Tag Manager */}\n` +
-        `        <script dangerouslySetInnerHTML={{ __html: \`(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src='https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);})(window,document,'script','dataLayer','${containerId}');\` }} />\n` +
-        `        {/* End Google Tag Manager */}`;
+      // 2–3. Strip any existing GTM block and re-inject (idempotent). Shared with the
+      //       auto-inject-at-generation path so both emit byte-identical output (ENG-334).
+      const updatedContent = injectGtmIntoLayout(currentContent, containerId);
 
-      const gtmBodySnippet =
-        `        {/* Google Tag Manager (noscript) */}\n` +
-        `        <noscript dangerouslySetInnerHTML={{ __html: \`<iframe src="https://www.googletagmanager.com/ns.html?id=${containerId}" height="0" width="0" style="display:none;visibility:hidden"></iframe>\` }} />\n` +
-        `        {/* End Google Tag Manager (noscript) */}`;
-
-      // 3. Strip any existing GTM blocks (always, whether adding or removing)
-      let updatedContent = currentContent
-        .replace(/[ \t]*\{\/\* Google Tag Manager \*\/\}[\s\S]*?\{\/\* End Google Tag Manager \*\/\}\n?/g, "")
-        .replace(/[ \t]*\{\/\* Google Tag Manager \(noscript\) \*\/\}[\s\S]*?\{\/\* End Google Tag Manager \(noscript\) \*\/\}\n?/g, "");
-
-      // Only re-inject if we have a non-empty containerId
-      if (containerId) {
-        // Insert head snippet inside <head> (before </head> or before first child after <head>)
-        if (/<head[^>]*>/.test(updatedContent)) {
-          updatedContent = updatedContent.replace(
-            /(<head[^>]*>)/,
-            `$1\n${gtmHeadSnippet}`
-          );
-        } else {
-          // Fallback: insert before <body
-          updatedContent = updatedContent.replace(
-            /(<body[^>]*>)/,
-            `${gtmHeadSnippet}\n      $1`
-          );
-        }
-
-        // Insert noscript snippet immediately after <body ...>
-        if (/<body[^>]*>/.test(updatedContent)) {
-          updatedContent = updatedContent.replace(
-            /(<body[^>]*>)/,
-            `$1\n${gtmBodySnippet}`
-          );
-        }
+      // Fail loud, not silent: a layout with neither <head> nor <body> to anchor on leaves
+      // injectGtmIntoLayout's insertion a no-op. Without this check we'd commit unchanged
+      // content to GitHub and still tell the caller "success" with the container ID they
+      // asked for — a manual Add-GTM click that silently did nothing.
+      if (!verifyGtmInjection(updatedContent, containerId)) {
+        // Log the precise technical reason for debugging, but never surface "layout.tsx" /
+        // "<head>" / "<body>" to the customer — they can't act on that, and it's not
+        // anything they did wrong. The message that reaches the UI must be something a
+        // non-technical marketer can actually read and act on.
+        console.error(
+          `[LP GENERATION] GTM ${containerId ? "injection" : "removal"} verification failed ` +
+          `for page ${page.id}: layout.tsx has no <head> or <body> tag to anchor on.`,
+        );
+        throw Object.assign(
+          new Error(
+            containerId
+              ? "We couldn't add tracking to this page automatically. Try regenerating the page, or contact support if this keeps happening."
+              : "We couldn't remove tracking from this page automatically. Try regenerating the page, or contact support if this keeps happening.",
+          ),
+          { httpStatus: 422 },
+        );
       }
 
       // 4. Commit updated layout.tsx to GitHub
@@ -1866,6 +1819,29 @@ async function saveGtmForPage(
 
   // 5. Persist gtmContainerId in DynamoDB
   await updateLandingPageGtm(page.id, page.userId, containerId);
+
+  // The layout we just committed is the SHARED root layout every page on this site inherits
+  // — so every sibling page (root + subpages) just became tracked (or untracked) on the live
+  // site, not just `page`. Sync trackingInstalled across all of them so the customer-portal
+  // warning badge doesn't stay stuck forever after the user correctly fixes it via Site
+  // Settings (a real gap this shipped with: the advice was always correct, only our own
+  // stored flag went stale). Best-effort per page — a sync failure must never undo the
+  // GitHub commit that already succeeded, so failures are logged and skipped, not thrown.
+  const siteId = page.siteId ?? page.id;
+  try {
+    const siblings = await listLandingPages(page.userId);
+    await Promise.all(
+      siblings
+        .filter((p) => (p.siteId ?? p.id) === siteId)
+        .map((p) =>
+          updateLandingPageTrackingInstalled(p.id, !!containerId).catch((err: any) => {
+            console.error(`[LP GENERATION] Failed to sync trackingInstalled for page ${p.id}: ${err.message}`);
+          }),
+        ),
+    );
+  } catch (err: any) {
+    console.error(`[LP GENERATION] Failed to list sibling pages for trackingInstalled sync: ${err.message}`);
+  }
 
   // Trigger Vercel re-deploy if we have a project ID
   const vercelProjectId = await resolveVercelProjectId(page);
@@ -2038,12 +2014,78 @@ router.patch("/generated/:id/lead-list", async (req, res: Response) => {
       }
       throw err;
     }
+
+    // ENG-310: the DB write alone means nothing. The capture route lives in the page's
+    // GitHub repo, so the repo has to be told too — otherwise the site keeps 404ing on
+    // /api/capture while the record cheerfully claims a lead list.
+    const captureSyncWarning = await syncLeadCaptureForPage(authz.page, leadListId);
+
     const updated = await getLandingPageById(id);
-    return res.json(updated);
+    return res.json(captureSyncWarning ? { ...updated, captureSyncWarning } : updated);
   } catch (err) {
     console.error("PATCH /lead-list failed:", err);
     return res.status(500).json({ error: "Failed to update lead list" });
   }
 });
+
+/**
+ * Push the site's lead-capture files to its GitHub repo after a lead list was attached
+ * to / detached from one of its pages (ENG-310).
+ *
+ * The capture route is REPO-level but the lead list is PER-PAGE, so the repo needs the
+ * map for the WHOLE SITE, not just the page that changed — writing only this page's entry
+ * would blank out every sibling page's list and misfile (or drop) their leads.
+ *
+ * Never throws: by the time this runs the DynamoDB write has already happened. A GitHub
+ * failure must not 500 the request and leave the user thinking nothing was saved — it
+ * returns a warning string instead, so the caller can say "wired, but the site hasn't
+ * picked it up yet".
+ *
+ * @returns a warning message if the repo was NOT updated, else undefined.
+ */
+async function syncLeadCaptureForPage(
+  page: GeneratedLandingPage,
+  leadListId: string | null
+): Promise<string | undefined> {
+  // Not deployed yet → there is no repo to sync. Generation injects the capture files
+  // itself, with this list already attached, so there is nothing to warn about.
+  if (!page.githubRepoUrl) return undefined;
+
+  const repoMatch = page.githubRepoUrl.match(/github\.com\/([^/]+\/[^/]+?)(?:\.git)?(?:\s|$)/);
+  if (!repoMatch) {
+    console.error(`[LP GENERATION] ENG-310: unparseable githubRepoUrl on page ${page.id}: ${page.githubRepoUrl}`);
+    return "Lead list saved, but this page's GitHub repo URL is malformed so the live site was not updated.";
+  }
+  const repoFullName = repoMatch[1];
+
+  try {
+    // Every page of this site — i.e. every page deployed into this same repo. Sibling
+    // pages are the page owner's (UserIdIndex query, same pattern routes/domains.ts uses).
+    const siblings = await getLandingPagesByOwner(page.userId);
+    const listByPath: Record<string, string> = {};
+    for (const p of siblings) {
+      if (p.id === page.id) continue; // this page's entry comes from the write below
+      if (p.githubRepoUrl !== page.githubRepoUrl) continue; // different site, different repo
+      if (!p.leadListId) continue;
+      // Same path convention routes/domains.ts uses for its domain map.
+      listByPath[p.slug ? `/${p.slug}` : "/"] = p.leadListId;
+    }
+    // The page we just wrote, from the value we wrote — the GSI read above is eventually
+    // consistent and may still be showing the old value. A detach (null) simply leaves the
+    // page OUT of the map, so its form starts failing loudly (422) rather than quietly
+    // filing leads into a list it is no longer wired to.
+    if (leadListId) {
+      listByPath[page.slug ? `/${page.slug}` : "/"] = leadListId;
+    }
+
+    const result = await syncLeadCaptureFilesToRepo(repoFullName, listByPath);
+    if (result.committed || result.reason === "up-to-date") return undefined;
+    return `Lead list saved, but the live site was not updated (${result.reason}). It will be applied on the next deploy or retry.`;
+  } catch (err: any) {
+    // syncLeadCaptureFilesToRepo does not throw, so this is a sibling-fetch failure.
+    console.error(`[LP GENERATION] ENG-310: lead-capture sync failed for page ${page.id}:`, err?.message || err);
+    return "Lead list saved, but the live site was not updated. It will be applied on the next deploy or retry.";
+  }
+}
 
 export default router;

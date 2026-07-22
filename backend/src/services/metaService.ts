@@ -3,6 +3,7 @@ import axios from 'axios';
 import { MetaAdAccount, MetaPage } from '../types/meta';
 import { INTEGRATION_CONFIG } from '../config/integrations';
 import { getMetaCredentials } from '../utils/secretsManager';
+import { buildUtmSpec, readUtmKeys, utmQueryString, mergeUtmIntoQueryString, utmKeysInQueryString } from '../utils/adUtm';
 
 export interface MetaAdsCampaignParams {
   name: string;
@@ -25,6 +26,11 @@ export interface MetaAdsAdSetParams {
   targeting: any;
   status?: string;
   promoted_object?: any;
+  // Conversion location for the ad set (e.g. 'WEBSITE', 'ON_AD' for instant forms, 'MESSENGER',
+  // 'APP'). When omitted Meta stores UNDEFINED and the ad-level Destination reads as "not selected"
+  // in Ads Manager (ENG-415). agentModeService.createMetaAdsAdSet defaults this to 'WEBSITE' for
+  // website optimization goals.
+  destination_type?: string;
 }
 
 export interface MetaPlacementAsset {
@@ -106,6 +112,54 @@ export class MetaService {
 
   private log(message: string, data?: any) {
     console.log(`[MetaService] ${message}`, data ? JSON.stringify(data, null, 2) : '');
+  }
+
+  /**
+   * Config fields readable on a Campaign / Ad Set via the Graph API GET. These are the
+   * allow-lists the marketing wrapper honors for CAMPAIGN / AD_SET LIST + GET `fields`.
+   * They include the fields that actually define what an ad set optimizes for
+   * (optimization_goal, billing_event, destination_type, promoted_object, bid_strategy)
+   * and the campaign budget/bid fields — none of which the wrapper could read before
+   * (ENG-398). A field outside the allow-list is rejected LOUDLY (see resolveReadFields),
+   * never silently dropped, so a caller learns its request was wrong instead of getting a
+   * quietly-incomplete payload (feedback-avoid-fallbacks).
+   */
+  private static readonly CAMPAIGN_READ_FIELDS = [
+    'id', 'name', 'status', 'objective',
+    'daily_budget', 'lifetime_budget', 'budget_remaining',
+    'bid_strategy', 'start_time', 'stop_time',
+  ] as const;
+
+  private static readonly AD_SET_READ_FIELDS = [
+    'id', 'name', 'status', 'campaign_id',
+    'optimization_goal', 'billing_event', 'destination_type', 'promoted_object', 'bid_strategy',
+    'daily_budget', 'lifetime_budget', 'start_time', 'end_time', 'targeting',
+  ] as const;
+
+  /**
+   * Resolve a caller-supplied `fields` selection against the readable allow-list.
+   * - undefined / empty  -> returns null, signalling "use the default field list".
+   * - a comma string or a string[] -> trimmed, validated, and returned as string[].
+   * Throws LOUDLY if any requested field is not in `allowed` — never silently reduces
+   * the selection to the supported subset (that silent reduction is the ENG-398 bug).
+   */
+  private resolveReadFields(
+    requested: string | string[] | undefined | null,
+    allowed: readonly string[],
+    entityLabel: string
+  ): string[] | null {
+    if (requested === undefined || requested === null) return null;
+    const list = Array.isArray(requested) ? requested : String(requested).split(',');
+    const cleaned = list.map(f => f.trim()).filter(Boolean);
+    if (cleaned.length === 0) return null;
+    const unsupported = cleaned.filter(f => !allowed.includes(f));
+    if (unsupported.length > 0) {
+      throw new Error(
+        `Unsupported ${entityLabel} field(s): ${unsupported.join(', ')}. ` +
+        `Supported fields: ${allowed.join(', ')}.`
+      );
+    }
+    return cleaned;
   }
 
   /**
@@ -712,13 +766,35 @@ export class MetaService {
   }
 
   /**
-   * List campaigns for an ad account
+   * List campaigns for an ad account.
+   *
+   * `options.fields` selects which config fields to read (validated against the
+   * allow-list; unsupported fields throw loudly). When omitted, the default list now
+   * includes budget/bid config (daily_budget, lifetime_budget, budget_remaining,
+   * bid_strategy) so a plain LIST can actually see what the campaign is set to spend —
+   * previously invisible (ENG-398). `options.campaignId` fetches that one campaign
+   * directly (the Graph edge has no id filter) and returns it as a one-element list so
+   * LIST semantics are preserved.
    */
-  public async listCampaigns(adAccountId: string, accessToken: string) {
+  public async listCampaigns(
+    adAccountId: string,
+    accessToken: string,
+    options: { campaignId?: string; fields?: string | string[] } = {}
+  ) {
+    // Validate the requested fields BEFORE any API round-trip so an unsupported field is
+    // a loud, dependency-free error rather than a silently-reduced payload.
+    const fields =
+      this.resolveReadFields(options.fields, MetaService.CAMPAIGN_READ_FIELDS, 'campaign') ??
+      [...MetaService.CAMPAIGN_READ_FIELDS];
     try {
       this.initApi(accessToken);
+      if (options.campaignId) {
+        this.log(`Fetching single campaign ${options.campaignId}`, { fields });
+        const campaign = new Campaign(options.campaignId);
+        const result = await campaign.get(fields);
+        return [result._data];
+      }
       const account = new AdAccount(`act_${adAccountId}`);
-      const fields = ['id', 'name', 'status', 'objective', 'start_time', 'stop_time'];
       this.log(`Listing campaigns for account: ${adAccountId}`, { fields });
       const campaigns = await account.getCampaigns(fields);
       return campaigns.map((c: any) => c._data);
@@ -792,13 +868,35 @@ export class MetaService {
   }
 
   /**
-   * List ad sets for an ad account
+   * List ad sets for an ad account.
+   *
+   * `options.fields` selects which config fields to read (validated; unsupported fields
+   * throw loudly). When omitted, the default list now includes the fields that define
+   * what the ad set optimizes for — optimization_goal, billing_event, destination_type,
+   * promoted_object, bid_strategy — which the wrapper previously could not read despite
+   * being able to WRITE them on CREATE (ENG-398, verify-after-write). `options.adSetId`
+   * fetches that one ad set directly and returns it as a one-element list, preserving
+   * LIST semantics. The legacy `campaignId` positional filter is unchanged.
    */
-  public async listAdSets(adAccountId: string, accessToken: string, campaignId?: string) {
+  public async listAdSets(
+    adAccountId: string,
+    accessToken: string,
+    campaignId?: string,
+    options: { adSetId?: string; fields?: string | string[] } = {}
+  ) {
+    // Validate requested fields BEFORE any API round-trip (loud, never silently reduced).
+    const fields =
+      this.resolveReadFields(options.fields, MetaService.AD_SET_READ_FIELDS, 'ad set') ??
+      [...MetaService.AD_SET_READ_FIELDS];
     try {
       this.initApi(accessToken);
+      if (options.adSetId) {
+        this.log(`Fetching single ad set ${options.adSetId}`, { fields });
+        const adSet = new AdSet(options.adSetId);
+        const result = await adSet.get(fields);
+        return [result._data];
+      }
       const account = new AdAccount(`act_${adAccountId}`);
-      const fields = ['id', 'name', 'status', 'campaign_id', 'daily_budget', 'lifetime_budget', 'start_time', 'end_time', 'targeting'];
       const params = campaignId ? { campaign_id: campaignId } : {};
       this.log(`Listing ad sets for account: ${adAccountId}`, { fields, ...params });
       const adSets = await account.getAdSets(fields, params);
@@ -837,6 +935,10 @@ export class MetaService {
       if (params.start_time !== undefined) adSetParams[AdSet.Fields.start_time] = params.start_time;
       if (params.end_time !== undefined) adSetParams[AdSet.Fields.end_time] = params.end_time;
       if (params.promoted_object !== undefined) adSetParams[AdSet.Fields.promoted_object] = params.promoted_object;
+      // Conversion location (ENG-415). Literal key — Meta accepts 'destination_type' directly and it
+      // is not guaranteed to exist on the SDK's AdSet.Fields enum across versions. Emitted only when
+      // present so the payload is byte-identical to before when the caller passes nothing.
+      if (params.destination_type !== undefined) adSetParams['destination_type'] = params.destination_type;
 
       // Defensive: Ensure no 'id' or other accidental fields
       delete adSetParams.id;
@@ -913,6 +1015,60 @@ export class MetaService {
     } catch (error) {
       return this.handleError(error, 'listAdCreatives');
     }
+  }
+
+  /**
+   * Resolve the creative-level `url_tags` (UTM append rules) for a creative (ENG-239).
+   *
+   * An explicitly-supplied `params.url_tags` always wins and is returned verbatim —
+   * this both honours a caller who hand-authored tracking and preserves the
+   * carried-over `url_tags` on a creative swap (agentModeService's carriedUrlTags).
+   *
+   * Otherwise we auto-generate Emma's UTM set (utm_source=meta, utm_medium=paid,
+   * utm_campaign / utm_content as Meta click-time macros).
+   *
+   * AC4 trap: Meta APPENDS `url_tags` to the destination link at delivery, so if the
+   * link already carries e.g. `utm_source`, emitting it again produces a duplicate
+   * param on the click URL. We therefore omit any UTM key the reference URL already
+   * carries; if it carries them all, `utmQueryString` returns "" and we return
+   * undefined so the caller writes no `url_tags` field at all.
+   *
+   * AC4 reference URL: `url_tags` is creative-level and Meta applies it to EVERY link
+   * on the creative, but there is only one tag string. We reference `params.link_url`
+   * (the single-image/video link, and the carousel fallback link at :989). Carousels
+   * may omit the top-level link and rely on per-card `child_attachments[].link` (:992),
+   * so when `link_url` is absent we fall back to the first card's `link_url`. If no
+   * reference URL exists at all, we omit nothing and emit the full set.
+   */
+  private static resolveUrlTags(params: MetaAdsAdCreativeParams): string | undefined {
+    if (params.url_tags) {
+      return params.url_tags;
+    }
+
+    // `url_tags` is creative-level: Meta appends the SAME string to EVERY link on the
+    // creative (the top-level link and every carousel card). So a key must be omitted
+    // if ANY of those links already carries it — emitting it would give that link the
+    // param twice, and a duplicated utm_source corrupts the very attribution this
+    // feature exists to produce. The cost is that a card the user tagged only
+    // partially may stay under-tagged; that is strictly better than a duplicate.
+    const linkUrls = [
+      params.link_url,
+      ...(params.carousel_cards?.map((c) => c.link_url) ?? []),
+    ].filter((u): u is string => Boolean(u));
+
+    const omit = new Set<string>();
+    for (const url of linkUrls) {
+      const keys = readUtmKeys(url);
+      // Unreadable link → we cannot know what it already carries, so we do not tag at
+      // all rather than risk a duplicate. Meta still rejects the bad URL with its own
+      // (precise) error; tagging must never be the thing that breaks an ad build.
+      if (!keys) return undefined;
+      for (const k of keys) omit.add(k);
+    }
+
+    const spec = buildUtmSpec('meta', { campaign: '{{campaign.id}}', content: '{{ad.id}}' });
+    const tags = utmQueryString(spec, omit);
+    return tags || undefined;
   }
 
   /**
@@ -1030,9 +1186,11 @@ export class MetaService {
         [AdCreative.Fields.name]: params.name,
         [AdCreative.Fields.object_story_spec]: objectStorySpec
       };
-      // Preserve UTM/tracking append rules so a link_url swap doesn't strip them.
-      if (params.url_tags) {
-        creativeParams.url_tags = params.url_tags;
+      // Auto-generate UTM append rules when the caller supplies none (ENG-239), and
+      // preserve an explicit value so a link_url swap doesn't strip them.
+      const urlTags = MetaService.resolveUrlTags(params);
+      if (urlTags) {
+        creativeParams.url_tags = urlTags;
       }
 
       this.log(`Creating ad creative in account: ${adAccountId}`, creativeParams);
@@ -1139,9 +1297,11 @@ export class MetaService {
       [AdCreative.Fields.object_story_spec]: objectStorySpec,
       asset_feed_spec: assetFeedSpec,
     };
-    // Preserve UTM/tracking append rules so a link_url swap doesn't strip them.
-    if (params.url_tags) {
-      creativeParams.url_tags = params.url_tags;
+    // Auto-generate UTM append rules when the caller supplies none (ENG-239), and
+    // preserve an explicit value so a link_url swap doesn't strip them.
+    const urlTags = MetaService.resolveUrlTags(params);
+    if (urlTags) {
+      creativeParams.url_tags = urlTags;
     }
 
     this.log(`Creating placement-customized ad creative in account: ${adAccountId}`, creativeParams);
@@ -1175,6 +1335,118 @@ export class MetaService {
       return ads.map((a: any) => a._data);
     } catch (error) {
       return this.handleError(error, 'listAds');
+    }
+  }
+
+  /**
+   * Every destination URL on a creative (ENG-239 AC3, read side).
+   *
+   * This is the exact mirror of `createAdCreative` / `createPlacementCustomizedCreative`'s
+   * write sites, plus `creative.link_url` (which Meta populates and Ads Manager writes
+   * directly). Read/write symmetry is the correctness bar: a location we fail to read is
+   * a healthy ad reported as "untagged", and acting on that means swapping a live creative
+   * and resetting its learning phase.
+   *
+   *   creative.link_url                                             (top-level / Ads Manager)
+   *   object_story_spec.link_data.link                              (single image; carousel fallback :1044)
+   *   object_story_spec.link_data.call_to_action.value.link         (:1058, :1071)
+   *   object_story_spec.link_data.child_attachments[].link          (carousel cards :1047)
+   *   object_story_spec.link_data.child_attachments[].call_to_action.value.link  (per-card CTA :1055)
+   *   object_story_spec.video_data.call_to_action.value.link        (:1029)
+   *   asset_feed_spec.link_urls[].website_url                       (placement-customized :1174)
+   *
+   * Deliberately NOT read: `link_data.caption`. The writer sets it to the link URL, but it is
+   * a DISPLAY field — Ads Manager routinely holds a bare domain ("example.com") there, which
+   * `readUtmKeys` cannot parse, and one unparseable URL marks the whole ad unreadable. It is
+   * never a click destination, so reading it would only manufacture noise.
+   *
+   * Returns [] when nothing is extractable. The audit classes that `unreadable` and surfaces
+   * it for a human — we never invent a placeholder URL.
+   */
+  static extractCreativeDestinationUrls(creative: any): string[] {
+    // Graph subfields arrive as plain objects, but tolerate an SDK node wrapper.
+    const c = creative?._data ?? creative;
+    if (!c || typeof c !== 'object') return [];
+
+    const urls: string[] = [];
+    const push = (u: unknown) => {
+      if (typeof u === 'string' && u.trim()) urls.push(u.trim());
+    };
+
+    push(c.link_url);
+
+    const oss = c.object_story_spec ?? {};
+
+    const linkData = oss.link_data ?? {};
+    push(linkData.link);
+    push(linkData.call_to_action?.value?.link);
+    for (const card of Array.isArray(linkData.child_attachments) ? linkData.child_attachments : []) {
+      push(card?.link);
+      push(card?.call_to_action?.value?.link);
+    }
+
+    push(oss.video_data?.call_to_action?.value?.link);
+
+    const linkUrls = c.asset_feed_spec?.link_urls;
+    for (const entry of Array.isArray(linkUrls) ? linkUrls : []) {
+      push(entry?.website_url);
+    }
+
+    return [...new Set(urls)];
+  }
+
+  /**
+   * Read every ad's destination URLs and creative-level `url_tags` for the UTM audit
+   * (ENG-239 AC3). STRICTLY READ-ONLY.
+   *
+   * Mirrors `listAds`: same SDK edge, same `effective_status` filter, so an ad paused at
+   * campaign/adset level is audited rather than silently omitted (an omitted ad reads as a
+   * vacuously-tagged campaign — a false negative that hides missing attribution).
+   *
+   * `campaignId` scopes the read to one campaign via Meta's `filtering` param; the caller
+   * ALSO filters client-side, so a filter the API ignores can never attribute another
+   * campaign's ads to this one.
+   */
+  public async listAdsForUtmAudit(
+    adAccountId: string,
+    accessToken: string,
+    campaignId?: string,
+  ): Promise<Array<{ adId: string; campaignId: string; destinationUrls: string[]; urlTags?: string }>> {
+    try {
+      this.initApi(accessToken);
+      const account = new AdAccount(`act_${adAccountId}`);
+      const fields = [
+        'id',
+        'campaign_id',
+        'creative{id,link_url,url_tags,object_story_spec,asset_feed_spec}',
+      ];
+      const params: Record<string, any> = {
+        effective_status: [
+          'ACTIVE', 'PAUSED', 'CAMPAIGN_PAUSED', 'ADSET_PAUSED',
+          'PENDING_REVIEW', 'DISAPPROVED', 'PREAPPROVED',
+          'PENDING_BILLING_INFO', 'IN_PROCESS', 'WITH_ISSUES'
+        ],
+      };
+      if (campaignId) {
+        params.filtering = [{ field: 'campaign.id', operator: 'IN', value: [campaignId] }];
+      }
+      this.log(`Listing ads for UTM audit in account: ${adAccountId}`, { fields, campaignId });
+      const ads = await account.getAds(fields, params);
+      return ads.map((a: any) => {
+        const data = a._data ?? a;
+        const creative = data.creative;
+        const urlTags = (creative?._data ?? creative)?.url_tags;
+        return {
+          adId: String(data.id),
+          campaignId: data.campaign_id != null ? String(data.campaign_id) : '',
+          destinationUrls: MetaService.extractCreativeDestinationUrls(creative),
+          urlTags: typeof urlTags === 'string' && urlTags.trim() ? urlTags : undefined,
+        };
+      });
+    } catch (error) {
+      // handleError always throws — a failed read must never look like "no ads"
+      // (which the audit would report as a vacuously tagged, healthy account).
+      return this.handleError(error, 'listAdsForUtmAudit') as never;
     }
   }
 
@@ -1228,9 +1500,20 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const creative = new AdCreative(creativeId);
+      // object_story_spec must be expanded with explicit subfields — the Graph API only returns
+      // image_hash when it is named directly; requesting the bare "object_story_spec" field
+      // silently drops image_hash and returns only the hosted "picture" URL. Copy/reuse flows
+      // (COPY_AD) that read the hash back to attach it to a new creative would otherwise always
+      // fall back to re-uploading that low-res preview URL, which Meta's AdCreative create
+      // endpoint rejects (error code 100, subcode 1487390).
+      const objectStorySpecField =
+        'object_story_spec{page_id,' +
+        'link_data{link,message,caption,name,image_hash,picture,call_to_action,' +
+        'child_attachments{link,image_hash,picture,name,description,video_id,call_to_action}},' +
+        'video_data{video_id,image_hash,image_url,title,message,call_to_action}}';
       const fields = [
         'id', 'name', 'body', 'title', 'image_url', 'thumbnail_url',
-        'object_type', 'link_url', 'object_story_spec', 'asset_feed_spec', 'url_tags'
+        'object_type', 'link_url', objectStorySpecField, 'asset_feed_spec', 'url_tags'
       ];
       this.log(`Fetching ad creative: ${creativeId}`);
       const result = await creative.get(fields);
@@ -1481,14 +1764,41 @@ export class MetaService {
     }
   }
 
+  // Geolocation search types must go through the top-level /search endpoint,
+  // NOT the ad account 'targetingsearch' edge (which only resolves interests/
+  // behaviors/demographics and silently returns interest-style results for
+  // geo queries). See ENG-331.
+  private static readonly GEO_SEARCH_TYPES = new Set([
+    'adgeolocation',
+    'adgeolocationmeta',
+    'adcountry',
+    'adregion',
+    'adcity',
+    'adzipcode',
+  ]);
+
   /**
    * Search for Detailed Targeting options
    */
-  public async searchTargeting(adAccountId: string, accessToken: string, q: string, type: string) {
+  public async searchTargeting(
+    adAccountId: string,
+    accessToken: string,
+    q: string,
+    type: string,
+    locationTypes?: string[]
+  ) {
+    // Geolocation lookups (cities, regions, zips, countries) resolve via the
+    // top-level /search endpoint, which returns entries with location keys/
+    // region_ids usable in ad set geo_locations. The targetingsearch edge does
+    // not support these types and returns interest results instead.
+    if (MetaService.GEO_SEARCH_TYPES.has(type)) {
+      return this.searchGeoLocations(accessToken, q, type, locationTypes);
+    }
+
     try {
       this.initApi(accessToken);
       const account = new AdAccount(`act_${adAccountId}`);
-      
+
       const params: any = {
         q: q,
         type: type,
@@ -1500,15 +1810,43 @@ export class MetaService {
       }
 
       this.log(`Searching targeting options in account: ${adAccountId}`, params);
-      
+
       // 'targetingsearch' edge returns a list of targeting options
       const results = await account.getTargetingSearch([], params);
-      
+
       // Handle both Cursor and plain array responses
       const data = results.map((item: any) => item._data);
       return data;
     } catch (error) {
       return this.handleError(error, 'searchTargeting');
+    }
+  }
+
+  /**
+   * Search for geo-targeting locations (cities, regions, zips, countries) via the
+   * top-level Graph API /search endpoint. Returns entries with a location `key`
+   * and `region_id` that can be used directly in an ad set's `geo_locations`.
+   */
+  private async searchGeoLocations(accessToken: string, q: string, type: string, locationTypes?: string[]) {
+    try {
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
+      let url = `https://graph.facebook.com/${apiVersion}/search?type=${encodeURIComponent(type)}` +
+        `&q=${encodeURIComponent(q)}&limit=25&access_token=${encodeURIComponent(accessToken)}`;
+      if (locationTypes && locationTypes.length > 0) {
+        url += `&location_types=${encodeURIComponent(JSON.stringify(locationTypes))}`;
+      }
+
+      this.log(`Searching geo locations (type=${type})`, { q, locationTypes });
+
+      const { fetchWithRetry } = await import('../utils/metaApiFetch');
+      const response = await fetchWithRetry(url);
+      const data = await response.json();
+      if (data.error) {
+        throw new Error(data.error.message || 'Failed to search geo locations');
+      }
+      return data.data || [];
+    } catch (error) {
+      return this.handleError(error, 'searchGeoLocations');
     }
   }
 
@@ -1629,3 +1967,44 @@ export class MetaService {
 }
 
 export const metaService = MetaService.getInstance();
+
+/**
+ * Compute the `url_tags` an existing, already-live ad should carry after a
+ * single-ad UTM retrofit (Harsha's ask — the audit tool can only find campaigns
+ * missing UTMs, never fix them).
+ *
+ * Mirrors `resolveUrlTags`'s algorithm (a key already on ANY reference link URL
+ * is never duplicated into `url_tags`) but operates on primitives instead of a
+ * full `MetaAdsAdCreativeParams`, since a retrofit only has what it read back
+ * from an existing creative, not a caller-supplied params object.
+ *
+ * `changed:false` means nothing should be written — either every required key
+ * is already present (on `currentUrlTags` or any link URL), or a link URL could
+ * not be parsed and we refuse to risk a duplicate. The caller (the creative-swap
+ * retrofit) uses `changed` to skip the API call entirely rather than diffing
+ * strings, which would be fooled by a normalized leading `?`/`&` on the input.
+ */
+export function computeRetagUrlTags(
+  currentUrlTags: string | undefined,
+  linkUrls: string[],
+): { urlTags: string | undefined; changed: boolean; unreadable?: boolean } {
+  const omit = new Set<string>(utmKeysInQueryString(currentUrlTags));
+  for (const url of linkUrls) {
+    const keys = readUtmKeys(url);
+    // Unreadable link → we cannot know what it already carries, so we do not
+    // tag at all rather than risk a duplicate — same rule as resolveUrlTags.
+    // `unreadable: true` distinguishes this from a genuine "already fully
+    // tagged" no-op: both return changed:false, but a caller that collapses
+    // them into the same alreadyTagged:true response gives false confirmation
+    // that a malformed-destination ad is actually covered (Greptile).
+    if (!keys) return { urlTags: currentUrlTags, changed: false, unreadable: true };
+    for (const k of keys) omit.add(k);
+  }
+
+  const spec = buildUtmSpec('meta', { campaign: '{{campaign.id}}', content: '{{ad.id}}' });
+  const merged = mergeUtmIntoQueryString(currentUrlTags, spec, omit);
+  const normalizedCurrent = (currentUrlTags || '').replace(/^[?&]+/, '').replace(/&+$/, '');
+
+  if (merged === normalizedCurrent) return { urlTags: currentUrlTags, changed: false };
+  return { urlTags: merged || undefined, changed: true };
+}

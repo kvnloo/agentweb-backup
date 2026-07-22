@@ -489,6 +489,115 @@ describe('listBudgets', () => {
   });
 });
 
+describe('listBiddingStrategies (portfolio / shared strategies)', () => {
+  it('returns mapped portfolio strategies from GAQL search', async () => {
+    mockAxiosPost.mockResolvedValueOnce({
+      data: {
+        results: [{
+          biddingStrategy: {
+            resourceName: 'customers/123/biddingStrategies/555',
+            id: '555',
+            name: 'My Portfolio tCPA',
+            type: 'TARGET_CPA',
+            status: 'ENABLED',
+          },
+        }],
+      },
+    });
+    const strategies = await service.listBiddingStrategies('user-123', '1234567890');
+    expect(strategies).toHaveLength(1);
+    expect(strategies[0].resourceName).toBe('customers/123/biddingStrategies/555');
+    expect(strategies[0].name).toBe('My Portfolio tCPA');
+    expect(strategies[0].type).toBe('TARGET_CPA');
+    expect(strategies[0].status).toBe('ENABLED');
+  });
+
+  it('sends correct GAQL fields in the search query', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [] } });
+    await service.listBiddingStrategies('user-123', '1234567890');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.query).toContain('bidding_strategy.resource_name');
+    expect(body.query).toContain('bidding_strategy.type');
+  });
+});
+
+describe('updateCampaign — portfolio / shared bidding strategy', () => {
+  it('attaches a portfolio strategy by masking the bidding_strategy resource field', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    const didUpdate = await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+      biddingStrategyResourceName: 'customers/123/biddingStrategies/555',
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    const op = body.operations[0];
+    expect(op.update.biddingStrategy).toBe('customers/123/biddingStrategies/555');
+    expect(op.updateMask.split(',')).toContain('bidding_strategy');
+    // Portfolio attach is a scalar resource-name field — never emit an embedded-strategy path.
+    expect(op.updateMask).not.toContain('maximize_conversions');
+    expect(op.updateMask).not.toContain('target_spend');
+    expect(didUpdate).toBe(true);
+  });
+
+  it('rejects passing both a standard bidding_strategy and a portfolio resource name', async () => {
+    await expect(
+      service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+        biddingStrategy: 'MANUAL_CPC',
+        biddingStrategyResourceName: 'customers/123/biddingStrategies/555',
+      }),
+    ).rejects.toThrow(/either .*bidding_strategy.*or.*bidding_strategy_resource_name|not both/i);
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+});
+
+describe('createCampaign — portfolio / shared bidding strategy', () => {
+  it('creates a campaign attached to a portfolio strategy (no embedded strategy field)', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/campaigns/9' }] } });
+    const res = await service.createCampaign('user-123', '1234567890', {
+      name: 'Portfolio Campaign',
+      type: 'SEARCH',
+      budgetResourceName: 'customers/123/campaignBudgets/1',
+      biddingStrategyResourceName: 'customers/123/biddingStrategies/555',
+      locationTargetIds: [],
+    });
+    const create = mockAxiosPost.mock.calls[0][1].operations[0].create;
+    expect(create.biddingStrategy).toBe('customers/123/biddingStrategies/555');
+    expect(create.maximizeConversions).toBeUndefined();
+    expect(create.targetSpend).toBeUndefined();
+    expect(res.resourceName).toBe('customers/123/campaigns/9');
+  });
+
+  it('rejects an unrecognized bidding_strategy on create without sending an incomplete mutate', async () => {
+    await expect(
+      service.createCampaign('user-123', '1234567890', {
+        name: 'Bogus Strategy Campaign',
+        type: 'SEARCH',
+        budgetResourceName: 'customers/123/campaignBudgets/1',
+        biddingStrategy: 'NOT_A_REAL_STRATEGY' as any,
+        locationTargetIds: [],
+      }),
+    ).rejects.toThrow('Unsupported bidding_strategy');
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
+  it('rejects TARGET_SPEND create with a zero/negative ceiling but allows uncapped (omitted)', async () => {
+    for (const ceiling of [0, -1]) {
+      await expect(
+        service.createCampaign('user-123', '1234567890', {
+          name: 'Zero Ceiling', type: 'SEARCH', budgetResourceName: 'customers/123/campaignBudgets/1',
+          biddingStrategy: 'TARGET_SPEND', cpcBidCeilingMicros: ceiling, locationTargetIds: [],
+        }),
+      ).rejects.toThrow('cpc_bid_ceiling_micros');
+    }
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+    // Uncapped (omitted) is still valid on create → empty target_spend, no ceiling sent.
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/campaigns/7' }] } });
+    await service.createCampaign('user-123', '1234567890', {
+      name: 'Uncapped', type: 'SEARCH', budgetResourceName: 'customers/123/campaignBudgets/1',
+      biddingStrategy: 'TARGET_SPEND', locationTargetIds: [],
+    });
+    expect(mockAxiosPost.mock.calls[0][1].operations[0].create.targetSpend).toEqual({});
+  });
+});
+
 describe('listCampaigns', () => {
   it('returns campaigns from GAQL search', async () => {
     mockAxiosPost.mockResolvedValueOnce({
@@ -558,6 +667,49 @@ describe('pauseCampaign / resumeCampaign', () => {
   });
 });
 
+describe('getCampaignFinalUrls (ENG-335)', () => {
+  it('collects and de-duplicates final URLs across ads and asset groups', async () => {
+    // First search: ad_group_ad final_urls. Second search: asset_group final_urls.
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [
+        { adGroupAd: { ad: { finalUrls: ['https://acme.com/lp', 'https://acme.com/pricing'] } } },
+        { adGroupAd: { ad: { finalUrls: ['https://acme.com/lp'] } } }, // duplicate
+      ] } })
+      .mockResolvedValueOnce({ data: { results: [
+        { assetGroup: { finalUrls: ['https://acme.com/pmax'] } },
+      ] } });
+
+    const urls = await service.getCampaignFinalUrls('user-123', '1234567890', 'customers/123/campaigns/1');
+    expect(urls.sort()).toEqual([
+      'https://acme.com/lp', 'https://acme.com/pmax', 'https://acme.com/pricing',
+    ]);
+    // Query filters by the campaign resource name and excludes REMOVED entities.
+    expect(mockAxiosPost.mock.calls[0][1].query).toContain("campaign.resource_name = 'customers/123/campaigns/1'");
+    expect(mockAxiosPost.mock.calls[0][1].query).toContain("!= 'REMOVED'");
+  });
+
+  it('returns an empty array when the campaign has no ads or asset groups', async () => {
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [] } })
+      .mockResolvedValueOnce({ data: { results: [] } });
+    const urls = await service.getCampaignFinalUrls('user-123', '1234567890', 'customers/123/campaigns/1');
+    expect(urls).toEqual([]);
+  });
+
+  it('rejects a crafted resource name before it reaches the GAQL query (no query issued)', async () => {
+    await expect(
+      service.getCampaignFinalUrls('user-123', '1234567890', "customers/123/campaigns/1' OR '1'='1"),
+    ).rejects.toThrow(/Invalid Google Ads campaigns resource name/);
+    await expect(
+      service.getCampaignStatus('user-123', '1234567890', 'not-a-resource-name'),
+    ).rejects.toThrow(/Invalid Google Ads campaigns resource name/);
+    await expect(
+      service.getAdGroupCampaign('user-123', '1234567890', "customers/123/adGroups/9'--"),
+    ).rejects.toThrow(/Invalid Google Ads adGroups resource name/);
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+});
+
 describe('searchLocations', () => {
   it('returns location suggestions', async () => {
     mockAxiosPost.mockResolvedValueOnce({
@@ -618,8 +770,25 @@ describe('addNegativeKeywords', () => {
   });
 });
 
+/**
+ * ENG-239: createAd now issues a GAQL read for the campaign's inherited
+ * final_url_suffix before mutating (an ad-level suffix REPLACES the campaign's, so
+ * we must carry it forward rather than destroy it). `search` posts `{ query }` and
+ * `mutate` posts `{ operations }`, so locate the mutate by body shape, not index.
+ */
+function mutateBody(): any {
+  const call = mockAxiosPost.mock.calls.find((c: any) => c[1]?.operations);
+  if (!call) throw new Error('no mutate call was made');
+  return call[1];
+}
+/** Stub the inherited-suffix read: campaign has no suffix of its own. */
+function mockNoInheritedSuffix() {
+  mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ campaign: {} }] } });
+}
+
 describe('createAd (Responsive Search Ad)', () => {
   it('creates RSA with headlines and descriptions', async () => {
+    mockNoInheritedSuffix();
     mockAxiosPost.mockResolvedValueOnce({
       data: { results: [{ resourceName: 'customers/123/adGroupAds/1' }] },
     });
@@ -630,7 +799,7 @@ describe('createAd (Responsive Search Ad)', () => {
       descriptions: ['Description 1', 'Description 2'],
       finalUrl: 'https://example.com',
     });
-    const body = mockAxiosPost.mock.calls[0][1];
+    const body = mutateBody();
     expect(body.operations[0].create.ad.responsiveSearchAd.headlines).toHaveLength(3);
     expect(body.operations[0].create.ad.finalUrls[0]).toBe('https://example.com');
   });
@@ -651,6 +820,7 @@ describe('addNegativeKeywords — adGroup level', () => {
 
 describe('createAd — Responsive Display Ad', () => {
   it('creates RDA with image assets', async () => {
+    mockNoInheritedSuffix();
     mockAxiosPost.mockResolvedValueOnce({
       data: { results: [{ resourceName: 'customers/123/adGroupAds/2' }] },
     });
@@ -662,7 +832,7 @@ describe('createAd — Responsive Display Ad', () => {
       finalUrl: 'https://example.com',
       imageAssetResourceNames: ['customers/123/assets/1'],
     });
-    const body = mockAxiosPost.mock.calls[0][1];
+    const body = mutateBody();
     expect(body.operations[0].create.ad.responsiveDisplayAd).toBeDefined();
     expect(body.operations[0].create.ad.responsiveDisplayAd.marketingImages).toHaveLength(1);
   });
@@ -786,6 +956,55 @@ describe('updateCampaign — TARGET_IMPRESSION_SHARE', () => {
   });
 });
 
+describe('updateCampaign — TARGET_SPEND (Maximize Clicks)', () => {
+  it('switches to TARGET_SPEND with a cpc bid ceiling', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    const didUpdate = await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+      biddingStrategy: 'TARGET_SPEND',
+      cpcBidCeilingMicros: 9_000_000,
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    const update = body.operations[0].update;
+    expect(update.targetSpend.cpcBidCeilingMicros).toBe('9000000');
+    expect(body.operations[0].updateMask).toContain('target_spend.cpc_bid_ceiling_micros');
+    // Must never emit the bare parent mask path (FieldMaskError.FIELD_HAS_SUBFIELDS).
+    expect(body.operations[0].updateMask.split(',')).not.toContain('target_spend');
+    expect(didUpdate).toBe(true);
+  });
+
+  it('rejects TARGET_SPEND with no cpc bid ceiling instead of sending a mutate the API would reject', async () => {
+    // Uncapped Maximize Clicks isn't expressible on an update: the bare 'target_spend'
+    // mask is FIELD_HAS_SUBFIELDS and a ceiling of 0 is TOO_LOW. Fail fast with guidance.
+    await expect(
+      service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+        biddingStrategy: 'TARGET_SPEND',
+      }),
+    ).rejects.toThrow('cpc_bid_ceiling_micros');
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
+  it('rejects TARGET_SPEND with a zero or negative cpc bid ceiling (Google rejects 0 as TOO_LOW)', async () => {
+    for (const ceiling of [0, -5]) {
+      await expect(
+        service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+          biddingStrategy: 'TARGET_SPEND',
+          cpcBidCeilingMicros: ceiling,
+        }),
+      ).rejects.toThrow('cpc_bid_ceiling_micros');
+    }
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unrecognized bidding_strategy without mutating anything', async () => {
+    await expect(
+      service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+        biddingStrategy: 'NOT_A_REAL_STRATEGY',
+      }),
+    ).rejects.toThrow('Unsupported bidding_strategy');
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+});
+
 describe('updateCampaign', () => {
   it('sends mutate request with update and updateMask for name change', async () => {
     mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
@@ -802,6 +1021,23 @@ describe('updateCampaign', () => {
     const body = mockAxiosPost.mock.calls[0][1];
     expect(body.operations[0].update.status).toBe('PAUSED');
     expect(body.operations[0].updateMask).toContain('status');
+  });
+
+  it('sends mutate request with update and updateMask for final_url_suffix change', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    const didUpdate = await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {
+      finalUrlSuffix: 'utm_source=google&utm_medium=cpc',
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].update.finalUrlSuffix).toBe('utm_source=google&utm_medium=cpc');
+    expect(body.operations[0].updateMask).toContain('final_url_suffix');
+    expect(didUpdate).toBe(true);
+  });
+
+  it('returns false and makes no API call when no recognized fields are provided', async () => {
+    const didUpdate = await service.updateCampaign('user-123', '1234567890', 'customers/123/campaigns/1', {});
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+    expect(didUpdate).toBe(false);
   });
 });
 
@@ -893,7 +1129,12 @@ describe('createAssetGroup', () => {
     // Asset group is after text assets (index 3)
     expect(body.mutateOperations[3].assetGroupOperation.create.name).toBe('My Asset Group');
     expect(body.mutateOperations[3].assetGroupOperation.create.campaign).toBe('customers/123/campaigns/1');
-    expect(body.mutateOperations[3].assetGroupOperation.create.finalUrls[0]).toBe('https://example.com');
+    // ENG-239: asset_group has no final_url_suffix field, so Emma merges the UTMs
+    // straight into final_urls (ValueTrack macros pass through un-encoded). No
+    // utm_content: Google's docs mark {creative} unsupported on Performance Max.
+    expect(body.mutateOperations[3].assetGroupOperation.create.finalUrls[0]).toBe(
+      'https://example.com?utm_source=google&utm_medium=paid&utm_campaign={campaignid}',
+    );
   });
 
   it('retries without LOGO links on BRAND_ASSETS_NOT_LINKED_AT_CAMPAIGN_LEVEL error', async () => {

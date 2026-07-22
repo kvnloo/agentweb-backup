@@ -12,6 +12,8 @@
  * looped on over-limit notes in a real session, so it stays pure deterministic trim.
  */
 
+import { meterUsageFromResponse } from '../utils/llmClients';
+
 /** Extract the note text from a Gemini JSON-ish response, tolerating markdown fences. */
 function extractContent(raw: string): string {
   if (!raw) return '';
@@ -58,6 +60,8 @@ export async function shortenInviteNoteToLimit(
   note: string,
   limit: number,
   attempts: number = 2,
+  userId?: string,
+  sessionId?: string,
 ): Promise<string> {
   let best = note;
   if (best.length <= limit) return best;
@@ -76,6 +80,19 @@ ${best}`;
         temperature: 0.4,
         max_tokens: 2048,
       });
+      // Meter this direct Gemini completion (bypasses callLLM): shadow analytics +
+      // the per-user cap. Only when usage is present, so an empty response records
+      // nothing. meterUsageFromResponse is fail-open, so no try/catch needed.
+      if ((completion as any)?.usage) {
+        meterUsageFromResponse({
+          userId,
+          sessionId,
+          model: 'gemini-3.5-flash',
+          provider: 'gemini',
+          feature: 'invite_note_shorten',
+        }, completion);
+      }
+
       const candidate = extractContent(completion?.choices?.[0]?.message?.content || '');
       // Only accept a candidate that actually moves us forward (shorter than best).
       if (candidate && candidate.length < best.length) best = candidate;

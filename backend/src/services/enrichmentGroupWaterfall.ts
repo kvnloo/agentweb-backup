@@ -138,6 +138,9 @@ export interface LLMFilledValue {
   value: string;
   sourceUrl?: string;
   sourceQuote?: string;
+  /** ENG-122 grounding classification, set by classifyWebValues on web-tier
+   *  fills. Absent on Apollo/other tiers. */
+  grounding?: 'grounded' | 'web-unverified' | 'ai-knowledge';
 }
 
 export interface LLMExtractResult {
@@ -287,13 +290,20 @@ function metaApollo(
   };
 }
 
-function metaWeb(sourceUrl?: string, sourceQuote?: string): EnrichedFieldMeta {
+export function metaWeb(
+  sourceUrl?: string,
+  sourceQuote?: string,
+  grounding?: 'grounded' | 'web-unverified' | 'ai-knowledge',
+): EnrichedFieldMeta {
   return {
     source: 'web_search',
     provider: 'llm_web_search',
-    confidence: 'medium',
+    // Grounded values are trustworthy; ungrounded (web-unverified / ai-knowledge)
+    // stay low so they surface with an "— unverified" badge (ENG-122).
+    confidence: grounding === 'grounded' ? 'high' : 'low',
     ...(sourceUrl ? { sourceUrl } : {}),
     ...(sourceQuote ? { sourceQuote } : {}),
+    ...(grounding ? { grounding } : {}),
     enrichedAt: new Date().toISOString(),
     fromCache: false,
   };
@@ -718,7 +728,7 @@ export async function runWaterfall(
       const entry = llmResult.filled[f];
       if (entry && typeof entry.value === 'string' && entry.value.length > 0) {
         console.log(`${tag} T4 HIT  field=${f} value="${String(entry.value).slice(0, 60)}" src=${entry.sourceUrl ?? '∅'}`);
-        filled.push({ field: f, value: entry.value, meta: metaWeb(entry.sourceUrl, entry.sourceQuote) });
+        filled.push({ field: f, value: entry.value, meta: metaWeb(entry.sourceUrl, entry.sourceQuote, entry.grounding) });
         webFills += 1;
       } else {
         console.log(`${tag} T4 MISS field=${f} reason=llm_returned_empty`);

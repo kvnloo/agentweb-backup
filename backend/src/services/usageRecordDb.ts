@@ -161,4 +161,35 @@ export const usageRecordDb = {
 
     return rows;
   },
+
+  /**
+   * Scan ALL users' rows between two dates (inclusive, YYYY-MM-DD), for the
+   * admin cost aggregation (ENG-366). Paginates through LastEvaluatedKey.
+   *
+   * A Scan is deliberate here: the table holds compact daily aggregates (one
+   * row per user/day/model/feature) with a 180-day TTL, so the scan is bounded
+   * and this is an admin-only, low-frequency read path. If row volume ever
+   * makes this slow, the upgrade path is a date-keyed GSI — not client-side
+   * filtering.
+   */
+  async scanByDateRange(startDate: string, endDate: string): Promise<UsageRecordRow[]> {
+    const rows: UsageRecordRow[] = [];
+    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+
+    do {
+      const result = await getDocumentClient()
+        .scan({
+          TableName: TABLE_NAME,
+          FilterExpression: "#date BETWEEN :start AND :end",
+          ExpressionAttributeNames: { "#date": "date" },
+          ExpressionAttributeValues: { ":start": startDate, ":end": endDate },
+          ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+        })
+        .promise();
+      rows.push(...((result.Items || []) as UsageRecordRow[]));
+      lastKey = result.LastEvaluatedKey;
+    } while (lastKey);
+
+    return rows;
+  },
 };

@@ -16,7 +16,8 @@ import {
   getSlackUserDisplayName,
   getSlackUserEmail,
   resolveSlackMentionsInText,
-  downloadSlackFile
+  downloadSlackFile,
+  resolveSlackFileUrl
 } from "../services/slackService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
 import { taskDb, subscriberDb } from "../services/db";
@@ -25,6 +26,18 @@ import { createRevisionExecutionFromSlack } from "../controllers/tasks";
 import { isSessionLimitError } from "../utils/agentModeErrors";
 import { sendAgentModeOncallAlert } from "../utils/agentModeAlerts";
 import { getEmmaBotUserId, handleLoopApprovalReaction } from "../services/loopSlackApprovalDispatcher";
+import { renderCitationMarkers } from "../utils/citations";
+
+// ENG-351: resolve Emma's {{cite:N}} markers to Slack-clickable source links. The citation metadata
+// rides on the response's last assistant message; render as markdown links, which postThreadResponse's
+// markdown→mrkdwn converter turns into "<url|Source>". Falls back to stripping when no citations.
+function citeForSlack(response: any): string {
+  const content: string = response?.content || '';
+  const citations = [...(response?.responseMessages || [])]
+    .reverse()
+    .find((m: any) => m?.role === 'assistant')?.metadata?.citations;
+  return renderCitationMarkers(content, Array.isArray(citations) ? citations : [], 'markdown');
+}
 
 const router = express.Router();
 
@@ -343,7 +356,10 @@ async function handleSlackSessionResponse(params: {
   if (files && files.length > 0) {
     for (const file of files) {
       try {
-        const fileBuffer = await downloadSlackFile(file.url_private);
+        // Slack Connect / ext-shared channels omit url_private and send a stub
+        // (file_access: 'check_file_info') — hydrate it via files.info first (ENG-323).
+        const fileUrl = await resolveSlackFileUrl(file);
+        const fileBuffer = await downloadSlackFile(fileUrl);
         const { uploadFileToS3 } = await import('../utils/s3Utils');
         const uploadResult = await uploadFileToS3(
           fileBuffer,
@@ -383,7 +399,7 @@ async function handleSlackSessionResponse(params: {
 
     // Post Emma's response to the Slack thread
     if (response.content) {
-      await postThreadResponse(channel, ts, response.content);
+      await postThreadResponse(channel, ts, citeForSlack(response));
     } else {
       // Generation succeeded but produced no text content — log and post a fallback so the
       // user gets feedback instead of silence. This can happen when the LLM returns only tool
@@ -967,15 +983,15 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
               }
 
               const displayName = await getSlackUserDisplayName(slackUserId);
-              // When user sends only a file with no text, provide a placeholder so Emma knows a file was shared
-              const messageText = text || (files && files.length > 0 ? '[attached file]' : '');
-              const formattedMessage = `${displayName}: ${messageText}`.trim();
 
               const attachments: any[] = [];
               if (files && files.length > 0) {
                 for (const file of files) {
                   try {
-                    const fileBuffer = await downloadSlackFile(file.url_private);
+                    // Slack Connect / ext-shared channels omit url_private and send a stub
+                    // (file_access: 'check_file_info') — hydrate it via files.info first (ENG-323).
+                    const fileUrl = await resolveSlackFileUrl(file);
+                    const fileBuffer = await downloadSlackFile(fileUrl);
                     const { uploadFileToS3 } = await import('../utils/s3Utils');
                     const uploadResult = await uploadFileToS3(
                       fileBuffer,
@@ -999,13 +1015,24 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
                 }
               }
 
+              // When the user sent only a file (no text), give Emma a placeholder so it knows
+              // a file was shared — but only claim '[attached file]' if an attachment actually
+              // reached the agent. If ingestion failed and attachments is empty, an honest
+              // marker keeps the model from calling read_file_content('[attached file]') on a
+              // non-URL and returning 'Invalid URL format' to the user (ENG-323).
+              let messageText = text;
+              if (!messageText && files && files.length > 0) {
+                messageText = attachments.length > 0 ? '[attached file]' : '[attachment could not be read]';
+              }
+              const formattedMessage = `${displayName}: ${messageText || ''}`.trim();
+
               const thinkingTs = await postThinkingMessage(channel, threadTs);
               const llmModel = session.llmModel || await agentModeService.getDefaultModel();
 
               try {
                 const response = await generateSessionResponse(sessionId, formattedMessage, userId, llmModel, attachments);
                 if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);
-                if (response.content) await postThreadResponse(channel, threadTs, response.content);
+                if (response.content) await postThreadResponse(channel, threadTs, citeForSlack(response));
               } catch (genError) {
                 console.error('❌ Error generating thread response:', genError);
                 if (thinkingTs) await deleteSlackMessage(channel, thinkingTs);

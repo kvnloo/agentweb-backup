@@ -1,55 +1,69 @@
-import { buildLocalAgentResult } from '../emma/localAgentTools';
+/**
+ * ENG-383 — local agent relay tools are DEPRECATED stubs.
+ *
+ * The relay (ngrok tunnel to a Codex agent on a Mac) is permanently dead
+ * (ERR_NGROK_6008, account suspended). Behavioral contract this suite pins:
+ *   1. Both tools stay REGISTERED (legacy skills / forced calls must not hit
+ *      an opaque "tool not found").
+ *   2. Each call fails fast with the clear local_agent_deprecated error —
+ *      immediately, with NO network, NO Secrets Manager, NO S3.
+ *   3. Descriptions are marked DEPRECATED so the model never picks them.
+ */
+import * as https from 'https';
+import * as http from 'http';
 
-describe('buildLocalAgentResult', () => {
-  it('maps a successful relay response with no error', () => {
-    const r = buildLocalAgentResult({ ok: true, result: 'page text', session_id: 's1', returncode: 0 }, []);
-    expect(r).toEqual({ success: true, result: 'page text', session_id: 's1', returncode: 0 });
-  });
+jest.mock('https', () => ({ request: jest.fn(() => { throw new Error('network call from deprecated stub'); }) }));
+jest.mock('http', () => ({ request: jest.fn(() => { throw new Error('network call from deprecated stub'); }) }));
+jest.mock('../utils/secretsManager', () => ({
+  getSecret: jest.fn(() => { throw new Error('Secrets Manager call from deprecated stub'); }),
+  secretExists: jest.fn(() => { throw new Error('Secrets Manager call from deprecated stub'); }),
+}));
+jest.mock('../utils/s3Utils', () => ({
+  uploadFileToS3: jest.fn(() => { throw new Error('S3 call from deprecated stub'); }),
+}));
 
-  it('passes a relay error through on failure', () => {
-    const r = buildLocalAgentResult({ ok: false, error: 'navigation blocked', returncode: 1 }, []);
-    expect(r.success).toBe(false);
-    expect(r.error).toBe('navigation blocked');
-  });
+import { LOCAL_AGENT_DEPRECATION_ERROR } from '../emma/localAgentTools';
+import { emmaToolRegistry } from '../emma/registry';
+import { getSecret, secretExists } from '../utils/secretsManager';
+import { uploadFileToS3 } from '../utils/s3Utils';
 
-  describe('Theme 1 — failure must never be opaque', () => {
-    it('uses `result` as the reason when the relay returns ok:false with no error', () => {
-      // the run_local "Tool returned success=false" class: detail was in result
-      const r = buildLocalAgentResult({ ok: false, result: 'Page returned a 500 error screen', returncode: 1 }, []);
-      expect(r.success).toBe(false);
-      expect(r.error).toBe('Page returned a 500 error screen');
+const DEPRECATED_TOOLS = ['run_local_agent_task', 'check_local_agent_status'] as const;
+
+describe('local agent tools are deprecated stubs (ENG-383)', () => {
+  describe.each(DEPRECATED_TOOLS)('%s', (toolName) => {
+    it('is still registered in the Emma tool registry', () => {
+      expect(emmaToolRegistry.getTool(toolName)).toBeDefined();
     });
 
-    it('falls back to a returncode message when there is no error and no usable result', () => {
-      const r = buildLocalAgentResult({ ok: false, returncode: 137 }, []);
-      expect(r.error).toBe('Local agent task failed (returncode 137)');
+    it('marks its description DEPRECATED and points at you_search_web', () => {
+      const definition = emmaToolRegistry.getTool(toolName)!.definition;
+      expect(definition.name).toBe(toolName);
+      expect(definition.description).toMatch(/^DEPRECATED \(2026-07\):/);
+      expect(definition.description).toContain('you_search_web');
     });
 
-    it('uses returncode -1 when the relay omits it', () => {
-      const r = buildLocalAgentResult({ ok: false }, []);
-      expect(r.error).toBe('Local agent task failed (returncode -1)');
+    it('returns the deprecation error immediately', async () => {
+      const startedAt = Date.now();
+      const result = await emmaToolRegistry.execute(toolName, { task: 'visit https://example.com' }, { userId: 'u1' });
+      expect(result).toEqual({ success: false, error: LOCAL_AGENT_DEPRECATION_ERROR });
+      expect(Date.now() - startedAt).toBeLessThan(1000);
     });
 
-    it('does not treat a non-string result as the reason', () => {
-      const r = buildLocalAgentResult({ ok: false, result: { foo: 1 }, returncode: 2 }, []);
-      expect(r.error).toBe('Local agent task failed (returncode 2)');
-      expect(r.result).toEqual({ foo: 1 });
+    it('makes no network, Secrets Manager, or S3 calls', async () => {
+      await emmaToolRegistry.execute(toolName, {}, { userId: 'u1' });
+      expect(https.request).not.toHaveBeenCalled();
+      expect(http.request).not.toHaveBeenCalled();
+      expect(getSecret).not.toHaveBeenCalled();
+      expect(secretExists).not.toHaveBeenCalled();
+      expect(uploadFileToS3).not.toHaveBeenCalled();
     });
   });
 
-  it('includes screenshot_urls when present', () => {
-    const r = buildLocalAgentResult({ ok: true, result: '', returncode: 0 }, ['https://s3/a.png']);
-    expect(r.screenshot_urls).toEqual(['https://s3/a.png']);
-  });
-
-  it('still surfaces a non-fatal error on a successful run (backward compatible)', () => {
-    const r = buildLocalAgentResult({ ok: true, result: 'ok', error: 'a screenshot failed to upload', returncode: 0 }, []);
-    expect(r.success).toBe(true);
-    expect(r.error).toBe('a screenshot failed to upload');
-  });
-
-  it('omits the error field when a success has none', () => {
-    const r = buildLocalAgentResult({ ok: true, result: 'ok', returncode: 0 }, []);
-    expect('error' in r).toBe(false);
+  it('names the retirement, the replacement, and the tracking issue in the error', () => {
+    expect(LOCAL_AGENT_DEPRECATION_ERROR).toMatch(/^local_agent_deprecated:/);
+    expect(LOCAL_AGENT_DEPRECATION_ERROR).toContain('retired in July 2026');
+    expect(LOCAL_AGENT_DEPRECATION_ERROR).toContain('you_search_web');
+    expect(LOCAL_AGENT_DEPRECATION_ERROR).toContain('you_search_news');
+    expect(LOCAL_AGENT_DEPRECATION_ERROR).toContain('ENG-381');
   });
 });

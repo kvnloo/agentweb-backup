@@ -256,6 +256,35 @@ describe('updateCampaign', () => {
       })
     );
   });
+
+  // ENG-367: a supplied runSchedule.start override was silently dropped -- updateCampaign
+  // never read it into setFields, so LinkedIn always re-validated against the OLD stored
+  // start time and rejected any update (including archiving) on a DRAFT ad set whose start
+  // had elapsed. This was OUR bug, not a LinkedIn API limitation.
+  it('includes a runSchedule.start override in the patch (object form)', async () => {
+    await svc.updateCampaign(ACCESS_TOKEN, ACCOUNT_ID, 'camp-1', {
+      status: 'ARCHIVED',
+      runSchedule: { start: 1784300000000 },
+    });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.patch.$set.runSchedule).toEqual({ start: 1784300000000 });
+    expect(call.data.patch.$set.status).toBe('ARCHIVED');
+  });
+
+  it('includes a runSchedule.start override in the patch (snake_case form)', async () => {
+    await svc.updateCampaign(ACCESS_TOKEN, ACCOUNT_ID, 'camp-1', {
+      run_schedule_start: 1784300000000,
+      run_schedule_end: 1784400000000,
+    });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.patch.$set.runSchedule).toEqual({ start: 1784300000000, end: 1784400000000 });
+  });
+
+  it('omits runSchedule from the patch when not supplied (no unintended field)', async () => {
+    await svc.updateCampaign(ACCESS_TOKEN, ACCOUNT_ID, 'camp-1', { status: 'PAUSED' });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.patch.$set).not.toHaveProperty('runSchedule');
+  });
 });
 
 describe('createCreative', () => {
@@ -289,8 +318,12 @@ describe('createCreative', () => {
     expect(call.data.content.textAd).toMatchObject({
       headline: 'Click Here',
       description: 'Ad copy',
-      landingPage: 'https://example.com',
     });
+    // ENG-239: the text-ad landing page is now UTM-tagged at create time (campaign_id
+    // is in scope here). See linkedInAdsService.utm.test.ts for full coverage.
+    expect(call.data.content.textAd.landingPage).toBe(
+      'https://example.com?utm_source=linkedin&utm_medium=paid&utm_campaign=camp-1'
+    );
   });
 
   it('returns error when no creative type provided', async () => {
@@ -303,6 +336,43 @@ describe('createCreative', () => {
     const result = await svc.createCreative(ACCESS_TOKEN, { campaign_id: 'camp-1', post_urn: 'urn:li:share:999' });
     expect(result.success).toBe(false);
     expect(result.error).toContain('ad_account_id');
+  });
+
+  it('attaches Lead Gen leadgenCallToAction for a sponsored content lead gen creative', async () => {
+    await svc.createCreative(ACCESS_TOKEN, {
+      campaign_id: 'camp-1',
+      post_urn: 'urn:li:share:999',
+      ad_account_id: ACCOUNT_ID,
+      leadgen_form_urn: 'urn:li:adForm:1016740005',
+      cta_label_type: 'SIGN_UP',
+    });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.leadgenCallToAction).toEqual({
+      destination: 'urn:li:adForm:1016740005',
+      label: 'SIGN_UP',
+    });
+  });
+
+  it('errors when a lead gen form is given without a labelType', async () => {
+    const result = await svc.createCreative(ACCESS_TOKEN, {
+      campaign_id: 'camp-1',
+      post_urn: 'urn:li:share:999',
+      ad_account_id: ACCOUNT_ID,
+      leadgen_form_urn: 'urn:li:adForm:1016740005',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('cta_label_type');
+  });
+
+  it('errors when a labelType is given without a lead gen form', async () => {
+    const result = await svc.createCreative(ACCESS_TOKEN, {
+      campaign_id: 'camp-1',
+      post_urn: 'urn:li:share:999',
+      ad_account_id: ACCOUNT_ID,
+      cta_label_type: 'SIGN_UP',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('leadgen_form_urn');
   });
 });
 
@@ -358,6 +428,74 @@ describe('createCreativeInline', () => {
     const result = await svc.createCreativeInline(ACCESS_TOKEN, { ad_account_id: ACCOUNT_ID, campaign_id: 'camp-1' });
     expect(result.success).toBe(false);
     expect(result.error).toContain('author_urn');
+  });
+
+  it('attaches Lead Gen leadgenCallToAction (destination + label) for a lead gen creative', async () => {
+    await svc.createCreativeInline(ACCESS_TOKEN, {
+      ad_account_id: ACCOUNT_ID,
+      campaign_id: 'camp-1',
+      author_urn: 'urn:li:organization:org-1',
+      image_urn: 'urn:li:image:img-1',
+      commentary: 'Grab the guide',
+      leadgen_form_urn: 'urn:li:adForm:1016740005',
+      cta_label_type: 'SIGN_UP',
+    });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.creative.leadgenCallToAction).toEqual({
+      destination: 'urn:li:adForm:1016740005',
+      label: 'SIGN_UP',
+    });
+  });
+
+  it('normalizes a bare adForm id into a full URN', async () => {
+    await svc.createCreativeInline(ACCESS_TOKEN, {
+      ad_account_id: ACCOUNT_ID,
+      campaign_id: 'camp-1',
+      author_urn: 'urn:li:organization:org-1',
+      image_urn: 'urn:li:image:img-1',
+      leadgen_form_urn: '1016740005',
+      cta_label_type: 'download',
+    });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.creative.leadgenCallToAction).toEqual({
+      destination: 'urn:li:adForm:1016740005',
+      label: 'DOWNLOAD',
+    });
+  });
+
+  it('errors when a lead gen form is given without a labelType', async () => {
+    const result = await svc.createCreativeInline(ACCESS_TOKEN, {
+      ad_account_id: ACCOUNT_ID,
+      campaign_id: 'camp-1',
+      author_urn: 'urn:li:organization:org-1',
+      image_urn: 'urn:li:image:img-1',
+      leadgen_form_urn: 'urn:li:adForm:1016740005',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('cta_label_type');
+  });
+
+  it('errors when a labelType is given without a lead gen form', async () => {
+    const result = await svc.createCreativeInline(ACCESS_TOKEN, {
+      ad_account_id: ACCOUNT_ID,
+      campaign_id: 'camp-1',
+      author_urn: 'urn:li:organization:org-1',
+      image_urn: 'urn:li:image:img-1',
+      cta_label_type: 'SIGN_UP',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('leadgen_form_urn');
+  });
+
+  it('omits leadgenCallToAction for a non-lead-gen creative', async () => {
+    await svc.createCreativeInline(ACCESS_TOKEN, {
+      ad_account_id: ACCOUNT_ID,
+      campaign_id: 'camp-1',
+      author_urn: 'urn:li:organization:org-1',
+      image_urn: 'urn:li:image:img-1',
+    });
+    const call = mockAxiosFn.mock.calls[0][0];
+    expect(call.data.creative.leadgenCallToAction).toBeUndefined();
   });
 });
 
@@ -721,7 +859,10 @@ describe('createDynamicCreative', () => {
     const body = mockAxiosFn.mock.calls[0][0].data;
     expect(body.content.spotlight.headline).toBe('See our work');
     expect(body.content.spotlight.callToAction).toBe('Visit Now');
-    expect(body.content.spotlight.landingPage).toBe('https://example.com');
+    // ENG-239: the spotlight landing page is now UTM-tagged at create time.
+    expect(body.content.spotlight.landingPage).toBe(
+      'https://example.com?utm_source=linkedin&utm_medium=paid&utm_campaign=camp-1'
+    );
     expect(body.content.spotlight.description).toBe('Award-winning agency');
     expect(body.content.spotlight.logo).toBe('urn:li:image:logo-1');
   });

@@ -16,6 +16,9 @@ const mockValidateAccessToken = jest.fn();
 const mockRefreshTokens = jest.fn();
 const mockValidatePkce = jest.fn();
 const mockValidateClientSecret = jest.fn();
+const mockRecordMcpOAuthStarted = jest.fn();
+const mockRecordMcpOAuthAuthorized = jest.fn();
+const mockRecordMcpOAuthTokenIssued = jest.fn();
 
 jest.mock('../oauthService', () => ({
   mcpOAuthService: {
@@ -29,6 +32,18 @@ jest.mock('../oauthService', () => ({
     validatePkce: (...args: any[]) => mockValidatePkce(...args),
     validateClientSecret: (...args: any[]) => mockValidateClientSecret(...args),
   },
+}));
+
+jest.mock('../../../services/mcpUsageEventsService', () => ({
+  classifyMcpClient: jest.fn(({ clientName, userAgent }: any) => {
+    const haystack = `${clientName || ''} ${userAgent || ''}`.toLowerCase();
+    if (haystack.includes('codex')) return 'codex';
+    if (haystack.includes('claude')) return 'claude_code';
+    return 'unknown';
+  }),
+  recordMcpOAuthStarted: (...args: any[]) => mockRecordMcpOAuthStarted(...args),
+  recordMcpOAuthAuthorized: (...args: any[]) => mockRecordMcpOAuthAuthorized(...args),
+  recordMcpOAuthTokenIssued: (...args: any[]) => mockRecordMcpOAuthTokenIssued(...args),
 }));
 
 // Mock authenticateToken middleware — simulates logged-in user
@@ -74,6 +89,9 @@ describe('MCP OAuth Routes', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockRecordMcpOAuthStarted.mockResolvedValue(true);
+    mockRecordMcpOAuthAuthorized.mockResolvedValue(true);
+    mockRecordMcpOAuthTokenIssued.mockResolvedValue(true);
     mockGetUserFromToken.mockResolvedValue({ user: null });
     process.env.BACKEND_URL = 'https://api.agentweb.pro';
     process.env.CUSTOMER_FRONTEND_URL = 'https://app.agentweb.pro';
@@ -116,6 +134,26 @@ describe('MCP OAuth Routes', () => {
 
       expect(res.body.issuer).toBe('https://custom.api.example.com');
       expect(res.body.authorization_endpoint).toBe('https://custom.api.example.com/oauth/authorize');
+    });
+  });
+
+  describe('GET /.well-known/oauth-protected-resource', () => {
+    it.each([
+      '/.well-known/oauth-protected-resource',
+      '/.well-known/oauth-protected-resource/mcp',
+    ])('should return MCP protected resource metadata from %s', async (path) => {
+      const res = await request(app)
+        .get(path)
+        .expect(200);
+
+      expect(res.body).toEqual({
+        resource: 'https://api.agentweb.pro/mcp',
+        authorization_servers: ['https://api.agentweb.pro'],
+        bearer_methods_supported: ['header'],
+        scopes_supported: ['mcp:tools'],
+        resource_documentation: 'https://api.agentweb.pro/skill.md',
+      });
+      expect(res.headers['cache-control']).toBe('public, max-age=3600');
     });
   });
 
@@ -208,6 +246,18 @@ describe('MCP OAuth Routes', () => {
       expect(location).toContain('https://app.agentweb.pro/oauth/authorize');
       expect(location).toContain('client_id=client-123');
       expect(location).toContain('state=random-state');
+      expect(location).toContain('utm_source=mcp');
+      expect(location).toContain('utm_medium=unknown');
+      expect(location).toContain('mcp_client_id=client-123');
+      expect(mockRecordMcpOAuthStarted).toHaveBeenCalledWith(
+        expect.objectContaining({
+          clientId: 'client-123',
+          clientName: 'Test Client',
+          clientType: 'unknown',
+          redirectUri: 'https://example.com/callback',
+          scope: 'mcp:tools',
+        })
+      );
     });
 
     it('should return 400 when client_id is missing', async () => {
@@ -404,6 +454,14 @@ describe('MCP OAuth Routes', () => {
       expect(location).toContain('https://example.com/callback');
       expect(location).toContain('code=auth-code-123');
       expect(location).toContain('state=random-state');
+      expect(mockRecordMcpOAuthAuthorized).toHaveBeenCalledWith({
+        userId: 'user-456',
+        clientId: 'client-123',
+        clientName: undefined,
+        clientType: 'unknown',
+        redirectUri: 'https://example.com/callback',
+        scope: 'mcp:tools',
+      });
     });
 
     it('should redirect with error=access_denied on denial', async () => {
@@ -518,6 +576,14 @@ describe('MCP OAuth Routes', () => {
       expect(res.body.access_token).toBe('access-token-123');
       expect(res.body.refresh_token).toBe('refresh-token-123');
       expect(res.body.token_type).toBe('Bearer');
+      expect(mockRecordMcpOAuthTokenIssued).toHaveBeenCalledWith({
+        userId: 'user-456',
+        clientId: 'client-123',
+        clientName: undefined,
+        clientType: 'unknown',
+        redirectUri: 'https://example.com/callback',
+        scope: 'mcp:tools',
+      });
       expect(res.body.expires_in).toBe(3600);
       expect(res.headers['cache-control']).toBe('no-store');
     });

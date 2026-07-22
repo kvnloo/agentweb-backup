@@ -354,6 +354,7 @@ router.post("/report-ui-bug", async (req, res) => {
       ${funnelStatusLabel ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>User status</strong></td><td style="padding: 6px 0;">${funnelStatusLabel}</td></tr>` : ""}
       ${issueId ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Issue ID</strong></td><td style="padding: 6px 0; font-family: monospace;">${issueId}</td></tr>` : ""}
       ${filed.trackerUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>${filed.tracker}</strong></td><td style="padding: 6px 0;"><a href="${filed.trackerUrl}" style="color: #4F46E5; font-weight: 600;">→ Open in ${filed.tracker}</a></td></tr>` : ""}
+      ${filed.canonicalUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Linear canonical</strong></td><td style="padding: 6px 0;"><a href="${filed.canonicalUrl}" style="color: #4F46E5; font-weight: 600;">→ Open canonical in Linear</a></td></tr>` : ""}
       ${pageUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Page URL</strong></td><td style="padding: 6px 0;"><a href="${pageUrl}" style="color: #4F46E5;">${pageUrl}</a></td></tr>` : ""}
     </table>
 
@@ -394,6 +395,9 @@ router.post("/report-ui-bug", async (req, res) => {
         : "Report submitted successfully",
       issueId,
       trackingUrl: filed.userUrl, // public link to the user's request on the feedback board
+      // The canonical Linear link is deliberately NOT returned here — surfacing it to admins is
+      // Emma-chat-only (ENG-289). The in-app bug report only exposes the Featurebase tracking link;
+      // the internal Linear canonical still lands in the team notification email above.
       deduped: filed.deduped,
     });
   } catch (error) {

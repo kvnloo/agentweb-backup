@@ -1,6 +1,6 @@
 import AWS from 'aws-sdk';
 import { taskDb } from './db';
-import { getAzureClient } from '../utils/llmClients';
+import { getAzureClient, meterUsageFromResponse } from '../utils/llmClients';
 import axios from 'axios';
 import { settingsService } from './settingsService';
 
@@ -36,7 +36,9 @@ export class ReportRevisionService {
     return getAzureClient(
       { userId, feature: 'report_revision' },
       process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
-      { apiVersion: process.env.AZURE_OPENAI_API_VERSION_AGENT_MODE || '2025-01-01-preview' }
+      // Un-metered: metered explicitly via meterUsageFromResponse; auto-metering
+      // here would double-record the same response (ENG-200).
+      { apiVersion: process.env.AZURE_OPENAI_API_VERSION_AGENT_MODE || '2025-01-01-preview', metered: false }
     );
   }
 
@@ -333,6 +335,13 @@ You MUST use the write_revised_report function to provide the complete revised H
           tool_choice: 'required', // Force the AI to use the function
           temperature: 0.7
         });
+
+        meterUsageFromResponse({
+          userId,
+          model: process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2',
+          provider: 'azure',
+          feature: 'report_revision',
+        }, response);
 
         const responseMessage = response.choices[0].message;
         

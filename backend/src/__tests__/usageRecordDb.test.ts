@@ -12,6 +12,7 @@ jest.mock('aws-sdk', () => {
   const mockDynamoDB = {
     update: jest.fn(),
     query: jest.fn(),
+    scan: jest.fn(),
     get: jest.fn(),
     put: jest.fn(),
   };
@@ -33,6 +34,7 @@ describe('usageRecordDb', () => {
     jest.clearAllMocks();
     mockDynamoDB.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
     mockDynamoDB.query.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Items: [] }) });
+    mockDynamoDB.scan.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Items: [] }) });
   });
 
   describe('incrementUsage', () => {
@@ -210,6 +212,62 @@ describe('usageRecordDb', () => {
       }
       const lastCall = mockDynamoDB.update.mock.calls.at(-1)[0];
       expect(lastCall.TableName).toBe('Dev-AW-UsageRecords');
+    });
+  });
+
+  // ENG-366: cross-user date-range scan feeding the admin cost aggregation.
+  // ENG-353 behavioral contract, assertion 3 (window filtering): the filter is
+  // pushed to DynamoDB as a BETWEEN on the row's date attribute, so rows outside
+  // [start, end] never reach the aggregation layer.
+  describe('scanByDateRange', () => {
+    it('scans with a date BETWEEN filter bounded by start and end (inclusive)', async () => {
+      await usageRecordDb.scanByDateRange('2026-06-01', '2026-06-30');
+
+      expect(mockDynamoDB.scan).toHaveBeenCalledTimes(1);
+      const params = mockDynamoDB.scan.mock.calls[0][0];
+      expect(params.FilterExpression).toBe('#date BETWEEN :start AND :end');
+      expect(params.ExpressionAttributeNames).toEqual({ '#date': 'date' });
+      expect(params.ExpressionAttributeValues).toEqual({
+        ':start': '2026-06-01',
+        ':end': '2026-06-30',
+      });
+    });
+
+    it('returns the rows and paginates through LastEvaluatedKey', async () => {
+      const page1 = {
+        Items: [{ userId: 'user-1', sk: '2026-06-01#m#f', costMicroUsd: 100 }],
+        LastEvaluatedKey: { userId: 'user-1', sk: '2026-06-01#m#f' },
+      };
+      const page2 = {
+        Items: [{ userId: 'user-2', sk: '2026-06-02#m#f', costMicroUsd: 200 }],
+      };
+      mockDynamoDB.scan
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue(page1) })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue(page2) });
+
+      const rows = await usageRecordDb.scanByDateRange('2026-06-01', '2026-06-30');
+
+      expect(rows).toHaveLength(2);
+      expect(mockDynamoDB.scan).toHaveBeenCalledTimes(2);
+      expect(mockDynamoDB.scan.mock.calls[1][0].ExclusiveStartKey).toEqual(
+        page1.LastEvaluatedKey
+      );
+      expect(rows.map((r: any) => r.userId)).toEqual(['user-1', 'user-2']);
+    });
+
+    it('returns an empty array (not undefined) when the scan matches nothing', async () => {
+      mockDynamoDB.scan.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+      const rows = await usageRecordDb.scanByDateRange('2026-06-01', '2026-06-30');
+      expect(rows).toEqual([]);
+    });
+
+    it('propagates DynamoDB errors', async () => {
+      mockDynamoDB.scan.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('ProvisionedThroughputExceeded')),
+      });
+      await expect(
+        usageRecordDb.scanByDateRange('2026-06-01', '2026-06-30')
+      ).rejects.toThrow('ProvisionedThroughputExceeded');
     });
   });
 });

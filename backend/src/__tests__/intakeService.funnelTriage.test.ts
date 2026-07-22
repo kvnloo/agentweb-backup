@@ -3,7 +3,7 @@
  *
  * Behavioral contract (human-written on ENG-187, comment "Design settled + behavioral contract
  * (Harsha, 2026-07-07)") covered here:
- *  #1 Retention-stage bug -> stage labels + Urgent + Todo + default assignee (Harshit)
+ *  #1 Retention-stage bug -> stage labels + Urgent + Todo + default assignee (Manan)
  *  #2 Trial-stage bug (Account Setup … Payment Conversion) -> stage labels + High
  *  #3 Missing/unknown funnel status -> STILL Todo + default assignee + Medium (bugs never rot)
  *  #5 Zero funnel leakage to the user: Featurebase ticket/post payloads + reporter-facing email
@@ -30,7 +30,7 @@ jest.mock('../services/linearService', () => ({
   createInternalLinearIssue: jest.fn(),
   addIssueComment: jest.fn(),
   raiseIssueTriage: jest.fn(),
-  getIssueComments: jest.fn(),
+  getIssueCommentsDetailed: jest.fn().mockResolvedValue([]),
 }));
 jest.mock('../services/resendService', () => ({ resendService: { sendSystemEmail: jest.fn() } }));
 jest.mock('../services/shipNotifyService', () => ({ notifyReporterShipped: jest.fn().mockResolvedValue('sent') }));
@@ -40,7 +40,7 @@ const fb = require('../services/featurebaseService');
 const linear = require('../services/linearService');
 const resend = require('../services/resendService').resendService;
 
-const HARSHIT = '4c29baa4-7778-42d9-8b35-045e4d9ec0b0';
+const MANAN = 'cabadf7c-b95d-4455-b9ec-df11d5d83f5f';
 // Every spelling a leak could take. "Status:" catches the stage labels; the coarse-bucket words
 // catch the tags; "funnel" catches the raw field.
 const FUNNEL_MARKERS = ['funnel', 'Status:', 'User Status', 'Retention', 'Setup', 'Activated', 'Parked', 'Paid / Retention Handoff'];
@@ -61,13 +61,13 @@ describe('fileUserIssue bug triage — funnel-derived labels, priority, state, a
   afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
 
   // Contract #1
-  it('Paid / Retention Handoff reporter -> Bug + Customer Reported + stage labels, Urgent, Todo, Harshit', async () => {
+  it('Paid / Retention Handoff reporter -> Bug + Customer Reported + stage labels, Urgent, Todo, Manan', async () => {
     await fileUserIssue({ type: 'bug', title: 'crash', description: 'on save', userEmail: 'u@e.com', funnelStatus: 'paid_retention_handoff' });
     expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({
       labelNames: ['Bug', 'Customer Reported', 'Status: Paid / Retention Handoff', 'Retention'],
       priority: 1, // Urgent
       stateName: 'Todo',
-      assigneeId: HARSHIT,
+      assigneeId: MANAN,
     }));
   });
 
@@ -78,7 +78,7 @@ describe('fileUserIssue bug triage — funnel-derived labels, priority, state, a
       labelNames: ['Bug', 'Customer Reported', 'Status: Account Setup', 'Setup'],
       priority: 2, // High
       stateName: 'Todo',
-      assigneeId: HARSHIT,
+      assigneeId: MANAN,
     }));
   });
 
@@ -105,7 +105,7 @@ describe('fileUserIssue bug triage — funnel-derived labels, priority, state, a
       labelNames: ['Bug', 'Customer Reported'],
       priority: 3,
       stateName: 'Todo',
-      assigneeId: HARSHIT,
+      assigneeId: MANAN,
     }));
   });
 
@@ -117,7 +117,7 @@ describe('fileUserIssue bug triage — funnel-derived labels, priority, state, a
       labelNames: ['Bug', 'Customer Reported', 'Status: mystery_stage'],
       priority: 3,
       stateName: 'Todo',
-      assigneeId: HARSHIT,
+      assigneeId: MANAN,
     }));
   });
 });
@@ -207,7 +207,9 @@ describe('funnel privacy — zero leakage to Featurebase or reporter-facing emai
   });
 
   it('reporter-facing resolve email carries no funnel/stage string', async () => {
-    linear.getIssueComments.mockResolvedValue(['[reporter-ticket #10 a@e.com] Affected user: a@e.com']);
+    linear.getIssueCommentsDetailed.mockResolvedValue([
+      { body: '[reporter-ticket #10 a@e.com] Affected user: a@e.com', createdAt: '2026-07-01T00:00:00.000Z' },
+    ]);
     await notifyCanonicalResolved('uuid-canonical', 'Save button crashes');
     expect(resend.sendSystemEmail).toHaveBeenCalledTimes(1);
     expectNoFunnelStrings(resend.sendSystemEmail.mock.calls[0]);

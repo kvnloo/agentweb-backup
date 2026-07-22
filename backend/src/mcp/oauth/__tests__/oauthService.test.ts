@@ -93,28 +93,28 @@ describe('McpOAuthService', () => {
       ).rejects.toThrow('Client name is required');
     });
 
-    it('should reject non-HTTPS redirect URIs in production', async () => {
+    it('should reject non-loopback HTTP redirect URIs in production', async () => {
       const origEnv = process.env.NODE_ENV;
       process.env.NODE_ENV = 'production';
       try {
         await expect(
-          service.registerClient({
-            redirectUris: ['http://example.com/callback'],
-            clientName: 'Insecure Client',
-          })
+        service.registerClient({
+          redirectUris: ['http://example.com/callback'],
+          clientName: 'Insecure Client',
+        })
         ).rejects.toThrow('Redirect URIs must use HTTPS');
       } finally {
         process.env.NODE_ENV = origEnv;
       }
     });
 
-    it('should allow localhost HTTP redirect URIs in development', async () => {
+    it('should allow loopback HTTP redirect URIs in production for installed MCP clients', async () => {
       const origEnv = process.env.NODE_ENV;
-      process.env.NODE_ENV = 'development';
+      process.env.NODE_ENV = 'production';
       try {
         const result = await service.registerClient({
-          redirectUris: ['http://localhost:3000/callback'],
-          clientName: 'Dev Client',
+          redirectUris: ['http://127.0.0.1:49152/callback', 'http://localhost:49153/callback'],
+          clientName: 'Claude Code',
         });
         expect(result.clientId).toBeDefined();
       } finally {

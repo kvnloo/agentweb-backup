@@ -812,7 +812,9 @@ describe('runWaterfall — web-tier per-field provenance (Fix 1)', () => {
     const fill = result.fields.find(f => f.field === 'company_description');
     expect(fill?.meta.source).toBe('web_search');
     expect(fill?.meta.provider).toBe('llm_web_search');
-    expect(fill?.meta.confidence).toBe('medium');
+    // ENG-122: metaWeb keys confidence off grounding. This fill carries no
+    // grounding tag, so it is unverified and must not look trustworthy.
+    expect(fill?.meta.confidence).toBe('low');
   });
 
   it('FAIL CASE: a web-tier fill carries the sourceUrl returned by the LLM', async () => {
@@ -938,7 +940,11 @@ describe('runWaterfall — confidence on meta (Fix 6)', () => {
     expect(fill?.meta.confidence).toBe('medium');
   });
 
-  it('SUCCESS CASE: a web-tier fill carries medium confidence', async () => {
+  // ENG-122: a web-tier fill's confidence is derived from its grounding, not a
+  // fixed 'medium'. An ungrounded value stays low so it surfaces with an
+  // "— unverified" badge; only a value grounded in the real fetched source is
+  // presented as trustworthy.
+  it('SUCCESS CASE: an UNGROUNDED web-tier fill carries low confidence', async () => {
     const deps = makeDeps({
       fetchWebForGroup: jest.fn().mockResolvedValue({ webContext: 'ctx' }),
       extractFieldsViaLLM: jest.fn().mockResolvedValue({
@@ -950,7 +956,27 @@ describe('runWaterfall — confidence on meta (Fix 6)', () => {
       deps,
     );
     const fill = result.fields.find(f => f.field === 'company_description');
-    expect(fill?.meta.confidence).toBe('medium');
+    expect(fill?.meta.confidence).toBe('low');
+    expect(fill?.meta.grounding).toBeUndefined();
+  });
+
+  it('SUCCESS CASE: a GROUNDED web-tier fill carries high confidence', async () => {
+    const deps = makeDeps({
+      fetchWebForGroup: jest.fn().mockResolvedValue({ webContext: 'ctx' }),
+      extractFieldsViaLLM: jest.fn().mockResolvedValue({
+        filled: {
+          company_description: { ...fv('A SaaS company'), grounding: 'grounded' as const },
+        },
+        missing: [],
+      }),
+    });
+    const result = await runWaterfall(
+      makeInput({ groupName: 'company_firmographic', requestedFields: ['company_description'] }),
+      deps,
+    );
+    const fill = result.fields.find(f => f.field === 'company_description');
+    expect(fill?.meta.confidence).toBe('high');
+    expect(fill?.meta.grounding).toBe('grounded');
   });
 });
 

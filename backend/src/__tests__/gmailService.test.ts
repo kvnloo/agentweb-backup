@@ -57,8 +57,12 @@ jest.mock('../config/integrations', () => ({
   }),
 }));
 
-// emailProviderService not needed in gmailService tests (gmailService is tested directly)
-jest.mock('../services/emailProviderService', () => ({}));
+// gmailService is tested directly, so emailProviderService's registry/bootstrap
+// machinery isn't needed — but EmailProviderError is a real base class that
+// GmailNotConnectedError etc. extend at module-load time, so it must stay real.
+jest.mock('../services/emailProviderService', () => ({
+  ...jest.requireActual('../services/emailProviderService'),
+}));
 
 import { GmailService, GmailNotConnectedError, GmailTokenRevokedError, GmailQuotaError, GmailBodyTooLargeError, GmailSendNotAuthorizedError } from '../services/gmailService';
 

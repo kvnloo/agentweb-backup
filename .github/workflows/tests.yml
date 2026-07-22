@@ -2,7 +2,7 @@ name: Tests
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
@@ -17,18 +17,25 @@ jobs:
   detect-changes:
     name: Detect changed projects
     runs-on: ubuntu-latest
+    # Per-PR concurrency: a newer commit on the same PR cancels this superseded
+    # test job. Group is unique per job so jobs within one run never serialize
+    # against each other. The deploy job is deliberately excluded (own lane) so
+    # an in-flight staging deploy is never interrupted.
+    concurrency:
+      group: ${{ github.workflow }}-detect-changes-${{ github.ref }}
+      cancel-in-progress: true
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
       partner: ${{ steps.filter.outputs.partner }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Paths filter
         id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           filters: |
@@ -41,16 +48,25 @@ jobs:
   backend-tests-a:
     name: Backend tests (agentMode)
     needs: detect-changes
-    if: needs.detect-changes.outputs.backend == 'true'
+    # Skip the heavy suite while the PR is a draft: intermediate pushes to a
+    # draft (e.g. the autofix pipeline's re-fix/revise commits) shouldn't burn
+    # ~26 runner-min they can't gate a merge with. Flipping the PR to Ready
+    # fires `ready_for_review` (see triggers) → one authoritative full run.
+    if: needs.detect-changes.outputs.backend == 'true' && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    # Distinct group from backend-tests-b so the two still run in parallel; a
+    # newer commit on the same PR cancels this job's superseded run.
+    concurrency:
+      group: ${{ github.workflow }}-backend-tests-a-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - name: Checkout PR head
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
@@ -74,16 +90,23 @@ jobs:
   backend-tests-b:
     name: Backend tests (all other + coverage)
     needs: detect-changes
-    if: needs.detect-changes.outputs.backend == 'true'
+    # Same draft gate as backend-tests-a (see above): drafts skip the heavy
+    # suite; the run happens once the PR is marked Ready for review.
+    if: needs.detect-changes.outputs.backend == 'true' && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    # Distinct group from backend-tests-a so the two still run in parallel; a
+    # newer commit on the same PR cancels this job's superseded run.
+    concurrency:
+      group: ${{ github.workflow }}-backend-tests-b-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - name: Checkout PR head
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
@@ -106,7 +129,7 @@ jobs:
 
       - name: Post coverage comment on PR
         if: always()
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
@@ -168,6 +191,11 @@ jobs:
     needs: detect-changes
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # A newer commit on the same PR cancels this superseded Greptile-wait job.
+    concurrency:
+      group: ${{ github.workflow }}-greptile-review-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - name: Wait for Greptile review check
         env:
@@ -208,15 +236,18 @@ jobs:
     if: github.event.pull_request.draft == false && needs.detect-changes.outputs.backend == 'true' && needs.backend-tests-a.result == 'success' && needs.backend-tests-b.result == 'success' && needs.greptile-review.result == 'success'
     runs-on: ubuntu-latest
     environment: staging
+    concurrency:
+      group: backend-staging-deploy
+      cancel-in-progress: false
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
@@ -242,7 +273,7 @@ jobs:
           zip -r "builds/backend-${DATE}-pr${PR_NUMBER}.zip" dist package.json package-lock.json .env.example .platform .ebextensions || zip -r "builds/backend-${DATE}-pr${PR_NUMBER}.zip" dist package.json package-lock.json
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -310,14 +341,18 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.partner == 'true'
     runs-on: ubuntu-latest
+    # A newer commit on the same PR cancels this superseded test job.
+    concurrency:
+      group: ${{ github.workflow }}-partner-tests-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - name: Checkout PR head
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           cache: 'npm'
           cache-dependency-path: partner-portal/package-lock.json

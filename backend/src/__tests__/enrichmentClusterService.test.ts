@@ -25,16 +25,40 @@ jest.mock('../services/crmEnrichmentService', () => ({
   },
 }));
 
+const mockMeterUserUsage = jest.fn();
+jest.mock('../services/usageRecorderService', () => ({
+  meterUserUsage: (...a: any[]) => mockMeterUserUsage(...a),
+}));
+
 import { getOrCreateClustersForFields } from '../services/enrichmentClusterService';
 import { crmDb } from '../services/db';
 const mockDb = crmDb as jest.Mocked<typeof crmDb>;
 
 beforeEach(() => {
   mockLLM.mockReset();
+  mockMeterUserUsage.mockReset();
   mockDb.getLeadListById.mockReset();
   mockDb.updateLeadList.mockReset();
   mockDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'u1' } as any);
   mockDb.updateLeadList.mockResolvedValue(undefined as any);
+});
+
+describe('getOrCreateClustersForFields — per-user metering (ENG-200)', () => {
+  it('charges the clustering LLM call to the caller (userId + tokens) via meterUserUsage', async () => {
+    mockLLM.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify([{ fields: ['x', 'y'], searchTemplate: '{{emailDomain}} x y' }]) } }],
+      usage: { prompt_tokens: 210, completion_tokens: 35 },
+    });
+
+    await getOrCreateClustersForFields('list1', ['x', 'y'], {}, undefined, 'user-9');
+
+    expect(mockMeterUserUsage).toHaveBeenCalledWith(expect.objectContaining({
+      userId: 'user-9',
+      feature: 'crm_enrichment_cluster',
+      inputTokens: 210,
+      outputTokens: 35,
+    }));
+  });
 });
 
 function llmCluster(clusters: any[]) {

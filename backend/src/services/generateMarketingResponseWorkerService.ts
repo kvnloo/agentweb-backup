@@ -316,7 +316,10 @@ export class GenerateMarketingResponseWorkerService {
     }
 
     if (this.worker && !this.worker.killed) {
-      this.worker.kill('SIGTERM');
+      // SIGKILL, not SIGTERM: the worker deliberately ignores SIGTERM so the OS
+      // process-group/cgroup SIGTERM on deploy can't abort an in-flight run before the
+      // drain above completes (ENG-201). The parent must therefore force-kill it here.
+      this.worker.kill('SIGKILL');
       this.worker = null;
     }
   }
