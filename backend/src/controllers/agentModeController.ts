@@ -1674,6 +1674,12 @@ export async function runScheduledChat(
           result.pendingUserQuestion.question,
           sessionId
         );
+      } else {
+        // Parked but no recipient (no emailNotifications and no account email) — the
+        // owner won't be notified. Surface it loudly rather than parking silently.
+        console.warn(
+          `AgentMode runScheduledChat: schedule ${schedule.scheduleId} parked on a user question but has NO notification recipient — owner will not be told. Session ${sessionId}, question ${result.pendingUserQuestion.questionId}`
+        );
       }
 
       const parkedResult = {
