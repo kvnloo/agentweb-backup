@@ -102,4 +102,36 @@ describe('fetchApolloOrg — personal/institutional domain guard (ENG-433)', () 
 
     expect(matchOrg).toHaveBeenCalledWith('acme.com');
   });
+
+  it('prefers a business email domain over a stale/personal website URL', async () => {
+    const matchOrg = jest.fn().mockResolvedValue({ organization: { name: 'Acme Corp' }, fromCache: false });
+    mockApolloService(matchOrg);
+
+    // Business email (acme.com) must win over a stale/personal website (oldsite.io).
+    await runOrgWaterfall(makeLead({ email: 'jane@acme.com', website: 'https://www.oldsite.io' }));
+
+    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+  });
+
+  it('uses the CURRENT email domain over a stale stored emailDomain (Greptile P1)', async () => {
+    const matchOrg = jest.fn().mockResolvedValue({ organization: { name: 'NewCorp' }, fromCache: false });
+    mockApolloService(matchOrg);
+
+    // Lead moved employers: email is newcorp.com but a stale emailDomain
+    // (oldcorp.com) lingers — the current email must win, not the former employer.
+    await runOrgWaterfall(makeLead({ email: 'person@newcorp.com', emailDomain: 'oldcorp.com' }));
+
+    expect(matchOrg).toHaveBeenCalledWith('newcorp.com');
+  });
+
+  it('uses a business stored emailDomain when the current email is free-mail', async () => {
+    const matchOrg = jest.fn().mockResolvedValue({ organization: { name: 'Acme Corp' }, fromCache: false });
+    mockApolloService(matchOrg);
+
+    // Personal email but an enrichment-resolved company domain in emailDomain —
+    // the resolved business domain is a stronger signal than the free-mail address.
+    await runOrgWaterfall(makeLead({ email: 'john@gmail.com', emailDomain: 'acme.com' }));
+
+    expect(matchOrg).toHaveBeenCalledWith('acme.com');
+  });
 });
