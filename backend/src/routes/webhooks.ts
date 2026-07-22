@@ -641,13 +641,27 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
                             : null)
                           || sendersResult.senders[0];
 
-                        if (sender) {
+                        // GUARD, intentionally NOT migrated in ENG-266 Part 3: this whole
+                        // auto-draft/auto-reply flow is only ever entered from the inbound
+                        // email.received Resend webhook above — which structurally cannot fire
+                        // for a mailbox sender (Graph produces no Resend webhooks). So a mailbox
+                        // sender can never actually reach this branch; the check stays as a
+                        // defensive backstop, not because this path lacks provider routing.
+                        if (sender && sender.senderProvider && sender.senderProvider !== 'resend') {
+                          console.error(
+                            `Auto send skipped: sender ${sender.id} uses a connected ${sender.senderProvider} mailbox, which this path cannot send through yet`,
+                            leadList.userId,
+                          );
+                          autoSendStatus = 'skipped_mailbox_sender_unsupported';
+                        } else if (sender) {
                           senderEmail = sender.email;
                           senderFromName = sender.fromName;
                         }
                       }
 
-                      if (!senderEmail || !senderFromName) {
+                      if (autoSendStatus === 'skipped_mailbox_sender_unsupported') {
+                        // already handled above
+                      } else if (!senderEmail || !senderFromName) {
                         console.error('Auto send skipped: no sender configured for user', leadList.userId);
                         autoSendStatus = 'skipped_no_sender';
                       } else {

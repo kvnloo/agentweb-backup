@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { providerLabel } from './crmSenderTypes';
 import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
@@ -15,6 +16,7 @@ import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoUrlForUser,
   missingBrandLogoToolResult,
+  promptCreatesLogo,
   promptRequestsLogo,
 } from './agentMode/brandLogo';
 import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
@@ -36,9 +38,8 @@ import { skillService } from './skillService';
 import { extractVariables } from '../utils/templateParser';
 import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
-import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
-import { recordUsage } from './usageRecorderService';
+import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
 import {
   getModelPrice,
@@ -54,6 +55,7 @@ import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
 import { SearchResultSource } from '../search/searchProvider';
+import { CitationRegistry } from '../utils/citations';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -116,11 +118,13 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
   return undefined;
 }
 const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
-import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
+import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { twitterService } from './twitterService';
+import { describeXApiError } from '../utils/twitterErrors';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
+import { preflightTrackingGate } from './googleAdsTrackingPreflight';
 import { HubSpotService } from './hubspotService';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
@@ -174,7 +178,8 @@ import {
   ALLOWED_DATE_PRESETS,
   META_OBJ_GOAL_MAP,
   META_GOAL_BILLING_MAP,
-  META_GOAL_BID_STRATEGY_MAP
+  META_GOAL_BID_STRATEGY_MAP,
+  META_WEBSITE_OPTIMIZATION_GOALS
 } from '../utils/metaConstants';
 
 // Initialize Azure OpenAI client for direct chat completion (same as blog.ts)
@@ -2495,7 +2500,12 @@ export class AgentModeService {
         try {
           const usage: any = (res as any)?.usage;
           if (usage) {
-            void recordUsage({
+            // ENG-200: meter the main agent turn — record shadow burn AND charge
+            // the per-user cost cap when a real user is attributable (org members
+            // resolve to the owner). Cost (incl. cache tokens) is computed once
+            // here; no separate deduction path exists for this call, so this is
+            // the single charge point. No userId → burn-only "system" record.
+            meterUserUsage({
               userId: usageContext?.userId,
               sessionId: usageContext?.sessionId,
               model,
@@ -2635,14 +2645,17 @@ export class AgentModeService {
     return videoGenerationCostUsd(model, durationSeconds);
   }
 
-  /** Returns an onUsage callback that records LLM token usage for a named tool. */
-  private makeToolUsageCallback(userId: string, sessionId: string | undefined, toolName: string): (usage: LLMUsageData) => void {
+  /**
+   * Returns an onUsage callback that attributes a tool's LLM cost to the session
+   * for per-tool cost display. It does NOT deduct from the per-user cap: the
+   * deduction happens once at the metering chokepoint (llmService.meterUsage,
+   * which these tools call via generateHTML/generateJSONContent). Charging here
+   * too would double-charge content-gen tools (ENG-200).
+   */
+  private makeToolUsageCallback(sessionId: string | undefined, toolName: string): (usage: LLMUsageData) => void {
     return (usage) => {
-      const cost = this.estimateCost(usage.model, usage.inputTokens, usage.outputTokens);
-      incrementUserTokenUsage(userId, usage.totalTokens, cost).catch((err) =>
-        console.error(`AgentMode: Failed to track token usage for ${toolName} tool:`, err)
-      );
       if (sessionId) {
+        const cost = this.estimateCost(usage.model, usage.inputTokens, usage.outputTokens);
         chatbotDb.addToolCostToSession(sessionId, cost, toolName).catch((err) =>
           console.error(`AgentMode: Failed to add ${toolName} cost to session:`, err)
         );
@@ -2861,7 +2874,7 @@ export class AgentModeService {
       if ((currentSession?.pageIdentifier || '').toLowerCase().includes('slack')) {
         messages.push({
           role: 'assistant',
-          content: `[AgentWeb Team] I know all four team members: Rui Wang is the CTO (also called Rui), Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately.`
+          content: `[AgentWeb Team] I know the team members: Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately.`
         });
       }
 
@@ -2895,6 +2908,9 @@ export class AgentModeService {
       _toolCallsForTelemetry = toolCalls;
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
+      // ENG-351: accumulates the web sources this message consults across all its search
+      // calls, into a de-duplicated, stably-numbered registry for the Sources UI.
+      const citationRegistry = new CitationRegistry();
       const iterationTimings: { iteration: number; llmDurationMs: number; toolNames: string[] }[] = [];
 
       // Remember initial message count to slice response messages later
@@ -3300,6 +3316,7 @@ export class AgentModeService {
           toolCalls: responseMessage.tool_calls,
           messages: messages as any[],
           toolCallsLedger: toolCalls,
+          citationRegistry,
           iteration,
           agentRuntimeRunId,
           sessionId,
@@ -3597,12 +3614,17 @@ export class AgentModeService {
             durationMs: endTime - startTime
           };
 
+          // ENG-351: the web sources this message consulted, de-duplicated and
+          // stably-numbered by the citation registry, for the Sources UI.
+          const citations = citationRegistry.list();
+
           lastMessage.metadata = {
             ...lastMessage.metadata,
             timestamp: new Date().toISOString(),
             iterationTimings,
             memoryUsage,
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
+            ...(citations.length > 0 ? { citations } : {}),
           };
         }
       }
@@ -4302,6 +4324,7 @@ export class AgentModeService {
     'read_market_strategy',
 
     // Knowledge Base & Research
+    'search_user_guide',
     'search_knowledge_base',
     'list_knowledge_base_files',
     'read_knowledge_base_files',
@@ -4314,6 +4337,13 @@ export class AgentModeService {
     // "read_file_content unavailable/failed" until the user manually installed
     // other_skills (ENG-152).
     'read_file_content',
+
+    // Image analysis — the visual analog of read_file_content. Always available
+    // so an attached screenshot/image can be read immediately, regardless of
+    // which page the user is on. Previously only injected on the `images` page,
+    // so a user attaching a UI screenshot elsewhere got "describe_image not
+    // available" and Emma had to ask them to type out what was on screen (ENG-260).
+    'describe_image',
 
     // Work Plans (Emma's execution planning system)
     'create_work_plan',
@@ -4330,6 +4360,7 @@ export class AgentModeService {
     'search_leads',           // CRM teaser
     'get_lead_lists',         // Lead management teaser
     'list_connected_accounts', // Social/ads integration teaser
+    'connect_account',        // Read-only UI handoff when a required account is absent
 
     'get_user_profile',         // Account info teaser
     'get_account_status',       // Self account status (plan, usage, api-key count) — wraps /api/auth/me, no args
@@ -4373,10 +4404,6 @@ export class AgentModeService {
     // Gmail-only `email` tool.
     'send_email_from_sender',
 
-    // Local Agent Relay (Codex agent running on user's machine)
-    'run_local_agent_task',
-    'check_local_agent_status',
-
     // S3 overflow retrieval — always available so the LLM can read large tool
     // responses that were offloaded to S3 by the 10KB overflow mechanism.
     // Without these, the LLM sees the "[Full response stored at S3 key: ...]"
@@ -4399,6 +4426,13 @@ export class AgentModeService {
     'resolve_skill',
     'you_search_web',
     'you_search_news',
+    // Product documentation is core infrastructure for both chat and live
+    // voice. Keep it available even if a stale settings override omits it.
+    'search_user_guide',
+    // Connection handoff is UI infrastructure, not an optional skill. The tool
+    // only asks the current page to open the existing OAuth dialog; it does not
+    // grant consent or connect an account by itself.
+    'connect_account',
     // S3 overflow retrieval is infrastructure, not a skill: whenever a tool result
     // is offloaded to S3 the model is handed a "[Full response stored at S3 key: ...]"
     // pointer and MUST be able to resolve it. A DB `foundation_tools` setting that
@@ -4429,6 +4463,26 @@ export class AgentModeService {
     // other_skills, producing the transient "read_file_content
     // unavailable/failed" failure (ENG-152).
     'read_file_content',
+    // Image analysis. Force-merged for the same reason as read_file_content: the
+    // prod `foundation_tools` AW-Settings override omits DEFAULT-only additions,
+    // so without this an attached screenshot could not be analyzed unless the user
+    // happened to be on the `images` page — Emma returned "describe_image not
+    // available" and had to ask the user to type out what was on screen (ENG-260).
+    'describe_image',
+    // Meeting Intelligence (Fathom). Force-merged because the prod
+    // `foundation_tools` AW-Settings override predates these tools and omits
+    // them — without force-merging, loadFoundationTools strips them in prod so
+    // `fathom_get_onboarding_context` (and the other Fathom tools) are "not
+    // available", tanking goalCompletion on any Fathom onboarding/meeting
+    // request (ENG-280). `fathom_get_meetings`/`fathom_get_transcript` stay
+    // reachable even when a connected Fathom account is missing, so those tools
+    // return the "connect Fathom in Settings → Connected Accounts" guidance
+    // instead of a generic tool-not-available error. `fathom_get_onboarding_context`
+    // reads a separate admin-curated ingestion pipeline (fathomOnboardingIngestions)
+    // and has no connection check by design.
+    'fathom_get_meetings',
+    'fathom_get_transcript',
+    'fathom_get_onboarding_context',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
@@ -4507,7 +4561,18 @@ export class AgentModeService {
       if (setting?.settingValue) {
         const toolNames: string[] = JSON.parse(setting.settingValue);
         if (Array.isArray(toolNames) && toolNames.length > 0) {
-          const merged = [...new Set([...toolNames, ...AgentModeService.MANDATORY_FOUNDATION_TOOLS])];
+          // The DB override is ADDITIVE, not a replacement: always union
+          // DEFAULT_FOUNDATION_TOOLS so a stale/drifted override can never strip
+          // a tool the code ships as a default. A prod `foundation_tools` row
+          // that predated newer tools was silently dropping every DEFAULT-only
+          // tool (Fathom, knowledge base, scheduled chats, Slack, org-memory
+          // writes, …), each surfacing as a separate "tool not available" bug
+          // (ENG-280, ENG-404). MANDATORY stays in the union as the hard floor.
+          const merged = [...new Set([
+            ...AgentModeService.DEFAULT_FOUNDATION_TOOLS,
+            ...toolNames,
+            ...AgentModeService.MANDATORY_FOUNDATION_TOOLS,
+          ])];
           AgentModeService.FOUNDATION_TOOLS = new Set(merged);
           console.log(`AgentMode: Loaded ${merged.length} foundation tools from DB`);
           return;
@@ -4523,7 +4588,14 @@ export class AgentModeService {
    * Update foundation tools in DB and refresh the in-memory set.
    */
   public async updateFoundationTools(toolNames: string[], updatedBy: string): Promise<string[]> {
-    const unique = [...new Set([...toolNames, ...AgentModeService.MANDATORY_FOUNDATION_TOOLS])];
+    // Additive on top of DEFAULT (see loadFoundationTools): the override can add
+    // tools but can never remove a shipped default, so no future edit can
+    // reintroduce the ENG-404 stripping. MANDATORY is the hard floor.
+    const unique = [...new Set([
+      ...AgentModeService.DEFAULT_FOUNDATION_TOOLS,
+      ...toolNames,
+      ...AgentModeService.MANDATORY_FOUNDATION_TOOLS,
+    ])];
     await settingsService.setSetting(
       AgentModeService.FOUNDATION_TOOLS_SETTING,
       JSON.stringify(unique),
@@ -6652,6 +6724,8 @@ export class AgentModeService {
       return_scenes?: boolean;
       start_time?: string;
       end_time?: string;
+      /** Attributable user — charges this describe_video LLM spend to their cap (ENG-200). */
+      userId?: string;
     }
   ): Promise<any> {
     let tempDirPath: string | null = null;
@@ -6690,11 +6764,12 @@ export class AgentModeService {
         };
       }
 
-      // Metered Gemini client (Ship 1 shadow metering). describeVideo has no
-      // userId in its signature, so usage attributes to "system" for now —
-      // follow-up: thread userId from the tool-dispatch / emmaApi callers.
+      // Un-metered Gemini client: the wrapped factory only RECORDS burn, so to
+      // actually CHARGE describe_video spend to the user's cap we meter the
+      // response ourselves via meterUsageFromResponse below (ENG-200). No userId
+      // → that meter degrades to a burn-only "system" record (absorbed).
       const { getGeminiClient } = await import('../utils/llmClients');
-      aiClient = await getGeminiClient({ feature: 'agent_task' }, geminiApiKey.trim());
+      aiClient = await getGeminiClient({ userId: options?.userId, feature: 'agent_task' }, geminiApiKey.trim(), { metered: false });
 
       const modelName = 'gemini-3-flash-preview';
 
@@ -6860,6 +6935,13 @@ export class AgentModeService {
         model: modelName,
         contents
       });
+
+      // Charge (record + deduct when a userId is present; absorb under "system"
+      // otherwise). The client above is un-metered, so this is the single meter.
+      meterUsageFromResponse(
+        { userId: options?.userId, model: modelName, provider: 'gemini', feature: 'agent_task' },
+        response
+      );
 
       const rawText = response.text;
 
@@ -7688,28 +7770,33 @@ export class AgentModeService {
   // Get CRM sender emails configuration
   public async getCrmSenders(userId: string): Promise<{
     success: boolean;
-    senders: Array<{ id: string; email: string; fromName: string; notes?: string; senderType?: 'gmail'; gmailAccountId?: string }>;
+    senders: Array<{
+      id: string;
+      email: string;
+      fromName: string;
+      notes?: string;
+      senderType?: 'gmail' | 'outlook';
+      gmailAccountId?: string;
+      senderProvider?: 'resend' | 'gmail' | 'outlook';
+      connectedAccountId?: string;
+    }>;
     defaultSenderId: string | null;
     error?: string;
   }> {
     try {
-      const { settingsService } = await import('./settingsService');
-      const settingName = `crm_sender_emails_${userId}`;
-      const setting = await settingsService.getSetting(settingName);
+      const { loadSenderConfig, serializeSender } = await import('./crmSenderService');
+      const config = await loadSenderConfig(userId);
 
-      if (!setting) {
-        return {
-          success: true,
-          senders: [],
-          defaultSenderId: null
-        };
-      }
-
-      const config = JSON.parse(setting.settingValue);
+      // Emit both shapes: legacy keys for callers that still branch on senderType,
+      // and the neutral ones for provider-aware code.
       return {
         success: true,
-        senders: config.senders || [],
-        defaultSenderId: config.defaultSenderId || null
+        senders: config.senders.map((s) => ({
+          ...serializeSender(s),
+          senderProvider: s.senderProvider,
+          connectedAccountId: s.connectedAccountId,
+        })),
+        defaultSenderId: config.defaultSenderId
       };
     } catch (error) {
       console.error('AgentMode: Error getting CRM senders:', error);
@@ -10731,8 +10818,16 @@ export class AgentModeService {
       }
 
       // Resolve sender: lead → list → account default → first available
-      // Use the list owner's sender config so org members can send using the owner's senders
-      const sendersResult = await this.getCrmSenders(list.userId || userId);
+      // Use the list owner's sender config so org members can send using the owner's senders.
+      //
+      // The owner's id is load-bearing beyond just reading the config: a mailbox sender's
+      // connected account lives on the OWNER's record, so the provider must be called with
+      // the owner's userId — otherwise getAccountById(accountId, actorUserId) finds nothing
+      // and the send fails with "account not connected" for a sender the UI happily offered.
+      // It also matters on the write side: a refreshed (and for Outlook, rotated) token must
+      // be persisted back onto the owner's account. See ENG-299.
+      const senderOwnerUserId = list.userId || userId;
+      const sendersResult = await this.getCrmSenders(senderOwnerUserId);
       if (!sendersResult.success || sendersResult.senders.length === 0) {
         return { success: false, message: 'No senders configured', error: 'No sender email is configured for this lead list. To set one up, select the lead list and click "Senders".' };
       }
@@ -10757,21 +10852,32 @@ export class AgentModeService {
 
       let emailId: string;
 
-      if ((sender as any).senderType === 'gmail') {
-        // Send via connected Gmail account
-        const gmailAccountId = (sender as any).gmailAccountId;
-        if (!gmailAccountId) {
-          return { success: false, message: 'Gmail sender misconfigured', error: 'Gmail sender is missing gmailAccountId' };
+      // Accept both shapes — see note in sendEmailFromConfiguredSender.
+      const leadSenderProvider: string = (sender as any).senderProvider || (sender as any).senderType || 'resend';
+
+      if (leadSenderProvider !== 'resend') {
+        // Send through the customer's own connected mailbox (Gmail / Outlook)
+        const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
+        if (!connectedAccountId) {
+          return {
+            success: false,
+            message: `${providerLabel(leadSenderProvider)} sender misconfigured`,
+            error: `The ${providerLabel(leadSenderProvider)} sender is missing its connected account id`,
+          };
         }
-        const { gmailService } = await import('./gmailService');
+        const { bootstrapEmailProviders, getEmailProvider } = await import('./emailProviderService');
+        await bootstrapEmailProviders();
+        const provider = getEmailProvider(leadSenderProvider);
         const body = draft.htmlContent || draft.textContent || '';
-        const gmailResult = await gmailService.sendEmail(userId, gmailAccountId, {
+        // senderOwnerUserId, not userId: the connected account belongs to whoever owns the
+        // sender config, and a refreshed/rotated token must be written back to them (ENG-299).
+        const sendResult = await provider.sendEmail(senderOwnerUserId, connectedAccountId, {
           to: lead.email,
           subject: draft.subject,
           body,
           isHtml: !!draft.htmlContent,
         });
-        emailId = gmailResult.messageId;
+        emailId = sendResult.messageId;
       } else {
         // Send via Resend (custom domain sender)
         const { resendService } = await import('./resendService');
@@ -10862,32 +10968,40 @@ export class AgentModeService {
       let sender: any = null;
       if (params.senderId) {
         // The model can't see internal sender IDs, so accept an id, an email
-        // address, a from-name (case-insensitive), or a sender-type keyword like
-        // "gmail" — whatever the user named ("send from my gmail sender").
+        // address, a from-name (case-insensitive), or a provider keyword like
+        // "gmail" / "outlook" — whatever the user named ("send from my outlook sender").
         const needle = params.senderId.trim().toLowerCase();
-        const wantsGmail = needle === 'gmail' || needle === 'gmail sender' || needle === 'my gmail' || needle === 'my gmail sender';
         sender = sendersResult.senders.find((s: any) =>
           s.id === params.senderId ||
           (s.email && s.email.toLowerCase() === needle) ||
           (s.fromName && s.fromName.toLowerCase() === needle)
         );
-        // Fall back to matching by sender type (e.g. the single Gmail-account sender).
-        if (!sender && wantsGmail) {
-          const gmailSenders = sendersResult.senders.filter((s: any) => s.senderType === 'gmail');
-          if (gmailSenders.length === 1) {
-            sender = gmailSenders[0];
-          } else if (gmailSenders.length > 1) {
-            const list = gmailSenders.map((s: any) => `${s.fromName} <${s.email}>`).join(', ');
-            return {
-              success: false,
-              message: 'Multiple Gmail senders',
-              error: `You have more than one Gmail sender: ${list}. Tell me which one to use by its email address.`,
-              availableSenders: gmailSenders.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: 'gmail' })),
-            };
+
+        // Fall back to matching by provider (e.g. the single connected-mailbox sender).
+        if (!sender) {
+          const wantedProvider = ['gmail', 'outlook'].find(
+            (p) => needle === p || needle === `${p} sender` || needle === `my ${p}` || needle === `my ${p} sender`,
+          );
+          if (wantedProvider) {
+            const matches = sendersResult.senders.filter(
+              (s: any) => (s.senderProvider || s.senderType) === wantedProvider,
+            );
+            if (matches.length === 1) {
+              sender = matches[0];
+            } else if (matches.length > 1) {
+              const list = matches.map((s: any) => `${s.fromName} <${s.email}>`).join(', ');
+              return {
+                success: false,
+                message: `Multiple ${wantedProvider} senders`,
+                error: `You have more than one ${wantedProvider} sender: ${list}. Tell me which one to use by its email address.`,
+                availableSenders: matches.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: wantedProvider })),
+              };
+            }
           }
         }
+
         if (!sender) {
-          const available = sendersResult.senders.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: s.senderType === 'gmail' ? 'gmail' : 'resend' }));
+          const available = sendersResult.senders.map((s: any) => ({ id: s.id, email: s.email, fromName: s.fromName, senderType: s.senderProvider || s.senderType || 'resend' }));
           const list = available.map((s: any) => `${s.fromName} <${s.email}> [${s.senderType}]`).join(', ');
           return {
             success: false,
@@ -10912,40 +11026,50 @@ export class AgentModeService {
 
       let emailId: string;
 
-      if ((sender as any).senderType === 'gmail') {
-        const gmailAccountId = (sender as any).gmailAccountId;
-        if (!gmailAccountId) {
-          return { success: false, message: 'Gmail sender misconfigured', error: 'Gmail sender is missing gmailAccountId' };
+      // Accept both shapes: senderProvider is the neutral field, senderType the legacy
+      // persisted key. A sender resolved outside loadSenderConfig may only carry the latter.
+      const senderProvider: string = (sender as any).senderProvider || (sender as any).senderType || 'resend';
+
+      if (senderProvider !== 'resend') {
+        const connectedAccountId = (sender as any).connectedAccountId || (sender as any).gmailAccountId;
+        if (!connectedAccountId) {
+          return {
+            success: false,
+            message: `${providerLabel(senderProvider)} sender misconfigured`,
+            error: `The ${providerLabel(senderProvider)} sender is missing its connected account id`,
+          };
         }
-        const { gmailService } = await import('./gmailService');
+        const { bootstrapEmailProviders, getEmailProvider } = await import('./emailProviderService');
+        const label = providerLabel(senderProvider);
+        await bootstrapEmailProviders();
+        const provider = getEmailProvider(senderProvider);
         const body = htmlBody || textBody || '';
         try {
-          const gmailResult = await gmailService.sendEmail(userId, gmailAccountId, {
+          const sendResult = await provider.sendEmail(userId, connectedAccountId, {
             to,
             subject: params.subject,
             body,
             isHtml: !!htmlBody,
           });
-          emailId = gmailResult.messageId;
-        } catch (gmailErr: any) {
-          // Translate Gmail/OAuth failures into an actionable message that names
-          // the affected sender. Raw errors like "unauthorized_client" /
-          // "invalid_grant" are otherwise opaque and get mis-paraphrased by the LLM
-          // (e.g. "no Gmail account configured"). Nearly all of these are resolved
-          // by reconnecting the Gmail account in Settings → Connected Accounts.
-          const raw = gmailErr instanceof Error ? gmailErr.message : String(gmailErr);
+          emailId = sendResult.messageId;
+        } catch (providerErr: any) {
+          // Translate OAuth failures into an actionable message that names the
+          // affected sender. Raw errors like "unauthorized_client" / "invalid_grant"
+          // are otherwise opaque and get mis-paraphrased by the LLM (e.g. "no account
+          // configured"). Nearly all are resolved by reconnecting in Settings.
+          const raw = providerErr instanceof Error ? providerErr.message : String(providerErr);
           const needsReconnect = /unauthorized_client|invalid_grant|invalid_client|token|revoked|expired|not connected|not authorized|insufficient|scope/i.test(raw);
           if (needsReconnect) {
             return {
               success: false,
-              message: 'Gmail sender needs reconnecting',
-              error: `Could not send from the Gmail sender ${sender.email} (${gmailAccountId}): ${raw}. Please reconnect this Gmail account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
+              message: `${label} sender needs reconnecting`,
+              error: `Could not send from the ${label} sender ${sender.email} (${connectedAccountId}): ${raw}. Please reconnect this account in Settings → Connected Accounts (make sure to grant send permission), or use a different configured sender.`,
             };
           }
           return {
             success: false,
-            message: 'Gmail send failed',
-            error: `Could not send from the Gmail sender ${sender.email}: ${raw}`,
+            message: `${label} send failed`,
+            error: `Could not send from the ${label} sender ${sender.email}: ${raw}`,
           };
         }
       } else {
@@ -13782,7 +13906,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async manageMetaAdsCampaigns(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
-        return this.listMetaAdsCampaignsNew(userId, account_id);
+        // Thread the campaign_id filter and any explicit fields selection so the caller can
+        // read budget/bid config and target a single campaign (ENG-398).
+        return this.listMetaAdsCampaignsNew(userId, account_id, { campaignId: campaign_id, fields: params?.fields });
       case 'CREATE':
         return this.createMetaAdsCampaign(userId, { ...params, account_id });
       case 'UPDATE':
@@ -13800,7 +13926,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async manageMetaAdsAdSets(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, ad_set_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
-        return this.listMetaAdsAdSets(userId, campaign_id, account_id);
+        // Thread the ad_set_id target and any explicit fields selection so the caller can
+        // read optimization_goal / promoted_object / etc. for a single ad set (ENG-398).
+        return this.listMetaAdsAdSets(userId, campaign_id, account_id, { adSetId: ad_set_id, fields: params?.fields });
       case 'CREATE':
         // Explicitly pass account_id in args for createMetaAdsAdSet as it expects it in the args object
         return this.createMetaAdsAdSet(userId, { ...params, account_id, campaign_id });
@@ -13833,7 +13961,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE' | 'COPY_AD' | 'RETAG_UTM', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
         return this.listMetaAdsAds(userId, ad_set_id, account_id);
@@ -13849,6 +13977,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       case 'COPY_AD':
         if (!ad_id) throw new Error('ad_id (source_ad_id) is required for COPY_AD action');
         return this.copyMetaAdsAd(userId, ad_id, params, account_id);
+      case 'RETAG_UTM':
+        // ENG-239 retrofit: retags ONE existing ad, never a list. Swaps in a new
+        // creative -- the caller (Emma) must have already told the user this
+        // resets the ad's learning phase, per the RETAG_UTM tool description.
+        if (!ad_id) throw new Error('ad_id is required for RETAG_UTM action');
+        return this.retagMetaAdUtm(userId, ad_id, account_id);
       default:
         throw new Error(`Invalid action: ${action}`);
     }
@@ -14102,10 +14236,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async listMetaAdsCampaignsNew(userId: string, account_id?: string): Promise<any> {
+  public async listMetaAdsCampaignsNew(
+    userId: string,
+    account_id?: string,
+    options: { campaignId?: string; fields?: string | string[] } = {}
+  ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const campaigns = (await metaService.listCampaigns(accountId, accessToken)) || [];
+      // Only forward the read-options bag when the caller supplied a campaign_id filter or
+      // an explicit fields selection; otherwise call listCampaigns the same 2-arg way as
+      // before. This preserves the CALL CONVENTION for a plain list-all — it does NOT keep
+      // the response payload identical: listCampaigns now defaults to the richer
+      // CAMPAIGN_READ_FIELDS (budget/bid config: daily_budget, lifetime_budget,
+      // budget_remaining, bid_strategy), the intended ENG-398 change, for every plain LIST
+      // caller regardless of this branch.
+      const hasSelector = Boolean(options.campaignId || options.fields);
+      const campaigns = (hasSelector
+        ? await metaService.listCampaigns(accountId, accessToken, options)
+        : await metaService.listCampaigns(accountId, accessToken)) || [];
       const totalCount = Array.isArray(campaigns) ? campaigns.length : 0;
 
       return {
@@ -14120,7 +14268,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: error.message || 'Failed to fetch Meta ad campaigns.',
-        error: error.message
+        error: error.message,
+        details: error.structuredError
       };
     }
   }
@@ -14147,10 +14296,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async listMetaAdsAdSets(userId: string, campaignId?: string, account_id?: string): Promise<any> {
+  public async listMetaAdsAdSets(
+    userId: string,
+    campaignId?: string,
+    account_id?: string,
+    options: { adSetId?: string; fields?: string | string[] } = {}
+  ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const adSets = (await metaService.listAdSets(accountId, accessToken, campaignId)) || [];
+      // Only forward the read-options bag when the caller supplied an ad_set_id target or an
+      // explicit fields selection; otherwise call listAdSets with just the (optional)
+      // campaignId, exactly as before. This preserves the CALL CONVENTION, NOT the response
+      // payload: listAdSets now defaults to the richer AD_SET_READ_FIELDS (optimization_goal,
+      // billing_event, destination_type, promoted_object, bid_strategy), the intended
+      // ENG-398 change, for every plain LIST caller regardless of this branch.
+      const hasSelector = Boolean(options.adSetId || options.fields);
+      const adSets = (hasSelector
+        ? await metaService.listAdSets(accountId, accessToken, campaignId, options)
+        : await metaService.listAdSets(accountId, accessToken, campaignId)) || [];
       const totalCount = Array.isArray(adSets) ? adSets.length : 0;
 
       return {
@@ -14325,6 +14488,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           }
         };
         console.log('[MetaAdSet] Auto-set targeting_automation.advantage_audience=0 (Meta requires this field)');
+      }
+
+      // Conversion location (ENG-415): default destination_type=WEBSITE for website
+      // traffic/conversion goals so the ad-level Destination is explicitly "Website" in Ads Manager
+      // rather than UNDEFINED (the "not selected" symptom). An explicit caller value always wins;
+      // non-website goals (engagement/reach/app installs, instant-form lead goals) are left untouched.
+      if (args.destination_type === undefined &&
+          META_WEBSITE_OPTIMIZATION_GOALS.includes(args.optimization_goal)) {
+        args.destination_type = 'WEBSITE';
       }
 
       // Convert all currencies to cents
@@ -14597,7 +14769,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * Keys that indicate a destination/creative content change rather than an ad-level change.
    * When these are present in params, we need to create a new creative and swap it.
    */
-  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets'];
+  // 'url_tags' lives on the creative, same as the others — an ad-level update
+  // silently drops it (see updateAd's params typing), so a UTM-only retag
+  // (ENG-239 retrofit, agentModeService.retagMetaAdUtm) must also go through
+  // the swap path. carriedUrlTags below already forwards it correctly.
+  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type', 'placement_assets', 'url_tags'];
 
   public async updateMetaAdsAd(userId: string, adId: string, params: any, account_id?: string): Promise<any> {
     try {
@@ -15041,6 +15217,75 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
+  /**
+   * Retag ONE existing, already-live Meta ad that's missing UTMs (Harsha's ask —
+   * the audit tool can only find these, never fix them). Deliberately single-ad:
+   * never loop or accept a list, so there is no "bulk retag" surface.
+   *
+   * Meta creatives are immutable for `url_tags`/`link_url`, so this reuses the
+   * SAME create-new-creative-then-swap machinery `updateAdViaCreativeSwap`
+   * already provides for other field changes — only `url_tags` changes here,
+   * the ad's existing destination is preserved untouched.
+   *
+   * Callers (the Emma tool) MUST tell the user before invoking this: swapping a
+   * live creative resets the ad's learning phase, which can hurt a paying
+   * client's performance. That is not enforced here — it belongs in the tool
+   * description Emma reads before deciding to call it.
+   */
+  public async retagMetaAdUtm(userId: string, adId: string, account_id?: string): Promise<any> {
+    try {
+      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+
+      const adData = await metaService.getAd(accessToken, adId);
+      const creativeId = adData?.creative?.creative_id || adData?.creative?.id;
+      if (!creativeId) {
+        return {
+          success: false,
+          message: 'Could not determine the current creative for this ad. The ad may not have a creative assigned.',
+          error: 'MISSING_CREATIVE'
+        };
+      }
+
+      const creativeData = await metaService.getAdCreative(accessToken, creativeId);
+      if (!creativeData?.object_story_spec) {
+        return {
+          success: false,
+          message: 'Could not read the current creative details. The creative may have been deleted or is in an unsupported format.',
+          error: 'MISSING_OBJECT_STORY_SPEC'
+        };
+      }
+
+      // The audit's own extractor (read/write symmetry is the correctness bar
+      // there too) — a hand-rolled subset here previously missed link_url,
+      // single-item/per-card CTA links, and asset_feed_spec website_urls,
+      // letting the retag miss an existing utm_source on those paths and
+      // duplicate it (Greptile).
+      const linkUrls: string[] = MetaService.extractCreativeDestinationUrls(creativeData);
+
+      const { urlTags, changed, unreadable } = computeRetagUrlTags(creativeData.url_tags, linkUrls);
+      if (unreadable) {
+        return {
+          success: false,
+          message: 'Could not verify this ad\'s destination is fully tagged — one of its link URLs could not be read.',
+          error: 'UNREADABLE_DESTINATION_URL',
+        };
+      }
+      if (!changed) {
+        return { success: true, alreadyTagged: true };
+      }
+
+      return await this.updateMetaAdsAd(userId, adId, { url_tags: urlTags }, account_id);
+    } catch (error: any) {
+      if (error.isMetaAuthError) throw error;
+      console.error('AgentMode: Error retagging Meta ad UTMs:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to retag Meta ad UTMs.',
+        error: error.message
+      };
+    }
+  }
+
   public async uploadMetaAdsImage(userId: string, imageUrl: string, account_id?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
@@ -15429,6 +15674,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           throw new Error('AD DELETE requires "ad_id".');
         } else if (action === 'COPY_AD' && !ad_id) {
           throw new Error('AD COPY_AD requires "ad_id" (the source ad to copy).');
+        } else if (action === 'RETAG_UTM' && !ad_id) {
+          throw new Error('AD RETAG_UTM requires "ad_id".');
         }
         break;
 
@@ -15456,7 +15703,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   private static META_WRITE_ACTIONS: Record<string, string[]> = {
     CAMPAIGN: ['CREATE', 'UPDATE', 'DELETE'],
     AD_SET: ['CREATE', 'UPDATE', 'DELETE'],
-    AD: ['CREATE', 'UPDATE', 'DELETE', 'COPY_AD'],
+    AD: ['CREATE', 'UPDATE', 'DELETE', 'COPY_AD', 'RETAG_UTM'],
     // Account-level assets. CREATE publishes a creative; UPLOAD_USERS pushes PII
     // user data to Meta. UPLOAD_IMAGE/UPLOAD_VIDEO only stage assets (no publish),
     // and LIST is read-only — none of those need confirmation.
@@ -15588,6 +15835,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         target.target_ad_set = nameOf(adSet, targetAdSetId);
         target.campaign = campaign ? nameOf(campaign, adSet?.campaign_id) : undefined;
         lines.push(`Copy ad ${target.source_ad} into ad set ${target.target_ad_set}${target.campaign ? `, which belongs to campaign ${target.campaign}` : ''}.`);
+      } else if (action === 'RETAG_UTM') {
+        const ad = await resolveAd(ad_id);
+        target.ad = nameOf(ad, ad_id);
+        // Mandatory risk statement (Harsha's ENG-239 retrofit ask): retagging a
+        // Meta ad swaps in a new creative, which resets the ad's learning phase
+        // and can hurt a live client's performance. This must be part of what the
+        // user confirms, not just a code comment nobody reads before approving.
+        lines.push(`Retag ad ${target.ad} with UTMs. This creates a NEW creative and swaps the ad to it, `
+          + `which RESETS THE AD'S LEARNING PHASE and can hurt performance on a live client campaign.`);
       } else {
         const ad = await resolveAd(ad_id);
         const adSet = await resolveAdSet(ad?.adset_id);
@@ -17300,6 +17556,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     options: {
       maxResults?: number;
       companyName?: string;
+      cursor?: string;
       format?: string[];
       platform?: string[];
       niche?: string[];
@@ -17333,6 +17590,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const result = await searchForeplayDiscoveryAds(foreplayToken, {
         query: effectiveQuery,
         limit,
+        cursor: options.cursor,
         format: options.format,
         platform: options.platform,
         niche: options.niche,
@@ -17367,7 +17625,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         results,
         totalResults: results.length,
         hasMore: !!result.cursor,
-        note: 'Each result costs 1 Foreplay credit. Discovery searches Foreplay\'s full database of millions of ads, not just your saved swipefile.'
+        cursor: result.cursor,
+        note: 'Each result costs 1 Foreplay credit. Discovery searches Foreplay\'s full database of millions of ads, not just your saved swipefile.' + (result.cursor ? ' More results are available — call this tool again with the returned cursor to fetch the next page.' : '')
       };
     } catch (error) {
       console.error('AgentMode: Error searching Foreplay discovery:', error);
@@ -19401,12 +19660,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   // Web search functionality
-  public async youSearchWeb(query: string, maxResults: number = 10): Promise<any> {
+  public async youSearchWeb(
+    query: string,
+    maxResults: number = 10,
+    freshness?: string,
+    includeDomains?: string[]
+  ): Promise<any> {
     return this.searchWithYou({
       toolName: 'you_search_web',
       query,
       maxResults,
       resultSource: 'web',
+      freshness,
+      includeDomains,
     });
   }
 
@@ -19468,6 +19734,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     maxResults: number;
     resultSource: SearchResultSource;
     freshness?: string;
+    includeDomains?: string[];
   }): Promise<any> {
     const { toolName, query, maxResults, resultSource } = params;
     try {
@@ -19488,6 +19755,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             maxResults: limitedMaxResults,
             resultSource,
             freshness: params.freshness,
+            includeDomains: params.includeDomains,
           });
           break;
         } catch (error) {
@@ -19701,6 +19969,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     maxResults: number;
     resultSource?: SearchResultSource;
     freshness?: string;
+    includeDomains?: string[];
   }) {
     const freshness = params.freshness || inferSearchFreshness(params.query);
     const provider = new YouSearchProvider();
@@ -19710,6 +19979,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       freshness,
       resultSource: params.resultSource || 'all',
       purpose: params.resultSource === 'news' ? 'news' : 'agent_research',
+      ...(params.includeDomains?.length ? { includeDomains: params.includeDomains } : {}),
     });
 
     console.log(`You.com Search returned ${response.results.length} ${params.resultSource || 'all'} results for query: "${params.query}"`);
@@ -20552,10 +20822,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // brand logo (AC-2); when none is persisted, ask the user / point at
       // brand config instead of generating (AC-3). Edits (inputImages) are
       // out of scope — the source images already carry the branding.
+      //
+      // ENG-393: this gate is for COMPOSITING an existing brand logo, not for
+      // CREATING one. A prompt that asks to design a brand-new logo from
+      // scratch ("create a logo for X") must NOT be gated — an account with no
+      // logo yet legitimately wants to generate its first one, and blocking
+      // that also blocks landing-page generation. Let creation asks through;
+      // compositing asks ("add our logo to this banner") still gate.
       if (
         !logoImage &&
         (!Array.isArray(inputImages) || inputImages.length === 0) &&
-        promptRequestsLogo(prompt)
+        promptRequestsLogo(prompt) &&
+        !promptCreatesLogo(prompt)
       ) {
         const persistedLogo = await getPersistedBrandLogoUrlForUser(userId);
         if (!persistedLogo) {
@@ -23799,7 +24077,7 @@ Please generate a complete, professional HTML document that properly formats and
       let htmlContent = '';
       for (let attempt = 1; attempt <= maxRenderAttempts; attempt++) {
         try {
-          htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
+          htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
           break;
         } catch (renderError) {
           const isLastAttempt = attempt === maxRenderAttempts;
@@ -24006,7 +24284,7 @@ Please:
 
       // Generate enhanced HTML template using LLMService
       console.log('AgentMode: Generating HTML email template with Claude model');
-      enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'), { userId, sessionId, feature: 'content_gen' });
+      enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(sessionId, 'createHtmlTemplate'), { userId, sessionId, feature: 'content_gen' });
 
       if (!enhancedHtml || enhancedHtml.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -24163,7 +24441,7 @@ ${strippedHtml}`;
       const parsed = await llmService.generateJsonRobust<{ variables?: Array<{ name?: string; anchor?: string; isArray?: boolean }> }>(
         systemPrompt,
         userPrompt,
-        this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'),
+        this.makeToolUsageCallback(sessionId, 'createHtmlTemplate'),
         { userId, sessionId, feature: 'content_gen' },
       );
       if (parsed && Array.isArray(parsed.variables)) {
@@ -25361,7 +25639,7 @@ IMPORTANT:
 IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly.`}`;
 
       // Generate content using LangChain with appropriate format
-      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(userId, sessionId, 'generateBookContent'), { userId, sessionId, feature: 'content_gen' });
+      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(sessionId, 'generateBookContent'), { userId, sessionId, feature: 'content_gen' });
 
       // Extract content from JSON
       if (!contentData.content) {
@@ -25741,9 +26019,31 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         ? await linkedInOutreachService.getStatusesForAccounts(unipileAccountIds)
         : new Map<string, string>();
 
+      // When a platform-specific lookup finds nothing the caller can access, the
+      // account may still be connected by an org teammate who never shared it (the
+      // ENG-368 case: a private Google Ads account owned by another member). Rather
+      // than inspect teammates' private accounts to confirm — which would disclose
+      // the existence of an account its owner deliberately kept private — surface
+      // that possibility as a hint, but ONLY when the caller actually belongs to an
+      // org. A solo user has no teammates, so the "ask a teammate to share" wording
+      // would be confusing; they get a plain connect prompt instead. We check only
+      // the caller's own orgId (never teammates' accounts), so the org privacy model
+      // stays intact. Any uncertainty (missing user) falls back to the plain message.
+      let message = `Found ${accounts.length} connected account(s)`;
+      if (accounts.length === 0 && platform && platform !== 'all') {
+        const { userDb } = await import('./db');
+        const caller = await userDb.getUserById(userId);
+        const callerInOrg = !!(caller && (caller as any).orgId);
+        if (callerInOrg) {
+          message = `Found 0 ${platform} account(s) available to you. If a teammate in your organization has connected ${platform} but hasn't shared it, they'll need to open Settings → Connected Accounts and click "Share with org" — otherwise, connect ${platform} under this account directly.`;
+        } else {
+          message = `Found 0 ${platform} account(s). Connect ${platform} in Settings → Connected Accounts to continue.`;
+        }
+      }
+
       return {
         success: true,
-        message: `Found ${accounts.length} connected account(s)`,
+        message,
         accounts: await Promise.all(accounts.map(async acc => ({
           id: acc.account_id,
           platform: acc.platform,
@@ -26446,7 +26746,62 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // persisting — see unipileProfileService.ts.
           const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
           const profileResult = await getUnipileProfileService().getProfile(target, account_id);
-          return { success: true, data: profileResult.rawData };
+          const raw = profileResult.rawData;
+
+          // The global profile cache strips is_relationship / connected_at because
+          // they are viewer-relative (ENG-440) — so on a cache hit a freshly-written
+          // blob carries no connection state at all (and a pre-change legacy row may
+          // carry another viewer's, which we discard below). Re-derive it for THIS
+          // account from our per-account AW-UnipileConnections cache (the authoritative
+          // ENG-377 path) so the agent's invite-vs-DM decision has a correct signal.
+          //
+          // IMPORTANT: overlay onto a SHALLOW COPY. `raw` is the object held in the
+          // profile cache (LRU/DDB row) — mutating it in place would persist this
+          // viewer's connection state back into the shared cache and re-introduce the
+          // very cross-viewer leak this fix closes.
+          if (raw && typeof raw === 'object') {
+            const profileUrl =
+              raw.public_profile_url ||
+              (raw.public_identifier
+                ? `https://www.linkedin.com/in/${raw.public_identifier}`
+                : (isUrl ? target : null));
+            let conn: { connectedAt?: number } | null = null;
+            if (profileUrl) {
+              const { getConnectionByProfileUrlAndAccount } = await import('./unipileConnectionsDb');
+              conn = await getConnectionByProfileUrlAndAccount(profileUrl, account_id).catch(() => null);
+            }
+            // Drop any is_relationship / connected_at that came off `raw` before
+            // re-deriving. New cache writes already strip these, but rows persisted
+            // BEFORE this change (30-day TTL) can still carry another viewer's stale
+            // values — a spread of `raw` would leak them until the row expires. Only a
+            // LIVE response (`!fromCache`) legitimately carries this viewer's own state.
+            const {
+              is_relationship: rawRelationship,
+              connected_at: rawConnectedAt,
+              ...viewerIndependentRaw
+            } = raw;
+            // Reconcile as a union: connected if our per-account cache has a row OR a
+            // LIVE blob said so. A `true` from either source wins — directly countering
+            // the false-negative in reporter-ticket #135 (is_relationship false while
+            // LinkedIn's send-time check said FIRST_DEGREE). On a cache hit we trust only
+            // `conn`, never the (possibly cross-viewer) cached is_relationship.
+            const isConnected =
+              !!conn || (!profileResult.fromCache && rawRelationship === true);
+            const data = {
+              ...viewerIndependentRaw,
+              is_relationship: isConnected,
+              // conn.connectedAt is already epoch-ms (Unipile created_at) — do NOT
+              // multiply by 1000 (ENG-379). Prefer the authoritative cache timestamp;
+              // otherwise keep the raw timestamp ONLY from a live response.
+              ...(conn && typeof conn.connectedAt === 'number'
+                ? { connected_at: conn.connectedAt }
+                : !profileResult.fromCache && typeof rawConnectedAt === 'number'
+                  ? { connected_at: rawConnectedAt }
+                  : {}),
+            };
+            return { success: true, data };
+          }
+          return { success: true, data: raw };
         }
 
         case 'list-connections': {
@@ -27061,7 +27416,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      // Surface X's real ApiResponseError payload (title/detail/errors) instead of
+      // collapsing to a bare "Request failed with code 403" — see describeXApiError.
+      const errorMessage = describeXApiError(error);
       console.error('AgentMode: twitter_manage_post failed:', errorMessage);
       return { success: false, message: 'Twitter action failed', error: errorMessage };
     }
@@ -27070,7 +27427,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   async twitterOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
-    const { text, handle, recipient_handle, query, max_results, tweet_id, list_id, lead_id, lead_email } = args;
+    const { text, handle, recipient_handle, query, max_results, tweet_id, x_list_id, list_name, list_id, lead_id, lead_email } = args;
     console.log(`[AgentMode] twitterOutreach called: action=${action}, account_id=${account_id}`);
 
     const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
@@ -27201,6 +27558,27 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: result };
         }
 
+        case 'list-owned-lists': {
+          const result = await twitterService.getOwnedLists(ownerUserId, account_id);
+          return { success: true, data: result };
+        }
+
+        case 'get-list-members': {
+          const listId = x_list_id
+            || (list_name ? await twitterService.resolveOwnedListIdByName(ownerUserId, account_id, list_name) : undefined);
+          if (!listId) throw new Error('x_list_id or list_name is required for get_list_members');
+          const result = await twitterService.getListMembers(ownerUserId, account_id, listId);
+          return { success: true, data: result };
+        }
+
+        case 'get-list-tweets': {
+          const listId = x_list_id
+            || (list_name ? await twitterService.resolveOwnedListIdByName(ownerUserId, account_id, list_name) : undefined);
+          if (!listId) throw new Error('x_list_id or list_name is required for get_list_tweets');
+          const result = await twitterService.getListTweets(ownerUserId, account_id, listId, max_results);
+          return { success: true, data: result };
+        }
+
         case 'block': {
           const target = handle || recipient_handle;
           if (!target) throw new Error('handle is required for block');
@@ -27235,13 +27613,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             'search-tweets', 'get-user-tweets',
             'send-dm', 'list-dms', 'get-dm-conversation',
             'bookmark', 'get-bookmarks',
+            'list-owned-lists', 'get-list-members', 'get-list-tweets',
             'block', 'unblock', 'mute', 'unmute',
           ];
           throw new Error(`Unsupported twitter_outreach action: "${action}". Valid actions are: ${validActions.join(', ')}`);
         }
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      // Surface X's real ApiResponseError payload (title/detail/errors) instead of
+      // collapsing to a bare "Request failed with code 403" — see describeXApiError.
+      const errorMessage = describeXApiError(error);
       console.error('AgentMode: twitter_outreach failed:', errorMessage);
       return { success: false, message: 'Twitter outreach action failed', error: errorMessage };
     }
@@ -27384,7 +27765,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!params.campaign_id) throw new Error('LIST creatives requires params.campaign_id');
           const result = await linkedInAdsService.listCreatives(accessToken, accountId, params.campaign_id);
           if (!result.success) throw new Error(result.error || 'Failed to list creatives');
-          return { success: true, creatives: result.data?.elements || [] };
+          const rawCreatives: any[] = result.data?.elements || [];
+          // ENG-239: a content.reference creative only carries a bare post URN
+          // pointer -- expand it with the referenced post's own fields
+          // (contentLandingPage etc) so a caller can see the actual destination
+          // without a manual follow-up POST/GET per creative. A failed read
+          // (e.g. deleted post) degrades to the bare creative rather than
+          // failing the whole LIST.
+          const creatives = await Promise.all(rawCreatives.map(async (creative) => {
+            const postUrn = creative?.content?.reference;
+            if (!postUrn) return creative;
+            const postResult = await linkedInAdsService.getPost(accessToken, postUrn);
+            return postResult.success ? { ...creative, referencedPost: postResult.data } : creative;
+          }));
+          return { success: true, creatives };
         }
         if (action === 'CREATE') {
           if (!params.campaign_id) throw new Error('CREATE creative requires params.campaign_id');
@@ -27411,6 +27805,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!result.success) throw new Error(result.error || 'Failed to create dynamic creative');
           return { success: true, message: 'Dynamic creative created', creative: result.data };
         }
+        if (action === 'RETAG_UTM') {
+          // ENG-239 retrofit: retags ONE existing creative, never a list.
+          // LIVE-VERIFIED 2026-07-16 for textAd creatives — see retagCreativeUtm's docstring
+          // for the $set-is-not-a-deep-merge caveat and the content.reference delegation.
+          if (!params.creative_id) throw new Error('RETAG_UTM requires creative_id');
+          if (!params.campaign_id) throw new Error('RETAG_UTM requires campaign_id');
+          const result = await linkedInAdsService.retagCreativeUtm(accessToken, accountId, params.creative_id, params.campaign_id);
+          if (!result.success) throw new Error(result.error || 'Failed to retag creative UTMs');
+          if (result.alreadyTagged) return { success: true, message: 'Creative already carries every UTM key — no change made.' };
+          return { success: true, message: 'Creative retagged with UTMs' };
+        }
         throw new Error(`Unknown action "${action}" for CREATIVE`);
       }
 
@@ -27426,6 +27831,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const postType = feedDistribution === 'MAIN_FEED' ? 'Company page post' : 'Dark post';
           const postUrl = postUrn ? `https://www.linkedin.com/feed/update/${encodeURIComponent(postUrn)}/` : undefined;
           return { success: true, message: `${postType} created. Use post_urn as reference in CREATIVE/CREATE.`, post_urn: postUrn, post_url: postUrl, post: result.data };
+        }
+        if (action === 'GET') {
+          if (!params.post_urn) throw new Error('POST GET requires params.post_urn');
+          const result = await linkedInAdsService.getPost(accessToken, params.post_urn);
+          if (!result.success) throw new Error(result.error || 'Failed to get post');
+          return { success: true, post: result.data };
         }
         throw new Error(`Unknown action "${action}" for POST`);
       }
@@ -27978,14 +28389,108 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     return response;
   }
 
+  /**
+   * Deterministic pre-flight tracking gate (ENG-335). Before a campaign is
+   * enabled/launched, fetch its final URLs and confirm each serves a detectable
+   * conversion-measurement mechanism (GA4 / GTM / Google Ads conversion snippet).
+   * Blocks the launch by default when any URL is unmeasured or unverifiable;
+   * an explicit `override_tracking_check` proceeds but is recorded. The per-URL
+   * result and the decision are persisted to the run record so a later report
+   * can state measurement status instead of a bare "0 conversions".
+   *
+   * Returns `{ proceed: false, blockResult }` when the launch must be blocked
+   * (caller returns blockResult verbatim), or `{ proceed: true }` to continue.
+   */
+  private async enforceGoogleAdsLaunchGate(
+    userId: string,
+    customerId: string,
+    campaignResourceName: string,
+    action: string,
+    override: boolean,
+    sessionId?: string,
+  ): Promise<{ proceed: boolean; blockResult?: any }> {
+    const finalUrls = await googleAdsService.getCampaignFinalUrls(userId, customerId, campaignResourceName);
+    // No serving URLs (e.g. a campaign with no ads yet) ⇒ nothing to gate.
+    if (finalUrls.length === 0) return { proceed: true };
+    return this.runGoogleAdsTrackingGate(customerId, campaignResourceName, action, override, sessionId, finalUrls);
+  }
+
+  /**
+   * ENG-335: adding a new ad or PMax asset group to an *already-ENABLED* campaign
+   * serves paid traffic to its final URL instantly — the same exposure as a launch.
+   * Gate the newly-added final URL(s) exactly like RESUME/UPDATE(ENABLED). Additions
+   * to a PAUSED/DRAFT campaign are not gated here; they are re-checked when that
+   * campaign is later enabled/resumed.
+   */
+  private async enforceGoogleAdsCreativeAdditionGate(
+    customerId: string,
+    campaignResourceName: string,
+    campaignStatus: string | null,
+    action: string,
+    override: boolean,
+    sessionId: string | undefined,
+    newFinalUrls: Array<string | undefined>,
+  ): Promise<{ proceed: boolean; blockResult?: any }> {
+    if (campaignStatus !== 'ENABLED') return { proceed: true };
+    const urls = newFinalUrls.filter((u): u is string => typeof u === 'string' && u.trim().length > 0);
+    if (urls.length === 0) return { proceed: true };
+    return this.runGoogleAdsTrackingGate(customerId, campaignResourceName, action, override, sessionId, urls);
+  }
+
+  /**
+   * Shared core of the tracking gate: run the deterministic pre-flight check over
+   * `finalUrls`, record the outcome (passed / blocked / overridden) on the run
+   * record, and return whether the caller may proceed.
+   */
+  private async runGoogleAdsTrackingGate(
+    customerId: string,
+    campaignResourceName: string,
+    action: string,
+    override: boolean,
+    sessionId: string | undefined,
+    finalUrls: string[],
+  ): Promise<{ proceed: boolean; blockResult?: any }> {
+    const gate = await preflightTrackingGate(finalUrls);
+    const urlResults = gate.results.map(r => ({ url: r.url, status: r.status, mechanisms: r.mechanisms, error: r.error }));
+
+    if (gate.ok) {
+      await chatbotDb.recordGoogleAdsMeasurementCheck(sessionId || '', {
+        customerId, campaignResourceName, action, outcome: 'passed', urlResults, checkedAt: new Date().toISOString(),
+      });
+      return { proceed: true };
+    }
+
+    if (override) {
+      await chatbotDb.recordGoogleAdsMeasurementCheck(sessionId || '', {
+        customerId, campaignResourceName, action, outcome: 'overridden', urlResults, checkedAt: new Date().toISOString(),
+      });
+      return { proceed: true };
+    }
+
+    await chatbotDb.recordGoogleAdsMeasurementCheck(sessionId || '', {
+      customerId, campaignResourceName, action, outcome: 'blocked', urlResults, checkedAt: new Date().toISOString(),
+    });
+    return {
+      proceed: false,
+      blockResult: {
+        success: false,
+        blocked: true,
+        reason: 'tracking_preflight',
+        error: gate.message,
+        trackingCheck: { measured: false, urlResults },
+      },
+    };
+  }
+
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
     entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
     action: string;
     [key: string]: any;
-  }): Promise<any> {
+  }, opts?: { sessionId?: string }): Promise<any> {
     try {
       const { customer_id, entity_type, action } = args;
+      const overrideTrackingCheck = args.override_tracking_check === true;
 
       if (entity_type === 'BIDDING_STRATEGY' && action === 'LIST') {
         const biddingStrategies = await googleAdsService.listBiddingStrategies(userId, customer_id);
@@ -28004,6 +28509,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'RESUME') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for RESUME action' };
+          const gate = await this.enforceGoogleAdsLaunchGate(userId, customer_id, args.campaign_resource_name, 'RESUME', overrideTrackingCheck, opts?.sessionId);
+          if (!gate.proceed) return gate.blockResult;
           await googleAdsService.resumeCampaign(userId, customer_id, args.campaign_resource_name);
           return { success: true, message: 'Campaign resumed' };
         }
@@ -28042,6 +28549,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'UPDATE') {
           if (!args.campaign_resource_name) return { success: false, error: 'campaign_resource_name is required for UPDATE action' };
+          // Enabling a campaign via UPDATE(status=ENABLED) is a launch — gate it like RESUME.
+          if (args.status === 'ENABLED') {
+            const gate = await this.enforceGoogleAdsLaunchGate(userId, customer_id, args.campaign_resource_name, 'UPDATE', overrideTrackingCheck, opts?.sessionId);
+            if (!gate.proceed) return gate.blockResult;
+          }
           const didUpdate = await googleAdsService.updateCampaign(userId, customer_id, args.campaign_resource_name, {
             name: args.name,
             status: args.status,
@@ -28166,6 +28678,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!args.ad_group_resource_name || !args.type || !args.headlines || !args.descriptions || !args.final_url) {
             return { success: false, error: 'ad_group_resource_name, type, headlines, descriptions, and final_url are required to create an ad' };
           }
+          // ENG-335: an ad added to an already-live campaign serves paid traffic
+          // instantly — gate its final_url like a launch when the parent is ENABLED.
+          // Fail-open on a lookup/gate error: this is defence-in-depth (the RESUME /
+          // UPDATE→ENABLED gate is the hard guarantee), so a transient parent-status
+          // lookup failure must NOT break an otherwise-valid ad creation.
+          try {
+            const parent = await googleAdsService.getAdGroupCampaign(userId, customer_id, args.ad_group_resource_name);
+            if (parent) {
+              const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, parent.campaignResourceName, parent.campaignStatus, 'AD_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
+              if (!gate.proceed) return gate.blockResult;
+            }
+          } catch (gateErr) {
+            console.error('[ENG-335] AD_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
+          }
           let adType = args.type as string;
           if (adType === 'SEARCH') adType = 'RESPONSIVE_SEARCH_AD';
           else if (adType === 'DISPLAY') adType = 'RESPONSIVE_DISPLAY_AD';
@@ -28192,6 +28718,22 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           await googleAdsService.removeAd(userId, customer_id, args.ad_resource_name);
           return { success: true, message: 'Ad removed' };
         }
+        if (action === 'RETAG_UTM') {
+          // ENG-239 retrofit: retags ONE existing ad, never a list.
+          if (!args.ad_resource_name) return { success: false, error: 'ad_resource_name is required for AD RETAG_UTM' };
+          const result = await googleAdsService.retagAdUtm(userId, customer_id, args.ad_resource_name);
+          if (!result.success) {
+            return {
+              success: false,
+              error: result.reason === 'no_destination_url'
+                ? 'This ad has no destination URL to tag.'
+                : result.reason === 'invalid_resource_name'
+                ? 'ad_resource_name is not a valid Google Ads resource name.'
+                : 'No change was made — the ad already carries every UTM key, or the campaign-level read needed to avoid clobbering existing tracking failed.',
+            };
+          }
+          return { success: true, message: 'Ad retagged with UTMs' };
+        }
       }
 
       if (entity_type === 'CAMPAIGN_ASSET' && action === 'ATTACH') {
@@ -28216,6 +28758,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             !args.logo_assets || !args.final_url) {
           return { success: false, error: 'name, campaign_resource_name, headlines, long_headlines, descriptions, square_image_assets, landscape_image_assets, logo_assets, and final_url are required' };
         }
+        // ENG-335: a PMax asset group added to an already-live campaign serves paid
+        // traffic instantly — gate its final_url like a launch when the parent is ENABLED.
+        // Fail-open on a lookup/gate error (see AD_CREATE above): defence-in-depth, so a
+        // transient campaign-status lookup failure must NOT break a valid asset-group create.
+        try {
+          const campaignStatus = await googleAdsService.getCampaignStatus(userId, customer_id, args.campaign_resource_name);
+          const gate = await this.enforceGoogleAdsCreativeAdditionGate(customer_id, args.campaign_resource_name, campaignStatus, 'ASSET_GROUP_CREATE', overrideTrackingCheck, opts?.sessionId, [args.final_url]);
+          if (!gate.proceed) return gate.blockResult;
+        } catch (gateErr) {
+          console.error('[ENG-335] ASSET_GROUP_CREATE creative-addition gate lookup failed; proceeding (RESUME/ENABLE gate still guards launch):', gateErr);
+        }
         const assetGroup = await googleAdsService.createAssetGroup(userId, customer_id, {
           name: args.name,
           campaignResourceName: args.campaign_resource_name,
@@ -28229,6 +28782,23 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           finalUrl: args.final_url,
         });
         return { success: true, assetGroupResourceName: assetGroup.resourceName };
+      }
+
+      if (entity_type === 'ASSET_GROUP' && action === 'RETAG_UTM') {
+        // ENG-239 PMax retrofit: retags ONE existing asset group, never a list.
+        if (!args.asset_group_resource_name) return { success: false, error: 'asset_group_resource_name is required for ASSET_GROUP RETAG_UTM' };
+        const result = await googleAdsService.retagAssetGroupUtm(userId, customer_id, args.asset_group_resource_name);
+        if (!result.success) {
+          return {
+            success: false,
+            error: result.reason === 'no_destination_url'
+              ? 'This asset group has no destination URL to tag.'
+              : result.reason === 'invalid_resource_name'
+              ? 'asset_group_resource_name is not a valid Google Ads resource name.'
+              : 'No change was made — the destination already carries every UTM key (directly or via the campaign\'s final_url_suffix), or the URL could not be read.',
+          };
+        }
+        return { success: true, message: 'Asset group retagged with UTMs' };
       }
 
       return { success: false, error: `Unsupported entity_type=${entity_type} action=${action}` };

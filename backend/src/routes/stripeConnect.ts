@@ -14,6 +14,7 @@
  */
 import express, { Request, Response } from 'express';
 import Stripe from 'stripe';
+import { createStripeClient } from '../services/stripeClientFactory';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
@@ -194,7 +195,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Missing stripe-signature header' });
   }
 
-  const stripe = new Stripe(stripeKey, { apiVersion: '2025-05-28.basil' as any });
+  const stripe = createStripeClient(stripeKey);
   let event: Stripe.Event;
   try {
     event = stripe.webhooks.constructEvent(req.body, signature, secret);

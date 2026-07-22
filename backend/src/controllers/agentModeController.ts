@@ -127,7 +127,7 @@ export function releaseSessionGeneration(sessionId: string): void {
 const GENERATION_TIMEOUT_MS = parseInt(
   process.env.AGENT_MODE_GENERATION_TIMEOUT_MS || '600000',
   10
-); // 10 minutes default — local agent browser tasks need > 5 min
+); // 10 minutes default — long-running browser/research tasks need > 5 min
 
 async function withGenerationTimeout<T>(
   promise: Promise<T>,
@@ -2336,7 +2336,7 @@ export async function generateSessionResponse(
         // For Slack sessions (including scheduled scans), inject team identity context so Emma
         // knows who is on the team and can distinguish teammates from external parties.
         if ((session.pageIdentifier || '').toLowerCase().includes('slack')) {
-          systemPrompt += `\n\n[Slack Context] You are part of the AgentWeb team.\n${ABOUT_AGENTWEB_TEAM}\nMessages in this Slack thread are prefixed with the sender's name (e.g. "Rui Wang: message text"). When a team member asks you to help reply, you are drafting a response FROM that team member TO the other person in the thread — not answering the team member as if they were asking you a direct question. Always respond in the voice of the team member addressing their conversation partner.`;
+          systemPrompt += `\n\n[Slack Context] You are part of the AgentWeb team.\n${ABOUT_AGENTWEB_TEAM}\nMessages in this Slack thread are prefixed with the sender's name (e.g. "Harsha Vankayalapati: message text"). When a team member asks you to help reply, you are drafting a response FROM that team member TO the other person in the thread — not answering the team member as if they were asking you a direct question. Always respond in the voice of the team member addressing their conversation partner.`;
         }
       }
 
@@ -3100,11 +3100,18 @@ export const agentModeController = {
         if (all.length > 0) invalidations = all;
       }
 
+      // ENG-351: surface the message's web-source citations on the live response so the
+      // Sources pill appears immediately (not only after a reload from the persisted copy).
+      const liveCitations = [...(response.responseMessages || [])]
+        .reverse()
+        .find((m: any) => m?.role === 'assistant')?.metadata?.citations;
+
       res.json({
         content: response.content,
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
+        ...(Array.isArray(liveCitations) && liveCitations.length > 0 ? { citations: liveCitations } : {}),
         workPlan: response.workPlan,
         skills: response.skills,
         ...(invalidations ? { invalidations } : {}),

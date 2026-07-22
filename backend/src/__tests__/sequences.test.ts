@@ -7,6 +7,8 @@
 import request from 'supertest';
 import express from 'express';
 import sequenceRoutes from '../routes/sequences';
+import { resendService } from '../services/resendService';
+import { settingsService } from '../services/settingsService';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────────
 
@@ -15,6 +17,20 @@ jest.mock('../middleware/auth', () => ({
     req.user = { userId: 'user-123', email: 'test@example.com' };
     next();
   },
+}));
+
+jest.mock('../services/resendService', () => ({
+  resendService: { sendEmail: jest.fn() },
+}));
+
+jest.mock('../services/settingsService', () => ({
+  settingsService: { getSetting: jest.fn(), setSetting: jest.fn() },
+}));
+
+const mockGetEmailProvider = jest.fn();
+jest.mock('../services/emailProviderService', () => ({
+  getEmailProvider: (...args: any[]) => mockGetEmailProvider(...args),
+  bootstrapEmailProviders: jest.fn().mockResolvedValue(undefined),
 }));
 
 // Mock the db service used in the by-list enrollment route
@@ -368,5 +384,84 @@ describe('PUT /:sequenceId - autoEnrollListIds', () => {
       'user-123',
       expect.objectContaining({ autoEnrollListIds: null }),
     );
+  });
+});
+
+// ─── POST /:sequenceId/steps/test-email — ENG-266 Part 3 sender routing ───────
+
+describe('POST /:sequenceId/steps/test-email', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (settingsService.getSetting as jest.Mock).mockResolvedValue(undefined);
+  });
+
+  const validBody = {
+    senderEmail: 'me@test.com',
+    senderName: 'Me',
+    subject: 'Hi',
+    htmlContent: '<p>hi</p>',
+    recipients: ['a@example.com'],
+  };
+
+  describe('FAIL cases', () => {
+    it('returns 400 if required fields are missing', async () => {
+      const res = await request(app).post('/seq_1/steps/test-email').send({ subject: 'Hi' });
+      expect(res.status).toBe(400);
+    });
+
+    it('returns 400 if no valid recipient emails are provided', async () => {
+      const res = await request(app)
+        .post('/seq_1/steps/test-email')
+        .send({ ...validBody, recipients: ['not-an-email'] });
+      expect(res.status).toBe(400);
+    });
+
+    it('counts a thrown send as failed instead of crashing the request', async () => {
+      (resendService.sendEmail as jest.Mock).mockRejectedValue(new Error('resend down'));
+      const res = await request(app).post('/seq_1/steps/test-email').send(validBody);
+      expect(res.status).toBe(200);
+      expect(res.body.failed).toBe(1);
+      expect(res.body.sent).toBe(0);
+    });
+  });
+
+  describe('SUCCESS cases', () => {
+    it('sends via Resend for an unconfigured/ad-hoc sender, unchanged from before', async () => {
+      (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'msg-1' });
+      const res = await request(app).post('/seq_1/steps/test-email').send(validBody);
+
+      expect(resendService.sendEmail).toHaveBeenCalledWith(
+        expect.objectContaining({
+          from: 'Me <me@test.com>',
+          to: 'a@example.com',
+          subject: '[TEST] Hi',
+        }),
+      );
+      expect(res.body.sent).toBe(1);
+    });
+
+    it('ENG-266 Part 3: routes a mailbox (outlook) sender through its real provider instead of refusing it', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify({
+          senders: [{ id: 'ol-1', email: 'hunter@baldwin.com', fromName: 'Hunter', senderType: 'outlook', connectedAccountId: 'acct-1' }],
+        }),
+      });
+      mockGetEmailProvider.mockReturnValue({
+        sendEmail: jest.fn().mockResolvedValue({ messageId: 'ol-msg-1', threadId: '' }),
+      });
+
+      const res = await request(app).post('/seq_1/steps/test-email').send({
+        senderId: 'ol-1',
+        senderEmail: 'hunter@baldwin.com',
+        senderName: 'Hunter',
+        subject: 'Hi',
+        htmlContent: '<p>hi</p>',
+        recipients: ['a@example.com'],
+      });
+
+      expect(resendService.sendEmail).not.toHaveBeenCalled();
+      expect(mockGetEmailProvider).toHaveBeenCalledWith('outlook');
+      expect(res.body.sent).toBe(1);
+    });
   });
 });

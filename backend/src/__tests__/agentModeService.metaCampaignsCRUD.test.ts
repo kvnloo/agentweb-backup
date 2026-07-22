@@ -71,6 +71,26 @@ describe('AgentModeService - Meta Campaign CRUD', () => {
       expect(result.totalCount).toBe(2);
       expect(metaService.listCampaigns).toHaveBeenCalledWith('123456789', 'mock-access-token');
     });
+
+    it('forwards Meta structuredError as details when listing fails (ENG-394)', async () => {
+      const metaErr: any = new Error('An unexpected error has occurred. Please retry your request later.');
+      metaErr.structuredError = {
+        message: metaErr.message,
+        code: 2,
+        fbtrace_id: 'ASaXJM0Tf2Rt',
+        classification: 'RETRYABLE_ERROR'
+      };
+
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaErr);
+
+      const result = await agentModeService.listMetaAdsCampaignsNew('user123');
+
+      expect(result.success).toBe(false);
+      // Diagnostics (Meta code / fbtrace_id / classification) survive to telemetry,
+      // matching the sibling createMetaAdsCampaign path — not dropped as a bare string.
+      expect(result.details).toEqual(metaErr.structuredError);
+    });
   });
 
   describe('createMetaAdsCampaign', () => {

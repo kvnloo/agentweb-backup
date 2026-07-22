@@ -1,4 +1,5 @@
 import Stripe from 'stripe';
+import { createStripeClient } from './stripeClientFactory';
 import dotenv from 'dotenv';
 import { userDb } from './db';
 import { getTierConfig, DEFAULT_PAGES } from './subscriptionService';
@@ -16,11 +17,27 @@ function getStripeOrThrow(): Stripe {
     if (!key) {
       throw new Error('Stripe SDK not initialized. Missing STRIPE_SECRET_KEY.');
     }
-    _stripe = new Stripe(key, {
-      apiVersion: '2025-05-28.basil' as any,
-    });
+    _stripe = createStripeClient(key);
   }
   return _stripe;
+}
+
+/**
+ * Read a subscription's current period end defensively and return it as an ISO
+ * string (or undefined if absent).
+ *
+ * Stripe's Basil API (2025-03-31+, which we pin via apiVersion) moved
+ * `current_period_end` off the subscription root onto each item
+ * (`items.data[].current_period_end`). Webhook payloads may still carry the
+ * root field depending on the account's pinned webhook version, so read the
+ * item first and fall back to the root. Value is epoch-seconds (number) on real
+ * Stripe; the string branch is kept for defensiveness.
+ */
+export function getSubscriptionPeriodEndIso(sub: any): string | undefined {
+  const raw =
+    sub?.items?.data?.[0]?.current_period_end ?? sub?.current_period_end;
+  if (raw == null) return undefined;
+  return new Date(typeof raw === 'number' ? raw * 1000 : raw).toISOString();
 }
 
 /**
@@ -337,12 +354,7 @@ export async function syncSubscriptionFromStripe(
       subscription_status: sub.status,
       stripe_subscription_id: sub.id,
       has_payment_method: hasPaymentMethod,
-      current_period_end: (sub as any).current_period_end
-        ? new Date(typeof (sub as any).current_period_end === 'number'
-            ? (sub as any).current_period_end * 1000
-            : (sub as any).current_period_end
-          ).toISOString()
-        : undefined,
+      current_period_end: getSubscriptionPeriodEndIso(sub),
       activeOffer: extractActiveOffer(sub),
     };
 
@@ -436,9 +448,7 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
       const s = getStripeOrThrow();
       subscription = await s.subscriptions.retrieve(stripeSubscriptionId, { expand: ['discount.coupon'] });
       actualStatus = subscription.status; // Could be 'trialing', 'active', etc.
-      if (subscription.current_period_end) {
-        currentPeriodEnd = new Date(subscription.current_period_end * 1000).toISOString();
-      }
+      currentPeriodEnd = getSubscriptionPeriodEndIso(subscription);
     } catch (err) {
       console.warn(`Could not fetch subscription ${stripeSubscriptionId} for status:`, err);
     }
@@ -592,12 +602,9 @@ export async function handleSubscriptionUpdated(
   updateData.has_payment_method = hasPaymentMethod;
 
   // Sync current_period_end so trial end dates are tracked
-  if (subscription.current_period_end) {
-    updateData.current_period_end = new Date(
-      typeof subscription.current_period_end === 'number'
-        ? subscription.current_period_end * 1000
-        : subscription.current_period_end
-    ).toISOString();
+  const updatedPeriodEndIso = getSubscriptionPeriodEndIso(subscription);
+  if (updatedPeriodEndIso) {
+    updateData.current_period_end = updatedPeriodEndIso;
   }
 
   // Sync plan tier on upgrades/downgrades
@@ -671,8 +678,9 @@ export async function handleInvoicePaymentSucceeded(invoice: any): Promise<void>
     try {
       const s = getStripeOrThrow();
       const subscription = await s.subscriptions.retrieve(subIdToFetch, { expand: ['discount.coupon'] }) as any;
-      if (subscription.current_period_end) {
-        updateData.current_period_end = new Date(subscription.current_period_end * 1000).toISOString();
+      const invoicePeriodEndIso = getSubscriptionPeriodEndIso(subscription);
+      if (invoicePeriodEndIso) {
+        updateData.current_period_end = invoicePeriodEndIso;
       }
       updateData.activeOffer = extractActiveOffer(subscription);
     } catch (err) {
@@ -746,11 +754,9 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
           }
 
           // Sync period end
-          const periodEnd = (activeSub as any).current_period_end;
-          if (periodEnd) {
-            updateData.current_period_end = new Date(
-              typeof periodEnd === 'number' ? periodEnd * 1000 : periodEnd
-            ).toISOString();
+          const activeSubPeriodEndIso = getSubscriptionPeriodEndIso(activeSub);
+          if (activeSubPeriodEndIso) {
+            updateData.current_period_end = activeSubPeriodEndIso;
           }
 
           await userDb.updateUser(user.userId, updateData);
@@ -1131,12 +1137,9 @@ export async function reconcileStripeUser(
     }
   }
 
-  const periodEnd = (sub as any).current_period_end;
-  if (periodEnd) {
-    const periodEndIso = new Date(typeof periodEnd === 'number' ? periodEnd * 1000 : periodEnd).toISOString();
-    if (user.current_period_end !== periodEndIso) {
-      updates.current_period_end = periodEndIso;
-    }
+  const periodEndIso = getSubscriptionPeriodEndIso(sub);
+  if (periodEndIso && user.current_period_end !== periodEndIso) {
+    updates.current_period_end = periodEndIso;
   }
 
   // Sync activeOffer — always overwrite so removed discounts are cleared

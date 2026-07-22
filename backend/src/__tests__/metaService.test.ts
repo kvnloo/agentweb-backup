@@ -231,6 +231,44 @@ describe('MetaService', () => {
             expect(result).toEqual(mockAdSetData);
         });
 
+        it('forwards destination_type to the Meta payload when provided (ENG-415)', async () => {
+            const mockCreateAdSet = jest.fn().mockResolvedValue({ _data: { id: 'adset_dt' } });
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                createAdSet: mockCreateAdSet,
+            }));
+
+            await service.createAdSet(mockAdAccountId, mockAccessToken, {
+                name: 'AS',
+                campaign_id: 'c1',
+                billing_event: 'IMPRESSIONS',
+                optimization_goal: 'OFFSITE_CONVERSIONS',
+                targeting: { geo_locations: { countries: ['US'] } },
+                daily_budget: 1000,
+                destination_type: 'WEBSITE',
+            });
+
+            expect(mockCreateAdSet).toHaveBeenCalledWith([], expect.objectContaining({ destination_type: 'WEBSITE' }));
+        });
+
+        it('omits destination_type from the payload when not provided (ENG-415)', async () => {
+            const mockCreateAdSet = jest.fn().mockResolvedValue({ _data: { id: 'adset_no_dt' } });
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                createAdSet: mockCreateAdSet,
+            }));
+
+            await service.createAdSet(mockAdAccountId, mockAccessToken, {
+                name: 'AS',
+                campaign_id: 'c1',
+                billing_event: 'IMPRESSIONS',
+                optimization_goal: 'REACH',
+                targeting: { geo_locations: { countries: ['US'] } },
+                daily_budget: 1000,
+            });
+
+            const payload = mockCreateAdSet.mock.calls[0][1];
+            expect(payload).not.toHaveProperty('destination_type');
+        });
+
         it('should update an ad set', async () => {
             const mockUpdate = jest.fn().mockResolvedValue({});
             (AdSet as unknown as jest.Mock).mockImplementation(() => ({
