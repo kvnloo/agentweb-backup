@@ -20,6 +20,7 @@ const CHAT = {
 function chatArgs(cap, sessionId, modelOverride) {
   const m = CHAT[cap] || {};
   const a = ['-p', '--output-format', 'stream-json', '--verbose', '--model', modelOverride || m.model, '--max-turns', String(m.maxTurns)];
+  a.push('--settings', '{"includeCoAuthoredBy":false}'); // no Claude co-author trailer on chat commits/PRs
   if (cap === 'readOnly') a.push('--allowedTools', (m.allowedTools || []).join(','));
   else {
     a.push('--dangerously-skip-permissions');

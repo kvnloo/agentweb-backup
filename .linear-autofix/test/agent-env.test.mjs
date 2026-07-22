@@ -27,11 +27,12 @@ function makeEnv(config, procEnv) {
 }
 
 const config = {
-  assigneeLinearKeyEnv: { 'mvarma@argusoft.com': 'LINEAR_KEY_MVARMA', 'hshah@argusoft.com': 'LINEAR_KEY_HSHAH' },
+  assigneeLinearKeyEnv: { 'mvarma@argusoft.com': 'LINEAR_KEY_MVARMA', 'aseth@argusoft.com': 'LINEAR_KEY_ASETH' },
   assigneeGhTokenEnv: { 'mvarma@argusoft.com': 'GH_TOKEN_MVARMA' },
 };
-// The shared/global key is Harshit's; LINEAR_KEY_HSHAH is intentionally NOT set (mirrors prod).
-const procEnv = { LINEAR_API_KEY: 'GLOBAL-harshit-key', LINEAR_KEY_MVARMA: 'MANAN-key', GH_TOKEN_MVARMA: 'MANAN-gh', PATH: '/usr/bin' };
+// The shared/global key is the poller's own key; LINEAR_KEY_ASETH is intentionally left unset here to
+// exercise the "assignee is configured in the map but their key env is empty" branch.
+const procEnv = { LINEAR_API_KEY: 'GLOBAL-SHARED-key', LINEAR_KEY_MVARMA: 'MANAN-key', GH_TOKEN_MVARMA: 'MANAN-gh', PATH: '/usr/bin' };
 
 console.log('agent env — Linear scoped to the assignee, shared key never leaks');
 {
@@ -40,13 +41,13 @@ console.log('agent env — Linear scoped to the assignee, shared key never leaks
   // happy path: ENG-200 full turn, assignee Manan (has a key) → agent gets Manan's key, NOT the global
   const full = agentEnv({ assigneeEmail: 'mvarma@argusoft.com' }, { email: 'mvarma@argusoft.com', idEnv: { GIT_AUTHOR_NAME: 'Manan Varma' } });
   ok(full.LINEAR_API_KEY === 'MANAN-key', 'full turn: LINEAR_API_KEY is the assignee (Manan) key');
-  ok(full.LINEAR_API_KEY !== 'GLOBAL-harshit-key', 'full turn: the shared/global key is NOT used');
+  ok(full.LINEAR_API_KEY !== 'GLOBAL-SHARED-key', 'full turn: the shared/global key is NOT used');
   ok(full.GH_TOKEN === 'MANAN-gh', 'full turn: assignee GH token attached');
   ok(full.GIT_AUTHOR_NAME === 'Manan Varma', 'full turn: assignee git identity attached');
   ok(full.PATH === '/usr/bin', 'full turn: the rest of the env is preserved');
 
-  // error path: assignee configured but their key env is UNSET (e.g. hshah) → NO Linear key (not shared)
-  const noKey = agentEnv({ assigneeEmail: 'hshah@argusoft.com' }, { email: 'hshah@argusoft.com', idEnv: {} });
+  // error path: assignee configured but their key env is UNSET (e.g. aseth here) → NO Linear key (not shared)
+  const noKey = agentEnv({ assigneeEmail: 'aseth@argusoft.com' }, { email: 'aseth@argusoft.com', idEnv: {} });
   ok(!('LINEAR_API_KEY' in noKey), 'assignee with an unset key env → LINEAR_API_KEY removed (never the shared key)');
 
   // error path: assignee not in the key map at all → LINEAR_API_KEY removed

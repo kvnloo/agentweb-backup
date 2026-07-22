@@ -9,7 +9,7 @@ console.log('assigneeBranchPrefix');
 {
   ok(assigneeBranchPrefix({ name: 'Manan Varma', email: 'mvarma@argusoft.com' }, 'autofix/') === 'manan/', 'first name only, lowercased → "manan/"');
   ok(assigneeBranchPrefix({ name: 'Anurag Seth' }, 'autofix/') === 'anurag/', 'multi-word name → first word only');
-  ok(assigneeBranchPrefix({ name: 'Harshit' }, 'autofix/') === 'harshit/', 'single-word name works');
+  ok(assigneeBranchPrefix({ name: 'Ravi' }, 'autofix/') === 'ravi/', 'single-word name works');
 
   // fallbacks — no resolvable assignee name → the provided fallback (config.branchPrefix)
   ok(assigneeBranchPrefix(null, 'autofix/') === 'autofix/', 'null identity → fallback');
