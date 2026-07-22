@@ -165,7 +165,7 @@ mcpToolRegistry.register({
   name: 'emma_create_session',
   definition: {
     name: 'emma_create_session',
-    description: 'Create a new Emma chat session. Emma is a full GTM (go-to-market) automation agent — the entry point for delegating any marketing/growth task to her via emma_send_message. Emma operates capabilities these MCP tools do not expose directly, including Meta (Facebook/Instagram) Ads, other paid social ads, CRM/lead engagement, social posting, content, landing pages, and multi-step work plans. Do NOT assume a capability (e.g. Meta / paid ads) is unavailable before creating a session and delegating the request to Emma; if a prerequisite like a connected ad account is missing, Emma will say so and guide the user to connect it rather than the capability being unsupported.',
+    description: 'Create a new Emma chat session — the entry point for delegating marketing/growth work to Emma, a full GTM (go-to-market) automation agent. Emma operates capabilities these MCP tools do not expose directly: paid social ads (including Meta/Facebook/Instagram), organic social posting, CRM and lead engagement, content and blogs, landing pages, and multi-step work plans. Delegate such requests via emma_send_message rather than assuming they are unsupported; if a prerequisite is missing (e.g. an unconnected account), Emma reports it and guides the user to connect it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -184,7 +184,7 @@ mcpToolRegistry.register({
   name: 'emma_send_message',
   definition: {
     name: 'emma_send_message',
-    description: 'Send a message to an Emma chat session and get a response. Delegate the user\'s actual marketing/growth request here in natural language and Emma executes it end to end. Emma can build and manage Meta (Facebook/Instagram) Ads campaigns and other paid social ads, as well as CRM/lead engagement, social posting, content creation, landing pages, and multi-step work plans. When a user asks to create or manage a Meta / paid-ads / social-ads campaign, delegate it by messaging Emma (e.g. "kick off a work plan for a B2B social ads campaign") rather than replying that the capability is unsupported. If a prerequisite is missing (e.g. no Meta Ads account connected yet), Emma reports that and tells the user how to connect it — relay her guidance instead of concluding Emma cannot do Meta ads.',
+    description: 'Send a message to an Emma chat session and get a response. Delegate the user\'s marketing/growth request in natural language and Emma executes it end to end — across paid social ads (including Meta), organic social, CRM and lead engagement, content, landing pages, and multi-step work plans. If a prerequisite is missing (e.g. an unconnected ad account), Emma reports it and explains how to connect it — relay that guidance rather than concluding the capability is unavailable.',
     inputSchema: {
       type: 'object',
       properties: {
