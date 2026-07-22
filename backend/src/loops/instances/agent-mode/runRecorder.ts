@@ -33,6 +33,7 @@ import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
 import { classifyToolFailureType } from '../../../utils/toolFailureType';
 import { AGENT_MODE_LOOP_ID } from './eventTypes';
 import {
+  EVT_CLAIM_CHECK_ERROR,
   EVT_DECISION,
   EVT_RUN_COMPLETED,
   EVT_RUN_FAILED,
@@ -56,6 +57,10 @@ export interface RunVerdictInput {
   /** Highest per-tool failure count in the run — catches retry spirals that a
    * low overall ratio hides (e.g. one tool retried 15× in a 100-call run). */
   maxSameToolFailures?: number;
+  /** The finalize guard found the final message claiming a completed action the
+   * tool ledger does not back, and the corrective turn did not resolve it
+   * (ENG-143). User-facing degradation even with zero tool failures. */
+  claimMismatch?: boolean;
 }
 
 /**
@@ -77,6 +82,7 @@ export function computeRunVerdict(input: RunVerdictInput): {
     reasons.push('high_failure_ratio');
   }
   if ((input.maxSameToolFailures ?? 0) >= 3) reasons.push('repeated_tool_failures');
+  if (input.claimMismatch) reasons.push('claim_mismatch');
 
   return reasons.length > 0 ? { verdict: 'degraded', reasons } : { verdict: 'ok', reasons: [] };
 }
@@ -127,7 +133,9 @@ export class AgentRunRecorder {
 
   async runStarted(
     runId: string,
-    info: { llmModel?: string; sessionType?: string; userId?: string; sessionId?: string } = {},
+    /** `traceId` is the OTel bridge (ENG-141): the active trace id, so a run in
+     * Dev-AW-LoopEvents can be joined to its Langfuse/Okareo trace by ID. */
+    info: { llmModel?: string; sessionType?: string; userId?: string; sessionId?: string; traceId?: string } = {},
   ): Promise<void> {
     await this.emit(runId, EVT_RUN_STARTED, cleanDims(info));
   }
@@ -249,7 +257,7 @@ export class AgentRunRecorder {
 
   async runCompleted(
     runId: string,
-    info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string } = {},
+    info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string; claimMismatch?: boolean } = {},
   ): Promise<void> {
     // Enqueue BOTH the terminal record and its verdict SYNCHRONOUSLY (no await
     // between) so they are both on the write chain before this method yields —
@@ -276,18 +284,36 @@ export class AgentRunRecorder {
     await Promise.all([failed, verdict]);
   }
 
+  /**
+   * The finalize guard's claim check itself failed (judge/correction LLM call
+   * errored, ENG-143). Emitted LOUDLY as its own event class: on judge failure
+   * the guard delivers the chat unchanged, so this event is the only durable
+   * trace that a truthfulness check was skipped for the run.
+   */
+  async claimCheckError(
+    runId: string,
+    info: { error: unknown; sessionId?: string },
+  ): Promise<void> {
+    await this.emit(runId, EVT_CLAIM_CHECK_ERROR, {
+      ...(info.sessionId ? { sessionId: info.sessionId } : {}),
+      errorClass: errorClassOf(info.error),
+      errorMessage: errorMessageOf(info.error),
+    });
+  }
+
   /** Durable outcome verdict alongside the terminal event — the loop's sensor
    * reads these; the inspector's read-time flags are invisible to the policy. */
   private async emitVerdict(
     runId: string,
     failed: boolean,
-    info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string },
+    info: { toolCalls?: number; failedToolCalls?: number; maxSameToolFailures?: number; sessionId?: string; claimMismatch?: boolean },
   ): Promise<void> {
     const { verdict, reasons } = computeRunVerdict({
       failed,
       toolCalls: info.toolCalls ?? 0,
       failedToolCalls: info.failedToolCalls ?? 0,
       maxSameToolFailures: info.maxSameToolFailures,
+      claimMismatch: info.claimMismatch,
     });
     await this.emit(runId, EVT_RUN_VERDICT, {
       verdict,

@@ -1,4 +1,4 @@
-import { getLinkedInCredentials, getLinkedInAdsSecrets, getMetaCredentials, getGmailCredentials, getYouTubeCredentials, getFathomCredentials, getClickUpCredentials, getHubSpotCredentials, getAttioCredentials, getGoogleAdsCredentials } from '../utils/secretsManager';
+import { getLinkedInCredentials, getLinkedInAdsSecrets, getMetaCredentials, getGmailCredentials, getOutlookCredentials, getYouTubeCredentials, getFathomCredentials, getClickUpCredentials, getHubSpotCredentials, getAttioCredentials, getGoogleAdsCredentials, getTwitterCredentials } from '../utils/secretsManager';
 import { MetaConfig } from '../types/meta';
 
 // Graph API version for Auth/Token exchange - decoupled from SDK version
@@ -85,6 +85,22 @@ export const INTEGRATION_CONFIG = {
       'https://www.googleapis.com/auth/userinfo.profile',
     ],
   },
+  outlook: {
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/outlook/callback`,
+    // 'common' = multitenant + personal accounts. The Entra app registration must be
+    // multitenant too, or only our own tenant can ever consent.
+    authorizationUrl: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize',
+    tokenUrl: 'https://login.microsoftonline.com/common/oauth2/v2.0/token',
+    profileUrl: 'https://graph.microsoft.com/v1.0/me',
+    sendMailUrl: 'https://graph.microsoft.com/v1.0/me/sendMail',
+    scopes: [
+      'https://graph.microsoft.com/Mail.Send',
+      // Mail.Read backs reply threading, and NDR/bounce detection (ENG-266 Part 3).
+      'https://graph.microsoft.com/Mail.Read',
+      'https://graph.microsoft.com/User.Read',
+      'offline_access',
+    ],
+  },
 
   googleDrive: {
     redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/google-drive/callback`,
@@ -93,7 +109,7 @@ export const INTEGRATION_CONFIG = {
     revokeUrl: 'https://oauth2.googleapis.com/revoke',
     profileUrl: 'https://www.googleapis.com/oauth2/v2/userinfo',
     scopes: [
-      'https://www.googleapis.com/auth/drive.file',
+      'https://www.googleapis.com/auth/drive',
       'https://www.googleapis.com/auth/documents',
       'https://www.googleapis.com/auth/spreadsheets',
       'https://www.googleapis.com/auth/userinfo.email',
@@ -180,6 +196,38 @@ export const INTEGRATION_CONFIG = {
     // ClickUp OAuth grants access to all workspaces the user has access to;
     // no explicit scopes are required in the authorization request.
     scopes: [] as string[],
+  },
+
+  twitter: {
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/twitter/callback`,
+    // offline.access is required to receive a refresh_token (access tokens expire ~2h).
+    // dm.read / dm.write require Elevated access in Twitter Developer Portal.
+    // follows.read/write required for follow/unfollow/list-followers/list-following actions.
+    // like.read/write required for like-tweet/unlike-tweet actions.
+    // bookmark.read/write required for bookmark/get-bookmarks actions.
+    // list.read required for list_owned_lists / get_list_members / get_list_tweets actions.
+    //   NOTE: adding this scope means X accounts connected BEFORE this change must be
+    //   reconnected to grant it — the list read handlers surface a clear reconnect
+    //   error (not a silent empty result) when the token lacks list.read.
+    scopes: [
+      'tweet.read',
+      'tweet.write',
+      'users.read',
+      'follows.read',
+      'follows.write',
+      'like.read',
+      'like.write',
+      'bookmark.read',
+      'bookmark.write',
+      'list.read',
+      'dm.read',
+      'dm.write',
+      'block.read',
+      'block.write',
+      'mute.read',
+      'mute.write',
+      'offline.access',
+    ],
   },
 
   linkedinAds: {
@@ -339,6 +387,47 @@ export async function getGmailConfig(): Promise<GmailOAuthConfig> {
   };
   gmailConfigCacheExpiresAt = Date.now() + GMAIL_CONFIG_CACHE_TTL_MS;
   return cachedGmailConfig;
+}
+
+// Outlook / Microsoft 365 configuration interface
+export interface OutlookOAuthConfig {
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+  scopes: string[];
+  authorizationUrl: string;
+  tokenUrl: string;
+  profileUrl: string;
+  sendMailUrl: string;
+}
+
+// Module-level cache — avoids hitting Secrets Manager on every Graph API call
+let cachedOutlookConfig: OutlookOAuthConfig | null = null;
+let outlookConfigCacheExpiresAt = 0;
+const OUTLOOK_CONFIG_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Returns Outlook / Microsoft 365 OAuth configuration.
+ * Credentials come from AWS Secrets Manager (dev/AgentWeb/Microsoft/Outlook or prod/...).
+ * Result is cached for 5 minutes to avoid per-request Secrets Manager calls.
+ */
+export async function getOutlookConfig(): Promise<OutlookOAuthConfig> {
+  if (cachedOutlookConfig && Date.now() < outlookConfigCacheExpiresAt) {
+    return cachedOutlookConfig;
+  }
+  const credentials = await getOutlookCredentials();
+  cachedOutlookConfig = {
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    redirectUri: INTEGRATION_CONFIG.outlook.redirectUri,
+    scopes: INTEGRATION_CONFIG.outlook.scopes,
+    authorizationUrl: INTEGRATION_CONFIG.outlook.authorizationUrl,
+    tokenUrl: INTEGRATION_CONFIG.outlook.tokenUrl,
+    profileUrl: INTEGRATION_CONFIG.outlook.profileUrl,
+    sendMailUrl: INTEGRATION_CONFIG.outlook.sendMailUrl,
+  };
+  outlookConfigCacheExpiresAt = Date.now() + OUTLOOK_CONFIG_CACHE_TTL_MS;
+  return cachedOutlookConfig;
 }
 
 // Google Drive OAuth configuration
@@ -631,3 +720,4 @@ export async function getAttioConfig(): Promise<AttioOAuthConfig> {
   attioConfigCacheExpiresAt = Date.now() + ATTIO_CONFIG_CACHE_TTL_MS;
   return cachedAttioConfig;
 }
+

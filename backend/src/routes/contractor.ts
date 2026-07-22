@@ -1,5 +1,6 @@
 import express from "express";
 import jwt from "jsonwebtoken";
+import { getJwtSecret } from "../config/jwt";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { userDb } from "../services/db";
@@ -92,7 +93,7 @@ router.post("/assigned-users/:userId/delegate-access", async (req, res) => {
 
     const delegateToken = jwt.sign(
       delegatePayload,
-      process.env.JWT_SECRET || "your-secret-key",
+      getJwtSecret(),
       { expiresIn: "90d" }
     );
 

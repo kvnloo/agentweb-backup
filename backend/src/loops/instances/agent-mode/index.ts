@@ -19,6 +19,7 @@
 import { CaptureGate } from '../../core/gates/captureGate';
 import { SlackReactionGate } from '../../core/gates/slackReactionGate';
 import { postLoopDigest, type LoopDigestTemplate } from '../../core/digest/loopDigest';
+import { claimLoopDailyDigestPost } from '../../core/digest/dailyDigestClaim';
 import { createInstanceRunner } from '../../core/instanceRunner';
 import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
 import { CooldownRuleSet } from '../../core/policy/cooldownRuleSet';
@@ -66,7 +67,15 @@ const runner = createInstanceRunner({
     // AGENT_MODE_LOOP_DIGEST=true once the Slack approval gate (C1) makes the
     // digest actionable. See dev.md 2026-06-14.
     if (process.env.AGENT_MODE_LOOP_DIGEST !== 'true') return;
-    await postLoopDigest(result, ports.slack, manifest.approval.slackUserId, agentModeDigestTemplate, drained.length);
+    await postLoopDigest(result, ports.slack, manifest.approval.slackUserId, agentModeDigestTemplate, drained.length, {
+      claimDailyDigest: (digestDate, slackUserId, runId) =>
+        claimLoopDailyDigestPost(ports.dynamo, {
+          loopId: AGENT_MODE_LOOP_ID,
+          digestDate,
+          slackUserId,
+          runId,
+        }),
+    });
   },
 });
 
@@ -99,6 +108,52 @@ export function getAgentRunRecorder(): AgentRunRecorder | null {
 export function isAgentRuntimeSpineEnabled(): boolean {
   return process.env.AGENT_RUNTIME_SPINE_ENABLED === 'true'
     || process.env.AGENT_MODE_LOOP_ENABLED === 'true';
+}
+
+/**
+ * Foot-gun check (ENG-143, found by live-testing on env1): AGENT_FINALIZE_GUARD
+ * gates the finalize guard itself, but claim_mismatch verdicts only reach
+ * Dev-AW-LoopEvents (and therefore the 17:30 UTC cron) through the recorder,
+ * which is a no-op unless the runtime spine is SEPARATELY enabled. Flipping
+ * only AGENT_FINALIZE_GUARD gives you working correction behavior in chat
+ * with zero telemetry and zero error — this makes that silent gap loud.
+ *
+ * AGENT_FINALIZE_GUARD_SHADOW (detect + telemetry only, never rewrites the
+ * message — see agentModeService.ts) has the SAME dependency, but the
+ * consequence is worse: shadow mode's entire purpose is collecting
+ * claim_mismatch telemetry, so without the spine it does nothing at all
+ * except pay for judge-call latency/cost on every flagged reply.
+ *
+ * Enforce mode takes precedence in the returned message when both are set,
+ * since AGENT_FINALIZE_GUARD alone already implies shadow's checks are also
+ * running (runFinalizeGuard is the same call either way).
+ *
+ * Returns a warning string to log, or null when correctly configured (or when
+ * neither guard mode is on, in which case the spine is irrelevant to this).
+ */
+export function checkFinalizeGuardMisconfiguration(): string | null {
+  const enforceOn = process.env.AGENT_FINALIZE_GUARD === 'true';
+  const shadowOn = process.env.AGENT_FINALIZE_GUARD_SHADOW === 'true';
+  if (!enforceOn && !shadowOn) return null;
+  if (isAgentRuntimeSpineEnabled()) return null;
+
+  if (enforceOn) {
+    return (
+      'AGENT_FINALIZE_GUARD is enabled but the runtime spine is not '
+      + '(AGENT_RUNTIME_SPINE_ENABLED / AGENT_MODE_LOOP_ENABLED are both unset/false). '
+      + 'The finalize guard will still correct replies in chat, but claim_mismatch '
+      + 'verdicts will never be recorded, so the 17:30 UTC agent-mode cron will never '
+      + 'see them. Set AGENT_RUNTIME_SPINE_ENABLED=true to get truthfulness telemetry.'
+    );
+  }
+  return (
+    'AGENT_FINALIZE_GUARD_SHADOW is enabled but the runtime spine is not '
+    + '(AGENT_RUNTIME_SPINE_ENABLED / AGENT_MODE_LOOP_ENABLED are both unset/false). '
+    + 'Shadow mode NEVER rewrites the message it sees — its only output is '
+    + 'claim_mismatch telemetry — so with the spine off it is doing nothing but '
+    + 'paying judge-call latency/cost on every flagged reply for zero benefit. '
+    + 'Set AGENT_RUNTIME_SPINE_ENABLED=true or turn AGENT_FINALIZE_GUARD_SHADOW off.'
+  );
 }
 
 /**
@@ -155,10 +210,10 @@ const agentModeDigestTemplate: LoopDigestTemplate<number> = {
     `_No agent-mode tool events in the 7d window — recorder off, or no tool use. Not "healthy", just empty._`,
   ],
   quietBody: () => [
-    `_No tool crossed the failure threshold this window. Tool reliability looks healthy._`,
+    `_No tool crossed the failure threshold this window. Keep watching the trend; this is not a dispatchable finding._`,
   ],
   findingsBody: (result, drainedCount) => [
-    `*Failing tools (fix specs dispatched: ${drainedCount})*`,
+    `*Failing tools (fix specs prepared: ${drainedCount})*`,
     ...result.proposals.map((p, i) => `${i + 1}. ${p.hypothesis}`),
   ],
 };

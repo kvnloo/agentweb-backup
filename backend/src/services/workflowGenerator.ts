@@ -1,5 +1,5 @@
 import yaml from 'js-yaml';
-import { getAzureClient } from '../utils/llmClients';
+import { getAzureClient, meterUsageFromResponse } from '../utils/llmClients';
 import { taskDb } from './db';
 import { Task } from '../types/task';
 
@@ -200,7 +200,9 @@ When creating task nodes, you can either:
 If referencing an existing task, use its taskId and the task's prompt will be automatically used.
 If creating a new task, provide a prompt that describes what the task should do.`;
 
-  const openai = getAzureClient({ userId, feature: 'workflow_gen' }, process.env.AZURE_OPENAI_DEPLOYMENT);
+  // Un-metered: metered explicitly below via meterUsageFromResponse; auto-metering
+  // here would double-record the same response (ENG-200).
+  const openai = getAzureClient({ userId, feature: 'workflow_gen' }, process.env.AZURE_OPENAI_DEPLOYMENT, { metered: false });
   const completion = await openai.chat.completions.create({
     model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
     messages: [
@@ -210,6 +212,13 @@ If creating a new task, provide a prompt that describes what the task should do.
     functions: [functionDefinition],
     function_call: { name: 'generate_workflow' }
   });
+
+  meterUsageFromResponse({
+    userId,
+    model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
+    provider: 'azure',
+    feature: 'workflow_gen',
+  }, completion);
 
   const functionCall = completion.choices[0].message.function_call;
   if (!functionCall?.arguments) {
@@ -259,7 +268,9 @@ export async function generateWorkflowFromDescription(
     const { nodes, edges } = generateVisualization(workflowData);
 
     // Get a user-friendly explanation of the workflow
-    const openai = getAzureClient({ userId, feature: 'workflow_gen' }, process.env.AZURE_OPENAI_DEPLOYMENT);
+    // Un-metered: metered explicitly below via meterUsageFromResponse; auto-metering
+  // here would double-record the same response (ENG-200).
+  const openai = getAzureClient({ userId, feature: 'workflow_gen' }, process.env.AZURE_OPENAI_DEPLOYMENT, { metered: false });
     const explanation = await openai.chat.completions.create({
       model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
       messages: [
@@ -272,6 +283,13 @@ export async function generateWorkflowFromDescription(
       temperature: 0.7,
       max_tokens: 150
     });
+
+    meterUsageFromResponse({
+      userId,
+      model: process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4',
+      provider: 'azure',
+      feature: 'workflow_explain',
+    }, explanation);
 
     return {
       yaml: yamlContent,

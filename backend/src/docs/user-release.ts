@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-06-30
+// Last updated: 2026-07-17
 
 export interface UserReleaseNote {
   date: string;
@@ -8,6 +8,97 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-07-17',
+    changes: [
+      'New: Send Campaigns and Sequences From a Connected Outlook / Microsoft 365 Mailbox',
+      '- Previously, a connected Outlook mailbox could only be used to send from Emma chat — campaigns and sequences always sent through your custom-domain sender instead',
+      '- Now, selecting a connected Outlook (or Gmail) mailbox as your sender works the same way for campaigns, sequence steps, and single-lead sends: the email leaves from your own mailbox, and a copy lands in your Sent folder',
+      '- Mailbox senders don\'t report opens or clicks (no tracking pixel), so a campaign sent this way is capped at 50 recipients — larger sends still need a custom-domain sender',
+      '- Bounced or rejected messages from a connected Outlook mailbox are now automatically detected and the lead is marked do-not-contact, the same protection your custom-domain senders already had via Resend',
+    ],
+  },
+  {
+    date: '2026-07-17',
+    changes: [
+      'Retired: Local Agent Browser Fallback',
+      '- The Local Agent (a relay to a real browser running on a local machine) has been retired and its tools no longer run',
+      '- If an older skill or scheduled chat still tries to use it, Emma now gets a clear message explaining it was retired and pointing her at web search instead of silently failing',
+      '- For web research and page lookups, Emma uses her built-in web search; workloads that genuinely needed the local browser are being migrated to replacements',
+    ],
+  },
+  {
+    date: '2026-07-15',
+    changes: [
+      'Fixed: Daily Satisfaction Score Report No Longer Times Out on Busy Days',
+      '- When you asked for chat history with on-the-fly satisfaction scoring (sync=true) over a busy time range, the request could take so long generating scores that it timed out and returned nothing — leaving the Daily Satisfaction Score Report with no data',
+      '- Scoring now runs several sessions in parallel and within a time budget, so the request returns before it can time out',
+      '- If a range has more unscored sessions than fit in that budget, you now get the sessions with the scores computed so far (plus any already-cached scores) instead of an all-or-nothing failure; the remaining sessions are scored on the next run, so coverage catches up automatically',
+    ],
+  },
+  {
+    date: '2026-07-14',
+    changes: [
+      'Fixed: Your Landing Pages Now Actually Record Where Their Leads Came From',
+      '- When someone filled in a form on one of your landing pages, the lead reached your CRM with no record of how they found you — the ad, the campaign, the source were all lost on the way in',
+      '- Leads from your landing pages now arrive carrying where they came from, so you can finally tell which campaign or ad actually produced them',
+      '- Two things were quietly breaking this. Attaching a custom domain or subdomain to a page silently removed its lead-tracking code, so any page you had bothered to give a proper address to was the least likely to be tracked. And wiring a page to a CRM list AFTER it was built never actually installed the code that saves the leads — the page looked correctly configured and captured nothing',
+      '- Both are fixed, and existing pages are repaired automatically the next time they are updated',
+      '',
+      'Fixed: Leads From Multi-Page Sites Went Into the Wrong List',
+      '- If your site had several pages pointing at different CRM lists, every page was saving its leads into whichever list was set up last — so leads from your pricing page could quietly end up in your webinar list',
+      '- Each page now saves to its own list, correctly',
+      '',
+      'Changed: Pages With No CRM List Now Tell You Instead of Silently Losing Leads',
+      '- A page with no CRM list attached cannot save leads anywhere. It used to accept the form and quietly discard the submission (or, on a multi-page site, file it into a different page\'s list)',
+      '- Such a page is now clearly flagged in your dashboard, and its form shows an error rather than pretending to have worked. If a form that seemed fine starts reporting an error, it means it was never really saving those leads — attach a CRM list and it will start working properly',
+      '',
+      'Changed: Attaching a CRM List Republishes the Page',
+      '- The code that saves leads lives inside the page itself, so changing the CRM list republishes your live page. It takes about a minute, and the dashboard now tells you before and after',
+      '- Detaching a list now asks you to confirm, because it stops that page saving leads immediately',
+    ],
+  },
+  {
+    date: '2026-07-13',
+    changes: [
+      'Fixed: Sequences Now Stop When a Lead Engages',
+      '- If you set a sequence to stop once a lead opens, clicks, or replies, that setting was not being applied. The check behind it never ran, so a sequence would keep sending regardless',
+      '- Replies were not checked at all — the case where it stings most: a lead answers you, and the automated follow-ups keep arriving anyway',
+      '- All three now work, and you can choose whichever fits the campaign: stop on open, on click, or on reply',
+      '- Only engagement that happens AFTER a lead is enrolled counts, so an old open or click from an earlier campaign will not cut a new sequence short',
+    ],
+  },
+  {
+    date: '2026-07-11',
+    changes: [
+      'New: Ads Emma Deploys Now Tell You Which Leads They Produced',
+      '- Until now, a lead that arrived from one of your ads looked exactly like a lead that wandered in from anywhere else — so you could see that an ad spent money, but not whether it earned any',
+      '- Emma now automatically tags the destination URL of every ad it deploys on Meta, Google, and LinkedIn, so leads arriving on your landing page carry the campaign and ad that sent them, all the way through to your CRM',
+      '- If you already put your own tracking on a URL, Emma leaves it exactly as you set it and only fills in the parts you left out — your setup is never overwritten',
+      '- Existing campaigns are left completely untouched. Nothing is changed behind your back',
+      '- Ask Emma "which of my campaigns are missing UTM tracking?" and she will list them per ad account, so you can decide which ones to bring across',
+      '- She reports ads she could not read separately from ads that are genuinely untagged, so you are never sent to "fix" an ad that was fine',
+    ],
+  },
+  {
+    date: '2026-07-08',
+    changes: [
+      'Improved: Your LinkedIn Invite Note Is Never Silently Dropped',
+      '- Free LinkedIn accounts can only attach a personalized note to a limited number of invitations each month. Once that monthly note allowance is used up, LinkedIn rejects any invite that carries a note',
+      '- Previously, when this happened, the connection request was quietly sent WITHOUT your note — so a message you deliberately wrote to get the recipient\'s attention could go missing without you knowing',
+      '- Now it is your call: if the note can\'t be attached, the invite is held and you are asked whether to send the connection request without the note or skip it — both when you send from the CRM and when you ask Emma to send invites in chat',
+      '- If you choose to send without the note, we tell you plainly that it went out as a plain connection request, so what you see always matches what was actually sent',
+      '- For scheduled outreach, affected invites are paused instead of being sent noteless; open the run\'s chat from your email to decide what to do',
+    ],
+  },
+  {
+    date: '2026-07-06',
+    changes: [
+      'Fixed: Emma No Longer Says She "Can\'t" Create Google Docs',
+      '- Previously, if you had connected Google Drive but had not shared any folder with AgentWeb, Emma could wrongly conclude she was unable to create Google Docs or Sheets — even though that capability was available',
+      '- Emma now correctly recognizes that creating and editing Google Docs and Sheets is a separate capability from browsing shared Drive folders, so she no longer turns down a request she can actually fulfill',
+    ],
+  },
   {
     date: '2026-06-30',
     changes: [

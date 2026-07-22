@@ -28,6 +28,8 @@
  * service tightens this at the LLM-output boundary.
  */
 
+import { randomUUID } from "crypto";
+
 export type ICPStatus = "idle" | "running" | "ready" | "failed";
 
 /**
@@ -35,12 +37,43 @@ export type ICPStatus = "idle" | "running" | "ready" | "failed";
  * boundary can tighten it without churning persistence types every time
  * the prompt evolves.
  */
+/** The persona fields a user may edit, and therefore may anchor. */
+export const ICP_PERSONA_FIELD_NAMES = [
+  "name",
+  "pain",
+  "desire",
+  "objection",
+  "meta_targeting_brief",
+] as const;
+
+export type ICPPersonaField = (typeof ICP_PERSONA_FIELD_NAMES)[number];
+
 export interface ICPPersona {
+  /**
+   * Stable, server-minted identity for this persona card. Personas used to be
+   * addressed positionally (`icp-<index>`), but `/icp/delete-one` splices the
+   * array and the FE does not refetch, so the browser's indices silently drift
+   * off the stored ones — deleting one card made the next edit or regeneration
+   * hit its neighbour. Optional because records written before this existed
+   * carry no id; `GET /icp/status` backfills them.
+   */
+  id?: string;
   name: string;
   pain: string;
   desire: string;
   objection: string;
   meta_targeting_brief: string;
+  /**
+   * The user's own words, per field, exactly as they typed them in the ICP
+   * review screen. Written only by `/icp/edit-one`; never by generation.
+   *
+   * This is an *anchor*, not a snapshot: every regeneration of this persona
+   * is driven from `userIntent` rather than from the last generated value, so
+   * repeated regenerations can never walk the persona away from what the user
+   * asked for. A persona carrying an anchor is also never clobbered by a
+   * full-set run. See ENG-255.
+   */
+  userIntent?: Partial<Record<ICPPersonaField, string>>;
 }
 
 export interface ICPStatusFields {
@@ -70,6 +103,31 @@ const MAX_NAME_LEN = 200;
 const MAX_TEXT_LEN = 1000;
 const MAX_BRIEF_LEN = 2000;
 const MAX_ERROR_LEN = 512;
+const MAX_ID_LEN = 64;
+
+/** Per-field caps, so an anchor can never outrun the field it anchors. */
+const PERSONA_FIELD_MAX_LEN: Record<ICPPersonaField, number> = {
+  name: MAX_NAME_LEN,
+  pain: MAX_TEXT_LEN,
+  desire: MAX_TEXT_LEN,
+  objection: MAX_TEXT_LEN,
+  meta_targeting_brief: MAX_BRIEF_LEN,
+};
+
+/** Shape of a server-minted persona id. Distinguishes it from `icp-<index>`. */
+export const MINTED_ICP_ID_RE = /^icp_[A-Za-z0-9_-]+$/;
+
+/**
+ * Assign a stable id to every persona that lacks one, leaving existing ids
+ * untouched. `mint` is injectable so tests can assert deterministically.
+ */
+export function ensurePersonaIds(
+  personas: ICPPersona[],
+  mint: () => string = () => `icp_${randomUUID()}`,
+): ICPPersona[] {
+  if (!Array.isArray(personas)) return [];
+  return personas.map((p) => (p?.id ? p : { ...p, id: mint() }));
+}
 
 /**
  * Compute a patch that marks ICP generation as just-started. Idempotent:
@@ -163,6 +221,30 @@ export function icpSnapshot(
 }
 
 /**
+ * Sanitize an edit anchor: keep only known persona fields with string values,
+ * bounded. Returns undefined when there is nothing worth persisting, so an
+ * unedited persona carries no `userIntent` key at all.
+ */
+export function sanitizeUserIntent(
+  raw: unknown,
+): Partial<Record<ICPPersonaField, string>> | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const src = raw as Record<string, unknown>;
+  const out: Partial<Record<ICPPersonaField, string>> = {};
+  for (const field of ICP_PERSONA_FIELD_NAMES) {
+    const value = src[field];
+    if (typeof value === "string" && value.length > 0) {
+      // Bound each anchor by the SAME cap as the field it anchors. A shared cap
+      // lets the anchor keep text that `sanitizeICPPersonas` truncates off the
+      // visible field — and since the anchor drives every later regeneration,
+      // the two would diverge further each time.
+      out[field] = value.slice(0, PERSONA_FIELD_MAX_LEN[field]);
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
  * Sanitize + bound-check ICP personas before persistence. Strips
  * malformed entries and caps the array at MAX_ICP_PERSONAS.
  */
@@ -183,13 +265,20 @@ export function sanitizeICPPersonas(raw: unknown): ICPPersona[] {
     ) {
       continue;
     }
-    out.push({
+    const persona: ICPPersona = {
+      ...(typeof v.id === "string" && v.id ? { id: v.id.slice(0, MAX_ID_LEN) } : {}),
       name: v.name.slice(0, MAX_NAME_LEN),
       pain: v.pain.slice(0, MAX_TEXT_LEN),
       desire: v.desire.slice(0, MAX_TEXT_LEN),
       objection: v.objection.slice(0, MAX_TEXT_LEN),
       meta_targeting_brief: v.meta_targeting_brief.slice(0, MAX_BRIEF_LEN),
-    });
+    };
+    // Carry the edit anchor through. Without this the whitelist above would
+    // silently drop it on every write, and the user's words would be lost the
+    // first time anything touched the persona.
+    const intent = sanitizeUserIntent(v.userIntent);
+    if (intent) persona.userIntent = intent;
+    out.push(persona);
     if (out.length >= MAX_ICP_PERSONAS) break;
   }
   return out;

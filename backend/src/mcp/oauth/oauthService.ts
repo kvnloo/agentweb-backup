@@ -138,11 +138,14 @@ export class McpOAuthService {
     // Validate redirect URIs
     for (const uri of params.redirectUris) {
       const parsed = new URL(uri);
-      const isLocalhost = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
-      const isDev = process.env.NODE_ENV === 'development';
+      const isLoopback =
+        parsed.hostname === 'localhost' ||
+        parsed.hostname === '127.0.0.1' ||
+        parsed.hostname === '::1' ||
+        parsed.hostname === '[::1]';
 
-      if (parsed.protocol !== 'https:' && !(isDev && isLocalhost && parsed.protocol === 'http:')) {
-        throw new Error('Redirect URIs must use HTTPS (HTTP only allowed for localhost in development)');
+      if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && isLoopback)) {
+        throw new Error('Redirect URIs must use HTTPS (HTTP only allowed for loopback redirect URIs)');
       }
     }
 

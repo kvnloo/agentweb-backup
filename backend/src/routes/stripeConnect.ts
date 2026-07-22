@@ -14,6 +14,7 @@
  */
 import express, { Request, Response } from 'express';
 import Stripe from 'stripe';
+import { createStripeClient } from '../services/stripeClientFactory';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
@@ -27,14 +28,11 @@ import {
   clearConnectFieldsForUser,
 } from '../services/stripeConnectService';
 import { syncContact } from '../services/contactSyncService';
+import { getJwtSecret } from '../config/jwt';
 
 const router = express.Router();
 
 const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-const STATE_SECRET = process.env.JWT_SECRET;
-if (!STATE_SECRET) {
-  throw new Error('JWT_SECRET must be set for Stripe Connect OAuth state verification');
-}
 
 interface StatePayload {
   userId: string;
@@ -43,14 +41,14 @@ interface StatePayload {
 
 function signState(userId: string): string {
   const nonce = crypto.randomBytes(16).toString('hex');
-  return jwt.sign({ userId, nonce } satisfies StatePayload, STATE_SECRET as string, {
+  return jwt.sign({ userId, nonce } satisfies StatePayload, getJwtSecret(), {
     expiresIn: '15m',
   });
 }
 
 function verifyState(state: string): StatePayload | null {
   try {
-    return jwt.verify(state, STATE_SECRET as string) as StatePayload;
+    return jwt.verify(state, getJwtSecret()) as StatePayload;
   } catch {
     return null;
   }
@@ -197,7 +195,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Missing stripe-signature header' });
   }
 
-  const stripe = new Stripe(stripeKey, { apiVersion: '2025-05-28.basil' as any });
+  const stripe = createStripeClient(stripeKey);
   let event: Stripe.Event;
   try {
     event = stripe.webhooks.constructEvent(req.body, signature, secret);

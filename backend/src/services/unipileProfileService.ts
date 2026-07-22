@@ -143,6 +143,12 @@ const VIEWER_RELATIVE_FIELDS = [
   'is_open_profile',
   'is_invitation_pending',
   'connection_degree',
+  // ENG-440: "am I connected to this person / when did I connect" is viewer-
+  // relative too. Left unstripped, a cache row cold-populated by a non-connected
+  // viewer serves is_relationship:false to a viewer who IS a 1st-degree
+  // connection, and the agent branches invite-vs-DM on the wrong signal.
+  'is_relationship',
+  'connected_at',
 ] as const;
 
 function stripViewerRelativeFields(raw: any): any {
@@ -194,6 +200,27 @@ export class UnipileProfileService {
       apiData = await this.deps.http.fetchProfile(identifierOrUrl, accountId);
     } catch (err: any) {
       const message = err?.message ?? String(err);
+      // Do NOT cache errors that are transient or that are NOT about this profile —
+      // caching them under the profile key traps the identifier behind the 1h
+      // ERROR_TTL and keeps serving a stale failure long after the real cause clears:
+      //   • Timeout (ENG-144): the same profile usually succeeds again in minutes.
+      //   • Account-level failure (disconnected/expired session, auth): this describes
+      //     the ACCOUNT, not the profile. A dead session poisons EVERY profile looked
+      //     up through it, and stays poisoned even after the account reconnects and
+      //     the very same profile fetches fine live (observed: get-profile kept
+      //     returning "Disconnected account" while account.getOne=OK and a
+      //     forceRefresh fetch succeeded). Both self-heal, so let the next lookup
+      //     re-hit Unipile live instead of caching. Only durable, profile-specific
+      //     failures (5xx / validation) get the error-row backoff.
+      const cls = err?.classification || err?.structuredError?.classification;
+      const doNotCache =
+        err?.isTimeout === true ||
+        cls === 'TIMEOUT_ERROR' ||
+        cls === 'AUTH_ERROR' ||
+        /disconnected|session (?:expired|invalid)|not connected|please reconnect/i.test(message);
+      if (doNotCache) {
+        throw err;
+      }
       const errorRow: UnipileCacheRow = {
         canonicalId: key.canonicalId,
         fieldGroup: key.sk,

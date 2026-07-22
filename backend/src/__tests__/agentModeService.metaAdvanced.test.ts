@@ -8,6 +8,12 @@ jest.mock('../mcp/client/mcpClientService', () => ({
 jest.mock('axios');
 import axios from 'axios';
 
+// slackService instantiates a Slack WebClient at import time (which reads
+// axios.defaults). Because this suite auto-mocks axios, axios.defaults is
+// undefined and the real WebClient constructor throws while the agentMode
+// module graph loads. Stub slackService so the suite can load.
+jest.mock('../services/slackService', () => ({}));
+
 //Mock the dependencies
 jest.mock('../services/metaService', () => ({
   metaService: {
@@ -382,7 +388,8 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
           '123456789',
           'mock-access-token',
           'marketing',
-          'adinterest'
+          'adinterest',
+          undefined
         );
       });
 
@@ -453,7 +460,22 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
 
         await agentModeService.searchAdTargeting('user123', '987654321', 'test', 'adinterest');
 
-        expect(metaService.searchTargeting).toHaveBeenCalledWith('987654321', 'token2', 'test', 'adinterest');
+        expect(metaService.searchTargeting).toHaveBeenCalledWith('987654321', 'token2', 'test', 'adinterest', undefined);
+      });
+
+      it('should forward location_types to metaService.searchTargeting for adgeolocation', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.searchTargeting as jest.Mock).mockResolvedValue([]);
+
+        await agentModeService.searchAdTargeting('user123', '123456789', 'San Jose', 'adgeolocation', ['city']);
+
+        expect(metaService.searchTargeting).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          'San Jose',
+          'adgeolocation',
+          ['city']
+        );
       });
     });
   });

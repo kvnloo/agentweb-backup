@@ -65,6 +65,16 @@ export const onboardingManifest: LoopManifest<NormalizedEvent, LlmAnalystProposa
     'brand_scrape_started',
     'brand_scrape_completed',
     'brand_scrape_failed',
+    // Voice-lab reliability: startup/response latency, completed turns,
+    // interruptions, failures, and tester-submitted diagnostic snapshots.
+    'voice_session_started',
+    'voice_session_ready',
+    'voice_first_audio',
+    'voice_turn_completed',
+    'voice_turn_recovery',
+    'voice_interrupted',
+    'voice_session_failed',
+    'voice_issue_reported',
   ],
   // Structural changes allowed, not just copy — so the loop can escape a
   // local maximum (guardrail #1), not just polish wording on a broken flow.

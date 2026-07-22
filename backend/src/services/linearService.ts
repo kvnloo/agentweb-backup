@@ -72,32 +72,66 @@ async function linearGraphQL(query: string, variables?: Record<string, any>): Pr
 interface TeamMeta {
   teamId: string;
   backlogStateId: string;
+  stateIds: Record<string, string>; // name (lowercased) -> id
   labelIds: Record<string, string>; // name -> id
 }
 let teamMetaCache: TeamMeta | null = null;
 
 async function getTeamMeta(): Promise<TeamMeta> {
   if (teamMetaCache) return teamMetaCache;
+  // Both connections MUST be explicitly sized: Linear defaults to 50 nodes, and the ENG team
+  // already has >50 labels — the un-sized query silently truncated "Bug" out of the page
+  // (caught by the 2026-07-07 live smoke). 250 is Linear's max page size.
   const data = await linearGraphQL(
     `query($key: String!) {
       teams(filter: { key: { eq: $key } }, first: 1) {
-        nodes { id states { nodes { id name type } } labels { nodes { id name } } }
+        nodes {
+          id
+          states(first: 250) { nodes { id name type } pageInfo { hasNextPage } }
+          labels(first: 250) { nodes { id name } pageInfo { hasNextPage } }
+        }
       }
     }`,
     { key: TEAM_KEY },
   );
   const team = data?.teams?.nodes?.[0];
   if (!team) throw new Error(`Linear team "${TEAM_KEY}" not found`);
+  if (team.states?.pageInfo?.hasNextPage || team.labels?.pageInfo?.hasNextPage) {
+    console.error(
+      `[linear] team "${TEAM_KEY}" metadata exceeds 250 states/labels — resolution map is truncated and names may be dropped; add pagination to getTeamMeta`,
+    );
+  }
   const states: any[] = team.states?.nodes || [];
   const backlog = states.find(s => s.type === 'backlog') || states.find(s => s.type === 'unstarted');
+  const stateIds: Record<string, string> = {};
+  for (const s of states) stateIds[s.name.toLowerCase()] = s.id;
   const labelIds: Record<string, string> = {};
   for (const l of (team.labels?.nodes || [])) labelIds[l.name.toLowerCase()] = l.id;
   teamMetaCache = {
     teamId: team.id,
     backlogStateId: backlog?.id,
+    stateIds,
     labelIds,
   };
   return teamMetaCache;
+}
+
+/**
+ * Resolve label names -> ids against the team, LOUDLY (ENG-187): a silently dropped label erases
+ * triage signal (funnel-stage labels drive the bug priority ladder), so every name that fails to
+ * resolve is an error log naming the label — never a silent drop.
+ */
+function resolveLabelIdsLoud(meta: TeamMeta, labelNames: string[]): string[] {
+  const ids: string[] = [];
+  for (const name of labelNames) {
+    const id = meta.labelIds[name.toLowerCase()];
+    if (id) {
+      ids.push(id);
+    } else {
+      console.error(`[linear] label "${name}" does not exist in team ${TEAM_KEY} — dropped from the issue. Create it in Linear to restore the triage signal.`);
+    }
+  }
+  return ids;
 }
 
 /** Test seam — reset the cached team metadata. */
@@ -126,13 +160,15 @@ export interface OpenCanonical {
  */
 export async function listOpenBugCanonicals(limit = 30): Promise<OpenCanonical[]> {
   const data = await linearGraphQL(
+    // Open-state WHITELIST (ENG-358): duplicate-state canonicals must never absorb new reports —
+    // see OPEN_STATE_TYPES below for the live-verified root cause.
     `query($team: String!, $bug: String!, $cust: String!, $limit: Int!) {
       issues(
         first: $limit,
         orderBy: createdAt,
         filter: {
           team: { key: { eq: $team } },
-          state: { type: { nin: ["completed", "canceled"] } },
+          state: { type: { in: ["triage", "backlog", "unstarted", "started"] } },
           and: [
             { labels: { name: { eq: $bug } } },
             { labels: { name: { eq: $cust } } }
@@ -148,13 +184,36 @@ export async function listOpenBugCanonicals(limit = 30): Promise<OpenCanonical[]
   return nodes.map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }));
 }
 
-/** Read an issue's comment bodies (the resolve bridge parses `[reporter-ticket #N]` from these). */
-export async function getIssueComments(issueId: string): Promise<string[]> {
+/** An issue comment with its creation timestamp (ISO string), for order-sensitive consumers. */
+export interface IssueCommentDetail {
+  body: string;
+  createdAt: string;
+}
+
+/**
+ * Read an issue's comments WITH `createdAt`, so callers that need "the most recent comment" can
+ * decide by timestamp instead of relying on the API's list order. The resolve bridge reads this
+ * ONCE per resolve for both of its jobs: parsing the `[reporter-ticket #N <email>]` markers and
+ * picking the latest `@Emma` comment as the customer-facing resolution message (ENG-316).
+ *
+ * Explicitly sized + ordered: Linear defaults connections to 50 nodes — the same silent-truncation
+ * trap getTeamMeta documents — and a high-reporter canonical can carry more comments than that.
+ * 250 is Linear's max page size; `orderBy: createdAt` returns NEWEST-first (verified live
+ * 2026-07-15 against ENG-316), so an overflow drops the OLDEST comments and the @Emma resolution
+ * message — written right before the flip to Done — always survives. Overflow is loud because
+ * reporter-ticket markers deep in the dropped tail would otherwise silently miss their email.
+ */
+export async function getIssueCommentsDetailed(issueId: string): Promise<IssueCommentDetail[]> {
   const data = await linearGraphQL(
-    `query($id: String!) { issue(id: $id) { comments { nodes { body } } } }`,
+    `query($id: String!) { issue(id: $id) { comments(first: 250, orderBy: createdAt) { nodes { body createdAt } pageInfo { hasNextPage } } } }`,
     { id: issueId },
   );
-  return (data?.issue?.comments?.nodes || []).map((c: any) => c?.body || '');
+  if (data?.issue?.comments?.pageInfo?.hasNextPage) {
+    console.error(
+      `[linear] issue ${issueId} has >250 comments — the page is truncated and the OLDEST comments were dropped; reporter-ticket markers may be missing. Add pagination to getIssueCommentsDetailed.`,
+    );
+  }
+  return (data?.issue?.comments?.nodes || []).map((c: any) => ({ body: c?.body || '', createdAt: c?.createdAt || '' }));
 }
 
 /** Add a comment to a Linear issue (used to record additional reporters on a canonical). */
@@ -174,20 +233,40 @@ export async function addIssueComment(issueId: string, body: string): Promise<vo
  * Create an INTERNAL Linear issue (auto-identified by the system). Crucially does NOT
  * carry the "Featurebase" label, so Featurebase never imports it as a public post —
  * these stay private engineering items. labelNames (e.g. ["Auto","Oncall"]) are
- * resolved against the team's labels; unknown names are dropped.
+ * resolved against the team's labels; unknown names are dropped LOUDLY (error log per name).
+ *
+ * Optional triage fields (ENG-187): `priority` (Linear enum 1=Urgent 2=High 3=Medium 4=Low),
+ * `stateName` (workflow state by name, e.g. "Todo"; falls back to the backlog state when omitted
+ * or unknown), `assigneeId` (Linear user uuid).
  */
-export async function createInternalLinearIssue(params: { title: string; description: string; labelNames: string[] }): Promise<LinearIssueResult> {
+export async function createInternalLinearIssue(params: {
+  title: string;
+  description: string;
+  labelNames: string[];
+  priority?: number;
+  stateName?: string;
+  assigneeId?: string;
+}): Promise<LinearIssueResult> {
   const meta = await getTeamMeta();
-  const labelIds = params.labelNames
-    .map((n) => meta.labelIds[n.toLowerCase()])
-    .filter((id): id is string => Boolean(id));
+  const labelIds = resolveLabelIdsLoud(meta, params.labelNames);
   const input: Record<string, any> = {
     teamId: meta.teamId,
     title: params.title,
     description: params.description,
     labelIds,
   };
-  if (meta.backlogStateId) input.stateId = meta.backlogStateId;
+  let stateId = meta.backlogStateId;
+  if (params.stateName) {
+    const named = meta.stateIds[params.stateName.toLowerCase()];
+    if (named) {
+      stateId = named;
+    } else {
+      console.error(`[linear] state "${params.stateName}" not found in team ${TEAM_KEY} — falling back to the backlog state.`);
+    }
+  }
+  if (stateId) input.stateId = stateId;
+  if (typeof params.priority === 'number') input.priority = params.priority;
+  if (params.assigneeId) input.assigneeId = params.assigneeId;
   const data = await linearGraphQL(
     `mutation($input: IssueCreateInput!) {
       issueCreate(input: $input) { success issue { id identifier url } }
@@ -201,13 +280,85 @@ export async function createInternalLinearIssue(params: { title: string; descrip
   return { id: issue.id, identifier: issue.identifier, url: issue.url };
 }
 
+/**
+ * Raise-only triage update on an existing issue (ENG-187 dedup upgrade): UNION the given labels in,
+ * and RAISE the priority to `priority` when it is more urgent than the current one. Never lowers
+ * priority and never removes labels — a later lower-tier reporter must not downgrade a canonical
+ * that a higher-tier reporter already escalated. Linear priority enum: 0=None, 1=Urgent … 4=Low,
+ * so "more urgent" = smaller non-zero number (and anything beats 0/None).
+ *
+ * `settleStateName` (ENG-187 contract #4): ensure a freshly synced issue SITS in the named state
+ * (e.g. Backlog for FB-synced feature requests). Applied only while the issue is still in a
+ * pre-work state (`triage`/`unstarted`) — an issue already in a backlog state needs no move, and
+ * one a human advanced to started/completed/canceled is never yanked back, so webhook retries
+ * can't fight people. An unknown state name is a LOUD error (no silent drop), state left untouched.
+ *
+ * No-op (no mutation) when nothing — labels, priority, state — would change.
+ */
+export async function raiseIssueTriage(
+  issueId: string,
+  params: { addLabelNames: string[]; priority?: number; settleStateName?: string },
+): Promise<void> {
+  const meta = await getTeamMeta();
+  const data = await linearGraphQL(
+    `query($id: String!) { issue(id: $id) { priority state { id type } labels { nodes { id } } } }`,
+    { id: issueId },
+  );
+  const issue = data?.issue;
+  if (!issue) throw new Error('Linear issue not found for triage raise');
+
+  const currentLabelIds: string[] = (issue.labels?.nodes || []).map((n: any) => n.id);
+  const addIds = resolveLabelIdsLoud(meta, params.addLabelNames).filter((id) => !currentLabelIds.includes(id));
+
+  const input: Record<string, any> = {};
+  if (addIds.length > 0) input.labelIds = [...currentLabelIds, ...addIds];
+  const current: number = typeof issue.priority === 'number' ? issue.priority : 0;
+  if (typeof params.priority === 'number' && params.priority > 0 && (current === 0 || params.priority < current)) {
+    input.priority = params.priority;
+  }
+  if (params.settleStateName) {
+    const targetId = meta.stateIds[params.settleStateName.toLowerCase()];
+    if (!targetId) {
+      console.error(`[linear] state "${params.settleStateName}" not found in team ${TEAM_KEY} — leaving the issue's state untouched.`);
+    } else {
+      const currentType = issue.state?.type;
+      if ((currentType === 'triage' || currentType === 'unstarted') && issue.state?.id !== targetId) {
+        input.stateId = targetId;
+      }
+    }
+  }
+  if (Object.keys(input).length === 0) return;
+
+  const res = await linearGraphQL(
+    `mutation($id: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $id, input: $input) { success }
+    }`,
+    { id: issueId, input },
+  );
+  if (!res?.issueUpdate?.success) {
+    throw new Error('Linear issueUpdate (triage raise) failed');
+  }
+}
+
 export interface OpenIssue {
   identifier: string;
   issueId: string;
   title: string;
+  /** Issue body — carries the structured Session/Schedule IDs the auto-issue dedup gate matches on. */
+  description: string;
 }
 
-/** List OPEN issues carrying a given label (used for auto-issue dedup). Open-only. */
+/**
+ * State types a dedupe candidate may be in — a WHITELIST of Linear's open types. Deliberately not
+ * a completed/canceled blacklist: Linear's "Duplicate" state has its own state type ("duplicate",
+ * verified live on ENG-350, 2026-07-16), and under the old blacklist a canceled Duplicate stayed a
+ * dedupe candidate — recurrence comments landed on it instead of the open canonical (ENG-358).
+ * A whitelist also stays correct if Linear ever adds another closed-ish type.
+ */
+const OPEN_STATE_TYPES = ['triage', 'backlog', 'unstarted', 'started'] as const;
+const OPEN_STATE_TYPES_GQL = `[${OPEN_STATE_TYPES.map((t) => `"${t}"`).join(', ')}]`;
+
+/** List OPEN issues carrying a given label (used for auto-issue dedup). Open-only — see OPEN_STATE_TYPES. */
 export async function listOpenIssuesByLabel(labelName: string, limit = 50): Promise<OpenIssue[]> {
   const data = await linearGraphQL(
     `query($team: String!, $label: String!, $limit: Int!) {
@@ -216,12 +367,167 @@ export async function listOpenIssuesByLabel(labelName: string, limit = 50): Prom
         orderBy: createdAt,
         filter: {
           team: { key: { eq: $team } },
-          state: { type: { nin: ["completed", "canceled"] } },
+          state: { type: { in: ${OPEN_STATE_TYPES_GQL} } },
           labels: { name: { eq: $label } }
         }
-      ) { nodes { id identifier title } }
+      ) { nodes { id identifier title description } }
     }`,
     { team: TEAM_KEY, label: labelName, limit },
   );
-  return (data?.issues?.nodes || []).map((n: any) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '' }));
+  return (data?.issues?.nodes || []).map((n: any) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }));
+}
+
+/**
+ * Raise-only escalation of an open canonical (ENG-358): when a recurring alert's severity rises
+ * (e.g. v0 credits low -> critical), the ONE open canonical is updated in place — priority raised
+ * and title refreshed to the latest occurrence's wording — instead of a new issue being filed.
+ * Returns false (no mutation at all) when the incoming priority does not beat the current one, so
+ * routine same-level occurrences never churn the issue. Throws on Linear failure; callers
+ * best-effort it (the occurrence comment + dedupe result must stand regardless).
+ */
+export async function escalateIssue(issueId: string, params: { title: string; priority: number }): Promise<boolean> {
+  const data = await linearGraphQL(
+    `query($id: String!) { issue(id: $id) { priority } }`,
+    { id: issueId },
+  );
+  const issue = data?.issue;
+  if (!issue) throw new Error('Linear issue not found for escalation');
+  const current: number = typeof issue.priority === 'number' ? issue.priority : 0;
+  // Linear priority: 1=Urgent … 4=Low, 0=None. Raise-only: only a strictly more severe incoming
+  // priority (numerically lower, or anything over "None") updates the canonical.
+  if (!(params.priority > 0 && (current === 0 || params.priority < current))) return false;
+  const res = await linearGraphQL(
+    `mutation($id: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $id, input: $input) { success }
+    }`,
+    { id: issueId, input: { title: params.title, priority: params.priority } },
+  );
+  if (!res?.issueUpdate?.success) {
+    throw new Error('Linear issueUpdate (escalation) failed');
+  }
+  return true;
+}
+
+/**
+ * List recently RESOLVED (completed/canceled) private bug canonicals — the reopen candidates for a
+ * regression / failed-retest report (ENG-240 contract #3). A new customer report that matches one of
+ * these must REOPEN the existing ticket, not file a brand-new canonical for a bug we already tracked.
+ * Same label pair as `listOpenBugCanonicals` (Bug + Customer Reported), ordered most-recently-updated
+ * first so freshly-closed tickets are the top candidates.
+ */
+export async function listRecentlyResolvedBugCanonicals(limit = 30): Promise<OpenCanonical[]> {
+  const data = await linearGraphQL(
+    `query($team: String!, $bug: String!, $cust: String!, $limit: Int!) {
+      issues(
+        first: $limit,
+        orderBy: updatedAt,
+        filter: {
+          team: { key: { eq: $team } },
+          state: { type: { in: ["completed", "canceled"] } },
+          and: [
+            { labels: { name: { eq: $bug } } },
+            { labels: { name: { eq: $cust } } }
+          ]
+        }
+      ) {
+        nodes { id identifier title description }
+      }
+    }`,
+    { team: TEAM_KEY, bug: 'Bug', cust: 'Customer Reported', limit },
+  );
+  const nodes: any[] = data?.issues?.nodes || [];
+  return nodes.map((n) => ({ identifier: n.identifier, issueId: n.id, title: n.title || '', description: n.description || '' }));
+}
+
+/**
+ * Reopen a resolved Linear issue by moving it to a live workflow state (default "Todo"). Used by the
+ * reopen-not-refile path (ENG-240 contract #3) when a regression / failed-retest report matches a Done
+ * canonical. An unknown state name throws (no silent no-op) so a reopen never quietly leaves the issue
+ * closed.
+ */
+export async function reopenIssue(issueId: string, stateName = 'Todo'): Promise<void> {
+  const meta = await getTeamMeta();
+  const stateId = meta.stateIds[stateName.toLowerCase()];
+  if (!stateId) {
+    throw new Error(`Linear reopen: state "${stateName}" not found in team ${TEAM_KEY}`);
+  }
+  const res = await linearGraphQL(
+    `mutation($id: String!, $stateId: String!) {
+      issueUpdate(id: $id, input: { stateId: $stateId }) { success }
+    }`,
+    { id: issueId, stateId },
+  );
+  if (!res?.issueUpdate?.success) {
+    throw new Error('Linear reopen (issueUpdate) failed');
+  }
+}
+
+export interface EngineeringBugStats {
+  netOpenBugs: number;
+  opened7d: number;
+  closed7d: number;
+}
+
+/**
+ * Read-only Engineering bug scoreboard counts. This deliberately does not use
+ * Featurebase/customer-report specific labels: the scoreboard wants all open
+ * ENG bugs, plus 7d bug inflow/outflow.
+ */
+export async function getEngineeringBugStats(startDate: string, endDate: string): Promise<EngineeringBugStats> {
+  const data = await linearGraphQL(
+    `query($team: String!, $bug: String!, $start: DateTime!, $end: DateTime!) {
+      open: issues(
+        first: 1,
+        filter: {
+          team: { key: { eq: $team } },
+          labels: { name: { eq: $bug } },
+          state: { type: { nin: ["completed", "canceled"] } }
+        }
+      ) {
+        totalCount
+      }
+      opened: issues(
+        first: 1,
+        filter: {
+          team: { key: { eq: $team } },
+          labels: { name: { eq: $bug } },
+          createdAt: { gte: $start, lt: $end }
+        }
+      ) {
+        totalCount
+      }
+      closed: issues(
+        first: 1,
+        filter: {
+          team: { key: { eq: $team } },
+          labels: { name: { eq: $bug } },
+          completedAt: { gte: $start, lt: $end }
+        }
+      ) {
+        totalCount
+      }
+      canceled: issues(
+        first: 1,
+        filter: {
+          team: { key: { eq: $team } },
+          labels: { name: { eq: $bug } },
+          canceledAt: { gte: $start, lt: $end }
+        }
+      ) {
+        totalCount
+      }
+    }`,
+    {
+      team: TEAM_KEY,
+      bug: 'Bug',
+      start: `${startDate}T00:00:00.000Z`,
+      end: `${endDate}T00:00:00.000Z`,
+    },
+  );
+
+  return {
+    netOpenBugs: Number(data?.open?.totalCount ?? 0),
+    opened7d: Number(data?.opened?.totalCount ?? 0),
+    closed7d: Number(data?.closed?.totalCount ?? 0) + Number(data?.canceled?.totalCount ?? 0),
+  };
 }

@@ -1,8 +1,11 @@
 import app from './app';
 import { isCronEnabled, disableCron } from './utils/instanceState';
+import { cronJobRegistry } from './utils/cronJobRegistry';
+import { DRAIN_CEILING_MS } from './utils/shutdownConstants';
 import { agentModeService } from './services/agentModeService';
 import { generateMarketingResponseWorkerService } from './services/generateMarketingResponseWorkerService';
 import dotenv from 'dotenv';
+import { getJwtSecret, assertJwtSecretAtBoot } from './config/jwt';
 import bcrypt from 'bcryptjs';
 import http from 'http';
 import { Server, Socket } from 'socket.io';
@@ -14,12 +17,21 @@ import { registerIo } from './services/sessionSockets';
 import {
   startLiveSession,
   sendAudioChunk,
+  sendAudioStreamEnd,
   sendTextTurn,
   closeLiveSession,
   hasLiveSession,
 } from './services/liveVoiceService';
+import {
+  ONBOARDING_TELEMETRY_EVENTS,
+  recordOnboardingEvent,
+} from './services/onboardingTelemetry';
 
 dotenv.config();
+
+// Fail fast at boot (before binding the port) if the JWT secret is missing, rather than
+// letting tokens be signed/verified with a fallback secret or erroring on first request.
+assertJwtSecretAtBoot();
 
 const port = process.env.PORT || 3001;
 const server = http.createServer(app);
@@ -75,7 +87,7 @@ io.use(async (socket, next) => {
 
   if (token) {
     try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key') as {
+      const decoded = jwt.verify(token, getJwtSecret()) as {
         userId?: string;
         sv?: number;
         delegateAccess?: unknown;
@@ -134,7 +146,7 @@ io.on('connection', (socket: Socket) => {
   try {
     const token = socket.handshake.auth.token;
     if (token) {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as { userId: string };
+      const decoded = jwt.verify(token, getJwtSecret()) as { userId: string };
       if (decoded.userId) {
         socket.join(`user:${decoded.userId}`);
       }
@@ -152,7 +164,7 @@ io.on('connection', (socket: Socket) => {
     // Clean up any live voice sessions owned by this socket
     socket.data.liveSessions?.forEach((sessionId: string) => {
       if (hasLiveSession(sessionId)) {
-        closeLiveSession(sessionId);
+        closeLiveSession(sessionId, socket.id);
       }
     });
   });
@@ -172,14 +184,20 @@ io.on('connection', (socket: Socket) => {
     }
     const token = socket.handshake.auth.token;
     if (!token) throw new Error('No auth token');
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as {
+    const decoded = jwt.verify(token, getJwtSecret()) as {
       userId: string;
       delegateAccess?: { targetUserId: string };
     };
     return decoded.delegateAccess?.targetUserId || decoded.userId;
   }
 
-  socket.on('live:start', async ({ sessionId }: { sessionId: string }) => {
+  socket.on('live:start', async ({
+    sessionId,
+    toolProfile = 'default',
+  }: {
+    sessionId: string;
+    toolProfile?: 'default' | 'onboarding';
+  }) => {
     try {
       // For conversable sockets, enforce that the sessionId matches what was auth'd
       if (socket.data.conversableSessionId && socket.data.conversableSessionId !== sessionId) {
@@ -190,9 +208,10 @@ io.on('connection', (socket: Socket) => {
       // Track which live sessions this socket owns (for disconnect cleanup)
       if (!socket.data.liveSessions) socket.data.liveSessions = new Set<string>();
       socket.data.liveSessions.add(sessionId);
-      await startLiveSession(sessionId, socket.id, liveEmit, userId);
+      await startLiveSession(sessionId, socket.id, liveEmit, userId, toolProfile);
       console.log(`[liveVoice] live:start completed for session ${sessionId}`);
     } catch (err: any) {
+      socket.data.liveSessions?.delete(sessionId);
       console.error(`[liveVoice] live:start error for session ${sessionId}:`, err?.message);
       socket.emit('live:error', { sessionId, error: err?.message ?? 'Failed to start live session' });
     }
@@ -200,7 +219,18 @@ io.on('connection', (socket: Socket) => {
 
   socket.on('live:audio', ({ sessionId, chunk }: { sessionId: string; chunk: string }) => {
     console.log(`[liveVoice] live:audio received for session ${sessionId}, hasSession=${hasLiveSession(sessionId)}`);
-    sendAudioChunk(sessionId, chunk).catch((err) => {
+    sendAudioChunk(sessionId, chunk, socket.id).catch((err) => {
+      socket.emit('live:error', { sessionId, error: err?.message });
+    });
+  });
+
+  socket.on('live:audio-stream-end', ({ sessionId }: { sessionId: string }) => {
+    if (!sessionId || !socket.data.liveSessions?.has(sessionId)) {
+      socket.emit('live:error', { sessionId, error: 'No active voice session' });
+      return;
+    }
+    console.warn(`[liveVoice] live:audio-stream-end received for session ${sessionId}`);
+    sendAudioStreamEnd(sessionId, socket.id).catch((err) => {
       socket.emit('live:error', { sessionId, error: err?.message });
     });
   });
@@ -208,7 +238,7 @@ io.on('connection', (socket: Socket) => {
   socket.on('live:text', async ({ sessionId, text }: { sessionId: string; text: string }) => {
     try {
       console.log(`[liveVoice] live:text received for session ${sessionId}, hasSession=${hasLiveSession(sessionId)}`);
-      await sendTextTurn(sessionId, text);
+      await sendTextTurn(sessionId, text, socket.id);
     } catch (err: any) {
       console.error(`[liveVoice] live:text error for session ${sessionId}:`, err?.message);
       socket.emit('live:error', { sessionId, error: err?.message });
@@ -216,8 +246,52 @@ io.on('connection', (socket: Socket) => {
   });
 
   socket.on('live:close', ({ sessionId }: { sessionId: string }) => {
-    closeLiveSession(sessionId);
+    closeLiveSession(sessionId, socket.id);
     socket.data.liveSessions?.delete(sessionId);
+  });
+
+  socket.on('live:report-issue', async ({
+    sessionId,
+    phase,
+    breadcrumbs,
+  }: {
+    sessionId: string;
+    phase?: string;
+    breadcrumbs?: unknown[];
+  }) => {
+    try {
+      if (!sessionId || !socket.data.liveSessions?.has(sessionId)) {
+        throw new Error('No active voice session for this report');
+      }
+      const userId = getLiveUserId();
+      const safePhase = typeof phase === 'string' ? phase.slice(0, 40) : 'unknown';
+      const safeBreadcrumbs = Array.isArray(breadcrumbs)
+        ? JSON.stringify(breadcrumbs.slice(-25)).slice(0, 2_500)
+        : '[]';
+
+      console.warn('[voiceOnboardingTelemetry] tester reported an issue', {
+        sessionId,
+        userId,
+        phase: safePhase,
+        breadcrumbs: safeBreadcrumbs,
+      });
+      await recordOnboardingEvent(
+        userId,
+        ONBOARDING_TELEMETRY_EVENTS.voiceIssueReported,
+        {
+          sessionId,
+          phase: safePhase,
+          breadcrumbs: safeBreadcrumbs,
+        },
+      );
+      socket.emit('live:report-received', { sessionId });
+    } catch (err: any) {
+      console.error('[voiceOnboardingTelemetry] report failed', err?.message);
+      socket.emit('live:report-error', {
+        sessionId,
+        error: 'Could not save this report. Try again.',
+      });
+    }
   });
 
   // Handle chat messages
@@ -235,7 +309,7 @@ io.on('connection', (socket: Socket) => {
         throw new Error('No authentication token provided');
       }
 
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as { userId: string; isAdmin?: boolean; delegateAccess?: { adminUserId: string; adminEmail: string; targetUserId: string; targetEmail: string } };
+      const decoded = jwt.verify(token, getJwtSecret()) as { userId: string; isAdmin?: boolean; delegateAccess?: { adminUserId: string; adminEmail: string; targetUserId: string; targetEmail: string } };
       const userId = decoded.delegateAccess?.targetUserId || decoded.userId;
       const isDelegatedAdmin = !!decoded.delegateAccess || decoded.isAdmin === true;
 
@@ -333,12 +407,12 @@ const gracefulShutdown = async (signal: string) => {
   console.log(`\n${signal} received. Shutting down gracefully...`);
 
   // Register force-exit FIRST so it's always set, even if an await below hangs.
-  // 13 min = drain ceiling (10 min) + 3 min buffer.
+  // Force-exit buffer = drain ceiling + 3 min.
   // EB Timeout: 900 s (15 min) sits above this so EB never force-kills first.
   setTimeout(() => {
     console.error('[gracefulShutdown] Force-exiting after drain ceiling');
     process.exit(1);
-  }, 13 * 60 * 1000).unref();
+  }, DRAIN_CEILING_MS + 3 * 60 * 1000).unref();
 
   // 1. Disable cron immediately — agent-engine's next /run-scheduled-chats call
   //    gets 503 and reroutes to the new instance within one 5-second poll cycle.
@@ -371,12 +445,27 @@ const gracefulShutdown = async (signal: string) => {
     }
   });
 
-  // 5. Drain the worker — waits for all in-flight scheduled chats / EMMA runs
-  //    to complete naturally (up to 10 minutes). Only then kills the child process.
-  await generateMarketingResponseWorkerService.shutdown();
+  // 5. Drain the LLM worker (scheduled chats / EMMA runs) and every other
+  //    in-flight cron job (LinkedIn sync, drip worker, meta token refresh,
+  //    etc. — see cronJobRegistry) concurrently, up to the same ceiling, so
+  //    the total wait is the max of the two rather than their sum.
+  const [, cronDrain] = await Promise.all([
+    generateMarketingResponseWorkerService.shutdown(),
+    cronJobRegistry.drain(),
+  ]);
+  if (!cronDrain.drained) {
+    console.warn(
+      `[gracefulShutdown] Cron drain ceiling reached — ${cronDrain.stuckCount} job(s) still in-flight:`,
+      cronDrain.stuckJobs
+    );
+  }
 
   // 6. Close parent MCP clients after the drain (child has its own MCP instance)
   await agentModeService.shutdown();
+
+  // 6.5. Flush OTel spans (ENG-141) — best-effort, never rejects, no-op when
+  //      tracing is off. Deploy-killed runs are exactly the traces we need.
+  await (await import('./observability/tracing')).flushTelemetry();
 
   // 7. Clean exit
   process.exit(0);
@@ -507,16 +596,20 @@ createTestAccount().then(async () => {
         // Pass callback: when scanner schedules an action within 30 min, register a direct setTimeout
         const scanner = new SocialEngagementScanner((delayMs) => {
           setTimeout(() => {
-            executor.processQueue().catch(e => console.error('[SocialEngagement] Direct executor error:', e));
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('SocialEngagementExecutor.processQueue', executor.processQueue())
+              .catch(e => console.error('[SocialEngagement] Direct executor error:', e));
           }, delayMs);
         });
 
         console.log('[SocialEngagement] Scanner initialized — running first pass...');
-        scanner.runScanner().catch(e => console.error('[SocialEngagement] Scanner error:', e));
+        cronJobRegistry.track('SocialEngagementScanner', scanner.runScanner())
+          .catch(e => console.error('[SocialEngagement] Scanner error:', e));
 
         setInterval(() => {
           if (!isCronEnabled()) return;
-          scanner.runScanner().catch(e => console.error('[SocialEngagement] Scanner error:', e));
+          cronJobRegistry.track('SocialEngagementScanner', scanner.runScanner())
+            .catch(e => console.error('[SocialEngagement] Scanner error:', e));
         }, SCANNER_INTERVAL_MS);
 
       } catch (error) {
@@ -540,10 +633,12 @@ createTestAccount().then(async () => {
         console.log(`[ActivationCron] Initialized — first run at 08:00 UTC (in ${Math.round(msUntilNextRun / 60000)} min)`);
         setTimeout(() => {
           if (!isCronEnabled()) return;
-          runActivationAnalysis().catch(e => console.error('[ActivationCron] Error:', e));
+          cronJobRegistry.track('ActivationCron', runActivationAnalysis())
+            .catch(e => console.error('[ActivationCron] Error:', e));
           setInterval(() => {
             if (!isCronEnabled()) return;
-            runActivationAnalysis().catch(e => console.error('[ActivationCron] Error:', e));
+            cronJobRegistry.track('ActivationCron', runActivationAnalysis())
+              .catch(e => console.error('[ActivationCron] Error:', e));
           }, ACTIVATION_INTERVAL_MS);
         }, msUntilNextRun);
       } catch (error) {
@@ -555,14 +650,35 @@ createTestAccount().then(async () => {
       try {
         const { processDueEnrollments } = await import('./services/dripSequenceWorker');
         const DRIP_INTERVAL_MS = 5 * 60 * 1000;
-        processDueEnrollments().catch(e => console.error('[dripWorker] Error on first run:', e));
+        cronJobRegistry.track('dripWorker', processDueEnrollments())
+          .catch(e => console.error('[dripWorker] Error on first run:', e));
         setInterval(() => {
           if (!isCronEnabled()) return;
-          processDueEnrollments().catch(e => console.error('[dripWorker] Error:', e));
+          cronJobRegistry.track('dripWorker', processDueEnrollments())
+            .catch(e => console.error('[dripWorker] Error:', e));
         }, DRIP_INTERVAL_MS);
         console.log('[dripWorker] Initialized — running every 5 minutes');
       } catch (error) {
         console.error('[dripWorker] Failed to initialize:', error);
+      }
+
+      // ENG-324: Scheduled-run reconciler — crash-safe backstop for the drain.
+      // Recovers scheduled runs whose process died mid-flight (SIGTERM past the
+      // 10-min drain ceiling, SIGKILL, OOM) by requeuing any in-flight lease whose
+      // heartbeat has gone stale. Boot sweep reclaims runs orphaned by the PREVIOUS
+      // instance's death (the common deploy case); the interval catches the rest.
+      try {
+        const { reconcileStaleScheduledRuns, RECONCILE_INTERVAL_MS } = await import('./controllers/agentModeController');
+        cronJobRegistry.track('scheduledRunReconciler', reconcileStaleScheduledRuns())
+          .catch(e => console.error('[scheduledRunReconciler] Boot sweep error:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('scheduledRunReconciler', reconcileStaleScheduledRuns())
+            .catch(e => console.error('[scheduledRunReconciler] Sweep error:', e));
+        }, RECONCILE_INTERVAL_MS);
+        console.log(`[scheduledRunReconciler] Initialized — sweeping every ${Math.round(RECONCILE_INTERVAL_MS / 60000)} min`);
+      } catch (error) {
+        console.error('[scheduledRunReconciler] Failed to initialize:', error);
       }
 
       // Durable Landing-Page Poller — redeploy backstop for in-flight builds.
@@ -574,16 +690,36 @@ createTestAccount().then(async () => {
         console.error('[durableLandingPoller] Failed to initialize:', error);
       }
 
+      // v0 Credit Alert — hourly low-credit check on the v0 (landing-page
+      // generation) account. Fires an oncall alert on warn-level transitions
+      // into low/critical so credits can never silently run out again.
+      try {
+        const { checkAndAlert } = await import('./services/v0BillingService');
+        const V0_CREDIT_ALERT_INTERVAL_MS = 60 * 60 * 1000;
+        cronJobRegistry.track('v0CreditAlert', checkAndAlert())
+          .catch(e => console.error('[v0CreditAlert] Error on first run:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('v0CreditAlert', checkAndAlert())
+            .catch(e => console.error('[v0CreditAlert] Error:', e));
+        }, V0_CREDIT_ALERT_INTERVAL_MS);
+        console.log('[v0CreditAlert] Initialized — running hourly');
+      } catch (error) {
+        console.error('[v0CreditAlert] Failed to initialize:', error);
+      }
+
       // LinkedIn Connection Sync — runs every 10 minutes
       // Polls Unipile for accepted connections, upserts into AW-UnipileConnections cache,
       // and activates any awaiting_connection drip enrollments.
       try {
         const { runLinkedInConnectionSync } = await import('./cron/linkedInConnectionSyncCron');
         const LI_CONN_INTERVAL_MS = 10 * 60 * 1000;
-        runLinkedInConnectionSync().catch(e => console.error('[linkedInConnectionSync] Error on first run:', e));
+        cronJobRegistry.track('linkedInConnectionSync', runLinkedInConnectionSync())
+          .catch(e => console.error('[linkedInConnectionSync] Error on first run:', e));
         setInterval(() => {
           if (!isCronEnabled()) return;
-          runLinkedInConnectionSync().catch(e => console.error('[linkedInConnectionSync] Error:', e));
+          cronJobRegistry.track('linkedInConnectionSync', runLinkedInConnectionSync())
+            .catch(e => console.error('[linkedInConnectionSync] Error:', e));
         }, LI_CONN_INTERVAL_MS);
         console.log('[linkedInConnectionSync] Initialized — running every 10 minutes');
       } catch (error) {
@@ -598,14 +734,36 @@ createTestAccount().then(async () => {
       try {
         const { runMetaTokenRefresh } = await import('./cron/metaTokenRefreshCron');
         const META_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
-        runMetaTokenRefresh().catch(e => console.error('[metaTokenRefreshCron] Error on first run:', e));
+        cronJobRegistry.track('metaTokenRefreshCron', runMetaTokenRefresh())
+          .catch(e => console.error('[metaTokenRefreshCron] Error on first run:', e));
         setInterval(() => {
           if (!isCronEnabled()) return;
-          runMetaTokenRefresh().catch(e => console.error('[metaTokenRefreshCron] Error:', e));
+          cronJobRegistry.track('metaTokenRefreshCron', runMetaTokenRefresh())
+            .catch(e => console.error('[metaTokenRefreshCron] Error:', e));
         }, META_REFRESH_INTERVAL_MS);
         console.log('[metaTokenRefreshCron] Initialized — running every 12 hours');
       } catch (error) {
         console.error('[metaTokenRefreshCron] Failed to initialize:', error);
+      }
+
+      // Outlook Bounce/Complaint Monitor (ENG-266 Part 3, option B+) — runs every 15
+      // minutes. Resend's webhook-based bounce/complaint auto-DNC cannot fire for a
+      // mailbox send (Graph produces no Resend webhooks), so this polls each connected
+      // Outlook mailbox's Inbox for delivery-failure notifications and applies the same
+      // suppression. This is the compliance floor B+ exists for — not optional.
+      try {
+        const { runOutlookBounceMonitor } = await import('./cron/outlookBounceMonitorCron');
+        const OUTLOOK_BOUNCE_MONITOR_INTERVAL_MS = 15 * 60 * 1000;
+        cronJobRegistry.track('outlookBounceMonitorCron', runOutlookBounceMonitor())
+          .catch(e => console.error('[outlookBounceMonitorCron] Error on first run:', e));
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('outlookBounceMonitorCron', runOutlookBounceMonitor())
+            .catch(e => console.error('[outlookBounceMonitorCron] Error:', e));
+        }, OUTLOOK_BOUNCE_MONITOR_INTERVAL_MS);
+        console.log('[outlookBounceMonitorCron] Initialized — running every 15 minutes');
+      } catch (error) {
+        console.error('[outlookBounceMonitorCron] Failed to initialize:', error);
       }
 
       // Onboarding stuck-user detector — DISABLED 2026-05-07. Was posting one
@@ -633,10 +791,12 @@ createTestAccount().then(async () => {
           console.log(`[OnboardingLoop] Initialized — first run at 15:00 UTC (in ${Math.round(msUntilLoop / 60000)} min)`);
           setTimeout(() => {
             if (!isCronEnabled()) return;
-            runOnboardingLoop().catch(e => console.error('[OnboardingLoop] Error:', e));
+            cronJobRegistry.track('OnboardingLoop', runOnboardingLoop())
+              .catch(e => console.error('[OnboardingLoop] Error:', e));
             setInterval(() => {
               if (!isCronEnabled()) return;
-              runOnboardingLoop().catch(e => console.error('[OnboardingLoop] Error:', e));
+              cronJobRegistry.track('OnboardingLoop', runOnboardingLoop())
+                .catch(e => console.error('[OnboardingLoop] Error:', e));
             }, LOOP_INTERVAL_MS);
           }, msUntilLoop);
         } catch (error) {
@@ -649,10 +809,12 @@ createTestAccount().then(async () => {
           const { runOnboardingLoopWatchdog } = await import('./cron/onboardingLoopWatchdog');
 
           console.log('[OnboardingWatchdog] Initialized — running hourly');
-          runOnboardingLoopWatchdog().catch(e => console.error('[OnboardingWatchdog] Error on first run:', e));
+          cronJobRegistry.track('OnboardingWatchdog', runOnboardingLoopWatchdog())
+            .catch(e => console.error('[OnboardingWatchdog] Error on first run:', e));
           setInterval(() => {
             if (!isCronEnabled()) return;
-            runOnboardingLoopWatchdog().catch(e => console.error('[OnboardingWatchdog] Error:', e));
+            cronJobRegistry.track('OnboardingWatchdog', runOnboardingLoopWatchdog())
+              .catch(e => console.error('[OnboardingWatchdog] Error:', e));
           }, WATCHDOG_INTERVAL_MS);
         } catch (error) {
           console.error('[OnboardingWatchdog] Failed to initialize:', error);
@@ -684,10 +846,12 @@ createTestAccount().then(async () => {
           );
           setTimeout(() => {
             if (!isCronEnabled()) return;
-            runAiEvalLoopOnce().catch(e => console.error('[AiEvalLoop] Error:', e));
+            cronJobRegistry.track('AiEvalLoop', runAiEvalLoopOnce())
+              .catch(e => console.error('[AiEvalLoop] Error:', e));
             setInterval(() => {
               if (!isCronEnabled()) return;
-              runAiEvalLoopOnce().catch(e => console.error('[AiEvalLoop] Error:', e));
+              cronJobRegistry.track('AiEvalLoop', runAiEvalLoopOnce())
+                .catch(e => console.error('[AiEvalLoop] Error:', e));
             }, AI_EVAL_LOOP_INTERVAL_MS);
           }, msUntilAiEval);
         } catch (error) {
@@ -720,10 +884,12 @@ createTestAccount().then(async () => {
           );
           setTimeout(() => {
             if (!isCronEnabled()) return;
-            runAiReadinessLoopOnce().catch(e => console.error('[AiReadinessLoop] Error:', e));
+            cronJobRegistry.track('AiReadinessLoop', runAiReadinessLoopOnce())
+              .catch(e => console.error('[AiReadinessLoop] Error:', e));
             setInterval(() => {
               if (!isCronEnabled()) return;
-              runAiReadinessLoopOnce().catch(e => console.error('[AiReadinessLoop] Error:', e));
+              cronJobRegistry.track('AiReadinessLoop', runAiReadinessLoopOnce())
+                .catch(e => console.error('[AiReadinessLoop] Error:', e));
             }, AI_READINESS_LOOP_INTERVAL_MS);
           }, msUntilReadiness);
         } catch (error) {
@@ -755,10 +921,12 @@ createTestAccount().then(async () => {
           );
           setTimeout(() => {
             if (!isCronEnabled()) return;
-            runOnboardingLoopV2Once().catch(e => console.error('[OnboardingLoopV2] Error:', e));
+            cronJobRegistry.track('OnboardingLoopV2', runOnboardingLoopV2Once())
+              .catch(e => console.error('[OnboardingLoopV2] Error:', e));
             setInterval(() => {
               if (!isCronEnabled()) return;
-              runOnboardingLoopV2Once().catch(e => console.error('[OnboardingLoopV2] Error:', e));
+              cronJobRegistry.track('OnboardingLoopV2', runOnboardingLoopV2Once())
+                .catch(e => console.error('[OnboardingLoopV2] Error:', e));
             }, ONBOARDING_V2_INTERVAL_MS);
           }, msUntilObV2);
         } catch (error) {
@@ -793,10 +961,12 @@ createTestAccount().then(async () => {
           );
           setTimeout(() => {
             if (!isCronEnabled()) return;
-            runAgentModeLoopOnce().catch(e => console.error('[AgentModeLoop] Error:', e));
+            cronJobRegistry.track('AgentModeLoop', runAgentModeLoopOnce())
+              .catch(e => console.error('[AgentModeLoop] Error:', e));
             setInterval(() => {
               if (!isCronEnabled()) return;
-              runAgentModeLoopOnce().catch(e => console.error('[AgentModeLoop] Error:', e));
+              cronJobRegistry.track('AgentModeLoop', runAgentModeLoopOnce())
+                .catch(e => console.error('[AgentModeLoop] Error:', e));
             }, AGENT_MODE_INTERVAL_MS);
           }, msUntilAgentMode);
         } catch (error) {
@@ -829,10 +999,12 @@ createTestAccount().then(async () => {
           );
           setTimeout(() => {
             if (!isCronEnabled()) return;
-            runAgentReliabilitySnapshot().catch(e => console.error('[AgentReliabilitySnapshot] Error:', e));
+            cronJobRegistry.track('AgentReliabilitySnapshot', runAgentReliabilitySnapshot())
+              .catch(e => console.error('[AgentReliabilitySnapshot] Error:', e));
             setInterval(() => {
               if (!isCronEnabled()) return;
-              runAgentReliabilitySnapshot().catch(e => console.error('[AgentReliabilitySnapshot] Error:', e));
+              cronJobRegistry.track('AgentReliabilitySnapshot', runAgentReliabilitySnapshot())
+                .catch(e => console.error('[AgentReliabilitySnapshot] Error:', e));
             }, SNAPSHOT_INTERVAL_MS);
           }, msUntilSnapshot);
         } catch (error) {
@@ -840,6 +1012,45 @@ createTestAccount().then(async () => {
         }
       } else {
         console.log('[AgentReliabilitySnapshot] Disabled (set AGENT_RELIABILITY_SNAPSHOT_ENABLED=true to enable)');
+      }
+
+      // Weekly Engineering Scoreboard — read-only backend replacement for the
+      // laptop launchd job. Runs Mondays at 09:00 UTC, gated by
+      // ENGINEERING_SCOREBOARD_LOOP_ENABLED=true. It reads Linear + Weave,
+      // DMs Harsha through the existing loop Slack rail, and appends one
+      // snapshot for restart-safe trend rendering.
+      if (process.env.ENGINEERING_SCOREBOARD_LOOP_ENABLED === 'true') {
+        try {
+          const { runEngineeringScoreboardLoopOnce } = await import('./cron/engineeringScoreboardLoop');
+
+          const scheduleNextEngineeringScoreboardRun = () => {
+            const nowForScoreboard = new Date();
+            const nextScoreboardRun = new Date(nowForScoreboard);
+            nextScoreboardRun.setUTCHours(9, 0, 0, 0);
+            const daysUntilMonday = (1 - nextScoreboardRun.getUTCDay() + 7) % 7;
+            nextScoreboardRun.setUTCDate(nextScoreboardRun.getUTCDate() + daysUntilMonday);
+            if (nextScoreboardRun <= nowForScoreboard) {
+              nextScoreboardRun.setUTCDate(nextScoreboardRun.getUTCDate() + 7);
+            }
+            const msUntilScoreboard = nextScoreboardRun.getTime() - nowForScoreboard.getTime();
+
+            console.log(
+              `[EngineeringScoreboard] Next run Monday 09:00 UTC (in ${Math.round(msUntilScoreboard / 60000)} min)`,
+            );
+            setTimeout(() => {
+              scheduleNextEngineeringScoreboardRun();
+              if (!isCronEnabled()) return;
+              cronJobRegistry.track('EngineeringScoreboard', runEngineeringScoreboardLoopOnce())
+                .catch(e => console.error('[EngineeringScoreboard] Error:', e));
+            }, msUntilScoreboard);
+          };
+
+          scheduleNextEngineeringScoreboardRun();
+        } catch (error) {
+          console.error('[EngineeringScoreboard] Failed to initialize:', error);
+        }
+      } else {
+        console.log('[EngineeringScoreboard] Disabled (set ENGINEERING_SCOREBOARD_LOOP_ENABLED=true to enable)');
       }
 
       // Generic Layer-5 attribution — daily at 18:00 UTC, after the product
@@ -864,10 +1075,12 @@ createTestAccount().then(async () => {
           );
           setTimeout(() => {
             if (!isCronEnabled()) return;
-            runLoopAttributionOnce().catch(e => console.error('[LoopAttribution] Error:', e));
+            cronJobRegistry.track('LoopAttribution', runLoopAttributionOnce())
+              .catch(e => console.error('[LoopAttribution] Error:', e));
             setInterval(() => {
               if (!isCronEnabled()) return;
-              runLoopAttributionOnce().catch(e => console.error('[LoopAttribution] Error:', e));
+              cronJobRegistry.track('LoopAttribution', runLoopAttributionOnce())
+                .catch(e => console.error('[LoopAttribution] Error:', e));
             }, LOOP_ATTRIBUTION_INTERVAL_MS);
           }, msUntilAttribution);
         } catch (error) {

@@ -492,7 +492,7 @@ describe("DELETE /api/landing-pages/v0/generated/:id — ownership and org-owner
 
   it("owner can DELETE their own page", async () => {
     mockGetLandingPageById.mockResolvedValue(myPage); // owned by user-1
-    mockDeleteLandingPageByRecord.mockResolvedValue(undefined);
+    mockDeleteLandingPageByRecord.mockResolvedValue({});
 
     const res = await request(app).delete("/api/landing-pages/v0/generated/page-1");
     expect(res.status).toBe(200);
@@ -506,7 +506,7 @@ describe("DELETE /api/landing-pages/v0/generated/:id — ownership and org-owner
     mockGetUserById
       .mockResolvedValueOnce({ userId: mockOrgOwnerId, orgId: mockOrgId, orgRole: "owner" }) // caller
       .mockResolvedValueOnce({ userId: mockOrgMemberId, orgId: mockOrgId }); // page owner
-    mockDeleteLandingPageByRecord.mockResolvedValue(undefined);
+    mockDeleteLandingPageByRecord.mockResolvedValue({});
 
     const res = await request(app).delete("/api/landing-pages/v0/generated/page-2");
     expect(res.status).toBe(200);

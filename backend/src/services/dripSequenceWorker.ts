@@ -12,13 +12,20 @@
  */
 
 import { dripSequenceDb, DripSequence, SequenceEnrollment, StepCondition, SequenceChannel } from './dripSequenceDb';
-import { resendService } from './resendService';
+import { sendAsSender } from './sendAsSender';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { crmDb, userDb } from './db';
 import { emailEventsDb } from './emailEventsDb';
 import { isDoNotContact } from '../utils/leadContactStatus';
 import { substituteVariables, injectUnsubscribeUrl, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
+import { loadSenderConfig as loadCrmSenderConfig } from './crmSenderService';
+import { CrmSender } from './crmSenderTypes';
 import { settingsService } from './settingsService';
+import { v4 as uuidv4 } from 'uuid';
+
+// Identifies this process for the claimedBy field — mirrors
+// socialEngagementExecutor.ts's INSTANCE_ID, used for log correlation only.
+const INSTANCE_ID = uuidv4();
 
 export async function processDueEnrollments(): Promise<{
   processed: number;
@@ -37,6 +44,19 @@ export async function processDueEnrollments(): Promise<{
   }
 
   for (const enrollment of due) {
+    // Claim before sending so a process killed between the send and the
+    // advance/complete write doesn't get its step re-sent by the very next
+    // tick (or by another instance). A claim self-heals after its stale
+    // window, so a crash never strands the enrollment permanently.
+    let claimed: boolean;
+    try {
+      claimed = await dripSequenceDb.claimEnrollment(enrollment.enrollmentId, INSTANCE_ID);
+    } catch (err) {
+      console.error(`[dripWorker] Failed to claim enrollment ${enrollment.enrollmentId}:`, err);
+      continue;
+    }
+    if (!claimed) continue; // another instance or a recent crash still holds this enrollment
+
     stats.processed++;
     try {
       await processEnrollment(enrollment, stats);
@@ -50,6 +70,11 @@ export async function processDueEnrollments(): Promise<{
         const retryAt = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString();
         await dripSequenceDb.snoozeEnrollment(enrollment.enrollmentId, retryAt).catch(() => {});
         console.log(`[dripWorker] Snoozed enrollment ${enrollment.enrollmentId} until ${retryAt} (not yet connected)`);
+      } else {
+        // Generic/transient error: release the claim so this enrollment is
+        // retried on the very next tick, same as today's behavior, instead
+        // of waiting out the stale-claim window.
+        await dripSequenceDb.releaseEnrollmentClaim(enrollment.enrollmentId).catch(() => {});
       }
     }
   }
@@ -158,29 +183,29 @@ async function sendEmailStep(
   const unsubscribeUrl = `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe?listId=${encodeURIComponent(enrollment.listId)}&leadId=${encodeURIComponent(enrollment.leadId)}&email=${encodeURIComponent(enrollment.leadEmail)}`;
   bodyHtml = injectUnsubscribeUrl(bodyHtml, unsubscribeUrl);
 
-  const senderEmail = resolveSenderEmail(user, senderConfig, step.senderId);
-  const senderName = resolveSenderName(user, senderConfig, step.senderId);
+  const selectedSender = senderConfig.senders.find(
+    (s) => s.id === (step.senderId ?? senderConfig.defaultSenderId),
+  );
+  const sender = selectedSender ?? legacyDefaultSender(user);
 
-  if (!senderEmail) {
+  if (!sender) {
     console.error(`[dripWorker] Skipping enrollment ${enrollment.enrollmentId}: user ${enrollment.userId} has no email sender configured`);
     throw new Error(`No email sender configured for user ${enrollment.userId}`);
   }
 
-  const fromField = senderName ? `${senderName} <${senderEmail}>` : senderEmail;
-
-  const sendResult = await resendService.sendEmail({
-    from: fromField,
-    to: [enrollment.leadEmail],
-    subject,
-    html: bodyHtml,
-  });
-
-  if (!sendResult) {
-    console.error(`[dripWorker] Resend returned null for step ${step.stepNumber} to ${enrollment.leadEmail} — not advancing`);
-    throw new Error(`Email send failed for ${enrollment.leadEmail}`);
+  let sendResult;
+  try {
+    sendResult = await sendAsSender(enrollment.userId, sender, {
+      to: enrollment.leadEmail,
+      subject,
+      html: bodyHtml,
+    });
+  } catch (error) {
+    console.error(`[dripWorker] Send failed for step ${step.stepNumber} to ${enrollment.leadEmail}:`, error);
+    throw error;
   }
 
-  console.log(`[dripWorker] Sent email step ${step.stepNumber} to ${enrollment.leadEmail} (id: ${sendResult.id})`);
+  console.log(`[dripWorker] Sent email step ${step.stepNumber} to ${enrollment.leadEmail} via ${sendResult.provider} (id: ${sendResult.messageId})`);
 }
 
 async function sendLinkedInStep(
@@ -247,16 +272,82 @@ async function checkExitConditions(
   }
 
   // Check email engagement exit
+  //
+  // This used to pass '' as the emailDomain — which is the GSI PARTITION KEY. DynamoDB
+  // rejects empty key values, and the .catch() swallowed it, so the query could never
+  // match and these exits never fired for anyone (ENG-298). It also only ever evaluated
+  // 'opened' and 'clicked': a sequence set to stop when a lead REPLIED kept on sending.
   if (exitConditions.onEmailEngagement?.length) {
-    const events = await emailEventsDb
-      .getEventsByEmailDomainAndLeadEmail('', enrollment.leadEmail)
-      .catch(() => []);
-    const engaged = events.some((e: any) => {
-      if (exitConditions.onEmailEngagement!.includes('opened') && e.eventType === 'email.opened') return true;
-      if (exitConditions.onEmailEngagement!.includes('clicked') && e.eventType === 'email.clicked') return true;
-      return false;
-    });
-    if (engaged) return 'engagement';
+    const user = await userDb.getUserById(enrollment.userId).catch(() => null);
+    const emailDomain = (user as any)?.emailDomain;
+
+    // A mailbox-only sender (Gmail/Outlook) has no Resend domain, and Resend webhooks are
+    // the only source of these events — so there is nothing to find. Skip rather than
+    // query with a key we know is invalid.
+    if (!emailDomain) {
+      console.log(
+        `[dripWorker] Skipping engagement exit check for enrollment ${enrollment.enrollmentId}: ` +
+        `user ${enrollment.userId} has no emailDomain, so no email events exist`,
+      );
+    } else {
+      const events = await emailEventsDb
+        .getEventsByEmailDomainAndLeadEmail(emailDomain, enrollment.leadEmail)
+        .catch(() => []);
+
+      // Scope to engagement that happened AFTER this enrollment started.
+      //
+      // The query returns EVERY event for that lead, ever — it is not scoped to a sequence
+      // or a time window. Without this bound, a lead who opened some unrelated email months
+      // ago would exit a sequence enrolled yesterday before it ever sent them anything. The
+      // LinkedIn reply exit below already does exactly this.
+      //
+      // An event with no createdAt cannot be proven to post-date enrollment, so it does not
+      // count — better to keep sending than to silently kill a live sequence.
+      const enrolledAt = new Date(enrollment.enrolledAt).getTime();
+      const wanted = exitConditions.onEmailEngagement;
+      const trigger = events.find((e: any) => {
+        const at = e.createdAt ? new Date(e.createdAt).getTime() : NaN;
+        if (!Number.isFinite(at) || at <= enrolledAt) return false;
+
+        if (wanted.includes('opened') && e.eventType === 'email.opened') return true;
+        if (wanted.includes('clicked') && e.eventType === 'email.clicked') return true;
+        // An inbound reply is stored as email.received, with leadEmail set to the SENDER
+        // (i.e. the lead) — see emailEventsDb.extractLeadEmail.
+        if (wanted.includes('replied') && e.eventType === 'email.received') return true;
+        return false;
+      });
+
+      if (trigger) {
+        // Name the exact event that caused this, and carry the two fields that would expose
+        // a false positive.
+        //
+        // Opens and clicks can be machine-generated: corporate link scanners (Microsoft Safe
+        // Links, Proofpoint, Mimecast) click every link on delivery, and Apple Mail
+        // pre-fetches tracking pixels. Neither is visible in today's traffic — sampled prod
+        // clicks sit 18s–250s after send, and the dominant open user-agent is Gmail's image
+        // proxy, which represents a REAL human open. But cold outreach into corporate M365
+        // tenants is exactly the workload that produces scanner engagement, and we do not
+        // have any of that yet.
+        //
+        // So instead of guessing at a filter we cannot calibrate, log the evidence. A
+        // scanner shows up here as a sub-second gap and a datacenter user-agent. If that
+        // starts appearing, we will know rather than infer. Tracked separately.
+        const t = trigger as any;
+        const detail = t.data?.click || t.data?.open || {};
+        const sentAt = t.data?.created_at ? new Date(String(t.data.created_at).replace(' ', 'T')).getTime() : NaN;
+        const eventAt = new Date(t.createdAt).getTime();
+        const gapSeconds = Number.isFinite(sentAt) ? Math.round((eventAt - sentAt) / 1000) : null;
+
+        console.log(
+          `[dripWorker] Enrollment ${enrollment.enrollmentId} exited: engagement — ` +
+          `lead ${enrollment.leadEmail} triggered "${t.eventType}" at ${t.createdAt} ` +
+          `(enrolled ${enrollment.enrolledAt}; sequence exits on: ${wanted.join(', ')}; ` +
+          `gapFromSend=${gapSeconds === null ? 'unknown' : `${gapSeconds}s`}; ` +
+          `userAgent=${detail.userAgent || 'n/a'})`,
+        );
+        return 'engagement';
+      }
+    }
   }
 
   // Check LinkedIn reply exit — fetch messages and look for inbound after enrollment
@@ -312,35 +403,25 @@ function addDays(date: Date, days: number): Date {
   return result;
 }
 
-async function loadSenderConfig(userId: string): Promise<{ senders: any[]; defaultSenderId: string | null }> {
-  try {
-    const setting = await settingsService.getSetting(`crm_sender_emails_${userId}`);
-    if (!setting?.settingValue) return { senders: [], defaultSenderId: null };
-    const config = JSON.parse(setting.settingValue);
-    return { senders: config.senders ?? [], defaultSenderId: config.defaultSenderId ?? null };
-  } catch {
-    return { senders: [], defaultSenderId: null };
-  }
+async function loadSenderConfig(userId: string): Promise<{ senders: CrmSender[]; defaultSenderId: string | null }> {
+  const config = await loadCrmSenderConfig(userId);
+  return { senders: config.senders, defaultSenderId: config.defaultSenderId };
 }
 
-function resolveSenderEmail(user: any, senderConfig: { senders: any[]; defaultSenderId: string | null }, senderId?: string): string | null {
-  const id = senderId ?? senderConfig.defaultSenderId;
-  if (id) {
-    const match = senderConfig.senders.find((s: any) => s.id === id);
-    if (match?.email) return match.email;
+/**
+ * Pre-dates CRM senders entirely: a user with no sender configured at all still
+ * gets a best-effort custom-domain address built from their own account fields.
+ * Synthesized as a resend CrmSender so it can go through sendAsSender like any
+ * other sender.
+ */
+function legacyDefaultSender(user: any): CrmSender | null {
+  if (!user?.emailDomain || !user?.defaultSenderUsername) {
+    return null;
   }
-  // Legacy fallback: user-level defaultSenderUsername
-  if (user?.emailDomain && user?.defaultSenderUsername) {
-    return `${user.defaultSenderUsername}@${user.emailDomain}`;
-  }
-  return null;
-}
-
-function resolveSenderName(user: any, senderConfig: { senders: any[]; defaultSenderId: string | null }, senderId?: string): string {
-  const id = senderId ?? senderConfig.defaultSenderId;
-  if (id) {
-    const match = senderConfig.senders.find((s: any) => s.id === id);
-    if (match?.fromName) return match.fromName;
-  }
-  return user?.fromName ?? user?.displayName ?? user?.name ?? '';
+  return {
+    id: '__legacy_user_default__',
+    email: `${user.defaultSenderUsername}@${user.emailDomain}`,
+    fromName: user?.fromName ?? user?.displayName ?? user?.name ?? '',
+    senderProvider: 'resend',
+  };
 }

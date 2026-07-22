@@ -23,6 +23,14 @@ jest.mock('../services/skillService', () => ({
   },
 }));
 
+// ENG-173 publish guardrail dependency
+jest.mock('../services/subscriptionService', () => ({
+  findTiersAllowingSkill: jest.fn(),
+}));
+
+import { findTiersAllowingSkill } from '../services/subscriptionService';
+const mockedFindTiers = findTiersAllowingSkill as jest.Mock;
+
 describe('SkillController', () => {
   let mockRequest: Partial<Request>;
   let mockResponse: Partial<Response>;
@@ -31,19 +39,111 @@ describe('SkillController', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    
+
     mockJson = jest.fn();
     mockStatus = jest.fn().mockReturnThis();
-    
+
     mockRequest = {
       body: {},
       params: {},
     };
-    
+
     mockResponse = {
       json: mockJson,
       status: mockStatus,
     };
+
+    // Default: skill is reachable (no warning). Individual tests override.
+    mockedFindTiers.mockResolvedValue({ reachable: true, allowingTiers: ['Pro'], totalTiers: 1 });
+  });
+
+  // ---- ENG-173 publish guardrail ----
+  describe('publish guardrail (entitlement reachability)', () => {
+    it('createSkill: warns when a PUBLISHED skill is in no tier allow-list', async () => {
+      const mockSkill = { skillId: 'skill-x', name: 'Docs', description: 'd', isPublished: true };
+      mockRequest.body = { name: 'Docs', description: 'd', isPublished: true };
+      (skillService.createSkill as jest.Mock).mockResolvedValue(mockSkill);
+      mockedFindTiers.mockResolvedValue({ reachable: false, allowingTiers: [], totalTiers: 3 });
+
+      await createSkill(mockRequest as Request, mockResponse as Response);
+
+      expect(mockedFindTiers).toHaveBeenCalledWith('skill-x');
+      const body = mockJson.mock.calls[0][0];
+      expect(Array.isArray(body.warnings)).toBe(true);
+      expect(body.warnings[0]).toMatch(/subscription tier/i);
+    });
+
+    it('createSkill: no warning when a published skill IS reachable', async () => {
+      const mockSkill = { skillId: 'skill-x', name: 'Docs', description: 'd', isPublished: true };
+      mockRequest.body = { name: 'Docs', description: 'd', isPublished: true };
+      (skillService.createSkill as jest.Mock).mockResolvedValue(mockSkill);
+      mockedFindTiers.mockResolvedValue({ reachable: true, allowingTiers: ['Pro'], totalTiers: 3 });
+
+      await createSkill(mockRequest as Request, mockResponse as Response);
+
+      const body = mockJson.mock.calls[0][0];
+      expect(body.warnings).toBeUndefined();
+    });
+
+    it('createSkill: does NOT run the guardrail for an unpublished skill', async () => {
+      const mockSkill = { skillId: 'skill-x', name: 'Docs', description: 'd', isPublished: false };
+      mockRequest.body = { name: 'Docs', description: 'd', isPublished: false };
+      (skillService.createSkill as jest.Mock).mockResolvedValue(mockSkill);
+
+      await createSkill(mockRequest as Request, mockResponse as Response);
+
+      expect(mockedFindTiers).not.toHaveBeenCalled();
+    });
+
+    it('updateSkill: warns when publishing a skill entitled to no tier', async () => {
+      mockRequest.params = { skillId: 'skill-x' };
+      mockRequest.body = { isPublished: true };
+      (skillService.getSkill as jest.Mock).mockResolvedValue({ skillId: 'skill-x', name: 'Docs', isPublished: false });
+      (skillService.updateSkill as jest.Mock).mockResolvedValue(undefined);
+      mockedFindTiers.mockResolvedValue({ reachable: false, allowingTiers: [], totalTiers: 3 });
+
+      await updateSkill(mockRequest as Request, mockResponse as Response);
+
+      expect(mockedFindTiers).toHaveBeenCalledWith('skill-x');
+      const body = mockJson.mock.calls[0][0];
+      expect(Array.isArray(body.warnings)).toBe(true);
+    });
+
+    it('createSkill: does NOT run the guardrail when the saved skill has no skillId', async () => {
+      const mockSkill = { name: 'Docs', description: 'd', isPublished: true }; // no skillId
+      mockRequest.body = { name: 'Docs', description: 'd', isPublished: true };
+      (skillService.createSkill as jest.Mock).mockResolvedValue(mockSkill);
+
+      await createSkill(mockRequest as Request, mockResponse as Response);
+
+      expect(mockedFindTiers).not.toHaveBeenCalled();
+      expect(mockJson.mock.calls[0][0].warnings).toBeUndefined();
+    });
+
+    it('createSkill: warning falls back to skillId when the saved skill has no name', async () => {
+      // request passes validation (has name), but the persisted skill object lacks a
+      // name → the warning must fall back to skillId (exercises `skill.name ?? skillId`).
+      const mockSkill = { skillId: 'skill-x', description: 'd', isPublished: true }; // no name
+      mockRequest.body = { name: 'Docs', description: 'd', isPublished: true };
+      (skillService.createSkill as jest.Mock).mockResolvedValue(mockSkill);
+      mockedFindTiers.mockResolvedValue({ reachable: false, allowingTiers: [], totalTiers: 3 });
+
+      await createSkill(mockRequest as Request, mockResponse as Response);
+
+      const body = mockJson.mock.calls[0][0];
+      expect(body.warnings[0]).toContain('skill-x');
+    });
+
+    it('entitlementWarnings: no warning when the saved skill is null/undefined', async () => {
+      // Defensive: skillService returns a falsy skill → guardrail must no-op safely.
+      mockRequest.body = { name: 'Docs', description: 'd', isPublished: true };
+      (skillService.createSkill as jest.Mock).mockResolvedValue(null);
+
+      await createSkill(mockRequest as Request, mockResponse as Response);
+
+      expect(mockedFindTiers).not.toHaveBeenCalled();
+      expect(mockJson.mock.calls[0][0]).toBeNull();
+    });
   });
 
   describe('POST /api/skills (createSkill)', () => {

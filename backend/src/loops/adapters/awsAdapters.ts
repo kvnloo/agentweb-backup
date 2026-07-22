@@ -69,6 +69,37 @@ export function awsDynamoAdapter(region = process.env.AWS_REGION || 'us-west-2')
     async putItem(tableName: string, item: DynamoAttributeMap): Promise<void> {
       await doc.put({ TableName: tableName, Item: item as Record<string, unknown> }).promise();
     },
+    async putItemIfAbsent(
+      tableName: string,
+      item: DynamoAttributeMap,
+      keyAttributes: readonly string[],
+    ): Promise<boolean> {
+      try {
+        await doc
+          .put({
+            TableName: tableName,
+            Item: item as Record<string, unknown>,
+            ConditionExpression: keyAttributes
+              .map((attr) => `attribute_not_exists(#${attr})`)
+              .join(' AND '),
+            ExpressionAttributeNames: Object.fromEntries(
+              keyAttributes.map((attr) => [`#${attr}`, attr]),
+            ),
+          })
+          .promise();
+        return true;
+      } catch (err) {
+        if (
+          typeof err === 'object' &&
+          err !== null &&
+          'code' in err &&
+          (err as { code?: unknown }).code === 'ConditionalCheckFailedException'
+        ) {
+          return false;
+        }
+        throw err;
+      }
+    },
     async getItem(tableName: string, key: DynamoAttributeMap): Promise<DynamoAttributeMap | null> {
       const r = await doc.get({ TableName: tableName, Key: key as Record<string, unknown> }).promise();
       return (r.Item as DynamoAttributeMap | undefined) ?? null;

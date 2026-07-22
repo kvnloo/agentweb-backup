@@ -26,6 +26,20 @@
  */
 
 import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
+import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
+import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../../../utils/citations';
+import { appendRetryabilityGuidance } from './errorRetryability';
+// OTel spine (ENG-141). Direct imports, NOT ports: both are pure/inert without
+// exporter env config (spans become no-ops), so they don't entangle the module
+// or affect the characterization contract — telemetry only, never behavior.
+import { endExecuteToolSpan, startRunChildSpan } from '../../../observability/tracing';
+import {
+  ATTR_GEN_AI_OPERATION_NAME,
+  ATTR_GEN_AI_TOOL_NAME,
+  ATTR_SESSION_ID,
+  GEN_AI_OP_EXECUTE_TOOL,
+  SPAN_EXECUTE_TOOL_PREFIX,
+} from '../../../observability/semconv';
 
 /**
  * Media-generation tools whose batches must run sequentially (rate limits) AND are
@@ -208,6 +222,8 @@ export interface ExecutePreparedToolsInput {
   messages: any[];
   /** the cumulative toolCalls ledger — MUTATED in place (entries pushed) */
   toolCallsLedger: any[];
+  /** ENG-351: per-message citation registry — MUTATED in place (web-search sources registered) */
+  citationRegistry?: CitationRegistry;
   // ---- run/iteration context ----
   iteration: number;
   agentRuntimeRunId: string;
@@ -278,6 +294,7 @@ export async function executePreparedTools(
     toolCalls: responseToolCalls,
     messages,
     toolCallsLedger: toolCalls,
+    citationRegistry,
     iteration,
     agentRuntimeRunId,
     sessionId,
@@ -430,7 +447,12 @@ export async function executePreparedTools(
       });
 
       if (contractResult.status === 'invalid') {
-        const errorContent = ports.formatToolError(toolCall.function.name, contractResult.modelMessage);
+        // ENG-124: schema rejects carry the explicit not-retryable-as-is verdict
+        // (fix the args first) so the model can't spiral on the identical call.
+        const errorContent = appendRetryabilityGuidance(
+          ports.formatToolError(toolCall.function.name, contractResult.modelMessage),
+          classifyToolErrorClass(contractResult.modelMessage),
+        );
         appendPreflightToolFailure(toolCall, functionArgs, contractResult.modelMessage, errorContent, initialPolicyDecision);
         continue;
       }
@@ -474,7 +496,12 @@ export async function executePreparedTools(
     } catch (error) {
       console.error(`AgentMode: Tool argument parse error for ${toolCall.function.name}:`, error);
       const errMsg = error instanceof Error ? error.message : String(error);
-      const errorContent = ports.formatToolError(toolCall.function.name, `Failed to parse arguments: ${errMsg}`);
+      // ENG-124: unparseable args are never retryable as-is — emit the corrected-
+      // arguments verdict alongside the formatted error.
+      const errorContent = appendRetryabilityGuidance(
+        ports.formatToolError(toolCall.function.name, `Failed to parse arguments: ${errMsg}`),
+        'invalid_args',
+      );
       appendPreflightToolFailure(toolCall, undefined, `Failed to parse arguments: ${errMsg}`, errorContent);
     }
   }
@@ -489,25 +516,50 @@ export async function executePreparedTools(
 
   let toolResults: DispatchToolResult[];
 
-  const runOne = (toolCall: any, functionArgs: any, policyDecision: AgentToolPolicyDecision) =>
-    ports.executeAgentToolThroughGateway({
-      toolName: toolCall.function.name,
-      args: functionArgs,
-      policyDecision,
-      runId: agentRuntimeRunId,
-      budgetScopeId: sessionId,
-      execute: () => ports.executePreparedAgentTool({
-        llmModel,
-        toolName: toolCall.function.name,
-        functionArgs,
-        userId,
-        sessionId,
-        mockMode,
-        socketEmit: ports.socketEmit,
-        screenshotUrl,
-        isDelegatedAccess,
-      }),
+  const runOne = async (toolCall: any, functionArgs: any, policyDecision: AgentToolPolicyDecision): Promise<ToolExecOutcome> => {
+    // OTel `execute_tool` span (ENG-141) — observability only; the gateway call,
+    // its outcome shape, and error propagation are untouched.
+    const span = startRunChildSpan(agentRuntimeRunId, `${SPAN_EXECUTE_TOOL_PREFIX} ${toolCall.function.name}`, {
+      [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OP_EXECUTE_TOOL,
+      [ATTR_GEN_AI_TOOL_NAME]: toolCall.function.name,
+      [ATTR_SESSION_ID]: sessionId,
     });
+    try {
+      const outcome = await ports.executeAgentToolThroughGateway({
+        toolName: toolCall.function.name,
+        args: functionArgs,
+        policyDecision,
+        runId: agentRuntimeRunId,
+        budgetScopeId: sessionId,
+        execute: () => ports.executePreparedAgentTool({
+          llmModel,
+          toolName: toolCall.function.name,
+          functionArgs,
+          userId,
+          sessionId,
+          mockMode,
+          socketEmit: ports.socketEmit,
+          screenshotUrl,
+          isDelegatedAccess,
+          // Long-render tools (compose_video) read this to hand off before the run's hard
+          // wall-clock timeout rather than blocking until killed with no asset (ENG-123).
+          renderDeadlineMs: mediaGenerationDeadlineMs,
+          // Run wall-clock budget deadline so wait_seconds can cap its sleep and not be
+          // killed mid-wait by the generation timeout (ENG-124).
+          runBudgetDeadlineMs: mediaGenerationDeadlineMs,
+        }),
+      });
+      endExecuteToolSpan(span, outcome.status === 'error'
+        ? { errorClass: classifyToolErrorClass(outcome.error), error: outcome.error }
+        : {});
+      return outcome;
+    } catch (err) {
+      // The gateway normalizes tool failures into outcomes; a throw here is
+      // unexpected — record it on the span and rethrow unchanged.
+      endExecuteToolSpan(span, { errorClass: classifyToolErrorClass(err), error: err });
+      throw err;
+    }
+  };
 
   const toDispatchResult = (
     outcome: ToolExecOutcome,
@@ -640,6 +692,14 @@ export async function executePreparedTools(
         }
       }
 
+      // ENG-351: harvest web-search sources into the per-message citation registry from the
+      // FULL result here — extractMinimalToolResult below trims search results to {} for storage,
+      // so this is the only place the structured sources are still available.
+      let citationBatch: Citation[] = [];
+      if (citationRegistry && WEB_SEARCH_TOOL_NAMES.has(toolCall.function.name)) {
+        citationBatch = citationRegistry.registerSearchResults(processedResult?.results);
+      }
+
       const minimalResult = ports.extractMinimalToolResult(processedResult, toolCall.function.name);
 
       toolCalls.push({
@@ -693,6 +753,12 @@ export async function executePreparedTools(
         toolContent = `Screenshot captured. URL: ${(processedResult as any).screenshotUrl}\n\n${ports.extractToolContent(result)}`;
       } else {
         toolContent = ports.extractToolContent(result);
+      }
+
+      // ENG-351 Phase 2: prepend the {{cite:N}} id→source map so the model can cite each
+      // figure inline. Prepend so it survives the large-response truncation/S3 path below.
+      if (citationBatch.length > 0 && typeof toolContent === 'string') {
+        toolContent = buildCitationIndexBlock(citationBatch) + toolContent;
       }
 
       // Large response: upload full content to S3 (search_tool_response retrieves later),
@@ -773,8 +839,17 @@ export async function executePreparedTools(
       failedCounterUpdates[toolCall.function.name] =
         (failedCounterUpdates[toolCall.function.name] || 0) + 1;
 
+      // ENG-124: the model-visible error carries (a) what failed (formatToolError
+      // names the tool + reason, with per-tool fix text), and (b+c) an explicit
+      // retryable yes/no verdict + actionable next step derived from the same
+      // classifier the telemetry uses — so a terminal failure (auth, provider
+      // rejection, schema reject) carries a hard stop signal instead of inviting
+      // a retry spiral.
       const errMsg = error instanceof Error ? error.message : String(error);
-      const errorContent = ports.formatToolError(toolCall.function.name, errMsg);
+      const errorContent = appendRetryabilityGuidance(
+        ports.formatToolError(toolCall.function.name, errMsg),
+        classifyToolErrorClass(error),
+      );
       messages.push({
         tool_call_id: toolCall.id,
         role: 'tool',

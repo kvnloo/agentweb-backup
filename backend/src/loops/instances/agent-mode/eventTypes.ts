@@ -65,6 +65,11 @@ export const EVT_RUN_FAILED = 'agent_run_failed';
  * still complete, and only a durable event lets the loop's sensor learn from
  * degraded runs (the inspector's read-time flags are invisible to the policy). */
 export const EVT_RUN_VERDICT = 'agent_run_verdict';
+/** The finalize guard's claim check itself failed (judge/correction call error,
+ * ENG-143). LOUD by design: the guard delivers the chat unchanged on judge
+ * failure (never blocks delivery), so this event is the only trace that a
+ * truthfulness check was skipped — silence here would hide a dark guard. */
+export const EVT_CLAIM_CHECK_ERROR = 'agent_claim_check_error';
 
 export const AGENT_MODE_EVENT_TYPES = [
   EVT_RUN_STARTED,
@@ -77,4 +82,5 @@ export const AGENT_MODE_EVENT_TYPES = [
   EVT_RUN_COMPLETED,
   EVT_RUN_FAILED,
   EVT_RUN_VERDICT,
+  EVT_CLAIM_CHECK_ERROR,
 ] as const;

@@ -1,10 +1,40 @@
 import { WebClient } from "@slack/web-api";
+import { stripCitationMarkers } from "../utils/citations";
+
+/**
+ * ENG-402 seam: resolve the Slack API base URL the WebClient should target.
+ *
+ * Default (env var unset) → `undefined`, i.e. the real Slack API — behavior-preserving.
+ * When `SLACK_API_BASE` is set it points the client at a test twin / mock server so the
+ * Slack surface can be exercised without hitting production Slack.
+ *
+ * Fail-loud guard: this override exists ONLY for testing. If `SLACK_API_BASE` is ever set
+ * while `NODE_ENV === 'production'` we throw at boot rather than silently talk to a
+ * non-Slack host — no silent swallow, no fallback path.
+ */
+export function resolveSlackApiUrl(
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const base = env.SLACK_API_BASE;
+  if (!base) return undefined;
+  if (env.NODE_ENV === "production") {
+    throw new Error(
+      `[slackService] SLACK_API_BASE is set ("${base}") while NODE_ENV=production. ` +
+        `This env var only exists to point the Slack client at a test twin/mock and must ` +
+        `never be configured in production. Unset SLACK_API_BASE to boot.`,
+    );
+  }
+  return base;
+}
 
 // Initialize Slack Web API client
 let slackClient: WebClient | null = null;
 
 if (process.env.SLACK_BOT_TOKEN) {
-  slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+  const slackApiUrl = resolveSlackApiUrl();
+  slackClient = slackApiUrl
+    ? new WebClient(process.env.SLACK_BOT_TOKEN, { slackApiUrl })
+    : new WebClient(process.env.SLACK_BOT_TOKEN);
 } else {
   console.warn("⚠️ SLACK_BOT_TOKEN not found in environment variables. Slack integration will not work.");
 }
@@ -1085,7 +1115,9 @@ export async function postThreadResponse(
     throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
   }
 
-  const mrkdwnContent = markdownToMrkdwn(markdownContent);
+  // ENG-351: Slack has no citation-chip renderer, so drop any {{cite:N}} markers Emma emitted —
+  // otherwise they would show as literal garbage in the thread. No-op on non-Emma/fallback strings.
+  const mrkdwnContent = markdownToMrkdwn(stripCitationMarkers(markdownContent));
 
   // Split into chunks if too long
   const chunks: string[] = [];
@@ -1348,6 +1380,50 @@ export async function postSlackMessage(
   };
 }
 
+/**
+ * A file reference as it arrives on a Slack `file_share` event.
+ *
+ * In a normal channel Slack includes `url_private`. In a Slack Connect /
+ * externally-shared channel (`is_ext_shared_channel: true`) it instead sends a
+ * stub with `file_access: 'check_file_info'` and NO `url_private`, expecting the
+ * app to call files.info to hydrate it.
+ */
+export interface SlackFileRef {
+  id?: string;
+  url_private?: string;
+  url_private_download?: string;
+  file_access?: string;
+}
+
+/**
+ * Resolve a downloadable Slack file URL from a `file_share` file object.
+ *
+ * If the file already carries a `url_private` (normal channels) it is returned
+ * as-is. If it is a Slack Connect stub (`file_access: 'check_file_info'`, no
+ * `url_private`), we hydrate it via files.info (requires the `files:read` scope)
+ * to obtain the real URL. Without this, `url_private` is undefined and
+ * downloadSlackFile → axios throws `TypeError: Invalid URL`, silently dropping
+ * the attachment (ENG-323).
+ */
+export async function resolveSlackFileUrl(file: SlackFileRef): Promise<string> {
+  if (file.url_private) {
+    return file.url_private;
+  }
+  if (!file.id) {
+    throw new Error('Slack file has no id or url_private; cannot resolve a download URL');
+  }
+  if (!slackClient) {
+    throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
+  }
+
+  const info = await slackClient.files.info({ file: file.id });
+  const url = info.file?.url_private_download || info.file?.url_private;
+  if (!url) {
+    throw new Error(`Slack files.info returned no url_private for file ${file.id}`);
+  }
+  return url;
+}
+
 export async function downloadSlackFile(urlPrivate: string): Promise<Buffer> {
   if (!process.env.SLACK_BOT_TOKEN) {
     throw new Error('SLACK_BOT_TOKEN not set');
@@ -1365,9 +1441,49 @@ export async function downloadSlackFile(urlPrivate: string): Promise<Buffer> {
   });
 
   const buffer = Buffer.from(response.data);
-  const prefix = buffer.slice(0, 20).toString('utf8');
-  if (prefix.trimStart().startsWith('<!') || prefix.trimStart().toLowerCase().startsWith('<html')) {
+  // Slack serves an HTML sign-in/error page (not the file bytes) when the bot can't
+  // access the file. Detect a real HTML document specifically — matching a bare "<!"
+  // prefix wrongly rejected valid SVG/XML uploads that legitimately begin with
+  // "<!DOCTYPE svg", "<!--", or "<!ENTITY" (ENG-323), leaving the attachment empty.
+  const prefix = buffer.slice(0, 64).toString('utf8').trimStart().toLowerCase();
+  if (prefix.startsWith('<!doctype html') || prefix.startsWith('<html')) {
     throw new Error(`Slack file download returned HTML for URL: ${urlPrivate}`);
   }
   return buffer;
+}
+
+// ---------------------------------------------------------------------------
+// User → channel resolution (moved from emma/slackMessageTools.ts so non-Emma
+// callers — e.g. shipNotifyService — can resolve "the customer's channel"
+// without pulling in the Emma tool registry).
+// ---------------------------------------------------------------------------
+
+/** The channels configured for a user (supports slackChannels array + legacy slackChannel). */
+export function getUserAllowedChannels(user: { slackChannels?: string[]; slackChannel?: string }): string[] {
+  if (user.slackChannels && user.slackChannels.length > 0) return user.slackChannels;
+  if (user.slackChannel) return [user.slackChannel];
+  return [];
+}
+
+/**
+ * Allowed channels for a user, falling back to the org's channel config for org members.
+ * Priority: personal channels → org.slackChannel (if set on org record) → org owner's user channels.
+ */
+export async function getEffectiveAllowedChannels(
+  user: { slackChannels?: string[]; slackChannel?: string; orgId?: string } | null | undefined,
+): Promise<string[]> {
+  const { userDb, orgDb } = await import('./db');
+  const personal = getUserAllowedChannels(user ?? {});
+  if (personal.length > 0) return personal;
+  if (user?.orgId) {
+    const org = await orgDb.getOrgById(user.orgId);
+    if (org?.slackChannel) return [org.slackChannel];
+    // Channels are typically stored on the org owner's user record, not the org record itself
+    if (org?.ownerUserId) {
+      const owner = await userDb.getUserById(org.ownerUserId);
+      const ownerChannels = getUserAllowedChannels(owner ?? {});
+      if (ownerChannels.length > 0) return ownerChannels;
+    }
+  }
+  return [];
 }

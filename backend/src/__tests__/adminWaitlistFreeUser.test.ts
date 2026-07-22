@@ -301,6 +301,64 @@ describe('Admin Waitlist Free User Management', () => {
       expect((mockWaitlistDb as any).updateStatus).toHaveBeenCalledWith(email, 'completed');
     });
 
+    it('should upgrade an existing free user even when create-user is called with free role only', async () => {
+      const email = 'freeonly-existing@example.com';
+      const freeUser = {
+        userId: 'user-free-only',
+        email,
+        roles: ['free']
+      };
+      const waitlistEntry = createWaitlistItem(email, {
+        fullName: 'Free Only',
+        companyName: 'Free Only Co'
+      });
+
+      mockUserDb.getUserByEmail.mockResolvedValue(freeUser);
+      mockWaitlistDb.getByEmail.mockResolvedValue(waitlistEntry);
+      (mockWaitlistDb as any).updateStatus.mockResolvedValue(createWaitlistItem(email, { status: 'completed' }));
+
+      const response = await request(app)
+        .post(`/api/admin/waitlist/${email}/create-user`)
+        .send({ roles: ['free'] });
+
+      expect(response.status).toBe(200);
+      expect((mockUserDb as any).updateUser).toHaveBeenCalledWith('user-free-only', {
+        roles: ['free', 'customer'],
+        subscriptionType: 'Free',
+        allowedPages: ['/agent-mode'],
+        allowedSkills: ['skill-1'],
+      });
+    });
+
+    it('should not duplicate roles when upgrading an existing free user', async () => {
+      const email = 'dedupe-existing@example.com';
+      const freeUser = {
+        userId: 'user-dedupe-free',
+        email,
+        roles: ['free']
+      };
+      const waitlistEntry = createWaitlistItem(email, {
+        fullName: 'Dedupe Free',
+        companyName: 'Dedupe Free Co'
+      });
+
+      mockUserDb.getUserByEmail.mockResolvedValue(freeUser);
+      mockWaitlistDb.getByEmail.mockResolvedValue(waitlistEntry);
+      (mockWaitlistDb as any).updateStatus.mockResolvedValue(createWaitlistItem(email, { status: 'completed' }));
+
+      const response = await request(app)
+        .post(`/api/admin/waitlist/${email}/create-user`)
+        .send({ roles: ['free', 'customer', 'customer'] });
+
+      expect(response.status).toBe(200);
+      expect((mockUserDb as any).updateUser).toHaveBeenCalledWith('user-dedupe-free', {
+        roles: ['free', 'customer'],
+        subscriptionType: 'Free',
+        allowedPages: ['/agent-mode'],
+        allowedSkills: ['skill-1'],
+      });
+    });
+
     it('should create new waitlist users with Free tier defaults', async () => {
       const email = 'newuser@example.com';
       const waitlistEntry = createWaitlistItem(email, {
@@ -356,6 +414,47 @@ describe('Admin Waitlist Free User Management', () => {
       const sentPassword: string = welcomeCall[1];
       expect(sentPassword).toHaveLength(16);
       expect(sentPassword).toMatch(/^[a-zA-Z0-9!@#$%^&*]{16}$/);
+    });
+
+    it('should create new users with customer portal access even when requested role is free only', async () => {
+      const email = 'freeonly-new@example.com';
+      const waitlistEntry = createWaitlistItem(email, {
+        fullName: 'New Free Only',
+        companyName: 'New Free Only Co',
+      });
+      mockUserDb.getUserByEmail.mockResolvedValue(undefined);
+      mockWaitlistDb.getByEmail.mockResolvedValue(waitlistEntry);
+      let createdRoles: string[] = [];
+      (mockUserDb as any).createUser.mockImplementation(
+        async (_email: string, userId: string, _password: string, _isOAuthUser: boolean, _isAdmin: boolean, roles: string[]) => {
+          createdRoles = roles;
+          return {
+            userId,
+            email,
+            displayName: 'New Free Only',
+            roles,
+          };
+        }
+      );
+      (mockUserDb as any).updateUser.mockImplementation(
+        async (userId: string, updates: any) => ({
+          userId,
+          email,
+          displayName: 'New Free Only',
+          roles: createdRoles,
+          ...updates,
+        })
+      );
+      (mockWaitlistDb as any).updateStatus.mockResolvedValue(createWaitlistItem(email, { status: 'completed' }));
+
+      const response = await request(app)
+        .post(`/api/admin/waitlist/${email}/create-user`)
+        .send({ roles: ['free'] });
+
+      expect(response.status).toBe(200);
+      const createUserCall = (mockUserDb as any).createUser.mock.calls[0];
+      expect(createUserCall[5]).toEqual(['free', 'customer']);
+      expect(response.body.user.roles).toEqual(['free', 'customer']);
     });
 
     it('should block registered users from being created', async () => {

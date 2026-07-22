@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { useAdmin } from "../contexts/AdminContext";
 import { Link as RouterLink, useSearchParams } from "react-router-dom";
 import {
@@ -56,9 +56,12 @@ import DefaultPromptsSettings from "../components/admin/DefaultPromptsSettings";
 import BenchmarksTab from "../components/admin/BenchmarksTab";
 import SubscriptionTypesTab from "../components/admin/SubscriptionTypesTab";
 import McpServersTab from "../components/admin/McpServersTab";
+import EmmaMcpUsageTab from "../components/admin/EmmaMcpUsageTab";
 import ResultEndpointsTab from "../components/admin/ResultEndpointsTab";
 import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
 import CrmTab from "../components/admin/CrmTab";
+import V0CreditsCard from "../components/admin/V0CreditsCard";
+import CostBreakdownBody, { OrgUsageRollup } from "../components/admin/CostBreakdownBody";
 import RevenueTab from "../components/admin/RevenueTab";
 import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
@@ -99,6 +102,8 @@ import {
   Cancel as CancelIcon,
   Search as SearchIcon,
   Email as EmailIcon,
+  BarChart as BarChartIcon,
+  ContentCopy as ContentCopyIcon,
 } from "@mui/icons-material";
 
 interface TabPanelProps {
@@ -155,6 +160,22 @@ interface UserNote {
   timestamp: string;
   authorEmail: string;
 }
+
+const FUNNEL_STATUS_OPTIONS = [
+  { value: "", label: "Unset" },
+  { value: "follow_up", label: "Follow-up" },
+  { value: "call_booking", label: "Call Booking" },
+  { value: "sales_conversation", label: "Sales Conversation" },
+  { value: "design_trial", label: "Design Trial" },
+  { value: "trial_agreed", label: "Trial Agreed" },
+  { value: "account_setup", label: "Account Setup" },
+  { value: "activation", label: "Activation" },
+  { value: "evaluation_period", label: "Evaluation Period" },
+  { value: "decision_day", label: "Decision Day" },
+  { value: "payment_conversion", label: "Payment Conversion" },
+  { value: "paid_retention_handoff", label: "Paid / Retention Handoff" },
+  { value: "parked", label: "Parked" },
+] as const;
 
 // Define ChatSession interface for the frontend, including portalType
 interface AdminChatSession {
@@ -229,6 +250,7 @@ interface User {
   lastLoginTime?: string;
   lastActiveAt?: string;
   displayName?: string;
+  funnelStatus?: string | null;
   supportNote?: string;
   role?: "partner" | "customer" | "free" | "contractor"; // For single role from API
   roles?: ("partner" | "customer" | "free" | "contractor")[];
@@ -294,6 +316,35 @@ interface User {
   orgName?: string;
   isOrgOwner?: boolean;
   orgShareAnalyticsWithOrg?: boolean;
+}
+
+// Caption paired with a hover-help info icon. Used to explain the burn / deduction
+// cost terminology to admins in the Users tab without cluttering the layout.
+const HelpCaption: React.FC<{ label: string; help: string }> = ({ label, help }) => (
+  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+    <Typography variant="caption" color="text.secondary">{label}</Typography>
+    <Tooltip title={help} arrow>
+      <InfoIcon sx={{ fontSize: 14, color: "text.disabled", cursor: "help" }} />
+    </Tooltip>
+  </Box>
+);
+
+// Recent months (newest first) for the cost-breakdown picker, as
+// { value: "YYYY-MM", label: "Jul 2026" }. Bounded on purpose: burn data only
+// exists for the recent window (shadow-table TTL), so an open-ended date input
+// would mostly land on empty months. Uses the same UTC basis as tokenUsage.month
+// and the inline cost cells, so the default month always matches an option.
+function recentMonthOptions(count: number): Array<{ value: string; label: string }> {
+  const now = new Date();
+  const opts: Array<{ value: string; label: string }> = [];
+  for (let i = 0; i < count; i++) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+    opts.push({
+      value: d.toISOString().slice(0, 7),
+      label: d.toLocaleString("en-US", { month: "short", year: "numeric", timeZone: "UTC" }),
+    });
+  }
+  return opts;
 }
 
 // Define an interface for the task data shown in the admin tasks tab
@@ -731,6 +782,7 @@ export default function AdminDashboard() {
     'onboarding': 20,
     'connected-accounts': 21,
     'contractors': 22,
+    'emma-mcp': 23,
   };
   
   // Get initial tab value from URL or default to Users
@@ -804,6 +856,7 @@ export default function AdminDashboard() {
   const [editingSupportNoteUserId, setEditingSupportNoteUserId] = useState<string | null>(null);
   const [currentSupportNoteText, setCurrentSupportNoteText] = useState("");
   const [supportNoteEditLoading, setSupportNoteEditLoading] = useState(false);
+  const [funnelStatusSavingUserId, setFunnelStatusSavingUserId] = useState<string | null>(null);
   const [userNotesMap, setUserNotesMap] = useState<Record<string, UserNote[]>>({});
   const [userNotesLoading, setUserNotesLoading] = useState<Record<string, boolean>>({});
   const [newNoteText, setNewNoteText] = useState<Record<string, string>>({});
@@ -867,6 +920,25 @@ export default function AdminDashboard() {
   const [subscriptionTypeEditLoading, setSubscriptionTypeEditLoading] = useState(false);
   const [availableSubscriptionTypes, setAvailableSubscriptionTypes] = useState<string[]>([]);
   const [subscriptionTypeAllowanceMap, setSubscriptionTypeAllowanceMap] = useState<Record<string, number | null>>({});
+  const [subscriptionTypeCostAllowanceMap, setSubscriptionTypeCostAllowanceMap] = useState<Record<string, number | null>>({});
+  // Per-user LLM cost breakdown modal (burn, from the shadow-usage table)
+  const [costBreakdownUser, setCostBreakdownUser] = useState<User | null>(null);
+  const [costBreakdownMonth, setCostBreakdownMonth] = useState<string>("");
+  const [costBreakdownData, setCostBreakdownData] = useState<OrgUsageRollup | null>(null);
+  const [costBreakdownLoading, setCostBreakdownLoading] = useState(false);
+  const [costBreakdownError, setCostBreakdownError] = useState<string | null>(null);
+  // Monotonic token to ignore stale org-rollup responses: if the admin switches
+  // user/month before a request returns, a slower earlier response must not
+  // overwrite the current selection's data (Greptile).
+  const costBreakdownReqRef = useRef(0);
+  // Table vs bar-chart view for the cost-breakdown modal — remembered per-admin.
+  const [costBreakdownView, setCostBreakdownView] = useState<"table" | "bars">(
+    () => (typeof window !== "undefined" && localStorage.getItem("costBreakdownView") === "bars" ? "bars" : "table")
+  );
+  const changeCostBreakdownView = (v: "table" | "bars") => {
+    setCostBreakdownView(v);
+    try { localStorage.setItem("costBreakdownView", v); } catch { /* non-fatal */ }
+  };
   const [grantBonusDialogOpen, setGrantBonusDialogOpen] = useState(false);
   const [grantBonusUserId, setGrantBonusUserId] = useState<string | null>(null);
   const [grantBonusEmail, setGrantBonusEmail] = useState("");
@@ -877,6 +949,8 @@ export default function AdminDashboard() {
   const [introEmailUserEmail, setIntroEmailUserEmail] = useState("");
   const [introEmailLoading, setIntroEmailLoading] = useState(false);
   const [delegateAccessLoading, setDelegateAccessLoading] = useState<string | null>(null);
+  const [delegatedPortalUrl, setDelegatedPortalUrl] = useState<string | null>(null);
+  const [delegatedUrlCopied, setDelegatedUrlCopied] = useState(false);
   const [emailToDelete, setEmailToDelete] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [userIdToDelete, setUserIdToDelete] = useState<string | null>(null);
@@ -1025,14 +1099,61 @@ export default function AdminDashboard() {
         : ['Basic'];
       setAvailableSubscriptionTypes(typeNames);
       const allowanceMap: Record<string, number | null> = {};
-      types.forEach((t: any) => { allowanceMap[t.name] = t.monthlyTokenAllowance ?? null; });
+      const costAllowanceMap: Record<string, number | null> = {};
+      types.forEach((t: any) => {
+        allowanceMap[t.name] = t.monthlyTokenAllowance ?? null;
+        costAllowanceMap[t.name] = t.monthlyCostAllowance ?? null;
+      });
       setSubscriptionTypeAllowanceMap(allowanceMap);
+      setSubscriptionTypeCostAllowanceMap(costAllowanceMap);
     } catch (error) {
       console.error('Error loading subscription types:', error);
       // Default to Basic if loading fails
       setAvailableSubscriptionTypes(['Basic']);
     }
   };
+
+  // Fetch the per-model LLM cost burn for a user over a calendar month (YYYY-MM).
+  const fetchCostBreakdown = async (userId: string, month: string) => {
+    const reqId = ++costBreakdownReqRef.current;
+    const isStale = () => reqId !== costBreakdownReqRef.current;
+    setCostBreakdownLoading(true);
+    setCostBreakdownError(null);
+    try {
+      // Org-aware rollup: gross burn summed across all org members, reconciled
+      // against the OWNER's quota counter (see backend usageAnalyticsService).
+      const response = await axios.get(
+        buildApiUrl(`/api/admin/users/${userId}/usage/org-rollup`),
+        { headers: { Authorization: `Bearer ${token}` }, params: { month } }
+      );
+      if (isStale()) return; // a newer request superseded this one
+      setCostBreakdownData(response.data);
+    } catch (error: any) {
+      if (isStale()) return;
+      console.error('Error loading cost breakdown:', error);
+      setCostBreakdownData(null);
+      setCostBreakdownError(error.response?.data?.message || 'Failed to load cost breakdown');
+    } finally {
+      if (!isStale()) setCostBreakdownLoading(false);
+    }
+  };
+
+  // Open the breakdown modal for a user, defaulting to the current month.
+  const openCostBreakdown = (user: User) => {
+    setCostBreakdownUser(user);
+    setCostBreakdownData(null);
+    setCostBreakdownError(null);
+    setCostBreakdownMonth(new Date().toISOString().slice(0, 7));
+  };
+
+
+  // (Re)load the breakdown whenever the target user or selected month changes.
+  useEffect(() => {
+    if (costBreakdownUser && costBreakdownMonth) {
+      fetchCostBreakdown(costBreakdownUser.userId, costBreakdownMonth);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [costBreakdownUser?.userId, costBreakdownMonth]);
 
   // Load waitlist data only when Waitlist tab (3) is selected
   useEffect(() => {
@@ -2162,6 +2283,33 @@ export default function AdminDashboard() {
     }
   };
 
+  const handleSaveFunnelStatus = async (userId: string, funnelStatus: string) => {
+    try {
+      setFunnelStatusSavingUserId(userId);
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${userId}/funnel-status`),
+        { funnelStatus: funnelStatus || null },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      if (response.status === 200) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === userId
+              ? { ...user, funnelStatus: response.data.funnelStatus ?? null }
+              : user
+          )
+        );
+        setSuccess("Funnel status updated successfully!");
+      }
+    } catch (error: any) {
+      console.error("Error updating funnel status:", error);
+      setError(error.response?.data?.message || "Failed to update funnel status");
+    } finally {
+      setFunnelStatusSavingUserId(null);
+    }
+  };
+
   const handleSaveAdAccount = async (userId: string) => {
     try {
       setAdAccountEditLoading(true);
@@ -2975,9 +3123,15 @@ export default function AdminDashboard() {
   };
 
   const handleAccessCustomerPortal = async (userId: string) => {
+    // Open a placeholder tab synchronously (inside the click handler) so the
+    // browser treats it as a user-initiated action and does not block it. We
+    // navigate this tab to the delegated URL once the async request resolves.
+    // If the browser still blocks the popup, `placeholderTab` is null and we
+    // fall back to exposing the URL in the UI so the admin can copy/open it.
+    const placeholderTab = window.open("", "_blank");
     try {
       setDelegateAccessLoading(userId);
-      
+
       const response = await axios.post(
         buildApiUrl(`/api/admin/users/${userId}/delegate-access`),
         {},
@@ -2986,17 +3140,72 @@ export default function AdminDashboard() {
         }
       );
 
-      if (response.status === 200) {
-        const { customerPortalUrl } = response.data;
-        // Open customer portal in new tab with delegate token
-        window.open(customerPortalUrl, '_blank');
-        setSuccess("Delegate access created successfully!");
+      // Key off the presence of the URL rather than an exact 200 so any 2xx
+      // response is handled. If the response has no URL (unexpected), fall
+      // through to the else and close the placeholder tab so it is never
+      // orphaned as a blank window.
+      const customerPortalUrl = response?.data?.customerPortalUrl;
+      if (customerPortalUrl) {
+        if (placeholderTab && !placeholderTab.closed) {
+          // Navigate the pre-opened tab to the delegated customer portal.
+          placeholderTab.location.href = customerPortalUrl;
+          setSuccess("Delegate access created successfully!");
+        } else {
+          // Popup was blocked — surface the URL so the admin can still recover it.
+          setDelegatedPortalUrl(customerPortalUrl);
+          setDelegatedUrlCopied(false);
+        }
+      } else {
+        // No usable URL in the response — don't leave a blank tab behind.
+        if (placeholderTab && !placeholderTab.closed) {
+          placeholderTab.close();
+        }
+        setError("Delegate access did not return a portal URL");
       }
     } catch (error: any) {
+      // Close the placeholder tab we opened optimistically so we don't leave a
+      // blank tab behind when the request fails.
+      if (placeholderTab && !placeholderTab.closed) {
+        placeholderTab.close();
+      }
       console.error("Error creating delegate access:", error);
       setError(error.response?.data?.message || "Failed to create delegate access");
     } finally {
       setDelegateAccessLoading(null);
+    }
+  };
+
+  const handleCopyDelegatedUrl = async () => {
+    if (!delegatedPortalUrl) return;
+    // Prefer the async Clipboard API, but it is only exposed in secure contexts
+    // (HTTPS/localhost). On plain HTTP (e.g. preview envs) navigator.clipboard is
+    // undefined, so fall back to a temporary textarea + execCommand("copy").
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(delegatedPortalUrl);
+        setDelegatedUrlCopied(true);
+        return;
+      } catch (error) {
+        console.error("Clipboard API copy failed, falling back to execCommand:", error);
+      }
+    }
+    try {
+      const textarea = document.createElement("textarea");
+      textarea.value = delegatedPortalUrl;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand("copy");
+      document.body.removeChild(textarea);
+      if (copied) {
+        setDelegatedUrlCopied(true);
+      } else {
+        console.error("Failed to copy delegated URL: execCommand returned false");
+      }
+    } catch (error) {
+      console.error("Failed to copy delegated URL:", error);
     }
   };
 
@@ -3152,6 +3361,7 @@ export default function AdminDashboard() {
             <Tab label="Onboarding" {...a11yProps(20)} />
             <Tab label="Connected Accounts" {...a11yProps(21)} />
             <Tab label="Contractors" {...a11yProps(22)} />
+            <Tab label="Emma MCP" {...a11yProps(23)} />
           </Tabs>
         </Box>
 
@@ -3633,6 +3843,9 @@ export default function AdminDashboard() {
                         )}
                       </CardContent>
                     </Card>
+                  </Grid>
+                  <Grid item xs={12} md={3}>
+                    <V0CreditsCard />
                   </Grid>
                 </Grid>
 
@@ -4140,6 +4353,9 @@ export default function AdminDashboard() {
                   </TableCell>
                   <TableCell>Payment</TableCell>
                   <TableCell>
+                    <UserSortLabel property="funnelStatus" label="Funnel Status" />
+                  </TableCell>
+                  <TableCell>
                     <UserSortLabel property="createdAt" label="Created" />
                   </TableCell>
                   <TableCell>
@@ -4155,7 +4371,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={9} align="center">
+                    <TableCell colSpan={10} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -4259,6 +4475,22 @@ export default function AdminDashboard() {
                           )}
                           </Box>
                         </TableCell>
+                        <TableCell onClick={(e) => e.stopPropagation()}>
+                          <FormControl size="small" sx={{ minWidth: 160 }}>
+                            <Select
+                              value={FUNNEL_STATUS_OPTIONS.some((option) => option.value === (user.funnelStatus || "")) ? (user.funnelStatus || "") : ""}
+                              onChange={(e) => handleSaveFunnelStatus(user.userId, e.target.value)}
+                              disabled={funnelStatusSavingUserId === user.userId}
+                              displayEmpty
+                            >
+                              {FUNNEL_STATUS_OPTIONS.map((option) => (
+                                <MenuItem key={option.value || "unset"} value={option.value}>
+                                  {option.label}
+                                </MenuItem>
+                              ))}
+                            </Select>
+                          </FormControl>
+                        </TableCell>
                         <TableCell>
                           <Typography variant="body2" color="text.secondary">
                             {user.createdAt ? format(new Date(user.createdAt), "MMM d, yyyy") : "—"}
@@ -4300,7 +4532,7 @@ export default function AdminDashboard() {
                       </TableRow>
                       {/* Expandable detail row */}
                       <TableRow>
-                        <TableCell colSpan={9} sx={{ py: 0, borderBottom: isExpanded ? undefined : "none" }}>
+                        <TableCell colSpan={10} sx={{ py: 0, borderBottom: isExpanded ? undefined : "none" }}>
                           <Collapse in={isExpanded} timeout="auto" unmountOnExit>
                             <Box sx={{ py: 2, px: 1 }}>
                               <Grid container spacing={2}>
@@ -4667,6 +4899,31 @@ export default function AdminDashboard() {
                                       ))}
                                     </Box>
                                   )}
+                                </Grid>
+                                {/* LLM Cost quota (dollar spend vs cost cap) */}
+                                <Grid item xs={6}>
+                                  <HelpCaption
+                                    label="LLM Cost"
+                                    help="Dollars deducted from this user's monthly cost cap so far this month, vs the cap (∞ = no cap). This is the counted/deducted figure — open the breakdown for gross burn per model, including platform-absorbed cost."
+                                  />
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
+                                    {user.roles?.includes("customer") ? (() => {
+                                      const currentMonth = new Date().toISOString().slice(0, 7);
+                                      const costUsed = user.tokenUsage?.month === currentMonth ? (user.tokenUsage?.totalCost ?? 0) : 0;
+                                      const costAllowance = subscriptionTypeCostAllowanceMap[user.subscriptionType || "Basic"] ?? null;
+                                      return (
+                                        <Typography variant="body2">
+                                          ${costUsed.toFixed(2)} / {costAllowance != null ? `$${costAllowance.toFixed(2)}` : "∞"}
+                                          <Typography component="span" variant="caption" color="text.secondary"> deducted</Typography>
+                                        </Typography>
+                                      );
+                                    })() : <Typography variant="body2" color="text.disabled">—</Typography>}
+                                    {user.roles?.includes("customer") && (
+                                      <Tooltip title="View per-model burn breakdown">
+                                        <IconButton size="small" onClick={() => openCostBreakdown(user)} color="primary"><BarChartIcon fontSize="small" /></IconButton>
+                                      </Tooltip>
+                                    )}
+                                  </Box>
                                 </Grid>
                                 {/* Extra Cost Usage (enrichment, image gen, etc.) */}
                                 {user.roles?.includes("customer") && (
@@ -6297,6 +6554,10 @@ export default function AdminDashboard() {
           <ContractorsTab />
         </TabPanel>
 
+        <TabPanel value={tabValue} index={23}>
+          <EmmaMcpUsageTab />
+        </TabPanel>
+
       </Paper>
 
       {/* Satisfaction Score Override Popover */}
@@ -6367,7 +6628,59 @@ export default function AdminDashboard() {
         </DialogActions>
       </Dialog>
 
-      {/* Grant Token Bonus Dialog */}
+      {/* Delegated Customer Portal Link Dialog (popup-blocked recovery) */}
+      <Dialog
+        open={Boolean(delegatedPortalUrl)}
+        onClose={() => { setDelegatedPortalUrl(null); setDelegatedUrlCopied(false); }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>Delegated Customer Portal Link</DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ mb: 2 }}>
+            Your browser blocked the popup, so the customer portal did not open
+            automatically. Use the link below to open the delegated session or
+            copy it to share/reuse.
+          </DialogContentText>
+          <TextField
+            value={delegatedPortalUrl || ""}
+            fullWidth
+            multiline
+            InputProps={{
+              readOnly: true,
+              endAdornment: (
+                <InputAdornment position="end">
+                  <Tooltip title={delegatedUrlCopied ? "Copied!" : "Copy link"}>
+                    <IconButton onClick={handleCopyDelegatedUrl} edge="end">
+                      {delegatedUrlCopied ? (
+                        <CheckIcon fontSize="small" color="success" />
+                      ) : (
+                        <ContentCopyIcon fontSize="small" />
+                      )}
+                    </IconButton>
+                  </Tooltip>
+                </InputAdornment>
+              ),
+            }}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => { setDelegatedPortalUrl(null); setDelegatedUrlCopied(false); }}>Close</Button>
+          {delegatedPortalUrl && (
+            <Button
+              component={Link}
+              href={delegatedPortalUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              variant="contained"
+              startIcon={<OpenInNewIcon />}
+            >
+              Open Portal
+            </Button>
+          )}
+        </DialogActions>
+      </Dialog>
+
       <Dialog open={introEmailDialogOpen} onClose={() => setIntroEmailDialogOpen(false)}>
         <DialogTitle>Send Team Introduction Email</DialogTitle>
         <DialogContent>
@@ -6383,6 +6696,7 @@ export default function AdminDashboard() {
         </DialogActions>
       </Dialog>
 
+      {/* Grant Bonus Tokens Dialog */}
       <Dialog open={grantBonusDialogOpen} onClose={() => setGrantBonusDialogOpen(false)}>
         <DialogTitle>Grant Bonus Tokens</DialogTitle>
         <DialogContent>
@@ -6411,6 +6725,60 @@ export default function AdminDashboard() {
           >
             {grantBonusLoading ? <CircularProgress size={24} /> : "Grant"}
           </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Per-user LLM cost burn breakdown */}
+      <Dialog open={!!costBreakdownUser} onClose={() => setCostBreakdownUser(null)} maxWidth="md" fullWidth>
+        <DialogTitle sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 2 }}>
+          <span>LLM Cost Burn — {costBreakdownUser?.email}</span>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1.5 }}>
+            <ButtonGroup size="small" aria-label="cost breakdown view">
+              <Button
+                variant={costBreakdownView === "table" ? "contained" : "outlined"}
+                onClick={() => changeCostBreakdownView("table")}
+              >
+                Table
+              </Button>
+              <Button
+                variant={costBreakdownView === "bars" ? "contained" : "outlined"}
+                onClick={() => changeCostBreakdownView("bars")}
+                startIcon={<BarChartIcon fontSize="small" />}
+              >
+                Bars
+              </Button>
+            </ButtonGroup>
+            <TextField
+              select
+              size="small"
+              label="Month"
+              value={costBreakdownMonth}
+              onChange={(e) => setCostBreakdownMonth(e.target.value)}
+              sx={{ width: 170 }}
+            >
+              {recentMonthOptions(12).map((m) => (
+                <MenuItem key={m.value} value={m.value}>{m.label}</MenuItem>
+              ))}
+            </TextField>
+          </Box>
+        </DialogTitle>
+        <DialogContent dividers>
+          {costBreakdownLoading ? (
+            <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}><CircularProgress /></Box>
+          ) : costBreakdownError ? (
+            <Typography color="error" variant="body2" sx={{ py: 2 }}>{costBreakdownError}</Typography>
+          ) : costBreakdownData ? (
+            <CostBreakdownBody
+              rollup={costBreakdownData}
+              view={costBreakdownView}
+              costAllowanceMap={subscriptionTypeCostAllowanceMap}
+            />
+          ) : (
+            <Typography variant="body2" color="text.secondary" sx={{ py: 2 }}>No data.</Typography>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setCostBreakdownUser(null)}>Close</Button>
         </DialogActions>
       </Dialog>
 

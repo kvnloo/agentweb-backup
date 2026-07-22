@@ -52,6 +52,7 @@ interface SubscriptionType {
   allowedSkills: string[];
   allowedConnectedAccounts?: string[];
   monthlyTokenAllowance?: number | null;
+  monthlyCostAllowance?: number | null;
 }
 
 const AVAILABLE_CONNECTED_ACCOUNTS = [
@@ -59,7 +60,9 @@ const AVAILABLE_CONNECTED_ACCOUNTS = [
   { id: 'unipile', label: 'LinkedIn Outreach' },
   { id: 'meta', label: 'Meta Marketing' },
   { id: 'instagram', label: 'Instagram Business' },
+  { id: 'twitter', label: 'Twitter/X' },
   { id: 'gmail', label: 'Gmail' },
+  { id: 'outlook', label: 'Outlook / Microsoft 365' },
   { id: 'youtube', label: 'YouTube' },
   { id: 'fathom', label: 'Fathom' },
   { id: 'hubspot', label: 'HubSpot' },
@@ -98,8 +101,10 @@ const SubscriptionTypesTab: React.FC = () => {
     allowedSkills: [],
     allowedConnectedAccounts: AVAILABLE_CONNECTED_ACCOUNTS.map((a) => a.id),
     monthlyTokenAllowance: null,
+    monthlyCostAllowance: null,
   });
   const [tokenAllowanceInput, setTokenAllowanceInput] = useState('');
+  const [costAllowanceInput, setCostAllowanceInput] = useState('');
   const [expandedSkills, setExpandedSkills] = useState<Set<string>>(new Set());
 
   useEffect(() => {
@@ -222,9 +227,11 @@ const SubscriptionTypesTab: React.FC = () => {
           : type.allowedSkills,
         allowedConnectedAccounts: expandedConnectedAccounts,
         monthlyTokenAllowance: type.monthlyTokenAllowance ?? null,
+        monthlyCostAllowance: type.monthlyCostAllowance ?? null,
       };
       setFormData(expandedData);
       setTokenAllowanceInput(type.monthlyTokenAllowance != null ? String(type.monthlyTokenAllowance) : '');
+      setCostAllowanceInput(type.monthlyCostAllowance != null ? String(type.monthlyCostAllowance) : '');
     } else {
       setEditingType(null);
       // When creating new, start with all pages, skills, and platforms selected
@@ -235,8 +242,10 @@ const SubscriptionTypesTab: React.FC = () => {
         allowedSkills: availableSkills.map((s) => s.skillId),
         allowedConnectedAccounts: AVAILABLE_CONNECTED_ACCOUNTS.map((a) => a.id),
         monthlyTokenAllowance: null,
+        monthlyCostAllowance: null,
       });
       setTokenAllowanceInput('');
+      setCostAllowanceInput('');
     }
     setExpandedSkills(new Set());
     setEditDialogOpen(true);
@@ -252,8 +261,10 @@ const SubscriptionTypesTab: React.FC = () => {
       allowedSkills: [],
       allowedConnectedAccounts: AVAILABLE_CONNECTED_ACCOUNTS.map((a) => a.id),
       monthlyTokenAllowance: null,
+      monthlyCostAllowance: null,
     });
     setTokenAllowanceInput('');
+    setCostAllowanceInput('');
     setExpandedSkills(new Set());
   };
 
@@ -276,6 +287,15 @@ const SubscriptionTypesTab: React.FC = () => {
         return;
       }
 
+      // Parse cost allowance (USD, decimals allowed; empty = unlimited)
+      const parsedCostAllowance = costAllowanceInput.trim() === ''
+        ? null
+        : parseFloat(costAllowanceInput.replace(/[$,]/g, ''));
+      if (parsedCostAllowance !== null && (isNaN(parsedCostAllowance) || parsedCostAllowance < 0)) {
+        setError('Monthly cost allowance must be a positive dollar amount or empty for unlimited');
+        return;
+      }
+
       // Convert all selected items back to "*" if all are selected
       const dataToSave: SubscriptionType = {
         name: formData.name,
@@ -290,6 +310,7 @@ const SubscriptionTypesTab: React.FC = () => {
             ? ['*']
             : formData.allowedConnectedAccounts || [],
         monthlyTokenAllowance: parsedAllowance,
+        monthlyCostAllowance: parsedCostAllowance,
       };
 
       let updatedTypes = [...subscriptionTypes];
@@ -473,6 +494,7 @@ const SubscriptionTypesTab: React.FC = () => {
               <TableRow>
                 <TableCell>Name</TableCell>
                 <TableCell>Monthly Token Allowance</TableCell>
+                <TableCell>Monthly Cost Allowance</TableCell>
                 <TableCell>Allowed Pages</TableCell>
                 <TableCell>Allowed Skills</TableCell>
                 <TableCell>Connected Accounts</TableCell>
@@ -482,7 +504,7 @@ const SubscriptionTypesTab: React.FC = () => {
             <TableBody>
               {subscriptionTypes.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={6} align="center">
+                  <TableCell colSpan={7} align="center">
                     <Typography variant="body2" color="text.secondary">
                       No subscription types defined. Using default "Basic" type.
                     </Typography>
@@ -500,6 +522,13 @@ const SubscriptionTypesTab: React.FC = () => {
                       <Typography variant="body2">
                         {type.monthlyTokenAllowance != null
                           ? type.monthlyTokenAllowance.toLocaleString()
+                          : 'Unlimited'}
+                      </Typography>
+                    </TableCell>
+                    <TableCell>
+                      <Typography variant="body2">
+                        {type.monthlyCostAllowance != null
+                          ? `$${type.monthlyCostAllowance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
                           : 'Unlimited'}
                       </Typography>
                     </TableCell>
@@ -611,6 +640,18 @@ const SubscriptionTypesTab: React.FC = () => {
               helperText="Maximum tokens per month for this subscription type. Leave empty for unlimited usage."
               type="text"
               inputProps={{ inputMode: 'numeric', pattern: '[0-9,]*' }}
+            />
+
+            <TextField
+              label="Monthly Cost Allowance (USD)"
+              fullWidth
+              value={costAllowanceInput}
+              onChange={(e) => setCostAllowanceInput(e.target.value)}
+              sx={{ mb: 3 }}
+              placeholder="Leave empty for unlimited"
+              helperText="Per-user monthly LLM spend cap in USD (normalized cost). Guards higher-cost models. Leave empty for unlimited. Only enforced when ENFORCE_COST_CAP is on."
+              type="text"
+              inputProps={{ inputMode: 'decimal', pattern: '[0-9.,$]*' }}
             />
 
             <Typography variant="h6" gutterBottom>

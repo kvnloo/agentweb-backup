@@ -4,11 +4,18 @@ jest.mock('../services/googleAdsService', () => ({
       { id: '1', name: 'Test', status: 'ENABLED', type: 'SEARCH', resourceName: 'customers/123/campaigns/1' },
     ]),
     listBudgets: jest.fn().mockResolvedValue([{ resourceName: 'customers/123/campaignBudgets/1', name: 'Test Budget', amountMicros: '10000000', explicitlyShared: false, referenceCount: 1 }]),
+    listBiddingStrategies: jest.fn().mockResolvedValue([{ resourceName: 'customers/123/biddingStrategies/555', id: '555', name: 'Portfolio tCPA', type: 'TARGET_CPA', status: 'ENABLED' }]),
     createBudget: jest.fn().mockResolvedValue({ resourceName: 'customers/123/campaignBudgets/1' }),
     createCampaign: jest.fn().mockResolvedValue({ resourceName: 'customers/123/campaigns/1' }),
     pauseCampaign: jest.fn().mockResolvedValue(undefined),
     resumeCampaign: jest.fn().mockResolvedValue(undefined),
-    updateCampaign: jest.fn().mockResolvedValue(undefined),
+    updateCampaign: jest.fn().mockResolvedValue(true),
+    // ENG-335 launch gate: default to no serving URLs and a PAUSED parent so the
+    // gate (and the ad/asset-group creative-addition gate) are no-ops here — these
+    // tests cover the underlying create paths, not the launch gate itself.
+    getCampaignFinalUrls: jest.fn().mockResolvedValue([]),
+    getCampaignStatus: jest.fn().mockResolvedValue('PAUSED'),
+    getAdGroupCampaign: jest.fn().mockResolvedValue({ campaignResourceName: 'customers/123/campaigns/1', campaignStatus: 'PAUSED' }),
     addKeywords: jest.fn().mockResolvedValue(undefined),
     addNegativeKeywords: jest.fn().mockResolvedValue(undefined),
     searchLocations: jest.fn().mockResolvedValue([
@@ -16,21 +23,23 @@ jest.mock('../services/googleAdsService', () => ({
     ]),
     listAdGroups: jest.fn().mockResolvedValue([]),
     createAdGroup: jest.fn().mockResolvedValue({ resourceName: 'customers/123/adGroups/1' }),
-    updateAdGroup: jest.fn().mockResolvedValue(undefined),
+    updateAdGroup: jest.fn().mockResolvedValue(true),
     listKeywords: jest.fn().mockResolvedValue([
       { resourceName: 'customers/123/adGroupCriteria/789~1', text: 'running shoes', matchType: 'BROAD', status: 'ENABLED', negative: false },
     ]),
-    updateKeyword: jest.fn().mockResolvedValue(undefined),
+    updateKeyword: jest.fn().mockResolvedValue(true),
     removeKeyword: jest.fn().mockResolvedValue(undefined),
     listAds: jest.fn().mockResolvedValue([
       { id: '1', adGroup: 'customers/123/adGroups/1', type: 'RESPONSIVE_SEARCH_AD', status: 'PAUSED' },
     ]),
-    updateAd: jest.fn().mockResolvedValue(undefined),
+    updateAd: jest.fn().mockResolvedValue(true),
     removeAd: jest.fn().mockResolvedValue(undefined),
     createAd: jest.fn().mockResolvedValue({ resourceName: 'customers/123/adGroupAds/1' }),
     uploadAsset: jest.fn().mockResolvedValue('customers/123/assets/1'),
     attachCampaignAssets: jest.fn().mockResolvedValue(undefined),
     createAssetGroup: jest.fn().mockResolvedValue({ resourceName: 'customers/123/assetGroups/1' }),
+    retagAdUtm: jest.fn().mockResolvedValue({ success: true }),
+    retagAssetGroupUtm: jest.fn().mockResolvedValue({ success: true }),
     queryReporting: jest.fn().mockResolvedValue([
       { campaign: { id: '1' }, metrics: { clicks: '100' } },
     ]),
@@ -173,6 +182,98 @@ describe('handleCallGoogleAdsApi', () => {
     expect(result.success).toBe(true);
   });
 
+  it('forwards final_url_suffix on CAMPAIGN UPDATE', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'UPDATE',
+      campaign_resource_name: 'customers/123/campaigns/1',
+      final_url_suffix: 'utm_source=google&utm_medium=cpc',
+    });
+    expect(result.success).toBe(true);
+    expect(googleAdsService.updateCampaign).toHaveBeenCalledWith(
+      'user-123',
+      '1234567890',
+      'customers/123/campaigns/1',
+      expect.objectContaining({ finalUrlSuffix: 'utm_source=google&utm_medium=cpc' })
+    );
+  });
+
+  it('handles BIDDING_STRATEGY LIST via listBiddingStrategies service method', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'BIDDING_STRATEGY',
+      action: 'LIST',
+    });
+    expect(result.success).toBe(true);
+    expect(result.biddingStrategies).toHaveLength(1);
+    expect(result.biddingStrategies[0].resourceName).toBe('customers/123/biddingStrategies/555');
+  });
+
+  it('forwards bidding_strategy_resource_name (portfolio) on CAMPAIGN CREATE', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'CREATE',
+      name: 'Portfolio Campaign',
+      type: 'SEARCH',
+      budget_resource_name: 'customers/123/campaignBudgets/1',
+      bidding_strategy_resource_name: 'customers/123/biddingStrategies/555',
+    });
+    expect(result.success).toBe(true);
+    expect(googleAdsService.createCampaign).toHaveBeenCalledWith(
+      'user-123',
+      '1234567890',
+      expect.objectContaining({ biddingStrategyResourceName: 'customers/123/biddingStrategies/555' }),
+    );
+  });
+
+  it('rejects CAMPAIGN CREATE with both bidding_strategy and bidding_strategy_resource_name', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'CREATE',
+      name: 'Conflicting Campaign',
+      type: 'SEARCH',
+      budget_resource_name: 'customers/123/campaignBudgets/1',
+      bidding_strategy: 'MANUAL_CPC',
+      bidding_strategy_resource_name: 'customers/123/biddingStrategies/555',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/not both/i);
+    expect(googleAdsService.createCampaign).not.toHaveBeenCalled();
+  });
+
+  it('forwards bidding_strategy_resource_name (portfolio) on CAMPAIGN UPDATE', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'UPDATE',
+      campaign_resource_name: 'customers/123/campaigns/1',
+      bidding_strategy_resource_name: 'customers/123/biddingStrategies/555',
+    });
+    expect(result.success).toBe(true);
+    expect(googleAdsService.updateCampaign).toHaveBeenCalledWith(
+      'user-123',
+      '1234567890',
+      'customers/123/campaigns/1',
+      expect.objectContaining({ biddingStrategyResourceName: 'customers/123/biddingStrategies/555' }),
+    );
+  });
+
+  it('returns an honest failure for CAMPAIGN UPDATE when no recognized fields were updated', async () => {
+    (googleAdsService.updateCampaign as jest.Mock).mockResolvedValueOnce(false);
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'UPDATE',
+      campaign_resource_name: 'customers/123/campaigns/1',
+      some_unsupported_field: 'value',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/does not support/i);
+  });
+
   it('returns error for CAMPAIGN UPDATE without campaign_resource_name', async () => {
     const result = await service.handleCallGoogleAdsApi('user-123', {
       customer_id: '1234567890',
@@ -229,6 +330,19 @@ describe('handleCallGoogleAdsApi', () => {
       status: 'PAUSED',
     });
     expect(result.success).toBe(true);
+  });
+
+  it('returns an honest failure for AD_GROUP UPDATE when no recognized fields were updated', async () => {
+    (googleAdsService.updateAdGroup as jest.Mock).mockResolvedValueOnce(false);
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'AD_GROUP',
+      action: 'UPDATE',
+      ad_group_resource_name: 'customers/123/adGroups/1',
+      some_unsupported_field: 'value',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/does not support/i);
   });
 
   it('returns error for AD_GROUP UPDATE without ad_group_resource_name', async () => {
@@ -356,6 +470,58 @@ describe('handleCallGoogleAdsApi', () => {
     expect(result.success).toBe(true);
     expect(result.assetGroupResourceName).toBeDefined();
   });
+
+  it('handles AD RETAG_UTM action', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'AD',
+      action: 'RETAG_UTM',
+      ad_resource_name: 'customers/1234567890/adGroupAds/1~1',
+    });
+    expect(result.success).toBe(true);
+    expect(googleAdsService.retagAdUtm).toHaveBeenCalledWith('user-123', '1234567890', 'customers/1234567890/adGroupAds/1~1');
+  });
+
+  it('AD RETAG_UTM requires ad_resource_name', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'AD',
+      action: 'RETAG_UTM',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('AD RETAG_UTM surfaces a no_destination_url reason distinctly', async () => {
+    (googleAdsService.retagAdUtm as jest.Mock).mockResolvedValueOnce({ success: false, reason: 'no_destination_url' });
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'AD',
+      action: 'RETAG_UTM',
+      ad_resource_name: 'customers/1234567890/adGroupAds/1~1',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('no destination URL');
+  });
+
+  it('handles ASSET_GROUP RETAG_UTM action', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'ASSET_GROUP',
+      action: 'RETAG_UTM',
+      asset_group_resource_name: 'customers/1234567890/assetGroups/1',
+    });
+    expect(result.success).toBe(true);
+    expect(googleAdsService.retagAssetGroupUtm).toHaveBeenCalledWith('user-123', '1234567890', 'customers/1234567890/assetGroups/1');
+  });
+
+  it('ASSET_GROUP RETAG_UTM requires asset_group_resource_name', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'ASSET_GROUP',
+      action: 'RETAG_UTM',
+    });
+    expect(result.success).toBe(false);
+  });
 });
 
 describe('handleCallGoogleAdsReportingApi', () => {
@@ -423,6 +589,19 @@ describe('handleCallGoogleAdsApi — KEYWORD actions', () => {
     expect(result.success).toBe(true);
   });
 
+  it('returns an honest failure for KEYWORD UPDATE when no recognized fields were updated', async () => {
+    (googleAdsService.updateKeyword as jest.Mock).mockResolvedValueOnce(false);
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'KEYWORD',
+      action: 'UPDATE',
+      criterion_resource_name: 'customers/123/adGroupCriteria/789~1',
+      some_unsupported_field: 'value',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/does not support/i);
+  });
+
   it('returns error for KEYWORD UPDATE without criterion_resource_name', async () => {
     const result = await service.handleCallGoogleAdsApi('user-123', {
       customer_id: '1234567890',
@@ -473,6 +652,19 @@ describe('handleCallGoogleAdsApi — AD UPDATE/REMOVE actions', () => {
       status: 'PAUSED',
     });
     expect(result.success).toBe(false);
+  });
+
+  it('returns an honest failure for AD UPDATE when no recognized fields were updated', async () => {
+    (googleAdsService.updateAd as jest.Mock).mockResolvedValueOnce(false);
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'AD',
+      action: 'UPDATE',
+      ad_resource_name: 'customers/123/adGroupAds/1',
+      some_unsupported_field: 'value',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/does not support/i);
   });
 
   it('handles AD REMOVE action', async () => {

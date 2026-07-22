@@ -19,7 +19,6 @@
  * server.ts and must be explicitly enabled via AI_READINESS_LOOP_ENABLED=true.
  */
 
-import AWS from 'aws-sdk';
 import { CaptureGate } from '../../core/gates/captureGate';
 import {
   analystFindingsBody,
@@ -27,11 +26,15 @@ import {
   postLoopDigest,
   type LoopDigestTemplate,
 } from '../../core/digest/loopDigest';
+import {
+  buildDailyDigestClaimItem as buildSharedDailyDigestClaimItem,
+  claimLoopDailyDigestPost,
+} from '../../core/digest/dailyDigestClaim';
 import { createInstanceRunner } from '../../core/instanceRunner';
 import { DynamoLearningStore } from '../../core/learning/dynamoLearningStore';
 import { CooldownRuleSet } from '../../core/policy/cooldownRuleSet';
 import { LlmAnalystRuleSet } from '../../core/policy/llmAnalystRuleSet';
-import { EventTableEventSource, LOOP_EVENTS_TABLE } from '../../core/sensors/eventTableEventSource';
+import { EventTableEventSource } from '../../core/sensors/eventTableEventSource';
 import { SpecOutputTool } from '../../core/tools/specOutputTool';
 import { productionLoopPorts } from '../../adapters/awsAdapters';
 import type { DynamoPort } from '../../core/ports';
@@ -47,9 +50,6 @@ const READINESS_SCOPE = {
   dimensionKey: 'landerPath',
   dimensionValue: '/ai-readiness',
 } as const;
-const DAILY_DIGEST_CLAIM_LOOP_ID = `${AI_READINESS_LOOP_ID}#daily-digest`;
-
-let digestDynamo: AWS.DynamoDB.DocumentClient | null = null;
 
 const runner = createInstanceRunner({
   loopId: AI_READINESS_LOOP_ID,
@@ -231,71 +231,19 @@ function buildLowDataDecisions(s: FunnelShape): LowDataDecision[] {
   return decisions.slice(0, 3);
 }
 
-interface DailyDigestClaimItem {
-  loopId: string;
-  tsSession: string;
-  eventType: 'digest_posted';
-  subjectId: string;
-  ts: string;
-  dimensions: {
-    digestDate: string;
-    loopId: string;
-    runId: string;
-    slackUserId: string;
-  };
-}
-
-function dailyDigestDynamo(): AWS.DynamoDB.DocumentClient {
-  if (!digestDynamo) {
-    digestDynamo = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || 'us-west-2' });
-  }
-  return digestDynamo;
-}
-
 function buildDailyDigestClaimItem(
   digestDate: string,
   slackUserId: string,
   runId: string,
   now = new Date(),
-): DailyDigestClaimItem {
-  return {
-    loopId: DAILY_DIGEST_CLAIM_LOOP_ID,
-    tsSession: digestDate,
-    eventType: 'digest_posted',
-    subjectId: slackUserId,
-    ts: now.toISOString(),
-    dimensions: {
-      digestDate,
-      loopId: AI_READINESS_LOOP_ID,
-      runId,
-      slackUserId,
-    },
-  };
-}
-
-function isConditionalCheckFailed(err: unknown): boolean {
-  return (
-    typeof err === 'object' &&
-    err !== null &&
-    'code' in err &&
-    (err as { code?: unknown }).code === 'ConditionalCheckFailedException'
-  );
-}
-
-async function claimDailyDigestPost(digestDate: string, slackUserId: string, runId: string): Promise<boolean> {
-  try {
-    await dailyDigestDynamo()
-      .put({
-        TableName: LOOP_EVENTS_TABLE,
-        Item: buildDailyDigestClaimItem(digestDate, slackUserId, runId),
-        ConditionExpression: 'attribute_not_exists(loopId) AND attribute_not_exists(tsSession)',
-      })
-      .promise();
-    return true;
-  } catch (err) {
-    if (isConditionalCheckFailed(err)) return false;
-    throw err;
-  }
+): ReturnType<typeof buildSharedDailyDigestClaimItem> {
+  return buildSharedDailyDigestClaimItem({
+    loopId: AI_READINESS_LOOP_ID,
+    digestDate,
+    slackUserId,
+    runId,
+    now,
+  });
 }
 
 type DailyDigestClaim = (digestDate: string, slackUserId: string, runId: string) => Promise<boolean>;
@@ -339,7 +287,13 @@ async function postDigest(
   shape: FunnelShape | null,
   slack: { postMessage: (channelOrUserId: string, markdown: string) => Promise<unknown> },
   slackUserId: string | undefined,
-  claimDigest: DailyDigestClaim = claimDailyDigestPost,
+  claimDigest: DailyDigestClaim = (digestDate, userId, runId) =>
+    claimLoopDailyDigestPost(productionLoopPorts().dynamo, {
+      loopId: AI_READINESS_LOOP_ID,
+      digestDate,
+      slackUserId: userId,
+      runId,
+    }),
 ): Promise<void> {
   if (!slackUserId) {
     console.warn('[ai-readiness-funnel] no approval.slackUserId — skipping DM');

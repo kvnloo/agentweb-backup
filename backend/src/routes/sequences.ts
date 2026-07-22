@@ -14,7 +14,9 @@ import {
   UpdateSequenceInput,
 } from '../services/dripSequenceDb';
 import { crmDb } from '../services/db';
-import { resendService } from '../services/resendService';
+import { resolveSenderForSend } from '../services/crmSenderService';
+import { CrmSender } from '../services/crmSenderTypes';
+import { sendAsSender } from '../services/sendAsSender';
 import axios from 'axios';
 import { extractVariables, leadHasVariable, isSupportedVariable, injectUnsubscribeUrl, inlineEmailStyles, rewriteS3ImageUrls, normalizeYoutubeUrls } from '../utils/emailVariables';
 import { LLMService } from '../utils/llmService';
@@ -314,7 +316,7 @@ router.post(
   async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
-    const { senderEmail, senderName, subject, htmlContent, recipients } = req.body;
+    const { senderId, senderEmail, senderName, subject, htmlContent, recipients } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -352,31 +354,36 @@ router.post(
     const withNormalizedUrls = normalizeYoutubeUrls(withRewrittenImages);
     // Wire up unsubscribe URL with the real portal domain
     const testHtml = injectUnsubscribeUrl(withNormalizedUrls, testUnsubscribeUrl);
-    const from = `${senderName} <${senderEmail}>`;
+
+    // ENG-266 Part 3: route through the sender's real provider (same fallback pattern
+    // as the crm.ts send sites).
+    const resolvedSender = await resolveSenderForSend(userId, senderId, senderEmail);
+    const sender: CrmSender = resolvedSender ?? {
+      id: '__adhoc__',
+      email: senderEmail,
+      fromName: senderName,
+      senderProvider: 'resend',
+    };
 
     let sent = 0;
     let failedCount = 0;
     const failedEmails: string[] = [];
+    const failureReasons: Array<{ email: string; reason: string }> = [];
 
     for (const email of validEmails) {
       try {
-        const result = await resendService.sendEmail({
-          from,
+        await sendAsSender(userId, sender, {
           to: email.trim(),
           subject: `[TEST] ${subject}`,
           html: testHtml,
         });
-
-        if (result && result.id) {
-          sent++;
-        } else {
-          failedCount++;
-          failedEmails.push(email);
-        }
+        sent++;
       } catch (err: any) {
-        console.error(`[sequences] Failed to send test email to ${email}:`, err.message || err);
+        const reason = err.message || String(err);
+        console.error(`[sequences] Failed to send test email to ${email}:`, reason);
         failedCount++;
         failedEmails.push(email);
+        failureReasons.push({ email, reason });
       }
     }
 
@@ -385,6 +392,7 @@ router.post(
       sent,
       failed: failedCount,
       failedEmails,
+      failureReasons,
     });
   },
 );

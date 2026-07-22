@@ -67,6 +67,20 @@ jest.mock('../services/db', () => ({
   },
 }));
 
+// Mock unipileSentInvitationsDb (ENG-182 pre-invite dedup cache). The pre-check
+// uses the publicProfileUrl GSI getter (case-robust, matches the CRM path).
+const mockGetSentInvitationByProfileUrlAndAccount = jest.fn().mockResolvedValue(null);
+const mockUpsertSentInvitation = jest.fn().mockResolvedValue(undefined);
+jest.mock('../services/unipileSentInvitationsDb', () => ({
+  getSentInvitationByProfileUrlAndAccount: (...args: any[]) => mockGetSentInvitationByProfileUrlAndAccount(...args),
+  upsertSentInvitation: (...args: any[]) => mockUpsertSentInvitation(...args),
+}));
+
+// Mock unipileConnectionsDb (normalizeLinkedInUrl used by the write-through upsert)
+jest.mock('../services/unipileConnectionsDb', () => ({
+  normalizeLinkedInUrl: (url: string) => (url ? url.trim().toLowerCase().replace(/\/?$/, '/') : ''),
+}));
+
 import { AgentModeService } from '../services/agentModeService';
 
 describe('AgentModeService - LinkedIn Outreach', () => {
@@ -267,6 +281,127 @@ describe('AgentModeService - LinkedIn Outreach', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('not connected to your profile');
+    });
+  });
+
+  describe('send-invite dedup (ENG-182)', () => {
+    const inviteArgs = {
+      action: 'send-invite',
+      account_id: 'test-account-id',
+      profile_url: 'https://www.linkedin.com/in/chang-liu/',
+      message: 'Great to connect!',
+    };
+
+    it('skips the send (no quota used) when a pending invitation already exists in the cache', async () => {
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValueOnce({
+        accountId: 'test-account-id',
+        invitedUserPublicId: 'chang-liu',
+        sentAt: '2026-07-01T00:00:00.000Z',
+      });
+
+      const result = await service.linkedinOutreach('user-1', inviteArgs);
+
+      expect(result.success).toBe(true);
+      expect(result.alreadyInvited).toBe(true);
+      expect(mockSendInvitation).not.toHaveBeenCalled();
+      // Must look up by a CANONICAL /in/{publicId}/ URL parsed from the profile URL,
+      // scoped to the account (the getter itself lowercases via normalizeLinkedInUrl).
+      expect(mockGetSentInvitationByProfileUrlAndAccount).toHaveBeenCalledWith(
+        'https://www.linkedin.com/in/chang-liu/',
+        'test-account-id',
+      );
+    });
+
+    it('canonicalizes the lookup URL, stripping query params / trailing slash', async () => {
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValueOnce({ sentAt: null });
+
+      const result = await service.linkedinOutreach('user-1', {
+        ...inviteArgs,
+        profile_url: 'https://www.linkedin.com/in/chang-liu?miniProfileUrn=urn%3Ali%3Aabc',
+      });
+
+      expect(result.alreadyInvited).toBe(true);
+      // Query string must be stripped so it matches the cron's clean stored key.
+      expect(mockGetSentInvitationByProfileUrlAndAccount).toHaveBeenCalledWith(
+        'https://www.linkedin.com/in/chang-liu/',
+        'test-account-id',
+      );
+      expect(mockSendInvitation).not.toHaveBeenCalled();
+    });
+
+    it('is case-insensitive on the public id (canonical URL is matched via the lowercasing GSI getter)', async () => {
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValueOnce({ sentAt: null });
+
+      const result = await service.linkedinOutreach('user-1', {
+        ...inviteArgs,
+        profile_url: 'https://www.linkedin.com/in/Chang-Liu/',
+      });
+
+      expect(result.alreadyInvited).toBe(true);
+      // Public id is lowercased when building the canonical URL.
+      expect(mockGetSentInvitationByProfileUrlAndAccount).toHaveBeenCalledWith(
+        'https://www.linkedin.com/in/chang-liu/',
+        'test-account-id',
+      );
+    });
+
+    it('sends and writes the invite through to the cache when no pending invitation exists', async () => {
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValueOnce(null);
+      mockSendInvitation.mockResolvedValueOnce({ id: 'inv-xyz' });
+
+      const result = await service.linkedinOutreach('user-1', inviteArgs);
+
+      expect(result.success).toBe(true);
+      expect(result.alreadyInvited).toBeUndefined();
+      expect(mockSendInvitation).toHaveBeenCalledTimes(1);
+      // Write-through with the SAME lowercased publicProfileUrl the GSI reads, so a
+      // subsequent run (before the next sync cron) dedups.
+      expect(mockUpsertSentInvitation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          accountId: 'test-account-id',
+          invitedUserPublicId: 'chang-liu',
+          publicProfileUrl: 'https://www.linkedin.com/in/chang-liu/',
+          invitationId: 'inv-xyz',
+        })
+      );
+    });
+
+    it('does NOT dedup or cache when inviting by raw provider_id (cache is keyed by public id)', async () => {
+      mockSendInvitation.mockResolvedValueOnce({ id: 'inv-1' });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'send-invite',
+        account_id: 'test-account-id',
+        provider_id: 'li-provider-999',
+        message: 'Hi',
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockGetSentInvitationByProfileUrlAndAccount).not.toHaveBeenCalled();
+      expect(mockUpsertSentInvitation).not.toHaveBeenCalled();
+      expect(mockSendInvitation).toHaveBeenCalledTimes(1);
+    });
+
+    it('still sends when the cache lookup throws (dedup is best-effort, never blocks a genuine invite)', async () => {
+      mockGetSentInvitationByProfileUrlAndAccount.mockRejectedValueOnce(new Error('dynamo down'));
+      mockSendInvitation.mockResolvedValueOnce({ id: 'inv-2' });
+
+      const result = await service.linkedinOutreach('user-1', inviteArgs);
+
+      expect(result.success).toBe(true);
+      expect(result.alreadyInvited).toBeUndefined();
+      expect(mockSendInvitation).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not fail the invite when the write-through cache upsert throws', async () => {
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValueOnce(null);
+      mockSendInvitation.mockResolvedValueOnce({ id: 'inv-3' });
+      mockUpsertSentInvitation.mockRejectedValueOnce(new Error('dynamo down'));
+
+      const result = await service.linkedinOutreach('user-1', inviteArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockSendInvitation).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -765,7 +900,63 @@ describe('AgentModeService - LinkedIn Outreach', () => {
         'provider-abc',
         false,
         'Hi, let us connect!',
-        200
+        200,
+        { onNoteQuota: 'skip' }
+      );
+    });
+
+    // ENG-213: default policy is to HOLD (not silently drop the note) when the
+    // account's monthly personalized-note quota is spent.
+    it("defaults onNoteQuota to 'skip' (hold) when on_note_quota is not provided", async () => {
+      mockSendInvitation.mockResolvedValue({ id: 'invite-123' });
+      mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+
+      await service.linkedinOutreach('user-1', {
+        action: 'send-invite',
+        account_id: 'test-account-id',
+        provider_id: 'provider-abc',
+        message: 'Hi, let us connect!',
+      });
+
+      expect(mockSendInvitation).toHaveBeenCalledWith(
+        'test-account-id', 'provider-abc', false, 'Hi, let us connect!', 200, { onNoteQuota: 'skip' },
+      );
+    });
+
+    it('returns a requiresDecision gate (does not decide) when the note quota is held', async () => {
+      mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+      const held: any = new Error('LinkedIn note quota reached — the personalized note could not be attached.');
+      held.noteQuotaExceeded = true;
+      mockSendInvitation.mockRejectedValue(held);
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'send-invite',
+        account_id: 'test-account-id',
+        provider_id: 'provider-abc',
+        message: 'A deliberately personalised note',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.requiresDecision).toBe(true);
+      expect(result.noteQuotaExceeded).toBe(true);
+      expect(result.error).toMatch(/without the note|skip/i);
+    });
+
+    it("re-call with on_note_quota='send_without_note' authorizes a note-less send", async () => {
+      mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+      mockSendInvitation.mockResolvedValue({ id: 'invite-123', note_dropped: true });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'send-invite',
+        account_id: 'test-account-id',
+        provider_id: 'provider-abc',
+        message: 'A personalised note',
+        on_note_quota: 'send_without_note',
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockSendInvitation).toHaveBeenCalledWith(
+        'test-account-id', 'provider-abc', false, 'A personalised note', 200, { onNoteQuota: 'send_without_note' },
       );
     });
 
@@ -784,6 +975,63 @@ describe('AgentModeService - LinkedIn Outreach', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('too long');
+    });
+
+    // ENG-126: LinkedIn returns "Cannot resend yet" for send-invite on EVERY
+    // recipient — even fresh ones — once the account hits its invitation cap.
+    // Surfaced verbatim, this reads like a per-recipient cooldown, so the agent
+    // moves to the next recipient and repeats, burning 10+ attempts per session.
+    // The handler must flag it as the account-level throttle it is and tell the
+    // agent to stop and report proactively.
+    describe('account-level invitation cooldown ("Cannot resend yet")', () => {
+      function makeCooldownError() {
+        const err = new Error('Cannot resend yet');
+        (err as any).structuredError = {
+          message: 'Cannot resend yet',
+          status: 422,
+          classification: 'VALIDATION_ERROR',
+        };
+        return err;
+      }
+
+      it('flags an account-level throttle instead of surfacing the raw per-recipient error', async () => {
+        mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+        mockSendInvitation.mockRejectedValue(makeCooldownError());
+
+        const result = await service.linkedinOutreach('user-1', {
+          action: 'send-invite',
+          account_id: 'test-account-id',
+          provider_id: 'provider-abc',
+          message: 'Hi, let us connect!',
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.accountThrottled).toBe(true);
+        // Names it as account-level, not per-recipient.
+        expect(result.error.toLowerCase()).toContain('account-level');
+        // Tells the agent to stop hammering other recipients.
+        expect(result.error.toLowerCase()).toContain('do not keep trying');
+        // Preserves the raw provider phrase so the error classifier still
+        // buckets this as an upstream_rejected LinkedIn business rule.
+        expect(result.error).toContain('Cannot resend yet');
+      });
+
+      it('does NOT treat "Cannot resend yet" on non-invite actions as an account throttle', async () => {
+        // A send-message cooldown is a different code path — the throttle guidance
+        // is specific to send-invite and must not leak onto other actions.
+        mockSendMessage.mockRejectedValue(makeCooldownError());
+
+        const result = await service.linkedinOutreach('user-1', {
+          action: 'send-message',
+          account_id: 'test-account-id',
+          provider_id: 'provider-abc',
+          message: 'Hello!',
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.accountThrottled).toBeUndefined();
+        expect(result.error).toBe('Cannot resend yet');
+      });
     });
   });
 

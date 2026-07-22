@@ -13,6 +13,7 @@ import axios from 'axios';
 import { mcpFetch } from '../mcp/server/httpClient';
 import { agentModeService } from './agentModeService';
 import { getGitHubOrgToken, getSecret } from '../utils/secretsManager';
+import { recordUsage, computeCostMicroUsd } from './usageRecorderService';
 import { getLandingPageById, getLandingPagesByOwner, canUserEditLandingPage, GeneratedLandingPage } from './v0Service';
 import { AcceptanceCheck, AcceptanceStatus, AcceptanceVerificationResult, verifyAcceptanceChecks } from './codingAgentAcceptance';
 import {
@@ -89,6 +90,29 @@ export interface CodingAgentResult {
   baseCommitSha?: string;
   latestCommitSha?: string;
   editedFiles?: string[];
+  /**
+   * Summed token usage across this run's self-contained LLM loop, so the caller
+   * can charge it to the per-user token/cost cap (ENG-200). The coding agent's
+   * turns are invisible to the parent agent-mode meter, so without this its spend
+   * never counts. Omitted when the run made no priced LLM call. costUsd is priced
+   * via the same source as the shadow meter (llmPricing), in USD.
+   */
+  usageTotals?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    totalTokens: number;
+    costUsd: number;
+  };
+}
+
+/** Mutable per-run token accumulator, filled by the loop, read once at result time. */
+interface CodingAgentUsageAccumulator {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
 }
 
 interface SearchReplaceEdit {
@@ -219,6 +243,50 @@ export function _isMissingGithubRefError(error: any): boolean {
   return false;
 }
 
+/**
+ * How many commits the reusable preview branch is ahead of main — i.e. how many
+ * unpublished coding_agent edits currently sit on draft/agentweb-preview. Uses
+ * GitHub's compare API (base...head). Returns 0 ONLY when the branch is absent
+ * (404) or is genuinely identical to / behind main — the cases where resetting
+ * the branch to main loses nothing. A positive result means "there is unpublished
+ * work here, do not reset."
+ *
+ * On any OTHER error (5xx / timeout / rate-limit / unparseable body) we fail
+ * CLOSED: return a positive count so the caller skips the reset (ENG-176). A
+ * transient compare failure must never be read as "0 ahead → safe to force-reset",
+ * because that would silently discard genuine unpublished edits — the exact
+ * clobber this guard exists to prevent. At worst the new edit builds on a slightly
+ * stale branch, which is recoverable; a destroyed edit is not. Exported for tests.
+ */
+export async function _previewBranchCommitsAheadOfMain(
+  repoBase: string,
+  headers: Record<string, string>,
+): Promise<number> {
+  try {
+    const res = await axios.get<any>(
+      `${repoBase}/compare/main...${encodeURIComponent(LANDING_PAGE_PREVIEW_BRANCH)}`,
+      { headers, timeout: GITHUB_API_TIMEOUT_MS },
+    );
+    const aheadBy = res?.data?.ahead_by;
+    return typeof aheadBy === 'number' && aheadBy > 0 ? aheadBy : 0;
+  } catch (error) {
+    // 404 = preview branch doesn't exist yet → nothing unpublished, reset/create
+    // as usual (fail open — creating a fresh branch loses nothing).
+    if (_isMissingGithubRefError(error)) {
+      return 0;
+    }
+    // Any other error (5xx / timeout / rate-limit) → fail CLOSED: treat the branch
+    // as ahead so the caller skips the reset and layers on top, rather than
+    // force-resetting to main and destroying unpublished work on a transient hiccup.
+    console.warn(
+      '[CODING AGENT] Could not compare preview branch to main; assuming unpublished ' +
+        'commits exist and skipping reset to avoid clobbering them (ENG-176):',
+      error instanceof Error ? error.message : error,
+    );
+    return 1;
+  }
+}
+
 async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Promise<void> {
   if (context.draftBranch !== LANDING_PAGE_PREVIEW_BRANCH) return;
 
@@ -253,6 +321,23 @@ async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Pr
   }
   if (!mainSha) {
     throw new Error('Cannot prepare preview branch: main SHA not found');
+  }
+
+  // ENG-176: If the reusable preview branch already carries commits that are not
+  // yet on main, those are UNPUBLISHED edits from an earlier coding_agent run on
+  // this page. Force-resetting the branch to main here would silently discard
+  // them, so a later sequential edit on the same page clobbers the earlier one
+  // (e.g. the first-added book card disappears after publish). In that case we
+  // must layer the new edit on top of the existing preview branch instead of
+  // resetting. We only reset when the branch is absent or fully published
+  // (not ahead of main) — the case the reusable branch was designed for.
+  const aheadBy = await _previewBranchCommitsAheadOfMain(repoBase, headers);
+  if (aheadBy > 0) {
+    console.log(
+      `[CODING AGENT] ${LANDING_PAGE_PREVIEW_BRANCH} has ${aheadBy} unpublished commit(s) ahead of main; ` +
+        `layering new edit on top instead of resetting (ENG-176)`,
+    );
+    return;
   }
 
   try {
@@ -1783,7 +1868,8 @@ async function runCodingAgentInternal(
   taskDescription: string,
   context: CodingAgentContext,
   maxIterations: number,
-  model: string
+  model: string,
+  usageAcc: CodingAgentUsageAccumulator
 ): Promise<CodingAgentResult> {
 
   const client = await getClientForModel(model);
@@ -1857,6 +1943,34 @@ async function runCodingAgentInternal(
       // Report this turn's token usage if a consumer is listening (eval harness).
       if (context.onUsage && response.usage) {
         context.onUsage(response.usage as any);
+      }
+
+      // Shadow-meter every turn's spend. The coding loop can run many high-cost
+      // Bedrock/Claude iterations, so leaving it unmetered was the biggest hole in
+      // per-user cost data. Fire-and-forget + fail-open: never blocks/slows the run.
+      try {
+        const u: any = response.usage;
+        if (u) {
+          // Accumulate for the per-user cap (charged once by the caller from
+          // result.usageTotals). Same numbers the shadow meter records below.
+          usageAcc.inputTokens += u.input_tokens || 0;
+          usageAcc.outputTokens += u.output_tokens || 0;
+          usageAcc.cacheReadTokens += u.cache_read_input_tokens || 0;
+          usageAcc.cacheWriteTokens += u.cache_creation_input_tokens || 0;
+          void recordUsage({
+            userId: context.userId,
+            sessionId: context.sessionId,
+            model,
+            provider: model.startsWith('claude-') ? 'vertex' : 'bedrock',
+            feature: 'coding_agent',
+            inputTokens: u.input_tokens || 0,
+            outputTokens: u.output_tokens || 0,
+            cacheReadTokens: u.cache_read_input_tokens || 0,
+            cacheWriteTokens: u.cache_creation_input_tokens || 0,
+          });
+        }
+      } catch {
+        // Metering must never break the coding loop.
       }
 
       // Add assistant message to history
@@ -2005,12 +2119,47 @@ export async function runCodingAgent(
     abortSignal: abortController.signal,
   };
 
-  const withRun = (result: CodingAgentResult, state?: CodingAgentRunState): CodingAgentResult => ({
-    ...result,
-    runId: run.runId,
-    state: state || result.state,
-    branch: result.branch ?? context.draftBranch,
-  });
+  // Filled by runCodingAgentInternal's loop; read once here to charge the caller.
+  const usageAcc: CodingAgentUsageAccumulator = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+  };
+
+  const withRun = (result: CodingAgentResult, state?: CodingAgentRunState): CodingAgentResult => {
+    const totalTokens =
+      usageAcc.inputTokens + usageAcc.outputTokens + usageAcc.cacheReadTokens + usageAcc.cacheWriteTokens;
+    // `model` is only accessed here (in the totalTokens > 0 branch), which cannot
+    // be reached until the loop has run — i.e. after model resolution below — so
+    // there is no temporal-dead-zone hazard on the early-return paths (auth denial,
+    // preview-branch reset failure) where no LLM call was made.
+    const usageTotals =
+      totalTokens > 0
+        ? {
+            inputTokens: usageAcc.inputTokens,
+            outputTokens: usageAcc.outputTokens,
+            cacheReadTokens: usageAcc.cacheReadTokens,
+            cacheWriteTokens: usageAcc.cacheWriteTokens,
+            totalTokens,
+            costUsd:
+              computeCostMicroUsd(
+                model,
+                usageAcc.inputTokens,
+                usageAcc.outputTokens,
+                usageAcc.cacheReadTokens,
+                usageAcc.cacheWriteTokens
+              ) / 1e6,
+          }
+        : undefined;
+    return {
+      ...result,
+      runId: run.runId,
+      state: state || result.state,
+      branch: result.branch ?? context.draftBranch,
+      usageTotals: result.usageTotals ?? usageTotals,
+    };
+  };
 
   // Preflight authorization. The page may be org-visible (so the agent could
   // see and select it) yet not editable by this caller — a plain member can
@@ -2098,7 +2247,7 @@ export async function runCodingAgent(
   let rawResult: CodingAgentResult;
   try {
     rawResult = await Promise.race<CodingAgentResult>([
-      runCodingAgentInternal(taskDescription, runContext, maxIterations, model).catch((error) => {
+      runCodingAgentInternal(taskDescription, runContext, maxIterations, model, usageAcc).catch((error) => {
         if (is403Error(error)) {
           return {
             success: false,

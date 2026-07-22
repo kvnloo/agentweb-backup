@@ -5,18 +5,13 @@ import crypto from 'crypto';
 import { getGmailConfig } from '../config/integrations';
 import { createAccount } from '../services/connectedAccountsDb';
 import { authenticateToken } from '../middleware/auth';
+import { getJwtSecret } from '../config/jwt';
+import { storeTokenSession, retrieveTokenSession } from '../services/oauthTokenSessionStore';
 
 const router = express.Router();
 
 const STATE_EXPIRATION = '15m';
-const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
-
-const STATE_SECRET = process.env.JWT_SECRET;
-if (!STATE_SECRET) {
-  throw new Error('JWT_SECRET environment variable must be set for OAuth state verification');
-}
 
 // ── State JWT ──────────────────────────────────────────────────────────────
 
@@ -27,60 +22,17 @@ interface StatePayload {
 
 const generateState = (userId: string): string => {
   const nonce = crypto.randomBytes(16).toString('hex');
-  return jwt.sign({ userId, nonce } as StatePayload, STATE_SECRET, { expiresIn: STATE_EXPIRATION });
+  return jwt.sign({ userId, nonce } as StatePayload, getJwtSecret(), { expiresIn: STATE_EXPIRATION });
 };
 
 const verifyState = (state: string, userId: string): StatePayload | null => {
   try {
-    const decoded = jwt.verify(state, STATE_SECRET) as StatePayload;
+    const decoded = jwt.verify(state, getJwtSecret()) as StatePayload;
     if (decoded.userId !== userId) return null;
     return decoded;
   } catch {
     return null;
   }
-};
-
-// ── Token session store (server-side, one-time use) ────────────────────────
-
-interface TokenSession {
-  tokens: {
-    access_token: string;
-    refresh_token?: string;
-    expires_in: number;
-    granted_scopes: string[];
-  };
-  profile: {
-    email: string;
-    name: string;
-    picture?: string;
-  };
-  userId: string;
-  expires: number;
-}
-
-const tokenSessions = new Map<string, TokenSession>();
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of tokenSessions.entries()) {
-    if (now > session.expires) tokenSessions.delete(id);
-  }
-}, SESSION_CLEANUP_INTERVAL_MS).unref();
-
-const storeTokenSession = (userId: string, tokens: TokenSession['tokens'], profile: TokenSession['profile']): string => {
-  const sessionId = crypto.randomBytes(32).toString('hex');
-  tokenSessions.set(sessionId, { tokens, profile, userId, expires: Date.now() + TOKEN_SESSION_TTL_MS });
-  return sessionId;
-};
-
-const retrieveTokenSession = (sessionId: string, userId: string): Pick<TokenSession, 'tokens' | 'profile'> | null => {
-  const session = tokenSessions.get(sessionId);
-  if (!session || session.userId !== userId || Date.now() > session.expires) {
-    tokenSessions.delete(sessionId);
-    return null;
-  }
-  tokenSessions.delete(sessionId); // one-time use
-  return { tokens: session.tokens, profile: session.profile };
 };
 
 // ── GET /init — build Google authorization URL ─────────────────────────────
@@ -98,7 +50,12 @@ router.get('/init', authenticateToken, async (req: any, res) => {
       state,
       access_type: 'offline',       // required to receive refresh_token
       prompt: 'consent',            // always return refresh_token even on re-auth
-      include_granted_scopes: 'true',
+      // Deliberately omitted: include_granted_scopes. Gmail shares its OAuth client_id
+      // with Google Drive/YouTube/Ads (same GCP project — see getGmailCredentials()).
+      // Setting this to 'true' makes Google fold in scopes the user granted to those
+      // OTHER integrations under the same client, so a user connecting only Gmail sees
+      // Drive/Sheets/Ads permissions on the consent screen too. Omitting it scopes the
+      // request (and the resulting token) to exactly what's listed in integrations.ts.
     });
 
     const url = `${config.authorizationUrl}?${params.toString()}`;
@@ -192,8 +149,9 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
     };
 
     // Store tokens server-side (never expose to frontend)
-    const tokenSessionId = storeTokenSession(
+    const tokenSessionId = await storeTokenSession(
       userId,
+      'gmail',
       { access_token, refresh_token, expires_in, granted_scopes: grantedScopes },
       { email, name, picture }
     );
@@ -221,7 +179,7 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     return res.status(400).json({ error: 'Missing tokenSessionId' });
   }
 
-  const session = retrieveTokenSession(tokenSessionId, userId);
+  const session = await retrieveTokenSession(tokenSessionId, userId, 'gmail');
   if (!session) {
     return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
   }

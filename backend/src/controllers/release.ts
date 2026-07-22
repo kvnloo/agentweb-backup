@@ -8,6 +8,25 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2026-07-21",
+    changes: [
+      "Org-Aware LLM Cost Breakdown (Admin)",
+      "- Fixed: the per-user \"LLM Cost Burn\" modal compared a user's gross burn against their own quota counter — but org member spend is deducted onto the org owner, so members showed burn with \"$0 counted\" (a false \"spend escaping the cap\" alarm) and owners showed a counter far above their own burn",
+      "- The modal now rolls gross burn across all org members and reconciles it against the owner's quota counter (the real cap), with a per-member burn table so per-user detail is preserved and the selected user is highlighted",
+      "- Members now read \"charged to org owner (<email>)\" instead of a false $0; the old red \"absorbed by platform / investigate\" card is replaced by a neutral coverage metric, and a counter-ahead-of-tracking case is shown as an informational note",
+      "- The cost-cap bar now reads the org owner's tier cap; no customer-facing behavior changes (cost accounting remains observe-only)",
+    ],
+  },
+  {
+    date: "2026-07-06",
+    changes: [
+      "Publish Guardrail for Skills Not Entitled to Any Tier",
+      "- When you publish a skill that is not in any subscription tier's allowed-skills list, Skill Management now shows a warning — a published-but-unentitled skill is invisible to all non-wildcard users and its tools are undiscoverable to Emma",
+      "- The warning is advisory only: publishing still succeeds, and it points you to Admin → Subscriptions to add the skill to the relevant tiers",
+      "- This closes a silent gap where a newly published skill (for example, Google Drive Management) could reach nobody until it was manually added to the tier allow-lists",
+    ],
+  },
+  {
     date: "2026-06-22",
     changes: [
       "Gemini 3.1 Flash Image Model Migrated to GA Endpoint",

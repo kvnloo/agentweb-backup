@@ -24,6 +24,12 @@ export interface Setting {
   description?: string;
   updatedAt: string;
   updatedBy: string;
+  /**
+   * Optional epoch-second DynamoDB TTL attribute. Only written when a caller opts in
+   * (e.g. oauthTokenSessionStore) — omitted for every other setting, preserving today's
+   * "settings live forever unless explicitly deleted" behavior exactly.
+   */
+  ttl?: number;
 }
 
 export interface PredefinedPlan {
@@ -76,16 +82,21 @@ export class SettingsService {
     }
   }
 
-  async setSetting(settingName: string, settingValue: string, description?: string, updatedBy: string = 'system'): Promise<Setting> {
+  async setSetting(settingName: string, settingValue: string, description?: string, updatedBy: string = 'system', ttl?: number): Promise<Setting> {
     try {
+      if (ttl !== undefined && !Number.isFinite(ttl)) {
+        throw new Error(`Invalid ttl for setting "${settingName}": must be a finite epoch-second number, got ${ttl}`);
+      }
+
       const timestamp = new Date().toISOString();
-      
+
       const setting: Setting = {
         settingName,
         settingValue,
         description,
         updatedAt: timestamp,
-        updatedBy
+        updatedBy,
+        ...(ttl !== undefined ? { ttl } : {}),
       };
 
       const params = {
@@ -112,6 +123,38 @@ export class SettingsService {
       console.error('Error getting all settings:', error);
       throw error;
     }
+  }
+
+  /**
+   * Atomically claim membership in a setting-backed string set (DynamoDB ADD on the
+   * `settingMembers` attribute — no read-modify-write). Returns true when `member`
+   * was NOT already in the set, i.e. this caller won the claim: concurrent callers
+   * for the same member get exactly one `true`. Used for exactly-once markers
+   * (e.g. ship-notify's per-item notified-reporters set).
+   */
+  async claimSetMember(settingName: string, member: string): Promise<boolean> {
+    const result = await dynamodb.update({
+      TableName: this.tableName,
+      Key: { settingName },
+      UpdateExpression: 'ADD settingMembers :m SET updatedAt = :t',
+      ExpressionAttributeValues: {
+        ':m': dynamodb.createSet([member]),
+        ':t': new Date().toISOString(),
+      },
+      ReturnValues: 'UPDATED_OLD',
+    }).promise();
+    const old: string[] = (result.Attributes?.settingMembers as any)?.values ?? [];
+    return !old.includes(member);
+  }
+
+  /** Inverse of claimSetMember — releases a claim (e.g. after a failed send, so a delivery retry can re-claim). */
+  async releaseSetMember(settingName: string, member: string): Promise<void> {
+    await dynamodb.update({
+      TableName: this.tableName,
+      Key: { settingName },
+      UpdateExpression: 'DELETE settingMembers :m',
+      ExpressionAttributeValues: { ':m': dynamodb.createSet([member]) },
+    }).promise();
   }
 
   async getJsonArraySetting<T>(settingName: string, fallback: T[]): Promise<T[]> {

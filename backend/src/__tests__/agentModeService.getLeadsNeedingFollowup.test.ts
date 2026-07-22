@@ -64,8 +64,10 @@ describe('AgentModeService.getLeadsNeedingFollowup', () => {
 
   const list = { listId, userId, name: 'Outreach', linkedInAccountId };
 
-  // connectedAt UNIX seconds: 2026-05-01
-  const CONNECTED_TS = Math.floor(new Date('2026-05-01T00:00:00.000Z').getTime() / 1000);
+  // connectedAt epoch MILLISECONDS: 2026-05-01 (matches AW-UnipileConnections storage).
+  // Must be ms — with the old seconds assumption the `* 1000` scaling pushed the
+  // "already followed up" comparison ~56,000 years out and it never fired (ENG-379).
+  const CONNECTED_TS = new Date('2026-05-01T00:00:00.000Z').getTime();
 
   const accepted = {
     leadId: 'lead-accepted',
@@ -182,7 +184,9 @@ describe('AgentModeService.getLeadsNeedingFollowup', () => {
     const lead = result.leads[0];
     expect(lead.leadId).toBe('lead-accepted');
     expect(lead.linkedInConnectionStatus.isConnected).toBe(true);
-    expect(lead.linkedInConnectionStatus.connectedAt).toBe(new Date(CONNECTED_TS * 1000).toISOString());
+    expect(lead.linkedInConnectionStatus.connectedAt).toBe(new Date(CONNECTED_TS).toISOString());
+    // Regression guard for ENG-379: the connect year must be sane, not ~58000.
+    expect(new Date(lead.linkedInConnectionStatus.connectedAt).getUTCFullYear()).toBe(2026);
     expect(lead.awaitingReply).toBe(false); // we owe them the next touch
     expect(result.matchCount).toBe(1);
   });

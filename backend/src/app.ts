@@ -8,6 +8,8 @@ import waitlistRoutes from "./routes/waitlist";
 import scheduleRoutes from "./routes/schedules";
 import adminRoutes from "./routes/admin";
 import adminUsageRoutes from "./routes/adminUsage";
+import mcpUsageAdminRoutes from "./routes/mcpUsageAdmin";
+import adminV0CreditsRoutes from "./routes/adminV0Credits";
 import internalUsageRoutes from "./routes/internalUsage";
 import configRouter from "./routes/config";
 import workflowRoutes from "./routes/workflows";
@@ -40,7 +42,9 @@ import subscriptionRoutes from "./routes/subscription";
 import booksRoutes from "./routes/books";
 import linkedinAuthRoutes from "./routes/linkedinAuth";
 import gmailAuthRoutes from "./routes/gmailAuth";
+import outlookAuthRoutes from "./routes/outlookAuth";
 import googleDriveAuthRoutes from "./routes/googleDriveAuth";
+import twitterAuthRoutes from "./routes/twitterAuth";
 import metaAuthRoutes from "./routes/metaAuth";
 import clickupAuthRoutes from "./routes/clickupAuth";
 import foreplayAuthRoutes from "./routes/foreplayAuth";
@@ -51,6 +55,7 @@ import youtubeAuthRoutes from "./routes/youtubeAuth";
 import googleAdsAuthRoutes from "./routes/googleAdsAuth";
 import fathomAuthRoutes from "./routes/fathomAuth";
 import fathomWebhookRoutes from "./routes/fathomWebhook";
+import fathomOnboardingAdminRoutes from "./routes/fathomOnboardingAdmin";
 import hubspotAuthRoutes from "./routes/hubspotAuth";
 import attioAuthRoutes from "./routes/attioAuth";
 import crmSyncRoutes from "./routes/crmSync";
@@ -93,7 +98,7 @@ import loopEventsRoutes from "./routes/loopEvents";
 import humanEvalRoutes from "./routes/humanEval";
 import { registerAiEvalFunnelForProduction } from "./loops/instances/ai-eval-funnel";
 import { registerAiReadinessFunnel } from "./loops/instances/ai-readiness-funnel";
-import { registerAgentModeLoop } from "./loops/instances/agent-mode";
+import { checkFinalizeGuardMisconfiguration, registerAgentModeLoop } from "./loops/instances/agent-mode";
 import loopHealthRoutes from "./routes/loopHealth";
 import brandBuildRoutes from "./routes/brandBuild";
 import adGenRoutes from "./routes/adGen";
@@ -213,7 +218,11 @@ const corsOptions = {
   // OPTIONS is intentionally omitted — the cors middleware handles preflight (OPTIONS)
   // requests automatically. This list specifies allowed methods for actual requests.
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  // Cache-Control + Pragma are needed because the top-nav UsageMeter's
+  // useTokenUsage hook cache-busts /api/subscription/usage with those request
+  // headers; cross-origin (app.agentweb.pro -> api.agentweb.pro) the browser
+  // preflights them and, if absent here, blocks the fetch so the meter never loads.
+  allowedHeaders: ["Content-Type", "Authorization", "Cache-Control", "Pragma"],
   credentials: true,
 };
 
@@ -247,6 +256,8 @@ app.use("/api/stripe/connect/webhook", express.raw({ type: "application/json" })
 app.use("/api/webhooks/hubspot", express.raw({ type: "application/json" }));
 // Linear webhook (bug-resolve bridge) needs raw body for HMAC signature verification — before express.json().
 app.use("/api/integrations/linear/webhook", express.raw({ type: "application/json" }));
+// Featurebase webhook (Slack ship-notify) signs the raw body too — before express.json().
+app.use("/api/integrations/featurebase/webhook", express.raw({ type: "application/json" }));
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());
@@ -274,6 +285,8 @@ app.use("/api/waitlist", waitlistRoutes);
 app.use("/api/schedules", scheduleRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/admin", adminUsageRoutes);
+app.use("/api/admin", mcpUsageAdminRoutes);
+app.use("/api/admin", adminV0CreditsRoutes);
 app.use("/api/internal", internalUsageRoutes);
 app.use("/api/config", configRouter);
 app.use("/api/workflows", workflowRoutes);
@@ -320,7 +333,9 @@ app.use("/api/oauth/linkedin", linkedinAuthRoutes);
 app.use("/api/oauth/linkedin-outreach", linkedInOutreachAuthRoutes);
 app.use("/api/oauth/linkedin-ads", linkedInAdsAuthRoutes);
 app.use("/api/oauth/gmail", gmailAuthRoutes);
+app.use("/api/oauth/outlook", outlookAuthRoutes);
 app.use("/api/oauth/google-drive", googleDriveAuthRoutes);
+app.use("/api/oauth/twitter", twitterAuthRoutes);
 app.use("/api/oauth/meta", metaAuthRoutes);
 app.use("/api/oauth/instagram", metaAuthRoutes);
 app.use("/api/oauth/youtube", youtubeAuthRoutes);
@@ -337,6 +352,7 @@ app.use("/api/oauth", connectedAccountsRoutes);
 app.use("/api/mcp-oauth", mcpOAuthPublicRouter);
 app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
 app.use("/api/admin/lead-magnets", authenticateToken, isAdmin, leadMagnetAdminRoutes);
+app.use("/api/admin/fathom-onboarding", authenticateToken, isAdmin, fathomOnboardingAdminRoutes);
 app.use("/api/admin/onboarding-loop", authenticateToken, isAdmin, onboardingLoopAdminRoutes);
 app.use("/api/admin/loops", authenticateToken, isAdmin, loopHealthRoutes);
 app.use("/api/admin/agent-runs", authenticateToken, isAdmin, agentRunsRoutes);
@@ -381,6 +397,10 @@ try {
 // AGENT_MODE_LOOP_ENABLED.
 try {
   registerAgentModeLoop();
+  const finalizeGuardWarning = checkFinalizeGuardMisconfiguration();
+  if (finalizeGuardWarning) {
+    console.warn("[loops] finalize guard misconfigured:", finalizeGuardWarning);
+  }
 } catch (err) {
   console.warn("[loops] registerAgentModeLoop skipped:", String(err));
 }

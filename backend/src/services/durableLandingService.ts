@@ -46,12 +46,23 @@ export const STUCK_CEILING_MS = 30 * 60 * 1000;
 
 /**
  * True when an in-flight record is old enough that no live process can still own it
- * (see {@link STUCK_CEILING_MS}). A record with no createdAt is treated as fresh
+ * (see {@link STUCK_CEILING_MS}). A record with no timestamp is treated as fresh
  * (never a zombie) — the same lenient default the poller uses.
+ *
+ * Measured from `updatedAt`, matching the abandoned-build janitor: a build that PROGRESSED
+ * recently is alive even if it started long ago. Keying this on `createdAt` while the
+ * janitor keyed on `updatedAt` meant the two disagreed about what "dead" means — a long but
+ * healthy build (slow generation + a correction round + a slow Vercel build) was declared a
+ * zombie, `deliverStuckFailure` burned its one-shot completion claim to tell the user
+ * "nothing was deployed", and then the real success could never be delivered because the
+ * claim was already spent. The page was live at a URL the user was never given.
+ * (ENG-287 residual)
  */
 function isZombieInFlight(page: GeneratedLandingPage, nowMs: number): boolean {
-  if (!page.createdAt) return false;
-  return nowMs - new Date(page.createdAt).getTime() > STUCK_CEILING_MS;
+  const ts = page.updatedAt || page.createdAt;
+  if (!ts) return false;
+  const ageMs = nowMs - new Date(ts).getTime();
+  return Number.isFinite(ageMs) && ageMs > STUCK_CEILING_MS;
 }
 
 /**

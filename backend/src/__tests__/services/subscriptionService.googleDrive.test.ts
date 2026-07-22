@@ -74,9 +74,11 @@ describe('getAllAvailableConnectedAccounts', () => {
       'unipile',
       'meta',
       'gmail',
+      'outlook',
       'youtube',
       'fathom',
       'instagram',
+      'twitter',
       'hubspot',
       'attio',
       'google_ads',
@@ -86,9 +88,9 @@ describe('getAllAvailableConnectedAccounts', () => {
     }
   });
 
-  it('returns exactly 11 items', () => {
+  it('returns exactly 13 items', () => {
     const result = getAllAvailableConnectedAccounts();
-    expect(result).toHaveLength(11);
+    expect(result).toHaveLength(13);
   });
 
   it('does not include unexpected platforms', () => {
@@ -98,9 +100,11 @@ describe('getAllAvailableConnectedAccounts', () => {
       'unipile',
       'meta',
       'gmail',
+      'outlook',
       'youtube',
       'fathom',
       'instagram',
+      'twitter',
       'hubspot',
       'attio',
       'google_ads',

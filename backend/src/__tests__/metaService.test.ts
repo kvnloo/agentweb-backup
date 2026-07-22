@@ -35,12 +35,17 @@ jest.mock('facebook-nodejs-business-sdk', () => {
             delete: jest.fn(),
         })),
         // AdCreative typically doesn't have update/delete in this service yet
-        AdCreative: {
-            Fields: {
-                name: 'name',
-                object_story_spec: 'object_story_spec',
+        AdCreative: Object.assign(
+            jest.fn().mockImplementation(() => ({
+                get: jest.fn(),
+            })),
+            {
+                Fields: {
+                    name: 'name',
+                    object_story_spec: 'object_story_spec',
+                }
             }
-        },
+        ),
         Ad: jest.fn().mockImplementation(() => ({
             update: jest.fn(),
             delete: jest.fn(),
@@ -226,6 +231,44 @@ describe('MetaService', () => {
             expect(result).toEqual(mockAdSetData);
         });
 
+        it('forwards destination_type to the Meta payload when provided (ENG-415)', async () => {
+            const mockCreateAdSet = jest.fn().mockResolvedValue({ _data: { id: 'adset_dt' } });
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                createAdSet: mockCreateAdSet,
+            }));
+
+            await service.createAdSet(mockAdAccountId, mockAccessToken, {
+                name: 'AS',
+                campaign_id: 'c1',
+                billing_event: 'IMPRESSIONS',
+                optimization_goal: 'OFFSITE_CONVERSIONS',
+                targeting: { geo_locations: { countries: ['US'] } },
+                daily_budget: 1000,
+                destination_type: 'WEBSITE',
+            });
+
+            expect(mockCreateAdSet).toHaveBeenCalledWith([], expect.objectContaining({ destination_type: 'WEBSITE' }));
+        });
+
+        it('omits destination_type from the payload when not provided (ENG-415)', async () => {
+            const mockCreateAdSet = jest.fn().mockResolvedValue({ _data: { id: 'adset_no_dt' } });
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                createAdSet: mockCreateAdSet,
+            }));
+
+            await service.createAdSet(mockAdAccountId, mockAccessToken, {
+                name: 'AS',
+                campaign_id: 'c1',
+                billing_event: 'IMPRESSIONS',
+                optimization_goal: 'REACH',
+                targeting: { geo_locations: { countries: ['US'] } },
+                daily_budget: 1000,
+            });
+
+            const payload = mockCreateAdSet.mock.calls[0][1];
+            expect(payload).not.toHaveProperty('destination_type');
+        });
+
         it('should update an ad set', async () => {
             const mockUpdate = jest.fn().mockResolvedValue({});
             (AdSet as unknown as jest.Mock).mockImplementation(() => ({
@@ -366,6 +409,66 @@ describe('MetaService', () => {
             // object_story_spec carries only the Page; all copy/link lives in asset_feed_spec
             expect(callArgs.object_story_spec.page_id).toBe('page_123');
             expect(callArgs.object_story_spec.link_data).toBeUndefined();
+        });
+
+        describe('getAdCreative', () => {
+            // Meta's Graph API only returns the subfields of object_story_spec that are
+            // explicitly requested via field-expansion syntax (e.g. "object_story_spec{link_data{image_hash}}").
+            // Requesting the bare "object_story_spec" field omits image_hash and returns only the
+            // hosted "picture" URL, even for creatives that were created from an image_hash.
+            // COPY_AD relies on getAdCreative to read back image_hash so it can reuse the same
+            // account-scoped hash on the copy; if the hash isn't requested, COPY_AD instead
+            // re-uploads Meta's low-res preview "picture" URL, which Meta's own AdCreative
+            // create endpoint rejects (error code 100, subcode 1487390).
+            it('requests link_data.image_hash as an explicit subfield of object_story_spec', async () => {
+                const mockGet = jest.fn().mockResolvedValue({ _data: { id: 'creative_1' } });
+                (AdCreative as unknown as jest.Mock).mockImplementation(() => ({ get: mockGet }));
+
+                await service.getAdCreative(mockAccessToken, 'creative_1');
+
+                expect(mockGet).toHaveBeenCalled();
+                const fields: string[] = mockGet.mock.calls[0][0];
+                const objectStorySpecField = fields.find(f => f.startsWith('object_story_spec'));
+                expect(objectStorySpecField).toBeDefined();
+                expect(objectStorySpecField).toContain('link_data');
+                expect(objectStorySpecField).toContain('image_hash');
+            });
+
+            it('requests video_data.image_hash as an explicit subfield of object_story_spec', async () => {
+                const mockGet = jest.fn().mockResolvedValue({ _data: { id: 'creative_2' } });
+                (AdCreative as unknown as jest.Mock).mockImplementation(() => ({ get: mockGet }));
+
+                await service.getAdCreative(mockAccessToken, 'creative_2');
+
+                const fields: string[] = mockGet.mock.calls[0][0];
+                const objectStorySpecField = fields.find(f => f.startsWith('object_story_spec'));
+                expect(objectStorySpecField).toContain('video_data');
+                expect((objectStorySpecField ?? '').match(/image_hash/g)?.length).toBeGreaterThanOrEqual(2);
+            });
+
+            it('requests child_attachments.image_hash for carousel creatives', async () => {
+                const mockGet = jest.fn().mockResolvedValue({ _data: { id: 'creative_3' } });
+                (AdCreative as unknown as jest.Mock).mockImplementation(() => ({ get: mockGet }));
+
+                await service.getAdCreative(mockAccessToken, 'creative_3');
+
+                const fields: string[] = mockGet.mock.calls[0][0];
+                const objectStorySpecField = fields.find(f => f.startsWith('object_story_spec'));
+                expect(objectStorySpecField).toContain('child_attachments');
+            });
+
+            it('returns the raw creative data from the Graph API response', async () => {
+                const mockCreativeData = {
+                    id: 'creative_4',
+                    object_story_spec: { link_data: { image_hash: 'abc123', link: 'https://example.com' } }
+                };
+                const mockGet = jest.fn().mockResolvedValue({ _data: mockCreativeData });
+                (AdCreative as unknown as jest.Mock).mockImplementation(() => ({ get: mockGet }));
+
+                const result = await service.getAdCreative(mockAccessToken, 'creative_4');
+
+                expect(result).toEqual(mockCreativeData);
+            });
         });
     });
 
@@ -686,6 +789,75 @@ describe('MetaService', () => {
             expect(result).toEqual([
                 { id: '789', name: 'Frequent Travelers', type: 'behaviors' }
             ]);
+        });
+
+        describe('geolocation search routing', () => {
+            let mockFetch: jest.SpyInstance;
+
+            beforeEach(() => {
+                mockFetch = jest.spyOn(global, 'fetch');
+            });
+
+            afterEach(() => {
+                mockFetch.mockRestore();
+            });
+
+            it('should route adgeolocation searches to the /search endpoint, not targetingsearch', async () => {
+                const mockGeoResults = [
+                    { key: '2418779', name: 'Palo Alto', type: 'city', region: 'California', region_id: 3847, country_code: 'US' }
+                ];
+                mockFetch.mockResolvedValue({
+                    ok: true,
+                    json: jest.fn().mockResolvedValue({ data: mockGeoResults })
+                });
+                const mockGetTargetingSearch = jest.fn();
+                (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                    getTargetingSearch: mockGetTargetingSearch,
+                }));
+
+                const result = await service.searchTargeting(mockAdAccountId, mockAccessToken, 'Palo Alto', 'adgeolocation');
+
+                // Must NOT go through the interest-oriented targetingsearch edge
+                expect(mockGetTargetingSearch).not.toHaveBeenCalled();
+                // Must hit the top-level /search endpoint with the geo type
+                expect(mockFetch).toHaveBeenCalledWith(
+                    expect.stringMatching(/\/search\?type=adgeolocation/)
+                );
+                expect(mockFetch).toHaveBeenCalledWith(
+                    expect.stringContaining('q=Palo%20Alto')
+                );
+                expect(result).toEqual(mockGeoResults);
+            });
+
+            it('should pass location_types through for adgeolocation searches', async () => {
+                mockFetch.mockResolvedValue({
+                    ok: true,
+                    json: jest.fn().mockResolvedValue({ data: [] })
+                });
+                (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                    getTargetingSearch: jest.fn(),
+                }));
+
+                await service.searchTargeting(mockAdAccountId, mockAccessToken, 'San Jose', 'adgeolocation', ['city']);
+
+                expect(mockFetch).toHaveBeenCalledWith(
+                    expect.stringContaining(`location_types=${encodeURIComponent(JSON.stringify(['city']))}`)
+                );
+            });
+
+            it('should throw when the /search endpoint returns an error for geolocation', async () => {
+                mockFetch.mockResolvedValue({
+                    ok: true,
+                    json: jest.fn().mockResolvedValue({ error: { message: 'Invalid location_types' } })
+                });
+                (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                    getTargetingSearch: jest.fn(),
+                }));
+
+                await expect(
+                    service.searchTargeting(mockAdAccountId, mockAccessToken, 'Nowhere', 'adgeolocation')
+                ).rejects.toThrow('Invalid location_types');
+            });
         });
     });
 

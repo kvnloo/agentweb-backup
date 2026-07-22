@@ -34,6 +34,18 @@ jest.mock('../services/connectedAccountsDb', () => ({
   isTokenValid: (...args: any[]) => mockIsTokenValid(...args),
 }));
 
+// The empty-platform branch looks up the CALLER's own record to decide whether to
+// show the org "teammate" hint (only for org members) or a plain connect prompt.
+// Override only userDb.getUserById; keep every other real db export intact.
+const mockGetUserById = jest.fn();
+jest.mock('../services/db', () => {
+  const actual = jest.requireActual('../services/db');
+  return {
+    ...actual,
+    userDb: { ...actual.userDb, getUserById: (...args: any[]) => mockGetUserById(...args) },
+  };
+});
+
 const mockGetStatusesForAccounts = jest.fn();
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
@@ -130,5 +142,81 @@ describe('AgentModeService.listConnectedAccounts', () => {
     const gmailAccount = result.accounts.find((a: any) => a.platform === 'gmail');
     expect(unipileAccount.is_active).toBe(false);
     expect(gmailAccount.is_active).toBe(true);
+  });
+
+  it('ENG-368: returns the org "teammate" hint for an org member with an empty platform-specific result, without inspecting teammates\' private accounts', async () => {
+    // Caller is in an org but has no accessible google_ads account. The message
+    // must not reveal whether a teammate actually has one — it is a static hint
+    // that guides the user to "Share with org" or connecting their own.
+    mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([]);
+    mockGetUserById.mockResolvedValue({ userId: 'user-1', orgId: 'org-1' });
+
+    const result = await service.listConnectedAccounts('user-1', 'google_ads');
+
+    expect(result.success).toBe(true);
+    expect(result.accounts).toHaveLength(0);
+    expect(result.message).toMatch(/Share with org/i);
+    expect(result.message).toMatch(/teammate in your organization/i);
+    expect(result.message).toMatch(/google_ads/);
+  });
+
+  it('ENG-368: a caller with NO org gets a plain connect prompt, not the "teammate" hint', async () => {
+    mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([]);
+    mockGetUserById.mockResolvedValue({ userId: 'user-1' }); // no orgId
+
+    const result = await service.listConnectedAccounts('user-1', 'google_ads');
+
+    expect(result.accounts).toHaveLength(0);
+    expect(result.message).not.toMatch(/teammate|Share with org/i);
+    expect(result.message).toMatch(/Connect google_ads in Settings/i);
+  });
+
+  it('ENG-368: falls back to the plain connect prompt when the caller record is missing', async () => {
+    mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([]);
+    mockGetUserById.mockResolvedValue(null);
+
+    const result = await service.listConnectedAccounts('user-1', 'google_ads');
+
+    expect(result.message).not.toMatch(/teammate|Share with org/i);
+    expect(result.message).toMatch(/Connect google_ads in Settings/i);
+  });
+
+  it('ENG-368: keeps the plain "0 accounts" message for platform="all" (no per-user org lookup)', async () => {
+    mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([]);
+
+    const result = await service.listConnectedAccounts('user-1', 'all');
+
+    expect(result.accounts).toHaveLength(0);
+    expect(result.message).toBe('Found 0 connected account(s)');
+    expect(mockGetUserById).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a connected google_ads account with its customer_id and currency', async () => {
+    mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
+      {
+        platform: 'google_ads',
+        account_id: '9030368888',
+        account_name: 'xCures',
+        config: {
+          account_type: 'google_ads',
+          customer_id: '9030368888',
+          currency: 'USD',
+          token_expires_at: Date.now() - 1000, // expired access token, but refresh_token present
+          refresh_token: 'refresh-token-value',
+        },
+      },
+    ]);
+    mockIsTokenValid.mockResolvedValue(true);
+
+    const result = await service.listConnectedAccounts('user-1', 'google_ads');
+
+    expect(result.success).toBe(true);
+    expect(result.accounts).toHaveLength(1);
+    expect(result.accounts[0]).toMatchObject({
+      platform: 'google_ads',
+      customer_id: '9030368888',
+      currency: 'USD',
+      is_active: true,
+    });
   });
 });

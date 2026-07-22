@@ -49,6 +49,22 @@ jest.mock("axios", () => ({
   },
 }));
 
+// This suite imports the REAL v0Service, whose transitive imports reach slackService.
+// slackService constructs a Slack WebClient at MODULE LOAD (`new WebClient(...)` at its
+// top level, guarded only by SLACK_BOT_TOKEN being set) — and WebClient's constructor
+// calls `axios.create()`. The axios mock above deliberately exposes only the verbs this
+// suite drives, so `create` is undefined and the whole suite died at import with
+// "axios_1.default.create is not a function" — 0 tests run, on main, for everyone.
+//
+// Stubbing slackService keeps the WebClient from ever being constructed, which is the
+// same dodge leadListAlertService.ccEmails and shipNotifyService already use. This suite
+// has nothing to do with Slack.
+jest.mock("../services/slackService", () => ({
+  __esModule: true,
+  sendSlackMessage: jest.fn().mockResolvedValue(undefined),
+  sendSlackNotification: jest.fn().mockResolvedValue(undefined),
+}));
+
 import {
   getProjectDomain,
   removeDomain,

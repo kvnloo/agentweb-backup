@@ -334,6 +334,93 @@ export async function getGmailCredentials(): Promise<GmailCredentials> {
 }
 
 /**
+ * Interface for Outlook / Microsoft 365 OAuth credentials returned from Secrets Manager
+ */
+export interface OutlookCredentials {
+  clientId: string;
+  clientSecret: string;
+}
+
+/**
+ * Get Outlook / Microsoft 365 OAuth credentials from AWS Secrets Manager.
+ *
+ * Secret location: dev/AgentWeb/Microsoft/Outlook (or prod/... for production)
+ * Secret format: { "clientId": "...", "clientSecret": "..." }
+ *
+ * The Entra app registration must be MULTITENANT — otherwise only our own tenant
+ * can consent and no customer can ever connect a mailbox.
+ *
+ * @returns Outlook OAuth client credentials
+ */
+export async function getOutlookCredentials(): Promise<OutlookCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/Microsoft/Outlook'
+      : 'dev/AgentWeb/Microsoft/Outlook';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('Outlook credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as OutlookCredentials;
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new Error('Outlook credentials missing clientId or clientSecret');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching Outlook credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch Outlook credentials from Secrets Manager');
+  }
+}
+
+/**
+ * Interface for Twitter/X OAuth2 credentials returned from Secrets Manager
+ */
+export interface TwitterCredentials {
+  clientId: string;
+  clientSecret: string;
+}
+
+/**
+ * Get Twitter/X OAuth2 (Authorization Code + PKCE) client credentials from AWS Secrets Manager.
+ *
+ * Secret location: dev/AgentWeb/Twitter (or prod/AgentWeb/Twitter for production)
+ * Secret format: { "clientId": "...", "clientSecret": "..." }
+ *
+ * @returns Twitter/X OAuth2 client credentials
+ */
+export async function getTwitterCredentials(): Promise<TwitterCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/Twitter'
+      : 'dev/AgentWeb/Twitter';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('Twitter credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as TwitterCredentials;
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new Error('Twitter credentials missing clientId or clientSecret');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching Twitter credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch Twitter credentials from Secrets Manager');
+  }
+}
+
+/**
  * Get YouTube OAuth credentials from AWS Secrets Manager.
  * Reuses the Gmail Google OAuth credentials (same Google Cloud project).
  *

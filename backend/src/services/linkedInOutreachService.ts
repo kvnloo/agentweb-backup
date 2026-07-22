@@ -16,11 +16,30 @@ export class LinkedInOutreachService {
   // Per-user resolved account cache — avoids re-running the full account resolution chain on every call
   private resolvedAccountCache: Map<string, { accountId: string; timestamp: number }> = new Map();
   private static readonly RESOLVED_ACCOUNT_TTL_MS = 30 * 60 * 1000; // 30 minutes
+  // Per-account invitation cooldown breaker (ENG-126). Once LinkedIn rejects a
+  // send-invite with "Cannot resend yet", the account has hit its invitation cap
+  // and EVERY subsequent invite — to any recipient — fails the same way until the
+  // cap resets. We record the epoch-ms until which further sends are short-circuited
+  // (no Unipile round-trip), so a runaway session or scheduled run can't burn attempt
+  // after attempt across fresh recipients. Self-heals on TTL expiry or the next
+  // successful send. Scoped per account_id, so one throttled account never blocks
+  // another. Note: the per-recipient "Should delay new invitation" rejection does
+  // NOT arm this breaker — that one is specific to a single recipient.
+  private invitationCooldownUntil: Map<string, number> = new Map();
+  private static readonly INVITATION_COOLDOWN_TTL_MS = 60 * 60 * 1000; // 1 hour
 
   // ─── Logging helpers ────────────────────────────────────────────────────────
 
   private log(message: string, data?: any) {
     console.log(`[LinkedInOutreachService] ${message}`, data ? JSON.stringify(data, null, 2) : '');
+  }
+
+  // Warnings go to stderr, which Elastic Beanstalk also captures into the
+  // web.stdout.log CloudWatch group — so these markers are queryable there by
+  // time window (14-day retention). Kept single-line + prefixed so a future
+  // profile-lookup hang is greppable without spelunking (see ENG-144).
+  private warn(message: string, data?: any) {
+    console.warn(`[LinkedInOutreachService] ${message}`, data ? JSON.stringify(data) : '');
   }
 
   private async handleError(error: any, context: string): Promise<never> {
@@ -52,6 +71,14 @@ export class LinkedInOutreachService {
       classification: 'UNKNOWN_ERROR'
     };
 
+    // Internal timeouts (from withTimeout) have no HTTP status — preserve the
+    // TIMEOUT_ERROR classification so callers/agent can surface a retry-friendly
+    // message instead of a generic "Unknown error".
+    if (error?.isTimeout || error?.classification === 'TIMEOUT_ERROR') {
+      structuredError.classification = 'TIMEOUT_ERROR';
+      structuredError.isTimeout = true;
+    }
+
     // Basic classification based on HTTP status or error code
     const status = Number(structuredError.status);
     if (status === 401 || status === 403) {
@@ -76,6 +103,118 @@ export class LinkedInOutreachService {
       : (error instanceof Error ? error : new Error(structuredError.message));
     (enhancedError as any).structuredError = structuredError;
     throw enhancedError;
+  }
+
+  // ─── Timeout / retry helpers ─────────────────────────────────────────────────
+
+  // Profile lookups occasionally hang when Unipile's upstream LinkedIn session is
+  // stuck (CAPTCHA/auth wall or a dead browser session). The Unipile SDK's fetch
+  // has no timeout, so a hung request blocks the agent for minutes — a real session
+  // (ENG-144) waited 167s before failing and returned no data. Bound each lookup
+  // with an internal timeout and one automatic retry so we surface a clear,
+  // classified error quickly instead of stalling the conversation.
+  static readonly PROFILE_LOOKUP_TIMEOUT_MS = 30_000;
+  // Healthy lookups return in ~1–3s (confirmed against prod CloudWatch logs). A
+  // success slower than this is an early warning that the upstream is degrading
+  // toward the ENG-144 hang — logged so we catch trouble before it's a full
+  // timeout.
+  static readonly PROFILE_LOOKUP_SLOW_MS = 10_000;
+  // Liveness probe timeout for isAccountConnected. Shorter than a real profile
+  // lookup: a hung probe should be treated as "not connected" quickly so
+  // resolveAccountId moves on to the next account instead of stalling the whole
+  // request on the same upstream hang ENG-144 is about.
+  static readonly CONNECTIVITY_CHECK_TIMEOUT_MS = 15_000;
+
+  /**
+   * Race a promise against a timeout. If the timeout fires first, reject with a
+   * TIMEOUT_ERROR-classified Error carrying `isTimeout = true`. The underlying
+   * promise is left to settle on its own (the SDK's fetch is not abortable), but
+   * the caller is unblocked. The timer is unref'd so it never keeps the process
+   * alive and is always cleared once the race settles.
+   */
+  private static withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const err: any = new Error(`${label} timed out after ${ms}ms`);
+        err.isTimeout = true;
+        err.classification = 'TIMEOUT_ERROR';
+        reject(err);
+      }, ms);
+      if (typeof (timer as any).unref === 'function') (timer as any).unref();
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  }
+
+  /**
+   * Fetch a full LinkedIn profile from Unipile with a bounded timeout and a single
+   * automatic retry on timeout. Non-timeout errors (404/401/etc.) bubble straight
+   * up to the caller's handleError without a retry — retrying those just wastes
+   * credits. Shared by getLinkedInProfile (URL input) and getProfile (raw id).
+   */
+  private async fetchProfileFromUnipile(identifier: string, accountId: string): Promise<any> {
+    const client = await this.getClient();
+    const doFetch = () => client.request.send({
+      method: 'GET',
+      path: ['users', identifier],
+      // linkedin_sections='*' returns ALL profile sections (experience,
+      // education, skills, languages, certifications, volunteer, etc.).
+      parameters: { account_id: accountId, linkedin_sections: '*' }
+    });
+
+    // One timed attempt. Emits structured, greppable markers so a future hang is
+    // diagnosable straight from CloudWatch given only a time window:
+    //   PROFILE_LOOKUP_TIMEOUT — this attempt exceeded PROFILE_LOOKUP_TIMEOUT_MS
+    //   PROFILE_LOOKUP_SLOW    — succeeded, but slower than the healthy baseline
+    // Every marker carries identifier + accountId + attempt + elapsedMs.
+    const attemptFetch = async (attempt: number): Promise<any> => {
+      const startedAt = Date.now();
+      try {
+        const result = await LinkedInOutreachService.withTimeout(
+          doFetch(),
+          LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+          `LinkedIn profile lookup for ${identifier}`
+        );
+        const elapsedMs = Date.now() - startedAt;
+        if (elapsedMs >= LinkedInOutreachService.PROFILE_LOOKUP_SLOW_MS) {
+          this.warn('PROFILE_LOOKUP_SLOW', { identifier, accountId, attempt, elapsedMs });
+        }
+        return result;
+      } catch (err: any) {
+        if (err?.isTimeout) {
+          this.warn('PROFILE_LOOKUP_TIMEOUT', {
+            identifier,
+            accountId,
+            attempt,
+            elapsedMs: Date.now() - startedAt,
+            timeoutMs: LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+          });
+        }
+        throw err;
+      }
+    };
+
+    try {
+      return await attemptFetch(1);
+    } catch (err: any) {
+      if (!err?.isTimeout) throw err; // real API error — surface immediately, no retry
+      this.log(`Profile lookup timed out; retrying once`, { identifier, accountId });
+      try {
+        return await attemptFetch(2);
+      } catch (retryErr: any) {
+        if (retryErr?.isTimeout) {
+          // Both attempts hung — this is the ENG-144 failure. One clear ERROR-level
+          // marker to alert on / grep for when a user reports "no data returned".
+          this.warn('PROFILE_LOOKUP_FAILED_TIMEOUT', {
+            identifier,
+            accountId,
+            attempts: 2,
+            timeoutMs: LinkedInOutreachService.PROFILE_LOOKUP_TIMEOUT_MS,
+          });
+        }
+        throw retryErr;
+      }
+    }
   }
 
   // ─── Client initialization ───────────────────────────────────────────────────
@@ -185,26 +324,38 @@ export class LinkedInOutreachService {
     let connected: boolean;
     try {
       const client = await this.getClient();
+      const timeoutMs = LinkedInOutreachService.CONNECTIVITY_CHECK_TIMEOUT_MS;
       // account.getOne() returns account metadata but no session status field.
       // Use the account's own LinkedIn publicIdentifier for a self-profile lookup —
-      // this fails with 401 if the LinkedIn session is disconnected.
-      const account = await client.account.getOne(accountId) as any;
+      // this fails with 401 if the LinkedIn session is disconnected. Both Unipile
+      // calls are timeout-bounded so a hung upstream (ENG-144) can't stall the
+      // caller (resolveAccountId loops this over every account) — a probe that
+      // times out is treated as "not connected" and resolution moves on.
+      const account = await LinkedInOutreachService.withTimeout(
+        client.account.getOne(accountId) as Promise<any>,
+        timeoutMs,
+        `LinkedIn connectivity check (account) for ${accountId}`,
+      ) as any;
       const publicIdentifier = account?.connection_params?.im?.publicIdentifier;
       if (!publicIdentifier) {
         this.log(`Account ${accountId} has no publicIdentifier — assuming connected`);
         connected = true;
       } else {
-        await client.request.send({
-          method: 'GET',
-          path: ['users', publicIdentifier],
-          parameters: { account_id: accountId },
-        });
+        await LinkedInOutreachService.withTimeout(
+          client.request.send({
+            method: 'GET',
+            path: ['users', publicIdentifier],
+            parameters: { account_id: accountId },
+          }),
+          timeoutMs,
+          `LinkedIn connectivity check (profile) for ${accountId}`,
+        );
         connected = true;
       }
     } catch (error: any) {
       const code = error?.body?.code || error?.code || '';
       const status = error?.body?.status || error?.status;
-      this.log(`Account ${accountId} connectivity check failed (${status} ${code})`);
+      this.log(`Account ${accountId} connectivity check failed (${status} ${code}${error?.isTimeout ? ' timeout' : ''})`);
       connected = false;
     }
     this.connectedStatusCache.set(accountId, { connected, timestamp: Date.now() });
@@ -329,15 +480,7 @@ export class LinkedInOutreachService {
 
     try {
       this.log(`Fetching LinkedIn profile: ${identifier}`, { account_id });
-      const client = await this.getClient();
-      const profile = await client.request.send({
-        method: 'GET',
-        path: ['users', identifier],
-        // linkedin_sections='*' returns ALL profile sections (experience,
-        // education, skills, languages, certifications, volunteer, etc.).
-        // Without it, Unipile returns only the base profile fields.
-        parameters: { account_id, linkedin_sections: '*' }
-      });
+      const profile = await this.fetchProfileFromUnipile(identifier, account_id);
       this.log(`Successfully fetched profile: ${identifier}`);
       return profile;
     } catch (error: any) {
@@ -420,8 +563,38 @@ export class LinkedInOutreachService {
     profileUrlOrId: string,
     isUrl: boolean,
     message?: string,
-    maxChars: number = LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS
+    maxChars: number = LinkedInOutreachService.INVITE_MESSAGE_MAX_CHARS,
+    opts?: { onNoteQuota?: 'send_without_note' | 'skip' }
   ): Promise<any> {
+    // Policy for when LinkedIn rejects the personalized note because the account's
+    // monthly note quota is spent (ENG-213). The service is a pure mechanism — the
+    // caller decides. 'send_without_note' drops the note and sends anyway (legacy
+    // behavior; kept as the default so existing callers are unaffected). 'skip'
+    // HOLDS the invite: it throws a typed `noteQuotaExceeded` signal WITHOUT sending,
+    // so the caller can ask the customer (CRM dialog / Emma) or defer the lead
+    // instead of silently downgrading a note the customer deliberately wrote.
+    const onNoteQuota: 'send_without_note' | 'skip' = opts?.onNoteQuota ?? 'send_without_note';
+
+    // Account-level cooldown breaker: if a prior send already hit LinkedIn's
+    // invitation cap, skip the network round-trip entirely and fail fast with the
+    // same signal, so callers (agent-mode, CRM) stop burning attempts recipient
+    // after recipient. The message keeps the "Cannot resend yet" phrase so the
+    // agent-mode handler surfaces it as the account-level throttle it is.
+    const cooldownUntil = this.invitationCooldownUntil.get(account_id);
+    if (cooldownUntil !== undefined) {
+      if (cooldownUntil > Date.now()) {
+        this.log(`Skipping invite — account under invitation cooldown`, { account_id, cooldownUntil });
+        const err: any = new Error(
+          'Cannot resend yet — this LinkedIn account is under an active account-level invitation ' +
+          'cooldown (its invitation cap was hit on an earlier send this run); skipped to avoid burning attempts.'
+        );
+        err.structuredError = { message: err.message, classification: 'VALIDATION_ERROR', status: 422 };
+        throw err;
+      }
+      // Cooldown window elapsed — clear it and allow a fresh attempt.
+      this.invitationCooldownUntil.delete(account_id);
+    }
+
     let outgoingMessage = message;
     if (outgoingMessage !== undefined && outgoingMessage.length > maxChars) {
       const trimmed = LinkedInOutreachService.trimInviteMessage(outgoingMessage, maxChars);
@@ -433,27 +606,135 @@ export class LinkedInOutreachService {
       outgoingMessage = trimmed;
     }
     try {
-      const provider_id = await this.resolveProviderId(profileUrlOrId, isUrl, account_id);
-      await this.checkIsNotAlreadyConnected(account_id, provider_id);
+      const resolvedTarget = await this.resolveProviderId(profileUrlOrId, isUrl, account_id);
+      // Unipile's invite endpoint requires the canonical provider_id (the member URN);
+      // a public-identifier slug (e.g. "william-kwak") is rejected with a generic
+      // "Invalid parameters" (ENG-213). The connection-check profile fetch accepts
+      // either form and reveals the canonical provider_id, so use that for the send
+      // rather than whatever identifier the caller happened to pass.
+      const provider_id = await this.checkIsNotAlreadyConnected(account_id, resolvedTarget);
       this.log(`Sending invitation`, { account_id, provider_id });
       const client = await this.getClient();
-      const res = await client.users.sendInvitation({
-        account_id,
-        provider_id,
-        message: outgoingMessage
-      });
+      const res = await this.sendInvitationRequest(client, account_id, provider_id, outgoingMessage, onNoteQuota);
       this.log(`Invitation sent successfully`, { account_id, provider_id });
+      // A successful send proves the account is not capped — clear any stale breaker.
+      this.invitationCooldownUntil.delete(account_id);
       return res;
     } catch (error: any) {
-      return this.handleError(error, 'sendInvitation');
+      // A note-quota HOLD (onNoteQuota:'skip') is an intentional, already-classified
+      // signal — surface it verbatim so callers can gate on `noteQuotaExceeded`.
+      // Running it through handleError would re-classify it as a generic validation
+      // error and strip the flag.
+      if (error?.noteQuotaExceeded) throw error;
+      // handleError always throws; inspect the normalized message it produces so
+      // an account-level "Cannot resend yet" arms the breaker for future calls.
+      // Per-recipient rejections (e.g. "Should delay new invitation") do not match
+      // and so never arm the account-wide breaker.
+      try {
+        return await this.handleError(error, 'sendInvitation');
+      } catch (enhanced: any) {
+        if (/cannot resend yet/i.test(enhanced?.message ?? '')) {
+          this.invitationCooldownUntil.set(
+            account_id,
+            Date.now() + LinkedInOutreachService.INVITATION_COOLDOWN_TTL_MS
+          );
+          this.log(`Armed invitation cooldown breaker`, { account_id });
+        }
+        throw enhanced;
+      }
     }
+  }
+
+  /**
+   * Send the invite to Unipile. Free LinkedIn accounts may only attach a note to ~5
+   * invitations per month, but can still send ~150 note-less invites per week; once
+   * the monthly note quota is spent, LinkedIn rejects every note-bearing invite with
+   * a generic "Invalid parameters" even though the recipient/provider_id are perfectly
+   * valid (ENG-213). What we do about that is the CALLER's policy, via `onNoteQuota`:
+   *   - 'send_without_note': transparently resend WITHOUT the note so the connection
+   *     request still goes out, tagging the result `note_dropped` so callers report it.
+   *   - 'skip': do NOT send — throw a typed `noteQuotaExceeded` signal so the caller
+   *     can ask the customer or hold the lead instead of silently dropping the note.
+   * Any non-note rejection (bad provider_id, already-invited, account cap) bubbles up
+   * unchanged for the caller/handleError to classify, regardless of `onNoteQuota`.
+   */
+  private async sendInvitationRequest(
+    client: UnipileClient,
+    account_id: string,
+    provider_id: string,
+    message: string | undefined,
+    onNoteQuota: 'send_without_note' | 'skip',
+  ): Promise<any> {
+    try {
+      return await client.users.sendInvitation({ account_id, provider_id, message });
+    } catch (error: any) {
+      const hadNote = typeof message === 'string' && message.length > 0;
+      if (hadNote && LinkedInOutreachService.isInviteNoteRejection(error)) {
+        if (onNoteQuota === 'skip') {
+          // Hold: the note quota is spent and the caller has NOT authorized a note-less
+          // send. Do not downgrade silently — surface a typed signal so the caller can
+          // ask the customer (or defer the lead). The invite is NOT sent.
+          this.warn('INVITE_NOTE_QUOTA_HELD', { account_id, provider_id });
+          const held: any = new Error(
+            'LinkedIn note quota reached — the personalized note could not be attached. ' +
+            'The invitation was held (not sent) so the note is not silently dropped.'
+          );
+          held.noteQuotaExceeded = true;
+          held.structuredError = {
+            message: held.message,
+            classification: 'NOTE_QUOTA_EXCEEDED',
+            status: 422,
+            noteQuotaExceeded: true,
+          };
+          throw held;
+        }
+        this.warn('INVITE_NOTE_REJECTED_RETRY_WITHOUT_NOTE', { account_id, provider_id });
+        const res = await client.users.sendInvitation({ account_id, provider_id, message: undefined });
+        // Signal to callers that the note was dropped — the invite still went out,
+        // just without the personalization, so they can report it accurately.
+        if (res && typeof res === 'object') (res as any).note_dropped = true;
+        return res;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * True when a Unipile invite rejection is the generic "Invalid parameters"
+   * validation error LinkedIn returns for a note-bearing invite once a free
+   * account's monthly personalized-invite quota is spent (ENG-213). Deliberately
+   * excludes the distinct cap/duplicate signals ("cannot resend yet",
+   * "already invited/connected", "should delay") — dropping the note cannot fix
+   * those, so we must not silently retry and mask them.
+   */
+  private static isInviteNoteRejection(error: any): boolean {
+    const body = error?.body;
+    if (!body || typeof body !== 'object' || (typeof Blob !== 'undefined' && body instanceof Blob)) {
+      return false;
+    }
+    const text = [body.title, body.message, body.detail, body.type]
+      .filter((v: any) => typeof v === 'string')
+      .join(' ')
+      .toLowerCase();
+    if (!text) return false;
+    if (/cannot resend yet|already invited|already connected|should delay|insufficient/.test(text)) {
+      return false;
+    }
+    return /invalid parameters?/.test(text);
   }
 
   /**
    * Check that a target profile is not already a 1st-degree connection before sending an invite.
    * Uses raw API call to avoid SDK validator failures.
+   *
+   * Returns the canonical Unipile provider_id (member URN) revealed by the profile
+   * lookup. The lookup accepts either a public-identifier slug or a provider_id, but
+   * the invite endpoint only accepts the canonical provider_id — so callers must send
+   * the returned value, not the identifier they passed in (ENG-213). Falls back to the
+   * passed identifier when the lookup fails or reveals no provider_id, so a transient
+   * lookup failure never blocks (or breaks) the invite.
    */
-  private async checkIsNotAlreadyConnected(accountId: string, providerId: string): Promise<void> {
+  private async checkIsNotAlreadyConnected(accountId: string, providerId: string): Promise<string> {
     try {
       const client = await this.getClient();
       this.log(`Fetching profile for connection check`, { accountId, providerId });
@@ -479,10 +760,16 @@ export class LinkedInOutreachService {
           `Use the send-message action to reach them directly.`
         );
       }
+      // Prefer the canonical provider_id from the live profile — the invite endpoint
+      // rejects a public-identifier slug with "Invalid parameters".
+      const canonical = profile?.provider_id;
+      return typeof canonical === 'string' && canonical.length > 0 ? canonical : providerId;
     } catch (error: any) {
       if (error.message?.startsWith('Cannot send invite:')) throw error;
-      // Profile lookup failed — log and proceed rather than blocking the invite
+      // Profile lookup failed — log and proceed with the identifier we were given
+      // rather than blocking the invite.
       this.log(`Connection status check skipped (profile fetch failed)`, { providerId, reason: error.message });
+      return providerId;
     }
   }
 
@@ -747,13 +1034,7 @@ export class LinkedInOutreachService {
   async getProfile(identifier: string, accountId: string): Promise<any> {
     try {
       this.log(`Fetching profile: ${identifier}`, { accountId });
-      const client = await this.getClient();
-      const profile = await client.request.send({
-        method: 'GET',
-        path: ['users', identifier],
-        // See getLinkedInProfile — linkedin_sections=* pulls all sections.
-        parameters: { account_id: accountId, linkedin_sections: '*' }
-      });
+      const profile = await this.fetchProfileFromUnipile(identifier, accountId);
       this.log(`Successfully fetched profile: ${identifier}`);
       return profile;
     } catch (error: any) {
@@ -1062,12 +1343,24 @@ export class LinkedInOutreachService {
    * Returns null if no account can be found.
    */
   async resolveAccountId(userId: string): Promise<string | null> {
-    // 1. User's own account
+    // 1. User's own accounts — try ALL of them and return the first whose LinkedIn
+    //    session is still live. A single disconnected account must not shadow a
+    //    working one, nor force a needless fall-through to the shared site-wide
+    //    pool: the user's own accounts are ALWAYS preferred, and only when EVERY
+    //    one of them is dead do we move on to the site-wide accounts below.
+    //    (Previously this returned the FIRST own account with no liveness check,
+    //    so a dead first account failed the whole lookup even when the user had a
+    //    second, working account. Mirrors resolveAccountIdForEnrichment.)
     try {
       const { getAccountsByUserId } = await import('./connectedAccountsDb');
       const accounts = await getAccountsByUserId(userId);
-      const userAccount = (accounts as any[]).find((a) => a.platform === 'unipile');
-      if (userAccount?.account_id) return userAccount.account_id;
+      const userAccounts = (accounts as any[]).filter((a) => a.platform === 'unipile' && a.account_id);
+      for (const account of userAccounts) {
+        if (await this.isAccountConnected(account.account_id)) {
+          return account.account_id;
+        }
+        this.log(`User account ${account.account_id} is disconnected — trying next own account`);
+      }
     } catch { /* ignore */ }
 
     // 2. Site-wide accounts — verify each one is still connected before returning

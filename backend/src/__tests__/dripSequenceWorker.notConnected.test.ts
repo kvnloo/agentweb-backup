@@ -13,6 +13,8 @@ jest.mock('../services/dripSequenceDb', () => ({
     completeEnrollment: jest.fn(),
     advanceEnrollment: jest.fn(),
     snoozeEnrollment: jest.fn(),
+    claimEnrollment: jest.fn(),
+    releaseEnrollmentClaim: jest.fn(),
   },
 }));
 
@@ -104,6 +106,8 @@ beforeEach(() => {
   (require('../services/settingsService').settingsService.getSetting as jest.Mock).mockResolvedValue(null);
   mockLinkedIn.resolveAccountId.mockResolvedValue('account-123');
   mockDb.snoozeEnrollment.mockResolvedValue(undefined as any);
+  mockDb.claimEnrollment.mockResolvedValue(true);
+  mockDb.releaseEnrollmentClaim.mockResolvedValue(undefined as any);
 });
 
 describe('dripSequenceWorker - LinkedIn not-connected handling', () => {

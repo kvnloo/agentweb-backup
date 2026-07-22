@@ -46,8 +46,20 @@ export interface LoopDigestTemplate<TExtra = void> {
   extraSections?: (result: LoopRunResult, extra: TExtra) => string[];
   /** Lines appended after the shared footer. */
   footerExtra?: readonly string[];
+  /** Footer for actionable findings. Return null to suppress the footer. */
+  footer?: (result: LoopRunResult, extra: TExtra) => string | null;
   /** Override for the missing-slackUserId warning suffix. */
   missingUserWarning?: string;
+}
+
+export type LoopDigestClaim = (
+  digestDate: string,
+  slackUserId: string,
+  runId: string,
+) => Promise<boolean>;
+
+export interface PostLoopDigestOptions {
+  claimDailyDigest?: LoopDigestClaim;
 }
 
 /** Render the digest lines for one run. Pure (no I/O) so each loop's exact
@@ -78,9 +90,16 @@ export function buildLoopDigestLines<TExtra>(
     lines.push(...extraSections);
   }
 
-  lines.push('');
-  lines.push(LOOP_DIGEST_FOOTER);
-  if (template.footerExtra) lines.push(...template.footerExtra);
+  const footer = template.footer
+    ? template.footer(result, extra)
+    : result.proposals.length > 0
+      ? LOOP_DIGEST_FOOTER
+      : null;
+  if (footer) {
+    lines.push('');
+    lines.push(footer);
+    if (template.footerExtra) lines.push(...template.footerExtra);
+  }
   return lines;
 }
 
@@ -109,12 +128,27 @@ export async function postLoopDigest<TExtra>(
   slackUserId: string | undefined,
   template: LoopDigestTemplate<TExtra>,
   extra: TExtra,
+  options: PostLoopDigestOptions = {},
 ): Promise<void> {
   if (!slackUserId) {
     console.warn(
       `${template.logTag} ${template.missingUserWarning ?? 'no approval.slackUserId — skipping DM'}`,
     );
     return;
+  }
+
+  if (options.claimDailyDigest) {
+    try {
+      const digestDate = new Date().toISOString().slice(0, 10);
+      const claimed = await options.claimDailyDigest(digestDate, slackUserId, result.runId);
+      if (!claimed) {
+        console.log(`${template.logTag} daily digest already posted for ${digestDate}; skipping duplicate DM`);
+        return;
+      }
+    } catch (err) {
+      console.error(`${template.logTag} daily digest claim failed; skipping Slack DM:`, err);
+      return;
+    }
   }
 
   try {

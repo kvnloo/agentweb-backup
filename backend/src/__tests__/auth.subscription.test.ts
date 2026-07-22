@@ -150,17 +150,63 @@ describe('GET /api/auth/me subscription fields', () => {
       .set('Authorization', 'Bearer test-token')
       .expect(200);
 
-    // Subscription fields come from owner
+    // Subscription fields come from owner (mocked resolution happens inside
+    // getUserSubscriptionType itself now — see resolveEntitlement below)
     expect(res.body.subscriptionType).toBe('Pro');
     expect(res.body.subscription_status).toBe('active');
     expect(res.body.current_period_end).toBe('2026-06-01T00:00:00.000Z');
     expect(res.body.has_payment_method).toBe(true);
     expect(res.body.orgManagedSubscription).toBe(true);
 
-    // Subscription service called with owner's userId
-    expect(mockedGetUserSubscriptionType).toHaveBeenCalledWith('owner-1');
-    expect(mockedGetAllowedPages).toHaveBeenCalledWith('owner-1');
-    expect(mockedGetAllowedSkills).toHaveBeenCalledWith('owner-1');
+    // Resolution (including the org-owner fallback and the own-active-subscription
+    // guard) is centralized inside getUserSubscriptionType — auth.ts must call it
+    // with the caller's own userId, not pre-resolve to the owner itself, or a
+    // member riding their own active subscription would bypass that guard.
+    expect(mockedGetUserSubscriptionType).toHaveBeenCalledWith('member-1');
+    expect(mockedGetAllowedPages).toHaveBeenCalledWith('member-1');
+    expect(mockedGetAllowedSkills).toHaveBeenCalledWith('member-1');
+  });
+
+  it('does not overlay the owner Stripe status when the member has their own active subscription', async () => {
+    mockedAuthenticate.mockImplementationOnce(async (req: any, _res: any, next: any) => {
+      req.user = { userId: 'member-active' };
+      next();
+      return undefined;
+    });
+
+    mockedUserDb.getUserById.mockResolvedValueOnce({
+      userId: 'member-active',
+      email: 'member-active@example.com',
+      roles: ['customer'],
+      orgId: 'org-1',
+      orgRole: 'member',
+      subscription_status: 'active',
+      current_period_end: '2026-09-01T00:00:00.000Z',
+      has_payment_method: true,
+      password: 'secret',
+    } as any);
+
+    mockedOrgDb.getOrgById.mockResolvedValue({
+      orgId: 'org-1',
+      ownerUserId: 'owner-1',
+      name: 'Test Org',
+    } as any);
+
+    mockedGetUserSubscriptionType.mockResolvedValueOnce('Pro');
+    mockedGetAllowedPages.mockResolvedValueOnce(['/tasks']);
+    mockedGetAllowedSkills.mockResolvedValueOnce(['skill-1']);
+
+    const res = await request(app)
+      .get('/api/auth/me')
+      .set('Authorization', 'Bearer test-token')
+      .expect(200);
+
+    // Own billing state must show through, not the owner's
+    expect(res.body.subscription_status).toBe('active');
+    expect(res.body.current_period_end).toBe('2026-09-01T00:00:00.000Z');
+    expect(res.body.orgManagedSubscription).toBeUndefined();
+    // Owner record should never even be fetched for the overlay
+    expect(mockedUserDb.getUserById).toHaveBeenCalledTimes(1);
   });
 
   it('does not set orgManagedSubscription for org owner', async () => {

@@ -1,5 +1,6 @@
 import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest, requireAdmin } from '../middleware/auth';
+import { requireScheduledChatsServiceSecret } from '../middleware/serviceAuth';
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { synthesizeSpeech } from '../services/voiceService';
@@ -108,8 +109,10 @@ router.get('/public/customer-support-default-model', asyncHandler(agentModeContr
 
 
 // POST /api/agent-mode/run-scheduled-chats
-// Run all scheduled chats that are ready to execute (called by agent-engine)
-router.post('/run-scheduled-chats', asyncHandler(agentModeController.runScheduledChats));
+// Run all scheduled chats that are ready to execute (called by agent-engine).
+// Service-to-service auth: shared secret in x-service-secret, enforced when
+// SCHEDULED_CHATS_SERVICE_SECRET is set (ENG-347).
+router.post('/run-scheduled-chats', requireScheduledChatsServiceSecret, asyncHandler(agentModeController.runScheduledChats));
 
 // GET /api/agent-mode/public/scheduled-chat-variables/:accessToken
 // Get required variable metadata for a one-time public scheduled chat variable link

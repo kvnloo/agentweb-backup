@@ -86,10 +86,15 @@ function classFromMessage(message: string): string | null {
   // contract layer rejects before execution) plus classic validation phrasing.
   if (/arguments failed schema validation|has the wrong type|missing required (argument|variable)|invalid parameters?|invalid argument|validation (failed|error)|(is|are) required|must be|is too long|too long \(|is too short/.test(m)) return 'invalid_args';
 
-  if (/unauthorized|forbidden|invalid (access |api )?token|invalid api key|authentication|missing credentials|not authorized|do not have permission|permission to|no secrets configured|not a member of channel|account connected|account not configured/.test(m)) return 'auth';
+  if (/unauthorized|forbidden|invalid (access |api )?token|invalid api key|authentication|missing credentials|not authorized|do not have permission|permission to|no secrets configured|not a member of channel|account connected|account not configured|not configured to access/.test(m)) return 'auth';
   if (/enotfound|econnrefused|econnreset|eai_again|socket hang up|network error|fetch failed/.test(m)) return 'network';
   if (/does not exist|not found/.test(m)) return 'not_found';
   if (/internal server error|bad gateway|service unavailable|upstream/.test(m)) return 'upstream_5xx';
+  // Meta Graph transient (codes 1/2): the SDK/campaign path surfaces Meta's generic
+  // body verbatim with NO HTTP status in the string, so the status-regex above misses
+  // it. Meta classifies these as "temporary, wait & retry" (metaService codes 1/2/4/17
+  // → RETRYABLE_ERROR); treat as retryable upstream instead of a terminal legacy class.
+  if (/an unexpected error has occurred\.?\s*please retry/.test(m)) return 'upstream_5xx';
 
   // Upstream accepted the call and deliberately refused the action (provider
   // business rules — LinkedIn invite/message cadence + connection-degree

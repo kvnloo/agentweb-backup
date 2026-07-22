@@ -101,7 +101,7 @@ For frontend and other changes, follow the existing testing strategy section bel
 
 ## CRITICAL: Working Directory Rule
 
-**NEVER navigate outside or reference files outside the current working directory.** The user has multiple clones of the same repo locally. Always use the working directory from the environment (shown in `<env>`) as the base path for ALL file operations. Do not hardcode or assume paths like `/Users/ruiwang/Documents/GitHub/agentweb/` — always use the actual working directory (e.g. `/Users/ruiwang/Documents/GitHub/agentweb3/`). Referencing the wrong clone will silently edit the wrong files.
+**NEVER navigate outside or reference files outside the current working directory.** The user has multiple clones of the same repo locally. Always use the working directory from the environment (shown in `<env>`) as the base path for ALL file operations. Do not hardcode or assume paths like `/Users/<you>/code/agentweb/` — always use the actual working directory (e.g. `/Users/<you>/code/agentweb3/`). Referencing the wrong clone will silently edit the wrong files.
 
 ## Core Architecture
 
@@ -652,11 +652,20 @@ socket.on('agent-response-chunk', (data) => {
 cd backend
 
 # 1. Verify TypeScript compilation (catches type errors)
-npx tsc
+#    Use `npm run typecheck` — it runs `tsc --noEmit` with a raised heap
+#    (--max-old-space-size=6144). A full backend type-check peaks near node's
+#    default ~4GB heap ceiling, so plain `npx tsc` can OOM when memory is tight.
+npm run typecheck
 
 # 2. Run tests
 npm test
 ```
+
+**Run the checks SEQUENTIALLY, never backgrounded together.** A full type-check
+and the jest workers are each memory-heavy Node processes; running them
+concurrently can exhaust the heap and OOM-crash one of them. Also never read a
+piped command's exit status as the tool's result (e.g. `tsc | head` reports
+`head`'s exit code, masking a tsc OOM) — run it unpiped or check `${PIPESTATUS[0]}`.
 
 ### Customer Portal
 
@@ -667,9 +676,9 @@ cd customer-portal
 npm test
 ```
 
-These checks prevent CI failures and ensure code quality. The `npx tsc` command is especially important as it catches TypeScript type errors that may not be caught during development with hot reload.
+These checks prevent CI failures and ensure code quality. The `npm run typecheck` command is especially important as it catches TypeScript type errors that may not be caught during development with hot reload.
 
-**CRITICAL:** Run `npx tsc` after **every** edit to any `.ts` file in the backend, including test files (`__tests__/*.test.ts`). Do not wait until all edits are done — verify compilation after each file change.
+**CRITICAL:** Run `npm run typecheck` after **every** edit to any `.ts` file in the backend, including test files (`__tests__/*.test.ts`). Do not wait until all edits are done — verify compilation after each file change.
 
 ## Commit Granularity
 

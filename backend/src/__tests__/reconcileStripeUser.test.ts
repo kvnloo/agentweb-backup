@@ -168,4 +168,40 @@ describe('reconcileStripeUserById — authoritative (Stripe wins)', () => {
     expect(updates).toBeNull();
     expect(mockUpdateUser).not.toHaveBeenCalled();
   });
+
+  // ─── ENG-405: authoritative reconcile must read the Basil item-level field ───
+  it('syncs current_period_end from a Basil-shaped subscription (item-level, absent root)', async () => {
+    const user = {
+      userId: 'user-basil',
+      email: 'basil@rankai.ai',
+      stripe_customer_id: 'cus_basil',
+      subscription_status: 'active',
+      stripe_subscription_id: 'sub_stripe_123',
+      subscriptionType: 'Complete',
+      has_payment_method: true,
+      current_period_end: '2020-01-01T00:00:00.000Z', // stale — must be repaired
+    };
+    mockGetUserById.mockResolvedValue(user);
+    mockPaymentMethodsList.mockResolvedValue({ data: [{ id: 'pm_1' }] });
+    // Basil shape: current_period_end lives on items.data[0], NOT the root.
+    mockSubscriptionsList.mockResolvedValue({
+      data: [
+        makeStripeSub({
+          current_period_end: undefined,
+          items: {
+            data: [{ current_period_end: 1735689600, price: { id: 'price_complete' } }],
+          },
+        }),
+      ],
+    });
+
+    await reconcileStripeUserById('user-basil');
+
+    expect(mockUpdateUser).toHaveBeenCalledWith(
+      'user-basil',
+      expect.objectContaining({
+        current_period_end: new Date(1735689600 * 1000).toISOString(),
+      })
+    );
+  });
 });

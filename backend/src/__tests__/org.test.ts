@@ -138,17 +138,19 @@ describe('Organization routes', () => {
       expect(mockUsers['user-1'].orgRole).toBe('owner');
     });
 
-    it('should seed shareSettings with skills + work plans shared by default', async () => {
+    it('should seed shareSettings with everything shared by default', async () => {
+      // A new org is a team that has just arrived. Seeding these to private meant they
+      // saw an empty product until someone found the org settings page.
       const res = await request(app).post('/api/org').send({ name: 'My Org' });
       expect(res.status).toBe(201);
       const settings = res.body.data.shareSettings;
       expect(settings).toBeDefined();
-      // Default-on features
       expect(settings.skills).toEqual({ enabled: true, editors: [] });
       expect(settings.workPlans).toEqual({ enabled: true, editors: [] });
-      // Default-off features
-      expect(settings.knowledgeBase.enabled).toBe(false);
-      expect(settings.landingPages.enabled).toBe(false);
+      expect(settings.knowledgeBase.enabled).toBe(true);
+      expect(settings.htmlTemplates.enabled).toBe(true);
+      expect(settings.landingPages.enabled).toBe(true);
+      expect(settings.analytics.enabled).toBe(true);
       // Always-on features carry only editors
       expect(settings.brandGuidelines).toEqual({ editors: [] });
       expect(settings.marketingStrategy).toEqual({ editors: [] });
@@ -395,6 +397,14 @@ describe('Organization routes', () => {
       };
       mockUsers['user-1'].orgId = 'org-1';
       mockUsers['user-1'].orgRole = 'owner';
+      // Owner is on a paid tier — the org's effective tier that members inherit.
+      mockUsers['user-1'].subscriptionType = 'Pro';
+      mockUsers['user-1'].allowedPages = ['/', '/agent-mode', '/settings', '/landing-pages'];
+      mockUsers['user-1'].allowedSkills = ['*'];
+      // Member starts on the default Free tier from signup.
+      mockUsers['user-2'].subscriptionType = 'Free';
+      mockUsers['user-2'].allowedPages = ['/', '/agent-mode', '/settings'];
+      mockUsers['user-2'].allowedSkills = [];
       // Switch to member user for accept
       mockUser = mockUsers['user-2'];
     });
@@ -432,6 +442,22 @@ describe('Organization routes', () => {
       expect(res.body.success).toBe(true);
       expect(mockUsers['user-2'].orgId).toBe('org-1');
       expect(mockUsers['user-2'].orgRole).toBe('member');
+    });
+
+    it('should NOT snapshot the owner tier onto the member on accept (ENG-288)', async () => {
+      const res = await request(app).post('/api/org/accept-invite').send({
+        orgId: 'org-1',
+        inviteToken: 'valid-token',
+      });
+      expect(res.status).toBe(200);
+      // The member's effective tier is resolved dynamically from the org owner at
+      // read time (getUserSubscriptionType), NOT persisted onto the member record.
+      // Snapshotting the owner's tier here would leave a departed/downgraded member
+      // with permanently elevated access, so accept-invite must leave the member's
+      // own subscription fields untouched.
+      expect(mockUsers['user-2'].subscriptionType).toBe('Free');
+      expect(mockUsers['user-2'].allowedPages).toEqual(['/', '/agent-mode', '/settings']);
+      expect(mockUsers['user-2'].allowedSkills).toEqual([]);
     });
   });
 
