@@ -78,7 +78,12 @@ export async function rehydrateAndServe(
   sessionId: string,
   record: McpSessionRecord,
   body: unknown,
-  createServer: ServerFactory = createMcpServer as unknown as ServerFactory,
+  // Default (production) factory. The real createMcpServer signature is
+  // (serverName, context); adapt it to the single-arg ServerFactory shape. A
+  // bare `createMcpServer as unknown as ServerFactory` cast passed the CONTEXT as
+  // the server name and left the real context undefined, so every rehydrated
+  // (cross-instance) session ran with no user identity — the P1 this fixes.
+  createServer: ServerFactory = (context) => createMcpServer(MCP_SERVER_NAME, context),
 ): Promise<void> {
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: () => sessionId,

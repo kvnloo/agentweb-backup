@@ -116,12 +116,17 @@ export class DynamoMcpSessionStore implements McpSessionStore {
 
   constructor(private readonly sessionTtlMs: number) {
     this.tableName = `${TABLE_PREFIX}AW-MCPSessions`;
+    const accessKeyId = process.env.AWS_ACCESS_KEY_ID;
+    const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
     this.dynamodb = new AWS.DynamoDB.DocumentClient({
       region: process.env.AWS_REGION || "us-west-2",
-      credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
-      },
+      // Only pass explicit static credentials when BOTH are present. Passing
+      // empty strings (the old `|| ""`) would override the default AWS provider
+      // chain — so under a normal IAM instance role (prod, no access-key env
+      // vars) every store call would fail with a credentials error.
+      ...(accessKeyId && secretAccessKey
+        ? { credentials: { accessKeyId, secretAccessKey } }
+        : {}),
     });
   }
 

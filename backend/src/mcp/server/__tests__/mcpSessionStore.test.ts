@@ -105,6 +105,42 @@ describe('InMemoryMcpSessionStore', () => {
 describe('DynamoMcpSessionStore', () => {
   beforeEach(() => jest.clearAllMocks());
 
+  it('does NOT pass empty credentials when access-key env vars are unset (uses IAM provider chain)', () => {
+    const saved = { id: process.env.AWS_ACCESS_KEY_ID, secret: process.env.AWS_SECRET_ACCESS_KEY };
+    delete process.env.AWS_ACCESS_KEY_ID;
+    delete process.env.AWS_SECRET_ACCESS_KEY;
+    const DocumentClient = require('aws-sdk').default.DynamoDB.DocumentClient as jest.Mock;
+    DocumentClient.mockClear();
+
+    new DynamoMcpSessionStore(HOUR_MS);
+
+    // Empty static creds would disable the default provider chain (IAM instance
+    // role) — the config must omit `credentials` entirely when env keys are unset.
+    const cfg = DocumentClient.mock.calls[0][0];
+    expect('credentials' in cfg).toBe(false);
+
+    if (saved.id !== undefined) process.env.AWS_ACCESS_KEY_ID = saved.id;
+    if (saved.secret !== undefined) process.env.AWS_SECRET_ACCESS_KEY = saved.secret;
+  });
+
+  it('passes static credentials when both access-key env vars are present', () => {
+    const saved = { id: process.env.AWS_ACCESS_KEY_ID, secret: process.env.AWS_SECRET_ACCESS_KEY };
+    process.env.AWS_ACCESS_KEY_ID = 'AKIA_test';
+    process.env.AWS_SECRET_ACCESS_KEY = 'secret_test';
+    const DocumentClient = require('aws-sdk').default.DynamoDB.DocumentClient as jest.Mock;
+    DocumentClient.mockClear();
+
+    new DynamoMcpSessionStore(HOUR_MS);
+
+    const cfg = DocumentClient.mock.calls[0][0];
+    expect(cfg.credentials).toEqual({ accessKeyId: 'AKIA_test', secretAccessKey: 'secret_test' });
+
+    if (saved.id === undefined) delete process.env.AWS_ACCESS_KEY_ID;
+    else process.env.AWS_ACCESS_KEY_ID = saved.id;
+    if (saved.secret === undefined) delete process.env.AWS_SECRET_ACCESS_KEY;
+    else process.env.AWS_SECRET_ACCESS_KEY = saved.secret;
+  });
+
   it('set writes a record and omits an undefined agentUserId (DynamoDB rejects undefined)', async () => {
     const store = new DynamoMcpSessionStore(HOUR_MS);
     await store.set({ sessionId: 's1', isInternal: true }); // no agentUserId

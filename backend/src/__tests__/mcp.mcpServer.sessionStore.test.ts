@@ -224,8 +224,9 @@ describe('setupMcpServer durable session store wiring', () => {
     expect(rehydrateAndServe as jest.Mock).not.toHaveBeenCalled();
   });
 
-  it('DELETE evicts the session from the store (global termination)', async () => {
-    const store = makeSpyStore();
+  it('DELETE evicts an OWNED session from the store (global termination)', async () => {
+    // Internal caller terminating an internal session it owns.
+    const store = makeSpyStore({ get: jest.fn().mockResolvedValue(record({ isInternal: true })) });
     const app = makeApp(store);
 
     const res = await request(app)
@@ -235,5 +236,22 @@ describe('setupMcpServer durable session store wiring', () => {
 
     expect(res.status).toBe(204);
     expect((store as any).delete).toHaveBeenCalledWith('sess-A');
+  });
+
+  it('DELETE does NOT evict another principal’s session — 204 without deleting (IDOR guard)', async () => {
+    // Session belongs to external userX; caller is the internal static token
+    // (a different principal) → must not be able to evict userX's session.
+    const store = makeSpyStore({
+      get: jest.fn().mockResolvedValue(record({ isInternal: false, agentUserId: 'userX' })),
+    });
+    const app = makeApp(store);
+
+    const res = await request(app)
+      .delete('/mcp')
+      .set('Authorization', `Bearer ${INTERNAL_TOKEN}`)
+      .set('mcp-session-id', 'sess-A');
+
+    expect(res.status).toBe(204); // idempotent, no existence leak
+    expect((store as any).delete).not.toHaveBeenCalled();
   });
 });

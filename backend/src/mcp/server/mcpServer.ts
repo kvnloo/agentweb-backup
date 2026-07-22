@@ -501,21 +501,45 @@ export function setupMcpServer(
       res.status(400).send('Missing session ID');
       return;
     }
-    if (!sessions.has(sessionId)) {
-      // Not live on this instance. Still evict it from the shared store so
-      // termination is globally consistent (ENG-114 AC #3), then succeed
-      // idempotently — the caller asked to terminate a session that is already
-      // gone here.
-      await sessionStore.delete(sessionId).catch((err) => {
-        console.error(`[MCP] Session store delete failed for ${sessionId}:`, err);
-      });
+
+    // The session id is a bearer capability — a caller may only terminate a
+    // session it OWNS. Never let one principal evict another user's session,
+    // locally or from the shared store (which any instance can reach). Respond
+    // 204 for a non-owned / already-gone session so we neither error nor leak
+    // whether it exists (IDOR guard; mirrors the rehydrate path above).
+    const reqUserId = (req as any)._agentApiUserId as string | undefined;
+    const reqIsInternal = (req as any)._mcpIsInternal === true;
+    const ownsSession = (owner: { agentUserId?: string; isInternal: boolean }): boolean =>
+      owner.isInternal ? reqIsInternal : !!owner.agentUserId && owner.agentUserId === reqUserId;
+
+    const local = sessions.get(sessionId);
+    if (!local) {
+      // Not live here. Evict from the shared store ONLY if the caller owns it,
+      // so termination stays globally consistent (ENG-114 AC #3) without
+      // becoming a cross-user eviction primitive.
+      let record: McpSessionRecord | null = null;
+      try {
+        record = await sessionStore.get(sessionId);
+      } catch (err) {
+        console.error(`[MCP] Session store lookup failed for ${sessionId}:`, err);
+      }
+      if (record && ownsSession(record)) {
+        await sessionStore.delete(sessionId).catch((err) => {
+          console.error(`[MCP] Session store delete failed for ${sessionId}:`, err);
+        });
+      }
       res.status(204).send();
       return;
     }
 
+    // Live on this instance — only the owner may terminate it.
+    if (!ownsSession(local)) {
+      res.status(204).send();
+      return;
+    }
 
     try {
-      const transport = sessions.get(sessionId)!.transport;
+      const transport = local.transport;
       await transport.handleRequest(req, res);
       // Evict from the shared store too so no other instance rehydrates it.
       await sessionStore.delete(sessionId).catch((err) => {

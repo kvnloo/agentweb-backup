@@ -21,6 +21,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { rehydrateAndServe } from '../mcpSessionRehydration';
+import { createMcpServer } from '../mcpServerCore';
 import type { McpSessionRecord } from '../mcpSessionStore';
 
 const SID = 'session-created-on-instance-A';
@@ -165,5 +166,37 @@ describe('rehydrateAndServe (cross-instance session resolution)', () => {
     await expect(
       rehydrateAndServe(req, res as any, SID, makeRecord(), body, createServer as any),
     ).rejects.toThrow('server construction failed');
+  });
+
+  it('DEFAULT (production) factory calls createMcpServer with (name, context) — P1 regression', async () => {
+    // Exercise the default createServer path (no injected factory) to prove the
+    // production wiring calls createMcpServer(serverName, context) and NOT the
+    // context-as-name shape the old `as unknown as ServerFactory` cast produced
+    // (which left the rehydrated session with no user identity).
+    (createMcpServer as jest.Mock).mockImplementation(() => {
+      const server = new Server(
+        { name: 'test-server', version: '1.0.0' },
+        { capabilities: { tools: {} } },
+      );
+      server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
+      return server;
+    });
+    const res = makeRes();
+    const body = { jsonrpc: '2.0', id: 6, method: 'tools/list', params: {} };
+
+    await rehydrateAndServe(
+      req,
+      res as any,
+      SID,
+      makeRecord({ agentUserId: 'user-A', isInternal: false }),
+      body,
+    );
+
+    expect(createMcpServer).toHaveBeenCalledWith('Emma - GTM Automation Specialist', {
+      agentUserId: 'user-A',
+      sessionId: SID,
+      isInternal: false,
+    });
+    expect(res.statusCode).toBe(200);
   });
 });
