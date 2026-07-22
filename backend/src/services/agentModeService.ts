@@ -2283,6 +2283,77 @@ export class AgentModeService {
     return blocks.length > 0 ? blocks : [{ type: 'text', text: '.' }];
   }
 
+  /** Media types the Anthropic Messages / Bedrock Converse vision APIs decode natively. */
+  private static readonly VISION_NATIVE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+  /**
+   * Ensure an image buffer is in a format the vision APIs can actually decode, and
+   * that the returned content-type matches the real bytes (ENG-370).
+   *
+   * Uploaded logos frequently arrive as either (a) a format Claude/Bedrock cannot
+   * read — HEIC, AVIF, TIFF, BMP, SVG — or (b) a supported format mislabeled by S3
+   * with a generic/incorrect content-type (commonly `application/octet-stream` when
+   * the browser omits it). Both used to fail silently: the downstream block
+   * converters relabel an unknown type to `image/jpeg` WITHOUT re-encoding, so the
+   * declared media type no longer matches the bytes and the API returns 400; and a
+   * non-`image/*` content-type produced a data URI the `image/` regex dropped
+   * entirely, so the model never saw the image. describe_image would then burn many
+   * retries/workarounds and still fail.
+   *
+   * This decodes the actual bytes with sharp: if they are already a native format it
+   * just corrects the label (no re-encode); otherwise it re-encodes to PNG so the
+   * bytes always match a supported media type. Animated inputs (animated AVIF/HEIC)
+   * re-encode to their first frame — enough to describe a logo.
+   *
+   * On a decode failure it returns the input unchanged (best effort) but sets
+   * `undecodable: true` so the caller can fast-fail with re-upload guidance instead
+   * of burning vision retries on bytes no vision API can read either (ENG-370).
+   */
+  private static async normalizeImageForVision(
+    buffer: Buffer,
+    contentType: string
+  ): Promise<{ buffer: Buffer; contentType: string; undecodable?: boolean; detectedFormat?: string }> {
+    let ct = (contentType || '').toLowerCase().trim();
+    if (ct === 'image/jpg') ct = 'image/jpeg';
+    if (AgentModeService.VISION_NATIVE_MEDIA_TYPES.has(ct)) {
+      return { buffer, contentType: ct };
+    }
+    try {
+      const sharp = (await import('sharp')).default;
+      const metadata = await sharp(buffer).metadata();
+      const sharpFormatToMedia: Record<string, string> = {
+        jpeg: 'image/jpeg',
+        png: 'image/png',
+        gif: 'image/gif',
+        webp: 'image/webp',
+      };
+      const detected = metadata.format ? sharpFormatToMedia[metadata.format] : undefined;
+      if (detected) {
+        // Bytes are already vision-native; only the content-type header was wrong/missing.
+        return { buffer, contentType: detected, detectedFormat: metadata.format };
+      }
+      // Genuinely unsupported encoding (heic/heif/avif/tiff/bmp/svg/...). Convert to PNG.
+      // sharp(buffer) reads only the first frame by default, so animated inputs
+      // collapse to a single describable frame here (no `{ animated: true }`).
+      const png = await sharp(buffer).png().toBuffer();
+      console.log(
+        `AgentMode: normalizeImageForVision converted "${ct || 'unknown'}" (sharp format "${metadata.format}") to image/png, ${png.length} bytes`
+      );
+      return { buffer: png, contentType: 'image/png', detectedFormat: metadata.format };
+    } catch (err) {
+      console.error(
+        'AgentMode: normalizeImageForVision failed to decode/convert image; using original:',
+        err instanceof Error ? err.message : err
+      );
+      // sharp could not decode the bytes at all — a corrupt file or a codec even
+      // sharp lacks. The vision APIs decode a strict subset of what sharp handles,
+      // so they cannot read it either. Flag it undecodable so the caller fast-fails.
+      // Only fall back to a native default when we have no usable label at all, so a
+      // missing/empty content-type never yields a `data:;base64,...` URI (ENG-370).
+      return { buffer, contentType: contentType || 'image/png', undecodable: true };
+    }
+  }
+
   private llmModels: Record<string, LLMModelConfig> = {
     // List openai models - create client dynamically for each deployment
     // Azure OpenAI enforces a 128-tool limit per request
@@ -6591,11 +6662,35 @@ export class AgentModeService {
           const { presignS3Url, isS3Url } = await import('../utils/s3Utils');
           const fetchUrl = isS3Url(imageUrl) ? (presignS3Url(imageUrl) ?? imageUrl) : imageUrl;
           const imgResp = await axios.get<ArrayBuffer>(fetchUrl, { responseType: 'arraybuffer', timeout: 30000 });
-          // Normalize content-type: strip any charset/extra params and trim whitespace
-          const rawContentType = (imgResp.headers['content-type'] || 'image/png').split(';')[0].trim();
-          const contentType = rawContentType || 'image/png';
+          // Normalize content-type: strip any charset/extra params and trim whitespace.
+          // Do NOT default a missing/empty header to a native type here — that would
+          // short-circuit sharp detection and embed non-PNG bytes as image/png (ENG-370).
+          // Pass the raw/empty type through so normalizeImageForVision decodes via sharp.
+          const contentType = (imgResp.headers['content-type'] || '').split(';')[0].trim();
           let imageBuffer = Buffer.from(imgResp.data as ArrayBuffer);
           let finalContentType = contentType;
+          // Normalize to a vision-decodable format so the declared media type always
+          // matches the bytes. Fixes HEIC/AVIF/TIFF/BMP/SVG logos and mislabeled or
+          // octet-stream content-types that otherwise fail silently downstream (ENG-370).
+          const normalized = await AgentModeService.normalizeImageForVision(imageBuffer, contentType);
+          if (normalized.undecodable) {
+            // sharp could not decode these bytes, so no vision API can either.
+            // Fast-fail with actionable re-upload guidance instead of burning vision
+            // retries and agent workarounds on an unreadable file (ENG-370).
+            console.warn(
+              `AgentMode: describeImage could not decode uploaded image (content-type "${contentType || 'none'}"); fast-failing with re-upload guidance`
+            );
+            return {
+              success: false,
+              retryable: false,
+              message:
+                `The uploaded file could not be read as an image${contentType ? ` (its content type was "${contentType}")` : ''} — ` +
+                'it may be corrupted or in a format that cannot be decoded. Please re-upload the logo as a PNG or JPEG and try again.',
+              error: 'Image could not be decoded',
+            };
+          }
+          imageBuffer = normalized.buffer;
+          finalContentType = normalized.contentType;
           // Auto-resize if image exceeds 4MB to stay under Bedrock's 5MB limit
           if (imageBuffer.length > 4 * 1024 * 1024) {
             try {
@@ -6684,9 +6779,16 @@ export class AgentModeService {
 
     } catch (error) {
       console.error('AgentMode: Error describing image:', error);
+      // This is a catch-all: besides bad image bytes it also receives transient
+      // network/provider failures that escaped the vision-call fallback flow. Do
+      // NOT hard-code retryable:false here (that would make the agent give up on a
+      // request that could succeed on retry) and do not assert the file itself is
+      // the problem — only the undecodable-bytes fast-fail above is truly terminal.
       return {
         success: false,
-        message: 'Failed to analyze image. Please check that the URL is accessible and contains a valid image.',
+        message:
+          'Failed to analyze the image. It may be temporarily unavailable, inaccessible, or in a ' +
+          'format that cannot be read. If it is a logo file, try re-uploading it as a PNG or JPEG.',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
