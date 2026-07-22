@@ -38,9 +38,8 @@ import { skillService } from './skillService';
 import { extractVariables } from '../utils/templateParser';
 import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
-import { incrementUserTokenUsage } from './tokenUsageService';
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
-import { recordUsage } from './usageRecorderService';
+import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
 import {
   getModelPrice,
@@ -56,6 +55,7 @@ import { inferSearchFreshness } from '../search/searchFreshness';
 import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
 import { SearchResultSource } from '../search/searchProvider';
+import { CitationRegistry } from '../utils/citations';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -178,7 +178,8 @@ import {
   ALLOWED_DATE_PRESETS,
   META_OBJ_GOAL_MAP,
   META_GOAL_BILLING_MAP,
-  META_GOAL_BID_STRATEGY_MAP
+  META_GOAL_BID_STRATEGY_MAP,
+  META_WEBSITE_OPTIMIZATION_GOALS
 } from '../utils/metaConstants';
 
 // Initialize Azure OpenAI client for direct chat completion (same as blog.ts)
@@ -2428,7 +2429,12 @@ export class AgentModeService {
         try {
           const usage: any = (res as any)?.usage;
           if (usage) {
-            void recordUsage({
+            // ENG-200: meter the main agent turn — record shadow burn AND charge
+            // the per-user cost cap when a real user is attributable (org members
+            // resolve to the owner). Cost (incl. cache tokens) is computed once
+            // here; no separate deduction path exists for this call, so this is
+            // the single charge point. No userId → burn-only "system" record.
+            meterUserUsage({
               userId: usageContext?.userId,
               sessionId: usageContext?.sessionId,
               model,
@@ -2568,14 +2574,17 @@ export class AgentModeService {
     return videoGenerationCostUsd(model, durationSeconds);
   }
 
-  /** Returns an onUsage callback that records LLM token usage for a named tool. */
-  private makeToolUsageCallback(userId: string, sessionId: string | undefined, toolName: string): (usage: LLMUsageData) => void {
+  /**
+   * Returns an onUsage callback that attributes a tool's LLM cost to the session
+   * for per-tool cost display. It does NOT deduct from the per-user cap: the
+   * deduction happens once at the metering chokepoint (llmService.meterUsage,
+   * which these tools call via generateHTML/generateJSONContent). Charging here
+   * too would double-charge content-gen tools (ENG-200).
+   */
+  private makeToolUsageCallback(sessionId: string | undefined, toolName: string): (usage: LLMUsageData) => void {
     return (usage) => {
-      const cost = this.estimateCost(usage.model, usage.inputTokens, usage.outputTokens);
-      incrementUserTokenUsage(userId, usage.totalTokens, cost).catch((err) =>
-        console.error(`AgentMode: Failed to track token usage for ${toolName} tool:`, err)
-      );
       if (sessionId) {
+        const cost = this.estimateCost(usage.model, usage.inputTokens, usage.outputTokens);
         chatbotDb.addToolCostToSession(sessionId, cost, toolName).catch((err) =>
           console.error(`AgentMode: Failed to add ${toolName} cost to session:`, err)
         );
@@ -2794,7 +2803,7 @@ export class AgentModeService {
       if ((currentSession?.pageIdentifier || '').toLowerCase().includes('slack')) {
         messages.push({
           role: 'assistant',
-          content: `[AgentWeb Team] I know all four team members: Rui Wang is the CTO (also called Rui), Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately.`
+          content: `[AgentWeb Team] I know the team members: Harsha Vankayalapati is the CEO (also called Harsha), Fangfang Tan is the CPO (also called Fangfang), and Matthew Wilmer is the CMO (also called Matt). If asked about any of them by name or nickname, I will identify them immediately.`
         });
       }
 
@@ -2828,6 +2837,9 @@ export class AgentModeService {
       _toolCallsForTelemetry = toolCalls;
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
+      // ENG-351: accumulates the web sources this message consults across all its search
+      // calls, into a de-duplicated, stably-numbered registry for the Sources UI.
+      const citationRegistry = new CitationRegistry();
       const iterationTimings: { iteration: number; llmDurationMs: number; toolNames: string[] }[] = [];
 
       // Remember initial message count to slice response messages later
@@ -3233,6 +3245,7 @@ export class AgentModeService {
           toolCalls: responseMessage.tool_calls,
           messages: messages as any[],
           toolCallsLedger: toolCalls,
+          citationRegistry,
           iteration,
           agentRuntimeRunId,
           sessionId,
@@ -3530,12 +3543,17 @@ export class AgentModeService {
             durationMs: endTime - startTime
           };
 
+          // ENG-351: the web sources this message consulted, de-duplicated and
+          // stably-numbered by the citation registry, for the Sources UI.
+          const citations = citationRegistry.list();
+
           lastMessage.metadata = {
             ...lastMessage.metadata,
             timestamp: new Date().toISOString(),
             iterationTimings,
             memoryUsage,
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
+            ...(citations.length > 0 ? { citations } : {}),
           };
         }
       }
@@ -6599,6 +6617,8 @@ export class AgentModeService {
       return_scenes?: boolean;
       start_time?: string;
       end_time?: string;
+      /** Attributable user — charges this describe_video LLM spend to their cap (ENG-200). */
+      userId?: string;
     }
   ): Promise<any> {
     let tempDirPath: string | null = null;
@@ -6637,11 +6657,12 @@ export class AgentModeService {
         };
       }
 
-      // Metered Gemini client (Ship 1 shadow metering). describeVideo has no
-      // userId in its signature, so usage attributes to "system" for now —
-      // follow-up: thread userId from the tool-dispatch / emmaApi callers.
+      // Un-metered Gemini client: the wrapped factory only RECORDS burn, so to
+      // actually CHARGE describe_video spend to the user's cap we meter the
+      // response ourselves via meterUsageFromResponse below (ENG-200). No userId
+      // → that meter degrades to a burn-only "system" record (absorbed).
       const { getGeminiClient } = await import('../utils/llmClients');
-      aiClient = await getGeminiClient({ feature: 'agent_task' }, geminiApiKey.trim());
+      aiClient = await getGeminiClient({ userId: options?.userId, feature: 'agent_task' }, geminiApiKey.trim(), { metered: false });
 
       const modelName = 'gemini-3-flash-preview';
 
@@ -6807,6 +6828,13 @@ export class AgentModeService {
         model: modelName,
         contents
       });
+
+      // Charge (record + deduct when a userId is present; absorb under "system"
+      // otherwise). The client above is un-metered, so this is the single meter.
+      meterUsageFromResponse(
+        { userId: options?.userId, model: modelName, provider: 'gemini', feature: 'agent_task' },
+        response
+      );
 
       const rawText = response.text;
 
@@ -14353,6 +14381,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           }
         };
         console.log('[MetaAdSet] Auto-set targeting_automation.advantage_audience=0 (Meta requires this field)');
+      }
+
+      // Conversion location (ENG-415): default destination_type=WEBSITE for website
+      // traffic/conversion goals so the ad-level Destination is explicitly "Website" in Ads Manager
+      // rather than UNDEFINED (the "not selected" symptom). An explicit caller value always wins;
+      // non-website goals (engagement/reach/app installs, instant-form lead goals) are left untouched.
+      if (args.destination_type === undefined &&
+          META_WEBSITE_OPTIMIZATION_GOALS.includes(args.optimization_goal)) {
+        args.destination_type = 'WEBSITE';
       }
 
       // Convert all currencies to cents
@@ -23933,7 +23970,7 @@ Please generate a complete, professional HTML document that properly formats and
       let htmlContent = '';
       for (let attempt = 1; attempt <= maxRenderAttempts; attempt++) {
         try {
-          htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
+          htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
           break;
         } catch (renderError) {
           const isLastAttempt = attempt === maxRenderAttempts;
@@ -24140,7 +24177,7 @@ Please:
 
       // Generate enhanced HTML template using LLMService
       console.log('AgentMode: Generating HTML email template with Claude model');
-      enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'), { userId, sessionId, feature: 'content_gen' });
+      enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(sessionId, 'createHtmlTemplate'), { userId, sessionId, feature: 'content_gen' });
 
       if (!enhancedHtml || enhancedHtml.trim().length === 0) {
         throw new Error('LLM did not generate HTML content');
@@ -24297,7 +24334,7 @@ ${strippedHtml}`;
       const parsed = await llmService.generateJsonRobust<{ variables?: Array<{ name?: string; anchor?: string; isArray?: boolean }> }>(
         systemPrompt,
         userPrompt,
-        this.makeToolUsageCallback(userId, sessionId, 'createHtmlTemplate'),
+        this.makeToolUsageCallback(sessionId, 'createHtmlTemplate'),
         { userId, sessionId, feature: 'content_gen' },
       );
       if (parsed && Array.isArray(parsed.variables)) {
@@ -25495,7 +25532,7 @@ IMPORTANT:
 IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly.`}`;
 
       // Generate content using LangChain with appropriate format
-      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(userId, sessionId, 'generateBookContent'), { userId, sessionId, feature: 'content_gen' });
+      const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format, this.makeToolUsageCallback(sessionId, 'generateBookContent'), { userId, sessionId, feature: 'content_gen' });
 
       // Extract content from JSON
       if (!contentData.content) {
@@ -26602,7 +26639,62 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // persisting — see unipileProfileService.ts.
           const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
           const profileResult = await getUnipileProfileService().getProfile(target, account_id);
-          return { success: true, data: profileResult.rawData };
+          const raw = profileResult.rawData;
+
+          // The global profile cache strips is_relationship / connected_at because
+          // they are viewer-relative (ENG-440) — so on a cache hit a freshly-written
+          // blob carries no connection state at all (and a pre-change legacy row may
+          // carry another viewer's, which we discard below). Re-derive it for THIS
+          // account from our per-account AW-UnipileConnections cache (the authoritative
+          // ENG-377 path) so the agent's invite-vs-DM decision has a correct signal.
+          //
+          // IMPORTANT: overlay onto a SHALLOW COPY. `raw` is the object held in the
+          // profile cache (LRU/DDB row) — mutating it in place would persist this
+          // viewer's connection state back into the shared cache and re-introduce the
+          // very cross-viewer leak this fix closes.
+          if (raw && typeof raw === 'object') {
+            const profileUrl =
+              raw.public_profile_url ||
+              (raw.public_identifier
+                ? `https://www.linkedin.com/in/${raw.public_identifier}`
+                : (isUrl ? target : null));
+            let conn: { connectedAt?: number } | null = null;
+            if (profileUrl) {
+              const { getConnectionByProfileUrlAndAccount } = await import('./unipileConnectionsDb');
+              conn = await getConnectionByProfileUrlAndAccount(profileUrl, account_id).catch(() => null);
+            }
+            // Drop any is_relationship / connected_at that came off `raw` before
+            // re-deriving. New cache writes already strip these, but rows persisted
+            // BEFORE this change (30-day TTL) can still carry another viewer's stale
+            // values — a spread of `raw` would leak them until the row expires. Only a
+            // LIVE response (`!fromCache`) legitimately carries this viewer's own state.
+            const {
+              is_relationship: rawRelationship,
+              connected_at: rawConnectedAt,
+              ...viewerIndependentRaw
+            } = raw;
+            // Reconcile as a union: connected if our per-account cache has a row OR a
+            // LIVE blob said so. A `true` from either source wins — directly countering
+            // the false-negative in reporter-ticket #135 (is_relationship false while
+            // LinkedIn's send-time check said FIRST_DEGREE). On a cache hit we trust only
+            // `conn`, never the (possibly cross-viewer) cached is_relationship.
+            const isConnected =
+              !!conn || (!profileResult.fromCache && rawRelationship === true);
+            const data = {
+              ...viewerIndependentRaw,
+              is_relationship: isConnected,
+              // conn.connectedAt is already epoch-ms (Unipile created_at) — do NOT
+              // multiply by 1000 (ENG-379). Prefer the authoritative cache timestamp;
+              // otherwise keep the raw timestamp ONLY from a live response.
+              ...(conn && typeof conn.connectedAt === 'number'
+                ? { connected_at: conn.connectedAt }
+                : !profileResult.fromCache && typeof rawConnectedAt === 'number'
+                  ? { connected_at: rawConnectedAt }
+                  : {}),
+            };
+            return { success: true, data };
+          }
+          return { success: true, data: raw };
         }
 
         case 'list-connections': {

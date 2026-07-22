@@ -27,7 +27,7 @@ use_tls = true
 [codex]
 binary = "codex"
 # Point this at the repo Codex should work inside.
-cwd = "/Users/ruiwang/Documents/GitHub/your-repo"
+cwd = "/Users/you/code/your-repo"
 sandbox = "workspace-write"
 timeout_seconds = 1800
 model = ""
