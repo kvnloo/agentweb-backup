@@ -2780,6 +2780,119 @@ export function collectMissingInternalImports(
   return missing;
 }
 
+// ENG-467: v0's literal name for a synthetic deployment stub. When a generation's deliverable is
+// component(s) with no designated page route, v0 emits an `app/page.tsx` whose default export is
+// `SyntheticV0PageForDeployment`, rendering only ONE component (typically the nav) as a preview
+// harness — orphaning every section it generated. The build SUCCEEDS (the stub is valid,
+// compilable React with resolvable imports), so no other check fires, but the deployed page is
+// blank but for the top bar. Matching v0's exact identifier keeps the check from ever touching a
+// legitimately-named page (a real page is `Home`/`Page`/`LandingPage`, never this).
+const SYNTHETIC_V0_PAGE_MARKER = "SyntheticV0PageForDeployment";
+
+// ENG-467: a generated component whose basename matches this is a provider/hook/util/type/config —
+// NOT a visible "section" whose absence blanks the page. Orphaning one of these is normal, so it
+// must not trip the incomplete-page check; only orphaned SECTION components (hero, features, …) do.
+const NON_SECTION_COMPONENT_NAME = /(provider|context|store|hooks?|use-|config|constants?|types?|utils?|helpers?|^lib$|theme|schema|validation)/i;
+
+/**
+ * ENG-467: resolve a relative/`@/` import specifier (from a file in `fromDir`) to the ACTUAL
+ * repo-root-relative file path it names within `existingPaths`, or null if it is not an internal,
+ * resolvable JS/TS module (bare package, non-JS asset, escapes the repo root, or resolves to no
+ * real file). Same `@/* -> ./*` convention and extension/`index` probing as the ENG-384 checks.
+ */
+function resolveInternalImportFile(
+  specifier: string,
+  fromDir: string,
+  existingPaths: Set<string>
+): string | null {
+  const isRelative = specifier.startsWith("./") || specifier.startsWith("../");
+  const isAlias = specifier.startsWith("@/");
+  if (!isRelative && !isAlias) return null;
+  if (NON_MODULE_IMPORT_EXTENSION.test(specifier)) return null;
+
+  const target = isAlias
+    ? specifier.slice(2)
+    : path.posix.normalize(path.posix.join(fromDir, specifier));
+  if (target.startsWith("..") || target.startsWith("/") || target === "" || target === ".") return null;
+
+  const normalized = target.replace(/\/+$/, "");
+  if (existingPaths.has(normalized)) return normalized;
+  for (const ext of MODULE_EXTENSIONS) {
+    if (existingPaths.has(`${normalized}${ext}`)) return `${normalized}${ext}`;
+    if (existingPaths.has(`${normalized}/index${ext}`)) return `${normalized}/index${ext}`;
+  }
+  return null;
+}
+
+/**
+ * ENG-467: detect the "synthetic stub" incomplete page — an `app/page.tsx` that v0 emitted as a
+ * `SyntheticV0PageForDeployment` placeholder rendering only a fraction of what it generated,
+ * leaving real section components orphaned so the deployed page is blank but for the top bar.
+ * Returns the entry path + the orphaned section files, or null when the page is fine.
+ *
+ * Conservative by construction — TWO gates that must BOTH hold:
+ *   1. the entry `app/page.*` default export is v0's literal synthetic-stub marker, AND
+ *   2. ≥1 generated SECTION component is unreachable from that entry via transitive local imports.
+ * Gate 1 alone would false-positive when the stub renders a single component that itself composes
+ * the whole page (then nothing is orphaned → gate 2 fails → not flagged). Gate 2 alone would
+ * false-positive on a real, well-named page that merely leaves a stray component unused. Together
+ * they fire only on the actual blank-page bug. Pure and exported for direct unit testing.
+ */
+export function detectIncompleteSyntheticPage(
+  files: Array<{ path: string; content: Buffer }>
+): { entryPath: string; orphaned: string[] } | null {
+  const existingPaths = new Set(files.map((f) => f.path));
+  const byPath = new Map(files.map((f) => [f.path, f]));
+
+  // The entry Next.js routes to for the site root. (Sub-page generations are validated in their
+  // own project's raw layout too, where the entry is likewise `app/page.*`, pre-remap.)
+  const entryPath = MODULE_EXTENSIONS.map((ext) => `app/page${ext}`).find((p) => existingPaths.has(p));
+  if (!entryPath) return null;
+
+  // Gate 1: is the entry v0's synthetic deployment stub?
+  if (!byPath.get(entryPath)!.content.toString("utf-8").includes(SYNTHETIC_V0_PAGE_MARKER)) return null;
+
+  // Walk transitive local imports from the entry to collect every reachable file.
+  const reachable = new Set<string>([entryPath]);
+  const queue = [entryPath];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (!/\.(tsx|ts|jsx|js)$/.test(current)) continue;
+    const file = byPath.get(current);
+    if (!file) continue;
+    const dir = path.posix.dirname(current);
+    const src = stripTemplatesAndComments(file.content.toString("utf-8"));
+    const specifiers = new Set<string>();
+    for (const m of src.matchAll(STATIC_IMPORT_EXPORT_PATTERN)) specifiers.add(m[1]);
+    for (const m of src.matchAll(DYNAMIC_IMPORT_PATTERN)) specifiers.add(m[1]);
+    for (const specifier of specifiers) {
+      const resolved = resolveInternalImportFile(specifier, dir, existingPaths);
+      if (resolved && !reachable.has(resolved)) {
+        reachable.add(resolved);
+        queue.push(resolved);
+      }
+    }
+  }
+
+  // Gate 2: generated SECTION components the entry never reaches. `components/ui/*` are shadcn
+  // primitives (leaf building blocks legitimately imported by sections, not by the page), and
+  // provider/util-ish files are not sections — both are excluded so only real orphaned content
+  // (hero, features, pricing, …) counts.
+  const orphaned: string[] = [];
+  for (const file of files) {
+    const p = file.path;
+    if (!p.endsWith(".tsx")) continue;
+    if (!p.startsWith("components/") && !/\/_components\//.test(p)) continue;
+    if (/(^|\/)ui\//.test(p)) continue;
+    if (reachable.has(p)) continue;
+    const base = path.posix.basename(p).replace(/\.tsx$/, "");
+    if (NON_SECTION_COMPONENT_NAME.test(base)) continue;
+    orphaned.push(p);
+  }
+
+  return orphaned.length > 0 ? { entryPath, orphaned } : null;
+}
+
 /**
  * Validate that unzipped v0 output contains actual React/Next.js code.
  * Rejects: empty output, markdown/prompts echoed back, files too small to be real code.
@@ -2891,6 +3004,23 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
     throw new V0OutputValidationError(
       `Import(s) reference a file that was not generated — ${details}. ` +
       `Generate the missing component/module file(s) so every import resolves.`
+    );
+  }
+
+  // 8. Incomplete-page check (ENG-467): v0 sometimes emits `app/page.tsx` as a
+  // `SyntheticV0PageForDeployment` stub that renders only ONE component (usually the nav),
+  // orphaning every section it generated. The build SUCCEEDS — the stub is valid, compilable
+  // React with resolvable imports — so checks 1–7 all pass, yet the deployed page is blank but
+  // for the top bar. Detect the stub + orphaned sections and reject so the retry loop asks v0 to
+  // compose the real page. Distinct failure class from ENG-374/384 (both build FAILURES); this
+  // one deploys silently, which is exactly why it recurs unnoticed.
+  const incomplete = detectIncompleteSyntheticPage(files);
+  if (incomplete) {
+    throw new V0OutputValidationError(
+      `${incomplete.entryPath} is a placeholder page (${SYNTHETIC_V0_PAGE_MARKER}) that renders only one ` +
+      `component; these generated section components are never rendered: ${incomplete.orphaned.join(", ")}. ` +
+      `Rewrite ${incomplete.entryPath} to import and render the full page — compose ALL generated sections ` +
+      `(e.g. hero, features, how-it-works, testimonials, pricing, signup, footer), not just the nav.`
     );
   }
 
