@@ -906,6 +906,31 @@ export async function classifyScheduledContinuationAsync(response: {
   return null;
 }
 
+// Result shape of a verified/scheduled chat run. Named so the ENG-396
+// park/auto-take helper can return the same type the function returns.
+type RunVerifiedChatResult = {
+  success: boolean;
+  content: string;
+  toolCalls: any[];
+  keywordMatches: string[];
+  keywordMisses: string[];
+  functionCallMatches: string[];
+  functionCallMisses: string[];
+  functionStatus: Array<{
+    functionName: string;
+    requiredCount: number;
+    actualCount: number;
+    met: boolean;
+  }>;
+  attempts: number;
+  workPlanCompleted: boolean;
+  // ENG-396: set when a headless turn left an unanswered blocking AskUserQuestion.
+  // The run stopped without proceeding on a guess; a human must answer it. The
+  // scheduled caller maps this to a `pending_user_input` outcome and notifies.
+  parked?: boolean;
+  pendingUserQuestion?: PendingUserQuestion;
+};
+
 // Common function to run verified chat with work plan, keywords, and function call verification
 // Used by both scheduled chat and verified-generate
 export async function runVerifiedChat(
@@ -931,28 +956,7 @@ export async function runVerifiedChat(
     // human protection on irreversible decisions (owner opted in per-schedule).
     fullAutonomy?: boolean;
   }
-): Promise<{
-  success: boolean;
-  content: string;
-  toolCalls: any[];
-  keywordMatches: string[];
-  keywordMisses: string[];
-  functionCallMatches: string[];
-  functionCallMisses: string[];
-  functionStatus: Array<{
-    functionName: string;
-    requiredCount: number;
-    actualCount: number;
-    met: boolean;
-  }>;
-  attempts: number;
-  workPlanCompleted: boolean;
-  // ENG-396: set when a headless turn left an unanswered blocking AskUserQuestion.
-  // The run stopped without proceeding on a guess; a human must answer it. The
-  // scheduled caller maps this to a `pending_user_input` outcome and notifies.
-  parked?: boolean;
-  pendingUserQuestion?: PendingUserQuestion;
-}> {
+): Promise<RunVerifiedChatResult> {
   const {
     sessionId,
     userId,
@@ -1089,6 +1093,72 @@ export async function runVerifiedChat(
   // or 'unfinished' (admitted it left per-entity work undone).
   let completionGateReason: ScheduledContinuationReason = 'unfinished';
 
+  // ENG-396: A turn — the MAIN turn OR a completion-gate continuation turn — may
+  // have left an unanswered blocking AskUserQuestion (the tool handler persisted
+  // it via updateSessionAskUserQuestion). Handle it identically at BOTH LLM call
+  // sites so the park guarantee can never be bypassed: re-read from the DB (never
+  // trust a stale in-memory blank), then AUTO-TAKE Emma's recommended option under
+  // full autonomy (bounded, logged as a delegation — a deliberate per-schedule
+  // WAIVER of the human protection on irreversible decisions), otherwise PARK and
+  // stop rather than proceed on a guess. Returns 'autoTake' (caller retries), a
+  // 'park' result to return, or null when no question is awaiting.
+  const resolveAwaitingUserQuestion = async (): Promise<
+    { action: 'autoTake' } | { action: 'park'; result: RunVerifiedChatResult } | null
+  > => {
+    const postTurnSession = await chatbotDb.getChatSession(sessionId);
+    if (postTurnSession?.pendingUserQuestion?.status !== 'awaiting') return null;
+    const pending = postTurnSession.pendingUserQuestion;
+
+    if (fullAutonomy && autoTakesUsed < MAX_AUTO_TAKES) {
+      autoTakesUsed++;
+      const answered = resolveInboundAnswer(pending, { delegated: true }, new Date().toISOString());
+      await chatbotDb.updateSessionAskUserQuestion(sessionId, answered);
+      const chosen = answered.options.find(o => o.id === answered.answer!.optionId);
+      console.log(
+        `AgentMode runVerifiedChat: full-autonomy auto-take on session ${sessionId} — question ${pending.questionId} → "${chosen?.label}" (delegation); continuing`
+      );
+      // Breadcrumb in history so Emma sees the decision and resumes without
+      // re-asking (best-effort; the persisted answer is the source of truth).
+      try {
+        await chatbotDb.addMessageToSession(sessionId, {
+          role: 'user',
+          content: `[Full autonomy] Proceed with "${chosen?.label}"${answered.answer?.rationale ? ` — ${answered.answer.rationale}` : ''}.`,
+          timestamp: new Date().toISOString(),
+          metadata: { timestamp: new Date().toISOString(), autoDelegatedAnswer: true, questionId: pending.questionId } as any,
+        });
+      } catch (breadcrumbError) {
+        console.error('Failed to persist full-autonomy auto-take breadcrumb:', breadcrumbError);
+      }
+      return { action: 'autoTake' };
+    }
+
+    console.log(
+      `AgentMode runVerifiedChat: parking session ${sessionId} — blocking user question (${pending.questionId}) awaiting a selection; run will not proceed on a guess`
+    );
+    return {
+      action: 'park',
+      result: {
+        success: false,
+        parked: true,
+        pendingUserQuestion: postTurnSession.pendingUserQuestion,
+        content: allContent,
+        toolCalls: allToolCalls,
+        keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
+        keywordMisses: remainingKeywords,
+        functionCallMatches: [],
+        functionCallMisses: requiredFunctions.map(f => f.functionName),
+        functionStatus: requiredFunctions.map(reqFunc => ({
+          functionName: reqFunc.functionName,
+          requiredCount: reqFunc.minCount,
+          actualCount: countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting),
+          met: false,
+        })),
+        attempts: attempt,
+        workPlanCompleted: false,
+      },
+    };
+  };
+
   while (attempt < maxAttempts) {
     attempt++;
 
@@ -1137,6 +1207,18 @@ export async function runVerifiedChat(
         allActualFunctionCallsForReporting.push(
           ...continuationToolCalls.map((call: any) => call.name).filter(Boolean)
         );
+        // ENG-396: a completion-gate continuation turn can ALSO emit a blocking
+        // AskUserQuestion. Route it through the same park/auto-take handler as the
+        // main turn instead of falling through and returning success on an
+        // unanswered question (the second LLM call site the original park missed).
+        const continuationQuestion = await resolveAwaitingUserQuestion();
+        if (continuationQuestion?.action === 'autoTake') {
+          await waitForVerifiedChatRetry(attempt);
+          continue;
+        }
+        if (continuationQuestion?.action === 'park') {
+          return continuationQuestion.result;
+        }
         // Re-evaluate the gate against the continuation's own output.
         const continuationReason = await classifyScheduledContinuationAsync(continuationResponse);
         if (
@@ -1239,71 +1321,16 @@ export async function runVerifiedChat(
 
       allActualFunctionCallsForReporting.push(...actualFunctionCalls);
 
-      // ENG-396: this turn may have left an unanswered blocking AskUserQuestion.
-      // Re-read from the DB (the tool handler persisted it via
-      // updateSessionAskUserQuestion) so we never read a stale in-memory blank.
-      const postTurnSession = await chatbotDb.getChatSession(sessionId);
-      if (postTurnSession?.pendingUserQuestion?.status === 'awaiting') {
-        const pending = postTurnSession.pendingUserQuestion;
-
-        // Full autonomy (opt-in, per-schedule): AUTO-TAKE Emma's recommended
-        // option instead of parking — including for IMMUTABLE questions. This is
-        // a deliberate WAIVER of the human protection on irreversible decisions;
-        // the owner accepted that risk by turning the schedule autonomous. It is
-        // NOT a blind default: resolveInboundAnswer records it as a delegation on
-        // the RECOMMENDED option with rationale, and the consumer gate then admits
-        // the write through the same seam a human answer would. Bounded by
-        // MAX_AUTO_TAKES so a re-asking model can't loop.
-        if (fullAutonomy && autoTakesUsed < MAX_AUTO_TAKES) {
-          autoTakesUsed++;
-          const answered = resolveInboundAnswer(pending, { delegated: true }, new Date().toISOString());
-          await chatbotDb.updateSessionAskUserQuestion(sessionId, answered);
-          const chosen = answered.options.find(o => o.id === answered.answer!.optionId);
-          console.log(
-            `AgentMode runVerifiedChat: full-autonomy auto-take on session ${sessionId} — question ${pending.questionId} → "${chosen?.label}" (delegation); continuing`
-          );
-          // Breadcrumb in history so Emma sees the decision and resumes without
-          // re-asking (best-effort; the persisted answer is the source of truth).
-          try {
-            await chatbotDb.addMessageToSession(sessionId, {
-              role: 'user',
-              content: `[Full autonomy] Proceed with "${chosen?.label}"${answered.answer?.rationale ? ` — ${answered.answer.rationale}` : ''}.`,
-              timestamp: new Date().toISOString(),
-              metadata: { timestamp: new Date().toISOString(), autoDelegatedAnswer: true, questionId: pending.questionId } as any,
-            });
-          } catch (breadcrumbError) {
-            console.error('Failed to persist full-autonomy auto-take breadcrumb:', breadcrumbError);
-          }
-          await waitForVerifiedChatRetry(attempt);
-          continue;
-        }
-
-        // Default (not autonomous, or auto-take budget exhausted): PARK. A
-        // scheduled/headless run must NOT proceed on a guess — stop and report a
-        // parked outcome. A human answers it later in an interactive session; the
-        // immutable consumer gate stays the hard backstop for the write itself.
-        console.log(
-          `AgentMode runVerifiedChat: parking session ${sessionId} — blocking user question (${pending.questionId}) awaiting a selection; run will not proceed on a guess`
-        );
-        return {
-          success: false,
-          parked: true,
-          pendingUserQuestion: postTurnSession.pendingUserQuestion,
-          content: allContent,
-          toolCalls: allToolCalls,
-          keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
-          keywordMisses: remainingKeywords,
-          functionCallMatches: [],
-          functionCallMisses: requiredFunctions.map(f => f.functionName),
-          functionStatus: requiredFunctions.map(reqFunc => ({
-            functionName: reqFunc.functionName,
-            requiredCount: reqFunc.minCount,
-            actualCount: countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting),
-            met: false,
-          })),
-          attempts: attempt,
-          workPlanCompleted: false,
-        };
+      // ENG-396: this MAIN turn may have left an unanswered blocking
+      // AskUserQuestion — auto-take (full autonomy) or park before doing anything
+      // else. Same handler covers the completion-gate continuation turn below.
+      const mainTurnQuestion = await resolveAwaitingUserQuestion();
+      if (mainTurnQuestion?.action === 'autoTake') {
+        await waitForVerifiedChatRetry(attempt);
+        continue;
+      }
+      if (mainTurnQuestion?.action === 'park') {
+        return mainTurnQuestion.result;
       }
 
       // Check work plan status
