@@ -545,7 +545,7 @@ export async function resolveIdentity(
           // employer domain (a real person/LinkedIn match) is still trusted, so
           // LinkedIn/person data remains the source of truth. Mirrors the guard in
           // fetchApolloOrg.
-          const emailIsInstitutional = !!email && CrmEnrichmentService.isPersonalEmailDomain(email);
+          const emailIsPersonal = !!email && CrmEnrichmentService.isPersonalEmailDomain(email);
           // Raw email domain, lower-cased, RETAINING free-mail providers.
           // extractDomainFromEmail() drops free-mail domains (rawEmailDomain is
           // undefined for gmail/yahoo/etc.), which would silently bypass this
@@ -554,20 +554,35 @@ export async function resolveIdentity(
           const apolloOrgDomain = apolloResult.website
             ? (deriveDomainFromWebsite(apolloResult.website) || '').toLowerCase()
             : '';
-          // Reject ONLY on a positive echo: the returned org resolves to the
+          // (a) Positive DOMAIN echo: the returned org's website resolves to the
           // lead's own personal/institutional email domain (dartmouth.edu →
           // Dartmouth College, website dartmouth.edu; yahoo.com → Yahoo, website
-          // yahoo.com). When Apollo returns no website there is nothing to
-          // identify as an echo, so we trust the email/LinkedIn-anchored person
-          // match rather than dropping a possibly-real employer (mit.edu person
-          // whose real employer "Google" comes back without an org website).
-          const orgEchoesEmailDomain =
-            emailIsInstitutional && !!emailDomainForEcho && !!apolloOrgDomain &&
+          // yahoo.com).
+          const domainEcho =
+            emailIsPersonal && !!emailDomainForEcho && !!apolloOrgDomain &&
             (apolloOrgDomain === emailDomainForEcho ||
              emailDomainForEcho.endsWith(`.${apolloOrgDomain}`) ||
              apolloOrgDomain.endsWith(`.${emailDomainForEcho}`));
+          // (b) Websiteless FREE-MAIL provider echo: no org website to compare,
+          // but the company name carries the free-mail provider itself as a token
+          // (yahoo.com → "Yahoo" / "Yahoo Inc"). Restricted to free-mail leads:
+          // provider names equal the domain's registrable label and no real
+          // employer is a token-exact "yahoo"/"aol", so there are no false
+          // positives. Institutional (.edu) leads are intentionally excluded —
+          // university names rarely contain the label and a real employer that
+          // comes back without a website must not be dropped (mit.edu → "Google").
+          const emailIsFreeMail =
+            emailIsPersonal && !!emailDomainForEcho &&
+            !CrmEnrichmentService.isInstitutionalDomain(emailDomainForEcho);
+          const providerLabel = emailDomainForEcho.split('.').slice(-2, -1)[0] || '';
+          const companyTokens = (apolloResult.company || '')
+            .toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+          const providerNameEcho =
+            !apolloResult.website && emailIsFreeMail &&
+            providerLabel.length >= 3 && companyTokens.includes(providerLabel);
+          const orgEchoesEmailDomain = domainEcho || providerNameEcho;
           if (orgEchoesEmailDomain) {
-            console.log(`${logTag} unified Apollo org echoes institutional email domain=${rawEmailDomain} org="${apolloResult.company}" — rejecting company/website`);
+            console.log(`${logTag} unified Apollo org echoes personal/institutional email domain=${emailDomainForEcho} org="${apolloResult.company}" — rejecting company/website`);
           }
           if (apolloResult.company && !lead.company && !orgEchoesEmailDomain) {
             // Apollo wins over Tier 0.5 LLM company — only guard against
