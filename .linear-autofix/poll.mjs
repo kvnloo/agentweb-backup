@@ -64,6 +64,12 @@ async function processNewBugs() {
   // 1) Normal capped picking, one-by-one under `maxOpenBugs`. EVERY state.json entry counts (the same
   //    list the chat UI shows); a slot frees only when a human marks the issue Done/Canceled and gc.mjs
   //    deletes its entry. Re-read state so the forced picks just made count against the cap.
+  //    GATED by config.requireForceLabel: when set, the poller NEVER auto-picks un-labelled bugs — the
+  //    only way in is the `forceLabel` ("autofix") path above, i.e. a human explicitly labelling the issue.
+  if (config.requireForceLabel) {
+    log(`${new Date().toISOString()} — requireForceLabel is on: only "${config.forceLabel}"-labelled issues are picked; no autonomous pickup this cycle`);
+    return;
+  }
   const cap = Math.max(0, config.maxOpenBugs ?? 15);
   const perCycle = Math.max(1, config.maxPicksPerCycle || 1);
   const open = Object.values(loadState()).filter((e) => e && e.identifier).length;

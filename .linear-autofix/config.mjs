@@ -8,10 +8,13 @@ export const config = {
                                    // is fixed IMMEDIATELY, bypassing the maxOpenBugs cap and the one-per-cycle
                                    // pacing. Already-tracked issues (a state.json entry exists) are ignored,
                                    // so accidentally re-labelling a handled bug never re-triggers it. null = off.
+  requireForceLabel: true,         // when true, the poller fixes ONLY issues carrying `forceLabel` ("autofix") —
+                                   // it NEVER auto-picks un-labelled Bug issues on its own. Assign the label to
+                                   // queue an issue; without it nothing happens. Set false to restore autonomous
+                                   // Bug-label pickup (backlog/unstarted) under the maxOpenBugs cap.
   teamKey: null,                   // e.g. 'ENG' to scope to one team; null = whole workspace
   pickupStateTypes: ['backlog', 'unstarted'], // issue state types the poller picks up
   assigneeEmails: [                // the poller ONLY picks up bugs assigned to these Linear users
-    'hshah@argusoft.com',          // Harshit Shah
     'mvarma@argusoft.com',         // Manan Varma
     'aseth@argusoft.com',          // Anurag Seth
   ],                               // set to null/[] to pick up bugs regardless of assignee
@@ -25,7 +28,6 @@ export const config = {
   // their Linear email isn't on their GitHub account.
   commitAsAssignee: true,
   assigneeGitIdentity: {
-    'hshah@argusoft.com':  { name: 'Harshit Shah', email: 'hshah@argusoft.com' },
     'mvarma@argusoft.com': { name: 'Manan Varma',  email: 'mvarma@argusoft.com' },
     'aseth@argusoft.com':  { name: 'Anurag Seth',  email: 'aseth@argusoft.com' },
   },
@@ -41,14 +43,12 @@ export const config = {
   // safe no-op until the tokens are added.
   prAsAssignee: true,
   assigneeGhTokenEnv: {
-    'hshah@argusoft.com':  'GH_TOKEN_HSHAH',
     'mvarma@argusoft.com': 'GH_TOKEN_MVARMA',
     'aseth@argusoft.com':  'GH_TOKEN_ASETH',
   },
   // The GitHub login each person's token MUST authenticate as — used by check-creds.mjs to catch a
   // swapped or expired token (a token in the wrong env var mis-attributes PRs silently otherwise).
   assigneeGithubLogin: {
-    'hshah@argusoft.com':  'harshit-argusoft',
     'mvarma@argusoft.com': 'mananv-argusoft',
     'aseth@argusoft.com':  'anurag-seth',
   },
@@ -63,7 +63,6 @@ export const config = {
   // (crash-recovery notes in poll.mjs) always use the default key.
   statusAsAssignee: true,
   assigneeLinearKeyEnv: {
-    'hshah@argusoft.com':  'LINEAR_KEY_HSHAH',
     'mvarma@argusoft.com': 'LINEAR_KEY_MVARMA',
     'aseth@argusoft.com':  'LINEAR_KEY_ASETH',
   },
