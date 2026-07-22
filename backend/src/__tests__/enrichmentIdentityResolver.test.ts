@@ -684,6 +684,35 @@ describe('resolveIdentity — Apollo people-match fills company from embedded or
     }
   });
 
+  // ENG-433 (Greptile P1): a WEBSITELESS institutional echo (dartmouth.edu →
+  // "Dartmouth College" with no org website) must be rejected via the domain-label
+  // token match, since there is no website to compare.
+  it('does NOT fill company from a websiteless INSTITUTIONAL echo (dartmouth.edu → "Dartmouth College")', async () => {
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        company: 'Dartmouth College', // no website
+      }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          email: 'student@dartmouth.edu',
+          firstName: 'Ivy',
+          lastName: 'Leaguer',
+          linkedin: 'https://www.linkedin.com/in/ivy-leaguer',
+        },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.resolved.company).toBeUndefined();
+    }
+  });
+
   // ENG-433 (Greptile P1): an Apollo people-match that returns a real employer
   // WITHOUT an org website must not be dropped just because the lead has an
   // institutional email and no LinkedIn — nothing identifies it as an echo.

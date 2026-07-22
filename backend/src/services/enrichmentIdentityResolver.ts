@@ -563,24 +563,21 @@ export async function resolveIdentity(
             (apolloOrgDomain === emailDomainForEcho ||
              emailDomainForEcho.endsWith(`.${apolloOrgDomain}`) ||
              apolloOrgDomain.endsWith(`.${emailDomainForEcho}`));
-          // (b) Websiteless FREE-MAIL provider echo: no org website to compare,
-          // but the company name carries the free-mail provider itself as a token
-          // (yahoo.com → "Yahoo" / "Yahoo Inc"). Restricted to free-mail leads:
-          // provider names equal the domain's registrable label and no real
-          // employer is a token-exact "yahoo"/"aol", so there are no false
-          // positives. Institutional (.edu) leads are intentionally excluded —
-          // university names rarely contain the label and a real employer that
-          // comes back without a website must not be dropped (mit.edu → "Google").
-          const emailIsFreeMail =
-            emailIsPersonal && !!emailDomainForEcho &&
-            !CrmEnrichmentService.isInstitutionalDomain(emailDomainForEcho);
-          const providerLabel = emailDomainForEcho.split('.').slice(-2, -1)[0] || '';
+          // (b) Websiteless NAME echo: no org website to compare, but the company
+          // name carries the email domain's registrable label as a TOKEN
+          // (yahoo.com → "Yahoo"/"Yahoo Inc"; dartmouth.edu → "Dartmouth College";
+          // berkeley.edu → "University of California, Berkeley"). A token match
+          // (not substring) keeps this precise: the label must appear as a whole
+          // word, so a real websiteless employer whose name does NOT contain the
+          // label is still kept (mit.edu person at "Google" — "mit" is not a token
+          // in "Google"). Applies to free-mail and institutional alike.
+          const domainLabel = emailDomainForEcho.split('.').slice(-2, -1)[0] || '';
           const companyTokens = (apolloResult.company || '')
             .toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-          const providerNameEcho =
-            !apolloResult.website && emailIsFreeMail &&
-            providerLabel.length >= 3 && companyTokens.includes(providerLabel);
-          const orgEchoesEmailDomain = domainEcho || providerNameEcho;
+          const nameEcho =
+            !apolloResult.website && emailIsPersonal &&
+            domainLabel.length >= 3 && companyTokens.includes(domainLabel);
+          const orgEchoesEmailDomain = domainEcho || nameEcho;
           if (orgEchoesEmailDomain) {
             console.log(`${logTag} unified Apollo org echoes personal/institutional email domain=${emailDomainForEcho} org="${apolloResult.company}" — rejecting company/website`);
           }
