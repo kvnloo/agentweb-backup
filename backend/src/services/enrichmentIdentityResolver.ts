@@ -546,16 +546,26 @@ export async function resolveIdentity(
           // LinkedIn/person data remains the source of truth. Mirrors the guard in
           // fetchApolloOrg.
           const emailIsInstitutional = !!email && CrmEnrichmentService.isPersonalEmailDomain(email);
-          const apolloOrgDomain = deriveDomainFromWebsite(apolloResult.website || '');
+          // Raw email domain, lower-cased, RETAINING free-mail providers.
+          // extractDomainFromEmail() drops free-mail domains (rawEmailDomain is
+          // undefined for gmail/yahoo/etc.), which would silently bypass this
+          // echo check for free-mail leads — so derive it directly here.
+          const emailDomainForEcho = email ? (email.split('@')[1] || '').toLowerCase().trim() : '';
+          const apolloOrgDomain = apolloResult.website
+            ? (deriveDomainFromWebsite(apolloResult.website) || '').toLowerCase()
+            : '';
+          // Reject ONLY on a positive echo: the returned org resolves to the
+          // lead's own personal/institutional email domain (dartmouth.edu →
+          // Dartmouth College, website dartmouth.edu; yahoo.com → Yahoo, website
+          // yahoo.com). When Apollo returns no website there is nothing to
+          // identify as an echo, so we trust the email/LinkedIn-anchored person
+          // match rather than dropping a possibly-real employer (mit.edu person
+          // whose real employer "Google" comes back without an org website).
           const orgEchoesEmailDomain =
-            emailIsInstitutional && !!rawEmailDomain &&
-            // No website to verify against + no LinkedIn anchor → the org is
-            // domain-derived, not person-derived; treat as an echo.
-            (!apolloResult.website ? !linkedinForApollo
-              : !!apolloOrgDomain &&
-                (apolloOrgDomain === rawEmailDomain ||
-                 rawEmailDomain.endsWith(`.${apolloOrgDomain}`) ||
-                 apolloOrgDomain.endsWith(`.${rawEmailDomain}`)));
+            emailIsInstitutional && !!emailDomainForEcho && !!apolloOrgDomain &&
+            (apolloOrgDomain === emailDomainForEcho ||
+             emailDomainForEcho.endsWith(`.${apolloOrgDomain}`) ||
+             apolloOrgDomain.endsWith(`.${emailDomainForEcho}`));
           if (orgEchoesEmailDomain) {
             console.log(`${logTag} unified Apollo org echoes institutional email domain=${rawEmailDomain} org="${apolloResult.company}" — rejecting company/website`);
           }

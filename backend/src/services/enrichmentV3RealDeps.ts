@@ -1203,9 +1203,17 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
     runWaterfall: (input) => pureRunWaterfall(input, {
       fetchApolloOrg: async (lead) => {
         if (!isApolloServiceReady()) return null;
-        // Prefer the website domain (strongest company signal), then the
-        // business emailDomain, then the raw email domain. Mirrors fetchApolloPerson.
-        const domain = extractDomain(lead.website) || lead.emailDomain || extractDomain(lead.email) || null;
+        // Domain precedence for the org match:
+        //  1. A genuine BUSINESS email domain — the strongest, verified company
+        //     signal. Preferred over the website so a stale/personal website URL
+        //     retained on the lead can't override the person's actual work domain.
+        //  2. The website domain.
+        //  3. The raw email domain (personal/institutional domains fall through
+        //     here and are rejected by the personal-domain guard below).
+        // Mirrors fetchApolloPerson.
+        const emailDom = lead.emailDomain || extractDomain(lead.email);
+        const businessEmailDomain = emailDom && !CrmEnrichmentService.isPersonalDomain(emailDom) ? emailDom : null;
+        const domain = businessEmailDomain || extractDomain(lead.website) || emailDom || null;
         if (!domain) {
           console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:org] SKIP no domain`);
           return null;
@@ -1241,7 +1249,12 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
 
       fetchApolloPerson: async (lead) => {
         if (!isApolloServiceReady()) return null;
-        const domain = extractDomain(lead.website) || lead.emailDomain || extractDomain(lead.email) || null;
+        // Domain precedence mirrors fetchApolloOrg: a genuine business email
+        // domain wins over a possibly-stale website, then the website, then the
+        // raw email domain.
+        const emailDom = lead.emailDomain || extractDomain(lead.email);
+        const businessEmailDomain = emailDom && !CrmEnrichmentService.isPersonalDomain(emailDom) ? emailDom : null;
+        const domain = businessEmailDomain || extractDomain(lead.website) || emailDom || null;
         const personalDomain = !!domain && CrmEnrichmentService.isPersonalEmailDomain(`x@${domain}`);
         const hasNameAndDomain = !!(lead.firstName || lead.lastName) && !!domain && !personalDomain;
         if (!lead.email && !hasNameAndDomain) {
