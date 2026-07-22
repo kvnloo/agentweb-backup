@@ -130,18 +130,19 @@ bash .linear-autofix/run.sh
 ## Schedule it (cron, every 5 minutes) — INSTALLED
 
 ```cron
-*/5 * * * * /usr/bin/env bash /home/harshit/IdeaProjects/Agentweb/agentweb/.linear-autofix/run.sh
+*/5 * * * * /usr/bin/env bash /home/ec2-user/agentweb/.linear-autofix/run.sh
 ```
 
-This entry is installed in the local crontab (check with `crontab -l`). Each cycle: fix new bugs
-(up to `config.maxConcurrent` in parallel, urgent-priority first), recover crashed runs, apply
-pending `revise:` comments, then gc worktrees for Done issues. `poll.log` auto-rotates at ~5MB.
+This entry is installed in the local crontab (check with `crontab -l`). Each cycle: fix issues
+carrying the `autofix` label (`config.requireForceLabel` — no autonomous pickup of un-labelled bugs),
+recover crashed runs, apply pending `revise:` comments, then gc worktrees for Done issues.
+`poll.log` auto-rotates at ~5MB.
 
 ## How issues flow
 
 | Step | Linear state |
 |---|---|
-| Poller picks up `Bug` issues in a backlog/unstarted state **assigned to one of `config.assigneeEmails`** (Harshit / Manan / Anurag; unassigned bugs are skipped) | picked up |
+| Poller picks up issues carrying the **`autofix` label** (`config.forceLabel`, gated by `config.requireForceLabel`) in a backlog/unstarted state **assigned to one of `config.assigneeEmails`** (Manan / Anurag; unassigned bugs are skipped). Without the label nothing is picked up. | picked up |
 | **Fixability gate** (cheap Sonnet pass over the issue text): blocked on an external action? | Blocked → `autofix:blocked` + comment, stays **Todo**, skipped until the label is removed. Fixable → **In Progress** (so it's not picked up twice) |
 | Fix committed, ALL gates green incl. real-browser verify | PR link(s) + reports commented + `autofix:green` + → **In Review** |
 | Fix committed but not browser-verified | Draft PR opened + `autofix:needs-manual-test`; stays **In Progress** |
