@@ -158,6 +158,53 @@ describe('runVerifiedChat — headless park on a blocking question (ENG-396)', (
     expect((result as any).parked).toBeFalsy();
     expect(result.success).toBe(true);
   });
+
+  it('parks when the blocking question is first emitted during a completion-gate CONTINUATION turn', async () => {
+    // Regression: the original park guarded ONLY the main LLM call. A question
+    // first emitted during a completion-gate continuation turn slipped past it
+    // and the run returned success. Both call sites now share one handler, so a
+    // question raised on the continuation turn must park just the same.
+    let workerCalls = 0;
+    mockWorkerService.runInWorker.mockImplementation(async () => {
+      workerCalls++;
+      if (workerCalls === 1) {
+        // Main turn: admits unfinished work, no question yet → gate continues.
+        return {
+          content: 'Event 1 done. I did not complete Step 3 for Events 2 and 3.',
+          toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [],
+        } as any;
+      }
+      // Continuation turn: NOW emits the blocking question.
+      return {
+        content: 'Which objective should I optimize for?',
+        toolCalls: [{ name: 'ask_user_question', result: { awaitingUserConfirmation: true } }],
+        knowledgeBaseQueries: [], sources: [], responseMessages: [],
+      } as any;
+    });
+    // The session reflects the awaiting question only AFTER the continuation turn.
+    mockChatbotDb.getChatSession.mockImplementation(async () => ({
+      ...baseSession,
+      pendingUserQuestion: workerCalls >= 2 ? awaitingQuestion() : undefined,
+    } as any));
+
+    const result = await runVerifiedChat({
+      sessionId: 'session-1',
+      userId: 'user-1',
+      startingMessage: 'For each of the 3 events, research and report on every guest.',
+      keywords: [],
+      requiredFunctions: [],
+      maxAttempts: 5, // room to loop — park must stop it on the continuation turn
+      attachments: [],
+      completionGate: true,
+    });
+
+    expect((result as any).parked).toBe(true);
+    expect(result.success).toBe(false);
+    expect((result as any).pendingUserQuestion).toMatchObject({ questionId: 'q-objective-1', status: 'awaiting' });
+    // Parked ON the continuation turn: main turn + one continuation = 2 worker
+    // calls, and it did NOT loop further or return success on the unanswered question.
+    expect(workerCalls).toBe(2);
+  });
 });
 
 describe('runVerifiedChat — full-autonomy auto-take (ENG-396 Version B)', () => {
