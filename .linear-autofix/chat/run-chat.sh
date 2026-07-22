@@ -37,7 +37,9 @@ case "${1:-}" in
     if alive; then kill "$(cat "$PIDFILE")"; rm -f "$PIDFILE"; echo "[chat] stopped"; else echo "[chat] not running"; rm -f "$PIDFILE"; fi
     ;;
   restart)
-    "$0" stop; "$0" start
+    # Self-call via the resolved absolute path, not "$0" — when invoked as `bash run-chat.sh`,
+    # "$0" is the bare word "run-chat.sh" which isn't on PATH, so the recursion fails.
+    bash "$HERE/run-chat.sh" stop; bash "$HERE/run-chat.sh" start
     ;;
   status)
     if alive; then echo "[chat] running (pid $(cat "$PIDFILE"))"; else echo "[chat] not running"; exit 1; fi
