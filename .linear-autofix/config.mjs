@@ -108,11 +108,13 @@ export const config = {
                                    // its entry. Prevents an unbounded pile of un-merged fixes.
   maxPicksPerCycle: 1,             // when there's room under maxOpenBugs, how many NEW bugs to pick per poll
                                    // cycle (every 5 min). 1 = drain the backlog one-by-one as slots free up.
-  maxForcedConcurrent: 0,          // how many `forceLabel` ("autofix") bugs run at once. 0 = unlimited (all of
+  maxForcedConcurrent: 3,          // how many `forceLabel` ("autofix") bugs run at once. 0 = unlimited (all of
                                    // them in parallel — they're urgent). Each fix is heavy (~4GB tsc + a browser);
-                                   // the runner is now a t3.2xlarge (8 vCPU / 32GB), so a handful in parallel is
-                                   // fine — but a big burst can still exhaust RAM. Set a positive number here to
-                                   // cap parallel forced runs if the box struggles.
+                                   // the runner is a t3.2xlarge (8 vCPU / 32GB). CAPPED to 3 after 2026-07-21:
+                                   // 5 concurrent forced runs (ENG-177/213/237/240/245), each a full backend +
+                                   // customer + partner + headless Chromium + 4GB tsc, saturated the 32GB box and
+                                   // stalled sshd (PAM/fork-exec taking 55s+ — same signature as the 2026-07-02
+                                   // OOM stall). 0 = unlimited bypasses this safety entirely — keep a small cap.
   maxConcurrent: 1,                // NON-forced bugs fixed in parallel per poll cycle. ONE pipeline already fans
                                    // out hard (parallel reviewers, 4GB tsc check, preview builds, verify browser);
                                    // 2 concurrent bugs OOM-stalled the OLD 16GB t3.xlarge on 2026-07-02 (load 57,
