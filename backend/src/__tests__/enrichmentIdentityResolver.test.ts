@@ -655,6 +655,35 @@ describe('resolveIdentity — Apollo people-match fills company from embedded or
     }
   });
 
+  // ENG-433 (Greptile P1): a WEBSITELESS free-mail provider echo (Apollo returns
+  // "Yahoo" as company with no org website for a yahoo.com lead) must be rejected
+  // via the provider-name token match, since there is no website to compare.
+  it('does NOT fill company from a websiteless FREE-MAIL provider echo (yahoo.com → "Yahoo")', async () => {
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        company: 'Yahoo', // no website
+      }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          email: 'someone@yahoo.com',
+          firstName: 'Free',
+          lastName: 'Mailer',
+          linkedin: 'https://www.linkedin.com/in/free-mailer',
+        },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.resolved.company).toBeUndefined();
+    }
+  });
+
   // ENG-433 (Greptile P1): an Apollo people-match that returns a real employer
   // WITHOUT an org website must not be dropped just because the lead has an
   // institutional email and no LinkedIn — nothing identifies it as an echo.
