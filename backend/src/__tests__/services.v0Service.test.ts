@@ -152,6 +152,7 @@ import {
   deleteLandingPage,
   validateV0Output,
   collectMissingInternalImports,
+  detectIncompleteSyntheticPage,
   V0OutputValidationError,
   BrandContext,
   remapFilesForSubPage,
@@ -3122,6 +3123,132 @@ describe("V0OutputValidationError", () => {
     expect(err.name).toBe("V0OutputValidationError");
     expect(err.reason).toBe("test reason");
     expect(err.message).toContain("test reason");
+  });
+});
+
+// =============================================================================
+// ENG-467: incomplete "synthetic stub" page (deploys blank but for the top bar)
+// =============================================================================
+describe("v0Service - incomplete synthetic page check (ENG-467)", () => {
+  const f = (path: string, content: string) => ({ path, content: Buffer.from(content) });
+
+  const NAVBAR = `export default function NavBar() {
+    return <header><nav><a href="#">FocusFlow</a></nav></header>;
+  }`;
+  const HERO = `import ProductMockup from "./ProductMockup";
+  export default function Hero() {
+    return <section><h1>Do your best work</h1><ProductMockup /></section>;
+  }`;
+  const PRODUCT_MOCKUP = `export default function ProductMockup() {
+    return <div className="mockup">screenshot</div>;
+  }`;
+  const THEME_PROVIDER = `export default function ThemeProvider({ children }: { children: React.ReactNode }) {
+    return <>{children}</>;
+  }`;
+
+  // The exact live repro (ENG-467): app/page.tsx is a SyntheticV0PageForDeployment stub that
+  // renders only <NavBar/>, orphaning the Hero + ProductMockup it generated.
+  const reproFiles = () => [
+    f("app/page.tsx", `"use client"\nimport NavBar from "@/components/focusflow/NavBar";\nexport default function SyntheticV0PageForDeployment() {\n  return <NavBar />;\n}`),
+    f("components/focusflow/NavBar.tsx", NAVBAR),
+    f("components/focusflow/Hero.tsx", HERO),
+    f("components/focusflow/ProductMockup.tsx", PRODUCT_MOCKUP),
+    f("components/theme-provider.tsx", THEME_PROVIDER),
+  ];
+
+  describe("detectIncompleteSyntheticPage (detection logic)", () => {
+    it("FAIL: flags the synthetic stub and lists orphaned SECTION components", () => {
+      const result = detectIncompleteSyntheticPage(reproFiles());
+      expect(result).not.toBeNull();
+      expect(result!.entryPath).toBe("app/page.tsx");
+      // Hero + ProductMockup are orphaned sections; theme-provider is excluded (provider).
+      expect(result!.orphaned.sort()).toEqual([
+        "components/focusflow/Hero.tsx",
+        "components/focusflow/ProductMockup.tsx",
+      ]);
+    });
+
+    it("FAIL: resolves a RELATIVE nav import too (not just the @/ alias)", () => {
+      const files = [
+        f("app/page.tsx", `import NavBar from "./_nav/NavBar";\nexport default function SyntheticV0PageForDeployment() { return <NavBar />; }`),
+        f("app/_nav/NavBar.tsx", NAVBAR),
+        f("components/hero.tsx", `export default function Hero() { return <section><h1>Hi there friend</h1></section>; }`),
+      ];
+      const result = detectIncompleteSyntheticPage(files);
+      expect(result).not.toBeNull();
+      expect(result!.orphaned).toEqual(["components/hero.tsx"]);
+    });
+
+    it("FAIL: lists EVERY orphaned section so one correction can name them all", () => {
+      const files = [
+        f("app/page.tsx", `import NavBar from "@/components/navbar";\nexport default function SyntheticV0PageForDeployment() { return <NavBar />; }`),
+        f("components/navbar.tsx", NAVBAR),
+        f("components/hero.tsx", `export default function Hero() { return <section><h1>Focus deeply</h1></section>; }`),
+        f("components/features.tsx", `export default function Features() { return <section><h2>Features here</h2></section>; }`),
+        f("components/pricing.tsx", `export default function Pricing() { return <section><h2>Pricing here</h2></section>; }`),
+      ];
+      const result = detectIncompleteSyntheticPage(files);
+      expect(result!.orphaned.sort()).toEqual([
+        "components/features.tsx",
+        "components/hero.tsx",
+        "components/pricing.tsx",
+      ]);
+    });
+
+    it("PASS (control): a real composed page (not a synthetic stub) is never examined", () => {
+      const files = [
+        f("app/page.tsx", `import NavBar from "@/components/navbar";\nimport Hero from "@/components/hero";\nexport default function Home() { return <main><NavBar /><Hero /></main>; }`),
+        f("components/navbar.tsx", NAVBAR),
+        f("components/hero.tsx", `export default function Hero() { return <section><h1>Hello world here</h1></section>; }`),
+        // A stray unused component must NOT trip the check when the page is legitimately named.
+        f("components/unused-banner.tsx", `export default function Banner() { return <div>promo banner</div>; }`),
+      ];
+      expect(detectIncompleteSyntheticPage(files)).toBeNull();
+    });
+
+    it("PASS (control): synthetic stub that renders ONE component composing the whole page — no orphans", () => {
+      const files = [
+        f("app/page.tsx", `import LandingPage from "@/components/landing-page";\nexport default function SyntheticV0PageForDeployment() { return <LandingPage />; }`),
+        f("components/landing-page.tsx", `import Hero from "./hero";\nimport Features from "./features";\nexport default function LandingPage() { return <main><Hero /><Features /></main>; }`),
+        f("components/hero.tsx", `export default function Hero() { return <section><h1>Deep work daily</h1></section>; }`),
+        f("components/features.tsx", `export default function Features() { return <section><h2>Great features</h2></section>; }`),
+      ];
+      expect(detectIncompleteSyntheticPage(files)).toBeNull();
+    });
+
+    it("PASS (control): synthetic stub with only a provider/util orphaned is not flagged", () => {
+      const files = [
+        f("app/page.tsx", `import NavBar from "@/components/navbar";\nexport default function SyntheticV0PageForDeployment() { return <NavBar />; }`),
+        f("components/navbar.tsx", NAVBAR),
+        f("components/theme-provider.tsx", THEME_PROVIDER),
+        f("lib/utils.ts", `export function cn(...a: string[]) { return a.join(" "); }`),
+      ];
+      expect(detectIncompleteSyntheticPage(files)).toBeNull();
+    });
+
+    it("PASS (control): no app/page.tsx entry → cannot judge, returns null", () => {
+      const files = [
+        f("components/hero.tsx", `export default function Hero() { return <section><h1>Orphan hero here</h1></section>; }`),
+      ];
+      expect(detectIncompleteSyntheticPage(files)).toBeNull();
+    });
+  });
+
+  describe("validateV0Output wiring (check 8)", () => {
+    it("FAIL: throws V0OutputValidationError naming the orphaned sections", () => {
+      expect(() => validateV0Output(reproFiles())).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(reproFiles())).toThrow(/SyntheticV0PageForDeployment/);
+      expect(() => validateV0Output(reproFiles())).toThrow(/Hero\.tsx/);
+    });
+
+    it("PASS: a fully-composed page deploys without a correction round", () => {
+      const files = [
+        f("app/page.tsx", `import NavBar from "@/components/navbar";\nimport Hero from "@/components/hero";\nexport default function Home() { return <main><NavBar /><Hero /></main>; }`),
+        f("components/navbar.tsx", NAVBAR),
+        f("components/hero.tsx", `export default function Hero() { return <section><h1>Hello world here</h1></section>; }`),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
   });
 });
 
