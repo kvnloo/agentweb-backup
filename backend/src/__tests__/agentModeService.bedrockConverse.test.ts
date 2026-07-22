@@ -1,4 +1,4 @@
-import { AgentModeService } from '../services/agentModeService';
+import { AgentModeService, AGENT_MODE_MAX_OUTPUT_TOKENS } from '../services/agentModeService';
 
 // Mock dependencies
 jest.mock('../services/db', () => ({
@@ -525,6 +525,35 @@ describe('AgentModeService - Bedrock Converse message conversion', () => {
       expect(result.choices[0].finish_reason).toBe('tool_calls');
     });
 
+    it('should request an output-token budget large enough for big tool-call arguments (ENG-403)', async () => {
+      const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
+
+      await (agentModeService as any).callLLM(
+        'anthropic.claude-sonnet-4-6',
+        [{ role: 'system', content: 'S' }, { role: 'user', content: 'Create an on-brand HTML one-pager' }]
+      );
+
+      const input = (ConverseCommand as jest.Mock).mock.calls[0][0];
+      // A ~30-40K char content_draft is ~10-13K output tokens; the old 12384 cap
+      // truncated the create_html_file tool call, dropping content_draft and
+      // triggering a "Missing required argument content_draft" validation loop.
+      expect(input.inferenceConfig.maxTokens).toBe(AGENT_MODE_MAX_OUTPUT_TOKENS);
+      expect(AGENT_MODE_MAX_OUTPUT_TOKENS).toBeGreaterThanOrEqual(32000);
+    });
+
+    it('should honor an explicit max_completion_tokens override', async () => {
+      const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
+
+      await (agentModeService as any).callLLM(
+        'anthropic.claude-sonnet-4-6',
+        [{ role: 'system', content: 'S' }, { role: 'user', content: 'Hi' }],
+        { max_completion_tokens: 2000 }
+      );
+
+      const input = (ConverseCommand as jest.Mock).mock.calls[0][0];
+      expect(input.inferenceConfig.maxTokens).toBe(2000);
+    });
+
     it('should handle max_tokens stop reason', async () => {
       mockBedrockSend.mockResolvedValue({
         output: { message: { role: 'assistant', content: [{ text: 'truncated...' }] } },
@@ -538,6 +567,36 @@ describe('AgentModeService - Bedrock Converse message conversion', () => {
       );
 
       expect(result.choices[0].finish_reason).toBe('length');
+    });
+
+    it('should NOT surface a max_tokens-truncated tool call as a completed tool_calls finish (ENG-403)', async () => {
+      // A create_html_file call whose large content_draft was cut off mid-argument:
+      // Converse returns a toolUse block but stopReason='max_tokens'. Surfacing this
+      // as finish_reason='tool_calls' sends an incomplete/invalid tool call to schema
+      // validation, which drops the required content_draft and loops with
+      // "Missing required argument content_draft". It must instead be reported as a
+      // truncation (finish_reason='length', no tool_calls) so the main loop's
+      // max-tokens continuation path handles it.
+      mockBedrockSend.mockResolvedValue({
+        output: {
+          message: {
+            role: 'assistant',
+            content: [
+              { toolUse: { toolUseId: 'tc_html', name: 'create_html_file', input: { title: 'One Pager' } } },
+            ],
+          },
+        },
+        usage: { inputTokens: 100, outputTokens: 32000 },
+        stopReason: 'max_tokens',
+      });
+
+      const result = await (agentModeService as any).callLLM(
+        'anthropic.claude-sonnet-4-6',
+        [{ role: 'system', content: 'S' }, { role: 'user', content: 'Create an on-brand HTML one-pager' }]
+      );
+
+      expect(result.choices[0].finish_reason).toBe('length');
+      expect(result.choices[0].message.tool_calls).toBeFalsy();
     });
   });
 
