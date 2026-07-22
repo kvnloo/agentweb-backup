@@ -233,4 +233,51 @@ describe('emailService.sendScheduledChatTokenLimitEmail', () => {
   });
 });
 
+describe('emailService.sendScheduledChatPausedForInputEmail (ENG-396)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('deep-links to the session via the PATH form the portal actually reads (not ?sessionId=)', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatPausedForInputEmail(
+      'owner@example.com',
+      'RankAI Meta Ads',
+      'schedule-xyz',
+      'Which Meta campaign objective? It cannot be changed after launch.',
+      'session-abc-123'
+    );
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [, subject, textContent, htmlContent] = spy.mock.calls[0];
+    expect(subject).toContain('Emma needs your input');
+    // The portal (AgentMode.tsx) reads sessionId from the route param, so the
+    // link MUST be /agent-mode/<sessionId>. The old ?sessionId= query form opened
+    // a blank chat — the "Open chat to decide" button dead-ended.
+    expect(htmlContent).toContain('/agent-mode/session-abc-123');
+    expect(textContent).toContain('/agent-mode/session-abc-123');
+    expect(htmlContent).not.toContain('?sessionId=');
+    // The question the user must answer is shown.
+    expect(htmlContent).toContain('Which Meta campaign objective?');
+  });
+
+  it('falls back to the bare /agent-mode link when no sessionId is available', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatPausedForInputEmail(
+      'owner@example.com',
+      'RankAI Meta Ads',
+      'schedule-xyz',
+      'Which objective?'
+    );
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [, , , htmlContent] = spy.mock.calls[0];
+    expect(htmlContent).toContain('/agent-mode');
+    expect(htmlContent).not.toContain('/agent-mode/');
+    expect(htmlContent).not.toContain('?sessionId=');
+  });
+});
+
 
