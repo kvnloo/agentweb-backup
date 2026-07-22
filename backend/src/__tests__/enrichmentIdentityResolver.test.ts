@@ -624,6 +624,59 @@ describe('resolveIdentity — Apollo people-match fills company from embedded or
       expect(result.resolved.website).toBe('https://www.nvidia.com');
     }
   });
+
+  // ENG-433 (Greptile P1): free-mail domains are dropped by extractDomainFromEmail,
+  // so the echo check must derive the domain directly or it silently lets a
+  // free-mail provider through as the employer.
+  it('does NOT fill company from an Apollo org that echoes a FREE-MAIL email domain', async () => {
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        company: 'Yahoo', website: 'https://www.yahoo.com',
+      }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          email: 'someone@yahoo.com',
+          firstName: 'Free',
+          lastName: 'Mailer',
+          linkedin: 'https://www.linkedin.com/in/free-mailer',
+        },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.resolved.company).toBeUndefined();
+      expect(result.resolved.website).toBeUndefined();
+    }
+  });
+
+  // ENG-433 (Greptile P1): an Apollo people-match that returns a real employer
+  // WITHOUT an org website must not be dropped just because the lead has an
+  // institutional email and no LinkedIn — nothing identifies it as an echo.
+  it('fills company from a websiteless Apollo employer for an institutional-email lead with no LinkedIn', async () => {
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        company: 'Google', // real employer, no organization website in the response
+      }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'employee@mit.edu', firstName: 'Grace', lastName: 'Hopper' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.resolved.company).toBe('Google');
+    }
+  });
 });
 
 describe('resolveIdentity — enrich.so reverse-lookup company fallback', () => {
