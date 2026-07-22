@@ -848,13 +848,24 @@ async function runCriticReal(input: {
     `"contradicted", no matter how clearly the source states the value. Only treat the ` +
     `source as a match when the company name AND/OR domain plausibly refer to the lead's ` +
     `company. When identity is genuinely ambiguous, use "unsupported", not "supported".\n\n` +
+    `CRITICAL — person identity: for person-level claims (e.g. a personal LinkedIn ` +
+    `/in/ URL, job title, or role), the source must describe the SAME person as the ` +
+    `lead — the name must match AND the employer/role must be consistent with what is ` +
+    `already known about the lead. A namesake — someone who shares the lead's name but ` +
+    `has a different employer or title (e.g. the lead is "Founder at The Bridge" but the ` +
+    `source snippet shows "Senior System Administrator at a University") — is ` +
+    `"contradicted", even when the name matches exactly. Use the lead's name, title, and ` +
+    `company to judge person identity.\n\n` +
     `Return strict JSON: an object keyed by field name with one verdict string per field.`;
 
   const userPrompt =
     `Lead: ${JSON.stringify({
       email: input.lead.email,
+      firstName: input.lead.firstName,
+      lastName: input.lead.lastName,
       company: input.lead.company,
       website: input.lead.website,
+      title: input.lead.title,
     })}\n\n` +
     `Claims to verify:\n${JSON.stringify(claims, null, 2)}\n\n` +
     `Return ONLY JSON like {"field_a": "supported", "field_b": "contradicted"}.`;

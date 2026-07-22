@@ -1,0 +1,110 @@
+import { AgentModeService } from '../services/agentModeService';
+
+// Mirror the mock set used by the other AgentModeService loop tests so the
+// module graph loads cleanly (do NOT mock axios/aws-sdk — that breaks the
+// transitive Slack WebClient construction at import time).
+jest.mock('openai');
+jest.mock('../services/settingsService');
+jest.mock('../services/db');
+jest.mock('../services/chatbotService');
+jest.mock('../utils/secretsManager');
+jest.mock('../services/skillService', () => ({
+  skillService: {
+    getPublishedSkills: jest.fn().mockResolvedValue([]),
+    getSkillsByIds: jest.fn().mockResolvedValue([]),
+  },
+}));
+jest.mock('../services/subscriptionService', () => ({
+  getAllowedSkills: jest.fn().mockResolvedValue(['*']),
+  resolveSkillsToToolNames: jest.fn().mockResolvedValue(['*']),
+  filterFunctionCalls: jest.fn().mockImplementation((tools: any) => tools),
+}));
+
+// The internal render step we want to prove is skipped for already-complete HTML.
+jest.mock('../utils/llmService', () => ({
+  createLLMService: jest.fn().mockReturnValue({
+    generateHTML: jest.fn().mockResolvedValue('<html><body>RENDERED BY LLM</body></html>'),
+  }),
+}));
+
+// Capture what content actually gets uploaded.
+jest.mock('../utils/s3Utils', () => ({
+  uploadFileToS3: jest.fn().mockResolvedValue({
+    success: true,
+    url: 'https://s3.amazonaws.com/bucket/html_test.html',
+  }),
+}));
+
+const COMPLETE_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Acme</title><style>body{font-family:Inter}</style></head>
+<body><h1>Acme Insight</h1><p>Real content here.</p></body>
+</html>`;
+
+describe('AgentModeService.createHtmlFile — ENG-472 (skip redundant render / fail fast)', () => {
+  let service: AgentModeService;
+  let mockGenerateHTML: jest.Mock;
+  let mockUpload: jest.Mock;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new AgentModeService();
+    jest.spyOn(service as any, 'makeToolUsageCallback').mockReturnValue(() => {});
+    mockGenerateHTML = require('../utils/llmService').createLLMService().generateHTML;
+    mockUpload = require('../utils/s3Utils').uploadFileToS3;
+  });
+
+  it('uploads an already-complete HTML document directly, WITHOUT calling the render LLM', async () => {
+    const res = await service.createHtmlFile('Acme Insight', COMPLETE_HTML, '', 'user-1', 'sess-1', 'document');
+
+    expect(res.success).toBe(true);
+    expect(res.s3_url).toContain('https://');
+    // The render LLM must NOT be invoked for already-complete HTML.
+    expect(mockGenerateHTML).not.toHaveBeenCalled();
+    // The user's exact HTML must be uploaded verbatim (not re-generated / altered).
+    expect(mockUpload).toHaveBeenCalledTimes(1);
+    expect(mockUpload.mock.calls[0][0]).toBe(COMPLETE_HTML);
+  });
+
+  it('passthrough works for arbitrarily LARGE complete HTML (the timeout case) without rendering', async () => {
+    const big = COMPLETE_HTML.replace('</body>', '<p>' + 'x'.repeat(120_000) + '</p></body>');
+    const res = await service.createHtmlFile('Big Guide', big, '', 'user-1', 'sess-1', 'document');
+
+    expect(res.success).toBe(true);
+    expect(mockGenerateHTML).not.toHaveBeenCalled();
+    expect(mockUpload.mock.calls[0][0]).toBe(big);
+  });
+
+  it('still RENDERS a small non-HTML draft via the LLM (no regression)', async () => {
+    const res = await service.createHtmlFile('Summary', 'Just a few plain sentences about email marketing.', '', 'user-1', 'sess-1', 'document');
+
+    expect(res.success).toBe(true);
+    expect(mockGenerateHTML).toHaveBeenCalledTimes(1);
+    // The rendered (LLM) output is uploaded, not the raw draft.
+    expect(mockUpload.mock.calls[0][0]).toContain('RENDERED BY LLM');
+  });
+
+  it('still RENDERS an email even when the draft is already complete HTML (email-safety must run)', async () => {
+    const res = await service.createHtmlFile('Newsletter', COMPLETE_HTML, '', 'user-1', 'sess-1', 'email');
+
+    expect(res.success).toBe(true);
+    expect(mockGenerateHTML).toHaveBeenCalledTimes(1);
+  });
+
+  it('still RENDERS incomplete HTML (no closing </html>) rather than passing a broken fragment through', async () => {
+    const partial = '<!DOCTYPE html><html><body><h1>Cut off mid';
+    const res = await service.createHtmlFile('Partial', partial, '', 'user-1', 'sess-1', 'document');
+
+    expect(res.success).toBe(true);
+    expect(mockGenerateHTML).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails fast with an actionable error for an oversized NON-HTML draft (no 15-min render timeout)', async () => {
+    const huge = 'This is a long plain-text chapter. '.repeat(3000); // ~105K chars, not HTML
+    const res = await service.createHtmlFile('Mega Guide', huge, '', 'user-1', 'sess-1', 'document');
+
+    expect(res.success).toBe(false);
+    expect(mockGenerateHTML).not.toHaveBeenCalled();
+    expect((res.error || '').toLowerCase()).toMatch(/too large|split|smaller/);
+  });
+});
