@@ -87,7 +87,7 @@ jest.mock('../services/tokenUsageService', () => ({
 
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
-import { scheduleDb } from '../services/db';
+import { scheduleDb, userDb } from '../services/db';
 import { emailService } from '../services/emailService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { runScheduledChat } from '../controllers/agentModeController';
@@ -180,6 +180,22 @@ describe('runScheduledChat — headless park + notify (ENG-396)', () => {
     expect(mockEmail.sendScheduledChatResultEmail).not.toHaveBeenCalled();
     // Recorded in history.
     expect(mockScheduleDb.addRunResult).toHaveBeenCalledWith('sched-1', expect.objectContaining({ status: 'pending_user_input' }));
+  });
+
+  it('parks but WARNS (never silently) when there is no notification recipient', async () => {
+    // No emailNotifications on the schedule AND no account email → nobody to notify.
+    // getUserById is called more than once in the flow, so override ALL calls.
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'test-user-123', email: undefined, isAdmin: false });
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = await runScheduledChat(schedule, 'test-user-123', false);
+
+    expect(result.status).toBe('pending_user_input');
+    expect(mockEmail.sendScheduledChatPausedForInputEmail).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('NO notification recipient'));
+    warnSpy.mockRestore();
+    // Restore the default so later tests still see an account email.
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'test-user-123', email: 'owner@example.com', isAdmin: false });
   });
 
   it('does NOT park (normal success) when the session has no awaiting question', async () => {
