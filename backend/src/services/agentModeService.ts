@@ -3163,6 +3163,26 @@ export class AgentModeService {
         const finishReason = response.choices[0]?.finish_reason;
         const stopReason = response.choices[0]?.stop_reason;
 
+        // Provider-agnostic truncated-tool-call guard (ENG-403).
+        // When a turn is cut off by the output-token limit mid-tool-call, the
+        // tool_calls JSON is incomplete (e.g. create_html_file's content_draft is
+        // sliced off), so executing it fails schema validation with a dropped
+        // required arg and the model retries identically — the "content_draft is
+        // required" loop. The Bedrock/Vertex adapters already null their tool_calls
+        // and report finish_reason='length' on max_tokens; the raw OpenAI-SDK paths
+        // (Azure gpt-*, Gemini OpenAI-compat — the DEFAULT agent model) instead
+        // return finish_reason='length' with the partial tool_calls still attached.
+        // Drop them here so the truncated turn falls through to the bounded
+        // max-tokens continuation path below (which asks the model to continue)
+        // instead of executing a broken call. responseMessage was already pushed
+        // into `messages` by reference above, so this also removes the dangling
+        // tool_use from history — required, else the next request would be a
+        // malformed assistant tool_calls turn with no matching tool results.
+        if (finishReason === 'length' && responseMessage.tool_calls?.length) {
+          console.warn(`AgentMode: Dropping ${responseMessage.tool_calls.length} truncated tool call(s) (finish_reason=length) in session ${sessionId}; routing to max-tokens continuation`);
+          delete responseMessage.tool_calls;
+        }
+
         if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
           // No tool calls — check WHY the model stopped
 
