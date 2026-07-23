@@ -477,6 +477,8 @@ describe('SessionScoring - surfacing silent dead runs (ENG-473)', () => {
     // ...and a diagnostic error field, mirroring the scheduled reconciler.
     expect(mockUpdateError).toHaveBeenCalledTimes(1);
     expect(mockUpdateError.mock.calls[0][0]).toBe('dead-regular-1');
+    // The persisted reason must be the FAILED_RUN_REASON diagnostic, not a placeholder.
+    expect(mockUpdateError.mock.calls[0][1]).toMatch(/crashed or timed out|failed run/i);
   });
 
   it('does NOT surface a note while the turn-less run is still in-flight (recent)', async () => {
@@ -525,6 +527,30 @@ describe('SessionScoring - surfacing silent dead runs (ENG-473)', () => {
     expect(mockCallLLM).not.toHaveBeenCalled();
     expect(mockAddMessage).not.toHaveBeenCalled();
     expect(mockUpdateError).not.toHaveBeenCalled();
+  });
+
+  it('swallows a persistence failure while surfacing the note — scoring still succeeds', async () => {
+    // The annotation is best-effort: if addMessageToSession (or updateSessionError)
+    // rejects, the failure must be logged and NOT propagated — the session is still
+    // scored 1/5 and that score is still persisted.
+    mockAddMessage.mockRejectedValueOnce(new Error('boom'));
+    mockUpdateError.mockRejectedValueOnce(new Error('boom'));
+    const session = {
+      sessionId: 'dead-regular-persist-fail-1',
+      userId: 'u1',
+      sessionType: 'regular',
+      messages: [...regularTurnless],
+      messageCount: regularTurnless.length,
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    // Persistence failure is swallowed, not propagated.
+    expect(result?.score).toBe(1);
+    expect(mockCallLLM).not.toHaveBeenCalled();
+    expect(mockUpdateScore).toHaveBeenCalledTimes(1);
   });
 
   it('does NOT surface a note on a healthy run that produced a real assistant reply', async () => {
