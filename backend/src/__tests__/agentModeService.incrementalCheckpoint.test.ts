@@ -132,4 +132,74 @@ describe('AgentModeService - incremental checkpoint persistence (ENG-473)', () =
     expect(result.persistedResponseCount).toBe(0);
     expect(result.responseMessages.map((m: any) => m.content)).toEqual(['partial answer', 'final answer']);
   });
+
+  // ── Error path: no token double-count ──────────────────────────────────────
+  // A run that THROWS after a checkpoint must NOT re-report the checkpointed
+  // message as partial usage — addMessagesToSession already counted its tokens.
+  function driveThenThrow(persistIncrementally: boolean) {
+    const { addMessagesToSession } = mockDeps();
+    let call = 0;
+    jest.spyOn(svc as any, 'callLLM').mockImplementation(async () => {
+      call++;
+      if (call === 1) return truncatedResponse('turn 1 with usage'); // settles at top of iter 2
+      throw new Error('LLM exploded'); // non-transient → propagates to the catch
+    });
+    return {
+      addMessagesToSession,
+      run: () =>
+        svc.generateMarketingResponse(
+          'go', [], 'u', svc.default_model, 'test-session',
+          false, undefined, undefined, false, undefined, undefined, undefined, false,
+          persistIncrementally
+        ),
+    };
+  }
+
+  it('error after a checkpoint: partialUsageMessages excludes the already-persisted prefix', async () => {
+    const { addMessagesToSession, run } = driveThenThrow(true);
+
+    let err: any;
+    try { await run(); } catch (e) { err = e; }
+
+    expect(err).toBeDefined();
+    // The settled turn-1 message was checkpointed (tokens already counted there)...
+    expect(addMessagesToSession).toHaveBeenCalledTimes(1);
+    expect(addMessagesToSession.mock.calls[0][1].map((m: any) => m.content)).toEqual(['turn 1 with usage']);
+    // ...so it is NOT re-reported for token tracking on the error path (no double-count).
+    expect(err.partialUsageMessages).toBeUndefined();
+  });
+
+  it('CONTRAST — without checkpointing, the same error DOES report the message as partial usage', async () => {
+    const { addMessagesToSession, run } = driveThenThrow(false);
+
+    let err: any;
+    try { await run(); } catch (e) { err = e; }
+
+    expect(err).toBeDefined();
+    expect(addMessagesToSession).not.toHaveBeenCalled();
+    // Nothing was checkpointed, so the usage-bearing turn-1 message is the partial usage.
+    expect(err.partialUsageMessages).toHaveLength(1);
+    expect(err.partialUsageMessages[0].content).toBe('turn 1 with usage');
+  });
+
+  // ── Cancel/Stop ───────────────────────────────────────────────────────────
+  it('cancel mid-run keeps the checkpointed prior turn and drops the in-flight turn', async () => {
+    const { addMessagesToSession } = mockDeps();
+    jest.spyOn(svc as any, 'callLLM').mockImplementation(async () => truncatedResponse('a turn'));
+    // Stop as soon as the first checkpoint has been written.
+    const isCancelled = () => addMessagesToSession.mock.calls.length > 0;
+
+    const result = await svc.generateMarketingResponse(
+      'go', [], 'u', svc.default_model, 'test-session',
+      false, undefined, undefined, false, isCancelled, undefined, undefined, false,
+      true
+    );
+
+    expect(result.cancelled).toBe(true);
+    // The completed prior turn was checkpointed and stays (real work, not a ghost)...
+    expect(addMessagesToSession).toHaveBeenCalledTimes(1);
+    expect(result.persistedResponseCount).toBe(1);
+    // ...while the in-flight turn the user stopped was never persisted by a checkpoint.
+    expect(addMessagesToSession.mock.calls[0][1]).toHaveLength(1);
+  });
 });
