@@ -113,7 +113,9 @@ Provide 2–4 options, each with a one-line \`consequence\`. EXACTLY ONE option 
 
 After you call this the run BLOCKS: you will NOT be able to answer it yourself and no further action executes until the user selects. Do not restate the options as prose asking for a "yes/confirm" — emit this tool instead.
 
-Ask only ONE question per turn. If several decisions are needed, ask the single most blocking/irreversible one now; the rest come up one at a time in later turns after each is answered. A second question emitted while one is still awaiting is rejected — never batch them.`,
+Ask only ONE question per turn. If several decisions are needed, ask the single most blocking/irreversible one now; the rest come up one at a time in later turns after each is answered. A second question emitted while one is still awaiting is rejected — never batch them.
+
+If the user replies with a TYPED message instead of clicking an option, that open card is abandoned (it freezes as unanswered) — do NOT infer their choice from the prose, even if it looks like they named an option. If you still need the answer, simply emit a FRESH card to ask again. Only an explicit click counts as the answer.`,
     inputSchema: {
       type: 'object',
       properties: {
