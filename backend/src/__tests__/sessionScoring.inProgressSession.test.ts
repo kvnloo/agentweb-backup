@@ -16,6 +16,8 @@ jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     updateSessionSatisfactionScore: jest.fn().mockResolvedValue({}),
     updateSessionJudgeScore: jest.fn().mockResolvedValue({}),
+    addMessageToSession: jest.fn().mockResolvedValue({}),
+    updateSessionError: jest.fn().mockResolvedValue({}),
   },
 }));
 
@@ -28,6 +30,8 @@ jest.mock('../services/settingsService', () => ({
 const mockCallLLM = agentModeService.callLLM as jest.MockedFunction<typeof agentModeService.callLLM>;
 const mockUpdateScore = chatbotDb.updateSessionSatisfactionScore as jest.Mock;
 const mockUpdateJudgeScore = chatbotDb.updateSessionJudgeScore as jest.Mock;
+const mockAddMessage = chatbotDb.addMessageToSession as jest.Mock;
+const mockUpdateError = chatbotDb.updateSessionError as jest.Mock;
 
 function makeLLMResponse(score: number, reason: string, dimensions?: object) {
   return {
@@ -427,5 +431,122 @@ describe('SessionScoring - sessions with an assistant turn score normally', () =
     expect(result?.judgeName).toBe('Test Judge');
     expect(mockCallLLM).toHaveBeenCalledTimes(1);
     expect(mockUpdateJudgeScore).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('SessionScoring - surfacing silent dead runs (ENG-473)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  // A regular (non-scheduled) interactive run whose owning process died mid-run
+  // (OOM/SIGKILL). Only the system + user prompt were persisted; no assistant
+  // reply, no tokens. Previously left as a silent dead chat with no explanation.
+  const regularTurnless: ChatMessage[] = [
+    { role: 'system', content: 'You are EMMA.' } as any,
+    { role: 'user', content: 'Draft a Meta lead-gen campaign.' },
+  ];
+
+  it('leaves a user-facing retry note + diagnostic error on a stale regular dead run', async () => {
+    const session = {
+      sessionId: 'dead-regular-1',
+      userId: 'u1',
+      sessionType: 'regular',
+      pageIdentifier: 'agent-mode',
+      messages: [...regularTurnless],
+      messageCount: regularTurnless.length,
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    // Still scored as a deterministic failed run (no LLM call).
+    expect(result?.score).toBe(1);
+    expect(mockCallLLM).not.toHaveBeenCalled();
+
+    // Silent dead session becomes visible: one user-facing assistant note...
+    expect(mockAddMessage).toHaveBeenCalledTimes(1);
+    const [sid, msg] = mockAddMessage.mock.calls[0];
+    expect(sid).toBe('dead-regular-1');
+    expect(msg.role).toBe('assistant');
+    expect(msg.content).toMatch(/didn't finish|send your message again|retry/i);
+    expect(msg.metadata.isRunFailureNotice).toBe(true);
+    expect(msg.metadata.isErrorMessage).toBe(true);
+
+    // ...and a diagnostic error field, mirroring the scheduled reconciler.
+    expect(mockUpdateError).toHaveBeenCalledTimes(1);
+    expect(mockUpdateError.mock.calls[0][0]).toBe('dead-regular-1');
+  });
+
+  it('does NOT surface a note while the turn-less run is still in-flight (recent)', async () => {
+    const session = {
+      sessionId: 'inflight-regular-1',
+      userId: 'u1',
+      sessionType: 'regular',
+      messages: [...regularTurnless],
+      messageCount: regularTurnless.length,
+      createdAt: RECENT(),
+      updatedAt: RECENT(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    expect(result).toBeNull();
+    expect(mockAddMessage).not.toHaveBeenCalled();
+    expect(mockUpdateError).not.toHaveBeenCalled();
+  });
+
+  it('is idempotent — never double-adds the note when one is already present', async () => {
+    const nowIso = new Date().toISOString();
+    const session = {
+      sessionId: 'dead-regular-2',
+      userId: 'u1',
+      sessionType: 'regular',
+      messages: [
+        ...regularTurnless,
+        {
+          role: 'assistant',
+          content: "This run didn't finish — please retry.",
+          metadata: { isErrorMessage: true, isRunFailureNotice: true, timestamp: nowIso },
+        } as any,
+      ],
+      messageCount: 3,
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    // The pre-existing notice must NOT count as a real assistant turn: the run is
+    // still classified as a deterministic failed run (no LLM), and no duplicate
+    // note or error write is issued.
+    expect(result?.score).toBe(1);
+    expect(mockCallLLM).not.toHaveBeenCalled();
+    expect(mockAddMessage).not.toHaveBeenCalled();
+    expect(mockUpdateError).not.toHaveBeenCalled();
+  });
+
+  it('does NOT surface a note on a healthy run that produced a real assistant reply', async () => {
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse(5, 'great', { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 })
+    );
+    const session = {
+      sessionId: 'healthy-1',
+      userId: 'u1',
+      sessionType: 'regular',
+      messages: [
+        ...regularTurnless,
+        { role: 'assistant', content: 'Here is your campaign draft.' } as any,
+      ],
+      messageCount: 3,
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    await scoreSessionIfNeeded(session);
+
+    expect(mockAddMessage).not.toHaveBeenCalled();
+    expect(mockUpdateError).not.toHaveBeenCalled();
   });
 });
