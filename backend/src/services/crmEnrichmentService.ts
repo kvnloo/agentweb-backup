@@ -482,12 +482,24 @@ export class CrmEnrichmentService {
    * Multi-space gaps left by empty substitutions are collapsed to a single space.
    */
   static applySearchTemplate(template: string, lead: LeadRecord): string {
+    // ENG-433: {{emailDomain}} is omitted for personal/institutional emails
+    // (gmail, yahoo, .edu, .gov, .ac.*). Such a domain is never the lead's
+    // company, and seeding a firmographic web search with it resolves the
+    // free-mail provider or university AS the company (e.g. the company_firmographic
+    // template "{{emailDomain}} company overview" → "berkeley.edu company overview"
+    // → "University of California, Berkeley"). Mirrors the guard in fetchApolloOrg
+    // and the v2 query builder. Person searches keep the signal via {{email}},
+    // which still carries the full address.
+    const emailDomainToken =
+      lead.email && !CrmEnrichmentService.isPersonalEmailDomain(lead.email)
+        ? (String(lead.email).split('@')[1] || '')
+        : '';
     return template
       .replace(/\{\{firstName\}\}/g, lead.firstName || '')
       .replace(/\{\{lastName\}\}/g, lead.lastName || '')
       .replace(/\{\{company\}\}/g, lead.company || '')
       .replace(/\{\{email\}\}/g, lead.email || '')
-      .replace(/\{\{emailDomain\}\}/g, lead.email ? (String(lead.email).split('@')[1] || '') : '')
+      .replace(/\{\{emailDomain\}\}/g, emailDomainToken)
       .replace(/\{\{title\}\}/g, lead.title || '')
       .replace(/\{\{linkedin\}\}/g, lead.linkedin || '')
       .replace(/\{\{customFields\.(\w+)\}\}/g, (_: string, f: string) => lead.customFields?.[f] || '')
