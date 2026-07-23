@@ -1739,7 +1739,10 @@ $('input').addEventListener('blur', () => { if (S.slash) setTimeout(hideSlash, 1
 // ---------- voice: push-to-talk dictation ----------
 // Only intercept space when the composer is actually usable; otherwise spaces behave normally.
 function voiceEnabled() {
-  return V.supported && !V.denied && !!S.sel && !S.busy && !S.deleting && !$('input').disabled;
+  // Note: intentionally NOT gated on S.busy — you can dictate your NEXT message while a turn runs;
+  // it lands in the composer and the send path queues it (see send() S.busy branch). Only a truly
+  // locked composer (compact/delete disable the input) or an in-progress delete blocks the mic.
+  return V.supported && !V.denied && !!S.sel && !S.deleting && !$('input').disabled;
 }
 function showVoice(on) { $('voice').style.display = on ? 'flex' : 'none'; $('input').classList.toggle('recording', on); }
 function voiceNote(msg) { const v = $('voice'); if (v) v.lastElementChild.textContent = msg; }
