@@ -226,13 +226,21 @@ export async function generateInviteDrafts(
     return { drafts: [], promptVersion: row.version, charLimit };
   }
 
-  // Cap the id up front so the value that goes INTO the prompt and the value we
-  // match responses back against are the same bounded string — capping only one
-  // side would silently drop every draft for an oversized id.
-  const capped = prospects.map((p) => ({
-    ...p,
-    id: capField(p.id, FIELD_CAPS.id),
-  }));
+  // The prospectId is the correlation key we match responses back against, so
+  // it must NOT be mutated — truncating it would collapse distinct ids that
+  // share a prefix and misassign or drop drafts. Instead DROP any prospect
+  // whose id is missing or abusively long: it simply gets no LLM upgrade (the
+  // frontend keeps its template pre-fill), which also keeps an oversized id out
+  // of the prompt so cost stays bounded.
+  const usable = prospects.filter(
+    (p) =>
+      typeof p.id === "string" &&
+      p.id.length > 0 &&
+      p.id.length <= FIELD_CAPS.id,
+  );
+  if (usable.length === 0) {
+    return { drafts: [], promptVersion: row.version, charLimit };
+  }
 
   const llm =
     deps.llm ??
@@ -242,7 +250,7 @@ export async function generateInviteDrafts(
   try {
     raw = await llm.generateJsonRobust<LlmDraftsResponse>(
       buildSystemPrompt(row.systemPrompt, charLimit),
-      buildUserPrompt(capped, ctx),
+      buildUserPrompt(usable, ctx),
     );
   } catch (err) {
     // eslint-disable-next-line no-console
@@ -259,9 +267,8 @@ export async function generateInviteDrafts(
     return { drafts: [], promptVersion: row.version, charLimit };
   }
 
-  // Only accept ids we asked for — a model can invent prospects. Match against
-  // the capped ids, i.e. exactly what the model was given.
-  const requested = new Set(capped.map((p) => p.id));
+  // Only accept ids we asked for — a model can invent prospects.
+  const requested = new Set(usable.map((p) => p.id));
   const seen = new Set<string>();
   const drafts: InviteDraft[] = [];
 

@@ -256,30 +256,49 @@ describe("generateInviteDrafts", () => {
     expect(llm.generateJsonRobust).not.toHaveBeenCalled();
   });
 
-  it("caps oversized context + prospect fields (including the id) so one caller can't inflate the prompt", async () => {
+  it("caps oversized context + prospect fields so one caller can't inflate the prompt", async () => {
     const llm = okLlm({});
     const huge = "x".repeat(10000);
-    const hugeId = "i".repeat(10000);
 
     await generateInviteDrafts(
-      [{ id: hugeId, name: huge, company: huge, title: huge }],
+      [{ id: "p-1", name: huge, company: huge, title: huge }],
       { brandName: huge, icpName: huge, specs: huge },
       { llm },
     );
 
     // The whole user prompt is bounded (all caps + labels), nowhere near the
-    // ~70k chars an uncapped blow-up would produce.
+    // ~60k chars an uncapped blow-up would produce.
     const userPrompt: string = (llm.generateJsonRobust as jest.Mock).mock
       .calls[0][1];
     expect(userPrompt.length).toBeLessThan(2000);
-    // No single field's padding survives past its cap (500 = specs, the largest
-    // text cap; 200 = id cap).
+    // No single field's padding survives past its cap (500 = specs, the largest).
     expect(/x{501,}/.test(userPrompt)).toBe(false);
-    expect(/i{201,}/.test(userPrompt)).toBe(false); // prospectId is capped too
     expect(userPrompt).toContain("x".repeat(120)); // a 120-cap field is present
   });
 
-  it("matches capped ids back so a normal (short) id still round-trips", async () => {
+  it("drops a prospect with an abusively long id instead of truncating it", async () => {
+    const llm = okLlm({ "p-1": "Hi Jane", "p-2": "Hi Bob" });
+    const hugeId = "i".repeat(10000);
+
+    const out = await generateInviteDrafts(
+      [
+        { id: "p-1", name: "Jane" },
+        { id: hugeId, name: "Bob" },
+      ],
+      CTX,
+      { llm },
+    );
+
+    // The oversized-id prospect is excluded from the prompt (cost bounded)...
+    const userPrompt: string = (llm.generateJsonRobust as jest.Mock).mock
+      .calls[0][1];
+    expect(userPrompt).toContain("p-1");
+    expect(/i{201,}/.test(userPrompt)).toBe(false);
+    // ...and its id is never truncated/misassigned — only the valid one drafts.
+    expect(out.drafts).toEqual([{ prospectId: "p-1", message: "Hi Jane" }]);
+  });
+
+  it("preserves the id verbatim so a normal id round-trips", async () => {
     const llm = okLlm({ "p-1": "Hi there Jane" });
 
     const out = await generateInviteDrafts(
