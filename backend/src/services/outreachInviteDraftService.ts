@@ -164,6 +164,10 @@ const FIELD_CAPS = {
   name: 120,
   company: 120,
   title: 120,
+  // The prospectId is echoed into the prompt too (and matched back on the way
+  // out), so it needs a cap of its own — otherwise a caller can inflate cost
+  // through the id even though every descriptive field is bounded.
+  id: 200,
 } as const;
 
 /** Trim, then hard-cap a field's length so one caller can't inflate the prompt. */
@@ -222,6 +226,14 @@ export async function generateInviteDrafts(
     return { drafts: [], promptVersion: row.version, charLimit };
   }
 
+  // Cap the id up front so the value that goes INTO the prompt and the value we
+  // match responses back against are the same bounded string — capping only one
+  // side would silently drop every draft for an oversized id.
+  const capped = prospects.map((p) => ({
+    ...p,
+    id: capField(p.id, FIELD_CAPS.id),
+  }));
+
   const llm =
     deps.llm ??
     new LLMService(INVITE_MODEL, INVITE_TEMPERATURE, INVITE_MAX_TOKENS);
@@ -230,7 +242,7 @@ export async function generateInviteDrafts(
   try {
     raw = await llm.generateJsonRobust<LlmDraftsResponse>(
       buildSystemPrompt(row.systemPrompt, charLimit),
-      buildUserPrompt(prospects, ctx),
+      buildUserPrompt(capped, ctx),
     );
   } catch (err) {
     // eslint-disable-next-line no-console
@@ -247,8 +259,9 @@ export async function generateInviteDrafts(
     return { drafts: [], promptVersion: row.version, charLimit };
   }
 
-  // Only accept ids we asked for — a model can invent prospects.
-  const requested = new Set(prospects.map((p) => p.id));
+  // Only accept ids we asked for — a model can invent prospects. Match against
+  // the capped ids, i.e. exactly what the model was given.
+  const requested = new Set(capped.map((p) => p.id));
   const seen = new Set<string>();
   const drafts: InviteDraft[] = [];
 
