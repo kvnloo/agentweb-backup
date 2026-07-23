@@ -617,7 +617,7 @@ function buildPreviewsPop() {
   const head = `<div class="pmhead"><span>Running previews (${S.previews.length}${cap})</span></div>`;
   if (!S.previews.length) return head + '<div class="fmempty">No previews running.</div>';
   return head + S.previews.map((p) => {
-    const owner = p.owner ? `<span class="pvowner" title="owner">${esc(p.owner)}</span>` : '';
+    const owner = p.owner ? `<span class="pvowner" title="${esc(p.owner)}">${esc(p.owner.split(/\s+/)[0])}</span>` : '';
     const stale = p.stale ? `<span class="pvstale" title="branch has advanced past this preview — stale">⚠</span>` : '';
     const chat = `<a class="pvopen" href="#${encodeURIComponent(p.id)}" title="Open this task's chat">chat ↗</a>`;
     const refresh = (p.stale && !p.busy) ? `<button class="pvrefresh" data-refresh="${esc(p.id)}" title="Rebuild to the branch head">↻</button>` : '';
