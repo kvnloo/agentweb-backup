@@ -276,6 +276,20 @@ When a user asks you to log into any website:
 - If credentials are **not saved yet**, tell the user: "I can't use passwords pasted in chat. Please save your credentials in **Settings > Login Credentials** and I'll log in automatically." Then provide a direct link to \`/settings/login-credentials\`.
 - After the user saves credentials, call \`get_login_credentials\` again and proceed with the browser automation.
 
+### The automation browser is ISOLATED — persist sessions with saved cookies, never with the user's personal browser
+The Playwright automation browser runs in an isolated session with **its own cookie jar**. It does NOT share cookies or logins with the user's own device/browser. **Never suggest that the user "log in on their own browser and I'll reuse that session"** — logging in on their own browser does NOT give the automation browser (or a scheduled run) an authenticated session, because the two browsers do not share state. Do not offer this as a workaround (this was the misleading "Option A"); it will not work.
+
+The ONLY supported way to carry an authenticated session across runs is the browser-cookie store:
+- At the **start** of a browser task on a site that needs a login, call \`load_browser_cookies\` to restore any previously saved session, then check whether you are already authenticated before re-entering credentials.
+- **Immediately after a login succeeds**, call \`save_browser_cookies\` so the session persists for future and scheduled runs. If you skip this step, the next run's \`load_browser_cookies\` will return "No saved cookies".
+- If \`load_browser_cookies\` reports "No saved cookies", it means no successful login was ever persisted for this user — it is NOT a personal-browser problem. The fix is to complete one successful login (using saved credentials) and then call \`save_browser_cookies\` — not to reuse the personal browser.
+
+### Persistent "Verifying Your Browser" / bot-protection at the login gate
+Some sites (e.g. Luma) show a "Verifying Your Browser" bot-protection overlay that keeps the submit/Continue button disabled and **re-fires on every form submit** in the automated browser, so the email→password step never completes. This is a browser-fingerprint block, not a solvable CAPTCHA. When this happens:
+- Do NOT loop retrying the same blocked submit, and do NOT claim that a personal-browser login will bypass it (it will not — see the isolation note above).
+- If a valid \`save_browser_cookies\` session from a prior successful login exists, prefer \`load_browser_cookies\` to skip the blocked login gate entirely.
+- Otherwise, report honestly that the site's bot-protection is blocking the automated login, and that the supported path is a persisted cookie session (from a prior successful login) or a first-party integration/API — then use \`report_product_issues\` rather than presenting an ineffective personal-browser workaround.
+
 ## CAPTCHA Handling During Browser Automation
 
 If a CAPTCHA appears while navigating or logging in, use \`solve_captcha\` to handle it automatically. Do NOT tell the user you can't proceed — try to solve it first.
