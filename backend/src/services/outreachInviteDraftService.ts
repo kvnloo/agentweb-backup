@@ -149,14 +149,36 @@ function buildSystemPrompt(adminPrompt: string, charLimit: number): string {
   ].join("\n");
 }
 
+/**
+ * Per-field input caps. A LinkedIn invite is short and these fields are just
+ * personalization hints, so the model needs nowhere near a full name/company of
+ * unbounded length. Capping every field before it reaches the prompt bounds the
+ * input-token cost of the endpoint: without it an authenticated caller could
+ * POST 50 prospects (the batch cap) each carrying megabytes of text and drive
+ * arbitrarily large — and expensive — Bedrock requests.
+ */
+const FIELD_CAPS = {
+  brand: 120,
+  icp: 200,
+  specs: 500,
+  name: 120,
+  company: 120,
+  title: 120,
+} as const;
+
+/** Trim, then hard-cap a field's length so one caller can't inflate the prompt. */
+function capField(value: string | undefined, max: number): string {
+  return (value ?? "").trim().slice(0, max);
+}
+
 function buildUserPrompt(
   prospects: InviteProspect[],
   ctx: InviteDraftContext,
 ): string {
   const lines: string[] = [];
-  const brand = (ctx.brandName ?? "").trim();
-  const icp = (ctx.icpName ?? "").trim();
-  const specs = (ctx.specs ?? "").trim();
+  const brand = capField(ctx.brandName, FIELD_CAPS.brand);
+  const icp = capField(ctx.icpName, FIELD_CAPS.icp);
+  const specs = capField(ctx.specs, FIELD_CAPS.specs);
 
   lines.push("Sender context:");
   lines.push(`- Brand: ${brand || "(not provided)"}`);
@@ -170,10 +192,10 @@ function buildUserPrompt(
   for (const p of prospects) {
     const bits = [
       `prospectId: ${p.id}`,
-      `name: ${(p.name ?? "").trim() || "(unknown)"}`,
+      `name: ${capField(p.name, FIELD_CAPS.name) || "(unknown)"}`,
     ];
-    const company = (p.company ?? "").trim();
-    const title = (p.title ?? "").trim();
+    const company = capField(p.company, FIELD_CAPS.company);
+    const title = capField(p.title, FIELD_CAPS.title);
     if (company) bits.push(`company: ${company}`);
     if (title) bits.push(`title: ${title}`);
     lines.push(`- ${bits.join(", ")}`);

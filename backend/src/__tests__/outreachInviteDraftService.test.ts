@@ -255,4 +255,25 @@ describe("generateInviteDrafts", () => {
     expect(out.drafts).toEqual([]);
     expect(llm.generateJsonRobust).not.toHaveBeenCalled();
   });
+
+  it("caps oversized context + prospect fields so one caller can't inflate the prompt", async () => {
+    const llm = okLlm({ big: "Hi there" });
+    const huge = "x".repeat(10000);
+
+    await generateInviteDrafts(
+      [{ id: "big", name: huge, company: huge, title: huge }],
+      { brandName: huge, icpName: huge, specs: huge },
+      { llm },
+    );
+
+    // The whole user prompt is bounded (all caps + labels), nowhere near the
+    // ~60k chars an uncapped 6-field blow-up would produce.
+    const userPrompt: string = (llm.generateJsonRobust as jest.Mock).mock
+      .calls[0][1];
+    expect(userPrompt.length).toBeLessThan(2000);
+    // No single run of the padding survives past its field cap (500 = specs, the
+    // largest cap).
+    expect(/x{501,}/.test(userPrompt)).toBe(false);
+    expect(userPrompt).toContain("x".repeat(120)); // a 120-cap field is present
+  });
 });
