@@ -1,5 +1,6 @@
 import { FacebookAdsApi, User, AdAccount, Campaign, AdSet, AdCreative, Ad, CustomAudience } from 'facebook-nodejs-business-sdk';
 import axios from 'axios';
+import * as crypto from 'crypto';
 import { MetaAdAccount, MetaPage } from '../types/meta';
 import { INTEGRATION_CONFIG } from '../config/integrations';
 import { getMetaCredentials } from '../utils/secretsManager';
@@ -1962,6 +1963,127 @@ export class MetaService {
       return data;
     } catch (error) {
       return this.handleError(error, 'getDatasetEventStats');
+    }
+  }
+
+  /**
+   * Auto-resolve which Meta pixel a lander should use, from the site owner's already-connected
+   * Meta ad account (ENG-449). Uses `pixel.id` directly as the dataset id — Meta unified
+   * pixel + dataset in Graph v25, so the per-pixel `listDatasets` edge (broken, ENG-399) is
+   * never called at all.
+   *
+   * Never throws: an unconnected account, an ambiguous pixel/account set, or any Graph/
+   * credential error all resolve to `{ unresolved: true, reason }` so generation can proceed
+   * without tracking rather than fail outright (AC3 — fail loud, never fail generation).
+   *
+   * Imports `services/metaAccountCredentials` dynamically (not at module top level) because
+   * that module depends on `metaTokenRefresh.ts`, which already imports this file — a static
+   * top-level import here would be circular. Deferring to call time (same pattern already used
+   * in this file for `utils/metaApiFetch`) sidesteps it, since by the time this runs the whole
+   * module graph is already loaded.
+   */
+  public async resolveMetaPixelForUser(
+    user: any,
+    userId: string,
+  ): Promise<{ pixelId: string; accountId: string } | { unresolved: true; reason: string }> {
+    try {
+      const { getConnectedMetaAccountsList, getMetaAccountCredentials } = await import('./metaAccountCredentials');
+
+      const accounts = getConnectedMetaAccountsList(user);
+      if (accounts.length === 0) {
+        return { unresolved: true, reason: 'No Meta ad account connected' };
+      }
+      if (accounts.length > 1) {
+        return { unresolved: true, reason: 'Multiple Meta ad accounts connected — no default account to resolve a pixel from' };
+      }
+
+      const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, accounts[0].accountId);
+      const pixels = await this.listPixels(accountId, accessToken);
+
+      if (!pixels || pixels.length === 0) {
+        return { unresolved: true, reason: `No Meta pixel found on ad account ${accountId}` };
+      }
+      if (pixels.length > 1) {
+        return { unresolved: true, reason: `Ad account ${accountId} has ${pixels.length} pixels — ambiguous which to use` };
+      }
+
+      return { pixelId: pixels[0].id, accountId };
+    } catch (error: any) {
+      return { unresolved: true, reason: error?.message || 'Unknown error resolving Meta pixel' };
+    }
+  }
+
+  /**
+   * Server-side Meta Conversions API (CAPI) send (ENG-449). Fires a `Lead` event directly to
+   * Meta from our own trusted backend — never from a generated customer repo, which would
+   * require shipping an access token into code we push to a customer-owned deployment.
+   *
+   * `event_id` must match whatever the browser-side `fbq('track','Lead', {}, {eventID})` call
+   * used, so Meta dedups the two into one conversion (AC2).
+   *
+   * Sends even with no email/phone present (event_source_url + IP/UA alone still counts as a
+   * signal) — skipping would recreate the exact silent-undercounting bug this card exists to
+   * fix. Never throws: the lead save that already happened in the caller must not be affected
+   * by a Meta-side failure.
+   */
+  public async sendCapiLeadEvent(
+    pixelId: string,
+    accessToken: string,
+    event: {
+      eventId: string;
+      email?: string;
+      firstName?: string;
+      lastName?: string;
+      phone?: string;
+      clientIp?: string;
+      userAgent?: string;
+      sourceUrl?: string;
+    },
+  ): Promise<{ success: true; fbtraceId?: string } | { success: false; error: string }> {
+    try {
+      const sha256 = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
+
+      const userData: Record<string, any> = {};
+      if (event.email) userData.em = [sha256(event.email.trim().toLowerCase())];
+      if (event.phone) userData.ph = [sha256(event.phone.replace(/[^0-9]/g, ''))];
+      if (event.firstName) userData.fn = [sha256(event.firstName.trim().toLowerCase())];
+      if (event.lastName) userData.ln = [sha256(event.lastName.trim().toLowerCase())];
+      if (event.clientIp) userData.client_ip_address = event.clientIp;
+      if (event.userAgent) userData.client_user_agent = event.userAgent;
+
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
+      const url = `https://graph.facebook.com/${apiVersion}/${pixelId}/events`;
+      const body = {
+        access_token: accessToken,
+        data: [
+          {
+            event_name: 'Lead',
+            event_id: event.eventId,
+            event_time: Math.floor(Date.now() / 1000),
+            action_source: 'website',
+            event_source_url: event.sourceUrl,
+            user_data: userData,
+          },
+        ],
+      };
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data: any = await response.json();
+
+      if (!response.ok || data.error) {
+        const message = data?.error?.message || `CAPI send failed with HTTP ${response.status}`;
+        console.error(`[MetaService] sendCapiLeadEvent failed for pixel ${pixelId}: ${message}`);
+        return { success: false, error: message };
+      }
+
+      return { success: true, fbtraceId: data.fbtrace_id };
+    } catch (error: any) {
+      console.error(`[MetaService] sendCapiLeadEvent threw for pixel ${pixelId}: ${error?.message}`);
+      return { success: false, error: error?.message || 'Unknown error sending CAPI event' };
     }
   }
 }
