@@ -20,6 +20,7 @@ import { isDoNotContact } from '../utils/leadContactStatus';
 import { normalizeAttribution } from '../types/attribution';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
+import { metaService } from '../services/metaService';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -381,6 +382,12 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       customFields,
       attribution,
       utm,
+      // ENG-449: baked into the generated app/api/capture/route.ts (see buildCaptureRoute) —
+      // not spread through automatically, this handler destructures a fixed field list rather
+      // than `...req.body`, so these must be listed explicitly or they're silently dropped.
+      pixelId,
+      metaAccountId,
+      eventId,
     } = req.body;
 
     // Validate required field (email)
@@ -523,6 +530,35 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         leadId: lead.leadId,
         listId: leadList.listId
       });
+    }
+
+    // ENG-449: server-side Meta Conversions API send. Fire-and-forget (same pattern as the
+    // roadmap-delivery email below) — this must never delay or affect the lead-save response
+    // already sent above, and a Meta-side failure must never be surfaced as a lead-capture
+    // failure (the lead itself already saved successfully).
+    if (pixelId && metaAccountId && eventId) {
+      void (async () => {
+        try {
+          const owner = await userDb.getUserById(leadList.userId);
+          const { getMetaAccountCredentials } = await import('../services/metaAccountCredentials');
+          const { accessToken } = await getMetaAccountCredentials(owner, leadList.userId, metaAccountId);
+          const result = await metaService.sendCapiLeadEvent(pixelId, accessToken, {
+            eventId,
+            email: leadData.email,
+            firstName: leadData.firstName,
+            lastName: leadData.lastName,
+            phone: leadData.phone,
+            clientIp: req.ip,
+            userAgent: req.headers['user-agent'],
+            sourceUrl: req.headers['referer'],
+          });
+          if (!result.success) {
+            console.error(`[CAPI] Lead event send failed for pixel ${pixelId}: ${result.error}`);
+          }
+        } catch (err: any) {
+          console.error(`[CAPI] Unexpected error sending Lead event for pixel ${pixelId}: ${err?.message}`);
+        }
+      })();
     }
 
     // WORKAROUND (2026-06-04): deliver the AI Readiness roadmap PDF directly.
