@@ -20,6 +20,7 @@ import {
   promptRequestsLogo,
 } from './agentMode/brandLogo';
 import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
+import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
@@ -118,6 +119,39 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
   return undefined;
 }
 const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
+
+// Max output tokens for agent-mode LLM turns. Must be large enough to hold a
+// single big tool-call argument (e.g. create_html_file's content_draft, which
+// can be a 30-40K char / ~10-13K token HTML document). The previous 12384 cap
+// truncated such tool calls mid-argument; the provider then returned a tool_use
+// block with content_draft missing, which the gateway rejected as "Missing
+// required argument content_draft", looping until the anti-loop breaker tripped
+// (ENG-403). 32000 is within every supported Bedrock/Vertex Claude model's
+// output ceiling. Models only emit what they need, so raising the cap does not
+// increase normal-turn cost.
+export const AGENT_MODE_MAX_OUTPUT_TOKENS = 32000;
+
+// Max size of a NON-HTML content_draft that create_html_file will attempt to
+// render into HTML in a single internal LLM call. The render (llmService
+// generateHTML) has a hard 5-minute per-call Bedrock timeout, retried 3x — an
+// oversized rough draft can't finish inside that budget and burns ~15 min before
+// failing (ENG-472). Above this we fail fast with actionable guidance instead.
+// Already-complete HTML drafts bypass the render entirely (see
+// isCompleteHtmlDocument) and are NOT subject to this cap.
+export const CREATE_HTML_RENDER_MAX_DRAFT_CHARS = 60000;
+
+// A create_html_file content_draft that is already a complete HTML document does
+// not need the internal HTML-generation LLM call — re-rendering HTML->HTML is
+// wasted cost/latency, risks the model altering the user's content, and is the
+// exact case that deterministically times out on large drafts (ENG-472). Detect
+// a self-contained document: an opening doctype/<html> AND a closing </html>.
+export function isCompleteHtmlDocument(draft: string): boolean {
+  if (typeof draft !== 'string') return false;
+  const s = draft.trim().toLowerCase();
+  const hasOpen = s.startsWith('<!doctype html') || s.startsWith('<html') || s.includes('<html');
+  const hasClose = s.includes('</html>');
+  return hasOpen && hasClose;
+}
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { twitterService } from './twitterService';
@@ -1622,7 +1656,7 @@ export class AgentModeService {
 
                 const body: any = {
                   anthropic_version: 'vertex-2023-10-16',
-                  max_tokens: params.max_completion_tokens || 12384,
+                  max_tokens: params.max_completion_tokens || AGENT_MODE_MAX_OUTPUT_TOKENS,
                   messages: merged,
                 };
                 if (systemParts.length > 0) body.system = systemParts.join('\n');
@@ -1686,14 +1720,26 @@ export class AgentModeService {
                 }
 
                 const usage = data.usage || {};
+                // A max_tokens stop with a tool_use block means the tool call
+                // was truncated mid-argument (e.g. create_html_file's large
+                // content_draft), so its JSON is incomplete and would fail
+                // schema validation with a dropped required arg — the ENG-403
+                // "content_draft is required" retry loop. Do NOT surface it as a
+                // completed tool_calls finish; report finish_reason='length'
+                // with no tool_calls so the main loop's max-tokens continuation
+                // path asks the model to continue.
+                const truncatedToolCall = data.stop_reason === 'max_tokens' && !!toolCalls;
                 return {
                   choices: [{
                     message: {
                       role: 'assistant',
                       content: messageContent || null,
-                      ...(toolCalls && { tool_calls: toolCalls }),
+                      ...(toolCalls && !truncatedToolCall && { tool_calls: toolCalls }),
                     },
-                    finish_reason: data.stop_reason === 'tool_use' ? 'tool_calls' : 'stop',
+                    finish_reason: data.stop_reason === 'max_tokens'
+                      ? 'length'
+                      : (data.stop_reason === 'tool_use' ? 'tool_calls' : 'stop'),
+                    stop_reason: data.stop_reason,
                   }],
                   usage: {
                     prompt_tokens: usage.input_tokens || 0,
@@ -1828,7 +1874,7 @@ export class AgentModeService {
               messages,
               ...(toolConfig && { toolConfig }),
               inferenceConfig: {
-                maxTokens: params.max_completion_tokens || 12384,
+                maxTokens: params.max_completion_tokens || AGENT_MODE_MAX_OUTPUT_TOKENS,
                 ...(params.temperature !== undefined && { temperature: params.temperature }),
               },
             });
@@ -1880,6 +1926,15 @@ export class AgentModeService {
 
             const stopReason: string = response.stopReason || '';
 
+            // A max_tokens stop with a tool_use block means the tool call was
+            // truncated mid-argument (e.g. create_html_file's content_draft),
+            // so its JSON is incomplete and would fail schema validation with a
+            // dropped required arg — the ENG-403 "content_draft is required"
+            // retry loop. Do NOT surface it as a completed tool_calls finish;
+            // report finish_reason='length' with no tool_calls so the main
+            // loop's max-tokens continuation path asks the model to continue.
+            const truncatedToolCall = stopReason === 'max_tokens' && !!toolCalls;
+
             // Convert response to OpenAI format
             return {
               id: `bedrock-${Date.now()}`,
@@ -1891,9 +1946,9 @@ export class AgentModeService {
                 message: {
                   role: 'assistant',
                   content: messageContent,
-                  tool_calls: toolCalls,
+                  tool_calls: truncatedToolCall ? null : toolCalls,
                 },
-                finish_reason: toolCalls ? 'tool_calls' : (stopReason === 'max_tokens' ? 'length' : 'stop'),
+                finish_reason: stopReason === 'max_tokens' ? 'length' : (toolCalls ? 'tool_calls' : 'stop'),
                 stop_reason: stopReason || (toolCalls ? 'tool_use' : 'end_turn'),
               }],
               usage: {
@@ -2227,6 +2282,77 @@ export class AgentModeService {
       }
     }
     return blocks.length > 0 ? blocks : [{ type: 'text', text: '.' }];
+  }
+
+  /** Media types the Anthropic Messages / Bedrock Converse vision APIs decode natively. */
+  private static readonly VISION_NATIVE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+  /**
+   * Ensure an image buffer is in a format the vision APIs can actually decode, and
+   * that the returned content-type matches the real bytes (ENG-370).
+   *
+   * Uploaded logos frequently arrive as either (a) a format Claude/Bedrock cannot
+   * read — HEIC, AVIF, TIFF, BMP, SVG — or (b) a supported format mislabeled by S3
+   * with a generic/incorrect content-type (commonly `application/octet-stream` when
+   * the browser omits it). Both used to fail silently: the downstream block
+   * converters relabel an unknown type to `image/jpeg` WITHOUT re-encoding, so the
+   * declared media type no longer matches the bytes and the API returns 400; and a
+   * non-`image/*` content-type produced a data URI the `image/` regex dropped
+   * entirely, so the model never saw the image. describe_image would then burn many
+   * retries/workarounds and still fail.
+   *
+   * This decodes the actual bytes with sharp: if they are already a native format it
+   * just corrects the label (no re-encode); otherwise it re-encodes to PNG so the
+   * bytes always match a supported media type. Animated inputs (animated AVIF/HEIC)
+   * re-encode to their first frame — enough to describe a logo.
+   *
+   * On a decode failure it returns the input unchanged (best effort) but sets
+   * `undecodable: true` so the caller can fast-fail with re-upload guidance instead
+   * of burning vision retries on bytes no vision API can read either (ENG-370).
+   */
+  private static async normalizeImageForVision(
+    buffer: Buffer,
+    contentType: string
+  ): Promise<{ buffer: Buffer; contentType: string; undecodable?: boolean; detectedFormat?: string }> {
+    let ct = (contentType || '').toLowerCase().trim();
+    if (ct === 'image/jpg') ct = 'image/jpeg';
+    if (AgentModeService.VISION_NATIVE_MEDIA_TYPES.has(ct)) {
+      return { buffer, contentType: ct };
+    }
+    try {
+      const sharp = (await import('sharp')).default;
+      const metadata = await sharp(buffer).metadata();
+      const sharpFormatToMedia: Record<string, string> = {
+        jpeg: 'image/jpeg',
+        png: 'image/png',
+        gif: 'image/gif',
+        webp: 'image/webp',
+      };
+      const detected = metadata.format ? sharpFormatToMedia[metadata.format] : undefined;
+      if (detected) {
+        // Bytes are already vision-native; only the content-type header was wrong/missing.
+        return { buffer, contentType: detected, detectedFormat: metadata.format };
+      }
+      // Genuinely unsupported encoding (heic/heif/avif/tiff/bmp/svg/...). Convert to PNG.
+      // sharp(buffer) reads only the first frame by default, so animated inputs
+      // collapse to a single describable frame here (no `{ animated: true }`).
+      const png = await sharp(buffer).png().toBuffer();
+      console.log(
+        `AgentMode: normalizeImageForVision converted "${ct || 'unknown'}" (sharp format "${metadata.format}") to image/png, ${png.length} bytes`
+      );
+      return { buffer: png, contentType: 'image/png', detectedFormat: metadata.format };
+    } catch (err) {
+      console.error(
+        'AgentMode: normalizeImageForVision failed to decode/convert image; using original:',
+        err instanceof Error ? err.message : err
+      );
+      // sharp could not decode the bytes at all — a corrupt file or a codec even
+      // sharp lacks. The vision APIs decode a strict subset of what sharp handles,
+      // so they cannot read it either. Flag it undecodable so the caller fast-fails.
+      // Only fall back to a native default when we have no usable label at all, so a
+      // missing/empty content-type never yields a `data:;base64,...` URI (ENG-370).
+      return { buffer, contentType: contentType || 'image/png', undecodable: true };
+    }
   }
 
   private llmModels: Record<string, LLMModelConfig> = {
@@ -2606,12 +2732,18 @@ export class AgentModeService {
     isCancelled?: () => boolean,
     excludeTools?: string[],
     screenshotUrl?: string,
-    isDelegatedAccess: boolean = false
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean }> {
+    isDelegatedAccess: boolean = false,
+    persistIncrementally: boolean = false
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; persistedResponseCount?: number }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
     let _toolCallsForTelemetry: any[] = [];
+    // ENG-473: count of response messages (assistant/tool, in `messages.slice(initialMessageCount)`
+    // order) already persisted to the session by incremental checkpointing. Hoisted so the catch
+    // block can skip them when persisting partial-usage messages (no double-count) and so the final
+    // batch in the controller can persist only the un-checkpointed tail.
+    let _persistedResponseCount = 0;
     const agentRuntimeRunId = buildAgentRuntimeRunId(sessionId);
     recordAgentModeRunStarted(agentRuntimeRunId, {
       llmModel,
@@ -2847,6 +2979,37 @@ export class AgentModeService {
       _messages = messages;
       _initialMessageCount = initialMessageCount;
 
+      // ENG-473 incremental checkpointing state. `persistedResponseCount` tracks how many
+      // response messages have been written to the session so far; `checkpointingActive`
+      // is cleared if a checkpoint write ever fails so the final batch (not a retry loop)
+      // persists the remainder. Only used when `persistIncrementally` is set by the caller.
+      let persistedResponseCount = 0;
+      let checkpointingActive = persistIncrementally;
+      const flushCheckpoint = async () => {
+        if (!checkpointingActive) return;
+        try {
+          const { toPersist, newPersistedCount } = computeCheckpointBatch(
+            messages,
+            initialMessageCount,
+            persistedResponseCount
+          );
+          if (toPersist.length > 0) {
+            await chatbotDb.addMessagesToSession(sessionId, toPersist);
+            persistedResponseCount = newPersistedCount;
+            _persistedResponseCount = newPersistedCount;
+          }
+        } catch (checkpointErr) {
+          // Best-effort: a persistence failure must never abort the run. Stop
+          // checkpointing and leave the cursor where it is so the controller's
+          // final batch persists everything from here (no gap, no duplicate).
+          console.error(
+            `AgentMode: incremental checkpoint persist failed for session ${sessionId} — deferring the rest to the final batch:`,
+            checkpointErr
+          );
+          checkpointingActive = false;
+        }
+      };
+
       // Per-run media-generation time budget. A work-plan step that generates many
       // images (e.g. LinkedIn Ads "Generate 3 Images Per Hook" = 18 images) runs them
       // sequentially and can exceed the controller's hard wall-clock timeout
@@ -2945,6 +3108,9 @@ export class AgentModeService {
             const delta = messages.length - preUpdateLen;
             if (delta !== 0) {
               initialMessageCount += delta;
+              // Keep the hoisted copy in sync so the catch-block partial-usage slice
+              // and the incremental checkpoint cursor share one boundary (ENG-473).
+              _initialMessageCount = initialMessageCount;
             }
 
             // Invalidate tools cache
@@ -2954,6 +3120,15 @@ export class AgentModeService {
             console.error('Error refreshing skill context:', error);
           }
         }
+
+        // ENG-473: checkpoint everything produced by PRIOR iterations before this
+        // iteration's LLM call. At this point the current turn's assistant/tool
+        // messages do not exist yet, so only fully-settled turns are flushed — the
+        // in-flight turn (where late mutations like suggestion chips land) is never
+        // checkpointed and stays owned by the controller's final batch. A hard kill
+        // during this iteration therefore leaves every completed prior turn visible
+        // instead of a silent zero-output session.
+        await flushCheckpoint();
 
         if (onProgress) {
           onProgress({
@@ -3015,7 +3190,7 @@ export class AgentModeService {
           response = await this.callLLM(llmModel, trimmedMessages, {
             tools: filteredToolsCache,
             tool_choice: 'auto',
-            max_completion_tokens: 12384,
+            max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
             temperature: 0.1,
             usageContext: { userId, sessionId, feature: 'agent_task' }
           });
@@ -3037,7 +3212,7 @@ export class AgentModeService {
               response = await this.callLLM(llmModel, trimmedMessages, {
                 tools: filteredToolsCache,
                 tool_choice: 'auto',
-                max_completion_tokens: 12384,
+                max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
                 temperature: 0.1,
                 usageContext: { userId, sessionId, feature: 'agent_task' }
               });
@@ -3130,6 +3305,26 @@ export class AgentModeService {
         // Check stop reason to determine next action
         const finishReason = response.choices[0]?.finish_reason;
         const stopReason = response.choices[0]?.stop_reason;
+
+        // Provider-agnostic truncated-tool-call guard (ENG-403).
+        // When a turn is cut off by the output-token limit mid-tool-call, the
+        // tool_calls JSON is incomplete (e.g. create_html_file's content_draft is
+        // sliced off), so executing it fails schema validation with a dropped
+        // required arg and the model retries identically — the "content_draft is
+        // required" loop. The Bedrock/Vertex adapters already null their tool_calls
+        // and report finish_reason='length' on max_tokens; the raw OpenAI-SDK paths
+        // (Azure gpt-*, Gemini OpenAI-compat — the DEFAULT agent model) instead
+        // return finish_reason='length' with the partial tool_calls still attached.
+        // Drop them here so the truncated turn falls through to the bounded
+        // max-tokens continuation path below (which asks the model to continue)
+        // instead of executing a broken call. responseMessage was already pushed
+        // into `messages` by reference above, so this also removes the dangling
+        // tool_use from history — required, else the next request would be a
+        // malformed assistant tool_calls turn with no matching tool results.
+        if (finishReason === 'length' && responseMessage.tool_calls?.length) {
+          console.warn(`AgentMode: Dropping ${responseMessage.tool_calls.length} truncated tool call(s) (finish_reason=length) in session ${sessionId}; routing to max-tokens continuation`);
+          delete responseMessage.tool_calls;
+        }
 
         if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
           // No tool calls — check WHY the model stopped
@@ -3582,6 +3777,9 @@ export class AgentModeService {
         knowledgeBaseQueries,
         sources,
         responseMessages,
+        // ENG-473: how many of `responseMessages` were already written by incremental
+        // checkpointing so the controller's final batch persists only the remaining tail.
+        persistedResponseCount,
         ...(wasCancelled ? { cancelled: true } : {}),
         ...(truncatedByStepBudget ? { truncatedByStepBudget: true } : {}),
         ...(backupModelUsed ? { backupModelUsed: true, originalModel: originalLlmModel, backupModel: llmModel } : {})
@@ -3621,8 +3819,16 @@ export class AgentModeService {
 
       // Extract partial usage from any response messages accumulated before the error.
       // This ensures token costs are tracked even when generation fails mid-stream.
+      // ENG-473: drop the response messages already written by incremental checkpointing
+      // FIRST (addMessagesToSession already counted their tokens), then keep the
+      // usage-bearing remainder — so a mid-stream failure never double-counts tokens for
+      // a message that was checkpointed.
       const partialResponseMessages = _messages
-        ? _messages.slice(_initialMessageCount).filter((msg: any) => msg.role !== 'user' && msg.usage)
+        ? _messages
+            .slice(_initialMessageCount)
+            .filter((msg: any) => msg.role !== 'user')
+            .slice(_persistedResponseCount)
+            .filter((msg: any) => msg.usage)
         : [];
 
       // Preserve original error details for upstream error classification (e.g. isContextLimitError)
@@ -6517,11 +6723,35 @@ export class AgentModeService {
           const { presignS3Url, isS3Url } = await import('../utils/s3Utils');
           const fetchUrl = isS3Url(imageUrl) ? (presignS3Url(imageUrl) ?? imageUrl) : imageUrl;
           const imgResp = await axios.get<ArrayBuffer>(fetchUrl, { responseType: 'arraybuffer', timeout: 30000 });
-          // Normalize content-type: strip any charset/extra params and trim whitespace
-          const rawContentType = (imgResp.headers['content-type'] || 'image/png').split(';')[0].trim();
-          const contentType = rawContentType || 'image/png';
+          // Normalize content-type: strip any charset/extra params and trim whitespace.
+          // Do NOT default a missing/empty header to a native type here — that would
+          // short-circuit sharp detection and embed non-PNG bytes as image/png (ENG-370).
+          // Pass the raw/empty type through so normalizeImageForVision decodes via sharp.
+          const contentType = (imgResp.headers['content-type'] || '').split(';')[0].trim();
           let imageBuffer = Buffer.from(imgResp.data as ArrayBuffer);
           let finalContentType = contentType;
+          // Normalize to a vision-decodable format so the declared media type always
+          // matches the bytes. Fixes HEIC/AVIF/TIFF/BMP/SVG logos and mislabeled or
+          // octet-stream content-types that otherwise fail silently downstream (ENG-370).
+          const normalized = await AgentModeService.normalizeImageForVision(imageBuffer, contentType);
+          if (normalized.undecodable) {
+            // sharp could not decode these bytes, so no vision API can either.
+            // Fast-fail with actionable re-upload guidance instead of burning vision
+            // retries and agent workarounds on an unreadable file (ENG-370).
+            console.warn(
+              `AgentMode: describeImage could not decode uploaded image (content-type "${contentType || 'none'}"); fast-failing with re-upload guidance`
+            );
+            return {
+              success: false,
+              retryable: false,
+              message:
+                `The uploaded file could not be read as an image${contentType ? ` (its content type was "${contentType}")` : ''} — ` +
+                'it may be corrupted or in a format that cannot be decoded. Please re-upload the logo as a PNG or JPEG and try again.',
+              error: 'Image could not be decoded',
+            };
+          }
+          imageBuffer = normalized.buffer;
+          finalContentType = normalized.contentType;
           // Auto-resize if image exceeds 4MB to stay under Bedrock's 5MB limit
           if (imageBuffer.length > 4 * 1024 * 1024) {
             try {
@@ -6610,9 +6840,16 @@ export class AgentModeService {
 
     } catch (error) {
       console.error('AgentMode: Error describing image:', error);
+      // This is a catch-all: besides bad image bytes it also receives transient
+      // network/provider failures that escaped the vision-call fallback flow. Do
+      // NOT hard-code retryable:false here (that would make the agent give up on a
+      // request that could succeed on retry) and do not assert the file itself is
+      // the problem — only the undecodable-bytes fast-fail above is truly terminal.
       return {
         success: false,
-        message: 'Failed to analyze image. Please check that the URL is accessible and contains a valid image.',
+        message:
+          'Failed to analyze the image. It may be temporarily unavailable, inaccessible, or in a ' +
+          'format that cannot be read. If it is a logo file, try re-uploading it as a PNG or JPEG.',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
@@ -23856,6 +24093,46 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       }
 
       const isEmail = documentType === 'email';
+
+      // ENG-472 #1 — Passthrough: when the draft is already a complete HTML
+      // document, skip the internal render LLM call and upload it verbatim.
+      // Re-rendering HTML->HTML wastes an expensive call, risks the model
+      // altering the content, and is exactly what times out on large drafts.
+      // Email is excluded: the email render applies email-client-safety
+      // transforms (table layout, inline styles) that a generic HTML document
+      // may lack, so emails always go through the render path.
+      if (!isEmail && isCompleteHtmlDocument(contentDraft)) {
+        console.log('AgentMode: create_html_file — draft is already complete HTML, uploading directly (skipping render)');
+        const { uploadFileToS3 } = await import('../utils/s3Utils');
+        const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
+        const uploadResult = await uploadFileToS3(contentDraft, filename, userId, 'text/html');
+        if (!uploadResult.success || !uploadResult.url) {
+          throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+        }
+        return {
+          success: true,
+          s3_url: uploadResult.url,
+          filename,
+          title,
+          document_type: documentType,
+          rendered: false,
+          message: 'HTML file created successfully'
+        };
+      }
+
+      // ENG-472 #2 — Fail fast: a draft that must be rendered but is larger than
+      // the render step can finish inside its 5-minute per-call budget would burn
+      // ~15 minutes across retries before failing. Return actionable guidance
+      // immediately instead. (Complete-HTML drafts already returned above and are
+      // not size-limited.)
+      if (contentDraft.length > CREATE_HTML_RENDER_MAX_DRAFT_CHARS) {
+        console.warn(`AgentMode: create_html_file — draft too large to render in one file (${contentDraft.length} chars > ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS})`);
+        return {
+          success: false,
+          message: 'Draft too large to render into a single HTML file',
+          error: `content_draft is too large to render into one HTML file in a single pass (${contentDraft.length} characters, limit ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS}). Either provide the draft as a complete, self-contained HTML document (which is saved directly without limit), or split it into smaller sections and create multiple files.`
+        };
+      }
 
       // Use Claude model by default (check for Claude in model name)
       const defaultClaudeModel = 'anthropic.claude-sonnet-4-6';

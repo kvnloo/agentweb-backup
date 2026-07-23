@@ -16,6 +16,8 @@ jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     updateSessionSatisfactionScore: jest.fn().mockResolvedValue({}),
     updateSessionJudgeScore: jest.fn().mockResolvedValue({}),
+    addMessageToSession: jest.fn().mockResolvedValue({}),
+    updateSessionError: jest.fn().mockResolvedValue({}),
   },
 }));
 
@@ -28,6 +30,8 @@ jest.mock('../services/settingsService', () => ({
 const mockCallLLM = agentModeService.callLLM as jest.MockedFunction<typeof agentModeService.callLLM>;
 const mockUpdateScore = chatbotDb.updateSessionSatisfactionScore as jest.Mock;
 const mockUpdateJudgeScore = chatbotDb.updateSessionJudgeScore as jest.Mock;
+const mockAddMessage = chatbotDb.addMessageToSession as jest.Mock;
+const mockUpdateError = chatbotDb.updateSessionError as jest.Mock;
 
 function makeLLMResponse(score: number, reason: string, dimensions?: object) {
   return {
@@ -222,6 +226,42 @@ describe('SessionScoring - sessions with an assistant turn score normally', () =
     expect(result?.score).toBe(5);
     expect(mockCallLLM).toHaveBeenCalledTimes(1);
     expect(mockUpdateScore).toHaveBeenCalledTimes(1);
+  });
+
+  // ENG-473 (A + backstop partition): a run that crashed mid-flight but had already
+  // persisted partial output via incremental checkpointing now carries a REAL assistant
+  // turn. It must be scored on its merits by the judge — NOT re-classified as a zero-output
+  // failed run and NOT annotated with a "please retry" notice. The surfaceFailedRun backstop
+  // only fires for runs that died before ANY settled turn (hasAssistantTurn === false).
+  it('scores a stale partial-output run (checkpoint-persisted) on its merits and does NOT surface it as a failed run', async () => {
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse(3, 'partial', { goalCompletion: 3, dataAccuracy: 4, outputQuality: 3 })
+    );
+
+    const session = {
+      sessionId: 'partial-persisted-1',
+      userId: 'u1',
+      sessionType: 'regular',
+      messages: [
+        { role: 'user', content: 'Draft the campaign.' },
+        // Iteration 1 completed and was checkpoint-persisted before the process was killed.
+        { role: 'assistant', content: 'Drafted the first ad set...', metadata: { toolCalls: [{ name: 'create_html_file' }] } } as any,
+        { role: 'tool', content: 'file created' } as any,
+      ],
+      messageCount: 3,
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    expect(result).not.toBeNull();
+    expect(result?.score).toBe(3);
+    // Scored by the judge on the partial transcript...
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    // ...and NOT double-annotated by the failed-run backstop.
+    expect(mockUpdateError).not.toHaveBeenCalled();
+    expect(mockAddMessage).not.toHaveBeenCalled();
   });
 
   // This shape (ends in tool result, RECENT) is mid-loop — must be deferred, not scored.
@@ -427,5 +467,182 @@ describe('SessionScoring - sessions with an assistant turn score normally', () =
     expect(result?.judgeName).toBe('Test Judge');
     expect(mockCallLLM).toHaveBeenCalledTimes(1);
     expect(mockUpdateJudgeScore).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('SessionScoring - surfacing silent dead runs (ENG-473)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  // A regular (non-scheduled) interactive run whose owning process died mid-run
+  // (OOM/SIGKILL). Only the system + user prompt were persisted; no assistant
+  // reply, no tokens. Previously left as a silent dead chat with no explanation.
+  const regularTurnless: ChatMessage[] = [
+    { role: 'system', content: 'You are EMMA.' } as any,
+    { role: 'user', content: 'Draft a Meta lead-gen campaign.' },
+  ];
+
+  it('leaves a user-facing retry note + diagnostic error on a stale regular dead run', async () => {
+    const session = {
+      sessionId: 'dead-regular-1',
+      userId: 'u1',
+      sessionType: 'regular',
+      pageIdentifier: 'agent-mode',
+      messages: [...regularTurnless],
+      messageCount: regularTurnless.length,
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    // Still scored as a deterministic failed run (no LLM call).
+    expect(result?.score).toBe(1);
+    expect(mockCallLLM).not.toHaveBeenCalled();
+
+    // Silent dead session becomes visible: one user-facing assistant note...
+    expect(mockAddMessage).toHaveBeenCalledTimes(1);
+    const [sid, msg] = mockAddMessage.mock.calls[0];
+    expect(sid).toBe('dead-regular-1');
+    expect(msg.role).toBe('assistant');
+    expect(msg.content).toMatch(/didn't finish|send your message again|retry/i);
+    expect(msg.metadata.isRunFailureNotice).toBe(true);
+    expect(msg.metadata.isErrorMessage).toBe(true);
+
+    // ...and a diagnostic error field, mirroring the scheduled reconciler.
+    expect(mockUpdateError).toHaveBeenCalledTimes(1);
+    expect(mockUpdateError.mock.calls[0][0]).toBe('dead-regular-1');
+    // The persisted reason must be the FAILED_RUN_REASON diagnostic, not a placeholder.
+    expect(mockUpdateError.mock.calls[0][1]).toMatch(/crashed or timed out|failed run/i);
+  });
+
+  it('does NOT surface a note while the turn-less run is still in-flight (recent)', async () => {
+    const session = {
+      sessionId: 'inflight-regular-1',
+      userId: 'u1',
+      sessionType: 'regular',
+      messages: [...regularTurnless],
+      messageCount: regularTurnless.length,
+      createdAt: RECENT(),
+      updatedAt: RECENT(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    expect(result).toBeNull();
+    expect(mockAddMessage).not.toHaveBeenCalled();
+    expect(mockUpdateError).not.toHaveBeenCalled();
+  });
+
+  it('is idempotent — never double-adds the note when one is already present', async () => {
+    const nowIso = new Date().toISOString();
+    const session = {
+      sessionId: 'dead-regular-2',
+      userId: 'u1',
+      sessionType: 'regular',
+      messages: [
+        ...regularTurnless,
+        {
+          role: 'assistant',
+          content: "This run didn't finish — please retry.",
+          metadata: { isErrorMessage: true, isRunFailureNotice: true, timestamp: nowIso },
+        } as any,
+      ],
+      messageCount: 3,
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    // The pre-existing notice must NOT count as a real assistant turn: the run is
+    // still classified as a deterministic failed run (no LLM), and no duplicate
+    // note or error write is issued.
+    expect(result?.score).toBe(1);
+    expect(mockCallLLM).not.toHaveBeenCalled();
+    expect(mockAddMessage).not.toHaveBeenCalled();
+    expect(mockUpdateError).not.toHaveBeenCalled();
+  });
+
+  it('swallows a persistence failure while surfacing the note — scoring still succeeds', async () => {
+    // The annotation is best-effort: if addMessageToSession (or updateSessionError)
+    // rejects, the failure must be logged and NOT propagated — the session is still
+    // scored 1/5 and that score is still persisted.
+    mockAddMessage.mockRejectedValueOnce(new Error('boom'));
+    mockUpdateError.mockRejectedValueOnce(new Error('boom'));
+    const session = {
+      sessionId: 'dead-regular-persist-fail-1',
+      userId: 'u1',
+      sessionType: 'regular',
+      messages: [...regularTurnless],
+      messageCount: regularTurnless.length,
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    // Persistence failure is swallowed, not propagated.
+    expect(result?.score).toBe(1);
+    expect(mockCallLLM).not.toHaveBeenCalled();
+    expect(mockUpdateScore).toHaveBeenCalledTimes(1);
+  });
+
+  it('self-heals a partial write: a first-pass error-write failure is retried and written on a later pass', async () => {
+    // Greptile P1: the notice is the idempotency marker, so it must only be
+    // persisted AFTER the diagnostic error write succeeds. Here the FIRST pass's
+    // updateSessionError throws — because it runs before the notice, no notice is
+    // left behind, so nothing suppresses a retry and the error is written next pass.
+    mockUpdateError.mockRejectedValueOnce(new Error('ddb throttled'));
+    const session = {
+      sessionId: 'dead-regular-selfheal-1',
+      userId: 'u1',
+      sessionType: 'regular',
+      messages: [...regularTurnless],
+      messageCount: regularTurnless.length,
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    // Pass 1 — the error write throws; crucially NO notice is persisted, so the
+    // run is not falsely marked as already-surfaced.
+    const r1 = await scoreSessionIfNeeded(session);
+    expect(r1?.score).toBe(1);
+    expect(mockAddMessage).not.toHaveBeenCalled();
+    expect(session.messages).toHaveLength(regularTurnless.length);
+
+    // Pass 2 — the error write now succeeds; the annotation is retried and completes.
+    const r2 = await scoreSessionIfNeeded(session);
+    expect(r2?.score).toBe(1);
+    // The diagnostic error was NOT permanently suppressed — it is written on retry.
+    expect(mockUpdateError).toHaveBeenCalledTimes(2);
+    expect(mockUpdateError.mock.calls[1][1]).toMatch(/crashed or timed out|failed run/i);
+    // ...and the user-facing notice lands exactly once, on the successful pass.
+    expect(mockAddMessage).toHaveBeenCalledTimes(1);
+    expect(mockAddMessage.mock.calls[0][1].metadata.isRunFailureNotice).toBe(true);
+  });
+
+  it('does NOT surface a note on a healthy run that produced a real assistant reply', async () => {
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse(5, 'great', { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 })
+    );
+    const session = {
+      sessionId: 'healthy-1',
+      userId: 'u1',
+      sessionType: 'regular',
+      messages: [
+        ...regularTurnless,
+        { role: 'assistant', content: 'Here is your campaign draft.' } as any,
+      ],
+      messageCount: 3,
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    await scoreSessionIfNeeded(session);
+
+    expect(mockAddMessage).not.toHaveBeenCalled();
+    expect(mockUpdateError).not.toHaveBeenCalled();
   });
 });
