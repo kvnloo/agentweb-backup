@@ -353,12 +353,13 @@ export function buildAnswerAcknowledgement(question: PendingUserQuestion): strin
 export function buildReaskDirective(question: PendingUserQuestion): string {
   return (
     `[The user typed a message instead of clicking the "${question.question}" card, so that ` +
-    `question is NOT answered. If their message clearly points to one of the options, ACKNOWLEDGE ` +
-    `it in one short line and ask them to tap it — e.g. "Sounds like you want <that option> — tap ` +
-    `it below to lock it in." Also handle anything else they asked. But do NOT treat the text as ` +
-    `the answer and do NOT resolve it yourself: re-emit THAT SAME question ("${question.question}") ` +
-    `as a fresh ask_user_question card and wait for an explicit click. Take no action that depends ` +
-    `on this answer until they click an option.]`
+    `question is NOT answered. Re-emit THAT SAME question ("${question.question}") as a fresh ` +
+    `ask_user_question card. If their message clearly points to one option, put the acknowledgment ` +
+    `in that card's \`intro\` field (NOT as separate prose — free text next to a card is hidden), ` +
+    `e.g. intro: "Sounds like you want <that option> — tap it below to lock it in (it's permanent)." ` +
+    `Also handle anything else they asked. Do NOT treat the typed message as the answer and do NOT ` +
+    `resolve it yourself; wait for an explicit click, and take no action that depends on this answer ` +
+    `until they click an option.]`
   );
 }
 
