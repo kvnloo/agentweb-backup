@@ -27,8 +27,152 @@ import express from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { searchProspectsPreview } from "../services/outreachProspectPreviewService";
 import { saveOutreachProspects } from "../services/outreachOnboardingSaveService";
+import { getOutreachInvitePrompt } from "../services/outreachInvitePromptService";
+import {
+  generateInviteDrafts,
+  DEFAULT_INVITE_CHAR_LIMIT,
+} from "../services/outreachInviteDraftService";
 
 const router = express.Router();
+
+/**
+ * GET /api/onboarding/outreach/invite-template
+ *
+ * Returns the admin-editable variant pool the onboarding "review your drafts"
+ * step uses for its INSTANT pre-fill (AC #1) — deterministic interpolation, no
+ * LLM, so textareas are never empty while the model is still thinking. The
+ * LLM upgrade then arrives via POST /outreach/draft-invites below.
+ *
+ * The system prompt is deliberately NOT returned here: it is only ever
+ * composed server-side, so there is no reason to ship it to every onboarding
+ * user. Admins edit it at `/api/admin/prompt-templates/outreach/invite`.
+ *
+ * Never fails the flow: the service degrades to its seed constants if
+ * DynamoDB is unreachable, and the FE has its own built-in fallback pool.
+ *
+ * Response (200)
+ *   { withCompanyVariants: string[], withoutCompanyVariants: string[],
+ *     version: string }
+ */
+router.get("/outreach/invite-template", authenticateToken, async (req, res) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    if (!authReq.user?.userId) {
+      return res.status(401).json({ message: "User not authenticated" });
+    }
+    const row = await getOutreachInvitePrompt();
+    return res.status(200).json({
+      withCompanyVariants: row.withCompanyVariants,
+      withoutCompanyVariants: row.withoutCompanyVariants,
+      version: row.version,
+    });
+  } catch (err: any) {
+    // eslint-disable-next-line no-console
+    console.error("[onboarding/outreach/invite-template] error:", err);
+    return res
+      .status(500)
+      .json({ message: err?.message ?? "Internal error" });
+  }
+});
+
+/** One user's batch cannot fan out unbounded LLM work. */
+const MAX_DRAFT_BATCH = 50;
+
+/**
+ * Invite-note char budget for the account that will actually send these
+ * invites: 300 on a Premium LinkedIn account, 200 on a free one. Mirrors the
+ * precedence used by the CRM send-invite path (user's default outreach account),
+ * and falls back to the free limit whenever no account resolves — drafting to
+ * 300 for a free account would mean the note the user reviewed gets silently
+ * trimmed at send time.
+ */
+async function resolveInviteCharLimit(userId: string): Promise<number> {
+  try {
+    const { linkedInOutreachService } = await import(
+      "../services/linkedInOutreachService"
+    );
+    const accountId =
+      await linkedInOutreachService.resolveUserOwnedAccountId(userId);
+    if (!accountId) return DEFAULT_INVITE_CHAR_LIMIT;
+    return await linkedInOutreachService.getInviteCharLimitForAccount(
+      userId,
+      accountId,
+    );
+  } catch {
+    return DEFAULT_INVITE_CHAR_LIMIT;
+  }
+}
+
+/**
+ * POST /api/onboarding/outreach/draft-invites
+ *
+ * Drafts a LinkedIn invite per prospect using the ADMIN-EDITABLE system prompt
+ * (AC #3) plus brand + ICP context (AC #1). This is what makes an admin's
+ * prompt edit actually change the messages users see, with no deploy.
+ *
+ * The frontend has already pre-filled every textarea from the template pool by
+ * the time this is called, so this endpoint is an *upgrade*, not a dependency:
+ * it returns 200 with `drafts: []` on any failure and the user keeps the
+ * instant copy. Rows the user already edited are never overwritten (the
+ * frontend owns that rule).
+ *
+ * Body: { prospects: [{id, name?, company?, title?}], brandName?, icpName?, specs? }
+ * Response (200): { drafts: [{prospectId, message}], promptVersion }
+ */
+router.post("/outreach/draft-invites", authenticateToken, async (req, res) => {
+  const authReq = req as AuthenticatedRequest;
+  if (!authReq.user?.userId) {
+    return res.status(401).json({ message: "User not authenticated" });
+  }
+
+  const body = req.body ?? {};
+  if (!Array.isArray(body.prospects)) {
+    return res.status(400).json({ message: "prospects must be an array" });
+  }
+  if (body.prospects.some((p: any) => typeof p?.id !== "string" || !p.id)) {
+    return res
+      .status(400)
+      .json({ message: "every prospect requires a string id" });
+  }
+  if (body.prospects.length === 0) {
+    // Nothing to draft — don't spend a model call to find that out. The char
+    // limit still matters: the FE renders its counter from it.
+    return res.status(200).json({
+      drafts: [],
+      promptVersion: null,
+      charLimit: await resolveInviteCharLimit(authReq.user.userId),
+    });
+  }
+
+  try {
+    const charLimit = await resolveInviteCharLimit(authReq.user.userId);
+    const result = await generateInviteDrafts(
+      body.prospects.slice(0, MAX_DRAFT_BATCH).map((p: any) => ({
+        id: p.id,
+        name: typeof p.name === "string" ? p.name : undefined,
+        company: typeof p.company === "string" ? p.company : undefined,
+        title: typeof p.title === "string" ? p.title : undefined,
+      })),
+      {
+        brandName:
+          typeof body.brandName === "string" ? body.brandName : undefined,
+        icpName: typeof body.icpName === "string" ? body.icpName : undefined,
+        specs: typeof body.specs === "string" ? body.specs : undefined,
+        charLimit,
+      },
+    );
+    return res.status(200).json(result);
+  } catch (err: any) {
+    // Defense in depth — the service already swallows its own failures.
+    // eslint-disable-next-line no-console
+    console.error("[onboarding/outreach/draft-invites] error:", err);
+    return res.status(200).json({
+      drafts: [],
+      promptVersion: null,
+      charLimit: DEFAULT_INVITE_CHAR_LIMIT,
+    });
+  }
+});
 
 router.post(
   "/outreach/preview-prospects",
