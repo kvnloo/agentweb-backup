@@ -297,11 +297,18 @@ async function surfaceFailedRun(session: ChatSession): Promise<void> {
     metadata: { timestamp: nowIso, isErrorMessage: true, isRunFailureNotice: true },
   } as any;
   try {
+    // Write the diagnostic error FIRST and add the transcript notice LAST. The
+    // notice is the idempotency marker (the early return above + hasAssistantTurn
+    // both key off it), so it must only land once BOTH writes have succeeded.
+    // Otherwise a notice persisted while updateSessionError threw would suppress
+    // the error write forever on every later pass. With this ordering a partial
+    // failure leaves no notice, so the whole annotation is retried next pass
+    // (updateSessionError just overwrites the same reason — idempotent).
+    await chatbotDb.updateSessionError(session.sessionId, FAILED_RUN_REASON);
     await chatbotDb.addMessageToSession(session.sessionId, notice);
     // Keep the in-memory snapshot consistent so a second scoring call on the same
     // object in the same pass sees the notice and skips re-adding it.
     if (Array.isArray(session.messages)) session.messages.push(notice);
-    await chatbotDb.updateSessionError(session.sessionId, FAILED_RUN_REASON);
   } catch (err) {
     console.error(`surfaceFailedRun: failed to annotate session ${session.sessionId}:`, err);
   }
