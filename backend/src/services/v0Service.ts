@@ -1608,6 +1608,11 @@ async function addPageToExistingRepo(
 
       const previewFiles = await unzipBuffer(zipBuffer);
       autoFixV0Files(previewFiles);
+      // Repair v0's mis-rooted imports BEFORE validating: otherwise check 7 flags them as
+      // "missing" and burns the retry loop on a v0 self-heal that keeps timing out, instead of
+      // this deterministic fix silently resolving them. A genuinely-missing file has no repair
+      // target, so it still (correctly) trips check 7 below.
+      repairMisrootedImports(previewFiles);
 
       try {
         validateV0Output(previewFiles);
@@ -1667,6 +1672,14 @@ async function addPageToExistingRepo(
     const allFiles = await unzipBuffer(zipBuffer);
     autoFixV0Files(allFiles);
     const filesToCommit = remapFilesForSubPage(allFiles, slug, name);
+
+    // Deterministically fix v0's mis-rooted relative imports (e.g. a landing/ component importing
+    // `./landing/Sibling` instead of `./Sibling`) against the FINAL committed set — no v0
+    // round-trip, so it heals what check 7 catches but v0's self-heal correction keeps timing out.
+    const importRepairs = repairMisrootedImports(filesToCommit);
+    if (importRepairs > 0) {
+      console.log(`[V0 SERVICE] Repaired ${importRepairs} mis-rooted relative import(s) in /${slug} files`);
+    }
 
     console.log(`[V0 SERVICE] Extracted ${filesToCommit.length} files for /${slug}: ${filesToCommit.map(f => f.path).join(", ")}`);
 
@@ -2293,6 +2306,9 @@ export async function deployLandingPage(
       // Unzip and validate before pushing to GitHub
       const previewFiles = await unzipBuffer(zipBuffer);
       autoFixV0Files(previewFiles);
+      // Repair v0's mis-rooted imports BEFORE validating — see addPageToExistingRepo for why
+      // (check 7 would otherwise reject them and lean on the flaky v0 self-heal correction).
+      repairMisrootedImports(previewFiles);
 
       try {
         validateV0Output(previewFiles);
@@ -2694,6 +2710,332 @@ function stripTemplatesAndComments(content: string): string {
   return content.replace(STRIP_TEMPLATES_AND_COMMENTS_PATTERN, " ");
 }
 
+// ENG-384: module paths the deploy pipeline ALWAYS materialises into the final commit, even
+// when v0's zip omits them — the tsconfig scaffold block (the `if (!hasFile(...))` injections)
+// and injectLeadCaptureAttribution. The missing-import check below runs on v0's raw download, so a
+// legitimate import of one of these must not be flagged just because this particular zip left
+// it out. Extensionless, repo-root-relative — compared against a resolved import target.
+const GUARANTEED_SCAFFOLD_MODULE_PATHS = new Set([
+  "lib/utils",
+  "app/layout",
+  "middleware",
+  "domainMap",
+]);
+
+// ENG-384: import specifiers whose extension marks them as a NON-JS/TS asset (stylesheet,
+// data, image, font, media). These are not resolved as JS/TS modules — a missing stylesheet is
+// a different failure class, and `./globals.css` is scaffold-provided, so treating it as a
+// module would false-positive. Only extensionless / .ts(x) / .js(x) specifiers are checked.
+const NON_MODULE_IMPORT_EXTENSION = /\.(css|scss|sass|less|styl|json|svg|png|jpe?g|gif|webp|avif|ico|bmp|woff2?|ttf|otf|eot|mp4|webm|mov|mp3|wav|txt|md|mdx|wasm|glb|gltf)$/i;
+
+/**
+ * ENG-384: collect internal imports that reference a file v0 never actually generated.
+ *
+ * The failure this catches (distinct from ENG-374's bare-import denylist): v0 emits a
+ * SYNTACTICALLY legitimate intra-project import — a relative path or the `@/` alias — pointing
+ * at a component it forgot to include in the zip. e.g. `compare-page.tsx` imports
+ * `@/components/compare-table`, but no `compare-table.tsx` exists. The alias resolves correctly;
+ * the target simply does not exist, so `next build` dies with "Module not found". ENG-374's
+ * denylist structurally cannot see this — the specifier is exactly how a real import looks.
+ *
+ * Runs against v0's OWN output (downloaded with `includeDefaultFiles: true`, so shadcn `ui/`
+ * primitives, `lib/utils`, layout, etc. are present), plus GUARANTEED_SCAFFOLD_MODULE_PATHS for
+ * the few files the caller injects later — this is the self-contained "does v0's deliverable
+ * reference anything it didn't deliver" question, answerable before any remap/scaffold step.
+ *
+ * Resolution follows this codebase's fixed generated-repo convention `@/* -> ./*` (see the
+ * tsconfig scaffold block's `paths` mapping): `@/x/y` -> repo-root `x/y`; a relative specifier resolves
+ * against the importing file's directory. Extension/`index` probing reuses `moduleExists`.
+ *
+ * Conservative by construction — anything it cannot judge (bare packages, non-JS assets,
+ * specifiers escaping the repo root) is skipped, so it can only ever flag an import that is
+ * genuinely unresolvable within v0's self-contained output. Pure and exported for direct
+ * unit testing of the resolution logic, separate from the throw trigger in validateV0Output.
+ */
+export function collectMissingInternalImports(
+  files: Array<{ path: string; content: Buffer }>
+): Array<{ path: string; specifier: string }> {
+  const existingPaths = new Set(files.map((f) => f.path));
+  const missing: Array<{ path: string; specifier: string }> = [];
+
+  for (const file of files) {
+    if (!file.path.endsWith(".tsx") && !file.path.endsWith(".ts")) continue;
+
+    const fileDir = path.posix.dirname(file.path);
+    const content = stripTemplatesAndComments(file.content.toString("utf-8"));
+    const specifiers = new Set<string>();
+    for (const match of content.matchAll(STATIC_IMPORT_EXPORT_PATTERN)) specifiers.add(match[1]);
+    for (const match of content.matchAll(DYNAMIC_IMPORT_PATTERN)) specifiers.add(match[1]);
+
+    for (const specifier of specifiers) {
+      const isRelative = specifier.startsWith("./") || specifier.startsWith("../");
+      const isAlias = specifier.startsWith("@/");
+      // Only intra-project imports are ours to resolve. Bare package specifiers are left to
+      // ENG-374's denylist; a scoped `@scope/pkg` (not `@/`) is a real npm package.
+      if (!isRelative && !isAlias) continue;
+      // Non-JS/TS asset imports (css/json/images/…) are not module-resolved here.
+      if (NON_MODULE_IMPORT_EXTENSION.test(specifier)) continue;
+
+      // Resolve to a repo-root-relative, extensionless module path.
+      const target = isAlias
+        ? specifier.slice(2)
+        : path.posix.normalize(path.posix.join(fileDir, specifier));
+
+      // Escapes the repo root (or is absolute) — we cannot say what it points at; skip rather
+      // than emit a confident false positive.
+      if (target.startsWith("..") || target.startsWith("/") || target === "" || target === ".") continue;
+
+      const normalized = target.replace(/\/+$/, "");
+      if (GUARANTEED_SCAFFOLD_MODULE_PATHS.has(normalized)) continue;
+      if (moduleExists(normalized, existingPaths)) continue;
+
+      missing.push({ path: file.path, specifier });
+    }
+  }
+
+  return missing;
+}
+
+// ENG-467: v0's literal name for a synthetic deployment stub. When a generation's deliverable is
+// component(s) with no designated page route, v0 emits an `app/page.tsx` whose default export is
+// `SyntheticV0PageForDeployment`, rendering only ONE component (typically the nav) as a preview
+// harness — orphaning every section it generated. The build SUCCEEDS (the stub is valid,
+// compilable React with resolvable imports), so no other check fires, but the deployed page is
+// blank but for the top bar. Matching v0's exact identifier keeps the check from ever touching a
+// legitimately-named page (a real page is `Home`/`Page`/`LandingPage`, never this).
+const SYNTHETIC_V0_PAGE_MARKER = "SyntheticV0PageForDeployment";
+
+// ENG-467: a generated component whose basename matches this is a provider/hook/util/type/config —
+// NOT a visible "section" whose absence blanks the page. Orphaning one of these is normal, so it
+// must not trip the incomplete-page check; only orphaned SECTION components (hero, features, …) do.
+const NON_SECTION_COMPONENT_NAME = /(provider|context|store|hooks?|use-|config|constants?|types?|utils?|helpers?|^lib$|theme|schema|validation)/i;
+
+/**
+ * ENG-467: resolve a relative/`@/` import specifier (from a file in `fromDir`) to the ACTUAL
+ * repo-root-relative file path it names within `existingPaths`, or null if it is not an internal,
+ * resolvable JS/TS module (bare package, non-JS asset, escapes the repo root, or resolves to no
+ * real file). Same `@/* -> ./*` convention and extension/`index` probing as the ENG-384 checks.
+ */
+function resolveInternalImportFile(
+  specifier: string,
+  fromDir: string,
+  existingPaths: Set<string>
+): string | null {
+  const isRelative = specifier.startsWith("./") || specifier.startsWith("../");
+  const isAlias = specifier.startsWith("@/");
+  if (!isRelative && !isAlias) return null;
+  if (NON_MODULE_IMPORT_EXTENSION.test(specifier)) return null;
+
+  const target = isAlias
+    ? specifier.slice(2)
+    : path.posix.normalize(path.posix.join(fromDir, specifier));
+  if (target.startsWith("..") || target.startsWith("/") || target === "" || target === ".") return null;
+
+  const normalized = target.replace(/\/+$/, "");
+  if (existingPaths.has(normalized)) return normalized;
+  for (const ext of MODULE_EXTENSIONS) {
+    if (existingPaths.has(`${normalized}${ext}`)) return `${normalized}${ext}`;
+    if (existingPaths.has(`${normalized}/index${ext}`)) return `${normalized}/index${ext}`;
+  }
+  return null;
+}
+
+/**
+ * ENG-467: detect the "synthetic stub" incomplete page — an `app/page.tsx` that v0 emitted as a
+ * `SyntheticV0PageForDeployment` placeholder rendering only a fraction of what it generated,
+ * leaving real section components orphaned so the deployed page is blank but for the top bar.
+ * Returns the entry path + the orphaned section files, or null when the page is fine.
+ *
+ * Conservative by construction — TWO gates that must BOTH hold:
+ *   1. the entry `app/page.*` default export is v0's literal synthetic-stub marker, AND
+ *   2. ≥1 generated SECTION component is unreachable from that entry via transitive local imports.
+ * Gate 1 alone would false-positive when the stub renders a single component that itself composes
+ * the whole page (then nothing is orphaned → gate 2 fails → not flagged). Gate 2 alone would
+ * false-positive on a real, well-named page that merely leaves a stray component unused. Together
+ * they fire only on the actual blank-page bug. Pure and exported for direct unit testing.
+ */
+export function detectIncompleteSyntheticPage(
+  files: Array<{ path: string; content: Buffer }>
+): { entryPath: string; orphaned: string[] } | null {
+  const existingPaths = new Set(files.map((f) => f.path));
+  const byPath = new Map(files.map((f) => [f.path, f]));
+
+  // The entry Next.js routes to for the site root. (Sub-page generations are validated in their
+  // own project's raw layout too, where the entry is likewise `app/page.*`, pre-remap.)
+  const entryPath = MODULE_EXTENSIONS.map((ext) => `app/page${ext}`).find((p) => existingPaths.has(p));
+  if (!entryPath) return null;
+
+  // Gate 1: is the entry v0's synthetic deployment stub?
+  if (!byPath.get(entryPath)!.content.toString("utf-8").includes(SYNTHETIC_V0_PAGE_MARKER)) return null;
+
+  // Walk transitive local imports from the entry to collect every reachable file.
+  const reachable = new Set<string>([entryPath]);
+  const queue = [entryPath];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (!/\.(tsx|ts|jsx|js)$/.test(current)) continue;
+    const file = byPath.get(current);
+    if (!file) continue;
+    const dir = path.posix.dirname(current);
+    const src = stripTemplatesAndComments(file.content.toString("utf-8"));
+    const specifiers = new Set<string>();
+    for (const m of src.matchAll(STATIC_IMPORT_EXPORT_PATTERN)) specifiers.add(m[1]);
+    for (const m of src.matchAll(DYNAMIC_IMPORT_PATTERN)) specifiers.add(m[1]);
+    for (const specifier of specifiers) {
+      const resolved = resolveInternalImportFile(specifier, dir, existingPaths);
+      if (resolved && !reachable.has(resolved)) {
+        reachable.add(resolved);
+        queue.push(resolved);
+      }
+    }
+  }
+
+  // Gate 2: generated SECTION components the entry never reaches. `components/ui/*` are shadcn
+  // primitives (leaf building blocks legitimately imported by sections, not by the page), and
+  // provider/util-ish files are not sections — both are excluded so only real orphaned content
+  // (hero, features, pricing, …) counts.
+  const orphaned: string[] = [];
+  for (const file of files) {
+    const p = file.path;
+    if (!p.endsWith(".tsx")) continue;
+    if (!p.startsWith("components/") && !/\/_components\//.test(p)) continue;
+    if (/(^|\/)ui\//.test(p)) continue;
+    if (reachable.has(p)) continue;
+    const base = path.posix.basename(p).replace(/\.tsx$/, "");
+    if (NON_SECTION_COMPONENT_NAME.test(base)) continue;
+    orphaned.push(p);
+  }
+
+  return orphaned.length > 0 ? { entryPath, orphaned } : null;
+}
+
+// Rewrites an intra-project import/re-export/dynamic-import specifier — relative (`./`/`../`) or
+// the `@/` alias. Both forms occur post-remap: v0 emits `./landing/X`, and the sub-page remap's
+// step-0 normalization turns that into `@/components/landing/landing/X`; either can be mis-rooted.
+const INTERNAL_IMPORT_REWRITE_PATTERN = /(\bfrom\s*['"]|\bimport\s*\(\s*['"])((?:\.\.?\/|@\/)[^'"]+)(['"])/g;
+
+// A BARE, package-shaped specifier that contains a slash and does NOT start with `.`, `@`, or `/`
+// — e.g. `landing/Nav`. v0 sometimes drops the prefix entirely, so this looks like an npm package
+// but is really a mis-rooted intra-project import; disambiguated below by whether `components/<it>`
+// actually exists (a real package never does). Scoped-package specs (`@scope/pkg`) can't match.
+const BARE_INTERNAL_IMPORT_PATTERN = /(\bfrom\s*['"]|\bimport\s*\(\s*['"])([A-Za-z0-9_-]+\/[^'"]+)(['"])/g;
+
+// The component subtree a file belongs to — a sub-page's `app/<slug>/_components`, or a
+// first-page's `components`. Repairs only ever point WITHIN a file's own subtree, so a broken
+// `./x` in a landing component can never be "repaired" to an unrelated `lib/x` in another tree.
+function componentScopeRoot(p: string): string {
+  const m = p.match(/^(app\/[^/]+\/_components|components)\//);
+  return m ? m[1] : path.posix.dirname(p);
+}
+
+// A `@/` specifier that legitimately lives in the ROOT repo (shadcn primitives, the cn helper,
+// hooks, and the caller-injected scaffold) and is NOT part of the file set this repair sees for a
+// sub-page. It resolves at build time but not here, so it must be preserved, never "repaired".
+function isRootScaffoldAlias(spec: string): boolean {
+  if (!spec.startsWith("@/")) return false;
+  const p = spec.slice(2).replace(/\/+$/, "");
+  return (
+    p.startsWith("components/ui/") ||
+    p.startsWith("lib/") ||
+    p.startsWith("hooks/") ||
+    p.startsWith("styles/") ||
+    GUARANTEED_SCAFFOLD_MODULE_PATHS.has(p)
+  );
+}
+
+/**
+ * ENG-384/467 follow-up — deterministically repair v0's recurring "mis-rooted" imports.
+ *
+ * v0 frequently writes an intra-folder import as if addressed from the components ROOT rather
+ * than from the importing file: a component at `.../landing/FinalCTA.tsx` imports
+ * `./landing/LeadCaptureForm` when the sibling is simply `./LeadCaptureForm`. The spurious
+ * `landing/` segment makes it resolve to `.../landing/landing/LeadCaptureForm`, which does not
+ * exist → `next build` dies with "Module not found". The sub-page remap's rewriting of nested
+ * component directories (and its step-0 `@/` normalization) leaves the same shape. Both hit
+ * ~every multi-component generation.
+ *
+ * check 7 (collectMissingInternalImports) *detects* this, but recovery then depends on v0's
+ * self-heal correction, which has repeatedly timed out (V0_CALL_TIMEOUT) — so the page fails
+ * instead of healing. This repairs it in-place with NO v0 round-trip: run on the FINAL committed
+ * file set (where every file's real location is known), for each broken intra-project import find
+ * the single file in the importing file's own component subtree whose module basename matches, and
+ * rewrite to the correct RELATIVE path.
+ *
+ * Conservative by construction — only rewrites an import that (a) is relative or a non-scaffold
+ * `@/` alias, (b) does NOT already resolve against the committed set, and (c) has EXACTLY ONE
+ * basename match within the same subtree; otherwise it is left untouched (a genuinely missing file
+ * still trips check 7 upstream, and legit root-repo `@/` refs are skipped outright). It never
+ * touches a working import and only ever rewrites to a path that provably resolves. Mutates in
+ * place; returns the number of imports repaired.
+ */
+export function repairMisrootedImports(files: Array<{ path: string; content: Buffer }>): number {
+  const existingPaths = new Set(files.map((f) => f.path));
+
+  // module basename -> providers (a `foo/index.tsx` provides the basename `foo`, matching a
+  // directory import). Scoped so a repair can only resolve within the importing file's subtree.
+  const providers: Array<{ base: string; scope: string; path: string }> = [];
+  for (const f of files) {
+    if (!/\.(tsx|ts|jsx|js)$/.test(f.path)) continue;
+    let base = path.posix.basename(f.path).replace(/\.(tsx|ts|jsx|js)$/, "");
+    if (base === "index") base = path.posix.basename(path.posix.dirname(f.path));
+    providers.push({ base, scope: componentScopeRoot(f.path), path: f.path });
+  }
+
+  let repaired = 0;
+  for (const file of files) {
+    if (!file.path.endsWith(".tsx") && !file.path.endsWith(".ts")) continue;
+    const fileDir = path.posix.dirname(file.path);
+    const fileScope = componentScopeRoot(file.path);
+    let changed = false;
+
+    let content = file.content.toString("utf-8").replace(
+      INTERNAL_IMPORT_REWRITE_PATTERN,
+      (whole, pre: string, spec: string, post: string) => {
+        if (NON_MODULE_IMPORT_EXTENSION.test(spec)) return whole;
+        if (isRootScaffoldAlias(spec)) return whole; // legit root-repo ref — preserve
+        const target = spec.startsWith("@/")
+          ? spec.slice(2).replace(/\/+$/, "")
+          : path.posix.normalize(path.posix.join(fileDir, spec));
+        if (target.startsWith("..") || target.startsWith("/")) return whole; // escapes the root
+        if (moduleExists(target, existingPaths)) return whole; // already resolves — hands off
+        const base = path.posix.basename(spec);
+        const matches = providers.filter(
+          (p) => p.base === base && p.scope === fileScope && p.path !== file.path
+        );
+        if (matches.length !== 1) return whole; // missing or ambiguous — leave for check 7
+        let rel = path.posix
+          .relative(fileDir, matches[0].path)
+          .replace(/\.(tsx|ts|jsx|js)$/, "")
+          .replace(/\/index$/, "");
+        if (!rel.startsWith(".")) rel = "./" + rel;
+        changed = true;
+        repaired++;
+        return `${pre}${rel}${post}`;
+      }
+    );
+
+    // Bare intra-project imports: v0 sometimes drops the prefix entirely (e.g. `landing/Nav`
+    // instead of `@/components/landing/Nav`) — package-shaped but not a package. Only rewrite when
+    // `components/<spec>` actually exists in the set (a real npm package never will), so this can't
+    // touch a genuine dependency. Rewrites to the `@/` alias, which the sub-page remap then relocates
+    // correctly. Runs where `components/` is present (pre-remap / first-page); a no-op otherwise.
+    content = content.replace(
+      BARE_INTERNAL_IMPORT_PATTERN,
+      (whole, pre: string, spec: string, post: string) => {
+        if (NON_MODULE_IMPORT_EXTENSION.test(spec)) return whole;
+        const asComponent = `components/${spec}`.replace(/\/+$/, "");
+        if (!moduleExists(asComponent, existingPaths)) return whole; // real package — leave alone
+        changed = true;
+        repaired++;
+        return `${pre}@/${asComponent}${post}`;
+      }
+    );
+
+    if (changed) file.content = Buffer.from(content);
+  }
+  return repaired;
+}
+
 /**
  * Validate that unzipped v0 output contains actual React/Next.js code.
  * Rejects: empty output, markdown/prompts echoed back, files too small to be real code.
@@ -2790,6 +3132,38 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
     throw new V0OutputValidationError(
       `Bare import(s) of internal concepts that are not real npm packages — ${details} ` +
       `(use a relative path or the @/ alias instead)`
+    );
+  }
+
+  // 7. Missing-file check (ENG-384): v0 sometimes references an intra-project file it never
+  // generated — a relative or `@/`-aliased import (syntactically a perfectly real import, so
+  // check 6 structurally cannot catch it) that resolves to no file in what v0 actually shipped.
+  // `next build` then dies with "Module not found". Collected across ALL files before throwing
+  // (mirroring check 6) so ONE correction message can name every missing file and v0 can
+  // regenerate them all in a single retry round, rather than burning the budget one at a time.
+  const missingImports = collectMissingInternalImports(files);
+  if (missingImports.length > 0) {
+    const details = missingImports.map((m) => `${m.path}: "${m.specifier}"`).join("; ");
+    throw new V0OutputValidationError(
+      `Import(s) reference a file that was not generated — ${details}. ` +
+      `Generate the missing component/module file(s) so every import resolves.`
+    );
+  }
+
+  // 8. Incomplete-page check (ENG-467): v0 sometimes emits `app/page.tsx` as a
+  // `SyntheticV0PageForDeployment` stub that renders only ONE component (usually the nav),
+  // orphaning every section it generated. The build SUCCEEDS — the stub is valid, compilable
+  // React with resolvable imports — so checks 1–7 all pass, yet the deployed page is blank but
+  // for the top bar. Detect the stub + orphaned sections and reject so the retry loop asks v0 to
+  // compose the real page. Distinct failure class from ENG-374/384 (both build FAILURES); this
+  // one deploys silently, which is exactly why it recurs unnoticed.
+  const incomplete = detectIncompleteSyntheticPage(files);
+  if (incomplete) {
+    throw new V0OutputValidationError(
+      `${incomplete.entryPath} is a placeholder page (${SYNTHETIC_V0_PAGE_MARKER}) that renders only one ` +
+      `component; these generated section components are never rendered: ${incomplete.orphaned.join(", ")}. ` +
+      `Rewrite ${incomplete.entryPath} to import and render the full page — compose ALL generated sections ` +
+      `(e.g. hero, features, how-it-works, testimonials, pricing, signup, footer), not just the nav.`
     );
   }
 
@@ -3236,6 +3610,13 @@ async function createGitHubRepoAndPush(
   const fixCount = autoFixV0Files(finalFiles);
   if (fixCount > 0) {
     console.log(`[V0 SERVICE] Auto-fixed ${fixCount} files for build compatibility`);
+  }
+
+  // Deterministically fix v0's mis-rooted relative imports on the first page too (it commits the
+  // files at their original paths, so v0's `./landing/Sibling`-style mistakes break here as well).
+  const importRepairs = repairMisrootedImports(finalFiles);
+  if (importRepairs > 0) {
+    console.log(`[V0 SERVICE] Repaired ${importRepairs} mis-rooted relative import(s)`);
   }
 
   // ENG-334: auto-inject the site's GTM container into the root layout BEFORE the initial
