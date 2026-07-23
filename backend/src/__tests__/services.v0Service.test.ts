@@ -4705,6 +4705,67 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
 
       expect(result.status).toBe("deployed");
     });
+
+    it("SUCCESS: capture-route sync commit's own Vercel build is polled and confirmed READY", async () => {
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [existingSiteRecord] }) });
+      setupCaptureRouteSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+      // The sync's own Vercel poll — matches sync_commit_sha, the sha
+      // setupCaptureRouteSyncMocks' commit POST returns.
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          deployments: [
+            { uid: "dpl_sync", readyState: "READY", meta: { githubCommitSha: "sync_commit_sha" } },
+          ],
+        },
+      });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a careers page",
+        "Careers",
+        {},
+        "list_careers"
+      );
+
+      expect(result.status).toBe("deployed");
+    });
+
+    it("FAIL: capture-route sync commit's own Vercel build errors → page still deploys, error only logged", async () => {
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [existingSiteRecord] }) });
+      setupCaptureRouteSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+      // Sync's own Vercel poll: build for sync_commit_sha errored.
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { deployments: [{ uid: "dpl_sync_fail", readyState: "ERROR", meta: { githubCommitSha: "sync_commit_sha" } }] },
+      });
+      // getVercelBuildErrors' own log-fetch call
+      mockAxiosGet.mockResolvedValueOnce({
+        data: [{ type: "stderr", payload: { text: "Module not found: @/lib/stale" } }],
+      });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a team page",
+        "Team",
+        {},
+        "list_team"
+      );
+
+      // The page's OWN content already deployed successfully — the sync's build
+      // failing must never flip this page to "failed".
+      expect(result.status).toBe("deployed");
+    });
   });
 });
 
