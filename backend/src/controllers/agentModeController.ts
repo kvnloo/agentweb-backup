@@ -13,7 +13,7 @@ import { settingsService } from '../services/settingsService';
 import { workPlanService } from '../services/workPlanService';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { resolveInboundAnswer, buildAnswerAcknowledgement, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
+import { resolveInboundAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
@@ -3282,10 +3282,13 @@ export const agentModeController = {
         // primitive's model, a selection is ONLY an explicit click — never inferred from
         // prose. So the open question is abandoned: clear it (the old card freezes as
         // "not answered" history) so the one-live-question guard lets Emma re-ask with a
-        // FRESH card if she still needs the answer. The irreversible-write gate still
-        // blocks until a real structured answer lands, so this can't rubber-stamp.
+        // FRESH card. The irreversible-write gate still blocks until a real structured
+        // answer lands, so this can't rubber-stamp. Inject a directive so Emma re-asks
+        // THAT SAME question instead of inferring a choice from the prose and advancing.
+        const abandoned = session.pendingUserQuestion;
         await chatbotDb.updateSessionAskUserQuestion(sessionId, null);
         session.pendingUserQuestion = undefined;
+        answerAck = buildReaskDirective(abandoned);
       }
 
       // Cross-restart duplicate-submit lock (ENG-147: one question spawned ~30

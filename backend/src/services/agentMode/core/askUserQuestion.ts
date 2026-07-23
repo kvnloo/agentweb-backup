@@ -335,6 +335,25 @@ export function buildAnswerAcknowledgement(question: PendingUserQuestion): strin
 }
 
 /**
+ * ENG-396: a model-visible directive injected when the user TYPES a message instead of
+ * clicking an open card. The typed reply abandons the question (it's cleared server-side),
+ * and this tells Emma to re-ask that SAME question rather than infer a choice from the
+ * prose or move on. Without it the model tends to treat "lets do traffic" as the answer
+ * and advance — leaving the (immutable) question unanswered while the card says so.
+ *
+ * Appended to the LLM message content ONLY (never the displayed user bubble).
+ */
+export function buildReaskDirective(question: PendingUserQuestion): string {
+  return (
+    `[The user typed a message instead of clicking the "${question.question}" card, so that ` +
+    `question is NOT answered — do NOT infer their choice from the text, even if it names an ` +
+    `option. Before anything else, re-emit THAT SAME question ("${question.question}") as a fresh ` +
+    `ask_user_question card and wait for an explicit click. Do not advance to any other question ` +
+    `or take any action that depends on this answer until they click an option.]`
+  );
+}
+
+/**
  * Render the question + options as a plain-text prompt. This is the fallback
  * shown/fed when the structured card can't render (and the string the loop's
  * confirmation-halt surfaces). The structured `options` on the tool result
