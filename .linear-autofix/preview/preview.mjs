@@ -67,6 +67,41 @@ function waitPort(port, timeoutMs = 120000) {
   });
 }
 
+// Resolves once nothing is listening on `port` (i.e. the old service released it), or after timeout.
+function waitPortFree(port, timeoutMs = 10000) {
+  const t0 = Date.now();
+  return new Promise((resolve) => {
+    const tick = () => {
+      const c = net.connect(port, '127.0.0.1');
+      c.once('connect', () => { c.destroy(); if (Date.now() - t0 > timeoutMs) resolve(false); else setTimeout(tick, 250); });
+      c.once('error', () => { c.destroy(); resolve(true); }); // refused = free
+    };
+    tick();
+  });
+}
+
+// Teardown-before-start: if a full stack is ALREADY running for this bug, stop it and wait for its
+// process groups to actually release their ports before we build a new one. Every bring-up funnels
+// through up(), so enforcing it here — not in any single caller — is what guarantees a ticket never
+// ends up with two live stacks: the chat "refresh" path stops-first, but the manual "up" button, the
+// pipeline auto-keep, and a direct `preview.mjs up` from Bash do not, and none coordinate across
+// processes. down() SIGTERMs the groups; we then wait, and SIGKILL any straggler so RAM is reclaimed.
+// A bare `starting: true` placeholder (a concurrent in-flight bring-up, no procs yet) is left alone.
+async function stopExistingStack(bug) {
+  const prior = readJson(STATE)[bug];
+  if (!prior?.procs || !Object.keys(prior.procs).length) return false;
+  console.log(`[preview] ${bug}: a stack is already running (started ${prior.at || '?'}) — stopping it before starting a new one`);
+  const ports = Object.values(prior.procs).map((p) => p.port).filter(Boolean);
+  const pids = Object.values(prior.procs).map((p) => p.pid).filter(Boolean);
+  down(bug); // SIGTERM the process groups; clears this bug's routes + state entry
+  const freed = await Promise.all(ports.map((p) => waitPortFree(p)));
+  if (freed.some((f) => !f)) {
+    for (const pid of pids) { try { process.kill(-pid, 'SIGKILL'); } catch { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } } }
+    await Promise.all(ports.map((p) => waitPortFree(p, 4000)));
+  }
+  return true;
+}
+
 const mtime = (p) => { try { return statSync(p).mtimeMs; } catch { return -1; } };
 // node_modules is fresh if npm's post-install marker is newer than package.json.
 const depsFresh = (pkgDir) => mtime(path.join(pkgDir, 'node_modules', '.package-lock.json')) >= mtime(path.join(pkgDir, 'package.json'));
@@ -104,6 +139,11 @@ async function up(bugRaw, worktreeRaw) {
   const worktree = path.resolve(worktreeRaw);
   if (!existsSync(worktree)) { console.error(`worktree not found: ${worktree}`); process.exit(1); }
   mkdirSync(LOGS, { recursive: true });
+
+  // Bug 2 leak fix: an existing live stack for this same bug is overwritten below (routes + state +
+  // freshly-allocated ports), orphaning its old process groups forever (two full stacks resident for
+  // one ticket → the OOM). Stop-and-await any prior stack FIRST so we never leak one.
+  await stopExistingStack(bug);
 
   // #14: register a placeholder entry BEFORE the cap check + build so a CONCURRENT bring-up counts
   // this in-flight preview and doesn't also skip eviction (otherwise two both see the same pre-write
