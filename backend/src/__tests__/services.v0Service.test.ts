@@ -153,6 +153,7 @@ import {
   validateV0Output,
   collectMissingInternalImports,
   detectIncompleteSyntheticPage,
+  repairMisrootedImports,
   V0OutputValidationError,
   BrandContext,
   remapFilesForSubPage,
@@ -3249,6 +3250,132 @@ describe("v0Service - incomplete synthetic page check (ENG-467)", () => {
       ];
       expect(() => validateV0Output(files)).not.toThrow();
     });
+  });
+});
+
+// =============================================================================
+// ENG-384/467 follow-up: deterministic repair of v0's mis-rooted relative imports
+// =============================================================================
+describe("v0Service - repairMisrootedImports", () => {
+  const f = (path: string, content: string) => ({ path, content: Buffer.from(content) });
+  const imp = (files: Array<{ path: string; content: Buffer }>, path: string) =>
+    files.find((x) => x.path === path)!.content.toString().split("\n").filter((l) => l.includes("import") || l.includes("from")).join(" | ");
+
+  it("REPAIR: sub-page nested sibling — ./landing/LeadCaptureForm -> ./LeadCaptureForm", () => {
+    const files = [
+      f("app/x/_components/landing/FinalCTA.tsx", `import LeadCaptureForm from "./landing/LeadCaptureForm";\nexport default function FinalCTA(){return <LeadCaptureForm/>;}`),
+      f("app/x/_components/landing/LeadCaptureForm.tsx", `export default function LeadCaptureForm(){return <form/>;}`),
+    ];
+    const n = repairMisrootedImports(files);
+    expect(n).toBe(1);
+    expect(imp(files, "app/x/_components/landing/FinalCTA.tsx")).toContain('"./LeadCaptureForm"');
+    // and it now actually resolves
+    expect(collectMissingInternalImports(files)).toEqual([]);
+  });
+
+  it("REPAIR: sub-page nested sibling — ./landing/Mockup -> ./Mockup", () => {
+    const files = [
+      f("app/x/_components/landing/Hero.tsx", `import Mockup from "./landing/Mockup";\nexport default function Hero(){return <Mockup/>;}`),
+      f("app/x/_components/landing/Mockup.tsx", `export default function Mockup(){return <div/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(1);
+    expect(imp(files, "app/x/_components/landing/Hero.tsx")).toContain('"./Mockup"');
+  });
+
+  it("REPAIR: first-page shape (components/landing/*) too", () => {
+    const files = [
+      f("components/landing/FinalCTA.tsx", `import LeadCaptureForm from "./landing/LeadCaptureForm";\nexport default function FinalCTA(){return <LeadCaptureForm/>;}`),
+      f("components/landing/LeadCaptureForm.tsx", `export default function LeadCaptureForm(){return <form/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(1);
+    expect(imp(files, "components/landing/FinalCTA.tsx")).toContain('"./LeadCaptureForm"');
+  });
+
+  it("REPAIR: re-export form (export ... from) in an index barrel", () => {
+    const files = [
+      f("app/x/_components/landing/index.ts", `export { default as Nav } from "./landing/Nav";\nexport { default as Hero } from "./landing/Hero";`),
+      f("app/x/_components/landing/Nav.tsx", `export default function Nav(){return <nav/>;}`),
+      f("app/x/_components/landing/Hero.tsx", `export default function Hero(){return <section/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(2);
+    expect(imp(files, "app/x/_components/landing/index.ts")).toContain('"./Nav"');
+    expect(imp(files, "app/x/_components/landing/index.ts")).toContain('"./Hero"');
+  });
+
+  it("NO-OP: a correct sibling import is left untouched", () => {
+    const files = [
+      f("app/x/_components/landing/FinalCTA.tsx", `import LeadCaptureForm from "./LeadCaptureForm";\nexport default function FinalCTA(){return <LeadCaptureForm/>;}`),
+      f("app/x/_components/landing/LeadCaptureForm.tsx", `export default function LeadCaptureForm(){return <form/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0);
+    expect(imp(files, "app/x/_components/landing/FinalCTA.tsx")).toContain('"./LeadCaptureForm"');
+  });
+
+  it("NO-OP: a genuinely missing file is NOT invented (stays for check 7)", () => {
+    const files = [
+      f("app/x/_components/landing/Hero.tsx", `import Ghost from "./landing/Ghost";\nexport default function Hero(){return <Ghost/>;}`),
+      f("app/x/_components/landing/Nav.tsx", `export default function Nav(){return <nav/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0);
+    expect(imp(files, "app/x/_components/landing/Hero.tsx")).toContain('"./landing/Ghost"');
+    // and check 7 still flags it
+    expect(collectMissingInternalImports(files).some((m) => m.specifier === "./landing/Ghost")).toBe(true);
+  });
+
+  it("NO-OP: ambiguous basename (two matches in scope) is left untouched", () => {
+    const files = [
+      f("app/x/_components/landing/A.tsx", `import Card from "./landing/Card";\nexport default function A(){return <Card/>;}`),
+      f("app/x/_components/landing/Card.tsx", `export default function Card(){return <div/>;}`),
+      f("app/x/_components/landing/sub/Card.tsx", `export default function Card(){return <div/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0);
+    expect(imp(files, "app/x/_components/landing/A.tsx")).toContain('"./landing/Card"');
+  });
+
+  it("NO-OP: legit root-repo @/ refs (ui, lib/utils) are preserved", () => {
+    const files = [
+      f("app/x/_components/landing/Hero.tsx", `import { Button } from "@/components/ui/button";\nimport { cn } from "@/lib/utils";\nexport default function Hero(){return <Button className={cn()}/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0);
+    expect(imp(files, "app/x/_components/landing/Hero.tsx")).toContain('"@/components/ui/button"');
+    expect(imp(files, "app/x/_components/landing/Hero.tsx")).toContain('"@/lib/utils"');
+  });
+
+  it("REPAIR: mangled @/ from remap step-0 (@/components/landing/landing/Mockup -> ./Mockup)", () => {
+    // The sub-page remap's step-0 turns v0's bad `./landing/Mockup` into this @/ form; it points
+    // at a repo-root path that doesn't exist, so it must be repaired to the real sibling.
+    const files = [
+      f("app/x/_components/landing/Hero.tsx", `import Mockup from "@/components/landing/landing/Mockup";\nexport default function Hero(){return <Mockup/>;}`),
+      f("app/x/_components/landing/Mockup.tsx", `export default function Mockup(){return <div/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(1);
+    expect(imp(files, "app/x/_components/landing/Hero.tsx")).toContain('"./Mockup"');
+    expect(collectMissingInternalImports(files)).toEqual([]);
+  });
+
+  it("NO-OP: does not repair across component subtrees (won't grab a lib/ file)", () => {
+    const files = [
+      f("app/x/_components/landing/Hero.tsx", `import { cn } from "./utils";\nexport default function Hero(){return <div className={cn()}/>;}`),
+      f("lib/utils.ts", `export function cn(){return "";}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0);
+    expect(imp(files, "app/x/_components/landing/Hero.tsx")).toContain('"./utils"');
+  });
+
+  it("INTEGRATION: remap output with v0's mis-rooted imports fully resolves after repair", () => {
+    // Raw v0 layout: page composes nested landing/ components; Hero & FinalCTA use v0's bad
+    // `./landing/X` sibling imports. After remap + repair, nothing should be unresolved.
+    const raw = [
+      f("app/page.tsx", `import { Hero } from "@/components/landing/Hero";\nimport { FinalCTA } from "@/components/landing/FinalCTA";\nexport default function Page(){return <main><Hero/><FinalCTA/></main>;}`),
+      f("components/landing/Hero.tsx", `import Mockup from "./landing/Mockup";\nexport function Hero(){return <Mockup/>;}`),
+      f("components/landing/Mockup.tsx", `export default function Mockup(){return <div/>;}`),
+      f("components/landing/FinalCTA.tsx", `import LeadCaptureForm from "./landing/LeadCaptureForm";\nexport function FinalCTA(){return <LeadCaptureForm/>;}`),
+      f("components/landing/LeadCaptureForm.tsx", `export default function LeadCaptureForm(){return <form/>;}`),
+    ];
+    const committed = remapFilesForSubPage(raw, "quiet", "Quiet");
+    repairMisrootedImports(committed);
+    // Every internal import in the committed set now resolves (no Module-not-found at build).
+    expect(collectMissingInternalImports(committed)).toEqual([]);
   });
 });
 
