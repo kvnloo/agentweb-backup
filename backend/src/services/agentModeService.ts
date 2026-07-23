@@ -51,8 +51,9 @@ import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmM
 import {
   createAutoPersistState,
   isBrowserAutomationTool,
+  shouldPersistAfterBrowserTool,
   autoLoadCookiesOnce,
-  autoSaveCookiesDebounced,
+  autoSaveCookies,
 } from '../emma/browserCookieAutoPersist';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { publishWithResolvedBlogPublisher } from './blogPublishers';
@@ -6391,13 +6392,12 @@ export class AgentModeService {
         const cookieCtx = { userId, sessionId, llmModel, service: this, ...extraContext };
         const autoDeps = {
           runTool: (name: string, toolArgs: any) => this.toolRegistry.execute(name, toolArgs ?? {}, cookieCtx),
-          now: () => Date.now(),
         };
         await autoLoadCookiesOnce(this.browserCookieAutoState, sessionId, autoDeps);
         const result = await this.toolRegistry.execute(toolName, preparedArgs, cookieCtx);
         const toolFailed = result && (result as any).success === false;
-        if (!toolFailed) {
-          await autoSaveCookiesDebounced(this.browserCookieAutoState, sessionId, autoDeps);
+        if (!toolFailed && shouldPersistAfterBrowserTool(toolName)) {
+          await autoSaveCookies(this.browserCookieAutoState, sessionId, autoDeps);
         }
         return result;
       }
