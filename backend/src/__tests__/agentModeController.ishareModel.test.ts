@@ -145,6 +145,52 @@ describe('AgentModeController - ishare Model Selection', () => {
         })
       );
     });
+
+    it('should expose pendingUserQuestion so a shared read-only card can show the answered option (ENG-396)', async () => {
+      const answeredQuestion = {
+        questionId: 'q-objective-1',
+        question: 'Which Meta campaign objective?',
+        options: [
+          { id: 'leads', label: 'Leads', recommended: true, why: 'pixel fires LEAD events' },
+          { id: 'traffic', label: 'Traffic' },
+        ],
+        recommendedOptionId: 'leads',
+        immutable: true,
+        allowEmmaDecide: true,
+        status: 'answered',
+        createdAt: new Date().toISOString(),
+        answer: { optionId: 'leads', delegated: false, answeredBy: 'user', at: new Date().toISOString() },
+      };
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSessionWithModel,
+        pendingUserQuestion: answeredQuestion,
+      });
+
+      const mockReq = {
+        params: { shareId: mockSessionId },
+        query: { conversable: mockConversableToken },
+        on: jest.fn(),
+      } as unknown as Request;
+
+      const mockRes = {
+        status: jest.fn().mockReturnThis(),
+        json: jest.fn(),
+      } as unknown as Response;
+
+      await agentModeController.getSharedConversation(mockReq, mockRes);
+
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          session: expect.objectContaining({
+            pendingUserQuestion: expect.objectContaining({
+              questionId: 'q-objective-1',
+              status: 'answered',
+              answer: expect.objectContaining({ optionId: 'leads' }),
+            }),
+          }),
+        })
+      );
+    });
   });
 
   describe('generateSharedResponse', () => {
