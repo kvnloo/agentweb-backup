@@ -415,12 +415,18 @@ describe('buildAnswerAcknowledgement — explicit in-response confirmation', () 
 });
 
 describe('buildReaskDirective — typed-past a card', () => {
-  it('tells Emma to re-emit THAT question, not infer from prose or advance', () => {
+  it('acknowledges the apparent option + asks for a tap, but never resolves from text, and re-asks', () => {
     const directive = buildReaskDirective(awaitingQuestion());
     expect(directive).toContain('Which Meta campaign objective');
-    expect(directive).toMatch(/do NOT infer/i);
+    // acknowledge the intent and ask them to tap — friendly, not a cold resend
+    expect(directive).toMatch(/acknowledge/i);
+    expect(directive).toMatch(/tap it/i);
+    // but the text is never the answer / never self-resolved
+    expect(directive).toMatch(/do NOT treat the text as the answer/i);
+    expect(directive).toMatch(/do NOT resolve it yourself/i);
+    // still re-emits and waits for the click
     expect(directive).toMatch(/re-emit THAT SAME question|re-emit that same question/i);
-    expect(directive).toMatch(/do not advance|until they click/i);
+    expect(directive).toMatch(/until they click/i);
   });
 });
 

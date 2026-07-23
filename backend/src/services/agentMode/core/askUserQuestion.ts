@@ -353,11 +353,12 @@ export function buildAnswerAcknowledgement(question: PendingUserQuestion): strin
 export function buildReaskDirective(question: PendingUserQuestion): string {
   return (
     `[The user typed a message instead of clicking the "${question.question}" card, so that ` +
-    `question is NOT answered — do NOT infer their choice from the text, even if it names an ` +
-    `option. Respond to what they actually said (answer any question they asked, handle any ` +
-    `request), but you still need this decision: re-emit THAT SAME question ("${question.question}") ` +
-    `as a fresh ask_user_question card and wait for an explicit click. Do not treat the typed ` +
-    `message as the answer, and take no action that depends on this answer until they click an option.]`
+    `question is NOT answered. If their message clearly points to one of the options, ACKNOWLEDGE ` +
+    `it in one short line and ask them to tap it — e.g. "Sounds like you want <that option> — tap ` +
+    `it below to lock it in." Also handle anything else they asked. But do NOT treat the text as ` +
+    `the answer and do NOT resolve it yourself: re-emit THAT SAME question ("${question.question}") ` +
+    `as a fresh ask_user_question card and wait for an explicit click. Take no action that depends ` +
+    `on this answer until they click an option.]`
   );
 }
 
