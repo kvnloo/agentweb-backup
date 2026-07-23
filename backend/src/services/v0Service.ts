@@ -2914,6 +2914,12 @@ export function detectIncompleteSyntheticPage(
 // step-0 normalization turns that into `@/components/landing/landing/X`; either can be mis-rooted.
 const INTERNAL_IMPORT_REWRITE_PATTERN = /(\bfrom\s*['"]|\bimport\s*\(\s*['"])((?:\.\.?\/|@\/)[^'"]+)(['"])/g;
 
+// A BARE, package-shaped specifier that contains a slash and does NOT start with `.`, `@`, or `/`
+// — e.g. `landing/Nav`. v0 sometimes drops the prefix entirely, so this looks like an npm package
+// but is really a mis-rooted intra-project import; disambiguated below by whether `components/<it>`
+// actually exists (a real package never does). Scoped-package specs (`@scope/pkg`) can't match.
+const BARE_INTERNAL_IMPORT_PATTERN = /(\bfrom\s*['"]|\bimport\s*\(\s*['"])([A-Za-z0-9_-]+\/[^'"]+)(['"])/g;
+
 // The component subtree a file belongs to — a sub-page's `app/<slug>/_components`, or a
 // first-page's `components`. Repairs only ever point WITHIN a file's own subtree, so a broken
 // `./x` in a landing component can never be "repaired" to an unrelated `lib/x` in another tree.
@@ -2982,7 +2988,7 @@ export function repairMisrootedImports(files: Array<{ path: string; content: Buf
     const fileScope = componentScopeRoot(file.path);
     let changed = false;
 
-    const content = file.content.toString("utf-8").replace(
+    let content = file.content.toString("utf-8").replace(
       INTERNAL_IMPORT_REWRITE_PATTERN,
       (whole, pre: string, spec: string, post: string) => {
         if (NON_MODULE_IMPORT_EXTENSION.test(spec)) return whole;
@@ -3005,6 +3011,23 @@ export function repairMisrootedImports(files: Array<{ path: string; content: Buf
         changed = true;
         repaired++;
         return `${pre}${rel}${post}`;
+      }
+    );
+
+    // Bare intra-project imports: v0 sometimes drops the prefix entirely (e.g. `landing/Nav`
+    // instead of `@/components/landing/Nav`) — package-shaped but not a package. Only rewrite when
+    // `components/<spec>` actually exists in the set (a real npm package never will), so this can't
+    // touch a genuine dependency. Rewrites to the `@/` alias, which the sub-page remap then relocates
+    // correctly. Runs where `components/` is present (pre-remap / first-page); a no-op otherwise.
+    content = content.replace(
+      BARE_INTERNAL_IMPORT_PATTERN,
+      (whole, pre: string, spec: string, post: string) => {
+        if (NON_MODULE_IMPORT_EXTENSION.test(spec)) return whole;
+        const asComponent = `components/${spec}`.replace(/\/+$/, "");
+        if (!moduleExists(asComponent, existingPaths)) return whole; // real package — leave alone
+        changed = true;
+        repaired++;
+        return `${pre}@/${asComponent}${post}`;
       }
     );
 
