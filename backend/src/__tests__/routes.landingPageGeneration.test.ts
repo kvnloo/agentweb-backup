@@ -84,6 +84,9 @@ const mockDeleteLandingPage = jest.fn();
 const mockDeleteLandingPageByRecord = jest.fn();
 const mockUpdateLandingPageGtm = jest.fn();
 const mockUpdateLandingPageTrackingInstalled = jest.fn();
+const mockUpdateLandingPageMetaPixel = jest.fn();
+const mockUpdateLandingPageMetaTrackingInstalled = jest.fn();
+const mockSyncLeadCaptureFilesToRepo = jest.fn();
 const mockUpdateLandingPageContext = jest.fn();
 const mockResolveVercelProjectId = jest.fn();
 const mockTriggerVercelDeployment = jest.fn();
@@ -114,6 +117,9 @@ jest.mock("../services/v0Service", () => ({
   deleteLandingPageByRecord: (...args: any[]) => mockDeleteLandingPageByRecord(...args),
   updateLandingPageGtm: (...args: any[]) => mockUpdateLandingPageGtm(...args),
   updateLandingPageTrackingInstalled: (...args: any[]) => mockUpdateLandingPageTrackingInstalled(...args),
+  updateLandingPageMetaPixel: (...args: any[]) => mockUpdateLandingPageMetaPixel(...args),
+  updateLandingPageMetaTrackingInstalled: (...args: any[]) => mockUpdateLandingPageMetaTrackingInstalled(...args),
+  syncLeadCaptureFilesToRepo: (...args: any[]) => mockSyncLeadCaptureFilesToRepo(...args),
   updateLandingPageContext: (...args: any[]) => mockUpdateLandingPageContext(...args),
   resolveVercelProjectId: (...args: any[]) => mockResolveVercelProjectId(...args),
   triggerVercelDeployment: (...args: any[]) => mockTriggerVercelDeployment(...args),
@@ -194,6 +200,8 @@ beforeEach(() => {
   mockListDomainsForPages.mockResolvedValue([]);
   mockGetSetting.mockResolvedValue(null);
   mockUpdateLandingPageGtm.mockResolvedValue(undefined);
+  mockUpdateLandingPageMetaPixel.mockResolvedValue(undefined);
+  mockSyncLeadCaptureFilesToRepo.mockResolvedValue({ committed: true });
   // main's tests rely on a non-null project id by default; HEAD's GTM tests
   // override per-call with `.mockResolvedValueOnce(null)` where needed.
   mockResolveVercelProjectId.mockResolvedValue("vercel-proj-123");
@@ -1242,6 +1250,123 @@ describe("POST /api/landing-pages/v0/generated/:id/gtm", () => {
     expect(res.body.error).not.toMatch(/layout\.tsx|<head>|<body>/);
     expect(mockAxios.put).not.toHaveBeenCalled();
     expect(mockUpdateLandingPageGtm).not.toHaveBeenCalled();
+  });
+});
+
+// =============================================================================
+// POST /generated/:id/meta-pixel (ENG-449 — manual override, API-only)
+// =============================================================================
+describe("POST /api/landing-pages/v0/generated/:id/meta-pixel", () => {
+  const PAGE_WITH_REPO = {
+    id: "page-1",
+    userId: "test-user-id",
+    githubRepoUrl: "https://github.com/testorg/testrepo",
+  };
+  const FAKE_LAYOUT = `<head>\n<title>Test</title>\n</head>\n<body>\nHello\n</body>`;
+  const ENCODED_LAYOUT = Buffer.from(FAKE_LAYOUT).toString("base64");
+
+  it("FAIL: missing pixelId → 400", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE_WITH_REPO);
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({});
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/pixelId is required/);
+  });
+
+  it("FAIL: non-numeric pixelId → 400", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE_WITH_REPO);
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "not-a-number" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/Invalid Meta pixel id/);
+  });
+
+  it("FAIL: page not found → 404", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(null);
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/missing/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+    expect(res.status).toBe(404);
+  });
+
+  it("FAIL: page has no githubRepoUrl → 400", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({ id: "page-1", userId: "test-user-id" });
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/no GitHub repository/);
+  });
+
+  it("SUCCESS: injects Meta Pixel and returns 200", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE_WITH_REPO);
+    mockAxios.get.mockResolvedValueOnce({
+      data: { content: ENCODED_LAYOUT, sha: "abc123sha" },
+    });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([PAGE_WITH_REPO]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValueOnce(undefined);
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428", accountId: "acc1" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.pixelId).toBe("1430870751246428");
+    expect(mockUpdateLandingPageMetaPixel).toHaveBeenCalledWith("page-1", "test-user-id", "1430870751246428", "acc1");
+    expect(mockSyncLeadCaptureFilesToRepo).toHaveBeenCalledWith(
+      "testorg/testrepo",
+      expect.any(Object),
+      "1430870751246428",
+      "acc1",
+    );
+    const putCall = mockAxios.put.mock.calls[0][1] as any;
+    expect(putCall.message).toContain("1430870751246428");
+  });
+
+  it("SUCCESS: syncs metaTrackingInstalled across every sibling page on the same site", async () => {
+    const root = { ...PAGE_WITH_REPO, id: "page-1", siteId: "page-1" };
+    const subpageA = { id: "sub-a", userId: "test-user-id", siteId: "page-1", githubRepoUrl: PAGE_WITH_REPO.githubRepoUrl };
+    const otherSite = { id: "other-1", userId: "test-user-id", siteId: "other-1" };
+
+    mockGetLandingPageById.mockResolvedValueOnce(root);
+    mockAxios.get.mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "sha-x" } });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([root, subpageA, otherSite]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValue(undefined);
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateLandingPageMetaTrackingInstalled).toHaveBeenCalledWith("page-1", true);
+    expect(mockUpdateLandingPageMetaTrackingInstalled).toHaveBeenCalledWith("sub-a", true);
+    expect(mockUpdateLandingPageMetaTrackingInstalled).not.toHaveBeenCalledWith("other-1", expect.anything());
+    expect(mockUpdateLandingPageMetaTrackingInstalled).toHaveBeenCalledTimes(2);
+  });
+
+  it("FAIL: verification failure on malformed layout → 422, no partial write", async () => {
+    const malformedLayout = `export default function RootLayout({ children }) { return <>{children}</>; }`;
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE_WITH_REPO);
+    mockAxios.get.mockResolvedValueOnce({
+      data: { content: Buffer.from(malformedLayout).toString("base64"), sha: "sha-y" },
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toBe(
+      "We couldn't add Meta Pixel tracking to this page automatically. Try regenerating the page, or contact support if this keeps happening.",
+    );
+    expect(res.body.error).not.toMatch(/layout\.tsx|<head>|<body>/);
+    expect(mockAxios.put).not.toHaveBeenCalled();
+    expect(mockUpdateLandingPageMetaPixel).not.toHaveBeenCalled();
   });
 });
 

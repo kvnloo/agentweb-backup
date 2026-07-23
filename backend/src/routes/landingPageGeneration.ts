@@ -38,8 +38,12 @@ import {
   resolveLandingPageLiveUrl,
   canUserEditLandingPage,
   updateLandingPageTrackingInstalled,
+  updateLandingPageMetaPixel,
+  updateLandingPageMetaTrackingInstalled,
+  buildCaptureRoute,
 } from "../services/v0Service";
 import { injectGtmIntoLayout, verifyGtmInjection } from "../utils/gtmInjection";
+import { injectPixelIntoLayout, verifyPixelInjection } from "../utils/pixelInjection";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { MISSING_BRAND_LOGO_ERROR } from "../services/agentMode/brandLogo";
 import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
@@ -1853,6 +1857,167 @@ async function saveGtmForPage(
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Helper: inject a Meta pixel into a page's layout.tsx + regenerate its capture
+// route with the pixel/account id baked in, and persist the pixel id (ENG-449).
+// Manual override path (API-only — no portal UI, per confirmed scope) for when
+// auto-resolution (metaService.resolveMetaPixelForUser) can't determine a pixel,
+// or a customer needs a different one than the one auto-resolved.
+// Does NOT do auth checks — callers must authorize before calling.
+// ---------------------------------------------------------------------------
+async function saveMetaPixelForPage(
+  page: GeneratedLandingPage,
+  pixelId: string,
+  accountId?: string,
+): Promise<void> {
+  if (!page.githubRepoUrl) throw new Error("Landing page has no GitHub repository");
+
+  const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+  if (!repoMatch) throw new Error("Invalid GitHub repo URL");
+  const [, owner, repoRaw] = repoMatch;
+  const repo = repoRaw.replace(".git", "");
+  const repoFullName = `${owner}/${repo}`;
+
+  const { getGitHubOrgToken } = await import("../utils/secretsManager");
+  const { token } = await getGitHubOrgToken();
+  const ghHeaders = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" };
+  const GITHUB_TIMEOUT_MS = 30_000;
+  const repoBase = `https://api.github.com/repos/${owner}/${repo}`;
+
+  // 1. Inject/strip the pixel base snippet in app/layout.tsx — same retry-on-409 pattern
+  //    as saveGtmForPage, and the SAME shared util the auto-inject-at-generation path uses.
+  const layoutPath = "app/layout.tsx";
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const fileRes = await axios.get<any>(`${repoBase}/contents/${layoutPath}`, {
+        headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS,
+      });
+      const currentContent = Buffer.from(fileRes.data.content, "base64").toString("utf-8");
+      const fileSha = fileRes.data.sha;
+
+      const updatedContent = injectPixelIntoLayout(currentContent, pixelId);
+
+      if (!verifyPixelInjection(updatedContent, pixelId)) {
+        console.error(
+          `[LP GENERATION] Meta Pixel ${pixelId ? "injection" : "removal"} verification failed ` +
+          `for page ${page.id}: layout.tsx has no <head> or <body> tag to anchor on.`,
+        );
+        throw Object.assign(
+          new Error(
+            pixelId
+              ? "We couldn't add Meta Pixel tracking to this page automatically. Try regenerating the page, or contact support if this keeps happening."
+              : "We couldn't remove Meta Pixel tracking from this page automatically. Try regenerating the page, or contact support if this keeps happening.",
+          ),
+          { httpStatus: 422 },
+        );
+      }
+
+      const base64New = Buffer.from(updatedContent, "utf-8").toString("base64");
+      await axios.put<any>(
+        `${repoBase}/contents/${layoutPath}`,
+        {
+          message: pixelId ? `chore: inject Meta Pixel ${pixelId}` : "chore: remove Meta Pixel",
+          content: base64New,
+          sha: fileSha,
+        },
+        { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+      );
+      break;
+    } catch (err: any) {
+      const status = err?.response?.status;
+      if (status === 404) {
+        throw Object.assign(new Error("app/layout.tsx not found in the repository"), { httpStatus: 400 });
+      }
+      if (status === 409 && attempt < MAX_ATTEMPTS) continue;
+      throw err;
+    }
+  }
+
+  // 2. Regenerate the repo's capture route with the new PIXEL_ID/META_ACCOUNT_ID baked in —
+  //    unlike GTM, the pixel id must also reach app/api/capture/route.ts so forward-lead can
+  //    fire the matching server-side CAPI event. Build the whole-site path->list map the same
+  //    way syncLeadCaptureForPage does (the capture route is repo-level, the list is per-page).
+  const siblings = await listLandingPages(page.userId);
+  const listByPath: Record<string, string> = {};
+  for (const p of siblings) {
+    if (p.githubRepoUrl !== page.githubRepoUrl) continue;
+    if (!p.leadListId) continue;
+    listByPath[p.slug ? `/${p.slug}` : "/"] = p.leadListId;
+  }
+  await syncLeadCaptureFilesToRepo(repoFullName, listByPath, pixelId || undefined, pixelId ? accountId : undefined);
+
+  // 3. Persist metaPixelId/metaAdAccountId on this record.
+  await updateLandingPageMetaPixel(page.id, page.userId, pixelId, accountId);
+
+  // 4. Sync metaTrackingInstalled across every sibling sharing this site's root layout —
+  //    same rationale as saveGtmForPage's trackingInstalled sync. Best-effort; a sync
+  //    failure must never undo the GitHub commit that already succeeded.
+  const siteId = page.siteId ?? page.id;
+  try {
+    await Promise.all(
+      siblings
+        .filter((p) => (p.siteId ?? p.id) === siteId)
+        .map((p) =>
+          updateLandingPageMetaTrackingInstalled(p.id, !!pixelId).catch((err: any) => {
+            console.error(`[LP GENERATION] Failed to sync metaTrackingInstalled for page ${p.id}: ${err.message}`);
+          }),
+        ),
+    );
+  } catch (err: any) {
+    console.error(`[LP GENERATION] Failed to sync metaTrackingInstalled across sibling pages: ${err.message}`);
+  }
+
+  // 5. Trigger Vercel re-deploy if we have a project ID
+  const vercelProjectId = await resolveVercelProjectId(page);
+  if (vercelProjectId) {
+    try {
+      await triggerVercelDeployment(vercelProjectId, `${owner}/${repo}`);
+    } catch (deployErr: any) {
+      console.warn(`[LP GENERATION] Could not trigger Vercel re-deploy after Meta Pixel inject: ${deployErr.message}`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /generated/:id/meta-pixel
+// Manual override for the Meta pixel/account id (API-only — no portal UI in v1).
+// ---------------------------------------------------------------------------
+router.post("/generated/:id/meta-pixel", editRateLimiter, async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const page = auth.page;
+    if (!page.githubRepoUrl) return res.status(400).json({ error: "Landing page has no GitHub repository" });
+
+    const { pixelId, accountId } = req.body as { pixelId?: string; accountId?: string };
+    if (typeof pixelId !== "string") {
+      return res.status(400).json({ error: "pixelId is required" });
+    }
+    const trimmed = pixelId.trim();
+    if (trimmed && !/^\d+$/.test(trimmed)) {
+      return res.status(400).json({ error: "Invalid Meta pixel id. Expected a numeric id." });
+    }
+
+    await saveMetaPixelForPage(page, trimmed, accountId);
+
+    res.json({
+      success: true,
+      pixelId: trimmed,
+      message: trimmed
+        ? `Meta Pixel ${trimmed} injected. Your site will redeploy shortly.`
+        : "Meta Pixel removed. Your site will redeploy shortly.",
+    });
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error injecting Meta Pixel:", error);
+    const httpStatus = error?.httpStatus ?? 500;
+    res.status(httpStatus).json({ error: error.response?.data?.message || error.message || "Failed to inject Meta Pixel" });
+  }
+});
 
 // ---------------------------------------------------------------------------
 // POST /site/gtm
