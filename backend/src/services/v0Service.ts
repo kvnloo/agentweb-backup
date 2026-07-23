@@ -6,6 +6,8 @@ import path from "path";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken, getLandingPagesConfig } from "../utils/secretsManager";
 import { resolveLandingPageGa4 } from "../utils/landingPageGa4";
 import { injectGtmIntoLayoutFiles } from "../utils/gtmInjection";
+import { injectPixelIntoLayoutFiles } from "../utils/pixelInjection";
+import { metaService } from "./metaService";
 import { userDb, orgDb } from "./db";
 import { canEditItem } from "./orgShareService";
 import { addSubdomain, generateSubdomain, listDomains, SUBDOMAIN_BASE } from "./customDomainService";
@@ -476,6 +478,29 @@ export interface GeneratedLandingPage {
    * generated code. Never implies a fallback to AgentWeb's own GA4 property.
    */
   trackingInstalled?: boolean;
+  /**
+   * ENG-449: the resolved (or manually-set) Meta pixel id, site-level (root record only),
+   * mirroring `gtmContainerId`. Used directly as the CAPI dataset id too — Meta unified
+   * pixel + dataset in Graph v25.
+   */
+  metaPixelId?: string;
+  /**
+   * ENG-449: which connected Meta ad account `metaPixelId` was resolved from — needed later
+   * so `forward-lead` can look up a fresh access token for the server-side CAPI send.
+   */
+  metaAdAccountId?: string;
+  /**
+   * ENG-449: whether the Meta Pixel base snippet was injected into the generated layout at
+   * push time. Mirrors `trackingInstalled`'s "fail loud, never silently skip" contract — false
+   * means the lander shipped with no Meta conversion tracking at all.
+   */
+  metaTrackingInstalled?: boolean;
+  /**
+   * ENG-449: per-page (not site-level) — whether the generated form component was confirmed,
+   * via the validation-retry check, to actually call fbq('track','Lead') on submit. v0 authors
+   * the form freeform, so unlike layout-level injection this can only be checked, not guaranteed.
+   */
+  pixelLeadEventVerified?: boolean;
   context?: string;
   /**
    * State captured at the most recent publish, used to revert it. The pre-merge
@@ -708,7 +733,16 @@ export function buildBrandEnrichedPrompt(
   userPrompt: string,
   brand: BrandContext,
   leadListId?: string,
-  templateHtml?: string
+  templateHtml?: string,
+  /**
+   * ENG-449: when set, instructs v0 to fire the Meta Pixel `Lead` event on successful form
+   * submit. This is the ONLY way to get that event into the generated form — unlike the
+   * layout-level Pixel base snippet (platform-injected, guaranteed), the form component
+   * itself is entirely v0-authored freeform code with no platform-owned seam. The
+   * validation-retry loop in generateFirstPage/addPageToExistingRepo is the safety net if
+   * v0 doesn't comply; this prompt instruction is the primary mechanism.
+   */
+  metaPixelId?: string,
 ): string {
   const parts: string[] = [];
 
@@ -767,6 +801,17 @@ export function buildBrandEnrichedPrompt(
       `   Show a success message after submission. Show an error message on failure.\n` +
       `2. Do NOT create app/api/capture/route.ts yourself — the platform injects this API route automatically. Only build the form component that posts to the relative /api/capture path.\n` +
       `3. NEVER put absolute backend URLs in any client-side .tsx file.`
+    );
+  }
+
+  if (leadListId && metaPixelId) {
+    parts.push(
+      `\n\nMETA PIXEL LEAD EVENT — IMPORTANT ARCHITECTURE:\n` +
+      `1. In the lead capture form component, generate a shared event id ONCE per submit: const eventId = crypto.randomUUID();\n` +
+      `2. Include that same value as an "eventId" field in the JSON body of the fetch('/api/capture', ...) call.\n` +
+      `3. On a SUCCESSFUL submission response, call: window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });\n` +
+      `4. If the form redirects the user anywhere after a successful submission, wait ~800ms (await new Promise(r => setTimeout(r, 800))) AFTER calling fbq and BEFORE navigating away — otherwise the tracking beacon can be dropped by the redirect.\n` +
+      `5. Do NOT call fbq('init', ...) yourself — the platform already injects the Meta Pixel base code in the root layout. Only fire the 'track' Lead event here.`
     );
   }
 
@@ -1174,7 +1219,27 @@ async function generateFirstPage(
   // We send a condensed outline (not the full 55KB HTML) to avoid exceeding v0 prompt limits.
   const effectiveTemplate = templateHtml ?? await loadDefaultTemplateOutline();
 
-  const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate);
+  // ENG-449: resolve the Meta pixel BEFORE building the prompt — the client-side Lead-event
+  // instruction must be in the prompt sent to v0 at chat-creation time, which is earlier than
+  // the layout-injection push step in deployLandingPage. A Meta API hiccup (or an
+  // unconnected/ambiguous account) must never fail generation — it just means no pixel
+  // instruction is included, same as GTM's "absent id" path.
+  let metaPixelId: string | undefined;
+  let metaAdAccountId: string | undefined;
+  try {
+    const user = await userDb.getUserById(userId);
+    const resolution = await metaService.resolveMetaPixelForUser(user, userId);
+    if ("pixelId" in resolution) {
+      metaPixelId = resolution.pixelId;
+      metaAdAccountId = resolution.accountId;
+    } else {
+      console.warn(`[V0 SERVICE] Meta Pixel not auto-resolved for user ${userId}: ${resolution.reason}`);
+    }
+  } catch (err: any) {
+    console.error(`[V0 SERVICE] Meta Pixel resolution threw unexpectedly (continuing without it): ${err?.message}`);
+  }
+
+  const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate, metaPixelId);
 
   const record: GeneratedLandingPage = {
     id,
@@ -1194,6 +1259,7 @@ async function generateFirstPage(
   if (leadListId) record.leadListId = leadListId;
   if (templateHtml) record.templateHtml = templateHtml;
   if (originatingSessionId) record.originatingSessionId = originatingSessionId;
+  if (metaPixelId) { record.metaPixelId = metaPixelId; record.metaAdAccountId = metaAdAccountId; }
 
   await dynamodb.put({ TableName: TABLE_NAME, Item: record }).promise();
 
@@ -1521,7 +1587,11 @@ async function addPageToExistingRepo(
     // If no template provided, fall back to landing-page-v2 (same behaviour as generateFirstPage)
     const effectiveTemplate = templateHtml ?? await loadDefaultTemplateOutline();
 
-    const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate);
+    // ENG-449: sub-pages never re-resolve or re-inject the pixel (the layout is inherited,
+    // untouched, from the first page's push) — but the Lead-event prompt instruction is still
+    // needed here since each page has its OWN form component. Just read whatever the site's
+    // root already resolved, no fresh Meta API call.
+    const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate, existingPage.metaPixelId);
     const v0 = await getV0Client();
 
     console.log(`[V0 SERVICE] Creating v0 chat for additional page /${slug}...`);
@@ -1586,6 +1656,8 @@ async function addPageToExistingRepo(
 
     const V0_VALIDATION_MAX_RETRIES = 2;
     let zipBuffer: any;
+    // ENG-449: per-page signal — see the equivalent block in deployLandingPage.
+    let pixelLeadEventVerified: boolean | undefined;
 
     for (let validationAttempt = 0; validationAttempt <= V0_VALIDATION_MAX_RETRIES; validationAttempt++) {
       console.log(`[V0 SERVICE] Downloading v0 files for /${slug} (version ${versionId}, attempt ${validationAttempt + 1})`);
@@ -1616,6 +1688,54 @@ async function addPageToExistingRepo(
 
       try {
         validateV0Output(previewFiles);
+
+        // ENG-449: same verify-and-retry as deployLandingPage — a sub-page has its OWN form
+        // component, so the Lead event must be checked here too, not just on the first page.
+        if (existingPage.metaPixelId) {
+          const pixelCheck = validatePixelLeadEvent(previewFiles);
+          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+            console.warn(`[V0 SERVICE] Meta Pixel Lead event missing for /${slug} (attempt ${validationAttempt + 1}): ${pixelCheck.reason}`);
+
+            await guardedV0CorrectionMessage({
+              userId,
+              scopeId: existingPage.siteId ?? existingPage.id,
+              chatId,
+              attempt: validationAttempt,
+              send: () => withRetry(
+                () => v0.chats.sendMessage({
+                  chatId,
+                  message:
+                    "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
+                    "generate `const eventId = crypto.randomUUID();`, include it as an \"eventId\" field in the " +
+                    "fetch('/api/capture', ...) JSON body, and on a successful response call " +
+                    "`window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });`. " +
+                    `Issue: ${pixelCheck.reason}`,
+                }),
+                "v0 correction message (pixel lead event, additional page)",
+                undefined, undefined, undefined,
+                { retryOnTimeout: false }
+              ),
+            });
+
+            versionId = await waitForCompletedV0Version(
+              v0,
+              chatId,
+              `v0 correction (pixel lead event) for /${slug}`,
+              {
+                heartbeat: () => touchLandingPageRecord(id),
+                deadline: buildDeadline,
+                afterVersionId: versionId,
+              }
+            );
+
+            continue;
+          }
+          pixelLeadEventVerified = pixelCheck.ok;
+          if (!pixelCheck.ok) {
+            console.warn(`[V0 SERVICE] Meta Pixel Lead event still missing for /${slug} after retries — proceeding without it: ${pixelCheck.reason}`);
+          }
+        }
+
         break;
       } catch (valErr: any) {
         if (valErr instanceof V0OutputValidationError && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
@@ -1783,6 +1903,7 @@ async function addPageToExistingRepo(
       ...record,
       status: "deployed",
       updatedAt: new Date().toISOString(),
+      ...(pixelLeadEventVerified !== undefined ? { pixelLeadEventVerified } : {}),
     };
 
     await dynamodb
@@ -1790,13 +1911,15 @@ async function addPageToExistingRepo(
         TableName: TABLE_NAME,
         Key: { id },
         UpdateExpression:
-          "SET #status = :status, updatedAt = :updatedAt, githubRepoUrl = :repoUrl, vercelProjectId = :vercelId",
+          "SET #status = :status, updatedAt = :updatedAt, githubRepoUrl = :repoUrl, vercelProjectId = :vercelId" +
+          (pixelLeadEventVerified !== undefined ? ", pixelLeadEventVerified = :pixelLeadEventVerified" : ""),
         ExpressionAttributeNames: { "#status": "status" },
         ExpressionAttributeValues: {
           ":status": "deployed",
           ":updatedAt": new Date().toISOString(),
           ":repoUrl": existingPage.githubRepoUrl ?? record.githubRepoUrl,
           ":vercelId": existingPage.vercelProjectId ?? record.vercelProjectId,
+          ...(pixelLeadEventVerified !== undefined ? { ":pixelLeadEventVerified": pixelLeadEventVerified } : {}),
         },
       })
       .promise();
@@ -2285,6 +2408,9 @@ export async function deployLandingPage(
     // Step 2: Download + validate v0 output (with retry on bad output)
     const V0_VALIDATION_MAX_RETRIES = 2;
     let zipBuffer: any;
+    // ENG-449: per-page signal — was the client-side fbq('track','Lead') call confirmed
+    // present in the generated form? Only meaningful when a pixel is actually configured.
+    let pixelLeadEventVerified: boolean | undefined;
 
     for (let validationAttempt = 0; validationAttempt <= V0_VALIDATION_MAX_RETRIES; validationAttempt++) {
       console.log(`[V0 SERVICE] Step 2: Downloading files from v0 (version ${versionId}, attempt ${validationAttempt + 1})`);
@@ -2312,6 +2438,56 @@ export async function deployLandingPage(
 
       try {
         validateV0Output(previewFiles);
+
+        // ENG-449: v0 authors the form component freeform — there's no platform-owned seam
+        // to guarantee the Lead event the way layout.tsx injection guarantees the base pixel.
+        // Verify it, and retry (same correction-message mechanism as validateV0Output) if
+        // missing. Exhausted retries must NOT fail generation — just record the miss.
+        if (record.metaPixelId) {
+          const pixelCheck = validatePixelLeadEvent(previewFiles);
+          if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+            console.warn(`[V0 SERVICE] Meta Pixel Lead event missing (attempt ${validationAttempt + 1}): ${pixelCheck.reason}`);
+
+            await guardedV0CorrectionMessage({
+              userId,
+              scopeId: record.siteId ?? record.id,
+              chatId: record.v0ChatId!,
+              attempt: validationAttempt,
+              send: () => withRetry(
+                () => v0.chats.sendMessage({
+                  chatId: record.v0ChatId!,
+                  message:
+                    "The lead capture form is missing the Meta Pixel Lead event. In the form's submit handler: " +
+                    "generate `const eventId = crypto.randomUUID();`, include it as an \"eventId\" field in the " +
+                    "fetch('/api/capture', ...) JSON body, and on a successful response call " +
+                    "`window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });`. " +
+                    `Issue: ${pixelCheck.reason}`,
+                }),
+                "v0 correction message (pixel lead event)",
+                undefined, undefined, undefined,
+                { retryOnTimeout: false }
+              ),
+            });
+
+            versionId = await waitForCompletedV0Version(
+              v0,
+              record.v0ChatId!,
+              "v0 correction (pixel lead event)",
+              {
+                heartbeat: () => touchLandingPageRecord(id),
+                deadline: buildDeadline,
+                afterVersionId: versionId,
+              }
+            );
+
+            continue;
+          }
+          pixelLeadEventVerified = pixelCheck.ok;
+          if (!pixelCheck.ok) {
+            console.warn(`[V0 SERVICE] Meta Pixel Lead event still missing after retries — proceeding without it (never fails generation): ${pixelCheck.reason}`);
+          }
+        }
+
         break; // validation passed
       } catch (valErr: any) {
         if (valErr instanceof V0OutputValidationError && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
@@ -2371,32 +2547,65 @@ export async function deployLandingPage(
     // convention routes/domains.ts uses to build its domain map (`p.slug ? "/"+p.slug : "/"`).
     const pagePath = record.slug ? `/${record.slug}` : "/";
     const listByPath: Record<string, string> = record.leadListId ? { [pagePath]: record.leadListId } : {};
-    const { githubRepoUrl, repoFullName, commitSha, gtmInjected } = await createGitHubRepoAndPush(
+
+    // ENG-449: resolve the Meta pixel to use, if one wasn't already manually set on this
+    // record. A Meta API hiccup (or an unconnected/ambiguous account) must never fail
+    // generation — it just means no pixel gets injected, same as GTM's "absent id" path.
+    let metaPixelId = record.metaPixelId;
+    let metaAdAccountId = record.metaAdAccountId;
+    if (!metaPixelId) {
+      try {
+        const user = await userDb.getUserById(userId);
+        const resolution = await metaService.resolveMetaPixelForUser(user, userId);
+        if ("pixelId" in resolution) {
+          metaPixelId = resolution.pixelId;
+          metaAdAccountId = resolution.accountId;
+        } else {
+          console.warn(`[V0 SERVICE] Meta Pixel not auto-resolved for user ${userId}: ${resolution.reason}`);
+        }
+      } catch (err: any) {
+        console.error(`[V0 SERVICE] Meta Pixel resolution threw unexpectedly (continuing without it): ${err?.message}`);
+      }
+    }
+
+    const { githubRepoUrl, repoFullName, commitSha, gtmInjected, pixelInjected } = await createGitHubRepoAndPush(
       repoName,
       zipBuffer,
       record.name,
       listByPath,
       record.gtmContainerId,
+      metaPixelId,
+      metaAdAccountId,
     );
-    // Reflect the tracking signal on the in-memory record so every downstream return
-    // (deployed or build-failed) carries it consistently with what we persisted.
+    // Reflect the tracking signals on the in-memory record so every downstream return
+    // (deployed or build-failed) carries them consistently with what we persisted.
     record.trackingInstalled = gtmInjected;
+    record.metaTrackingInstalled = pixelInjected;
+    record.metaPixelId = metaPixelId;
+    record.metaAdAccountId = metaAdAccountId;
+    if (pixelLeadEventVerified !== undefined) record.pixelLeadEventVerified = pixelLeadEventVerified;
 
     // Save GitHub repo URL immediately so it's not lost if Vercel step fails.
-    // ENG-334: persist an explicit tracking signal so "shipped with no conversion tracking"
-    // is detectable from the record itself, without reading the generated code.
+    // ENG-334/ENG-449: persist explicit tracking signals so "shipped with no conversion
+    // tracking" is detectable from the record itself, without reading the generated code.
     await dynamodb
       .update({
         TableName: TABLE_NAME,
         Key: { id },
         UpdateExpression:
-          "SET #status = :status, githubRepoUrl = :repoUrl, trackingInstalled = :trackingInstalled, updatedAt = :updatedAt",
+          "SET #status = :status, githubRepoUrl = :repoUrl, trackingInstalled = :trackingInstalled, " +
+          "metaTrackingInstalled = :metaTrackingInstalled, updatedAt = :updatedAt" +
+          (metaPixelId ? ", metaPixelId = :metaPixelId, metaAdAccountId = :metaAdAccountId" : "") +
+          (pixelLeadEventVerified !== undefined ? ", pixelLeadEventVerified = :pixelLeadEventVerified" : ""),
         ExpressionAttributeNames: { "#status": "status" },
         ExpressionAttributeValues: {
           ":status": "deploying",
           ":repoUrl": githubRepoUrl,
           ":trackingInstalled": gtmInjected,
+          ":metaTrackingInstalled": pixelInjected,
+          ...(pixelLeadEventVerified !== undefined ? { ":pixelLeadEventVerified": pixelLeadEventVerified } : {}),
           ":updatedAt": new Date().toISOString(),
+          ...(metaPixelId ? { ":metaPixelId": metaPixelId, ":metaAdAccountId": metaAdAccountId } : {}),
         },
       })
       .promise();
@@ -3171,6 +3380,29 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
 }
 
 /**
+ * ENG-449 — check whether v0's generated form component actually fires the Meta Pixel
+ * Lead event on submit, per the prompt instruction added to buildBrandEnrichedPrompt.
+ *
+ * Unlike `validateV0Output` this is not a hard build-breaking check: the form component is
+ * entirely v0-authored freeform code (no platform-owned seam to inject into, unlike
+ * layout.tsx), so this can only be *verified*, not *guaranteed*. Callers use this to decide
+ * whether to send a correction message and retry; if retries are exhausted, generation must
+ * still proceed (AC3 — never fail generation over a missing client-side event).
+ */
+export function validatePixelLeadEvent(files: Array<{ path: string; content: Buffer }>): { ok: boolean; reason?: string } {
+  const tsxSource = files
+    .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
+    .map((f) => f.content.toString("utf-8"))
+    .join("\n");
+
+  if (!/fbq\(\s*['"]track['"]\s*,\s*['"]Lead['"]/.test(tsxSource)) {
+    return { ok: false, reason: "No fbq('track', 'Lead') call found in the generated form component" };
+  }
+
+  return { ok: true };
+}
+
+/**
  * Deterministically inject platform-owned lead-capture attribution files into a
  * generated repo's file set, and drop any v0-generated capture route / middleware
  * that would conflict with them.
@@ -3351,7 +3583,16 @@ export function buildDomainMapFile(domainMap: Record<string, string> = {}): stri
  */
 export function buildCaptureRoute(
   listByPath: Record<string, string>,
-  apiBase: string = process.env.BACKEND_URL || "https://api.agentweb.pro"
+  apiBase: string = process.env.BACKEND_URL || "https://api.agentweb.pro",
+  /**
+   * ENG-449: the site's resolved Meta pixel id + the connected ad account it came from.
+   * Baked in as plain string constants (like LIST_BY_PATH) — neither is a secret (the pixel
+   * id is already public in the base snippet itself; the account id is just an identifier
+   * `forward-lead` uses to look up a fresh access token server-side). When absent, no
+   * pixelId/metaAccountId fields are added to the forwarded body at all.
+   */
+  pixelId?: string,
+  metaAccountId?: string,
 ): string {
   // Guard the shape. This used to take a bare `leadListId: string`, and passing the old
   // string form here silently produced `const LIST_BY_PATH = "list_xyz"` — a route that
@@ -3371,6 +3612,10 @@ import { cookies, headers } from "next/headers";
 // path -> lead list. One entry per page of this site; the route is shared by all of them.
 const LIST_BY_PATH: Record<string, string> = ${JSON.stringify(listByPath, null, 2)};
 const FORWARD_URL = "${apiBase}/api/webhooks/forward-lead";
+// ENG-449: not secrets — the pixel id is already public in the base snippet, and the account
+// id is just an identifier the backend uses to look up its own stored access token.
+const PIXEL_ID = ${pixelId ? JSON.stringify(pixelId) : "undefined"};
+const META_ACCOUNT_ID = ${metaAccountId ? JSON.stringify(metaAccountId) : "undefined"};
 
 /** Which page was this form submitted from? */
 async function resolvePagePath(): Promise<string | undefined> {
@@ -3408,7 +3653,13 @@ export async function POST(req: Request) {
     const res = await fetch(FORWARD_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...body, listId, source: "landing-page", ...(attribution ? { attribution } : {}) }),
+      body: JSON.stringify({
+        ...body,
+        listId,
+        source: "landing-page",
+        ...(attribution ? { attribution } : {}),
+        ...(PIXEL_ID ? { pixelId: PIXEL_ID, metaAccountId: META_ACCOUNT_ID } : {}),
+      }),
     });
     if (!res.ok) return NextResponse.json({ success: false }, { status: 502 });
     return NextResponse.json({ success: true });
@@ -3432,14 +3683,17 @@ export async function POST(req: Request) {
  */
 export function injectLeadCaptureAttribution(
   files: Array<{ path: string; content: Buffer }>,
-  listByPath: Record<string, string>
+  listByPath: Record<string, string>,
+  /** ENG-449: threaded through to buildCaptureRoute — see its own doc comment. */
+  pixelId?: string,
+  metaAccountId?: string,
 ): Array<{ path: string; content: Buffer }> {
   const filtered = files.filter(
     (f) => !isV0CaptureRoute(f.path) && !isV0Middleware(f.path) && !isV0DomainMap(f.path)
   );
 
   filtered.push({ path: "middleware.ts", content: Buffer.from(buildLandingPageMiddleware()) });
-  filtered.push({ path: "app/api/capture/route.ts", content: Buffer.from(buildCaptureRoute(listByPath)) });
+  filtered.push({ path: "app/api/capture/route.ts", content: Buffer.from(buildCaptureRoute(listByPath, undefined, pixelId, metaAccountId)) });
   // The middleware imports ./domainMap, so a fresh page MUST ship one or its very
   // first Vercel build fails. Empty until a subdomain is actually attached, at which
   // point updateSubdomainMiddleware rewrites it with the real map.
@@ -3470,7 +3724,17 @@ async function createGitHubRepoAndPush(
    * platform GA4 property on a customer page.
    */
   gtmContainerId?: string,
-): Promise<{ githubRepoUrl: string; repoFullName: string; commitSha: string; gtmInjected: boolean }> {
+  /**
+   * ENG-449: the site's resolved (or manually-set) Meta pixel id. When set, the pixel base
+   * snippet is injected into the root layout before the initial commit, mirroring GTM. When
+   * absent, NOTHING is injected — no fallback pixel.
+   */
+  metaPixelId?: string,
+  /** ENG-449: the connected Meta ad account `metaPixelId` was resolved from — baked into the
+   *  generated capture route (as a public identifier, not a secret) so `forward-lead` can look
+   *  up a fresh access token for the CAPI send. */
+  metaAdAccountId?: string,
+): Promise<{ githubRepoUrl: string; repoFullName: string; commitSha: string; gtmInjected: boolean; pixelInjected: boolean }> {
   const { token, org } = await getGitHubOrgToken();
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -3598,7 +3862,7 @@ async function createGitHubRepoAndPush(
   // stamps cookies), and a capture route that reports "this page has no lead list
   // configured" beats a bare 404, so we always inject. The route simply carries an empty
   // map until a list is wired up.
-  const finalFiles = injectLeadCaptureAttribution(files, listByPath);
+  const finalFiles = injectLeadCaptureAttribution(files, listByPath, metaPixelId, metaAdAccountId);
   const wired = Object.entries(listByPath);
   console.log(
     wired.length
@@ -3628,6 +3892,16 @@ async function createGitHubRepoAndPush(
     gtmInjected
       ? `[V0 SERVICE] Injected GTM container ${gtmContainerId} into app/layout.tsx`
       : `[V0 SERVICE] No GTM container configured for this site — pushing WITHOUT conversion tracking`,
+  );
+
+  // ENG-449: auto-inject the site's resolved Meta pixel into the root layout BEFORE the
+  // initial commit, mirroring GTM above. Absent a pixel id, nothing is injected and the
+  // caller records a "no Meta tracking installed" signal.
+  const pixelInjected = injectPixelIntoLayoutFiles(finalFiles, metaPixelId);
+  console.log(
+    pixelInjected
+      ? `[V0 SERVICE] Injected Meta Pixel ${metaPixelId} into app/layout.tsx`
+      : `[V0 SERVICE] No Meta Pixel configured for this site — pushing WITHOUT Meta conversion tracking`,
   );
 
   // Push files to the repo using the Git Trees API (single commit for all files)
@@ -3688,7 +3962,7 @@ async function createGitHubRepoAndPush(
 
   console.log(`[V0 SERVICE] Pushed ${finalFiles.length} files to ${repoFullName} (${commitSha.substring(0, 7)})`);
 
-  return { githubRepoUrl, repoFullName, commitSha, gtmInjected };
+  return { githubRepoUrl, repoFullName, commitSha, gtmInjected, pixelInjected };
 }
 
 /**
@@ -4884,6 +5158,65 @@ export async function updateLandingPageTrackingInstalled(
 }
 
 /**
+ * ENG-449 — mirrors updateLandingPageGtm for the Meta pixel manual-override path.
+ */
+export async function updateLandingPageMetaPixel(
+  id: string,
+  userId: string,
+  pixelId: string,
+  accountId?: string,
+): Promise<void> {
+  const record = await getLandingPage(id, userId);
+  if (!record) throw new Error("Landing page not found");
+
+  if (pixelId) {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "SET metaPixelId = :px, metaAdAccountId = :acc, updatedAt = :now",
+        ExpressionAttributeValues: {
+          ":px": pixelId,
+          ":acc": accountId,
+          ":now": new Date().toISOString(),
+        },
+      })
+      .promise();
+  } else {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "REMOVE metaPixelId, metaAdAccountId SET updatedAt = :now",
+        ExpressionAttributeValues: { ":now": new Date().toISOString() },
+      })
+      .promise();
+  }
+}
+
+/**
+ * ENG-449 — mirrors updateLandingPageTrackingInstalled for the Meta pixel signal. Split out
+ * the same way, for the same reason: a site-level pixel change affects every page sharing
+ * the root layout, not just the record `metaPixelId` was written to.
+ */
+export async function updateLandingPageMetaTrackingInstalled(
+  id: string,
+  metaTrackingInstalled: boolean,
+): Promise<void> {
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id },
+      UpdateExpression: "SET metaTrackingInstalled = :t, updatedAt = :now",
+      ExpressionAttributeValues: {
+        ":t": metaTrackingInstalled,
+        ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
+}
+
+/**
  * Persist the state needed to revert the most recent publish. Overwrites any
  * prior `lastPublish` — only the latest publish is revertable (single-step).
  */
@@ -5235,7 +5568,10 @@ async function readRepoFile(
  */
 export async function syncLeadCaptureFilesToRepo(
   repoFullName: string,
-  listByPath: Record<string, string>
+  listByPath: Record<string, string>,
+  /** ENG-449: threaded through to buildCaptureRoute — see its own doc comment. */
+  pixelId?: string,
+  metaAccountId?: string,
 ): Promise<{ committed: boolean; reason?: string }> {
   try {
     const { token: ghToken } = await getGitHubOrgToken();
@@ -5245,7 +5581,7 @@ export async function syncLeadCaptureFilesToRepo(
     };
 
     const middlewareContent = buildLandingPageMiddleware();
-    const captureRouteContent = buildCaptureRoute(listByPath);
+    const captureRouteContent = buildCaptureRoute(listByPath, undefined, pixelId, metaAccountId);
 
     const [existingMiddleware, existingCaptureRoute, existingDomainMap] = await Promise.all([
       readRepoFile(repoFullName, "middleware.ts", ghHeaders),

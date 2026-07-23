@@ -179,6 +179,7 @@ import {
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord, getVercelBuildErrors, isNonErrorBuildLine } from "../services/v0Service";
+import { metaService } from "../services/metaService";
 import { _resetV0UsageGuardForTest, guardedV0ChatCreate, hashV0Prompt } from "../services/v0UsageGuard";
 const { enqueueAutoHumanEval } = jest.requireMock("../services/autoHumanEvalService");
 
@@ -540,6 +541,36 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("SUCCESS: injectLeadCaptureAttribution never trips the duplicate guard on the normal path", () => {
     const files = [file("app/page.tsx"), file("app/api/capture/route.ts", "// v0's own"), file("middleware.ts", "// v0's own")];
     expect(() => injectLeadCaptureAttribution(files, { "/": "list_xyz" })).not.toThrow();
+  });
+
+  // ---------------------------------------------------------------------------
+  // ENG-449: pixelId/metaAccountId threaded through to the generated capture route,
+  // forwarded to the backend's forward-lead webhook alongside the client's own eventId.
+  // ---------------------------------------------------------------------------
+  it("SUCCESS (ENG-449): pixelId + metaAccountId are baked into the capture route and forwarded", () => {
+    const result = injectLeadCaptureAttribution([file("app/page.tsx")], { "/": "list_xyz" }, "1430870751246428", "acc1");
+
+    const route = result.find((f) => f.path === "app/api/capture/route.ts")!;
+    const routeSrc = route.content.toString();
+    expect(routeSrc).toContain('const PIXEL_ID = "1430870751246428"');
+    expect(routeSrc).toContain('const META_ACCOUNT_ID = "acc1"');
+    expect(routeSrc).toContain("pixelId: PIXEL_ID");
+    expect(routeSrc).toContain("metaAccountId: META_ACCOUNT_ID");
+    // The client's own eventId already passes through via the existing `...body` spread —
+    // no separate handling needed, but pin that the spread still comes first.
+    expect(routeSrc.indexOf("...body")).toBeLessThan(routeSrc.indexOf("pixelId: PIXEL_ID"));
+  });
+
+  it("SUCCESS (ENG-449): no pixelId => no PIXEL_ID/META_ACCOUNT_ID fields forwarded at all", () => {
+    const result = injectLeadCaptureAttribution([file("app/page.tsx")], { "/": "list_xyz" });
+
+    const route = result.find((f) => f.path === "app/api/capture/route.ts")!;
+    const routeSrc = route.content.toString();
+    // PIXEL_ID/META_ACCOUNT_ID are declared undefined, so the runtime `PIXEL_ID ? {...} : {}`
+    // ternary in the forwarded body naturally omits pixelId/metaAccountId — no separate
+    // conditional needed in the generated source itself.
+    expect(routeSrc).toContain("const PIXEL_ID = undefined");
+    expect(routeSrc).toContain("const META_ACCOUNT_ID = undefined");
   });
 });
 
@@ -1884,6 +1915,131 @@ describe("v0Service - deployLandingPage", () => {
       .some((c) => Buffer.from(c[1].content, "base64").toString("utf8").includes("googletagmanager.com"));
     expect(anyTagPushed).toBe(false);
     expect(pushedTrackingSignal()).toBe(false);
+  });
+
+  // ---------------------------------------------------------------------------
+  // ENG-449: Meta Pixel auto-injection wiring — the resolved metaPixelId flows through
+  // the push path into the files array pushed to GitHub, and metaTrackingInstalled is
+  // persisted. Mirrors the ENG-334 GTM wiring section above. resolveMetaPixelForUser
+  // itself is unit-tested elsewhere (metaService.pixelResolution.test.ts) — these pin
+  // the WIRING between resolution and injection (acceptance criteria 1, 3, 4).
+  // ---------------------------------------------------------------------------
+
+  function pushedMetaTrackingSignal(): boolean | undefined {
+    const call = mockUpdate.mock.calls.find(
+      (c) => c[0]?.ExpressionAttributeValues && ":metaTrackingInstalled" in c[0].ExpressionAttributeValues,
+    );
+    return call?.[0].ExpressionAttributeValues[":metaTrackingInstalled"];
+  }
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it("SUCCESS (criterion 1): a resolvable pixel pushes an app/layout.tsx carrying the Meta Pixel snippet and records metaTrackingInstalled=true", async () => {
+    jest.spyOn(metaService, "resolveMetaPixelForUser").mockResolvedValue({
+      pixelId: "1430870751246428",
+      accountId: "acc1",
+    });
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page-1",
+            userId: "user-1",
+            name: "Compare Landing Page",
+            prompt: "Build a compare landing page",
+            status: "draft",
+            v0ChatId: "chat_1",
+            iterations: 0,
+          },
+        }),
+    });
+    mockChatsGetById.mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+    mockChatsDownloadVersion.mockResolvedValueOnce(await createV0ZipWithLayout());
+    wireHappyPathDeploy();
+
+    const result = await deployLandingPage("page-1", "user-1");
+
+    expect(result.status).toBe("deployed");
+    const layout = pushedLayoutBlob();
+    expect(layout).toBeDefined();
+    expect(layout).toContain("fbq('init', '1430870751246428')");
+    expect(layout).toContain('rel="icon"'); // v0's original layout content preserved
+    expect(pushedMetaTrackingSignal()).toBe(true);
+  });
+
+  it("SUCCESS (criterion 3): an unresolvable pixel (0 connected accounts) still deploys, pushes NO pixel tag, and records metaTrackingInstalled=false", async () => {
+    jest.spyOn(metaService, "resolveMetaPixelForUser").mockResolvedValue({
+      unresolved: true,
+      reason: "No Meta ad account connected",
+    });
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page-1",
+            userId: "user-1",
+            name: "Untracked Landing Page",
+            prompt: "Build an untracked landing page",
+            status: "draft",
+            v0ChatId: "chat_1",
+            iterations: 0,
+            // metaPixelId intentionally absent
+          },
+        }),
+    });
+    mockChatsGetById.mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+    mockChatsDownloadVersion.mockResolvedValueOnce(await createV0ZipWithLayout());
+    wireHappyPathDeploy();
+
+    const result = await deployLandingPage("page-1", "user-1");
+
+    expect(result.status).toBe("deployed");
+    const layout = pushedLayoutBlob();
+    expect(layout).toBeDefined();
+    expect(layout).not.toContain("fbq(");
+    expect(layout).not.toContain("facebook.com");
+    expect(pushedMetaTrackingSignal()).toBe(false);
+  });
+
+  it("SUCCESS (criterion 4): both GTM and Meta Pixel configured — both snippets present in the same pushed layout, neither corrupts the other", async () => {
+    jest.spyOn(metaService, "resolveMetaPixelForUser").mockResolvedValue({
+      pixelId: "1430870751246428",
+      accountId: "acc1",
+    });
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page-1",
+            userId: "user-1",
+            name: "Fully Tracked Landing Page",
+            prompt: "Build a fully tracked landing page",
+            status: "draft",
+            v0ChatId: "chat_1",
+            iterations: 0,
+            gtmContainerId: "GTM-TEST99",
+          },
+        }),
+    });
+    mockChatsGetById.mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+    mockChatsDownloadVersion.mockResolvedValueOnce(await createV0ZipWithLayout());
+    wireHappyPathDeploy();
+
+    const result = await deployLandingPage("page-1", "user-1");
+
+    expect(result.status).toBe("deployed");
+    const layout = pushedLayoutBlob();
+    expect(layout).toBeDefined();
+    // Both present
+    expect(layout).toContain("'GTM-TEST99'");
+    expect(layout).toContain("fbq('init', '1430870751246428')");
+    // Neither duplicated / corrupted by the other's injection running second
+    expect(layout!.match(/gtm\.js\?id=/g)).toHaveLength(1);
+    expect(layout!.match(/fbq\('init',/g)).toHaveLength(1);
+    expect(pushedTrackingSignal()).toBe(true);
+    expect(pushedMetaTrackingSignal()).toBe(true);
   });
 });
 
