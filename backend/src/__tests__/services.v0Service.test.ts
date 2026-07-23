@@ -544,10 +544,10 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // ENG-449: pixelId/metaAccountId threaded through to the generated capture route,
+  // pixelId/metaAccountId threaded through to the generated capture route,
   // forwarded to the backend's forward-lead webhook alongside the client's own eventId.
   // ---------------------------------------------------------------------------
-  it("SUCCESS (ENG-449): pixelId + metaAccountId are baked into the capture route and forwarded", () => {
+  it("SUCCESS: pixelId + metaAccountId are baked into the capture route and forwarded", () => {
     const result = injectLeadCaptureAttribution([file("app/page.tsx")], { "/": "list_xyz" }, "1430870751246428", "acc1");
 
     const route = result.find((f) => f.path === "app/api/capture/route.ts")!;
@@ -561,7 +561,7 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
     expect(routeSrc.indexOf("...body")).toBeLessThan(routeSrc.indexOf("pixelId: PIXEL_ID"));
   });
 
-  it("SUCCESS (ENG-449): no pixelId => no PIXEL_ID/META_ACCOUNT_ID fields forwarded at all", () => {
+  it("SUCCESS: no pixelId => no PIXEL_ID/META_ACCOUNT_ID fields forwarded at all", () => {
     const result = injectLeadCaptureAttribution([file("app/page.tsx")], { "/": "list_xyz" });
 
     const route = result.find((f) => f.path === "app/api/capture/route.ts")!;
@@ -1918,11 +1918,11 @@ describe("v0Service - deployLandingPage", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // ENG-449: Meta Pixel auto-injection wiring — the resolved metaPixelId flows through
+  // Meta Pixel auto-injection wiring — the resolved metaPixelId flows through
   // the push path into the files array pushed to GitHub, and metaTrackingInstalled is
-  // persisted. Mirrors the ENG-334 GTM wiring section above. resolveMetaPixelForUser
+  // persisted. Mirrors the GTM wiring section above. resolveMetaPixelForUser
   // itself is unit-tested elsewhere (metaService.pixelResolution.test.ts) — these pin
-  // the WIRING between resolution and injection (acceptance criteria 1, 3, 4).
+  // the WIRING between resolution and injection.
   // ---------------------------------------------------------------------------
 
   function pushedMetaTrackingSignal(): boolean | undefined {

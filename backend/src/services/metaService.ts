@@ -1968,9 +1968,9 @@ export class MetaService {
 
   /**
    * Auto-resolve which Meta pixel a lander should use, from the site owner's already-connected
-   * Meta ad account (ENG-449). Uses `pixel.id` directly as the dataset id — Meta unified
-   * pixel + dataset in Graph v25, so the per-pixel `listDatasets` edge (broken, ENG-399) is
-   * never called at all.
+   * Meta ad account. Uses `pixel.id` directly as the dataset id — Meta unified
+   * pixel + dataset in Graph v25, so the per-pixel `listDatasets` edge (broken, see ENG-399)
+   * is never called at all.
    *
    * Never throws: an unconnected account, an ambiguous pixel/account set, or any Graph/
    * credential error all resolve to `{ unresolved: true, reason }` so generation can proceed
@@ -2014,7 +2014,7 @@ export class MetaService {
   }
 
   /**
-   * Server-side Meta Conversions API (CAPI) send (ENG-449). Fires a `Lead` event directly to
+   * Server-side Meta Conversions API (CAPI) send. Fires a `Lead` event directly to
    * Meta from our own trusted backend — never from a generated customer repo, which would
    * require shipping an access token into code we push to a customer-owned deployment.
    *

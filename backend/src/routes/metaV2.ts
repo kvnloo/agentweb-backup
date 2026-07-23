@@ -16,8 +16,8 @@ router.use(authenticateToken);
 // Helpers
 // ---------------------------------------------------------------------------
 // cleanAccountId / getConnectedMetaAccountsList / getMetaAccountCredentials now live in
-// services/metaAccountCredentials.ts (ENG-449) so metaService.resolveMetaPixelForUser and
-// the CAPI send in routes/webhooks.ts can reuse the same account-resolution logic.
+// services/metaAccountCredentials.ts so metaService.resolveMetaPixelForUser and the CAPI
+// send in routes/webhooks.ts can reuse the same account-resolution logic.
 
 /**
  * Download a remote image and return a Buffer + resolved filename.

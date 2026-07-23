@@ -1,12 +1,12 @@
 /**
- * ENG-449 — Auto-wire Meta Pixel + CAPI into Emma-generated landers.
+ * Auto-wire Meta Pixel + CAPI into Emma-generated landers.
  *
- * Mirrors ENG-334's GTM injection tests (`gtmInjection.test.ts`) 1:1. The Meta Pixel base
+ * Mirrors the GTM injection tests (`gtmInjection.test.ts`) 1:1. The Meta Pixel base
  * snippet (init + PageView) used to require a manual post-deploy step (there wasn't even
  * one — Pixel had zero support anywhere). Paid Meta campaigns hit freshly generated landers
- * with no pixel at all, so "0 conversions" was structurally unmeasurable (the RankAI/ENG-443
- * incident). The fix mirrors ENG-334 exactly: a shared, pure util run in the push path at
- * generation time, driven by the site's resolved `metaPixelId`. These tests pin the
+ * with no pixel at all, so "0 conversions" was structurally unmeasurable. The fix mirrors
+ * the GTM injection util exactly: a shared, pure util run in the push path at generation
+ * time, driven by the site's resolved `metaPixelId`. These tests pin the
  * behavioral contract for that util:
  *   1. Pixel is injected into the layout the site actually ships (v0's own layout.tsx).
  *   2. Injection is idempotent — a subpage inheriting the same root layout never duplicates it.
@@ -40,7 +40,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 }
 `;
 
-describe('ENG-449 — injectPixelIntoLayout (shared util)', () => {
+describe('injectPixelIntoLayout (shared util)', () => {
   it('injects the Meta Pixel base snippet for a configured pixel id', () => {
     const out = injectPixelIntoLayout(V0_LAYOUT, '1430870751246428');
     // fbq init carrying the customer's pixel id
@@ -90,7 +90,7 @@ describe('ENG-449 — injectPixelIntoLayout (shared util)', () => {
   });
 });
 
-describe('ENG-449 — injectPixelIntoLayoutFiles (files array passed to the GitHub push)', () => {
+describe('injectPixelIntoLayoutFiles (files array passed to the GitHub push)', () => {
   const filesWithV0Layout = () => [
     { path: 'app/page.tsx', content: Buffer.from('export default () => null;') },
     { path: 'app/layout.tsx', content: Buffer.from(V0_LAYOUT) },
@@ -132,7 +132,7 @@ describe('ENG-449 — injectPixelIntoLayoutFiles (files array passed to the GitH
   });
 });
 
-describe('ENG-449 — injectPixelIntoLayout size guard (regex-safety hardening)', () => {
+describe('injectPixelIntoLayout size guard (regex-safety hardening)', () => {
   it('leaves an oversized layout untouched instead of running the regex on it', () => {
     const huge = V0_LAYOUT + '// padding\n'.repeat(70_000); // well over 500KB
     expect(huge.length).toBeGreaterThan(500_000);
@@ -147,7 +147,7 @@ describe('ENG-449 — injectPixelIntoLayout size guard (regex-safety hardening)'
   });
 });
 
-describe('ENG-449 — verifyPixelInjection (fail loud, not silent, on a broken insert)', () => {
+describe('verifyPixelInjection (fail loud, not silent, on a broken insert)', () => {
   it('is true for a normal successful injection', () => {
     const out = injectPixelIntoLayout(V0_LAYOUT, '1430870751246428');
     expect(verifyPixelInjection(out, '1430870751246428')).toBe(true);

@@ -1,7 +1,7 @@
 import { ensureFreshMetaAdAccountToken } from './metaTokenRefresh';
 
 /**
- * Shared Meta ad-account credential resolution (ENG-449).
+ * Shared Meta ad-account credential resolution.
  *
  * Extracted out of `routes/metaV2.ts` (where it was private/non-exported) into its own leaf
  * module so it can be reused by `metaService.resolveMetaPixelForUser` and by the CAPI send in

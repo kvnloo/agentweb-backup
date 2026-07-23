@@ -1,7 +1,7 @@
 /**
- * Shared Meta Pixel injection for generated landing pages (ENG-449).
+ * Shared Meta Pixel injection for generated landing pages.
  *
- * Mirrors `gtmInjection.ts` (ENG-334) exactly in shape: a pure, dependency-free util so the
+ * Mirrors `gtmInjection.ts` exactly in shape: a pure, dependency-free util so the
  * auto-inject-at-generation path and the manual-override path emit byte-identical output and
  * share a single source of truth. Kept as a separate module (not merged with gtmInjection) so
  * each injection is independently regex-scoped and provably cannot corrupt or duplicate the

@@ -1254,7 +1254,7 @@ describe("POST /api/landing-pages/v0/generated/:id/gtm", () => {
 });
 
 // =============================================================================
-// POST /generated/:id/meta-pixel (ENG-449 — manual override, API-only)
+// POST /generated/:id/meta-pixel (manual override, API-only)
 // =============================================================================
 describe("POST /api/landing-pages/v0/generated/:id/meta-pixel", () => {
   const PAGE_WITH_REPO = {

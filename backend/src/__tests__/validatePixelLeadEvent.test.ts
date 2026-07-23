@@ -1,6 +1,4 @@
 /**
- * ENG-449 — validatePixelLeadEvent.
- *
  * Checks whether v0's generated form component actually fires the Meta Pixel Lead event on
  * submit, per the prompt instruction added to buildBrandEnrichedPrompt. Unlike
  * validateV0Output this can only be verified, not guaranteed — v0 authors the form freeform,
@@ -9,7 +7,7 @@
 
 import { validatePixelLeadEvent } from '../services/v0Service';
 
-describe('ENG-449 — validatePixelLeadEvent', () => {
+describe('validatePixelLeadEvent', () => {
   it('fails when no fbq Lead call exists anywhere in the generated .tsx files', () => {
     const files = [
       { path: 'app/page.tsx', content: Buffer.from('export default function Page() { return <div>hi</div>; }') },

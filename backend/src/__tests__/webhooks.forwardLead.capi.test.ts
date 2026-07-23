@@ -1,5 +1,5 @@
 /**
- * ENG-449 — server-side Meta Conversions API (CAPI) send from the forward-lead webhook.
+ * Server-side Meta Conversions API (CAPI) send from the forward-lead webhook.
  *
  * pixelId/metaAccountId/eventId are baked into the generated app/api/capture/route.ts
  * (buildCaptureRoute) and forwarded here. This is the one place the CAPI send can safely
@@ -70,7 +70,7 @@ const flushAsyncWork = async () => {
   await new Promise((resolve) => setImmediate(resolve));
 };
 
-describe('ENG-449 — forward-lead CAPI send', () => {
+describe('forward-lead CAPI send', () => {
   const mockLeadList = {
     listId: 'list_123',
     userId: 'user_123',

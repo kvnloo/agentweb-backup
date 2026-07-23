@@ -472,31 +472,31 @@ export interface GeneratedLandingPage {
   archivedAt?: string;
   gtmContainerId?: string;
   /**
-   * ENG-334: whether conversion tracking (the site's GTM container) was injected into the
+   * Whether conversion tracking (the site's GTM container) was injected into the
    * generated layout at push time. `false` means the lander shipped with NO tracking — an
    * explicit, machine-readable signal so this can be surfaced/alerted on without reading the
    * generated code. Never implies a fallback to AgentWeb's own GA4 property.
    */
   trackingInstalled?: boolean;
   /**
-   * ENG-449: the resolved (or manually-set) Meta pixel id, site-level (root record only),
+   * The resolved (or manually-set) Meta pixel id, site-level (root record only),
    * mirroring `gtmContainerId`. Used directly as the CAPI dataset id too — Meta unified
    * pixel + dataset in Graph v25.
    */
   metaPixelId?: string;
   /**
-   * ENG-449: which connected Meta ad account `metaPixelId` was resolved from — needed later
+   * Which connected Meta ad account `metaPixelId` was resolved from — needed later
    * so `forward-lead` can look up a fresh access token for the server-side CAPI send.
    */
   metaAdAccountId?: string;
   /**
-   * ENG-449: whether the Meta Pixel base snippet was injected into the generated layout at
+   * Whether the Meta Pixel base snippet was injected into the generated layout at
    * push time. Mirrors `trackingInstalled`'s "fail loud, never silently skip" contract — false
    * means the lander shipped with no Meta conversion tracking at all.
    */
   metaTrackingInstalled?: boolean;
   /**
-   * ENG-449: per-page (not site-level) — whether the generated form component was confirmed,
+   * Per-page (not site-level) — whether the generated form component was confirmed,
    * via the validation-retry check, to actually call fbq('track','Lead') on submit. v0 authors
    * the form freeform, so unlike layout-level injection this can only be checked, not guaranteed.
    */
@@ -735,7 +735,7 @@ export function buildBrandEnrichedPrompt(
   leadListId?: string,
   templateHtml?: string,
   /**
-   * ENG-449: when set, instructs v0 to fire the Meta Pixel `Lead` event on successful form
+   * When set, instructs v0 to fire the Meta Pixel `Lead` event on successful form
    * submit. This is the ONLY way to get that event into the generated form — unlike the
    * layout-level Pixel base snippet (platform-injected, guaranteed), the form component
    * itself is entirely v0-authored freeform code with no platform-owned seam. The
@@ -1219,7 +1219,7 @@ async function generateFirstPage(
   // We send a condensed outline (not the full 55KB HTML) to avoid exceeding v0 prompt limits.
   const effectiveTemplate = templateHtml ?? await loadDefaultTemplateOutline();
 
-  // ENG-449: resolve the Meta pixel BEFORE building the prompt — the client-side Lead-event
+  // Resolve the Meta pixel BEFORE building the prompt — the client-side Lead-event
   // instruction must be in the prompt sent to v0 at chat-creation time, which is earlier than
   // the layout-injection push step in deployLandingPage. A Meta API hiccup (or an
   // unconnected/ambiguous account) must never fail generation — it just means no pixel
@@ -1587,7 +1587,7 @@ async function addPageToExistingRepo(
     // If no template provided, fall back to landing-page-v2 (same behaviour as generateFirstPage)
     const effectiveTemplate = templateHtml ?? await loadDefaultTemplateOutline();
 
-    // ENG-449: sub-pages never re-resolve or re-inject the pixel (the layout is inherited,
+    // Sub-pages never re-resolve or re-inject the pixel (the layout is inherited,
     // untouched, from the first page's push) — but the Lead-event prompt instruction is still
     // needed here since each page has its OWN form component. Just read whatever the site's
     // root already resolved, no fresh Meta API call.
@@ -1656,7 +1656,7 @@ async function addPageToExistingRepo(
 
     const V0_VALIDATION_MAX_RETRIES = 2;
     let zipBuffer: any;
-    // ENG-449: per-page signal — see the equivalent block in deployLandingPage.
+    // Per-page signal — see the equivalent block in deployLandingPage.
     let pixelLeadEventVerified: boolean | undefined;
 
     for (let validationAttempt = 0; validationAttempt <= V0_VALIDATION_MAX_RETRIES; validationAttempt++) {
@@ -1689,7 +1689,7 @@ async function addPageToExistingRepo(
       try {
         validateV0Output(previewFiles);
 
-        // ENG-449: same verify-and-retry as deployLandingPage — a sub-page has its OWN form
+        // Same verify-and-retry as deployLandingPage — a sub-page has its OWN form
         // component, so the Lead event must be checked here too, not just on the first page.
         if (existingPage.metaPixelId) {
           const pixelCheck = validatePixelLeadEvent(previewFiles);
@@ -2408,7 +2408,7 @@ export async function deployLandingPage(
     // Step 2: Download + validate v0 output (with retry on bad output)
     const V0_VALIDATION_MAX_RETRIES = 2;
     let zipBuffer: any;
-    // ENG-449: per-page signal — was the client-side fbq('track','Lead') call confirmed
+    // Per-page signal — was the client-side fbq('track','Lead') call confirmed
     // present in the generated form? Only meaningful when a pixel is actually configured.
     let pixelLeadEventVerified: boolean | undefined;
 
@@ -2439,7 +2439,7 @@ export async function deployLandingPage(
       try {
         validateV0Output(previewFiles);
 
-        // ENG-449: v0 authors the form component freeform — there's no platform-owned seam
+        // v0 authors the form component freeform — there's no platform-owned seam
         // to guarantee the Lead event the way layout.tsx injection guarantees the base pixel.
         // Verify it, and retry (same correction-message mechanism as validateV0Output) if
         // missing. Exhausted retries must NOT fail generation — just record the miss.
@@ -2548,7 +2548,7 @@ export async function deployLandingPage(
     const pagePath = record.slug ? `/${record.slug}` : "/";
     const listByPath: Record<string, string> = record.leadListId ? { [pagePath]: record.leadListId } : {};
 
-    // ENG-449: resolve the Meta pixel to use, if one wasn't already manually set on this
+    // Resolve the Meta pixel to use, if one wasn't already manually set on this
     // record. A Meta API hiccup (or an unconnected/ambiguous account) must never fail
     // generation — it just means no pixel gets injected, same as GTM's "absent id" path.
     let metaPixelId = record.metaPixelId;
@@ -2586,7 +2586,7 @@ export async function deployLandingPage(
     if (pixelLeadEventVerified !== undefined) record.pixelLeadEventVerified = pixelLeadEventVerified;
 
     // Save GitHub repo URL immediately so it's not lost if Vercel step fails.
-    // ENG-334/ENG-449: persist explicit tracking signals so "shipped with no conversion
+    // Persist explicit tracking signals so "shipped with no conversion
     // tracking" is detectable from the record itself, without reading the generated code.
     await dynamodb
       .update({
@@ -3380,7 +3380,7 @@ export function validateV0Output(files: Array<{ path: string; content: Buffer }>
 }
 
 /**
- * ENG-449 — check whether v0's generated form component actually fires the Meta Pixel
+ * Check whether v0's generated form component actually fires the Meta Pixel
  * Lead event on submit, per the prompt instruction added to buildBrandEnrichedPrompt.
  *
  * Unlike `validateV0Output` this is not a hard build-breaking check: the form component is
@@ -3585,7 +3585,7 @@ export function buildCaptureRoute(
   listByPath: Record<string, string>,
   apiBase: string = process.env.BACKEND_URL || "https://api.agentweb.pro",
   /**
-   * ENG-449: the site's resolved Meta pixel id + the connected ad account it came from.
+   * The site's resolved Meta pixel id + the connected ad account it came from.
    * Baked in as plain string constants (like LIST_BY_PATH) — neither is a secret (the pixel
    * id is already public in the base snippet itself; the account id is just an identifier
    * `forward-lead` uses to look up a fresh access token server-side). When absent, no
@@ -3612,7 +3612,7 @@ import { cookies, headers } from "next/headers";
 // path -> lead list. One entry per page of this site; the route is shared by all of them.
 const LIST_BY_PATH: Record<string, string> = ${JSON.stringify(listByPath, null, 2)};
 const FORWARD_URL = "${apiBase}/api/webhooks/forward-lead";
-// ENG-449: not secrets — the pixel id is already public in the base snippet, and the account
+// Not secrets — the pixel id is already public in the base snippet, and the account
 // id is just an identifier the backend uses to look up its own stored access token.
 const PIXEL_ID = ${pixelId ? JSON.stringify(pixelId) : "undefined"};
 const META_ACCOUNT_ID = ${metaAccountId ? JSON.stringify(metaAccountId) : "undefined"};
@@ -3684,7 +3684,7 @@ export async function POST(req: Request) {
 export function injectLeadCaptureAttribution(
   files: Array<{ path: string; content: Buffer }>,
   listByPath: Record<string, string>,
-  /** ENG-449: threaded through to buildCaptureRoute — see its own doc comment. */
+  /** Threaded through to buildCaptureRoute — see its own doc comment. */
   pixelId?: string,
   metaAccountId?: string,
 ): Array<{ path: string; content: Buffer }> {
@@ -3718,19 +3718,19 @@ async function createGitHubRepoAndPush(
    */
   listByPath: Record<string, string> = {},
   /**
-   * The site's saved GTM container id (ENG-334). When set, the head+noscript snippet is
+   * The site's saved GTM container id. When set, the head+noscript snippet is
    * injected into the root layout before the initial commit so paid traffic is measurable
    * from the first deploy. When absent, NOTHING is injected — no fallback to AgentWeb's
    * platform GA4 property on a customer page.
    */
   gtmContainerId?: string,
   /**
-   * ENG-449: the site's resolved (or manually-set) Meta pixel id. When set, the pixel base
+   * The site's resolved (or manually-set) Meta pixel id. When set, the pixel base
    * snippet is injected into the root layout before the initial commit, mirroring GTM. When
    * absent, NOTHING is injected — no fallback pixel.
    */
   metaPixelId?: string,
-  /** ENG-449: the connected Meta ad account `metaPixelId` was resolved from — baked into the
+  /** The connected Meta ad account `metaPixelId` was resolved from — baked into the
    *  generated capture route (as a public identifier, not a secret) so `forward-lead` can look
    *  up a fresh access token for the CAPI send. */
   metaAdAccountId?: string,
@@ -3839,7 +3839,7 @@ async function createGitHubRepoAndPush(
   }
 
   if (!hasFile("app/layout.tsx")) {
-    // ENG-334: no platform-GA4 fallback here — a customer page must never ship AgentWeb's
+    // No platform-GA4 fallback here — a customer page must never ship AgentWeb's
     // own GA4 property. Conversion tracking comes solely from the site's own GTM container,
     // injected below from `gtmContainerId` (or nothing, flagged as "no tracking installed").
     scaffoldFiles.push({
@@ -3883,7 +3883,7 @@ async function createGitHubRepoAndPush(
     console.log(`[V0 SERVICE] Repaired ${importRepairs} mis-rooted relative import(s)`);
   }
 
-  // ENG-334: auto-inject the site's GTM container into the root layout BEFORE the initial
+  // Auto-inject the site's GTM container into the root layout BEFORE the initial
   // commit, so every generated lander (and its subpages, via the shared layout) is
   // measurable from the first deploy — no manual "Add GTM" step. Absent a container id,
   // nothing is injected and the caller records a "no tracking installed" signal.
@@ -3894,7 +3894,7 @@ async function createGitHubRepoAndPush(
       : `[V0 SERVICE] No GTM container configured for this site — pushing WITHOUT conversion tracking`,
   );
 
-  // ENG-449: auto-inject the site's resolved Meta pixel into the root layout BEFORE the
+  // Auto-inject the site's resolved Meta pixel into the root layout BEFORE the
   // initial commit, mirroring GTM above. Absent a pixel id, nothing is injected and the
   // caller records a "no Meta tracking installed" signal.
   const pixelInjected = injectPixelIntoLayoutFiles(finalFiles, metaPixelId);
@@ -5135,7 +5135,7 @@ export async function updateLandingPageGtm(
 }
 
 /**
- * Update the `trackingInstalled` signal (ENG-334) on a single page record. Split out from
+ * Update the `trackingInstalled` signal on a single page record. Split out from
  * `updateLandingPageGtm` because a GTM change at the site level (saveGtmForPage) affects
  * EVERY page sharing that site's root layout, not just the one record `gtmContainerId` was
  * written to — callers loop this across siblings rather than calling it once per-page.
@@ -5158,7 +5158,7 @@ export async function updateLandingPageTrackingInstalled(
 }
 
 /**
- * ENG-449 — mirrors updateLandingPageGtm for the Meta pixel manual-override path.
+ * Mirrors updateLandingPageGtm for the Meta pixel manual-override path.
  */
 export async function updateLandingPageMetaPixel(
   id: string,
@@ -5195,7 +5195,7 @@ export async function updateLandingPageMetaPixel(
 }
 
 /**
- * ENG-449 — mirrors updateLandingPageTrackingInstalled for the Meta pixel signal. Split out
+ * Mirrors updateLandingPageTrackingInstalled for the Meta pixel signal. Split out
  * the same way, for the same reason: a site-level pixel change affects every page sharing
  * the root layout, not just the record `metaPixelId` was written to.
  */
@@ -5569,7 +5569,7 @@ async function readRepoFile(
 export async function syncLeadCaptureFilesToRepo(
   repoFullName: string,
   listByPath: Record<string, string>,
-  /** ENG-449: threaded through to buildCaptureRoute — see its own doc comment. */
+  /** Threaded through to buildCaptureRoute — see its own doc comment. */
   pixelId?: string,
   metaAccountId?: string,
 ): Promise<{ committed: boolean; reason?: string }> {

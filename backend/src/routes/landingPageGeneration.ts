@@ -1860,7 +1860,7 @@ async function saveGtmForPage(
 
 // ---------------------------------------------------------------------------
 // Helper: inject a Meta pixel into a page's layout.tsx + regenerate its capture
-// route with the pixel/account id baked in, and persist the pixel id (ENG-449).
+// route with the pixel/account id baked in, and persist the pixel id.
 // Manual override path (API-only — no portal UI, per confirmed scope) for when
 // auto-resolution (metaService.resolveMetaPixelForUser) can't determine a pixel,
 // or a customer needs a different one than the one auto-resolved.

@@ -1,5 +1,5 @@
 /**
- * ENG-449 — resolveMetaPixelForUser.
+ * resolveMetaPixelForUser.
  *
  * Auto-resolves which Meta pixel a lander should use from the site owner's already-connected
  * Meta ad account, so generation doesn't require a manually-typed field (unlike GTM). Uses
@@ -20,7 +20,7 @@ jest.mock('../services/metaAccountCredentials', () => ({
 
 import { getConnectedMetaAccountsList, getMetaAccountCredentials } from '../services/metaAccountCredentials';
 
-describe('ENG-449 — resolveMetaPixelForUser', () => {
+describe('resolveMetaPixelForUser', () => {
   let mockFetch: jest.SpyInstance;
 
   beforeEach(() => {

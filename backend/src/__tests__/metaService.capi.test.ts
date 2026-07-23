@@ -1,5 +1,5 @@
 /**
- * ENG-449 — sendCapiLeadEvent (server-side Meta Conversions API).
+ * sendCapiLeadEvent (server-side Meta Conversions API).
  *
  * Fires a `Lead` event to Meta's CAPI from our own trusted backend (never from a generated
  * customer repo, which would leak the access token). Must never throw — a Meta-side failure
@@ -9,7 +9,7 @@
 import { metaService } from '../services/metaService';
 import * as crypto from 'crypto';
 
-describe('ENG-449 — sendCapiLeadEvent', () => {
+describe('sendCapiLeadEvent', () => {
   let mockFetch: jest.SpyInstance;
 
   beforeEach(() => {
