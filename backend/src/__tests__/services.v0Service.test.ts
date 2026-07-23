@@ -951,22 +951,23 @@ describe("v0Service - multi-site routing (DURABLE_LANDING_GENERATION=on)", () =>
     else process.env.DURABLE_LANDING_GENERATION = ORIG;
   });
 
-  const siteRow = (over: Record<string, any> = {}) => ({
-    promise: () =>
-      Promise.resolve({
-        Items: [
-          {
-            id: "site-1",
-            userId: "user-1",
-            githubRepoUrl: "https://github.com/o/r",
-            vercelProjectId: "vp1",
-            isRootPage: true,
-            siteId: "site-1",
-            ...over,
-          },
-        ],
-      }),
-  });
+  const siteRow = (over: Record<string, any> = {}) => {
+    const item = {
+      id: "site-1",
+      userId: "user-1",
+      githubRepoUrl: "https://github.com/o/r",
+      vercelProjectId: "vp1",
+      isRootPage: true,
+      siteId: "site-1",
+      ...over,
+    };
+    // ENG-478: findUserSiteRecord verifies its GSI-selected candidate with a
+    // strongly-consistent GetItem by id — this file's shared mockGet defaults to
+    // `{Item: null}`, so every caller of siteRow() needs a matching get() response
+    // too, or the candidate above would look archived/deleted and return null.
+    mockGet.mockReturnValue({ promise: () => Promise.resolve({ Item: item }) });
+    return { promise: () => Promise.resolve({ Items: [item] }) };
+  };
   const noSites = () => ({ promise: () => Promise.resolve({ Items: [] }) });
 
   it("unified default + no existing site → creates the first site root", async () => {
@@ -4163,6 +4164,13 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     mockQuery.mockReturnValueOnce({
       promise: () => Promise.resolve({ Items: [existingSiteRecord] }),
     });
+    // ENG-478: findUserSiteRecord now verifies its GSI-selected candidate with a
+    // strongly-consistent GetItem by primary key. This file's shared mockGet
+    // defaults to `{Item: null}` (used elsewhere for unrelated lookups), which would
+    // make every test here see "no site found" unless paired explicitly.
+    mockGet.mockReturnValueOnce({
+      promise: () => Promise.resolve({ Item: existingSiteRecord }),
+    });
   };
 
   // Setup: mock v0 chat creation, polling, and zip download
@@ -4527,6 +4535,9 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     mockQuery.mockReturnValueOnce({
       promise: () => Promise.resolve({ Items: [siteWithCustomDomain] }),
     });
+    mockGet.mockReturnValueOnce({
+      promise: () => Promise.resolve({ Item: siteWithCustomDomain }),
+    });
     await setupV0Mocks();
     setupGitHubMocks();
     setupVercelDeploySuccessMock();
@@ -4827,6 +4838,9 @@ describe("v0Service - loadDefaultTemplateOutline fallback", () => {
   const setupFullSuccess = async () => {
     const zipBuffer = await createTestZip();
     mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [existingSiteRecord] }) });
+    // ENG-478: findUserSiteRecord verifies its GSI candidate with a strongly-
+    // consistent GetItem — this file's shared mockGet defaults to `{Item: null}`.
+    mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: existingSiteRecord }) });
     mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
     mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "version_new" } });
     mockChatsDownloadVersion.mockResolvedValueOnce(zipBuffer);

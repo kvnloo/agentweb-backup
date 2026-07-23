@@ -4661,10 +4661,35 @@ export async function findUserSiteRecord(userId: string): Promise<GeneratedLandi
   });
 
   // Prefer: 1) explicit root page, 2) page with v0ChatId (original v0 page), 3) any with githubRepoUrl
-  const siteRecord =
+  let siteRecord =
     pages.find((p) => p.isRootPage && p.githubRepoUrl) ||
     pages.find((p) => p.v0ChatId && p.githubRepoUrl) ||
     pages.find((p) => !!p.githubRepoUrl);
+
+  if (siteRecord) {
+    // ENG-478: the query above reads via a GSI (UserIdIndex), which DynamoDB can only
+    // ever serve eventually consistent — ConsistentRead is not supported on GSI
+    // queries at all. So instead of trying to strengthen that read, verify the ONE
+    // candidate it picked with a strongly-consistent GetItem on the base table's
+    // primary key (id). This closes the race where a concurrent delete
+    // (deleteLandingPageByRecord sets archived:true on this exact id) lands in the
+    // window between the GSI read and this function returning its result — e.g. a
+    // fast double-click or a second tab generating a page right after a delete,
+    // which would otherwise attach the new page to a site whose GitHub route tree
+    // is being/has been torn down.
+    const fresh = await dynamodb
+      .get({ TableName: TABLE_NAME, Key: { id: siteRecord.id }, ConsistentRead: true })
+      .promise();
+    if (!fresh.Item || fresh.Item.archived) {
+      // Archived (or hard-deleted) since the GSI read. Do not fall back to another
+      // candidate in `pages` — every item in it came from the same single, equally
+      // stale read. Returning null is safe: the caller treats "no site" as "create
+      // a fresh one", which is exactly the right outcome instead of attaching to a
+      // dying repo.
+      return null;
+    }
+    siteRecord = fresh.Item as GeneratedLandingPage;
+  }
 
   if (siteRecord && !siteRecord.isRootPage) {
     // Backfill: mark this as the root page
