@@ -34,14 +34,22 @@ describe('AgentMode system prompt - browser session persistence & isolation guid
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('Verifying Your Browser');
   });
 
-  it('does not overpromise save_browser_cookies when a fingerprint block prevents the login from ever completing', () => {
+  it('treats the "Verifying Your Browser" challenge as intermittent and forbids resubmitting while it verifies', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('intermittent, not an absolute block');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('Do NOT resubmit while it is verifying');
+  });
+
+  it('drives the proven interactive one-time-email-code login and persists it with save_browser_cookies', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('one-time email code');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('paste it here');
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
-      'do NOT promise that logging in now will persist one'
+      'Immediately after the login succeeds, call `save_browser_cookies`'
     );
   });
 
-  it('keeps the work plan moving via a manual data export/paste path instead of dead-ending at the login gate', () => {
-    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('export the needed data');
+  it('falls back to user-provided data + report_product_issues only when the gate will not clear, and flags that scheduled runs cannot relay a code', () => {
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('paste or attach');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('report_product_issues');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('unattended/scheduled run cannot relay a one-time code');
   });
 });
