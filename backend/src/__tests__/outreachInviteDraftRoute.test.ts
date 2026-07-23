@@ -34,11 +34,11 @@ jest.mock("../services/outreachInviteDraftService", () => ({
 
 // The route resolves the sending account's invite budget (300 Premium / 200
 // free) before drafting. Mocked so these tests don't touch Unipile/Dynamo.
-const mockResolveAccount = jest.fn();
+const mockListAccounts = jest.fn();
 const mockGetCharLimit = jest.fn();
 jest.mock("../services/linkedInOutreachService", () => ({
   linkedInOutreachService: {
-    resolveUserOwnedAccountId: (...a: any[]) => mockResolveAccount(...a),
+    listUserOwnedUnipileAccountIds: (...a: any[]) => mockListAccounts(...a),
     getInviteCharLimitForAccount: (...a: any[]) => mockGetCharLimit(...a),
   },
   LinkedInOutreachService: {
@@ -77,7 +77,7 @@ beforeEach(() => {
     promptVersion: "v3-2026-07-13",
     charLimit: 200,
   });
-  mockResolveAccount.mockResolvedValue("acct-1");
+  mockListAccounts.mockResolvedValue(["acct-1"]);
   mockGetCharLimit.mockResolvedValue(200);
 });
 
@@ -149,7 +149,21 @@ describe(`POST ${URL}`, () => {
   });
 
   it("falls back to the free 200 limit when no LinkedIn account resolves", async () => {
-    mockResolveAccount.mockResolvedValue(null);
+    mockListAccounts.mockResolvedValue([]);
+
+    const res = await request(app).post(URL).send({ prospects: PROSPECTS });
+
+    expect(res.status).toBe(200);
+    const [, ctx] = generateInviteDrafts.mock.calls[0];
+    expect(ctx.charLimit).toBe(200);
+    expect(mockGetCharLimit).not.toHaveBeenCalled();
+  });
+
+  it("stays at the free limit when the user owns MULTIPLE accounts (sender ambiguous)", async () => {
+    // The real send picks the lead list's assigned account, which doesn't exist
+    // yet at draft time. With >1 owned account we can't know which sends, so we
+    // must not over-promise a Premium 300-char budget.
+    mockListAccounts.mockResolvedValue(["acct-1", "acct-2"]);
 
     const res = await request(app).post(URL).send({ prospects: PROSPECTS });
 
@@ -160,7 +174,7 @@ describe(`POST ${URL}`, () => {
   });
 
   it("falls back to the free limit when account lookup throws", async () => {
-    mockResolveAccount.mockRejectedValue(new Error("unipile down"));
+    mockListAccounts.mockRejectedValue(new Error("unipile down"));
 
     const res = await request(app).post(URL).send({ prospects: PROSPECTS });
 

@@ -80,23 +80,28 @@ const MAX_DRAFT_BATCH = 50;
 
 /**
  * Invite-note char budget for the account that will actually send these
- * invites: 300 on a Premium LinkedIn account, 200 on a free one. Mirrors the
- * precedence used by the CRM send-invite path (user's default outreach account),
- * and falls back to the free limit whenever no account resolves — drafting to
- * 300 for a free account would mean the note the user reviewed gets silently
- * trimmed at send time.
+ * invites: 300 on a Premium LinkedIn account, 200 on a free one.
+ *
+ * The real send resolves the account from the eventual lead list
+ * (`list.linkedInAccountId`) with `resolveUserOwnedAccountId` only as a
+ * fallback (see `routes/crm.ts` send-invite path). At draft time that list
+ * doesn't exist yet, so we can only be SURE which account sends when the user
+ * owns exactly one. With zero or more than one owned account the sender is
+ * ambiguous, so we default to the free limit rather than over-promise a
+ * 300-char note that a free sending account would silently trim to 200.
  */
 async function resolveInviteCharLimit(userId: string): Promise<number> {
   try {
     const { linkedInOutreachService } = await import(
       "../services/linkedInOutreachService"
     );
-    const accountId =
-      await linkedInOutreachService.resolveUserOwnedAccountId(userId);
-    if (!accountId) return DEFAULT_INVITE_CHAR_LIMIT;
+    const accountIds =
+      await linkedInOutreachService.listUserOwnedUnipileAccountIds(userId);
+    // 0 owned → free default; >1 → ambiguous sender, stay safe at free.
+    if (accountIds.length !== 1) return DEFAULT_INVITE_CHAR_LIMIT;
     return await linkedInOutreachService.getInviteCharLimitForAccount(
       userId,
-      accountId,
+      accountIds[0],
     );
   } catch {
     return DEFAULT_INVITE_CHAR_LIMIT;
