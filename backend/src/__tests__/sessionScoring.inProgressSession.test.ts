@@ -589,6 +589,40 @@ describe('SessionScoring - surfacing silent dead runs (ENG-473)', () => {
     expect(mockUpdateScore).toHaveBeenCalledTimes(1);
   });
 
+  it('self-heals a partial write: a first-pass error-write failure is retried and written on a later pass', async () => {
+    // Greptile P1: the notice is the idempotency marker, so it must only be
+    // persisted AFTER the diagnostic error write succeeds. Here the FIRST pass's
+    // updateSessionError throws — because it runs before the notice, no notice is
+    // left behind, so nothing suppresses a retry and the error is written next pass.
+    mockUpdateError.mockRejectedValueOnce(new Error('ddb throttled'));
+    const session = {
+      sessionId: 'dead-regular-selfheal-1',
+      userId: 'u1',
+      sessionType: 'regular',
+      messages: [...regularTurnless],
+      messageCount: regularTurnless.length,
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    // Pass 1 — the error write throws; crucially NO notice is persisted, so the
+    // run is not falsely marked as already-surfaced.
+    const r1 = await scoreSessionIfNeeded(session);
+    expect(r1?.score).toBe(1);
+    expect(mockAddMessage).not.toHaveBeenCalled();
+    expect(session.messages).toHaveLength(regularTurnless.length);
+
+    // Pass 2 — the error write now succeeds; the annotation is retried and completes.
+    const r2 = await scoreSessionIfNeeded(session);
+    expect(r2?.score).toBe(1);
+    // The diagnostic error was NOT permanently suppressed — it is written on retry.
+    expect(mockUpdateError).toHaveBeenCalledTimes(2);
+    expect(mockUpdateError.mock.calls[1][1]).toMatch(/crashed or timed out|failed run/i);
+    // ...and the user-facing notice lands exactly once, on the successful pass.
+    expect(mockAddMessage).toHaveBeenCalledTimes(1);
+    expect(mockAddMessage.mock.calls[0][1].metadata.isRunFailureNotice).toBe(true);
+  });
+
   it('does NOT surface a note on a healthy run that produced a real assistant reply', async () => {
     mockCallLLM.mockResolvedValue(
       makeLLMResponse(5, 'great', { goalCompletion: 5, dataAccuracy: 5, outputQuality: 5 })
