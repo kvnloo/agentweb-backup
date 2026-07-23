@@ -281,8 +281,21 @@ describe('generateResponse — AskUserQuestion answer channel (ENG-396)', () => 
     expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
   });
 
-  it('a normal message with no questionAnswer never touches the answer channel', async () => {
+  it('a typed message while a question is awaiting RELEASES it (never infers from prose) so Emma can re-ask, then runs', async () => {
     mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(pendingObjectiveQuestion()) as any);
+
+    const res = makeRes();
+    await agentModeController.generateResponse(makeReq({ userId: ownerId }, undefined, 'lets do lead'), res);
+
+    expect(res.statusCode).toBe(200);
+    // The open question is abandoned (cleared) — the prose is NOT parsed into an answer.
+    // Clearing frees the one-live-question guard so Emma can emit a fresh card.
+    expect((mockChatbotDb as any).updateSessionAskUserQuestion).toHaveBeenCalledWith(sessionId, null);
+    expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('a typed message with NO pending question never touches the answer channel', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(undefined) as any);
 
     const res = makeRes();
     await agentModeController.generateResponse(makeReq({ userId: ownerId }, undefined, 'just chatting'), res);
