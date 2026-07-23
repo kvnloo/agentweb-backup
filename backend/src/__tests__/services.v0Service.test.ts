@@ -4963,6 +4963,120 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       errorSpy.mockRestore();
     });
   });
+
+  // ENG-482: validatePixelLeadEvent used to run on `previewFiles` — v0's raw,
+  // unfiltered zip — while the files actually committed are `filesToCommit`, produced
+  // by a LATER, separate remapFilesForSubPage() call with its own skip-list (drops
+  // app/layout.tsx, lib/utils.ts, etc.). A file that satisfies the fbq('track','Lead')
+  // regex in the raw zip but gets dropped by that skip-list made pixelLeadEventVerified
+  // a false positive: the platform believed Lead tracking worked on a page whose
+  // deployed code could never fire it. Live-repro'd against a real generated sub-page
+  // whose only "hit" was v0's own scaffold app/layout.tsx, which remapFilesForSubPage
+  // always drops (the real, already-injected layout already lives in the target repo).
+  describe("ENG-482: pixel Lead-event validation must check the file set that actually ships", () => {
+    const existingSiteWithPixel = {
+      ...existingSiteRecord,
+      metaPixelId: "1012387921717047",
+    };
+
+    const setupSiteRecordWithPixelMock = () => {
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Items: [existingSiteWithPixel] }),
+      });
+      mockGet.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Item: existingSiteWithPixel }),
+      });
+    };
+
+    /** v0's raw zip: the real form component has NO fbq call, but v0's own scaffold
+     *  app/layout.tsx (always dropped by remapFilesForSubPage) happens to contain one —
+     *  exactly the false-positive mechanism the live repro found. */
+    const createZipWithFbqOnlyInLayout = async () => {
+      const AdmZip = (await import("adm-zip")).default;
+      const zip = new AdmZip();
+      zip.addFile(
+        "app/page.tsx",
+        Buffer.from('export default function Page() { return <div>No form here</div>; }')
+      );
+      zip.addFile(
+        "app/layout.tsx",
+        Buffer.from(
+          `export default function RootLayout({ children }: { children: React.ReactNode }) {
+             return <html><body>{children}<script>fbq('track', 'Lead');</script></body></html>;
+           }`
+        )
+      );
+      return zip.toBuffer();
+    };
+
+    it("SUCCESS: exhausts retries and correctly reports pixelLeadEventVerified:false when the only fbq match is in a file remapFilesForSubPage drops", async () => {
+      setupSiteRecordWithPixelMock();
+
+      const buggyZip = await createZipWithFbqOnlyInLayout();
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      // Initial version + 2 correction-round versions — all download the SAME
+      // buggy zip, so validation fails identically on every attempt.
+      mockChatsGetById
+        .mockResolvedValueOnce({ latestVersion: { id: "v1" } })
+        .mockResolvedValueOnce({ latestVersion: { id: "v2" } })
+        .mockResolvedValueOnce({ latestVersion: { id: "v3" } });
+      mockChatsDownloadVersion
+        .mockResolvedValueOnce(buggyZip)
+        .mockResolvedValueOnce(buggyZip)
+        .mockResolvedValueOnce(buggyZip);
+      mockChatsSendMessage.mockResolvedValue({});
+
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a signup page",
+        "Signup Page",
+        {},
+        "list_signup"
+      );
+
+      // Never fails generation over a missing client-side event (AC3) — the page
+      // itself is fine, this is purely a tracking-completeness signal.
+      expect(result.status).toBe("deployed");
+      // 2 correction messages sent (both retry attempts exhausted, not just detected once).
+      expect(mockChatsSendMessage).toHaveBeenCalledTimes(2);
+      expect(result.pixelLeadEventVerified).toBe(false);
+    });
+
+    it("SUCCESS: reports pixelLeadEventVerified:true when the fbq call is in the file that actually ships (app/page.tsx)", async () => {
+      setupSiteRecordWithPixelMock();
+      const AdmZip = (await import("adm-zip")).default;
+      const zip = new AdmZip();
+      zip.addFile(
+        "app/page.tsx",
+        Buffer.from(
+          `export default function Page() { return <button onClick={() => window.fbq && window.fbq('track', 'Lead')}>Submit</button>; }`
+        )
+      );
+      const goodZip = zip.toBuffer();
+
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "v1" } });
+      mockChatsDownloadVersion.mockResolvedValueOnce(goodZip);
+
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a signup page",
+        "Signup Page 2",
+        {},
+        "list_signup2"
+      );
+
+      expect(result.status).toBe("deployed");
+      expect(mockChatsSendMessage).not.toHaveBeenCalled();
+      expect(result.pixelLeadEventVerified).toBe(true);
+    });
+  });
 });
 
 // =============================================================================
