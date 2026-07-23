@@ -1608,6 +1608,11 @@ async function addPageToExistingRepo(
 
       const previewFiles = await unzipBuffer(zipBuffer);
       autoFixV0Files(previewFiles);
+      // Repair v0's mis-rooted imports BEFORE validating: otherwise check 7 flags them as
+      // "missing" and burns the retry loop on a v0 self-heal that keeps timing out, instead of
+      // this deterministic fix silently resolving them. A genuinely-missing file has no repair
+      // target, so it still (correctly) trips check 7 below.
+      repairMisrootedImports(previewFiles);
 
       try {
         validateV0Output(previewFiles);
@@ -2301,6 +2306,9 @@ export async function deployLandingPage(
       // Unzip and validate before pushing to GitHub
       const previewFiles = await unzipBuffer(zipBuffer);
       autoFixV0Files(previewFiles);
+      // Repair v0's mis-rooted imports BEFORE validating — see addPageToExistingRepo for why
+      // (check 7 would otherwise reject them and lean on the flaky v0 self-heal correction).
+      repairMisrootedImports(previewFiles);
 
       try {
         validateV0Output(previewFiles);
