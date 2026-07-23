@@ -83,4 +83,44 @@ describe('chatbotDb.updateSessionAskUserQuestion', () => {
       'DynamoDB unavailable',
     );
   });
+
+  // ENG-396: the one-live-question invariant. A new AWAITING question may only be
+  // posed when none is already awaiting — enforced atomically via a conditional
+  // write so two ask_user_question calls in the same turn can't both take the slot.
+  it('does NOT add a ConditionExpression on the normal (unguarded) write', async () => {
+    await chatbotDb.updateSessionAskUserQuestion('s-1', sampleQuestion());
+    expect(updateSpy.mock.calls[0][0].ConditionExpression).toBeUndefined();
+  });
+
+  it('guards against overwriting an awaiting question when failIfAwaitingExists is set', async () => {
+    await chatbotDb.updateSessionAskUserQuestion('s-1', sampleQuestion(), { failIfAwaitingExists: true });
+    const params = updateSpy.mock.calls[0][0];
+    expect(params.ConditionExpression).toMatch(
+      /attribute_not_exists\(pendingUserQuestion\) OR pendingUserQuestion\.#pStatus <> :awaitingStatus/,
+    );
+    expect(params.ExpressionAttributeNames['#pStatus']).toBe('status');
+    expect(params.ExpressionAttributeValues[':awaitingStatus']).toBe('awaiting');
+  });
+
+  it('returns null (refuses) when a question is already awaiting — conditional write fails', async () => {
+    updateSpy.mockReturnValue({
+      promise: () =>
+        Promise.reject(Object.assign(new Error('conditional'), { code: 'ConditionalCheckFailedException' })),
+    } as any);
+
+    const res = await chatbotDb.updateSessionAskUserQuestion('s-1', sampleQuestion(), {
+      failIfAwaitingExists: true,
+    });
+    expect(res).toBeNull();
+  });
+
+  it('still propagates non-conditional DynamoDB errors even when guarded', async () => {
+    updateSpy.mockReturnValue({
+      promise: () => Promise.reject(new Error('DynamoDB unavailable')),
+    } as any);
+
+    await expect(
+      chatbotDb.updateSessionAskUserQuestion('s-1', sampleQuestion(), { failIfAwaitingExists: true }),
+    ).rejects.toThrow('DynamoDB unavailable');
+  });
 });

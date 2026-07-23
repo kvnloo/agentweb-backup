@@ -151,8 +151,8 @@ describe('AgentModeController - ishare Model Selection', () => {
         questionId: 'q-objective-1',
         question: 'Which Meta campaign objective?',
         options: [
-          { id: 'leads', label: 'Leads', recommended: true, why: 'pixel fires LEAD events' },
-          { id: 'traffic', label: 'Traffic' },
+          { id: 'leads', label: 'Leads', consequence: 'Optimizes for leads', recommended: true, why: 'pixel fires LEAD events' },
+          { id: 'traffic', label: 'Traffic', consequence: 'Optimizes for clicks' },
         ],
         recommendedOptionId: 'leads',
         immutable: true,
@@ -163,7 +163,9 @@ describe('AgentModeController - ishare Model Selection', () => {
       };
       mockChatbotDb.getChatSession.mockResolvedValue({
         ...mockSessionWithModel,
-        pendingUserQuestion: answeredQuestion,
+        // string-literal fields (status/answeredBy) widen in a plain object literal;
+        // cast for the mock rather than hand-annotate the whole PendingUserQuestion.
+        pendingUserQuestion: answeredQuestion as any,
       });
 
       const mockReq = {

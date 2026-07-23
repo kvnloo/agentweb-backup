@@ -56,6 +56,27 @@ describe('ask_user_question tool handler', () => {
     expect(JSON.stringify(result)).not.toMatch(/confirm\s*[:=]\s*true/i);
   });
 
+  it('poses the question with the one-live-question guard so a second call cannot overwrite it', async () => {
+    await emmaToolRegistry.execute('ask_user_question', validArgs(), { sessionId: 's-1' });
+    expect(persistSpy).toHaveBeenCalledWith(
+      's-1',
+      expect.objectContaining({ status: 'awaiting' }),
+      { failIfAwaitingExists: true },
+    );
+  });
+
+  it('FAIL: refuses with guidance (no card, no halt) when a question is already awaiting', async () => {
+    // A conditional-write refusal surfaces as null from the persistence layer.
+    persistSpy.mockResolvedValue(null as any);
+    const result = await emmaToolRegistry.execute('ask_user_question', validArgs(), { sessionId: 's-1' });
+
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/one question|already (waiting|being asked)/i);
+    // Must NOT render a second card or halt the loop again.
+    expect(result.awaitingUserConfirmation).toBeUndefined();
+    expect(result.type).not.toBe('ask_user_question');
+  });
+
   it('auto-generates option ids by position when omitted', async () => {
     await emmaToolRegistry.execute('ask_user_question', validArgs(), { sessionId: 's-1' });
     const persisted = persistSpy.mock.calls[0][1] as PendingUserQuestion;
