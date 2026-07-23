@@ -34,8 +34,8 @@
   /* Running-previews dropdown rows (reuses .popmenu). */
   .popmenu .pvrow { display: flex; align-items: center; gap: 8px; padding: 6px 10px; font-size: 13px; white-space: nowrap; }
   .popmenu .pvrow .pvid { font-weight: 600; color: var(--text); }
-  .popmenu .pvrow .pvsha { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--dim); }
-  .popmenu .pvrow.stale .pvsha { color: var(--accent); }
+  .popmenu .pvrow .pvowner { font-size: 12px; color: var(--dim); }
+  .popmenu .pvrow .pvstale { color: var(--accent); font-size: 12px; cursor: default; }
   .popmenu .pvrow .pvrefresh { background: var(--panel2); color: var(--accent); border: 1px solid var(--border); border-radius: 6px; padding: 3px 7px; font-size: 12px; cursor: pointer; }
   .popmenu .pvrow .pvrefresh:hover { border-color: var(--accent); }
   .popmenu .pvrow .pvrefresh:disabled { opacity: .5; cursor: default; }
@@ -617,13 +617,14 @@ function buildPreviewsPop() {
   const head = `<div class="pmhead"><span>Running previews (${S.previews.length}${cap})</span></div>`;
   if (!S.previews.length) return head + '<div class="fmempty">No previews running.</div>';
   return head + S.previews.map((p) => {
-    const sha = p.commit ? `<span class="pvsha" title="${p.stale ? 'branch has advanced past this commit — stale' : 'deployed commit'}">${esc(p.commit)}${p.stale ? ' ⚠' : ''}</span>` : '';
-    const open = p.urls?.customer ? `<a class="pvopen" href="${esc(p.urls.customer)}" target="_blank" rel="noopener">open ↗</a>` : '';
+    const owner = p.owner ? `<span class="pvowner" title="owner">${esc(p.owner)}</span>` : '';
+    const stale = p.stale ? `<span class="pvstale" title="branch has advanced past this preview — stale">⚠</span>` : '';
+    const chat = `<a class="pvopen" href="#${encodeURIComponent(p.id)}" title="Open this task's chat">chat ↗</a>`;
     const refresh = (p.stale && !p.busy) ? `<button class="pvrefresh" data-refresh="${esc(p.id)}" title="Rebuild to the branch head">↻</button>` : '';
     const btn = p.busy
       ? '<button class="pvkill" disabled>working…</button>'
       : `<button class="pvkill" data-id="${esc(p.id)}">■ Disable</button>`;
-    return `<div class="pvrow${p.stale ? ' stale' : ''}"><span class="pvid">${esc(p.id)}</span>${sha}${open}${refresh}${btn}</div>`;
+    return `<div class="pvrow${p.stale ? ' stale' : ''}"><span class="pvid">${esc(p.id)}</span>${owner}${stale}${chat}${refresh}${btn}</div>`;
   }).join('');
 }
 function openPreviews(anchorEl) {
@@ -639,6 +640,8 @@ function openPreviews(anchorEl) {
       // Give the teardown a moment to update preview-state.json, then refresh the list in place.
       setTimeout(async () => { await loadPreviews(); if (S.menu === m) render(); }, 800);
     };
+    // Chat link: let the hash navigate (hashchange → select), just close the dropdown.
+    for (const el of m.querySelectorAll('a.pvopen')) el.onclick = () => closeMenu();
     for (const el of m.querySelectorAll('.pvrefresh[data-refresh]')) el.onclick = async (e) => {
       e.stopPropagation();
       const id = el.dataset.refresh;

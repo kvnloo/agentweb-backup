@@ -483,12 +483,16 @@ function previewInfo(identifier) {
 const gitHeadOf = (repoPath) => { try { const r = spawnSync('git', ['-C', repoPath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }); return r.status === 0 ? r.stdout.trim() : null; } catch { return null; } };
 function listPreviews() {
   let st = {}; try { st = JSON.parse(readFileSync(previewStatePath, 'utf8')); } catch { /* none */ }
+  // Owner display name per issue/chat: the Linear assignee for an ENG card, the chat owner for a
+  // standalone chat. Built once from state.json (same source the sidebar uses).
+  const owners = {};
+  for (const e of Object.values(loadState())) if (e?.identifier) owners[e.identifier.toUpperCase()] = e.assignee?.name || e.ownerName || null;
   return Object.entries(st)
     .filter(([, e]) => e && !e.starting)
     .map(([id, e]) => {
       // Stale = the branch moved past the commit this stack was brought up from (see preview.mjs refresh).
       const head = e.commit && e.worktree ? gitHeadOf(e.worktree) : null;
-      return { id: id.toUpperCase(), urls: e.urls || null, at: e.at || null, busy: previewOps.has(id.toUpperCase()), commit: e.commit ? e.commit.slice(0, 9) : null, stale: !!(head && e.commit && head !== e.commit) };
+      return { id: id.toUpperCase(), urls: e.urls || null, at: e.at || null, busy: previewOps.has(id.toUpperCase()), owner: owners[id.toUpperCase()] || null, commit: e.commit ? e.commit.slice(0, 9) : null, stale: !!(head && e.commit && head !== e.commit) };
     })
     .sort((a, b) => String(a.at).localeCompare(String(b.at)));
 }
