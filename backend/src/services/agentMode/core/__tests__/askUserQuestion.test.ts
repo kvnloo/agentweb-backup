@@ -24,6 +24,7 @@ import {
   checkQuestionGate,
   renderQuestionPrompt,
   buildAnswerAcknowledgement,
+  buildReaskDirective,
   AskUserQuestionError,
   type AskUserQuestionOption,
   type AskUserQuestionInput,
@@ -398,6 +399,16 @@ describe('buildAnswerAcknowledgement — explicit in-response confirmation', () 
     expect(ack).toContain('"Leads"'); // the recommended option
     expect(ack).toMatch(/let you decide/i);
     expect(ack).toContain('162 LEAD events'); // the recommended why, surfaced for the confirmation
+  });
+});
+
+describe('buildReaskDirective — typed-past a card', () => {
+  it('tells Emma to re-emit THAT question, not infer from prose or advance', () => {
+    const directive = buildReaskDirective(awaitingQuestion());
+    expect(directive).toContain('Which Meta campaign objective');
+    expect(directive).toMatch(/do NOT infer/i);
+    expect(directive).toMatch(/re-emit THAT SAME question|re-emit that same question/i);
+    expect(directive).toMatch(/do not advance|until they click/i);
   });
 });
 
