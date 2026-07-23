@@ -354,9 +354,10 @@ export function buildReaskDirective(question: PendingUserQuestion): string {
   return (
     `[The user typed a message instead of clicking the "${question.question}" card, so that ` +
     `question is NOT answered — do NOT infer their choice from the text, even if it names an ` +
-    `option. Before anything else, re-emit THAT SAME question ("${question.question}") as a fresh ` +
-    `ask_user_question card and wait for an explicit click. Do not advance to any other question ` +
-    `or take any action that depends on this answer until they click an option.]`
+    `option. Respond to what they actually said (answer any question they asked, handle any ` +
+    `request), but you still need this decision: re-emit THAT SAME question ("${question.question}") ` +
+    `as a fresh ask_user_question card and wait for an explicit click. Do not treat the typed ` +
+    `message as the answer, and take no action that depends on this answer until they click an option.]`
   );
 }
 
