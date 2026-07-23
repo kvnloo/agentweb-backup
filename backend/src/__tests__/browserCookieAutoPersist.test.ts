@@ -3,15 +3,20 @@
  *
  * The reported Luma-style failure is that a login only persists if the model
  * remembers to call save_browser_cookies. These helpers make load-at-start /
- * save-as-you-go automatic, and — because they run on a long-lived singleton for
- * every user — must be recursion-safe, memory-bounded, and non-destructive (never
- * overwrite a good saved session with one we failed to restore).
+ * save-after-each-state-change automatic, and — because they run on a long-lived
+ * singleton for every user — must be recursion-safe, memory-bounded, and
+ * non-destructive (never overwrite a good saved session with one we failed to
+ * restore). Persisting after every state-changing tool (rather than on a timer)
+ * also guarantees the post-login cookie jar is captured, instead of being
+ * swallowed by a debounce window that an earlier unauthenticated save started
+ * (Greptile, PR #2163).
  */
 import {
   isBrowserAutomationTool,
+  shouldPersistAfterBrowserTool,
   createAutoPersistState,
   autoLoadCookiesOnce,
-  autoSaveCookiesDebounced,
+  autoSaveCookies,
 } from '../emma/browserCookieAutoPersist';
 
 describe('isBrowserAutomationTool', () => {
@@ -32,11 +37,34 @@ describe('isBrowserAutomationTool', () => {
   });
 });
 
+describe('shouldPersistAfterBrowserTool', () => {
+  it('persists after state-changing browser tools (incl. unknown ones by default)', () => {
+    expect(shouldPersistAfterBrowserTool('playwright_browser_navigate')).toBe(true);
+    expect(shouldPersistAfterBrowserTool('playwright_browser_click')).toBe(true);
+    expect(shouldPersistAfterBrowserTool('playwright_browser_type')).toBe(true);
+    expect(shouldPersistAfterBrowserTool('playwright_browser_wait_for')).toBe(true);
+    expect(shouldPersistAfterBrowserTool('playwright_browser_run_code')).toBe(true);
+    expect(shouldPersistAfterBrowserTool('playwright_browser_some_new_action')).toBe(true);
+  });
+
+  it('skips pure-read browser tools (no cookie change → no needless round-trip)', () => {
+    expect(shouldPersistAfterBrowserTool('playwright_browser_snapshot')).toBe(false);
+    expect(shouldPersistAfterBrowserTool('playwright_browser_take_screenshot')).toBe(false);
+    expect(shouldPersistAfterBrowserTool('playwright_browser_console_messages')).toBe(false);
+    expect(shouldPersistAfterBrowserTool('playwright_browser_network_requests')).toBe(false);
+  });
+
+  it('is false for non-browser tools', () => {
+    expect(shouldPersistAfterBrowserTool('save_browser_cookies')).toBe(false);
+    expect(shouldPersistAfterBrowserTool('install_skills')).toBe(false);
+  });
+});
+
 describe('autoLoadCookiesOnce', () => {
   it('loads exactly once per session, then skips on later calls', async () => {
     const state = createAutoPersistState();
     const runTool = jest.fn().mockResolvedValue({ success: true });
-    const deps = { runTool, now: () => 1000 };
+    const deps = { runTool };
 
     expect(await autoLoadCookiesOnce(state, 'sess-1', deps)).toBe(true);
     expect(await autoLoadCookiesOnce(state, 'sess-1', deps)).toBe(false);
@@ -49,14 +77,14 @@ describe('autoLoadCookiesOnce', () => {
   it('skips (no throw) when there is no sessionId', async () => {
     const state = createAutoPersistState();
     const runTool = jest.fn().mockResolvedValue({ success: true });
-    expect(await autoLoadCookiesOnce(state, '', { runTool, now: () => 1 })).toBe(false);
+    expect(await autoLoadCookiesOnce(state, '', { runTool })).toBe(false);
     expect(runTool).not.toHaveBeenCalled();
   });
 
   it('swallows runTool errors, marks the session attempted (no retry-loop), and clears busy', async () => {
     const state = createAutoPersistState();
     const runTool = jest.fn().mockRejectedValue(new Error('no page yet'));
-    const deps = { runTool, now: () => 1 };
+    const deps = { runTool };
 
     await expect(autoLoadCookiesOnce(state, 'sess-1', deps)).resolves.toBe(false);
     expect(state.busySessions.has('sess-1')).toBe(false); // not left wedged
@@ -69,10 +97,10 @@ describe('autoLoadCookiesOnce', () => {
     let reentrantResult: boolean | undefined;
     const runTool = jest.fn().mockImplementation(async () => {
       // A nested browser tool (browser_run_code) would call back in here.
-      reentrantResult = await autoSaveCookiesDebounced(state, 'sess-1', { runTool, now: () => 99999 });
+      reentrantResult = await autoSaveCookies(state, 'sess-1', { runTool });
       return { success: true };
     });
-    await autoLoadCookiesOnce(state, 'sess-1', { runTool, now: () => 1 });
+    await autoLoadCookiesOnce(state, 'sess-1', { runTool });
     expect(reentrantResult).toBe(false); // nested save was suppressed
     expect(runTool).toHaveBeenCalledTimes(1); // only the load ran
   });
@@ -80,7 +108,7 @@ describe('autoLoadCookiesOnce', () => {
   it('prunes oldest sessions first so tracking is memory-bounded', async () => {
     const state = createAutoPersistState(2); // cap of 2
     const runTool = jest.fn().mockResolvedValue({ success: true });
-    const deps = { runTool, now: () => 1 };
+    const deps = { runTool };
 
     await autoLoadCookiesOnce(state, 'a', deps);
     await autoLoadCookiesOnce(state, 'b', deps);
@@ -93,25 +121,22 @@ describe('autoLoadCookiesOnce', () => {
   });
 });
 
-describe('autoSaveCookiesDebounced', () => {
+describe('autoSaveCookies', () => {
   // A session is only save-eligible once its one-time auto-load has run.
   const withLoadedSession = async (state: ReturnType<typeof createAutoPersistState>, sessionId: string) => {
-    await autoLoadCookiesOnce(state, sessionId, { runTool: jest.fn().mockResolvedValue({ success: true }), now: () => 0 });
+    await autoLoadCookiesOnce(state, sessionId, { runTool: jest.fn().mockResolvedValue({ success: true }) });
   };
 
-  it('saves on first eligible call, then debounces subsequent calls within the window', async () => {
+  it('saves on every eligible call — no time window can swallow a post-login save', async () => {
     const state = createAutoPersistState();
     await withLoadedSession(state, 'sess-1');
 
     const runTool = jest.fn().mockResolvedValue({ success: true });
-    let t = 100000;
-    const deps = { runTool, now: () => t, saveDebounceMs: 15000 };
+    const deps = { runTool };
 
-    expect(await autoSaveCookiesDebounced(state, 'sess-1', deps)).toBe(true);
-    t += 5000;
-    expect(await autoSaveCookiesDebounced(state, 'sess-1', deps)).toBe(false); // within 15s
-    t += 11000; // now >15s since last save
-    expect(await autoSaveCookiesDebounced(state, 'sess-1', deps)).toBe(true);
+    // Simulates: navigate (unauth) → save; then login click → save right after.
+    expect(await autoSaveCookies(state, 'sess-1', deps)).toBe(true);
+    expect(await autoSaveCookies(state, 'sess-1', deps)).toBe(true);
 
     expect(runTool).toHaveBeenCalledTimes(2);
     expect(runTool).toHaveBeenCalledWith('save_browser_cookies', {});
@@ -120,24 +145,24 @@ describe('autoSaveCookiesDebounced', () => {
   it('skips (no throw) when there is no sessionId', async () => {
     const state = createAutoPersistState();
     const runTool = jest.fn();
-    expect(await autoSaveCookiesDebounced(state, '', { runTool, now: () => 1 })).toBe(false);
+    expect(await autoSaveCookies(state, '', { runTool })).toBe(false);
     expect(runTool).not.toHaveBeenCalled();
   });
 
   it('does not save a session whose auto-load never ran (no blind overwrite)', async () => {
     const state = createAutoPersistState();
     const runTool = jest.fn().mockResolvedValue({ success: true });
-    expect(await autoSaveCookiesDebounced(state, 'never-loaded', { runTool, now: () => 99999 })).toBe(false);
+    expect(await autoSaveCookies(state, 'never-loaded', { runTool })).toBe(false);
     expect(runTool).not.toHaveBeenCalled();
   });
 
   it('SAFETY: never overwrites a saved session when auto-load errored (no clobber)', async () => {
     const state = createAutoPersistState();
     // auto-load throws (e.g. browser had no page) → session flagged loadErrored
-    await autoLoadCookiesOnce(state, 'sess-1', { runTool: jest.fn().mockRejectedValue(new Error('no page')), now: () => 0 });
+    await autoLoadCookiesOnce(state, 'sess-1', { runTool: jest.fn().mockRejectedValue(new Error('no page')) });
 
     const save = jest.fn().mockResolvedValue({ success: true });
-    expect(await autoSaveCookiesDebounced(state, 'sess-1', { runTool: save, now: () => 99999 })).toBe(false);
+    expect(await autoSaveCookies(state, 'sess-1', { runTool: save })).toBe(false);
     expect(save).not.toHaveBeenCalled(); // the previously-saved session is left intact
   });
 
@@ -145,7 +170,7 @@ describe('autoSaveCookiesDebounced', () => {
     const state = createAutoPersistState();
     await withLoadedSession(state, 'sess-1');
     const runTool = jest.fn().mockRejectedValue(new Error('save failed'));
-    await expect(autoSaveCookiesDebounced(state, 'sess-1', { runTool, now: () => 99999 })).resolves.toBe(false);
+    await expect(autoSaveCookies(state, 'sess-1', { runTool })).resolves.toBe(false);
     expect(state.busySessions.has('sess-1')).toBe(false);
   });
 });
