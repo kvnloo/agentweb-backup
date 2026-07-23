@@ -1778,6 +1778,37 @@ async function addPageToExistingRepo(
       };
     }
 
+    // Register this new page's own path in the repo-level capture route (ENG-483).
+    // Without this, a new sub-page's lead form 422s forever ("no lead list configured")
+    // until some UNRELATED action (a GTM/Pixel manual override) happens to resync the
+    // whole-site LIST_BY_PATH map as a side effect. Best-effort: a site whose sibling
+    // lookup or GitHub sync fails must still keep its just-deployed page. Reuses the
+    // exact ENG-310 mechanism (`syncLeadCaptureForPage` in routes/landingPageGeneration.ts)
+    // which does this same thing when a lead list is attached after the fact.
+    try {
+      const siblings = await getLandingPagesByOwner(userId);
+      const listByPath: Record<string, string> = {};
+      for (const p of siblings) {
+        if (p.id === id) continue;
+        if (p.githubRepoUrl !== existingPage.githubRepoUrl) continue;
+        if (!p.leadListId) continue;
+        listByPath[p.slug ? `/${p.slug}` : "/"] = p.leadListId;
+      }
+      if (leadListId) listByPath[`/${slug}`] = leadListId;
+
+      const syncResult = await syncLeadCaptureFilesToRepo(repoFullName, listByPath);
+      if (!syncResult.committed && syncResult.reason !== "up-to-date") {
+        console.warn(
+          `[V0 SERVICE] ENG-483: lead-capture route sync did not commit for new page /${slug}: ${syncResult.reason}`
+        );
+      }
+    } catch (syncErr: any) {
+      console.error(
+        `[V0 SERVICE] ENG-483: lead-capture route sync failed for new page /${slug}:`,
+        syncErr?.message || syncErr
+      );
+    }
+
     // Update record to deployed, re-persisting repo fields in case they were missing
     const deployedSubPage: GeneratedLandingPage = {
       ...record,
