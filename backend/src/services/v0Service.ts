@@ -4592,7 +4592,8 @@ export async function findUserSiteRecord(userId: string): Promise<GeneratedLandi
     TableName: TABLE_NAME,
     IndexName: "UserIdIndex",
     KeyConditionExpression: "userId = :userId",
-    ExpressionAttributeValues: { ":userId": userId },
+    FilterExpression: "attribute_not_exists(archived) OR archived = :archivedFalse",
+    ExpressionAttributeValues: { ":userId": userId, ":archivedFalse": false },
   });
 
   // Prefer: 1) explicit root page, 2) page with v0ChatId (original v0 page), 3) any with githubRepoUrl
