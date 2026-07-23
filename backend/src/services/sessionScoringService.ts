@@ -185,6 +185,11 @@ export function isGreetingOnlySession(messages: ChatMessage[] = []): boolean {
 function hasAssistantTurn(messages: ChatMessage[] = []): boolean {
   return messages.some((m: any) => {
     if (m.role !== "assistant") return false;
+    // Ignore the "run failed, please retry" note left by surfaceFailedRun() — it
+    // is a placeholder for a crashed run, NOT a genuine assistant turn, so a
+    // session that only carries it must still classify as a failed run (and the
+    // note must never be double-added on a later scoring pass).
+    if (m.metadata?.isRunFailureNotice) return false;
     const text = (typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")).trim();
     const toolCalls = m.metadata?.toolCalls;
     return text.length > 0 || (Array.isArray(toolCalls) && toolCalls.length > 0);
@@ -254,6 +259,60 @@ function transcriptEndsMidToolLoop(messages: ChatMessage[]): boolean {
 
 const FAILED_RUN_REASON =
   "Session produced no assistant response — it appears to have crashed or timed out before completing. Flagged as a failed run.";
+
+// User-facing note left in the transcript of a run that crashed/timed out before
+// producing any assistant turn. Without it the session is a silent dead chat —
+// [system, user] with no reply and no explanation. Flagged isRunFailureNotice so
+// hasAssistantTurn() ignores it (the run is still a failure) and it is added at
+// most once.
+const RUN_FAILED_USER_MESSAGE =
+  "This run didn't finish — it looks like it stopped before producing a response. Please send your message again to retry.";
+
+function hasRunFailureNotice(messages: ChatMessage[] = []): boolean {
+  return (messages || []).some((m: any) => m?.metadata?.isRunFailureNotice === true);
+}
+
+/**
+ * Turn a silent dead session (crashed/timed out before any assistant turn) into a
+ * visible failed run: record the failure on the session's diagnostic `error`
+ * field AND leave a single user-facing "please retry" note in the transcript.
+ *
+ * The scheduled-run reconciler (ENG-324) already does this for scheduled runs via
+ * a durable lease; regular interactive runs have no such lease, so a hard process
+ * death (OOM/SIGKILL) leaves them silent. This backstop — driven by the same
+ * satisfaction sweep that already DETECTS the failure — closes that gap for every
+ * turn-less stale session, scheduled or not.
+ *
+ * Idempotent: a session already carrying the notice is left untouched, so
+ * repeated scoring passes never duplicate it. Best-effort: a persistence failure
+ * only logs and never blocks scoring.
+ */
+async function surfaceFailedRun(session: ChatSession): Promise<void> {
+  if (hasRunFailureNotice(session.messages)) return;
+  const nowIso = new Date().toISOString();
+  const notice: ChatMessage = {
+    role: "assistant",
+    content: RUN_FAILED_USER_MESSAGE,
+    timestamp: nowIso,
+    metadata: { timestamp: nowIso, isErrorMessage: true, isRunFailureNotice: true },
+  } as any;
+  try {
+    // Write the diagnostic error FIRST and add the transcript notice LAST. The
+    // notice is the idempotency marker (the early return above + hasAssistantTurn
+    // both key off it), so it must only land once BOTH writes have succeeded.
+    // Otherwise a notice persisted while updateSessionError threw would suppress
+    // the error write forever on every later pass. With this ordering a partial
+    // failure leaves no notice, so the whole annotation is retried next pass
+    // (updateSessionError just overwrites the same reason — idempotent).
+    await chatbotDb.updateSessionError(session.sessionId, FAILED_RUN_REASON);
+    await chatbotDb.addMessageToSession(session.sessionId, notice);
+    // Keep the in-memory snapshot consistent so a second scoring call on the same
+    // object in the same pass sees the notice and skips re-adding it.
+    if (Array.isArray(session.messages)) session.messages.push(notice);
+  } catch (err) {
+    console.error(`surfaceFailedRun: failed to annotate session ${session.sessionId}:`, err);
+  }
+}
 
 /**
  * Deterministic failure score for a session that stalled before producing any
@@ -538,6 +597,9 @@ export async function scoreSessionIfNeeded(
     if (classifyTurnlessSession(session) === "in-flight") {
       return null;
     }
+    // Convert the silent dead session into a visible failed run (user-facing
+    // retry note + diagnostic error) before recording the deterministic score.
+    await surfaceFailedRun(session);
     result = buildFailedRunResult(messageCount);
   } else if (transcriptEndsMidToolLoop(session.messages)) {
     // Partial tool-loop persisted (tool result or pure tool-call turn is last).
