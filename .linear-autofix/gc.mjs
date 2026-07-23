@@ -11,7 +11,7 @@ import path from 'node:path';
 import { config } from './config.mjs';
 import { resolveIssue } from './linear.mjs';
 import { lockActive } from './lock.mjs';
-import { evictIdlePreviews, evictUnderMemoryPressure } from './preview/policy.mjs';
+import { evictIdlePreviews, evictUnderMemoryPressure, stalePreviews } from './preview/policy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '..');
@@ -109,6 +109,22 @@ async function main() {
         minIdleMs: (config.previewMemMinIdleMinutes ?? 10) * 60 * 1000,
       }, log);
     } catch (e) { log(`memory-pressure preview reap failed: ${e.message}`); }
+  }
+
+  // Keep each live preview matching its branch HEAD. A preview is a bring-up-time SNAPSHOT — the backend
+  // runs ts-node from the worktree source, the portals are built once — so commits landing on the branch
+  // AFTER bring-up leave it serving STALE code until it's restarted (this is what made ENG-384 look stale:
+  // the backend predated the fix commit). Detect the drift here and refresh: cheap ts-node restart for a
+  // backend-only change, full rebuild only if a portal changed. Skip a locked worktree (a run/turn/rebuild
+  // is mid-flight — refreshing under it would corrupt it). Disable via config.previewAutoRefreshOnHeadChange.
+  if (config.previewAutoRefreshOnHeadChange !== false) {
+    try {
+      for (const { b, from, to } of stalePreviews()) {
+        if (lockActive(b)) { log(`${b} stale (${from.slice(0, 9)} → ${to.slice(0, 9)}) but an operation is active — deferring refresh`); continue; }
+        log(`${b} preview is stale (${from.slice(0, 9)} → branch head ${to.slice(0, 9)}) → refreshing`);
+        spawnSync('node', [previewScript, 'refresh', b], { stdio: 'inherit' });
+      }
+    } catch (e) { log(`preview auto-refresh failed: ${e.message}`); }
   }
 
   // Worktree dirs (may be empty). Even with none, we still reconcile worktree-less state entries below,

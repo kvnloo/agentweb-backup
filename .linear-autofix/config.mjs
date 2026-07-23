@@ -181,6 +181,10 @@ export const config = {
   previewMemKeep: 1,               // never let the memory-pressure reap drop below this many live previews.
   previewMemMinIdleMinutes: 10,    // and never let it stop a preview touched within this window (a human
                                    // actively opening its URL / chatting on it), even under pressure.
+  previewAutoRefreshOnHeadChange: true, // a preview is a bring-up-time snapshot (ts-node backend + built-once
+                                   // portals); when the branch advances past the commit it was brought up
+                                   // from, gc.mjs refreshes it — cheap ts-node restart for a backend-only
+                                   // change, full rebuild only if a portal changed. false = leave it stale.
 
   // --- Claude ---
   defaultModel: 'opus',            // the fixer model

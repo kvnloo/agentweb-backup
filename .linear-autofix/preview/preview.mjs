@@ -46,6 +46,8 @@ const SERVICES = [
 const readJson = (p) => { try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return {}; } };
 const writeJson = (p, o) => writeFileSync(p, JSON.stringify(o, null, 2));
 const stripSlash = (u) => u.replace(/\/$/, '');
+// HEAD sha of a git repo/worktree — the source revision the preview is (or would be) serving. null on error.
+const currentHead = (repoPath) => { const r = spawnSync('git', ['-C', repoPath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }); return r.status === 0 ? r.stdout.trim() : null; };
 
 function freePort(start) {
   return new Promise((resolve) => {
@@ -219,7 +221,10 @@ async function up(bugRaw, worktreeRaw) {
   writeJson(ROUTES, routes);
 
   const state = readJson(STATE);
-  state[bug] = { worktree, ports, procs, urls, at: new Date().toISOString() };
+  // Record the commit this stack was brought up from, so gc / the chat dropdown can tell when the branch
+  // has advanced past it (→ stale, needs a refresh). This is the main agentweb worktree HEAD (backend +
+  // partner-portal live here; the customer-portal repo isn't tracked for staleness yet).
+  state[bug] = { worktree, ports, procs, urls, commit: currentHead(worktree), at: new Date().toISOString() };
   writeJson(STATE, state);
 
   console.log('[preview] waiting for services to come up (first boot of backend can take ~30s)...');
@@ -273,6 +278,52 @@ function down(bugRaw) {
   }
 }
 
+// Restart ONLY the backend on its EXISTING port, re-reading the worktree source (ts-node --transpile-only
+// → new code, no build). Reuses the recorded ports/urls and the same env construction as up(), so the
+// proxy routes stay valid. Returns whether the backend came back up. Cheap path for a backend-only change.
+async function restartBackend(bug, entry, newHead) {
+  const worktree = entry.worktree;
+  const cwd = path.join(worktree, 'backend');
+  const port = entry.ports?.api;
+  const oldPid = entry.procs?.backend?.pid;
+  if (!existsSync(cwd) || !port) { console.log(`[preview] ${bug}: can't backend-restart (missing backend dir/port)`); return false; }
+  if (oldPid) { try { process.kill(-oldPid, 'SIGTERM'); } catch { try { process.kill(oldPid, 'SIGTERM'); } catch { /* gone */ } } }
+  let freed = await waitPortFree(port);
+  if (!freed && oldPid) { try { process.kill(-oldPid, 'SIGKILL'); } catch { try { process.kill(oldPid, 'SIGKILL'); } catch { /* gone */ } } freed = await waitPortFree(port, 5000); }
+  const env = { ...process.env, PORT: String(port), NODE_ENV: process.env.NODE_ENV || 'development',
+    BACKEND_URL: stripSlash(entry.urls.api), CUSTOMER_FRONTEND_URL: stripSlash(entry.urls.customer), FRONTEND_URL: stripSlash(entry.urls.partner) };
+  mkdirSync(LOGS, { recursive: true });
+  const out = openSync(path.join(LOGS, `${bug}-backend.log`), 'a');
+  const child = spawn('npx', ['ts-node', '--transpile-only', 'src/server.ts'], { cwd, env, detached: true, stdio: ['ignore', out, out] });
+  child.unref();
+  // Persist the new pid + the commit we just moved to (so staleness resets). RMW so we don't clobber
+  // a concurrent write for another bug.
+  const st = readJson(STATE);
+  if (st[bug]?.procs?.backend) { st[bug].procs.backend.pid = child.pid; st[bug].commit = newHead; st[bug].at = new Date().toISOString(); writeJson(STATE, st); }
+  const ok = await waitPort(port);
+  console.log(`[preview] ${bug}: backend restarted (pid ${child.pid}) on :${port} at ${newHead ? newHead.slice(0, 9) : '?'} — ${ok ? 'up' : 'NOT UP'}`);
+  return ok;
+}
+
+// Bring a running preview up to its branch HEAD if it has drifted (new commits landed after bring-up).
+// Backend-only change → cheap ts-node restart (keeps the built portals serving). Anything touching a
+// portal (or no recorded baseline) → full down+up so the static builds are regenerated too.
+async function refresh(bugRaw) {
+  const bug = bugRaw.toLowerCase();
+  const entry = readJson(STATE)[bug];
+  if (!entry || entry.starting || !entry.procs) { console.log(`[preview] ${bug}: not running — nothing to refresh`); return; }
+  const worktree = entry.worktree;
+  const head = currentHead(worktree);
+  if (!head) { console.log(`[preview] ${bug}: can't read worktree HEAD — skipping refresh`); return; }
+  if (entry.commit === head) { console.log(`[preview] ${bug}: already at ${head.slice(0, 9)} — fresh`); return; }
+  let changed = null;
+  if (entry.commit) { const d = spawnSync('git', ['-C', worktree, 'diff', '--name-only', entry.commit, head], { encoding: 'utf8' }); if (d.status === 0) changed = d.stdout.split('\n').filter(Boolean); }
+  const portalTouched = !changed || changed.some((f) => f.startsWith('partner-portal/') || f.startsWith('customer-portal/'));
+  console.log(`[preview] ${bug}: ${entry.commit ? entry.commit.slice(0, 9) : '(no baseline)'} → ${head.slice(0, 9)}${changed ? ` (${changed.length} file(s) changed)` : ''}`);
+  if (portalTouched) { console.log(`[preview] ${bug}: a portal changed (or no baseline) — full rebuild`); await up(bug, worktree); }
+  else { console.log(`[preview] ${bug}: backend-only change — restarting ts-node (no build)`); await restartBackend(bug, entry, head); }
+}
+
 function list() {
   const state = readJson(STATE);
   const keys = Object.keys(state);
@@ -283,5 +334,6 @@ function list() {
 const [cmd, bug, wt] = process.argv.slice(2);
 if (cmd === 'up' && bug && wt) up(bug, wt);
 else if (cmd === 'down' && bug) down(bug);
+else if (cmd === 'refresh' && bug) refresh(bug);
 else if (cmd === 'list') list();
-else { console.error('Usage:\n  preview.mjs up <bug-id> <worktree>\n  preview.mjs down <bug-id>\n  preview.mjs list'); process.exit(2); }
+else { console.error('Usage:\n  preview.mjs up <bug-id> <worktree>\n  preview.mjs down <bug-id>\n  preview.mjs refresh <bug-id>\n  preview.mjs list'); process.exit(2); }

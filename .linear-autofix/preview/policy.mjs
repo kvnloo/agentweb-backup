@@ -44,6 +44,21 @@ export const runningPreviewIds = (identifier, state = readJson(STATE)) =>
 export const atConcurrentPreviewCap = (identifier, cap, state = readJson(STATE)) =>
   cap > 0 && runningPreviewIds(identifier, state).length >= cap;
 
+// Live previews whose recorded bring-up commit no longer matches their worktree's current HEAD — the
+// branch advanced after bring-up, so the preview is serving STALE code (the backend runs ts-node from a
+// snapshot; the portals are built once). Returns [{ b, worktree, from, to }]. `headOf` is injectable so
+// the git probe can be stubbed in tests; entries with no recorded commit / still `starting` are skipped.
+const gitHead = (repoPath) => { const r = spawnSync('git', ['-C', repoPath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }); return r.status === 0 ? r.stdout.trim() : null; };
+export function stalePreviews(state = readJson(STATE), headOf = gitHead) {
+  const out = [];
+  for (const [b, e] of Object.entries(state)) {
+    if (!e || e.starting || !e.worktree || !e.commit) continue;
+    const head = headOf(e.worktree);
+    if (head && head !== e.commit) out.push({ b, worktree: e.worktree, from: e.commit, to: head });
+  }
+  return out;
+}
+
 // Before a user-forced bring-up of `identifier`, make sure the total will stay within `cap`: evict
 // the longest-idle OTHER previews until at most cap-1 remain (leaving one slot). Never evicts the
 // target itself (re-enabling an already-up preview shouldn't kill it). Returns evicted bug ids.
