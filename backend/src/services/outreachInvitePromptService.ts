@@ -253,16 +253,24 @@ export async function saveOutreachInvitePrompt(
       updatedBy: input.updatedBy,
     };
 
-    // Guard the write so we only overwrite the exact row we merged onto.
-    const guard =
-      raw && typeof raw.version === "string"
+    // Guard the write so we only overwrite the exact row we merged onto. The
+    // stored `version` is the concurrency token; our own writes always set it,
+    // so a row without one is either brand-new or corrupt. In that case we
+    // guard on the version staying ABSENT (`attribute_not_exists(version)`) —
+    // the first writer stamps a version and any concurrent versionless save
+    // then fails the condition, retries, and re-reads the real token. Guarding
+    // on mere `attribute_exists(templateId)` would give the versionless case no
+    // protection at all, letting concurrent saves silently clobber each other.
+    const hasVersionToken =
+      raw && raw.version !== undefined && raw.version !== null;
+    const guard = !raw
+      ? { ConditionExpression: "attribute_not_exists(templateId)" }
+      : hasVersionToken
         ? {
             ConditionExpression: "version = :expected",
             ExpressionAttributeValues: { ":expected": raw.version },
           }
-        : raw
-          ? { ConditionExpression: "attribute_exists(templateId)" }
-          : { ConditionExpression: "attribute_not_exists(templateId)" };
+        : { ConditionExpression: "attribute_not_exists(version)" };
 
     try {
       await docClient

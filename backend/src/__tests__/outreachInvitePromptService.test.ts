@@ -429,7 +429,7 @@ describe("saveOutreachInvitePrompt", () => {
     expect(put.ConditionExpression).toBe("attribute_not_exists(templateId)");
   });
 
-  it("conditions on attribute_exists when the stored row has no version string", async () => {
+  it("guards a versionless row on the version staying absent (still concurrency-safe)", async () => {
     mockGet.mockResolvedValueOnce({
       Item: {
         templateId: OUTREACH_INVITE_TEMPLATE_ID,
@@ -441,7 +441,47 @@ describe("saveOutreachInvitePrompt", () => {
     });
     await saveOutreachInvitePrompt({ systemPrompt: "NEW", updatedBy: "admin-9" });
     const put = mockPut.mock.calls[mockPut.mock.calls.length - 1][0];
-    expect(put.ConditionExpression).toBe("attribute_exists(templateId)");
+    // Not a toothless attribute_exists — the version's ABSENCE is the token, so
+    // the first writer stamps a version and a concurrent versionless save loses.
+    expect(put.ConditionExpression).toBe("attribute_not_exists(version)");
     expect(put.ExpressionAttributeValues).toBeUndefined();
+  });
+
+  it("retries a versionless save that lost the race, then guards on the winner's version", async () => {
+    // Initial read: versionless row.
+    mockGet.mockResolvedValueOnce({
+      Item: {
+        templateId: OUTREACH_INVITE_TEMPLATE_ID,
+        systemPrompt: "OLD",
+        withCompanyVariants: ["A"],
+        withoutCompanyVariants: ["B"],
+      },
+    });
+    const conflict: any = new Error("stale");
+    conflict.code = "ConditionalCheckFailedException";
+    mockPut.mockRejectedValueOnce(conflict); // attribute_not_exists(version) fails
+    // Re-read: the concurrent writer stamped a real version.
+    mockGet.mockResolvedValueOnce({
+      Item: {
+        templateId: OUTREACH_INVITE_TEMPLATE_ID,
+        version: "v5-2026-07-13",
+        systemPrompt: "OLD",
+        withCompanyVariants: ["CONCURRENT A"],
+        withoutCompanyVariants: ["B"],
+        updatedAt: "2026-07-13T02:00:00Z",
+        updatedBy: "admin-2",
+      },
+    });
+    const row = await saveOutreachInvitePrompt({
+      systemPrompt: "MINE",
+      updatedBy: "admin-9",
+    });
+
+    expect(mockPut).toHaveBeenCalledTimes(2);
+    expect(row.systemPrompt).toBe("MINE");
+    expect(row.withCompanyVariants).toEqual(["CONCURRENT A"]); // winner preserved
+    const put2 = mockPut.mock.calls[1][0];
+    expect(put2.ConditionExpression).toBe("version = :expected");
+    expect(put2.ExpressionAttributeValues).toEqual({ ":expected": "v5-2026-07-13" });
   });
 });
