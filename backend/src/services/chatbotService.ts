@@ -2671,8 +2671,16 @@ export class ChatbotDB {
   async updateSessionAskUserQuestion(
     sessionId: string,
     pendingUserQuestion: PendingUserQuestion | null,
-  ): Promise<ChatSession> {
-    const params = pendingUserQuestion
+    opts?: { failIfAwaitingExists?: boolean },
+  ): Promise<ChatSession | null> {
+    // ENG-396: the one-live-question invariant. When posing a NEW awaiting question,
+    // `failIfAwaitingExists` gates the write on there being no question already
+    // awaiting — a settled 'answered' slot may be replaced (that's the normal
+    // turn-by-turn next question). Enforced atomically so two ask_user_question
+    // calls in the same turn can never both take the single slot; the loser is
+    // refused (returns null) and the model asks it in a later turn.
+    const guard = opts?.failIfAwaitingExists === true && pendingUserQuestion !== null;
+    const params: any = pendingUserQuestion
       ? {
           TableName: this.tableName,
           Key: { sessionId },
@@ -2690,10 +2698,22 @@ export class ChatbotDB {
           ReturnValues: "ALL_NEW",
         };
 
+    if (guard) {
+      params.ConditionExpression =
+        "attribute_not_exists(pendingUserQuestion) OR pendingUserQuestion.#pStatus <> :awaitingStatus";
+      params.ExpressionAttributeNames = { "#pStatus": "status" };
+      params.ExpressionAttributeValues[":awaitingStatus"] = "awaiting";
+    }
+
     try {
       const result = await dynamodb.update(params).promise();
       return result.Attributes as ChatSession;
     } catch (error) {
+      // A guarded write that fails the condition means a question is already
+      // awaiting — an expected outcome, not an error. Signal it with null.
+      if (guard && (error as any)?.code === "ConditionalCheckFailedException") {
+        return null;
+      }
       console.error("Error updating session AskUserQuestion:", error);
       throw error;
     }

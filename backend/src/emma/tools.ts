@@ -175,8 +175,20 @@ After you call this the run BLOCKS: you will NOT be able to answer it yourself a
       throw err;
     }
 
-    // Persist as the single active question (supersedes any prior awaiting one).
-    await chatbotDb.updateSessionAskUserQuestion(sessionId, question);
+    // Persist as the single active question. The guard enforces one live question
+    // at a time: if a question is already awaiting, the write is refused (null) and
+    // we tell the model to ask this one later — questions are asked ONE AT A TIME,
+    // never batched, so a second call can't overwrite the pending one's slot.
+    const posted = await chatbotDb.updateSessionAskUserQuestion(sessionId, question, {
+      failIfAwaitingExists: true,
+    });
+    if (!posted) {
+      return {
+        success: false,
+        message:
+          'A question is already waiting for the user to answer. Only ONE question can be open at a time — do not ask another now. Wait until the current question is answered, then ask this one in a later turn (one question per turn).',
+      };
+    }
 
     const prompt = renderQuestionPrompt(question);
     // awaitingUserConfirmation halts the loop; type + options let the chat card
