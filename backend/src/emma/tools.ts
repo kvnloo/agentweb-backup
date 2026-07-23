@@ -111,7 +111,9 @@ emmaToolRegistry.register({
 
 Provide 2–4 options, each with a one-line \`consequence\`. EXACTLY ONE option must be marked recommended:true with a one-line \`why\` grounded in real signal from this session (e.g. "162 LEAD events fired on your pixel in the last 30d") — the recommendation is the point. Optionally set allow_emma_decide:true to offer a "Let Emma decide" delegation button (proceeds with the recommended option, logged).
 
-After you call this the run BLOCKS: you will NOT be able to answer it yourself and no further action executes until the user selects. Do not restate the options as prose asking for a "yes/confirm" — emit this tool instead.`,
+After you call this the run BLOCKS: you will NOT be able to answer it yourself and no further action executes until the user selects. Do not restate the options as prose asking for a "yes/confirm" — emit this tool instead.
+
+Ask only ONE question per turn. If several decisions are needed, ask the single most blocking/irreversible one now; the rest come up one at a time in later turns after each is answered. A second question emitted while one is still awaiting is rejected — never batch them.`,
     inputSchema: {
       type: 'object',
       properties: {
