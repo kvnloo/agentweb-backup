@@ -22,7 +22,10 @@ case "${1:-}" in
     if [ -f "$LOGFILE" ] && [ "$(stat -c%s "$LOGFILE" 2>/dev/null || echo 0)" -gt 5242880 ]; then
       mv "$LOGFILE" "$LOGFILE.1"
     fi
-    nohup node "$HERE/server.mjs" >>"$LOGFILE" 2>&1 &
+    # 9>&- closes any inherited poll-lock fd: when run.sh revives this daemon it holds flock on
+    # fd 9 (.poll.lock); without this the server inherits + pins it forever, wedging every future
+    # poll cycle at `flock -n` (the 2026-07-22 stall — no pickups for ~16h). The server never uses fd 9.
+    nohup node "$HERE/server.mjs" >>"$LOGFILE" 2>&1 9>&- &
     echo $! >"$PIDFILE"
     sleep 1
     PORT="$(node -e "import('$BASE/config.mjs').then(m=>console.log(m.config.chat?.port||8790))")"
