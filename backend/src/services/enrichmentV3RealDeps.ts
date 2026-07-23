@@ -395,7 +395,20 @@ async function fetchWebForGroupReal(
   if (!groupCfg) return null;
   const wtag = `[v3:${listId ? `${listId}:` : ''}${lead.leadId ?? lead.email ?? '?'}:web:${groupName}]`;
 
-  // 1. Cache check (shared across leads at the same canonical entity)
+  // 1. Build query from the group's searchTemplate. Done BEFORE the cache check
+  // so a signal-less query (e.g. a personal/institutional email whose domain we
+  // intentionally omit — ENG-433) short-circuits the whole tier, including the
+  // shared cache. The cache is keyed on the canonical entity (email domain), so
+  // for a university/free-mail domain it can hold a stale institution-as-company
+  // entry (e.g. cornell.edu → "Cornell University") populated before the guard;
+  // skipping here keeps that from being re-served.
+  const query = CrmEnrichmentService.applySearchTemplate(groupCfg.searchTemplate, lead);
+  if (!query || query === groupCfg.searchTemplate.replace(/\{\{[^}]+\}\}/g, '').trim().replace(/\s+/g, ' ')) {
+    console.log(`${wtag} SKIP no lead-specific signal in query`);
+    return null;
+  }
+
+  // 2. Cache check (shared across leads at the same canonical entity)
   try {
     const cached = await getRawDataFromCache(lead as any, groupName, false);
     if (cached) {
@@ -406,12 +419,6 @@ async function fetchWebForGroupReal(
     console.warn('[v3 deps] cache read failed:', (err as Error).message);
   }
 
-  // 2. Build query from the group's searchTemplate
-  const query = CrmEnrichmentService.applySearchTemplate(groupCfg.searchTemplate, lead);
-  if (!query || query === groupCfg.searchTemplate.replace(/\{\{[^}]+\}\}/g, '').trim().replace(/\s+/g, ' ')) {
-    console.log(`${wtag} SKIP no lead-specific signal in query`);
-    return null;
-  }
   console.log(`${wtag} query="${query.slice(0, 120)}"`);
 
   // 3. Google CSE — for company_technographic also run a job-postings query
@@ -1207,9 +1214,19 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
     runWaterfall: (input) => pureRunWaterfall(input, {
       fetchApolloOrg: async (lead) => {
         if (!isApolloServiceReady()) return null;
-        const domain = lead.emailDomain || (lead.email ? lead.email.split('@')[1]?.trim() || null : null) || extractDomain(lead.website);
+        const domain = resolveApolloMatchDomain(lead);
         if (!domain) {
           console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:org] SKIP no domain`);
+          return null;
+        }
+        // Personal / institutional domains (gmail, yahoo, .edu, .gov, .ac.*) are
+        // NOT company domains: matchOrg would return the free-mail provider or the
+        // university as the "company" (e.g. alum.mit.edu → MIT, yahoo.com → Yahoo),
+        // which is never the lead's actual employer. Skip so LinkedIn/person data
+        // becomes the source of truth for company. Mirrors the guard in
+        // fetchApolloPerson below.
+        if (CrmEnrichmentService.isPersonalEmailDomain(`x@${domain}`)) {
+          console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:org] SKIP personal/institutional domain=${domain}`);
           return null;
         }
         console.log(`[v3:${lead.leadId ?? lead.email ?? '?'}:apollo:org] matchOrg domain=${domain}`);
@@ -1233,7 +1250,7 @@ export function buildOrchestratorDeps(userId: string): OrchestratorDeps {
 
       fetchApolloPerson: async (lead) => {
         if (!isApolloServiceReady()) return null;
-        const domain = extractDomain(lead.website) || lead.emailDomain || extractDomain(lead.email) || null;
+        const domain = resolveApolloMatchDomain(lead);
         const personalDomain = !!domain && CrmEnrichmentService.isPersonalEmailDomain(`x@${domain}`);
         const hasNameAndDomain = !!(lead.firstName || lead.lastName) && !!domain && !personalDomain;
         if (!lead.email && !hasNameAndDomain) {
@@ -1645,4 +1662,28 @@ function extractDomain(input: string | undefined): string | null {
   const tail = atIdx >= 0 ? input.slice(atIdx + 1) : input;
   const stripped = tail.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0];
   return stripped || null;
+}
+
+// Resolve the domain to feed Apollo org/person matching, shared by fetchApolloOrg
+// and fetchApolloPerson so they stay consistent. Precedence (ENG-433):
+//  1. A genuine BUSINESS domain from the CURRENT email — the source of truth. The
+//     stored `emailDomain` is checked only after this, since it can be stale after
+//     an email change (person@oldcorp.com → person@newcorp.com) and would
+//     otherwise select the former employer.
+//  2. A genuine BUSINESS stored `emailDomain` — may be an enrichment-resolved
+//     company domain for a personal-email lead (e.g. gmail + resolved acme.com),
+//     which is a stronger signal than the free-mail address.
+//  3. The website domain (a stale/personal website must not outrank a business
+//     email domain, so it comes after those).
+//  4. Any remaining current/stored domain — personal/institutional domains fall
+//     through here and are rejected by the caller's personal-domain guard.
+function resolveApolloMatchDomain(lead: LeadRecord): string | null {
+  const currentEmailDomain = extractDomain(lead.email);
+  const storedEmailDomain = lead.emailDomain || undefined;
+  const isBusiness = (d: string | null | undefined): d is string =>
+    !!d && !CrmEnrichmentService.isPersonalDomain(d);
+  const businessDomain =
+    (isBusiness(currentEmailDomain) ? currentEmailDomain : null) ||
+    (isBusiness(storedEmailDomain) ? storedEmailDomain : null);
+  return businessDomain || extractDomain(lead.website) || currentEmailDomain || storedEmailDomain || null;
 }
