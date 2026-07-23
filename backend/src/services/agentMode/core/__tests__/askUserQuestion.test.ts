@@ -23,6 +23,7 @@ import {
   selectedPayload,
   checkQuestionGate,
   renderQuestionPrompt,
+  buildAnswerAcknowledgement,
   AskUserQuestionError,
   type AskUserQuestionOption,
   type AskUserQuestionInput,
@@ -371,6 +372,32 @@ describe('selectedPayload — deterministic parameter apply', () => {
 
   it('returns undefined while still awaiting', () => {
     expect(selectedPayload(awaitingQuestion())).toBeUndefined();
+  });
+});
+
+describe('buildAnswerAcknowledgement — explicit in-response confirmation', () => {
+  const AT = '2026-07-21T00:05:00.000Z';
+
+  it('returns null while the question is still awaiting (nothing to acknowledge)', () => {
+    expect(buildAnswerAcknowledgement(awaitingQuestion())).toBeNull();
+  });
+
+  it('a direct pick → names the selected option and asks Emma to confirm it', () => {
+    const answered = resolveInboundAnswer(awaitingQuestion(), { optionId: 'traffic' }, AT);
+    const ack = buildAnswerAcknowledgement(answered)!;
+    expect(ack).toContain('selecting "Traffic / Landing-page views"');
+    expect(ack).toMatch(/confirming "Traffic \/ Landing-page views" is now locked in/);
+    // A direct pick is NOT framed as a delegation.
+    expect(ack).not.toMatch(/Let Emma decide|let you decide/i);
+  });
+
+  it('a delegation → names Emma\'s recommended option, frames it as "you let me decide", includes the why', () => {
+    const answered = resolveInboundAnswer(awaitingQuestion(), { delegated: true }, AT);
+    const ack = buildAnswerAcknowledgement(answered)!;
+    expect(ack).toContain('Let Emma decide');
+    expect(ack).toContain('"Leads"'); // the recommended option
+    expect(ack).toMatch(/let you decide/i);
+    expect(ack).toContain('162 LEAD events'); // the recommended why, surfaced for the confirmation
   });
 });
 
