@@ -13,7 +13,7 @@ import { settingsService } from '../services/settingsService';
 import { workPlanService } from '../services/workPlanService';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { resolveInboundAnswer, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
+import { resolveInboundAnswer, buildAnswerAcknowledgement, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
@@ -2570,7 +2570,11 @@ export async function generateSessionResponse(
   isInteractiveShare?: boolean,
   pageContext?: { currentUrl?: string; structuredContext?: string; screenshot?: string },
   isDelegatedAccess?: boolean,
-  ishareSenderInfo?: { ip?: string; userAgent?: string }
+  ishareSenderInfo?: { ip?: string; userAgent?: string },
+  // ENG-396: a model-visible directive (from buildAnswerAcknowledgement) appended to
+  // THIS turn's LLM content so Emma opens her reply by naming the chosen option.
+  // Never stored on the displayed user bubble.
+  answerAck?: string
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -2615,6 +2619,12 @@ export async function generateSessionResponse(
   // For emma-sidebar sessions, append current page URL so the LLM knows user context
   if (pageContext?.currentUrl && session.portalType === 'emma-sidebar') {
     messageContent += `\n\n[Current page: ${pageContext.currentUrl}]`;
+  }
+
+  // ENG-396: when this turn answers an AskUserQuestion, append a directive (LLM-only)
+  // so Emma explicitly names the chosen option in her reply — not just the card footer.
+  if (answerAck) {
+    messageContent += `\n\n${answerAck}`;
   }
 
   // Create user message object - store processed content with attachments
@@ -3225,6 +3235,7 @@ export const agentModeController = {
       // Placed before the idempotency/session locks so a bad selection returns
       // cleanly with no lock to release. answeredBy is derived server-side inside
       // resolveInboundAnswer — the client cannot forge who answered.
+      let answerAck: string | undefined;
       if (questionAnswer) {
         try {
           const answered = resolveInboundAnswer(
@@ -3237,6 +3248,9 @@ export const agentModeController = {
             new Date().toISOString(),
           );
           await chatbotDb.updateSessionAskUserQuestion(sessionId, answered);
+          // ENG-396: make Emma name the chosen option in her reply (esp. for delegation,
+          // where the user's "Let Emma decide" bubble doesn't say which option won).
+          answerAck = buildAnswerAcknowledgement(answered) ?? undefined;
         } catch (err) {
           if (err instanceof AskUserQuestionError) {
             // Stale/duplicate/invalid selection (e.g. the card was already
@@ -3377,7 +3391,9 @@ export const agentModeController = {
         attachments,
         undefined, // isInteractiveShare
         pageContext,
-        isDelegatedAccessForMessage
+        isDelegatedAccessForMessage,
+        undefined, // ishareSenderInfo
+        answerAck // ENG-396: make Emma name the chosen option in her reply
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;

@@ -306,6 +306,35 @@ export function selectedPayload(question: PendingUserQuestion): Record<string, u
 }
 
 /**
+ * ENG-396: a model-visible directive appended to the answering turn so Emma OPENS
+ * her reply by explicitly naming the option now in effect. Users shouldn't have to
+ * read the small card footer to learn what was chosen — especially after "Let Emma
+ * decide", where they never named an option themselves.
+ *
+ * This is appended to the LLM message content ONLY — never to the stored/displayed
+ * user bubble (which stays "Let Emma decide" / the picked label). Returns null when
+ * the question isn't answered or the chosen option can't be resolved (nothing to say).
+ */
+export function buildAnswerAcknowledgement(question: PendingUserQuestion): string | null {
+  if (question.status !== 'answered' || !question.answer) return null;
+  const chosen = question.options.find((o) => o.id === question.answer!.optionId);
+  if (!chosen) return null;
+  const why = typeof chosen.why === 'string' ? chosen.why.trim() : '';
+  if (question.answer.delegated) {
+    return (
+      `[The user clicked "Let Emma decide" for your question "${question.question}", so they let you ` +
+      `decide — you chose your recommended option: "${chosen.label}". Your reply MUST OPEN with one ` +
+      `plain sentence confirming this to the user, e.g. "Since you let me decide, I'm going with ` +
+      `${chosen.label}${why ? ` — ${why}` : ''}." Say that first, before anything else, then continue.]`
+    );
+  }
+  return (
+    `[The user answered your question "${question.question}" by selecting "${chosen.label}". Your reply ` +
+    `MUST OPEN with one short sentence confirming "${chosen.label}" is now locked in, then continue.]`
+  );
+}
+
+/**
  * Render the question + options as a plain-text prompt. This is the fallback
  * shown/fed when the structured card can't render (and the string the loop's
  * confirmation-halt surfaces). The structured `options` on the tool result
