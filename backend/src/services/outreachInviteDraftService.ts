@@ -102,6 +102,14 @@ export interface InviteDraftContext {
    * Premium LinkedIn account, 200 for a free one. Defaults to the free limit.
    */
   charLimit?: number;
+  /**
+   * The authenticated user this draft run is for. Passed to the model call as
+   * usage-attribution context so the Bedrock cost is metered against this user
+   * and charged to the per-user cost cap (rather than the "system" burn-only
+   * bucket). Omitted only when there is genuinely no user (should not happen on
+   * the onboarding path).
+   */
+  userId?: string;
 }
 
 export interface InviteDraft {
@@ -125,6 +133,8 @@ interface InviteLlm {
   generateJsonRobust: <T = any>(
     systemPrompt: string,
     userPrompt: string,
+    onUsage?: (usage: any) => void,
+    usageContext?: { userId?: string; sessionId?: string; feature?: string },
   ) => Promise<T>;
 }
 
@@ -251,6 +261,9 @@ export async function generateInviteDrafts(
     raw = await llm.generateJsonRobust<LlmDraftsResponse>(
       buildSystemPrompt(row.systemPrompt, charLimit),
       buildUserPrompt(usable, ctx),
+      undefined,
+      // Attribute the Bedrock spend to the user so it hits their cost cap.
+      { userId: ctx.userId, feature: "onboarding" },
     );
   } catch (err) {
     // eslint-disable-next-line no-console

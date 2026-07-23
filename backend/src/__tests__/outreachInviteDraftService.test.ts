@@ -309,4 +309,18 @@ describe("generateInviteDrafts", () => {
 
     expect(out.drafts).toEqual([{ prospectId: "p-1", message: "Hi there Jane" }]);
   });
+
+  it("meters the model spend against the requesting user (per-user cost cap)", async () => {
+    const llm = okLlm({ "p-1": "Hi Jane" });
+
+    await generateInviteDrafts(
+      [{ id: "p-1", name: "Jane" }],
+      { ...CTX, userId: "user-42" },
+      { llm },
+    );
+
+    // 4th arg to generateJsonRobust is the usage-attribution context.
+    const usageContext = (llm.generateJsonRobust as jest.Mock).mock.calls[0][3];
+    expect(usageContext).toEqual({ userId: "user-42", feature: "onboarding" });
+  });
 });

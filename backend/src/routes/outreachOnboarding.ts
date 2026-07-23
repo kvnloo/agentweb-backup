@@ -164,6 +164,8 @@ router.post("/outreach/draft-invites", authenticateToken, async (req, res) => {
         icpName: typeof body.icpName === "string" ? body.icpName : undefined,
         specs: typeof body.specs === "string" ? body.specs : undefined,
         charLimit,
+        // Attribute the model spend to this user (per-user cost cap).
+        userId: authReq.user.userId,
       },
     );
     return res.status(200).json(result);

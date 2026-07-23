@@ -135,6 +135,7 @@ describe(`POST ${URL}`, () => {
       icpName: "program directors",
       specs: "K-5, Bay Area",
       charLimit: 200,
+      userId: "user-1",
     });
   });
 
