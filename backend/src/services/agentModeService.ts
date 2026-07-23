@@ -48,6 +48,12 @@ import {
 } from '../utils/llmPricing';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
 import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmMutationEvents';
+import {
+  createAutoPersistState,
+  isBrowserAutomationTool,
+  autoLoadCookiesOnce,
+  autoSaveCookiesDebounced,
+} from '../emma/browserCookieAutoPersist';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { publishWithResolvedBlogPublisher } from './blogPublishers';
 import { enqueueAutoHumanEval } from './autoHumanEvalService';
@@ -756,6 +762,10 @@ function linkedInPublicIdFromUrl(url: string | undefined | null): string | null 
 
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
+  // ENG-475: deterministic browser-session persistence (auto load-at-start /
+  // save-as-you-go around browser automation tools, so an intermittent login
+  // success is captured without depending on the model calling the cookie tools).
+  private browserCookieAutoState = createAutoPersistState();
   private toolRegistry: ToolRegistry;
   private mcpClientService: McpClientService;
   private static toolsRegistered: boolean = false;
@@ -6371,6 +6381,27 @@ export class AgentModeService {
     }
 
     try {
+      // ENG-475: bracket browser-automation tools with deterministic cookie
+      // persistence. runTool drives the existing save/load_browser_cookies tools;
+      // the helper guards against recursion (those tools re-enter via
+      // browser_run_code) and is fully best-effort — a cookie op never breaks the
+      // browser tool the user asked for.
+      const isBrowserTool = isBrowserAutomationTool(toolName);
+      if (isBrowserTool) {
+        const cookieCtx = { userId, sessionId, llmModel, service: this, ...extraContext };
+        const autoDeps = {
+          runTool: (name: string, toolArgs: any) => this.toolRegistry.execute(name, toolArgs ?? {}, cookieCtx),
+          now: () => Date.now(),
+        };
+        await autoLoadCookiesOnce(this.browserCookieAutoState, sessionId, autoDeps);
+        const result = await this.toolRegistry.execute(toolName, preparedArgs, cookieCtx);
+        const toolFailed = result && (result as any).success === false;
+        if (!toolFailed) {
+          await autoSaveCookiesDebounced(this.browserCookieAutoState, sessionId, autoDeps);
+        }
+        return result;
+      }
+
       return await this.toolRegistry.execute(toolName, preparedArgs, {
         userId,
         sessionId,
