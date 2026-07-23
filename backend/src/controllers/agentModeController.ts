@@ -2574,7 +2574,10 @@ export async function generateSessionResponse(
   // ENG-396: a model-visible directive (from buildAnswerAcknowledgement) appended to
   // THIS turn's LLM content so Emma opens her reply by naming the chosen option.
   // Never stored on the displayed user bubble.
-  answerAck?: string
+  answerAck?: string,
+  // ENG-396: the structured selection stamped on this reply's metadata, so a card can
+  // show which option was CLICKED (never inferred from the message text).
+  answeredQuestionMeta?: { questionId: string; optionId: string; delegated: boolean }
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -2643,7 +2646,10 @@ export async function generateSessionResponse(
           ...(ishareSenderInfo?.ip ? { ip: ishareSenderInfo.ip } : {}),
           ...(ishareSenderInfo?.userAgent ? { userAgent: ishareSenderInfo.userAgent } : {}),
         }
-      } : {})
+      } : {}),
+      // ENG-396: structured record of the card selection this reply answered (from a
+      // click, not the text). The card reads this to show which option was chosen.
+      ...(answeredQuestionMeta ? { askUserQuestionAnswer: answeredQuestionMeta } : {})
     }
   };
 
@@ -3236,6 +3242,7 @@ export const agentModeController = {
       // cleanly with no lock to release. answeredBy is derived server-side inside
       // resolveInboundAnswer — the client cannot forge who answered.
       let answerAck: string | undefined;
+      let answeredQuestionMeta: { questionId: string; optionId: string; delegated: boolean } | undefined;
       if (questionAnswer) {
         try {
           const answered = resolveInboundAnswer(
@@ -3251,6 +3258,16 @@ export const agentModeController = {
           // ENG-396: make Emma name the chosen option in her reply (esp. for delegation,
           // where the user's "Let Emma decide" bubble doesn't say which option won).
           answerAck = buildAnswerAcknowledgement(answered) ?? undefined;
+          // ENG-396: stamp the STRUCTURED selection on this reply so the card reads which
+          // option was chosen from the click record — never inferred from prose. Superseded
+          // cards read this instead of matching chat text.
+          if (answered.answer) {
+            answeredQuestionMeta = {
+              questionId: answered.questionId,
+              optionId: answered.answer.optionId,
+              delegated: answered.answer.delegated === true,
+            };
+          }
         } catch (err) {
           if (err instanceof AskUserQuestionError) {
             // Stale/duplicate/invalid selection (e.g. the card was already
@@ -3260,6 +3277,15 @@ export const agentModeController = {
           }
           throw err;
         }
+      } else if (session.pendingUserQuestion?.status === 'awaiting') {
+        // ENG-396: the user typed a message instead of clicking the open card. Per the
+        // primitive's model, a selection is ONLY an explicit click — never inferred from
+        // prose. So the open question is abandoned: clear it (the old card freezes as
+        // "not answered" history) so the one-live-question guard lets Emma re-ask with a
+        // FRESH card if she still needs the answer. The irreversible-write gate still
+        // blocks until a real structured answer lands, so this can't rubber-stamp.
+        await chatbotDb.updateSessionAskUserQuestion(sessionId, null);
+        session.pendingUserQuestion = undefined;
       }
 
       // Cross-restart duplicate-submit lock (ENG-147: one question spawned ~30
@@ -3393,7 +3419,8 @@ export const agentModeController = {
         pageContext,
         isDelegatedAccessForMessage,
         undefined, // ishareSenderInfo
-        answerAck // ENG-396: make Emma name the chosen option in her reply
+        answerAck, // ENG-396: make Emma name the chosen option in her reply
+        answeredQuestionMeta // ENG-396: structured click record stamped on the reply
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
