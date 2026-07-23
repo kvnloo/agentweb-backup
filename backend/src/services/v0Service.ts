@@ -4680,12 +4680,12 @@ export async function findUserSiteRecord(userId: string): Promise<GeneratedLandi
     const fresh = await dynamodb
       .get({ TableName: TABLE_NAME, Key: { id: siteRecord.id }, ConsistentRead: true })
       .promise();
-    if (!fresh.Item || fresh.Item.archived) {
-      // Archived (or hard-deleted) since the GSI read. Do not fall back to another
-      // candidate in `pages` — every item in it came from the same single, equally
-      // stale read. Returning null is safe: the caller treats "no site" as "create
-      // a fresh one", which is exactly the right outcome instead of attaching to a
-      // dying repo.
+    if (!fresh.Item || fresh.Item.archived || fresh.Item.userId !== userId) {
+      // Archived, hard-deleted, or (defensively) no longer owned by this caller
+      // since the GSI read — do not fall back to another candidate in `pages`,
+      // every item in it came from the same single, equally stale read. Returning
+      // null is safe: the caller treats "no site" as "create a fresh one", the
+      // right outcome instead of attaching to a dying repo or someone else's site.
       return null;
     }
     siteRecord = fresh.Item as GeneratedLandingPage;
