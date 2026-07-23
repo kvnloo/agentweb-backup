@@ -655,23 +655,24 @@ describe('resolveIdentity — Apollo people-match fills company from embedded or
     }
   });
 
-  // ENG-433 (Greptile P1): a WEBSITELESS free-mail provider echo (Apollo returns
-  // "Yahoo" as company with no org website for a yahoo.com lead) must be rejected
-  // via the provider-name token match, since there is no website to compare.
-  it('does NOT fill company from a websiteless FREE-MAIL provider echo (yahoo.com → "Yahoo")', async () => {
+  // ENG-433: a WEBSITELESS Apollo company is trusted (it comes from the person's
+  // employment history — their real employer). It must NOT be name-matched against
+  // the email domain, or legitimate employers that contain the institution's name
+  // ("MIT Lincoln Laboratory" for an @mit.edu lead) would be wrongly dropped.
+  it('KEEPS a websiteless real employer whose name contains the institution (mit.edu → "MIT Lincoln Laboratory")', async () => {
     const deps = makeDeps({
       apolloPeopleMatch: jest.fn().mockResolvedValue({
-        company: 'Yahoo', // no website
+        company: 'MIT Lincoln Laboratory', // no website; real employer, not an echo
       }),
     });
     const result = await resolveIdentity(
       makeInput({
         lead: {
           leadId: LEAD_ID,
-          email: 'someone@yahoo.com',
-          firstName: 'Free',
-          lastName: 'Mailer',
-          linkedin: 'https://www.linkedin.com/in/free-mailer',
+          email: 'researcher@mit.edu',
+          firstName: 'Real',
+          lastName: 'Scientist',
+          linkedin: 'https://www.linkedin.com/in/real-scientist',
         },
         needsCompanyFields: true,
       }),
@@ -680,36 +681,7 @@ describe('resolveIdentity — Apollo people-match fills company from embedded or
 
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.resolved.company).toBeUndefined();
-    }
-  });
-
-  // ENG-433 (Greptile P1): a WEBSITELESS institutional echo (dartmouth.edu →
-  // "Dartmouth College" with no org website) must be rejected via the domain-label
-  // token match, since there is no website to compare.
-  it('does NOT fill company from a websiteless INSTITUTIONAL echo (dartmouth.edu → "Dartmouth College")', async () => {
-    const deps = makeDeps({
-      apolloPeopleMatch: jest.fn().mockResolvedValue({
-        company: 'Dartmouth College', // no website
-      }),
-    });
-    const result = await resolveIdentity(
-      makeInput({
-        lead: {
-          leadId: LEAD_ID,
-          email: 'student@dartmouth.edu',
-          firstName: 'Ivy',
-          lastName: 'Leaguer',
-          linkedin: 'https://www.linkedin.com/in/ivy-leaguer',
-        },
-        needsCompanyFields: true,
-      }),
-      deps,
-    );
-
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.resolved.company).toBeUndefined();
+      expect(result.resolved.company).toBe('MIT Lincoln Laboratory');
     }
   });
 

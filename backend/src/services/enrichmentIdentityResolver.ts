@@ -554,30 +554,21 @@ export async function resolveIdentity(
           const apolloOrgDomain = apolloResult.website
             ? (deriveDomainFromWebsite(apolloResult.website) || '').toLowerCase()
             : '';
-          // (a) Positive DOMAIN echo: the returned org's website resolves to the
-          // lead's own personal/institutional email domain (dartmouth.edu →
-          // Dartmouth College, website dartmouth.edu; yahoo.com → Yahoo, website
-          // yahoo.com).
-          const domainEcho =
+          // Reject ONLY on a positive DOMAIN echo: the returned org's website
+          // resolves to the lead's own personal/institutional email domain
+          // (dartmouth.edu → Dartmouth College, website dartmouth.edu; yahoo.com →
+          // Yahoo, website yahoo.com). This is the only reliable, false-positive-
+          // free signal. A WEBSITELESS Apollo company is deliberately trusted: it
+          // comes from the person's employment history — their real employer — so
+          // name-matching it against the domain would wrongly drop legitimate
+          // employers such as "MIT Lincoln Laboratory" (@mit.edu) or "Dartmouth
+          // Hitchcock Medical Center" (@dartmouth.edu). Those false positives are
+          // worse than letting a rare websiteless org-echo through.
+          const orgEchoesEmailDomain =
             emailIsPersonal && !!emailDomainForEcho && !!apolloOrgDomain &&
             (apolloOrgDomain === emailDomainForEcho ||
              emailDomainForEcho.endsWith(`.${apolloOrgDomain}`) ||
              apolloOrgDomain.endsWith(`.${emailDomainForEcho}`));
-          // (b) Websiteless NAME echo: no org website to compare, but the company
-          // name carries the email domain's registrable label as a TOKEN
-          // (yahoo.com → "Yahoo"/"Yahoo Inc"; dartmouth.edu → "Dartmouth College";
-          // berkeley.edu → "University of California, Berkeley"). A token match
-          // (not substring) keeps this precise: the label must appear as a whole
-          // word, so a real websiteless employer whose name does NOT contain the
-          // label is still kept (mit.edu person at "Google" — "mit" is not a token
-          // in "Google"). Applies to free-mail and institutional alike.
-          const domainLabel = emailDomainForEcho.split('.').slice(-2, -1)[0] || '';
-          const companyTokens = (apolloResult.company || '')
-            .toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-          const nameEcho =
-            !apolloResult.website && emailIsPersonal &&
-            domainLabel.length >= 3 && companyTokens.includes(domainLabel);
-          const orgEchoesEmailDomain = domainEcho || nameEcho;
           if (orgEchoesEmailDomain) {
             console.log(`${logTag} unified Apollo org echoes personal/institutional email domain=${emailDomainForEcho} org="${apolloResult.company}" — rejecting company/website`);
           }
