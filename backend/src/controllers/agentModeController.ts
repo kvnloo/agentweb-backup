@@ -4096,7 +4096,12 @@ export const agentModeController = {
           hasActiveProgress: hasActiveProgress(session.sessionId),
           supportNote: supportNote,
           skills: sharedSkills,
-          slackThread: session.slackThread
+          slackThread: session.slackThread,
+          // ENG-396: expose the AskUserQuestion state so a shared/read-only card can
+          // reflect the real answered option (highlight + "Answered") instead of a bare
+          // "View only". Everything here is already visible in the transcript's card, so
+          // it leaks nothing new; the share stays read-only via the card's readOnly path.
+          pendingUserQuestion: session.pendingUserQuestion
         }
       });
 
