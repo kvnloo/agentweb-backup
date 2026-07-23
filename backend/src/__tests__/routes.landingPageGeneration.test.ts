@@ -1368,6 +1368,94 @@ describe("POST /api/landing-pages/v0/generated/:id/meta-pixel", () => {
     expect(mockAxios.put).not.toHaveBeenCalled();
     expect(mockUpdateLandingPageMetaPixel).not.toHaveBeenCalled();
   });
+
+  it("SUCCESS: retries on a GitHub 409 (stale sha) and succeeds on the second attempt", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE_WITH_REPO);
+    // First GET+PUT: sha is stale by the time we PUT, GitHub returns 409.
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "stale-sha" } })
+      .mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "fresh-sha" } });
+    mockAxios.put
+      .mockRejectedValueOnce({ response: { status: 409 } })
+      .mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([PAGE_WITH_REPO]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValueOnce(undefined);
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428", accountId: "acc1" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(mockAxios.get).toHaveBeenCalledTimes(2);
+    expect(mockAxios.put).toHaveBeenCalledTimes(2);
+    // The successful PUT used the sha fetched on the retry, not the stale one.
+    expect(mockAxios.put.mock.calls[1][1].sha).toBe("fresh-sha");
+    expect(mockUpdateLandingPageMetaPixel).toHaveBeenCalledWith("page-1", "test-user-id", "1430870751246428", "acc1");
+  });
+
+  it("FAIL: exhausts all 3 attempts on repeated 409s and surfaces the error", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE_WITH_REPO);
+    mockAxios.get.mockResolvedValue({ data: { content: ENCODED_LAYOUT, sha: "sha-x" } });
+    mockAxios.put.mockRejectedValue({ response: { status: 409 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+
+    expect(res.status).toBe(500);
+    expect(mockAxios.get).toHaveBeenCalledTimes(3);
+    expect(mockAxios.put).toHaveBeenCalledTimes(3);
+    expect(mockUpdateLandingPageMetaPixel).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: empty pixelId removes the block and persists an empty pixelId", async () => {
+    const injectedLayout =
+      `<head>\n{/* Meta Pixel Code */}\n<script>fbq('init','1430870751246428');</script>\n{/* End Meta Pixel Code */}\n</head>\n<body></body>`;
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE_WITH_REPO);
+    mockAxios.get.mockResolvedValueOnce({
+      data: { content: Buffer.from(injectedLayout).toString("base64"), sha: "sha-remove" },
+    });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([PAGE_WITH_REPO]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValueOnce(undefined);
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.pixelId).toBe("");
+    expect(res.body.message).toMatch(/removed/i);
+    const putBody = mockAxios.put.mock.calls[0][1] as any;
+    expect(putBody.content).not.toContain(
+      Buffer.from("fbq('init','1430870751246428')").toString("base64").slice(0, 10),
+    );
+    expect(mockUpdateLandingPageMetaPixel).toHaveBeenCalledWith("page-1", "test-user-id", "", undefined);
+    expect(mockUpdateLandingPageMetaTrackingInstalled).toHaveBeenCalledWith("page-1", false);
+  });
+
+  it("FAIL: 61st request in the same hour → 429 (shared editRateLimiter, 60/hr)", async () => {
+    mockGetLandingPageById.mockResolvedValue(PAGE_WITH_REPO);
+    mockAxios.get.mockResolvedValue({ data: { content: ENCODED_LAYOUT, sha: "sha-rl" } });
+    mockAxios.put.mockResolvedValue({ data: {} });
+    mockListLandingPages.mockResolvedValue([PAGE_WITH_REPO]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValue(undefined);
+
+    for (let i = 0; i < 60; i++) {
+      await request(app)
+        .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+        .send({ pixelId: "1430870751246428" });
+    }
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+
+    expect(res.status).toBe(429);
+    expect(res.body.error).toMatch(/Rate limit exceeded/);
+  });
 });
 
 // =============================================================================
