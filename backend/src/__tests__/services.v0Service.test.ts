@@ -3377,6 +3377,30 @@ describe("v0Service - repairMisrootedImports", () => {
     // Every internal import in the committed set now resolves (no Module-not-found at build).
     expect(collectMissingInternalImports(committed)).toEqual([]);
   });
+
+  it("ORDERING: repair before validate lets check 7 pass on a mis-rooted import", () => {
+    // The caller runs repair BEFORE validateV0Output; otherwise check 7 rejects the mis-rooted
+    // import and the flaky v0 self-heal runs instead of this deterministic fix.
+    const raw = () => [
+      f("app/page.tsx", `import { Hero } from "@/components/landing/Hero";\nexport default function Page(){return <Hero/>;}`),
+      f("components/landing/Hero.tsx", `import Mockup from "./landing/Mockup";\nexport function Hero(){return <Mockup/>;}`),
+      f("components/landing/Mockup.tsx", `export default function Mockup(){return <div/>;}`),
+    ];
+    // Without repair, check 7 rejects it.
+    expect(() => validateV0Output(raw())).toThrow(V0OutputValidationError);
+    // With repair first, validation passes.
+    const repaired = raw();
+    expect(repairMisrootedImports(repaired)).toBe(1);
+    expect(() => validateV0Output(repaired)).not.toThrow();
+  });
+
+  it("ORDERING: a genuinely-missing file still trips check 7 even after repair", () => {
+    const files = [
+      f("app/page.tsx", `import Compare from "@/components/compare-table";\nexport default function Page(){return <Compare/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0); // nothing to repair to
+    expect(() => validateV0Output(files)).toThrow(/not generated/);
+  });
 });
 
 // =============================================================================
