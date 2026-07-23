@@ -33,6 +33,17 @@ export function lastHit(bug, state = readJson(STATE), access = readJson(ACCESS),
 
 export const livePreviewCount = () => Object.keys(readJson(STATE)).length;
 
+// Ids of previews currently live OTHER than `identifier` — re-enabling an issue's own preview isn't a
+// new one, so it never counts against the cap. Includes in-flight `starting` placeholders (they hold a
+// slot). Preview state is keyed lowercase.
+export const runningPreviewIds = (identifier, state = readJson(STATE)) =>
+  Object.keys(state).filter((b) => b !== String(identifier).toLowerCase());
+
+// True if starting a NEW preview for `identifier` would break the hard concurrent cap `cap`: at least
+// `cap` OTHER previews are already up. cap<=0 disables the cap. Pure/injectable for tests.
+export const atConcurrentPreviewCap = (identifier, cap, state = readJson(STATE)) =>
+  cap > 0 && runningPreviewIds(identifier, state).length >= cap;
+
 // Before a user-forced bring-up of `identifier`, make sure the total will stay within `cap`: evict
 // the longest-idle OTHER previews until at most cap-1 remain (leaving one slot). Never evicts the
 // target itself (re-enabling an already-up preview shouldn't kill it). Returns evicted bug ids.

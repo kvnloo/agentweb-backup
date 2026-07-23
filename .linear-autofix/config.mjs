@@ -159,6 +159,10 @@ export const config = {
                                    // needs-manual-test (the ones a human actually opens); green/rework
                                    // previews tear down right after the run. gc.mjs stops kept ones once
                                    // the issue is Done/Canceled. Set false to always tear down.
+  maxConcurrentPreviews: 3,        // HARD cap on previews running at once. Unlike the evict-based caps
+                                   // below, this REFUSES a new bring-up when the cap is hit rather than
+                                   // killing someone else's preview: the pipeline skips enabling one, and
+                                   // a chat "enable preview" is rejected with "close one first". 0 = off.
   maxLivePreviews: 5,              // normal cap on simultaneously-running previews (pipeline auto-keep and
                                    // a plain chat "enable preview"). Unbounded accumulation (~0.8GB each)
                                    // crept the box into swapping, and swap-on-EBS I/O is what stalled the

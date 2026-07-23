@@ -14,7 +14,7 @@ import { config } from './config.mjs';
 import { resolveIssue, addComment, findStateId, moveIssue, setAutofixLabel, uploadFile, useAssigneeLinearKey } from './linear.mjs';
 import { applyAssigneeIdentity, applyWorktreeIdentity, resolveAssigneeGhToken } from './git-identity.mjs';
 import { findSessionId, fetchItem, summarizeSession } from './tools/session.mjs';
-import { evictPreviewsToFit } from './preview/policy.mjs';
+import { evictPreviewsToFit, atConcurrentPreviewCap } from './preview/policy.mjs';
 import { acquireLock, releaseLock } from './lock.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1071,6 +1071,18 @@ export function enforcePreviewPolicy(id, triage) {
 
 async function runVerify(issue, WT) {
   const id = issue.identifier;
+  // Hard concurrent-preview cap: if N previews are already running when this task is picked, do NOT
+  // enable a preview for it — skip browser verification cleanly (the fix still lands). Same refusal the
+  // chat "enable preview" gives a user; env_down is the established "couldn't verify via browser" verdict.
+  const previewCap = config.maxConcurrentPreviews ?? 0;
+  if (atConcurrentPreviewCap(id, previewCap)) {
+    log(`${previewCap} previews already running — skipping the browser preview/verify for ${id} (concurrent-preview cap).`);
+    return {
+      verdict: 'env_down', method: '', scenario: '',
+      summary: `Browser verification skipped: ${previewCap} previews were already running (concurrent-preview cap). The fix was still applied — enable a preview after closing one of the running previews.`,
+      screenshots: [], urls: {},
+    };
+  }
   await ensureProxy();
   log('Bringing up full preview for browser verification...');
   const bringUp = () => spawnSync('node', [previewScript, 'up', id, WT], { stdio: 'inherit', env: process.env });

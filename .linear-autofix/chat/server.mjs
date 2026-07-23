@@ -26,7 +26,7 @@ import {
   assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, unpushedRepos, countCommits, ensureProxy,
   headShas, resetTo, ensureOpenPrs, touchedPreviewFiles, commitsDropped,
 } from '../autofix.mjs';
-import { evictToMakeRoom } from '../preview/policy.mjs';
+import { atConcurrentPreviewCap, runningPreviewIds } from '../preview/policy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BASE = path.resolve(__dirname, '..');            // .linear-autofix/
@@ -496,10 +496,8 @@ async function runPreviewOp(identifier, entry, action) {
       const loc = resolveCwd(identifier, entry, emit);
       if (loc.error) { emit({ type: 'error', error: loc.error }); return; }
       if (loc.cwd === agentRoot) { emit({ type: 'error', error: 'no worktree/branch to preview for this issue' }); return; }
-      // A chat-initiated preview is a user force: allow up to maxForcedPreviews, evicting the
-      // longest-idle preview(s) to make room past the cap (never this issue's own).
-      const evicted = evictToMakeRoom(identifier, config.maxForcedPreviews ?? 7, (m) => log(`preview (${identifier}): ${m}`));
-      if (evicted.length) emit({ type: 'status', text: `Preview cap reached — closed ${evicted.length} idle preview(s) (${evicted.join(', ')}) to make room.` });
+      // The concurrent-preview cap is enforced synchronously in startPreviewOp (below) so the user gets
+      // an immediate "close one first" rejection; nothing to evict here.
       await ensureProxy();
       emit({ type: 'status', text: 'Starting preview — builds the portals once, can take a few minutes…' });
       await spawnPreview(['up', identifier, loc.cwd]);
@@ -550,6 +548,14 @@ function startPreviewOp(identifier, body) {
   const found = findEntry(identifier);
   if (!found) return { code: 404, error: `no autofix record for ${identifier}` };
   if (previewOps.has(identifier)) return { code: 409, error: 'a preview operation is already running for this issue' };
+  // Hard concurrent-preview cap: enabling a preview when the cap is already reached is REFUSED (we don't
+  // evict someone else's) — the UI renders this error as a ⚠ banner. Only gate 'up', and never gate a
+  // re-up of an issue whose own preview is already running (that isn't a new stack).
+  const cap = config.maxConcurrentPreviews ?? 0;
+  if (action === 'up' && !previewInfo(identifier).running && atConcurrentPreviewCap(identifier, cap)) {
+    const others = runningPreviewIds(identifier).map((b) => b.toUpperCase());
+    return { code: 409, error: `${others.length} previews are already running (${others.join(', ')}) and the limit is ${cap}. Please close one to enable this preview.` };
+  }
   previewOps.add(identifier);
   runPreviewOp(identifier, found.entry, action);
   return { code: 202, body: { started: action } };

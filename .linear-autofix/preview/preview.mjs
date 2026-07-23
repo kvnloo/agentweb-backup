@@ -17,7 +17,7 @@ import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { config } from '../config.mjs';
-import { evictToMakeRoom } from './policy.mjs';
+import { atConcurrentPreviewCap, runningPreviewIds } from './policy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '../..'); // the agentweb (main) repo root
@@ -145,18 +145,24 @@ async function up(bugRaw, worktreeRaw) {
   // one ticket → the OOM). Stop-and-await any prior stack FIRST so we never leak one.
   await stopExistingStack(bug);
 
-  // #14: register a placeholder entry BEFORE the cap check + build so a CONCURRENT bring-up counts
-  // this in-flight preview and doesn't also skip eviction (otherwise two both see the same pre-write
-  // count, both evict nothing, and the cap is exceeded). Overwritten with the full entry at the end;
-  // torn down by down() on failure. evictToMakeRoom excludes this bug, so its own placeholder is fine.
+  // #14: register a placeholder entry BEFORE the cap check + build so a CONCURRENT bring-up of another
+  // bug counts this in-flight preview (otherwise two both read the same pre-write count and both slip
+  // past the cap). Overwritten with the full entry at the end; torn down by down() / the cap-refuse
+  // below on failure. The cap check excludes this bug, so its own placeholder never blocks it.
   { const st0 = readJson(STATE); if (!st0[bug]) { st0[bug] = { worktree, at: new Date().toISOString(), starting: true }; writeJson(STATE, st0); } }
 
-  // Universal cap backstop: every bring-up funnels through here — the chat button, the pipeline, AND
-  // the agent running this script directly via Bash — so enforce the ceiling here too. Make room
-  // within maxForcedPreviews by evicting the longest-idle preview(s) first (never this one). Skipped
-  // when re-upping an already-live preview (evictToMakeRoom excludes the target).
-  try { evictToMakeRoom(bug, config.maxForcedPreviews ?? 7, (m) => console.log(`[preview] ${m}`)); }
-  catch (e) { console.log(`[preview] cap check skipped: ${e && e.message}`); }
+  // Hard concurrent-preview cap (config.maxConcurrentPreviews): never run more than N full stacks at
+  // once — the memory guard. REFUSE, don't evict: if N OTHER previews are already up, drop our
+  // placeholder and bail non-zero so the caller reports "close one first" instead of silently killing
+  // someone else's preview. Every bring-up funnels through up(), so this one ceiling covers the chat
+  // button, the pipeline verify, AND a direct `preview.mjs up` from Bash.
+  const cap = config.maxConcurrentPreviews ?? 0;
+  if (atConcurrentPreviewCap(bug, cap)) {
+    const others = runningPreviewIds(bug).map((b) => b.toUpperCase());
+    console.log(`[preview] ${bug}: ${others.length} preview(s) already running (${others.join(', ')}) — at the concurrent cap of ${cap}. NOT starting a new one; close one first.`);
+    { const st = readJson(STATE); if (st[bug]?.starting) { delete st[bug]; writeJson(STATE, st); } }
+    process.exit(3);
+  }
 
   const urls = { api: urlFor(bug, 'api'), customer: urlFor(bug, ''), partner: urlFor(bug, 'admin') };
   const ports = {};
