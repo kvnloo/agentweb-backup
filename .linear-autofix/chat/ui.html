@@ -1371,7 +1371,15 @@ function handleEvent(e) {
       if (!e.refreshing) { addSys(e.running ? '🌐 preview is up' : '⏹ preview stopped'); loadPreviews(); } // keep the sidebar dropdown in sync
       break;
     case 'error': addSys('⚠ ' + e.error, 'err'); break;
-    case 'aborted': addSys('⏹ aborted', 'err'); break;
+    case 'aborted':
+      // Snappy stop: finalize NOW rather than waiting for the SIGKILLed process's trailing 'done' (which
+      // can lag several seconds). The user message is already persisted (turn-start), and the server drops
+      // the empty aborted turn — so refreshing brings edit/delete back immediately with no "(no reply)".
+      addSys('⏹ Stopped', 'err');
+      S.curBubble = null; S.compacting = false;
+      setBusy(false);
+      if (S.sel) refreshDetail(S.sel);
+      break;
     case 'closed': // the agent closed this standalone chat ([[CLOSE_CHAT]]) — drop the view + refresh the list
       addSys('✓ Chat closed and its workspace removed.', 'sys');
       setBusy(false); if (S.sel) deselectClosed(S.sel); lastIssuesJson = ''; loadIssues();

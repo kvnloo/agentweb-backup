@@ -1309,8 +1309,12 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
     else if (!out.result && !aborted(identifier, turnId)) emit({ type: 'error', error: `claude exited without a result${out.stderr ? `: ${out.stderr.slice(-300)}` : ''}` });
     else if (out.result?.is_error) emit({ type: 'error', error: `turn ended abnormally (${out.result.subtype || 'error'})${out.result.result ? `: ${String(out.result.result).slice(0, 300)}` : ''}` });
 
+    // A user abort that landed before the agent produced anything leaves an EMPTY turn. Don't persist a
+    // "(no reply)" placeholder for it — drop the turn entirely so the UI is a clean redo (the user message
+    // keeps its edit/delete, nothing to wait for). Only skip when truly empty; a partial reply is kept.
+    const abortedEmpty = aborted(identifier, turnId) && !out.texts.length && !out.tools.length;
     updateChatState(identifier, (cs) => {
-      cs.messages.push({
+      if (!abortedEmpty) cs.messages.push({
         role: 'assistant', cap, at: new Date().toISOString(),
         text: stripWatchMarkers(out.texts.join('\n\n')).slice(0, 50000) || '(no reply)',
         turns: out.result?.num_turns, ms: out.result?.duration_ms,
