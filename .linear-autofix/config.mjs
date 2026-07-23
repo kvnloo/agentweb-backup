@@ -274,7 +274,7 @@ export const config = {
   // fix branch exists) the chat has FULL access and new commits auto-push to the open PR; anywhere
   // else it is READ-ONLY. Binds localhost only — reach it via `ssh -L 8790:localhost:8790 ec2-user@<ip>`.
   chat: {
-    port: 8790,
+    port: process.env.CHAT_PORT ? Number(process.env.CHAT_PORT) : 8790, // env override lets a test/second instance run off 8790
     bind: '127.0.0.1',               // NEVER 0.0.0.0 — no auth layer; SSH tunnel only
     btwModel: 'sonnet',              // /btw side-thread model — a read-only aside doesn't need Opus, so it
                                      // runs on Sonnet (cheaper) while keeping the read-only tool set.

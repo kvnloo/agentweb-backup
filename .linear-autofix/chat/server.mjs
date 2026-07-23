@@ -2018,9 +2018,12 @@ function watchTick() {
   }
 }
 
-server.listen(CHAT.port || 8790, CHAT.bind || '127.0.0.1', () => {
-  log(`listening on http://${CHAT.bind || '127.0.0.1'}:${CHAT.port || 8790} (fix ${fixEnabled() ? 'ENABLED' : 'disabled'})`);
-  log(`tunnel: ssh -L ${CHAT.port || 8790}:localhost:${CHAT.port || 8790} ec2-user@<ip>`);
+const CHAT_PORT = CHAT.port || 8790;
+const CHAT_BIND = CHAT.bind || '127.0.0.1';
+
+function onListening() {
+  log(`listening on http://${CHAT_BIND}:${CHAT_PORT} (fix ${fixEnabled() ? 'ENABLED' : 'disabled'})`);
+  log(`tunnel: ssh -L ${CHAT_PORT}:localhost:${CHAT_PORT} ec2-user@<ip>`);
   // Verify the per-assignee GitHub tokens + Linear keys map to the right owner on boot (non-blocking;
   // logs to chat.log). Catches a swapped/expired credential before it silently mis-attributes.
   try { spawn('node', [path.join(BASE, 'check-creds.mjs')], { stdio: 'inherit' }); } catch { /* best-effort */ }
@@ -2029,4 +2032,27 @@ server.listen(CHAT.port || 8790, CHAT.bind || '127.0.0.1', () => {
     setInterval(watchTick, CHAT.watch?.tickMs || 60 * 1000);
     log(`watch: tick ${Math.round((CHAT.watch?.tickMs || 60000) / 1000)}s · cadence ${Math.round((CHAT.watch?.cadenceMs || 3e5) / 6e4)}m · cap ${Math.round((CHAT.watch?.maxMs || 864e5) / 36e5)}h`);
   }
+}
+
+// EADDRINUSE resilience: on a restart the previous instance's listening socket can take a second or
+// two to release (slower under memory pressure). Left unhandled, listen() emits 'error' with no
+// listener → it reaches the uncaughtException handler above, which only logs — so the process lingers
+// ALIVE but never bound. run-chat.sh's alive() then sees the pid and treats it as up, so run.sh never
+// revives it and the tunnel stays dead until a human notices. Instead: retry with backoff for a few
+// seconds; if the port truly won't free, exit(1) so the next cron cycle revives us cleanly. Never
+// linger not-listening.
+let listenAttempt = 0;
+const tryListen = () => server.listen(CHAT_PORT, CHAT_BIND);
+server.on('listening', onListening);
+server.on('error', (e) => {
+  if (e.code !== 'EADDRINUSE') { console.error('[chat] fatal server error:', e); process.exit(1); }
+  listenAttempt += 1;
+  if (listenAttempt > 12) {
+    console.error(`[chat] port ${CHAT_PORT} still in use after ${listenAttempt} attempts — exiting so run.sh revives us once it frees`);
+    process.exit(1);
+  }
+  const delay = Math.min(2000, 250 * listenAttempt);
+  log(`port ${CHAT_PORT} busy (EADDRINUSE) — retry ${listenAttempt}/12 in ${delay}ms (previous instance's socket releasing)`);
+  setTimeout(tryListen, delay); // keep the loop alive across the retry window (do NOT unref)
 });
+tryListen();

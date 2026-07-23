@@ -16,6 +16,18 @@ if [ -f "$BASE/.env" ]; then set -a; . "$BASE/.env"; set +a; fi
 
 alive() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
 
+PORT="$(node -e "import('$BASE/config.mjs').then(m=>console.log(m.config.chat?.port||8790))" 2>/dev/null || echo 8790)"
+
+# Actually SERVING, not just pid-alive: two quick tries (a busy event loop — e.g. parsing the 22MB
+# chat-state.json — can blip a single probe) so `ensure` doesn't flap-restart a healthy-but-busy server.
+healthy() {
+  for _ in 1 2; do
+    curl -fsS --max-time 5 "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  return 1
+}
+
 case "${1:-}" in
   start)
     if alive; then echo "[chat] already running (pid $(cat "$PIDFILE"))"; exit 0; fi
@@ -28,8 +40,7 @@ case "${1:-}" in
     nohup node "$HERE/server.mjs" >>"$LOGFILE" 2>&1 9>&- &
     echo $! >"$PIDFILE"
     sleep 1
-    PORT="$(node -e "import('$BASE/config.mjs').then(m=>console.log(m.config.chat?.port||8790))")"
-    if curl -fsS "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
+    if healthy; then
       echo "[chat] up on 127.0.0.1:$PORT (pid $(cat "$PIDFILE")) — tunnel: ssh -L $PORT:localhost:$PORT ec2-user@<ip>"
     else
       echo "[chat] started (pid $(cat "$PIDFILE")) but health check failed — see $LOGFILE"
@@ -37,17 +48,42 @@ case "${1:-}" in
     fi
     ;;
   stop)
-    if alive; then kill "$(cat "$PIDFILE")"; rm -f "$PIDFILE"; echo "[chat] stopped"; else echo "[chat] not running"; rm -f "$PIDFILE"; fi
+    if alive; then
+      PID="$(cat "$PIDFILE")"
+      kill "$PID" 2>/dev/null || true
+      # Wait for the process to actually exit (and release :8790) before returning — otherwise a
+      # following `start` (via restart) races the socket teardown and hits EADDRINUSE. Escalate to
+      # SIGKILL if it won't go within ~10s, then confirm the pid is gone.
+      for _ in $(seq 1 50); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
+      if kill -0 "$PID" 2>/dev/null; then kill -9 "$PID" 2>/dev/null || true; sleep 0.5; fi
+      rm -f "$PIDFILE"; echo "[chat] stopped"
+    else
+      echo "[chat] not running"; rm -f "$PIDFILE"
+    fi
     ;;
   restart)
     # Self-call via the resolved absolute path, not "$0" — when invoked as `bash run-chat.sh`,
     # "$0" is the bare word "run-chat.sh" which isn't on PATH, so the recursion fails.
     bash "$HERE/run-chat.sh" stop; bash "$HERE/run-chat.sh" start
     ;;
+  ensure)
+    # Health-gated supervision — this is what run.sh's cron calls every 5 min (NOT plain `start`).
+    # `start` only revives a DEAD server (alive() = pid check). But a server can be alive-but-not-
+    # serving: wedged on a hang, or (pre-fix) lingering after a swallowed listen error. Plain `start`
+    # no-ops on those (pid exists) and the tunnel stays dead until a human notices. Here we probe the
+    # health endpoint: dead → start; alive-but-unhealthy → restart; healthy → leave it alone.
+    if alive; then
+      if healthy; then exit 0; fi
+      echo "[chat] pid $(cat "$PIDFILE") alive but not serving on :$PORT — restarting"
+      bash "$HERE/run-chat.sh" restart
+    else
+      bash "$HERE/run-chat.sh" start
+    fi
+    ;;
   status)
     if alive; then echo "[chat] running (pid $(cat "$PIDFILE"))"; else echo "[chat] not running"; exit 1; fi
     ;;
   *)
-    echo "Usage: $0 start|stop|status|restart"; exit 2
+    echo "Usage: $0 start|stop|status|restart|ensure"; exit 2
     ;;
 esac
