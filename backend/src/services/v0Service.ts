@@ -1802,31 +1802,38 @@ async function addPageToExistingRepo(
           `[V0 SERVICE] ENG-483: lead-capture route sync did not commit for new page /${slug}: ${syncResult.reason}`
         );
       } else if (syncResult.committed && syncResult.pushedCommitSha) {
-        // Visibility only, never a reason to fail this page: the page's OWN content
-        // already deployed successfully above. A concurrent sub-page add can push a
-        // newer commit on top of this one before Vercel builds it, which makes Vercel
-        // supersede/cancel our build — that shows up here as "timeout", not a real
-        // failure, so only a genuine `error` state is logged loudly.
-        const syncDeployResult = await pollVercelDeployment(
-          existingPage.vercelProjectId!,
-          vercelToken,
-          syncResult.pushTimestampMs,
-          syncResult.pushedCommitSha
-        );
-        if (syncDeployResult.buildStatus === "error") {
-          console.error(
-            `[V0 SERVICE] ENG-483: capture-route sync build FAILED for ${repoFullName} ` +
-              `(commit ${syncResult.pushedCommitSha.substring(0, 7)}): ${syncDeployResult.buildError}. ` +
-              `Page /${slug} is deployed, but its lead form (and possibly siblings') may still 422 ` +
-              `until the route resyncs.`
-          );
-        } else if (syncDeployResult.buildStatus === "timeout") {
-          console.warn(
-            `[V0 SERVICE] ENG-483: capture-route sync build for ${repoFullName} (commit ` +
-              `${syncResult.pushedCommitSha.substring(0, 7)}) did not confirm READY within the poll ` +
-              `window — likely just slow, or superseded by a newer concurrent commit; not treated as a failure.`
-          );
-        }
+        // Fire-and-forget: never block returning this page as deployed on a SECOND
+        // Vercel build. A concurrent sub-page add is the common case ENG-483 exists
+        // for, and it routinely supersedes this exact commit before Vercel ever
+        // finishes building it — awaiting this poll here would hang every bulk/rapid
+        // page add for up to the full poll window (production: up to 5 minutes) for a
+        // build result that, in the common case, will never resolve to this commit at
+        // all. Visibility only: the page's OWN content already deployed successfully
+        // above, so nothing here can change this page's outcome, only get logged.
+        const { pushedCommitSha, pushTimestampMs } = syncResult;
+        void pollVercelDeployment(existingPage.vercelProjectId!, vercelToken, pushTimestampMs, pushedCommitSha)
+          .then((syncDeployResult) => {
+            if (syncDeployResult.buildStatus === "error") {
+              console.error(
+                `[V0 SERVICE] ENG-483: capture-route sync build FAILED for ${repoFullName} ` +
+                  `(commit ${pushedCommitSha.substring(0, 7)}): ${syncDeployResult.buildError}. ` +
+                  `Page /${slug} is deployed, but its lead form (and possibly siblings') may still 422 ` +
+                  `until the route resyncs.`
+              );
+            } else if (syncDeployResult.buildStatus === "timeout") {
+              console.warn(
+                `[V0 SERVICE] ENG-483: capture-route sync build for ${repoFullName} (commit ` +
+                  `${pushedCommitSha.substring(0, 7)}) did not confirm READY within the poll window — ` +
+                  `likely just slow, or superseded by a newer concurrent commit; not treated as a failure.`
+              );
+            }
+          })
+          .catch((pollErr: any) => {
+            console.error(
+              `[V0 SERVICE] ENG-483: capture-route sync build poll itself failed for ${repoFullName}:`,
+              pollErr?.message || pollErr
+            );
+          });
       }
     } catch (syncErr: any) {
       console.error(
