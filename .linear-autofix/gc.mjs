@@ -11,7 +11,7 @@ import path from 'node:path';
 import { config } from './config.mjs';
 import { resolveIssue } from './linear.mjs';
 import { lockActive } from './lock.mjs';
-import { evictIdlePreviews } from './preview/policy.mjs';
+import { evictIdlePreviews, evictUnderMemoryPressure } from './preview/policy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '..');
@@ -94,6 +94,21 @@ async function main() {
   if (idleHours > 0) {
     try { evictIdlePreviews(idleHours * 3600 * 1000, log); }
     catch (e) { log(`idle-preview reap failed: ${e.message}`); }
+  }
+
+  // OOM backstop: the idle reaper above only fires at 24h, but a handful of live stacks can exhaust
+  // RAM long before that (tickets sit in Verifying for hours, each holding a full backend+2×vite copy).
+  // When MemAvailable drops below the floor, stop the longest-idle stacks NOW — regardless of Linear
+  // status or the 24h age — while protecting any preview touched in the last few minutes. This is the
+  // status-independent eviction the worktree GC alone can't provide. Disabled when floor is 0/unset.
+  const memFloorMB = config.previewMemFloorMB ?? 0;
+  if (memFloorMB > 0) {
+    try {
+      evictUnderMemoryPressure(memFloorMB, {
+        keep: config.previewMemKeep ?? 1,
+        minIdleMs: (config.previewMemMinIdleMinutes ?? 10) * 60 * 1000,
+      }, log);
+    } catch (e) { log(`memory-pressure preview reap failed: ${e.message}`); }
   }
 
   // Worktree dirs (may be empty). Even with none, we still reconcile worktree-less state entries below,

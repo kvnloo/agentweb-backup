@@ -82,6 +82,54 @@ export function evictIdlePreviews(maxIdleMs, log = () => {}) {
   return evicted;
 }
 
+// Available memory (MB) from /proc/meminfo's MemAvailable — the kernel's own estimate of what a new
+// workload could claim without swapping (accounts for reclaimable cache), so a truer pressure signal
+// than `free`. Returns null if unreadable, so callers treat "unknown" as "no pressure" (never evict
+// blindly). `now`-free and injectable for tests.
+export function availMemMB(read = () => readFileSync('/proc/meminfo', 'utf8')) {
+  try { const m = read().match(/^MemAvailable:\s+(\d+)\s+kB/m); return m ? Math.round(+m[1] / 1024) : null; }
+  catch { return null; }
+}
+
+// Pure OOM-eviction decision: given the current memory reading and preview state, which bugs should be
+// stopped? When available memory is below `floorMB`, pick the longest-idle previews (oldest last-hit
+// first) — but NEVER one hit within `minIdleMs` (someone is actively opening its URL or chatting on it)
+// and never drop below `keep` total. Returns `{ avail, victims:[{b,hit}] }`. Everything injectable.
+export function memoryPressureVictims(floorMB, {
+  keep = 1,
+  minIdleMs = 10 * 60 * 1000,
+  now = Date.now(),
+  mem = availMemMB,
+  state = readJson(STATE),
+  access = readJson(ACCESS),
+  chat = readJson(CHAT_STATE),
+} = {}) {
+  const avail = mem();
+  if (avail == null || avail >= floorMB) return { avail, victims: [] }; // unknown or healthy → nothing
+  const bugs = Object.keys(state);
+  if (bugs.length <= keep) return { avail, victims: [] };
+  const ranked = bugs
+    .map((b) => ({ b, hit: lastHit(b, state, access, chat) }))
+    .filter(({ hit }) => now - hit >= minIdleMs)           // protect actively-used previews
+    .sort((a, z) => a.hit - z.hit);                        // longest-idle first
+  return { avail, victims: ranked.slice(0, Math.max(0, bugs.length - keep)) };
+}
+
+// OOM backstop, independent of Linear status AND of the 24h idle age. Thin effectful wrapper around
+// memoryPressureVictims: logs + spawns the teardown. Called from gc.mjs each sweep. Returns evicted ids.
+export function evictUnderMemoryPressure(floorMB, opts = {}, log = () => {}) {
+  const now = opts.now ?? Date.now();
+  const { avail, victims } = memoryPressureVictims(floorMB, { now, ...opts });
+  const evicted = [];
+  for (const { b, hit } of victims) {
+    const ago = hit ? `${Math.round((now - hit) / 60000)}m ago` : 'never';
+    log(`memory pressure (${avail}MB avail < ${floorMB}MB floor): stopping idle ${b} (last hit ${ago})`);
+    spawnSync('node', [PREVIEW, 'down', b], { stdio: 'inherit' });
+    evicted.push(b);
+  }
+  return evicted;
+}
+
 // Evict longest-idle previews (oldest last-hit first) until at most `cap` remain. Returns the bug ids
 // evicted. `log` receives a human line per eviction.
 export function evictPreviewsToFit(cap, log = () => {}) {

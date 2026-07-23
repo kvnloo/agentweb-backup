@@ -170,6 +170,13 @@ export const config = {
   previewIdleHours: 24,            // gc.mjs stops any preview untouched this long — same "last hit" signal
                                    // as the cap eviction (URL last opened, bring-up time, or chat activity),
                                    // so an actively-used preview is never reaped. Set 0 to disable.
+  previewMemFloorMB: 3500,         // OOM backstop (gc.mjs): when MemAvailable drops below this, stop the
+                                   // longest-idle preview stack(s) NOW — regardless of Linear status or the
+                                   // 24h idle age — since a few live stacks exhaust RAM long before 24h.
+                                   // Matches the watch loop's memory gate (chat.watch.minMemMB). 0 disables.
+  previewMemKeep: 1,               // never let the memory-pressure reap drop below this many live previews.
+  previewMemMinIdleMinutes: 10,    // and never let it stop a preview touched within this window (a human
+                                   // actively opening its URL / chatting on it), even under pressure.
 
   // --- Claude ---
   defaultModel: 'opus',            // the fixer model
