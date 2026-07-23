@@ -33,4 +33,15 @@ describe('AgentMode system prompt - browser session persistence & isolation guid
   it('handles persistent "Verifying Your Browser" bot-protection at the login gate honestly, without recommending personal-browser reuse', () => {
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('Verifying Your Browser');
   });
+
+  it('does not overpromise save_browser_cookies when a fingerprint block prevents the login from ever completing', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      'do NOT promise that logging in now will persist one'
+    );
+  });
+
+  it('keeps the work plan moving via a manual data export/paste path instead of dead-ending at the login gate', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('export the needed data');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('paste or attach');
+  });
 });
