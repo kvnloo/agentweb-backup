@@ -355,6 +355,18 @@ describe('renderQuestionPrompt — text fallback', () => {
     expect(text).not.toMatch(/confirm\s*[:=]\s*true/i);
     expect(text.toLowerCase()).not.toMatch(/call .* again/);
   });
+
+  it('prepends the optional intro (lead-in) above the question', () => {
+    const q = awaitingQuestion({ intro: 'Pixel data is in (~200 LEAD/30d).' });
+    const text = renderQuestionPrompt(q);
+    expect(text.indexOf('Pixel data is in')).toBeLessThan(text.indexOf('Which Meta campaign objective?'));
+  });
+
+  it('buildPendingUserQuestion carries a trimmed intro, and drops an empty one', () => {
+    expect(awaitingQuestion({ intro: '  Context here.  ' }).intro).toBe('Context here.');
+    expect(awaitingQuestion({ intro: '   ' }).intro).toBeUndefined();
+    expect(awaitingQuestion().intro).toBeUndefined();
+  });
 });
 
 describe('selectedPayload — deterministic parameter apply', () => {
