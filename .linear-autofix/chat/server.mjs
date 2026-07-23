@@ -477,6 +477,17 @@ function previewInfo(identifier) {
   return { running: !!entry, busy: previewOps.has(identifier), urls: entry?.urls || null };
 }
 
+// Every currently-running preview (for the sidebar "running previews" dropdown): id (uppercased for
+// display), live urls, and bring-up time. preview-state.json is keyed lowercase; skip in-flight
+// `starting` placeholders (no urls yet). Oldest first, matching the eviction ordering elsewhere.
+function listPreviews() {
+  let st = {}; try { st = JSON.parse(readFileSync(previewStatePath, 'utf8')); } catch { /* none */ }
+  return Object.entries(st)
+    .filter(([, e]) => e && !e.starting)
+    .map(([id, e]) => ({ id: id.toUpperCase(), urls: e.urls || null, at: e.at || null, busy: previewOps.has(id.toUpperCase()) }))
+    .sort((a, b) => String(a.at).localeCompare(String(b.at)));
+}
+
 // Run preview.mjs <args> to completion. Resolves regardless of exit code (caller re-reads state).
 function spawnPreview(args, timeoutMs = 15 * 60 * 1000) {
   return new Promise((resolve) => {
@@ -1838,6 +1849,7 @@ async function route(req, res) {
   if (req.method === 'GET' && p === '/api/issues') { json(res, 200, { fixEnabled: fixEnabled(), issues: listIssues() }); return; }
   if (req.method === 'GET' && p === '/api/usage') { json(res, 200, await fetchOauthUsage()); return; }
   if (req.method === 'GET' && p === '/api/members') { json(res, 200, { members: chatMembers() }); return; }
+  if (req.method === 'GET' && p === '/api/previews') { json(res, 200, { previews: listPreviews(), cap: config.maxConcurrentPreviews ?? 0 }); return; }
   if (req.method === 'POST' && p === '/api/chats') { const r = createChat((await readBody(req))?.email); json(res, r.code, r.body || { error: r.error }); return; }
 
   const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/attach|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat\/merge|\/chat\/compact|\/chat\/btw|\/chat\/rename|\/chat\/owner|\/chat\/close|\/chat|\/preview)?$/);

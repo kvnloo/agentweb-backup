@@ -25,12 +25,20 @@
   #side { width: 290px; min-width: 290px; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
   #side h1 { font-size: 15px; padding: 14px 16px 6px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   #side h1 > span:first-child { margin-right: auto; } /* title left, control buttons clustered right */
-  #sideToggle, #sideOpen, #sidePosToggle, #filterBtn { background: var(--panel2); color: var(--dim); border: 1px solid var(--border); border-radius: 7px; cursor: pointer; font-size: 15px; line-height: 1; padding: 4px 9px; }
-  #sideToggle:hover, #sideOpen:hover, #sidePosToggle:hover, #filterBtn:hover { border-color: var(--accent); color: var(--text); }
-  /* Filter button: funnel icon, highlighted with a count badge when any facet is selected. */
-  #filterBtn { display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; }
-  #filterBtn.active { border-color: var(--accent); color: var(--text); }
-  #filterBtn .fcount { background: var(--accent); color: #0d0f13; font-size: 10px; font-weight: 700; border-radius: 8px; padding: 0 5px; line-height: 15px; }
+  #sideToggle, #sideOpen, #sidePosToggle, #filterBtn, #previewsBtn { background: var(--panel2); color: var(--dim); border: 1px solid var(--border); border-radius: 7px; cursor: pointer; font-size: 15px; line-height: 1; padding: 4px 9px; }
+  #sideToggle:hover, #sideOpen:hover, #sidePosToggle:hover, #filterBtn:hover, #previewsBtn:hover { border-color: var(--accent); color: var(--text); }
+  /* Filter + running-previews buttons: icon, highlighted with a count badge. */
+  #filterBtn, #previewsBtn { display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; }
+  #filterBtn.active, #previewsBtn.active { border-color: var(--accent); color: var(--text); }
+  #filterBtn .fcount, #previewsBtn .fcount { background: var(--accent); color: #0d0f13; font-size: 10px; font-weight: 700; border-radius: 8px; padding: 0 5px; line-height: 15px; }
+  /* Running-previews dropdown rows (reuses .popmenu). */
+  .popmenu .pvrow { display: flex; align-items: center; gap: 8px; padding: 6px 10px; font-size: 13px; white-space: nowrap; }
+  .popmenu .pvrow .pvid { font-weight: 600; color: var(--text); }
+  .popmenu .pvrow a.pvopen { color: var(--dim); font-size: 11px; text-decoration: none; }
+  .popmenu .pvrow a.pvopen:hover { color: var(--accent); }
+  .popmenu .pvrow .pvkill { margin-left: auto; background: var(--panel2); color: var(--red); border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; font-size: 12px; cursor: pointer; }
+  .popmenu .pvrow .pvkill:hover { border-color: var(--red); }
+  .popmenu .pvrow .pvkill:disabled { opacity: .5; cursor: default; }
   /* Move the whole sidebar to the right (persisted). row-reverse flips the two flex children; the
      side border and the floating ☰ reopener move with it so the layout stays consistent. */
   body.side-right { flex-direction: row-reverse; }
@@ -46,7 +54,7 @@
      #side so they beat the ID-specificity base styles (e.g. `#side .sub`). */
   body.side-rail #side { width: 74px; min-width: 74px; }
   body.side-rail #side h1 { justify-content: center; padding: 12px 4px; }
-  body.side-rail #side h1 > span, body.side-rail #side .sub, body.side-rail #side #searchWrap, body.side-rail #sidePosToggle, body.side-rail #filterBtn { display: none; }
+  body.side-rail #side h1 > span, body.side-rail #side .sub, body.side-rail #side #searchWrap, body.side-rail #sidePosToggle, body.side-rail #filterBtn, body.side-rail #previewsBtn { display: none; }
   body.side-rail #side #issues { padding: 2px 0; }
   body.side-rail #side .issue { padding: 9px 6px; margin: 0; border-radius: 0; text-align: center; border-left: 2px solid transparent; }
   body.side-rail #side .issue.sel { border-left-color: var(--accent); }
@@ -372,7 +380,7 @@
 </head>
 <body>
   <div id="side">
-    <h1><span>🔧 Autofix</span><button id="filterBtn" title="Filter by assignee, state & priority"><svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor" aria-hidden="true"><path d="M1.5 2h13a.5.5 0 0 1 .38.82L10 9v4.5a.5.5 0 0 1-.28.45l-3 1.5A.5.5 0 0 1 6 15.5V9L1.12 2.82A.5.5 0 0 1 1.5 2z"/></svg></button><button id="sidePosToggle" title="Move sidebar to the other side">⇄</button><button id="sideToggle" title="Collapse to rail (Ctrl+B)">‹</button></h1>
+    <h1><span>🔧 Autofix</span><button id="previewsBtn" title="Running previews — click to disable any"><svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor" aria-hidden="true"><path d="M1.5 2h13a.5.5 0 0 1 .5.5v8a.5.5 0 0 1-.5.5H9v1.5h1.5a.5.5 0 0 1 0 1h-5a.5.5 0 0 1 0-1H7V11H1.5a.5.5 0 0 1-.5-.5v-8a.5.5 0 0 1 .5-.5zM2 3v6h12V3H2z"/></svg></button><button id="filterBtn" title="Filter by assignee, state & priority"><svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor" aria-hidden="true"><path d="M1.5 2h13a.5.5 0 0 1 .38.82L10 9v4.5a.5.5 0 0 1-.28.45l-3 1.5A.5.5 0 0 1 6 15.5V9L1.12 2.82A.5.5 0 0 1 1.5 2z"/></svg></button><button id="sidePosToggle" title="Move sidebar to the other side">⇄</button><button id="sideToggle" title="Collapse to rail (Ctrl+B)">‹</button></h1>
     <div class="sub"><span id="count"></span><span id="showAll">show all</span></div>
     <div id="searchWrap">
       <input id="search" type="text" placeholder="Search ID, name or summary…" autocomplete="off" spellcheck="false" />
@@ -579,6 +587,60 @@ function openFilter(anchorEl) {
   S.menu = m;
   setTimeout(() => document.addEventListener('mousedown', onMenuOutside, true), 0);
 }
+
+// ---------- running-previews dropdown (sidebar header) ----------
+// A global view of every live preview stack with a per-row Disable button — handy since a new preview
+// is now REFUSED past the concurrent cap ("close one to enable this"), so users need a way to free a slot.
+async function loadPreviews() {
+  try {
+    const r = await (await fetch('/api/previews')).json();
+    S.previews = r.previews || [];
+    S.previewCap = r.cap || 0;
+  } catch { /* server briefly down — keep the last list */ }
+  updatePreviewsBtn();
+}
+function updatePreviewsBtn() {
+  const b = $('previewsBtn'); if (!b) return;
+  const n = S.previews.length;
+  b.classList.toggle('active', n > 0);
+  b.title = n ? `${n} preview${n === 1 ? '' : 's'} running${S.previewCap ? ` (max ${S.previewCap})` : ''} — click to disable any` : 'No previews running';
+  const c = b.querySelector('.fcount'); if (c) c.remove();
+  if (n > 0) { const s = document.createElement('span'); s.className = 'fcount'; s.textContent = n; b.appendChild(s); }
+}
+function buildPreviewsPop() {
+  const cap = S.previewCap ? ` · limit ${S.previewCap}` : '';
+  const head = `<div class="pmhead"><span>Running previews (${S.previews.length}${cap})</span></div>`;
+  if (!S.previews.length) return head + '<div class="fmempty">No previews running.</div>';
+  return head + S.previews.map((p) => {
+    const open = p.urls?.customer ? `<a class="pvopen" href="${esc(p.urls.customer)}" target="_blank" rel="noopener">open ↗</a>` : '';
+    const btn = p.busy
+      ? '<button class="pvkill" disabled>working…</button>'
+      : `<button class="pvkill" data-id="${esc(p.id)}">■ Disable</button>`;
+    return `<div class="pvrow"><span class="pvid">${esc(p.id)}</span>${open}${btn}</div>`;
+  }).join('');
+}
+function openPreviews(anchorEl) {
+  closeMenu();
+  const m = document.createElement('div'); m.className = 'popmenu pvpop';
+  const render = () => {
+    m.innerHTML = buildPreviewsPop();
+    for (const el of m.querySelectorAll('.pvkill[data-id]')) el.onclick = async (e) => {
+      e.stopPropagation();
+      const id = el.dataset.id;
+      el.disabled = true; el.textContent = 'disabling…';
+      try { await fetch(`/api/issues/${id}/preview`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'down' }) }); } catch { /* ignore */ }
+      // Give the teardown a moment to update preview-state.json, then refresh the list in place.
+      setTimeout(async () => { await loadPreviews(); if (S.menu === m) render(); }, 800);
+    };
+  };
+  render();
+  document.body.appendChild(m);
+  const r = anchorEl.getBoundingClientRect();
+  m.style.top = Math.min(r.bottom + 4, window.innerHeight - m.offsetHeight - 8) + 'px';
+  m.style.left = Math.min(r.left, window.innerWidth - m.offsetWidth - 8) + 'px';
+  S.menu = m;
+  setTimeout(() => document.addEventListener('mousedown', onMenuOutside, true), 0);
+}
 const rel = (iso) => {
   if (!iso) return '';
   const m = Math.round((Date.now() - new Date(iso)) / 60000);
@@ -616,7 +678,7 @@ function stampStats(bubbleEl, tok, cost) {
   bubbleEl.appendChild(el);
 }
 
-const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true, picker: null, lastEsc: 0, slash: null, cmd: null, mergePhase: null, lastResult: '', lastTokens: null, lastCost: null, lastMs: null, compacting: false, lastSent: '', escArmed: 0, escText: '', queue: [], queuePaused: false, attachments: [], collapsed: {}, drafts: {}, filter: { assignee: [], state: [], priority: [] } };
+const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true, picker: null, lastEsc: 0, slash: null, cmd: null, mergePhase: null, lastResult: '', lastTokens: null, lastCost: null, lastMs: null, compacting: false, lastSent: '', escArmed: 0, escText: '', queue: [], queuePaused: false, attachments: [], collapsed: {}, drafts: {}, filter: { assignee: [], state: [], priority: [] }, previews: [], previewCap: 0 };
 try { S.collapsed = JSON.parse(localStorage.getItem('secCollapsed')) || {}; } catch { /* private mode */ }
 try { const f = JSON.parse(localStorage.getItem('sideFilter')); if (f) S.filter = { assignee: f.assignee || [], state: f.state || [], priority: f.priority || [] }; } catch { /* private mode */ }
 const COMMANDS = [
@@ -824,6 +886,7 @@ async function changeOwnerMenu(anchorEl, id) {
 $('newChat').onclick = (ev) => newChatMenu(ev.currentTarget);
 $('filterBtn').onclick = (ev) => openFilter(ev.currentTarget);
 updateFilterBtn(); // reflect any persisted filter on load
+$('previewsBtn').onclick = (ev) => openPreviews(ev.currentTarget);
 $('showAll').onclick = () => { S.showAll = !S.showAll; lastIssuesJson = ''; renderIssues(); };
 $('search').addEventListener('input', (ev) => { S.search = ev.target.value; lastIssuesJson = ''; renderIssues(); });
 $('searchClear').onclick = () => { S.search = ''; $('search').value = ''; $('search').focus(); lastIssuesJson = ''; renderIssues(); };
@@ -1290,7 +1353,7 @@ function handleEvent(e) {
     case 'fix_summary': addFixCard(e); break;
     case 'preview':
       if (S.detail) { S.detail.preview = { running: e.running, busy: e.busy, urls: e.urls, refreshing: e.refreshing }; renderPreviewBar(); }
-      if (!e.refreshing) addSys(e.running ? '🌐 preview is up' : '⏹ preview stopped');
+      if (!e.refreshing) { addSys(e.running ? '🌐 preview is up' : '⏹ preview stopped'); loadPreviews(); } // keep the sidebar dropdown in sync
       break;
     case 'error': addSys('⚠ ' + e.error, 'err'); break;
     case 'aborted': addSys('⏹ aborted', 'err'); break;
@@ -2154,6 +2217,8 @@ try { if (localStorage.getItem('sidePos') === 'right') setSidePos('right'); } ca
 // ---------- boot ----------
 loadIssues();
 setInterval(loadIssues, 30000);
+loadPreviews();                          // running-previews dropdown badge + list
+setInterval(loadPreviews, 30000);
 // Restore the issue named in the URL hash (a refresh, a bookmark, or a shared link), and follow
 // later hash changes (back/forward, manual edits). select() no-ops when it's already the open one.
 const hashId = () => decodeURIComponent(location.hash.replace(/^#/, '')).trim();
