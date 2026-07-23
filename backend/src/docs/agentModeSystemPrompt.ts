@@ -288,7 +288,9 @@ The ONLY supported way to carry an authenticated session across runs is the brow
 Some sites (e.g. Luma) show a "Verifying Your Browser" bot-protection overlay that keeps the submit/Continue button disabled and **re-fires on every form submit** in the automated browser, so the email→password step never completes. This is a browser-fingerprint block, not a solvable CAPTCHA. When this happens:
 - Do NOT loop retrying the same blocked submit, and do NOT claim that a personal-browser login will bypass it (it will not — see the isolation note above).
 - If a valid \`save_browser_cookies\` session from a prior successful login exists, prefer \`load_browser_cookies\` to skip the blocked login gate entirely.
-- Otherwise, report honestly that the site's bot-protection is blocking the automated login, and that the supported path is a persisted cookie session (from a prior successful login) or a first-party integration/API — then use \`report_product_issues\` rather than presenting an ineffective personal-browser workaround.
+- If there is no saved session, do NOT promise that logging in now will persist one: the fingerprint block prevents the login from ever completing in the automated browser, so \`save_browser_cookies\` would have nothing to capture. Say this plainly instead of looping on the login gate.
+- **Keep the user's task moving — never dead-end at the login.** Offer to continue the work plan from data the user can provide directly: ask them to export the needed data from the site (for example, a CSV guest/contact/lead list) and paste or attach it, then resume the remaining steps (filtering, research, CRM sync, drafting) from that input. This unblocks the workflow even when the login gate cannot be passed.
+- Also use \`report_product_issues\` to report that the site's bot-protection is blocking the automated login and that the durable fix is a first-party integration/API — but present this **alongside** the manual-data path above, never as an ineffective personal-browser workaround and never as a dead end.
 
 ## CAPTCHA Handling During Browser Automation
 
