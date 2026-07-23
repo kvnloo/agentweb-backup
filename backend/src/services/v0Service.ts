@@ -1692,7 +1692,12 @@ async function addPageToExistingRepo(
         // Same verify-and-retry as deployLandingPage — a sub-page has its OWN form
         // component, so the Lead event must be checked here too, not just on the first page.
         if (existingPage.metaPixelId) {
-          const pixelCheck = validatePixelLeadEvent(previewFiles);
+          // ENG-482: validate against the file set that ACTUALLY ships (post-remap), not
+          // previewFiles (v0's raw, unfiltered zip). remapFilesForSubPage's skip-list drops
+          // files like app/layout.tsx — v0's own scaffold layout.tsx can independently
+          // contain something matching the fbq('track','Lead') regex, which used to make
+          // this check pass against code that never reaches the deployed site at all.
+          const pixelCheck = validatePixelLeadEvent(remapFilesForSubPage(previewFiles, slug, name));
           if (!pixelCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
             console.warn(`[V0 SERVICE] Meta Pixel Lead event missing for /${slug} (attempt ${validationAttempt + 1}): ${pixelCheck.reason}`);
 
