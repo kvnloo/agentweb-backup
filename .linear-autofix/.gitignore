@@ -12,3 +12,6 @@ chat/locks/
 .credcheck.stamp
 .env.bak.*
 state.json.bak.*
+chat/chat-state.json.bak.*
+preview/proxy.pid
+*.bak
