@@ -386,7 +386,7 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
     expect(res.body.captureSyncWarning).toBeUndefined();
   });
 
-  it("ENG-486: threads the site root's metaPixelId/metaAdAccountId through even when a SUB-page's lead list changes (never strips a configured pixel out of the route)", async () => {
+  it("ENG-489: threads the site root's metaPixelId/metaAdAccountId through even when a SUB-page's lead list changes (never strips a configured pixel out of the route)", async () => {
     const rootWithPixel = { ...rootPage, metaPixelId: "1012387921717047", metaAdAccountId: "act_555" };
     mockGetLandingPageById.mockResolvedValue(pricingPage); // the page being updated is the SUB-page, not root
     mockGetLandingPagesByOwner.mockResolvedValue([rootWithPixel, pricingPage, otherSitePage]);

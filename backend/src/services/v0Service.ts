@@ -1916,7 +1916,7 @@ async function addPageToExistingRepo(
       }
       if (leadListId) listByPath[`/${slug}`] = leadListId;
 
-      // ENG-486: syncLeadCaptureFilesToRepo fully regenerates app/api/capture/route.ts,
+      // ENG-489: syncLeadCaptureFilesToRepo fully regenerates app/api/capture/route.ts,
       // so a sync that omits the site's pixelId/metaAdAccountId would silently strip an
       // already-configured Meta pixel back out of the route. existingPage IS the site's
       // root record (passed in by the caller), so its own metaPixelId/metaAdAccountId are

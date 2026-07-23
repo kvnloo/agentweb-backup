@@ -2243,7 +2243,7 @@ async function syncLeadCaptureForPage(
       listByPath[page.slug ? `/${page.slug}` : "/"] = leadListId;
     }
 
-    // ENG-486: syncLeadCaptureFilesToRepo fully regenerates app/api/capture/route.ts,
+    // ENG-489: syncLeadCaptureFilesToRepo fully regenerates app/api/capture/route.ts,
     // so omitting the site's pixelId/metaAdAccountId here would silently strip an
     // already-configured Meta pixel back out of the route on every lead-list attach.
     // metaPixelId/metaAdAccountId live on the SITE ROOT record, which may not be `page`
