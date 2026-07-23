@@ -1801,6 +1801,32 @@ async function addPageToExistingRepo(
         console.warn(
           `[V0 SERVICE] ENG-483: lead-capture route sync did not commit for new page /${slug}: ${syncResult.reason}`
         );
+      } else if (syncResult.committed && syncResult.pushedCommitSha) {
+        // Visibility only, never a reason to fail this page: the page's OWN content
+        // already deployed successfully above. A concurrent sub-page add can push a
+        // newer commit on top of this one before Vercel builds it, which makes Vercel
+        // supersede/cancel our build — that shows up here as "timeout", not a real
+        // failure, so only a genuine `error` state is logged loudly.
+        const syncDeployResult = await pollVercelDeployment(
+          existingPage.vercelProjectId!,
+          vercelToken,
+          syncResult.pushTimestampMs,
+          syncResult.pushedCommitSha
+        );
+        if (syncDeployResult.buildStatus === "error") {
+          console.error(
+            `[V0 SERVICE] ENG-483: capture-route sync build FAILED for ${repoFullName} ` +
+              `(commit ${syncResult.pushedCommitSha.substring(0, 7)}): ${syncDeployResult.buildError}. ` +
+              `Page /${slug} is deployed, but its lead form (and possibly siblings') may still 422 ` +
+              `until the route resyncs.`
+          );
+        } else if (syncDeployResult.buildStatus === "timeout") {
+          console.warn(
+            `[V0 SERVICE] ENG-483: capture-route sync build for ${repoFullName} (commit ` +
+              `${syncResult.pushedCommitSha.substring(0, 7)}) did not confirm READY within the poll ` +
+              `window — likely just slow, or superseded by a newer concurrent commit; not treated as a failure.`
+          );
+        }
       }
     } catch (syncErr: any) {
       console.error(
@@ -5267,7 +5293,7 @@ async function readRepoFile(
 export async function syncLeadCaptureFilesToRepo(
   repoFullName: string,
   listByPath: Record<string, string>
-): Promise<{ committed: boolean; reason?: string }> {
+): Promise<{ committed: boolean; reason?: string; pushedCommitSha?: string; pushTimestampMs?: number }> {
   try {
     const { token: ghToken } = await getGitHubOrgToken();
     const ghHeaders = {
@@ -5314,7 +5340,7 @@ export async function syncLeadCaptureFilesToRepo(
     // sub-page add and a lead-list attach (or two sub-page adds) can land on the same
     // repo close together; a raw ref PATCH here would surface that as a non-fast-forward
     // that this function used to just log and give up on, leaving LIST_BY_PATH stale.
-    await commitFilesToRepoMain(
+    const { pushedCommitSha, pushTimestampMs } = await commitFilesToRepoMain(
       repoFullName,
       ghHeaders,
       filesToCommit.map((file) => ({ path: file.path, content: Buffer.from(file.content) })),
@@ -5334,7 +5360,7 @@ export async function syncLeadCaptureFilesToRepo(
           : "NO page of this site has a lead list — its forms will fail loudly"
       }`
     );
-    return { committed: true };
+    return { committed: true, pushedCommitSha, pushTimestampMs };
   } catch (err: any) {
     const reason = err?.response?.data?.message || err?.message || String(err);
     console.error(
