@@ -5008,6 +5008,7 @@ export class AgentModeService {
           type: 'ask_user_question',
           questionId: result.questionId,
           question: result.question,
+          ...(result.intro ? { intro: result.intro } : {}),
           options: result.options,
           recommendedOptionId: result.recommendedOptionId,
           allowEmmaDecide: result.allowEmmaDecide,

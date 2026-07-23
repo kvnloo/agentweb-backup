@@ -120,6 +120,7 @@ If the user replies with a TYPED message instead of clicking an option, that ope
       type: 'object',
       properties: {
         question: { type: 'string', description: 'The question to ask, e.g. "Which Meta campaign objective? It cannot be changed after launch."' },
+        intro: { type: 'string', description: 'Optional one- or two-sentence lead-in shown ABOVE the question on the card (e.g. context you just gathered). A card may come with text — use this instead of separate prose. Do NOT restate the options here.' },
         options: {
           type: 'array',
           minItems: 2,
@@ -166,6 +167,7 @@ If the user replies with a TYPED message instead of clicking an option, that ope
       question = buildPendingUserQuestion({
         questionId: uuidv4(),
         question: args.question,
+        intro: typeof args.intro === 'string' ? args.intro : undefined,
         options,
         immutable: args.immutable === true,
         allowEmmaDecide: args.allow_emma_decide === true,
@@ -204,6 +206,7 @@ If the user replies with a TYPED message instead of clicking an option, that ope
       type: 'ask_user_question',
       questionId: question.questionId,
       question: question.question,
+      ...(question.intro ? { intro: question.intro } : {}),
       options: question.options,
       recommendedOptionId: question.recommendedOptionId,
       allowEmmaDecide: question.allowEmmaDecide,

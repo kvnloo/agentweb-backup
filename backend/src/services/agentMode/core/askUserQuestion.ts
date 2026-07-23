@@ -73,6 +73,10 @@ export interface PendingUserQuestion {
   questionId: string;
   /** The question text shown on the card. */
   question: string;
+  /** Optional lead-in shown ABOVE the question on the card (and prepended to the
+   *  plain-text mirror for non-card surfaces) — a sentence of context, never a
+   *  restatement of the options. Lets a card come with text, not card-alone. */
+  intro?: string;
   /** 2–4 options; exactly one recommended. */
   options: AskUserQuestionOption[];
   /** Id of the single recommended option (redundant with the flag, kept in sync
@@ -93,6 +97,7 @@ export interface PendingUserQuestion {
 export interface AskUserQuestionInput {
   questionId: string;
   question: string;
+  intro?: string;
   options: AskUserQuestionOption[];
   immutable?: boolean;
   allowEmmaDecide?: boolean;
@@ -164,9 +169,11 @@ export function buildPendingUserQuestion(input: AskUserQuestionInput): PendingUs
     throw new AskUserQuestionError('question text is required');
   }
   const recommendedOptionId = resolveRecommendedOptionId(input.options);
+  const intro = typeof input.intro === 'string' && input.intro.trim() !== '' ? input.intro.trim() : undefined;
   return {
     questionId: input.questionId,
     question: input.question,
+    ...(intro ? { intro } : {}),
     options: input.options,
     recommendedOptionId,
     immutable: input.immutable === true,
@@ -369,7 +376,9 @@ export function renderQuestionPrompt(question: PendingUserQuestion): string {
   const footer = question.allowEmmaDecide
     ? '\n\nPick an option above, or choose "Let Emma decide" to go with the recommendation.'
     : '\n\nPick an option above to continue.';
-  return `${question.question}\n\n${lines.join('\n')}${footer}`;
+  // The optional lead-in prefixes the question on non-card surfaces too.
+  const intro = question.intro ? `${question.intro}\n\n` : '';
+  return `${intro}${question.question}\n\n${lines.join('\n')}${footer}`;
 }
 
 export type QuestionGateOutcome =
