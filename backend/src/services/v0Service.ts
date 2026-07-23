@@ -1668,6 +1668,14 @@ async function addPageToExistingRepo(
     autoFixV0Files(allFiles);
     const filesToCommit = remapFilesForSubPage(allFiles, slug, name);
 
+    // Deterministically fix v0's mis-rooted relative imports (e.g. a landing/ component importing
+    // `./landing/Sibling` instead of `./Sibling`) against the FINAL committed set — no v0
+    // round-trip, so it heals what check 7 catches but v0's self-heal correction keeps timing out.
+    const importRepairs = repairMisrootedImports(filesToCommit);
+    if (importRepairs > 0) {
+      console.log(`[V0 SERVICE] Repaired ${importRepairs} mis-rooted relative import(s) in /${slug} files`);
+    }
+
     console.log(`[V0 SERVICE] Extracted ${filesToCommit.length} files for /${slug}: ${filesToCommit.map(f => f.path).join(", ")}`);
 
     // ── Step 5: Commit files to existing repo using Git Trees API ──
@@ -2893,6 +2901,110 @@ export function detectIncompleteSyntheticPage(
   return orphaned.length > 0 ? { entryPath, orphaned } : null;
 }
 
+// Rewrites an intra-project import/re-export/dynamic-import specifier — relative (`./`/`../`) or
+// the `@/` alias. Both forms occur post-remap: v0 emits `./landing/X`, and the sub-page remap's
+// step-0 normalization turns that into `@/components/landing/landing/X`; either can be mis-rooted.
+const INTERNAL_IMPORT_REWRITE_PATTERN = /(\bfrom\s*['"]|\bimport\s*\(\s*['"])((?:\.\.?\/|@\/)[^'"]+)(['"])/g;
+
+// The component subtree a file belongs to — a sub-page's `app/<slug>/_components`, or a
+// first-page's `components`. Repairs only ever point WITHIN a file's own subtree, so a broken
+// `./x` in a landing component can never be "repaired" to an unrelated `lib/x` in another tree.
+function componentScopeRoot(p: string): string {
+  const m = p.match(/^(app\/[^/]+\/_components|components)\//);
+  return m ? m[1] : path.posix.dirname(p);
+}
+
+// A `@/` specifier that legitimately lives in the ROOT repo (shadcn primitives, the cn helper,
+// hooks, and the caller-injected scaffold) and is NOT part of the file set this repair sees for a
+// sub-page. It resolves at build time but not here, so it must be preserved, never "repaired".
+function isRootScaffoldAlias(spec: string): boolean {
+  if (!spec.startsWith("@/")) return false;
+  const p = spec.slice(2).replace(/\/+$/, "");
+  return (
+    p.startsWith("components/ui/") ||
+    p.startsWith("lib/") ||
+    p.startsWith("hooks/") ||
+    p.startsWith("styles/") ||
+    GUARANTEED_SCAFFOLD_MODULE_PATHS.has(p)
+  );
+}
+
+/**
+ * ENG-384/467 follow-up — deterministically repair v0's recurring "mis-rooted" imports.
+ *
+ * v0 frequently writes an intra-folder import as if addressed from the components ROOT rather
+ * than from the importing file: a component at `.../landing/FinalCTA.tsx` imports
+ * `./landing/LeadCaptureForm` when the sibling is simply `./LeadCaptureForm`. The spurious
+ * `landing/` segment makes it resolve to `.../landing/landing/LeadCaptureForm`, which does not
+ * exist → `next build` dies with "Module not found". The sub-page remap's rewriting of nested
+ * component directories (and its step-0 `@/` normalization) leaves the same shape. Both hit
+ * ~every multi-component generation.
+ *
+ * check 7 (collectMissingInternalImports) *detects* this, but recovery then depends on v0's
+ * self-heal correction, which has repeatedly timed out (V0_CALL_TIMEOUT) — so the page fails
+ * instead of healing. This repairs it in-place with NO v0 round-trip: run on the FINAL committed
+ * file set (where every file's real location is known), for each broken intra-project import find
+ * the single file in the importing file's own component subtree whose module basename matches, and
+ * rewrite to the correct RELATIVE path.
+ *
+ * Conservative by construction — only rewrites an import that (a) is relative or a non-scaffold
+ * `@/` alias, (b) does NOT already resolve against the committed set, and (c) has EXACTLY ONE
+ * basename match within the same subtree; otherwise it is left untouched (a genuinely missing file
+ * still trips check 7 upstream, and legit root-repo `@/` refs are skipped outright). It never
+ * touches a working import and only ever rewrites to a path that provably resolves. Mutates in
+ * place; returns the number of imports repaired.
+ */
+export function repairMisrootedImports(files: Array<{ path: string; content: Buffer }>): number {
+  const existingPaths = new Set(files.map((f) => f.path));
+
+  // module basename -> providers (a `foo/index.tsx` provides the basename `foo`, matching a
+  // directory import). Scoped so a repair can only resolve within the importing file's subtree.
+  const providers: Array<{ base: string; scope: string; path: string }> = [];
+  for (const f of files) {
+    if (!/\.(tsx|ts|jsx|js)$/.test(f.path)) continue;
+    let base = path.posix.basename(f.path).replace(/\.(tsx|ts|jsx|js)$/, "");
+    if (base === "index") base = path.posix.basename(path.posix.dirname(f.path));
+    providers.push({ base, scope: componentScopeRoot(f.path), path: f.path });
+  }
+
+  let repaired = 0;
+  for (const file of files) {
+    if (!file.path.endsWith(".tsx") && !file.path.endsWith(".ts")) continue;
+    const fileDir = path.posix.dirname(file.path);
+    const fileScope = componentScopeRoot(file.path);
+    let changed = false;
+
+    const content = file.content.toString("utf-8").replace(
+      INTERNAL_IMPORT_REWRITE_PATTERN,
+      (whole, pre: string, spec: string, post: string) => {
+        if (NON_MODULE_IMPORT_EXTENSION.test(spec)) return whole;
+        if (isRootScaffoldAlias(spec)) return whole; // legit root-repo ref — preserve
+        const target = spec.startsWith("@/")
+          ? spec.slice(2).replace(/\/+$/, "")
+          : path.posix.normalize(path.posix.join(fileDir, spec));
+        if (target.startsWith("..") || target.startsWith("/")) return whole; // escapes the root
+        if (moduleExists(target, existingPaths)) return whole; // already resolves — hands off
+        const base = path.posix.basename(spec);
+        const matches = providers.filter(
+          (p) => p.base === base && p.scope === fileScope && p.path !== file.path
+        );
+        if (matches.length !== 1) return whole; // missing or ambiguous — leave for check 7
+        let rel = path.posix
+          .relative(fileDir, matches[0].path)
+          .replace(/\.(tsx|ts|jsx|js)$/, "")
+          .replace(/\/index$/, "");
+        if (!rel.startsWith(".")) rel = "./" + rel;
+        changed = true;
+        repaired++;
+        return `${pre}${rel}${post}`;
+      }
+    );
+
+    if (changed) file.content = Buffer.from(content);
+  }
+  return repaired;
+}
+
 /**
  * Validate that unzipped v0 output contains actual React/Next.js code.
  * Rejects: empty output, markdown/prompts echoed back, files too small to be real code.
@@ -3467,6 +3579,13 @@ async function createGitHubRepoAndPush(
   const fixCount = autoFixV0Files(finalFiles);
   if (fixCount > 0) {
     console.log(`[V0 SERVICE] Auto-fixed ${fixCount} files for build compatibility`);
+  }
+
+  // Deterministically fix v0's mis-rooted relative imports on the first page too (it commits the
+  // files at their original paths, so v0's `./landing/Sibling`-style mistakes break here as well).
+  const importRepairs = repairMisrootedImports(finalFiles);
+  if (importRepairs > 0) {
+    console.log(`[V0 SERVICE] Repaired ${importRepairs} mis-rooted relative import(s)`);
   }
 
   // ENG-334: auto-inject the site's GTM container into the root layout BEFORE the initial
