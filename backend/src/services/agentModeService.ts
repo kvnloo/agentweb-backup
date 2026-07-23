@@ -20,6 +20,7 @@ import {
   promptRequestsLogo,
 } from './agentMode/brandLogo';
 import { executePreparedTools, mediaGenProducedAsset } from './agentMode/core/toolDispatch';
+import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
@@ -2742,12 +2743,18 @@ export class AgentModeService {
     isCancelled?: () => boolean,
     excludeTools?: string[],
     screenshotUrl?: string,
-    isDelegatedAccess: boolean = false
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean }> {
+    isDelegatedAccess: boolean = false,
+    persistIncrementally: boolean = false
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; persistedResponseCount?: number }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
     let _toolCallsForTelemetry: any[] = [];
+    // ENG-473: count of response messages (assistant/tool, in `messages.slice(initialMessageCount)`
+    // order) already persisted to the session by incremental checkpointing. Hoisted so the catch
+    // block can skip them when persisting partial-usage messages (no double-count) and so the final
+    // batch in the controller can persist only the un-checkpointed tail.
+    let _persistedResponseCount = 0;
     const agentRuntimeRunId = buildAgentRuntimeRunId(sessionId);
     recordAgentModeRunStarted(agentRuntimeRunId, {
       llmModel,
@@ -2983,6 +2990,37 @@ export class AgentModeService {
       _messages = messages;
       _initialMessageCount = initialMessageCount;
 
+      // ENG-473 incremental checkpointing state. `persistedResponseCount` tracks how many
+      // response messages have been written to the session so far; `checkpointingActive`
+      // is cleared if a checkpoint write ever fails so the final batch (not a retry loop)
+      // persists the remainder. Only used when `persistIncrementally` is set by the caller.
+      let persistedResponseCount = 0;
+      let checkpointingActive = persistIncrementally;
+      const flushCheckpoint = async () => {
+        if (!checkpointingActive) return;
+        try {
+          const { toPersist, newPersistedCount } = computeCheckpointBatch(
+            messages,
+            initialMessageCount,
+            persistedResponseCount
+          );
+          if (toPersist.length > 0) {
+            await chatbotDb.addMessagesToSession(sessionId, toPersist);
+            persistedResponseCount = newPersistedCount;
+            _persistedResponseCount = newPersistedCount;
+          }
+        } catch (checkpointErr) {
+          // Best-effort: a persistence failure must never abort the run. Stop
+          // checkpointing and leave the cursor where it is so the controller's
+          // final batch persists everything from here (no gap, no duplicate).
+          console.error(
+            `AgentMode: incremental checkpoint persist failed for session ${sessionId} — deferring the rest to the final batch:`,
+            checkpointErr
+          );
+          checkpointingActive = false;
+        }
+      };
+
       // Per-run media-generation time budget. A work-plan step that generates many
       // images (e.g. LinkedIn Ads "Generate 3 Images Per Hook" = 18 images) runs them
       // sequentially and can exceed the controller's hard wall-clock timeout
@@ -3081,6 +3119,9 @@ export class AgentModeService {
             const delta = messages.length - preUpdateLen;
             if (delta !== 0) {
               initialMessageCount += delta;
+              // Keep the hoisted copy in sync so the catch-block partial-usage slice
+              // and the incremental checkpoint cursor share one boundary (ENG-473).
+              _initialMessageCount = initialMessageCount;
             }
 
             // Invalidate tools cache
@@ -3090,6 +3131,15 @@ export class AgentModeService {
             console.error('Error refreshing skill context:', error);
           }
         }
+
+        // ENG-473: checkpoint everything produced by PRIOR iterations before this
+        // iteration's LLM call. At this point the current turn's assistant/tool
+        // messages do not exist yet, so only fully-settled turns are flushed — the
+        // in-flight turn (where late mutations like suggestion chips land) is never
+        // checkpointed and stays owned by the controller's final batch. A hard kill
+        // during this iteration therefore leaves every completed prior turn visible
+        // instead of a silent zero-output session.
+        await flushCheckpoint();
 
         if (onProgress) {
           onProgress({
@@ -3738,6 +3788,9 @@ export class AgentModeService {
         knowledgeBaseQueries,
         sources,
         responseMessages,
+        // ENG-473: how many of `responseMessages` were already written by incremental
+        // checkpointing so the controller's final batch persists only the remaining tail.
+        persistedResponseCount,
         ...(wasCancelled ? { cancelled: true } : {}),
         ...(truncatedByStepBudget ? { truncatedByStepBudget: true } : {}),
         ...(backupModelUsed ? { backupModelUsed: true, originalModel: originalLlmModel, backupModel: llmModel } : {})
@@ -3777,8 +3830,16 @@ export class AgentModeService {
 
       // Extract partial usage from any response messages accumulated before the error.
       // This ensures token costs are tracked even when generation fails mid-stream.
+      // ENG-473: drop the response messages already written by incremental checkpointing
+      // FIRST (addMessagesToSession already counted their tokens), then keep the
+      // usage-bearing remainder — so a mid-stream failure never double-counts tokens for
+      // a message that was checkpointed.
       const partialResponseMessages = _messages
-        ? _messages.slice(_initialMessageCount).filter((msg: any) => msg.role !== 'user' && msg.usage)
+        ? _messages
+            .slice(_initialMessageCount)
+            .filter((msg: any) => msg.role !== 'user')
+            .slice(_persistedResponseCount)
+            .filter((msg: any) => msg.usage)
         : [];
 
       // Preserve original error details for upstream error classification (e.g. isContextLimitError)
