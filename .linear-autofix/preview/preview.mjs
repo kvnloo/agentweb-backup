@@ -248,18 +248,29 @@ function down(bugRaw) {
   const bug = bugRaw.toLowerCase();
   const state = readJson(STATE);
   const entry = state[bug];
-  if (entry?.procs) {
-    for (const [name, p] of Object.entries(entry.procs)) {
-      try { process.kill(-p.pid, 'SIGTERM'); }
-      catch { try { process.kill(p.pid, 'SIGTERM'); } catch { /* already gone */ } }
-      console.log(`[preview] stopped ${name} (pid ${p.pid})`);
-    }
+  const procs = entry?.procs ? Object.entries(entry.procs) : [];
+  for (const [name, p] of procs) {
+    try { process.kill(-p.pid, 'SIGTERM'); }
+    catch { try { process.kill(p.pid, 'SIGTERM'); } catch { /* already gone */ } }
+    console.log(`[preview] stopped ${name} (pid ${p.pid})`);
   }
   const routes = readJson(ROUTES);
   delete routes[bug]; delete routes[`${bug}-api`]; delete routes[`${bug}-admin`];
   writeJson(ROUTES, routes);
   delete state[bug]; writeJson(STATE, state);
   console.log(`[preview] ${bug} torn down`);
+  // The agentweb backend's graceful SIGTERM shutdown can hold ~0.5GB (plus its --max-old-space worker)
+  // for up to a minute — but a user hits Disable (or the cap evicts) specifically to FREE memory. State
+  // and routes are already cleared above, so the UI/cap see the slot freed instantly; this just makes the
+  // OS actually reclaim the RAM promptly by SIGKILLing any group still alive after a short grace.
+  if (procs.length) {
+    setTimeout(() => {
+      for (const [, p] of procs) {
+        try { process.kill(-p.pid, 'SIGKILL'); }
+        catch { try { process.kill(p.pid, 'SIGKILL'); } catch { /* already exited on SIGTERM */ } }
+      }
+    }, 2500);
+  }
 }
 
 function list() {
