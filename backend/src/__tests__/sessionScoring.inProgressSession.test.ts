@@ -228,6 +228,42 @@ describe('SessionScoring - sessions with an assistant turn score normally', () =
     expect(mockUpdateScore).toHaveBeenCalledTimes(1);
   });
 
+  // ENG-473 (A + backstop partition): a run that crashed mid-flight but had already
+  // persisted partial output via incremental checkpointing now carries a REAL assistant
+  // turn. It must be scored on its merits by the judge — NOT re-classified as a zero-output
+  // failed run and NOT annotated with a "please retry" notice. The surfaceFailedRun backstop
+  // only fires for runs that died before ANY settled turn (hasAssistantTurn === false).
+  it('scores a stale partial-output run (checkpoint-persisted) on its merits and does NOT surface it as a failed run', async () => {
+    mockCallLLM.mockResolvedValue(
+      makeLLMResponse(3, 'partial', { goalCompletion: 3, dataAccuracy: 4, outputQuality: 3 })
+    );
+
+    const session = {
+      sessionId: 'partial-persisted-1',
+      userId: 'u1',
+      sessionType: 'regular',
+      messages: [
+        { role: 'user', content: 'Draft the campaign.' },
+        // Iteration 1 completed and was checkpoint-persisted before the process was killed.
+        { role: 'assistant', content: 'Drafted the first ad set...', metadata: { toolCalls: [{ name: 'create_html_file' }] } } as any,
+        { role: 'tool', content: 'file created' } as any,
+      ],
+      messageCount: 3,
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    expect(result).not.toBeNull();
+    expect(result?.score).toBe(3);
+    // Scored by the judge on the partial transcript...
+    expect(mockCallLLM).toHaveBeenCalledTimes(1);
+    // ...and NOT double-annotated by the failed-run backstop.
+    expect(mockUpdateError).not.toHaveBeenCalled();
+    expect(mockAddMessage).not.toHaveBeenCalled();
+  });
+
   // This shape (ends in tool result, RECENT) is mid-loop — must be deferred, not scored.
   // The previous test name was wrong; this is now a negative test for the fix.
   it('defers (returns null) a recent session ending in a tool result — mid-loop, not settled', async () => {
