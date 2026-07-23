@@ -3394,6 +3394,29 @@ describe("v0Service - repairMisrootedImports", () => {
     expect(() => validateV0Output(repaired)).not.toThrow();
   });
 
+  it("REPAIR (bare): v0's prefix-less `landing/Nav` -> @/components/landing/Nav", () => {
+    // v0 sometimes drops the prefix entirely; the spec looks like a package but isn't.
+    const files = [
+      f("app/page.tsx", `"use client"\nimport { Nav } from "landing/Nav";\nexport default function Page(){return <Nav/>;}`),
+      f("components/landing/Nav.tsx", `export function Nav(){return <nav/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(1);
+    expect(imp(files, "app/page.tsx")).toContain('"@/components/landing/Nav"');
+    expect(collectMissingInternalImports(files)).toEqual([]);
+  });
+
+  it("NO-OP (bare): real npm packages are never touched", () => {
+    const files = [
+      f("app/page.tsx", `import Image from "next/image";\nimport { Star } from "lucide-react";\nimport * as React from "react";\nimport { Slot } from "@radix-ui/react-slot";\nexport default function Page(){return <Image/>;}`),
+      f("components/landing/Nav.tsx", `export function Nav(){return <nav/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0);
+    const line = imp(files, "app/page.tsx");
+    expect(line).toContain('"next/image"');
+    expect(line).toContain('"lucide-react"');
+    expect(line).toContain('"@radix-ui/react-slot"');
+  });
+
   it("ORDERING: a genuinely-missing file still trips check 7 even after repair", () => {
     const files = [
       f("app/page.tsx", `import Compare from "@/components/compare-table";\nexport default function Page(){return <Compare/>;}`),
