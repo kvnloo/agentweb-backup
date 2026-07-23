@@ -183,14 +183,47 @@ function bumpVersion(prev: string): string {
 }
 
 /**
+ * Read the current row straight from DynamoDB, bypassing the cache, along with
+ * the raw stored `version` string used as the optimistic-concurrency token.
+ * `raw` is null when no row exists yet (so the caller conditions on
+ * attribute_not_exists). Never throws — degrades to the seed row.
+ */
+async function fetchRowForSave(): Promise<{
+  raw: any | null;
+  row: OutreachInvitePromptRow;
+}> {
+  try {
+    const resp = await docClient
+      .get({
+        TableName: TEMPLATES_TABLE,
+        Key: { templateId: OUTREACH_INVITE_TEMPLATE_ID },
+      })
+      .promise();
+    if (resp.Item) return { raw: resp.Item, row: normaliseRow(resp.Item) };
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn("[outreachInvitePromptService] save read failed; using seed", {
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+  return { raw: null, row: seedRow() };
+}
+
+/**
  * Overwrite the row, merging only the provided fields, bumping `version`.
  * Empty/whitespace-only variant lists are rejected upstream by the route;
  * here we defensively fall back to existing values for anything absent.
+ *
+ * Concurrency-safe: reads the CURRENT row fresh (not the 5-minute cache) and
+ * writes it back under a version-guarded `ConditionExpression`, so a save that
+ * merged onto a stale row can never clobber a concurrent admin edit — it loses
+ * the conditional write, re-reads the winner, and retries once, merging its own
+ * change on top. Without this, two admins (or two instances) saving within the
+ * cache window would silently revert one another.
  */
 export async function saveOutreachInvitePrompt(
   input: SaveOutreachInvitePromptInput,
 ): Promise<OutreachInvitePromptRow> {
-  const existing = await getOutreachInvitePrompt();
   const cleanList = (v: string[] | undefined): string[] | undefined => {
     if (v === undefined) return undefined;
     const list = v
@@ -199,25 +232,57 @@ export async function saveOutreachInvitePrompt(
       .filter((s) => s.length > 0);
     return list.length > 0 ? list : undefined;
   };
-  const next: OutreachInvitePromptRow = {
-    templateId: OUTREACH_INVITE_TEMPLATE_ID,
-    systemPrompt:
-      typeof input.systemPrompt === "string" && input.systemPrompt.trim().length > 0
-        ? input.systemPrompt
-        : existing.systemPrompt,
-    withCompanyVariants:
-      cleanList(input.withCompanyVariants) ?? existing.withCompanyVariants,
-    withoutCompanyVariants:
-      cleanList(input.withoutCompanyVariants) ?? existing.withoutCompanyVariants,
-    version: bumpVersion(existing.version),
-    updatedAt: new Date().toISOString(),
-    updatedBy: input.updatedBy,
-  };
-  await docClient
-    .put({ TableName: TEMPLATES_TABLE, Item: next })
-    .promise();
-  cache = { row: next, loadedAt: nowMs() };
-  return next;
+
+  const MAX_ATTEMPTS = 2;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const { raw, row: existing } = await fetchRowForSave();
+    const next: OutreachInvitePromptRow = {
+      templateId: OUTREACH_INVITE_TEMPLATE_ID,
+      systemPrompt:
+        typeof input.systemPrompt === "string" &&
+        input.systemPrompt.trim().length > 0
+          ? input.systemPrompt
+          : existing.systemPrompt,
+      withCompanyVariants:
+        cleanList(input.withCompanyVariants) ?? existing.withCompanyVariants,
+      withoutCompanyVariants:
+        cleanList(input.withoutCompanyVariants) ??
+        existing.withoutCompanyVariants,
+      version: bumpVersion(existing.version),
+      updatedAt: new Date().toISOString(),
+      updatedBy: input.updatedBy,
+    };
+
+    // Guard the write so we only overwrite the exact row we merged onto.
+    const guard =
+      raw && typeof raw.version === "string"
+        ? {
+            ConditionExpression: "version = :expected",
+            ExpressionAttributeValues: { ":expected": raw.version },
+          }
+        : raw
+          ? { ConditionExpression: "attribute_exists(templateId)" }
+          : { ConditionExpression: "attribute_not_exists(templateId)" };
+
+    try {
+      await docClient
+        .put({ TableName: TEMPLATES_TABLE, Item: next, ...guard })
+        .promise();
+      cache = { row: next, loadedAt: nowMs() };
+      return next;
+    } catch (e: any) {
+      // Lost the race: another writer changed the row. Re-read and retry once.
+      if (
+        e?.code === "ConditionalCheckFailedException" &&
+        attempt < MAX_ATTEMPTS - 1
+      ) {
+        continue;
+      }
+      throw e;
+    }
+  }
+  /* istanbul ignore next — unreachable: the loop always returns or throws. */
+  throw new Error("saveOutreachInvitePrompt: exhausted retries");
 }
 
 /** For tests only — drop the in-memory cache. */

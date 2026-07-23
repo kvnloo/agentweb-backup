@@ -281,4 +281,167 @@ describe("saveOutreachInvitePrompt", () => {
     expect(row.withCompanyVariants).toEqual(["KEEP A"]);
     expect(row.systemPrompt).toBe("OLD PROMPT");
   });
+
+  it("guards the write with a version condition matching the stored row", async () => {
+    mockGet.mockResolvedValueOnce({
+      Item: {
+        templateId: OUTREACH_INVITE_TEMPLATE_ID,
+        version: "v7-2026-07-13",
+        systemPrompt: "OLD",
+        withCompanyVariants: ["A"],
+        withoutCompanyVariants: ["B"],
+        updatedAt: "2026-07-13T00:00:00Z",
+        updatedBy: "admin-1",
+      },
+    });
+    await saveOutreachInvitePrompt({ systemPrompt: "NEW", updatedBy: "admin-9" });
+    const put = mockPut.mock.calls[mockPut.mock.calls.length - 1][0];
+    expect(put.ConditionExpression).toBe("version = :expected");
+    expect(put.ExpressionAttributeValues).toEqual({
+      ":expected": "v7-2026-07-13",
+    });
+  });
+
+  it("reads fresh (not the cache) so it never merges onto stale state", async () => {
+    // Warm the cache with one row...
+    mockGet.mockResolvedValueOnce({
+      Item: {
+        templateId: OUTREACH_INVITE_TEMPLATE_ID,
+        version: "v1-2026-07-13",
+        systemPrompt: "CACHED",
+        withCompanyVariants: ["CACHED A"],
+        withoutCompanyVariants: ["CACHED B"],
+        updatedAt: "2026-07-13T00:00:00Z",
+        updatedBy: "admin-1",
+      },
+    });
+    await getOutreachInvitePrompt();
+    // ...then save must still hit Dynamo for the CURRENT row, not reuse cache.
+    mockGet.mockResolvedValueOnce({
+      Item: {
+        templateId: OUTREACH_INVITE_TEMPLATE_ID,
+        version: "v2-2026-07-13",
+        systemPrompt: "FRESH",
+        withCompanyVariants: ["FRESH A"],
+        withoutCompanyVariants: ["FRESH B"],
+        updatedAt: "2026-07-13T01:00:00Z",
+        updatedBy: "admin-2",
+      },
+    });
+    const row = await saveOutreachInvitePrompt({
+      systemPrompt: "MINE",
+      updatedBy: "admin-9",
+    });
+    // Merged onto the FRESH row's untouched fields, not the cached ones.
+    expect(row.withCompanyVariants).toEqual(["FRESH A"]);
+    expect(row.systemPrompt).toBe("MINE");
+    expect(row.version).toMatch(/^v\d+-\d{4}-\d{2}-\d{2}$/); // bumped
+    // Guarded on the FRESH row's version, proving it re-read past the cache.
+    const put = mockPut.mock.calls[mockPut.mock.calls.length - 1][0];
+    expect(put.ExpressionAttributeValues).toEqual({
+      ":expected": "v2-2026-07-13",
+    });
+  });
+
+  it("re-reads and retries once on a concurrent-edit conflict, preserving the winner", async () => {
+    // Initial read.
+    mockGet.mockResolvedValueOnce({
+      Item: {
+        templateId: OUTREACH_INVITE_TEMPLATE_ID,
+        version: "v1-2026-07-13",
+        systemPrompt: "OLD",
+        withCompanyVariants: ["OLD A"],
+        withoutCompanyVariants: ["OLD B"],
+        updatedAt: "2026-07-13T00:00:00Z",
+        updatedBy: "admin-1",
+      },
+    });
+    // First put loses the race.
+    const conflict: any = new Error("stale");
+    conflict.code = "ConditionalCheckFailedException";
+    mockPut.mockRejectedValueOnce(conflict);
+    // Re-read returns the concurrent winner (a different admin edited variants).
+    mockGet.mockResolvedValueOnce({
+      Item: {
+        templateId: OUTREACH_INVITE_TEMPLATE_ID,
+        version: "v2-2026-07-13",
+        systemPrompt: "OLD",
+        withCompanyVariants: ["CONCURRENT A"],
+        withoutCompanyVariants: ["OLD B"],
+        updatedAt: "2026-07-13T02:00:00Z",
+        updatedBy: "admin-2",
+      },
+    });
+    // Second put succeeds (default mockPut resolves).
+    const row = await saveOutreachInvitePrompt({
+      systemPrompt: "MINE",
+      updatedBy: "admin-9",
+    });
+
+    expect(mockPut).toHaveBeenCalledTimes(2);
+    // My edit landed AND the concurrent admin's variant edit survived.
+    expect(row.systemPrompt).toBe("MINE");
+    expect(row.withCompanyVariants).toEqual(["CONCURRENT A"]);
+    expect(row.version).toMatch(/^v\d+-\d{4}-\d{2}-\d{2}$/); // bumped
+    // Retry guarded on the winner's version.
+    const put2 = mockPut.mock.calls[1][0];
+    expect(put2.ExpressionAttributeValues).toEqual({
+      ":expected": "v2-2026-07-13",
+    });
+  });
+
+  it("throws when the conflict persists past the single retry", async () => {
+    mockGet.mockResolvedValue({
+      Item: {
+        templateId: OUTREACH_INVITE_TEMPLATE_ID,
+        version: "v1-2026-07-13",
+        systemPrompt: "OLD",
+        withCompanyVariants: ["A"],
+        withoutCompanyVariants: ["B"],
+        updatedAt: "2026-07-13T00:00:00Z",
+        updatedBy: "admin-1",
+      },
+    });
+    const conflict: any = new Error("stale");
+    conflict.code = "ConditionalCheckFailedException";
+    mockPut.mockRejectedValue(conflict);
+    await expect(
+      saveOutreachInvitePrompt({ systemPrompt: "MINE", updatedBy: "admin-9" }),
+    ).rejects.toThrow();
+    expect(mockPut).toHaveBeenCalledTimes(2);
+  });
+
+  it("conditions on attribute_not_exists when there is no row yet", async () => {
+    mockGet.mockResolvedValueOnce({}); // no Item
+    await saveOutreachInvitePrompt({ systemPrompt: "FIRST", updatedBy: "admin-9" });
+    const put = mockPut.mock.calls[mockPut.mock.calls.length - 1][0];
+    expect(put.ConditionExpression).toBe("attribute_not_exists(templateId)");
+  });
+
+  it("conditions on attribute_not_exists (seeded) when the pre-save read fails", async () => {
+    mockGet.mockRejectedValueOnce(new Error("ddb unreachable"));
+    const row = await saveOutreachInvitePrompt({
+      systemPrompt: "FIRST",
+      updatedBy: "admin-9",
+    });
+    expect(row.systemPrompt).toBe("FIRST"); // merged onto the seed
+    const put = mockPut.mock.calls[mockPut.mock.calls.length - 1][0];
+    expect(put.ConditionExpression).toBe("attribute_not_exists(templateId)");
+  });
+
+  it("conditions on attribute_exists when the stored row has no version string", async () => {
+    mockGet.mockResolvedValueOnce({
+      Item: {
+        templateId: OUTREACH_INVITE_TEMPLATE_ID,
+        // version missing entirely (hand-edited/corrupt row)
+        systemPrompt: "OLD",
+        withCompanyVariants: ["A"],
+        withoutCompanyVariants: ["B"],
+      },
+    });
+    await saveOutreachInvitePrompt({ systemPrompt: "NEW", updatedBy: "admin-9" });
+    const put = mockPut.mock.calls[mockPut.mock.calls.length - 1][0];
+    expect(put.ConditionExpression).toBe("attribute_exists(templateId)");
+    expect(put.ExpressionAttributeValues).toBeUndefined();
+  });
 });
