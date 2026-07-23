@@ -5309,48 +5309,19 @@ export async function syncLeadCaptureFilesToRepo(
       filesToCommit.push({ path: "domainMap.ts", content: buildDomainMapFile({}) });
     }
 
-    const refRes = await axios.get<any>(
-      `https://api.github.com/repos/${repoFullName}/git/ref/heads/main`,
-      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
-    );
-    const latestCommitSha = refRes.data.object.sha;
-
-    const treeItems = await Promise.all(
-      filesToCommit.map(async (file) => {
-        const blobRes = await axios.post<any>(
-          `https://api.github.com/repos/${repoFullName}/git/blobs`,
-          { content: Buffer.from(file.content).toString("base64"), encoding: "base64" },
-          { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
-        );
-        return {
-          path: file.path,
-          mode: "100644" as const,
-          type: "blob" as const,
-          sha: blobRes.data.sha,
-        };
-      })
-    );
-
-    const treeRes = await axios.post<any>(
-      `https://api.github.com/repos/${repoFullName}/git/trees`,
-      { base_tree: latestCommitSha, tree: treeItems },
-      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
-    );
-
-    const commitRes = await axios.post<any>(
-      `https://api.github.com/repos/${repoFullName}/git/commits`,
-      {
-        message: "chore: sync lead-capture route and middleware",
-        tree: treeRes.data.sha,
-        parents: [latestCommitSha],
-      },
-      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
-    );
-
-    await axios.patch<any>(
-      `https://api.github.com/repos/${repoFullName}/git/refs/heads/main`,
-      { sha: commitRes.data.sha },
-      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+    // ENG-483: reuse the same retry-with-rebase commit path the page's own commit uses
+    // (commitFilesToRepoMain) instead of a bare, single-shot blob/tree/commit/patch. A
+    // sub-page add and a lead-list attach (or two sub-page adds) can land on the same
+    // repo close together; a raw ref PATCH here would surface that as a non-fast-forward
+    // that this function used to just log and give up on, leaving LIST_BY_PATH stale.
+    await commitFilesToRepoMain(
+      repoFullName,
+      ghHeaders,
+      filesToCommit.map((file) => ({ path: file.path, content: Buffer.from(file.content) })),
+      "chore: sync lead-capture route and middleware",
+      2 // this sync is best-effort (caller only logs a warning on failure) — one rebase
+        // retry covers the common single-concurrent-writer race without piling up the
+        // full 4-attempt backoff behind an already-deployed page.
     );
 
     const wired = Object.entries(listByPath);
