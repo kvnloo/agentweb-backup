@@ -213,7 +213,11 @@ describe("syncLeadCaptureFilesToRepo", () => {
 
     const result = await syncLeadCaptureFilesToRepo(REPO, { "/": "list_1" });
 
-    expect(result).toEqual({ committed: true });
+    // ENG-483: committed:true now also carries the pushed commit's sha/timestamp so a
+    // caller can poll Vercel for that specific build (see addPageToExistingRepo).
+    expect(result.committed).toBe(true);
+    expect(result.pushedCommitSha).toBeTruthy();
+    expect(result.pushTimestampMs).toBeGreaterThan(0);
     expect(treePaths()).toEqual(expect.arrayContaining(["middleware.ts", "app/api/capture/route.ts"]));
     expect(blobForPath("middleware.ts")).toBe(buildLandingPageMiddleware());
     expect(blobForPath("app/api/capture/route.ts")).toBe(buildCaptureRoute({ "/": "list_1" }));
@@ -373,11 +377,31 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
 
     expect(res.status).toBe(200);
     expect(mockUpdateLeadList).toHaveBeenCalledWith("p1", "u1", "list_home");
-    expect(mockSyncLeadCaptureFilesToRepo).toHaveBeenCalledWith(REPO, {
-      "/": "list_home",
-      "/pricing": "list_pricing",
-    });
+    expect(mockSyncLeadCaptureFilesToRepo).toHaveBeenCalledWith(
+      REPO,
+      { "/": "list_home", "/pricing": "list_pricing" },
+      undefined,
+      undefined,
+    );
     expect(res.body.captureSyncWarning).toBeUndefined();
+  });
+
+  it("ENG-486: threads the site root's metaPixelId/metaAdAccountId through even when a SUB-page's lead list changes (never strips a configured pixel out of the route)", async () => {
+    const rootWithPixel = { ...rootPage, metaPixelId: "1012387921717047", metaAdAccountId: "act_555" };
+    mockGetLandingPageById.mockResolvedValue(pricingPage); // the page being updated is the SUB-page, not root
+    mockGetLandingPagesByOwner.mockResolvedValue([rootWithPixel, pricingPage, otherSitePage]);
+
+    const res = await request(app)
+      .patch("/api/landing-pages/v0/generated/p2/lead-list")
+      .send({ leadListId: "list_pricing" });
+
+    expect(res.status).toBe(200);
+    expect(mockSyncLeadCaptureFilesToRepo).toHaveBeenCalledWith(
+      REPO,
+      expect.any(Object),
+      "1012387921717047",
+      "act_555",
+    );
   });
 
   it("detaching REMOVES the page from the map and resyncs", async () => {
@@ -394,9 +418,12 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
 
     expect(res.status).toBe(200);
     expect(mockUpdateLeadList).toHaveBeenCalledWith("p1", "u1", null);
-    expect(mockSyncLeadCaptureFilesToRepo).toHaveBeenCalledWith(REPO, {
-      "/pricing": "list_pricing",
-    });
+    expect(mockSyncLeadCaptureFilesToRepo).toHaveBeenCalledWith(
+      REPO,
+      { "/pricing": "list_pricing" },
+      undefined,
+      undefined,
+    );
   });
 
   it("a GitHub failure does not lose the DB write — 200 with captureSyncWarning", async () => {

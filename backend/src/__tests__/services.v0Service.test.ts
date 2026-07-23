@@ -982,22 +982,23 @@ describe("v0Service - multi-site routing (DURABLE_LANDING_GENERATION=on)", () =>
     else process.env.DURABLE_LANDING_GENERATION = ORIG;
   });
 
-  const siteRow = (over: Record<string, any> = {}) => ({
-    promise: () =>
-      Promise.resolve({
-        Items: [
-          {
-            id: "site-1",
-            userId: "user-1",
-            githubRepoUrl: "https://github.com/o/r",
-            vercelProjectId: "vp1",
-            isRootPage: true,
-            siteId: "site-1",
-            ...over,
-          },
-        ],
-      }),
-  });
+  const siteRow = (over: Record<string, any> = {}) => {
+    const item = {
+      id: "site-1",
+      userId: "user-1",
+      githubRepoUrl: "https://github.com/o/r",
+      vercelProjectId: "vp1",
+      isRootPage: true,
+      siteId: "site-1",
+      ...over,
+    };
+    // ENG-478: findUserSiteRecord verifies its GSI-selected candidate with a
+    // strongly-consistent GetItem by id — this file's shared mockGet defaults to
+    // `{Item: null}`, so every caller of siteRow() needs a matching get() response
+    // too, or the candidate above would look archived/deleted and return null.
+    mockGet.mockReturnValue({ promise: () => Promise.resolve({ Item: item }) });
+    return { promise: () => Promise.resolve({ Items: [item] }) };
+  };
   const noSites = () => ({ promise: () => Promise.resolve({ Items: [] }) });
 
   it("unified default + no existing site → creates the first site root", async () => {
@@ -4319,6 +4320,13 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     mockQuery.mockReturnValueOnce({
       promise: () => Promise.resolve({ Items: [existingSiteRecord] }),
     });
+    // ENG-478: findUserSiteRecord now verifies its GSI-selected candidate with a
+    // strongly-consistent GetItem by primary key. This file's shared mockGet
+    // defaults to `{Item: null}` (used elsewhere for unrelated lookups), which would
+    // make every test here see "no site found" unless paired explicitly.
+    mockGet.mockReturnValueOnce({
+      promise: () => Promise.resolve({ Item: existingSiteRecord }),
+    });
   };
 
   // Setup: mock v0 chat creation, polling, and zip download
@@ -4667,7 +4675,11 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     // 1 repair-scan tree listing + 1 GitHub ref + 2 Vercel polls.
     // The tree listing is the whole cost of the poisoned-import scan on a healthy repo:
     // an empty/clean tree yields no candidates, so no file contents are ever read.
-    expect(mockAxiosGet).toHaveBeenCalledTimes(4);
+    // Plus 3 more (ENG-483): the post-deploy capture-route sync reads middleware.ts,
+    // app/api/capture/route.ts, and domainMap.ts to decide whether LIST_BY_PATH needs
+    // updating. No mock is queued for them here, so all 3 reject and the sync gives up
+    // silently (never blocking the deploy) — still 3 real GET attempts.
+    expect(mockAxiosGet).toHaveBeenCalledTimes(7);
   });
 
   it("SUCCESS: sub-page deployedUrl uses customDomainUrl as base when existingPage has one", async () => {
@@ -4678,6 +4690,9 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     };
     mockQuery.mockReturnValueOnce({
       promise: () => Promise.resolve({ Items: [siteWithCustomDomain] }),
+    });
+    mockGet.mockReturnValueOnce({
+      promise: () => Promise.resolve({ Item: siteWithCustomDomain }),
     });
     await setupV0Mocks();
     setupGitHubMocks();
@@ -4693,6 +4708,260 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     expect(result.status).toBe("deployed");
     expect(result.deployedUrl).toContain("https://my-brand.agentwebforms.com/");
     expect(result.deployedUrl).not.toContain("vercel.app");
+  });
+
+  // ENG-483: addPageToExistingRepo used to push only the new page's own files, never
+  // updating the shared app/api/capture/route.ts LIST_BY_PATH map — so a new sub-page's
+  // lead form 422'd forever until an unrelated GTM/Pixel override happened to resync it.
+  describe("ENG-483: sub-page registered in shared capture route", () => {
+    // Sync's own GitHub calls, run AFTER the page's own commit + Vercel poll succeed:
+    // Promise.all([middleware.ts, capture route, domainMap.ts]) reads, then (if different)
+    // a ref read, a blob per changed file, a tree, a commit, and a ref patch.
+    const setupCaptureRouteSyncMocks = (existingCaptureRouteContent: string) => {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from("stale middleware").toString("base64") },
+      }); // middleware.ts (deliberately stale so the sync always proceeds to commit)
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from(existingCaptureRouteContent).toString("base64") },
+      }); // app/api/capture/route.ts
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from("{}").toString("base64") },
+      }); // domainMap.ts (already exists)
+      mockAxiosGet.mockResolvedValueOnce({ data: { object: { sha: "sync_base_sha" } } }); // ref/heads/main
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_middleware" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_capture_route" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "sync_tree_sha" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "sync_commit_sha" } });
+      mockAxiosPatch.mockResolvedValueOnce({ data: {} }); // ref update
+    };
+
+    const committedCaptureRouteContent = (): string | undefined =>
+      mockAxiosPost.mock.calls
+        .filter((c) => typeof c[0] === "string" && c[0].includes("/git/blobs"))
+        .map((c) => Buffer.from(c[1].content, "base64").toString("utf8"))
+        .find((content) => content.includes("LIST_BY_PATH"));
+
+    it("SUCCESS: new sub-page's path + an existing sibling's path both land in the committed LIST_BY_PATH", async () => {
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      // findReusablePageForRoute's own listLandingPages query runs BEFORE
+      // addPageToExistingRepo — must be satisfied first so it doesn't consume the
+      // siblings mock meant for this fix's own getLandingPagesByOwner call.
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Items: [
+              existingSiteRecord,
+              {
+                id: "sibling-1",
+                userId: "user-1",
+                githubRepoUrl: existingSiteRecord.githubRepoUrl,
+                slug: "features",
+                leadListId: "list_features",
+              },
+            ],
+          }),
+      });
+      setupCaptureRouteSyncMocks('const LIST_BY_PATH: Record<string, string> = {"/features":"list_features"};');
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create pricing page with a lead form",
+        "Pricing",
+        {},
+        "list_pricing"
+      );
+
+      expect(result.status).toBe("deployed");
+      const capturedContent = committedCaptureRouteContent();
+      expect(capturedContent).toBeDefined();
+      expect(capturedContent).toContain('"/pricing": "list_pricing"');
+      expect(capturedContent).toContain('"/features": "list_features"');
+    });
+
+    it("SUCCESS: new sub-page has no leadListId → sync still commits siblings, new page's own path stays absent", async () => {
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Items: [
+              existingSiteRecord,
+              {
+                id: "sibling-1",
+                userId: "user-1",
+                githubRepoUrl: existingSiteRecord.githubRepoUrl,
+                slug: "features",
+                leadListId: "list_features",
+              },
+            ],
+          }),
+      });
+      setupCaptureRouteSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create an about page",
+        "About Page",
+        {}
+        // no leadListId
+      );
+
+      expect(result.status).toBe("deployed");
+      const capturedContent = committedCaptureRouteContent();
+      expect(capturedContent).toBeDefined();
+      expect(capturedContent).toContain('"/features": "list_features"');
+      expect(capturedContent).not.toContain("/about-page");
+    });
+
+    it("FAIL: sibling lookup (getLandingPagesByOwner) throws → page still deploys, error only logged", async () => {
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.reject(new Error("DynamoDB unavailable")),
+      });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a newsletter signup page",
+        "Newsletter",
+        {},
+        "list_newsletter"
+      );
+
+      expect(result.status).toBe("deployed");
+    });
+
+    it("FAIL: capture-route sync's own GitHub read fails → page still deploys, error only logged", async () => {
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Items: [existingSiteRecord] }),
+      });
+      // middleware.ts read fails with a non-404 error inside the Promise.all —
+      // syncLeadCaptureFilesToRepo must swallow this, not let it escape.
+      mockAxiosGet.mockRejectedValueOnce(new Error("GitHub 500"));
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from("const LIST_BY_PATH = {};").toString("base64") },
+      });
+      mockAxiosGet.mockResolvedValueOnce({ data: { content: Buffer.from("{}").toString("base64") } });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a contact page",
+        "Contact",
+        {},
+        "list_contact"
+      );
+
+      expect(result.status).toBe("deployed");
+    });
+
+    // The sync build's Vercel poll is fire-and-forget (never awaited by
+    // addPageToExistingRepo — see the "bulk sub-page add" latency note at its call
+    // site), so these two tests must drain it explicitly before asserting, or its
+    // queued mocks would leak into whichever test runs next.
+    const flushFireAndForgetPoll = () => new Promise((r) => setTimeout(r, 20));
+
+    it("SUCCESS: capture-route sync commit's own Vercel build is polled (fire-and-forget) and confirmed READY", async () => {
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [existingSiteRecord] }) });
+      setupCaptureRouteSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+      // The sync's own Vercel poll — matches sync_commit_sha, the sha
+      // setupCaptureRouteSyncMocks' commit POST returns.
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          deployments: [
+            { uid: "dpl_sync", readyState: "READY", meta: { githubCommitSha: "sync_commit_sha" } },
+          ],
+        },
+      });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a careers page",
+        "Careers",
+        {},
+        "list_careers"
+      );
+
+      // generateLandingPage resolves WITHOUT waiting for the sync poll — proves it's
+      // genuinely non-blocking, not just fast in this test's 0ms-interval config.
+      expect(result.status).toBe("deployed");
+
+      await flushFireAndForgetPoll();
+      const loggedSyncBuildIssue = [...warnSpy.mock.calls, ...errorSpy.mock.calls].some((call) =>
+        String(call[0]).includes("ENG-483: capture-route sync build")
+      );
+      expect(loggedSyncBuildIssue).toBe(false);
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it("FAIL: capture-route sync commit's own Vercel build errors (fire-and-forget) → page already deployed, error only logged", async () => {
+      const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [existingSiteRecord] }) });
+      setupCaptureRouteSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+      // Sync's own Vercel poll: build for sync_commit_sha errored.
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { deployments: [{ uid: "dpl_sync_fail", readyState: "ERROR", meta: { githubCommitSha: "sync_commit_sha" } }] },
+      });
+      // getVercelBuildErrors' own log-fetch call
+      mockAxiosGet.mockResolvedValueOnce({
+        data: [{ type: "stderr", payload: { text: "Module not found: @/lib/stale" } }],
+      });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a team page",
+        "Team",
+        {},
+        "list_team"
+      );
+
+      // The page's OWN content already deployed successfully, and the poll hasn't
+      // even run yet at this point — the sync's build failing must never flip this
+      // page to "failed".
+      expect(result.status).toBe("deployed");
+
+      await flushFireAndForgetPoll();
+      const loggedBuildFailure = errorSpy.mock.calls.some(
+        (call) =>
+          String(call[0]).includes("ENG-483: capture-route sync build FAILED") &&
+          String(call[0]).includes("Module not found: @/lib/stale")
+      );
+      expect(loggedBuildFailure).toBe(true);
+      errorSpy.mockRestore();
+    });
   });
 });
 
@@ -4725,6 +4994,9 @@ describe("v0Service - loadDefaultTemplateOutline fallback", () => {
   const setupFullSuccess = async () => {
     const zipBuffer = await createTestZip();
     mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [existingSiteRecord] }) });
+    // ENG-478: findUserSiteRecord verifies its GSI candidate with a strongly-
+    // consistent GetItem — this file's shared mockGet defaults to `{Item: null}`.
+    mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: existingSiteRecord }) });
     mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
     mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "version_new" } });
     mockChatsDownloadVersion.mockResolvedValueOnce(zipBuffer);

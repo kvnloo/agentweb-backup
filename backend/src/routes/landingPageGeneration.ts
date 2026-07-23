@@ -2243,7 +2243,22 @@ async function syncLeadCaptureForPage(
       listByPath[page.slug ? `/${page.slug}` : "/"] = leadListId;
     }
 
-    const result = await syncLeadCaptureFilesToRepo(repoFullName, listByPath);
+    // ENG-486: syncLeadCaptureFilesToRepo fully regenerates app/api/capture/route.ts,
+    // so omitting the site's pixelId/metaAdAccountId here would silently strip an
+    // already-configured Meta pixel back out of the route on every lead-list attach.
+    // metaPixelId/metaAdAccountId live on the SITE ROOT record, which may not be `page`
+    // itself (a lead list can be attached to any sub-page) — find it among siblings.
+    // The root's own id equals the site's siteId by construction — more reliable than
+    // the isRootPage flag, which isn't guaranteed set on every record.
+    const siteId = page.siteId ?? page.id;
+    const rootRecord = page.id === siteId ? page : siblings.find((p) => p.id === siteId);
+
+    const result = await syncLeadCaptureFilesToRepo(
+      repoFullName,
+      listByPath,
+      rootRecord?.metaPixelId,
+      rootRecord?.metaAdAccountId,
+    );
     if (result.committed || result.reason === "up-to-date") return undefined;
     return `Lead list saved, but the live site was not updated (${result.reason}). It will be applied on the next deploy or retry.`;
   } catch (err: any) {

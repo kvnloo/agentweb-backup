@@ -1898,6 +1898,80 @@ async function addPageToExistingRepo(
       };
     }
 
+    // Register this new page's own path in the repo-level capture route (ENG-483).
+    // Without this, a new sub-page's lead form 422s forever ("no lead list configured")
+    // until some UNRELATED action (a GTM/Pixel manual override) happens to resync the
+    // whole-site LIST_BY_PATH map as a side effect. Best-effort: a site whose sibling
+    // lookup or GitHub sync fails must still keep its just-deployed page. Reuses the
+    // exact ENG-310 mechanism (`syncLeadCaptureForPage` in routes/landingPageGeneration.ts)
+    // which does this same thing when a lead list is attached after the fact.
+    try {
+      const siblings = await getLandingPagesByOwner(userId);
+      const listByPath: Record<string, string> = {};
+      for (const p of siblings) {
+        if (p.id === id) continue;
+        if (p.githubRepoUrl !== existingPage.githubRepoUrl) continue;
+        if (!p.leadListId) continue;
+        listByPath[p.slug ? `/${p.slug}` : "/"] = p.leadListId;
+      }
+      if (leadListId) listByPath[`/${slug}`] = leadListId;
+
+      // ENG-486: syncLeadCaptureFilesToRepo fully regenerates app/api/capture/route.ts,
+      // so a sync that omits the site's pixelId/metaAdAccountId would silently strip an
+      // already-configured Meta pixel back out of the route. existingPage IS the site's
+      // root record (passed in by the caller), so its own metaPixelId/metaAdAccountId are
+      // already the right values — no extra lookup needed.
+      const syncResult = await syncLeadCaptureFilesToRepo(
+        repoFullName,
+        listByPath,
+        existingPage.metaPixelId,
+        existingPage.metaAdAccountId,
+      );
+      if (!syncResult.committed && syncResult.reason !== "up-to-date") {
+        console.warn(
+          `[V0 SERVICE] ENG-483: lead-capture route sync did not commit for new page /${slug}: ${syncResult.reason}`
+        );
+      } else if (syncResult.committed && syncResult.pushedCommitSha) {
+        // Fire-and-forget: never block returning this page as deployed on a SECOND
+        // Vercel build. A concurrent sub-page add is the common case ENG-483 exists
+        // for, and it routinely supersedes this exact commit before Vercel ever
+        // finishes building it — awaiting this poll here would hang every bulk/rapid
+        // page add for up to the full poll window (production: up to 5 minutes) for a
+        // build result that, in the common case, will never resolve to this commit at
+        // all. Visibility only: the page's OWN content already deployed successfully
+        // above, so nothing here can change this page's outcome, only get logged.
+        const { pushedCommitSha, pushTimestampMs } = syncResult;
+        void pollVercelDeployment(existingPage.vercelProjectId!, vercelToken, pushTimestampMs, pushedCommitSha)
+          .then((syncDeployResult) => {
+            if (syncDeployResult.buildStatus === "error") {
+              console.error(
+                `[V0 SERVICE] ENG-483: capture-route sync build FAILED for ${repoFullName} ` +
+                  `(commit ${pushedCommitSha.substring(0, 7)}): ${syncDeployResult.buildError}. ` +
+                  `Page /${slug} is deployed, but its lead form (and possibly siblings') may still 422 ` +
+                  `until the route resyncs.`
+              );
+            } else if (syncDeployResult.buildStatus === "timeout") {
+              console.warn(
+                `[V0 SERVICE] ENG-483: capture-route sync build for ${repoFullName} (commit ` +
+                  `${pushedCommitSha.substring(0, 7)}) did not confirm READY within the poll window — ` +
+                  `likely just slow, or superseded by a newer concurrent commit; not treated as a failure.`
+              );
+            }
+          })
+          .catch((pollErr: any) => {
+            console.error(
+              `[V0 SERVICE] ENG-483: capture-route sync build poll itself failed for ${repoFullName}:`,
+              pollErr?.message || pollErr
+            );
+          });
+      }
+    } catch (syncErr: any) {
+      console.error(
+        `[V0 SERVICE] ENG-483: lead-capture route sync failed for new page /${slug}:`,
+        syncErr?.message || syncErr
+      );
+    }
+
     // Update record to deployed, re-persisting repo fields in case they were missing
     const deployedSubPage: GeneratedLandingPage = {
       ...record,
@@ -4871,10 +4945,35 @@ export async function findUserSiteRecord(userId: string): Promise<GeneratedLandi
   });
 
   // Prefer: 1) explicit root page, 2) page with v0ChatId (original v0 page), 3) any with githubRepoUrl
-  const siteRecord =
+  let siteRecord =
     pages.find((p) => p.isRootPage && p.githubRepoUrl) ||
     pages.find((p) => p.v0ChatId && p.githubRepoUrl) ||
     pages.find((p) => !!p.githubRepoUrl);
+
+  if (siteRecord) {
+    // ENG-478: the query above reads via a GSI (UserIdIndex), which DynamoDB can only
+    // ever serve eventually consistent — ConsistentRead is not supported on GSI
+    // queries at all. So instead of trying to strengthen that read, verify the ONE
+    // candidate it picked with a strongly-consistent GetItem on the base table's
+    // primary key (id). This closes the race where a concurrent delete
+    // (deleteLandingPageByRecord sets archived:true on this exact id) lands in the
+    // window between the GSI read and this function returning its result — e.g. a
+    // fast double-click or a second tab generating a page right after a delete,
+    // which would otherwise attach the new page to a site whose GitHub route tree
+    // is being/has been torn down.
+    const fresh = await dynamodb
+      .get({ TableName: TABLE_NAME, Key: { id: siteRecord.id }, ConsistentRead: true })
+      .promise();
+    if (!fresh.Item || fresh.Item.archived || fresh.Item.userId !== userId) {
+      // Archived, hard-deleted, or (defensively) no longer owned by this caller
+      // since the GSI read — do not fall back to another candidate in `pages`,
+      // every item in it came from the same single, equally stale read. Returning
+      // null is safe: the caller treats "no site" as "create a fresh one", the
+      // right outcome instead of attaching to a dying repo or someone else's site.
+      return null;
+    }
+    siteRecord = fresh.Item as GeneratedLandingPage;
+  }
 
   if (siteRecord && !siteRecord.isRootPage) {
     // Backfill: mark this as the root page
@@ -5572,7 +5671,7 @@ export async function syncLeadCaptureFilesToRepo(
   /** Threaded through to buildCaptureRoute — see its own doc comment. */
   pixelId?: string,
   metaAccountId?: string,
-): Promise<{ committed: boolean; reason?: string }> {
+): Promise<{ committed: boolean; reason?: string; pushedCommitSha?: string; pushTimestampMs?: number }> {
   try {
     const { token: ghToken } = await getGitHubOrgToken();
     const ghHeaders = {
@@ -5614,48 +5713,19 @@ export async function syncLeadCaptureFilesToRepo(
       filesToCommit.push({ path: "domainMap.ts", content: buildDomainMapFile({}) });
     }
 
-    const refRes = await axios.get<any>(
-      `https://api.github.com/repos/${repoFullName}/git/ref/heads/main`,
-      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
-    );
-    const latestCommitSha = refRes.data.object.sha;
-
-    const treeItems = await Promise.all(
-      filesToCommit.map(async (file) => {
-        const blobRes = await axios.post<any>(
-          `https://api.github.com/repos/${repoFullName}/git/blobs`,
-          { content: Buffer.from(file.content).toString("base64"), encoding: "base64" },
-          { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
-        );
-        return {
-          path: file.path,
-          mode: "100644" as const,
-          type: "blob" as const,
-          sha: blobRes.data.sha,
-        };
-      })
-    );
-
-    const treeRes = await axios.post<any>(
-      `https://api.github.com/repos/${repoFullName}/git/trees`,
-      { base_tree: latestCommitSha, tree: treeItems },
-      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
-    );
-
-    const commitRes = await axios.post<any>(
-      `https://api.github.com/repos/${repoFullName}/git/commits`,
-      {
-        message: "chore: sync lead-capture route and middleware",
-        tree: treeRes.data.sha,
-        parents: [latestCommitSha],
-      },
-      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
-    );
-
-    await axios.patch<any>(
-      `https://api.github.com/repos/${repoFullName}/git/refs/heads/main`,
-      { sha: commitRes.data.sha },
-      { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
+    // ENG-483: reuse the same retry-with-rebase commit path the page's own commit uses
+    // (commitFilesToRepoMain) instead of a bare, single-shot blob/tree/commit/patch. A
+    // sub-page add and a lead-list attach (or two sub-page adds) can land on the same
+    // repo close together; a raw ref PATCH here would surface that as a non-fast-forward
+    // that this function used to just log and give up on, leaving LIST_BY_PATH stale.
+    const { pushedCommitSha, pushTimestampMs } = await commitFilesToRepoMain(
+      repoFullName,
+      ghHeaders,
+      filesToCommit.map((file) => ({ path: file.path, content: Buffer.from(file.content) })),
+      "chore: sync lead-capture route and middleware",
+      2 // this sync is best-effort (caller only logs a warning on failure) — one rebase
+        // retry covers the common single-concurrent-writer race without piling up the
+        // full 4-attempt backoff behind an already-deployed page.
     );
 
     const wired = Object.entries(listByPath);
@@ -5668,7 +5738,7 @@ export async function syncLeadCaptureFilesToRepo(
           : "NO page of this site has a lead list — its forms will fail loudly"
       }`
     );
-    return { committed: true };
+    return { committed: true, pushedCommitSha, pushTimestampMs };
   } catch (err: any) {
     const reason = err?.response?.data?.message || err?.message || String(err);
     console.error(
