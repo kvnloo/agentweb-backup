@@ -4706,7 +4706,15 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       expect(result.status).toBe("deployed");
     });
 
-    it("SUCCESS: capture-route sync commit's own Vercel build is polled and confirmed READY", async () => {
+    // The sync build's Vercel poll is fire-and-forget (never awaited by
+    // addPageToExistingRepo — see the "bulk sub-page add" latency note at its call
+    // site), so these two tests must drain it explicitly before asserting, or its
+    // queued mocks would leak into whichever test runs next.
+    const flushFireAndForgetPoll = () => new Promise((r) => setTimeout(r, 20));
+
+    it("SUCCESS: capture-route sync commit's own Vercel build is polled (fire-and-forget) and confirmed READY", async () => {
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
       setupSiteRecordMock();
       await setupV0Mocks();
       setupGitHubMocks();
@@ -4733,10 +4741,21 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
         "list_careers"
       );
 
+      // generateLandingPage resolves WITHOUT waiting for the sync poll — proves it's
+      // genuinely non-blocking, not just fast in this test's 0ms-interval config.
       expect(result.status).toBe("deployed");
+
+      await flushFireAndForgetPoll();
+      const loggedSyncBuildIssue = [...warnSpy.mock.calls, ...errorSpy.mock.calls].some((call) =>
+        String(call[0]).includes("ENG-483: capture-route sync build")
+      );
+      expect(loggedSyncBuildIssue).toBe(false);
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
     });
 
-    it("FAIL: capture-route sync commit's own Vercel build errors → page still deploys, error only logged", async () => {
+    it("FAIL: capture-route sync commit's own Vercel build errors (fire-and-forget) → page already deployed, error only logged", async () => {
+      const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
       setupSiteRecordMock();
       await setupV0Mocks();
       setupGitHubMocks();
@@ -4762,9 +4781,19 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
         "list_team"
       );
 
-      // The page's OWN content already deployed successfully — the sync's build
-      // failing must never flip this page to "failed".
+      // The page's OWN content already deployed successfully, and the poll hasn't
+      // even run yet at this point — the sync's build failing must never flip this
+      // page to "failed".
       expect(result.status).toBe("deployed");
+
+      await flushFireAndForgetPoll();
+      const loggedBuildFailure = errorSpy.mock.calls.some(
+        (call) =>
+          String(call[0]).includes("ENG-483: capture-route sync build FAILED") &&
+          String(call[0]).includes("Module not found: @/lib/stale")
+      );
+      expect(loggedBuildFailure).toBe(true);
+      errorSpy.mockRestore();
     });
   });
 });
