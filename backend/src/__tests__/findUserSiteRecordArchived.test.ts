@@ -158,6 +158,33 @@ describe("findUserSiteRecord archived filter", () => {
       expect(result).toBeNull();
     });
 
+    it("FAIL: strongly-consistent read shows the record now owned by a different user — returns null, never someone else's site (Greptile)", async () => {
+      allItems = [
+        {
+          id: "root-1",
+          userId: "user-1",
+          isRootPage: true,
+          githubRepoUrl: "https://github.com/org/reassigned-repo",
+        },
+      ];
+      // No feature in this codebase actually reassigns a landing page's userId today —
+      // this is a defensive check, not a reproduction of an existing mechanism. Still
+      // worth pinning: if `id` ever pointed to a row some other write had claimed by
+      // the time of the verify, this must never hand it back as the caller's own site.
+      getById = {
+        "root-1": {
+          id: "root-1",
+          userId: "someone-else",
+          isRootPage: true,
+          githubRepoUrl: "https://github.com/org/reassigned-repo",
+        },
+      };
+
+      const result = await findUserSiteRecord("user-1");
+
+      expect(result).toBeNull();
+    });
+
     it("FAIL: strongly-consistent read finds no Item at all (hard-deleted between reads) — returns null", async () => {
       allItems = [
         {
