@@ -48,15 +48,19 @@ interface GetPostsResult {
 }
 
 /**
- * Account IDs eligible for force_reload — i.e. the same social accounts
- * getPostsForUser would actually hit. Used by the route to key the
- * force_reload cooldown to real, owned accounts instead of arbitrary
- * caller-supplied query values.
+ * Account IDs eligible for force_reload — i.e. the accounts where force_reload
+ * actually does something. Only LinkedIn company pages consult it: personal
+ * LinkedIn profiles always read from the DB (linkedInAdapter.listPosts ignores
+ * force_reload for account_type 'personal'), and Instagram's adapter doesn't
+ * even accept a force_reload option. Used by the route to key the force_reload
+ * cooldown to real, owned, force-reload-eligible accounts — including a
+ * no-op account here would let refreshing it wrongly cool down (429) an
+ * "all accounts" refresh that hasn't touched an eligible company page yet.
  */
 export async function getSocialAccountIds(userId: string): Promise<string[]> {
   const allAccounts = await getAccountsByUserId(userId);
   return allAccounts
-    .filter(a => SOCIAL_PLATFORMS.includes(a.platform))
+    .filter(a => a.platform === 'linkedin' && (a.config as LinkedInConfig)?.account_type === 'company_page')
     .map(a => a.account_id);
 }
 
