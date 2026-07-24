@@ -4637,6 +4637,17 @@ export class AgentModeService {
     'fathom_get_meetings',
     'fathom_get_transcript',
     'fathom_get_onboarding_context',
+    // ENG-396/400: re-exposed after being found dormant-only in practice (a
+    // user asking Emma to "confirm settings via a card before building"
+    // couldn't get one at all — she has no way to render a real card and was
+    // fabricating fake HTML in prose instead, since the deterministic Meta
+    // objective gate only auto-fires at an actual CAMPAIGN CREATE attempt, not
+    // proactively). The gate itself (resolveCampaignObjectiveGate) is
+    // UNCHANGED and fully independent of this exposure — it enforces the
+    // objective at create time regardless of whether Emma also calls this
+    // voluntarily. Restriction to Meta-only is prompt-level (tool description),
+    // not code-enforced — see emma/tools.ts for the explicit scope language.
+    'ask_user_question',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
@@ -4675,15 +4686,6 @@ export class AgentModeService {
     ADMIN_SKILL_TOOL_NAMES.forEach(t => excludedTools.add(t));
     // get_visual_context is page-embedded Emma only — never expose in Agent Mode or __other_skills__
     excludedTools.add('get_visual_context');
-    // ENG-396/400: ask_user_question must stay Emma-uncallable everywhere except its
-    // one sanctioned consumer, the Meta objective gate (resolveCampaignObjectiveGate),
-    // which builds/persists the question directly and never goes through this tool.
-    // It's deliberately NOT in FOUNDATION_TOOLS (see emma/tools.ts registration
-    // comment) — but that alone isn't enough: an unassociated, non-foundation tool
-    // still falls into the __other_skills__ catch-all bucket and becomes
-    // self-installable via install_skills, which is a bigger exposure than a single
-    // foundation slot. Exclude it explicitly so it truly has zero exposure surface.
-    excludedTools.add('ask_user_question');
 
     // Get all registered tools and find those not in any skill
     const allTools = this.toolRegistry.getAllTools();

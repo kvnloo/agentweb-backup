@@ -102,23 +102,25 @@ emmaToolRegistry.register({
 // the answer is persisted structurally on the session and only an inbound USER
 // selection resolves it — the model cannot self-answer.
 //
-// DELIBERATELY NOT in MANDATORY_FOUNDATION_TOOLS: ENG-396/400's stated scope is
-// "the first (and for now only) consumer is the Meta campaign-objective ask" —
-// exposing this as a general Emma-callable tool would let the model reach for
-// it in any context it judges high-stakes, which is the general-purpose future
-// this primitive is headed toward, but NOT what's authorized yet. It doesn't
-// need to be — the Meta objective gate (agentModeService.ts,
-// resolveCampaignObjectiveGate) builds and persists the question DIRECTLY
-// (buildPendingUserQuestion + chatbotDb.updateSessionAskUserQuestion), without
-// ever calling through the tool registry, so ENG-400 works fully with this
-// tool registration inert. Registering the handler here (rather than deleting
-// it) keeps the validated primitive ready for its next consumer without
-// widening exposure today.
+// EXPOSED IN MANDATORY_FOUNDATION_TOOLS (re-enabled 2026-07-24): the Meta
+// objective gate (agentModeService.ts, resolveCampaignObjectiveGate) enforces
+// the objective automatically ONLY at an actual CAMPAIGN CREATE attempt — it
+// never fires proactively. A user asking Emma to "confirm settings via cards
+// before building anything" found Emma with nothing real to reach for, and she
+// fabricated fake HTML "cards" in prose instead (no tool call, no persisted
+// question, no real answer channel). Re-exposing this tool restores the
+// proactive-ask UX. This is a PROMPT-LEVEL restriction, not code-enforced —
+// the description below is the only thing keeping Emma from reaching for this
+// outside Meta objective; the deterministic gate itself is unaffected either
+// way and enforces the objective at create time regardless of whether this
+// tool is ever called voluntarily.
 emmaToolRegistry.register({
   name: 'ask_user_question',
   definition: {
     name: 'ask_user_question',
-    description: `Ask the user a structured, blocking multiple-choice question and STOP until they pick. Use this ONLY for a decision that is high-stakes or IRREVERSIBLE and that the user (not you) must own — e.g. an immutable Meta campaign objective. Do NOT use it for routine confirmations or reversible choices.
+    description: `Ask the user a structured, blocking multiple-choice question and STOP until they pick.
+
+SCOPE — READ THIS FIRST: as of now, use this ONLY for confirming the Meta campaign objective before a CAMPAIGN CREATE (immutable, high-stakes, and the one sanctioned use of this tool). Do NOT use it for any other decision — not ad category, not which pixel event to optimize for, not budget, not targeting, not "should I use account X or Y", not any other platform (Google Ads, LinkedIn, etc.), and not routine confirmations. For everything else: use your own best judgment and proceed (reversible choices are yours to make; the existing target-confirmation flow on writes still applies where it already does). Calling this tool for a non-Meta-objective decision is a misuse of scope, not a feature.
 
 Provide 2–4 options, each with a one-line \`consequence\`. EXACTLY ONE option must be marked recommended:true with a one-line \`why\` grounded in real signal from this session (e.g. "162 LEAD events fired on your pixel in the last 30d") — the recommendation is the point. Optionally set allow_emma_decide:true to offer a "Let Emma decide" delegation button (proceeds with the recommended option, logged).
 
