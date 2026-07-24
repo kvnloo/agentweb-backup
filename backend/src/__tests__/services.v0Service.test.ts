@@ -151,6 +151,9 @@ import {
   listLandingPages,
   deleteLandingPage,
   validateV0Output,
+  collectMissingInternalImports,
+  detectIncompleteSyntheticPage,
+  repairMisrootedImports,
   V0OutputValidationError,
   BrandContext,
   remapFilesForSubPage,
@@ -948,22 +951,23 @@ describe("v0Service - multi-site routing (DURABLE_LANDING_GENERATION=on)", () =>
     else process.env.DURABLE_LANDING_GENERATION = ORIG;
   });
 
-  const siteRow = (over: Record<string, any> = {}) => ({
-    promise: () =>
-      Promise.resolve({
-        Items: [
-          {
-            id: "site-1",
-            userId: "user-1",
-            githubRepoUrl: "https://github.com/o/r",
-            vercelProjectId: "vp1",
-            isRootPage: true,
-            siteId: "site-1",
-            ...over,
-          },
-        ],
-      }),
-  });
+  const siteRow = (over: Record<string, any> = {}) => {
+    const item = {
+      id: "site-1",
+      userId: "user-1",
+      githubRepoUrl: "https://github.com/o/r",
+      vercelProjectId: "vp1",
+      isRootPage: true,
+      siteId: "site-1",
+      ...over,
+    };
+    // ENG-478: findUserSiteRecord verifies its GSI-selected candidate with a
+    // strongly-consistent GetItem by id — this file's shared mockGet defaults to
+    // `{Item: null}`, so every caller of siteRow() needs a matching get() response
+    // too, or the candidate above would look archived/deleted and return null.
+    mockGet.mockReturnValue({ promise: () => Promise.resolve({ Item: item }) });
+    return { promise: () => Promise.resolve({ Items: [item] }) };
+  };
   const noSites = () => ({ promise: () => Promise.resolve({ Items: [] }) });
 
   it("unified default + no existing site → creates the first site root", async () => {
@@ -2791,6 +2795,9 @@ export default function Page() {
           "app/page.tsx",
           VALID_TSX + `\nasync function load() { const m = await import("./heavy-component"); return m; }`
         ),
+        // ENG-384: the target file must exist, else the missing-file check (check 7) rightly
+        // flags it — this test's point is only that a RELATIVE specifier isn't a denylisted bare word.
+        makeFile("app/heavy-component.tsx", `export default function H() { return null; }`),
       ];
       expect(() => validateV0Output(files)).not.toThrow();
     });
@@ -2899,6 +2906,217 @@ export default function Page() {
       });
     });
   });
+
+  // ENG-384: v0 sometimes references an intra-project file it never generated — a
+  // syntactically legitimate relative or `@/` import pointing at a component missing from the
+  // zip (e.g. `@/components/compare-table` with no compare-table.tsx). The alias resolves
+  // correctly; the file simply is not there, so `next build` fails "Module not found". This is
+  // the OPPOSITE shape from ENG-374's bare-import denylist, which structurally cannot see it.
+  describe("missing-file import check (ENG-384)", () => {
+    it("FAIL: flags an @/ import of a component that was never generated", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX),
+        makeFile(
+          "components/compare-page.tsx",
+          `import CompareTable from "@/components/compare-table"\nexport default function Compare() { return <CompareTable />; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(files)).toThrow(/not generated/i);
+      expect(() => validateV0Output(files)).toThrow(/@\/components\/compare-table/);
+    });
+
+    it("FAIL: flags a relative import of a sibling file that was never generated", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX),
+        makeFile(
+          "components/compare-page.tsx",
+          `import CompareTable from "./compare-table"\nexport default function Compare() { return <CompareTable />; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).toThrow(/compare-table/);
+    });
+
+    it("passes when the @/ import DOES resolve to a generated file (any tried extension)", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX),
+        makeFile(
+          "components/compare-page.tsx",
+          `import CompareTable from "@/components/compare-table"\nimport CompareHero from "@/components/compare-hero"\nexport default function Compare() { return <><CompareHero /><CompareTable /></>; }`
+        ),
+        makeFile("components/compare-table.tsx", `export default function T() { return <table />; }`),
+        makeFile("components/compare-hero.tsx", `export default function H() { return <div />; }`),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("passes an @/ import resolved via an index file inside a directory", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX),
+        makeFile(
+          "components/widget.tsx",
+          `import { thing } from "@/lib/helpers"\nexport default function W() { return <div>{thing}</div>; }`
+        ),
+        makeFile("lib/helpers/index.ts", `export const thing = 1;`),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("passes an @/ import of a scaffold-provided file even when v0 omits it from the zip", () => {
+      // lib/utils, app/layout, middleware, domainMap are injected by the deploy pipeline later,
+      // so a legitimate import of one must never be flagged just because this zip lacks it.
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import { cn } from "@/lib/utils"\nimport "@/middleware"\nexport default function Page() { return <div className={cn("a")} />; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("passes a component importing a shadcn ui primitive present via includeDefaultFiles", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import { Button } from "@/components/ui/button"\nexport default function Page() { return <Button />; }`
+        ),
+        makeFile("components/ui/button.tsx", `export function Button() { return <button />; }`),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("does NOT flag non-JS asset imports (css/json/images)", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import "./styles.css"\nimport data from "@/data/config.json"\nimport logo from "@/assets/logo.svg"\n${VALID_TSX}`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("does NOT flag bare package imports (left to ENG-374 / real dependency resolution)", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import React from "react"\nimport { motion } from "framer-motion"\nimport { Icon } from "@radix-ui/react-icons"\n${VALID_TSX}`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("does NOT flag an import that escapes the repo root (unknowable)", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import shared from "../../shared/thing"\n${VALID_TSX}`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("reports ALL missing files across all components in a single aggregated error", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX),
+        makeFile(
+          "components/a.tsx",
+          `import X from "@/components/missing-x"\nexport default function A() { return <X />; }`
+        ),
+        makeFile(
+          "components/b.tsx",
+          `import Y from "./missing-y"\nexport default function B() { return <Y />; }`
+        ),
+      ];
+      let error: V0OutputValidationError | undefined;
+      try {
+        validateV0Output(files);
+      } catch (e) {
+        error = e as V0OutputValidationError;
+      }
+      expect(error).toBeInstanceOf(V0OutputValidationError);
+      expect(error!.message).toContain("components/a.tsx");
+      expect(error!.message).toContain('"@/components/missing-x"');
+      expect(error!.message).toContain("components/b.tsx");
+      expect(error!.message).toContain('"./missing-y"');
+    });
+
+    // Direct unit tests of the pure resolution helper — the resolution logic is the
+    // false-positive-prone part, so it is verified in isolation from the throw trigger.
+    describe("collectMissingInternalImports (resolution logic)", () => {
+      const mk = (path: string, content: string) => ({ path, content: Buffer.from(content) });
+
+      it("returns the exact missing (path, specifier) for a dangling @/ import", () => {
+        const result = collectMissingInternalImports([
+          mk("components/compare-page.tsx", `import T from "@/components/compare-table"`),
+        ]);
+        expect(result).toEqual([
+          { path: "components/compare-page.tsx", specifier: "@/components/compare-table" },
+        ]);
+      });
+
+      it("returns empty when every relative/@ import resolves", () => {
+        const result = collectMissingInternalImports([
+          mk("app/page.tsx", `import H from "@/components/hero"\nimport B from "./page-bits"`),
+          mk("components/hero.tsx", `export default function H() { return null; }`),
+          mk("app/page-bits.ts", `export default 1;`),
+        ]);
+        expect(result).toEqual([]);
+      });
+
+      it("ignores content inside comments and template literals", () => {
+        const result = collectMissingInternalImports([
+          mk(
+            "app/page.tsx",
+            `// import Ghost from "@/components/ghost"\nconst s = \`import Ghost from "@/components/ghost"\`;\nexport default function P() { return null; }`
+          ),
+        ]);
+        expect(result).toEqual([]);
+      });
+
+      it("resolves a relative import against the importing file's own directory", () => {
+        // "./bar" from components/foo.tsx means components/bar — present, so NOT missing.
+        expect(
+          collectMissingInternalImports([
+            mk("components/foo.tsx", `import Bar from "./bar"`),
+            mk("components/bar.tsx", `export default function Bar() { return null; }`),
+          ])
+        ).toEqual([]);
+        // ...but the same specifier from app/foo.tsx means app/bar — absent, so missing.
+        expect(
+          collectMissingInternalImports([mk("app/foo.tsx", `import Bar from "./bar"`)])
+        ).toEqual([{ path: "app/foo.tsx", specifier: "./bar" }]);
+      });
+
+      it("flags a MISSING dynamic import (await import(...))", () => {
+        // DYNAMIC_IMPORT_PATTERN is scanned too — a dangling `await import("@/...")` is just
+        // as unresolvable at build time as a static one.
+        const result = collectMissingInternalImports([
+          mk(
+            "app/page.tsx",
+            `export default async function P() { const m = await import("@/components/missing-dynamic"); return m; }`
+          ),
+        ]);
+        expect(result).toEqual([
+          { path: "app/page.tsx", specifier: "@/components/missing-dynamic" },
+        ]);
+      });
+
+      it("scans a .ts (non-.tsx) importer for dangling imports", () => {
+        // Both extensions are scanned — a plain .ts module with a dangling relative/@ import
+        // fails the build the same way a .tsx one does.
+        const result = collectMissingInternalImports([
+          mk(
+            "lib/data.ts",
+            `import { helper } from "./helpers"\nimport C from "@/components/gone"\nexport const x = helper;`
+          ),
+        ]);
+        expect(result).toEqual([
+          { path: "lib/data.ts", specifier: "./helpers" },
+          { path: "lib/data.ts", specifier: "@/components/gone" },
+        ]);
+      });
+    });
+  });
 });
 
 describe("V0OutputValidationError", () => {
@@ -2907,6 +3125,305 @@ describe("V0OutputValidationError", () => {
     expect(err.name).toBe("V0OutputValidationError");
     expect(err.reason).toBe("test reason");
     expect(err.message).toContain("test reason");
+  });
+});
+
+// =============================================================================
+// ENG-467: incomplete "synthetic stub" page (deploys blank but for the top bar)
+// =============================================================================
+describe("v0Service - incomplete synthetic page check (ENG-467)", () => {
+  const f = (path: string, content: string) => ({ path, content: Buffer.from(content) });
+
+  const NAVBAR = `export default function NavBar() {
+    return <header><nav><a href="#">FocusFlow</a></nav></header>;
+  }`;
+  const HERO = `import ProductMockup from "./ProductMockup";
+  export default function Hero() {
+    return <section><h1>Do your best work</h1><ProductMockup /></section>;
+  }`;
+  const PRODUCT_MOCKUP = `export default function ProductMockup() {
+    return <div className="mockup">screenshot</div>;
+  }`;
+  const THEME_PROVIDER = `export default function ThemeProvider({ children }: { children: React.ReactNode }) {
+    return <>{children}</>;
+  }`;
+
+  // The exact live repro (ENG-467): app/page.tsx is a SyntheticV0PageForDeployment stub that
+  // renders only <NavBar/>, orphaning the Hero + ProductMockup it generated.
+  const reproFiles = () => [
+    f("app/page.tsx", `"use client"\nimport NavBar from "@/components/focusflow/NavBar";\nexport default function SyntheticV0PageForDeployment() {\n  return <NavBar />;\n}`),
+    f("components/focusflow/NavBar.tsx", NAVBAR),
+    f("components/focusflow/Hero.tsx", HERO),
+    f("components/focusflow/ProductMockup.tsx", PRODUCT_MOCKUP),
+    f("components/theme-provider.tsx", THEME_PROVIDER),
+  ];
+
+  describe("detectIncompleteSyntheticPage (detection logic)", () => {
+    it("FAIL: flags the synthetic stub and lists orphaned SECTION components", () => {
+      const result = detectIncompleteSyntheticPage(reproFiles());
+      expect(result).not.toBeNull();
+      expect(result!.entryPath).toBe("app/page.tsx");
+      // Hero + ProductMockup are orphaned sections; theme-provider is excluded (provider).
+      expect(result!.orphaned.sort()).toEqual([
+        "components/focusflow/Hero.tsx",
+        "components/focusflow/ProductMockup.tsx",
+      ]);
+    });
+
+    it("FAIL: resolves a RELATIVE nav import too (not just the @/ alias)", () => {
+      const files = [
+        f("app/page.tsx", `import NavBar from "./_nav/NavBar";\nexport default function SyntheticV0PageForDeployment() { return <NavBar />; }`),
+        f("app/_nav/NavBar.tsx", NAVBAR),
+        f("components/hero.tsx", `export default function Hero() { return <section><h1>Hi there friend</h1></section>; }`),
+      ];
+      const result = detectIncompleteSyntheticPage(files);
+      expect(result).not.toBeNull();
+      expect(result!.orphaned).toEqual(["components/hero.tsx"]);
+    });
+
+    it("FAIL: lists EVERY orphaned section so one correction can name them all", () => {
+      const files = [
+        f("app/page.tsx", `import NavBar from "@/components/navbar";\nexport default function SyntheticV0PageForDeployment() { return <NavBar />; }`),
+        f("components/navbar.tsx", NAVBAR),
+        f("components/hero.tsx", `export default function Hero() { return <section><h1>Focus deeply</h1></section>; }`),
+        f("components/features.tsx", `export default function Features() { return <section><h2>Features here</h2></section>; }`),
+        f("components/pricing.tsx", `export default function Pricing() { return <section><h2>Pricing here</h2></section>; }`),
+      ];
+      const result = detectIncompleteSyntheticPage(files);
+      expect(result!.orphaned.sort()).toEqual([
+        "components/features.tsx",
+        "components/hero.tsx",
+        "components/pricing.tsx",
+      ]);
+    });
+
+    it("PASS (control): a real composed page (not a synthetic stub) is never examined", () => {
+      const files = [
+        f("app/page.tsx", `import NavBar from "@/components/navbar";\nimport Hero from "@/components/hero";\nexport default function Home() { return <main><NavBar /><Hero /></main>; }`),
+        f("components/navbar.tsx", NAVBAR),
+        f("components/hero.tsx", `export default function Hero() { return <section><h1>Hello world here</h1></section>; }`),
+        // A stray unused component must NOT trip the check when the page is legitimately named.
+        f("components/unused-banner.tsx", `export default function Banner() { return <div>promo banner</div>; }`),
+      ];
+      expect(detectIncompleteSyntheticPage(files)).toBeNull();
+    });
+
+    it("PASS (control): synthetic stub that renders ONE component composing the whole page — no orphans", () => {
+      const files = [
+        f("app/page.tsx", `import LandingPage from "@/components/landing-page";\nexport default function SyntheticV0PageForDeployment() { return <LandingPage />; }`),
+        f("components/landing-page.tsx", `import Hero from "./hero";\nimport Features from "./features";\nexport default function LandingPage() { return <main><Hero /><Features /></main>; }`),
+        f("components/hero.tsx", `export default function Hero() { return <section><h1>Deep work daily</h1></section>; }`),
+        f("components/features.tsx", `export default function Features() { return <section><h2>Great features</h2></section>; }`),
+      ];
+      expect(detectIncompleteSyntheticPage(files)).toBeNull();
+    });
+
+    it("PASS (control): synthetic stub with only a provider/util orphaned is not flagged", () => {
+      const files = [
+        f("app/page.tsx", `import NavBar from "@/components/navbar";\nexport default function SyntheticV0PageForDeployment() { return <NavBar />; }`),
+        f("components/navbar.tsx", NAVBAR),
+        f("components/theme-provider.tsx", THEME_PROVIDER),
+        f("lib/utils.ts", `export function cn(...a: string[]) { return a.join(" "); }`),
+      ];
+      expect(detectIncompleteSyntheticPage(files)).toBeNull();
+    });
+
+    it("PASS (control): no app/page.tsx entry → cannot judge, returns null", () => {
+      const files = [
+        f("components/hero.tsx", `export default function Hero() { return <section><h1>Orphan hero here</h1></section>; }`),
+      ];
+      expect(detectIncompleteSyntheticPage(files)).toBeNull();
+    });
+  });
+
+  describe("validateV0Output wiring (check 8)", () => {
+    it("FAIL: throws V0OutputValidationError naming the orphaned sections", () => {
+      expect(() => validateV0Output(reproFiles())).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(reproFiles())).toThrow(/SyntheticV0PageForDeployment/);
+      expect(() => validateV0Output(reproFiles())).toThrow(/Hero\.tsx/);
+    });
+
+    it("PASS: a fully-composed page deploys without a correction round", () => {
+      const files = [
+        f("app/page.tsx", `import NavBar from "@/components/navbar";\nimport Hero from "@/components/hero";\nexport default function Home() { return <main><NavBar /><Hero /></main>; }`),
+        f("components/navbar.tsx", NAVBAR),
+        f("components/hero.tsx", `export default function Hero() { return <section><h1>Hello world here</h1></section>; }`),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+  });
+});
+
+// =============================================================================
+// ENG-384/467 follow-up: deterministic repair of v0's mis-rooted relative imports
+// =============================================================================
+describe("v0Service - repairMisrootedImports", () => {
+  const f = (path: string, content: string) => ({ path, content: Buffer.from(content) });
+  const imp = (files: Array<{ path: string; content: Buffer }>, path: string) =>
+    files.find((x) => x.path === path)!.content.toString().split("\n").filter((l) => l.includes("import") || l.includes("from")).join(" | ");
+
+  it("REPAIR: sub-page nested sibling — ./landing/LeadCaptureForm -> ./LeadCaptureForm", () => {
+    const files = [
+      f("app/x/_components/landing/FinalCTA.tsx", `import LeadCaptureForm from "./landing/LeadCaptureForm";\nexport default function FinalCTA(){return <LeadCaptureForm/>;}`),
+      f("app/x/_components/landing/LeadCaptureForm.tsx", `export default function LeadCaptureForm(){return <form/>;}`),
+    ];
+    const n = repairMisrootedImports(files);
+    expect(n).toBe(1);
+    expect(imp(files, "app/x/_components/landing/FinalCTA.tsx")).toContain('"./LeadCaptureForm"');
+    // and it now actually resolves
+    expect(collectMissingInternalImports(files)).toEqual([]);
+  });
+
+  it("REPAIR: sub-page nested sibling — ./landing/Mockup -> ./Mockup", () => {
+    const files = [
+      f("app/x/_components/landing/Hero.tsx", `import Mockup from "./landing/Mockup";\nexport default function Hero(){return <Mockup/>;}`),
+      f("app/x/_components/landing/Mockup.tsx", `export default function Mockup(){return <div/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(1);
+    expect(imp(files, "app/x/_components/landing/Hero.tsx")).toContain('"./Mockup"');
+  });
+
+  it("REPAIR: first-page shape (components/landing/*) too", () => {
+    const files = [
+      f("components/landing/FinalCTA.tsx", `import LeadCaptureForm from "./landing/LeadCaptureForm";\nexport default function FinalCTA(){return <LeadCaptureForm/>;}`),
+      f("components/landing/LeadCaptureForm.tsx", `export default function LeadCaptureForm(){return <form/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(1);
+    expect(imp(files, "components/landing/FinalCTA.tsx")).toContain('"./LeadCaptureForm"');
+  });
+
+  it("REPAIR: re-export form (export ... from) in an index barrel", () => {
+    const files = [
+      f("app/x/_components/landing/index.ts", `export { default as Nav } from "./landing/Nav";\nexport { default as Hero } from "./landing/Hero";`),
+      f("app/x/_components/landing/Nav.tsx", `export default function Nav(){return <nav/>;}`),
+      f("app/x/_components/landing/Hero.tsx", `export default function Hero(){return <section/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(2);
+    expect(imp(files, "app/x/_components/landing/index.ts")).toContain('"./Nav"');
+    expect(imp(files, "app/x/_components/landing/index.ts")).toContain('"./Hero"');
+  });
+
+  it("NO-OP: a correct sibling import is left untouched", () => {
+    const files = [
+      f("app/x/_components/landing/FinalCTA.tsx", `import LeadCaptureForm from "./LeadCaptureForm";\nexport default function FinalCTA(){return <LeadCaptureForm/>;}`),
+      f("app/x/_components/landing/LeadCaptureForm.tsx", `export default function LeadCaptureForm(){return <form/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0);
+    expect(imp(files, "app/x/_components/landing/FinalCTA.tsx")).toContain('"./LeadCaptureForm"');
+  });
+
+  it("NO-OP: a genuinely missing file is NOT invented (stays for check 7)", () => {
+    const files = [
+      f("app/x/_components/landing/Hero.tsx", `import Ghost from "./landing/Ghost";\nexport default function Hero(){return <Ghost/>;}`),
+      f("app/x/_components/landing/Nav.tsx", `export default function Nav(){return <nav/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0);
+    expect(imp(files, "app/x/_components/landing/Hero.tsx")).toContain('"./landing/Ghost"');
+    // and check 7 still flags it
+    expect(collectMissingInternalImports(files).some((m) => m.specifier === "./landing/Ghost")).toBe(true);
+  });
+
+  it("NO-OP: ambiguous basename (two matches in scope) is left untouched", () => {
+    const files = [
+      f("app/x/_components/landing/A.tsx", `import Card from "./landing/Card";\nexport default function A(){return <Card/>;}`),
+      f("app/x/_components/landing/Card.tsx", `export default function Card(){return <div/>;}`),
+      f("app/x/_components/landing/sub/Card.tsx", `export default function Card(){return <div/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0);
+    expect(imp(files, "app/x/_components/landing/A.tsx")).toContain('"./landing/Card"');
+  });
+
+  it("NO-OP: legit root-repo @/ refs (ui, lib/utils) are preserved", () => {
+    const files = [
+      f("app/x/_components/landing/Hero.tsx", `import { Button } from "@/components/ui/button";\nimport { cn } from "@/lib/utils";\nexport default function Hero(){return <Button className={cn()}/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0);
+    expect(imp(files, "app/x/_components/landing/Hero.tsx")).toContain('"@/components/ui/button"');
+    expect(imp(files, "app/x/_components/landing/Hero.tsx")).toContain('"@/lib/utils"');
+  });
+
+  it("REPAIR: mangled @/ from remap step-0 (@/components/landing/landing/Mockup -> ./Mockup)", () => {
+    // The sub-page remap's step-0 turns v0's bad `./landing/Mockup` into this @/ form; it points
+    // at a repo-root path that doesn't exist, so it must be repaired to the real sibling.
+    const files = [
+      f("app/x/_components/landing/Hero.tsx", `import Mockup from "@/components/landing/landing/Mockup";\nexport default function Hero(){return <Mockup/>;}`),
+      f("app/x/_components/landing/Mockup.tsx", `export default function Mockup(){return <div/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(1);
+    expect(imp(files, "app/x/_components/landing/Hero.tsx")).toContain('"./Mockup"');
+    expect(collectMissingInternalImports(files)).toEqual([]);
+  });
+
+  it("NO-OP: does not repair across component subtrees (won't grab a lib/ file)", () => {
+    const files = [
+      f("app/x/_components/landing/Hero.tsx", `import { cn } from "./utils";\nexport default function Hero(){return <div className={cn()}/>;}`),
+      f("lib/utils.ts", `export function cn(){return "";}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0);
+    expect(imp(files, "app/x/_components/landing/Hero.tsx")).toContain('"./utils"');
+  });
+
+  it("INTEGRATION: remap output with v0's mis-rooted imports fully resolves after repair", () => {
+    // Raw v0 layout: page composes nested landing/ components; Hero & FinalCTA use v0's bad
+    // `./landing/X` sibling imports. After remap + repair, nothing should be unresolved.
+    const raw = [
+      f("app/page.tsx", `import { Hero } from "@/components/landing/Hero";\nimport { FinalCTA } from "@/components/landing/FinalCTA";\nexport default function Page(){return <main><Hero/><FinalCTA/></main>;}`),
+      f("components/landing/Hero.tsx", `import Mockup from "./landing/Mockup";\nexport function Hero(){return <Mockup/>;}`),
+      f("components/landing/Mockup.tsx", `export default function Mockup(){return <div/>;}`),
+      f("components/landing/FinalCTA.tsx", `import LeadCaptureForm from "./landing/LeadCaptureForm";\nexport function FinalCTA(){return <LeadCaptureForm/>;}`),
+      f("components/landing/LeadCaptureForm.tsx", `export default function LeadCaptureForm(){return <form/>;}`),
+    ];
+    const committed = remapFilesForSubPage(raw, "quiet", "Quiet");
+    repairMisrootedImports(committed);
+    // Every internal import in the committed set now resolves (no Module-not-found at build).
+    expect(collectMissingInternalImports(committed)).toEqual([]);
+  });
+
+  it("ORDERING: repair before validate lets check 7 pass on a mis-rooted import", () => {
+    // The caller runs repair BEFORE validateV0Output; otherwise check 7 rejects the mis-rooted
+    // import and the flaky v0 self-heal runs instead of this deterministic fix.
+    const raw = () => [
+      f("app/page.tsx", `import { Hero } from "@/components/landing/Hero";\nexport default function Page(){return <Hero/>;}`),
+      f("components/landing/Hero.tsx", `import Mockup from "./landing/Mockup";\nexport function Hero(){return <Mockup/>;}`),
+      f("components/landing/Mockup.tsx", `export default function Mockup(){return <div/>;}`),
+    ];
+    // Without repair, check 7 rejects it.
+    expect(() => validateV0Output(raw())).toThrow(V0OutputValidationError);
+    // With repair first, validation passes.
+    const repaired = raw();
+    expect(repairMisrootedImports(repaired)).toBe(1);
+    expect(() => validateV0Output(repaired)).not.toThrow();
+  });
+
+  it("REPAIR (bare): v0's prefix-less `landing/Nav` -> @/components/landing/Nav", () => {
+    // v0 sometimes drops the prefix entirely; the spec looks like a package but isn't.
+    const files = [
+      f("app/page.tsx", `"use client"\nimport { Nav } from "landing/Nav";\nexport default function Page(){return <Nav/>;}`),
+      f("components/landing/Nav.tsx", `export function Nav(){return <nav/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(1);
+    expect(imp(files, "app/page.tsx")).toContain('"@/components/landing/Nav"');
+    expect(collectMissingInternalImports(files)).toEqual([]);
+  });
+
+  it("NO-OP (bare): real npm packages are never touched", () => {
+    const files = [
+      f("app/page.tsx", `import Image from "next/image";\nimport { Star } from "lucide-react";\nimport * as React from "react";\nimport { Slot } from "@radix-ui/react-slot";\nexport default function Page(){return <Image/>;}`),
+      f("components/landing/Nav.tsx", `export function Nav(){return <nav/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0);
+    const line = imp(files, "app/page.tsx");
+    expect(line).toContain('"next/image"');
+    expect(line).toContain('"lucide-react"');
+    expect(line).toContain('"@radix-ui/react-slot"');
+  });
+
+  it("ORDERING: a genuinely-missing file still trips check 7 even after repair", () => {
+    const files = [
+      f("app/page.tsx", `import Compare from "@/components/compare-table";\nexport default function Page(){return <Compare/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0); // nothing to repair to
+    expect(() => validateV0Output(files)).toThrow(/not generated/);
   });
 });
 
@@ -3647,6 +4164,13 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     mockQuery.mockReturnValueOnce({
       promise: () => Promise.resolve({ Items: [existingSiteRecord] }),
     });
+    // ENG-478: findUserSiteRecord now verifies its GSI-selected candidate with a
+    // strongly-consistent GetItem by primary key. This file's shared mockGet
+    // defaults to `{Item: null}` (used elsewhere for unrelated lookups), which would
+    // make every test here see "no site found" unless paired explicitly.
+    mockGet.mockReturnValueOnce({
+      promise: () => Promise.resolve({ Item: existingSiteRecord }),
+    });
   };
 
   // Setup: mock v0 chat creation, polling, and zip download
@@ -3995,7 +4519,11 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     // 1 repair-scan tree listing + 1 GitHub ref + 2 Vercel polls.
     // The tree listing is the whole cost of the poisoned-import scan on a healthy repo:
     // an empty/clean tree yields no candidates, so no file contents are ever read.
-    expect(mockAxiosGet).toHaveBeenCalledTimes(4);
+    // Plus 3 more (ENG-483): the post-deploy capture-route sync reads middleware.ts,
+    // app/api/capture/route.ts, and domainMap.ts to decide whether LIST_BY_PATH needs
+    // updating. No mock is queued for them here, so all 3 reject and the sync gives up
+    // silently (never blocking the deploy) — still 3 real GET attempts.
+    expect(mockAxiosGet).toHaveBeenCalledTimes(7);
   });
 
   it("SUCCESS: sub-page deployedUrl uses customDomainUrl as base when existingPage has one", async () => {
@@ -4006,6 +4534,9 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     };
     mockQuery.mockReturnValueOnce({
       promise: () => Promise.resolve({ Items: [siteWithCustomDomain] }),
+    });
+    mockGet.mockReturnValueOnce({
+      promise: () => Promise.resolve({ Item: siteWithCustomDomain }),
     });
     await setupV0Mocks();
     setupGitHubMocks();
@@ -4021,6 +4552,260 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     expect(result.status).toBe("deployed");
     expect(result.deployedUrl).toContain("https://my-brand.agentwebforms.com/");
     expect(result.deployedUrl).not.toContain("vercel.app");
+  });
+
+  // ENG-483: addPageToExistingRepo used to push only the new page's own files, never
+  // updating the shared app/api/capture/route.ts LIST_BY_PATH map — so a new sub-page's
+  // lead form 422'd forever until an unrelated GTM/Pixel override happened to resync it.
+  describe("ENG-483: sub-page registered in shared capture route", () => {
+    // Sync's own GitHub calls, run AFTER the page's own commit + Vercel poll succeed:
+    // Promise.all([middleware.ts, capture route, domainMap.ts]) reads, then (if different)
+    // a ref read, a blob per changed file, a tree, a commit, and a ref patch.
+    const setupCaptureRouteSyncMocks = (existingCaptureRouteContent: string) => {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from("stale middleware").toString("base64") },
+      }); // middleware.ts (deliberately stale so the sync always proceeds to commit)
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from(existingCaptureRouteContent).toString("base64") },
+      }); // app/api/capture/route.ts
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from("{}").toString("base64") },
+      }); // domainMap.ts (already exists)
+      mockAxiosGet.mockResolvedValueOnce({ data: { object: { sha: "sync_base_sha" } } }); // ref/heads/main
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_middleware" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_capture_route" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "sync_tree_sha" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "sync_commit_sha" } });
+      mockAxiosPatch.mockResolvedValueOnce({ data: {} }); // ref update
+    };
+
+    const committedCaptureRouteContent = (): string | undefined =>
+      mockAxiosPost.mock.calls
+        .filter((c) => typeof c[0] === "string" && c[0].includes("/git/blobs"))
+        .map((c) => Buffer.from(c[1].content, "base64").toString("utf8"))
+        .find((content) => content.includes("LIST_BY_PATH"));
+
+    it("SUCCESS: new sub-page's path + an existing sibling's path both land in the committed LIST_BY_PATH", async () => {
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      // findReusablePageForRoute's own listLandingPages query runs BEFORE
+      // addPageToExistingRepo — must be satisfied first so it doesn't consume the
+      // siblings mock meant for this fix's own getLandingPagesByOwner call.
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Items: [
+              existingSiteRecord,
+              {
+                id: "sibling-1",
+                userId: "user-1",
+                githubRepoUrl: existingSiteRecord.githubRepoUrl,
+                slug: "features",
+                leadListId: "list_features",
+              },
+            ],
+          }),
+      });
+      setupCaptureRouteSyncMocks('const LIST_BY_PATH: Record<string, string> = {"/features":"list_features"};');
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create pricing page with a lead form",
+        "Pricing",
+        {},
+        "list_pricing"
+      );
+
+      expect(result.status).toBe("deployed");
+      const capturedContent = committedCaptureRouteContent();
+      expect(capturedContent).toBeDefined();
+      expect(capturedContent).toContain('"/pricing": "list_pricing"');
+      expect(capturedContent).toContain('"/features": "list_features"');
+    });
+
+    it("SUCCESS: new sub-page has no leadListId → sync still commits siblings, new page's own path stays absent", async () => {
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Items: [
+              existingSiteRecord,
+              {
+                id: "sibling-1",
+                userId: "user-1",
+                githubRepoUrl: existingSiteRecord.githubRepoUrl,
+                slug: "features",
+                leadListId: "list_features",
+              },
+            ],
+          }),
+      });
+      setupCaptureRouteSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create an about page",
+        "About Page",
+        {}
+        // no leadListId
+      );
+
+      expect(result.status).toBe("deployed");
+      const capturedContent = committedCaptureRouteContent();
+      expect(capturedContent).toBeDefined();
+      expect(capturedContent).toContain('"/features": "list_features"');
+      expect(capturedContent).not.toContain("/about-page");
+    });
+
+    it("FAIL: sibling lookup (getLandingPagesByOwner) throws → page still deploys, error only logged", async () => {
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.reject(new Error("DynamoDB unavailable")),
+      });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a newsletter signup page",
+        "Newsletter",
+        {},
+        "list_newsletter"
+      );
+
+      expect(result.status).toBe("deployed");
+    });
+
+    it("FAIL: capture-route sync's own GitHub read fails → page still deploys, error only logged", async () => {
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Items: [existingSiteRecord] }),
+      });
+      // middleware.ts read fails with a non-404 error inside the Promise.all —
+      // syncLeadCaptureFilesToRepo must swallow this, not let it escape.
+      mockAxiosGet.mockRejectedValueOnce(new Error("GitHub 500"));
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from("const LIST_BY_PATH = {};").toString("base64") },
+      });
+      mockAxiosGet.mockResolvedValueOnce({ data: { content: Buffer.from("{}").toString("base64") } });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a contact page",
+        "Contact",
+        {},
+        "list_contact"
+      );
+
+      expect(result.status).toBe("deployed");
+    });
+
+    // The sync build's Vercel poll is fire-and-forget (never awaited by
+    // addPageToExistingRepo — see the "bulk sub-page add" latency note at its call
+    // site), so these two tests must drain it explicitly before asserting, or its
+    // queued mocks would leak into whichever test runs next.
+    const flushFireAndForgetPoll = () => new Promise((r) => setTimeout(r, 20));
+
+    it("SUCCESS: capture-route sync commit's own Vercel build is polled (fire-and-forget) and confirmed READY", async () => {
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [existingSiteRecord] }) });
+      setupCaptureRouteSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+      // The sync's own Vercel poll — matches sync_commit_sha, the sha
+      // setupCaptureRouteSyncMocks' commit POST returns.
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          deployments: [
+            { uid: "dpl_sync", readyState: "READY", meta: { githubCommitSha: "sync_commit_sha" } },
+          ],
+        },
+      });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a careers page",
+        "Careers",
+        {},
+        "list_careers"
+      );
+
+      // generateLandingPage resolves WITHOUT waiting for the sync poll — proves it's
+      // genuinely non-blocking, not just fast in this test's 0ms-interval config.
+      expect(result.status).toBe("deployed");
+
+      await flushFireAndForgetPoll();
+      const loggedSyncBuildIssue = [...warnSpy.mock.calls, ...errorSpy.mock.calls].some((call) =>
+        String(call[0]).includes("ENG-483: capture-route sync build")
+      );
+      expect(loggedSyncBuildIssue).toBe(false);
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it("FAIL: capture-route sync commit's own Vercel build errors (fire-and-forget) → page already deployed, error only logged", async () => {
+      const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [existingSiteRecord] }) });
+      setupCaptureRouteSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+      // Sync's own Vercel poll: build for sync_commit_sha errored.
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { deployments: [{ uid: "dpl_sync_fail", readyState: "ERROR", meta: { githubCommitSha: "sync_commit_sha" } }] },
+      });
+      // getVercelBuildErrors' own log-fetch call
+      mockAxiosGet.mockResolvedValueOnce({
+        data: [{ type: "stderr", payload: { text: "Module not found: @/lib/stale" } }],
+      });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a team page",
+        "Team",
+        {},
+        "list_team"
+      );
+
+      // The page's OWN content already deployed successfully, and the poll hasn't
+      // even run yet at this point — the sync's build failing must never flip this
+      // page to "failed".
+      expect(result.status).toBe("deployed");
+
+      await flushFireAndForgetPoll();
+      const loggedBuildFailure = errorSpy.mock.calls.some(
+        (call) =>
+          String(call[0]).includes("ENG-483: capture-route sync build FAILED") &&
+          String(call[0]).includes("Module not found: @/lib/stale")
+      );
+      expect(loggedBuildFailure).toBe(true);
+      errorSpy.mockRestore();
+    });
   });
 });
 
@@ -4053,6 +4838,9 @@ describe("v0Service - loadDefaultTemplateOutline fallback", () => {
   const setupFullSuccess = async () => {
     const zipBuffer = await createTestZip();
     mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [existingSiteRecord] }) });
+    // ENG-478: findUserSiteRecord verifies its GSI candidate with a strongly-
+    // consistent GetItem — this file's shared mockGet defaults to `{Item: null}`.
+    mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: existingSiteRecord }) });
     mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
     mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "version_new" } });
     mockChatsDownloadVersion.mockResolvedValueOnce(zipBuffer);

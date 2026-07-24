@@ -213,7 +213,11 @@ describe("syncLeadCaptureFilesToRepo", () => {
 
     const result = await syncLeadCaptureFilesToRepo(REPO, { "/": "list_1" });
 
-    expect(result).toEqual({ committed: true });
+    // ENG-483: committed:true now also carries the pushed commit's sha/timestamp so a
+    // caller can poll Vercel for that specific build (see addPageToExistingRepo).
+    expect(result.committed).toBe(true);
+    expect(result.pushedCommitSha).toBeTruthy();
+    expect(result.pushTimestampMs).toBeGreaterThan(0);
     expect(treePaths()).toEqual(expect.arrayContaining(["middleware.ts", "app/api/capture/route.ts"]));
     expect(blobForPath("middleware.ts")).toBe(buildLandingPageMiddleware());
     expect(blobForPath("app/api/capture/route.ts")).toBe(buildCaptureRoute({ "/": "list_1" }));

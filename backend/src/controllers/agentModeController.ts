@@ -32,6 +32,7 @@ import {
   markRunTerminal,
   IDEM_TTL_INTERACTIVE_S,
 } from '../services/agentMode/runStore';
+import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
@@ -1768,9 +1769,38 @@ export async function runScheduledChat(
       return tokenLimitResult;
     }
 
-    // Create a session for the run
     const sessionTitle = isTest ? `Test: ${schedule.scheduleName}` : `Scheduled: ${schedule.scheduleName}`;
     const pageIdentifier = `${sessionTitle}|scheduleId:${schedule.scheduleId}`;
+
+    // ENG-479 (GAP 1): stamp the durable in-flight lease BEFORE creating the session
+    // and start heartbeating it. ENG-324 stamped the lease only AFTER
+    // createChatSession, which left a window: a hard-kill (OOM/SIGKILL) landing
+    // between session creation and the lease write produced a session with no lease
+    // — invisible to the reconciler (getInFlightSchedules keys off attribute_exists
+    // (runInFlight)), so it was never requeued and stayed silently zero-output.
+    // Stamping first makes any death from here through the LLM turn reconciler-
+    // visible. The lease carries no sessionId yet; it's attached below once the
+    // session exists (the reconciler tolerates an empty sessionId — it just skips
+    // annotation, but still requeues the run).
+    if (!isTest) {
+      try {
+        await scheduleDb.setRunInFlight(schedule.scheduleId, {
+          runId: leaseRunId,
+          sessionId: '',
+          startedAt: new Date().toISOString(),
+          instanceId: SCHEDULED_RUN_INSTANCE_ID,
+        });
+        leaseAcquired = true;
+        heartbeatTimer = setInterval(() => {
+          void scheduleDb.heartbeatRunInFlight(schedule.scheduleId, leaseRunId);
+        }, HEARTBEAT_INTERVAL_MS);
+        if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
+      } catch (leaseError) {
+        console.error(`Failed to set in-flight lease for schedule ${schedule.scheduleId}:`, leaseError);
+      }
+    }
+
+    // Create a session for the run.
     const testSession = await chatbotDb.createChatSession(
       userId,
       undefined,
@@ -1784,24 +1814,15 @@ export async function runScheduledChat(
     );
     sessionId = testSession.sessionId;
 
-    // ENG-324: stamp the durable in-flight lease now that we have a session, and
-    // start heartbeating it. If this process dies during the (possibly long) LLM
-    // turn below, the reconciler will find this lease stale and requeue the run.
-    if (!isTest) {
+    // Attach the freshly-created session to the lease so the reconciler's recovery
+    // annotates the correct session if this run is later abandoned. Best-effort:
+    // this is a nicety, not correctness — the reconciler still requeues an abandoned
+    // run with an empty sessionId — so a failure here must never abort a healthy run.
+    if (leaseAcquired && sessionId) {
       try {
-        await scheduleDb.setRunInFlight(schedule.scheduleId, {
-          runId: leaseRunId,
-          sessionId,
-          startedAt: new Date().toISOString(),
-          instanceId: SCHEDULED_RUN_INSTANCE_ID,
-        });
-        leaseAcquired = true;
-        heartbeatTimer = setInterval(() => {
-          void scheduleDb.heartbeatRunInFlight(schedule.scheduleId, leaseRunId);
-        }, HEARTBEAT_INTERVAL_MS);
-        if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
-      } catch (leaseError) {
-        console.error(`Failed to set in-flight lease for schedule ${schedule.scheduleId}:`, leaseError);
+        await scheduleDb.attachSessionToRunInFlight(schedule.scheduleId, leaseRunId, sessionId);
+      } catch (attachError) {
+        console.error(`Failed to attach session to in-flight lease for schedule ${schedule.scheduleId}:`, attachError);
       }
     }
 
@@ -2801,7 +2822,11 @@ export async function generateSessionResponse(
       isInteractiveShare: isInteractiveShare || false,
       isDelegatedAccess,
       excludeTools,
-      screenshotUrl
+      screenshotUrl,
+      // ENG-473: persist each settled turn as it completes so a hard process kill
+      // (OOM/SIGKILL/force-exit past drain) leaves a visible partial transcript
+      // instead of a silent zero-output session.
+      persistIncrementally: true
     },
     (progress) => {
       // Emit progress updates via SSE
@@ -2809,26 +2834,24 @@ export async function generateSessionResponse(
     }
   );
 
-  // If the user clicked Stop, discard the response entirely — don't persist anything.
-  // The user message was already saved before the LLM call; the assistant response is dropped
-  // so a page reload shows the user message with no ghost response from a cancelled turn.
+  // If the user clicked Stop, drop the FINAL (in-flight) turn — we don't run the batch
+  // below, so a page reload shows no ghost final response from the cancelled turn. Any
+  // fully-settled PRIOR turns already checkpoint-persisted mid-run (ENG-473) intentionally
+  // remain: they reflect real completed work (e.g. an image that was already generated and
+  // posted), and the in-flight final answer is never among them.
   if (response.cancelled) {
     clearCancel(sessionId);
   } else {
     // Add all response messages to session (includes assistant responses and tool calls).
-    // Strip base64 image data URIs from tool result content before persisting — they are
-    // ~300KB each and would exceed the DynamoDB 400KB item limit.
-    if (response.responseMessages.length > 0) {
-      const persistableMessages = response.responseMessages.map((msg: any) => {
-        if (msg.role === 'tool' && Array.isArray(msg.content)) {
-          const strippedContent = msg.content
-            .filter((item: any) => item.type !== 'image_url')
-            .map((item: any) => item.text ?? item)
-            .join('\n') || '[screenshot captured]';
-          return { ...msg, content: strippedContent };
-        }
-        return msg;
-      });
+    // ENG-473: skip the leading messages already written incrementally during the run
+    // (persistedResponseCount) so this final batch persists only the un-checkpointed tail —
+    // no duplicates and no double-counted token usage. Strip base64 image data URIs from
+    // tool result content before persisting — they are ~300KB each and would exceed the
+    // DynamoDB 400KB item limit.
+    const alreadyPersisted = response.persistedResponseCount || 0;
+    const remainingMessages = response.responseMessages.slice(alreadyPersisted);
+    if (remainingMessages.length > 0) {
+      const persistableMessages = stripImageDataForPersistence(remainingMessages);
       // Wrap in try/catch so a DynamoDB save failure does not discard the generated response.
       // The caller (e.g. Slack handler) still receives response.content and can deliver it to the user.
       try {

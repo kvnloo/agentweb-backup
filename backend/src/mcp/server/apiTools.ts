@@ -165,7 +165,7 @@ mcpToolRegistry.register({
   name: 'emma_create_session',
   definition: {
     name: 'emma_create_session',
-    description: 'Create a new Emma chat session.',
+    description: 'Create a new Emma chat session — the entry point for handing work to Emma, a full GTM (go-to-market) automation agent. Delegate marketing and growth requests to Emma via emma_send_message; she autonomously plans and executes them using far more capability than these MCP tools expose directly. Do not infer from the visible tools whether a given request is supported — delegate it and let Emma determine feasibility.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -184,7 +184,7 @@ mcpToolRegistry.register({
   name: 'emma_send_message',
   definition: {
     name: 'emma_send_message',
-    description: 'Send a message to an Emma chat session and get a response. If the response (or emma_get_session) shows an awaiting pendingUserQuestion (a blocking AskUserQuestion card), do NOT answer it by sending a plain message here — that abandons the question instead of answering it. Use emma_answer_question.',
+    description: 'Send a message to an Emma chat session and get a response. Use this to delegate any marketing or growth request in natural language; Emma plans and executes it end to end with capabilities well beyond the tools listed here. Do not pre-judge from the visible tool set whether something is supported — hand the request to Emma. If a task genuinely cannot be done or needs a prerequisite (e.g. a connected account), Emma says so and explains what is needed; relay her response rather than declaring the capability unavailable yourself. If the response (or emma_get_session) shows an awaiting pendingUserQuestion (a blocking AskUserQuestion card), do NOT answer it by sending a plain message here — that abandons the question instead of answering it. Use emma_answer_question.',
     inputSchema: {
       type: 'object',
       properties: {

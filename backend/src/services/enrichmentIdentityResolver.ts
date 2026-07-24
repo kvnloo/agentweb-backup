@@ -535,13 +535,50 @@ export async function resolveIdentity(
             resolved.linkedin = apolloResult.linkedin;
             meta.linkedin = makeApiMeta('apollo', 'linkedin', apolloResult.fromCache);
           }
-          if (apolloResult.company && !lead.company) {
+          // ENG-433: for a personal/institutional email (gmail, .edu, .gov, ...)
+          // Apollo's people-match enriches the "organization" from the email
+          // DOMAIN when it can't pin the real person — echoing the free-mail
+          // provider or university itself (xqvistgaard@dartmouth.edu → Dartmouth
+          // College, website dartmouth.edu). That institution is never the lead's
+          // employer. Reject the company/website when the returned org resolves to
+          // the lead's own institutional email domain; a genuinely different
+          // employer domain (a real person/LinkedIn match) is still trusted, so
+          // LinkedIn/person data remains the source of truth. Mirrors the guard in
+          // fetchApolloOrg.
+          const emailIsPersonal = !!email && CrmEnrichmentService.isPersonalEmailDomain(email);
+          // Raw email domain, lower-cased, RETAINING free-mail providers.
+          // extractDomainFromEmail() drops free-mail domains (rawEmailDomain is
+          // undefined for gmail/yahoo/etc.), which would silently bypass this
+          // echo check for free-mail leads — so derive it directly here.
+          const emailDomainForEcho = email ? (email.split('@')[1] || '').toLowerCase().trim() : '';
+          const apolloOrgDomain = apolloResult.website
+            ? (deriveDomainFromWebsite(apolloResult.website) || '').toLowerCase()
+            : '';
+          // Reject ONLY on a positive DOMAIN echo: the returned org's website
+          // resolves to the lead's own personal/institutional email domain
+          // (dartmouth.edu → Dartmouth College, website dartmouth.edu; yahoo.com →
+          // Yahoo, website yahoo.com). This is the only reliable, false-positive-
+          // free signal. A WEBSITELESS Apollo company is deliberately trusted: it
+          // comes from the person's employment history — their real employer — so
+          // name-matching it against the domain would wrongly drop legitimate
+          // employers such as "MIT Lincoln Laboratory" (@mit.edu) or "Dartmouth
+          // Hitchcock Medical Center" (@dartmouth.edu). Those false positives are
+          // worse than letting a rare websiteless org-echo through.
+          const orgEchoesEmailDomain =
+            emailIsPersonal && !!emailDomainForEcho && !!apolloOrgDomain &&
+            (apolloOrgDomain === emailDomainForEcho ||
+             emailDomainForEcho.endsWith(`.${apolloOrgDomain}`) ||
+             apolloOrgDomain.endsWith(`.${emailDomainForEcho}`));
+          if (orgEchoesEmailDomain) {
+            console.log(`${logTag} unified Apollo org echoes personal/institutional email domain=${emailDomainForEcho} org="${apolloResult.company}" — rejecting company/website`);
+          }
+          if (apolloResult.company && !lead.company && !orgEchoesEmailDomain) {
             // Apollo wins over Tier 0.5 LLM company — only guard against
             // overwriting what the user explicitly imported on the lead.
             resolved.company = apolloResult.company;
             meta.company = makeApiMeta('apollo', 'company', apolloResult.fromCache);
           }
-          if (apolloResult.website && !lead.website && !resolved.website) {
+          if (apolloResult.website && !lead.website && !resolved.website && !orgEchoesEmailDomain) {
             resolved.website = apolloResult.website;
             meta.website = makeApiMeta('apollo', 'website', apolloResult.fromCache);
           }
