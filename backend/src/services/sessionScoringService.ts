@@ -173,6 +173,23 @@ export function isGreetingOnlySession(messages: ChatMessage[] = []): boolean {
 }
 
 /**
+ * A message left by the harness to explain a crashed/abandoned run, NOT a genuine
+ * assistant turn. Two variants exist and must be treated identically:
+ *   - `isRunFailureNotice`: the "please retry" note surfaceFailedRun() writes for a
+ *     turn-less regular run (ENG-473).
+ *   - `jobIncomplete`: the "job incomplete" note the scheduled-run reconciler /
+ *     in-process catch (ENG-324) writes when a scheduled run's process died
+ *     mid-flight and was recovered/requeued (ENG-479).
+ * Either placeholder must be ignored when deciding whether a run produced output,
+ * so an abandoned run classifies as a deterministic failed run instead of being
+ * fed to the LLM judge (which then mis-describes it, e.g. "never called any tools"
+ * for a run that in fact called many before dying).
+ */
+function isRunFailurePlaceholder(m: any): boolean {
+  return m?.metadata?.isRunFailureNotice === true || m?.metadata?.jobIncomplete === true;
+}
+
+/**
  * Whether the session has produced at least one real assistant turn — i.e. the
  * model actually responded with text or invoked a tool.
  *
@@ -185,11 +202,10 @@ export function isGreetingOnlySession(messages: ChatMessage[] = []): boolean {
 function hasAssistantTurn(messages: ChatMessage[] = []): boolean {
   return messages.some((m: any) => {
     if (m.role !== "assistant") return false;
-    // Ignore the "run failed, please retry" note left by surfaceFailedRun() — it
-    // is a placeholder for a crashed run, NOT a genuine assistant turn, so a
-    // session that only carries it must still classify as a failed run (and the
-    // note must never be double-added on a later scoring pass).
-    if (m.metadata?.isRunFailureNotice) return false;
+    // Ignore a harness-written failure placeholder (crash/abandon note) — it is
+    // NOT a genuine assistant turn, so a session that only carries it must still
+    // classify as a failed run (and no note is ever double-added on a later pass).
+    if (isRunFailurePlaceholder(m)) return false;
     const text = (typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")).trim();
     const toolCalls = m.metadata?.toolCalls;
     return text.length > 0 || (Array.isArray(toolCalls) && toolCalls.length > 0);
@@ -269,7 +285,10 @@ const RUN_FAILED_USER_MESSAGE =
   "This run didn't finish — it looks like it stopped before producing a response. Please send your message again to retry.";
 
 function hasRunFailureNotice(messages: ChatMessage[] = []): boolean {
-  return (messages || []).some((m: any) => m?.metadata?.isRunFailureNotice === true);
+  // Also treat the scheduled reconciler's jobIncomplete note as "already surfaced"
+  // (ENG-479): that run was recovered/requeued and already carries a user-facing
+  // explanation + diagnostic error, so surfaceFailedRun() must not add a second note.
+  return (messages || []).some(isRunFailurePlaceholder);
 }
 
 /**
