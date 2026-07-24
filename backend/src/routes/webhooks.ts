@@ -432,6 +432,11 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       pixelId,
       metaAccountId,
       eventId,
+      // Meta's own first-party click-id cookies, read server-side from the Cookie header by
+      // the platform-owned app/api/capture/route.ts (buildCaptureRoute) and forwarded here —
+      // deterministic, no v0-authored client code involved.
+      fbp,
+      fbc,
     } = req.body;
 
     // Validate required field (email)
@@ -586,15 +591,21 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           const owner = await userDb.getUserById(leadList.userId);
           const { getMetaAccountCredentials } = await import('../services/metaAccountCredentials');
           const { accessToken } = await getMetaAccountCredentials(owner, leadList.userId, metaAccountId);
+          // ENG-493 is deferred (flipping Express's global `trust proxy` also changes
+          // auth.ts's IP-keyed rate limiters — a separate, riskier change). Scope the fix to
+          // just this CAPI call site instead, same pattern as loopEvents.ts/assetController.ts.
+          const clientIp = (req.headers['x-forwarded-for']?.toString().split(',')[0] ?? req.ip ?? 'unknown').trim();
           const result = await metaService.sendCapiLeadEvent(pixelId, accessToken, {
             eventId,
             email: leadData.email,
             firstName: leadData.firstName,
             lastName: leadData.lastName,
             phone: leadData.phone,
-            clientIp: req.ip,
+            clientIp,
             userAgent: req.headers['user-agent'],
             sourceUrl: req.headers['referer'],
+            fbp: typeof fbp === 'string' ? fbp : undefined,
+            fbc: typeof fbc === 'string' ? fbc : undefined,
           });
           if (!result.success) {
             console.error(`[CAPI] Lead event send failed for pixel ${pixelId}: ${result.error}`);

@@ -828,24 +828,18 @@ export function buildBrandEnrichedPrompt(
     );
   }
 
-  if (leadListId && metaPixelId) {
+  if (leadListId && (metaPixelId || bridgeOutUrl)) {
     parts.push(
-      `\n\nMETA PIXEL LEAD EVENT — IMPORTANT ARCHITECTURE:\n` +
+      `\n\nLEAD TRACKING — IMPORTANT ARCHITECTURE:\n` +
       `1. In the lead capture form component, generate a shared event id ONCE per submit: const eventId = crypto.randomUUID();\n` +
       `2. Include that same value as an "eventId" field in the JSON body of the fetch('/api/capture', ...) call.\n` +
-      `3. On a SUCCESSFUL submission response, call: window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });\n` +
-      `4. If the form redirects the user anywhere after a successful submission, wait ~800ms (await new Promise(r => setTimeout(r, 800))) AFTER calling fbq and BEFORE navigating away — otherwise the tracking beacon can be dropped by the redirect.\n` +
-      `5. Do NOT call fbq('init', ...) yourself — the platform already injects the Meta Pixel base code in the root layout. Only fire the 'track' Lead event here.`
-    );
-  }
-
-  if (leadListId && bridgeOutUrl) {
-    parts.push(
-      `\n\nBRIDGE-OUT REDIRECT — IMPORTANT ARCHITECTURE:\n` +
-      `1. After a SUCCESSFUL form submission (and after the fbq Lead call + 800ms flush above, if a pixel is configured), redirect the visitor to:\n` +
-      `   ${bridgeOutUrl}${bridgeOutUrl.includes("?") ? "&" : "?"}email=${"$"}{encodeURIComponent(email)}\n` +
-      `   using window.location.href — do NOT use a Next.js client-side <Link>/router.push for this, since it's an external destination.\n` +
-      `2. Use the email value the visitor actually submitted, URL-encoded.`
+      `3. On a SUCCESSFUL submission response, call: await fireLeadTracking({ email, eventId, ` +
+        `${metaPixelId ? `pixelId: ${JSON.stringify(metaPixelId)}, ` : ""}` +
+        `${bridgeOutUrl ? `bridgeOutUrl: ${JSON.stringify(bridgeOutUrl)}` : ""} });\n` +
+      `   Import it via: import { fireLeadTracking } from "@/lib/agentweb-track";\n` +
+      `4. Do NOT hand-author your own fbq('track', ...) call or window.location.href redirect — ` +
+        `fireLeadTracking already does both correctly (including the required flush delay before any redirect). Only call fireLeadTracking; do not duplicate its logic.\n` +
+      `5. Do NOT call fbq('init', ...) yourself — the platform already injects the Meta Pixel base code in the root layout.`
     );
   }
 
@@ -1885,6 +1879,20 @@ async function addPageToExistingRepo(
     const allFiles = await unzipBuffer(zipBuffer);
     autoFixV0Files(allFiles);
     const filesToCommit = remapFilesForSubPage(allFiles, slug, name);
+
+    // ENG-449 follow-up: unlike the capture-route/middleware sync below (best-effort,
+    // fire-and-forget — a stale LIST_BY_PATH only breaks a lead SUBMIT, not the BUILD), this
+    // page's own form imports `@/lib/agentweb-track` (per the updated buildBrandEnrichedPrompt
+    // instruction) ONLY when that instruction was actually included — same gate
+    // buildBrandEnrichedPrompt itself uses (leadListId && (metaPixelId || bridgeOutUrl)). When
+    // it applies, the import is a genuine build-time dependency: a repo created before this
+    // file existed (or one whose deferred sync hasn't landed yet) fails this page's Vercel
+    // build OUTRIGHT with "Module not found" if the file isn't in THIS commit — live-repro'd
+    // exactly this by adding a page to a pre-existing test-env repo. Must ride in the SAME
+    // commit whose build status this function actually checks, not a later async sync.
+    if (leadListId && (existingPage.metaPixelId || bridgeOutUrl)) {
+      filesToCommit.push({ path: "lib/agentweb-track.ts", content: Buffer.from(buildTrackingHelper()) });
+    }
 
     // Deterministically fix v0's mis-rooted relative imports (e.g. a landing/ component importing
     // `./landing/Sibling` instead of `./Sibling`) against the FINAL committed set — no v0
@@ -3619,8 +3627,17 @@ export function validatePixelLeadEvent(files: Array<{ path: string; content: Buf
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
 
-  if (!/fbq\(\s*['"]track['"]\s*,\s*['"]Lead['"]/.test(tsxSource)) {
-    return { ok: false, reason: "No fbq('track', 'Lead') call found in the generated form component" };
+  // Two valid patterns, checked with OR (not a replacement): the OLD inline fbq() call
+  // (pages generated before the ENG-449 follow-up deterministic-helper change), and the NEW
+  // fireLeadTracking({ pixelId: ... }) call (buildTrackingHelper/buildBrandEnrichedPrompt).
+  // An existing page must keep validating true under whichever pattern it actually shipped
+  // with — tightening this to ONLY the new pattern would falsely regress every
+  // already-working page the next time validation runs against it (e.g. iterateLandingPage).
+  const hasOldPattern = /fbq\(\s*['"]track['"]\s*,\s*['"]Lead['"]/.test(tsxSource);
+  const hasNewPattern = /fireLeadTracking\(\s*\{[^}]*pixelId\s*:/.test(tsxSource);
+
+  if (!hasOldPattern && !hasNewPattern) {
+    return { ok: false, reason: "No fbq('track', 'Lead') call (or fireLeadTracking({ pixelId }) call) found in the generated form component" };
   }
 
   return { ok: true };
@@ -3637,6 +3654,18 @@ export function validateBridgeOutRedirect(files: Array<{ path: string; content: 
     .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
     .map((f) => f.content.toString("utf-8"))
     .join("\n");
+
+  // NEW pattern (buildTrackingHelper/buildBrandEnrichedPrompt): v0 calls the platform-owned
+  // fireLeadTracking({ bridgeOutUrl: "..." }) helper, which guarantees the email= forwarding
+  // internally — no literal "email=" required in v0's own code for this pattern. Checked
+  // with OR against the OLD inline pattern (pre-follow-up pages), never as a replacement —
+  // an existing page must keep validating true under whichever pattern it actually shipped.
+  const escapedUrl = bridgeOutUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const hasNewPattern = new RegExp(`fireLeadTracking\\(\\s*\\{[^}]*bridgeOutUrl\\s*:\\s*["'\`]${escapedUrl}["'\`]`).test(tsxSource);
+
+  if (hasNewPattern) {
+    return { ok: true };
+  }
 
   if (!tsxSource.includes(bridgeOutUrl)) {
     return { ok: false, reason: "Bridge-out URL not found in the generated form component" };
@@ -3691,6 +3720,53 @@ function isV0DomainMap(p: string): boolean {
   return /^domainMap\.(ts|js)$/.test(normalizeGeneratedPath(p));
 }
 
+/** v0 may emit its own tracking-helper file at this path; ours is authoritative. */
+function isV0TrackingHelper(p: string): boolean {
+  return /^lib\/agentweb-track\.(ts|tsx|js|jsx)$/.test(normalizeGeneratedPath(p));
+}
+
+/**
+ * Platform-owned, deterministic tracking helper (ENG-449 follow-up). Shrinks the
+ * v0-compliance surface: rather than asking v0 to author the `fbq()`/bridge-out-redirect
+ * logic itself (freeform code, verified only after the fact — see validatePixelLeadEvent /
+ * validateBridgeOutRedirect), v0 is instructed to import this ONE guaranteed function and
+ * call it with the page's own pixelId/bridgeOutUrl as literal arguments. pixelId and
+ * bridgeOutUrl are CALL-TIME arguments, not baked into this file: the helper is a single
+ * repo-level shared module, but bridgeOutUrl (and, for a multi-page site, potentially
+ * pixelId) is per-page data — same reason buildCaptureRoute takes a path->list MAP rather
+ * than a single baked id.
+ */
+export function buildTrackingHelper(): string {
+  return `// Generated by AgentWeb — DO NOT hand-author fbq()/redirect logic in your form
+// component. Call fireLeadTracking(...) instead; it is guaranteed to fire the Meta Pixel
+// Lead event (if a pixelId is configured) and perform the bridge-out redirect (if a
+// bridgeOutUrl is configured), in the correct order, with the correct 800ms flush.
+export async function fireLeadTracking(opts: {
+  email: string;
+  /** The SAME eventId you generated and sent in the /api/capture POST body — required so
+   *  Meta's server-side CAPI event can be deduplicated against this client-side Pixel event. */
+  eventId?: string;
+  pixelId?: string;
+  bridgeOutUrl?: string;
+}): Promise<void> {
+  if (opts.pixelId) {
+    // @ts-ignore — fbq is injected globally by the platform-owned base Pixel snippet in layout.tsx
+    if (typeof window !== "undefined" && window.fbq) {
+      // @ts-ignore
+      window.fbq('track', 'Lead', {}, { eventID: opts.eventId });
+    }
+    // Give the tracking beacon time to flush before any redirect below.
+    await new Promise((resolve) => setTimeout(resolve, 800));
+  }
+
+  if (opts.bridgeOutUrl) {
+    const separator = opts.bridgeOutUrl.includes("?") ? "&" : "?";
+    window.location.href = \`\${opts.bridgeOutUrl}\${separator}email=\${encodeURIComponent(opts.email)}\`;
+  }
+}
+`;
+}
+
 /**
  * Defense in depth: if a v0-generated file somehow survives the drop-filter above
  * and still collides with our injected route/middleware, fail loudly here
@@ -3703,9 +3779,10 @@ export function assertNoDuplicateInjectedRoutes(files: Array<{ path: string; con
   const captureRouteCount = files.filter((f) => f.path === "app/api/capture/route.ts").length;
   const middlewareCount = files.filter((f) => f.path === "middleware.ts").length;
   const domainMapCount = files.filter((f) => f.path === "domainMap.ts").length;
-  if (captureRouteCount > 1 || middlewareCount > 1 || domainMapCount > 1) {
+  const trackingHelperCount = files.filter((f) => f.path === "lib/agentweb-track.ts").length;
+  if (captureRouteCount > 1 || middlewareCount > 1 || domainMapCount > 1 || trackingHelperCount > 1) {
     throw new Error(
-      `[V0 SERVICE] duplicate route after lead-capture injection (capture routes: ${captureRouteCount}, middleware: ${middlewareCount}, domainMap: ${domainMapCount})`
+      `[V0 SERVICE] duplicate route after lead-capture injection (capture routes: ${captureRouteCount}, middleware: ${middlewareCount}, domainMap: ${domainMapCount}, tracking helper: ${trackingHelperCount})`
     );
   }
 }
@@ -3897,6 +3974,12 @@ export async function POST(req: Request) {
     const raw = (await cookies()).get("aw_first_touch")?.value;
     if (raw) { try { attribution = JSON.parse(raw); } catch {} }
 
+    // Meta's own first-party click-id cookies (set by the base Pixel snippet, already
+    // platform-injected). Forwarded deterministically here — no v0-authored client code
+    // needs to read or forward these itself.
+    const fbp = (await cookies()).get("_fbp")?.value;
+    const fbc = (await cookies()).get("_fbc")?.value;
+
     const res = await fetch(FORWARD_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -3906,6 +3989,8 @@ export async function POST(req: Request) {
         source: "landing-page",
         ...(attribution ? { attribution } : {}),
         ...(PIXEL_ID ? { pixelId: PIXEL_ID, metaAccountId: META_ACCOUNT_ID } : {}),
+        ...(fbp ? { fbp } : {}),
+        ...(fbc ? { fbc } : {}),
       }),
     });
     if (!res.ok) return NextResponse.json({ success: false }, { status: 502 });
@@ -3936,7 +4021,7 @@ export function injectLeadCaptureAttribution(
   metaAccountId?: string,
 ): Array<{ path: string; content: Buffer }> {
   const filtered = files.filter(
-    (f) => !isV0CaptureRoute(f.path) && !isV0Middleware(f.path) && !isV0DomainMap(f.path)
+    (f) => !isV0CaptureRoute(f.path) && !isV0Middleware(f.path) && !isV0DomainMap(f.path) && !isV0TrackingHelper(f.path)
   );
 
   filtered.push({ path: "middleware.ts", content: Buffer.from(buildLandingPageMiddleware()) });
@@ -3945,6 +4030,7 @@ export function injectLeadCaptureAttribution(
   // first Vercel build fails. Empty until a subdomain is actually attached, at which
   // point updateSubdomainMiddleware rewrites it with the real map.
   filtered.push({ path: "domainMap.ts", content: Buffer.from(buildDomainMapFile({})) });
+  filtered.push({ path: "lib/agentweb-track.ts", content: Buffer.from(buildTrackingHelper()) });
 
   assertNoDuplicateInjectedRoutes(filtered);
 
@@ -5869,11 +5955,13 @@ export async function syncLeadCaptureFilesToRepo(
       const listByPath = await buildListByPath();
       const middlewareContent = buildLandingPageMiddleware();
       const captureRouteContent = buildCaptureRoute(listByPath, undefined, pixelId, metaAccountId);
+      const trackingHelperContent = buildTrackingHelper();
 
-      const [existingMiddleware, existingCaptureRoute, existingDomainMap] = await Promise.all([
+      const [existingMiddleware, existingCaptureRoute, existingDomainMap, existingTrackingHelper] = await Promise.all([
         readRepoFile(repoFullName, "middleware.ts", ghHeaders),
         readRepoFile(repoFullName, "app/api/capture/route.ts", ghHeaders),
         readRepoFile(repoFullName, "domainMap.ts", ghHeaders),
+        readRepoFile(repoFullName, "lib/agentweb-track.ts", ghHeaders),
       ]);
 
       // Only write domainMap.ts if the repo has none. If it exists it may carry a real
@@ -5883,7 +5971,8 @@ export async function syncLeadCaptureFilesToRepo(
       if (
         !needsDomainMap &&
         existingMiddleware === middlewareContent &&
-        existingCaptureRoute === captureRouteContent
+        existingCaptureRoute === captureRouteContent &&
+        existingTrackingHelper === trackingHelperContent
       ) {
         console.log(
           `[V0 SERVICE] Lead-capture files already up to date in ${repoFullName} — skipping commit (no redeploy)`
@@ -5894,6 +5983,7 @@ export async function syncLeadCaptureFilesToRepo(
       const filesToCommit: Array<{ path: string; content: string }> = [
         { path: "middleware.ts", content: middlewareContent },
         { path: "app/api/capture/route.ts", content: captureRouteContent },
+        { path: "lib/agentweb-track.ts", content: trackingHelperContent },
       ];
       if (needsDomainMap) {
         // Pre-ENG-308 repo: the middleware imports ./domainMap, so it MUST exist or the

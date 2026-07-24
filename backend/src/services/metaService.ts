@@ -2038,6 +2038,10 @@ export class MetaService {
       clientIp?: string;
       userAgent?: string;
       sourceUrl?: string;
+      /** Meta's own first-party click-id cookies (`_fbp`/`_fbc`) — opaque values, sent
+       * verbatim per Meta's CAPI spec (unlike em/ph, these are NOT hashed). */
+      fbp?: string;
+      fbc?: string;
     },
   ): Promise<{ success: true; fbtraceId?: string } | { success: false; error: string }> {
     try {
@@ -2056,6 +2060,8 @@ export class MetaService {
       if (event.lastName) userData.ln = [sha256(event.lastName.trim().toLowerCase())];
       if (event.clientIp) userData.client_ip_address = event.clientIp;
       if (event.userAgent) userData.client_user_agent = event.userAgent;
+      if (event.fbp) userData.fbp = event.fbp;
+      if (event.fbc) userData.fbc = event.fbc;
 
       const apiVersion = process.env.META_API_VERSION || 'v25.0';
       const url = `https://graph.facebook.com/${apiVersion}/${pixelId}/events`;
