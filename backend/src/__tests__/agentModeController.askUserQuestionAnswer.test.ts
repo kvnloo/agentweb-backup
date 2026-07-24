@@ -327,8 +327,33 @@ describe('generateResponse — AskUserQuestion answer channel (ENG-396)', () => 
 
     expect(res.statusCode).toBe(200);
     // The open question is abandoned (cleared) — the prose is NOT parsed into an answer.
-    // Clearing frees the one-live-question guard so Emma can emit a fresh card.
-    expect((mockChatbotDb as any).updateSessionAskUserQuestion).toHaveBeenCalledWith(sessionId, null);
+    // Clearing frees the one-live-question guard so Emma can emit a fresh card. Guarded
+    // (requireStillAwaiting) so a concurrent card-answer submission can't be erased by
+    // this clear (Greptile P1, "Typed messages bypass answer lock").
+    expect((mockChatbotDb as any).updateSessionAskUserQuestion).toHaveBeenCalledWith(
+      sessionId, null, { requireStillAwaiting: 'q-objective-1' },
+    );
+    expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('when the clear LOSES a race to a concurrent answer, re-reads fresh state instead of erasing it', async () => {
+    mockChatbotDb.getChatSession
+      .mockResolvedValueOnce(sessionWith(pendingObjectiveQuestion()) as any) // initial read
+      .mockResolvedValueOnce(sessionWith({
+        ...pendingObjectiveQuestion(),
+        status: 'answered',
+        answer: { optionId: 'leads', delegated: false, answeredBy: 'user', at: 't' },
+      }) as any); // re-read after lost race
+    (mockChatbotDb as any).updateSessionAskUserQuestion.mockResolvedValue(null); // guard refused: lost the race
+
+    const res = await (async () => {
+      const r = makeRes();
+      await agentModeController.generateResponse(makeReq({ userId: ownerId }, undefined, 'lets do lead'), r);
+      return r;
+    })();
+
+    expect(res.statusCode).toBe(200);
+    // Did NOT treat the concurrently-answered question as abandoned/re-askable.
     expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
   });
 

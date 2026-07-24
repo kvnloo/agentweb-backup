@@ -6,6 +6,7 @@
 
 import { Router, Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
+import { chatbotDb } from '../services/chatbotService';
 
 const router = Router();
 
@@ -363,8 +364,19 @@ router.get('/meta-ads/campaigns', async (req: Request, res: Response) => {
 
 router.post('/meta-ads/marketing-api', async (req: Request, res: Response) => {
   try {
-    const svc = await getAgentModeService();
     const { entity_type, action, account_id, parent_id, entity_id, fields, params, session_id } = req.body;
+    // Greptile P1/security ("Session does not bind authorization"): session_id
+    // feeds the objective gate's confirmation check (a prior answer, or the
+    // transcript for an explicit-statement quote) — an authenticated caller
+    // supplying ANOTHER user's session_id must not be able to have that
+    // session's confirmation applied to their own write.
+    if (session_id) {
+      const session = await chatbotDb.getChatSession(session_id);
+      if (!session || session.userId !== userId(req)) {
+        return res.status(403).json({ message: 'session_id does not belong to the authenticated user.' });
+      }
+    }
+    const svc = await getAgentModeService();
     const result = await svc.callMetaMarketingApi(userId(req), entity_type, action, account_id, parent_id, entity_id, fields, params, session_id);
     res.json(result);
   } catch (err: any) {

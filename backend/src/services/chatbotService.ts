@@ -2693,19 +2693,18 @@ export class ChatbotDB {
     // refused (returns null) and the model asks it in a later turn.
     const guard = opts?.failIfAwaitingExists === true && pendingUserQuestion !== null;
 
-    // Greptile P1 ("Concurrent answers overwrite selections"): persisting an
-    // ANSWER previously had no guard at all — two concurrent /generate calls
-    // could both read the same 'awaiting' snapshot, both resolve successfully,
-    // and the later unconditional write would silently clobber the earlier
-    // answer even if the later request was subsequently rejected elsewhere as
-    // busy. `requireStillAwaiting` makes the answer-write optimistic-locked:
-    // it only succeeds if the question is STILL exactly this one, STILL
-    // 'awaiting', at the moment of write — the loser of the race gets null
-    // (refused) instead of silently overwriting the winner.
+    // Greptile P1 ("Concurrent answers overwrite selections" / "Typed messages
+    // bypass answer lock"): persisting an ANSWER, or clearing an abandoned
+    // question (the typed-past-a-card path), previously had no guard at all —
+    // two concurrent requests (a card answer racing a typed message, or two
+    // answer submissions) could both read the same 'awaiting' snapshot and the
+    // later unconditional write would silently clobber or erase the earlier
+    // one's result. `requireStillAwaiting` makes EITHER write (SET an answer,
+    // or REMOVE/clear) optimistic-locked: it only succeeds if the question is
+    // STILL exactly this one, STILL 'awaiting', at the moment of write — the
+    // loser of the race gets null (refused) instead of corrupting the winner.
     const requireStillAwaiting =
-      typeof opts?.requireStillAwaiting === 'string' && pendingUserQuestion !== null
-        ? opts.requireStillAwaiting
-        : undefined;
+      typeof opts?.requireStillAwaiting === 'string' ? opts.requireStillAwaiting : undefined;
 
     let updatedArchive: Record<string, PendingUserQuestion> | undefined;
     if (pendingUserQuestion !== null) {
@@ -2755,8 +2754,15 @@ export class ChatbotDB {
       params.ConditionExpression =
         "pendingUserQuestion.questionId = :requireQuestionId AND pendingUserQuestion.#pStatus = :awaitingStatus";
       params.ExpressionAttributeNames = { "#pStatus": "status" };
-      params.ExpressionAttributeValues[":requireQuestionId"] = requireStillAwaiting;
-      params.ExpressionAttributeValues[":awaitingStatus"] = "awaiting";
+      // The REMOVE branch's params literal has no ExpressionAttributeValues at
+      // all (nothing to reference) until a guard needs one — create it here
+      // rather than assuming it exists, so a plain unconditional REMOVE keeps
+      // its existing (undefined) shape when no guard applies.
+      params.ExpressionAttributeValues = {
+        ...(params.ExpressionAttributeValues || {}),
+        ":requireQuestionId": requireStillAwaiting,
+        ":awaitingStatus": "awaiting",
+      };
     }
 
     try {

@@ -223,4 +223,35 @@ describe('chatbotDb.updateSessionAskUserQuestion', () => {
       expect(params.ConditionExpression).toBeUndefined();
     });
   });
+
+  // ── Greptile P1 ("Typed messages bypass answer lock") ─────────────────────
+  describe('requireStillAwaiting on REMOVE (clearing an abandoned question)', () => {
+    it('adds the SAME guard to a REMOVE (null) write when requireStillAwaiting is given', async () => {
+      await chatbotDb.updateSessionAskUserQuestion('s-1', null, { requireStillAwaiting: 'q-1' });
+
+      const params = updateSpy.mock.calls[0][0];
+      expect(params.UpdateExpression).toBe('REMOVE pendingUserQuestion');
+      expect(params.ConditionExpression).toMatch(
+        /pendingUserQuestion\.questionId = :requireQuestionId AND pendingUserQuestion\.#pStatus = :awaitingStatus/,
+      );
+      expect(params.ExpressionAttributeValues[':requireQuestionId']).toBe('q-1');
+      expect(params.ExpressionAttributeValues[':awaitingStatus']).toBe('awaiting');
+    });
+
+    it('a plain REMOVE with no requireStillAwaiting keeps its unconditional (undefined ExpressionAttributeValues) shape', async () => {
+      await chatbotDb.updateSessionAskUserQuestion('s-1', null);
+      const params = updateSpy.mock.calls[0][0];
+      expect(params.ConditionExpression).toBeUndefined();
+      expect(params.ExpressionAttributeValues).toBeUndefined();
+    });
+
+    it('returns null when a concurrent answer already won the race — the clear does NOT erase it', async () => {
+      updateSpy.mockReturnValue({
+        promise: () => Promise.reject(Object.assign(new Error('conditional'), { code: 'ConditionalCheckFailedException' })),
+      } as any);
+
+      const res = await chatbotDb.updateSessionAskUserQuestion('s-1', null, { requireStillAwaiting: 'q-1' });
+      expect(res).toBeNull();
+    });
+  });
 });

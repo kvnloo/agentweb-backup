@@ -3326,10 +3326,27 @@ export const agentModeController = {
         // FRESH card. The irreversible-write gate still blocks until a real structured
         // answer lands, so this can't rubber-stamp. Inject a directive so Emma re-asks
         // THAT SAME question instead of inferring a choice from the prose and advancing.
+        // Optimistic-locked (Greptile P1, "Typed messages bypass answer lock"):
+        // a card-answer submission racing this typed message could already have
+        // persisted a real answer between our read and this write. An
+        // unconditional clear would then erase that just-landed answer (or,
+        // the other way round, this clear could land first and make the valid
+        // answer submission fail with a false "already answered"). Guard the
+        // clear on the question still being exactly this one, still awaiting.
         const abandoned = session.pendingUserQuestion;
-        await chatbotDb.updateSessionAskUserQuestion(sessionId, null);
-        session.pendingUserQuestion = undefined;
-        answerAck = buildReaskDirective(abandoned);
+        const cleared = await chatbotDb.updateSessionAskUserQuestion(sessionId, null, {
+          requireStillAwaiting: abandoned.questionId,
+        });
+        if (cleared) {
+          session.pendingUserQuestion = undefined;
+          answerAck = buildReaskDirective(abandoned);
+        } else {
+          // Lost the race — a concurrent structured answer already resolved
+          // this question. Re-read the fresh state so the run proceeds against
+          // the REAL answer rather than silently discarding it.
+          const fresh = await chatbotDb.getChatSession(sessionId);
+          session.pendingUserQuestion = fresh?.pendingUserQuestion;
+        }
       }
 
       // Cross-restart duplicate-submit lock (ENG-147: one question spawned ~30
