@@ -646,3 +646,87 @@ describe('SessionScoring - surfacing silent dead runs (ENG-473)', () => {
     expect(mockUpdateError).not.toHaveBeenCalled();
   });
 });
+
+// A scheduled run whose owning process died mid-flight is recovered by the ENG-324
+// reconciler (or the in-process catch), which leaves a graceful "job incomplete"
+// assistant note flagged metadata.jobIncomplete. That placeholder is NOT a genuine
+// assistant turn any more than surfaceFailedRun's isRunFailureNotice note is — so
+// the scorer must classify such a session as a deterministic failed run, NOT feed
+// the placeholder to the LLM judge (which then hallucinates a "never called any
+// tools" narrative on a run that actually called many tools). ENG-479.
+describe('SessionScoring - abandoned scheduled run recovered by reconciler (jobIncomplete note)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  const abandonedScheduled: ChatMessage[] = [
+    { role: 'system', content: 'You are an automated scheduled run.' } as any,
+    { role: 'user', content: 'Enrich the CRM leads and draft outreach.' },
+    {
+      role: 'assistant',
+      content: "This scheduled run didn't finish. Try splitting it into smaller batches.",
+      metadata: { isErrorMessage: true, jobIncomplete: true, timestamp: new Date().toISOString() },
+    } as any,
+  ];
+
+  it('scoreSessionIfNeeded classifies a jobIncomplete-only session as a deterministic failed run (no LLM judge)', async () => {
+    const session = {
+      sessionId: 'abandoned-1',
+      userId: 'u1',
+      sessionType: 'scheduled',
+      messages: [...abandonedScheduled],
+      messageCount: abandonedScheduled.length,
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    expect(result?.score).toBe(1);
+    expect(result?.reason).toMatch(/crashed or timed out|failed run/i);
+    expect(result?.dimensions).toEqual({ goalCompletion: 1, dataAccuracy: 1, outputQuality: 1 });
+    // The reconciler's placeholder must never be scored by the judge LLM.
+    expect(mockCallLLM).not.toHaveBeenCalled();
+    // The reconciler already annotated the session — do not double-add a retry note.
+    expect(mockAddMessage).not.toHaveBeenCalled();
+    expect(mockUpdateError).not.toHaveBeenCalled();
+    expect(mockUpdateScore).toHaveBeenCalledTimes(1);
+  });
+
+  it('scoreSessionWithJudgeIfNeeded scores a jobIncomplete-only session as a failed run without the LLM', async () => {
+    const session = {
+      sessionId: 'abandoned-2',
+      userId: 'u1',
+      sessionType: 'scheduled',
+      messages: [...abandonedScheduled],
+      messageCount: abandonedScheduled.length,
+      judgeScores: {},
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    const result = await scoreSessionWithJudgeIfNeeded(session, testJudge);
+
+    expect(result?.score).toBe(1);
+    expect(result?.dimensions).toEqual({ goalCompletion: 1, dataAccuracy: 1, outputQuality: 1 });
+    expect(mockCallLLM).not.toHaveBeenCalled();
+    expect(mockUpdateJudgeScore).toHaveBeenCalledTimes(1);
+  });
+
+  it('defers a jobIncomplete session still within the grace window (recovery/retry may still be racing)', async () => {
+    const session = {
+      sessionId: 'abandoned-recent-1',
+      userId: 'u1',
+      sessionType: 'scheduled',
+      messages: [...abandonedScheduled],
+      messageCount: abandonedScheduled.length,
+      createdAt: RECENT(),
+      updatedAt: RECENT(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    expect(result).toBeNull();
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+});

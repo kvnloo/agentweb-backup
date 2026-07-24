@@ -139,6 +139,52 @@ describe('SessionScoring - Tool Call Visibility for Judge', () => {
     expect(userMessage.content).not.toContain('x'.repeat(2000));
   });
 
+  it('excludes a jobIncomplete run-failure placeholder from the judge transcript when a real turn coexists (ENG-479)', async () => {
+    mockCallLLM.mockResolvedValue(makeLLMResponse(4, 'recovered'));
+
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Run my weekly report' },
+      {
+        role: 'assistant',
+        content: 'This scheduled run stopped before it could produce a response, so no results were generated.',
+        metadata: { timestamp: '2026-01-01T00:00:00.000Z', isErrorMessage: true, jobIncomplete: true },
+      },
+      { role: 'user', content: 'try again' },
+      { role: 'assistant', content: 'Here is your weekly report.' },
+    ];
+
+    await scoreSession(messages, 4);
+
+    const userMessage = (mockCallLLM.mock.calls[0][1] as any[]).find((m) => m.role === 'user');
+    // The harness crash note must be invisible to the judge...
+    expect(userMessage.content).not.toContain('stopped before it could produce a response');
+    // ...while the genuine assistant turn is still serialized.
+    expect(userMessage.content).toContain('assistant: Here is your weekly report.');
+    const assistantLines = userMessage.content.split('\n').filter((l: string) => l.startsWith('assistant:'));
+    expect(assistantLines).toHaveLength(1);
+  });
+
+  it('excludes an isRunFailureNotice retry placeholder from the judge transcript when a real turn coexists (ENG-479)', async () => {
+    mockCallLLM.mockResolvedValue(makeLLMResponse(3, 'retried'));
+
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'Do the thing' },
+      {
+        role: 'assistant',
+        content: "This run didn't finish — it looks like it stopped before producing a response. Please send your message again to retry.",
+        metadata: { timestamp: '2026-01-01T00:00:00.000Z', isErrorMessage: true, isRunFailureNotice: true },
+      },
+      { role: 'user', content: 'Do the thing' },
+      { role: 'assistant', content: 'Done — here you go.' },
+    ];
+
+    await scoreSession(messages, 4);
+
+    const userMessage = (mockCallLLM.mock.calls[0][1] as any[]).find((m) => m.role === 'user');
+    expect(userMessage.content).not.toContain("didn't finish");
+    expect(userMessage.content).toContain('assistant: Done — here you go.');
+  });
+
   it('excludes system messages from the serialized transcript', async () => {
     mockCallLLM.mockResolvedValue(makeLLMResponse(5, 'great'));
 

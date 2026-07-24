@@ -1653,9 +1653,38 @@ export async function runScheduledChat(
       return tokenLimitResult;
     }
 
-    // Create a session for the run
     const sessionTitle = isTest ? `Test: ${schedule.scheduleName}` : `Scheduled: ${schedule.scheduleName}`;
     const pageIdentifier = `${sessionTitle}|scheduleId:${schedule.scheduleId}`;
+
+    // ENG-479 (GAP 1): stamp the durable in-flight lease BEFORE creating the session
+    // and start heartbeating it. ENG-324 stamped the lease only AFTER
+    // createChatSession, which left a window: a hard-kill (OOM/SIGKILL) landing
+    // between session creation and the lease write produced a session with no lease
+    // — invisible to the reconciler (getInFlightSchedules keys off attribute_exists
+    // (runInFlight)), so it was never requeued and stayed silently zero-output.
+    // Stamping first makes any death from here through the LLM turn reconciler-
+    // visible. The lease carries no sessionId yet; it's attached below once the
+    // session exists (the reconciler tolerates an empty sessionId — it just skips
+    // annotation, but still requeues the run).
+    if (!isTest) {
+      try {
+        await scheduleDb.setRunInFlight(schedule.scheduleId, {
+          runId: leaseRunId,
+          sessionId: '',
+          startedAt: new Date().toISOString(),
+          instanceId: SCHEDULED_RUN_INSTANCE_ID,
+        });
+        leaseAcquired = true;
+        heartbeatTimer = setInterval(() => {
+          void scheduleDb.heartbeatRunInFlight(schedule.scheduleId, leaseRunId);
+        }, HEARTBEAT_INTERVAL_MS);
+        if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
+      } catch (leaseError) {
+        console.error(`Failed to set in-flight lease for schedule ${schedule.scheduleId}:`, leaseError);
+      }
+    }
+
+    // Create a session for the run.
     const testSession = await chatbotDb.createChatSession(
       userId,
       undefined,
@@ -1669,24 +1698,15 @@ export async function runScheduledChat(
     );
     sessionId = testSession.sessionId;
 
-    // ENG-324: stamp the durable in-flight lease now that we have a session, and
-    // start heartbeating it. If this process dies during the (possibly long) LLM
-    // turn below, the reconciler will find this lease stale and requeue the run.
-    if (!isTest) {
+    // Attach the freshly-created session to the lease so the reconciler's recovery
+    // annotates the correct session if this run is later abandoned. Best-effort:
+    // this is a nicety, not correctness — the reconciler still requeues an abandoned
+    // run with an empty sessionId — so a failure here must never abort a healthy run.
+    if (leaseAcquired && sessionId) {
       try {
-        await scheduleDb.setRunInFlight(schedule.scheduleId, {
-          runId: leaseRunId,
-          sessionId,
-          startedAt: new Date().toISOString(),
-          instanceId: SCHEDULED_RUN_INSTANCE_ID,
-        });
-        leaseAcquired = true;
-        heartbeatTimer = setInterval(() => {
-          void scheduleDb.heartbeatRunInFlight(schedule.scheduleId, leaseRunId);
-        }, HEARTBEAT_INTERVAL_MS);
-        if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
-      } catch (leaseError) {
-        console.error(`Failed to set in-flight lease for schedule ${schedule.scheduleId}:`, leaseError);
+        await scheduleDb.attachSessionToRunInFlight(schedule.scheduleId, leaseRunId, sessionId);
+      } catch (attachError) {
+        console.error(`Failed to attach session to in-flight lease for schedule ${schedule.scheduleId}:`, attachError);
       }
     }
 
