@@ -33,8 +33,18 @@ export function _forceReloadCooldownSize(): number {
 }
 
 router.get('/social-posts', authenticateToken, async (req: Request, res: Response) => {
+  let userId: string | undefined;
+  // Account ids whose cooldown was reserved by THIS request — rolled back in
+  // the catch block if getPostsForUser throws outright, so a hard failure
+  // (e.g. a DB read error) doesn't consume the user's retry window for a
+  // refresh that never actually reached LinkedIn. Per-account LinkedIn
+  // failures don't hit this path — getPostsForUser catches those internally
+  // and returns them as a per-account `error` field, not a thrown error —
+  // so an attempt that did reach (and fail against) LinkedIn still correctly
+  // keeps its cooldown.
+  let reservedCooldownIds: string[] = [];
   try {
-    const userId = (req as any).user?.userId;
+    userId = (req as any).user?.userId;
     if (!userId) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
@@ -78,14 +88,23 @@ router.get('/social-posts', authenticateToken, async (req: Request, res: Respons
         });
       }
 
+      // Reserve synchronously — before the async getPostsForUser call below —
+      // so a concurrent request for the same account can't slip past the
+      // check above while this one is still in flight.
       for (const id of targetAccountIds) {
         forceReloadCooldown.set(`${userId}::${id}`, now);
       }
+      reservedCooldownIds = targetAccountIds;
     }
 
     const result = await getPostsForUser(userId, { accountId, limit, includeMetrics, forceReload });
     return res.json(result);
   } catch (error) {
+    if (userId) {
+      for (const id of reservedCooldownIds) {
+        forceReloadCooldown.delete(`${userId}::${id}`);
+      }
+    }
     console.error('[SocialPosts] Error:', error);
     return res.status(500).json({
       success: false,
