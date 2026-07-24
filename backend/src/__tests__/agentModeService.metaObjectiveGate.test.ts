@@ -168,14 +168,19 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       expect(metaService.createCampaign).toHaveBeenCalled();
     });
 
-    it('an invalid objective value is rejected by param validation before the gate ever runs', async () => {
+    it('an invalid objective value with nothing settled surfaces the real ask card (gate runs BEFORE param validation)', async () => {
+      // ENG-400 reorder: the gate must run before validateMetaActionParams, so
+      // a model that supplies a bogus objective still gets the real blocking
+      // card instead of a generic param-validation error — the gate always
+      // resolves to a valid objective (or blocks) before validation ever sees it.
       const result = await callApi(
         service,
         validParams({ objective: 'NOT_REAL', objective_quote: 'NOT_REAL' }),
         'session-1',
       );
-      expect(result.success).toBe(false);
-      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
+      expect(result.success).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(result.type).toBe('ask_user_question');
       expect(metaService.createCampaign).not.toHaveBeenCalled();
     });
   });
@@ -274,6 +279,22 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toBe('ASK_USER_QUESTION_ALREADY_PENDING');
+      expect(metaService.createCampaign).not.toHaveBeenCalled();
+    });
+
+    // Regression (found live, 2026-07-24): a model that correctly OMITS an
+    // objective it doesn't know — the safest thing it can do — must still get
+    // the real ask card. Before the gate-before-validation reorder,
+    // validateMetaActionParams required objective to be PRESENT and threw
+    // PARAM_VALIDATION_ERROR before the gate ever ran, so the model never saw
+    // a real card and (live) started fabricating fake HTML "cards" in prose
+    // instead — the exact failure mode this whole gate exists to prevent.
+    it('emits the real ask card when objective is OMITTED entirely (not just invalid) — the gate runs before param validation', async () => {
+      const result = await callApi(service, validParams(), 'session-1'); // no objective key at all
+
+      expect(result.success).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(result.type).toBe('ask_user_question');
       expect(metaService.createCampaign).not.toHaveBeenCalled();
     });
   });

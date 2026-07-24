@@ -112,9 +112,18 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
 
   // ==================== Pre-validation via callMetaMarketingApi ====================
   describe('callMetaMarketingApi pre-validation', () => {
-    it('returns PARAM_VALIDATION_ERROR for CAMPAIGN CREATE with missing name', async () => {
+    it('returns PARAM_VALIDATION_ERROR for CAMPAIGN CREATE with missing name (objective already settled via the gate)', async () => {
+      // ENG-400: the objective gate runs BEFORE param validation (a model that
+      // correctly omits an unknown objective must hit the real ask card, not a
+      // generic validation error — see the sibling gate test file). So this test
+      // settles the objective first (a verified explicit statement) to isolate
+      // the missing-name validation path specifically.
+      (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
+        { role: 'user', content: 'set up a traffic campaign' },
+      ]);
       const result = await callApi(service, 'CAMPAIGN', 'CREATE', {
-        params: { objective: 'OUTCOME_TRAFFIC' } // missing name
+        sessionId: 'session-1',
+        params: { objective: 'OUTCOME_TRAFFIC', objective_quote: 'traffic campaign' }, // missing name
       });
 
       expect(result.success).toBe(false);
@@ -123,14 +132,21 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(metaService.createCampaign).not.toHaveBeenCalled();
     });
 
-    it('returns PARAM_VALIDATION_ERROR for CAMPAIGN CREATE with invalid objective', async () => {
+    it('an invalid objective value with nothing settled surfaces the real ask card, not a validation error', async () => {
+      // ENG-400 reorder: the objective gate now runs first and ALWAYS resolves
+      // to a valid objective (or blocks/asks) before validateMetaActionParams
+      // ever sees the field — so a garbage objective value can no longer reach
+      // the "Invalid objective" validation branch for CAMPAIGN CREATE; it's
+      // subsumed by the same ask-card path as an omitted one.
       const result = await callApi(service, 'CAMPAIGN', 'CREATE', {
-        params: { name: 'My Campaign', objective: 'INVALID_OBJ' }
+        sessionId: 'session-1',
+        params: { name: 'My Campaign', objective: 'INVALID_OBJ' },
       });
 
-      expect(result.success).toBe(false);
-      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
-      expect(result.message).toContain('INVALID_OBJ');
+      expect(result.success).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(result.type).toBe('ask_user_question');
+      expect(metaService.createCampaign).not.toHaveBeenCalled();
     });
 
     it('returns PARAM_VALIDATION_ERROR for CAMPAIGN UPDATE without campaign_id', async () => {

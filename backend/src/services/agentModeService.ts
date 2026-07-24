@@ -16302,23 +16302,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Ensure params is an object
     params = params || {};
 
-    // Pre-validate params before any API round-trip
-    try {
-      this.validateMetaActionParams(entity_type, action, campaign_id, ad_set_id, ad_id, params);
-    } catch (validationError: any) {
-      return {
-        success: false,
-        message: validationError.message,
-        error: 'PARAM_VALIDATION_ERROR',
-        hint: 'Fix the listed parameters and retry.'
-      } as any;
-    }
-
     // ENG-400: a Meta campaign objective is IMMUTABLE — the one hard rule this
     // gate exists to enforce is that a CAMPAIGN CREATE never executes with an
-    // objective no human chose. Runs BEFORE the generic target-confirmation
-    // guardrail below (settling the objective first avoids asking twice / in
-    // the wrong order). Scope is deliberately narrow: only CAMPAIGN CREATE
+    // objective no human chose. MUST run BEFORE param validation below: the
+    // safest thing a model can do when it doesn't know the objective is omit
+    // it entirely, but validateMetaActionParams requires objective to be
+    // PRESENT for CAMPAIGN CREATE — if validation ran first, omitting it would
+    // produce a generic PARAM_VALIDATION_ERROR instead of the real blocking
+    // card, defeating the whole point of the gate for exactly the callers who
+    // behave correctly. Scope is deliberately narrow: only CAMPAIGN CREATE
     // calls this — no other Meta write is gated.
     if (entity_type === 'CAMPAIGN' && action === 'CREATE') {
       const gate = await this.resolveCampaignObjectiveGate(userId, sessionId, params);
@@ -16329,6 +16321,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // re-derived from params after this point, so nothing downstream can
       // silently drift it (the idx=202→205 LEADS→TRAFFIC flip in the incident).
       params = { ...params, objective: gate.objective };
+    }
+
+    // Pre-validate params before any API round-trip
+    try {
+      this.validateMetaActionParams(entity_type, action, campaign_id, ad_set_id, ad_id, params);
+    } catch (validationError: any) {
+      return {
+        success: false,
+        message: validationError.message,
+        error: 'PARAM_VALIDATION_ERROR',
+        hint: 'Fix the listed parameters and retry.'
+      } as any;
     }
 
     // Target-confirmation guardrail for mutating actions (publish/change/delete).
