@@ -29,6 +29,12 @@ function serializeMessagesForScoring(messages: ChatMessage[]): string {
       lines.push(`user: ${text}`);
 
     } else if (m.role === "assistant") {
+      // A harness-written run-failure placeholder (crash/abandon note) is NOT model
+      // output — it stands in for a turn the model never produced. Never surface it
+      // to the LLM judge: if a placeholder coexists with a later real turn (e.g. an
+      // interactive run that crashed and the user retried in the same session), the
+      // judge would otherwise read the note verbatim and score against it (ENG-479).
+      if (isRunFailurePlaceholder(m)) continue;
       const text = (typeof m.content === "string" ? m.content : JSON.stringify(m.content)).trim();
       const toolCalls: Array<{ name: string; arguments?: any }> = (m as any).metadata?.toolCalls || [];
 
