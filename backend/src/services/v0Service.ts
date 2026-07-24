@@ -3845,7 +3845,10 @@ export function middleware(req: NextRequest) {
   // curl, test tooling) is treated as a real navigation — permissive default, never MORE
   // restrictive than before this fix. The rewrite above still applies to asset requests too.
   const secFetchDest = req.headers.get("sec-fetch-dest");
-  const isPageNavigation = !secFetchDest || secFetchDest === "document";
+  // "iframe"/"frame" are a REAL page being loaded for a visitor to view — just nested, not
+  // top-level (a widget embed, agency preview tool, AB-test wrapper). Only asset-type dests
+  // (image, script, style, font, empty, etc.) are actual sub-resources.
+  const isPageNavigation = !secFetchDest || secFetchDest === "document" || secFetchDest === "iframe" || secFetchDest === "frame";
   if (!isPageNavigation) return res;
 
   // 2. Which page is this, AFTER any rewrite? The capture route needs to know, because
@@ -5905,6 +5908,74 @@ async function readRepoFile(
   } catch (err: any) {
     if (err?.response?.status === 404) return null;
     throw err;
+  }
+}
+
+/**
+ * Backfill middleware.ts + lib/agentweb-track.ts into an EXISTING repo (ENG-501). Deliberately
+ * NARROWER than syncLeadCaptureFilesToRepo below: this function NEVER reads or writes
+ * app/api/capture/route.ts, and therefore cannot touch a repo's real lead-routing data
+ * (LIST_BY_PATH) at all — by construction, not by care taken at each call site. Built
+ * specifically for a one-time bulk backfill across every existing customer repo (ENG-504),
+ * where the ONLY thing that needs fixing is middleware.ts's aw_page cookie-clobber bug (and,
+ * incidentally, the ENG-449 tracking-helper backfill) — rewriting the capture route there
+ * would be pure unrelated risk to real customer lead data for zero benefit.
+ *
+ * Same idempotence/anti-clobber contract as syncLeadCaptureFilesToRepo: no commit if nothing
+ * differs; domainMap.ts is only written when absent (never overwrites a real subdomain map);
+ * never throws (returns a result the caller decides how to surface).
+ */
+export async function syncMiddlewareAndTrackingHelper(
+  repoFullName: string,
+): Promise<{ committed: boolean; reason?: string; pushedCommitSha?: string; pushTimestampMs?: number }> {
+  try {
+    const { token: ghToken } = await getGitHubOrgToken();
+    const ghHeaders = {
+      Authorization: `Bearer ${ghToken}`,
+      Accept: "application/vnd.github.v3+json",
+    };
+
+    const middlewareContent = buildLandingPageMiddleware();
+    const trackingHelperContent = buildTrackingHelper();
+
+    const [existingMiddleware, existingTrackingHelper, existingDomainMap] = await Promise.all([
+      readRepoFile(repoFullName, "middleware.ts", ghHeaders),
+      readRepoFile(repoFullName, "lib/agentweb-track.ts", ghHeaders),
+      readRepoFile(repoFullName, "domainMap.ts", ghHeaders),
+    ]);
+
+    const needsDomainMap = existingDomainMap === null;
+
+    if (!needsDomainMap && existingMiddleware === middlewareContent && existingTrackingHelper === trackingHelperContent) {
+      console.log(`[V0 SERVICE] middleware/tracking-helper already up to date in ${repoFullName} — skipping commit`);
+      return { committed: false, reason: "up-to-date" };
+    }
+
+    const filesToCommit: Array<{ path: string; content: string }> = [];
+    if (existingMiddleware !== middlewareContent) {
+      filesToCommit.push({ path: "middleware.ts", content: middlewareContent });
+    }
+    if (existingTrackingHelper !== trackingHelperContent) {
+      filesToCommit.push({ path: "lib/agentweb-track.ts", content: trackingHelperContent });
+    }
+    if (needsDomainMap) {
+      filesToCommit.push({ path: "domainMap.ts", content: buildDomainMapFile({}) });
+    }
+
+    const { pushedCommitSha, pushTimestampMs } = await commitFilesToRepoMain(
+      repoFullName,
+      ghHeaders,
+      filesToCommit.map((file) => ({ path: file.path, content: Buffer.from(file.content) })),
+      "chore: backfill middleware/tracking-helper fix (ENG-501)",
+      1,
+    );
+
+    console.log(`[V0 SERVICE] Synced middleware/tracking-helper to ${repoFullName} (${filesToCommit.map((f) => f.path).join(", ")})`);
+    return { committed: true, pushedCommitSha, pushTimestampMs };
+  } catch (err: any) {
+    const reason = err?.response?.data?.message || err?.message || String(err);
+    console.error(`[V0 SERVICE] FAILED to sync middleware/tracking-helper to ${repoFullName}: ${reason}`);
+    return { committed: false, reason };
   }
 }
 

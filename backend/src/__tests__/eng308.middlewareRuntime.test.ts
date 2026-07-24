@@ -242,6 +242,28 @@ describe('ENG-308 — the emitted middleware, actually executed', () => {
       const res = mw.middleware(makeReq('https://lp.example.com/pricing', { host: 'lp.example.com' }));
       expect(res.cookies.wasSet('aw_page')!.value).toBe('/pricing');
     });
+
+    // A page embedded in an iframe (widget embed, agency preview tool, AB-test wrapper) is
+    // still a REAL page being loaded for a visitor to view and submit a form on — just nested,
+    // not top-level. Its Sec-Fetch-Dest is "iframe"/"frame", not "document", but it must NOT
+    // be treated as a sub-resource: doing so would silently degrade attribution for embedded
+    // pages to the weaker Referer-based fallback (the exact problem the aw_page cookie exists
+    // to avoid on a rewritten custom-domain host).
+    it('a page loaded inside an iframe (Sec-Fetch-Dest: iframe) STILL stamps aw_page — it is a real page view, not a sub-resource', () => {
+      const mw = loadMiddleware({});
+      const res = mw.middleware(
+        makeReq('https://lp.example.com/pricing', { host: 'lp.example.com', secFetchDest: 'iframe' })
+      );
+      expect(res.cookies.wasSet('aw_page')!.value).toBe('/pricing');
+    });
+
+    it('a page loaded inside a legacy <frame> (Sec-Fetch-Dest: frame) STILL stamps aw_page', () => {
+      const mw = loadMiddleware({});
+      const res = mw.middleware(
+        makeReq('https://lp.example.com/pricing', { host: 'lp.example.com', secFetchDest: 'frame' })
+      );
+      expect(res.cookies.wasSet('aw_page')!.value).toBe('/pricing');
+    });
   });
 
   describe('the matcher, as Next.js would apply it', () => {
