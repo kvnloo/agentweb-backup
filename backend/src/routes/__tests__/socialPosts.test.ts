@@ -106,6 +106,30 @@ describe('GET /api/social-posts', () => {
     );
   });
 
+  it('should pass forceReload when force_reload=true is set (on-demand refresh)', async () => {
+    mockGetPosts.mockResolvedValue({ posts: [], total: 0 } as any);
+
+    await request(app)
+      .get('/api/social-posts?force_reload=true')
+      .expect(200);
+
+    expect(mockGetPosts).toHaveBeenCalledWith(
+      'user-1',
+      expect.objectContaining({ forceReload: true })
+    );
+  });
+
+  it('should default forceReload to false when force_reload is absent', async () => {
+    mockGetPosts.mockResolvedValue({ posts: [], total: 0 } as any);
+
+    await request(app).get('/api/social-posts').expect(200);
+
+    expect(mockGetPosts).toHaveBeenCalledWith(
+      'user-1',
+      expect.objectContaining({ forceReload: false })
+    );
+  });
+
   it('should return 500 when getPostsForUser throws', async () => {
     mockGetPosts.mockRejectedValue(new Error('DB error'));
 
