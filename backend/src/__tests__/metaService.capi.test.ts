@@ -106,7 +106,7 @@ describe('sendCapiLeadEvent', () => {
     expect(evt.user_data.client_user_agent).toBe('Mozilla/5.0');
   });
 
-  // ENG-490: Meta's documented CAPI normalization for `ph` is digits-only, then strip any
+  // ENG-492: Meta's documented CAPI normalization for `ph` is digits-only, then strip any
   // leading zero(s) (a national-dialing-prefix artifact, e.g. a UK number entered with its
   // domestic leading 0) before hashing. Missing before this: only non-digits were stripped.
   it('normalizes phone by stripping non-digits AND any leading zero(s) before hashing (Meta CAPI spec)', async () => {

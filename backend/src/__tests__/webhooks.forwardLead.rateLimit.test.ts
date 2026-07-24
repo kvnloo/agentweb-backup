@@ -1,5 +1,5 @@
 /**
- * ENG-490: /forward-lead is public and unauthenticated by design (any generated customer
+ * ENG-492: /forward-lead is public and unauthenticated by design (any generated customer
  * site's capture route must reach it with no login), and always allowed unbounded requests.
  * Before ENG-449 that only risked junk CRM leads; since ENG-449 the same flood also fires a
  * real server-side Meta CAPI send using the actual page owner's own credentials (safely
@@ -60,7 +60,7 @@ import request from 'supertest';
 import express from 'express';
 import { crmDb } from '../services/db';
 
-describe('forward-lead rate limiting (ENG-490)', () => {
+describe('forward-lead rate limiting (ENG-492)', () => {
   let app: express.Express;
 
   beforeAll(() => {
