@@ -1317,12 +1317,19 @@ describe("POST /api/landing-pages/v0/generated/:id/meta-pixel", () => {
     expect(res.body.success).toBe(true);
     expect(res.body.pixelId).toBe("1430870751246428");
     expect(mockUpdateLandingPageMetaPixel).toHaveBeenCalledWith("page-1", "test-user-id", "1430870751246428", "acc1");
-    expect(mockSyncLeadCaptureFilesToRepo).toHaveBeenCalledWith(
-      "testorg/testrepo",
-      expect.any(Object),
-      "1430870751246428",
-      "acc1",
-    );
+    // ENG-485: 2nd arg is now a callback (re-derived fresh on every retry attempt inside
+    // syncLeadCaptureFilesToRepo, which is mocked here so the callback is never actually
+    // invoked) — assert it's a function with the right shape, and that calling it directly
+    // still produces the expected map.
+    const [repoArg, buildListByPath, pixelArg, accountArg] = mockSyncLeadCaptureFilesToRepo.mock.calls[0];
+    expect(repoArg).toBe("testorg/testrepo");
+    expect(typeof buildListByPath).toBe("function");
+    expect(pixelArg).toBe("1430870751246428");
+    expect(accountArg).toBe("acc1");
+    // PAGE_WITH_REPO carries no leadListId, so the map it produces is empty — the point of
+    // this assertion is just that calling the callback works and re-queries, not the value.
+    mockListLandingPages.mockResolvedValueOnce([PAGE_WITH_REPO]);
+    await expect(buildListByPath()).resolves.toEqual({});
     const putCall = mockAxios.put.mock.calls[0][1] as any;
     expect(putCall.message).toContain("1430870751246428");
   });
