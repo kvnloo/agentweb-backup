@@ -17,8 +17,11 @@ router.get('/social-posts', authenticateToken, async (req: Request, res: Respons
     const accountId = req.query.accountId as string | undefined;
     const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 20;
     const includeMetrics = req.query.include_metrics !== 'false';
+    // On-demand refresh: bypass the 24h cache and re-fetch from LinkedIn.
+    // Only affects company/organization pages — personal profiles always read from the DB.
+    const forceReload = req.query.force_reload === 'true';
 
-    const result = await getPostsForUser(userId, { accountId, limit, includeMetrics });
+    const result = await getPostsForUser(userId, { accountId, limit, includeMetrics, forceReload });
     return res.json(result);
   } catch (error) {
     console.error('[SocialPosts] Error:', error);
