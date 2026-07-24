@@ -868,6 +868,14 @@ emmaToolRegistry.register({
   the call returns a blocking question instead of creating the campaign — do not try to work around this
   by guessing an objective or retrying.
 
+  If the user asks you to confirm the objective (or any other setting) via a structured card BEFORE you
+  build anything: you have NO way to render an interactive card yourself — do not fabricate one out of HTML,
+  markdown tables, or styled text in your reply; a hand-written "card" you write is not real and answering
+  it does nothing. Just attempt the CAMPAIGN CREATE call directly (with your real name/budget/targeting
+  params, omitting objective if it isn't explicitly confirmed) — if the objective truly isn't settled, the
+  call itself returns the real blocking question, which the platform renders as an actual clickable card.
+  Do not stall in prose waiting to "ask first"; attempting the call is how the real card appears.
+
 ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
   AD_SET        → LIST, CREATE, UPDATE, DELETE
