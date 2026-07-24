@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { AuthenticatedRequest } from '../middleware/auth';
-import { getPostsForUser, generateEngagementMemory } from '../services/socialPostsService';
+import { getPostsForUser, getSocialAccountIds, generateEngagementMemory } from '../services/socialPostsService';
 import { userDb, scheduleDb, socialEngagementTrackingDb } from '../services/db';
 import { getEngagementMemory, saveEngagementMemory, EngagementMemory } from '../services/connectedAccountsDb';
 
@@ -20,6 +20,11 @@ export function _resetForceReloadCooldown(): void {
   forceReloadCooldown.clear();
 }
 
+/** Exported for testing — asserts the cooldown map stays bounded to real accounts. */
+export function _forceReloadCooldownSize(): number {
+  return forceReloadCooldown.size;
+}
+
 router.get('/social-posts', authenticateToken, async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user?.userId;
@@ -36,19 +41,39 @@ router.get('/social-posts', authenticateToken, async (req: Request, res: Respons
 
     // Throttle force_reload — it's the only path that bypasses the 24h cache and
     // burns the shared LinkedIn quota, so cap how frequently one user can call it.
+    //
+    // The cooldown is keyed per real, owned social account (not the raw
+    // accountId query param) for two reasons:
+    //  1. Bounded memory — an unvalidated accountId would let a caller grow
+    //     the process-global map without limit; real accounts are finite.
+    //  2. Consistent throttling — an "all accounts" refresh and a refresh of
+    //     one of those same accounts must share cooldown state, otherwise a
+    //     caller can alternate between the two to bypass the cooldown and
+    //     double up on LinkedIn calls for the same account.
     if (forceReload) {
-      const cooldownKey = `${userId}::${accountId ?? 'all'}`;
+      const socialAccountIds = await getSocialAccountIds(userId);
+      const targetAccountIds = accountId
+        ? socialAccountIds.filter((id) => id === accountId)
+        : socialAccountIds;
+
       const now = Date.now();
-      const last = forceReloadCooldown.get(cooldownKey) ?? 0;
-      if (now - last < FORCE_RELOAD_COOLDOWN_MS) {
-        const retryAfterSeconds = Math.ceil((last + FORCE_RELOAD_COOLDOWN_MS - now) / 1000);
+      let retryAfterMs = 0;
+      for (const id of targetAccountIds) {
+        const last = forceReloadCooldown.get(`${userId}::${id}`) ?? 0;
+        retryAfterMs = Math.max(retryAfterMs, last + FORCE_RELOAD_COOLDOWN_MS - now);
+      }
+
+      if (retryAfterMs > 0) {
         return res.status(429).json({
           success: false,
           error: 'Posts were just refreshed. Please wait a moment before refreshing again.',
-          retry_after_seconds: retryAfterSeconds,
+          retry_after_seconds: Math.ceil(retryAfterMs / 1000),
         });
       }
-      forceReloadCooldown.set(cooldownKey, now);
+
+      for (const id of targetAccountIds) {
+        forceReloadCooldown.set(`${userId}::${id}`, now);
+      }
     }
 
     const result = await getPostsForUser(userId, { accountId, limit, includeMetrics, forceReload });

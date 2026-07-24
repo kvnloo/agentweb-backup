@@ -47,6 +47,19 @@ interface GetPostsResult {
   accounts: AccountSummary[];
 }
 
+/**
+ * Account IDs eligible for force_reload — i.e. the same social accounts
+ * getPostsForUser would actually hit. Used by the route to key the
+ * force_reload cooldown to real, owned accounts instead of arbitrary
+ * caller-supplied query values.
+ */
+export async function getSocialAccountIds(userId: string): Promise<string[]> {
+  const allAccounts = await getAccountsByUserId(userId);
+  return allAccounts
+    .filter(a => SOCIAL_PLATFORMS.includes(a.platform))
+    .map(a => a.account_id);
+}
+
 export async function getPostsForUser(
   userId: string,
   options: GetPostsOptions = {}
