@@ -92,6 +92,14 @@ function shouldAttemptCapiSend(listId: string): boolean {
   );
   if (recent.length >= CAPI_SEND_BUDGET_MAX) {
     capiSendTimestampsByListId.set(listId, recent);
+    // Logged every time (not just on the first overflow) so the actual overflow VOLUME is
+    // visible in logs, not just that it happened once — that's what tells us whether
+    // CAPI_SEND_BUDGET_MAX is too low for a real customer's real traffic (tune it up) vs.
+    // a genuine flood (leave it, or investigate the source).
+    console.warn(
+      `[CAPI] Send budget exhausted for list ${listId} (${recent.length}/${CAPI_SEND_BUDGET_MAX} ` +
+      `in the last ${CAPI_SEND_BUDGET_WINDOW_MS / 60000}min) — this submission's Lead event will NOT be forwarded to Meta. Lead itself still saved normally.`
+    );
     return false;
   }
   recent.push(now);
