@@ -236,6 +236,27 @@ export class MetaService {
   }
 
   /**
+   * Greptile P1 ("Invalid requests now require session storage"): validates ONLY
+   * the objective-INDEPENDENT campaign fields (name, special_ad_categories
+   * shape) — no DB access. Called BEFORE the ENG-400 objective gate so a
+   * request missing basic required fields is rejected deterministically,
+   * without ever touching session storage, exactly as it was before the gate
+   * was reordered to run first. Objective itself is validated separately, by
+   * construction, via the gate (which only ever returns a value from the
+   * fixed valid-objective set).
+   */
+  public static validateCampaignParamsExceptObjective(action: string, params: Partial<MetaAdsCampaignParams>): void {
+    if (action !== 'CREATE') return;
+
+    if (!params.name) {
+      throw new Error('Campaign CREATE requires "name".');
+    }
+    if (params.special_ad_categories !== undefined && !Array.isArray(params.special_ad_categories)) {
+      throw new Error('Campaign "special_ad_categories" must be an array (e.g. ["NONE"]).');
+    }
+  }
+
+  /**
    * Validate campaign params before hitting the Meta API.
    * Throws a descriptive Error if validation fails.
    */

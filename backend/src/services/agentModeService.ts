@@ -26,6 +26,7 @@ import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWor
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb } from './db';
 import {
+  applyAnswer,
   buildPendingUserQuestion,
   checkQuestionGate,
   findQuestionByKind,
@@ -16130,6 +16131,58 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * Greptile P1 ("Confirmation retry reopens objective gate"): makes a Path 1
+   * (verified explicit-statement) success durable for the rest of the session,
+   * the same way a card answer is — so a target-confirmation retry (or any
+   * later CAMPAIGN CREATE in this session) finds it via Path 2 instead of
+   * re-deriving it against a possibly different later message. Synthesizes a
+   * single-option "question" that's already answered — never shown to the
+   * user (no card was needed; the user already stated it themselves), just a
+   * structural record for the gate to find.
+   */
+  private async persistExplicitObjectiveConfirmation(
+    sessionId: string,
+    objective: string,
+    quote: string,
+  ): Promise<void> {
+    const question = buildPendingUserQuestion({
+      questionId: uuidv4(),
+      question: 'Meta campaign objective (confirmed from the user\'s own explicit statement).',
+      options: [
+        {
+          id: 'confirmed',
+          label: objective,
+          consequence: 'Confirmed by the user\'s own words — not shown as a card.',
+          recommended: true,
+          why: `The user explicitly stated this: "${quote}"`,
+          payload: { objective },
+        },
+        {
+          // Structural placeholder only — the primitive requires 2–4 options
+          // and exactly one recommended. This one was never actually offered;
+          // it can never be selected since this record is built pre-answered.
+          id: 'not-applicable',
+          label: 'N/A',
+          consequence: 'Not a real choice — this record reflects an explicit user statement, not a live card.',
+          payload: {},
+        },
+      ],
+      immutable: true,
+      allowEmmaDecide: false,
+      kind: 'meta_objective',
+      createdAt: new Date().toISOString(),
+    });
+    const answered = applyAnswer(question, {
+      optionId: 'confirmed',
+      delegated: false,
+      answeredBy: 'user',
+      rationale: `Explicitly stated by the user: "${quote}"`,
+      at: new Date().toISOString(),
+    });
+    await chatbotDb.updateSessionAskUserQuestion(sessionId, answered);
+  }
+
+  /**
    * ENG-400: the Meta campaign-objective write gate — the one hard rule this
    * whole chain exists to enforce. A CAMPAIGN CREATE's objective must come from
    * one of three human-attributed sources; there is no fourth path. See the
@@ -16191,6 +16244,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const lastUserText = await this.getLastUserMessageText(sessionId);
       const keywordPattern = AgentModeService.META_OBJECTIVE_KEYWORDS[claimedObjective];
       if (verifyExplicitStatement(lastUserText, quote) && keywordPattern?.test(quote)) {
+        // Greptile P1 ("Confirmation retry reopens objective gate"): CAMPAIGN
+        // CREATE is also a write action, so the target-confirmation guardrail
+        // below still fires after this and asks the user to confirm the
+        // target. That reply ("yes") becomes the new last user message on the
+        // retry — the ORIGINAL quote no longer appears there, so re-evaluating
+        // Path 1 from scratch would fail and wrongly fall through to a fresh
+        // Path 3 ask, even though the objective was already legitimately
+        // confirmed. Persist this success as a real answered record (same
+        // shape Path 2 looks for) so the retry finds it settled instead of
+        // re-deriving it against a message that no longer contains the quote.
+        await this.persistExplicitObjectiveConfirmation(sessionId, claimedObjective, quote);
         return { allowed: true, objective: claimedObjective };
       }
       // The quote didn't check out against the real transcript, or doesn't
@@ -16306,14 +16370,35 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     // ENG-400: a Meta campaign objective is IMMUTABLE — the one hard rule this
     // gate exists to enforce is that a CAMPAIGN CREATE never executes with an
-    // objective no human chose. MUST run BEFORE param validation below: the
-    // safest thing a model can do when it doesn't know the objective is omit
-    // it entirely, but validateMetaActionParams requires objective to be
-    // PRESENT for CAMPAIGN CREATE — if validation ran first, omitting it would
-    // produce a generic PARAM_VALIDATION_ERROR instead of the real blocking
-    // card, defeating the whole point of the gate for exactly the callers who
-    // behave correctly. Scope is deliberately narrow: only CAMPAIGN CREATE
-    // calls this — no other Meta write is gated.
+    // objective no human chose. The gate itself MUST run BEFORE objective
+    // validation: the safest thing a model can do when it doesn't know the
+    // objective is omit it entirely, and validateMetaActionParams used to
+    // require objective to be PRESENT for CAMPAIGN CREATE — if that ran first,
+    // omitting it produced a generic PARAM_VALIDATION_ERROR instead of the real
+    // blocking card, defeating the whole point of the gate for exactly the
+    // callers who behave correctly.
+    //
+    // Greptile P1 ("Invalid requests now require session storage"): the gate
+    // can touch the DB (auto-provisioning a session, reading pending
+    // questions), so a request that's malformed independent of objective
+    // (e.g. missing "name") must be rejected BEFORE the gate runs, not after —
+    // otherwise a basic, previously DB-free validation failure now depends on
+    // session storage being reachable at all. Validate those fields first.
+    if (entity_type === 'CAMPAIGN' && action === 'CREATE') {
+      try {
+        MetaService.validateCampaignParamsExceptObjective(action, params);
+      } catch (validationError: any) {
+        return {
+          success: false,
+          message: validationError.message,
+          error: 'PARAM_VALIDATION_ERROR',
+          hint: 'Fix the listed parameters and retry.'
+        } as any;
+      }
+    }
+
+    // Scope is deliberately narrow: only CAMPAIGN CREATE calls this — no other
+    // Meta write is gated.
     if (entity_type === 'CAMPAIGN' && action === 'CREATE') {
       const gate = await this.resolveCampaignObjectiveGate(userId, sessionId, params);
       if (!gate.allowed) {

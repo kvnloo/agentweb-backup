@@ -134,6 +134,52 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       expect(metaService.createCampaign).not.toHaveBeenCalled();
     });
 
+    // Greptile P1 ("Confirmation retry reopens objective gate"): CAMPAIGN
+    // CREATE is also a write action, so the target-confirmation guardrail
+    // fires AFTER a Path 1 success and asks the user to confirm the target.
+    // That "yes" reply becomes the new last user message on the retry — the
+    // original quote no longer appears there. A Path 1 success must persist a
+    // settled record so the retry finds it via Path 2 instead of wrongly
+    // re-asking (the confirmed campaign must not get blocked by a NEW
+    // objective question after the user already answered it once).
+    it('persists a Path 1 success so a later retry (different last message) still resolves without re-quoting', async () => {
+      (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
+        { role: 'user', content: 'Create a leads campaign for our new offer.' },
+      ]);
+      const firstCall = await callApi(
+        service,
+        validParams({ objective: 'OUTCOME_LEADS', objective_quote: 'leads campaign' }),
+        'session-1',
+      );
+      expect(firstCall.success).toBe(true);
+      expect(chatbotDb.updateSessionAskUserQuestion).toHaveBeenCalled();
+      const persisted = (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mock.calls[0][1];
+      expect(persisted.status).toBe('answered');
+      expect(persisted.kind).toBe('meta_objective');
+      expect(persisted.answer.answeredBy).toBe('user');
+
+      // Simulate the retry: the session now reflects that persisted record,
+      // and the LATEST message is the user's confirmation reply ("yes"), which
+      // does NOT contain the original quote.
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ pendingUserQuestion: persisted });
+      (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
+        { role: 'user', content: 'Create a leads campaign for our new offer.' },
+        { role: 'assistant', content: 'Confirm this campaign?' },
+        { role: 'user', content: 'yes' },
+      ]);
+
+      const retry = await callApi(
+        service,
+        validParams({ objective: 'OUTCOME_TRAFFIC' /* model's retry may omit/vary the quote */, confirm: true }),
+        'session-1',
+      );
+
+      expect(retry.success).toBe(true);
+      expect(metaService.createCampaign).toHaveBeenCalled();
+      // Applied the ORIGINALLY-confirmed objective verbatim, not the retry's own claim.
+      expect((metaService.createCampaign as jest.Mock).mock.calls[0][2].objective).toBe('OUTCOME_LEADS');
+    });
+
     // Greptile P1 ("Quote does not bind objective"): a genuine quote proves it's
     // real transcript text, but says nothing about WHICH objective it names. A
     // model could pair a real "traffic campaign" quote with a totally different
@@ -250,6 +296,45 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       const result = await callApi(service, validParams({ objective: 'OUTCOME_LEADS' }), 'session-1');
       expect(result.awaitingUserConfirmation).toBe(true);
       expect(metaService.createCampaign).not.toHaveBeenCalled();
+    });
+  });
+
+  // Greptile P1 ("Invalid requests now require session storage"): fields
+  // independent of objective (name, special_ad_categories shape) must be
+  // rejected BEFORE the gate touches the DB — otherwise a basic, previously
+  // DB-free validation failure now depends on session storage being reachable.
+  describe('objective-independent validation runs BEFORE the gate touches the DB', () => {
+    it('rejects missing "name" WITHOUT calling any chatbotDb method (no DB access)', async () => {
+      const result = await callApi(service, { special_ad_categories: ['NONE'], confirm: true }, 'session-1');
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
+      expect(result.message).toContain('"name"');
+      expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
+      expect(chatbotDb.getMessagesFromMessagesTable).not.toHaveBeenCalled();
+      expect(chatbotDb.createChatSession).not.toHaveBeenCalled();
+      expect(metaService.createCampaign).not.toHaveBeenCalled();
+    });
+
+    it('rejects malformed special_ad_categories WITHOUT calling any chatbotDb method', async () => {
+      const result = await callApi(
+        service,
+        { name: 'Test', special_ad_categories: 'NONE' /* should be an array */, confirm: true },
+        'session-1',
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
+      expect(chatbotDb.getChatSession).not.toHaveBeenCalled();
+      expect(metaService.createCampaign).not.toHaveBeenCalled();
+    });
+
+    it('still rejects missing "name" even with NO session — no DB access either way', async () => {
+      const result = await callApi(service, { special_ad_categories: ['NONE'], confirm: true }); // no sessionId
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
+      expect(chatbotDb.createChatSession).not.toHaveBeenCalled();
     });
   });
 
