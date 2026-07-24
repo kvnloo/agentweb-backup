@@ -1,6 +1,5 @@
 import * as crypto from 'crypto';
 import express from 'express';
-import rateLimit from 'express-rate-limit';
 import { IncomingMessage } from 'http';
 import { WebhookRequiredHeaders } from 'svix';
 import { webhookService, ResendWebhookEvent } from '../services/webhookService';
@@ -74,6 +73,31 @@ async function resolveContactEmail(
 }
 
 const router = express.Router();
+
+// ENG-492: bounds how often the Meta CAPI send (below, in the forward-lead handler) is
+// actually ATTEMPTED per lead list, so a scripted flood against one customer's list can't
+// pollute their live ad account with unlimited fake "Lead" conversions. Deliberately NOT an
+// HTTP-level rate limiter (like express-rate-limit) — this only ever gates the optional,
+// fire-and-forget CAPI call, never the lead save/response itself, so hitting the cap has
+// zero customer-visible effect: the lead still saves normally, the response is still 201,
+// the only consequence is that this one submission doesn't get forwarded to Meta.
+const capiSendTimestampsByListId = new Map<string, number[]>();
+const CAPI_SEND_BUDGET_MAX = 100;
+const CAPI_SEND_BUDGET_WINDOW_MS = 15 * 60 * 1000;
+
+function shouldAttemptCapiSend(listId: string): boolean {
+  const now = Date.now();
+  const recent = (capiSendTimestampsByListId.get(listId) || []).filter(
+    (t) => now - t < CAPI_SEND_BUDGET_WINDOW_MS,
+  );
+  if (recent.length >= CAPI_SEND_BUDGET_MAX) {
+    capiSendTimestampsByListId.set(listId, recent);
+    return false;
+  }
+  recent.push(now);
+  capiSendTimestampsByListId.set(listId, recent);
+  return true;
+}
 
 /**
  * Fire-and-forget: enroll a single lead into any sequences that have
@@ -310,39 +334,19 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
   }
 });
 
-// ENG-492: this endpoint is public and unauthenticated by design — any generated customer
-// site's capture route needs to reach it with no login. Before ENG-449, unbounded abuse here
-// only created junk CRM leads. Since ENG-449, pixelId/metaAccountId also flow through to a
-// real server-side Meta CAPI send using the ACTUAL page owner's own access token (safely
-// scoped — see metaAccountCredentials.ts — so this can't leak a DIFFERENT customer's
-// credentials), which means a scripted flood can now pollute a real customer's live ad
-// account with fake "Lead" conversions, skewing their actual paid campaign's optimization.
+// ENG-492: the lead-SAVE path below is never rate-limited — a real customer's real lead must
+// never be rejected, no matter how large a traffic spike (viral post, big ad spend, a featured
+// TV segment can all legitimately blow past any fixed number we'd pick). Rate limiting here
+// used to gate the whole request, including the save; that was reverted in favor of gating
+// ONLY the optional, best-effort Meta CAPI send below (capiSendBudget), so the worst case of
+// hitting a limit is "this one submission doesn't get forwarded to Meta" — never a lost lead.
 //
-// Keyed by listId, NOT by IP (ENG-493): this app never configures Express's `trust proxy`,
-// so `req.ip` collapses to the same value (127.0.0.1 behind nginx-on-localhost in prod, or
-// the one ngrok agent in the test env) for every caller regardless of their real origin —
-// confirmed live against both environments. An IP-keyed limiter here would be a de facto
-// GLOBAL cap shared by every customer's site combined, not a per-caller one — a flood
-// against ONE customer's page would start rejecting every OTHER customer's real leads too.
-// Keying by listId scopes the limit to "this one customer's capture route", which is also a
-// better fit for the actual threat this exists to stop (one site's ad account getting
-// polluted) than IP ever would have been, and doesn't depend on ENG-493 being fixed.
-const forwardLeadRateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => String(req.body?.listId || 'unknown-list'),
-  // supertest requests across this suite reuse the same handful of listIds far more than
-  // 100 times in a single run, and this route's real protection doesn't depend on IP at all
-  // (see above), so there's nothing test-env-topology-specific left for this skip to guard
-  // against other than raw volume.
-  skip: () => process.env.NODE_ENV === 'test',
-  message: { success: false, message: 'Too many submissions for this list. Please try again later.' },
-});
+// (Keying any future request-level limiter here by IP would also be unsound: this app never
+// configures Express's `trust proxy`, so `req.ip` collapses to the same value for every
+// caller — confirmed live in both prod and the test env. See ENG-493.)
 
 // Public endpoint for forwarding leads to CRM
-router.post('/forward-lead', forwardLeadRateLimiter, async (req: express.Request, res: express.Response) => {
+router.post('/forward-lead', async (req: express.Request, res: express.Response) => {
   // Set CORS headers to allow all origins for this endpoint
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
@@ -568,7 +572,7 @@ router.post('/forward-lead', forwardLeadRateLimiter, async (req: express.Request
     // roadmap-delivery email below) — this must never delay or affect the lead-save response
     // already sent above, and a Meta-side failure must never be surfaced as a lead-capture
     // failure (the lead itself already saved successfully).
-    if (pixelId && metaAccountId && eventId) {
+    if (pixelId && metaAccountId && eventId && shouldAttemptCapiSend(leadList.listId)) {
       void (async () => {
         try {
           const owner = await userDb.getUserById(leadList.userId);
