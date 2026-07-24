@@ -55,11 +55,15 @@ const NextResponse = {
 };
 
 /** Build a NextRequest-alike. */
-function makeReq(url: string, opts: { host?: string; cookie?: string; referer?: string } = {}) {
+function makeReq(
+  url: string,
+  opts: { host?: string; cookie?: string; referer?: string; secFetchDest?: string } = {}
+) {
   const nextUrl = new URL(url);
   const headers = new Map<string, string>();
   if (opts.host) headers.set('host', opts.host);
   if (opts.referer) headers.set('referer', opts.referer);
+  if (opts.secFetchDest !== undefined) headers.set('sec-fetch-dest', opts.secFetchDest);
   return {
     nextUrl: Object.assign(nextUrl, { clone: () => new URL(nextUrl.href) }),
     headers: { get: (k: string) => headers.get(k.toLowerCase()) ?? null },
@@ -189,6 +193,54 @@ describe('ENG-308 — the emitted middleware, actually executed', () => {
         makeReq('https://lp.example.com/b', { host: 'lp.example.com', referer: 'https://lp.example.com/a' }),
       );
       expect(JSON.parse(self.cookies.wasSet(COOKIE)!.value).referrer).toBeUndefined();
+    });
+  });
+
+  describe('sub-resource requests must NOT clobber aw_page/aw_first_touch (live-repro: /placeholder.svg)', () => {
+    // The middleware matcher (below) cannot practically exclude every static asset path a
+    // generated page might reference (v0's own placeholder images, uploaded photos, fonts —
+    // arbitrary paths, not just a fixed extension list). Before this fix, an asset request
+    // for e.g. /placeholder.svg matched the SAME catch-all and re-stamped aw_page with
+    // "/placeholder.svg" — silently misfiling the NEXT lead submitted from that page into no
+    // list at all ("This page has no lead list configured"). Live-repro'd exactly this
+    // against a real generated page whose hero section referenced a placeholder image.
+    it('a browser sub-resource request (Sec-Fetch-Dest: image) does NOT stamp aw_page', () => {
+      const mw = loadMiddleware({});
+      const res = mw.middleware(
+        makeReq('https://lp.example.com/placeholder.svg', { host: 'lp.example.com', secFetchDest: 'image' })
+      );
+      expect(res.cookies.wasSet('aw_page')).toBeUndefined();
+    });
+
+    it('a browser sub-resource request does NOT stamp aw_first_touch either', () => {
+      const mw = loadMiddleware({});
+      const res = mw.middleware(
+        makeReq('https://lp.example.com/placeholder.svg?utm_source=meta', { host: 'lp.example.com', secFetchDest: 'image' })
+      );
+      expect(res.cookies.wasSet(COOKIE)).toBeUndefined();
+    });
+
+    it('a sub-resource request on the REWRITE path still gets routed correctly (rewrite unaffected)', () => {
+      const mw = loadMiddleware({ 'pricing.acme.com': '/pricing' });
+      const res = mw.middleware(
+        makeReq('https://pricing.acme.com/placeholder.svg', { host: 'pricing.acme.com', secFetchDest: 'image' })
+      );
+      expect(res.kind).toBe('rewrite');
+      expect(res.cookies.wasSet('aw_page')).toBeUndefined();
+    });
+
+    it('a real page navigation (Sec-Fetch-Dest: document) still stamps aw_page normally', () => {
+      const mw = loadMiddleware({});
+      const res = mw.middleware(
+        makeReq('https://lp.example.com/pricing', { host: 'lp.example.com', secFetchDest: 'document' })
+      );
+      expect(res.cookies.wasSet('aw_page')!.value).toBe('/pricing');
+    });
+
+    it('permissive default: a request with NO Sec-Fetch-Dest header (old browser, curl, test tooling) still stamps aw_page — never MORE restrictive than before this fix', () => {
+      const mw = loadMiddleware({});
+      const res = mw.middleware(makeReq('https://lp.example.com/pricing', { host: 'lp.example.com' }));
+      expect(res.cookies.wasSet('aw_page')!.value).toBe('/pricing');
     });
   });
 
