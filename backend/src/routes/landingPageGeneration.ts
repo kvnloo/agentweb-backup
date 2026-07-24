@@ -302,11 +302,29 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       }
     }
 
-    const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_id, site_id, originating_session_id, mode: requestedMode } = req.body;
+    const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_id, site_id, originating_session_id, mode: requestedMode, bridge_out_url } = req.body;
     // Condense uploaded HTML to avoid exceeding v0 prompt size limits
     let template_html: string | undefined = rawTemplateHtml
       ? extractTemplateOutline(rawTemplateHtml)
       : undefined;
+
+    // ENG-449 (Harsha, 2026-07-24): a bridge-out destination is a THIRD-PARTY URL the
+    // generated form redirects to after capturing the lead (e.g. an external booking
+    // page) — a malformed destination would silently break that customer's funnel, so
+    // fail loud here rather than generate a page whose redirect goes nowhere useful.
+    if (bridge_out_url !== undefined && bridge_out_url !== null) {
+      if (typeof bridge_out_url !== "string") {
+        return res.status(400).json({ error: "bridge_out_url must be a string" });
+      }
+      try {
+        const parsed = new URL(bridge_out_url);
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+          throw new Error("not http(s)");
+        }
+      } catch {
+        return res.status(400).json({ error: "bridge_out_url must be a well-formed http(s) URL" });
+      }
+    }
 
     // If template_id provided (user picked a template), look it up from DynamoDB
     if (template_id && !template_html) {
@@ -397,6 +415,7 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       siteId: typeof site_id === "string" ? site_id : undefined,
       originatingSessionId: typeof originating_session_id === "string" ? originating_session_id : undefined,
       mode: effectiveMode,
+      bridgeOutUrl: typeof bridge_out_url === "string" ? bridge_out_url : undefined,
     });
     void emitLanderLifecycle("created", { pageId: (result as any)?.id || "unknown", userId, channel: landerChannelFromRequest(req), mode: "cold_start", outcome: (result as any)?.status === "failed" ? "failed" : "ok" });
     res.status(201).json(result);

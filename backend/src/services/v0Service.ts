@@ -501,6 +501,22 @@ export interface GeneratedLandingPage {
    * the form freeform, so unlike layout-level injection this can only be checked, not guaranteed.
    */
   pixelLeadEventVerified?: boolean;
+  /**
+   * Per-page. When set, the generated form redirects the visitor to a THIRD-PARTY
+   * destination (e.g. a booking page) after a successful submit, forwarding the
+   * submitted email as a query param — for landers that hand off to an external
+   * booking/scheduling surface rather than showing an inline success state. Set only
+   * at generation time (mirrors leadListId); no manual-override path for v1 (Harsha,
+   * ENG-449, 2026-07-24).
+   */
+  bridgeOutUrl?: string;
+  /**
+   * Whether the generated form component was confirmed, via the validation-retry
+   * check, to actually redirect to bridgeOutUrl with the email appended. Same
+   * "verify not guarantee" contract as pixelLeadEventVerified — v0 authors the form
+   * freeform, so this can only be checked, never platform-guaranteed.
+   */
+  bridgeOutVerified?: boolean;
   context?: string;
   /**
    * State captured at the most recent publish, used to revert it. The pre-merge
@@ -743,6 +759,14 @@ export function buildBrandEnrichedPrompt(
    * v0 doesn't comply; this prompt instruction is the primary mechanism.
    */
   metaPixelId?: string,
+  /**
+   * When set (alongside leadListId), instructs v0 to redirect the visitor to this
+   * third-party URL after a successful submit, forwarding the submitted email as a query
+   * param — for landers that hand off to an external booking/scheduling page rather than
+   * showing an inline success state. Same "prompt instruction + validation-retry safety
+   * net" pattern as metaPixelId (see bridgeOutVerified/validateBridgeOutRedirect).
+   */
+  bridgeOutUrl?: string,
 ): string {
   const parts: string[] = [];
 
@@ -812,6 +836,16 @@ export function buildBrandEnrichedPrompt(
       `3. On a SUCCESSFUL submission response, call: window.fbq && window.fbq('track', 'Lead', {}, { eventID: eventId });\n` +
       `4. If the form redirects the user anywhere after a successful submission, wait ~800ms (await new Promise(r => setTimeout(r, 800))) AFTER calling fbq and BEFORE navigating away — otherwise the tracking beacon can be dropped by the redirect.\n` +
       `5. Do NOT call fbq('init', ...) yourself — the platform already injects the Meta Pixel base code in the root layout. Only fire the 'track' Lead event here.`
+    );
+  }
+
+  if (leadListId && bridgeOutUrl) {
+    parts.push(
+      `\n\nBRIDGE-OUT REDIRECT — IMPORTANT ARCHITECTURE:\n` +
+      `1. After a SUCCESSFUL form submission (and after the fbq Lead call + 800ms flush above, if a pixel is configured), redirect the visitor to:\n` +
+      `   ${bridgeOutUrl}${bridgeOutUrl.includes("?") ? "&" : "?"}email=${"$"}{encodeURIComponent(email)}\n` +
+      `   using window.location.href — do NOT use a Next.js client-side <Link>/router.push for this, since it's an external destination.\n` +
+      `2. Use the email value the visitor actually submitted, URL-encoded.`
     );
   }
 
@@ -986,6 +1020,8 @@ export interface GenerateLandingPageOptions {
   mode?: "unified" | "separate";
   /** The agent-mode session that spawned this build (durable-execution marker). */
   originatingSessionId?: string;
+  /** See GeneratedLandingPage.bridgeOutUrl's own doc comment. */
+  bridgeOutUrl?: string;
 }
 
 /**
@@ -1003,7 +1039,8 @@ async function addSubPage(
   brandContext: BrandContext,
   leadListId?: string,
   templateHtml?: string,
-  originatingSessionId?: string
+  originatingSessionId?: string,
+  bridgeOutUrl?: string
 ): Promise<GeneratedLandingPage> {
   if (process.env.CODING_AGENT_SUBPAGES === "true") {
     const { addPageViaCodingAgent } = await import("./codingAgentSubpageService");
@@ -1013,7 +1050,7 @@ async function addSubPage(
     });
   }
   return addPageToExistingRepo(
-    site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
+    site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId, bridgeOutUrl
   );
 }
 
@@ -1029,6 +1066,7 @@ export async function generateLandingPage(
   const multiSite = process.env.DURABLE_LANDING_GENERATION === "true";
   const originatingSessionId = opts?.originatingSessionId;
   const mode = opts?.mode ?? "unified";
+  const bridgeOutUrl = opts?.bridgeOutUrl;
 
   if (multiSite) {
     // 1. Explicit target site → add a page/variant to it (shares the subdomain).
@@ -1042,7 +1080,7 @@ export async function generateLandingPage(
           return reuse;
         }
         return addSubPage(
-          site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
+          site, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId, bridgeOutUrl
         );
       }
       // siteId given but not a usable site (deleted / never deployed) → fall through.
@@ -1052,7 +1090,7 @@ export async function generateLandingPage(
     //    subdomain). The costlier, opt-in path (e.g. distinct campaign URLs).
     if (mode === "separate") {
       return generateFirstPage(
-        userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId
+        userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl
       );
     }
 
@@ -1068,11 +1106,11 @@ export async function generateLandingPage(
         return reuse;
       }
       return addSubPage(
-        existing, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId
+        existing, userId, prompt, name, brandContext, leadListId, templateHtml, originatingSessionId, bridgeOutUrl
       );
     }
     return generateFirstPage(
-      userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId
+      userId, prompt, name, brandContext, leadListId, templateHtml, undefined, originatingSessionId, bridgeOutUrl
     );
   }
 
@@ -1098,7 +1136,7 @@ export async function generateLandingPage(
       return reuse;
     }
     // ── Add new page route to existing repo (no v0 call) ──
-    return addPageToExistingRepo(siteRecord, userId, prompt, name, brandContext, leadListId, templateHtml);
+    return addPageToExistingRepo(siteRecord, userId, prompt, name, brandContext, leadListId, templateHtml, undefined, bridgeOutUrl);
   }
 
   const existingPages = await listLandingPages(userId);
@@ -1116,7 +1154,7 @@ export async function generateLandingPage(
     await cleanupOrphanedFailedPages(userId, existingPages, recyclable.id);
   }
 
-  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id);
+  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml, recyclable?.id, undefined, bridgeOutUrl);
 }
 
 /**
@@ -1209,7 +1247,8 @@ async function generateFirstPage(
   leadListId?: string,
   templateHtml?: string,
   existingId?: string,
-  originatingSessionId?: string
+  originatingSessionId?: string,
+  bridgeOutUrl?: string
 ): Promise<GeneratedLandingPage> {
   // Reuse a recyclable failed record's id when retrying, otherwise mint a new one.
   const id = existingId ?? uuidv4();
@@ -1239,7 +1278,7 @@ async function generateFirstPage(
     console.error(`[V0 SERVICE] Meta Pixel resolution threw unexpectedly (continuing without it): ${err?.message}`);
   }
 
-  const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate, metaPixelId);
+  const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate, metaPixelId, bridgeOutUrl);
 
   const record: GeneratedLandingPage = {
     id,
@@ -1260,6 +1299,7 @@ async function generateFirstPage(
   if (templateHtml) record.templateHtml = templateHtml;
   if (originatingSessionId) record.originatingSessionId = originatingSessionId;
   if (metaPixelId) { record.metaPixelId = metaPixelId; record.metaAdAccountId = metaAdAccountId; }
+  if (bridgeOutUrl) record.bridgeOutUrl = bridgeOutUrl;
 
   await dynamodb.put({ TableName: TABLE_NAME, Item: record }).promise();
 
@@ -1522,7 +1562,8 @@ async function addPageToExistingRepo(
   brandContext: BrandContext,
   leadListId?: string,
   templateHtml?: string,
-  originatingSessionId?: string
+  originatingSessionId?: string,
+  bridgeOutUrl?: string
 ): Promise<GeneratedLandingPage> {
   const id = uuidv4();
   const now = new Date().toISOString();
@@ -1572,6 +1613,7 @@ async function addPageToExistingRepo(
 
   if (leadListId) record.leadListId = leadListId;
   if (templateHtml) record.templateHtml = templateHtml;
+  if (bridgeOutUrl) record.bridgeOutUrl = bridgeOutUrl;
 
   await dynamodb.put({ TableName: TABLE_NAME, Item: record }).promise();
 
@@ -1591,7 +1633,7 @@ async function addPageToExistingRepo(
     // untouched, from the first page's push) — but the Lead-event prompt instruction is still
     // needed here since each page has its OWN form component. Just read whatever the site's
     // root already resolved, no fresh Meta API call.
-    const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate, existingPage.metaPixelId);
+    const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate, existingPage.metaPixelId, bridgeOutUrl);
     const v0 = await getV0Client();
 
     console.log(`[V0 SERVICE] Creating v0 chat for additional page /${slug}...`);
@@ -1658,6 +1700,7 @@ async function addPageToExistingRepo(
     let zipBuffer: any;
     // Per-page signal — see the equivalent block in deployLandingPage.
     let pixelLeadEventVerified: boolean | undefined;
+    let bridgeOutVerified: boolean | undefined;
 
     for (let validationAttempt = 0; validationAttempt <= V0_VALIDATION_MAX_RETRIES; validationAttempt++) {
       console.log(`[V0 SERVICE] Downloading v0 files for /${slug} (version ${versionId}, attempt ${validationAttempt + 1})`);
@@ -1738,6 +1781,51 @@ async function addPageToExistingRepo(
           pixelLeadEventVerified = pixelCheck.ok;
           if (!pixelCheck.ok) {
             console.warn(`[V0 SERVICE] Meta Pixel Lead event still missing for /${slug} after retries — proceeding without it: ${pixelCheck.reason}`);
+          }
+        }
+
+        if (leadListId && bridgeOutUrl) {
+          // Same post-remap file set rationale as the pixel check above (ENG-482).
+          const bridgeCheck = validateBridgeOutRedirect(remapFilesForSubPage(previewFiles, slug, name), bridgeOutUrl);
+          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+            console.warn(`[V0 SERVICE] Bridge-out redirect missing for /${slug} (attempt ${validationAttempt + 1}): ${bridgeCheck.reason}`);
+
+            await guardedV0CorrectionMessage({
+              userId,
+              scopeId: existingPage.siteId ?? existingPage.id,
+              chatId,
+              attempt: validationAttempt,
+              send: () => withRetry(
+                () => v0.chats.sendMessage({
+                  chatId,
+                  message:
+                    "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
+                    `redirect the visitor via window.location.href to ${bridgeOutUrl} with the submitted email ` +
+                    "appended as an email= query param (URL-encoded). " +
+                    `Issue: ${bridgeCheck.reason}`,
+                }),
+                "v0 correction message (bridge-out redirect, additional page)",
+                undefined, undefined, undefined,
+                { retryOnTimeout: false }
+              ),
+            });
+
+            versionId = await waitForCompletedV0Version(
+              v0,
+              chatId,
+              `v0 correction (bridge-out redirect) for /${slug}`,
+              {
+                heartbeat: () => touchLandingPageRecord(id),
+                deadline: buildDeadline,
+                afterVersionId: versionId,
+              }
+            );
+
+            continue;
+          }
+          bridgeOutVerified = bridgeCheck.ok;
+          if (!bridgeCheck.ok) {
+            console.warn(`[V0 SERVICE] Bridge-out redirect still missing for /${slug} after retries — proceeding without it: ${bridgeCheck.reason}`);
           }
         }
 
@@ -1989,6 +2077,7 @@ async function addPageToExistingRepo(
       status: "deployed",
       updatedAt: new Date().toISOString(),
       ...(pixelLeadEventVerified !== undefined ? { pixelLeadEventVerified } : {}),
+      ...(bridgeOutVerified !== undefined ? { bridgeOutVerified } : {}),
     };
 
     await dynamodb
@@ -1997,7 +2086,8 @@ async function addPageToExistingRepo(
         Key: { id },
         UpdateExpression:
           "SET #status = :status, updatedAt = :updatedAt, githubRepoUrl = :repoUrl, vercelProjectId = :vercelId" +
-          (pixelLeadEventVerified !== undefined ? ", pixelLeadEventVerified = :pixelLeadEventVerified" : ""),
+          (pixelLeadEventVerified !== undefined ? ", pixelLeadEventVerified = :pixelLeadEventVerified" : "") +
+          (bridgeOutVerified !== undefined ? ", bridgeOutVerified = :bridgeOutVerified" : ""),
         ExpressionAttributeNames: { "#status": "status" },
         ExpressionAttributeValues: {
           ":status": "deployed",
@@ -2005,6 +2095,7 @@ async function addPageToExistingRepo(
           ":repoUrl": existingPage.githubRepoUrl ?? record.githubRepoUrl,
           ":vercelId": existingPage.vercelProjectId ?? record.vercelProjectId,
           ...(pixelLeadEventVerified !== undefined ? { ":pixelLeadEventVerified": pixelLeadEventVerified } : {}),
+          ...(bridgeOutVerified !== undefined ? { ":bridgeOutVerified": bridgeOutVerified } : {}),
         },
       })
       .promise();
@@ -2496,6 +2587,7 @@ export async function deployLandingPage(
     // Per-page signal — was the client-side fbq('track','Lead') call confirmed
     // present in the generated form? Only meaningful when a pixel is actually configured.
     let pixelLeadEventVerified: boolean | undefined;
+    let bridgeOutVerified: boolean | undefined;
 
     for (let validationAttempt = 0; validationAttempt <= V0_VALIDATION_MAX_RETRIES; validationAttempt++) {
       console.log(`[V0 SERVICE] Step 2: Downloading files from v0 (version ${versionId}, attempt ${validationAttempt + 1})`);
@@ -2570,6 +2662,50 @@ export async function deployLandingPage(
           pixelLeadEventVerified = pixelCheck.ok;
           if (!pixelCheck.ok) {
             console.warn(`[V0 SERVICE] Meta Pixel Lead event still missing after retries — proceeding without it (never fails generation): ${pixelCheck.reason}`);
+          }
+        }
+
+        if (record.leadListId && record.bridgeOutUrl) {
+          const bridgeCheck = validateBridgeOutRedirect(previewFiles, record.bridgeOutUrl);
+          if (!bridgeCheck.ok && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+            console.warn(`[V0 SERVICE] Bridge-out redirect missing (attempt ${validationAttempt + 1}): ${bridgeCheck.reason}`);
+
+            await guardedV0CorrectionMessage({
+              userId,
+              scopeId: record.siteId ?? record.id,
+              chatId: record.v0ChatId!,
+              attempt: validationAttempt,
+              send: () => withRetry(
+                () => v0.chats.sendMessage({
+                  chatId: record.v0ChatId!,
+                  message:
+                    "The lead capture form is missing the bridge-out redirect. On a SUCCESSFUL submission, " +
+                    `redirect the visitor via window.location.href to ${record.bridgeOutUrl} with the submitted email ` +
+                    "appended as an email= query param (URL-encoded). " +
+                    `Issue: ${bridgeCheck.reason}`,
+                }),
+                "v0 correction message (bridge-out redirect)",
+                undefined, undefined, undefined,
+                { retryOnTimeout: false }
+              ),
+            });
+
+            versionId = await waitForCompletedV0Version(
+              v0,
+              record.v0ChatId!,
+              "v0 correction (bridge-out redirect)",
+              {
+                heartbeat: () => touchLandingPageRecord(id),
+                deadline: buildDeadline,
+                afterVersionId: versionId,
+              }
+            );
+
+            continue;
+          }
+          bridgeOutVerified = bridgeCheck.ok;
+          if (!bridgeCheck.ok) {
+            console.warn(`[V0 SERVICE] Bridge-out redirect still missing after retries — proceeding without it (never fails generation): ${bridgeCheck.reason}`);
           }
         }
 
@@ -2669,6 +2805,7 @@ export async function deployLandingPage(
     record.metaPixelId = metaPixelId;
     record.metaAdAccountId = metaAdAccountId;
     if (pixelLeadEventVerified !== undefined) record.pixelLeadEventVerified = pixelLeadEventVerified;
+    if (bridgeOutVerified !== undefined) record.bridgeOutVerified = bridgeOutVerified;
 
     // Save GitHub repo URL immediately so it's not lost if Vercel step fails.
     // Persist explicit tracking signals so "shipped with no conversion
@@ -2681,7 +2818,8 @@ export async function deployLandingPage(
           "SET #status = :status, githubRepoUrl = :repoUrl, trackingInstalled = :trackingInstalled, " +
           "metaTrackingInstalled = :metaTrackingInstalled, updatedAt = :updatedAt" +
           (metaPixelId ? ", metaPixelId = :metaPixelId, metaAdAccountId = :metaAdAccountId" : "") +
-          (pixelLeadEventVerified !== undefined ? ", pixelLeadEventVerified = :pixelLeadEventVerified" : ""),
+          (pixelLeadEventVerified !== undefined ? ", pixelLeadEventVerified = :pixelLeadEventVerified" : "") +
+          (bridgeOutVerified !== undefined ? ", bridgeOutVerified = :bridgeOutVerified" : ""),
         ExpressionAttributeNames: { "#status": "status" },
         ExpressionAttributeValues: {
           ":status": "deploying",
@@ -2689,6 +2827,7 @@ export async function deployLandingPage(
           ":trackingInstalled": gtmInjected,
           ":metaTrackingInstalled": pixelInjected,
           ...(pixelLeadEventVerified !== undefined ? { ":pixelLeadEventVerified": pixelLeadEventVerified } : {}),
+          ...(bridgeOutVerified !== undefined ? { ":bridgeOutVerified": bridgeOutVerified } : {}),
           ":updatedAt": new Date().toISOString(),
           ...(metaPixelId ? { ":metaPixelId": metaPixelId, ":metaAdAccountId": metaAdAccountId } : {}),
         },
@@ -3482,6 +3621,29 @@ export function validatePixelLeadEvent(files: Array<{ path: string; content: Buf
 
   if (!/fbq\(\s*['"]track['"]\s*,\s*['"]Lead['"]/.test(tsxSource)) {
     return { ok: false, reason: "No fbq('track', 'Lead') call found in the generated form component" };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Check whether v0's generated form component actually redirects to the configured
+ * bridge-out URL with the submitted email forwarded, per the prompt instruction added to
+ * buildBrandEnrichedPrompt. Same "verify not guarantee" contract as validatePixelLeadEvent —
+ * regex-based, not full parsing, since this is v0-authored freeform code.
+ */
+export function validateBridgeOutRedirect(files: Array<{ path: string; content: Buffer }>, bridgeOutUrl: string): { ok: boolean; reason?: string } {
+  const tsxSource = files
+    .filter((f) => f.path.endsWith(".tsx") || f.path.endsWith(".ts"))
+    .map((f) => f.content.toString("utf-8"))
+    .join("\n");
+
+  if (!tsxSource.includes(bridgeOutUrl)) {
+    return { ok: false, reason: "Bridge-out URL not found in the generated form component" };
+  }
+
+  if (!/email=/.test(tsxSource)) {
+    return { ok: false, reason: "Bridge-out redirect found but no email= query param forwarding was detected" };
   }
 
   return { ok: true };
