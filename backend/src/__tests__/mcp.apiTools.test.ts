@@ -67,7 +67,7 @@ describe('apiTools', () => {
     it('should register API-wrapping tools', () => {
       const names = mcpToolRegistry.getToolNames();
       const expectedTools = [
-        'emma_create_session', 'emma_send_message', 'emma_get_session', 'emma_list_sessions',
+        'emma_create_session', 'emma_send_message', 'emma_answer_question', 'emma_get_session', 'emma_list_sessions',
         'list_tasks', 'manage_task', 'execute_task', 'list_task_executions',
         'list_schedules', 'manage_schedule',
         'list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat',
@@ -310,6 +310,82 @@ describe('apiTools', () => {
       expect(callBody.attachments[0].filename).toBe('screenshot-dashboard.png');
     });
 
+  });
+
+  // ─── emma_answer_question (ENG-400: MCP transport for the AskUserQuestion primitive) ───
+
+  describe('emma_answer_question', () => {
+    it('posts a direct pick through the structured questionAnswer channel, using option_id as the default label', async () => {
+      mockMcpFetch.mockResolvedValue({ response: 'OK' });
+
+      await mcpToolRegistry.execute('emma_answer_question', {
+        session_id: 'sess-1',
+        question_id: 'q-1',
+        option_id: 'leads',
+      }, context);
+
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        body: {
+          sessionId: 'sess-1',
+          userMessage: 'leads',
+          questionAnswer: { questionId: 'q-1', optionId: 'leads', delegated: false },
+        },
+      }));
+    });
+
+    it('uses a provided label as the human-readable chat message instead of the raw option_id', async () => {
+      mockMcpFetch.mockResolvedValue({ response: 'OK' });
+
+      await mcpToolRegistry.execute('emma_answer_question', {
+        session_id: 'sess-1',
+        question_id: 'q-1',
+        option_id: 'leads',
+        label: 'Leads',
+      }, context);
+
+      const callBody = mockMcpFetch.mock.calls[0][0].body as any;
+      expect(callBody.userMessage).toBe('Leads');
+    });
+
+    it('posts a delegation ("Let Emma decide") with delegated:true and no option_id required', async () => {
+      mockMcpFetch.mockResolvedValue({ response: 'OK' });
+
+      await mcpToolRegistry.execute('emma_answer_question', {
+        session_id: 'sess-1',
+        question_id: 'q-1',
+        delegate: true,
+      }, context);
+
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+        body: {
+          sessionId: 'sess-1',
+          userMessage: 'Let Emma decide',
+          questionAnswer: { questionId: 'q-1', optionId: undefined, delegated: true },
+        },
+      }));
+    });
+
+    it('refuses (without calling the API) a direct pick missing option_id', async () => {
+      const result = await mcpToolRegistry.execute('emma_answer_question', {
+        session_id: 'sess-1',
+        question_id: 'q-1',
+      }, context);
+
+      expect(mockMcpFetch).not.toHaveBeenCalled();
+      expect(JSON.parse(result.content[0].text).success).toBe(false);
+    });
+
+    it('is registered with session_id and question_id required', () => {
+      const defs = mcpToolRegistry.getToolDefinitions();
+      const answerQuestion = defs.find((d: any) => d.name === 'emma_answer_question');
+      expect(answerQuestion).toBeDefined();
+      expect(answerQuestion.inputSchema.required).toEqual(['session_id', 'question_id']);
+    });
+  });
+
+  describe('emma_send_message input schema', () => {
     it('should include media_urls in tool input schema', () => {
       const defs = mcpToolRegistry.getToolDefinitions();
       const emmaSend = defs.find((d: any) => d.name === 'emma_send_message');
