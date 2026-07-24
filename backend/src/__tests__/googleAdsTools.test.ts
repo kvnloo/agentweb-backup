@@ -827,6 +827,45 @@ describe('handleCallGoogleAdsApi — error handling', () => {
     expect(result).toEqual({ success: false, error: 'Unknown error' });
   });
 
+  // ENG-487 — adversarial inputs, confirmed against the live Google Ads API (v24):
+  // an ungeocodable address and an invalid radius (0/negative/huge) all come back
+  // as INVALID_PROXIMITY_ADDRESS / INVALID_PROXIMITY_RADIUS criterionErrors, which
+  // the existing "CODE: message" formatter above already renders cleanly — no new
+  // formatting code needed, just locking the behavior in with a mock.
+  it('formats an ungeocodable-address error from ADD_PROXIMITY as "CODE: message"', async () => {
+    (googleAdsService.addProximityCriterion as jest.Mock).mockRejectedValueOnce({
+      response: { data: { error: { details: [{ errors: [
+        { errorCode: { criterionError: 'INVALID_PROXIMITY_ADDRESS' }, message: 'The Proximity address cannot be geocoded to a valid lat/long.' },
+      ] }] } } },
+    });
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'ADD_PROXIMITY',
+      campaign_resource_name: 'customers/123/campaigns/1',
+      radius: 10,
+      address: { street_address: 'near the mall lol' },
+    });
+    expect(result).toEqual({ success: false, error: 'INVALID_PROXIMITY_ADDRESS: The Proximity address cannot be geocoded to a valid lat/long.' });
+  });
+
+  it('formats an invalid-radius error from ADD_PROXIMITY as "CODE: message"', async () => {
+    (googleAdsService.addProximityCriterion as jest.Mock).mockRejectedValueOnce({
+      response: { data: { error: { details: [{ errors: [
+        { errorCode: { criterionError: 'INVALID_PROXIMITY_RADIUS' }, message: 'Distance for the radius for the proximity criterion is invalid.' },
+      ] }] } } },
+    });
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'ADD_PROXIMITY',
+      campaign_resource_name: 'customers/123/campaigns/1',
+      radius: 0,
+      address: { city_name: 'Austin', country_code: 'US' },
+    });
+    expect(result).toEqual({ success: false, error: 'INVALID_PROXIMITY_RADIUS: Distance for the radius for the proximity criterion is invalid.' });
+  });
+
   it('returns a structured error for an unsupported entity_type/action', async () => {
     const result = await service.handleCallGoogleAdsApi('user-123', {
       customer_id: '1234567890',
