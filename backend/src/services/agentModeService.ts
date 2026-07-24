@@ -16144,6 +16144,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     sessionId: string,
     objective: string,
     quote: string,
+    objectiveKind: string,
   ): Promise<void> {
     const question = buildPendingUserQuestion({
       questionId: uuidv4(),
@@ -16169,7 +16170,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       ],
       immutable: true,
       allowEmmaDecide: false,
-      kind: 'meta_objective',
+      kind: objectiveKind,
       createdAt: new Date().toISOString(),
     });
     const answered = applyAnswer(question, {
@@ -16205,6 +16206,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   ): Promise<{ allowed: true; objective: string } | { allowed: false; response: MetaApiResult }> {
     const claimedObjective = typeof params.objective === 'string' ? params.objective : undefined;
     const quote = typeof params.objective_quote === 'string' ? params.objective_quote : undefined;
+    // Greptile P1 ("Objective persists across campaigns"): a bare 'meta_objective'
+    // kind matches ANY campaign's objective question in this session — a second,
+    // different campaign created later would silently inherit the first one's
+    // answered objective via Path 2. Scope the kind to THIS campaign (name is
+    // guaranteed present here — validateCampaignParamsExceptObjective already
+    // ran before this method is called) so each campaign's objective is found
+    // and persisted independently.
+    const objectiveKind = `meta_objective:${typeof params.name === 'string' ? params.name : ''}`;
 
     // No session was given — this shouldn't happen for either known caller
     // (emma/tools.ts and routes/emmaApi.ts both pass one), so this is an
@@ -16254,7 +16263,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // confirmed. Persist this success as a real answered record (same
         // shape Path 2 looks for) so the retry finds it settled instead of
         // re-deriving it against a message that no longer contains the quote.
-        await this.persistExplicitObjectiveConfirmation(sessionId, claimedObjective, quote);
+        await this.persistExplicitObjectiveConfirmation(sessionId, claimedObjective, quote, objectiveKind);
         return { allowed: true, objective: claimedObjective };
       }
       // The quote didn't check out against the real transcript, or doesn't
@@ -16262,9 +16271,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // the claim; fall through to the deterministic ask gate below.
     }
 
-    // Path 2: already settled via a prior ask_user_question in this session.
+    // Path 2: already settled via a prior ask_user_question in this session,
+    // scoped to THIS campaign (see objectiveKind above).
     const session = await chatbotDb.getChatSession(sessionId);
-    const candidate = findQuestionByKind(session?.pendingUserQuestion, session?.answeredQuestions, 'meta_objective');
+    const candidate = findQuestionByKind(session?.pendingUserQuestion, session?.answeredQuestions, objectiveKind);
     const outcome = checkQuestionGate(candidate);
     if (outcome.allowed) {
       const objective = (outcome.payload as any)?.objective;
@@ -16310,7 +16320,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       options,
       immutable: true,
       allowEmmaDecide: true,
-      kind: 'meta_objective',
+      kind: objectiveKind,
       createdAt: new Date().toISOString(),
     });
 

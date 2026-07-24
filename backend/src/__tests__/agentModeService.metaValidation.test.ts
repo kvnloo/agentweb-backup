@@ -285,7 +285,7 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
           recommendedOptionId: 'sales',
           immutable: true,
           allowEmmaDecide: true,
-          kind: 'meta_objective',
+          kind: 'meta_objective:Test', // scoped to this call's params.name: 'Test'
           status: 'answered',
           createdAt: '2026-07-24T00:00:00.000Z',
           answer: { optionId: 'sales', delegated: false, answeredBy: 'user', at: '2026-07-24T00:01:00.000Z' },

@@ -155,7 +155,7 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       expect(chatbotDb.updateSessionAskUserQuestion).toHaveBeenCalled();
       const persisted = (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mock.calls[0][1];
       expect(persisted.status).toBe('answered');
-      expect(persisted.kind).toBe('meta_objective');
+      expect(persisted.kind).toBe('meta_objective:Test');
       expect(persisted.answer.answeredBy).toBe('user');
 
       // Simulate the retry: the session now reflects that persisted record,
@@ -178,6 +178,42 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       expect(metaService.createCampaign).toHaveBeenCalled();
       // Applied the ORIGINALLY-confirmed objective verbatim, not the retry's own claim.
       expect((metaService.createCampaign as jest.Mock).mock.calls[0][2].objective).toBe('OUTCOME_LEADS');
+    });
+
+    // Greptile P1 ("Objective persists across campaigns"): a bare 'meta_objective'
+    // kind matched ANY campaign in the session — a SECOND, different campaign
+    // created later would silently inherit the FIRST campaign's answered
+    // objective instead of asking/confirming its own. Scoped by campaign name.
+    it('does NOT let a second, differently-named campaign inherit the first campaign\'s confirmed objective', async () => {
+      (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
+        { role: 'user', content: 'Create a leads campaign called Campaign One.' },
+      ]);
+      await callApi(
+        service,
+        validParams({ name: 'Campaign One', objective: 'OUTCOME_LEADS', objective_quote: 'leads campaign' }),
+        'session-1',
+      );
+      const persistedFirst = (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mock.calls[0][1];
+      expect(persistedFirst.kind).toBe('meta_objective:Campaign One');
+
+      // A second, unrelated campaign in the SAME session — session now reflects
+      // Campaign One's answered objective as the live slot.
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({ pendingUserQuestion: persistedFirst });
+      (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
+        { role: 'user', content: 'Now also create a second campaign called Campaign Two, no objective decided yet.' },
+      ]);
+
+      const secondResult = await callApi(
+        service,
+        validParams({ name: 'Campaign Two' /* no objective claimed at all */ }),
+        'session-1',
+      );
+
+      // Must NOT silently inherit Campaign One's Leads objective — nothing has
+      // settled Campaign Two's objective yet, so it must park/ask, not create.
+      expect(secondResult.awaitingUserConfirmation).toBe(true);
+      expect(secondResult.type).toBe('ask_user_question');
+      expect(metaService.createCampaign).toHaveBeenCalledTimes(1); // only Campaign One
     });
 
     // Greptile P1 ("Quote does not bind objective"): a genuine quote proves it's
@@ -240,7 +276,7 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
         recommendedOptionId: 'x',
         immutable: true,
         allowEmmaDecide: true,
-        kind: 'meta_objective',
+        kind: 'meta_objective:Test', // scoped to validParams()'s default name: 'Test'
         status: 'answered',
         createdAt: '2026-07-24T00:00:00.000Z',
         answer: { optionId: 'x', delegated: false, answeredBy: 'user', at: '2026-07-24T00:01:00.000Z' },
@@ -354,7 +390,7 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       expect(salesOption.recommended).toBeFalsy();
       expect(chatbotDb.updateSessionAskUserQuestion).toHaveBeenCalled();
       const persisted = (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mock.calls[0][1];
-      expect(persisted.kind).toBe('meta_objective');
+      expect(persisted.kind).toBe('meta_objective:Test');
       expect(persisted.immutable).toBe(true);
     });
 
