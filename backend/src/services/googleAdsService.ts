@@ -488,6 +488,55 @@ export class GoogleAdsService {
     return { resourceName: campaignResourceName };
   }
 
+  /**
+   * ENG-487 — add a PROXIMITY (mile/km-radius) campaign criterion centered on a street
+   * address. Google geocodes the address into a geo point server-side; this is
+   * additive to (not a replacement for) any existing LOCATION (city) criteria on the
+   * campaign — remove those separately via removeCampaignCriterion if only the radius
+   * should apply.
+   */
+  async addProximityCriterion(userId: string, customerId: string, campaignResourceName: string, params: {
+    radius: number;
+    radiusUnits?: 'MILES' | 'KILOMETERS';
+    address: {
+      streetAddress?: string;
+      cityName?: string;
+      postalCode?: string;
+      provinceCode?: string;
+      provinceName?: string;
+      countryCode?: string;
+    };
+  }): Promise<{ resourceName: string }> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    const address: Record<string, any> = {};
+    if (params.address.streetAddress) address.streetAddress = params.address.streetAddress;
+    if (params.address.cityName) address.cityName = params.address.cityName;
+    if (params.address.postalCode) address.postalCode = params.address.postalCode;
+    if (params.address.provinceCode) address.provinceCode = params.address.provinceCode;
+    if (params.address.provinceName) address.provinceName = params.address.provinceName;
+    if (params.address.countryCode) address.countryCode = params.address.countryCode;
+    if (Object.keys(address).length === 0) {
+      throw new Error('addProximityCriterion requires at least one address field (street_address, city_name, postal_code, province_code, province_name, country_code)');
+    }
+    const data = await this.mutate(customerId, accessToken, 'campaignCriteria', [{
+      create: {
+        campaign: campaignResourceName,
+        proximity: {
+          radius: params.radius,
+          radiusUnits: params.radiusUnits || 'MILES',
+          address,
+        },
+      },
+    }], loginCustomerId);
+    return { resourceName: data.results[0].resourceName };
+  }
+
+  /** Remove a campaign-level criterion (LOCATION or PROXIMITY) by resource name. */
+  async removeCampaignCriterion(userId: string, customerId: string, criterionResourceName: string): Promise<void> {
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'campaignCriteria', [{ remove: criterionResourceName }], loginCustomerId);
+  }
+
   async updateCampaign(userId: string, customerId: string, campaignResourceName: string, params: {
     name?: string;
     status?: 'ENABLED' | 'PAUSED';

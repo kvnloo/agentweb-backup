@@ -28777,6 +28777,29 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (!didUpdate) return { success: false, error: 'This tool does not support updating the field(s) requested for CAMPAIGN — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Campaign updated' };
         }
+        if (action === 'ADD_PROXIMITY') {
+          if (!args.campaign_resource_name || args.radius === undefined || !args.address) {
+            return { success: false, error: 'campaign_resource_name, radius, and address are required for ADD_PROXIMITY' };
+          }
+          const criterion = await googleAdsService.addProximityCriterion(userId, customer_id, args.campaign_resource_name, {
+            radius: args.radius,
+            radiusUnits: args.radius_units,
+            address: {
+              streetAddress: args.address.street_address,
+              cityName: args.address.city_name,
+              postalCode: args.address.postal_code,
+              provinceCode: args.address.province_code,
+              provinceName: args.address.province_name,
+              countryCode: args.address.country_code,
+            },
+          });
+          return { success: true, criterionResourceName: criterion.resourceName };
+        }
+        if (action === 'REMOVE_PROXIMITY') {
+          if (!args.criterion_resource_name) return { success: false, error: 'criterion_resource_name is required for REMOVE_PROXIMITY' };
+          await googleAdsService.removeCampaignCriterion(userId, customer_id, args.criterion_resource_name);
+          return { success: true, message: 'Campaign criterion removed' };
+        }
       }
 
       if (entity_type === 'BUDGET' && action === 'LIST') {
