@@ -3835,6 +3835,19 @@ export function middleware(req: NextRequest) {
     res = NextResponse.next();
   }
 
+  // The matcher below cannot practically exclude every static asset path a generated page
+  // might reference (v0's own placeholder images, uploaded photos, fonts — arbitrary paths,
+  // not a fixed extension list), so a sub-resource request (image, font, stylesheet) also
+  // reaches this function. Only a real page navigation should stamp aw_page/aw_first_touch —
+  // otherwise an asset request re-stamps aw_page with ITS OWN path, silently misfiling the
+  // NEXT lead submitted from that page into no list at all ("no lead list configured").
+  // Sec-Fetch-Dest is sent by all modern browsers for every request; absent (older browsers,
+  // curl, test tooling) is treated as a real navigation — permissive default, never MORE
+  // restrictive than before this fix. The rewrite above still applies to asset requests too.
+  const secFetchDest = req.headers.get("sec-fetch-dest");
+  const isPageNavigation = !secFetchDest || secFetchDest === "document";
+  if (!isPageNavigation) return res;
+
   // 2. Which page is this, AFTER any rewrite? The capture route needs to know, because
   //    the lead list is per-page while the route is per-repo. We stamp it rather than
   //    letting the route read the Referer: for a rewritten host the browser reports
