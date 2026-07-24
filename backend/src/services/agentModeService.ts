@@ -16202,18 +16202,34 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   private async resolveCampaignObjectiveGate(
     userId: string,
     sessionId: string | undefined,
+    account_id: string,
     params: any,
   ): Promise<{ allowed: true; objective: string } | { allowed: false; response: MetaApiResult }> {
     const claimedObjective = typeof params.objective === 'string' ? params.objective : undefined;
     const quote = typeof params.objective_quote === 'string' ? params.objective_quote : undefined;
-    // Greptile P1 ("Objective persists across campaigns"): a bare 'meta_objective'
-    // kind matches ANY campaign's objective question in this session — a second,
-    // different campaign created later would silently inherit the first one's
-    // answered objective via Path 2. Scope the kind to THIS campaign (name is
-    // guaranteed present here — validateCampaignParamsExceptObjective already
-    // ran before this method is called) so each campaign's objective is found
-    // and persisted independently.
-    const objectiveKind = `meta_objective:${typeof params.name === 'string' ? params.name : ''}`;
+    // Greptile P1 ("Objective persists across campaigns" / "Campaign name
+    // conflates objective state"): a bare 'meta_objective' kind matches ANY
+    // campaign's objective question in this session — a second, different
+    // campaign created later would silently inherit the first one's answered
+    // objective via Path 2. Scoped to a composite correlator (account + name,
+    // normalized + budget + special_ad_categories, all objective-independent
+    // fields already validated present/shaped before this runs) rather than
+    // name alone — collapses the two failure modes together: a confirmation
+    // retry (tool description guarantees "the SAME arguments plus
+    // params.confirm=true") reproduces the identical key regardless of
+    // name whitespace/casing, while two genuinely DIFFERENT campaigns need to
+    // differ in at least one of these fields to get a real create through
+    // (matching name is common; matching name AND budget AND categories too is
+    // not). Not a perfect unique ID — no caller supplies one — but meaningfully
+    // stronger than name alone against both bugs Greptile found.
+    const objectiveCorrelator = [
+      account_id,
+      typeof params.name === 'string' ? params.name.trim().toLowerCase() : '',
+      params.daily_budget ?? '',
+      params.lifetime_budget ?? '',
+      Array.isArray(params.special_ad_categories) ? [...params.special_ad_categories].sort().join(',') : '',
+    ].join('|');
+    const objectiveKind = `meta_objective:${objectiveCorrelator}`;
 
     // No session was given — this shouldn't happen for either known caller
     // (emma/tools.ts and routes/emmaApi.ts both pass one), so this is an
@@ -16410,7 +16426,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // Scope is deliberately narrow: only CAMPAIGN CREATE calls this — no other
     // Meta write is gated.
     if (entity_type === 'CAMPAIGN' && action === 'CREATE') {
-      const gate = await this.resolveCampaignObjectiveGate(userId, sessionId, params);
+      const gate = await this.resolveCampaignObjectiveGate(userId, sessionId, account_id, params);
       if (!gate.allowed) {
         return gate.response;
       }

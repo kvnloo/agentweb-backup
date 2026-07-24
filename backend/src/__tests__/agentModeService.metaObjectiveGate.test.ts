@@ -155,7 +155,7 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       expect(chatbotDb.updateSessionAskUserQuestion).toHaveBeenCalled();
       const persisted = (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mock.calls[0][1];
       expect(persisted.status).toBe('answered');
-      expect(persisted.kind).toBe('meta_objective:Test');
+      expect(persisted.kind).toBe('meta_objective:123456789|test|||NONE');
       expect(persisted.answer.answeredBy).toBe('user');
 
       // Simulate the retry: the session now reflects that persisted record,
@@ -194,7 +194,7 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
         'session-1',
       );
       const persistedFirst = (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mock.calls[0][1];
-      expect(persistedFirst.kind).toBe('meta_objective:Campaign One');
+      expect(persistedFirst.kind).toBe('meta_objective:123456789|campaign one|||NONE');
 
       // A second, unrelated campaign in the SAME session — session now reflects
       // Campaign One's answered objective as the live slot.
@@ -276,7 +276,7 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
         recommendedOptionId: 'x',
         immutable: true,
         allowEmmaDecide: true,
-        kind: 'meta_objective:Test', // scoped to validParams()'s default name: 'Test'
+        kind: 'meta_objective:123456789|test|||NONE',
         status: 'answered',
         createdAt: '2026-07-24T00:00:00.000Z',
         answer: { optionId: 'x', delegated: false, answeredBy: 'user', at: '2026-07-24T00:01:00.000Z' },
@@ -390,7 +390,7 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       expect(salesOption.recommended).toBeFalsy();
       expect(chatbotDb.updateSessionAskUserQuestion).toHaveBeenCalled();
       const persisted = (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mock.calls[0][1];
-      expect(persisted.kind).toBe('meta_objective:Test');
+      expect(persisted.kind).toBe('meta_objective:123456789|test|||NONE');
       expect(persisted.immutable).toBe(true);
     });
 
