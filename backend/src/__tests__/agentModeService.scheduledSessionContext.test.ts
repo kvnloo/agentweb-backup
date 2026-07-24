@@ -258,6 +258,21 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
   it('still requires producing the deliverable in full rather than stopping', () => {
     expect(directive.toLowerCase()).toContain('always produce the requested deliverable');
   });
+
+  // The reframing must NOT bleed into per-entity ACTIONS (send/post/draft). It is
+  // scoped to fetching per-item DATA for a report; a batched call must never be
+  // treated as satisfying a per-entity side effect (guards the tension with the
+  // PER-ENTITY COMPLETION LOOP directive that immediately follows it).
+  it('scopes the reframing to reading/gathering data, not per-entity actions', () => {
+    expect(directive.toLowerCase()).toContain('reading/gathering data');
+  });
+
+  it('carves out per-entity actions so a batched call never collapses per-item side effects', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toContain('carve-out');
+    expect(lower).toContain('does not loosen per-entity actions');
+    expect(lower).toContain('per-entity completion loop');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
