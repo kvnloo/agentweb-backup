@@ -206,6 +206,35 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
   it('requires surfacing skipped/blocked work as actionable items', () => {
     expect(directive.toLowerCase()).toContain('actionable');
   });
+
+  // ── (5) ENG-396/ENG-369 reconciliation: irreversible-parameter carve-out ─────
+  // ENG-369's best-effort mandate says a scheduled run should self-pick rather
+  // than ever present a blocking menu. That must NOT extend to an irreversible /
+  // immutable parameter no human specified (e.g. the Meta campaign objective) —
+  // guessing one is the RankAI incident ENG-396 exists to prevent. The directive
+  // must carve that class out of "pick it yourself".
+  it('carves irreversible/immutable parameters out of the best-effort self-pick rule', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toContain('irreversible');
+    expect(lower).toContain('never fabricate');
+    // The named exemplar keeps the boundary concrete.
+    expect(directive).toContain('Meta campaign objective');
+  });
+
+  it('routes an irreversible unspecified decision to park (or logged auto-take), not a guess', () => {
+    const lower = directive.toLowerCase();
+    // parks for the owner by default...
+    expect(lower).toContain('park');
+    // ...and only auto-proceeds on an explicitly autonomous schedule, logged.
+    expect(lower).toContain('autonomous');
+    expect(lower).toMatch(/log(s|ged)? the delegation/);
+  });
+
+  it('still lets reversible choices proceed best-effort (the carve-out is narrow)', () => {
+    // The exception must not swallow ENG-369: reversible work still runs.
+    expect(directive.toLowerCase()).toContain('reversible');
+    expect(directive).toContain('best-effort');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

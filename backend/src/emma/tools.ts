@@ -16,6 +16,13 @@ import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
 import { enqueueAutoHumanEval } from '../services/autoHumanEvalService';
+import { v4 as uuidv4 } from 'uuid';
+import {
+  buildPendingUserQuestion,
+  renderQuestionPrompt,
+  AskUserQuestionError,
+  type AskUserQuestionOption,
+} from '../services/agentMode/core/askUserQuestion';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -86,6 +93,140 @@ emmaToolRegistry.register({
       slackMessageTs: candidate.slackMessageTs,
     };
   }
+});
+
+// ENG-396: AskUserQuestion — a structured, BLOCKING option-select prompt. Emma
+// emits it to force a human choice on an immutable/irreversible parameter (first
+// consumer: the Meta campaign objective, ENG-400) before building. It returns
+// awaitingUserConfirmation:true so the agent loop HALTS (see collectConfirmationPrompt);
+// the answer is persisted structurally on the session and only an inbound USER
+// selection resolves it — the model cannot self-answer.
+//
+// DELIBERATELY NOT in MANDATORY_FOUNDATION_TOOLS: ENG-396/400's stated scope is
+// "the first (and for now only) consumer is the Meta campaign-objective ask" —
+// exposing this as a general Emma-callable tool would let the model reach for
+// it in any context it judges high-stakes, which is the general-purpose future
+// this primitive is headed toward, but NOT what's authorized yet. It doesn't
+// need to be — the Meta objective gate (agentModeService.ts,
+// resolveCampaignObjectiveGate) builds and persists the question DIRECTLY
+// (buildPendingUserQuestion + chatbotDb.updateSessionAskUserQuestion), without
+// ever calling through the tool registry, so ENG-400 works fully with this
+// tool registration inert. Registering the handler here (rather than deleting
+// it) keeps the validated primitive ready for its next consumer without
+// widening exposure today.
+emmaToolRegistry.register({
+  name: 'ask_user_question',
+  definition: {
+    name: 'ask_user_question',
+    description: `Ask the user a structured, blocking multiple-choice question and STOP until they pick. Use this ONLY for a decision that is high-stakes or IRREVERSIBLE and that the user (not you) must own — e.g. an immutable Meta campaign objective. Do NOT use it for routine confirmations or reversible choices.
+
+Provide 2–4 options, each with a one-line \`consequence\`. EXACTLY ONE option must be marked recommended:true with a one-line \`why\` grounded in real signal from this session (e.g. "162 LEAD events fired on your pixel in the last 30d") — the recommendation is the point. Optionally set allow_emma_decide:true to offer a "Let Emma decide" delegation button (proceeds with the recommended option, logged).
+
+After you call this the run BLOCKS: you will NOT be able to answer it yourself and no further action executes until the user selects. Do not restate the options as prose asking for a "yes/confirm" — emit this tool instead.
+
+Ask only ONE question per turn. If several decisions are needed, ask the single most blocking/irreversible one now; the rest come up one at a time in later turns after each is answered. A second question emitted while one is still awaiting is rejected — never batch them.
+
+If the user replies with a TYPED message instead of clicking an option, that open card is abandoned (it freezes as unanswered) — do NOT infer their choice from the prose, even if it looks like they named an option. If you still need the answer, simply emit a FRESH card to ask again. Only an explicit click counts as the answer.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: 'The question to ask, e.g. "Which Meta campaign objective? It cannot be changed after launch."' },
+        intro: { type: 'string', description: 'Optional one- or two-sentence lead-in shown ABOVE the question on the card (e.g. context you just gathered). A card may come with text — use this instead of separate prose. Do NOT restate the options here.' },
+        options: {
+          type: 'array',
+          minItems: 2,
+          maxItems: 4,
+          description: '2–4 options; exactly one with recommended:true and a one-line why.',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Optional stable id; auto-generated from position if omitted.' },
+              label: { type: 'string', description: 'Short button label, e.g. "Leads".' },
+              consequence: { type: 'string', description: 'One-line consequence of choosing this option.' },
+              recommended: { type: 'boolean', description: 'Set true on EXACTLY ONE option.' },
+              why: { type: 'string', description: 'One-line justification. REQUIRED on the recommended option.' },
+              payload: { type: 'object', description: 'The concrete machine parameters this option implies (applied verbatim by the consumer — no re-inference).' },
+            },
+            required: ['label', 'consequence'],
+          },
+        },
+        immutable: { type: 'boolean', description: 'True if the parameter is irreversible (e.g. Meta objective). Immutable questions never auto-resolve in headless runs.' },
+        allow_emma_decide: { type: 'boolean', description: 'Offer a "Let Emma decide" delegation button that takes the recommended option.' },
+        kind: { type: 'string', description: 'Optional consumer tag (e.g. "meta_objective") identifying which class of decision this is, for a write gate to correlate against without inspecting question text.' },
+      },
+      required: ['question', 'options'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const sessionId = context?.sessionId;
+    if (!sessionId) {
+      return { success: false, message: 'ask_user_question requires an active session.' };
+    }
+    // Normalize incoming options: assign a stable id when the model omitted one.
+    const options: AskUserQuestionOption[] = Array.isArray(args.options)
+      ? args.options.map((o: any, i: number) => ({
+          id: typeof o?.id === 'string' && o.id.trim() !== '' ? o.id : `option-${i + 1}`,
+          label: o?.label,
+          consequence: o?.consequence,
+          recommended: o?.recommended === true,
+          why: o?.why,
+          payload: o?.payload,
+        }))
+      : [];
+
+    let question;
+    try {
+      question = buildPendingUserQuestion({
+        questionId: uuidv4(),
+        question: args.question,
+        intro: typeof args.intro === 'string' ? args.intro : undefined,
+        options,
+        immutable: args.immutable === true,
+        allowEmmaDecide: args.allow_emma_decide === true,
+        kind: typeof args.kind === 'string' ? args.kind : undefined,
+        createdAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      if (err instanceof AskUserQuestionError) {
+        // Surface the validation problem so the model can fix and re-emit.
+        return { success: false, message: `Invalid ask_user_question: ${err.message}` };
+      }
+      throw err;
+    }
+
+    // Persist as the single active question. The guard enforces one live question
+    // at a time: if a question is already awaiting, the write is refused (null) and
+    // we tell the model to ask this one later — questions are asked ONE AT A TIME,
+    // never batched, so a second call can't overwrite the pending one's slot.
+    const posted = await chatbotDb.updateSessionAskUserQuestion(sessionId, question, {
+      failIfAwaitingExists: true,
+    });
+    if (!posted) {
+      return {
+        success: false,
+        message:
+          'A question is already waiting for the user to answer. Only ONE question can be open at a time — do not ask another now. Wait until the current question is answered, then ask this one in a later turn (one question per turn).',
+      };
+    }
+
+    const prompt = renderQuestionPrompt(question);
+    // awaitingUserConfirmation halts the loop; type + options let the chat card
+    // render and the frontend post back a structured selection. No field tells
+    // the model how to answer — only a user selection can resolve it.
+    return {
+      success: true,
+      awaitingUserConfirmation: true,
+      type: 'ask_user_question',
+      questionId: question.questionId,
+      question: question.question,
+      ...(question.intro ? { intro: question.intro } : {}),
+      options: question.options,
+      recommendedOptionId: question.recommendedOptionId,
+      allowEmmaDecide: question.allowEmmaDecide,
+      confirmationPrompt: prompt,
+      summary: prompt,
+    };
+  },
 });
 
 function outputFieldNames(outputFields: unknown): string[] {
@@ -720,6 +861,13 @@ emmaToolRegistry.register({
   user did not explicitly name, and never regenerate/edit an asset set without confirming which assets.
   (LIST/SEARCH/UPLOAD_IMAGE/UPLOAD_VIDEO are read/upload-only and need no confirmation.)
 
+⚠️ CAMPAIGN OBJECTIVE IS IMMUTABLE — cannot be changed after creation. There is NO "start with Traffic/LPV
+  and switch to conversions later" on Meta; that is not a valid plan. Because of this, a CAMPAIGN CREATE
+  with no objective the user explicitly chose is BLOCKED SERVER-SIDE before it reaches Meta: if you omit
+  objective_quote (see below) and the objective hasn't already been confirmed by the user in this session,
+  the call returns a blocking question instead of creating the campaign — do not try to work around this
+  by guessing an objective or retrying.
+
 ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
   AD_SET        → LIST, CREATE, UPDATE, DELETE
@@ -893,6 +1041,11 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
 
             // --- Campaign ---
             objective: { type: "string", description: "Campaign objective (e.g., OUTCOME_TRAFFIC, OUTCOME_SALES)." },
+            objective_quote: {
+              type: "string",
+              description:
+                "CAMPAIGN CREATE ONLY: the exact, literal substring from the user's own message that names this objective (e.g. the user typed \"set up a leads campaign\" → objective_quote: \"leads campaign\"). Provide this ONLY when the user explicitly named the objective themselves — it is checked against their actual message, and a quote that doesn't genuinely appear there is rejected. Do NOT invent or paraphrase a quote, and do NOT provide this if the user did not actually name an objective — just omit it and the objective will be confirmed automatically before the campaign is created.",
+            },
             special_ad_categories: { type: "array", items: { type: "string" }, description: 'Special ad categories. Use ["NONE"] if not applicable.' },
             advantage_campaign_budget: { type: "boolean", description: "Enable Advantage Campaign Budget." },
             budget_amount: { type: "number", description: "Campaign-level daily budget in dollars (when advantage_campaign_budget is true)." },
@@ -986,6 +1139,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
       args.ad_set_id,
       args.ad_id,
       args.params,
+      context?.sessionId,
     );
   }
 });

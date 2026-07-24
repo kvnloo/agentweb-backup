@@ -2866,6 +2866,10 @@ export const scheduleDb = {
       emailNotifications: string[];
       dailyDigest: boolean;
       selfImprove: boolean;
+      // ENG-396: opt-in full autonomy — headless runs auto-take Emma's recommended
+      // option on a blocking question instead of parking (waives the human gate on
+      // irreversible decisions). Default off.
+      fullAutonomy?: boolean;
       promptRevisions: Array<{ startingMessage: string; updatedAt: string }>;
       updatedAt: string;
       emailCampaignTaskId: string;

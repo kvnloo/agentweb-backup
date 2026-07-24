@@ -459,3 +459,92 @@ describe('createScheduledChat / updateScheduledChat selfImprove persistence', ()
     );
   });
 });
+
+describe('createScheduledChat / updateScheduledChat fullAutonomy persistence (ENG-396)', () => {
+  const mockUserId = 'user-create-2';
+
+  const makeRes = () => {
+    const res: Partial<Response> = {};
+    res.status = jest.fn().mockReturnValue(res) as any;
+    res.json = jest.fn().mockReturnValue(res) as any;
+    return res as Response;
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockScheduleDb.createSchedule.mockResolvedValue(undefined as any);
+    mockScheduleDb.updateSchedule.mockResolvedValue(undefined as any);
+  });
+
+  it('persists fullAutonomy=true on create', async () => {
+    const req = {
+      user: { userId: mockUserId, email: 'owner@example.com' },
+      body: {
+        scheduleName: 'S', startingMessage: 'do the thing', scheduleFrequency: 'daily',
+        fullAutonomy: true, emailNotifications: ['owner@example.com'],
+      },
+    } as unknown as Request;
+
+    await agentModeController.createScheduledChat(req, makeRes());
+
+    expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(
+      expect.objectContaining({ fullAutonomy: true })
+    );
+  });
+
+  it('defaults fullAutonomy to false on create when omitted (safe default)', async () => {
+    const req = {
+      user: { userId: mockUserId, email: 'owner@example.com' },
+      body: {
+        scheduleName: 'S', startingMessage: 'do the thing', scheduleFrequency: 'daily',
+        emailNotifications: ['owner@example.com'],
+      },
+    } as unknown as Request;
+
+    await agentModeController.createScheduledChat(req, makeRes());
+
+    expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(
+      expect.objectContaining({ fullAutonomy: false })
+    );
+  });
+
+  it('persists fullAutonomy on update', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue({
+      scheduleId: 'sched-a', userId: mockUserId, scheduleName: 'S', startingMessage: 'do the thing',
+      frequency: 'daily', emailNotifications: ['owner@example.com'], fullAutonomy: false,
+    } as any);
+
+    const req = {
+      user: { userId: mockUserId, email: 'owner@example.com' },
+      params: { scheduleId: 'sched-a' },
+      body: { fullAutonomy: true },
+    } as unknown as Request;
+
+    await agentModeController.updateScheduledChat(req, makeRes());
+
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+      'sched-a',
+      expect.objectContaining({ fullAutonomy: true })
+    );
+  });
+
+  it('preserves existing fullAutonomy on update when omitted', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue({
+      scheduleId: 'sched-b', userId: mockUserId, scheduleName: 'S', startingMessage: 'do the thing',
+      frequency: 'daily', emailNotifications: ['owner@example.com'], fullAutonomy: true,
+    } as any);
+
+    const req = {
+      user: { userId: mockUserId, email: 'owner@example.com' },
+      params: { scheduleId: 'sched-b' },
+      body: { description: 'updated desc' },
+    } as unknown as Request;
+
+    await agentModeController.updateScheduledChat(req, makeRes());
+
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+      'sched-b',
+      expect.objectContaining({ fullAutonomy: true })
+    );
+  });
+});
