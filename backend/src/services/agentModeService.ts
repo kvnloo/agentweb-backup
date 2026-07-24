@@ -16097,6 +16097,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     'OUTCOME_APP_PROMOTION',
   ];
 
+  // Greptile P1 ("Quote does not bind objective"): verifyExplicitStatement only
+  // proves the quote is real transcript text — it says nothing about WHICH
+  // objective that text describes. Without this, a genuine quote for one
+  // objective (e.g. "traffic campaign") could be paired with a completely
+  // different claimed objective (OUTCOME_LEADS) and both would check out,
+  // letting a model-supplied objective bypass the human-attribution gate on
+  // its own say-so — the exact class of bug this gate exists to prevent. Each
+  // claimed objective must have its OWN keyword actually present in the quote.
+  private static readonly META_OBJECTIVE_KEYWORDS: Record<string, RegExp> = {
+    OUTCOME_LEADS: /\blead(s|-?gen(eration)?)?\b/i,
+    OUTCOME_SALES: /\bsales?\b|\bpurchase(s)?\b|\be-?commerce\b|\bcheckout\b|\bconversion(s)?\b/i,
+    OUTCOME_TRAFFIC: /\btraffic\b|\bclicks?\b|\blanding[- ]page\b|\blpv\b/i,
+    OUTCOME_AWARENESS: /\bawareness\b|\breach\b|\bimpressions?\b/i,
+    OUTCOME_ENGAGEMENT: /\bengagement\b/i,
+    OUTCOME_APP_PROMOTION: /\bapp[- ]?(promotion|install(s)?)\b/i,
+  };
+
   /**
    * The last message with role 'user' in the session, or undefined. Used ONLY
    * to verify an "explicitly stated by the user" claim against real transcript
@@ -16162,13 +16179,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       sessionId = created.sessionId;
     }
 
-    // Path 1: explicitly stated by the user in their own words this turn.
+    // Path 1: explicitly stated by the user in their own words this turn. Two
+    // independent checks, BOTH required: the quote must be real transcript
+    // text (verifyExplicitStatement), AND it must actually describe the
+    // claimed objective (its own keyword present in the quote) — otherwise a
+    // genuine-but-unrelated quote could rubber-stamp any objective the model
+    // names alongside it.
     if (claimedObjective && AgentModeService.META_OBJECTIVE_VALUES.includes(claimedObjective) && quote) {
       const lastUserText = await this.getLastUserMessageText(sessionId);
-      if (verifyExplicitStatement(lastUserText, quote)) {
+      const keywordPattern = AgentModeService.META_OBJECTIVE_KEYWORDS[claimedObjective];
+      if (verifyExplicitStatement(lastUserText, quote) && keywordPattern?.test(quote)) {
         return { allowed: true, objective: claimedObjective };
       }
-      // The quote didn't check out against the real transcript — do NOT trust
+      // The quote didn't check out against the real transcript, or doesn't
+      // describe the claimed objective — do NOT trust
       // the claim; fall through to the deterministic ask gate below.
     }
 

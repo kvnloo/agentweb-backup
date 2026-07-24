@@ -2683,7 +2683,7 @@ export class ChatbotDB {
   async updateSessionAskUserQuestion(
     sessionId: string,
     pendingUserQuestion: PendingUserQuestion | null,
-    opts?: { failIfAwaitingExists?: boolean },
+    opts?: { failIfAwaitingExists?: boolean; requireStillAwaiting?: string },
   ): Promise<ChatSession | null> {
     // ENG-396: the one-live-question invariant. When posing a NEW awaiting question,
     // `failIfAwaitingExists` gates the write on there being no question already
@@ -2692,6 +2692,20 @@ export class ChatbotDB {
     // calls in the same turn can never both take the single slot; the loser is
     // refused (returns null) and the model asks it in a later turn.
     const guard = opts?.failIfAwaitingExists === true && pendingUserQuestion !== null;
+
+    // Greptile P1 ("Concurrent answers overwrite selections"): persisting an
+    // ANSWER previously had no guard at all — two concurrent /generate calls
+    // could both read the same 'awaiting' snapshot, both resolve successfully,
+    // and the later unconditional write would silently clobber the earlier
+    // answer even if the later request was subsequently rejected elsewhere as
+    // busy. `requireStillAwaiting` makes the answer-write optimistic-locked:
+    // it only succeeds if the question is STILL exactly this one, STILL
+    // 'awaiting', at the moment of write — the loser of the race gets null
+    // (refused) instead of silently overwriting the winner.
+    const requireStillAwaiting =
+      typeof opts?.requireStillAwaiting === 'string' && pendingUserQuestion !== null
+        ? opts.requireStillAwaiting
+        : undefined;
 
     let updatedArchive: Record<string, PendingUserQuestion> | undefined;
     if (pendingUserQuestion !== null) {
@@ -2737,15 +2751,23 @@ export class ChatbotDB {
         "attribute_not_exists(pendingUserQuestion) OR pendingUserQuestion.#pStatus <> :awaitingStatus";
       params.ExpressionAttributeNames = { "#pStatus": "status" };
       params.ExpressionAttributeValues[":awaitingStatus"] = "awaiting";
+    } else if (requireStillAwaiting) {
+      params.ConditionExpression =
+        "pendingUserQuestion.questionId = :requireQuestionId AND pendingUserQuestion.#pStatus = :awaitingStatus";
+      params.ExpressionAttributeNames = { "#pStatus": "status" };
+      params.ExpressionAttributeValues[":requireQuestionId"] = requireStillAwaiting;
+      params.ExpressionAttributeValues[":awaitingStatus"] = "awaiting";
     }
 
     try {
       const result = await dynamodb.update(params).promise();
       return result.Attributes as ChatSession;
     } catch (error) {
-      // A guarded write that fails the condition means a question is already
-      // awaiting — an expected outcome, not an error. Signal it with null.
-      if (guard && (error as any)?.code === "ConditionalCheckFailedException") {
+      // A guarded write that fails the condition means either a question is
+      // already awaiting (posting a new one) or this answer lost a race to a
+      // concurrent one (persisting an answer) — an expected outcome, not an
+      // error. Signal it with null either way.
+      if ((guard || requireStillAwaiting) && (error as any)?.code === "ConditionalCheckFailedException") {
         return null;
       }
       console.error("Error updating session AskUserQuestion:", error);

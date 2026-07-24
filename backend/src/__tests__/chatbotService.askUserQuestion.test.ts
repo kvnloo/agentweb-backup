@@ -188,4 +188,39 @@ describe('chatbotDb.updateSessionAskUserQuestion', () => {
       expect(getSpy).not.toHaveBeenCalled();
     });
   });
+
+  // ── Greptile P1 ("Concurrent answers overwrite selections") ──────────────
+  describe('requireStillAwaiting (optimistic-lock guard on answer persistence)', () => {
+    it('adds a ConditionExpression requiring the SAME questionId AND status still awaiting', async () => {
+      const answered = { ...sampleQuestion(), status: 'answered' as const, answer: { optionId: 'leads', delegated: false, answeredBy: 'user' as const, at: 't' } };
+      await chatbotDb.updateSessionAskUserQuestion('s-1', answered, { requireStillAwaiting: 'q-1' });
+
+      const params = updateSpy.mock.calls[0][0];
+      expect(params.ConditionExpression).toMatch(
+        /pendingUserQuestion\.questionId = :requireQuestionId AND pendingUserQuestion\.#pStatus = :awaitingStatus/,
+      );
+      expect(params.ExpressionAttributeNames['#pStatus']).toBe('status');
+      expect(params.ExpressionAttributeValues[':requireQuestionId']).toBe('q-1');
+      expect(params.ExpressionAttributeValues[':awaitingStatus']).toBe('awaiting');
+    });
+
+    it('returns null (never throws) when a concurrent write already won the race', async () => {
+      updateSpy.mockReturnValue({
+        promise: () => Promise.reject(Object.assign(new Error('conditional'), { code: 'ConditionalCheckFailedException' })),
+      } as any);
+
+      const res = await chatbotDb.updateSessionAskUserQuestion(
+        's-1',
+        { ...sampleQuestion(), status: 'answered', answer: { optionId: 'leads', delegated: false, answeredBy: 'user', at: 't' } },
+        { requireStillAwaiting: 'q-1' },
+      );
+      expect(res).toBeNull();
+    });
+
+    it('does NOT add the guard when requireStillAwaiting is absent (unconditional write, unchanged default)', async () => {
+      await chatbotDb.updateSessionAskUserQuestion('s-1', sampleQuestion());
+      const params = updateSpy.mock.calls[0][0];
+      expect(params.ConditionExpression).toBeUndefined();
+    });
+  });
 });

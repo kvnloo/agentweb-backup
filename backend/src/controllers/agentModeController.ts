@@ -1113,7 +1113,9 @@ export async function runVerifiedChat(
     if (fullAutonomy && autoTakesUsed < MAX_AUTO_TAKES) {
       autoTakesUsed++;
       const answered = resolveInboundAnswer(pending, { delegated: true }, new Date().toISOString());
-      await chatbotDb.updateSessionAskUserQuestion(sessionId, answered);
+      await chatbotDb.updateSessionAskUserQuestion(sessionId, answered, {
+        requireStillAwaiting: pending.questionId,
+      });
       const chosen = answered.options.find(o => o.id === answered.answer!.optionId);
       console.log(
         `AgentMode runVerifiedChat: full-autonomy auto-take on session ${sessionId} — question ${pending.questionId} → "${chosen?.label}" (delegation); continuing`
@@ -3277,7 +3279,23 @@ export const agentModeController = {
             },
             new Date().toISOString(),
           );
-          await chatbotDb.updateSessionAskUserQuestion(sessionId, answered);
+          // Optimistic-locked: only persists if the question is STILL exactly
+          // this one and STILL 'awaiting' at write time. Without this, two
+          // concurrent submissions (e.g. a double-click) could both validate
+          // against the same in-memory snapshot and the later write would
+          // silently clobber the earlier answer.
+          const persisted = await chatbotDb.updateSessionAskUserQuestion(sessionId, answered, {
+            requireStillAwaiting: session.pendingUserQuestion!.questionId,
+          });
+          if (!persisted) {
+            // Lost the race to a concurrent submission that already answered
+            // this same question — refresh and re-render rather than silently
+            // overwriting whichever answer actually won.
+            return res.status(409).json({
+              error: 'This question was already answered by a concurrent request.',
+              code: 'ASK_USER_QUESTION_INVALID',
+            });
+          }
           // ENG-396: make Emma name the chosen option in her reply (esp. for delegation,
           // where the user's "Let Emma decide" bubble doesn't say which option won).
           answerAck = buildAnswerAcknowledgement(answered) ?? undefined;

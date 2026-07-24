@@ -1213,11 +1213,11 @@ Schedule ID: ${scheduleId}
           <div class="container">
             <div class="header">
               <h2 style="margin: 0;">Emma needs your input to continue</h2>
-              <p style="margin: 6px 0 0 0; opacity: 0.92;">${scheduleName}</p>
+              <p style="margin: 6px 0 0 0; opacity: 0.92;">${this.escapeHtml(scheduleName)}</p>
             </div>
             <div class="content">
               <p>Your scheduled run on ${currentDate} paused because Emma needs you to make a choice before continuing. She did not proceed on a guess.</p>
-              <div class="question">${question}</div>
+              <div class="question">${this.escapeHtml(question)}</div>
               <p>Open the chat to see the options and choose, and the run will pick up from there.</p>
               <a class="button" href="${openUrl}">Open chat to decide</a>
             </div>

@@ -199,7 +199,10 @@ describe('generateResponse — AskUserQuestion answer channel (ENG-396)', () => 
     mockChatbotDb.addMessageToSession.mockResolvedValue(undefined as any);
     mockChatbotDb.addMessagesToSession.mockResolvedValue(undefined as any);
     mockChatbotDb.updateSessionTitle.mockResolvedValue(undefined as any);
-    (mockChatbotDb as any).updateSessionAskUserQuestion.mockResolvedValue(undefined as any);
+    // A real DynamoDB update always returns truthy Attributes on success — only
+    // a lost optimistic-lock race (a concurrent answer already won) returns
+    // null. Default to a successful persist; race-specific tests override this.
+    (mockChatbotDb as any).updateSessionAskUserQuestion.mockResolvedValue({ sessionId } as any);
     mockWorkerService.runInWorker.mockResolvedValue(workerResult as any);
   });
 
@@ -236,6 +239,41 @@ describe('generateResponse — AskUserQuestion answer channel (ENG-396)', () => 
     expect(persisted.answer).toMatchObject({ optionId: 'leads', delegated: true, answeredBy: 'delegation' });
     expect(persisted.answer.rationale).toContain('162 LEAD events');
     expect(mockWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('persists the answer with an optimistic-lock guard requiring the question to still be THIS awaiting one', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(pendingObjectiveQuestion()) as any);
+
+    await agentModeController.generateResponse(
+      makeReq({ userId: ownerId }, { questionId: 'q-objective-1', optionId: 'leads' }),
+      makeRes(),
+    );
+
+    expect((mockChatbotDb as any).updateSessionAskUserQuestion).toHaveBeenCalledWith(
+      sessionId,
+      expect.objectContaining({ status: 'answered' }),
+      { requireStillAwaiting: 'q-objective-1' },
+    );
+  });
+
+  // Greptile P1 ("Concurrent answers overwrite selections"): two concurrent
+  // submissions both validate against the same in-memory 'awaiting' snapshot;
+  // without a guard the later unconditional write would silently clobber the
+  // earlier answer. A null return means the optimistic lock lost the race
+  // (the question was already answered by the time this write landed).
+  it('a lost optimistic-lock race (concurrent answer already won) is a 409 — never silently overwrites', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue(sessionWith(pendingObjectiveQuestion()) as any);
+    (mockChatbotDb as any).updateSessionAskUserQuestion.mockResolvedValue(null);
+
+    const res = makeRes();
+    await agentModeController.generateResponse(
+      makeReq({ userId: ownerId }, { questionId: 'q-objective-1', optionId: 'leads' }),
+      res,
+    );
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body).toEqual(expect.objectContaining({ code: 'ASK_USER_QUESTION_INVALID' }));
+    expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
   });
 
   it('a selection with NO pending question is a 409 ASK_USER_QUESTION_INVALID — no run', async () => {

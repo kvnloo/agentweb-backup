@@ -134,6 +134,40 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       expect(metaService.createCampaign).not.toHaveBeenCalled();
     });
 
+    // Greptile P1 ("Quote does not bind objective"): a genuine quote proves it's
+    // real transcript text, but says nothing about WHICH objective it names. A
+    // model could pair a real "traffic campaign" quote with a totally different
+    // claimed objective (OUTCOME_LEADS) and both checks would pass under the old
+    // logic — silently creating a Leads campaign the user never chose. Each
+    // claimed objective must have ITS OWN keyword present in the quote.
+    it('REJECTS a genuine quote that describes a DIFFERENT objective than the one claimed', async () => {
+      (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
+        { role: 'user', content: 'Please set up a traffic campaign for our launch.' },
+      ]);
+      const result = await callApi(
+        service,
+        // The quote is 100% real text — but it describes Traffic, not Leads.
+        validParams({ objective: 'OUTCOME_LEADS', objective_quote: 'traffic campaign' }),
+        'session-1',
+      );
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(result.type).toBe('ask_user_question');
+      expect(metaService.createCampaign).not.toHaveBeenCalled();
+    });
+
+    it('ALLOWS Sales when the quote genuinely names a sales/purchase/conversion funnel', async () => {
+      (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
+        { role: 'user', content: 'We need a campaign optimized for purchases on our checkout page.' },
+      ]);
+      const result = await callApi(
+        service,
+        validParams({ objective: 'OUTCOME_SALES', objective_quote: 'optimized for purchases on our checkout page' }),
+        'session-1',
+      );
+      expect(result.success).toBe(true);
+      expect(metaService.createCampaign).toHaveBeenCalled();
+    });
+
     it('an invalid objective value is rejected by param validation before the gate ever runs', async () => {
       const result = await callApi(
         service,
