@@ -105,4 +105,33 @@ describe('sendCapiLeadEvent', () => {
     expect(evt.user_data.client_ip_address).toBe('1.2.3.4');
     expect(evt.user_data.client_user_agent).toBe('Mozilla/5.0');
   });
+
+  // ENG-490: Meta's documented CAPI normalization for `ph` is digits-only, then strip any
+  // leading zero(s) (a national-dialing-prefix artifact, e.g. a UK number entered with its
+  // domestic leading 0) before hashing. Missing before this: only non-digits were stripped.
+  it('normalizes phone by stripping non-digits AND any leading zero(s) before hashing (Meta CAPI spec)', async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ events_received: 1, fbtrace_id: 'trace1' }),
+    });
+
+    await metaService.sendCapiLeadEvent('px1', 'tok', { ...baseEvent, phone: '07911 123456' });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const expectedHash = crypto.createHash('sha256').update('7911123456').digest('hex');
+    expect(body.data[0].user_data.ph).toEqual([expectedHash]);
+  });
+
+  it('does not strip digits that are not part of a leading-zero run (e.g. a 1 after the leading zeros stays)', async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ events_received: 1, fbtrace_id: 'trace1' }),
+    });
+
+    await metaService.sendCapiLeadEvent('px1', 'tok', { ...baseEvent, phone: '001 555 000 1111' });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const expectedHash = crypto.createHash('sha256').update('15550001111').digest('hex');
+    expect(body.data[0].user_data.ph).toEqual([expectedHash]);
+  });
 });
