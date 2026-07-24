@@ -100,9 +100,20 @@ emmaToolRegistry.register({
 // consumer: the Meta campaign objective, ENG-400) before building. It returns
 // awaitingUserConfirmation:true so the agent loop HALTS (see collectConfirmationPrompt);
 // the answer is persisted structurally on the session and only an inbound USER
-// selection resolves it — the model cannot self-answer. NOTE: exposure is
-// feature-flagged OFF until the whole feature (answer channel + card) ships;
-// registering the handler here is inert until the tool is added to the exposed set.
+// selection resolves it — the model cannot self-answer.
+//
+// DELIBERATELY NOT in MANDATORY_FOUNDATION_TOOLS: ENG-396/400's stated scope is
+// "the first (and for now only) consumer is the Meta campaign-objective ask" —
+// exposing this as a general Emma-callable tool would let the model reach for
+// it in any context it judges high-stakes, which is the general-purpose future
+// this primitive is headed toward, but NOT what's authorized yet. It doesn't
+// need to be — the Meta objective gate (agentModeService.ts,
+// resolveCampaignObjectiveGate) builds and persists the question DIRECTLY
+// (buildPendingUserQuestion + chatbotDb.updateSessionAskUserQuestion), without
+// ever calling through the tool registry, so ENG-400 works fully with this
+// tool registration inert. Registering the handler here (rather than deleting
+// it) keeps the validated primitive ready for its next consumer without
+// widening exposure today.
 emmaToolRegistry.register({
   name: 'ask_user_question',
   definition: {
@@ -141,6 +152,7 @@ If the user replies with a TYPED message instead of clicking an option, that ope
         },
         immutable: { type: 'boolean', description: 'True if the parameter is irreversible (e.g. Meta objective). Immutable questions never auto-resolve in headless runs.' },
         allow_emma_decide: { type: 'boolean', description: 'Offer a "Let Emma decide" delegation button that takes the recommended option.' },
+        kind: { type: 'string', description: 'Optional consumer tag (e.g. "meta_objective") identifying which class of decision this is, for a write gate to correlate against without inspecting question text.' },
       },
       required: ['question', 'options'],
     },
@@ -171,6 +183,7 @@ If the user replies with a TYPED message instead of clicking an option, that ope
         options,
         immutable: args.immutable === true,
         allowEmmaDecide: args.allow_emma_decide === true,
+        kind: typeof args.kind === 'string' ? args.kind : undefined,
         createdAt: new Date().toISOString(),
       });
     } catch (err) {
@@ -848,6 +861,13 @@ emmaToolRegistry.register({
   user did not explicitly name, and never regenerate/edit an asset set without confirming which assets.
   (LIST/SEARCH/UPLOAD_IMAGE/UPLOAD_VIDEO are read/upload-only and need no confirmation.)
 
+⚠️ CAMPAIGN OBJECTIVE IS IMMUTABLE — cannot be changed after creation. There is NO "start with Traffic/LPV
+  and switch to conversions later" on Meta; that is not a valid plan. Because of this, a CAMPAIGN CREATE
+  with no objective the user explicitly chose is BLOCKED SERVER-SIDE before it reaches Meta: if you omit
+  objective_quote (see below) and the objective hasn't already been confirmed by the user in this session,
+  the call returns a blocking question instead of creating the campaign — do not try to work around this
+  by guessing an objective or retrying.
+
 ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
   AD_SET        → LIST, CREATE, UPDATE, DELETE
@@ -1021,6 +1041,11 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
 
             // --- Campaign ---
             objective: { type: "string", description: "Campaign objective (e.g., OUTCOME_TRAFFIC, OUTCOME_SALES)." },
+            objective_quote: {
+              type: "string",
+              description:
+                "CAMPAIGN CREATE ONLY: the exact, literal substring from the user's own message that names this objective (e.g. the user typed \"set up a leads campaign\" → objective_quote: \"leads campaign\"). Provide this ONLY when the user explicitly named the objective themselves — it is checked against their actual message, and a quote that doesn't genuinely appear there is rejected. Do NOT invent or paraphrase a quote, and do NOT provide this if the user did not actually name an objective — just omit it and the objective will be confirmed automatically before the campaign is created.",
+            },
             special_ad_categories: { type: "array", items: { type: "string" }, description: 'Special ad categories. Use ["NONE"] if not applicable.' },
             advantage_campaign_budget: { type: "boolean", description: "Enable Advantage Campaign Budget." },
             budget_amount: { type: "number", description: "Campaign-level daily budget in dollars (when advantage_campaign_budget is true)." },
@@ -1114,6 +1139,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
       args.ad_set_id,
       args.ad_id,
       args.params,
+      context?.sessionId,
     );
   }
 });

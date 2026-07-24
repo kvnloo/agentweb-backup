@@ -364,8 +364,8 @@ router.get('/meta-ads/campaigns', async (req: Request, res: Response) => {
 router.post('/meta-ads/marketing-api', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const { entity_type, action, account_id, parent_id, entity_id, fields, params } = req.body;
-    const result = await svc.callMetaMarketingApi(userId(req), entity_type, action, account_id, parent_id, entity_id, fields, params);
+    const { entity_type, action, account_id, parent_id, entity_id, fields, params, session_id } = req.body;
+    const result = await svc.callMetaMarketingApi(userId(req), entity_type, action, account_id, parent_id, entity_id, fields, params, session_id);
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
