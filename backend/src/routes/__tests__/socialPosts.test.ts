@@ -16,6 +16,7 @@ jest.mock('../../middleware/auth', () => ({
 
 jest.mock('../../services/socialPostsService', () => ({
   getPostsForUser: jest.fn(),
+  getSocialAccountIds: jest.fn(),
 }));
 
 jest.mock('../../services/db', () => ({
@@ -32,11 +33,12 @@ jest.mock('../../services/db', () => ({
   },
 }));
 
-import { getPostsForUser } from '../../services/socialPostsService';
-import { _resetForceReloadCooldown } from '../socialPosts';
+import { getPostsForUser, getSocialAccountIds } from '../../services/socialPostsService';
+import { _resetForceReloadCooldown, _forceReloadCooldownSize } from '../socialPosts';
 import { userDb, scheduleDb, socialEngagementTrackingDb } from '../../services/db';
 
 const mockGetPosts = getPostsForUser as jest.MockedFunction<typeof getPostsForUser>;
+const mockGetSocialAccountIds = getSocialAccountIds as jest.MockedFunction<typeof getSocialAccountIds>;
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
 const mockTrackingDb = socialEngagementTrackingDb as jest.Mocked<typeof socialEngagementTrackingDb>;
@@ -78,6 +80,9 @@ let app: express.Application;
 beforeEach(() => {
   jest.clearAllMocks();
   _resetForceReloadCooldown();
+  // Default: caller owns two social accounts. Individual tests override this
+  // to exercise the "unowned accountId" / bounded-growth cases.
+  mockGetSocialAccountIds.mockResolvedValue(['acc-1', 'acc-2']);
   app = express();
   app.use(express.json());
   app.use('/api', socialPostsRouter);
@@ -181,6 +186,77 @@ describe('GET /api/social-posts', () => {
         .expect(429);
 
       expect(mockGetPosts).toHaveBeenCalledTimes(2);
+    });
+
+    it('should throttle a specific-account refresh after an all-account refresh already covered it', async () => {
+      mockGetPosts.mockResolvedValue({ posts: [], total: 0 } as any);
+      mockGetSocialAccountIds.mockResolvedValue(['acc-1']);
+
+      // "All accounts" refresh covers acc-1.
+      await request(app).get('/api/social-posts?force_reload=true').expect(200);
+
+      // Refreshing acc-1 specifically must be throttled — it was just
+      // refreshed a moment ago as part of the "all" request.
+      const res = await request(app)
+        .get('/api/social-posts?force_reload=true&accountId=acc-1')
+        .expect(429);
+
+      expect(res.body).toHaveProperty('error');
+      expect(mockGetPosts).toHaveBeenCalledTimes(1);
+    });
+
+    it('should throttle an all-account refresh after an account-specific refresh already covered it', async () => {
+      mockGetPosts.mockResolvedValue({ posts: [], total: 0 } as any);
+      mockGetSocialAccountIds.mockResolvedValue(['acc-1']);
+
+      await request(app)
+        .get('/api/social-posts?force_reload=true&accountId=acc-1')
+        .expect(200);
+
+      // "All accounts" refresh must be throttled — acc-1 (its only target)
+      // was just refreshed a moment ago.
+      const res = await request(app).get('/api/social-posts?force_reload=true').expect(429);
+
+      expect(res.body).toHaveProperty('error');
+      expect(mockGetPosts).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not throttle or persist cooldown state for an accountId the caller does not own', async () => {
+      mockGetPosts.mockResolvedValue({ posts: [], total: 0 } as any);
+      mockGetSocialAccountIds.mockResolvedValue(['acc-1']);
+
+      // Neither call is throttled — an unowned accountId can't trigger any
+      // downstream LinkedIn call (getPostsForUser filters it out), so it's
+      // never written into the cooldown map in the first place.
+      await request(app)
+        .get('/api/social-posts?force_reload=true&accountId=someone-elses-account')
+        .expect(200);
+      await request(app)
+        .get('/api/social-posts?force_reload=true&accountId=someone-elses-account')
+        .expect(200);
+
+      expect(mockGetPosts).toHaveBeenCalledTimes(2);
+      expect(_forceReloadCooldownSize()).toBe(0);
+    });
+
+    it('should bound cooldown map growth to the caller\'s real accounts, not arbitrary query values', async () => {
+      mockGetPosts.mockResolvedValue({ posts: [], total: 0 } as any);
+      mockGetSocialAccountIds.mockResolvedValue(['acc-1']);
+
+      for (let i = 0; i < 25; i++) {
+        await request(app)
+          .get(`/api/social-posts?force_reload=true&accountId=attacker-${i}`)
+          .expect(200);
+      }
+
+      // None of the 25 distinct unowned accountIds grew the map.
+      expect(_forceReloadCooldownSize()).toBe(0);
+
+      // A legitimate, owned account still gets exactly one entry.
+      await request(app)
+        .get('/api/social-posts?force_reload=true&accountId=acc-1')
+        .expect(200);
+      expect(_forceReloadCooldownSize()).toBe(1);
     });
   });
 });
