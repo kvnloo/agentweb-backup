@@ -96,31 +96,37 @@ emmaToolRegistry.register({
 });
 
 // ENG-396: AskUserQuestion — a structured, BLOCKING option-select prompt. Emma
-// emits it to force a human choice on an immutable/irreversible parameter (first
-// consumer: the Meta campaign objective, ENG-400) before building. It returns
-// awaitingUserConfirmation:true so the agent loop HALTS (see collectConfirmationPrompt);
-// the answer is persisted structurally on the session and only an inbound USER
-// selection resolves it — the model cannot self-answer.
+// emits it to force a human choice on an immutable/irreversible parameter
+// before building. It returns awaitingUserConfirmation:true so the agent loop
+// HALTS (see collectConfirmationPrompt); the answer is persisted structurally
+// on the session and only an inbound USER selection resolves it — the model
+// cannot self-answer.
 //
-// EXPOSED IN MANDATORY_FOUNDATION_TOOLS (re-enabled 2026-07-24): the Meta
-// objective gate (agentModeService.ts, resolveCampaignObjectiveGate) enforces
-// the objective automatically ONLY at an actual CAMPAIGN CREATE attempt — it
-// never fires proactively. A user asking Emma to "confirm settings via cards
-// before building anything" found Emma with nothing real to reach for, and she
-// fabricated fake HTML "cards" in prose instead (no tool call, no persisted
-// question, no real answer channel). Re-exposing this tool restores the
-// proactive-ask UX. This is a PROMPT-LEVEL restriction, not code-enforced —
-// the description below is the only thing keeping Emma from reaching for this
-// outside Meta objective; the deterministic gate itself is unaffected either
-// way and enforces the objective at create time regardless of whether this
-// tool is ever called voluntarily.
+// META-SCOPED, NOT OBJECTIVE-SCOPED (2026-07-25): originally restricted to
+// "Meta campaign objective only." That was narrower than intended — the
+// restriction is meant to bound the DOMAIN (Meta Ads), not the specific field
+// within it. Widened to any high-stakes/irreversible Meta Ads decision (e.g.
+// objective, special ad category), still explicitly NOT general-purpose across
+// other domains/platforms. Every part of the underlying mechanism (persistence,
+// the real UI card, the answer channel, headless park, full-autonomy
+// auto-take, delegation, archive, MCP wiring) is fully generic with zero
+// Meta-specific logic and was proven working end-to-end live before this was
+// widened — only the description below is what keeps this Meta-bounded, and
+// that's a prompt-level restriction, not code-enforced.
+//
+// The Meta objective write gate (agentModeService.ts,
+// resolveCampaignObjectiveGate) is UNCHANGED and independent of this — it
+// still enforces the objective deterministically at CAMPAIGN CREATE
+// regardless of whether Emma calls this tool voluntarily for anything else
+// within Meta. This only widens Emma's OWN judgment-based use of the card
+// within Meta; it does not add a new hard-enforced gate for other Meta
+// entities — that requires its own dedicated gate, built the same way
+// ENG-400 was, per irreversible action.
 emmaToolRegistry.register({
   name: 'ask_user_question',
   definition: {
     name: 'ask_user_question',
-    description: `Ask the user a structured, blocking multiple-choice question and STOP until they pick.
-
-SCOPE — READ THIS FIRST: as of now, use this ONLY for confirming the Meta campaign objective before a CAMPAIGN CREATE (immutable, high-stakes, and the one sanctioned use of this tool). Do NOT use it for any other decision — not ad category, not which pixel event to optimize for, not budget, not targeting, not "should I use account X or Y", not any other platform (Google Ads, LinkedIn, etc.), and not routine confirmations. For everything else: use your own best judgment and proceed (reversible choices are yours to make; the existing target-confirmation flow on writes still applies where it already does). Calling this tool for a non-Meta-objective decision is a misuse of scope, not a feature.
+    description: `Ask the user a structured, blocking multiple-choice question and STOP until they pick. SCOPE: Meta Ads only — do NOT use this for Google Ads, LinkedIn, or any other platform/domain decision, no matter how high-stakes. Within Meta Ads, use this ONLY for a decision that is high-stakes or IRREVERSIBLE and that the user (not you) must own — e.g. the immutable campaign objective, a special ad category with legal/compliance implications, or a similarly consequential Meta-specific choice. Do NOT use it for routine confirmations or reversible Meta choices — those are yours to make with your own best judgment (the existing target-confirmation flow on writes still applies where it already does).
 
 Provide 2–4 options, each with a one-line \`consequence\`. EXACTLY ONE option must be marked recommended:true with a one-line \`why\` grounded in real signal from this session (e.g. "162 LEAD events fired on your pixel in the last 30d") — the recommendation is the point. Optionally set allow_emma_decide:true to offer a "Let Emma decide" delegation button (proceeds with the recommended option, logged).
 
