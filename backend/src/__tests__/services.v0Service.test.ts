@@ -176,6 +176,7 @@ import {
   triggerVercelDeployment,
   injectLeadCaptureAttribution,
   assertNoDuplicateInjectedRoutes,
+  buildTrackingHelper,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord, getVercelBuildErrors, isNonErrorBuildLine } from "../services/v0Service";
@@ -448,6 +449,12 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
     expect(routeSrc).toContain("/api/webhooks/forward-lead");
     expect(routeSrc).toContain('from "next/headers"');
     expect(routeSrc).toContain("aw_first_touch");
+
+    // ENG-449 match-quality gap: _fbp/_fbc are Meta's own first-party click-id cookies (set
+    // by the already-platform-injected base Pixel snippet) — read server-side here and
+    // forwarded to /forward-lead, fully deterministic, no v0-authored client code involved.
+    expect(routeSrc).toContain('"_fbp"');
+    expect(routeSrc).toContain('"_fbc"');
   });
 
   it("FAIL: v0-generated app/api/capture/route.ts is replaced, not duplicated", () => {
@@ -571,6 +578,65 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
     // conditional needed in the generated source itself.
     expect(routeSrc).toContain("const PIXEL_ID = undefined");
     expect(routeSrc).toContain("const META_ACCOUNT_ID = undefined");
+  });
+});
+
+// =============================================================================
+// buildTrackingHelper + its injection (ENG-449 follow-up: deterministic tracking,
+// shrinks the v0-compliance surface for fbq()/bridge-out — see plan
+// "ENG-449 follow-up: close CAPI/Pixel reliability gaps")
+// =============================================================================
+describe("v0Service - buildTrackingHelper", () => {
+  it("SUCCESS: generated module exports fireLeadTracking with fbq + 800ms flush + bridge-out redirect logic", () => {
+    const src = buildTrackingHelper();
+    expect(src).toContain("export async function fireLeadTracking");
+    expect(src).toContain("window.fbq");
+    expect(src).toContain("'track'");
+    expect(src).toContain("'Lead'");
+    expect(src).toContain("800");
+    expect(src).toContain("window.location.href");
+    expect(src).toContain("encodeURIComponent");
+    // pixelId/bridgeOutUrl are CALL-TIME arguments (per-page data), not baked into this
+    // repo-level shared file — a page's own values are literal args v0 is instructed to pass.
+    expect(src).toContain("pixelId");
+    expect(src).toContain("bridgeOutUrl");
+    // eventId must be a caller-supplied argument, NOT generated inside this helper — the
+    // SAME id has to also reach the server (in the /api/capture POST body) for Meta's CAPI
+    // dedup to work. Generating it here would desync the client fbq call from the
+    // server-side CAPI event_id, silently breaking dedup.
+    expect(src).toContain("eventId");
+    expect(src).not.toContain("crypto.randomUUID");
+  });
+});
+
+describe("v0Service - injectLeadCaptureAttribution also injects lib/agentweb-track.ts", () => {
+  const file = (path: string, content = "// v0 generated") => ({ path, content: Buffer.from(content) });
+
+  it("SUCCESS: injects lib/agentweb-track.ts alongside the existing capture files", () => {
+    const result = injectLeadCaptureAttribution([file("app/page.tsx")], { "/": "list_xyz" });
+    const helper = result.find((f) => f.path === "lib/agentweb-track.ts");
+    expect(helper).toBeDefined();
+    expect(helper!.content.toString()).toContain("fireLeadTracking");
+  });
+
+  it("FAIL: v0-generated lib/agentweb-track.ts is replaced, not duplicated", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("lib/agentweb-track.ts", "// v0's own fake tracking helper"), file("app/page.tsx")],
+      { "/": "list_xyz" }
+    );
+    const helpers = result.filter((f) => f.path === "lib/agentweb-track.ts");
+    expect(helpers).toHaveLength(1);
+    expect(helpers[0].content.toString()).not.toContain("v0's own fake tracking helper");
+  });
+
+  it("FAIL: route-group/src-prefixed variant of v0's tracking helper is also dropped", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("src/lib/agentweb-track.ts", "// v0 variant"), file("app/page.tsx")],
+      { "/": "list_xyz" }
+    );
+    const helpers = result.filter((f) => f.path === "lib/agentweb-track.ts");
+    expect(helpers).toHaveLength(1);
+    expect(helpers[0].content.toString()).not.toContain("v0 variant");
   });
 });
 
@@ -4043,6 +4109,20 @@ describe("v0Service - remapFilesForSubPage", () => {
     expect(result[0].path).toBe("app/test/page.tsx");
   });
 
+  // ENG-449 follow-up: if v0 ever authors its own copy of the platform-owned tracking
+  // helper for a sub-page (rather than just importing it, per the updated prompt
+  // instruction), it must be dropped here — same defense as lib/utils.ts above — so the
+  // platform's own version (injected/synced separately) stays authoritative.
+  it("skips a v0-authored lib/agentweb-track.ts", () => {
+    const files = [
+      { path: "lib/agentweb-track.ts", content: buf('// v0-authored fake tracking helper') },
+      { path: "app/page.tsx", content: buf('export default function Page() { return <div/>; }') },
+    ];
+    const result = remapFilesForSubPage(files, "test");
+    expect(result).toHaveLength(1);
+    expect(result[0].path).toBe("app/test/page.tsx");
+  });
+
   it("moves custom components to app/<slug>/_components/ and rewrites imports", () => {
     const pageContent = `import { Hero } from "@/components/hero";\nimport { Footer } from "@/components/footer";\nexport default function Page() { return <><Hero/><Footer/></>; }`;
     const files = [
@@ -4341,7 +4421,13 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
   };
 
   // Setup: mock GitHub API (repair scan, ref, blob, tree, commit, patch)
-  const setupGitHubMocks = () => {
+  // `extraBlobs`: mockAxiosPost is a plain sequential mockResolvedValueOnce queue (not
+  // URL-matched), so every POST call — blob, tree, or commit — consumes the next queued
+  // entry regardless of which one it "means" to be. When lib/agentweb-track.ts also rides in
+  // the page's own commit (ENG-449 follow-up: only when leadListId && (metaPixelId ||
+  // bridgeOutUrl)), that's a 2nd blob upload that MUST be queued between the page's own blob
+  // and the tree/commit mocks, or the tree call would wrongly consume a blob-shaped response.
+  const setupGitHubMocks = (extraBlobs: number = 0) => {
     // GET git/trees/main?recursive=1 — the poisoned-import repair scan runs first.
     // An empty tree means a healthy repo: nothing to scan, nothing to repair, no extra reads.
     mockAxiosGet.mockResolvedValueOnce({ data: { tree: [] } });
@@ -4353,6 +4439,9 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     mockAxiosPost.mockResolvedValueOnce({
       data: { sha: "blob_sha" },
     });
+    for (let i = 0; i < extraBlobs; i++) {
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: `blob_sha_extra_${i}` } });
+    }
     // POST tree
     mockAxiosPost.mockResolvedValueOnce({
       data: { sha: "tree_sha" },
@@ -4675,11 +4764,12 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     // 1 repair-scan tree listing + 1 GitHub ref + 2 Vercel polls.
     // The tree listing is the whole cost of the poisoned-import scan on a healthy repo:
     // an empty/clean tree yields no candidates, so no file contents are ever read.
-    // Plus 3 more (ENG-483): the post-deploy capture-route sync reads middleware.ts,
-    // app/api/capture/route.ts, and domainMap.ts to decide whether LIST_BY_PATH needs
-    // updating. No mock is queued for them here, so all 3 reject and the sync gives up
-    // silently (never blocking the deploy) — still 3 real GET attempts.
-    expect(mockAxiosGet).toHaveBeenCalledTimes(7);
+    // Plus 4 more (ENG-483 + ENG-449 follow-up): the post-deploy capture-route sync reads
+    // middleware.ts, app/api/capture/route.ts, domainMap.ts, and lib/agentweb-track.ts to
+    // decide whether anything needs updating/backfilling. No mock is queued for them here,
+    // so all 4 reject and the sync gives up silently (never blocking the deploy) — still 4
+    // real GET attempts.
+    expect(mockAxiosGet).toHaveBeenCalledTimes(8);
   });
 
   it("SUCCESS: sub-page deployedUrl uses customDomainUrl as base when existingPage has one", async () => {
@@ -4715,8 +4805,8 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
   // lead form 422'd forever until an unrelated GTM/Pixel override happened to resync it.
   describe("ENG-483: sub-page registered in shared capture route", () => {
     // Sync's own GitHub calls, run AFTER the page's own commit + Vercel poll succeed:
-    // Promise.all([middleware.ts, capture route, domainMap.ts]) reads, then (if different)
-    // a ref read, a blob per changed file, a tree, a commit, and a ref patch.
+    // Promise.all([middleware.ts, capture route, domainMap.ts, lib/agentweb-track.ts]) reads,
+    // then (if different) a ref read, a blob per changed file, a tree, a commit, and a ref patch.
     const setupCaptureRouteSyncMocks = (existingCaptureRouteContent: string) => {
       mockAxiosGet.mockResolvedValueOnce({
         data: { content: Buffer.from("stale middleware").toString("base64") },
@@ -4727,9 +4817,13 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       mockAxiosGet.mockResolvedValueOnce({
         data: { content: Buffer.from("{}").toString("base64") },
       }); // domainMap.ts (already exists)
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from(buildTrackingHelper()).toString("base64") },
+      }); // lib/agentweb-track.ts (already up to date — only the capture-route staleness above forces the commit)
       mockAxiosGet.mockResolvedValueOnce({ data: { object: { sha: "sync_base_sha" } } }); // ref/heads/main
       mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_middleware" } });
       mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_capture_route" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_tracking_helper" } });
       mockAxiosPost.mockResolvedValueOnce({ data: { sha: "sync_tree_sha" } });
       mockAxiosPost.mockResolvedValueOnce({ data: { sha: "sync_commit_sha" } });
       mockAxiosPatch.mockResolvedValueOnce({ data: {} }); // ref update
@@ -5026,7 +5120,7 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
         .mockResolvedValueOnce(buggyZip);
       mockChatsSendMessage.mockResolvedValue({});
 
-      setupGitHubMocks();
+      setupGitHubMocks(1);
       setupVercelDeploySuccessMock();
 
       const result = await generateLandingPage(
@@ -5061,7 +5155,7 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "v1" } });
       mockChatsDownloadVersion.mockResolvedValueOnce(goodZip);
 
-      setupGitHubMocks();
+      setupGitHubMocks(1);
       setupVercelDeploySuccessMock();
 
       const result = await generateLandingPage(
@@ -5120,7 +5214,7 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
         .mockResolvedValueOnce(buggyZip);
       mockChatsSendMessage.mockResolvedValue({});
 
-      setupGitHubMocks();
+      setupGitHubMocks(1);
       setupVercelDeploySuccessMock();
 
       const result = await generateLandingPage(
@@ -5155,7 +5249,7 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "v1" } });
       mockChatsDownloadVersion.mockResolvedValueOnce(goodZip);
 
-      setupGitHubMocks();
+      setupGitHubMocks(1);
       setupVercelDeploySuccessMock();
 
       const result = await generateLandingPage(

@@ -134,4 +134,37 @@ describe('sendCapiLeadEvent', () => {
     const expectedHash = crypto.createHash('sha256').update('15550001111').digest('hex');
     expect(body.data[0].user_data.ph).toEqual([expectedHash]);
   });
+
+  // fbp/fbc are Meta's own first-party click-id cookies (set by the base Pixel snippet /
+  // ad-click redirect) — a real match-quality signal, sent as opaque values (NOT hashed,
+  // per Meta's CAPI spec — only PII fields like em/ph get sha256'd).
+  it('includes user_data.fbp/fbc verbatim (not hashed) when provided', async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ events_received: 1, fbtrace_id: 'trace1' }),
+    });
+
+    await metaService.sendCapiLeadEvent('px1', 'tok', {
+      ...baseEvent,
+      fbp: 'fb.1.1234567890.1122334455',
+      fbc: 'fb.1.1234567890.AbCdEfGhIj',
+    });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.data[0].user_data.fbp).toBe('fb.1.1234567890.1122334455');
+    expect(body.data[0].user_data.fbc).toBe('fb.1.1234567890.AbCdEfGhIj');
+  });
+
+  it('omits user_data.fbp/fbc when not provided (does not send undefined/empty fields)', async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ events_received: 1, fbtrace_id: 'trace1' }),
+    });
+
+    await metaService.sendCapiLeadEvent('px1', 'tok', baseEvent);
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.data[0].user_data.fbp).toBeUndefined();
+    expect(body.data[0].user_data.fbc).toBeUndefined();
+  });
 });

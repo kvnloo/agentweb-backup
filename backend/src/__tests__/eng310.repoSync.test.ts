@@ -123,6 +123,7 @@ const {
   buildLandingPageMiddleware,
   buildCaptureRoute,
   buildDomainMapFile,
+  buildTrackingHelper,
 } = jest.requireActual("../services/v0Service");
 
 const REPO = "AgentWebPro/lp-test-abc123";
@@ -265,12 +266,13 @@ describe("syncLeadCaptureFilesToRepo", () => {
     expect(blobForPath("domainMap.ts")).toBe(buildDomainMapFile({}));
   });
 
-  it("IDEMPOTENT: makes no commit when both files already match byte-for-byte", async () => {
+  it("IDEMPOTENT: makes no commit when all files already match byte-for-byte", async () => {
     const listByPath = { "/": "list_1", "/pricing": "list_2" };
     mockGitHub({
       "middleware.ts": buildLandingPageMiddleware(),
       "app/api/capture/route.ts": buildCaptureRoute(listByPath),
       "domainMap.ts": REAL_DOMAIN_MAP,
+      "lib/agentweb-track.ts": buildTrackingHelper(),
     });
 
     const result = await syncLeadCaptureFilesToRepo(REPO, () => listByPath);
@@ -278,6 +280,28 @@ describe("syncLeadCaptureFilesToRepo", () => {
     expect(result).toEqual({ committed: false, reason: "up-to-date" });
     expect(mockAxiosPost).not.toHaveBeenCalled(); // no blobs, no tree, no commit
     expect(mockAxiosPatch).not.toHaveBeenCalled(); // no ref move => no Vercel redeploy
+  });
+
+  // ENG-449 follow-up: a repo created BEFORE the deterministic-tracking-helper change never
+  // got lib/agentweb-track.ts. Any NEW page added to that repo imports it (per the updated
+  // buildBrandEnrichedPrompt instruction) and the Vercel build fails outright with "Module
+  // not found: Can't resolve '@/lib/agentweb-track'" — live-repro'd this exact failure while
+  // testing against a pre-existing test-env repo. This sync must backfill it, same as it
+  // already backfills a missing domainMap.ts.
+  it("backfills lib/agentweb-track.ts when the repo predates it (would otherwise break the next page's build)", async () => {
+    const listByPath = { "/": "list_1" };
+    mockGitHub({
+      "middleware.ts": buildLandingPageMiddleware(),
+      "app/api/capture/route.ts": buildCaptureRoute(listByPath),
+      "domainMap.ts": REAL_DOMAIN_MAP,
+      // no lib/agentweb-track.ts — simulates a repo created before this change
+    });
+
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => listByPath);
+
+    expect(result.committed).toBe(true);
+    expect(treePaths()).toContain("lib/agentweb-track.ts");
+    expect(blobForPath("lib/agentweb-track.ts")).toBe(buildTrackingHelper());
   });
 
   it("still commits when the files match but domainMap.ts is missing (the build would fail without it)", async () => {

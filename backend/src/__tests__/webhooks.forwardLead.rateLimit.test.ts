@@ -161,3 +161,112 @@ describe('forward-lead: CAPI send is budgeted per listId, independent of the lea
     expect(metaService.sendCapiLeadEvent).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('forward-lead: CAPI client IP prefers x-forwarded-for over req.ip (scoped mitigation for ENG-493)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (crmDb.getLeadListById as jest.Mock).mockImplementation((listId: string) =>
+      Promise.resolve({ listId, userId: 'user_123', name: 'Test List', publicAccessEnabled: true }),
+    );
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+    (crmDb.createLead as jest.Mock).mockImplementation((listId: string, data: any) =>
+      Promise.resolve({ leadId: `lead_${Math.random()}`, listId, ...data }),
+    );
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user_123', connected_accounts: [] });
+    (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'acc1', accessToken: 'tok', accountName: 'Acc 1' });
+    (metaService.sendCapiLeadEvent as jest.Mock).mockResolvedValue({ success: true });
+  });
+
+  // This app never configures Express's `trust proxy` (ENG-493), so `req.ip` collapses to
+  // the same internal/shared value for every caller — actively hurting Meta's match quality
+  // since client_ip_address is a real matching signal. Rather than flip the global `trust
+  // proxy` setting (which would also change auth.ts's IP-keyed rate limiters — separate,
+  // riskier change), this scopes the fix to just this CAPI call site, reusing the pattern
+  // already established in loopEvents.ts/assetController.ts.
+  it('SUCCESS: uses the first x-forwarded-for IP when present, not req.ip', async () => {
+    await request(app)
+      .post('/api/webhooks/forward-lead')
+      .set('X-Forwarded-For', '203.0.113.7, 10.0.0.1')
+      .send({
+        listId: 'list_ip_test',
+        email: 'ip-test@example.com',
+        pixelId: '1430870751246428',
+        metaAccountId: 'acc1',
+        eventId: 'evt_ip_test',
+      });
+    await flushAsyncWork();
+
+    expect(metaService.sendCapiLeadEvent).toHaveBeenCalledWith(
+      '1430870751246428',
+      'tok',
+      expect.objectContaining({ clientIp: '203.0.113.7' }),
+    );
+  });
+
+  it('SUCCESS: falls back to req.ip when x-forwarded-for is absent', async () => {
+    await request(app)
+      .post('/api/webhooks/forward-lead')
+      .send({
+        listId: 'list_ip_test_2',
+        email: 'ip-test-2@example.com',
+        pixelId: '1430870751246428',
+        metaAccountId: 'acc1',
+        eventId: 'evt_ip_test_2',
+      });
+    await flushAsyncWork();
+
+    const call = (metaService.sendCapiLeadEvent as jest.Mock).mock.calls[0];
+    expect(call[2].clientIp).toBeTruthy();
+    expect(call[2].clientIp).not.toBe('203.0.113.7');
+  });
+});
+
+describe('forward-lead: fbp/fbc forwarded to CAPI when the client sent them (ENG-449 match-quality gap)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (crmDb.getLeadListById as jest.Mock).mockImplementation((listId: string) =>
+      Promise.resolve({ listId, userId: 'user_123', name: 'Test List', publicAccessEnabled: true }),
+    );
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+    (crmDb.createLead as jest.Mock).mockImplementation((listId: string, data: any) =>
+      Promise.resolve({ leadId: `lead_${Math.random()}`, listId, ...data }),
+    );
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user_123', connected_accounts: [] });
+    (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'acc1', accessToken: 'tok', accountName: 'Acc 1' });
+    (metaService.sendCapiLeadEvent as jest.Mock).mockResolvedValue({ success: true });
+  });
+
+  it('SUCCESS: fbp/fbc in the request body are passed through to sendCapiLeadEvent', async () => {
+    await request(app).post('/api/webhooks/forward-lead').send({
+      listId: 'list_fbp_test',
+      email: 'fbp-test@example.com',
+      pixelId: '1430870751246428',
+      metaAccountId: 'acc1',
+      eventId: 'evt_fbp_test',
+      fbp: 'fb.1.1111111111.2222222222',
+      fbc: 'fb.1.1111111111.AbCdEf',
+    });
+    await flushAsyncWork();
+
+    expect(metaService.sendCapiLeadEvent).toHaveBeenCalledWith(
+      '1430870751246428',
+      'tok',
+      expect.objectContaining({ fbp: 'fb.1.1111111111.2222222222', fbc: 'fb.1.1111111111.AbCdEf' }),
+    );
+  });
+
+  it('SUCCESS: omits fbp/fbc when absent from the request body (does not send undefined fields)', async () => {
+    await request(app).post('/api/webhooks/forward-lead').send({
+      listId: 'list_fbp_test_2',
+      email: 'fbp-test-2@example.com',
+      pixelId: '1430870751246428',
+      metaAccountId: 'acc1',
+      eventId: 'evt_fbp_test_2',
+    });
+    await flushAsyncWork();
+
+    const call = (metaService.sendCapiLeadEvent as jest.Mock).mock.calls[0];
+    expect(call[2].fbp).toBeUndefined();
+    expect(call[2].fbc).toBeUndefined();
+  });
+});

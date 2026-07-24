@@ -51,4 +51,27 @@ describe('validatePixelLeadEvent', () => {
     ];
     expect(validatePixelLeadEvent(files).ok).toBe(true);
   });
+
+  // ENG-449 follow-up: v0 is now instructed to call the platform-owned fireLeadTracking()
+  // helper instead of hand-authoring fbq() (see buildTrackingHelper/buildBrandEnrichedPrompt).
+  // Both patterns must keep validating true — an EXISTING page generated before this change
+  // still ships the old inline fbq() code and must not start reporting
+  // pixelLeadEventVerified:false on a later re-validation (e.g. iterateLandingPage) just
+  // because the check got stricter. This is the explicit no-regression requirement.
+  it('passes when the form calls fireLeadTracking({ pixelId: ... }) instead of writing fbq() itself (new pattern)', () => {
+    const files = [
+      {
+        path: 'app/components/LeadForm.tsx',
+        content: Buffer.from(`await fireLeadTracking({ email, eventId, pixelId: "1430870751246428" });`),
+      },
+    ];
+    expect(validatePixelLeadEvent(files).ok).toBe(true);
+  });
+
+  it('still fails when fireLeadTracking is called WITHOUT a pixelId (pixel not actually wired)', () => {
+    const files = [
+      { path: 'app/components/LeadForm.tsx', content: Buffer.from(`await fireLeadTracking({ email, bridgeOutUrl: "https://x.com" });`) },
+    ];
+    expect(validatePixelLeadEvent(files).ok).toBe(false);
+  });
 });

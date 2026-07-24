@@ -60,4 +60,27 @@ describe('validateBridgeOutRedirect', () => {
     ];
     expect(validateBridgeOutRedirect(files, urlWithQuery).ok).toBe(true);
   });
+
+  // ENG-449 follow-up: v0 is now instructed to call the platform-owned fireLeadTracking()
+  // helper instead of hand-authoring the redirect (see buildTrackingHelper). Both patterns
+  // must keep validating true — an EXISTING page generated before this change still ships
+  // the old inline redirect code and must not start reporting bridgeOutVerified:false on a
+  // later re-validation just because the check got stricter (explicit no-regression
+  // requirement).
+  it('passes when the form calls fireLeadTracking({ bridgeOutUrl: ... }) instead of writing the redirect itself (new pattern) — no literal email= required, fireLeadTracking guarantees it', () => {
+    const files = [
+      {
+        path: 'app/components/LeadForm.tsx',
+        content: Buffer.from(`await fireLeadTracking({ email, eventId, bridgeOutUrl: "${BRIDGE_URL}" });`),
+      },
+    ];
+    expect(validateBridgeOutRedirect(files, BRIDGE_URL).ok).toBe(true);
+  });
+
+  it('still fails when fireLeadTracking is called but with a DIFFERENT bridgeOutUrl than the one configured', () => {
+    const files = [
+      { path: 'app/components/LeadForm.tsx', content: Buffer.from(`await fireLeadTracking({ email, bridgeOutUrl: "https://wrong-destination.com" });`) },
+    ];
+    expect(validateBridgeOutRedirect(files, BRIDGE_URL).ok).toBe(false);
+  });
 });
