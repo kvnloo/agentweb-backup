@@ -258,6 +258,82 @@ describe('GET /api/social-posts', () => {
         .expect(200);
       expect(_forceReloadCooldownSize()).toBe(1);
     });
+
+    describe('cooldown rollback on a hard getPostsForUser failure', () => {
+      it('should NOT leave a cooldown entry when getPostsForUser throws (e.g. a DB read failure)', async () => {
+        mockGetSocialAccountIds.mockResolvedValue(['acc-1']);
+        mockGetPosts.mockRejectedValue(new Error('DynamoDB unavailable'));
+
+        await request(app)
+          .get('/api/social-posts?force_reload=true&accountId=acc-1')
+          .expect(500);
+
+        // No attempt actually reached LinkedIn, so nothing should be throttled.
+        expect(_forceReloadCooldownSize()).toBe(0);
+      });
+
+      it('should allow an immediate retry after a hard failure, not a 429', async () => {
+        mockGetSocialAccountIds.mockResolvedValue(['acc-1']);
+        mockGetPosts.mockRejectedValueOnce(new Error('DynamoDB unavailable'));
+        mockGetPosts.mockResolvedValueOnce({ posts: [], total: 0 } as any);
+
+        await request(app)
+          .get('/api/social-posts?force_reload=true&accountId=acc-1')
+          .expect(500);
+
+        // Retrying right away must succeed (not be blocked by a leftover
+        // cooldown from the failed attempt above).
+        await request(app)
+          .get('/api/social-posts?force_reload=true&accountId=acc-1')
+          .expect(200);
+
+        expect(mockGetPosts).toHaveBeenCalledTimes(2);
+      });
+
+      it('should still keep the cooldown when getPostsForUser resolves with a per-account error (a real attempt reached LinkedIn)', async () => {
+        mockGetSocialAccountIds.mockResolvedValue(['acc-1']);
+        mockGetPosts.mockResolvedValue({
+          success: true,
+          posts: [],
+          accounts: [{ accountId: 'acc-1', accountName: 'Acme', platform: 'linkedin', accountType: 'company_page', postCount: 0, error: 'LinkedIn API error' }],
+        } as any);
+
+        await request(app)
+          .get('/api/social-posts?force_reload=true&accountId=acc-1')
+          .expect(200);
+
+        // A per-account failure still means LinkedIn was actually called —
+        // the cooldown must apply, unlike a hard/thrown failure.
+        const res = await request(app)
+          .get('/api/social-posts?force_reload=true&accountId=acc-1')
+          .expect(429);
+        expect(res.body).toHaveProperty('error');
+      });
+
+      it('should not roll back a DIFFERENT account\'s pre-existing cooldown when this request\'s target account fails', async () => {
+        mockGetPosts.mockResolvedValueOnce({ posts: [], total: 0 } as any);
+        mockGetSocialAccountIds.mockResolvedValue(['acc-1', 'acc-2']);
+
+        // acc-1 is legitimately refreshed and cooled down first.
+        await request(app)
+          .get('/api/social-posts?force_reload=true&accountId=acc-1')
+          .expect(200);
+        expect(_forceReloadCooldownSize()).toBe(1);
+
+        // A subsequent hard failure refreshing acc-2 must only roll back
+        // acc-2's own reservation, not acc-1's unrelated cooldown.
+        mockGetPosts.mockRejectedValueOnce(new Error('DynamoDB unavailable'));
+        await request(app)
+          .get('/api/social-posts?force_reload=true&accountId=acc-2')
+          .expect(500);
+
+        expect(_forceReloadCooldownSize()).toBe(1);
+        const res = await request(app)
+          .get('/api/social-posts?force_reload=true&accountId=acc-1')
+          .expect(429);
+        expect(res.body).toHaveProperty('error');
+      });
+    });
   });
 });
 
