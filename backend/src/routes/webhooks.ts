@@ -317,17 +317,28 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
 // scoped — see metaAccountCredentials.ts — so this can't leak a DIFFERENT customer's
 // credentials), which means a scripted flood can now pollute a real customer's live ad
 // account with fake "Lead" conversions, skewing their actual paid campaign's optimization.
-// Keyed by IP (same pattern as auth.ts's login limiter), not by listId/pixelId, so a
-// popular page's many distinct real visitors never throttle each other.
+//
+// Keyed by listId, NOT by IP (ENG-493): this app never configures Express's `trust proxy`,
+// so `req.ip` collapses to the same value (127.0.0.1 behind nginx-on-localhost in prod, or
+// the one ngrok agent in the test env) for every caller regardless of their real origin —
+// confirmed live against both environments. An IP-keyed limiter here would be a de facto
+// GLOBAL cap shared by every customer's site combined, not a per-caller one — a flood
+// against ONE customer's page would start rejecting every OTHER customer's real leads too.
+// Keying by listId scopes the limit to "this one customer's capture route", which is also a
+// better fit for the actual threat this exists to stop (one site's ad account getting
+// polluted) than IP ever would have been, and doesn't depend on ENG-493 being fixed.
 const forwardLeadRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 20,
+  max: 100,
   standardHeaders: true,
   legacyHeaders: false,
-  // supertest requests all share one address with no real per-test isolation, and this
-  // suite's existing tests already send far more than 20 requests to this endpoint.
+  keyGenerator: (req) => String(req.body?.listId || 'unknown-list'),
+  // supertest requests across this suite reuse the same handful of listIds far more than
+  // 100 times in a single run, and this route's real protection doesn't depend on IP at all
+  // (see above), so there's nothing test-env-topology-specific left for this skip to guard
+  // against other than raw volume.
   skip: () => process.env.NODE_ENV === 'test',
-  message: { success: false, message: 'Too many submissions from this address. Please try again later.' },
+  message: { success: false, message: 'Too many submissions for this list. Please try again later.' },
 });
 
 // Public endpoint for forwarding leads to CRM
