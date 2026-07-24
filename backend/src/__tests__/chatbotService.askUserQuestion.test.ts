@@ -35,10 +35,17 @@ function sampleQuestion(): PendingUserQuestion {
 
 describe('chatbotDb.updateSessionAskUserQuestion', () => {
   let updateSpy: jest.SpyInstance;
+  let getSpy: jest.SpyInstance;
 
   beforeEach(() => {
     updateSpy = jest.spyOn(dynamodb, 'update').mockReturnValue({
       promise: () => Promise.resolve({ Attributes: { sessionId: 's-1' } }),
+    } as any);
+    // Default: no existing pendingUserQuestion, so the archiving pre-read is a
+    // no-op and every pre-existing test below sees the SAME UpdateExpression
+    // shape as before this pre-read was introduced (ENG-400).
+    getSpy = jest.spyOn(dynamodb, 'get').mockReturnValue({
+      promise: () => Promise.resolve({ Item: undefined }),
     } as any);
   });
 
@@ -122,5 +129,63 @@ describe('chatbotDb.updateSessionAskUserQuestion', () => {
     await expect(
       chatbotDb.updateSessionAskUserQuestion('s-1', sampleQuestion(), { failIfAwaitingExists: true }),
     ).rejects.toThrow('DynamoDB unavailable');
+  });
+
+  // ── ENG-400: archiving the live slot before it's replaced ────────────────
+  describe('answer archiving (multi-question generalization)', () => {
+    it('archives the current ANSWERED question under its id when a different new question is posted', async () => {
+      const current: PendingUserQuestion = { ...sampleQuestion(), questionId: 'q-old', status: 'answered', answer: { optionId: 'leads', delegated: false, answeredBy: 'user', at: '2026-07-21T00:01:00.000Z' } };
+      getSpy.mockReturnValue({ promise: () => Promise.resolve({ Item: { pendingUserQuestion: current } }) } as any);
+
+      const next = { ...sampleQuestion(), questionId: 'q-new' };
+      await chatbotDb.updateSessionAskUserQuestion('s-1', next);
+
+      const params = updateSpy.mock.calls[0][0];
+      expect(params.UpdateExpression).toMatch(/answeredQuestions = :answeredQuestions/);
+      expect(params.ExpressionAttributeValues[':answeredQuestions']).toEqual({ 'q-old': current });
+      expect(params.ExpressionAttributeValues[':pendingUserQuestion']).toEqual(next);
+    });
+
+    it('merges into an existing answeredQuestions archive rather than overwriting it', async () => {
+      const priorArchive = { 'q-ancient': { ...sampleQuestion(), questionId: 'q-ancient', status: 'answered' as const } };
+      const current: PendingUserQuestion = { ...sampleQuestion(), questionId: 'q-old', status: 'answered', answer: { optionId: 'leads', delegated: false, answeredBy: 'user', at: '2026-07-21T00:01:00.000Z' } };
+      getSpy.mockReturnValue({
+        promise: () => Promise.resolve({ Item: { pendingUserQuestion: current, answeredQuestions: priorArchive } }),
+      } as any);
+
+      await chatbotDb.updateSessionAskUserQuestion('s-1', { ...sampleQuestion(), questionId: 'q-new' });
+
+      const params = updateSpy.mock.calls[0][0];
+      expect(params.ExpressionAttributeValues[':answeredQuestions']).toEqual({
+        ...priorArchive,
+        'q-old': current,
+      });
+    });
+
+    it('does NOT archive when the current live slot is still AWAITING (nothing worth keeping)', async () => {
+      const current: PendingUserQuestion = { ...sampleQuestion(), questionId: 'q-old', status: 'awaiting' };
+      getSpy.mockReturnValue({ promise: () => Promise.resolve({ Item: { pendingUserQuestion: current } }) } as any);
+
+      await chatbotDb.updateSessionAskUserQuestion('s-1', { ...sampleQuestion(), questionId: 'q-new' });
+
+      const params = updateSpy.mock.calls[0][0];
+      expect(params.UpdateExpression).not.toMatch(/answeredQuestions/);
+      expect(params.ExpressionAttributeValues[':answeredQuestions']).toBeUndefined();
+    });
+
+    it('does NOT archive when re-posting the SAME questionId (not a rollover)', async () => {
+      const current: PendingUserQuestion = { ...sampleQuestion(), questionId: 'q-1', status: 'answered', answer: { optionId: 'leads', delegated: false, answeredBy: 'user', at: '2026-07-21T00:01:00.000Z' } };
+      getSpy.mockReturnValue({ promise: () => Promise.resolve({ Item: { pendingUserQuestion: current } }) } as any);
+
+      await chatbotDb.updateSessionAskUserQuestion('s-1', sampleQuestion()); // same questionId 'q-1'
+
+      const params = updateSpy.mock.calls[0][0];
+      expect(params.UpdateExpression).not.toMatch(/answeredQuestions/);
+    });
+
+    it('does NOT read/archive on a REMOVE (null) write', async () => {
+      await chatbotDb.updateSessionAskUserQuestion('s-1', null);
+      expect(getSpy).not.toHaveBeenCalled();
+    });
   });
 });

@@ -29,7 +29,19 @@
  * (`updateSessionAskUserQuestion`); loop/tool wiring lives in agentModeService;
  * the structured answer channel lives in the /generate controller. Scope is
  * deliberately minimal (no generic requires_structured_choice framework) — the
- * first and only consumer is the Meta campaign-objective gate (ENG-400).
+ * first consumer is the Meta campaign-objective gate (ENG-400), but the
+ * primitive itself is consumer-agnostic (see `kind` and the answer archive
+ * below) so a later second consumer doesn't require a redesign.
+ *
+ * MULTI-QUESTION NOTE (ENG-400): a session has one LIVE slot at a time
+ * (`session.pendingUserQuestion` — Emma asks turn-by-turn, never batches; the
+ * one-live-question guard in chatbotService enforces this). Once a question is
+ * answered and a LATER question becomes the live slot, the older answer would
+ * otherwise be unreachable to any consumer that needs to gate on it after the
+ * fact. `session.answeredQuestions` (keyed by questionId) archives every
+ * answered question when it rolls off the live slot, so `checkQuestionGate`
+ * can still find it by id. This does not change the one-question-at-a-time UX
+ * — it only prevents the gate from losing a real human answer to a later ask.
  */
 
 /** One selectable option on the card. */
@@ -85,6 +97,10 @@ export interface PendingUserQuestion {
   /** True when the parameter is IRREVERSIBLE (e.g. Meta campaign objective).
    *  Headless/scheduled runs must PARK such questions and never auto-take. */
   immutable: boolean;
+  /** Optional consumer tag (e.g. 'meta_objective') so a write gate can identify
+   *  which class of decision this is without inspecting question text. Purely
+   *  for correlation/logging — never used to relax the answered/human check. */
+  kind?: string;
   /** When true, the card shows a "Let Emma decide" delegation button. */
   allowEmmaDecide: boolean;
   status: AskUserQuestionStatus;
@@ -101,6 +117,7 @@ export interface AskUserQuestionInput {
   options: AskUserQuestionOption[];
   immutable?: boolean;
   allowEmmaDecide?: boolean;
+  kind?: string;
   createdAt: string;
 }
 
@@ -178,6 +195,7 @@ export function buildPendingUserQuestion(input: AskUserQuestionInput): PendingUs
     recommendedOptionId,
     immutable: input.immutable === true,
     allowEmmaDecide: input.allowEmmaDecide === true,
+    ...(typeof input.kind === 'string' && input.kind.trim() !== '' ? { kind: input.kind } : {}),
     status: 'awaiting',
     createdAt: input.createdAt,
   };
@@ -408,28 +426,84 @@ export type QuestionGateOutcome =
  * budget edit) never call it and are never gated. The guard itself is
  * parameter-agnostic; the consumer decides when it applies.
  *
- * @param pending    session.pendingUserQuestion, read fresh from the DB
+ * @param pending    session.pendingUserQuestion (the live slot), read fresh from the DB
  * @param questionId when provided, the pending question must match this id
- *                   (correlation); omit to accept any answered question
+ *                   (correlation); omit to accept any answered live question
+ * @param archive    session.answeredQuestions (keyed by questionId), read fresh
+ *                   from the DB. A LATER question may have already rolled off
+ *                   the live slot by the time this write executes; when
+ *                   `questionId` doesn't match the live slot, this archive is
+ *                   checked before refusing so an earlier human answer is not
+ *                   lost just because Emma has since asked something else.
  */
 export function checkQuestionGate(
   pending: PendingUserQuestion | null | undefined,
   questionId?: string,
+  archive?: Record<string, PendingUserQuestion> | null,
 ): QuestionGateOutcome {
-  if (!pending) {
+  const candidate: PendingUserQuestion | undefined =
+    pending && (!questionId || pending.questionId === questionId)
+      ? pending
+      : questionId
+        ? archive?.[questionId]
+        : undefined;
+
+  if (!candidate) {
+    if (questionId && pending && pending.questionId !== questionId) {
+      return {
+        allowed: false,
+        reason: `The pending question (${pending.questionId}) does not match the expected question (${questionId}).`,
+      };
+    }
     return { allowed: false, reason: 'No question has been asked yet — the choice must be made first.' };
   }
-  if (questionId && pending.questionId !== questionId) {
-    return {
-      allowed: false,
-      reason: `The pending question (${pending.questionId}) does not match the expected question (${questionId}).`,
-    };
-  }
-  if (pending.status !== 'answered' || !pending.answer) {
+  if (candidate.status !== 'answered' || !candidate.answer) {
     return { allowed: false, reason: 'The question is still awaiting a selection.' };
   }
-  if (pending.answer.answeredBy !== 'user' && pending.answer.answeredBy !== 'delegation') {
+  if (candidate.answer.answeredBy !== 'user' && candidate.answer.answeredBy !== 'delegation') {
     return { allowed: false, reason: 'The answer was not attributable to a human selection.' };
   }
-  return { allowed: true, answer: pending.answer, payload: selectedPayload(pending) };
+  return { allowed: true, answer: candidate.answer, payload: selectedPayload(candidate) };
+}
+
+/**
+ * Find a question by consumer `kind` (e.g. 'meta_objective'), checking the live
+ * slot first and falling back to the archive. Lets a consumer gate on "has THIS
+ * class of decision been settled in this session" without knowing a specific
+ * questionId up front (it doesn't exist yet the first time the gate runs).
+ */
+export function findQuestionByKind(
+  pending: PendingUserQuestion | null | undefined,
+  archive: Record<string, PendingUserQuestion> | null | undefined,
+  kind: string,
+): PendingUserQuestion | undefined {
+  if (pending && pending.kind === kind) return pending;
+  if (archive) {
+    for (const q of Object.values(archive)) {
+      if (q.kind === kind) return q;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * ENG-400 (general-purpose, not Meta-specific): verify a claimed "the user
+ * explicitly said this" bypass against the ACTUAL text of a message, rather
+ * than trusting a model-asserted flag. A consumer that wants to skip the
+ * blocking ask when the user already named the value in their own words must
+ * supply the literal quoted snippet AND the real message text to check it
+ * against; this returns true only when that snippet genuinely appears in the
+ * message. A model claiming "the user said X" with no verifiable quote (or a
+ * quote that isn't actually in the message) is refused — this is the same
+ * class of failure as a model-controlled `confirm:true` flag (see file
+ * header) and must not be trusted on the model's word alone.
+ */
+export function verifyExplicitStatement(
+  messageText: string | null | undefined,
+  quotedEvidence: string | null | undefined,
+): boolean {
+  if (typeof quotedEvidence !== 'string' || quotedEvidence.trim().length < 3) return false;
+  if (typeof messageText !== 'string' || messageText.trim().length === 0) return false;
+  const normalize = (s: string) => s.toLowerCase().replace(/\s+/g, ' ').trim();
+  return normalize(messageText).includes(normalize(quotedEvidence));
 }

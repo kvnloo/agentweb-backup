@@ -333,6 +333,43 @@ describe('checkQuestionGate — the consumer guard (Option A safety, the scary c
   it('accepts any answered question when no questionId is supplied', () => {
     expect(checkQuestionGate(answered('leads')).allowed).toBe(true);
   });
+
+  // ── ENG-400: archive lookup (multi-question generalization) ──────────────
+  it('ALLOWS via the archive when a LATER question has taken the live slot (earlier answer not lost)', () => {
+    const earlier = answered('leads'); // questionId 'q-objective-1'
+    const later = applyAnswer(
+      buildPendingUserQuestion({
+        questionId: 'q-later-2',
+        question: 'A later, unrelated question',
+        options: [
+          { id: 'a', label: 'A', consequence: 'x', recommended: true, why: 'y' },
+          { id: 'b', label: 'B', consequence: 'z' },
+        ],
+        createdAt: '2026-07-21T00:02:00.000Z',
+      }),
+      { optionId: 'a', delegated: false, answeredBy: 'user', at: '2026-07-21T00:03:00.000Z' },
+    );
+    // The live slot is now `later`; `earlier` only survives in the archive.
+    const outcome = checkQuestionGate(later, 'q-objective-1', { 'q-objective-1': earlier });
+    expect(outcome.allowed).toBe(true);
+    if (outcome.allowed) {
+      expect(outcome.answer.optionId).toBe('leads');
+    }
+  });
+
+  it('BLOCKS when the requested questionId is in neither the live slot nor the archive', () => {
+    const outcome = checkQuestionGate(answered('leads'), 'q-missing', { 'q-some-other-id': answered('traffic') });
+    expect(outcome.allowed).toBe(false);
+    if (!outcome.allowed) expect(outcome.reason).toMatch(/does not match the expected question/);
+  });
+
+  it('prefers the live slot over the archive when both would match', () => {
+    const live = answered('traffic');
+    const staleArchiveEntry = answered('leads');
+    const outcome = checkQuestionGate(live, 'q-objective-1', { 'q-objective-1': staleArchiveEntry });
+    expect(outcome.allowed).toBe(true);
+    if (outcome.allowed) expect(outcome.answer.optionId).toBe('traffic');
+  });
 });
 
 describe('renderQuestionPrompt — text fallback', () => {

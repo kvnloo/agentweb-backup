@@ -200,6 +200,11 @@ export interface ChatSession {
   // re-parsed from prose) and so an unanswered gate survives run boundaries as a
   // parked pending_user_input state. Mirrors the workPlan persistence pattern.
   pendingUserQuestion?: PendingUserQuestion;
+  // ENG-400: answered questions archived by questionId when they roll off the
+  // live pendingUserQuestion slot (a later question replaced them). Lets a
+  // write gate (checkQuestionGate) still find an earlier human answer even
+  // after Emma has moved on to asking something else in the same session.
+  answeredQuestions?: Record<string, PendingUserQuestion>;
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
@@ -2661,12 +2666,18 @@ export class ChatbotDB {
   }
 
   /**
-   * ENG-396: persist (or clear) the session's blocking AskUserQuestion.
+   * ENG-396/400: persist (or clear) the session's blocking AskUserQuestion.
    * Pass a PendingUserQuestion to set it (status 'awaiting' when posed,
    * 'answered' once the user selects); pass null to clear it after the
    * consumer has read the answer. Mirrors updateSessionWorkPlan — a targeted
    * SET/REMOVE so subsequent tool calls read session.pendingUserQuestion
    * directly rather than parsing prose.
+   *
+   * ENG-400: when posting a NEW question, if the CURRENT live slot is already
+   * 'answered' (a different, earlier question), it is archived into
+   * session.answeredQuestions[questionId] before being overwritten — so
+   * checkQuestionGate can still find that earlier human answer by id even
+   * after Emma has moved on to asking something else in the same session.
    */
   async updateSessionAskUserQuestion(
     sessionId: string,
@@ -2680,14 +2691,36 @@ export class ChatbotDB {
     // calls in the same turn can never both take the single slot; the loser is
     // refused (returns null) and the model asks it in a later turn.
     const guard = opts?.failIfAwaitingExists === true && pendingUserQuestion !== null;
+
+    let updatedArchive: Record<string, PendingUserQuestion> | undefined;
+    if (pendingUserQuestion !== null) {
+      // A lightweight, PROJECTED read (not getChatSession — that also loads/migrates
+      // messages, which this write doesn't need) of just the two fields this
+      // archiving decision depends on.
+      const existing = await dynamodb
+        .get({
+          TableName: this.tableName,
+          Key: { sessionId },
+          ProjectionExpression: "pendingUserQuestion, answeredQuestions",
+        })
+        .promise();
+      const current: PendingUserQuestion | undefined = existing?.Item?.pendingUserQuestion;
+      if (current && current.status === 'answered' && current.questionId !== pendingUserQuestion.questionId) {
+        updatedArchive = { ...(existing?.Item?.answeredQuestions || {}), [current.questionId]: current };
+      }
+    }
+
     const params: any = pendingUserQuestion
       ? {
           TableName: this.tableName,
           Key: { sessionId },
-          UpdateExpression: "SET pendingUserQuestion = :pendingUserQuestion, adminListPartition = :adminListPartition",
+          UpdateExpression: updatedArchive
+            ? "SET pendingUserQuestion = :pendingUserQuestion, adminListPartition = :adminListPartition, answeredQuestions = :answeredQuestions"
+            : "SET pendingUserQuestion = :pendingUserQuestion, adminListPartition = :adminListPartition",
           ExpressionAttributeValues: {
             ":pendingUserQuestion": pendingUserQuestion,
             ":adminListPartition": "all",
+            ...(updatedArchive ? { ":answeredQuestions": updatedArchive } : {}),
           },
           ReturnValues: "ALL_NEW",
         }
