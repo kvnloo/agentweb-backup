@@ -1911,15 +1911,21 @@ async function addPageToExistingRepo(
     // exact ENG-310 mechanism (`syncLeadCaptureForPage` in routes/landingPageGeneration.ts)
     // which does this same thing when a lead list is attached after the fact.
     try {
-      const siblings = await getLandingPagesByOwner(userId);
-      const listByPath: Record<string, string> = {};
-      for (const p of siblings) {
-        if (p.id === id) continue;
-        if (p.githubRepoUrl !== existingPage.githubRepoUrl) continue;
-        if (!p.leadListId) continue;
-        listByPath[p.slug ? `/${p.slug}` : "/"] = p.leadListId;
-      }
-      if (leadListId) listByPath[`/${slug}`] = leadListId;
+      // ENG-485: re-derived FRESH by syncLeadCaptureFilesToRepo on every retry attempt, not
+      // just once here — see that function's own doc comment on why a static snapshot isn't
+      // safe to reuse across a rebase retry.
+      const buildListByPath = async (): Promise<Record<string, string>> => {
+        const siblings = await getLandingPagesByOwner(userId);
+        const listByPath: Record<string, string> = {};
+        for (const p of siblings) {
+          if (p.id === id) continue;
+          if (p.githubRepoUrl !== existingPage.githubRepoUrl) continue;
+          if (!p.leadListId) continue;
+          listByPath[p.slug ? `/${p.slug}` : "/"] = p.leadListId;
+        }
+        if (leadListId) listByPath[`/${slug}`] = leadListId;
+        return listByPath;
+      };
 
       // ENG-489: syncLeadCaptureFilesToRepo fully regenerates app/api/capture/route.ts,
       // so a sync that omits the site's pixelId/metaAdAccountId would silently strip an
@@ -1928,7 +1934,7 @@ async function addPageToExistingRepo(
       // already the right values — no extra lookup needed.
       const syncResult = await syncLeadCaptureFilesToRepo(
         repoFullName,
-        listByPath,
+        buildListByPath,
         existingPage.metaPixelId,
         existingPage.metaAdAccountId,
       );
@@ -5672,11 +5678,23 @@ async function readRepoFile(
  */
 export async function syncLeadCaptureFilesToRepo(
   repoFullName: string,
-  listByPath: Record<string, string>,
+  /**
+   * ENG-485: a callback, not a static value — called FRESH on every retry attempt, not once
+   * upfront. `commitFilesToRepoMain`'s own retry re-reads the git ref to rebase the COMMIT
+   * onto, but reuses the same precomputed file content across every attempt; that's correct
+   * for a page's own STATIC files (they never change based on what's on `main`), but wrong
+   * here, where the correct content depends on who else just committed. A losing writer's
+   * retry used to recommit a stale LIST_BY_PATH snapshot on top of a winning writer's newer
+   * commit, silently erasing whichever page's entry the winner had just added.
+   */
+  buildListByPath: () => Record<string, string> | Promise<Record<string, string>>,
   /** Threaded through to buildCaptureRoute — see its own doc comment. */
   pixelId?: string,
   metaAccountId?: string,
 ): Promise<{ committed: boolean; reason?: string; pushedCommitSha?: string; pushTimestampMs?: number }> {
+  const MAX_ATTEMPTS = 2;
+  let lastErr: any;
+
   try {
     const { token: ghToken } = await getGitHubOrgToken();
     const ghHeaders = {
@@ -5684,66 +5702,80 @@ export async function syncLeadCaptureFilesToRepo(
       Accept: "application/vnd.github.v3+json",
     };
 
-    const middlewareContent = buildLandingPageMiddleware();
-    const captureRouteContent = buildCaptureRoute(listByPath, undefined, pixelId, metaAccountId);
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      // Fresh every attempt — see the buildListByPath doc comment above for why.
+      const listByPath = await buildListByPath();
+      const middlewareContent = buildLandingPageMiddleware();
+      const captureRouteContent = buildCaptureRoute(listByPath, undefined, pixelId, metaAccountId);
 
-    const [existingMiddleware, existingCaptureRoute, existingDomainMap] = await Promise.all([
-      readRepoFile(repoFullName, "middleware.ts", ghHeaders),
-      readRepoFile(repoFullName, "app/api/capture/route.ts", ghHeaders),
-      readRepoFile(repoFullName, "domainMap.ts", ghHeaders),
-    ]);
+      const [existingMiddleware, existingCaptureRoute, existingDomainMap] = await Promise.all([
+        readRepoFile(repoFullName, "middleware.ts", ghHeaders),
+        readRepoFile(repoFullName, "app/api/capture/route.ts", ghHeaders),
+        readRepoFile(repoFullName, "domainMap.ts", ghHeaders),
+      ]);
 
-    // Only write domainMap.ts if the repo has none. If it exists it may carry a real
-    // subdomain map — clobbering it with {} would break the customer's routing.
-    const needsDomainMap = existingDomainMap === null;
+      // Only write domainMap.ts if the repo has none. If it exists it may carry a real
+      // subdomain map — clobbering it with {} would break the customer's routing.
+      const needsDomainMap = existingDomainMap === null;
 
-    if (
-      !needsDomainMap &&
-      existingMiddleware === middlewareContent &&
-      existingCaptureRoute === captureRouteContent
-    ) {
-      console.log(
-        `[V0 SERVICE] Lead-capture files already up to date in ${repoFullName} — skipping commit (no redeploy)`
-      );
-      return { committed: false, reason: "up-to-date" };
+      if (
+        !needsDomainMap &&
+        existingMiddleware === middlewareContent &&
+        existingCaptureRoute === captureRouteContent
+      ) {
+        console.log(
+          `[V0 SERVICE] Lead-capture files already up to date in ${repoFullName} — skipping commit (no redeploy)`
+        );
+        return { committed: false, reason: "up-to-date" };
+      }
+
+      const filesToCommit: Array<{ path: string; content: string }> = [
+        { path: "middleware.ts", content: middlewareContent },
+        { path: "app/api/capture/route.ts", content: captureRouteContent },
+      ];
+      if (needsDomainMap) {
+        // Pre-ENG-308 repo: the middleware imports ./domainMap, so it MUST exist or the
+        // Vercel build fails. Empty is correct here — no subdomain has ever been attached.
+        filesToCommit.push({ path: "domainMap.ts", content: buildDomainMapFile({}) });
+      }
+
+      try {
+        // ONE internal attempt per OUR loop iteration — WE regenerate fresh content on
+        // retry now, so commitFilesToRepoMain's own multi-attempt retry (correct for static
+        // content) would just waste time recommitting the SAME content commitFilesToRepoMain
+        // itself can't know is stale.
+        const { pushedCommitSha, pushTimestampMs } = await commitFilesToRepoMain(
+          repoFullName,
+          ghHeaders,
+          filesToCommit.map((file) => ({ path: file.path, content: Buffer.from(file.content) })),
+          "chore: sync lead-capture route and middleware",
+          1,
+        );
+
+        const wired = Object.entries(listByPath);
+        console.log(
+          `[V0 SERVICE] Synced lead-capture files to ${repoFullName} (${filesToCommit
+            .map((f) => f.path)
+            .join(", ")}); ${
+            wired.length
+              ? wired.map(([p, l]) => `${p} -> ${l}`).join(", ")
+              : "NO page of this site has a lead list — its forms will fail loudly"
+          }`
+        );
+        return { committed: true, pushedCommitSha, pushTimestampMs };
+      } catch (err: any) {
+        lastErr = err;
+        const { retryable, reason } = isRetryableGithubPushError(err);
+        if (!retryable || attempt === MAX_ATTEMPTS) throw err;
+        const delay = 800 * Math.pow(2, attempt - 1) + Math.random() * 400;
+        console.warn(
+          `[V0 SERVICE] lead-capture sync to ${repoFullName} attempt ${attempt} failed (${reason}); ` +
+            `rebuilding fresh content and retrying in ${Math.round(delay)}ms`
+        );
+        await new Promise((r) => setTimeout(r, delay));
+      }
     }
-
-    const filesToCommit: Array<{ path: string; content: string }> = [
-      { path: "middleware.ts", content: middlewareContent },
-      { path: "app/api/capture/route.ts", content: captureRouteContent },
-    ];
-    if (needsDomainMap) {
-      // Pre-ENG-308 repo: the middleware imports ./domainMap, so it MUST exist or the
-      // Vercel build fails. Empty is correct here — no subdomain has ever been attached.
-      filesToCommit.push({ path: "domainMap.ts", content: buildDomainMapFile({}) });
-    }
-
-    // ENG-483: reuse the same retry-with-rebase commit path the page's own commit uses
-    // (commitFilesToRepoMain) instead of a bare, single-shot blob/tree/commit/patch. A
-    // sub-page add and a lead-list attach (or two sub-page adds) can land on the same
-    // repo close together; a raw ref PATCH here would surface that as a non-fast-forward
-    // that this function used to just log and give up on, leaving LIST_BY_PATH stale.
-    const { pushedCommitSha, pushTimestampMs } = await commitFilesToRepoMain(
-      repoFullName,
-      ghHeaders,
-      filesToCommit.map((file) => ({ path: file.path, content: Buffer.from(file.content) })),
-      "chore: sync lead-capture route and middleware",
-      2 // this sync is best-effort (caller only logs a warning on failure) — one rebase
-        // retry covers the common single-concurrent-writer race without piling up the
-        // full 4-attempt backoff behind an already-deployed page.
-    );
-
-    const wired = Object.entries(listByPath);
-    console.log(
-      `[V0 SERVICE] Synced lead-capture files to ${repoFullName} (${filesToCommit
-        .map((f) => f.path)
-        .join(", ")}); ${
-        wired.length
-          ? wired.map(([p, l]) => `${p} -> ${l}`).join(", ")
-          : "NO page of this site has a lead list — its forms will fail loudly"
-      }`
-    );
-    return { committed: true, pushedCommitSha, pushTimestampMs };
+    throw lastErr;
   } catch (err: any) {
     const reason = err?.response?.data?.message || err?.message || String(err);
     console.error(

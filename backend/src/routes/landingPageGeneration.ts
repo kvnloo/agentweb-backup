@@ -1939,25 +1939,35 @@ async function saveMetaPixelForPage(
   //    unlike GTM, the pixel id must also reach app/api/capture/route.ts so forward-lead can
   //    fire the matching server-side CAPI event. Build the whole-site path->list map the same
   //    way syncLeadCaptureForPage does (the capture route is repo-level, the list is per-page).
-  const siblings = await listLandingPages(page.userId);
-  const listByPath: Record<string, string> = {};
-  for (const p of siblings) {
-    if (p.githubRepoUrl !== page.githubRepoUrl) continue;
-    if (!p.leadListId) continue;
-    listByPath[p.slug ? `/${p.slug}` : "/"] = p.leadListId;
-  }
-  await syncLeadCaptureFilesToRepo(repoFullName, listByPath, pixelId || undefined, pixelId ? accountId : undefined);
+  //
+  //    ENG-485: re-derived FRESH by syncLeadCaptureFilesToRepo on every retry attempt, not
+  //    just once here — see that function's own doc comment on why a static snapshot isn't
+  //    safe to reuse across a rebase retry.
+  const buildListByPath = async (): Promise<Record<string, string>> => {
+    const siblings = await listLandingPages(page.userId);
+    const listByPath: Record<string, string> = {};
+    for (const p of siblings) {
+      if (p.githubRepoUrl !== page.githubRepoUrl) continue;
+      if (!p.leadListId) continue;
+      listByPath[p.slug ? `/${p.slug}` : "/"] = p.leadListId;
+    }
+    return listByPath;
+  };
+  await syncLeadCaptureFilesToRepo(repoFullName, buildListByPath, pixelId || undefined, pixelId ? accountId : undefined);
 
   // 3. Persist metaPixelId/metaAdAccountId on this record.
   await updateLandingPageMetaPixel(page.id, page.userId, pixelId, accountId);
 
   // 4. Sync metaTrackingInstalled across every sibling sharing this site's root layout —
   //    same rationale as saveGtmForPage's trackingInstalled sync. Best-effort; a sync
-  //    failure must never undo the GitHub commit that already succeeded.
+  //    failure must never undo the GitHub commit that already succeeded. Its own fresh
+  //    query (ENG-485 moved the capture-route map's own siblings lookup into a re-callable
+  //    closure above) — this one is unrelated to the race that closure exists to fix.
   const siteId = page.siteId ?? page.id;
   try {
+    const siblingsForTrackingSync = await listLandingPages(page.userId);
     await Promise.all(
-      siblings
+      siblingsForTrackingSync
         .filter((p) => (p.siteId ?? p.id) === siteId)
         .map((p) =>
           updateLandingPageMetaTrackingInstalled(p.id, !!pixelId).catch((err: any) => {
@@ -2224,38 +2234,47 @@ async function syncLeadCaptureForPage(
   const repoFullName = repoMatch[1];
 
   try {
-    // Every page of this site — i.e. every page deployed into this same repo. Sibling
-    // pages are the page owner's (UserIdIndex query, same pattern routes/domains.ts uses).
-    const siblings = await getLandingPagesByOwner(page.userId);
-    const listByPath: Record<string, string> = {};
-    for (const p of siblings) {
-      if (p.id === page.id) continue; // this page's entry comes from the write below
-      if (p.githubRepoUrl !== page.githubRepoUrl) continue; // different site, different repo
-      if (!p.leadListId) continue;
-      // Same path convention routes/domains.ts uses for its domain map.
-      listByPath[p.slug ? `/${p.slug}` : "/"] = p.leadListId;
-    }
-    // The page we just wrote, from the value we wrote — the GSI read above is eventually
-    // consistent and may still be showing the old value. A detach (null) simply leaves the
-    // page OUT of the map, so its form starts failing loudly (422) rather than quietly
-    // filing leads into a list it is no longer wired to.
-    if (leadListId) {
-      listByPath[page.slug ? `/${page.slug}` : "/"] = leadListId;
-    }
+    // ENG-485: re-derived FRESH by syncLeadCaptureFilesToRepo on every retry attempt, not
+    // just once here — see that function's own doc comment on why a static snapshot isn't
+    // safe to reuse across a rebase retry.
+    const buildListByPath = async (): Promise<Record<string, string>> => {
+      // Every page of this site — i.e. every page deployed into this same repo. Sibling
+      // pages are the page owner's (UserIdIndex query, same pattern routes/domains.ts uses).
+      const siblings = await getLandingPagesByOwner(page.userId);
+      const listByPath: Record<string, string> = {};
+      for (const p of siblings) {
+        if (p.id === page.id) continue; // this page's entry comes from the write below
+        if (p.githubRepoUrl !== page.githubRepoUrl) continue; // different site, different repo
+        if (!p.leadListId) continue;
+        // Same path convention routes/domains.ts uses for its domain map.
+        listByPath[p.slug ? `/${p.slug}` : "/"] = p.leadListId;
+      }
+      // The page we just wrote, from the value we wrote — the GSI read above is eventually
+      // consistent and may still be showing the old value. A detach (null) simply leaves the
+      // page OUT of the map, so its form starts failing loudly (422) rather than quietly
+      // filing leads into a list it is no longer wired to.
+      if (leadListId) {
+        listByPath[page.slug ? `/${page.slug}` : "/"] = leadListId;
+      }
+      return listByPath;
+    };
 
     // ENG-489: syncLeadCaptureFilesToRepo fully regenerates app/api/capture/route.ts,
     // so omitting the site's pixelId/metaAdAccountId here would silently strip an
     // already-configured Meta pixel back out of the route on every lead-list attach.
     // metaPixelId/metaAdAccountId live on the SITE ROOT record, which may not be `page`
-    // itself (a lead list can be attached to any sub-page) — find it among siblings.
+    // itself (a lead list can be attached to any sub-page) — resolve it once (not part of
+    // the race being fixed above — site-level config, not the fast-changing sibling list).
     // The root's own id equals the site's siteId by construction — more reliable than
     // the isRootPage flag, which isn't guaranteed set on every record.
     const siteId = page.siteId ?? page.id;
-    const rootRecord = page.id === siteId ? page : siblings.find((p) => p.id === siteId);
+    const rootRecord = page.id === siteId
+      ? page
+      : (await getLandingPagesByOwner(page.userId)).find((p) => p.id === siteId);
 
     const result = await syncLeadCaptureFilesToRepo(
       repoFullName,
-      listByPath,
+      buildListByPath,
       rootRecord?.metaPixelId,
       rootRecord?.metaAdAccountId,
     );
