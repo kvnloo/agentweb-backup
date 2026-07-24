@@ -60,6 +60,28 @@ describe('scheduleDb.setRunInFlight', () => {
   });
 });
 
+describe('scheduleDb.attachSessionToRunInFlight (ENG-479)', () => {
+  it('conditionally sets the lease sessionId on the matching runId', async () => {
+    mockDynamoDB.update.mockReturnValue(ok());
+    await scheduleDb.attachSessionToRunInFlight('sched-1', 'run-1', 'sess-1');
+    const params = mockDynamoDB.update.mock.calls[0][0];
+    expect(params.UpdateExpression).toBe('SET runInFlight.sessionId = :sid');
+    expect(params.ConditionExpression).toBe('runInFlight.runId = :runId');
+    expect(params.ExpressionAttributeValues[':sid']).toBe('sess-1');
+    expect(params.ExpressionAttributeValues[':runId']).toBe('run-1');
+  });
+
+  it('never rejects — swallows a stale-lease condition failure', async () => {
+    mockDynamoDB.update.mockReturnValue(conditionalFail());
+    await expect(scheduleDb.attachSessionToRunInFlight('sched-1', 'run-1', 'sess-1')).resolves.toBeUndefined();
+  });
+
+  it('never rejects — swallows an unexpected error', async () => {
+    mockDynamoDB.update.mockReturnValue({ promise: jest.fn().mockRejectedValue(new Error('throttled')) });
+    await expect(scheduleDb.attachSessionToRunInFlight('sched-1', 'run-1', 'sess-1')).resolves.toBeUndefined();
+  });
+});
+
 describe('scheduleDb.heartbeatRunInFlight', () => {
   it('conditionally bumps heartbeatAt on the matching runId', async () => {
     mockDynamoDB.update.mockReturnValue(ok());
