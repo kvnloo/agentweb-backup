@@ -6,6 +6,12 @@
  * scoped — see metaAccountCredentials.test.ts), so it can now pollute a real customer's live
  * ad account with fake "Lead" conversions and skew their paid campaign's optimization.
  *
+ * Keyed by listId, not IP (ENG-493: this app never configures Express's `trust proxy`, so
+ * req.ip collapses to one value for every caller in both prod and the test env — confirmed
+ * live. An IP-keyed limiter would be a de facto GLOBAL cap shared by every customer's site
+ * combined). Keying by listId also means the real behavioral guarantee worth testing isn't
+ * just "the cap exists" — it's that ONE list's flood never throttles a DIFFERENT list.
+ *
  * This file deliberately does NOT rely on the route's own `skip: NODE_ENV === 'test'` guard
  * (added so the OTHER forward-lead test suites, which fire far more than the request cap in
  * a single run, don't trip it) — it flips NODE_ENV for its own duration so the real limiter
@@ -80,9 +86,9 @@ describe('forward-lead rate limiting (ENG-492)', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
-      listId: 'list_123', userId: 'user_123', name: 'Test List', publicAccessEnabled: true,
-    });
+    (crmDb.getLeadListById as jest.Mock).mockImplementation((listId: string) =>
+      Promise.resolve({ listId, userId: 'user_123', name: 'Test List', publicAccessEnabled: true }),
+    );
     (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
     (crmDb.createLead as jest.Mock).mockImplementation((listId: string, data: any) =>
       Promise.resolve({ leadId: `lead_${Math.random()}`, listId, ...data }),
@@ -90,23 +96,42 @@ describe('forward-lead rate limiting (ENG-492)', () => {
   });
 
   // One test, not two: express-rate-limit's in-memory store is shared by the one router
-  // instance built in beforeAll, so a separate "first 20 succeed" test run before this one
-  // would leave the 21st request's counter already exhausted (or a separate "21st fails"
-  // test run alone wouldn't have made the first 20 real requests itself) — same window,
+  // instance built in beforeAll, so a separate "first 100 succeed" test run before this one
+  // would leave the 101st request's counter already exhausted (or a separate "101st fails"
+  // test run alone wouldn't have made the first 100 real requests itself) — same window,
   // same key, must be asserted in one continuous sequence.
-  it('SUCCESS then FAIL: the first 20 requests from the same address succeed, the 21st is rejected with 429', async () => {
-    for (let i = 0; i < 20; i++) {
+  it('SUCCESS then FAIL: the first 100 requests for the same listId succeed, the 101st is rejected with 429', async () => {
+    for (let i = 0; i < 100; i++) {
       const res = await request(app)
         .post('/api/webhooks/forward-lead')
-        .send({ listId: 'list_123', email: `lead${i}@example.com` });
+        .send({ listId: 'list_flood_target', email: `lead${i}@example.com` });
       expect(res.status).toBe(201);
     }
 
     const res = await request(app)
       .post('/api/webhooks/forward-lead')
-      .send({ listId: 'list_123', email: 'lead21@example.com' });
+      .send({ listId: 'list_flood_target', email: 'lead101@example.com' });
 
     expect(res.status).toBe(429);
     expect(res.body.success).toBe(false);
+  });
+
+  it("a flood against one listId does not throttle a DIFFERENT listId's real submissions (the actual point of keying by listId, not IP)", async () => {
+    // Exhaust list_flood_target's own quota first.
+    for (let i = 0; i < 100; i++) {
+      await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({ listId: 'list_flood_target_2', email: `flood${i}@example.com` });
+    }
+    const floodedRes = await request(app)
+      .post('/api/webhooks/forward-lead')
+      .send({ listId: 'list_flood_target_2', email: 'flood101@example.com' });
+    expect(floodedRes.status).toBe(429);
+
+    // A completely different customer's list must be unaffected.
+    const otherRes = await request(app)
+      .post('/api/webhooks/forward-lead')
+      .send({ listId: 'list_unrelated_customer', email: 'real-lead@example.com' });
+    expect(otherRes.status).toBe(201);
   });
 });
