@@ -33,6 +33,7 @@ jest.mock('../../services/db', () => ({
 }));
 
 import { getPostsForUser } from '../../services/socialPostsService';
+import { _resetForceReloadCooldown } from '../socialPosts';
 import { userDb, scheduleDb, socialEngagementTrackingDb } from '../../services/db';
 
 const mockGetPosts = getPostsForUser as jest.MockedFunction<typeof getPostsForUser>;
@@ -76,6 +77,7 @@ let app: express.Application;
 
 beforeEach(() => {
   jest.clearAllMocks();
+  _resetForceReloadCooldown();
   app = express();
   app.use(express.json());
   app.use('/api', socialPostsRouter);
@@ -136,6 +138,50 @@ describe('GET /api/social-posts', () => {
     const res = await request(app).get('/api/social-posts').expect(500);
 
     expect(res.body).toHaveProperty('error');
+  });
+
+  describe('force_reload cooldown (LinkedIn quota protection)', () => {
+    it('should 429 a second force_reload within the cooldown window', async () => {
+      mockGetPosts.mockResolvedValue({ posts: [], total: 0 } as any);
+
+      await request(app).get('/api/social-posts?force_reload=true').expect(200);
+
+      const res = await request(app)
+        .get('/api/social-posts?force_reload=true')
+        .expect(429);
+
+      expect(res.body).toHaveProperty('error');
+      expect(res.body.retry_after_seconds).toBeGreaterThan(0);
+      // The throttled request must NOT reach the (quota-burning) service again.
+      expect(mockGetPosts).toHaveBeenCalledTimes(1);
+    });
+
+    it('should NOT throttle non-force_reload reads (cache-served)', async () => {
+      mockGetPosts.mockResolvedValue({ posts: [], total: 0 } as any);
+
+      await request(app).get('/api/social-posts').expect(200);
+      await request(app).get('/api/social-posts').expect(200);
+
+      expect(mockGetPosts).toHaveBeenCalledTimes(2);
+    });
+
+    it('should throttle per-account independently', async () => {
+      mockGetPosts.mockResolvedValue({ posts: [], total: 0 } as any);
+
+      await request(app)
+        .get('/api/social-posts?force_reload=true&accountId=acc-1')
+        .expect(200);
+      // A different account is not under the same cooldown key.
+      await request(app)
+        .get('/api/social-posts?force_reload=true&accountId=acc-2')
+        .expect(200);
+      // Repeating the first account within the window is throttled.
+      await request(app)
+        .get('/api/social-posts?force_reload=true&accountId=acc-1')
+        .expect(429);
+
+      expect(mockGetPosts).toHaveBeenCalledTimes(2);
+    });
   });
 });
 
