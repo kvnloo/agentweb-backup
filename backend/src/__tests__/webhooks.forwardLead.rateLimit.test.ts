@@ -123,7 +123,8 @@ describe('forward-lead: CAPI send is budgeted per listId, independent of the lea
       eventId: `evt_${email}`,
     });
 
-  it('FAIL: the 101st CAPI-eligible submission to the same list in one window still saves (201) but does NOT attempt the CAPI send', async () => {
+  it('FAIL: the 101st CAPI-eligible submission to the same list in one window still saves (201), does NOT attempt the CAPI send, and logs the overflow for visibility', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
     const listId = 'list_capi_flood_target';
     for (let i = 0; i < 100; i++) {
       const res = await sendWithCapiFields(listId, `lead${i}@example.com`);
@@ -137,6 +138,10 @@ describe('forward-lead: CAPI send is budgeted per listId, independent of the lea
 
     expect(res.status).toBe(201); // the lead itself still saves, always
     expect(metaService.sendCapiLeadEvent).toHaveBeenCalledTimes(100); // not 101 — budget held
+    // Silent skips would be un-tunable — must be visible in logs so a real customer
+    // legitimately hitting this can actually be noticed and the budget adjusted.
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(`[CAPI] Send budget exhausted for list ${listId}`));
+    warnSpy.mockRestore();
   });
 
   it("SUCCESS: a CAPI-send budget exhausted for one listId does not affect a DIFFERENT listId's CAPI budget", async () => {
