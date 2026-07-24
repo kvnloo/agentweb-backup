@@ -443,6 +443,60 @@ describe("POST /api/landing-pages/v0/generate", () => {
     expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("list-123");
   });
 
+  it("FAIL: bridge_out_url is not a well-formed http(s) URL → 400", async () => {
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", bridge_out_url: "not-a-url" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/bridge_out_url must be a well-formed http\(s\) URL/);
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: bridge_out_url is a non-http(s) URL (e.g. javascript:) → 400", async () => {
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", bridge_out_url: "javascript:alert(1)" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/bridge_out_url must be a well-formed http\(s\) URL/);
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: bridge_out_url is not a string (e.g. a number) → 400", async () => {
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", bridge_out_url: 12345 });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("bridge_out_url must be a string");
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: well-formed bridge_out_url is threaded through to generateLandingPage's opts", async () => {
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1", bridge_out_url: "https://rankai.ai/book-a-call" });
+
+    expect(res.status).toBe(201);
+    expect(mockGenerateLandingPage.mock.calls[0][6]).toMatchObject({
+      bridgeOutUrl: "https://rankai.ai/book-a-call",
+    });
+  });
+
+  it("SUCCESS: bridge_out_url omitted → generateLandingPage's opts.bridgeOutUrl is undefined", async () => {
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page" });
+
+    expect(res.status).toBe(201);
+    expect(mockGenerateLandingPage.mock.calls[0][6].bridgeOutUrl).toBeUndefined();
+  });
+
   it("FAIL: template_html provided but extractTemplateOutline returns empty string → generation proceeds with empty template", async () => {
     mockedExtractOutline.mockReturnValue("");
     mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });

@@ -5077,6 +5077,102 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       expect(result.pixelLeadEventVerified).toBe(true);
     });
   });
+
+  // ENG-449 (Harsha's bridge-out requirement): validateBridgeOutRedirect mirrors
+  // validatePixelLeadEvent's "verify not guarantee" contract — exhausted retries never
+  // fail generation, they just record bridgeOutVerified:false on the record.
+  describe("bridge-out redirect validation (ENG-449, mirrors ENG-482's pixel Lead-event checks)", () => {
+    const BRIDGE_URL = "https://rankai.ai/book-a-call";
+
+    const existingSiteWithBridgeOut = {
+      ...existingSiteRecord,
+      bridgeOutUrl: BRIDGE_URL,
+    };
+
+    const setupSiteRecordWithBridgeOutMock = () => {
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Items: [existingSiteWithBridgeOut] }),
+      });
+      mockGet.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Item: existingSiteWithBridgeOut }),
+      });
+    };
+
+    it("SUCCESS: exhausts retries and correctly reports bridgeOutVerified:false when the redirect is missing", async () => {
+      setupSiteRecordWithBridgeOutMock();
+
+      const AdmZip = (await import("adm-zip")).default;
+      const zip = new AdmZip();
+      zip.addFile(
+        "app/page.tsx",
+        Buffer.from('export default function Page() { return <div>No redirect here</div>; }')
+      );
+      const buggyZip = zip.toBuffer();
+
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      mockChatsGetById
+        .mockResolvedValueOnce({ latestVersion: { id: "v1" } })
+        .mockResolvedValueOnce({ latestVersion: { id: "v2" } })
+        .mockResolvedValueOnce({ latestVersion: { id: "v3" } });
+      mockChatsDownloadVersion
+        .mockResolvedValueOnce(buggyZip)
+        .mockResolvedValueOnce(buggyZip)
+        .mockResolvedValueOnce(buggyZip);
+      mockChatsSendMessage.mockResolvedValue({});
+
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a booking page",
+        "Booking Page",
+        {},
+        "list_booking",
+        undefined,
+        { bridgeOutUrl: BRIDGE_URL }
+      );
+
+      // Never fails generation over a missing client-side redirect (same AC3 contract).
+      expect(result.status).toBe("deployed");
+      expect(mockChatsSendMessage).toHaveBeenCalledTimes(2);
+      expect(result.bridgeOutVerified).toBe(false);
+    });
+
+    it("SUCCESS: reports bridgeOutVerified:true when the redirect + email= param are in the file that actually ships", async () => {
+      setupSiteRecordWithBridgeOutMock();
+      const AdmZip = (await import("adm-zip")).default;
+      const zip = new AdmZip();
+      zip.addFile(
+        "app/page.tsx",
+        Buffer.from(
+          `export default function Page() { return <button onClick={() => { window.location.href = \`${BRIDGE_URL}?email=\${encodeURIComponent(email)}\`; }}>Submit</button>; }`
+        )
+      );
+      const goodZip = zip.toBuffer();
+
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "v1" } });
+      mockChatsDownloadVersion.mockResolvedValueOnce(goodZip);
+
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a booking page",
+        "Booking Page 2",
+        {},
+        "list_booking2",
+        undefined,
+        { bridgeOutUrl: BRIDGE_URL }
+      );
+
+      expect(result.status).toBe("deployed");
+      expect(mockChatsSendMessage).not.toHaveBeenCalled();
+      expect(result.bridgeOutVerified).toBe(true);
+    });
+  });
 });
 
 // =============================================================================
