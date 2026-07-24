@@ -244,7 +244,7 @@ describe('handleCallGoogleAdsApi', () => {
       criterion_resource_name: 'customers/123/campaignCriteria/1~1',
     });
     expect(result.success).toBe(true);
-    expect(googleAdsService.removeCampaignCriterion).toHaveBeenCalledWith('user-123', '1234567890', 'customers/123/campaignCriteria/1~1');
+    expect(googleAdsService.removeCampaignCriterion).toHaveBeenCalledWith('user-123', '1234567890', 'customers/123/campaignCriteria/1~1', ['PROXIMITY']);
   });
 
   it('returns error for REMOVE_PROXIMITY without criterion_resource_name', async () => {

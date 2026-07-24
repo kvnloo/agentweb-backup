@@ -28797,7 +28797,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
         if (action === 'REMOVE_PROXIMITY') {
           if (!args.criterion_resource_name) return { success: false, error: 'criterion_resource_name is required for REMOVE_PROXIMITY' };
-          await googleAdsService.removeCampaignCriterion(userId, customer_id, args.criterion_resource_name);
+          await googleAdsService.removeCampaignCriterion(userId, customer_id, args.criterion_resource_name, ['PROXIMITY']);
           return { success: true, message: 'Campaign criterion removed' };
         }
       }

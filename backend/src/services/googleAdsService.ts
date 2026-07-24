@@ -531,9 +531,21 @@ export class GoogleAdsService {
     return { resourceName: data.results[0].resourceName };
   }
 
-  /** Remove a campaign-level criterion (LOCATION or PROXIMITY) by resource name. */
-  async removeCampaignCriterion(userId: string, customerId: string, criterionResourceName: string): Promise<void> {
+  /**
+   * Remove a campaign-level criterion by resource name, restricted to the given type(s)
+   * so a mis-selected resource name (e.g. an audience or demographic criterion) can't be
+   * deleted through an action scoped to a narrower purpose (e.g. REMOVE_PROXIMITY).
+   */
+  async removeCampaignCriterion(userId: string, customerId: string, criterionResourceName: string, allowedTypes?: string[]): Promise<void> {
+    this.assertResourceName(criterionResourceName, 'campaignCriteria');
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    if (allowedTypes?.length) {
+      const rows = await this.search(customerId, accessToken, `SELECT campaign_criterion.type FROM campaign_criterion WHERE campaign_criterion.resource_name = '${criterionResourceName}'`, loginCustomerId);
+      const actualType = rows[0]?.campaignCriterion?.type;
+      if (!actualType || !allowedTypes.includes(actualType)) {
+        throw new Error(`Refusing to remove ${criterionResourceName}: expected criterion type ${allowedTypes.join(' or ')}, found ${actualType || 'unknown (criterion not found)'}`);
+      }
+    }
     await this.mutate(customerId, accessToken, 'campaignCriteria', [{ remove: criterionResourceName }], loginCustomerId);
   }
 
@@ -626,8 +638,9 @@ export class GoogleAdsService {
    * so we reject anything else rather than let a crafted string alter the query (e.g. one
    * engineered to return zero rows and silently skip the creative-addition gate).
    */
-  private assertResourceName(value: string, segment: 'campaigns' | 'adGroups'): void {
-    if (typeof value !== 'string' || !new RegExp(`^customers/\\d+/${segment}/\\d+$`).test(value)) {
+  private assertResourceName(value: string, segment: 'campaigns' | 'adGroups' | 'campaignCriteria'): void {
+    const idPattern = segment === 'campaignCriteria' ? '\\d+~\\d+' : '\\d+';
+    if (typeof value !== 'string' || !new RegExp(`^customers/\\d+/${segment}/${idPattern}$`).test(value)) {
       throw new Error(`Invalid Google Ads ${segment} resource name`);
     }
   }

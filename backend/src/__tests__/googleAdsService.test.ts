@@ -691,6 +691,29 @@ describe('addProximityCriterion / removeCampaignCriterion (ENG-487)', () => {
     const body = mockAxiosPost.mock.calls[0][1];
     expect(body.operations[0].remove).toBe('customers/123/campaignCriteria/2~1');
   });
+
+  it('rejects a malformed criterion resource name before calling the API', async () => {
+    await expect(service.removeCampaignCriterion('user-123', '1234567890', 'not-a-resource-name'))
+      .rejects.toThrow('Invalid Google Ads campaignCriteria resource name');
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
+  it('when allowedTypes is given, verifies the criterion type before removing', async () => {
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [{ campaignCriterion: { type: 'PROXIMITY' } }] } })
+      .mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.removeCampaignCriterion('user-123', '1234567890', 'customers/123/campaignCriteria/2~1', ['PROXIMITY']);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(2);
+    const removeBody = mockAxiosPost.mock.calls[1][1];
+    expect(removeBody.operations[0].remove).toBe('customers/123/campaignCriteria/2~1');
+  });
+
+  it('refuses to remove a criterion whose actual type is not in allowedTypes', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ campaignCriterion: { type: 'LOCATION' } }] } });
+    await expect(service.removeCampaignCriterion('user-123', '1234567890', 'customers/123/campaignCriteria/2~1', ['PROXIMITY']))
+      .rejects.toThrow('Refusing to remove');
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('pauseCampaign / resumeCampaign', () => {
