@@ -1,25 +1,21 @@
 /**
- * ENG-492: /forward-lead is public and unauthenticated by design (any generated customer
- * site's capture route must reach it with no login), and always allowed unbounded requests.
- * Before ENG-449 that only risked junk CRM leads; since ENG-449 the same flood also fires a
- * real server-side Meta CAPI send using the actual page owner's own credentials (safely
- * scoped — see metaAccountCredentials.test.ts), so it can now pollute a real customer's live
- * ad account with fake "Lead" conversions and skew their paid campaign's optimization.
+ * ENG-492: forward-lead's lead-SAVE path is never rate-limited — a real customer's real lead
+ * must never be rejected, no matter how large a legitimate traffic spike (viral post, big ad
+ * spend, a featured TV segment can all blow past any fixed request-count we'd pick). An
+ * earlier version of this fix gated the whole request; that was reverted after live-testing
+ * surfaced two problems: (1) a big enough customer's own real traffic could eventually hit
+ * the cap and lose real leads, and (2) this app never configures Express's `trust proxy`
+ * (ENG-493), so an IP-keyed limiter would collapse to one shared bucket for every caller.
  *
- * Keyed by listId, not IP (ENG-493: this app never configures Express's `trust proxy`, so
- * req.ip collapses to one value for every caller in both prod and the test env — confirmed
- * live. An IP-keyed limiter would be a de facto GLOBAL cap shared by every customer's site
- * combined). Keying by listId also means the real behavioral guarantee worth testing isn't
- * just "the cap exists" — it's that ONE list's flood never throttles a DIFFERENT list.
- *
- * This file deliberately does NOT rely on the route's own `skip: NODE_ENV === 'test'` guard
- * (added so the OTHER forward-lead test suites, which fire far more than the request cap in
- * a single run, don't trip it) — it flips NODE_ENV for its own duration so the real limiter
- * logic actually runs.
+ * Instead, only the optional, best-effort Meta CAPI send is budgeted (shouldAttemptCapiSend,
+ * keyed by listId) — before ENG-449, unbounded abuse here only created junk CRM leads; since
+ * ENG-449, pixelId/metaAccountId also flow through to a real server-side Meta CAPI send using
+ * the actual page owner's own access token (safely scoped — see metaAccountCredentials.test.ts
+ * — so this can't leak a different customer's credentials), which means a scripted flood can
+ * pollute a real customer's live ad account with fake "Lead" conversions. Hitting the budget
+ * has ZERO customer-visible effect: the lead still saves normally and the response is still
+ * 201 — the only consequence is that this one submission doesn't get forwarded to Meta.
  */
-
-const ORIGINAL_NODE_ENV = process.env.NODE_ENV;
-(process.env as any).NODE_ENV = 'production';
 
 jest.mock('../services/db', () => ({
   crmDb: {
@@ -33,6 +29,9 @@ jest.mock('../services/db', () => ({
 }));
 jest.mock('../services/metaAccountCredentials', () => ({
   getMetaAccountCredentials: jest.fn(),
+}));
+jest.mock('../services/metaService', () => ({
+  metaService: { sendCapiLeadEvent: jest.fn() },
 }));
 jest.mock('../services/dripSequenceDb', () => ({
   dripSequenceDb: { getSequencesByAutoEnrollList: jest.fn().mockResolvedValue([]), bulkEnroll: jest.fn() },
@@ -64,26 +63,21 @@ jest.mock('../services/emailEventsDb', () => ({
 
 import request from 'supertest';
 import express from 'express';
-import { crmDb } from '../services/db';
+import webhookRouter from '../routes/webhooks';
+import { crmDb, userDb } from '../services/db';
+import { metaService } from '../services/metaService';
+import { getMetaAccountCredentials } from '../services/metaAccountCredentials';
 
-describe('forward-lead rate limiting (ENG-492)', () => {
-  let app: express.Express;
+const app = express();
+app.use(express.json());
+app.use('/api/webhooks', webhookRouter);
 
-  beforeAll(() => {
-    // Import the router only after NODE_ENV is flipped and mocks are registered, and
-    // build a FRESH app/router per suite run so each test's own request count doesn't
-    // carry over between test files (express-rate-limit's in-memory store is scoped to
-    // the middleware instance created at module load).
-    const webhookRouter = require('../routes/webhooks').default;
-    app = express();
-    app.use(express.json());
-    app.use('/api/webhooks', webhookRouter);
-  });
+const flushAsyncWork = async () => {
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+};
 
-  afterAll(() => {
-    (process.env as any).NODE_ENV = ORIGINAL_NODE_ENV;
-  });
-
+describe('forward-lead: lead save is never rate-limited (ENG-492)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     (crmDb.getLeadListById as jest.Mock).mockImplementation((listId: string) =>
@@ -95,43 +89,70 @@ describe('forward-lead rate limiting (ENG-492)', () => {
     );
   });
 
-  // One test, not two: express-rate-limit's in-memory store is shared by the one router
-  // instance built in beforeAll, so a separate "first 100 succeed" test run before this one
-  // would leave the 101st request's counter already exhausted (or a separate "101st fails"
-  // test run alone wouldn't have made the first 100 real requests itself) — same window,
-  // same key, must be asserted in one continuous sequence.
-  it('SUCCESS then FAIL: the first 100 requests for the same listId succeed, the 101st is rejected with 429', async () => {
-    for (let i = 0; i < 100; i++) {
+  it('SUCCESS: more than 100 submissions to the same list in one window all still save and get a 201 — none are ever rejected', async () => {
+    for (let i = 0; i < 105; i++) {
       const res = await request(app)
         .post('/api/webhooks/forward-lead')
-        .send({ listId: 'list_flood_target', email: `lead${i}@example.com` });
+        .send({ listId: 'list_high_volume_real_customer', email: `real-lead-${i}@example.com` });
       expect(res.status).toBe(201);
     }
+  });
+});
 
-    const res = await request(app)
-      .post('/api/webhooks/forward-lead')
-      .send({ listId: 'list_flood_target', email: 'lead101@example.com' });
-
-    expect(res.status).toBe(429);
-    expect(res.body.success).toBe(false);
+describe('forward-lead: CAPI send is budgeted per listId, independent of the lead save (ENG-492)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (crmDb.getLeadListById as jest.Mock).mockImplementation((listId: string) =>
+      Promise.resolve({ listId, userId: 'user_123', name: 'Test List', publicAccessEnabled: true }),
+    );
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+    (crmDb.createLead as jest.Mock).mockImplementation((listId: string, data: any) =>
+      Promise.resolve({ leadId: `lead_${Math.random()}`, listId, ...data }),
+    );
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user_123', connected_accounts: [] });
+    (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'acc1', accessToken: 'tok', accountName: 'Acc 1' });
+    (metaService.sendCapiLeadEvent as jest.Mock).mockResolvedValue({ success: true });
   });
 
-  it("a flood against one listId does not throttle a DIFFERENT listId's real submissions (the actual point of keying by listId, not IP)", async () => {
-    // Exhaust list_flood_target's own quota first.
-    for (let i = 0; i < 100; i++) {
-      await request(app)
-        .post('/api/webhooks/forward-lead')
-        .send({ listId: 'list_flood_target_2', email: `flood${i}@example.com` });
-    }
-    const floodedRes = await request(app)
-      .post('/api/webhooks/forward-lead')
-      .send({ listId: 'list_flood_target_2', email: 'flood101@example.com' });
-    expect(floodedRes.status).toBe(429);
+  const sendWithCapiFields = (listId: string, email: string) =>
+    request(app).post('/api/webhooks/forward-lead').send({
+      listId,
+      email,
+      pixelId: '1430870751246428',
+      metaAccountId: 'acc1',
+      eventId: `evt_${email}`,
+    });
 
-    // A completely different customer's list must be unaffected.
-    const otherRes = await request(app)
-      .post('/api/webhooks/forward-lead')
-      .send({ listId: 'list_unrelated_customer', email: 'real-lead@example.com' });
+  it('FAIL: the 101st CAPI-eligible submission to the same list in one window still saves (201) but does NOT attempt the CAPI send', async () => {
+    const listId = 'list_capi_flood_target';
+    for (let i = 0; i < 100; i++) {
+      const res = await sendWithCapiFields(listId, `lead${i}@example.com`);
+      expect(res.status).toBe(201);
+    }
+    await flushAsyncWork();
+    expect(metaService.sendCapiLeadEvent).toHaveBeenCalledTimes(100);
+
+    const res = await sendWithCapiFields(listId, 'lead101@example.com');
+    await flushAsyncWork();
+
+    expect(res.status).toBe(201); // the lead itself still saves, always
+    expect(metaService.sendCapiLeadEvent).toHaveBeenCalledTimes(100); // not 101 — budget held
+  });
+
+  it("SUCCESS: a CAPI-send budget exhausted for one listId does not affect a DIFFERENT listId's CAPI budget", async () => {
+    const floodedList = 'list_capi_flood_target_2';
+    for (let i = 0; i < 100; i++) {
+      await sendWithCapiFields(floodedList, `flood${i}@example.com`);
+    }
+    await sendWithCapiFields(floodedList, 'flood101@example.com');
+    await flushAsyncWork();
+    expect(metaService.sendCapiLeadEvent).toHaveBeenCalledTimes(100);
+
+    (metaService.sendCapiLeadEvent as jest.Mock).mockClear();
+    const otherRes = await sendWithCapiFields('list_unrelated_customer', 'real-lead@example.com');
+    await flushAsyncWork();
+
     expect(otherRes.status).toBe(201);
+    expect(metaService.sendCapiLeadEvent).toHaveBeenCalledTimes(1);
   });
 });
