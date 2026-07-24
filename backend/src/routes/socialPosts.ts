@@ -7,6 +7,19 @@ import { getEngagementMemory, saveEngagementMemory, EngagementMemory } from '../
 
 const router = Router();
 
+// In-memory per-user/per-account cooldown for on-demand force_reload refreshes.
+// force_reload bypasses the 24h cache and hits the shared LinkedIn API quota, so a
+// caller who spams it could exhaust app-wide quota or trip LinkedIn abuse detection
+// for every tenant. Throttle how often a single user can trigger it, returning 429
+// when called too soon. Mirrors the SEO GA-probe per-user cooldown convention.
+const FORCE_RELOAD_COOLDOWN_MS = 60_000;
+const forceReloadCooldown = new Map<string, number>();
+
+/** Exported for testing — clears force_reload cooldown state between runs. */
+export function _resetForceReloadCooldown(): void {
+  forceReloadCooldown.clear();
+}
+
 router.get('/social-posts', authenticateToken, async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user?.userId;
@@ -20,6 +33,23 @@ router.get('/social-posts', authenticateToken, async (req: Request, res: Respons
     // On-demand refresh: bypass the 24h cache and re-fetch from LinkedIn.
     // Only affects company/organization pages — personal profiles always read from the DB.
     const forceReload = req.query.force_reload === 'true';
+
+    // Throttle force_reload — it's the only path that bypasses the 24h cache and
+    // burns the shared LinkedIn quota, so cap how frequently one user can call it.
+    if (forceReload) {
+      const cooldownKey = `${userId}::${accountId ?? 'all'}`;
+      const now = Date.now();
+      const last = forceReloadCooldown.get(cooldownKey) ?? 0;
+      if (now - last < FORCE_RELOAD_COOLDOWN_MS) {
+        const retryAfterSeconds = Math.ceil((last + FORCE_RELOAD_COOLDOWN_MS - now) / 1000);
+        return res.status(429).json({
+          success: false,
+          error: 'Posts were just refreshed. Please wait a moment before refreshing again.',
+          retry_after_seconds: retryAfterSeconds,
+        });
+      }
+      forceReloadCooldown.set(cooldownKey, now);
+    }
 
     const result = await getPostsForUser(userId, { accountId, limit, includeMetrics, forceReload });
     return res.json(result);
