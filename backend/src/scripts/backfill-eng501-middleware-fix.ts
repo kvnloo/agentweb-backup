@@ -22,8 +22,16 @@
  * makes no commit at all — no needless redeploy.
  *
  * ── Usage ──────────────────────────────────────────────────────────────────
- *   npx ts-node src/scripts/backfill-eng501-middleware-fix.ts            # DRY RUN (default)
- *   npx ts-node src/scripts/backfill-eng501-middleware-fix.ts --apply    # write changes
+ *   npx ts-node src/scripts/backfill-eng501-middleware-fix.ts                        # DRY RUN, all repos
+ *   npx ts-node src/scripts/backfill-eng501-middleware-fix.ts --repo=owner/name      # DRY RUN, one repo
+ *   npx ts-node src/scripts/backfill-eng501-middleware-fix.ts --repo=owner/name --apply   # write, one repo
+ *   npx ts-node src/scripts/backfill-eng501-middleware-fix.ts --apply                # write, ALL repos
+ *
+ * The actual write path (a real GitHub commit via this script) has not been exercised for
+ * real anywhere yet — only against mocked GitHub in tests, and dry-run against real DynamoDB
+ * data. Use --repo=<owner>/<name> to make the FIRST real write a single, observable repo you
+ * can check by hand (commit history + a live page load), before ever running --apply without
+ * --repo against the full fleet.
  */
 import AWS from "aws-sdk";
 import dotenv from "dotenv";
@@ -45,6 +53,7 @@ const dynamodb = new AWS.DynamoDB.DocumentClient();
 const TABLE_NAME = `${TABLE_PREFIX}AW-LandingPages`;
 
 const APPLY = process.argv.includes("--apply");
+const REPO_FILTER = process.argv.find((a) => a.startsWith("--repo="))?.slice("--repo=".length);
 
 interface LpItem {
   githubRepoUrl?: string;
@@ -61,6 +70,7 @@ async function main() {
     region: process.env.AWS_REGION,
     tableName: TABLE_NAME,
     mode: APPLY ? "APPLY (will write)" : "DRY RUN (no writes — pass --apply to write)",
+    repoFilter: REPO_FILTER ?? "(none — all repos)",
   });
 
   // ── Pass 1: collect the distinct set of repos across ALL pages, any status ───────────────
@@ -84,14 +94,15 @@ async function main() {
     }
   } while (lastKey);
 
-  console.log(`\nScanned ${totalScanned} records; ${repos.size} distinct repos.\n`);
+  const targetRepos = REPO_FILTER ? new Set([...repos].filter((r) => r.includes(REPO_FILTER))) : repos;
+  console.log(`\nScanned ${totalScanned} records; ${repos.size} distinct repos` + (REPO_FILTER ? `; ${targetRepos.size} match --repo=${REPO_FILTER}.\n` : `.\n`));
 
   let synced = 0;
   let upToDate = 0;
   let failed = 0;
 
   // ── Pass 2: sync middleware.ts + lib/agentweb-track.ts only, per repo ────────────────────
-  for (const repoUrl of repos) {
+  for (const repoUrl of targetRepos) {
     const repoFullName = parseRepoFullName(repoUrl);
     if (!repoFullName) {
       console.log(`  REPO ${repoUrl}: unparseable URL — skipping`);
@@ -116,7 +127,7 @@ async function main() {
     }
   }
 
-  console.log(`\nDone. synced=${synced} upToDate=${upToDate} failed=${failed} totalRepos=${repos.size}`);
+  console.log(`\nDone. synced=${synced} upToDate=${upToDate} failed=${failed} totalRepos=${targetRepos.size}`);
 }
 
 main()
