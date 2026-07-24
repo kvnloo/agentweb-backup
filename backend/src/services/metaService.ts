@@ -2045,7 +2045,13 @@ export class MetaService {
 
       const userData: Record<string, any> = {};
       if (event.email) userData.em = [sha256(event.email.trim().toLowerCase())];
-      if (event.phone) userData.ph = [sha256(event.phone.replace(/[^0-9]/g, ''))];
+      // Meta's documented CAPI normalization for `ph`: digits only, then strip any leading
+      // zero(s) (a common national-dialing-prefix artifact, e.g. a UK number entered as
+      // "07911123456" should normalize the same as "7911123456" before country-code
+      // prefixing). This does not add a missing country code — no user locale is available
+      // here — so a phone entered without one will still under-match; that's a data-quality
+      // gap, not something this normalization step can fix on its own.
+      if (event.phone) userData.ph = [sha256(event.phone.replace(/[^0-9]/g, '').replace(/^0+/, ''))];
       if (event.firstName) userData.fn = [sha256(event.firstName.trim().toLowerCase())];
       if (event.lastName) userData.ln = [sha256(event.lastName.trim().toLowerCase())];
       if (event.clientIp) userData.client_ip_address = event.clientIp;

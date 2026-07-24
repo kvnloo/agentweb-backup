@@ -1,5 +1,6 @@
 import * as crypto from 'crypto';
 import express from 'express';
+import rateLimit from 'express-rate-limit';
 import { IncomingMessage } from 'http';
 import { WebhookRequiredHeaders } from 'svix';
 import { webhookService, ResendWebhookEvent } from '../services/webhookService';
@@ -309,8 +310,28 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
   }
 });
 
+// ENG-490: this endpoint is public and unauthenticated by design — any generated customer
+// site's capture route needs to reach it with no login. Before ENG-449, unbounded abuse here
+// only created junk CRM leads. Since ENG-449, pixelId/metaAccountId also flow through to a
+// real server-side Meta CAPI send using the ACTUAL page owner's own access token (safely
+// scoped — see metaAccountCredentials.ts — so this can't leak a DIFFERENT customer's
+// credentials), which means a scripted flood can now pollute a real customer's live ad
+// account with fake "Lead" conversions, skewing their actual paid campaign's optimization.
+// Keyed by IP (same pattern as auth.ts's login limiter), not by listId/pixelId, so a
+// popular page's many distinct real visitors never throttle each other.
+const forwardLeadRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  // supertest requests all share one address with no real per-test isolation, and this
+  // suite's existing tests already send far more than 20 requests to this endpoint.
+  skip: () => process.env.NODE_ENV === 'test',
+  message: { success: false, message: 'Too many submissions from this address. Please try again later.' },
+});
+
 // Public endpoint for forwarding leads to CRM
-router.post('/forward-lead', async (req: express.Request, res: express.Response) => {
+router.post('/forward-lead', forwardLeadRateLimiter, async (req: express.Request, res: express.Response) => {
   // Set CORS headers to allow all origins for this endpoint
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
