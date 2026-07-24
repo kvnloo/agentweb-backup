@@ -12,6 +12,13 @@ const router = Router();
 // caller who spams it could exhaust app-wide quota or trip LinkedIn abuse detection
 // for every tenant. Throttle how often a single user can trigger it, returning 429
 // when called too soon. Mirrors the SEO GA-probe per-user cooldown convention.
+//
+// Process-local by design, same trade-off as the loop-events rate limiter
+// (routes/loopEvents.ts): sufficient as long as the backend runs a single
+// instance (currently pinned at MinSize=MaxSize=1 in production). If backend
+// auto-scaling is ever turned on in production, replace this with a shared
+// store (e.g. a DynamoDB item with a conditional write + TTL) so the cooldown
+// is enforced across instances instead of per-process.
 const FORCE_RELOAD_COOLDOWN_MS = 60_000;
 const forceReloadCooldown = new Map<string, number>();
 
