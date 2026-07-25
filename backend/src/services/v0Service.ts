@@ -517,6 +517,22 @@ export interface GeneratedLandingPage {
    * freeform, so this can only be checked, never platform-guaranteed.
    */
   bridgeOutVerified?: boolean;
+  /**
+   * ENG-449 gap #3: result of the automated post-deploy Playwright smoke test
+   * (loads the live page, submits the lead form for real, confirms the lead lands in
+   * the CRM and — if a pixel is configured — that a real facebook.com/tr request
+   * fired). Unlike pixelLeadEventVerified/bridgeOutVerified (static code checks at
+   * generation time), this verifies the actually-deployed, actually-live page.
+   * Written by runGenerationSmokeTest (landingPageSmokeTest.ts), fire-and-forget
+   * after deploy — absent until that first run completes.
+   */
+  smokeTestResult?: {
+    ok: boolean;
+    leadCaptured?: boolean;
+    pixelFired?: boolean;
+    checkedAt: string;
+    error?: string;
+  };
   context?: string;
   /**
    * State captured at the most recent publish, used to revert it. The pre-merge
@@ -2109,6 +2125,11 @@ async function addPageToExistingRepo(
       .promise();
 
     void enqueueLandingPageHumanEval(deployedSubPage);
+    // Dynamic import: landingPageSmokeTest.ts imports FROM this module (GeneratedLandingPage,
+    // updateLandingPageSmokeTestResult), so a static import here would be circular.
+    void import("./landingPageSmokeTest")
+      .then((m) => m.runGenerationSmokeTest(deployedSubPage))
+      .catch((err) => console.warn(`[V0 SERVICE] Smoke test dispatch failed: ${err?.message}`));
 
     return deployedSubPage;
   } catch (error: any) {
@@ -2949,6 +2970,11 @@ export async function deployLandingPage(
     };
 
     void enqueueLandingPageHumanEval(deployedRecord);
+    // Dynamic import: landingPageSmokeTest.ts imports FROM this module (GeneratedLandingPage,
+    // updateLandingPageSmokeTestResult), so a static import here would be circular.
+    void import("./landingPageSmokeTest")
+      .then((m) => m.runGenerationSmokeTest(deployedRecord))
+      .catch((err) => console.warn(`[V0 SERVICE] Smoke test dispatch failed: ${err?.message}`));
 
     return deployedRecord;
   } catch (error: any) {
@@ -5588,6 +5614,33 @@ export async function updateLandingPageMetaPixel(
         ExpressionAttributeValues: { ":now": new Date().toISOString() },
       })
       .promise();
+  }
+}
+
+/**
+ * ENG-449 gap #3: persists the result of the post-deploy Playwright smoke test
+ * (runGenerationSmokeTest, landingPageSmokeTest.ts). Fire-and-forget by design — never
+ * throws, only warns, since a failed WRITE of the result must not itself become a new
+ * unhandled rejection in a background task nobody is awaiting.
+ */
+export async function updateLandingPageSmokeTestResult(
+  id: string,
+  result: NonNullable<GeneratedLandingPage["smokeTestResult"]>
+): Promise<void> {
+  try {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "SET smokeTestResult = :result, updatedAt = :now",
+        ExpressionAttributeValues: {
+          ":result": result,
+          ":now": new Date().toISOString(),
+        },
+      })
+      .promise();
+  } catch (error: any) {
+    console.warn(`[V0 SERVICE] Could not persist smoke test result for page ${id}: ${error?.message}`);
   }
 }
 
