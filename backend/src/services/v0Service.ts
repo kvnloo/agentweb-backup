@@ -3760,8 +3760,31 @@ export async function fireLeadTracking(opts: {
   }
 
   if (opts.bridgeOutUrl) {
-    const separator = opts.bridgeOutUrl.includes("?") ? "&" : "?";
-    window.location.href = \`\${opts.bridgeOutUrl}\${separator}email=\${encodeURIComponent(opts.email)}\`;
+    // ENG-449 (Harsha): bridge-out must forward UTMs, not just email — the 3rd-party
+    // destination needs the SAME ad-attribution params that got this visitor here, or
+    // conversion tracking on THEIR side breaks even though ours is fine. Read them off
+    // this page's own URL (they arrived via the ad click that landed here) and pass
+    // them straight through, alongside email. Uses the URL API (not manual string
+    // building) so a utm_* param the destination URL was explicitly configured with
+    // is NEVER clobbered/duplicated — an explicit override on the destination always wins.
+    try {
+      const url = new URL(opts.bridgeOutUrl);
+      url.searchParams.set("email", opts.email);
+      if (typeof window !== "undefined") {
+        const currentParams = new URLSearchParams(window.location.search);
+        for (const key of ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"]) {
+          if (url.searchParams.has(key)) continue;
+          const value = currentParams.get(key);
+          if (value) url.searchParams.set(key, value);
+        }
+      }
+      window.location.href = url.toString();
+    } catch (err) {
+      // A malformed bridgeOutUrl shouldn't crash the whole submit flow — the lead was
+      // already captured via /api/capture before this ever runs. Degrade gracefully
+      // (stay on the success state) rather than throw past a caller that isn't expecting it.
+      console.error("fireLeadTracking: invalid bridgeOutUrl, skipping redirect", err);
+    }
   }
 }
 `;
