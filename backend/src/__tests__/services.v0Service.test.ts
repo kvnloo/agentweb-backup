@@ -595,7 +595,10 @@ describe("v0Service - buildTrackingHelper", () => {
     expect(src).toContain("'Lead'");
     expect(src).toContain("800");
     expect(src).toContain("window.location.href");
-    expect(src).toContain("encodeURIComponent");
+    // Query building uses the URL API now (searchParams.set), not manual
+    // encodeURIComponent string concatenation — see the dedicated UTM test below
+    // for why (respecting an explicit override already on the destination URL).
+    expect(src).toContain("URLSearchParams");
     // pixelId/bridgeOutUrl are CALL-TIME arguments (per-page data), not baked into this
     // repo-level shared file — a page's own values are literal args v0 is instructed to pass.
     expect(src).toContain("pixelId");
@@ -606,6 +609,34 @@ describe("v0Service - buildTrackingHelper", () => {
     // server-side CAPI event_id, silently breaking dedup.
     expect(src).toContain("eventId");
     expect(src).not.toContain("crypto.randomUUID");
+  });
+
+  it("SUCCESS (ENG-449): bridge-out forwards UTMs alongside email, read from the current page's own URL", () => {
+    const src = buildTrackingHelper();
+    expect(src).toContain("window.location.search");
+    expect(src).toContain("URLSearchParams");
+    for (const key of ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"]) {
+      expect(src).toContain(key);
+    }
+  });
+
+  it("SUCCESS (ENG-449): an explicit utm_* param already on the bridge-out URL is never overridden — source asserts the override-respecting guard", () => {
+    const src = buildTrackingHelper();
+    // A same-named-key match alone wouldn't prove the guard is real (a same-looking
+    // string could still omit the check). Assert the specific defensive line directly:
+    // the destination URL's OWN params are checked first, before ever copying one over.
+    expect(src).toContain("url.searchParams.has(key)");
+    expect(src).toContain("continue");
+  });
+
+  it("SUCCESS (gap follow-up): a malformed bridgeOutUrl degrades gracefully instead of throwing", () => {
+    const src = buildTrackingHelper();
+    // new URL(opts.bridgeOutUrl) throws on a malformed value — a persisted-record edge
+    // case that shouldn't crash the whole submit flow (the lead is already captured via
+    // /api/capture by the time this runs). Assert the guard exists around it.
+    expect(src).toContain("try {");
+    expect(src).toContain("catch (err)");
+    expect(src).toMatch(/catch \(err\) \{[\s\S]*console\.error/);
   });
 });
 
