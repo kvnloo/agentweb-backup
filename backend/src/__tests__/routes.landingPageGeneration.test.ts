@@ -48,6 +48,8 @@ const mockGetUserById = jest.fn();
 const mockGetOrgById = jest.fn();
 const mockGetLeadListById = jest.fn();
 const mockUpdateLeadList = jest.fn();
+const mockGetLeadListsForUser = jest.fn();
+const mockCreateLeadList = jest.fn();
 
 jest.mock("../services/db", () => ({
   userDb: {
@@ -60,6 +62,8 @@ jest.mock("../services/db", () => ({
   crmDb: {
     getLeadListById: (...args: any[]) => mockGetLeadListById(...args),
     updateLeadList: (...args: any[]) => mockUpdateLeadList(...args),
+    getLeadListsForUser: (...args: any[]) => mockGetLeadListsForUser(...args),
+    createLeadList: (...args: any[]) => mockCreateLeadList(...args),
   },
 }));
 
@@ -218,6 +222,16 @@ beforeEach(() => {
     brandName: "TestBrand",
     logoUrl: "https://s3/brand/logo.png",
   });
+  // ENG-449 capture-or-fail gate: generation requires an existing, bound lead
+  // list. Default to a resolvable one so unrelated tests pass the gate; the
+  // dedicated capture-or-fail tests override per-call.
+  mockGetLeadListById.mockResolvedValue({ id: "list-1", publicAccessEnabled: true });
+  // Default-list auto-resolve path: default to "already exists" so tests that omit
+  // lead_list_id don't accidentally exercise list creation unless they mean to.
+  mockGetLeadListsForUser.mockResolvedValue([
+    { listId: "default-list-1", name: "Landing Page Leads", publicAccessEnabled: true, isSystemManaged: true },
+  ]);
+  mockCreateLeadList.mockResolvedValue({ listId: "default-list-1", publicAccessEnabled: false });
   _resetRateLimitState();
 });
 
@@ -267,7 +281,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
     const exactPrompt = "a".repeat(10_000);
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: exactPrompt });
+      .send({ prompt: exactPrompt, lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
   });
@@ -277,7 +291,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a page" });
+      .send({ prompt: "Create a page", lead_list_id: "list-1" });
 
     expect(res.status).toBe(500);
   });
@@ -312,7 +326,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a pricing page", name: "Test Page" });
+      .send({ prompt: "Create a pricing page", name: "Test Page", lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
     expect(res.body.status).toBe("draft");
@@ -343,6 +357,24 @@ describe("POST /api/landing-pages/v0/generate", () => {
     expect(mockUpdateLeadList).not.toHaveBeenCalled();
   });
 
+  it("FAIL: no persisted brand logo AND lead_list_id omitted → 422, and NO default list is provisioned (side effect must not fire on a rejected request)", async () => {
+    mockGetUserById.mockResolvedValue({ userId: "test-user-id" });
+    mockBuildBrandContextFromUser.mockReturnValue({ brandName: "TestBrand" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a pricing page" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toBe("missing_brand_logo");
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+    // The bug this test locks in: the default-list auto-resolve/create step must run
+    // AFTER the brand-logo gate, never before — otherwise every failed generation
+    // attempt from a user with no saved logo would silently spawn an orphan lead list.
+    expect(mockGetLeadListsForUser).not.toHaveBeenCalled();
+    expect(mockCreateLeadList).not.toHaveBeenCalled();
+  });
+
   it("SUCCESS: org member → the projection receives the ORG brandGuidelines (logo lives on the org record)", async () => {
     const orgBrand = {
       brandData: { brandName: "OrgBrand" },
@@ -359,7 +391,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a page" });
+      .send({ prompt: "Create a page", lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
     expect(mockBuildBrandContextFromUser).toHaveBeenCalledWith(userRecord, orgBrand);
@@ -383,7 +415,8 @@ describe("POST /api/landing-pages/v0/generate", () => {
       .post("/api/landing-pages/v0/generate")
       .send({
         prompt: "Create a B2B page",
-        template_id: "event-marketing-id"
+        template_id: "event-marketing-id",
+        lead_list_id: "list-1"
       });
 
     expect(res.status).toBe(201);
@@ -401,7 +434,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a page", template_id: "event-marketing-id" });
+      .send({ prompt: "Create a page", template_id: "event-marketing-id", lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
     expect(mockGetSetting).toHaveBeenCalled();
@@ -414,7 +447,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a page", template_id: "unknown-xyz" });
+      .send({ prompt: "Create a page", template_id: "unknown-xyz", lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
     expect(mockGetSetting).toHaveBeenCalled();
@@ -428,7 +461,9 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
   it("SUCCESS: auto-enables public access on lead list if disabled", async () => {
     mockGetUserById.mockResolvedValueOnce({ userId: "test-user-id" });
-    mockGetLeadListById.mockResolvedValueOnce({ id: "list-123", publicAccessEnabled: false });
+    // Fetched twice (existence-validation gate, then the auto-enable-public-access
+    // step) — mockResolvedValue (not Once) so both calls see the disabled state.
+    mockGetLeadListById.mockResolvedValue({ id: "list-123", publicAccessEnabled: false });
     mockUpdateLeadList.mockResolvedValueOnce({});
     mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
 
@@ -441,6 +476,154 @@ describe("POST /api/landing-pages/v0/generate", () => {
     
     // Verify generation service was called with the lead_list_id
     expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("list-123");
+  });
+
+  it("SUCCESS (ENG-449 capture-or-fail): lead_list_id omitted → auto-resolves the existing default list, generation proceeds bound to it", async () => {
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page" });
+
+    expect(res.status).toBe(201);
+    expect(mockGetLeadListsForUser).toHaveBeenCalledWith("test-user-id");
+    expect(mockCreateLeadList).not.toHaveBeenCalled();
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("default-list-1");
+  });
+
+  it("SUCCESS (ENG-449 capture-or-fail): no default list exists yet → creates one, generation proceeds bound to it", async () => {
+    mockGetLeadListsForUser.mockResolvedValueOnce([]);
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page" });
+
+    expect(res.status).toBe(201);
+    expect(mockCreateLeadList).toHaveBeenCalledWith(
+      "test-user-id",
+      "Landing Page Leads",
+      expect.any(String),
+      undefined,
+      null,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "sales",
+      true
+    );
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("default-list-1");
+  });
+
+  it("SUCCESS (ENG-449 capture-or-fail): a same-named list the user made themselves is ignored (not isSystemManaged) — a fresh default is created instead", async () => {
+    mockGetLeadListsForUser.mockResolvedValueOnce([
+      { listId: "user-owned-list", name: "Landing Page Leads", publicAccessEnabled: false }, // no isSystemManaged
+    ]);
+    mockCreateLeadList.mockResolvedValueOnce({ listId: "new-default-list", publicAccessEnabled: false });
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page" });
+
+    expect(res.status).toBe(201);
+    expect(mockCreateLeadList).toHaveBeenCalled();
+    // Never bound to the unrelated user-owned list that happened to share the name.
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("new-default-list");
+  });
+
+  it("SUCCESS (ENG-449 capture-or-fail): concurrent omitted-lead_list_id requests singleflight — only ONE list gets created", async () => {
+    mockGetLeadListsForUser.mockResolvedValue([]); // no default exists yet, for either call
+    // A real (short) delay, not a manually-held-open promise — a promise resolved
+    // synchronously right after firing both requests can settle before either
+    // request's actual async I/O reaches the mock, closing the race window before
+    // it opens. A real setTimeout guarantees both requests have time to arrive.
+    mockCreateLeadList.mockImplementationOnce(
+      () => new Promise((resolve) => setTimeout(() => resolve({ listId: "new-default-list", publicAccessEnabled: false }), 20))
+    );
+    mockGenerateLandingPage.mockResolvedValue({ id: "page-1", status: "draft" });
+
+    const [res1, res2] = await Promise.all([
+      request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page A" }),
+      request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page B" }),
+    ]);
+
+    expect(res1.status).toBe(201);
+    expect(res2.status).toBe(201);
+    expect(mockCreateLeadList).toHaveBeenCalledTimes(1);
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("new-default-list");
+    expect(mockGenerateLandingPage.mock.calls[1][4]).toBe("new-default-list");
+  });
+
+  it("SUCCESS (ENG-449 capture-or-fail): default-list resolution retries once on a transient failure", async () => {
+    mockGetLeadListsForUser
+      .mockRejectedValueOnce(new Error("transient DynamoDB blip"))
+      .mockResolvedValueOnce([{ listId: "default-list-1", name: "Landing Page Leads", isSystemManaged: true, publicAccessEnabled: true }]);
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page" });
+
+    expect(res.status).toBe(201);
+    expect(mockGetLeadListsForUser).toHaveBeenCalledTimes(2);
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("default-list-1");
+  });
+
+  it("FAIL (ENG-449 capture-or-fail): default-list resolution fails twice → 500, never generates unbound", async () => {
+    mockGetLeadListsForUser.mockRejectedValue(new Error("DynamoDB is down"));
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page" });
+
+    expect(res.status).toBe(500);
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS (ENG-449 capture-or-fail): lead_list_id is an empty string → treated as omitted, auto-resolves default", async () => {
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "" });
+
+    expect(res.status).toBe(201);
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("default-list-1");
+  });
+
+  it("FAIL (ENG-449 capture-or-fail): lead_list_id is not a string → 400", async () => {
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: 12345 });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("lead_list_id must be a string");
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+  });
+
+  it("FAIL (ENG-449 capture-or-fail): lead_list_id does not resolve to a real list → 400, never generates", async () => {
+    mockGetLeadListById.mockResolvedValueOnce(null);
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "nonexistent-list" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/does not exist/);
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS (ENG-449 capture-or-fail): valid, existing lead_list_id → generation proceeds", async () => {
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1" });
+
+    expect(res.status).toBe(201);
+    expect(mockGetLeadListById).toHaveBeenCalledWith("list-1");
   });
 
   it("FAIL: bridge_out_url is not a well-formed http(s) URL → 400", async () => {
@@ -491,7 +674,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a page" });
+      .send({ prompt: "Create a page", lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
     expect(mockGenerateLandingPage.mock.calls[0][6].bridgeOutUrl).toBeUndefined();
@@ -503,7 +686,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a page", template_html: "<html></html>" });
+      .send({ prompt: "Create a page", template_html: "<html></html>", lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
     expect(mockedExtractOutline).toHaveBeenCalledWith("<html></html>");
@@ -518,7 +701,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
     const largeHtml = "<html><body><section id='hero'>Hello</section></body></html>";
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Deploy this page", template_html: largeHtml });
+      .send({ prompt: "Deploy this page", template_html: largeHtml, lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
     // extractTemplateOutline must be called on the raw uploaded HTML
@@ -533,7 +716,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a page", template_html: "<html>uploaded</html>", template_id: "some-template-id" });
+      .send({ prompt: "Create a page", template_html: "<html>uploaded</html>", template_id: "some-template-id", lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
     // template_html was condensed from uploaded content
@@ -999,6 +1182,48 @@ describe("POST /api/landing-pages/v0/generated/:id/duplicate", () => {
     expect(res.body.error).toBe("missing_brand_logo");
     expect(mockGenerateLandingPage).not.toHaveBeenCalled();
   });
+
+  it("SUCCESS (ENG-449 capture-or-fail): the original page's own leadListId is carried over to the duplicate, no default-list resolution", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Original",
+      prompt: "Build a page",
+      status: "deployed",
+      iterations: 0,
+      leadListId: "list-original",
+    });
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(201);
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("list-original");
+    expect(mockGetLeadListsForUser).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS (ENG-449 capture-or-fail): the original page has no leadListId → duplicate resolves the default list, never generates unbound", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Original",
+      prompt: "Build a page",
+      status: "deployed",
+      iterations: 0,
+      // no leadListId
+    });
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(201);
+    expect(mockGetLeadListsForUser).toHaveBeenCalledWith("test-user-id");
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("default-list-1");
+  });
 });
 
 describe("Rate limiting on expensive endpoints", () => {
@@ -1009,14 +1234,14 @@ describe("Rate limiting on expensive endpoints", () => {
     for (let i = 0; i < 10; i++) {
       const res = await request(app)
         .post("/api/landing-pages/v0/generate")
-        .send({ prompt: "Create a page" });
+        .send({ prompt: "Create a page", lead_list_id: "list-1" });
       expect(res.status).toBe(201);
     }
 
     // 11th request should be rate limited
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a page" });
+      .send({ prompt: "Create a page", lead_list_id: "list-1" });
 
     expect(res.status).toBe(429);
     expect(res.body.error).toMatch(/Rate limit exceeded/);
@@ -1029,7 +1254,7 @@ describe("Rate limiting on expensive endpoints", () => {
 
     // 4 generate
     for (let i = 0; i < 4; i++) {
-      await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page" });
+      await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page", lead_list_id: "list-1" });
     }
     // 3 deploy
     for (let i = 0; i < 3; i++) {
@@ -1051,17 +1276,17 @@ describe("Rate limiting on expensive endpoints", () => {
     mockGenerateLandingPage.mockResolvedValue({ id: "page-1", status: "draft" });
 
     for (let i = 0; i < 10; i++) {
-      await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page" });
+      await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page", lead_list_id: "list-1" });
     }
 
     // Rate limited
-    let res = await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page" });
+    let res = await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page", lead_list_id: "list-1" });
     expect(res.status).toBe(429);
 
     // Reset (simulates window expiration)
     _resetRateLimitState();
 
-    res = await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page" });
+    res = await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page", lead_list_id: "list-1" });
     expect(res.status).toBe(201);
   });
 
@@ -1071,7 +1296,7 @@ describe("Rate limiting on expensive endpoints", () => {
     for (let i = 0; i < 8; i++) {
       const r = await request(app)
         .post("/api/landing-pages/v0/generate")
-        .send({ prompt: "Page" });
+        .send({ prompt: "Page", lead_list_id: "list-1" });
       expect(r.status).toBe(201);
     }
 
@@ -1080,7 +1305,7 @@ describe("Rate limiting on expensive endpoints", () => {
     for (let i = 0; i < 5; i++) {
       const r = await request(app)
         .post("/api/landing-pages/v0/generate")
-        .send({ prompt: "Page" });
+        .send({ prompt: "Page", lead_list_id: "list-1" });
       expect(r.status).toBe(500);
     }
 
@@ -1088,7 +1313,7 @@ describe("Rate limiting on expensive endpoints", () => {
     mockGenerateLandingPage.mockResolvedValue({ id: "page-2", status: "draft" });
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Page" });
+      .send({ prompt: "Page", lead_list_id: "list-1" });
     expect(res.status).toBe(201);
   });
 
