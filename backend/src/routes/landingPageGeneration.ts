@@ -65,6 +65,85 @@ const EDIT_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 
 const REUSABLE_PREVIEW_BRANCH = "draft/agentweb-preview";
 
+const DEFAULT_LANDING_PAGE_LEAD_LIST_NAME = "Landing Page Leads";
+
+// Singleflight for default-list resolution, keyed by orgId-or-userId (the same
+// identity boundary the org-shared list lookup uses). Prod runs a single backend
+// instance today (verified 2026-07-24), so this fully closes the double-click /
+// two-tabs / two-org-members-simultaneously-generating race — two concurrent
+// callers sharing a key join the SAME resolve-or-create call instead of each
+// racing to create their own default list. Same scope caveat as the analogous
+// fix in metaTokenRefresh.ts: per-process only, revisit if ever scaled to 2+ instances.
+const inFlightDefaultListResolutions = new Map<string, Promise<{ id: string; publicAccessEnabled: boolean }>>();
+
+async function resolveDefaultListOnce(userId: string): Promise<{ id: string; publicAccessEnabled: boolean }> {
+  // Only match a list WE created (isSystemManaged), never an unrelated pre-existing
+  // list a user happens to have named the same thing — a name-only match could
+  // silently start routing landing-page leads into a list the user made for some
+  // other purpose. isSystemManaged is only ever set by this function's own create call.
+  const existing = await crmDb.getLeadListsForUser(userId);
+  const match = (existing || []).find(
+    (l: any) => l && l.isSystemManaged === true && l.name === DEFAULT_LANDING_PAGE_LEAD_LIST_NAME
+  );
+  if (match) {
+    return { id: match.listId, publicAccessEnabled: !!match.publicAccessEnabled };
+  }
+  console.log(`[LP GENERATION] No default lead list found for user ${userId} — creating "${DEFAULT_LANDING_PAGE_LEAD_LIST_NAME}"`);
+  const created = await crmDb.createLeadList(
+    userId,
+    DEFAULT_LANDING_PAGE_LEAD_LIST_NAME,
+    "Auto-created default list for landing pages generated without an explicit lead list. System-managed.",
+    undefined, // alertEvents
+    null, // listSenderId
+    undefined, // autoDraftEnabled
+    undefined, // autoDraftInstruction
+    undefined, // autoSendEnabled
+    undefined, // statusConfig — defaults to sales-style
+    "sales", // listType
+    true // isSystemManaged
+  );
+  return { id: (created as any).listId, publicAccessEnabled: !!(created as any).publicAccessEnabled };
+}
+
+/**
+ * ENG-449 capture-or-fail: resolve (or create) the default lead list a landing
+ * page generated with no explicit lead_list_id gets bound to, so no page is ever
+ * generated unbound. Idempotent by name+isSystemManaged, org-aware (mirrors
+ * signupAutoEnrollService's ensureFoundersSignupsList pattern) — org members
+ * share ONE default list rather than one each, consistent with how brand
+ * guidelines are already org-shared in this same route.
+ *
+ * Retries once on failure (transient DynamoDB blips happen) before giving up —
+ * but deliberately does NOT swallow a persistent failure and fall back to
+ * "proceed unbound": that would silently reintroduce the exact bug this fix
+ * exists to close. A persistent failure here is meant to fail the generation
+ * request loudly, not slip an unbound page through.
+ */
+async function resolveOrCreateDefaultLeadList(
+  userId: string,
+  orgId?: string
+): Promise<{ id: string; publicAccessEnabled: boolean }> {
+  const key = orgId || userId;
+  let inFlight = inFlightDefaultListResolutions.get(key);
+  if (!inFlight) {
+    inFlight = (async () => {
+      try {
+        return await resolveDefaultListOnce(userId);
+      } catch (firstError) {
+        console.warn(`[LP GENERATION] Default lead list resolution failed once, retrying:`, firstError);
+        return await resolveDefaultListOnce(userId);
+      }
+    })();
+    inFlightDefaultListResolutions.set(key, inFlight);
+    // .finally()'s returned promise re-throws on rejection — if left unhandled (and
+    // uncaught, since the ORIGINAL inFlight's rejection is separately handled by
+    // whoever awaits resolveOrCreateDefaultLeadList), it surfaces as an unhandled
+    // promise rejection. The cleanup itself can't fail (a synchronous Map.delete).
+    inFlight.finally(() => inFlightDefaultListResolutions.delete(key)).catch(() => {});
+  }
+  return inFlight;
+}
+
 function validateBranchName(branch: string): boolean {
   return branch === "main" || branch === REUSABLE_PREVIEW_BRANCH;
 }
@@ -362,6 +441,21 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       return res.status(400).json({ error: `prompt must not exceed ${MAX_INPUT_LENGTH} characters` });
     }
 
+    // ENG-449 (Harsha, 2026-07-24) capture-or-fail, explicit lead_list_id case: if the
+    // caller names a specific list, it must actually exist — that's a genuine bad-input
+    // error, fail loud. (The no-list-given case is handled AFTER the brand-logo gate
+    // below, since it may provision a list — a real side effect that must not happen
+    // on a request that's about to be rejected for an unrelated reason.)
+    if (lead_list_id !== undefined && lead_list_id !== null && lead_list_id !== "") {
+      if (typeof lead_list_id !== "string") {
+        return res.status(400).json({ error: "lead_list_id must be a string" });
+      }
+      const explicitList = await crmDb.getLeadListById(lead_list_id);
+      if (!explicitList) {
+        return res.status(400).json({ error: `lead_list_id "${lead_list_id}" does not exist` });
+      }
+    }
+
     const pageName = name || prompt.slice(0, 60);
 
     // Brand guidelines + market strategy for maximum context. The shared
@@ -388,17 +482,27 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       });
     }
 
-    // Auto-enable public access on the lead list so the landing page form works
-    if (lead_list_id) {
-      try {
-        const list = await crmDb.getLeadListById(lead_list_id);
-        if (list && !list.publicAccessEnabled) {
-          await crmDb.updateLeadList(lead_list_id, { publicAccessEnabled: true });
-          console.log(`[LP GENERATION] Auto-enabled public access on lead list ${lead_list_id}`);
-        }
-      } catch (err) {
-        console.warn(`[LP GENERATION] Could not auto-enable public access on lead list:`, err);
+    // ENG-449 capture-or-fail: every generated page ships bound to a REAL lead list —
+    // either the caller's explicit one (already validated to exist above) or, if none
+    // was given, an auto-resolved/created default. No page is ever generated unbound.
+    // Placed AFTER the brand-logo gate so a request that's about to be rejected for an
+    // unrelated reason never triggers the (write) side effect of provisioning a list.
+    const effectiveLeadListId: string =
+      typeof lead_list_id === "string" && lead_list_id !== ""
+        ? lead_list_id
+        : (await resolveOrCreateDefaultLeadList(userId, caller?.orgId)).id;
+
+    // Auto-enable public access on the lead list so the landing page form works.
+    // Only the enabling WRITE is best-effort here: a transient DB hiccup on this side
+    // effect shouldn't block generation (unlike a genuinely missing explicit list).
+    try {
+      const boundLeadList = await crmDb.getLeadListById(effectiveLeadListId);
+      if (boundLeadList && !boundLeadList.publicAccessEnabled) {
+        await crmDb.updateLeadList(effectiveLeadListId, { publicAccessEnabled: true });
+        console.log(`[LP GENERATION] Auto-enabled public access on lead list ${effectiveLeadListId}`);
       }
+    } catch (err) {
+      console.warn(`[LP GENERATION] Could not auto-enable public access on lead list:`, err);
     }
 
     // Effective site mode, WRITE-ONCE locked. A saved mode is immutable (switching
@@ -411,7 +515,7 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
         .catch((e) => console.warn(`[LP GENERATION] could not lock site mode: ${e?.message}`));
     }
 
-    const result = await generateLandingPage(userId, prompt, pageName, brandContext, lead_list_id, template_html, {
+    const result = await generateLandingPage(userId, prompt, pageName, brandContext, effectiveLeadListId, template_html, {
       siteId: typeof site_id === "string" ? site_id : undefined,
       originatingSessionId: typeof originating_session_id === "string" ? originating_session_id : undefined,
       mode: effectiveMode,
@@ -743,7 +847,13 @@ router.post("/generated/:id/duplicate", async (req, res: Response) => {
       });
     }
 
-    const result = await generateLandingPage(userId, original.prompt, newName, brandContext);
+    // ENG-449 capture-or-fail: carry over the original page's own list if it had one;
+    // otherwise resolve/create the same default list /generate uses. A duplicated page
+    // used to start completely unbound — this closes that gap without needing a new
+    // request field, consistent with the "no page is ever generated unbound" intent.
+    const leadListId = original.leadListId || (await resolveOrCreateDefaultLeadList(userId, user?.orgId)).id;
+
+    const result = await generateLandingPage(userId, original.prompt, newName, brandContext, leadListId);
     res.status(201).json(result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error duplicating:", error);
