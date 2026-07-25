@@ -67,6 +67,9 @@ import webhookRouter from '../routes/webhooks';
 import { crmDb, userDb } from '../services/db';
 import { metaService } from '../services/metaService';
 import { getMetaAccountCredentials } from '../services/metaAccountCredentials';
+import { dripSequenceDb } from '../services/dripSequenceDb';
+import { externalCrmSyncService } from '../services/externalCrmSyncService';
+import { leadListAlertService } from '../services/leadListAlertService';
 
 const app = express();
 app.use(express.json());
@@ -268,5 +271,52 @@ describe('forward-lead: fbp/fbc forwarded to CAPI when the client sent them (ENG
     const call = (metaService.sendCapiLeadEvent as jest.Mock).mock.calls[0];
     expect(call[2].fbp).toBeUndefined();
     expect(call[2].fbc).toBeUndefined();
+  });
+});
+
+describe('forward-lead: synthetic smoke-test leads skip all side effects (ENG-449 gap #3)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (crmDb.getLeadListById as jest.Mock).mockImplementation((listId: string) =>
+      Promise.resolve({ listId, userId: 'user_123', name: 'Test List', publicAccessEnabled: true }),
+    );
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+    (crmDb.createLead as jest.Mock).mockImplementation((listId: string, data: any) =>
+      Promise.resolve({ leadId: `lead_${Math.random()}`, listId, ...data }),
+    );
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user_123', connected_accounts: [] });
+    (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'acc1', accessToken: 'tok', accountName: 'Acc 1' });
+    (metaService.sendCapiLeadEvent as jest.Mock).mockResolvedValue({ success: true });
+  });
+
+  it('SUCCESS: a smoke-test lead (smoke-test+<ts>@agentweb.pro) still saves and gets a 201, but skips CAPI/CRM-sync/sequence-enrollment/owner-notify', async () => {
+    const res = await request(app).post('/api/webhooks/forward-lead').send({
+      listId: 'list_smoke_test',
+      email: 'smoke-test+1721000000000@agentweb.pro',
+      pixelId: '1430870751246428',
+      metaAccountId: 'acc1',
+      eventId: 'evt_smoke_test',
+    });
+    await flushAsyncWork();
+
+    expect(res.status).toBe(201);
+    expect(metaService.sendCapiLeadEvent).not.toHaveBeenCalled();
+    expect(externalCrmSyncService.autoSyncLead).not.toHaveBeenCalled();
+    expect(dripSequenceDb.getSequencesByAutoEnrollList).not.toHaveBeenCalled();
+    expect(leadListAlertService.notifyLeadListOwnerIfConfigured).not.toHaveBeenCalled();
+  });
+
+  it('FAIL (regression guard): a real lead with a similar-looking but non-matching email still gets the full side-effect cascade', async () => {
+    await request(app).post('/api/webhooks/forward-lead').send({
+      listId: 'list_real_lead',
+      email: 'smoke-test-but-not-really@agentweb.pro', // doesn't match the strict pattern
+      pixelId: '1430870751246428',
+      metaAccountId: 'acc1',
+      eventId: 'evt_real',
+    });
+    await flushAsyncWork();
+
+    expect(metaService.sendCapiLeadEvent).toHaveBeenCalled();
+    expect(externalCrmSyncService.autoSyncLead).toHaveBeenCalled();
   });
 });
