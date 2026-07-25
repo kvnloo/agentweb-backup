@@ -114,6 +114,10 @@ jest.mock("../services/settingsService", () => ({
 jest.mock("../services/autoHumanEvalService", () => ({
   enqueueAutoHumanEval: jest.fn().mockResolvedValue(null),
 }), { virtual: true });
+const mockRunGenerationSmokeTest = jest.fn().mockResolvedValue(undefined);
+jest.mock("../services/landingPageSmokeTest", () => ({
+  runGenerationSmokeTest: (...args: any[]) => mockRunGenerationSmokeTest(...args),
+}));
 
 // Mock fs for filesystem fallback tests
 const mockFsExistsSync = jest.fn().mockReturnValue(false);
@@ -1824,6 +1828,15 @@ describe("v0Service - deployLandingPage", () => {
         userId: "user-1",
       },
     }));
+
+    // ENG-449 gap #3: dispatched via a dynamic import (avoids a circular import with
+    // landingPageSmokeTest.ts, which imports FROM this module) — flush microtasks so
+    // that import()'s .then() chain has a chance to run before asserting.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mockRunGenerationSmokeTest).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "page-1", status: "deployed" })
+    );
   });
 
   it("FAIL: chats.downloadVersion throws → throws deployment error", async () => {
