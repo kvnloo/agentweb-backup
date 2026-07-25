@@ -43,6 +43,7 @@ import { injectGtmIntoLayout, verifyGtmInjection } from "../utils/gtmInjection";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { MISSING_BRAND_LOGO_ERROR } from "../services/agentMode/brandLogo";
 import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
+import { verifyLanderLiveMapping } from "../services/landerLiveMappingCheck";
 
 const router = Router();
 
@@ -942,6 +943,29 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
     } else {
       res.status(500).json({ error: `GitHub API error (${ghStatus || 'unknown'}): ${ghMessage}` });
     }
+  }
+});
+
+/**
+ * GET /api/landing-pages/v0/generated/:id/verify-live-mapping
+ * ENG-496: verify this page's stored githubRepoUrl/vercelProjectId against
+ * what Vercel is ACTUALLY serving at its live URL. Surfaces a sibling record
+ * whose own githubRepoUrl matches reality when this one has drifted — the
+ * same manual GitHub-search step Harsha had to do by hand during ENG-443.
+ */
+router.get("/generated/:id/verify-live-mapping", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "view");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+
+    const result = await verifyLanderLiveMapping(auth.page);
+    res.json(result);
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error verifying live mapping:", error);
+    res.status(500).json({ error: error.message || "Failed to verify live mapping" });
   }
 });
 
