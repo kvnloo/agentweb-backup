@@ -21,6 +21,7 @@ import { normalizeAttribution } from '../types/attribution';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { metaService } from '../services/metaService';
+import { isSmokeTestEmail } from '../utils/smokeTestLead';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -585,7 +586,11 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // roadmap-delivery email below) — this must never delay or affect the lead-save response
     // already sent above, and a Meta-side failure must never be surfaced as a lead-capture
     // failure (the lead itself already saved successfully).
-    if (pixelId && metaAccountId && eventId && shouldAttemptCapiSend(leadList.listId)) {
+    // ENG-449 gap #3: never send a real CAPI conversion event for the automated smoke test's
+    // synthetic lead — CAPI's correctness is already covered by unit tests (metaService.capi
+    // .test.ts) and doesn't depend on v0-authored code, so there's nothing extra to verify
+    // live here, only real-ad-account conversion data to needlessly pollute.
+    if (pixelId && metaAccountId && eventId && !isSmokeTestEmail(leadData.email) && shouldAttemptCapiSend(leadList.listId)) {
       void (async () => {
         try {
           const owner = await userDb.getUserById(leadList.userId);
@@ -649,7 +654,17 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     }
 
     // After response is sent: auto-draft, auto-send, and alert (fire-and-forget, fully awaited internally)
-    if (isNew || isUpdated) {
+    if (isNew && isSmokeTestEmail(lead.email)) {
+      // ENG-449 gap #3: the automated post-deploy smoke test submits a REAL lead through a
+      // customer's real form to verify the pipeline works, then deletes the row. But deleting
+      // the row doesn't undo an already-fired side effect — HubSpot/Attio sync, drip-sequence
+      // enrollment, and (worse) a real auto-sent email to a fake address would all have
+      // already fired by the time the row is deleted, since they're dispatched fire-and-forget
+      // the instant the lead is created. Skip the whole cascade for a recognized synthetic
+      // lead; the lead row itself is still created/returned normally above so the smoke
+      // test's CRM-landing check still works.
+      console.log(`[webhooks] Synthetic smoke-test lead (${lead.email}) — skipping CRM sync/sequence enrollment/auto-draft/auto-send/owner-notify side effects`);
+    } else if (isNew || isUpdated) {
       // Real-time push to any connected external CRM (HubSpot / Attio). The
       // authenticated UI create/update routes do this inline; inbound capture
       // (landing pages, lead-forward webhooks) did not, so form leads only ever
