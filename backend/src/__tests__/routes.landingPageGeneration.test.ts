@@ -157,6 +157,11 @@ jest.mock("../services/settingsService", () => ({
   },
 }));
 
+const mockVerifyLanderLiveMapping = jest.fn();
+jest.mock("../services/landerLiveMappingCheck", () => ({
+  verifyLanderLiveMapping: (...args: any[]) => mockVerifyLanderLiveMapping(...args),
+}));
+
 import landingPageGenerationRouter, { _resetRateLimitState } from "../routes/landingPageGeneration";
 
 const app = express();
@@ -1453,5 +1458,49 @@ describe("PUT /api/landing-pages/v0/generated/:id/integrations", () => {
       "proj-1", "MY_API_URL", "https://api.example.com",
       ["production", "preview", "development"], undefined, "plain"
     );
+  });
+});
+
+describe("GET /generated/:id/verify-live-mapping (ENG-496)", () => {
+  it("SUCCESS: owner gets the mapping report", async () => {
+    mockVerifyLanderLiveMapping.mockResolvedValueOnce({
+      liveUrl: "https://test-page.vercel.app",
+      liveTrafficFound: true,
+      actualProjectId: "vercel-proj-123",
+      storedProjectId: "vercel-proj-123",
+      projectIdMismatch: false,
+      repoMismatch: false,
+      checkedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const res = await request(app).get("/api/landing-pages/v0/generated/page-1/verify-live-mapping");
+
+    expect(res.status).toBe(200);
+    expect(res.body.projectIdMismatch).toBe(false);
+    expect(mockVerifyLanderLiveMapping).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "page-1" })
+    );
+  });
+
+  it("FAIL: non-owner, non-org caller -> 404 (view-mode denial is masked as not-found), verifyLanderLiveMapping never called", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "someone-else",
+      status: "deployed",
+    });
+
+    const res = await request(app).get("/api/landing-pages/v0/generated/page-1/verify-live-mapping");
+
+    expect(res.status).toBe(404);
+    expect(mockVerifyLanderLiveMapping).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: page not found -> 404", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(null);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated/page-1/verify-live-mapping");
+
+    expect(res.status).toBe(404);
+    expect(mockVerifyLanderLiveMapping).not.toHaveBeenCalled();
   });
 });
