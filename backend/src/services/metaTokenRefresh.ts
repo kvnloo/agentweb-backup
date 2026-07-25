@@ -40,9 +40,27 @@ export interface MetaTokenRefreshResult {
   refreshed: boolean;
   /** New expiry (ms epoch) if refreshed. */
   newExpiresAt?: number;
+  /** New access token if refreshed — used internally to sync singleflight joiners' own account objects. */
+  newAccessToken?: string;
   /** Error message if an attempted refresh failed. */
   error?: string;
 }
+
+/**
+ * In-process singleflight: multiple callers racing to refresh the SAME account
+ * (e.g. two concurrent webhook deliveries) share one in-flight refresh instead
+ * of each re-exchanging the same still-valid token. Without this, two
+ * concurrent exchanges both read the same OLD_TOKEN before either persists —
+ * harmless if Meta treats fb_exchange_token as idempotent, but if Meta
+ * invalidates the source token on first exchange, the second call fails (or
+ * worse, both succeed and only one write wins, discarding the other's new
+ * token). This only dedupes within one Node process — it does NOT protect
+ * across multiple EB instances, which would need a distributed lock; not
+ * attempted here since prod (Agentweb-backend-env-prod-3) runs a single
+ * instance today, so this fully covers the current race. If prod is ever
+ * scaled to 2+ instances, this dedup stops being complete — revisit then.
+ */
+const inFlightRefreshes = new Map<string, Promise<MetaTokenRefreshResult>>();
 
 /**
  * Is this a Meta ad-account connection with a usable access token? Recognizes
@@ -94,6 +112,54 @@ export async function ensureFreshMetaAdAccountToken(
     return { attempted: false, refreshed: false };
   }
 
+  // Singleflight: join an already-in-flight refresh for this exact
+  // user+platform+account instead of re-exchanging the same still-valid
+  // token concurrently. Keyed by userId too — the same Meta ad_account_id can
+  // be connected by two different AgentWeb users, each holding their own
+  // distinct long-lived token for it, so account_id alone is not unique.
+  const key = `${userId}:${account.platform}:${account.account_id}`;
+  let refreshPromise = inFlightRefreshes.get(key);
+  if (!refreshPromise) {
+    refreshPromise = performRefresh(account, userId, now);
+    inFlightRefreshes.set(key, refreshPromise);
+    refreshPromise.finally(() => inFlightRefreshes.delete(key));
+  }
+
+  const result = await refreshPromise;
+
+  // The singleflight promise mutates the FIRST caller's account object. Any
+  // other caller racing in with its own separate account object (e.g. a
+  // different in-flight request that fetched its own copy from the DB) needs
+  // its own object synced too, or it would keep using the stale token.
+  if (result.refreshed && result.newAccessToken && result.newExpiresAt) {
+    const config = account.config as MetaAdAccountConfig;
+    config.access_token = result.newAccessToken;
+    config.token_expires_at = result.newExpiresAt;
+  }
+
+  return result;
+}
+
+/**
+ * Ensure a Meta ad-account token is fresh.
+ *
+ * If the token is within the refresh window (or already expired but still
+ * exchangeable), re-exchange it via fb_exchange_token, persist the new token,
+ * and mutate the in-memory `account.config` so the current request uses it.
+ *
+ * This NEVER throws — a failed refresh is reported via the result so the caller
+ * can decide whether the existing token is still usable (proactive cron: log
+ * and move on; inline path: fall back to the old token, which may still work).
+ *
+ * @param account - The connected Meta ad account (config mutated in place on success).
+ * @param userId  - Owner user id, required to persist the refreshed token.
+ * @param now     - Injectable clock for testing.
+ */
+async function performRefresh(
+  account: ConnectedAccount,
+  userId: string,
+  now: number
+): Promise<MetaTokenRefreshResult> {
   const config = account.config as MetaAdAccountConfig;
   try {
     const { access_token, expires_in } = await metaService.extendAccessToken(config.access_token);
@@ -119,7 +185,7 @@ export async function ensureFreshMetaAdAccountToken(
       `[MetaTokenRefresh] Refreshed token for user ${userId} account ${account.account_id} ` +
         `(new expiry ${new Date(newExpiresAt).toISOString()})`
     );
-    return { attempted: true, refreshed: true, newExpiresAt };
+    return { attempted: true, refreshed: true, newExpiresAt, newAccessToken: access_token };
   } catch (error: any) {
     const message = error?.message || String(error);
     console.warn(
