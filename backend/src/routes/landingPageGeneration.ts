@@ -456,6 +456,9 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       if (!explicitList) {
         return res.status(400).json({ error: `lead_list_id "${lead_list_id}" does not exist` });
       }
+      if (!(await crmDb.canOrgMemberAccessList(userId, explicitList))) {
+        return res.status(403).json({ error: `lead_list_id "${lead_list_id}" is not accessible to you` });
+      }
     }
 
     const pageName = name || prompt.slice(0, 60);
