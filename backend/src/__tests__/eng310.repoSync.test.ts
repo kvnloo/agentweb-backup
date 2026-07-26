@@ -123,6 +123,7 @@ const {
   buildLandingPageMiddleware,
   buildCaptureRoute,
   buildDomainMapFile,
+  buildTrackingHelper,
 } = jest.requireActual("../services/v0Service");
 
 const REPO = "AgentWebPro/lp-test-abc123";
@@ -211,7 +212,7 @@ describe("syncLeadCaptureFilesToRepo", () => {
       "domainMap.ts": REAL_DOMAIN_MAP,
     });
 
-    const result = await syncLeadCaptureFilesToRepo(REPO, { "/": "list_1" });
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/": "list_1" }));
 
     // ENG-483: committed:true now also carries the pushed commit's sha/timestamp so a
     // caller can poll Vercel for that specific build (see addPageToExistingRepo).
@@ -241,7 +242,7 @@ describe("syncLeadCaptureFilesToRepo", () => {
       "domainMap.ts": REAL_DOMAIN_MAP, // a REAL map — a subdomain is attached
     });
 
-    const result = await syncLeadCaptureFilesToRepo(REPO, { "/pricing": "list_1" });
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/pricing": "list_1" }));
 
     expect(result.committed).toBe(true);
     expect(treePaths()).not.toContain("domainMap.ts");
@@ -258,26 +259,49 @@ describe("syncLeadCaptureFilesToRepo", () => {
       // no domainMap.ts
     });
 
-    const result = await syncLeadCaptureFilesToRepo(REPO, { "/": "list_1" });
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/": "list_1" }));
 
     expect(result.committed).toBe(true);
     expect(treePaths()).toContain("domainMap.ts");
     expect(blobForPath("domainMap.ts")).toBe(buildDomainMapFile({}));
   });
 
-  it("IDEMPOTENT: makes no commit when both files already match byte-for-byte", async () => {
+  it("IDEMPOTENT: makes no commit when all files already match byte-for-byte", async () => {
     const listByPath = { "/": "list_1", "/pricing": "list_2" };
     mockGitHub({
       "middleware.ts": buildLandingPageMiddleware(),
       "app/api/capture/route.ts": buildCaptureRoute(listByPath),
       "domainMap.ts": REAL_DOMAIN_MAP,
+      "lib/agentweb-track.ts": buildTrackingHelper(),
     });
 
-    const result = await syncLeadCaptureFilesToRepo(REPO, listByPath);
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => listByPath);
 
     expect(result).toEqual({ committed: false, reason: "up-to-date" });
     expect(mockAxiosPost).not.toHaveBeenCalled(); // no blobs, no tree, no commit
     expect(mockAxiosPatch).not.toHaveBeenCalled(); // no ref move => no Vercel redeploy
+  });
+
+  // ENG-449 follow-up: a repo created BEFORE the deterministic-tracking-helper change never
+  // got lib/agentweb-track.ts. Any NEW page added to that repo imports it (per the updated
+  // buildBrandEnrichedPrompt instruction) and the Vercel build fails outright with "Module
+  // not found: Can't resolve '@/lib/agentweb-track'" — live-repro'd this exact failure while
+  // testing against a pre-existing test-env repo. This sync must backfill it, same as it
+  // already backfills a missing domainMap.ts.
+  it("backfills lib/agentweb-track.ts when the repo predates it (would otherwise break the next page's build)", async () => {
+    const listByPath = { "/": "list_1" };
+    mockGitHub({
+      "middleware.ts": buildLandingPageMiddleware(),
+      "app/api/capture/route.ts": buildCaptureRoute(listByPath),
+      "domainMap.ts": REAL_DOMAIN_MAP,
+      // no lib/agentweb-track.ts — simulates a repo created before this change
+    });
+
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => listByPath);
+
+    expect(result.committed).toBe(true);
+    expect(treePaths()).toContain("lib/agentweb-track.ts");
+    expect(blobForPath("lib/agentweb-track.ts")).toBe(buildTrackingHelper());
   });
 
   it("still commits when the files match but domainMap.ts is missing (the build would fail without it)", async () => {
@@ -287,7 +311,7 @@ describe("syncLeadCaptureFilesToRepo", () => {
       "app/api/capture/route.ts": buildCaptureRoute(listByPath),
     });
 
-    const result = await syncLeadCaptureFilesToRepo(REPO, listByPath);
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => listByPath);
 
     expect(result.committed).toBe(true);
     expect(treePaths()).toContain("domainMap.ts");
@@ -300,11 +324,11 @@ describe("syncLeadCaptureFilesToRepo", () => {
       "domainMap.ts": REAL_DOMAIN_MAP,
     });
 
-    await syncLeadCaptureFilesToRepo(REPO, {
+    await syncLeadCaptureFilesToRepo(REPO, () => ({
       "/": "list_home",
       "/pricing": "list_pricing",
       "/contact": "list_contact",
-    });
+    }));
 
     const route = blobForPath("app/api/capture/route.ts")!;
     expect(route).toContain('"/": "list_home"');
@@ -320,10 +344,82 @@ describe("syncLeadCaptureFilesToRepo", () => {
     });
     mockAxiosPost.mockRejectedValue(Object.assign(new Error("boom"), { response: { status: 500 } }));
 
-    const result = await syncLeadCaptureFilesToRepo(REPO, { "/": "list_1" });
+    const result = await syncLeadCaptureFilesToRepo(REPO, () => ({ "/": "list_1" }));
 
     expect(result.committed).toBe(false);
     expect(result.reason).toMatch(/boom/);
+  });
+
+  // ENG-485 (Greptile, flagged during ENG-483's review): commitFilesToRepoMain's own retry
+  // re-reads the ref to rebase the COMMIT onto, but reuses the same precomputed file content
+  // across every attempt. A losing writer's retry could therefore recommit a STALE
+  // LIST_BY_PATH snapshot on top of a winning writer's newer commit, silently erasing
+  // whichever page's entry the winner had just added. Fixed by having syncLeadCaptureFilesToRepo
+  // re-derive listByPath fresh on every attempt via a callback, instead of delegating its own
+  // retries wholesale to commitFilesToRepoMain (which is correct for the page's own STATIC
+  // files, but wrong for this DYNAMIC, whole-site-dependent content).
+  it("ENG-485: a retry re-derives listByPath fresh — the retried commit reflects the CURRENT state, not the stale pre-retry snapshot", async () => {
+    blobBySha.clear();
+    let refReadCount = 0;
+    let patchCount = 0;
+    let buildCallCount = 0;
+
+    mockAxiosGet.mockImplementation((url: string) => {
+      if (url.includes("/git/ref/heads/main")) {
+        refReadCount++;
+        // Attempt 1 sees the OLD tip; the retry (after rebasing) sees the NEW tip the other
+        // writer already landed in between.
+        return Promise.resolve({ data: { object: { sha: refReadCount === 1 ? "old-sha" : "new-sha" } } });
+      }
+      // Always "absent" for the existing-file checks, so the up-to-date short-circuit never
+      // fires and every attempt proceeds to a real commit.
+      return Promise.reject({ response: { status: 404 }, message: "Not Found" });
+    });
+
+    mockAxiosPost.mockImplementation((url: string, body: any) => {
+      if (url.includes("/git/blobs")) {
+        const sha = `blob-sha-${blobBySha.size + 1}`;
+        blobBySha.set(sha, blobText(body));
+        return Promise.resolve({ data: { sha } });
+      }
+      if (url.includes("/git/trees")) return Promise.resolve({ data: { sha: `tree-sha-${refReadCount}` } });
+      if (url.includes("/git/commits")) return Promise.resolve({ data: { sha: `commit-sha-${refReadCount}` } });
+      return Promise.reject(new Error(`unexpected POST ${url}`));
+    });
+
+    mockAxiosPatch.mockImplementation(() => {
+      patchCount++;
+      if (patchCount === 1) {
+        // Attempt 1's ref-move is rejected: someone else committed in between (non-fast-forward).
+        return Promise.reject({ response: { status: 422, data: { message: "Update is not a fast forward" } } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    const buildListByPath = () => {
+      buildCallCount++;
+      return buildCallCount === 1
+        ? { "/a": "list_a" }                     // attempt 1: stale snapshot, missing "/b"
+        : { "/a": "list_a", "/b": "list_b" };     // retry: fresh, includes the sibling that landed
+    };
+
+    const result = await syncLeadCaptureFilesToRepo(REPO, buildListByPath);
+
+    expect(result.committed).toBe(true);
+    // Re-derived fresh on EACH attempt, not computed once and reused across retries.
+    expect(buildCallCount).toBe(2);
+
+    // Resolve the ACTUAL final (successfully-landed) tree, not attempt 1's orphaned one —
+    // both attempts push blobs, so `blobBySha` alone can't distinguish them.
+    const treeCalls = mockAxiosPost.mock.calls.filter((c) => String(c[0]).includes("/git/trees"));
+    const finalTree = treeCalls[treeCalls.length - 1][1].tree;
+    const captureRouteItem = finalTree.find((t: any) => t.path === "app/api/capture/route.ts");
+    const finalCaptureRouteContent = blobBySha.get(captureRouteItem.sha);
+
+    // The bug would land attempt 1's stale content (missing "/b") on top of the retry's
+    // rebase. The fix must land the FRESH content instead.
+    expect(finalCaptureRouteContent).toContain('"/a": "list_a"');
+    expect(finalCaptureRouteContent).toContain('"/b": "list_b"');
   });
 });
 
@@ -377,11 +473,33 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
 
     expect(res.status).toBe(200);
     expect(mockUpdateLeadList).toHaveBeenCalledWith("p1", "u1", "list_home");
-    expect(mockSyncLeadCaptureFilesToRepo).toHaveBeenCalledWith(REPO, {
-      "/": "list_home",
-      "/pricing": "list_pricing",
-    });
+    // ENG-485: the 2nd arg is now a callback (re-derived fresh on every retry attempt
+    // inside syncLeadCaptureFilesToRepo, not a static value) — call it to check what it
+    // actually produces.
+    const [repoArg, buildListByPath, pixelArg, accountArg] = mockSyncLeadCaptureFilesToRepo.mock.calls[0];
+    expect(repoArg).toBe(REPO);
+    expect(pixelArg).toBeUndefined();
+    expect(accountArg).toBeUndefined();
+    await expect(buildListByPath()).resolves.toEqual({ "/": "list_home", "/pricing": "list_pricing" });
     expect(res.body.captureSyncWarning).toBeUndefined();
+  });
+
+  it("ENG-489: threads the site root's metaPixelId/metaAdAccountId through even when a SUB-page's lead list changes (never strips a configured pixel out of the route)", async () => {
+    const rootWithPixel = { ...rootPage, metaPixelId: "1012387921717047", metaAdAccountId: "act_555" };
+    mockGetLandingPageById.mockResolvedValue(pricingPage); // the page being updated is the SUB-page, not root
+    mockGetLandingPagesByOwner.mockResolvedValue([rootWithPixel, pricingPage, otherSitePage]);
+
+    const res = await request(app)
+      .patch("/api/landing-pages/v0/generated/p2/lead-list")
+      .send({ leadListId: "list_pricing" });
+
+    expect(res.status).toBe(200);
+    expect(mockSyncLeadCaptureFilesToRepo).toHaveBeenCalledWith(
+      REPO,
+      expect.any(Function), // ENG-485: now a callback, re-derived fresh on every retry
+      "1012387921717047",
+      "act_555",
+    );
   });
 
   it("detaching REMOVES the page from the map and resyncs", async () => {
@@ -398,9 +516,11 @@ describe("PATCH /generated/:id/lead-list — repo sync", () => {
 
     expect(res.status).toBe(200);
     expect(mockUpdateLeadList).toHaveBeenCalledWith("p1", "u1", null);
-    expect(mockSyncLeadCaptureFilesToRepo).toHaveBeenCalledWith(REPO, {
-      "/pricing": "list_pricing",
-    });
+    const [repoArg, buildListByPath, pixelArg, accountArg] = mockSyncLeadCaptureFilesToRepo.mock.calls[0];
+    expect(repoArg).toBe(REPO);
+    expect(pixelArg).toBeUndefined();
+    expect(accountArg).toBeUndefined();
+    await expect(buildListByPath()).resolves.toEqual({ "/pricing": "list_pricing" });
   });
 
   it("a GitHub failure does not lose the DB write — 200 with captureSyncWarning", async () => {

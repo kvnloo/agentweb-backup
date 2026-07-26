@@ -163,6 +163,19 @@ describe('ENG-310 — the capture route is path-aware (leads must not be misfile
     expect(src).toContain('attribution');
     expect(src).toContain('/api/webhooks/forward-lead');
   });
+
+  it('ENG-449: captures the real submission time at the top of POST and forwards it, not server CAPI-send time', () => {
+    const src = buildCaptureRoute(MAP);
+    expect(src).toContain('capturedAtMs');
+    expect(src).toContain('Date.now()');
+    // Captured BEFORE the request body is even parsed — as close to the real
+    // submission moment as this handler can get.
+    const capturedIdx = src.indexOf('capturedAtMs = Date.now()');
+    const bodyParseIdx = src.indexOf('req.json()');
+    expect(capturedIdx).toBeGreaterThan(-1);
+    expect(bodyParseIdx).toBeGreaterThan(-1);
+    expect(capturedIdx).toBeLessThan(bodyParseIdx);
+  });
 });
 
 describe('ENG-309 — capture is never silently skipped', () => {

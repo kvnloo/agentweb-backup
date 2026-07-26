@@ -151,6 +151,69 @@ describe('ensureFreshMetaAdAccountToken', () => {
     expect(account.config.token_expires_at).toBe(NOW + META_DEFAULT_TOKEN_TTL_MS);
   });
 
+  it('leaves DB and in-memory state on the OLD token when persist fails after a successful exchange', async () => {
+    (metaService.extendAccessToken as jest.Mock).mockResolvedValue({
+      access_token: 'NEW_TOKEN',
+      expires_in: 5_184_000,
+    });
+    (updateAccountTokens as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB write failed'));
+    const account = makeMetaAdAccount({ config: { token_expires_at: NOW - 1 } });
+
+    const result = await ensureFreshMetaAdAccountToken(account, 'user1', NOW);
+
+    expect(result.attempted).toBe(true);
+    expect(result.refreshed).toBe(false);
+    expect(result.error).toMatch(/DynamoDB write failed/);
+    // must NOT mutate in-memory config to a token that was never persisted —
+    // otherwise the in-flight request would use a token no other code path knows about
+    expect(account.config.access_token).toBe('OLD_TOKEN');
+    expect(account.config.token_expires_at).toBe(NOW - 1);
+  });
+
+  it('SINGLEFLIGHT: two concurrent refreshes for the same account only call Meta once, and both callers end up on the new token', async () => {
+    let resolveExchange!: (v: any) => void;
+    (metaService.extendAccessToken as jest.Mock).mockReturnValue(
+      new Promise((resolve) => { resolveExchange = resolve; })
+    );
+
+    const accountA = makeMetaAdAccount({ config: { token_expires_at: NOW - 1 } });
+    const accountB = makeMetaAdAccount({ config: { token_expires_at: NOW - 1 } }); // separate object, same account_id
+
+    const p1 = ensureFreshMetaAdAccountToken(accountA, 'user1', NOW);
+    const p2 = ensureFreshMetaAdAccountToken(accountB, 'user1', NOW);
+
+    resolveExchange({ access_token: 'NEW_TOKEN', expires_in: 5_184_000 });
+    const [r1, r2] = await Promise.all([p1, p2]);
+
+    expect(metaService.extendAccessToken).toHaveBeenCalledTimes(1);
+    expect(updateAccountTokens).toHaveBeenCalledTimes(1);
+    expect(r1.refreshed).toBe(true);
+    expect(r2.refreshed).toBe(true);
+    // both callers' own account objects synced to the new token
+    expect(accountA.config.access_token).toBe('NEW_TOKEN');
+    expect(accountB.config.access_token).toBe('NEW_TOKEN');
+  });
+
+  it('SINGLEFLIGHT: different users with the same account_id are NOT deduped together', async () => {
+    (metaService.extendAccessToken as jest.Mock)
+      .mockResolvedValueOnce({ access_token: 'USER1_NEW_TOKEN', expires_in: 5_184_000 })
+      .mockResolvedValueOnce({ access_token: 'USER2_NEW_TOKEN', expires_in: 5_184_000 });
+
+    const accountUser1 = makeMetaAdAccount({ config: { access_token: 'USER1_OLD', token_expires_at: NOW - 1 } });
+    const accountUser2 = makeMetaAdAccount({ config: { access_token: 'USER2_OLD', token_expires_at: NOW - 1 } });
+
+    const [r1, r2] = await Promise.all([
+      ensureFreshMetaAdAccountToken(accountUser1, 'user1', NOW),
+      ensureFreshMetaAdAccountToken(accountUser2, 'user2', NOW),
+    ]);
+
+    expect(metaService.extendAccessToken).toHaveBeenCalledTimes(2);
+    expect(r1.refreshed).toBe(true);
+    expect(r2.refreshed).toBe(true);
+    expect(accountUser1.config.access_token).toBe('USER1_NEW_TOKEN');
+    expect(accountUser2.config.access_token).toBe('USER2_NEW_TOKEN');
+  });
+
   it('does NOT throw and reports error when the exchange fails', async () => {
     (metaService.extendAccessToken as jest.Mock).mockRejectedValue(new Error('token too old'));
     const account = makeMetaAdAccount({ config: { token_expires_at: NOW - 1 } });
