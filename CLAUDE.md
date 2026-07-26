@@ -16,14 +16,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Database/data-plane work requires Harsha before merge: migrations or persistent
   schema/table/index/key/model changes; backfills, bulk mutations, deletes, or
   production data repair; persistence provisioning/retention/backup/access
-  changes; and changes that can reinterpret, orphan, expose, or make stored data
-  unrecoverable.
+  changes, including encryption and access-policy changes; and changes that can
+  reinterpret, orphan, expose, or make stored data unrecoverable.
 - Auth, billing, security, and production-infrastructure code are executable
   without routine human merge approval when fully bounded, strongly tested,
   reversible, and outside the database/data-plane gate.
-- Judgment-heavy external customer, sales, marketing, social, and press copy
-  stops for Harsha before publish. Already-approved copy can be applied
-  mechanically.
+- Material customer, sales, marketing, social, or press copy that Harsha has not
+  reviewed stops before publish/merge. Already-approved copy can be applied
+  mechanically without a second review gate.
 - Repair failed or missing tests, evaluators, CI, staging, deploy, attribution,
   and monitoring as pipeline defects. Do not make Harsha the fallback gate.
 - For OPS, GROW, Sales, Marketing, and CS, invoke Emma directly wherever she has
@@ -463,7 +463,7 @@ Uses browser-use library with Playwright:
   - **Automatic trigger:** Every merge/push to `main`
   - Detects changes via path filters and only deploys components with actual changes
   - Separate jobs for backend and partner-portal (agentweb repo) and customer portal (separate repo)
-  - Version labels: `<component>-<YYYYMMDD>-pr<PR-or-SHA>` or `<component>-<YYYYMMDD>-manual-<SHA>`
+  - Version labels: `<component>-<YYYYMMDD>-pr<PR-or-SHA>` or `<component>-<YYYYMMDD>-prmanual-<SHA>`
 
 ### Deployment Targets
 
