@@ -1451,14 +1451,20 @@ export function isRetryableGithubPushError(err: any): { retryable: boolean; reas
 }
 
 /**
- * Commit files to a repo's `main` and advance the ref, with retry + rebase.
+ * Commit files to a repo branch (`main` by default) and advance the ref, with
+ * retry + rebase.
  *
- * Every attempt re-reads the current `main` SHA and bases the new commit on it,
+ * Every attempt re-reads the current branch SHA and bases the new commit on it,
  * so when two pages are generated into the SAME repo concurrently (the common
  * case under unified multi-site), the second push rebases onto the first instead
  * of failing as a non-fast-forward. Transient network/5xx failures are retried
  * with backoff. This replaces the previous bare-axios sequence, which had no
  * retry and was the dominant source of "fetch failed" generation failures.
+ *
+ * `branch` defaults to `"main"` — the shared reusable staging branch
+ * (`draft/agentweb-preview`) is also a valid target (ENG-497: the coding
+ * agent's edits always go there, and it must exist first, e.g. via
+ * `ensureBranchExists`).
  *
  * Returns the pushed commit SHA and the post-push timestamp (used to scope the
  * Vercel deployment poll).
@@ -1468,11 +1474,12 @@ export async function commitFilesToRepoMain(
   ghHeaders: Record<string, string>,
   filesToCommit: RepoFileToCommit[],
   commitMessage: string,
-  maxAttempts = 4
+  maxAttempts = 4,
+  branch = "main"
 ): Promise<{ pushedCommitSha: string; pushTimestampMs: number }> {
   const getMainSha = async (): Promise<string> => {
     const refRes = await axios.get<any>(
-      `https://api.github.com/repos/${repoFullName}/git/ref/heads/main`,
+      `https://api.github.com/repos/${repoFullName}/git/ref/heads/${branch}`,
       { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
     );
     return refRes.data.object.sha;
@@ -1528,7 +1535,7 @@ export async function commitFilesToRepoMain(
 
       // The ref update is where a concurrent commit surfaces as a non-fast-forward.
       await axios.patch<any>(
-        `https://api.github.com/repos/${repoFullName}/git/refs/heads/main`,
+        `https://api.github.com/repos/${repoFullName}/git/refs/heads/${branch}`,
         { sha: pushedCommitSha },
         { headers: ghHeaders, timeout: GITHUB_API_TIMEOUT_MS }
       );

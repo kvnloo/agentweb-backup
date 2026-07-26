@@ -2866,6 +2866,10 @@ export const scheduleDb = {
       emailNotifications: string[];
       dailyDigest: boolean;
       selfImprove: boolean;
+      // ENG-396: opt-in full autonomy — headless runs auto-take Emma's recommended
+      // option on a blocking question instead of parking (waives the human gate on
+      // irreversible decisions). Default off.
+      fullAutonomy?: boolean;
       promptRevisions: Array<{ startingMessage: string; updatedAt: string }>;
       updatedAt: string;
       emailCampaignTaskId: string;
@@ -3005,6 +3009,29 @@ export const scheduleDb = {
       }).promise();
     } catch (error) {
       handleDynamoDbError(error, 'setRunInFlight');
+    }
+  },
+
+  // Attach the run's session id to an existing in-flight lease. ENG-479: the lease
+  // is now stamped BEFORE the session exists (so a hard-kill in the session-creation
+  // window is still reconciler-visible), which means it initially carries no
+  // sessionId; this fills it in once createChatSession returns, so the reconciler's
+  // recovery can annotate the right session. Conditional on runId (like the
+  // heartbeat) so it can never resurrect a lease a reconciler already reaped or a
+  // newer run replaced. Best-effort: a failed condition just means the lease moved on.
+  async attachSessionToRunInFlight(scheduleId: string, runId: string, sessionId: string): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        Key: { scheduleId },
+        UpdateExpression: 'SET runInFlight.sessionId = :sid',
+        ConditionExpression: 'runInFlight.runId = :runId',
+        ExpressionAttributeValues: { ':sid': sessionId, ':runId': runId },
+      }).promise();
+    } catch (error: any) {
+      if (error?.code !== 'ConditionalCheckFailedException') {
+        console.error('DynamoDB attachSessionToRunInFlight error:', error);
+      }
     }
   },
 

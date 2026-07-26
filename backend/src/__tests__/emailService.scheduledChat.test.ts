@@ -233,4 +233,74 @@ describe('emailService.sendScheduledChatTokenLimitEmail', () => {
   });
 });
 
+describe('emailService.sendScheduledChatPausedForInputEmail (ENG-396)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('deep-links to the session via the PATH form the portal actually reads (not ?sessionId=)', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatPausedForInputEmail(
+      'owner@example.com',
+      'RankAI Meta Ads',
+      'schedule-xyz',
+      'Which Meta campaign objective? It cannot be changed after launch.',
+      'session-abc-123'
+    );
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [, subject, textContent, htmlContent] = spy.mock.calls[0];
+    expect(subject).toContain('Emma needs your input');
+    // The portal (AgentMode.tsx) reads sessionId from the route param, so the
+    // link MUST be /agent-mode/<sessionId>. The old ?sessionId= query form opened
+    // a blank chat — the "Open chat to decide" button dead-ended.
+    expect(htmlContent).toContain('/agent-mode/session-abc-123');
+    expect(textContent).toContain('/agent-mode/session-abc-123');
+    expect(htmlContent).not.toContain('?sessionId=');
+    // The question the user must answer is shown.
+    expect(htmlContent).toContain('Which Meta campaign objective?');
+  });
+
+  it('falls back to the bare /agent-mode link when no sessionId is available', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatPausedForInputEmail(
+      'owner@example.com',
+      'RankAI Meta Ads',
+      'schedule-xyz',
+      'Which objective?'
+    );
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [, , , htmlContent] = spy.mock.calls[0];
+    expect(htmlContent).toContain('/agent-mode');
+    expect(htmlContent).not.toContain('/agent-mode/');
+    expect(htmlContent).not.toContain('?sessionId=');
+  });
+
+  // Greptile P1/security ("Notification HTML remains unescaped"): scheduleName
+  // and question were interpolated into the email HTML raw. A schedule name or
+  // a model-generated question containing HTML/script markup would render
+  // unescaped in the recipient's inbox — altering layout, injecting misleading
+  // links, or hiding the real question and CTA.
+  it('escapes HTML in scheduleName and question so markup cannot alter the email or inject links', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatPausedForInputEmail(
+      'owner@example.com',
+      '<script>alert(1)</script>Evil Schedule',
+      'schedule-xyz',
+      '<a href="https://evil.example">Click here</a> instead of choosing',
+      'session-abc-123',
+    );
+
+    const [, , , htmlContent] = spy.mock.calls[0];
+    expect(htmlContent).not.toContain('<script>');
+    expect(htmlContent).not.toContain('<a href="https://evil.example">');
+    expect(htmlContent).toContain('&lt;script&gt;');
+    expect(htmlContent).toContain('&lt;a href=');
+  });
+});
+
 

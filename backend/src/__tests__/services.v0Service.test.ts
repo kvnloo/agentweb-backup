@@ -1023,6 +1023,24 @@ describe("v0Service - commitFilesToRepoMain (retry + rebase)", () => {
     expect(mockAxiosGet).toHaveBeenCalledTimes(1); // no rebase needed
   });
 
+  it("ENG-497: commits to a non-default branch when one is passed, never touching heads/main", async () => {
+    mockAxiosGet.mockResolvedValue(ref);
+    mockAxiosPost.mockResolvedValue(post);
+    mockAxiosPatch.mockResolvedValue({ data: {} });
+
+    const res = await commitFilesToRepoMain("o/r", {}, files, "msg", 4, "draft/agentweb-preview");
+    expect(res.pushedCommitSha).toBe("new-sha");
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      "https://api.github.com/repos/o/r/git/ref/heads/draft/agentweb-preview",
+      expect.anything()
+    );
+    expect(mockAxiosPatch).toHaveBeenCalledWith(
+      "https://api.github.com/repos/o/r/git/refs/heads/draft/agentweb-preview",
+      expect.anything(),
+      expect.anything()
+    );
+  });
+
   it("rebases and retries on a non-fast-forward 422 (concurrent commit landed)", async () => {
     mockAxiosGet.mockResolvedValue(ref);
     mockAxiosPost.mockResolvedValue(post);
