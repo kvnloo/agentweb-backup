@@ -165,6 +165,81 @@ describe('forward-lead: CAPI send is budgeted per listId, independent of the lea
   });
 });
 
+describe('forward-lead: CAPI paused per Meta ad account on its real Business Use Case rate limit (ENG-449 residual risk)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (crmDb.getLeadListById as jest.Mock).mockImplementation((listId: string) =>
+      Promise.resolve({ listId, userId: 'user_123', name: 'Test List', publicAccessEnabled: true }),
+    );
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+    (crmDb.createLead as jest.Mock).mockImplementation((listId: string, data: any) =>
+      Promise.resolve({ leadId: `lead_${Math.random()}`, listId, ...data }),
+    );
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'user_123', connected_accounts: [] });
+    (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'acc1', accessToken: 'tok', accountName: 'Acc 1' });
+  });
+
+  const sendFor = (listId: string, accountId: string, email: string) =>
+    request(app).post('/api/webhooks/forward-lead').send({
+      listId,
+      email,
+      pixelId: '1430870751246428',
+      metaAccountId: accountId,
+      eventId: `evt_${email}`,
+    });
+
+  it('a real Meta throttle (usage at 100%, real estimated_time_to_regain_access) pauses the NEXT send on the SAME account, even with per-listId budget untouched', async () => {
+    (metaService.sendCapiLeadEvent as jest.Mock).mockResolvedValueOnce({
+      success: false,
+      error: 'User request limit reached',
+      usage: { callCountPct: 100, totalTimePct: 40, totalCpuTimePct: 30, estimatedMinutesToRegainAccess: 10 },
+    });
+
+    const res1 = await sendFor('list_a', 'acc_throttled', 'first@example.com');
+    await flushAsyncWork();
+    expect(res1.status).toBe(201);
+    expect(metaService.sendCapiLeadEvent).toHaveBeenCalledTimes(1);
+
+    // A DIFFERENT list, same Meta account — its own per-listId budget has plenty of room,
+    // but the account-level pause must still block it.
+    const res2 = await sendFor('list_b', 'acc_throttled', 'second@example.com');
+    await flushAsyncWork();
+    expect(res2.status).toBe(201); // lead still saves
+    expect(metaService.sendCapiLeadEvent).toHaveBeenCalledTimes(1); // NOT called again
+  });
+
+  it('usage below 100% on every metric never pauses the account', async () => {
+    (metaService.sendCapiLeadEvent as jest.Mock).mockResolvedValue({
+      success: true,
+      usage: { callCountPct: 80, totalTimePct: 50, totalCpuTimePct: 20, estimatedMinutesToRegainAccess: undefined },
+    });
+
+    await sendFor('list_c', 'acc_healthy', 'a@example.com');
+    await flushAsyncWork();
+    await sendFor('list_c', 'acc_healthy', 'b@example.com');
+    await flushAsyncWork();
+
+    expect(metaService.sendCapiLeadEvent).toHaveBeenCalledTimes(2);
+  });
+
+  it('a throttle on one Meta ad account never pauses a DIFFERENT account', async () => {
+    (metaService.sendCapiLeadEvent as jest.Mock).mockResolvedValueOnce({
+      success: false,
+      error: 'User request limit reached',
+      usage: { callCountPct: 100, totalTimePct: 100, totalCpuTimePct: 100, estimatedMinutesToRegainAccess: 15 },
+    });
+
+    await sendFor('list_d', 'acc_throttled_2', 'x@example.com');
+    await flushAsyncWork();
+    expect(metaService.sendCapiLeadEvent).toHaveBeenCalledTimes(1);
+
+    (metaService.sendCapiLeadEvent as jest.Mock).mockResolvedValueOnce({ success: true, usage: undefined });
+    await sendFor('list_e', 'acc_unrelated', 'y@example.com');
+    await flushAsyncWork();
+    expect(metaService.sendCapiLeadEvent).toHaveBeenCalledTimes(2); // the unrelated account still gets its send
+  });
+});
+
 describe('forward-lead: CAPI client IP prefers x-forwarded-for over req.ip (scoped mitigation for ENG-493)', () => {
   beforeEach(() => {
     jest.clearAllMocks();

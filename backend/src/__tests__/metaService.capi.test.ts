@@ -167,4 +167,74 @@ describe('sendCapiLeadEvent', () => {
     expect(body.data[0].user_data.fbp).toBeUndefined();
     expect(body.data[0].user_data.fbc).toBeUndefined();
   });
+
+  // --- X-Business-Use-Case-Usage (Meta's real, dynamic CAPI rate-limit signal) ---
+
+  it('parses a present X-Business-Use-Case-Usage header into result.usage', async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ events_received: 1, fbtrace_id: 'trace1' }),
+      headers: {
+        get: (name: string) =>
+          name === 'x-business-use-case-usage'
+            ? JSON.stringify({ act_123: [{ type: 'ads_management', call_count: 42, total_cputime: 10, total_time: 15 }] })
+            : null,
+      },
+    });
+
+    const result = await metaService.sendCapiLeadEvent('px1', 'tok', baseEvent);
+
+    expect(result.success).toBe(true);
+    expect(result.usage).toEqual({
+      callCountPct: 42,
+      totalTimePct: 15,
+      totalCpuTimePct: 10,
+      estimatedMinutesToRegainAccess: undefined,
+    });
+  });
+
+  it('parses estimated_time_to_regain_access once actually throttled', async () => {
+    mockFetch.mockResolvedValue({
+      ok: false,
+      status: 429,
+      json: jest.fn().mockResolvedValue({ error: { message: 'User request limit reached' } }),
+      headers: {
+        get: (name: string) =>
+          name === 'x-business-use-case-usage'
+            ? JSON.stringify({ act_123: [{ type: 'ads_management', call_count: 100, total_cputime: 40, total_time: 55, estimated_time_to_regain_access: 7 }] })
+            : null,
+      },
+    });
+
+    const result = await metaService.sendCapiLeadEvent('px1', 'tok', baseEvent);
+
+    expect(result.success).toBe(false);
+    expect(result.usage?.estimatedMinutesToRegainAccess).toBe(7);
+    expect(result.usage?.callCountPct).toBe(100);
+  });
+
+  it('a response with no .headers at all (every other test in this file) still resolves normally, usage is undefined', async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ events_received: 1, fbtrace_id: 'trace1' }),
+    });
+
+    const result = await metaService.sendCapiLeadEvent('px1', 'tok', baseEvent);
+
+    expect(result.success).toBe(true);
+    expect(result.usage).toBeUndefined();
+  });
+
+  it('a malformed (non-JSON) header value is caught, not thrown', async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ events_received: 1, fbtrace_id: 'trace1' }),
+      headers: { get: (name: string) => (name === 'x-business-use-case-usage' ? 'not-json{{{' : null) },
+    });
+
+    const result = await metaService.sendCapiLeadEvent('px1', 'tok', baseEvent);
+
+    expect(result.success).toBe(true);
+    expect(result.usage).toBeUndefined();
+  });
 });
