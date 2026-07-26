@@ -48,7 +48,6 @@ function fakeResult(over: Partial<LoopRunResult>): LoopRunResult {
     eventsScanned: 0,
     proposals: [],
     mutations: [],
-    approvals: [],
     blocked: false,
     durationMs: 1,
     tokensSpentUsd: 0,
@@ -103,8 +102,8 @@ describe('loop digest characterization (exact rendered text)', () => {
     // default — it DM'd Harsha on EVERY daily run, including the empty/quiet
     // "healthy" windows, which was the only loop chirping in prod. The digest
     // wire format is still pinned below, but only when explicitly re-enabled
-    // via AGENT_MODE_LOOP_DIGEST=true (set once the Slack approval gate makes
-    // the DM actionable). See dev.md 2026-06-14.
+    // via AGENT_MODE_LOOP_DIGEST=true once the digest is operationally useful.
+    // See dev.md 2026-06-14.
     it('is silent by default — posts NO digest DM even when tools are failing', async () => {
       delete process.env.AGENT_MODE_LOOP_DIGEST;
       mockedRunLoop.mockResolvedValue(

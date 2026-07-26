@@ -7,7 +7,6 @@
 
 import {
   _resetRegistryForTesting,
-  registerGate,
   registerLearningStore,
   registerLoop,
   registerRuleSet,
@@ -15,7 +14,6 @@ import {
   registerTools,
 } from '../loops';
 import type {
-  ApprovalGate,
   EventSource,
   LearningStore,
   LoopManifest,
@@ -44,7 +42,6 @@ function manifest(id: string, paused = false): LoopManifest {
     sensorImpl: `${id}:sensor`,
     rulesetImpl: `${id}:rules`,
     toolsImpl: `${id}:tools`,
-    gateImpl: `${id}:gate`,
     learningImpl: `${id}:learning`,
     thresholds: {
       promoteLiftPct: 10,
@@ -66,8 +63,6 @@ function manifest(id: string, paused = false): LoopManifest {
 const sensor: EventSource<NormalizedEvent> = { fetchEvents: jest.fn().mockResolvedValue([]) };
 const rules: RuleSet<NormalizedEvent, unknown> = { evaluate: jest.fn().mockResolvedValue([]) };
 const tools: MutationTools<unknown> = { apply: jest.fn() };
-const gate: ApprovalGate = { requestApproval: jest.fn(), pollDecision: jest.fn() };
-
 function learningStore() {
   return {
     record: jest.fn().mockResolvedValue(undefined),
@@ -82,7 +77,7 @@ function ports(): LoopPorts {
     s3: {} as LoopPorts['s3'],
     dynamo: {} as LoopPorts['dynamo'],
     bedrock: {} as LoopPorts['bedrock'],
-    slack: { postMessage: jest.fn(), getReactions: jest.fn(), getReplies: jest.fn() },
+    slack: { postMessage: jest.fn() },
     clock: { now: () => now },
     logger: { log: jest.fn() },
   };
@@ -92,7 +87,6 @@ function registerTestLoop(m: LoopManifest, learning: LearningStore) {
   registerSensor(m.sensorImpl, sensor);
   registerRuleSet(m.rulesetImpl, rules);
   registerTools(m.toolsImpl, tools);
-  registerGate(m.gateImpl, gate);
   registerLearningStore(m.learningImpl, learning);
   registerLoop(m);
 }

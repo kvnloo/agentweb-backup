@@ -48,7 +48,6 @@ export const aiEvalManifest: LoopManifest<NormalizedEvent, AiEvalProposalPayload
   sensorImpl: 'aiEvalSensor',
   rulesetImpl: 'aiEvalRules',
   toolsImpl: 'aiEvalSpecTool',
-  gateImpl: 'aiEvalCaptureGate',
   learningImpl: 'aiEvalLearning',
   thresholds: {
     promoteLiftPct: 15,

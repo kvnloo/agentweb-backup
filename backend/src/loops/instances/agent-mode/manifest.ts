@@ -1,7 +1,7 @@
 /**
  * Agent-mode loop manifest.
  *
- * AgentMode/Emma as a first-class loop instance — same 5 layers, same registry,
+ * AgentMode/Emma as a first-class loop instance — same 4 layers, same registry,
  * same attribution cron + health endpoint as the funnel loops. This is the
  * audit's "plug AgentMode into the same apparatus" made concrete:
  *
@@ -9,7 +9,6 @@
  *   policy   = AgentFailureRuleSet (cluster tool failures) wrapped in
  *              CooldownRuleSet (don't re-propose an in-flight / failed fix)
  *   tools    = SpecOutputTool (emit a cloud-dev fix spec — the AgentLearningEvent)
- *   gate     = CaptureGate → Slack DM (code changes are never auto-shipped)
  *   learning = DynamoLearningStore (durable decision + outcome records)
  *
  * Target metric = tool reliability: agent_tool_succeeded / agent_tool_invoked.
@@ -37,7 +36,6 @@ export const agentModeManifest: LoopManifest<NormalizedEvent, AgentFailurePropos
   sensorImpl: 'agentModeSensor',
   rulesetImpl: 'agentModeFailurePolicy',
   toolsImpl: 'agentModeSpecTool',
-  gateImpl: 'agentModeGate',
   learningImpl: 'agentModeLearning',
   thresholds: {
     // A shipped tool fix must lift the tool's success rate by >=10% over the

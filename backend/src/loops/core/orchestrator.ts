@@ -1,11 +1,11 @@
 /**
- * Orchestrator — wires the 5 layers for a single loop run.
+ * Orchestrator — wires the 4 layers for a single loop run.
  *
  * Loop-agnostic. The manifest names which layer impls to use; the registry
  * (loops/index.ts) returns them; this function calls them in order:
  *
- *   sensor.fetchEvents → ruleSet.evaluate → tools.apply → gate.requestApproval
- *   → learning.record (after each step that produces a fact worth keeping)
+ *   sensor.fetchEvents → ruleSet.evaluate → tools.apply → learning.record
+ *   (after each step that produces a fact worth keeping)
  *
  * The orchestrator is responsible for:
  *   - Skipping the run when the manifest is paused.
@@ -15,20 +15,17 @@
  *
  * It is NOT responsible for:
  *   - Generating mutations (the tools layer does that, often via Bedrock).
- *   - Polling for approval decisions (the watchdog cron does that separately).
  *   - Statistical lift computation (a future Statistician agent does that
  *     inside the policy layer or as a periodic batch job).
  */
 
 import {
-  getGate,
   getLearningStore,
   getRuleSet,
   getSensor,
   getTools,
 } from '../index';
 import {
-  ApprovalRecord,
   LoopManifest,
   LoopRunResult,
   Mutation,
@@ -42,9 +39,6 @@ export interface RunLoopOptions {
   /** Override the time window. If omitted, defaults to the last
    * `manifest.targetMetric.windowDays` days ending at clock.now(). */
   window?: TimeWindow;
-  /** Skip the gate step (used by the smoke harness so it can assert on
-   * proposals + mutations without posting real Slack DMs). */
-  skipGate?: boolean;
 }
 
 export async function runLoop(
@@ -70,7 +64,6 @@ export async function runLoop(
     eventsScanned: 0,
     proposals: [],
     mutations: [],
-    approvals: [],
     blocked: false,
     durationMs: 0,
     tokensSpentUsd: 0,
@@ -110,7 +103,7 @@ export async function runLoop(
       capped: allProposals.length - proposals.length,
     });
 
-    // Layer 5 (learning record for proposals) is interleaved with each step
+    // Layer 4 (learning record for proposals) is interleaved with each step
     // so partial-failure runs still emit useful audit trails.
     const learning = getLearningStore(manifest.learningImpl);
 
@@ -151,32 +144,6 @@ export async function runLoop(
     }
     result.mutations = mutations;
 
-    // Layer 4: Quality gate.
-    if (!options.skipGate) {
-      const gate = getGate(manifest.gateImpl);
-      const approvals: ApprovalRecord[] = [];
-      for (const mutation of mutations) {
-        if (mutation.error) continue; // don't request approval on failed mutations
-        try {
-          const approval = await gate.requestApproval(mutation);
-          approvals.push(approval);
-          await learning.record({
-            loopId: manifest.loopId,
-            runId,
-            ts: ports.clock.now(),
-            mutation,
-            decision: { status: 'pending', decidedAt: ports.clock.now() },
-          });
-        } catch (err) {
-          ports.logger.log('error', '[loops] gate.requestApproval failed', {
-            loopId: manifest.loopId,
-            mutationId: mutation.mutationId,
-            error: String(err),
-          });
-        }
-      }
-      result.approvals = approvals;
-    }
   } catch (err) {
     ports.logger.log('error', '[loops] runLoop top-level error', {
       loopId: manifest.loopId,
@@ -195,7 +162,6 @@ export async function runLoop(
     eventsScanned: result.eventsScanned,
     proposals: result.proposals.length,
     mutations: result.mutations.length,
-    approvals: result.approvals.length,
     blocked: result.blocked,
   });
 

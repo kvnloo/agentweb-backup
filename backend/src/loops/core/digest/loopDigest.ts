@@ -25,7 +25,7 @@ export const LOOP_DIGEST_FOOTER =
 
 /**
  * Per-loop digest template. `TExtra` carries whatever loop-specific context
- * the sections need (drained mutation count, funnel shape, mutations, …).
+ * the sections need (mutation count, funnel shape, mutations, …).
  */
 export interface LoopDigestTemplate<TExtra = void> {
   /** Console-log prefix, e.g. '[agent-mode-loop]'. */

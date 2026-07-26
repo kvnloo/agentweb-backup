@@ -14,8 +14,8 @@
  *   - `low_satisfaction` if satisfactionScore.score <= 3
  *
  * Then runs `runLoop(aiEvalManifest, smokePorts)` against those events and
- * reports what rules fired against REAL data, plus drains the captureGate
- * for the proposed fixes that need cloud-dev attention.
+ * reports what rules fired against REAL data, including the mutations produced
+ * for work that needs executor attention.
  */
 
 import * as fs from 'fs';
@@ -219,12 +219,6 @@ const noopBedrock: BedrockPort = {
 const noopSlack: SlackPort = {
   async postMessage() {
     return { channel: 'smoke', ts: 'smoke' };
-  },
-  async getReactions() {
-    return [];
-  },
-  async getReplies() {
-    return [];
   },
 };
 const realClock: ClockPort = { now: () => new Date() };

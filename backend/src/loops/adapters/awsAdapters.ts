@@ -22,8 +22,6 @@ import type {
   DynamoQueryResult,
   SlackPort,
   SlackMessageHandle,
-  SlackReaction,
-  SlackReply,
   ClockPort,
   LoggerPort,
   BedrockPort,
@@ -173,19 +171,6 @@ export function awsSlackAdapter(): SlackPort {
         mrkdwn: true,
       });
       return { channel: (r.channel as string) ?? channelOrUserId, ts: (r.ts as string) ?? '' };
-    },
-    async getReactions(handle: SlackMessageHandle): Promise<readonly SlackReaction[]> {
-      const r = await getSlackClient().reactions.get({ channel: handle.channel, timestamp: handle.ts });
-      const message = (r as { message?: { reactions?: { name: string; users: string[] }[] } }).message;
-      const reactions = message?.reactions ?? [];
-      return reactions.map((rx) => ({ name: rx.name, users: rx.users ?? [] }));
-    },
-    async getReplies(handle: SlackMessageHandle): Promise<readonly SlackReply[]> {
-      const r = await getSlackClient().conversations.replies({ channel: handle.channel, ts: handle.ts });
-      const messages = (r as { messages?: { user?: string; text?: string; ts?: string }[] }).messages ?? [];
-      return messages
-        .filter((m) => m.ts && m.ts !== handle.ts) // skip the original DM
-        .map((m) => ({ user: m.user ?? 'unknown', text: m.text ?? '', ts: m.ts ?? '' }));
     },
   };
 }
