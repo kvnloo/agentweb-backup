@@ -391,6 +391,26 @@ export async function _rollbackEditedFiles(input: {
   const basePath = `/api/landing-pages/v0/generated/${input.context.pageId}`;
   const branch = input.context.draftBranch || 'main';
 
+  const deleteInsteadOfRevert = async (filePath: string): Promise<void> => {
+    try {
+      const deleteResult = await mcpFetch({
+        method: 'PUT',
+        path: `${basePath}/update-files`,
+        body: {
+          files: [{ file_path: filePath, deleted: true }],
+          commit_message: `Rollback: remove ${filePath} (new this session, nothing to revert to)`,
+          ...(branch !== 'main' ? { branch } : {}),
+        },
+        context: { userId: input.context.userId }
+      });
+      if (!deleteResult?.success) {
+        failures.push(`${filePath}: could not delete new file during rollback`);
+      }
+    } catch (error) {
+      failures.push(`${filePath}: could not delete new file during rollback (${error instanceof Error ? error.message : String(error)})`);
+    }
+  };
+
   const failures: string[] = [];
   for (const filePath of files) {
     try {
@@ -400,36 +420,33 @@ export async function _rollbackEditedFiles(input: {
         commit_message: `Rollback ${filePath} after failed coding-agent run`,
       }, input.context);
 
-      // Greptile: revert_file returns an ERROR STRING (doesn't throw) when the
-      // file doesn't exist at the base commit — a brand-new file created this
-      // session has nothing to "revert" to. That case previously fell through
-      // this try/catch undetected (no exception was thrown), so a genuinely
-      // failed rollback was reported as succeeded, leaving the new file
-      // committed on the reusable draft branch. Narrowly matched: only THIS
-      // specific "not found at that commit" signal falls back to deleting the
-      // file — any OTHER revert_file failure (auth, timeout, rate limit) must
-      // still be reported as a real failure, not silently treated as "must be
-      // a new file" and deleted, which would destroy a file that genuinely
-      // existed and should have been restored instead.
+      // Belt-and-suspenders: revert_file's OWN read step can (in principle)
+      // return this string without throwing if the API call itself succeeds
+      // but yields no content. mcpFetch actually throws on a real 404 (see
+      // the catch below), so this branch is a defensive fallback, not the
+      // primary path.
       if (typeof result === 'string' && /may not exist at that commit/i.test(result)) {
-        const deleteResult = await mcpFetch({
-          method: 'PUT',
-          path: `${basePath}/update-files`,
-          body: {
-            files: [{ file_path: filePath, deleted: true }],
-            commit_message: `Rollback: remove ${filePath} (new this session, nothing to revert to)`,
-            ...(branch !== 'main' ? { branch } : {}),
-          },
-          context: { userId: input.context.userId }
-        });
-        if (!deleteResult?.success) {
-          failures.push(`${filePath}: could not delete new file during rollback`);
-        }
+        await deleteInsteadOfRevert(filePath);
       } else if (typeof result === 'string' && /^Error:/i.test(result)) {
         failures.push(`${filePath}: ${result}`);
       }
     } catch (error) {
-      failures.push(`${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+      const message = error instanceof Error ? error.message : String(error);
+      // Greptile: a brand-new file created this session has nothing at the
+      // base commit — mcpFetch throws a real 404 reading it, which used to
+      // just get reported as a rollback failure, leaving it committed on the
+      // reusable draft branch (which only resets when fully published,
+      // ENG-176 — an unresolved leftover persists across sessions, it doesn't
+      // clear on the next run). Narrowly matched to the 404 specifically: any
+      // OTHER thrown error (auth, timeout, rate limit) still reports as a
+      // real failure — treating every failure as "must be new, delete it"
+      // would risk destroying a file that genuinely existed and should have
+      // had its content restored instead.
+      if (/API error \(404\)/i.test(message)) {
+        await deleteInsteadOfRevert(filePath);
+      } else {
+        failures.push(`${filePath}: ${message}`);
+      }
     }
   }
 
@@ -1340,7 +1357,11 @@ async function executeTool(
         context: { userId: context.userId }
       });
 
-      if (!oldFileData.content) {
+      // A legitimately-empty file at that commit has content === "" (falsy but
+      // real) — only an actually-missing key (undefined/null) means "no such
+      // file recorded here." Greptile: the previous falsy check treated an
+      // empty-but-real file the same as a missing one.
+      if (oldFileData.content === undefined || oldFileData.content === null) {
         return `Error: Could not read ${args.file_path} at commit ${args.commit_sha}. The file may not exist at that commit.`;
       }
 

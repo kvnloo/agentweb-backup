@@ -2561,4 +2561,39 @@ describe('_rollbackEditedFiles (Greptile: new files must be deleted, not "revert
     // might genuinely still exist and need real content restored, not deletion.
     expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
   });
+
+  test('a REAL 404 (mcpFetch throws, the actual behavior for a missing file) still triggers the delete fallback', async () => {
+    mockedMcpFetch
+      .mockRejectedValueOnce(new Error('API error (404): File not found at the specified commit')) // real throw, not a resolved string
+      .mockResolvedValueOnce({ success: true }); // update-files delete
+
+    const result = await _rollbackEditedFiles({
+      context: rollbackContext,
+      baseCommitSha: 'base-sha',
+      editedFiles: ['app/api/new-route/route.ts'],
+    });
+
+    expect(result.status).toBe('succeeded');
+    const deleteCall = mockedMcpFetch.mock.calls[1][0] as any;
+    expect(deleteCall.path).toBe('/api/landing-pages/v0/generated/test-page-123/update-files');
+    expect(deleteCall.body.files).toEqual([{ file_path: 'app/api/new-route/route.ts', deleted: true }]);
+  });
+
+  test('Greptile: a file that legitimately existed with EMPTY content at the base commit is restored, NOT deleted', async () => {
+    mockedMcpFetch
+      .mockResolvedValueOnce({ path: 'app/empty.css', content: '', sha: 'sha1' }) // file-at-commit: real, just empty
+      .mockResolvedValueOnce({ success: true, commit_url: 'https://github.com/test/repo/commit/def' }); // github-edit restore
+
+    const result = await _rollbackEditedFiles({
+      context: rollbackContext,
+      baseCommitSha: 'base-sha',
+      editedFiles: ['app/empty.css'],
+    });
+
+    expect(result.status).toBe('succeeded');
+    // Second call must be the normal restore-content write, NOT a delete.
+    const secondCall = mockedMcpFetch.mock.calls[1][0] as any;
+    expect(secondCall.path).toBe('/api/landing-pages/v0/generated/test-page-123/github-edit');
+    expect(secondCall.body.content).toBe('');
+  });
 });
