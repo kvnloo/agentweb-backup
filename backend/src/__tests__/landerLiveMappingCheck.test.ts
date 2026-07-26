@@ -17,12 +17,19 @@ jest.mock("axios", () => ({
 }));
 
 const mockGetLandingPagesByOwner = jest.fn().mockResolvedValue([]);
+const mockGetLandingPagesByOrg = jest.fn().mockResolvedValue([]);
 const mockResolveLandingPageLiveUrl = jest.fn(
   (page: any) => Promise.resolve(page.customDomainUrl || page.deployedUrl || "")
 );
 jest.mock("../services/v0Service", () => ({
   resolveLandingPageLiveUrl: (page: any) => mockResolveLandingPageLiveUrl(page),
   getLandingPagesByOwner: (...args: any[]) => mockGetLandingPagesByOwner(...args),
+  getLandingPagesByOrg: (...args: any[]) => mockGetLandingPagesByOrg(...args),
+}));
+
+const mockGetUserById = jest.fn().mockResolvedValue(null);
+jest.mock("../services/db", () => ({
+  userDb: { getUserById: (...args: any[]) => mockGetUserById(...args) },
 }));
 
 import { verifyLanderLiveMapping } from "../services/landerLiveMappingCheck";
@@ -46,6 +53,8 @@ describe("verifyLanderLiveMapping", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockGetLandingPagesByOwner.mockResolvedValue([]);
+    mockGetLandingPagesByOrg.mockResolvedValue([]);
+    mockGetUserById.mockResolvedValue(null);
     mockResolveLandingPageLiveUrl.mockImplementation(
       (page: any) => Promise.resolve(page.customDomainUrl || page.deployedUrl || "")
     );
@@ -157,6 +166,44 @@ describe("verifyLanderLiveMapping", () => {
     const result = await verifyLanderLiveMapping(BASE_PAGE);
     expect(result.repoMismatch).toBe(true);
     expect(result.possibleCorrectRecord).toEqual({ id: "page-2", name: "The real page" });
+  });
+
+  it("SUCCESS (drift + found via ORG sibling): the matching record belongs to a DIFFERENT org member, not the page owner", async () => {
+    mockAxiosGet
+      .mockResolvedValueOnce({ data: { projectId: "prj_actual", deploymentId: "dpl_1" } })
+      .mockResolvedValueOnce({ data: { gitSource: { type: "github", repoId: 999, ref: "main", sha: "abc" } } })
+      .mockResolvedValueOnce({ data: { full_name: "AgentWebPro/lp-real-repo" } });
+    mockGetUserById.mockResolvedValueOnce({ userId: "user-1", orgId: "org-1" });
+    // The owner's OWN pages don't contain the match — it only shows up via org fanout.
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([
+      { id: "page-1", name: "Test Page", githubRepoUrl: "https://github.com/AgentWebPro/lp-stored-repo" },
+    ]);
+    mockGetLandingPagesByOrg.mockResolvedValueOnce([
+      { id: "page-3", name: "Org member's page", userId: "user-2", githubRepoUrl: "https://github.com/AgentWebPro/lp-real-repo" },
+    ]);
+
+    const result = await verifyLanderLiveMapping(BASE_PAGE);
+
+    expect(result.repoMismatch).toBe(true);
+    expect(result.possibleCorrectRecord).toEqual({ id: "page-3", name: "Org member's page" });
+    expect(mockGetLandingPagesByOrg).toHaveBeenCalledWith("org-1", "user-1");
+  });
+
+  it("SUCCESS (drift, no org): a user with no orgId still works exactly as before — getLandingPagesByOrg never called", async () => {
+    mockAxiosGet
+      .mockResolvedValueOnce({ data: { projectId: "prj_actual", deploymentId: "dpl_1" } })
+      .mockResolvedValueOnce({ data: { gitSource: { type: "github", repoId: 999, ref: "main", sha: "abc" } } })
+      .mockResolvedValueOnce({ data: { full_name: "AgentWebPro/lp-real-repo" } });
+    mockGetUserById.mockResolvedValueOnce({ userId: "user-1" }); // no orgId
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([
+      { id: "page-2", name: "The real page", githubRepoUrl: "https://github.com/AgentWebPro/lp-real-repo" },
+    ]);
+
+    const result = await verifyLanderLiveMapping(BASE_PAGE);
+
+    expect(result.repoMismatch).toBe(true);
+    expect(result.possibleCorrectRecord).toEqual({ id: "page-2", name: "The real page" });
+    expect(mockGetLandingPagesByOrg).not.toHaveBeenCalled();
   });
 
   it("SUCCESS (drift, no match found): repo drifted, no sibling record matches the actual live repo", async () => {
