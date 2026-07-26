@@ -126,6 +126,75 @@ describe('forward-lead CAPI send', () => {
     );
   });
 
+  // --- ENG-449: real client-submission time (capturedAtMs) threaded into event_time ---
+
+  it('a valid, recent capturedAtMs is threaded through as eventTimeSeconds', async () => {
+    const sendSpy = jest.spyOn(metaService, 'sendCapiLeadEvent').mockResolvedValue({ success: true, fbtraceId: 'trace1' });
+    const capturedAtMs = Date.now() - 10_000; // 10s ago — a real, recent submission
+
+    await request(app).post('/api/webhooks/forward-lead').send({
+      listId: 'list_123', email: 'test@example.com',
+      pixelId: '1430870751246428', metaAccountId: 'acc1', eventId: 'evt_client_abc',
+      capturedAtMs,
+    });
+    await flushAsyncWork();
+
+    expect(sendSpy).toHaveBeenCalledWith(
+      '1430870751246428', 'tok',
+      expect.objectContaining({ eventTimeSeconds: Math.floor(capturedAtMs / 1000) }),
+    );
+  });
+
+  it('a capturedAtMs over an hour in the past is rejected — eventTimeSeconds omitted, not forwarded', async () => {
+    const sendSpy = jest.spyOn(metaService, 'sendCapiLeadEvent').mockResolvedValue({ success: true, fbtraceId: 'trace1' });
+    const capturedAtMs = Date.now() - 2 * 60 * 60 * 1000; // 2 hours ago
+
+    await request(app).post('/api/webhooks/forward-lead').send({
+      listId: 'list_123', email: 'test@example.com',
+      pixelId: '1430870751246428', metaAccountId: 'acc1', eventId: 'evt_client_abc',
+      capturedAtMs,
+    });
+    await flushAsyncWork();
+
+    expect(sendSpy).toHaveBeenCalledWith(
+      '1430870751246428', 'tok',
+      expect.objectContaining({ eventTimeSeconds: undefined }),
+    );
+  });
+
+  it('a capturedAtMs 10 minutes in the future is rejected — eventTimeSeconds omitted', async () => {
+    const sendSpy = jest.spyOn(metaService, 'sendCapiLeadEvent').mockResolvedValue({ success: true, fbtraceId: 'trace1' });
+    const capturedAtMs = Date.now() + 10 * 60 * 1000;
+
+    await request(app).post('/api/webhooks/forward-lead').send({
+      listId: 'list_123', email: 'test@example.com',
+      pixelId: '1430870751246428', metaAccountId: 'acc1', eventId: 'evt_client_abc',
+      capturedAtMs,
+    });
+    await flushAsyncWork();
+
+    expect(sendSpy).toHaveBeenCalledWith(
+      '1430870751246428', 'tok',
+      expect.objectContaining({ eventTimeSeconds: undefined }),
+    );
+  });
+
+  it('no capturedAtMs at all (an older, not-yet-regenerated customer repo) still sends CAPI normally', async () => {
+    const sendSpy = jest.spyOn(metaService, 'sendCapiLeadEvent').mockResolvedValue({ success: true, fbtraceId: 'trace1' });
+
+    const response = await request(app).post('/api/webhooks/forward-lead').send({
+      listId: 'list_123', email: 'test@example.com',
+      pixelId: '1430870751246428', metaAccountId: 'acc1', eventId: 'evt_client_abc',
+    });
+    await flushAsyncWork();
+
+    expect(response.status).toBe(201);
+    expect(sendSpy).toHaveBeenCalledWith(
+      '1430870751246428', 'tok',
+      expect.objectContaining({ eventTimeSeconds: undefined }),
+    );
+  });
+
   it('CAPI throwing does not affect the already-sent lead-save response', async () => {
     (getMetaAccountCredentials as jest.Mock).mockRejectedValue(new Error('token expired'));
 

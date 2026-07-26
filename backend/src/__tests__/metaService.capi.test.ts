@@ -237,4 +237,50 @@ describe('sendCapiLeadEvent', () => {
     expect(result.success).toBe(true);
     expect(result.usage).toBeUndefined();
   });
+
+  // --- event_time: real client-submission time, not server CAPI-send time (ENG-449) ---
+
+  it('uses a valid eventTimeSeconds verbatim as event_time', async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ events_received: 1, fbtrace_id: 'trace1' }),
+    });
+
+    await metaService.sendCapiLeadEvent('px1', 'tok', { ...baseEvent, eventTimeSeconds: 1750000000 });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.data[0].event_time).toBe(1750000000);
+  });
+
+  it.each([
+    ['NaN', NaN],
+    ['negative', -5],
+    ['non-integer', 123.45],
+    ['zero', 0],
+  ])('falls back to current server time when eventTimeSeconds is invalid (%s)', async (_label, invalid) => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ events_received: 1, fbtrace_id: 'trace1' }),
+    });
+    const before = Math.floor(Date.now() / 1000);
+
+    await metaService.sendCapiLeadEvent('px1', 'tok', { ...baseEvent, eventTimeSeconds: invalid as number });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.data[0].event_time).toBeGreaterThanOrEqual(before);
+    expect(body.data[0].event_time).not.toBe(invalid);
+  });
+
+  it('falls back to current server time when eventTimeSeconds is omitted entirely (matches every pre-existing test/caller)', async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ events_received: 1, fbtrace_id: 'trace1' }),
+    });
+    const before = Math.floor(Date.now() / 1000);
+
+    await metaService.sendCapiLeadEvent('px1', 'tok', baseEvent);
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.data[0].event_time).toBeGreaterThanOrEqual(before);
+  });
 });
