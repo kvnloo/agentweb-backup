@@ -473,6 +473,9 @@ You CAN create new files using \`edit_file\`. For a file that does not yet exist
 - Or use \`edits\` with a search/replace where \`search\` is an empty string \`""\` and \`replace\` is the full file content.
 The tool will create the file if it doesn't exist. No need to read it first.
 
+## Editing multiple files for one fix
+If a single logical change requires editing 2+ files (e.g. a page plus a new API route it calls), use \`edit_files\` instead of multiple \`edit_file\` calls — it lands all of them in ONE atomic commit, so the repo never sits in a broken intermediate state between commits.
+
 ## Principles
 - Make targeted, small edits (1-5 edit blocks per call). Never rewrite entire files.
 - For files over 5KB, use search_in_file to locate code before reading. Use read_file with line ranges, not whole files.
@@ -824,6 +827,64 @@ function getToolDefinitions(): Anthropic.Tool[] {
       }
     },
     {
+      name: 'edit_files',
+      description: 'Commit changes to MULTIPLE files in ONE atomic commit. Use this instead of calling edit_file N times when a single logical fix spans 2+ files (e.g. editing a page AND adding a new API route it depends on) — landing them in separate commits can leave the repo in a broken intermediate state if something fails partway. Each file entry supports the same line_edits/edits modes as edit_file, or deleted: true to remove a file.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          files: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                file_path: {
+                  type: 'string',
+                  description: 'Path to the file'
+                },
+                line_edits: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      start_line: { type: 'number', description: 'First line to replace (1-indexed)' },
+                      end_line: { type: 'number', description: 'Last line to replace (1-indexed, inclusive)' },
+                      new_content: { type: 'string', description: 'Replacement content (can be empty string to delete lines)' },
+                      expected_content: { type: 'string', description: 'Optional: expected content at those lines (safety check)' }
+                    },
+                    required: ['start_line', 'end_line', 'new_content']
+                  },
+                  description: 'Line-number-based edits for this file (preferred). Omit if using edits or deleted.'
+                },
+                edits: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      search: { type: 'string', description: 'Exact string to find (must match exactly once)' },
+                      replace: { type: 'string', description: 'Replacement string' }
+                    },
+                    required: ['search', 'replace']
+                  },
+                  description: 'Search/replace edits for this file (fallback). Omit if using line_edits or deleted.'
+                },
+                deleted: {
+                  type: 'boolean',
+                  description: 'Set true to remove this file in the same commit instead of editing it.'
+                }
+              },
+              required: ['file_path']
+            },
+            description: 'Files to commit together atomically. Each needs line_edits, edits, or deleted: true.'
+          },
+          commit_message: {
+            type: 'string',
+            description: 'Git commit message describing the combined change'
+          }
+        },
+        required: ['files']
+      }
+    },
+    {
       name: 'check_deployment',
       description: 'Check the Vercel deployment status. Use this after editing files to verify the build succeeded.',
       input_schema: {
@@ -924,6 +985,74 @@ function getToolDefinitions(): Anthropic.Tool[] {
 
 // ─── Tool Execution ─────────────────────────────────────────────────────────
 
+/**
+ * Shared by `edit_file` and `edit_files` (ENG-497): read a file's current
+ * content (from the draft branch if applicable; a 404 means "doesn't exist
+ * yet, start empty" so new files can be created), then apply either
+ * line_edits (preferred) or edits (search/replace fallback) to compute the
+ * new full content. Does NOT write anything — callers batch the write
+ * themselves (one PUT per file for edit_file, one atomic multi-file PUT for
+ * edit_files).
+ */
+async function computeFileEdit(
+  basePath: string,
+  branchQuery: Record<string, string>,
+  context: CodingAgentContext,
+  file: { file_path: string; line_edits?: unknown; edits?: unknown }
+): Promise<
+  | { ok: true; content: string; appliedCount: number; totalEdits: number; errors: string[] }
+  | { ok: false; reason: 'no_edits' }
+  | { ok: false; reason: 'zero_applied'; errors: string[] }
+> {
+  const hasLineEdits = Array.isArray(file.line_edits) && file.line_edits.length > 0;
+  const hasSearchReplace = Array.isArray(file.edits) && file.edits.length > 0;
+
+  if (!hasLineEdits && !hasSearchReplace) {
+    return { ok: false, reason: 'no_edits' };
+  }
+
+  let currentContent = '';
+  try {
+    const fileData = await mcpFetch({
+      method: 'GET',
+      path: `${basePath}/file-content`,
+      queryParams: { path: file.file_path, ...branchQuery },
+      context: { userId: context.userId }
+    });
+    currentContent = fileData.content || '';
+  } catch (readErr: unknown) {
+    if (readErr instanceof Error && /API error \(404\)/i.test(readErr.message)) {
+      currentContent = '';
+    } else {
+      throw readErr;
+    }
+  }
+
+  let newContent: string;
+  let appliedCount: number;
+  let errors: string[];
+  let totalEdits: number;
+
+  if (hasLineEdits) {
+    const editResult = applyLineNumberEdit(currentContent, file.line_edits as any);
+    newContent = editResult.result;
+    appliedCount = editResult.appliedCount;
+    errors = editResult.errors;
+    totalEdits = (file.line_edits as any[]).length;
+  } else {
+    const editResult = applySearchReplace(currentContent, file.edits as any);
+    newContent = editResult.result;
+    appliedCount = editResult.appliedCount;
+    errors = editResult.errors;
+    totalEdits = (file.edits as any[]).length;
+  }
+
+  if (appliedCount === 0) {
+    return { ok: false, reason: 'zero_applied', errors };
+  }
+  return { ok: true, content: newContent, appliedCount, totalEdits, errors };
+}
+
 async function executeTool(
   toolName: string,
   args: any,
@@ -943,6 +1072,16 @@ async function executeTool(
     !isSafeRepoPath(args.file_path)
   ) {
     return scopeViolationMessage(args.file_path);
+  }
+  // edit_files (ENG-497): same guard, applied to EVERY file in the batch — one
+  // bad path blocks the whole atomic commit, matching update-files' own
+  // whole-batch rejection.
+  if (toolName === 'edit_files' && Array.isArray(args.files)) {
+    for (const f of args.files) {
+      if (f?.file_path && !isSafeRepoPath(f.file_path)) {
+        return scopeViolationMessage(f.file_path);
+      }
+    }
   }
 
   switch (toolName) {
@@ -1038,58 +1177,20 @@ async function executeTool(
     }
 
     case 'edit_file': {
-      const hasLineEdits = args.line_edits && Array.isArray(args.line_edits) && args.line_edits.length > 0;
-      const hasSearchReplace = args.edits && Array.isArray(args.edits) && args.edits.length > 0;
-
-      if (!hasLineEdits && !hasSearchReplace) {
-        return 'Error: either line_edits or edits array is required and must not be empty.';
-      }
-
-      // Step 1: Read current file content (from draft branch if applicable).
-      // A 404 means the file doesn't exist yet — treat as empty content so the agent can create new files.
-      let currentContent = '';
-      try {
-        const fileData = await mcpFetch({
-          method: 'GET',
-          path: `${basePath}/file-content`,
-          queryParams: { path: args.file_path, ...branchQuery },
-          context: { userId: context.userId }
-        });
-        currentContent = fileData.content || '';
-      } catch (readErr: unknown) {
-        if (readErr instanceof Error && /API error \(404\)/i.test(readErr.message)) {
-          // New file — start with empty content
-          currentContent = '';
-        } else {
-          throw readErr;
+      const computed = await computeFileEdit(basePath, branchQuery, context, {
+        file_path: args.file_path,
+        line_edits: args.line_edits,
+        edits: args.edits,
+      });
+      if (!computed.ok) {
+        if (computed.reason === 'no_edits') {
+          return 'Error: either line_edits or edits array is required and must not be empty.';
         }
+        return `Failed to apply edits. Errors:\n${computed.errors.join('\n')}`;
       }
-      let newContent: string;
-      let appliedCount: number;
-      let errors: string[];
-      let totalEdits: number;
+      const { content: newContent, appliedCount, totalEdits, errors } = computed;
 
-      if (hasLineEdits) {
-        // Line-number-based editing (preferred)
-        const editResult = applyLineNumberEdit(currentContent, args.line_edits);
-        newContent = editResult.result;
-        appliedCount = editResult.appliedCount;
-        errors = editResult.errors;
-        totalEdits = args.line_edits.length;
-      } else {
-        // Search/replace editing (fallback)
-        const editResult = applySearchReplace(currentContent, args.edits);
-        newContent = editResult.result;
-        appliedCount = editResult.appliedCount;
-        errors = editResult.errors;
-        totalEdits = args.edits.length;
-      }
-
-      if (appliedCount === 0) {
-        return `Failed to apply edits. Errors:\n${errors.join('\n')}`;
-      }
-
-      // Step 3: Write back via GitHub API
+      // Write back via GitHub API
       const writeResult = await mcpFetch({
         method: 'PUT',
         path: `${basePath}/github-edit`,
@@ -1113,6 +1214,65 @@ async function executeTool(
       }
       if (errors.length > 0) {
         response += `\nWarnings (${errors.length} edits skipped):\n${errors.join('\n')}`;
+      }
+      return response;
+    }
+
+    case 'edit_files': {
+      // ENG-497: commit several files in ONE atomic commit — use this instead
+      // of calling edit_file N times when a single logical fix spans multiple
+      // files (the ENG-443 incident's exact shape: a lander file + a new API
+      // route landing together).
+      if (!Array.isArray(args.files) || args.files.length === 0) {
+        return 'Error: files must be a non-empty array.';
+      }
+
+      const filesToCommit: Array<{ file_path: string; content?: string; deleted?: boolean }> = [];
+      const warnings: string[] = [];
+
+      for (const f of args.files) {
+        if (!f?.file_path || typeof f.file_path !== 'string') {
+          return 'Error: each file requires a file_path.';
+        }
+        if (f.deleted) {
+          filesToCommit.push({ file_path: f.file_path, deleted: true });
+          continue;
+        }
+        const computed = await computeFileEdit(basePath, branchQuery, context, f);
+        if (!computed.ok) {
+          if (computed.reason === 'no_edits') {
+            return `Error: ${f.file_path}: either line_edits or edits array is required and must not be empty (or deleted: true).`;
+          }
+          return `Error: ${f.file_path}: failed to apply edits. Errors:\n${computed.errors.join('\n')}`;
+        }
+        filesToCommit.push({ file_path: f.file_path, content: computed.content });
+        if (computed.errors.length > 0) {
+          warnings.push(`${f.file_path}: ${computed.errors.join('; ')}`);
+        }
+      }
+
+      const writeResult = await mcpFetch({
+        method: 'PUT',
+        path: `${basePath}/update-files`,
+        body: {
+          files: filesToCommit,
+          commit_message: args.commit_message || `Update ${filesToCommit.length} files`,
+          ...(branch !== "main" ? { branch } : {}),
+        },
+        context: { userId: context.userId }
+      });
+
+      let response = `Committed ${filesToCommit.length} file(s) in one atomic commit: ${filesToCommit.map((f) => f.file_path).join(', ')}.`;
+      if (writeResult.is_staging) {
+        response += ` Changes pushed to draft branch ${branch}. A preview deployment is being created.`;
+      } else if (writeResult.deployed_url) {
+        response += ` Changes will auto-deploy to ${writeResult.deployed_url}.`;
+      }
+      if (writeResult.commit_url) {
+        response += ` Commit: ${writeResult.commit_url}`;
+      }
+      if (warnings.length > 0) {
+        response += `\nWarnings:\n${warnings.join('\n')}`;
       }
       return response;
     }
