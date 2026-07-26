@@ -608,17 +608,16 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
       }
     }
     if (routeLabels.length > 0) {
-      try {
-        await raiseIssueTriage(match.issueId, {
-          addLabelNames: routeLabels,
-          removeLabelNames: route.removeLabels,
-          assigneeId: route.assigneeId,
-          ...(priority ? { priority } : {}),
-          settleStateName: route.stateName,
-        });
-      } catch (e) {
-        console.warn('[intake] auto route enrichment failed:', e instanceof Error ? e.message : e);
-      }
+      // Routing metadata is part of successful intake, not best-effort
+      // decoration. Propagate failures so the producer retries instead of
+      // silently leaving the canonical in the wrong execution queue.
+      await raiseIssueTriage(match.issueId, {
+        addLabelNames: routeLabels,
+        removeLabelNames: route.removeLabels,
+        assigneeId: route.assigneeId,
+        ...(priority ? { priority } : {}),
+        settleStateName: route.stateName,
+      });
     }
     return { pageId: match.identifier, url: `${LINEAR_ISSUE_BASE}/${match.identifier}`, deduped: true, tracker: 'Linear' };
   }

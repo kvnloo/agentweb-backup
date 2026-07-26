@@ -574,6 +574,22 @@ describe('intakeService.fileAutoIssue', () => {
     });
   });
 
+  it('fails deduped intake visibly when required route enrichment fails', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-11', issueId: 'uuid-11', title: 'same alert', description: 'd' },
+    ]);
+    linear.raiseIssueTriage.mockRejectedValueOnce(new Error('Linear route update rejected'));
+
+    await expect(
+      fileAutoIssue({
+        title: 'same alert',
+        description: 'd',
+        source: 'AI eval',
+        executionRoute: 'autofix',
+      }),
+    ).rejects.toThrow('Linear route update rejected');
+  });
+
   it('flag ON + open Auto issue with same title -> groups (comment), no new issue', async () => {
     process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenIssuesByLabel.mockResolvedValue([{ identifier: 'ENG-7', issueId: 'uuid-7', title: 'Context limit reached' }]);
