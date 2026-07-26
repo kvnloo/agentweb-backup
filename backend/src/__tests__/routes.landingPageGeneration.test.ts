@@ -50,6 +50,7 @@ const mockGetLeadListById = jest.fn();
 const mockUpdateLeadList = jest.fn();
 const mockGetLeadListsForUser = jest.fn();
 const mockCreateLeadList = jest.fn();
+const mockCanOrgMemberAccessList = jest.fn();
 
 jest.mock("../services/db", () => ({
   userDb: {
@@ -64,6 +65,7 @@ jest.mock("../services/db", () => ({
     updateLeadList: (...args: any[]) => mockUpdateLeadList(...args),
     getLeadListsForUser: (...args: any[]) => mockGetLeadListsForUser(...args),
     createLeadList: (...args: any[]) => mockCreateLeadList(...args),
+    canOrgMemberAccessList: (...args: any[]) => mockCanOrgMemberAccessList(...args),
   },
 }));
 
@@ -234,6 +236,10 @@ beforeEach(() => {
   // list. Default to a resolvable one so unrelated tests pass the gate; the
   // dedicated capture-or-fail tests override per-call.
   mockGetLeadListById.mockResolvedValue({ id: "list-1", publicAccessEnabled: true });
+  // ENG-449 security fix: explicit lead_list_id must belong to the caller's own
+  // account/org. Default to allowed so unrelated tests pass the gate; the
+  // dedicated cross-tenant test overrides per-call.
+  mockCanOrgMemberAccessList.mockResolvedValue(true);
   // Default-list auto-resolve path: default to "already exists" so tests that omit
   // lead_list_id don't accidentally exercise list creation unless they mean to.
   mockGetLeadListsForUser.mockResolvedValue([
@@ -632,6 +638,35 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     expect(res.status).toBe(201);
     expect(mockGetLeadListById).toHaveBeenCalledWith("list-1");
+  });
+
+  it("FAIL (security): explicit lead_list_id belongs to another tenant → 403, never generates", async () => {
+    mockGetLeadListById.mockResolvedValueOnce({ id: "list-1", userId: "other-user-id", publicAccessEnabled: true });
+    mockCanOrgMemberAccessList.mockResolvedValueOnce(false);
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1" });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toMatch(/not accessible to you/);
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+    expect(mockCanOrgMemberAccessList).toHaveBeenCalledWith(
+      "test-user-id",
+      expect.objectContaining({ id: "list-1", userId: "other-user-id" }),
+    );
+  });
+
+  it("SUCCESS (security): explicit lead_list_id owned by the caller's own org → generation proceeds", async () => {
+    mockGetLeadListById.mockResolvedValueOnce({ id: "list-1", userId: "org-mate-id", publicAccessEnabled: true });
+    mockCanOrgMemberAccessList.mockResolvedValueOnce(true);
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1" });
+
+    expect(res.status).toBe(201);
   });
 
   it("FAIL: bridge_out_url is not a well-formed http(s) URL → 400", async () => {
