@@ -83,6 +83,8 @@ describe('linearService.createInternalLinearIssue — triage fields + loud label
               { id: 'lab_crep', name: 'Customer Reported' },
               { id: 'lab_ret', name: 'Retention' },
               { id: 'lab_st_paid', name: 'Status: Paid / Retention Handoff' },
+              { id: 'lab_autofix', name: 'autofix' },
+              { id: 'lab_needs_pm', name: 'Needs PM' },
             ],
           },
         }],
@@ -182,6 +184,22 @@ describe('linearService.createInternalLinearIssue — triage fields + loud label
       const input = lastUpdateInput();
       expect(input.labelIds.sort()).toEqual(['lab_bug', 'lab_ret'].sort());
       expect(input.priority).toBeUndefined();
+    });
+
+    it('atomically replaces an exclusive route label and updates the assignee', async () => {
+      mockFetchSequence(
+        TEAM_TRIAGE,
+        issueResponse(3, ['lab_bug', 'lab_needs_pm']),
+        UPDATE_OK,
+      );
+      await raiseIssueTriage('uuid-5', {
+        addLabelNames: ['autofix'],
+        removeLabelNames: ['Needs PM'],
+        assigneeId: 'user-manan',
+      });
+      const input = lastUpdateInput();
+      expect(input.labelIds.sort()).toEqual(['lab_bug', 'lab_autofix'].sort());
+      expect(input.assigneeId).toBe('user-manan');
     });
 
     // ENG-187 contract #4 — settleStateName: an FB-synced feature request must END UP in Backlog,

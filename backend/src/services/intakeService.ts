@@ -490,8 +490,15 @@ export interface FileAutoIssueParams {
   source: string;
   /** Extra Linear labels beyond "Auto" (e.g. ["Scheduled Chat"]). Unknown names are dropped. */
   extraLabels?: string[];
-  /** Tags + context for the Notion path (flag off). */
+  /**
+   * Explicit execution decision for machine-generated work. Priority and complexity never imply
+   * autonomy: callers should choose an execution route, and unknown/mixed work should use
+   * `human-triage`. Omission fails closed to human triage for legacy callers.
+   */
+  executionRoute?: 'autofix' | 'human-triage';
+  /** Legacy field retained for source compatibility; auto issues are always filed in Linear. */
   notionTags?: string[];
+  /** Structured occurrence context used by the Linear dedupe gate. */
   notionContext?: Record<string, any>;
 }
 
@@ -512,31 +519,43 @@ const ALERT_PRIORITY_CONTEXT_KEY = 'Alert Priority';
 
 export interface FiledAutoResult {
   pageId: string;
-  /** Link to the filed item (Linear issue or Notion page), for alert emails. */
+  /** Link to the filed Linear issue, for alert emails. */
   url?: string;
   deduped: boolean;
-  tracker: 'Linear' | 'Notion';
+  tracker: 'Linear';
 }
 
 /**
- * File an auto-identified issue. Callers should treat this as best-effort and wrap it
- * (a failed self-report must not break the user's real request) — it throws on a hard
- * failure rather than rerouting to another tracker.
+ * File an auto-identified issue in Linear. Callers should treat this as best-effort and wrap it
+ * (a failed self-report must not break the user's real request) — it throws on a hard failure.
+ *
+ * Auto issues deliberately ignore FEATUREBASE_INTAKE: that flag controls the customer-facing
+ * Featurebase migration, while Linear is the sole source of truth for system-generated work.
  */
 export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoResult> {
-  // Migration switch (NOT a fallback): off -> Notion.
-  if (!intakeEnabled()) {
-    const { createOncallItem } = await import('./notionService');
-    const o = await createOncallItem({
-      title: p.title,
-      description: p.description,
-      additionalTags: p.notionTags || ['Oncall'],
-      context: p.notionContext,
-    });
-    return { pageId: o.pageId, url: o.notionUrl, deduped: false, tracker: 'Notion' };
-  }
-
-  const { listOpenIssuesByLabel, addIssueComment, createInternalLinearIssue, escalateIssue } = await import('./linearService');
+  const {
+    listOpenIssuesByLabel,
+    addIssueComment,
+    createInternalLinearIssue,
+    escalateIssue,
+    raiseIssueTriage,
+  } = await import('./linearService');
+  const executionRoute = p.executionRoute ?? 'human-triage';
+  const route =
+    executionRoute === 'autofix'
+      ? {
+          labels: ['Bug', 'autofix'],
+          removeLabels: ['Needs PM'],
+          assigneeId: BUG_DEFAULT_ASSIGNEE_ID,
+          stateName: 'Todo',
+        }
+      : {
+          labels: ['Bug', 'Needs PM'],
+          removeLabels: ['autofix'],
+          assigneeId: '142fef82-4d45-4070-99be-c5debe565ac6', // Harsha
+          stateName: 'Todo',
+        };
+  const routeLabels = route.labels;
   // Amount-insensitive title normalization (ENG-358): dollar amounts in a recurring alert's title
   // are occurrence data, not identity — "v0 credits LOW — $58.51 spendable" and "… $59.15 …" are
   // the same issue. Collapsing amounts also lets pre-ENG-358 open canonicals (no class marker in
@@ -588,6 +607,18 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
         console.warn('[intake] auto alert escalation failed:', e instanceof Error ? e.message : e);
       }
     }
+    if (routeLabels.length > 0) {
+      // Routing metadata is part of successful intake, not best-effort
+      // decoration. Propagate failures so the producer retries instead of
+      // silently leaving the canonical in the wrong execution queue.
+      await raiseIssueTriage(match.issueId, {
+        addLabelNames: routeLabels,
+        removeLabelNames: route.removeLabels,
+        assigneeId: route.assigneeId,
+        ...(priority ? { priority } : {}),
+        settleStateName: route.stateName,
+      });
+    }
     return { pageId: match.identifier, url: `${LINEAR_ISSUE_BASE}/${match.identifier}`, deduped: true, tracker: 'Linear' };
   }
   const body = [
@@ -600,7 +631,9 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
   const li = await createInternalLinearIssue({
     title: p.title,
     description: body,
-    labelNames: ['Auto', ...(p.extraLabels || [])],
+    labelNames: [...new Set(['Auto', ...routeLabels, ...(p.extraLabels || [])])],
+    stateName: route.stateName,
+    assigneeId: route.assigneeId,
     // Classed alerts land with a real priority so the canonical never sits at "No priority"
     // (ENG-350 did). Absent the context key, behavior is unchanged.
     ...(priority ? { priority } : {}),
