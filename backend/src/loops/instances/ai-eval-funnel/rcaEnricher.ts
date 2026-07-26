@@ -14,10 +14,10 @@
  *   - Hard 25-second timeout. Any failure path (Bedrock error, non-JSON
  *     response, schema mismatch, timeout) returns the same graceful envelope:
  *         { topHypotheses: [proposal.hypothesis], rankedFixes: [], error: '...' }
- *     The caller (NotionDigestTool / cron DM) NEVER sees a thrown exception.
+ *     The caller (LinearIntakeTool / cron DM) NEVER sees a thrown exception.
  *   - This module is the single source of truth for the RCA shape. Both the
- *     Notion task body and the Slack DM read its output via
- *     `mutation.artifact.rcaEnrichment` (populated by NotionDigestTool.apply()).
+ *     Linear issue body and the Slack DM read its output via
+ *     `mutation.artifact.rcaEnrichment` (populated by LinearIntakeTool.apply()).
  */
 
 import type { MutationProposal } from '../../core/types';
@@ -72,7 +72,7 @@ function buildSystemPrompt(mutationSurface: readonly MutationSurfaceEntry[]): st
     'ARCHITECTURE:',
     'A daily cron scans funnel telemetry from a DynamoDB events table, fires policy-DSL rules',
     'when ratios cross thresholds, and asks you to explain WHY each fired rule actually triggered',
-    'and HOW to fix it. Your output drives the Notion task spec + the Slack DM line for the founder.',
+    'and HOW to fix it. Your output drives the Linear issue spec + the Slack DM line for the founder.',
     '',
     'TELEMETRY EVENTS (these are the event types in the table — fluent reference):',
     '  - landed: a user hit any AgentWeb pathname. Note: <LandedTracker /> in the landing-page',

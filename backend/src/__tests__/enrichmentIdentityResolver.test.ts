@@ -562,6 +562,151 @@ describe('resolveIdentity — Apollo people-match fills company from embedded or
     }
     expect(deps.enrichSoReverseLookup).not.toHaveBeenCalled();
   });
+
+  // ENG-433: for a personal/institutional email (gmail, .edu, ...) Apollo's
+  // people-match enriches the org from the email DOMAIN when it can't pin the
+  // real person, echoing the free-mail provider or university itself. That is
+  // never the lead's employer, so it must not be resolved/persisted.
+  it('does NOT fill company from an Apollo org that echoes the lead\'s institutional email domain', async () => {
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        // Apollo echoing the university back for a .edu address.
+        company: 'Dartmouth College', website: 'https://www.dartmouth.edu',
+      }),
+    });
+    // Mirrors the real reported case: institutional email + a LinkedIn URL
+    // (so the lead still resolves and company can come from LinkedIn/person
+    // data downstream) — the Apollo domain-echo must NOT become the company.
+    const result = await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          email: 'xqvistgaard@dartmouth.edu',
+          firstName: 'Xochitl',
+          lastName: 'Qvistgaard',
+          linkedin: 'https://www.linkedin.com/in/xqvistgaard',
+        },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.resolved.company).toBeUndefined();
+      expect(result.resolved.website).toBeUndefined();
+    }
+    // The institutional org must never be written to the lead.
+    expect(deps.writeLeadFields).not.toHaveBeenCalledWith(
+      expect.objectContaining({ fields: expect.objectContaining({ company: 'Dartmouth College' }) }),
+    );
+  });
+
+  it('still fills company from an Apollo org on a DIFFERENT domain for a personal-email lead (real employer)', async () => {
+    // A free-mail lead whose real employer Apollo resolved (different domain) —
+    // the guard must NOT reject this; it is the "source of truth" we want.
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        company: 'NVIDIA', website: 'https://www.nvidia.com',
+      }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'someone@gmail.com', firstName: 'Real', lastName: 'Person' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.resolved.company).toBe('NVIDIA');
+      expect(result.resolved.website).toBe('https://www.nvidia.com');
+    }
+  });
+
+  // ENG-433 (Greptile P1): free-mail domains are dropped by extractDomainFromEmail,
+  // so the echo check must derive the domain directly or it silently lets a
+  // free-mail provider through as the employer.
+  it('does NOT fill company from an Apollo org that echoes a FREE-MAIL email domain', async () => {
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        company: 'Yahoo', website: 'https://www.yahoo.com',
+      }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          email: 'someone@yahoo.com',
+          firstName: 'Free',
+          lastName: 'Mailer',
+          linkedin: 'https://www.linkedin.com/in/free-mailer',
+        },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.resolved.company).toBeUndefined();
+      expect(result.resolved.website).toBeUndefined();
+    }
+  });
+
+  // ENG-433: a WEBSITELESS Apollo company is trusted (it comes from the person's
+  // employment history — their real employer). It must NOT be name-matched against
+  // the email domain, or legitimate employers that contain the institution's name
+  // ("MIT Lincoln Laboratory" for an @mit.edu lead) would be wrongly dropped.
+  it('KEEPS a websiteless real employer whose name contains the institution (mit.edu → "MIT Lincoln Laboratory")', async () => {
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        company: 'MIT Lincoln Laboratory', // no website; real employer, not an echo
+      }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          email: 'researcher@mit.edu',
+          firstName: 'Real',
+          lastName: 'Scientist',
+          linkedin: 'https://www.linkedin.com/in/real-scientist',
+        },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.resolved.company).toBe('MIT Lincoln Laboratory');
+    }
+  });
+
+  // ENG-433 (Greptile P1): an Apollo people-match that returns a real employer
+  // WITHOUT an org website must not be dropped just because the lead has an
+  // institutional email and no LinkedIn — nothing identifies it as an echo.
+  it('fills company from a websiteless Apollo employer for an institutional-email lead with no LinkedIn', async () => {
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        company: 'Google', // real employer, no organization website in the response
+      }),
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'employee@mit.edu', firstName: 'Grace', lastName: 'Hopper' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.resolved.company).toBe('Google');
+    }
+  });
 });
 
 describe('resolveIdentity — enrich.so reverse-lookup company fallback', () => {

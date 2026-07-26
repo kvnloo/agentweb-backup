@@ -98,7 +98,7 @@ describe('UnipileProfileService.getProfile — cold cache', () => {
 // ─── Viewer-relative field stripping ──────────────────────────────────────────
 
 describe('UnipileProfileService.getProfile — viewer-relative stripping', () => {
-  it('strips network_distance, is_open_profile, is_invitation_pending, connection_degree before write', async () => {
+  it('strips network_distance, is_open_profile, is_invitation_pending, connection_degree, is_relationship, connected_at before write', async () => {
     const http = makeHttp({
       fetchProfile: jest.fn().mockResolvedValue({
         public_identifier: 'alice-smith',
@@ -109,6 +109,9 @@ describe('UnipileProfileService.getProfile — viewer-relative stripping', () =>
         is_open_profile: true,
         is_invitation_pending: false,
         connection_degree: 1,
+        // ENG-440: "am I connected / when did I connect" is viewer-relative too
+        is_relationship: true,
+        connected_at: 1777170167000,
       }),
     });
     const store = makeStore();
@@ -122,9 +125,37 @@ describe('UnipileProfileService.getProfile — viewer-relative stripping', () =>
     expect(written.rawData).not.toHaveProperty('is_open_profile');
     expect(written.rawData).not.toHaveProperty('is_invitation_pending');
     expect(written.rawData).not.toHaveProperty('connection_degree');
+    expect(written.rawData).not.toHaveProperty('is_relationship');
+    expect(written.rawData).not.toHaveProperty('connected_at');
     // viewer-independent fields are kept
     expect(written.rawData).toHaveProperty('first_name', 'Alice');
     expect(written.rawData).toHaveProperty('public_identifier', 'alice-smith');
+  });
+
+  it('does not serve a first viewer\'s is_relationship/connected_at to a second viewer on a cache hit (ENG-440)', async () => {
+    // Viewer A is a 1st-degree connection; the live response says so.
+    const http = makeHttp({
+      fetchProfile: jest.fn().mockResolvedValue({
+        public_identifier: 'sri-sunda',
+        provider_id: 'ACoAAA2',
+        first_name: 'Sri',
+        is_relationship: true,
+        connected_at: 1780960142000,
+      }),
+    });
+    const store = makeStore();
+    const svc = makeService(http, store);
+
+    // Viewer A cold call sees live viewer-relative state.
+    const cold = await svc.getProfile('sri-sunda', 'acct-A');
+    expect(cold.rawData.is_relationship).toBe(true);
+    expect(cold.rawData.connected_at).toBe(1780960142000);
+
+    // Viewer B hits the shared global cache — it must NOT inherit A's relationship state.
+    const warm = await svc.getProfile('sri-sunda', 'acct-B');
+    expect(warm.fromCache).toBe(true);
+    expect(warm.rawData).not.toHaveProperty('is_relationship');
+    expect(warm.rawData).not.toHaveProperty('connected_at');
   });
 
   it('returns viewer-relative fields on the cold call (live response) but never on subsequent cache hits', async () => {

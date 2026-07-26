@@ -1,4 +1,4 @@
-import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, LANDING_PAGE_PREVIEW_BRANCH, _isMissingGithubRefError, _describeGithubError, _previewBranchCommitsAheadOfMain, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream } from '../services/codingAgentService';
+import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, LANDING_PAGE_PREVIEW_BRANCH, _isMissingGithubRefError, _describeGithubError, _previewBranchCommitsAheadOfMain, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream, _rollbackEditedFiles } from '../services/codingAgentService';
 import { agentModeService } from '../services/agentModeService';
 
 // Mock mcpFetch
@@ -661,6 +661,140 @@ describe('runCodingAgent', () => {
     expect(result.message).toContain('New Title');
     expect(result.iterations).toBe(3);
     expect(mockCreate).toHaveBeenCalledTimes(3);
+  });
+
+  // --- edit_files (ENG-497): atomic multi-file commit ---
+
+  test('edit_files: commits 2 files (one edited, one deleted) in ONE atomic PUT to update-files', async () => {
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_files', input: {
+          files: [
+            { file_path: 'public/book-a-demo.html', edits: [{ search: '<h1>Old</h1>', replace: '<h1>New</h1>' }] },
+            { file_path: 'app/api/old-route/route.ts', deleted: true },
+          ],
+          commit_message: 'Fix email capture + remove stale route',
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    // edit_files: reads current content only for the non-deleted file, then ONE PUT
+    mockedMcpFetch
+      .mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 1000 }] }) // preflight list_files
+      .mockResolvedValueOnce({ path: 'public/book-a-demo.html', content: '<h1>Old</h1>' })
+      .mockResolvedValueOnce({
+        success: true,
+        commit_url: 'https://github.com/test/repo/commit/abc123',
+        deployed_url: 'https://test.vercel.app',
+      });
+
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Committed both files.', status: 'success' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    const result = await runCodingAgent('Fix the demo page and remove the old route', mockContext);
+
+    expect(result.success).toBe(true);
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(3); // preflight + one read + ONE atomic write, not two writes
+    const putCall = mockedMcpFetch.mock.calls[2][0] as any;
+    expect(putCall.method).toBe('PUT');
+    expect(putCall.path).toBe(`/api/landing-pages/v0/generated/${mockContext.pageId}/update-files`);
+    expect(putCall.body.files).toEqual([
+      { file_path: 'public/book-a-demo.html', content: '<h1>New</h1>' },
+      { file_path: 'app/api/old-route/route.ts', deleted: true },
+    ]);
+    expect(putCall.body.commit_message).toBe('Fix email capture + remove stale route');
+    // Greptile: batch commits must be tracked for rollback the same way edit_file's are.
+    expect(result.editedFiles).toEqual(
+      expect.arrayContaining(['public/book-a-demo.html', 'app/api/old-route/route.ts'])
+    );
+  });
+
+  test('edit_files: empty files array is rejected without calling update-files', async () => {
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 1000 }] }); // preflight list_files
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_files', input: { files: [], commit_message: 'msg' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Could not edit — no files given.', status: 'error' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    await runCodingAgent('do something', mockContext);
+
+    // Only the preflight call — the empty-array guard fires before any read/write.
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('edit_files: a path-traversal attempt in ANY one file blocks the whole batch, no update-files call', async () => {
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 1000 }] }); // preflight list_files
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_files', input: {
+          files: [
+            { file_path: 'app/page.tsx', edits: [{ search: 'a', replace: 'b' }] },
+            { file_path: '../../etc/passwd', edits: [{ search: 'a', replace: 'b' }] },
+          ],
+          commit_message: 'msg',
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Rejected unsafe path.', status: 'error' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    await runCodingAgent('do something', mockContext);
+
+    // Only the preflight call — the safety guard fires before any read/write for this tool.
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('edit_files: a PARTIAL edit on one file blocks the whole atomic batch — no update-files call, nothing tracked as edited (Greptile)', async () => {
+    mockedMcpFetch
+      .mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 1000 }] }) // preflight list_files
+      .mockResolvedValueOnce({ path: 'public/book-a-demo.html', content: '<h1>Old</h1>' }); // read for the partial file
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_files', input: {
+          files: [
+            // Two edits requested for this ONE file; only one search string matches.
+            { file_path: 'public/book-a-demo.html', edits: [
+              { search: '<h1>Old</h1>', replace: '<h1>New</h1>' },
+              { search: 'THIS STRING DOES NOT EXIST', replace: 'irrelevant' },
+            ] },
+            { file_path: 'app/api/new-route/route.ts', deleted: true },
+          ],
+          commit_message: 'msg',
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Could not complete the batch.', status: 'error' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    const result = await runCodingAgent('do a 2-file fix', mockContext);
+
+    // Read happened, but the atomic write to update-files must NEVER be reached.
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(2);
+    expect(mockedMcpFetch.mock.calls.every((c: any) => c[0].path !== '/api/landing-pages/v0/generated/test-page-123/update-files')).toBe(true);
+    // Nothing was actually committed, so nothing should be tracked as edited for rollback.
+    expect(result.editedFiles).toEqual([]);
   });
 
   test('returns text response when LLM responds without tool calls', async () => {
@@ -2351,5 +2485,115 @@ describe('_previewBranchCommitsAheadOfMain', () => {
     // closed by reporting the branch as ahead so the caller skips the reset.
     mockedAxios.get.mockRejectedValueOnce(githubAxiosError(500, { message: 'Service Unavailable' }));
     await expect(_previewBranchCommitsAheadOfMain(repoBase, headers)).resolves.toBeGreaterThan(0);
+  });
+});
+
+describe('_rollbackEditedFiles (Greptile: new files must be deleted, not "reverted")', () => {
+  const rollbackContext: CodingAgentContext = {
+    pageId: 'test-page-123',
+    userId: 'user-456',
+    sessionId: 'session-789',
+    llmModel: 'anthropic.claude-sonnet-4-6',
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedMcpFetch.mockReset();
+  });
+
+  test('succeeds normally when the file existed at the base commit (real content to revert to)', async () => {
+    mockedMcpFetch
+      .mockResolvedValueOnce({ content: '<h1>Old</h1>' }) // file-at-commit: existed
+      .mockResolvedValueOnce({ success: true, commit_url: 'https://github.com/test/repo/commit/abc' }); // github-edit write
+
+    const result = await _rollbackEditedFiles({
+      context: rollbackContext,
+      baseCommitSha: 'base-sha',
+      editedFiles: ['app/page.tsx'],
+    });
+
+    expect(result.status).toBe('succeeded');
+  });
+
+  test('a brand-new file (nothing at the base commit) is DELETED instead of left committed', async () => {
+    mockedMcpFetch
+      .mockResolvedValueOnce({ content: undefined }) // file-at-commit: 404-equivalent, nothing there
+      .mockResolvedValueOnce({ success: true }); // update-files delete
+
+    const result = await _rollbackEditedFiles({
+      context: rollbackContext,
+      baseCommitSha: 'base-sha',
+      editedFiles: ['app/api/new-route/route.ts'],
+    });
+
+    expect(result.status).toBe('succeeded');
+    const deleteCall = mockedMcpFetch.mock.calls[1][0] as any;
+    expect(deleteCall.method).toBe('PUT');
+    expect(deleteCall.path).toBe('/api/landing-pages/v0/generated/test-page-123/update-files');
+    expect(deleteCall.body.files).toEqual([{ file_path: 'app/api/new-route/route.ts', deleted: true }]);
+  });
+
+  test('reports FAILURE (not a false success) when deleting the new file itself fails', async () => {
+    mockedMcpFetch
+      .mockResolvedValueOnce({ content: undefined }) // file-at-commit: nothing there
+      .mockResolvedValueOnce({ success: false }); // update-files delete failed
+
+    const result = await _rollbackEditedFiles({
+      context: rollbackContext,
+      baseCommitSha: 'base-sha',
+      editedFiles: ['app/api/new-route/route.ts'],
+    });
+
+    expect(result.status).toBe('failed');
+  });
+
+  test('a genuine transient failure (not "file doesn\'t exist") is reported as failed, NEVER treated as a new file / deleted', async () => {
+    mockedMcpFetch.mockRejectedValueOnce(new Error('API error (500): GitHub is down'));
+
+    const result = await _rollbackEditedFiles({
+      context: rollbackContext,
+      baseCommitSha: 'base-sha',
+      editedFiles: ['app/page.tsx'],
+    });
+
+    expect(result.status).toBe('failed');
+    // Only the one failed file-at-commit call — no delete attempt for a file that
+    // might genuinely still exist and need real content restored, not deletion.
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('a REAL 404 (mcpFetch throws, the actual behavior for a missing file) still triggers the delete fallback', async () => {
+    mockedMcpFetch
+      .mockRejectedValueOnce(new Error('API error (404): File not found at the specified commit')) // real throw, not a resolved string
+      .mockResolvedValueOnce({ success: true }); // update-files delete
+
+    const result = await _rollbackEditedFiles({
+      context: rollbackContext,
+      baseCommitSha: 'base-sha',
+      editedFiles: ['app/api/new-route/route.ts'],
+    });
+
+    expect(result.status).toBe('succeeded');
+    const deleteCall = mockedMcpFetch.mock.calls[1][0] as any;
+    expect(deleteCall.path).toBe('/api/landing-pages/v0/generated/test-page-123/update-files');
+    expect(deleteCall.body.files).toEqual([{ file_path: 'app/api/new-route/route.ts', deleted: true }]);
+  });
+
+  test('Greptile: a file that legitimately existed with EMPTY content at the base commit is restored, NOT deleted', async () => {
+    mockedMcpFetch
+      .mockResolvedValueOnce({ path: 'app/empty.css', content: '', sha: 'sha1' }) // file-at-commit: real, just empty
+      .mockResolvedValueOnce({ success: true, commit_url: 'https://github.com/test/repo/commit/def' }); // github-edit restore
+
+    const result = await _rollbackEditedFiles({
+      context: rollbackContext,
+      baseCommitSha: 'base-sha',
+      editedFiles: ['app/empty.css'],
+    });
+
+    expect(result.status).toBe('succeeded');
+    // Second call must be the normal restore-content write, NOT a delete.
+    const secondCall = mockedMcpFetch.mock.calls[1][0] as any;
+    expect(secondCall.path).toBe('/api/landing-pages/v0/generated/test-page-123/github-edit');
+    expect(secondCall.body.content).toBe('');
   });
 });

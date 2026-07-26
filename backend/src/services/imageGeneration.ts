@@ -36,6 +36,12 @@ const LEGACY_IMAGE_MODEL_ALIASES: Record<string, string> = {
   "gemini-3.1-flash-image-preview": "gemini-3.1-flash-image",
 };
 
+// ENG-410: the original Azure image-gen endpoint lived in departed co-founder Rui's personal
+// Microsoft account. It stays as the fallback for the legacy raw-key secret format so this
+// change is behaviour-preserving until `{env}/AgentWeb/Azure/Image` is switched to the JSON
+// `{ apiKey, endpoint }` format pointing at the AgentWeb-owned resource.
+const LEGACY_AZURE_IMAGE_ENDPOINT = "https://ai-ruiwangwarm7085ai345967089938.services.ai.azure.com";
+
 /**
  * Normalize a legacy image-model id to its canonical (GA) equivalent.
  * Unknown/canonical ids (and undefined) pass through unchanged.
@@ -375,6 +381,46 @@ export class ImageService {
   }
 
   /**
+   * Resolve the Azure image-gen endpoint + api key together (gpt-image-1 / gpt-image-2).
+   *
+   * The secret `{env}/AgentWeb/Azure/Image` may be either:
+   *   - a raw API-key string (legacy format) → key + the legacy hardcoded endpoint, or
+   *   - a JSON object `{ "apiKey": "...", "endpoint": "https://<resource>..." }` (new format),
+   *     which lets image generation point at an AgentWeb-owned Azure resource with no code
+   *     change (ENG-410). Behaviour is identical to before until the secret is switched to JSON.
+   */
+  private async getAzureImageConfig(model: string): Promise<{ apiKey: string; endpoint: string }> {
+    const secretName = process.env.NODE_ENV === "development"
+      ? "dev/AgentWeb/Azure/Image"
+      : "prod/AgentWeb/Azure/Image";
+
+    const raw = await getSecret(secretName);
+    if (!raw || raw.trim() === "") {
+      throw new Error(`${model} Azure image secret is empty`);
+    }
+
+    const trimmed = raw.trim();
+    if (trimmed.startsWith("{")) {
+      let parsed: { apiKey?: string; key?: string; endpoint?: string };
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch (error) {
+        throw new Error(`Azure image secret is not valid JSON: ${(error as Error).message}`);
+      }
+      const apiKey = parsed.apiKey || parsed.key;
+      if (!apiKey) {
+        throw new Error(`${model} Azure image secret JSON is missing "apiKey"`);
+      }
+      // Trailing slashes are stripped so callers can safely build `${endpoint}/openai/...`.
+      const endpoint = (parsed.endpoint || LEGACY_AZURE_IMAGE_ENDPOINT).replace(/\/+$/, "");
+      return { apiKey, endpoint };
+    }
+
+    // Legacy raw-key format: key from the secret, endpoint from the constant.
+    return { apiKey: trimmed, endpoint: LEGACY_AZURE_IMAGE_ENDPOINT };
+  }
+
+  /**
    * Retry a function with exponential backoff for transient API errors (503, 429).
    * Includes a total timeout (default 5 minutes) to prevent hanging for 30+ minutes.
    */
@@ -567,10 +613,9 @@ export class ImageService {
    * Generate image using Azure AI Services
    */
   private async generateWithAzureAI(params: ImageGenerationParams, model: string, hasInputImages: boolean = false): Promise<ImageGenerationResult> {
-    const apiKey = await this.getApiKey(model);
+    const { apiKey, endpoint: azureEndpoint } = await this.getAzureImageConfig(model);
     const axios = require('axios');
-    
-    const azureEndpoint = "https://ai-ruiwangwarm7085ai345967089938.services.ai.azure.com";
+
     const deploymentName = model === "gpt-image-2" ? "gpt-image-2" : "gpt-image-1";
     
     if (hasInputImages) {

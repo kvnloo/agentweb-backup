@@ -14,6 +14,7 @@
 const mockLiveConnect = jest.fn();
 const mockSessionSendClientContent = jest.fn();
 const mockSessionSendRealtimeInput = jest.fn();
+const mockSessionSendToolResponse = jest.fn();
 const mockSessionClose = jest.fn();
 
 jest.mock('@google/genai', () => ({
@@ -24,6 +25,23 @@ jest.mock('@google/genai', () => ({
   })),
   Modality: { AUDIO: 'AUDIO', TEXT: 'TEXT' },
   MediaResolution: { MEDIA_RESOLUTION_MEDIUM: 'MEDIA_RESOLUTION_MEDIUM' },
+  StartSensitivity: { START_SENSITIVITY_LOW: 'START_SENSITIVITY_LOW' },
+  EndSensitivity: { END_SENSITIVITY_LOW: 'END_SENSITIVITY_LOW' },
+  ActivityHandling: { START_OF_ACTIVITY_INTERRUPTS: 'START_OF_ACTIVITY_INTERRUPTS' },
+}));
+
+jest.mock('../services/onboardingTelemetry', () => ({
+  ONBOARDING_TELEMETRY_EVENTS: {
+    voiceSessionStarted: 'voice_session_started',
+    voiceSessionReady: 'voice_session_ready',
+    voiceFirstAudio: 'voice_first_audio',
+    voiceTurnCompleted: 'voice_turn_completed',
+    voiceTurnRecovery: 'voice_turn_recovery',
+    voiceInterrupted: 'voice_interrupted',
+    voiceSessionFailed: 'voice_session_failed',
+  },
+  recordOnboardingEvent: jest.fn().mockResolvedValue(undefined),
+  recordOnboardingFailure: jest.fn().mockResolvedValue(undefined),
 }));
 
 const mockAddMessageToSession = jest.fn();
@@ -41,12 +59,15 @@ jest.mock('../utils/secretsManager', () => ({
 }));
 
 const mockExecuteTool = jest.fn();
+const mockGetFilteredTools = jest.fn().mockResolvedValue([]);
+const mockGetAvailableTools = jest.fn().mockReturnValue([]);
 const mockCallLLM = jest.fn().mockResolvedValue({
   choices: [{ message: { content: '{"narrative":"Tool completed successfully.","artifacts":[]}' } }],
 });
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
-    getFilteredTools: jest.fn().mockResolvedValue([]),
+    getFilteredTools: mockGetFilteredTools,
+    getAvailableTools: mockGetAvailableTools,
     executeTool: mockExecuteTool,
     callLLM: mockCallLLM,
   },
@@ -60,6 +81,7 @@ function makeMockSession() {
   return {
     sendClientContent: mockSessionSendClientContent,
     sendRealtimeInput: mockSessionSendRealtimeInput,
+    sendToolResponse: mockSessionSendToolResponse,
     close: mockSessionClose,
   };
 }
@@ -80,6 +102,7 @@ function makeCallbacks() {
 import {
   startLiveSession,
   sendAudioChunk,
+  sendAudioStreamEnd,
   sendTextTurn,
   closeLiveSession,
   hasLiveSession,
@@ -104,6 +127,10 @@ beforeEach(() => {
   jest.clearAllMocks();
 });
 
+afterEach(() => {
+  jest.useRealTimers();
+});
+
 // ---------------------------------------------------------------------------
 // startLiveSession
 // ---------------------------------------------------------------------------
@@ -124,7 +151,7 @@ describe('startLiveSession', () => {
           speechConfig: expect.objectContaining({
             voiceConfig: expect.objectContaining({
               prebuiltVoiceConfig: expect.objectContaining({
-                voiceName: expect.any(String),
+                voiceName: 'Kore',
               }),
             }),
           }),
@@ -139,6 +166,77 @@ describe('startLiveSession', () => {
     );
 
     expect(hasLiveSession('session-1')).toBe(true);
+  });
+
+  it('signals the browser only after the Gemini Live session is ready', async () => {
+    makeCallbacks();
+    const emitFn = jest.fn();
+
+    await startLiveSession('session-ready', 'socket-ready', emitFn, 'test-user-id');
+
+    expect(emitFn).toHaveBeenCalledWith('live:ready', { sessionId: 'session-ready' });
+  });
+
+  it('loads only onboarding-safe tools for the onboarding profile', async () => {
+    makeCallbacks();
+    mockGetAvailableTools.mockReturnValueOnce([
+      { type: 'function', function: { name: 'publish_blog_article', parameters: { type: 'object' } } },
+    ]);
+    mockGetFilteredTools.mockResolvedValueOnce([
+      { type: 'function', function: { name: 'list_connected_accounts', parameters: { type: 'object' } } },
+      { type: 'function', function: { name: 'connect_account', parameters: { type: 'object' } } },
+      { type: 'function', function: { name: 'publish_blog_article', parameters: { type: 'object' } } },
+    ]);
+
+    await startLiveSession(
+      'session-onboarding-tools',
+      'socket-onboarding-tools',
+      jest.fn(),
+      'test-user-id',
+      'onboarding',
+    );
+
+    const declarations = mockLiveConnect.mock.calls[0][0].config.tools[0].functionDeclarations;
+    expect(declarations.map((tool: { name: string }) => tool.name)).toEqual([
+      'list_connected_accounts',
+      'connect_account',
+    ]);
+    expect(mockGetFilteredTools).toHaveBeenCalledWith('test-user-id');
+    expect(mockGetAvailableTools).not.toHaveBeenCalled();
+  });
+
+  it('directs Emma to use a neutral accent', async () => {
+    makeCallbacks();
+
+    await startLiveSession('session-neutral-accent', 'socket-accent', jest.fn(), 'test-user-id');
+
+    const connectionConfig = mockLiveConnect.mock.calls[0][0].config;
+    expect(connectionConfig.systemInstruction.parts[0].text).toContain('neutral');
+  });
+
+  it('directs Emma to use General American English', async () => {
+    makeCallbacks();
+
+    await startLiveSession('session-american-english', 'socket-american', jest.fn(), 'test-user-id');
+
+    const connectionConfig = mockLiveConnect.mock.calls[0][0].config;
+    expect(connectionConfig.systemInstruction.parts[0].text).toContain('General American English');
+  });
+
+  it('allows a natural pause before committing the user turn', async () => {
+    makeCallbacks();
+
+    await startLiveSession('session-natural-pause', 'socket-pause', jest.fn(), 'test-user-id');
+
+    const detection = mockLiveConnect.mock.calls[0][0].config
+      .realtimeInputConfig.automaticActivityDetection;
+    expect(detection).toEqual(expect.objectContaining({
+      disabled: false,
+      startOfSpeechSensitivity: 'START_SENSITIVITY_LOW',
+      endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
+    }));
+    expect(detection.prefixPaddingMs).toBeGreaterThanOrEqual(150);
+    expect(detection.silenceDurationMs).toBeGreaterThanOrEqual(1_000);
   });
 
   it('starting a second session for the same sessionId replaces the old one', async () => {
@@ -178,7 +276,7 @@ describe('sendAudioChunk', () => {
     makeCallbacks();
     await startLiveSession('session-audio', 'socket-1', emitFn, 'test-user-id');
 
-    await sendAudioChunk('session-audio', 'SGVsbG8=');
+    await sendAudioChunk('session-audio', 'SGVsbG8=', 'socket-1');
 
     expect(mockSessionSendRealtimeInput).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -191,7 +289,38 @@ describe('sendAudioChunk', () => {
   });
 
   it('throws if session does not exist', async () => {
-    await expect(sendAudioChunk('no-such-session', 'abc=')).rejects.toThrow();
+    await expect(sendAudioChunk('no-such-session', 'abc=', 'socket-1')).rejects.toThrow();
+  });
+
+  it('rejects audio from a socket that does not own the session', async () => {
+    makeCallbacks();
+    await startLiveSession('session-owned-audio', 'socket-owner', jest.fn(), 'test-user-id');
+
+    await expect(
+      sendAudioChunk('session-owned-audio', 'abc=', 'socket-attacker'),
+    ).rejects.toThrow(/active live session/i);
+  });
+});
+
+describe('sendAudioStreamEnd', () => {
+  it('flushes a stalled automatic-VAD turn without closing the live session', async () => {
+    makeCallbacks();
+    await startLiveSession('session-stalled-turn', 'socket-1', jest.fn(), 'test-user-id');
+
+    await sendAudioStreamEnd('session-stalled-turn', 'socket-1');
+
+    expect(mockSessionSendRealtimeInput).toHaveBeenCalledWith({ audioStreamEnd: true });
+    expect(hasLiveSession('session-stalled-turn')).toBe(true);
+  });
+
+  it('rejects a stream-end request from a socket that does not own the session', async () => {
+    makeCallbacks();
+    await startLiveSession('session-owned-turn', 'socket-owner', jest.fn(), 'test-user-id');
+
+    await expect(
+      sendAudioStreamEnd('session-owned-turn', 'socket-attacker'),
+    ).rejects.toThrow(/active live session/i);
+    expect(mockSessionSendRealtimeInput).not.toHaveBeenCalledWith({ audioStreamEnd: true });
   });
 });
 
@@ -205,7 +334,7 @@ describe('sendTextTurn', () => {
     makeCallbacks();
     await startLiveSession('session-text', 'socket-1', emitFn, 'test-user-id');
 
-    await sendTextTurn('session-text', 'What is my ad spend this month?');
+    await sendTextTurn('session-text', 'What is my ad spend this month?', 'socket-1');
 
     expect(mockSessionSendClientContent).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -221,7 +350,16 @@ describe('sendTextTurn', () => {
   });
 
   it('throws if session does not exist', async () => {
-    await expect(sendTextTurn('ghost-session', 'hello')).rejects.toThrow();
+    await expect(sendTextTurn('ghost-session', 'hello', 'socket-1')).rejects.toThrow();
+  });
+
+  it('rejects text from a socket that does not own the session', async () => {
+    makeCallbacks();
+    await startLiveSession('session-owned-text', 'socket-owner', jest.fn(), 'test-user-id');
+
+    await expect(
+      sendTextTurn('session-owned-text', 'hello', 'socket-attacker'),
+    ).rejects.toThrow(/active live session/i);
   });
 });
 
@@ -230,6 +368,20 @@ describe('sendTextTurn', () => {
 // ---------------------------------------------------------------------------
 
 describe('incoming audio relay', () => {
+  it('tells the browser to clear buffered speech when Gemini confirms an interruption', async () => {
+    const emitFn = jest.fn();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-interrupted', 'socket-1', emitFn, 'test-user-id');
+
+    callbacks['onmessage']?.({
+      serverContent: { interrupted: true },
+    });
+
+    expect(emitFn).toHaveBeenCalledWith('live:interrupted', {
+      sessionId: 'session-interrupted',
+    });
+  });
+
   it('emits live:audio event when Gemini returns inline audio data', async () => {
     const emitFn = jest.fn();
     const callbacks = makeCallbacks();
@@ -608,6 +760,18 @@ describe('closeLiveSession', () => {
   it('is a no-op for unknown sessionId', () => {
     expect(() => closeLiveSession('does-not-exist')).not.toThrow();
   });
+
+  it('does not let stale socket cleanup close a replacement session', async () => {
+    makeCallbacks();
+    await startLiveSession('session-replaced', 'socket-old', jest.fn(), 'test-user-id');
+    await startLiveSession('session-replaced', 'socket-new', jest.fn(), 'test-user-id');
+
+    closeLiveSession('session-replaced', 'socket-old');
+    expect(hasLiveSession('session-replaced')).toBe(true);
+
+    closeLiveSession('session-replaced', 'socket-new');
+    expect(hasLiveSession('session-replaced')).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -836,6 +1000,90 @@ describe('tool call surfacing', () => {
     mockLiveConnect.mockImplementation(({ callbacks: cbs }: any) => {
       Object.assign(makeCallbacks(), cbs);
       return Promise.resolve(mockSession);
+    });
+  });
+
+  it('returns a bounded error to Gemini when a live tool never finishes', async () => {
+    jest.useFakeTimers();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-tool-timeout', 'socket-1', jest.fn(), 'test-user-id');
+    mockExecuteTool.mockReturnValue(new Promise(() => {}));
+
+    callbacks['onmessage']?.({
+      toolCall: {
+        functionCalls: [{ id: 'fc-timeout', name: 'read_brand_guidelines', args: {} }],
+      },
+    });
+
+    await jest.advanceTimersByTimeAsync(12_000);
+    await Promise.resolve();
+
+    expect(mockSessionSendToolResponse).toHaveBeenCalledWith({
+      functionResponses: [
+        expect.objectContaining({
+          id: 'fc-timeout',
+          name: 'read_brand_guidelines',
+          response: expect.objectContaining({ error: expect.stringMatching(/timed out/i) }),
+        }),
+      ],
+    });
+    jest.useRealTimers();
+  });
+
+  it('does not timeout and retry a non-cancellable mutating tool', async () => {
+    jest.useFakeTimers();
+    const callbacks = makeCallbacks();
+    await startLiveSession('session-mutating-tool', 'socket-1', jest.fn(), 'test-user-id');
+    let resolveTool!: (value: { post_url: string }) => void;
+    mockExecuteTool.mockReturnValue(new Promise((resolve) => {
+      resolveTool = resolve;
+    }));
+
+    callbacks['onmessage']?.({
+      toolCall: {
+        functionCalls: [{
+          id: 'fc-mutation',
+          name: 'post_on_connected_account',
+          args: { content: 'Hello' },
+        }],
+      },
+    });
+
+    await jest.advanceTimersByTimeAsync(12_000);
+    expect(mockSessionSendToolResponse).toHaveBeenCalledWith({
+      functionResponses: [
+        expect.objectContaining({
+          id: 'fc-mutation',
+          name: 'post_on_connected_account',
+          response: expect.objectContaining({ status: 'in_progress' }),
+        }),
+      ],
+    });
+    mockSessionSendToolResponse.mockClear();
+
+    callbacks['onmessage']?.({
+      toolCall: {
+        functionCalls: [{
+          id: 'fc-mutation-retry',
+          name: 'post_on_connected_account',
+          args: { content: 'Hello' },
+        }],
+      },
+    });
+
+    resolveTool({ post_url: 'https://linkedin.com/post/123' });
+    await jest.runAllTimersAsync();
+
+    expect(mockExecuteTool).toHaveBeenCalledTimes(1);
+
+    expect(mockSessionSendToolResponse).toHaveBeenCalledWith({
+      functionResponses: [
+        expect.objectContaining({
+          id: 'fc-mutation-retry',
+          name: 'post_on_connected_account',
+          response: expect.objectContaining({ result: expect.any(String) }),
+        }),
+      ],
     });
   });
 

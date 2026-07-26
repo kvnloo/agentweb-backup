@@ -1,10 +1,10 @@
 /**
- * Tests for search_user_guide surfacing the canonical documentation site
- * (docs.agentweb.pro) so Emma can return correct integration deep links
- * (e.g. https://docs.agentweb.pro/integrations/hubspot).
+ * Tests for search_user_guide searching the canonical Mintlify corpus so Emma
+ * can answer a blocked product/setup question with one relevant excerpt and
+ * canonical source link.
  *
- * Regression test for ENG-314: Emma could not access the docs.agentweb.pro
- * knowledge source when answering client integration questions.
+ * Regression coverage for ENG-450. The old behavior returned an entire legacy
+ * Notion guide plus a short list of static integration links.
  */
 
 jest.mock('../services/notionService', () => ({
@@ -47,46 +47,80 @@ describe('documentationSite helpers', () => {
 });
 
 describe('search_user_guide tool', () => {
+  const originalFetch = global.fetch;
+
   beforeEach(() => {
     jest.clearAllMocks();
   });
 
-  it('appends the documentation site reference to the Notion guide content', async () => {
-    (getUserGuideContent as jest.Mock).mockResolvedValue('PORTAL ONBOARDING GUIDE BODY');
-
-    const result = await emmaToolRegistry.execute(TOOL, {});
-
-    expect(result.success).toBe(true);
-    expect(result.content).toContain('PORTAL ONBOARDING GUIDE BODY');
-    expect(result.content).toContain('https://docs.agentweb.pro/integrations/hubspot');
+  afterAll(() => {
+    global.fetch = originalFetch;
   });
 
-  it('still surfaces the documentation site when the Notion guide is blank whitespace', async () => {
-    (getUserGuideContent as jest.Mock).mockResolvedValue('   ');
+  it('falls back to the legacy Notion guide when Mintlify is unavailable', async () => {
+    global.fetch = jest.fn().mockRejectedValue(new Error('mintlify down')) as jest.Mock;
+    (getUserGuideContent as jest.Mock).mockResolvedValue('LEGACY PORTAL GUIDE BODY');
 
-    const result = await emmaToolRegistry.execute(TOOL, {});
+    const result = await emmaToolRegistry.execute(TOOL, { query: 'connect Meta' });
 
     expect(result.success).toBe(true);
-    expect(result.content).toContain('https://docs.agentweb.pro/integrations/hubspot');
+    expect(result.content).toContain('LEGACY PORTAL GUIDE BODY');
+    expect(result.content).toMatch(/legacy fallback/i);
+    expect(result.content).toContain(DOCS_SITE_BASE_URL);
   });
 
-  it('still surfaces the documentation site when the Notion page is empty', async () => {
-    (getUserGuideContent as jest.Mock).mockResolvedValue('');
+  it('searches the Mintlify corpus and returns only the relevant canonical page', async () => {
+    const oversizedMetaDetails = `Meta detail for campaign setup. `.repeat(900);
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      text: async () => [
+        '# Google Ads',
+        'Source: https://docs.agentweb.pro/integrations/google-ads',
+        'Compare this Google account with a Meta ads account.',
+        '# Meta (Facebook + Instagram)',
+        'Source: https://docs.agentweb.pro/integrations/meta',
+        'Open Connected Accounts, choose Meta, and complete OAuth.',
+        oversizedMetaDetails,
+        '# Connect Google Drive',
+        'Source: https://docs.agentweb.pro/integrations/google-drive',
+        'Choose Google Drive and select folders to index.',
+      ].join('\n'),
+    }) as jest.Mock;
 
-    const result = await emmaToolRegistry.execute(TOOL, {});
+    const result = await emmaToolRegistry.execute(TOOL, { query: 'How do I connect Meta ads?' });
 
     expect(result.success).toBe(true);
-    expect(result.content).toContain('https://docs.agentweb.pro/integrations/hubspot');
+    expect(global.fetch).toHaveBeenCalledWith(
+      'https://docs.agentweb.pro/llms-full.txt',
+      expect.objectContaining({ headers: expect.any(Object) })
+    );
+    expect(result.content).toContain('Meta (Facebook + Instagram)');
+    expect(result.content).toContain('complete OAuth');
+    expect(result.content).toContain('Meta detail for campaign setup');
+    expect(result.content).not.toContain('select folders to index');
+    expect(result.results).toEqual([
+      expect.objectContaining({
+        title: 'Meta (Facebook + Instagram)',
+        url: 'https://docs.agentweb.pro/integrations/meta',
+        recommended: true,
+      }),
+    ]);
   });
 
-  it('still surfaces the documentation site when fetching the user guide throws', async () => {
-    (getUserGuideContent as jest.Mock).mockRejectedValue(new Error('notion down'));
+  it('keeps the Mintlify result bounded instead of returning the full corpus', async () => {
+    const result = await emmaToolRegistry.execute(TOOL, { query: 'Meta campaign setup' });
 
-    const result = await emmaToolRegistry.execute(TOOL, {});
+    expect(result.content.length).toBeLessThanOrEqual(12_000);
+    expect(result.results).toHaveLength(1);
+    expect(JSON.stringify(result).length).toBeLessThan(10_000);
+  });
 
-    expect(result.success).toBe(true);
-    expect(result.content).toContain('https://docs.agentweb.pro/integrations/hubspot');
-    expect(result.content).toContain('notion down');
+  it('accepts a query so Emma can retrieve the exact blocked setup step', () => {
+    const tool = emmaToolRegistry.getTool(TOOL);
+
+    expect(tool?.definition.inputSchema.properties.query).toEqual(
+      expect.objectContaining({ type: 'string' })
+    );
   });
 });
 

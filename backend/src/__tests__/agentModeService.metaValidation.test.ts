@@ -47,9 +47,24 @@ jest.mock('../utils/secretsManager', () => ({
   getMetaAccessToken: jest.fn().mockResolvedValue('mock-access-token')
 }));
 
+// ENG-400: the CAMPAIGN CREATE objective gate reads the session's last user
+// message (to verify an explicit-statement bypass) and pending/answered
+// questions. Default to "no session context" so every pre-existing test here
+// that doesn't care about the objective gate is unaffected; the one test that
+// exercises a real CAMPAIGN CREATE dispatch overrides these explicitly.
+jest.mock('../services/chatbotService', () => ({
+  chatbotDb: {
+    getMessagesFromMessagesTable: jest.fn().mockResolvedValue([]),
+    getChatSession: jest.fn().mockResolvedValue(null),
+    updateSessionAskUserQuestion: jest.fn().mockResolvedValue({}),
+    createChatSession: jest.fn().mockResolvedValue({ sessionId: 'auto-created-session' }),
+  },
+}));
+
 import { AgentModeService } from '../services/agentModeService';
 import { metaService } from '../services/metaService';
 import { userDb } from '../services/db';
+import { chatbotDb } from '../services/chatbotService';
 
 const mockUser = {
   id: 'user123',
@@ -67,12 +82,12 @@ const mockUser = {
   ]
 };
 
-// signature: callMetaMarketingApi(userId, entity_type, action, account_id, campaign_id?, ad_set_id?, ad_id?, params)
+// signature: callMetaMarketingApi(userId, entity_type, action, account_id, campaign_id?, ad_set_id?, ad_id?, params, sessionId?)
 const callApi = (
   service: AgentModeService,
   entity_type: string,
   action: string,
-  opts: { campaign_id?: string; ad_set_id?: string; ad_id?: string; params?: any } = {}
+  opts: { campaign_id?: string; ad_set_id?: string; ad_id?: string; params?: any; sessionId?: string } = {}
 ) =>
   (service as any).callMetaMarketingApi(
     'user123',
@@ -82,7 +97,8 @@ const callApi = (
     opts.campaign_id,
     opts.ad_set_id,
     opts.ad_id,
-    opts.params ?? {}
+    opts.params ?? {},
+    opts.sessionId
   );
 
 describe('AgentModeService - Meta validation & error enrichment', () => {
@@ -96,9 +112,18 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
 
   // ==================== Pre-validation via callMetaMarketingApi ====================
   describe('callMetaMarketingApi pre-validation', () => {
-    it('returns PARAM_VALIDATION_ERROR for CAMPAIGN CREATE with missing name', async () => {
+    it('returns PARAM_VALIDATION_ERROR for CAMPAIGN CREATE with missing name (objective already settled via the gate)', async () => {
+      // ENG-400: the objective gate runs BEFORE param validation (a model that
+      // correctly omits an unknown objective must hit the real ask card, not a
+      // generic validation error — see the sibling gate test file). So this test
+      // settles the objective first (a verified explicit statement) to isolate
+      // the missing-name validation path specifically.
+      (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
+        { role: 'user', content: 'set up a traffic campaign' },
+      ]);
       const result = await callApi(service, 'CAMPAIGN', 'CREATE', {
-        params: { objective: 'OUTCOME_TRAFFIC' } // missing name
+        sessionId: 'session-1',
+        params: { objective: 'OUTCOME_TRAFFIC', objective_quote: 'traffic campaign' }, // missing name
       });
 
       expect(result.success).toBe(false);
@@ -107,14 +132,21 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(metaService.createCampaign).not.toHaveBeenCalled();
     });
 
-    it('returns PARAM_VALIDATION_ERROR for CAMPAIGN CREATE with invalid objective', async () => {
+    it('an invalid objective value with nothing settled surfaces the real ask card, not a validation error', async () => {
+      // ENG-400 reorder: the objective gate now runs first and ALWAYS resolves
+      // to a valid objective (or blocks/asks) before validateMetaActionParams
+      // ever sees the field — so a garbage objective value can no longer reach
+      // the "Invalid objective" validation branch for CAMPAIGN CREATE; it's
+      // subsumed by the same ask-card path as an omitted one.
       const result = await callApi(service, 'CAMPAIGN', 'CREATE', {
-        params: { name: 'My Campaign', objective: 'INVALID_OBJ' }
+        sessionId: 'session-1',
+        params: { name: 'My Campaign', objective: 'INVALID_OBJ' },
       });
 
-      expect(result.success).toBe(false);
-      expect(result.error).toBe('PARAM_VALIDATION_ERROR');
-      expect(result.message).toContain('INVALID_OBJ');
+      expect(result.success).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(result.type).toBe('ask_user_question');
+      expect(metaService.createCampaign).not.toHaveBeenCalled();
     });
 
     it('returns PARAM_VALIDATION_ERROR for CAMPAIGN UPDATE without campaign_id', async () => {
@@ -190,14 +222,88 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
 
     it('passes validation and proceeds to API for valid CAMPAIGN CREATE', async () => {
       (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', name: 'Test' });
+      // ENG-400: the objective gate requires either a verified explicit-statement
+      // quote or an answered ask_user_question. Here the user's own message names
+      // the objective, so objective_quote (checked against the real transcript)
+      // satisfies the gate with zero added friction.
+      (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
+        { role: 'user', content: 'Please set up a traffic campaign for me.' },
+      ]);
 
       // confirm=true bypasses the target-confirmation gate so the action executes.
       const result = await callApi(service, 'CAMPAIGN', 'CREATE', {
-        params: { name: 'Test', objective: 'OUTCOME_TRAFFIC', special_ad_categories: ['NONE'], confirm: true }
+        sessionId: 'session-1',
+        params: {
+          name: 'Test',
+          objective: 'OUTCOME_TRAFFIC',
+          objective_quote: 'traffic campaign',
+          special_ad_categories: ['NONE'],
+          confirm: true,
+        },
       });
 
       expect(result.success).toBe(true);
       expect(metaService.createCampaign).toHaveBeenCalled();
+    });
+
+    it('auto-provisions a session and PARKS (does not dead-end) a valid CAMPAIGN CREATE with no session', async () => {
+      const result = await callApi(service, 'CAMPAIGN', 'CREATE', {
+        params: { name: 'Test', objective: 'OUTCOME_TRAFFIC', special_ad_categories: ['NONE'], confirm: true }
+        // no sessionId — an anomaly for both known callers, but must still be
+        // recoverable (a normal park) rather than a hard dead-end.
+      });
+
+      expect(chatbotDb.createChatSession).toHaveBeenCalled();
+      expect(result.success).toBe(true);
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(result.type).toBe('ask_user_question');
+      expect(result.sessionId).toBe('auto-created-session');
+      expect(metaService.createCampaign).not.toHaveBeenCalled();
+    });
+
+    it('BLOCKS and emits the objective ask_user_question when neither an explicit quote nor a prior answer exists', async () => {
+      const result = await callApi(service, 'CAMPAIGN', 'CREATE', {
+        sessionId: 'session-1',
+        params: { name: 'Test', objective: 'OUTCOME_TRAFFIC', special_ad_categories: ['NONE'], confirm: true },
+      });
+
+      expect(result.success).toBe(true); // halting-card responses use success:true (see ask_user_question tool)
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(result.type).toBe('ask_user_question');
+      expect(result.recommendedOptionId).toBe('leads'); // OUTCOME_LEADS default, no account preference set
+      expect(metaService.createCampaign).not.toHaveBeenCalled();
+      expect(chatbotDb.updateSessionAskUserQuestion).toHaveBeenCalled();
+    });
+
+    it('ALLOWS a CAMPAIGN CREATE whose objective was already answered via ask_user_question (kind meta_objective)', async () => {
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        sessionId: 'session-1',
+        pendingUserQuestion: {
+          questionId: 'q-1',
+          question: 'Which objective?',
+          options: [{ id: 'sales', label: 'Sales', consequence: 'x', recommended: true, why: 'y', payload: { objective: 'OUTCOME_SALES' } }],
+          recommendedOptionId: 'sales',
+          immutable: true,
+          allowEmmaDecide: true,
+          kind: 'meta_objective:123456789|test|||NONE',
+          status: 'answered',
+          createdAt: '2026-07-24T00:00:00.000Z',
+          answer: { optionId: 'sales', delegated: false, answeredBy: 'user', at: '2026-07-24T00:01:00.000Z' },
+        },
+      });
+      (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_456', name: 'Test' });
+
+      const result = await callApi(service, 'CAMPAIGN', 'CREATE', {
+        sessionId: 'session-1',
+        // Model's own params.objective is deliberately WRONG here — the gate must
+        // apply the gate-resolved objective verbatim, never trust params.objective.
+        params: { name: 'Test', objective: 'OUTCOME_TRAFFIC', special_ad_categories: ['NONE'], confirm: true },
+      });
+
+      expect(result.success).toBe(true);
+      expect(metaService.createCampaign).toHaveBeenCalled();
+      const passedParams = (metaService.createCampaign as jest.Mock).mock.calls[0][2];
+      expect(passedParams.objective).toBe('OUTCOME_SALES');
     });
   });
 
@@ -755,6 +861,56 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
 
       const calledWith = (metaService.createAdSet as jest.Mock).mock.calls[0][2];
       expect(calledWith.targeting.targeting_automation.advantage_audience).toBe(0);
+    });
+  });
+
+  describe('destination_type defaulting in createMetaAdsAdSet (ENG-415)', () => {
+    const websiteGoalParams = {
+      name: 'Ad Set',
+      campaign_id: 'camp_123',
+      billing_event: 'IMPRESSIONS',
+      daily_budget: 10,
+      targeting: { geo_locations: { countries: ['US'] } }
+    };
+
+    beforeEach(() => {
+      (metaService.createAdSet as jest.Mock).mockResolvedValue({ id: 'adset_new', name: 'Ad Set' });
+    });
+
+    it('defaults destination_type=WEBSITE for a website traffic goal (LINK_CLICKS)', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_TRAFFIC' });
+      await service.createMetaAdsAdSet('user123', { ...websiteGoalParams, optimization_goal: 'LINK_CLICKS' });
+      const calledWith = (metaService.createAdSet as jest.Mock).mock.calls[0][2];
+      expect(calledWith.destination_type).toBe('WEBSITE');
+    });
+
+    it('defaults destination_type=WEBSITE for a website conversion goal (OFFSITE_CONVERSIONS)', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_LEADS' });
+      await service.createMetaAdsAdSet('user123', {
+        ...websiteGoalParams,
+        optimization_goal: 'OFFSITE_CONVERSIONS',
+        promoted_object: { pixel_id: 'px_1', custom_event_type: 'LEAD' }
+      });
+      const calledWith = (metaService.createAdSet as jest.Mock).mock.calls[0][2];
+      expect(calledWith.destination_type).toBe('WEBSITE');
+    });
+
+    it('does NOT set destination_type for a non-website goal (POST_ENGAGEMENT)', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_ENGAGEMENT' });
+      await service.createMetaAdsAdSet('user123', { ...websiteGoalParams, optimization_goal: 'POST_ENGAGEMENT' });
+      const calledWith = (metaService.createAdSet as jest.Mock).mock.calls[0][2];
+      expect(calledWith.destination_type).toBeUndefined();
+    });
+
+    it('respects an explicit destination_type and does not override it', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_TRAFFIC' });
+      await service.createMetaAdsAdSet('user123', {
+        ...websiteGoalParams,
+        optimization_goal: 'LINK_CLICKS',
+        destination_type: 'ON_AD'
+      });
+      const calledWith = (metaService.createAdSet as jest.Mock).mock.calls[0][2];
+      expect(calledWith.destination_type).toBe('ON_AD');
     });
   });
 });

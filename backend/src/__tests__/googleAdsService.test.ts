@@ -651,6 +651,71 @@ describe('createCampaign', () => {
   });
 });
 
+describe('addProximityCriterion / removeCampaignCriterion (ENG-487)', () => {
+  it('creates a PROXIMITY campaign criterion with radius + address', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/campaignCriteria/1~1' }] } });
+    const result = await service.addProximityCriterion('user-123', '1234567890', 'customers/123/campaigns/2', {
+      radius: 25,
+      address: { streetAddress: '123 Main St', cityName: 'Tacoma', provinceCode: 'WA', countryCode: 'US' },
+    });
+    expect(result.resourceName).toBe('customers/123/campaignCriteria/1~1');
+    const body = mockAxiosPost.mock.calls[0][1];
+    const create = body.operations[0].create;
+    expect(create.campaign).toBe('customers/123/campaigns/2');
+    expect(create.proximity.radius).toBe(25);
+    expect(create.proximity.radiusUnits).toBe('MILES');
+    expect(create.proximity.address).toEqual({ streetAddress: '123 Main St', cityName: 'Tacoma', provinceCode: 'WA', countryCode: 'US' });
+  });
+
+  it('defaults radiusUnits to MILES and omits empty address fields', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ resourceName: 'customers/123/campaignCriteria/1~2' }] } });
+    await service.addProximityCriterion('user-123', '1234567890', 'customers/123/campaigns/2', {
+      radius: 30,
+      address: { postalCode: '99201' },
+    });
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].create.proximity.address).toEqual({ postalCode: '99201' });
+  });
+
+  it('rejects an address with no fields set', async () => {
+    await expect(service.addProximityCriterion('user-123', '1234567890', 'customers/123/campaigns/2', {
+      radius: 25,
+      address: {},
+    })).rejects.toThrow('at least one address field');
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
+  it('removes a campaign criterion by resource name', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.removeCampaignCriterion('user-123', '1234567890', 'customers/123/campaignCriteria/2~1');
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations[0].remove).toBe('customers/123/campaignCriteria/2~1');
+  });
+
+  it('rejects a malformed criterion resource name before calling the API', async () => {
+    await expect(service.removeCampaignCriterion('user-123', '1234567890', 'not-a-resource-name'))
+      .rejects.toThrow('Invalid Google Ads campaignCriteria resource name');
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
+  it('when allowedTypes is given, verifies the criterion type before removing', async () => {
+    mockAxiosPost
+      .mockResolvedValueOnce({ data: { results: [{ campaignCriterion: { type: 'PROXIMITY' } }] } })
+      .mockResolvedValueOnce({ data: { results: [{}] } });
+    await service.removeCampaignCriterion('user-123', '1234567890', 'customers/123/campaignCriteria/2~1', ['PROXIMITY']);
+    expect(mockAxiosPost).toHaveBeenCalledTimes(2);
+    const removeBody = mockAxiosPost.mock.calls[1][1];
+    expect(removeBody.operations[0].remove).toBe('customers/123/campaignCriteria/2~1');
+  });
+
+  it('refuses to remove a criterion whose actual type is not in allowedTypes', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{ campaignCriterion: { type: 'LOCATION' } }] } });
+    await expect(service.removeCampaignCriterion('user-123', '1234567890', 'customers/123/campaignCriteria/2~1', ['PROXIMITY']))
+      .rejects.toThrow('Refusing to remove');
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('pauseCampaign / resumeCampaign', () => {
   it('pauses a campaign', async () => {
     mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}] } });

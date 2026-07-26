@@ -2,7 +2,7 @@
  * Tests for the daily DM digest's RCA enrichment integration.
  *
  * The cron's `postDailyDigest` reads RCA enrichment from
- * `mutation.artifact.rcaEnrichment` (populated by NotionDigestTool.apply()).
+ * `mutation.artifact.rcaEnrichment` (populated by LinearIntakeTool.apply()).
  * These tests pin the DM format and the graceful-degradation behavior when
  * enrichment is missing or carries an error.
  */
@@ -85,7 +85,7 @@ describe('postDailyDigest with RCA enrichment', () => {
     const result = runResult(props);
     const muts: Mutation[] = [
       mutation('p1', 'capture-broken', {
-        notionUrl: 'https://www.notion.so/p1',
+        linearUrl: 'https://linear.app/emmabyaw/issue/ENG-601',
         title: 'fix(ai-eval-funnel): capture-broken — …',
         rcaEnrichment: {
           topHypotheses: ['LandedTracker pollutes the denominator', 'a', 'b'],
@@ -101,7 +101,7 @@ describe('postDailyDigest with RCA enrichment', () => {
         },
       }),
       mutation('p2', 'no-signup', {
-        notionUrl: 'https://www.notion.so/p2',
+        linearUrl: 'https://linear.app/emmabyaw/issue/ENG-602',
         title: 'fix(ai-eval-funnel): no-signup — …',
         rcaEnrichment: {
           topHypotheses: ['ReportView iframe disconnects sticky CTA', 'x', 'y'],
@@ -185,18 +185,17 @@ describe('postDailyDigest with RCA enrichment', () => {
     expect(mockSlack.postMessage).toHaveBeenCalledTimes(1);
   });
 
-  it('does NOT crash when a mutation already has an `error` field set (Notion API failed)', async () => {
+  it('does NOT crash when a mutation already has a Linear intake error', async () => {
     const props = [proposal('p1', 'capture-broken', 'x')];
     const result = runResult(props);
     const m = mutation('p1', 'capture-broken', { title: 't' });
-    (m as Mutation & { error?: string }).error = 'Notion API 502';
+    (m as Mutation & { error?: string }).error = 'Linear API 502';
     const muts: Mutation[] = [m];
 
     await _postDailyDigestForTesting(result, muts, mockSlack, 'U08TM4QFQ1L');
 
     const message = slackPosts[0].message;
-    // The existing notion-error warning line is preserved
-    expect(message).toContain('Notion API 502');
+    expect(message).toContain('Linear API 502');
   });
 
   it('is silent if slackUserId is unset', async () => {

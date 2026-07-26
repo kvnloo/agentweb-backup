@@ -282,9 +282,9 @@ export async function createInternalLinearIssue(params: {
 
 /**
  * Raise-only triage update on an existing issue (ENG-187 dedup upgrade): UNION the given labels in,
- * and RAISE the priority to `priority` when it is more urgent than the current one. Never lowers
- * priority and never removes labels — a later lower-tier reporter must not downgrade a canonical
- * that a higher-tier reporter already escalated. Linear priority enum: 0=None, 1=Urgent … 4=Low,
+ * and RAISE the priority to `priority` when it is more urgent than the current one. Route callers
+ * may also atomically remove mutually exclusive labels and set the canonical owner; ordinary
+ * callers retain the original union-only behavior. Linear priority enum: 0=None, 1=Urgent … 4=Low,
  * so "more urgent" = smaller non-zero number (and anything beats 0/None).
  *
  * `settleStateName` (ENG-187 contract #4): ensure a freshly synced issue SITS in the named state
@@ -297,21 +297,38 @@ export async function createInternalLinearIssue(params: {
  */
 export async function raiseIssueTriage(
   issueId: string,
-  params: { addLabelNames: string[]; priority?: number; settleStateName?: string },
+  params: {
+    addLabelNames: string[];
+    removeLabelNames?: string[];
+    priority?: number;
+    settleStateName?: string;
+    assigneeId?: string;
+  },
 ): Promise<void> {
   const meta = await getTeamMeta();
   const data = await linearGraphQL(
-    `query($id: String!) { issue(id: $id) { priority state { id type } labels { nodes { id } } } }`,
+    `query($id: String!) { issue(id: $id) { priority assignee { id } state { id type } labels { nodes { id } } } }`,
     { id: issueId },
   );
   const issue = data?.issue;
   if (!issue) throw new Error('Linear issue not found for triage raise');
 
   const currentLabelIds: string[] = (issue.labels?.nodes || []).map((n: any) => n.id);
-  const addIds = resolveLabelIdsLoud(meta, params.addLabelNames).filter((id) => !currentLabelIds.includes(id));
+  const removeIds = new Set(resolveLabelIdsLoud(meta, params.removeLabelNames ?? []));
+  const retainedLabelIds = currentLabelIds.filter((id) => !removeIds.has(id));
+  const addIds = resolveLabelIdsLoud(meta, params.addLabelNames).filter((id) => !retainedLabelIds.includes(id));
+  const nextLabelIds = [...retainedLabelIds, ...addIds];
 
   const input: Record<string, any> = {};
-  if (addIds.length > 0) input.labelIds = [...currentLabelIds, ...addIds];
+  if (
+    nextLabelIds.length !== currentLabelIds.length ||
+    nextLabelIds.some((id) => !currentLabelIds.includes(id))
+  ) {
+    input.labelIds = nextLabelIds;
+  }
+  if (params.assigneeId && issue.assignee?.id !== params.assigneeId) {
+    input.assigneeId = params.assigneeId;
+  }
   const current: number = typeof issue.priority === 'number' ? issue.priority : 0;
   if (typeof params.priority === 'number' && params.priority > 0 && (current === 0 || params.priority < current)) {
     input.priority = params.priority;

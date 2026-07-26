@@ -64,6 +64,7 @@ jest.mock('../services/db', () => ({
     getSchedulesReadyToRun: jest.fn(),
     updateScheduleAfterRun: jest.fn(),
     setRunInFlight: jest.fn().mockResolvedValue(undefined),
+    attachSessionToRunInFlight: jest.fn().mockResolvedValue(undefined),
     heartbeatRunInFlight: jest.fn().mockResolvedValue(undefined),
     clearRunInFlight: jest.fn().mockResolvedValue(true),
     getInFlightSchedules: jest.fn().mockResolvedValue([]),
@@ -251,16 +252,40 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       await runScheduledChat(baseSchedule, mockUserId, false);
 
-      // Lease is stamped once the session exists, before the (long) LLM turn.
+      // ENG-479: the lease is stamped BEFORE the session exists, so it carries no
+      // sessionId yet; the session is attached to it in a second step below.
       expect(mockScheduleDb.setRunInFlight).toHaveBeenCalledTimes(1);
       const [leaseScheduleId, lease] = (mockScheduleDb.setRunInFlight as jest.Mock).mock.calls[0];
       expect(leaseScheduleId).toBe(mockScheduleId);
       expect(lease).toEqual(
-        expect.objectContaining({ sessionId: mockSession.sessionId, runId: expect.any(String) })
+        expect.objectContaining({ sessionId: '', runId: expect.any(String) })
+      );
+      // The created session is attached to the lease so the reconciler can annotate it.
+      expect(mockScheduleDb.attachSessionToRunInFlight).toHaveBeenCalledWith(
+        mockScheduleId,
+        lease.runId,
+        mockSession.sessionId
       );
       // And released in `finally` once the run settles.
       expect(mockScheduleDb.clearRunInFlight).toHaveBeenCalledTimes(1);
       expect((mockScheduleDb.clearRunInFlight as jest.Mock).mock.calls[0][0]).toBe(mockScheduleId);
+    });
+
+    it('stamps the in-flight lease BEFORE creating the session so a pre-lease hard-kill is still reconciler-visible (ENG-479 GAP 1)', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        ...mockResponse,
+        content: 'Here are some marketing strategy and tips for your business.',
+      });
+
+      await runScheduledChat(baseSchedule, mockUserId, false);
+
+      const leaseOrder = (mockScheduleDb.setRunInFlight as jest.Mock).mock.invocationCallOrder[0];
+      const sessionOrder = (mockChatbotDb.createChatSession as jest.Mock).mock.invocationCallOrder[0];
+      const attachOrder = (mockScheduleDb.attachSessionToRunInFlight as jest.Mock).mock.invocationCallOrder[0];
+      // Lease first, THEN session, THEN attach — closing the window where a session
+      // exists with no lease (invisible to the reconciler, never auto-requeued).
+      expect(leaseOrder).toBeLessThan(sessionOrder);
+      expect(sessionOrder).toBeLessThan(attachOrder);
     });
 
     it('does NOT stamp an in-flight lease for a test run (ENG-324)', async () => {
