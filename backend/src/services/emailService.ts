@@ -1875,7 +1875,7 @@ View Session: ${sessionUrl}`;
     subject: string,
     message: string,
     context?: Record<string, any>,
-    notionUrl?: string
+    trackerUrl?: string
   ) {
     if (process.env.NODE_ENV !== 'production') {
       console.log(`[DEV] Suppressed oncall alert: ${subject}`);
@@ -1886,26 +1886,24 @@ View Session: ${sessionUrl}`;
       const env: string = process.env.NODE_ENV || 'unknown';
       const envLabel = env === 'production' ? 'PROD' : env.toUpperCase();
 
-      // File a tracked oncall item if no URL was provided. Routes via the shared intake
-      // service: behind FEATUREBASE_INTAKE this creates a PRIVATE Linear issue (Auto label,
-      // deduped by title) instead of Notion. Best-effort — a filing failure just means the
-      // alert email carries full details instead of a link.
-      let resolvedNotionUrl = notionUrl || null;
-      if (!resolvedNotionUrl) {
+      // File a tracked oncall item if no URL was provided. System-generated work always goes
+      // through Linear; generic alerts fail closed to PM triage because this layer cannot prove
+      // that a code-only fix is safe. A filing failure leaves the full detail in email.
+      let resolvedTrackerUrl = trackerUrl || null;
+      if (!resolvedTrackerUrl) {
         try {
           const { fileAutoIssue } = await import('./intakeService');
           const result = await fileAutoIssue({
             title: subject,
             description: message,
             source: 'Oncall alert',
+            executionRoute: 'human-triage',
             extraLabels: ['Oncall'],
-            // notionTags [] -> createOncallItem still adds its internal "Oncall" tag, so the
-            // Notion-path behaviour is unchanged (no duplicate Oncall tag).
             notionTags: [],
             notionContext: context,
           });
-          resolvedNotionUrl = result.url || null;
-          console.log(`Oncall item filed (${result.tracker}): ${resolvedNotionUrl}`);
+          resolvedTrackerUrl = result.url || null;
+          console.log(`Oncall item filed (${result.tracker}): ${resolvedTrackerUrl}`);
         } catch (fileError) {
           console.error('Failed to file oncall item, falling back to full email:', fileError);
         }
@@ -1914,8 +1912,8 @@ View Session: ${sessionUrl}`;
       let html: string;
       let text: string;
 
-      if (resolvedNotionUrl) {
-        // Slim email with Notion link
+      if (resolvedTrackerUrl) {
+        // Slim email with a link to the canonical tracked issue.
         html = `
         <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f8f9fa;">
           <div style="background-color: #dc3545; color: white; padding: 20px; border-radius: 8px 8px 0 0;">
@@ -1924,18 +1922,18 @@ View Session: ${sessionUrl}`;
           <div style="background-color: white; padding: 20px; border-radius: 0 0 8px 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
             <h2 style="color: #dc3545; margin-top: 0;">${this.escapeHtml(subject)}</h2>
             <div style="margin: 20px 0;">
-              <a href="${this.escapeHtml(resolvedNotionUrl)}" style="display: inline-block; padding: 12px 24px; background-color: #dc3545; color: white; text-decoration: none; border-radius: 6px; font-weight: bold;">View in Notion</a>
+              <a href="${this.escapeHtml(resolvedTrackerUrl)}" style="display: inline-block; padding: 12px 24px; background-color: #dc3545; color: white; text-decoration: none; border-radius: 6px; font-weight: bold;">View tracked issue</a>
             </div>
             <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #e9ecef; color: #6c757d; font-size: 12px;">
-              <p>Full details available in the Notion item above.</p>
+              <p>Full details are available in the tracked issue above.</p>
             </div>
           </div>
         </div>
         `;
 
-        text = `⚠️ [${envLabel}] Oncall Alert\n\n${subject}\n\nNotion: ${resolvedNotionUrl}`;
+        text = `⚠️ [${envLabel}] Oncall Alert\n\n${subject}\n\nIssue: ${resolvedTrackerUrl}`;
       } else {
-        // Full detail email (fallback when Notion creation failed)
+        // Full detail email (fallback when issue filing failed)
         const contextHtml = context
           ? Object.entries(context)
             .map(([key, value]) => {

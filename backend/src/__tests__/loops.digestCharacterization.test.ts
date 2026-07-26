@@ -369,7 +369,7 @@ describe('loop digest characterization (exact rendered text)', () => {
       return m;
     }
 
-    it('renders the findings digest (Notion link + RCA top fix + Notion error) verbatim', async () => {
+    it('renders the findings digest (Linear link + route + RCA + intake error) verbatim', async () => {
       const result = fakeResult({
         runId: 'run-eval-1' as LoopRunResult['runId'],
         eventsScanned: 300,
@@ -380,8 +380,9 @@ describe('loop digest characterization (exact rendered text)', () => {
       });
       const muts: Mutation[] = [
         evalMutation({
-          notionUrl: 'https://www.notion.so/p1',
+          linearUrl: 'https://linear.app/emmabyaw/issue/ENG-601',
           title: 'fix(ai-eval-funnel): capture-broken',
+          executionRoute: 'human-triage',
           rcaEnrichment: {
             topHypotheses: ['x'],
             rankedFixes: [
@@ -389,7 +390,11 @@ describe('loop digest characterization (exact rendered text)', () => {
             ],
           },
         }),
-        evalMutation({ title: 'fix(ai-eval-funnel): no-signup', rcaEnrichment: { topHypotheses: [], rankedFixes: [], error: 'Bedrock 500' } }, 'Notion API 502'),
+        evalMutation({
+          title: 'fix(ai-eval-funnel): no-signup',
+          executionRoute: 'human-triage',
+          rcaEnrichment: { topHypotheses: [], rankedFixes: [], error: 'Bedrock 500' },
+        }, 'Linear API 502'),
       ];
       const slack = { postMessage: jest.fn().mockResolvedValue({ ok: true }) };
 
@@ -404,16 +409,15 @@ describe('loop digest characterization (exact rendered text)', () => {
           'Events scanned: 300  |  Rules fired: 2  |  Mutations: 2',
           '',
           '*Proposed fixes*',
-          '1. <https://www.notion.so/p1|fix(ai-eval-funnel): capture-broken>',
-          '   Rule: `capture-broken`  |  Kind: `copy`',
+          '1. <https://linear.app/emmabyaw/issue/ENG-601|fix(ai-eval-funnel): capture-broken>',
+          '   Rule: `capture-broken`  |  Kind: `copy`  |  Route: `human-triage`',
           '   ↳ Top fix: Scope rule denominator by landerPath = /ai-eval',
           '2. fix(ai-eval-funnel): no-signup',
-          '   Rule: `no-signup`  |  Kind: `copy`',
+          '   Rule: `no-signup`  |  Kind: `copy`  |  Route: `human-triage`',
           '   ⚠️ RCA unavailable',
-          '   ⚠️ Notion API 502',
+          '   ⚠️ Linear API 502',
           '',
-          FOOTER,
-          'Reply in thread to skip a specific item (e.g. "skip 2").',
+          'Filed in Linear automatically. Autofix-eligible work is queued; restricted work is labeled Needs PM.',
         ].join('\n'),
       );
     });

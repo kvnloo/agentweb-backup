@@ -72,7 +72,7 @@ export const aiEvalManifest: LoopManifest<NormalizedEvent, AiEvalProposalPayload
       'Voice: direct, founder-to-founder, no jargon, no hedging, no exclamation marks.',
       'Concrete > abstract. Specific numbers > vague qualifiers. Time-anchored > timeless.',
       '',
-      'When a code_change is proposed, output a Notion-task-ready spec with: ',
+      'When a code_change is proposed, output a Linear-issue-ready spec with: ',
       '  - "What was wrong" (1-2 sentences from triggering data, including any errorSample / complaintSample)',
       '  - "Proposed fix" (concrete code change description; reference the agent-mode endpoint or component file)',
       '  - "Acceptance criteria" (3 behavioral assertions Harsha could verify)',

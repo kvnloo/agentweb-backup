@@ -5,7 +5,7 @@
  *  - `registerAiEvalFunnelForProduction` + `runAiEvalLoopOnce` — the daily
  *    production cron wiring (previously in cron.ts), built on the shared
  *    instance runner like the other loop instances: real DynamoPort + real
- *    SlackPort + NotionDigestTool + CaptureGate + DynamoLearningStore.
+ *    SlackPort + LinearIntakeTool + CaptureGate + DynamoLearningStore.
  *    After each runLoop() the runner drains CaptureGate's collected mutations
  *    and posts a single Slack DM digest.
  *
@@ -46,7 +46,7 @@ import { productionLoopPorts } from '../../adapters/awsAdapters';
 import type { LoopRunResult, Mutation, NormalizedEvent, RuleSet } from '../../core/types';
 import { asLoopId } from '../../core/types';
 import { AI_EVAL_LOOP_ID, aiEvalManifest } from './manifest';
-import { NotionDigestTool } from './notionDigestTool';
+import { LinearIntakeTool } from './linearIntakeTool';
 import type { RcaEnrichment } from './rcaEnricher';
 import type { AiEvalProposalPayload } from './rules';
 import { aiEvalRules } from './rules';
@@ -99,7 +99,7 @@ const runner = createInstanceRunner({
   implNames: {
     sensor: 'aiEvalSensor:prod',
     ruleSet: 'aiEvalRules:prod',
-    tools: 'aiEvalSpecTool:prod',
+    tools: 'aiEvalLinearIntake:prod',
     gate: 'aiEvalCaptureGate:prod',
     learning: 'aiEvalLearning:prod',
   },
@@ -150,7 +150,7 @@ const runner = createInstanceRunner({
     return {
       sensor,
       ruleSet: new CooldownRuleSet(baseRuleSet, learning, AI_EVAL_LOOP_ID),
-      tools: new NotionDigestTool(),
+      tools: new LinearIntakeTool(),
       gate: new CaptureGate(),
       learning,
     };
@@ -159,7 +159,7 @@ const runner = createInstanceRunner({
     ...aiEvalManifest,
     sensorImpl: 'aiEvalSensor:prod',
     rulesetImpl: 'aiEvalRules:prod',
-    toolsImpl: 'aiEvalSpecTool:prod',
+    toolsImpl: 'aiEvalLinearIntake:prod',
     gateImpl: 'aiEvalCaptureGate:prod',
     learningImpl: 'aiEvalLearning:prod',
   }),
@@ -212,16 +212,19 @@ const aiEvalDigestTemplate: LoopDigestTemplate<readonly Mutation[]> = {
       const m = mutations[i];
       const p = result.proposals[i];
       const artifact = m.artifact as {
-        notionUrl?: string;
+        linearUrl?: string;
         title?: string;
+        executionRoute?: 'autofix' | 'human-triage';
         rcaEnrichment?: RcaEnrichment;
       };
       const ruleId = p?.sourceRuleId ?? 'unknown';
-      const titleLine = artifact.notionUrl
-        ? `${i + 1}. <${artifact.notionUrl}|${artifact.title ?? ruleId}>`
+      const titleLine = artifact.linearUrl
+        ? `${i + 1}. <${artifact.linearUrl}|${artifact.title ?? ruleId}>`
         : `${i + 1}. ${artifact.title ?? ruleId}`;
       lines.push(titleLine);
-      lines.push(`   Rule: \`${ruleId}\`  |  Kind: \`${p?.kind ?? 'n/a'}\``);
+      lines.push(
+        `   Rule: \`${ruleId}\`  |  Kind: \`${p?.kind ?? 'n/a'}\`  |  Route: \`${artifact.executionRoute ?? 'unknown'}\``,
+      );
       // RCA top-fix line: one indented bullet under each rule. Acceptance #3.
       const rca = artifact.rcaEnrichment;
       if (rca?.error) {
@@ -233,7 +236,10 @@ const aiEvalDigestTemplate: LoopDigestTemplate<readonly Mutation[]> = {
     }
     return lines;
   },
-  footerExtra: [`Reply in thread to skip a specific item (e.g. "skip 2").`],
+  footer: (result) =>
+    result.proposals.length > 0
+      ? 'Filed in Linear automatically. Autofix-eligible work is queued; restricted work is labeled Needs PM.'
+      : null,
 };
 
 async function postDailyDigest(

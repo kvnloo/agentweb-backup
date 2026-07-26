@@ -2,7 +2,7 @@
  * Onboarding stuck-user detector — DAILY AGGREGATED REPORT.
  *
  * Runs once per day. Scans all users with a non-terminal `onboardingStage`,
- * groups them by stage, and posts ONE Notion oncall task per day summarizing
+ * groups them by stage, and posts ONE Linear issue per day summarizing
  * "how many users are stuck at which stage" with sample emails per stage.
  *
  * History:
@@ -71,7 +71,7 @@ export interface DailyStuckReport {
     sampleEmails: string[];
     oldestHours: number;
   }>;
-  notionUrl: string | null;
+  trackerUrl: string | null;
 }
 
 function classifyUser(user: any, now: number): { stage: string; hoursIdle: number; email: string } | null {
@@ -140,10 +140,10 @@ export async function runOnboardingStuckDetector(): Promise<DailyStuckReport> {
     totalStuck += entries.length;
   }
 
-  let notionUrl: string | null = null;
+  let trackerUrl: string | null = null;
   if (totalStuck > 0) {
     // Build the per-stage context map. Each stage becomes one bullet in the
-    // Notion task body, sorted by count desc so the biggest funnel leak is
+    // Linear issue body, sorted by count desc so the biggest funnel leak is
     // first. Tie-break on oldestHours desc so equal-count stages still order
     // by severity.
     const orderedStages = Object.entries(byStage).sort((a, b) => {
@@ -178,14 +178,14 @@ export async function runOnboardingStuckDetector(): Promise<DailyStuckReport> {
         title,
         description,
         source: 'Onboarding stuck',
+        executionRoute: 'human-triage',
         notionTags: ['Onboarding'],
         notionContext: context,
       });
-      // Linear path returns an issue identifier (no public URL); Notion returns a page id.
-      notionUrl = result.pageId ? `AGW-${result.pageId}` : null;
+      trackerUrl = result.url || null;
     } catch (err) {
       console.error('[onboardingStuckDetector] issue filing failed:', err);
-      notionUrl = null;
+      trackerUrl = null;
     }
   }
 
@@ -193,6 +193,6 @@ export async function runOnboardingStuckDetector(): Promise<DailyStuckReport> {
     scanned: users.length,
     totalStuck,
     byStage,
-    notionUrl,
+    trackerUrl,
   };
 }

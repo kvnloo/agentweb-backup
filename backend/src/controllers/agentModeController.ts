@@ -211,10 +211,10 @@ function getInteractiveShareExpiresAt(share: { expiresAt?: string; sharedAt?: st
 }
 
 /**
- * Auto-files a Notion "Customer Reported" issue for context-limit errors.
+ * Auto-files a Linear "Customer Reported" issue for context-limit errors.
  * Skips if the session already has contextLimitReported set (dedup).
  */
-async function autoReportContextLimitToNotion(
+async function autoReportContextLimitToLinear(
   sessionId: string | undefined,
   userEmail: string | undefined,
   userId: string | undefined,
@@ -227,7 +227,8 @@ async function autoReportContextLimitToNotion(
       title: `Context limit reached - session ${sessionId}`,
       description: `User hit the context window limit in agent mode.\n\nUser: ${userEmail || 'Unknown'}\nModel: ${llmModel || 'Not specified'}\nSession messages: ${session?.messages?.length ?? 'N/A'}\nSession title: ${session?.title || 'N/A'}`,
       source: 'Context limit',
-      notionTags: ['Customer Reported', 'Context Limit'],
+      executionRoute: 'human-triage',
+      extraLabels: ['Customer Reported', 'Context Limit'],
       notionContext: {
         'User ID': userId || 'N/A',
         'User Email': userEmail || 'N/A',
@@ -241,7 +242,7 @@ async function autoReportContextLimitToNotion(
       console.error('Failed to set contextLimitReported flag:', err)
     );
   } catch (err) {
-    console.error('Failed to create context-limit Notion item:', err);
+    console.error('Failed to create context-limit Linear issue:', err);
   }
 }
 
@@ -3761,8 +3762,8 @@ export const agentModeController = {
             }
           }).catch(err => console.error('Failed to send oncall alert:', err));
 
-          autoReportContextLimitToNotion(sessionId, user?.email, user?.userId, llmModel, session)
-            .catch(err => console.error('autoReportContextLimitToNotion failed:', err));
+          autoReportContextLimitToLinear(sessionId, user?.email, user?.userId, llmModel, session)
+            .catch(err => console.error('autoReportContextLimitToLinear failed:', err));
 
           res.status(413).json({
             error: 'Context limit exceeded',
@@ -4445,8 +4446,8 @@ export const agentModeController = {
             }
           }).catch(err => console.error('Failed to send oncall alert:', err));
 
-          autoReportContextLimitToNotion(shareId, session?.userId, session?.userId, llmModel || session?.llmModel, session)
-            .catch(err => console.error('autoReportContextLimitToNotion failed (shared):', err));
+          autoReportContextLimitToLinear(shareId, session?.userId, session?.userId, llmModel || session?.llmModel, session)
+            .catch(err => console.error('autoReportContextLimitToLinear failed (shared):', err));
 
           res.status(413).json({
             error: 'Context limit exceeded',
@@ -4794,6 +4795,7 @@ export const agentModeController = {
           `Message preview: ${String(message.content || '').slice(0, 300)}`,
         ].filter(Boolean).join('\n'),
         source: `Feedback (${type})`,
+        executionRoute: 'human-triage',
         notionTags: [type === 'like' ? 'Feedback-Like' : 'Feedback-Dislike'],
         notionContext: {
           sessionId,
