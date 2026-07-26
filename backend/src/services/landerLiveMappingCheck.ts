@@ -28,6 +28,18 @@ export interface LanderLiveMappingResult {
   storedRepoFullName?: string;
   projectIdMismatch: boolean;
   repoMismatch: boolean;
+  /**
+   * True when Vercel resolved a real live repo but the page never had ANY
+   * githubRepoUrl stored to compare it against — distinct from repoMismatch
+   * (an explicit stored value that disagrees). Mutually exclusive with
+   * repoMismatch by construction (repoMismatch requires a stored value to
+   * exist). A missing vercelProjectId has no equivalent flag: that field is
+   * already a known, benign, backfillable gap (see resolveVercelProjectId in
+   * v0Service.ts), unlike githubRepoUrl, which is written at the same time
+   * and has no such precedent — a live repo with nothing stored at all is
+   * exactly the RankAI incident's shape, not routine sparseness.
+   */
+  repoUnknown?: boolean;
   /** A sibling page (same owner, or an org member's page) whose OWN githubRepoUrl matches the actual live repo. */
   possibleCorrectRecord?: { id: string; name: string };
   checkedAt: string;
@@ -171,8 +183,9 @@ export async function verifyLanderLiveMapping(
 
     result.actualRepoFullName = actualRepoFullName;
     result.repoMismatch = !!storedRepoFullName && actualRepoFullName !== storedRepoFullName;
+    result.repoUnknown = !storedRepoFullName;
 
-    if (result.repoMismatch) {
+    if (result.repoMismatch || result.repoUnknown) {
       const siblings = await findSiblingPages(page);
 
       const match = siblings.find(

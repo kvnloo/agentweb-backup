@@ -218,4 +218,46 @@ describe("verifyLanderLiveMapping", () => {
     expect(result.repoMismatch).toBe(true);
     expect(result.possibleCorrectRecord).toBeUndefined();
   });
+
+  it("SUCCESS (repo never stored at all): repoUnknown: true, repoMismatch stays false, sibling search still runs and finds a match (Greptile)", async () => {
+    mockAxiosGet
+      .mockResolvedValueOnce({ data: { projectId: "prj_actual", deploymentId: "dpl_1" } })
+      .mockResolvedValueOnce({ data: { gitSource: { type: "github", repoId: 999, ref: "main", sha: "abc" } } })
+      .mockResolvedValueOnce({ data: { full_name: "AgentWebPro/lp-real-repo" } });
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([
+      { id: "page-2", name: "The real page", githubRepoUrl: "https://github.com/AgentWebPro/lp-real-repo" },
+    ]);
+
+    const result = await verifyLanderLiveMapping({ ...BASE_PAGE, githubRepoUrl: undefined });
+
+    expect(result.repoUnknown).toBe(true);
+    expect(result.repoMismatch).toBe(false); // distinct from an explicit disagreement
+    expect(result.possibleCorrectRecord).toEqual({ id: "page-2", name: "The real page" });
+  });
+
+  it("SUCCESS (repo never stored, no match found): repoUnknown: true, possibleCorrectRecord stays undefined", async () => {
+    mockAxiosGet
+      .mockResolvedValueOnce({ data: { projectId: "prj_actual", deploymentId: "dpl_1" } })
+      .mockResolvedValueOnce({ data: { gitSource: { type: "github", repoId: 999, ref: "main", sha: "abc" } } })
+      .mockResolvedValueOnce({ data: { full_name: "AgentWebPro/lp-nobody-owns-this" } });
+    mockGetLandingPagesByOwner.mockResolvedValueOnce([]);
+
+    const result = await verifyLanderLiveMapping({ ...BASE_PAGE, githubRepoUrl: undefined });
+
+    expect(result.repoUnknown).toBe(true);
+    expect(result.repoMismatch).toBe(false);
+    expect(result.possibleCorrectRecord).toBeUndefined();
+  });
+
+  it("SUCCESS (normal case unaffected): repo stored and matching -> repoUnknown stays false", async () => {
+    mockAxiosGet
+      .mockResolvedValueOnce({ data: { projectId: "prj_stored", deploymentId: "dpl_1" } })
+      .mockResolvedValueOnce({ data: { gitRepo: { type: "github", org: "AgentWebPro", repo: "lp-stored-repo" } } });
+
+    const result = await verifyLanderLiveMapping(BASE_PAGE);
+
+    expect(result.repoUnknown).toBe(false);
+    expect(result.repoMismatch).toBe(false);
+    expect(mockGetLandingPagesByOwner).not.toHaveBeenCalled(); // no sibling search needed
+  });
 });
