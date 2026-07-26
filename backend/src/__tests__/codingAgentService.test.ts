@@ -761,6 +761,42 @@ describe('runCodingAgent', () => {
     expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
   });
 
+  test('edit_files: a PARTIAL edit on one file blocks the whole atomic batch — no update-files call, nothing tracked as edited (Greptile)', async () => {
+    mockedMcpFetch
+      .mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 1000 }] }) // preflight list_files
+      .mockResolvedValueOnce({ path: 'public/book-a-demo.html', content: '<h1>Old</h1>' }); // read for the partial file
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_files', input: {
+          files: [
+            // Two edits requested for this ONE file; only one search string matches.
+            { file_path: 'public/book-a-demo.html', edits: [
+              { search: '<h1>Old</h1>', replace: '<h1>New</h1>' },
+              { search: 'THIS STRING DOES NOT EXIST', replace: 'irrelevant' },
+            ] },
+            { file_path: 'app/api/new-route/route.ts', deleted: true },
+          ],
+          commit_message: 'msg',
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Could not complete the batch.', status: 'error' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    const result = await runCodingAgent('do a 2-file fix', mockContext);
+
+    // Read happened, but the atomic write to update-files must NEVER be reached.
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(2);
+    expect(mockedMcpFetch.mock.calls.every((c: any) => c[0].path !== '/api/landing-pages/v0/generated/test-page-123/update-files')).toBe(true);
+    // Nothing was actually committed, so nothing should be tracked as edited for rollback.
+    expect(result.editedFiles).toEqual([]);
+  });
+
   test('returns text response when LLM responds without tool calls', async () => {
     mockCreate.mockResolvedValueOnce({
       content: [

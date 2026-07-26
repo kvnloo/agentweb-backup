@@ -1228,7 +1228,6 @@ async function executeTool(
       }
 
       const filesToCommit: Array<{ file_path: string; content?: string; deleted?: boolean }> = [];
-      const warnings: string[] = [];
 
       for (const f of args.files) {
         if (!f?.file_path || typeof f.file_path !== 'string') {
@@ -1245,10 +1244,16 @@ async function executeTool(
           }
           return `Error: ${f.file_path}: failed to apply edits. Errors:\n${computed.errors.join('\n')}`;
         }
-        filesToCommit.push({ file_path: f.file_path, content: computed.content });
+        // A file that only PARTLY applied (some edit blocks matched, some didn't)
+        // is refused rather than committed with a footnote warning: edit_files'
+        // whole point is one atomic, trustworthy commit, and bundling a silently
+        // incomplete file alongside genuinely good ones — reported as one clean
+        // success — is worse here than for single-file edit_file (Greptile).
+        // No partial commit made; nothing in this batch has been written yet.
         if (computed.errors.length > 0) {
-          warnings.push(`${f.file_path}: ${computed.errors.join('; ')}`);
+          return `Error: ${f.file_path}: only ${computed.appliedCount}/${computed.totalEdits} edits applied — refusing to commit a partially-edited file as part of an atomic multi-file batch. Errors:\n${computed.errors.join('\n')}\nFix or drop this file's edits and retry the whole batch.`;
         }
+        filesToCommit.push({ file_path: f.file_path, content: computed.content });
       }
 
       const writeResult = await mcpFetch({
@@ -1270,9 +1275,6 @@ async function executeTool(
       }
       if (writeResult.commit_url) {
         response += ` Commit: ${writeResult.commit_url}`;
-      }
-      if (warnings.length > 0) {
-        response += `\nWarnings:\n${warnings.join('\n')}`;
       }
       return response;
     }
