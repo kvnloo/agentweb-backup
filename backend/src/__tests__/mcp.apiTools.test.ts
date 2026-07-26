@@ -67,7 +67,7 @@ describe('apiTools', () => {
     it('should register API-wrapping tools', () => {
       const names = mcpToolRegistry.getToolNames();
       const expectedTools = [
-        'emma_create_session', 'emma_send_message', 'emma_get_session', 'emma_list_sessions',
+        'emma_create_session', 'emma_send_message', 'emma_answer_question', 'emma_get_session', 'emma_list_sessions',
         'list_tasks', 'manage_task', 'execute_task', 'list_task_executions',
         'list_schedules', 'manage_schedule',
         'list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat',
@@ -310,12 +310,139 @@ describe('apiTools', () => {
       expect(callBody.attachments[0].filename).toBe('screenshot-dashboard.png');
     });
 
+  });
+
+  // ─── emma_answer_question (ENG-400: MCP transport for the AskUserQuestion primitive) ───
+
+  describe('emma_answer_question', () => {
+    it('posts a direct pick through the structured questionAnswer channel, using option_id as the default label', async () => {
+      mockMcpFetch.mockResolvedValue({ response: 'OK' });
+
+      await mcpToolRegistry.execute('emma_answer_question', {
+        session_id: 'sess-1',
+        question_id: 'q-1',
+        option_id: 'leads',
+      }, context);
+
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        body: {
+          sessionId: 'sess-1',
+          userMessage: 'leads',
+          questionAnswer: { questionId: 'q-1', optionId: 'leads', delegated: false },
+        },
+      }));
+    });
+
+    it('uses a provided label as the human-readable chat message instead of the raw option_id', async () => {
+      mockMcpFetch.mockResolvedValue({ response: 'OK' });
+
+      await mcpToolRegistry.execute('emma_answer_question', {
+        session_id: 'sess-1',
+        question_id: 'q-1',
+        option_id: 'leads',
+        label: 'Leads',
+      }, context);
+
+      const callBody = mockMcpFetch.mock.calls[0][0].body as any;
+      expect(callBody.userMessage).toBe('Leads');
+    });
+
+    it('posts a delegation ("Let Emma decide") with delegated:true and no option_id required', async () => {
+      mockMcpFetch.mockResolvedValue({ response: 'OK' });
+
+      await mcpToolRegistry.execute('emma_answer_question', {
+        session_id: 'sess-1',
+        question_id: 'q-1',
+        delegate: true,
+      }, context);
+
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+        body: {
+          sessionId: 'sess-1',
+          userMessage: 'Let Emma decide',
+          questionAnswer: { questionId: 'q-1', optionId: undefined, delegated: true },
+        },
+      }));
+    });
+
+    it('refuses (without calling the API) a direct pick missing option_id', async () => {
+      const result = await mcpToolRegistry.execute('emma_answer_question', {
+        session_id: 'sess-1',
+        question_id: 'q-1',
+      }, context);
+
+      expect(mockMcpFetch).not.toHaveBeenCalled();
+      expect(JSON.parse(result.content[0].text).success).toBe(false);
+    });
+
+    it('is registered with session_id and question_id required', () => {
+      const defs = mcpToolRegistry.getToolDefinitions();
+      const answerQuestion = defs.find((d: any) => d.name === 'emma_answer_question');
+      expect(answerQuestion).toBeDefined();
+      expect(answerQuestion.inputSchema.required).toEqual(['session_id', 'question_id']);
+    });
+  });
+
+  describe('emma_send_message input schema', () => {
     it('should include media_urls in tool input schema', () => {
       const defs = mcpToolRegistry.getToolDefinitions();
       const emmaSend = defs.find((d: any) => d.name === 'emma_send_message');
       expect(emmaSend).toBeDefined();
       expect(emmaSend!.inputSchema.properties.media_urls).toBeDefined();
       expect(emmaSend!.inputSchema.properties.media_urls.type).toBe('array');
+    });
+  });
+
+  // ─── Emma delegation capability discovery (ENG-257) ──────────────────
+  // External MCP clients (e.g. Claude) only see these tool descriptions, and
+  // there is no ads/marketing execution tool in the external set — that work
+  // happens by delegating to Emma. If the delegation tools don't tell the client
+  // to hand marketing/growth requests to Emma, it pre-judges feasibility from the
+  // visible tools and hallucinates that the capability is unsupported.
+  //
+  // The fix is a GENERAL delegation directive, NOT a capability catalogue: the
+  // description must NOT enumerate Emma's capabilities (platforms OR feature list).
+  // Enumerations undersell (anything not listed gets denied) and go stale as Emma
+  // gains skills — verified live: an enumerated list under-delegated a non-listed
+  // capability (SEO) while the general directive delegated it. So these assertions
+  // check the delegate/don't-pre-judge/don't-deny contract and FORBID enumeration.
+  describe('emma delegation capability discovery', () => {
+    const getDesc = (name: string) => {
+      const def = mcpToolRegistry.getToolDefinitions().find((d: any) => d.name === name);
+      expect(def).toBeDefined();
+      return def!.description as string;
+    };
+
+    it('emma_send_message tells the client to delegate and NOT pre-judge feasibility, and not to deny it itself', () => {
+      const desc = getDesc('emma_send_message').toLowerCase();
+      expect(desc).toContain('delegate');                 // route the request to Emma
+      expect(desc).toMatch(/pre-judge|feasib|determine/); // let Emma decide, don't guess
+      expect(desc).toMatch(/unsupported|unavailable/);    // don't-deny guidance
+    });
+
+    it('emma_create_session signals Emma is a full GTM agent to delegate marketing work to', () => {
+      const desc = getDesc('emma_create_session').toLowerCase();
+      expect(desc).toContain('gtm');
+      expect(desc).toContain('delegate');
+      expect(desc).toMatch(/feasib|pre-judge|determine/);
+    });
+
+    it('descriptions do NOT enumerate capabilities — no platform names, no feature catalogue (maintainability / no-undersell guard)', () => {
+      // A capability list means editing prose on every new skill/platform AND
+      // undersells anything omitted. The general delegation directive must carry
+      // the meaning instead. Forbid specific platforms and enumerated feature nouns.
+      const forbidden = [
+        'meta', 'facebook', 'instagram', 'linkedin', 'tiktok', 'google ads', // platforms
+        'crm', 'landing page', 'blog', 'work plan', 'seo',                    // feature catalogue
+      ];
+      for (const name of ['emma_create_session', 'emma_send_message']) {
+        const desc = getDesc(name).toLowerCase();
+        for (const term of forbidden) {
+          expect(desc).not.toContain(term);
+        }
+      }
     });
   });
 

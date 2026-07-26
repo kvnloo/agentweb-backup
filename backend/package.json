@@ -100,6 +100,7 @@
     "passport-google-oauth20": "^2.0.0",
     "pdf-parse": "^1.1.1",
     "pdfkit": "^0.15.0",
+    "playwright": "1.60.0-alpha-1774999321000",
     "puppeteer-core": "^24.37.2",
     "reactflow": "^11.11.4",
     "rehype-highlight": "^7.0.2",

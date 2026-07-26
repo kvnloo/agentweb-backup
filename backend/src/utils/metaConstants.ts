@@ -161,6 +161,22 @@ export const META_OBJ_GOAL_MAP: Record<string, string[]> = {
 };
 
 /**
+ * Optimization goals whose ad sets drive traffic to a website (a destination URL),
+ * so the ad set's conversion location is "Website" (`destination_type=WEBSITE`).
+ *
+ * Used to default `destination_type` when the caller omits it (ENG-415): without it
+ * Meta stores `UNDEFINED` and the ad-level Destination reads as "not selected" in Ads
+ * Manager. Non-website goals (reach/engagement/app installs, or instant-form lead
+ * goals) are intentionally excluded — their destination is not a website.
+ */
+export const META_WEBSITE_OPTIMIZATION_GOALS: string[] = [
+  'LINK_CLICKS',
+  'LANDING_PAGE_VIEWS',
+  'OFFSITE_CONVERSIONS',
+  'VALUE'
+];
+
+/**
  * Meta v24 Optimization Goal to Billing Event Compatibility Matrix
  */
 export const META_GOAL_BILLING_MAP: Record<string, string[]> = {

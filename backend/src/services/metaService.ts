@@ -1,5 +1,6 @@
 import { FacebookAdsApi, User, AdAccount, Campaign, AdSet, AdCreative, Ad, CustomAudience } from 'facebook-nodejs-business-sdk';
 import axios from 'axios';
+import * as crypto from 'crypto';
 import { MetaAdAccount, MetaPage } from '../types/meta';
 import { INTEGRATION_CONFIG } from '../config/integrations';
 import { getMetaCredentials } from '../utils/secretsManager';
@@ -26,6 +27,11 @@ export interface MetaAdsAdSetParams {
   targeting: any;
   status?: string;
   promoted_object?: any;
+  // Conversion location for the ad set (e.g. 'WEBSITE', 'ON_AD' for instant forms, 'MESSENGER',
+  // 'APP'). When omitted Meta stores UNDEFINED and the ad-level Destination reads as "not selected"
+  // in Ads Manager (ENG-415). agentModeService.createMetaAdsAdSet defaults this to 'WEBSITE' for
+  // website optimization goals.
+  destination_type?: string;
 }
 
 export interface MetaPlacementAsset {
@@ -78,6 +84,51 @@ export interface MetaAdsAdParams {
   adset_id: string;
   creative_id: string;
   status?: string;
+}
+
+/**
+ * Meta's real, dynamic Business Use Case (BUC) rate-limit signal — returned on
+ * every Marketing API response (CAPI included) via the `X-Business-Use-Case-Usage`
+ * header, NOT a fixed numeric limit Meta documents anywhere. Percentages of the
+ * ad account's rolling hourly allowance used; `estimatedMinutesToRegainAccess`
+ * only appears once actually throttled (a metric at/over 100).
+ */
+export interface CapiUsage {
+  callCountPct: number;
+  totalTimePct: number;
+  totalCpuTimePct: number;
+  estimatedMinutesToRegainAccess?: number;
+}
+
+/**
+ * Parse `X-Business-Use-Case-Usage` off a real Marketing API response. The
+ * header is a JSON object keyed by ad account id, each value an array with one
+ * usage entry — CAPI's ad-account-scoped rate limit is DYNAMIC (Meta documents
+ * no fixed number), so this is the only real signal for how close an account
+ * is to being throttled. Never throws: a missing header (every existing mocked
+ * test response lacks `.headers` entirely) or a malformed value is inconclusive,
+ * not an error — returns `undefined` rather than guessing.
+ */
+function parseBusinessUseCaseUsage(response: { headers?: { get?: (name: string) => string | null } }): CapiUsage | undefined {
+  try {
+    const raw = response.headers?.get?.('x-business-use-case-usage');
+    if (!raw) return undefined;
+    const parsed = JSON.parse(raw);
+    const firstAccountEntries = Object.values(parsed)[0] as any[] | undefined;
+    const entry = firstAccountEntries?.[0];
+    if (!entry) return undefined;
+    return {
+      callCountPct: Number(entry.call_count) || 0,
+      totalTimePct: Number(entry.total_time) || 0,
+      totalCpuTimePct: Number(entry.total_cputime) || 0,
+      estimatedMinutesToRegainAccess:
+        entry.estimated_time_to_regain_access !== undefined
+          ? Number(entry.estimated_time_to_regain_access)
+          : undefined,
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 export class MetaService {
@@ -228,6 +279,27 @@ export class MetaService {
   public setAppCredentials(appId: string, appSecret: string) {
     this.appId = appId;
     this.appSecret = appSecret;
+  }
+
+  /**
+   * Greptile P1 ("Invalid requests now require session storage"): validates ONLY
+   * the objective-INDEPENDENT campaign fields (name, special_ad_categories
+   * shape) — no DB access. Called BEFORE the ENG-400 objective gate so a
+   * request missing basic required fields is rejected deterministically,
+   * without ever touching session storage, exactly as it was before the gate
+   * was reordered to run first. Objective itself is validated separately, by
+   * construction, via the gate (which only ever returns a value from the
+   * fixed valid-objective set).
+   */
+  public static validateCampaignParamsExceptObjective(action: string, params: Partial<MetaAdsCampaignParams>): void {
+    if (action !== 'CREATE') return;
+
+    if (!params.name) {
+      throw new Error('Campaign CREATE requires "name".');
+    }
+    if (params.special_ad_categories !== undefined && !Array.isArray(params.special_ad_categories)) {
+      throw new Error('Campaign "special_ad_categories" must be an array (e.g. ["NONE"]).');
+    }
   }
 
   /**
@@ -930,6 +1002,10 @@ export class MetaService {
       if (params.start_time !== undefined) adSetParams[AdSet.Fields.start_time] = params.start_time;
       if (params.end_time !== undefined) adSetParams[AdSet.Fields.end_time] = params.end_time;
       if (params.promoted_object !== undefined) adSetParams[AdSet.Fields.promoted_object] = params.promoted_object;
+      // Conversion location (ENG-415). Literal key — Meta accepts 'destination_type' directly and it
+      // is not guaranteed to exist on the SDK's AdSet.Fields enum across versions. Emitted only when
+      // present so the payload is byte-identical to before when the caller passes nothing.
+      if (params.destination_type !== undefined) adSetParams['destination_type'] = params.destination_type;
 
       // Defensive: Ensure no 'id' or other accidental fields
       delete adSetParams.id;
@@ -1953,6 +2029,158 @@ export class MetaService {
       return data;
     } catch (error) {
       return this.handleError(error, 'getDatasetEventStats');
+    }
+  }
+
+  /**
+   * Auto-resolve which Meta pixel a lander should use, from the site owner's already-connected
+   * Meta ad account. Uses `pixel.id` directly as the dataset id — Meta unified
+   * pixel + dataset in Graph v25, so the per-pixel `listDatasets` edge (broken, see ENG-399)
+   * is never called at all.
+   *
+   * Never throws: an unconnected account, an ambiguous pixel/account set, or any Graph/
+   * credential error all resolve to `{ unresolved: true, reason }` so generation can proceed
+   * without tracking rather than fail outright (AC3 — fail loud, never fail generation).
+   *
+   * Imports `services/metaAccountCredentials` dynamically (not at module top level) because
+   * that module depends on `metaTokenRefresh.ts`, which already imports this file — a static
+   * top-level import here would be circular. Deferring to call time (same pattern already used
+   * in this file for `utils/metaApiFetch`) sidesteps it, since by the time this runs the whole
+   * module graph is already loaded.
+   */
+  public async resolveMetaPixelForUser(
+    user: any,
+    userId: string,
+  ): Promise<{ pixelId: string; accountId: string } | { unresolved: true; reason: string }> {
+    try {
+      const { getConnectedMetaAccountsList, getMetaAccountCredentials } = await import('./metaAccountCredentials');
+
+      const accounts = getConnectedMetaAccountsList(user);
+      if (accounts.length === 0) {
+        return { unresolved: true, reason: 'No Meta ad account connected' };
+      }
+      if (accounts.length > 1) {
+        return { unresolved: true, reason: 'Multiple Meta ad accounts connected — no default account to resolve a pixel from' };
+      }
+
+      const { accountId, accessToken } = await getMetaAccountCredentials(user, userId, accounts[0].accountId);
+      const pixels = await this.listPixels(accountId, accessToken);
+
+      if (!pixels || pixels.length === 0) {
+        return { unresolved: true, reason: `No Meta pixel found on ad account ${accountId}` };
+      }
+      if (pixels.length > 1) {
+        return { unresolved: true, reason: `Ad account ${accountId} has ${pixels.length} pixels — ambiguous which to use` };
+      }
+
+      return { pixelId: pixels[0].id, accountId };
+    } catch (error: any) {
+      return { unresolved: true, reason: error?.message || 'Unknown error resolving Meta pixel' };
+    }
+  }
+
+  /**
+   * Server-side Meta Conversions API (CAPI) send. Fires a `Lead` event directly to
+   * Meta from our own trusted backend — never from a generated customer repo, which would
+   * require shipping an access token into code we push to a customer-owned deployment.
+   *
+   * `event_id` must match whatever the browser-side `fbq('track','Lead', {}, {eventID})` call
+   * used, so Meta dedups the two into one conversion (AC2).
+   *
+   * Sends even with no email/phone present (event_source_url + IP/UA alone still counts as a
+   * signal) — skipping would recreate the exact silent-undercounting bug this card exists to
+   * fix. Never throws: the lead save that already happened in the caller must not be affected
+   * by a Meta-side failure.
+   */
+  public async sendCapiLeadEvent(
+    pixelId: string,
+    accessToken: string,
+    event: {
+      eventId: string;
+      email?: string;
+      firstName?: string;
+      lastName?: string;
+      phone?: string;
+      clientIp?: string;
+      userAgent?: string;
+      sourceUrl?: string;
+      /** Meta's own first-party click-id cookies (`_fbp`/`_fbc`) — opaque values, sent
+       * verbatim per Meta's CAPI spec (unlike em/ph, these are NOT hashed). */
+      fbp?: string;
+      fbc?: string;
+      /** Real client-submission time (Unix seconds), threaded from the customer's own
+       *  capture route via forward-lead — NOT server CAPI-send time. Falls back to the
+       *  current time when absent/invalid (an older, not-yet-regenerated capture route
+       *  never sent one, or the caller's own validation rejected it as implausible). */
+      eventTimeSeconds?: number;
+    },
+  ): Promise<
+    | { success: true; fbtraceId?: string; usage?: CapiUsage }
+    | { success: false; error: string; usage?: CapiUsage }
+  > {
+    try {
+      const sha256 = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
+
+      const userData: Record<string, any> = {};
+      if (event.email) userData.em = [sha256(event.email.trim().toLowerCase())];
+      // Meta's documented CAPI normalization for `ph`: digits only, then strip any leading
+      // zero(s) (a common national-dialing-prefix artifact, e.g. a UK number entered as
+      // "07911123456" should normalize the same as "7911123456" before country-code
+      // prefixing). This does not add a missing country code — no user locale is available
+      // here — so a phone entered without one will still under-match; that's a data-quality
+      // gap, not something this normalization step can fix on its own.
+      if (event.phone) userData.ph = [sha256(event.phone.replace(/[^0-9]/g, '').replace(/^0+/, ''))];
+      if (event.firstName) userData.fn = [sha256(event.firstName.trim().toLowerCase())];
+      if (event.lastName) userData.ln = [sha256(event.lastName.trim().toLowerCase())];
+      if (event.clientIp) userData.client_ip_address = event.clientIp;
+      if (event.userAgent) userData.client_user_agent = event.userAgent;
+      if (event.fbp) userData.fbp = event.fbp;
+      if (event.fbc) userData.fbc = event.fbc;
+
+      // Prefer the real client-submission time over server processing time — everything
+      // else about this function is about not UNDER-counting; a stale/skewed event_time
+      // is the opposite failure mode (risks Meta treating a delayed retry as a distinct
+      // event past its dedup window, i.e. OVER-counting). Only trust a valid, safe, positive
+      // integer; anything else (NaN, negative, non-integer) silently falls back to now.
+      const eventTime =
+        Number.isSafeInteger(event.eventTimeSeconds) && (event.eventTimeSeconds as number) > 0
+          ? (event.eventTimeSeconds as number)
+          : Math.floor(Date.now() / 1000);
+
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
+      const url = `https://graph.facebook.com/${apiVersion}/${pixelId}/events`;
+      const body = {
+        access_token: accessToken,
+        data: [
+          {
+            event_name: 'Lead',
+            event_id: event.eventId,
+            event_time: eventTime,
+            action_source: 'website',
+            event_source_url: event.sourceUrl,
+            user_data: userData,
+          },
+        ],
+      };
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data: any = await response.json();
+      const usage = parseBusinessUseCaseUsage(response);
+
+      if (!response.ok || data.error) {
+        const message = data?.error?.message || `CAPI send failed with HTTP ${response.status}`;
+        console.error(`[MetaService] sendCapiLeadEvent failed for pixel ${pixelId}: ${message}`);
+        return { success: false, error: message, usage };
+      }
+
+      return { success: true, fbtraceId: data.fbtrace_id, usage };
+    } catch (error: any) {
+      console.error(`[MetaService] sendCapiLeadEvent threw for pixel ${pixelId}: ${error?.message}`);
+      return { success: false, error: error?.message || 'Unknown error sending CAPI event' };
     }
   }
 }

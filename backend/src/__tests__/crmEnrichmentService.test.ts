@@ -1514,6 +1514,41 @@ describe('CrmEnrichmentService.applySearchTemplate', () => {
     const template = '{{company}} {{customFields.missing_field}}';
     expect(CrmEnrichmentService.applySearchTemplate(template, lead)).toBe('Acme Corp');
   });
+
+  // ENG-433: a personal/institutional email domain is never the lead's company,
+  // so it must not be emitted into {{emailDomain}} — otherwise a firmographic
+  // web search seeded with it ("berkeley.edu company overview") resolves the
+  // university/free-mail provider AS the company.
+  it('omits {{emailDomain}} for a university (.edu) email so the company search is not seeded with the institution', () => {
+    const eduLead = { leadId: 't', email: 'sofronie@alum.mit.edu' };
+    const template = '{{emailDomain}} company overview';
+    expect(CrmEnrichmentService.applySearchTemplate(template, eduLead)).toBe('company overview');
+  });
+
+  it('omits {{emailDomain}} for a free-mail (yahoo.com) email', () => {
+    const freeLead = { leadId: 't', email: 'ajaymangalam@yahoo.com' };
+    const template = '{{emailDomain}} company overview';
+    expect(CrmEnrichmentService.applySearchTemplate(template, freeLead)).toBe('company overview');
+  });
+
+  it('omits {{emailDomain}} for a .ac.uk institutional email', () => {
+    const acLead = { leadId: 't', email: 'someone@ox.ac.uk' };
+    const template = '{{emailDomain}} funding investors';
+    expect(CrmEnrichmentService.applySearchTemplate(template, acLead)).toBe('funding investors');
+  });
+
+  it('still emits {{emailDomain}} for a genuine business email', () => {
+    const bizLead = { leadId: 't', email: 'jane@nvidia.com' };
+    const template = '{{emailDomain}} company overview';
+    expect(CrmEnrichmentService.applySearchTemplate(template, bizLead)).toBe('nvidia.com company overview');
+  });
+
+  it('keeps the person signal ({{email}} + name) when omitting a personal {{emailDomain}}', () => {
+    const eduLead = { leadId: 't', firstName: 'Jane', lastName: 'Roe', email: 'jane@berkeley.edu' };
+    const template = '{{firstName}} {{lastName}} {{email}} {{emailDomain}} linkedin';
+    // Domain dropped, but the full address (and name) remain so person lookup still works.
+    expect(CrmEnrichmentService.applySearchTemplate(template, eduLead)).toBe('Jane Roe jane@berkeley.edu linkedin');
+  });
 });
 
 // ─── templateHasNoLeadSignal ─────────────────────────────────────────────────

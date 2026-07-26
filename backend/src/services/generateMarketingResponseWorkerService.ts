@@ -19,6 +19,9 @@ interface GenerateMarketingResponseParams {
   isDelegatedAccess?: boolean;
   excludeTools?: string[];
   screenshotUrl?: string;
+  // ENG-473: when set, the worker persists each settled turn to the session as it
+  // completes so a hard process kill leaves a visible partial transcript.
+  persistIncrementally?: boolean;
 }
 
 interface GenerateMarketingResponseResult {
@@ -31,6 +34,9 @@ interface GenerateMarketingResponseResult {
   backupModelUsed?: boolean;
   originalModel?: string;
   backupModel?: string;
+  // ENG-473: count of responseMessages already persisted incrementally during the
+  // run, so the caller's final batch persists only the remaining tail.
+  persistedResponseCount?: number;
 }
 
 export class GenerateMarketingResponseWorkerService {

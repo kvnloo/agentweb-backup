@@ -44,7 +44,7 @@ mkdir -p /home/ec2-user/agentweb/logs
 chown -R ec2-user:ec2-user /home/ec2-user/agentweb
 
 # Set up git config for ec2-user (use john-the-dev identity for commit attribution)
-sudo -u ec2-user git config --global user.name "Rui Wang"
+sudo -u ec2-user git config --global user.name "john-the-dev"
 sudo -u ec2-user git config --global user.email "52230987+john-the-dev@users.noreply.github.com"
 
 # Signal readiness — the launch script polls for this file
