@@ -12,7 +12,8 @@
  */
 import axios from "axios";
 import { getVercelToken, getGitHubOrgToken } from "../utils/secretsManager";
-import { resolveLandingPageLiveUrl, getLandingPagesByOwner, GeneratedLandingPage } from "./v0Service";
+import { resolveLandingPageLiveUrl, getLandingPagesByOwner, getLandingPagesByOrg, GeneratedLandingPage } from "./v0Service";
+import { userDb } from "./db";
 
 const VERCEL_API_TIMEOUT_MS = 30_000;
 const GITHUB_API_TIMEOUT_MS = 30_000;
@@ -27,7 +28,7 @@ export interface LanderLiveMappingResult {
   storedRepoFullName?: string;
   projectIdMismatch: boolean;
   repoMismatch: boolean;
-  /** A sibling page (same owner) whose OWN githubRepoUrl matches the actual live repo. */
+  /** A sibling page (same owner, or an org member's page) whose OWN githubRepoUrl matches the actual live repo. */
   possibleCorrectRecord?: { id: string; name: string };
   checkedAt: string;
   /** A Vercel API failure — inconclusive, must never be reported as a mismatch. */
@@ -75,6 +76,31 @@ async function resolveActualRepoFullName(deploymentData: any): Promise<string | 
     timeout: GITHUB_API_TIMEOUT_MS,
   });
   return res.data?.full_name;
+}
+
+/**
+ * Sibling pages to search for a repo match: the owner's own pages, PLUS —
+ * when the owner belongs to an org — the org's shared pages. Without this,
+ * the correct record is invisible whenever it's owned by a DIFFERENT org
+ * member than the drifted page (mirrors the same owner+org fanout pattern
+ * `GET /generated` already uses in landingPageGeneration.ts).
+ */
+async function findSiblingPages(page: GeneratedLandingPage): Promise<GeneratedLandingPage[]> {
+  const ownPages = await getLandingPagesByOwner(page.userId).catch(() => [] as GeneratedLandingPage[]);
+
+  const owner = await userDb.getUserById(page.userId).catch(() => null);
+  if (!owner?.orgId) return ownPages;
+
+  const orgPages = await getLandingPagesByOrg(owner.orgId, page.userId).catch(() => [] as GeneratedLandingPage[]);
+
+  const seen = new Set<string>();
+  const merged: GeneratedLandingPage[] = [];
+  for (const p of [...ownPages, ...orgPages]) {
+    if (seen.has(p.id)) continue;
+    seen.add(p.id);
+    merged.push(p);
+  }
+  return merged;
 }
 
 export async function verifyLanderLiveMapping(
@@ -147,7 +173,7 @@ export async function verifyLanderLiveMapping(
     result.repoMismatch = !!storedRepoFullName && actualRepoFullName !== storedRepoFullName;
 
     if (result.repoMismatch) {
-      const siblings = await getLandingPagesByOwner(page.userId).catch(() => [] as GeneratedLandingPage[]);
+      const siblings = await findSiblingPages(page);
 
       const match = siblings.find(
         (s) => s.id !== page.id && parseRepoFullName(s.githubRepoUrl) === actualRepoFullName
