@@ -761,7 +761,10 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
     const { file_path, content, commit_message, branch: rawBranch } = req.body;
     const branch: string = rawBranch || "main";
 
-    if (!file_path || !content) {
+    // content === "" is a legitimate empty file, not a missing one (Greptile) —
+    // only an actually-absent value should be rejected. Mirrors update-files'
+    // already-correct check for the same reason.
+    if (!file_path || content === undefined || content === null) {
       return res.status(400).json({ error: "file_path and content are required" });
     }
 

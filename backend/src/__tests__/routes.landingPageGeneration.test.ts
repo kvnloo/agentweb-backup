@@ -1508,6 +1508,31 @@ describe("GET /generated/:id/verify-live-mapping (ENG-496)", () => {
   });
 });
 
+describe("PUT /generated/:id/github-edit (Greptile: empty content must not be rejected)", () => {
+  it("FAIL: content genuinely missing (undefined) -> 400", async () => {
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/github-edit")
+      .send({ file_path: "app/page.tsx", commit_message: "msg" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("file_path and content are required");
+  });
+
+  it("SUCCESS: content is an empty string (a legitimately empty file) -> accepted, not rejected as missing", async () => {
+    mockAxios.get.mockResolvedValueOnce({ data: { sha: "existing-file-sha" } }); // getFileSha
+    mockAxios.put.mockResolvedValueOnce({ data: { content: { html_url: "https://github.com/agentweb/test-repo/blob/main/app/empty.css" }, commit: { html_url: "https://github.com/agentweb/test-repo/commit/abc" } } });
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/github-edit")
+      .send({ file_path: "app/empty.css", content: "", commit_message: "Restore to empty" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    const putBody = mockAxios.put.mock.calls[0][1] as any;
+    expect(putBody.content).toBe(""); // empty base64 of "" is still ""
+  });
+});
+
 describe("PUT /generated/:id/update-files (ENG-497)", () => {
   it("SUCCESS: commits 2 files (one edit, one delete) in ONE atomic commit", async () => {
     const res = await request(app)
