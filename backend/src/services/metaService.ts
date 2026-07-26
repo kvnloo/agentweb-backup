@@ -86,6 +86,51 @@ export interface MetaAdsAdParams {
   status?: string;
 }
 
+/**
+ * Meta's real, dynamic Business Use Case (BUC) rate-limit signal — returned on
+ * every Marketing API response (CAPI included) via the `X-Business-Use-Case-Usage`
+ * header, NOT a fixed numeric limit Meta documents anywhere. Percentages of the
+ * ad account's rolling hourly allowance used; `estimatedMinutesToRegainAccess`
+ * only appears once actually throttled (a metric at/over 100).
+ */
+export interface CapiUsage {
+  callCountPct: number;
+  totalTimePct: number;
+  totalCpuTimePct: number;
+  estimatedMinutesToRegainAccess?: number;
+}
+
+/**
+ * Parse `X-Business-Use-Case-Usage` off a real Marketing API response. The
+ * header is a JSON object keyed by ad account id, each value an array with one
+ * usage entry — CAPI's ad-account-scoped rate limit is DYNAMIC (Meta documents
+ * no fixed number), so this is the only real signal for how close an account
+ * is to being throttled. Never throws: a missing header (every existing mocked
+ * test response lacks `.headers` entirely) or a malformed value is inconclusive,
+ * not an error — returns `undefined` rather than guessing.
+ */
+function parseBusinessUseCaseUsage(response: { headers?: { get?: (name: string) => string | null } }): CapiUsage | undefined {
+  try {
+    const raw = response.headers?.get?.('x-business-use-case-usage');
+    if (!raw) return undefined;
+    const parsed = JSON.parse(raw);
+    const firstAccountEntries = Object.values(parsed)[0] as any[] | undefined;
+    const entry = firstAccountEntries?.[0];
+    if (!entry) return undefined;
+    return {
+      callCountPct: Number(entry.call_count) || 0,
+      totalTimePct: Number(entry.total_time) || 0,
+      totalCpuTimePct: Number(entry.total_cputime) || 0,
+      estimatedMinutesToRegainAccess:
+        entry.estimated_time_to_regain_access !== undefined
+          ? Number(entry.estimated_time_to_regain_access)
+          : undefined,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 export class MetaService {
   private static instance: MetaService;
 
@@ -2064,7 +2109,10 @@ export class MetaService {
       fbp?: string;
       fbc?: string;
     },
-  ): Promise<{ success: true; fbtraceId?: string } | { success: false; error: string }> {
+  ): Promise<
+    | { success: true; fbtraceId?: string; usage?: CapiUsage }
+    | { success: false; error: string; usage?: CapiUsage }
+  > {
     try {
       const sha256 = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
 
@@ -2106,14 +2154,15 @@ export class MetaService {
         body: JSON.stringify(body),
       });
       const data: any = await response.json();
+      const usage = parseBusinessUseCaseUsage(response);
 
       if (!response.ok || data.error) {
         const message = data?.error?.message || `CAPI send failed with HTTP ${response.status}`;
         console.error(`[MetaService] sendCapiLeadEvent failed for pixel ${pixelId}: ${message}`);
-        return { success: false, error: message };
+        return { success: false, error: message, usage };
       }
 
-      return { success: true, fbtraceId: data.fbtrace_id };
+      return { success: true, fbtraceId: data.fbtrace_id, usage };
     } catch (error: any) {
       console.error(`[MetaService] sendCapiLeadEvent threw for pixel ${pixelId}: ${error?.message}`);
       return { success: false, error: error?.message || 'Unknown error sending CAPI event' };

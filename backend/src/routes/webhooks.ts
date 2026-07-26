@@ -108,6 +108,36 @@ function shouldAttemptCapiSend(listId: string): boolean {
   return true;
 }
 
+// Second, independent layer on top of the per-listId budget above: that budget is an
+// invented internal number, not Meta's actual rate limit. Meta documents NO fixed CAPI
+// rate limit of its own — CAPI calls count against the ad account's dynamic Business Use
+// Case (BUC) allowance, reported on every response via the X-Business-Use-Case-Usage
+// header (see metaService.sendCapiLeadEvent's CapiUsage return). A customer with many
+// lists, each individually within its own per-list budget, could still collectively
+// exceed what THEIR OWN Meta access token is actually allowed. This tracks that real
+// signal per ad account and pauses sends for that account using Meta's own reported
+// cooldown — Meta's own documented advice is to stop calling once throttled, since
+// calling through it only extends the throttle.
+const capiAccountPausedUntil = new Map<string, number>();
+
+function isCapiAccountPaused(accountId: string): boolean {
+  const pausedUntil = capiAccountPausedUntil.get(accountId);
+  return !!pausedUntil && Date.now() < pausedUntil;
+}
+
+function recordCapiUsage(accountId: string, usage?: { callCountPct: number; totalTimePct: number; totalCpuTimePct: number; estimatedMinutesToRegainAccess?: number }): void {
+  if (!usage || usage.estimatedMinutesToRegainAccess === undefined) return;
+  const atLimit = usage.callCountPct >= 100 || usage.totalTimePct >= 100 || usage.totalCpuTimePct >= 100;
+  if (!atLimit) return;
+  const pausedUntil = Date.now() + usage.estimatedMinutesToRegainAccess * 60_000;
+  capiAccountPausedUntil.set(accountId, pausedUntil);
+  console.warn(
+    `[CAPI] Meta ad account ${accountId} at its Business Use Case rate limit ` +
+    `(call_count=${usage.callCountPct}%, total_time=${usage.totalTimePct}%, total_cputime=${usage.totalCpuTimePct}%) — ` +
+    `pausing CAPI sends for this account for ~${usage.estimatedMinutesToRegainAccess}min. Leads still save normally.`
+  );
+}
+
 /**
  * Fire-and-forget: enroll a single lead into any sequences that have
  * autoEnrollListIds containing this list. Mirrors the authenticated CRM path
@@ -590,7 +620,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // synthetic lead — CAPI's correctness is already covered by unit tests (metaService.capi
     // .test.ts) and doesn't depend on v0-authored code, so there's nothing extra to verify
     // live here, only real-ad-account conversion data to needlessly pollute.
-    if (pixelId && metaAccountId && eventId && !isSmokeTestEmail(leadData.email) && shouldAttemptCapiSend(leadList.listId)) {
+    if (pixelId && metaAccountId && eventId && !isSmokeTestEmail(leadData.email) && shouldAttemptCapiSend(leadList.listId) && !isCapiAccountPaused(metaAccountId)) {
       void (async () => {
         try {
           const owner = await userDb.getUserById(leadList.userId);
@@ -615,6 +645,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           if (!result.success) {
             console.error(`[CAPI] Lead event send failed for pixel ${pixelId}: ${result.error}`);
           }
+          recordCapiUsage(metaAccountId, result.usage);
         } catch (err: any) {
           console.error(`[CAPI] Unexpected error sending Lead event for pixel ${pixelId}: ${err?.message}`);
         }
