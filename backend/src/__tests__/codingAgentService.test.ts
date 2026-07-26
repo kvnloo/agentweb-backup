@@ -1,4 +1,4 @@
-import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, LANDING_PAGE_PREVIEW_BRANCH, _isMissingGithubRefError, _describeGithubError, _previewBranchCommitsAheadOfMain, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream } from '../services/codingAgentService';
+import { applySearchReplace, applyLineNumberEdit, runCodingAgent, CodingAgentContext, resolvePageScope, isSafeRepoPath, buildScopeSystemClause, LANDING_PAGE_PREVIEW_BRANCH, _isMissingGithubRefError, _describeGithubError, _previewBranchCommitsAheadOfMain, _setBedrockClientForTest, _setVertexClientForTest, _setBedrockBearerClientForTest, _setSleepFnForTest, _parseEventStreamFrames, _accumulateBedrockStream, _rollbackEditedFiles } from '../services/codingAgentService';
 import { agentModeService } from '../services/agentModeService';
 
 // Mock mcpFetch
@@ -2485,5 +2485,80 @@ describe('_previewBranchCommitsAheadOfMain', () => {
     // closed by reporting the branch as ahead so the caller skips the reset.
     mockedAxios.get.mockRejectedValueOnce(githubAxiosError(500, { message: 'Service Unavailable' }));
     await expect(_previewBranchCommitsAheadOfMain(repoBase, headers)).resolves.toBeGreaterThan(0);
+  });
+});
+
+describe('_rollbackEditedFiles (Greptile: new files must be deleted, not "reverted")', () => {
+  const rollbackContext: CodingAgentContext = {
+    pageId: 'test-page-123',
+    userId: 'user-456',
+    sessionId: 'session-789',
+    llmModel: 'anthropic.claude-sonnet-4-6',
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedMcpFetch.mockReset();
+  });
+
+  test('succeeds normally when the file existed at the base commit (real content to revert to)', async () => {
+    mockedMcpFetch
+      .mockResolvedValueOnce({ content: '<h1>Old</h1>' }) // file-at-commit: existed
+      .mockResolvedValueOnce({ success: true, commit_url: 'https://github.com/test/repo/commit/abc' }); // github-edit write
+
+    const result = await _rollbackEditedFiles({
+      context: rollbackContext,
+      baseCommitSha: 'base-sha',
+      editedFiles: ['app/page.tsx'],
+    });
+
+    expect(result.status).toBe('succeeded');
+  });
+
+  test('a brand-new file (nothing at the base commit) is DELETED instead of left committed', async () => {
+    mockedMcpFetch
+      .mockResolvedValueOnce({ content: undefined }) // file-at-commit: 404-equivalent, nothing there
+      .mockResolvedValueOnce({ success: true }); // update-files delete
+
+    const result = await _rollbackEditedFiles({
+      context: rollbackContext,
+      baseCommitSha: 'base-sha',
+      editedFiles: ['app/api/new-route/route.ts'],
+    });
+
+    expect(result.status).toBe('succeeded');
+    const deleteCall = mockedMcpFetch.mock.calls[1][0] as any;
+    expect(deleteCall.method).toBe('PUT');
+    expect(deleteCall.path).toBe('/api/landing-pages/v0/generated/test-page-123/update-files');
+    expect(deleteCall.body.files).toEqual([{ file_path: 'app/api/new-route/route.ts', deleted: true }]);
+  });
+
+  test('reports FAILURE (not a false success) when deleting the new file itself fails', async () => {
+    mockedMcpFetch
+      .mockResolvedValueOnce({ content: undefined }) // file-at-commit: nothing there
+      .mockResolvedValueOnce({ success: false }); // update-files delete failed
+
+    const result = await _rollbackEditedFiles({
+      context: rollbackContext,
+      baseCommitSha: 'base-sha',
+      editedFiles: ['app/api/new-route/route.ts'],
+    });
+
+    expect(result.status).toBe('failed');
+  });
+
+  test('a genuine transient failure (not "file doesn\'t exist") is reported as failed, NEVER treated as a new file / deleted', async () => {
+    mockedMcpFetch.mockRejectedValueOnce(new Error('API error (500): GitHub is down'));
+
+    const result = await _rollbackEditedFiles({
+      context: rollbackContext,
+      baseCommitSha: 'base-sha',
+      editedFiles: ['app/page.tsx'],
+    });
+
+    expect(result.status).toBe('failed');
+    // Only the one failed file-at-commit call — no delete attempt for a file that
+    // might genuinely still exist and need real content restored, not deletion.
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
   });
 });

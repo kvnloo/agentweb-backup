@@ -373,7 +373,7 @@ async function resetReusablePreviewBranchToMain(context: CodingAgentContext): Pr
   }
 }
 
-async function rollbackEditedFiles(input: {
+export async function _rollbackEditedFiles(input: {
   context: CodingAgentContext;
   baseCommitSha?: string;
   editedFiles?: string[];
@@ -388,14 +388,46 @@ async function rollbackEditedFiles(input: {
     };
   }
 
+  const basePath = `/api/landing-pages/v0/generated/${input.context.pageId}`;
+  const branch = input.context.draftBranch || 'main';
+
   const failures: string[] = [];
   for (const filePath of files) {
     try {
-      await executeTool('revert_file', {
+      const result = await executeTool('revert_file', {
         file_path: filePath,
         commit_sha: input.baseCommitSha,
         commit_message: `Rollback ${filePath} after failed coding-agent run`,
       }, input.context);
+
+      // Greptile: revert_file returns an ERROR STRING (doesn't throw) when the
+      // file doesn't exist at the base commit — a brand-new file created this
+      // session has nothing to "revert" to. That case previously fell through
+      // this try/catch undetected (no exception was thrown), so a genuinely
+      // failed rollback was reported as succeeded, leaving the new file
+      // committed on the reusable draft branch. Narrowly matched: only THIS
+      // specific "not found at that commit" signal falls back to deleting the
+      // file — any OTHER revert_file failure (auth, timeout, rate limit) must
+      // still be reported as a real failure, not silently treated as "must be
+      // a new file" and deleted, which would destroy a file that genuinely
+      // existed and should have been restored instead.
+      if (typeof result === 'string' && /may not exist at that commit/i.test(result)) {
+        const deleteResult = await mcpFetch({
+          method: 'PUT',
+          path: `${basePath}/update-files`,
+          body: {
+            files: [{ file_path: filePath, deleted: true }],
+            commit_message: `Rollback: remove ${filePath} (new this session, nothing to revert to)`,
+            ...(branch !== 'main' ? { branch } : {}),
+          },
+          context: { userId: input.context.userId }
+        });
+        if (!deleteResult?.success) {
+          failures.push(`${filePath}: could not delete new file during rollback`);
+        }
+      } else if (typeof result === 'string' && /^Error:/i.test(result)) {
+        failures.push(`${filePath}: ${result}`);
+      }
     } catch (error) {
       failures.push(`${filePath}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -2517,7 +2549,7 @@ export async function runCodingAgent(
     let recovery: CodingAgentRecoveryState = { status: 'not_needed', baseCommitSha };
     let state: CodingAgentRunState = 'failed';
     if (isBuildOrDeploymentFailure(result)) {
-      recovery = await rollbackEditedFiles({
+      recovery = await _rollbackEditedFiles({
         context: runContext,
         baseCommitSha,
         editedFiles: result.editedFiles,
