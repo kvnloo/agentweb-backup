@@ -2177,6 +2177,13 @@ async function runCodingAgentInternal(
           if (fnName === 'edit_file' && fnArgs.file_path && typeof toolResult === 'string' && !/^Failed to apply edits|^Error:/i.test(toolResult)) {
             editedFiles.add(fnArgs.file_path);
           }
+          if (fnName === 'edit_files' && Array.isArray(fnArgs.files) && typeof toolResult === 'string' && !/^Error:/i.test(toolResult)) {
+            // ENG-497 / Greptile: batch commits must be tracked too, or a failed
+            // deployment/acceptance check after this can't roll them back.
+            for (const f of fnArgs.files) {
+              if (f?.file_path) editedFiles.add(f.file_path);
+            }
+          }
 
           // Emit progress about tool execution
           if (context.socketEmit) {

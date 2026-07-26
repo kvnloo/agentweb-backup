@@ -707,6 +707,10 @@ describe('runCodingAgent', () => {
       { file_path: 'app/api/old-route/route.ts', deleted: true },
     ]);
     expect(putCall.body.commit_message).toBe('Fix email capture + remove stale route');
+    // Greptile: batch commits must be tracked for rollback the same way edit_file's are.
+    expect(result.editedFiles).toEqual(
+      expect.arrayContaining(['public/book-a-demo.html', 'app/api/old-route/route.ts'])
+    );
   });
 
   test('edit_files: empty files array is rejected without calling update-files', async () => {
