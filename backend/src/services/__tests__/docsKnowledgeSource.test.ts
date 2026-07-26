@@ -42,7 +42,10 @@ describe('fetchMintlifyDocsContent', () => {
 
     const content = await fetchMintlifyDocsContent();
 
-    expect(mockFetch).toHaveBeenCalledWith(MINTLIFY_DOCS_URL);
+    expect(mockFetch).toHaveBeenCalledWith(
+      MINTLIFY_DOCS_URL,
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
     expect(content).toContain('To connect HubSpot');
   });
 
@@ -54,6 +57,39 @@ describe('fetchMintlifyDocsContent', () => {
     });
 
     await expect(fetchMintlifyDocsContent()).rejects.toThrow(/HTTP 503/);
+  });
+
+  it('passes an abort signal to the Mintlify request', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      text: () => Promise.resolve(MINTLIFY_DOCS),
+    });
+
+    await fetchMintlifyDocsContent();
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      MINTLIFY_DOCS_URL,
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
+  });
+
+  it('fails with a clear timeout error when Mintlify stalls', async () => {
+    jest.useFakeTimers();
+    mockFetch.mockImplementationOnce((_url, options) =>
+      new Promise((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => {
+          reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+        });
+      })
+    );
+
+    const request = fetchMintlifyDocsContent();
+    const rejection = expect(request).rejects.toThrow(/timed out/i);
+    await jest.runAllTimersAsync();
+
+    await rejection;
+    jest.useRealTimers();
   });
 });
 
@@ -85,6 +121,24 @@ describe('chunkDocsContent', () => {
     for (const chunk of chunks) {
       expect(chunk.content.length).toBeLessThanOrEqual(2000);
     }
+  });
+
+  it('splits a punctuation-free span within the 2000-char budget', () => {
+    const longSpan = 'x'.repeat(5001);
+    const chunks = chunkDocsContent(longSpan, 'guide');
+
+    expect(chunks).toHaveLength(3);
+    expect(chunks.every((chunk) => chunk.content.length <= 2000)).toBe(true);
+    expect(chunks.map((chunk) => chunk.content).join('')).toBe(longSpan);
+  });
+
+  it('splits an oversized single sentence without dropping content', () => {
+    const longSentence = `${'code-token '.repeat(400)}.`;
+    const chunks = chunkDocsContent(longSentence, 'guide');
+
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every((chunk) => chunk.content.length <= 2000)).toBe(true);
+    expect(chunks.map((chunk) => chunk.content).join('')).toBe(longSentence);
   });
 });
 

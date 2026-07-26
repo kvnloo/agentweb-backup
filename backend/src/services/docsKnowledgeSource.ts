@@ -11,6 +11,8 @@ import type { ContextChunk } from './chatbotService';
  */
 export const MINTLIFY_DOCS_URL =
   process.env.MINTLIFY_DOCS_URL || 'https://docs.agentweb.pro/llms-full.txt';
+export const MINTLIFY_DOCS_TIMEOUT_MS = 10_000;
+export const MAX_DOC_CHUNK_CHARS = 2_000;
 
 /**
  * Fetch the full Mintlify docs corpus as plain text. Fails loudly (throws) on a
@@ -18,13 +20,27 @@ export const MINTLIFY_DOCS_URL =
  * ingesting an error page.
  */
 export async function fetchMintlifyDocsContent(): Promise<string> {
-  const res = await fetch(MINTLIFY_DOCS_URL);
-  if (!res.ok) {
-    throw new Error(
-      `Failed to fetch Mintlify docs (${MINTLIFY_DOCS_URL}): HTTP ${res.status}`
-    );
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MINTLIFY_DOCS_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(MINTLIFY_DOCS_URL, { signal: controller.signal });
+    if (!res.ok) {
+      throw new Error(
+        `Failed to fetch Mintlify docs (${MINTLIFY_DOCS_URL}): HTTP ${res.status}`
+      );
+    }
+    return await res.text();
+  } catch (error: any) {
+    if (error?.name === 'AbortError') {
+      throw new Error(
+        `Mintlify docs request timed out after ${MINTLIFY_DOCS_TIMEOUT_MS}ms`
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
   }
-  return res.text();
 }
 
 /**
@@ -34,31 +50,33 @@ export async function fetchMintlifyDocsContent(): Promise<string> {
  */
 export function chunkDocsContent(text: string, source = 'guide'): ContextChunk[] {
   const chunks: ContextChunk[] = [];
-  if (!text || !text.trim()) return chunks;
+  const content = text?.trim();
+  if (!content) return chunks;
 
-  const sentences = text.match(/[^\.!\?]+[\.!\?]+/g) || [text];
-  let currentChunk = '';
-  let chunkId = 0;
+  let cursor = 0;
+  while (cursor < content.length) {
+    let end = Math.min(cursor + MAX_DOC_CHUNK_CHARS, content.length);
 
-  const flush = () => {
-    if (currentChunk.trim()) {
-      chunks.push({
-        id: `chunk-${source}-${chunkId++}`,
-        content: currentChunk.trim(),
-        metadata: { source },
-      });
+    if (end < content.length) {
+      const window = content.slice(cursor, end);
+      const preferredBoundary = Math.max(
+        window.lastIndexOf('\n'),
+        window.lastIndexOf('.'),
+        window.lastIndexOf('!'),
+        window.lastIndexOf('?')
+      );
+      if (preferredBoundary >= MAX_DOC_CHUNK_CHARS / 2) {
+        end = cursor + preferredBoundary + 1;
+      }
     }
-  };
 
-  for (const sentence of sentences) {
-    if ((currentChunk + sentence).length > 2000) {
-      flush();
-      currentChunk = sentence;
-    } else {
-      currentChunk += ' ' + sentence;
-    }
+    chunks.push({
+      id: `chunk-${source}-${chunks.length}`,
+      content: content.slice(cursor, end),
+      metadata: { source },
+    });
+    cursor = end;
   }
-  flush();
 
   return chunks;
 }
