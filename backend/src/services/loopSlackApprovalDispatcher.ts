@@ -1,5 +1,5 @@
 import { WebClient } from '@slack/web-api';
-import { isDispatched, markDispatched } from './loopDispatchTracker';
+import { getDispatched, markDispatched } from './loopDispatchTracker';
 import { fileAutoIssue } from './intakeService';
 import { getLearningStore, getLoopManifest, getRegisteredLoopIds } from '../loops/index';
 import {
@@ -359,11 +359,6 @@ export async function handleLoopApprovalReaction(event: ReactionAddedEvent): Pro
   if (!item || item.type !== 'message' || !item.channel || !item.ts) return;
   if (!item.channel.startsWith('D')) return;
 
-  if (await isDispatched(item.ts)) {
-    console.log(`🔁 loop approval reaction: ${item.ts} already dispatched — skipping`);
-    return;
-  }
-
   const message = await fetchReactedMessage(item.channel, item.ts);
   if (!message) return;
 
@@ -385,13 +380,29 @@ export async function handleLoopApprovalReaction(event: ReactionAddedEvent): Pro
     return;
   }
 
-  await markDispatched(item.ts, tasks.map((t) => t.id));
+  const priorDispatch = await getDispatched(item.ts);
+  const completedTaskIds = new Set(priorDispatch?.pageIds ?? []);
+  const pendingTasks = tasks.filter((task) => !completedTaskIds.has(task.id));
+  if (pendingTasks.length === 0) {
+    console.log(`🔁 loop approval reaction: ${item.ts} has no undispatched tasks — skipping`);
+    return;
+  }
+
+  // Claim pending IDs before the first side effect so concurrent reactions cannot double-file.
+  // After filing, overwrite the claim with successful IDs only; a failed task is then eligible
+  // for a later reaction retry while successful siblings remain idempotent.
+  await markDispatched(item.ts, [
+    ...completedTaskIds,
+    ...pendingTasks.map((task) => task.id),
+  ]);
   await postThread(
     item.channel,
     item.ts,
-    `🚀 Queuing ${tasks.length} approved Linear task${tasks.length === 1 ? '' : 's'} from ${loopTitle}...`,
+    `🚀 Queuing ${pendingTasks.length} approved Linear task${pendingTasks.length === 1 ? '' : 's'} from ${loopTitle}...`,
   );
-  const results = await dispatchCreatedTasks(tasks);
+  const results = await dispatchCreatedTasks(pendingTasks);
+  const successfulTaskIds = results.filter((result) => result.ok).map((result) => result.id);
+  await markDispatched(item.ts, [...completedTaskIds, ...successfulTaskIds]);
   await postThread(item.channel, item.ts, formatSummary(loopTitle, results));
   await persistApproval(item.channel, item.ts, message.text, event.user, results);
 }

@@ -492,8 +492,8 @@ export interface FileAutoIssueParams {
   extraLabels?: string[];
   /**
    * Explicit execution decision for machine-generated work. Priority and complexity never imply
-   * autonomy: callers must choose an execution route, and unknown/mixed work should use
-   * `human-triage`.
+   * autonomy: callers should choose an execution route, and unknown/mixed work should use
+   * `human-triage`. Omission fails closed to human triage for legacy callers.
    */
   executionRoute?: 'autofix' | 'human-triage';
   /** Legacy field retained for source compatibility; auto issues are always filed in Linear. */
@@ -540,21 +540,22 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
     escalateIssue,
     raiseIssueTriage,
   } = await import('./linearService');
+  const executionRoute = p.executionRoute ?? 'human-triage';
   const route =
-    p.executionRoute === 'autofix'
+    executionRoute === 'autofix'
       ? {
           labels: ['Bug', 'autofix'],
+          removeLabels: ['Needs PM'],
           assigneeId: BUG_DEFAULT_ASSIGNEE_ID,
           stateName: 'Todo',
         }
-      : p.executionRoute === 'human-triage'
-        ? {
-            labels: ['Bug', 'Needs PM'],
-            assigneeId: '142fef82-4d45-4070-99be-c5debe565ac6', // Harsha
-            stateName: 'Todo',
-          }
-        : null;
-  const routeLabels = route?.labels ?? [];
+      : {
+          labels: ['Bug', 'Needs PM'],
+          removeLabels: ['autofix'],
+          assigneeId: '142fef82-4d45-4070-99be-c5debe565ac6', // Harsha
+          stateName: 'Todo',
+        };
+  const routeLabels = route.labels;
   // Amount-insensitive title normalization (ENG-358): dollar amounts in a recurring alert's title
   // are occurrence data, not identity — "v0 credits LOW — $58.51 spendable" and "… $59.15 …" are
   // the same issue. Collapsing amounts also lets pre-ENG-358 open canonicals (no class marker in
@@ -610,8 +611,10 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
       try {
         await raiseIssueTriage(match.issueId, {
           addLabelNames: routeLabels,
+          removeLabelNames: route.removeLabels,
+          assigneeId: route.assigneeId,
           ...(priority ? { priority } : {}),
-          settleStateName: route?.stateName,
+          settleStateName: route.stateName,
         });
       } catch (e) {
         console.warn('[intake] auto route enrichment failed:', e instanceof Error ? e.message : e);
@@ -630,7 +633,8 @@ export async function fileAutoIssue(p: FileAutoIssueParams): Promise<FiledAutoRe
     title: p.title,
     description: body,
     labelNames: [...new Set(['Auto', ...routeLabels, ...(p.extraLabels || [])])],
-    ...(route ? { stateName: route.stateName, assigneeId: route.assigneeId } : {}),
+    stateName: route.stateName,
+    assigneeId: route.assigneeId,
     // Classed alerts land with a real priority so the canonical never sits at "No priority"
     // (ENG-350 did). Absent the context key, behavior is unchanged.
     ...(priority ? { priority } : {}),

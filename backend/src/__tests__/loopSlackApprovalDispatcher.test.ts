@@ -29,11 +29,12 @@ jest.mock('@slack/web-api', () => ({
 
 // --- loopDispatchTracker mock ---------------------------------------------------
 
-const mockIsDispatched = jest.fn().mockReturnValue(false);
+const mockGetDispatched = jest.fn();
 const mockMarkDispatched = jest.fn();
+let dispatchEntry: { dispatchedAt: Date; pageIds: string[] } | null = null;
 
 jest.mock('../services/loopDispatchTracker', () => ({
-  isDispatched: (...args: unknown[]) => mockIsDispatched(...args),
+  getDispatched: (...args: unknown[]) => mockGetDispatched(...args),
   markDispatched: (...args: unknown[]) => mockMarkDispatched(...args),
 }));
 
@@ -81,7 +82,11 @@ function mockBotMessage(text: string, bot_id = 'BBOT123'): void {
 beforeEach(() => {
   jest.clearAllMocks();
   _resetLoopApprovalForTesting();
-  mockIsDispatched.mockReturnValue(false);
+  dispatchEntry = null;
+  mockGetDispatched.mockImplementation(async () => dispatchEntry);
+  mockMarkDispatched.mockImplementation(async (_ts: string, pageIds: string[]) => {
+    dispatchEntry = { dispatchedAt: new Date(), pageIds: [...pageIds] };
+  });
   mockAuthTest.mockResolvedValue({ user_id: 'UBOT123' });
 });
 
@@ -123,10 +128,14 @@ describe('handleLoopApprovalReaction — gate checks', () => {
 // -------------------------------------------------------------------------------
 
 describe('handleLoopApprovalReaction — idempotency', () => {
-  it('skips dispatch when ts is already marked dispatched', async () => {
-    mockIsDispatched.mockReturnValue(true);
+  it('skips tasks whose IDs are already marked dispatched', async () => {
+    mockBotMessage(`*Daily digest*\nRun ID: run-001\n1. Fix the thing\n\n${FOOTER}`);
+    dispatchEntry = {
+      dispatchedAt: new Date(),
+      pageIds: ['daily-digest-run-001-1'],
+    };
     await handleLoopApprovalReaction(makeEvent());
-    expect(mockHistoryFn).not.toHaveBeenCalled();
+    expect(mockHistoryFn).toHaveBeenCalled();
     expect(mockMarkDispatched).not.toHaveBeenCalled();
     expect(mockPostMessage).not.toHaveBeenCalled();
   });
@@ -247,6 +256,26 @@ describe('handleLoopApprovalReaction — tasks path (no Notion URLs)', () => {
     expect(mockPostMessage).toHaveBeenCalledTimes(2);
     const summary = mockPostMessage.mock.calls[1][0].text as string;
     expect(summary).toMatch(/✅ Queued/);
+  });
+
+  it('removes failed task claims so a later reaction retries them', async () => {
+    mockFileAutoIssue
+      .mockRejectedValueOnce(new Error('Linear unavailable'))
+      .mockResolvedValueOnce({
+        pageId: 'ENG-601',
+        url: 'https://linear.app/emmabyaw/issue/ENG-601',
+        deduped: false,
+        tracker: 'Linear',
+      });
+
+    await handleLoopApprovalReaction(makeEvent());
+    expect(dispatchEntry?.pageIds).toEqual([]);
+
+    mockBotMessage(taskText);
+    await handleLoopApprovalReaction(makeEvent());
+
+    expect(mockFileAutoIssue).toHaveBeenCalledTimes(2);
+    expect(dispatchEntry?.pageIds).toEqual(['comp-a']);
   });
 });
 

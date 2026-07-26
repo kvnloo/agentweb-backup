@@ -483,7 +483,11 @@ describe('intakeService.fileAutoIssue', () => {
     const r = await fileAutoIssue({ title: 't', description: 'd', source: 'Context limit' });
     expect(notion.createOncallItem).not.toHaveBeenCalled();
     expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(
-      expect.objectContaining({ labelNames: ['Auto'] }),
+      expect.objectContaining({
+        labelNames: ['Auto', 'Bug', 'Needs PM'],
+        stateName: 'Todo',
+        assigneeId: '142fef82-4d45-4070-99be-c5debe565ac6',
+      }),
     );
     expect(r.tracker).toBe('Linear');
   });
@@ -531,6 +535,45 @@ describe('intakeService.fileAutoIssue', () => {
     expect(linear.createInternalLinearIssue.mock.calls[0][0].labelNames).not.toContain('autofix');
   });
 
+  it('fails closed to human triage when a caller omits executionRoute', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-10', url: 'u' });
+
+    await fileAutoIssue({
+      title: 'legacy system alert',
+      description: 'd',
+      source: 'Scheduled chat',
+    });
+
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        labelNames: ['Auto', 'Bug', 'Needs PM'],
+        stateName: 'Todo',
+        assigneeId: '142fef82-4d45-4070-99be-c5debe565ac6',
+      }),
+    );
+  });
+
+  it('replaces a conflicting route and owner when enriching a deduped canonical', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-11', issueId: 'uuid-11', title: 'same alert', description: 'd' },
+    ]);
+
+    await fileAutoIssue({
+      title: 'same alert',
+      description: 'd',
+      source: 'AI eval',
+      executionRoute: 'autofix',
+    });
+
+    expect(linear.raiseIssueTriage).toHaveBeenCalledWith('uuid-11', {
+      addLabelNames: ['Bug', 'autofix'],
+      removeLabelNames: ['Needs PM'],
+      assigneeId: 'cabadf7c-b95d-4455-b9ec-df11d5d83f5f',
+      settleStateName: 'Todo',
+    });
+  });
+
   it('flag ON + open Auto issue with same title -> groups (comment), no new issue', async () => {
     process.env.FEATUREBASE_INTAKE = 'true';
     linear.listOpenIssuesByLabel.mockResolvedValue([{ identifier: 'ENG-7', issueId: 'uuid-7', title: 'Context limit reached' }]);
@@ -545,7 +588,9 @@ describe('intakeService.fileAutoIssue', () => {
     linear.listOpenIssuesByLabel.mockResolvedValue([]);
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-8', url: 'u' });
     const r = await fileAutoIssue({ title: 'new auto', description: 'd', source: 'Scheduled chat', extraLabels: ['Scheduled Chat'] });
-    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({ labelNames: ['Auto', 'Scheduled Chat'] }));
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(
+      expect.objectContaining({ labelNames: ['Auto', 'Bug', 'Needs PM', 'Scheduled Chat'] }),
+    );
     expect(r).toMatchObject({ deduped: false, tracker: 'Linear' });
   });
 });
@@ -934,7 +979,9 @@ describe('intakeService.fileAutoIssue — alert-class clustering (ENG-358)', () 
     });
     expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
     expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({
-      labelNames: ['Auto', 'Oncall'],
+      labelNames: ['Auto', 'Bug', 'Needs PM', 'Oncall'],
+      stateName: 'Todo',
+      assigneeId: '142fef82-4d45-4070-99be-c5debe565ac6',
       priority: 2, // 'high'
       description: expect.stringContaining('Alert Class: v0-credits'),
     }));
