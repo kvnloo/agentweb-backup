@@ -92,6 +92,7 @@ const mockUpsertEnvVar = jest.fn();
 const mockDeleteEnvVar = jest.fn();
 const mockResolveLandingPageLiveUrl = jest.fn();
 const mockRecordLandingPagePublish = jest.fn();
+const mockCommitFilesToRepoMain = jest.fn();
 
 jest.mock("../services/v0Service", () => ({
   // Real lock logic (pure) so the route resolves the mode correctly under test.
@@ -126,6 +127,7 @@ jest.mock("../services/v0Service", () => ({
   getPreviewDeploymentUrl: jest.fn(),
   resolveLandingPageLiveUrl: (...args: any[]) => mockResolveLandingPageLiveUrl(...args),
   recordLandingPagePublish: (...args: any[]) => mockRecordLandingPagePublish(...args),
+  commitFilesToRepoMain: (...args: any[]) => mockCommitFilesToRepoMain(...args),
   markLandingPagePublishReverted: jest.fn(),
   // Owner fast-path returns true; non-owner cases aren't exercised by this suite.
   canUserEditLandingPage: jest.fn().mockResolvedValue(true),
@@ -155,6 +157,11 @@ jest.mock("../services/settingsService", () => ({
   settingsService: {
     getSetting: (...args: any[]) => mockGetSetting(...args),
   },
+}));
+
+const mockVerifyLanderLiveMapping = jest.fn();
+jest.mock("../services/landerLiveMappingCheck", () => ({
+  verifyLanderLiveMapping: (...args: any[]) => mockVerifyLanderLiveMapping(...args),
 }));
 
 import landingPageGenerationRouter, { _resetRateLimitState } from "../routes/landingPageGeneration";
@@ -203,6 +210,7 @@ beforeEach(() => {
   mockDeleteEnvVar.mockResolvedValue(undefined);
   mockResolveLandingPageLiveUrl.mockResolvedValue("https://everyio.agentwebforms.com");
   mockRecordLandingPagePublish.mockResolvedValue(undefined);
+  mockCommitFilesToRepoMain.mockResolvedValue({ pushedCommitSha: "abc1234", pushTimestampMs: Date.now() });
   // ENG-326 AC-3 gate: generation requires a persisted brand logo. Default
   // the projection to a logo-carrying context so unrelated tests pass the
   // gate; the missing-logo tests override per-call.
@@ -1453,5 +1461,227 @@ describe("PUT /api/landing-pages/v0/generated/:id/integrations", () => {
       "proj-1", "MY_API_URL", "https://api.example.com",
       ["production", "preview", "development"], undefined, "plain"
     );
+  });
+});
+
+describe("GET /generated/:id/verify-live-mapping (ENG-496)", () => {
+  it("SUCCESS: owner gets the mapping report", async () => {
+    mockVerifyLanderLiveMapping.mockResolvedValueOnce({
+      liveUrl: "https://test-page.vercel.app",
+      liveTrafficFound: true,
+      actualProjectId: "vercel-proj-123",
+      storedProjectId: "vercel-proj-123",
+      projectIdMismatch: false,
+      repoMismatch: false,
+      checkedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const res = await request(app).get("/api/landing-pages/v0/generated/page-1/verify-live-mapping");
+
+    expect(res.status).toBe(200);
+    expect(res.body.projectIdMismatch).toBe(false);
+    expect(mockVerifyLanderLiveMapping).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "page-1" })
+    );
+  });
+
+  it("FAIL: non-owner, non-org caller -> 404 (view-mode denial is masked as not-found), verifyLanderLiveMapping never called", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "someone-else",
+      status: "deployed",
+    });
+
+    const res = await request(app).get("/api/landing-pages/v0/generated/page-1/verify-live-mapping");
+
+    expect(res.status).toBe(404);
+    expect(mockVerifyLanderLiveMapping).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: page not found -> 404", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(null);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated/page-1/verify-live-mapping");
+
+    expect(res.status).toBe(404);
+    expect(mockVerifyLanderLiveMapping).not.toHaveBeenCalled();
+  });
+});
+
+describe("PUT /generated/:id/github-edit (Greptile: empty content must not be rejected)", () => {
+  it("FAIL: content genuinely missing (undefined) -> 400", async () => {
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/github-edit")
+      .send({ file_path: "app/page.tsx", commit_message: "msg" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("file_path and content are required");
+  });
+
+  it("SUCCESS: content is an empty string (a legitimately empty file) -> accepted, not rejected as missing", async () => {
+    mockAxios.get.mockResolvedValueOnce({ data: { sha: "existing-file-sha" } }); // getFileSha
+    mockAxios.put.mockResolvedValueOnce({ data: { content: { html_url: "https://github.com/agentweb/test-repo/blob/main/app/empty.css" }, commit: { html_url: "https://github.com/agentweb/test-repo/commit/abc" } } });
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/github-edit")
+      .send({ file_path: "app/empty.css", content: "", commit_message: "Restore to empty" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    const putBody = mockAxios.put.mock.calls[0][1] as any;
+    expect(putBody.content).toBe(""); // empty base64 of "" is still ""
+  });
+});
+
+describe("PUT /generated/:id/update-files (ENG-497)", () => {
+  it("SUCCESS: commits 2 files (one edit, one delete) in ONE atomic commit", async () => {
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({
+        commit_message: "Fix email capture + add API route",
+        files: [
+          { file_path: "public/book-a-demo.html", content: "<html>updated</html>" },
+          { file_path: "app/api/old-route/route.ts", deleted: true },
+        ],
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.files).toEqual(["public/book-a-demo.html", "app/api/old-route/route.ts"]);
+    expect(mockCommitFilesToRepoMain).toHaveBeenCalledTimes(1); // ONE atomic commit, not two
+    const [repoFullNameArg, , filesArg, messageArg] = mockCommitFilesToRepoMain.mock.calls[0];
+    expect(repoFullNameArg).toBe("agentweb/test-repo");
+    expect(messageArg).toBe("Fix email capture + add API route");
+    expect(filesArg).toEqual([
+      { path: "public/book-a-demo.html", content: Buffer.from("<html>updated</html>", "utf-8") },
+      { path: "app/api/old-route/route.ts", deleted: true },
+    ]);
+  });
+
+  it("FAIL: empty files array -> 400, commit never attempted", async () => {
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({ commit_message: "msg", files: [] });
+
+    expect(res.status).toBe(400);
+    expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: more than 20 files -> 400, commit never attempted", async () => {
+    const files = Array.from({ length: 21 }, (_, i) => ({ file_path: `f${i}.txt`, content: "x" }));
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({ commit_message: "msg", files });
+
+    expect(res.status).toBe(400);
+    expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: a file missing both content and deleted -> 400, whole call rejected", async () => {
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({
+        commit_message: "msg",
+        files: [
+          { file_path: "ok.txt", content: "fine" },
+          { file_path: "bad.txt" },
+        ],
+      });
+
+    expect(res.status).toBe(400);
+    expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: path traversal in one file rejects the whole call, even with other valid files", async () => {
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({
+        commit_message: "msg",
+        files: [
+          { file_path: "ok.txt", content: "fine" },
+          { file_path: "../../etc/passwd", content: "nope" },
+        ],
+      });
+
+    expect(res.status).toBe(400);
+    expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: an invalid (unsupported) branch name is rejected", async () => {
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({ commit_message: "msg", branch: "some-random-branch", files: [{ file_path: "ok.txt", content: "x" }] });
+
+    expect(res.status).toBe(400);
+    expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: staging branch (draft/agentweb-preview) commits with is_staging: true, ensureBranchExists invoked", async () => {
+    // ensureBranchExists: GET the branch ref — resolves (already exists), no POST needed.
+    mockAxios.get.mockResolvedValueOnce({ data: { object: { sha: "existing-branch-sha" } } });
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({
+        commit_message: "Preview a 2-file change",
+        branch: "draft/agentweb-preview",
+        files: [{ file_path: "ok.txt", content: "x" }],
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.is_staging).toBe(true);
+    expect(res.body.branch).toBe("draft/agentweb-preview");
+    expect(mockAxios.get).toHaveBeenCalledWith(
+      expect.stringContaining("/git/ref/heads/draft/agentweb-preview"),
+      expect.anything()
+    );
+    expect(mockCommitFilesToRepoMain).toHaveBeenCalledWith(
+      "agentweb/test-repo",
+      expect.anything(),
+      expect.anything(),
+      "Preview a 2-file change",
+      4,
+      "draft/agentweb-preview"
+    );
+  });
+
+  it("FAIL: no commit_message -> 400", async () => {
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({ files: [{ file_path: "ok.txt", content: "x" }] });
+
+    expect(res.status).toBe(400);
+    expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: non-owner, non-org caller -> 403 (edit-mode denial), commit never attempted", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "someone-else",
+      status: "deployed",
+      githubRepoUrl: "https://github.com/agentweb/test-repo",
+    });
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({ commit_message: "msg", files: [{ file_path: "ok.txt", content: "x" }] });
+
+    expect(res.status).toBe(403);
+    expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: page has no GitHub repo -> 400", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      status: "generating",
+    });
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({ commit_message: "msg", files: [{ file_path: "ok.txt", content: "x" }] });
+
+    expect(res.status).toBe(400);
+    expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
   });
 });

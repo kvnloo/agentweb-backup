@@ -38,11 +38,13 @@ import {
   resolveLandingPageLiveUrl,
   canUserEditLandingPage,
   updateLandingPageTrackingInstalled,
+  commitFilesToRepoMain,
 } from "../services/v0Service";
 import { injectGtmIntoLayout, verifyGtmInjection } from "../utils/gtmInjection";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { MISSING_BRAND_LOGO_ERROR } from "../services/agentMode/brandLogo";
 import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
+import { verifyLanderLiveMapping } from "../services/landerLiveMappingCheck";
 
 const router = Router();
 
@@ -759,7 +761,10 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
     const { file_path, content, commit_message, branch: rawBranch } = req.body;
     const branch: string = rawBranch || "main";
 
-    if (!file_path || !content) {
+    // content === "" is a legitimate empty file, not a missing one (Greptile) —
+    // only an actually-absent value should be rejected. Mirrors update-files'
+    // already-correct check for the same reason.
+    if (!file_path || content === undefined || content === null) {
       return res.status(400).json({ error: "file_path and content are required" });
     }
 
@@ -942,6 +947,151 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
     } else {
       res.status(500).json({ error: `GitHub API error (${ghStatus || 'unknown'}): ${ghMessage}` });
     }
+  }
+});
+
+const MAX_UPDATE_FILES_PER_COMMIT = 20;
+
+/**
+ * PUT /api/landing-pages/v0/generated/:id/update-files
+ * ENG-497: commit several files to an existing lander's repo in ONE atomic
+ * commit — the multi-file cousin of github-edit (which commits exactly one
+ * file per call). Reuses commitFilesToRepoMain, the same retry/rebase-safe
+ * commit path generation itself trusts, authored via the org's GitHub App
+ * token (not a personal git identity) — this is why it doesn't hit Vercel's
+ * "commit must be authored by agentwebdeployer" deploy-guard block that
+ * forced a manual re-authored git push during the ENG-443 incident.
+ *
+ * Supports the reusable staging branch (draft/agentweb-preview) the same
+ * way github-edit does — creating it from main first via ensureBranchExists
+ * if it doesn't exist yet — since commitFilesToRepoMain now accepts a
+ * branch parameter (defaults to "main").
+ */
+router.put("/generated/:id/update-files", editRateLimiter, async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const page = auth.page;
+
+    if (!page.githubRepoUrl) {
+      return res.status(400).json({ error: "Landing page has no GitHub repository" });
+    }
+
+    const match = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+    if (!match) {
+      return res.status(400).json({ error: "Invalid GitHub repo URL" });
+    }
+    const [, owner, repo] = match;
+    const repoName = repo.replace(".git", "");
+    const repoFullName = `${owner}/${repoName}`;
+
+    const { files, commit_message, branch: rawBranch } = req.body;
+    const branch: string = rawBranch || "main";
+    if (!validateBranchName(branch)) {
+      return res.status(400).json({ error: "Invalid branch name. Must be 'main' or 'draft/agentweb-preview'." });
+    }
+    if (!commit_message || typeof commit_message !== "string") {
+      return res.status(400).json({ error: "commit_message is required" });
+    }
+    if (!Array.isArray(files) || files.length === 0) {
+      return res.status(400).json({ error: "files must be a non-empty array" });
+    }
+    if (files.length > MAX_UPDATE_FILES_PER_COMMIT) {
+      return res.status(400).json({ error: `files must not exceed ${MAX_UPDATE_FILES_PER_COMMIT} entries per commit` });
+    }
+
+    const filesToCommit: Array<{ path: string; content?: Buffer; deleted?: boolean }> = [];
+    for (const f of files) {
+      const filePath = f?.file_path;
+      if (!filePath || typeof filePath !== "string") {
+        return res.status(400).json({ error: "Each file requires a file_path" });
+      }
+      if (filePath.includes("..") || filePath.startsWith(".github/") || filePath.startsWith(".github\\")) {
+        return res.status(400).json({ error: `Invalid file path: ${filePath}` });
+      }
+      if (!f.deleted && (f.content === undefined || f.content === null)) {
+        return res.status(400).json({ error: `File ${filePath} requires content (or deleted: true)` });
+      }
+      filesToCommit.push({
+        path: filePath,
+        ...(f.deleted ? { deleted: true } : { content: Buffer.from(String(f.content), "utf-8") }),
+      });
+    }
+
+    const { getGitHubOrgToken } = await import("../utils/secretsManager");
+    const { token } = await getGitHubOrgToken();
+    const ghHeaders = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" };
+
+    if (branch !== "main") {
+      await ensureBranchExists(`https://api.github.com/repos/${owner}/${repoName}`, branch, ghHeaders, 30_000);
+    }
+
+    const { pushedCommitSha } = await commitFilesToRepoMain(
+      repoFullName,
+      ghHeaders,
+      filesToCommit as any,
+      commit_message,
+      4,
+      branch
+    );
+
+    const isStaging = branch !== "main";
+    const liveUrl = await resolveLandingPageLiveUrl(page);
+    void emitLanderLifecycle("edited", { pageId: page.id, userId, channel: landerChannelFromRequest(req), mode: "incremental" });
+    res.json({
+      success: true,
+      commit_url: `https://github.com/${repoFullName}/commit/${pushedCommitSha}`,
+      files: filesToCommit.map((f) => f.path),
+      page_id: page.id,
+      live_url: liveUrl,
+      deployed_url: page.deployedUrl,
+      branch,
+      is_staging: isStaging,
+      message: isStaging
+        ? `${filesToCommit.length} file(s) updated on branch ${branch}. A Vercel preview deployment will be created.`
+        : `${filesToCommit.length} file(s) updated in one commit. Changes will auto-deploy to ${liveUrl} within ~30 seconds.`,
+    });
+  } catch (error: any) {
+    const ghStatus = error.response?.status;
+    const ghMessage = error.response?.data?.message || error.message;
+    console.error(`[LP GENERATION] Error with update-files (HTTP ${ghStatus}):`, ghMessage);
+    if (ghStatus === 401 || ghStatus === 403) {
+      res.status(ghStatus).json({ error: `GitHub auth error: ${ghMessage}` });
+    } else if (ghStatus === 422) {
+      res.status(422).json({ error: `GitHub rejected the request: ${ghMessage}` });
+    } else if (error.code === "ECONNABORTED" || error.code === "ETIMEDOUT") {
+      res.status(504).json({ error: `GitHub API timed out. Files may be too large or GitHub is slow.` });
+    } else {
+      res.status(500).json({ error: `GitHub API error (${ghStatus || "unknown"}): ${ghMessage}` });
+    }
+  }
+});
+
+/**
+ * GET /api/landing-pages/v0/generated/:id/verify-live-mapping
+ * ENG-496: verify this page's stored githubRepoUrl/vercelProjectId against
+ * what Vercel is ACTUALLY serving at its live URL. Surfaces a sibling record
+ * whose own githubRepoUrl matches reality when this one has drifted — the
+ * same manual GitHub-search step Harsha had to do by hand during ENG-443.
+ */
+router.get("/generated/:id/verify-live-mapping", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "view");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+
+    const result = await verifyLanderLiveMapping(auth.page);
+    res.json(result);
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error verifying live mapping:", error);
+    res.status(500).json({ error: error.message || "Failed to verify live mapping" });
   }
 });
 
