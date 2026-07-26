@@ -476,11 +476,59 @@ describe('intakeService.fileAutoIssue', () => {
   const realFlag = process.env.FEATUREBASE_INTAKE;
   afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
 
-  it('flag OFF -> Notion', async () => {
+  it('auto issues always use Linear even when the customer-intake migration flag is off', async () => {
     process.env.FEATUREBASE_INTAKE = 'false';
+    linear.listOpenIssuesByLabel.mockResolvedValue([]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-6', url: 'u' });
     const r = await fileAutoIssue({ title: 't', description: 'd', source: 'Context limit' });
-    expect(notion.createOncallItem).toHaveBeenCalled();
-    expect(r.tracker).toBe('Notion');
+    expect(notion.createOncallItem).not.toHaveBeenCalled();
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(
+      expect.objectContaining({ labelNames: ['Auto'] }),
+    );
+    expect(r.tracker).toBe('Linear');
+  });
+
+  it('maps the autofix execution route to an executable Todo owned by Manan', async () => {
+    process.env.FEATUREBASE_INTAKE = 'true';
+    linear.listOpenIssuesByLabel.mockResolvedValue([]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-8', url: 'u' });
+
+    await fileAutoIssue({
+      title: 'tool schema regression',
+      description: 'd',
+      source: 'AgentMode loop',
+      executionRoute: 'autofix',
+    } as any);
+
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        labelNames: ['Auto', 'Bug', 'autofix'],
+        stateName: 'Todo',
+        assigneeId: 'cabadf7c-b95d-4455-b9ec-df11d5d83f5f',
+      }),
+    );
+  });
+
+  it('maps the human-triage route to Needs PM and Harsha without autofix', async () => {
+    process.env.FEATUREBASE_INTAKE = 'true';
+    linear.listOpenIssuesByLabel.mockResolvedValue([]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'u' });
+
+    await fileAutoIssue({
+      title: 'unknown product behavior',
+      description: 'd',
+      source: 'Onboarding loop',
+      executionRoute: 'human-triage',
+    } as any);
+
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        labelNames: ['Auto', 'Bug', 'Needs PM'],
+        stateName: 'Todo',
+        assigneeId: '142fef82-4d45-4070-99be-c5debe565ac6',
+      }),
+    );
+    expect(linear.createInternalLinearIssue.mock.calls[0][0].labelNames).not.toContain('autofix');
   });
 
   it('flag ON + open Auto issue with same title -> groups (comment), no new issue', async () => {

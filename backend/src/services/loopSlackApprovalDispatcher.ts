@@ -1,6 +1,6 @@
 import { WebClient } from '@slack/web-api';
 import { isDispatched, markDispatched } from './loopDispatchTracker';
-import { getNotionCredentials, getSprintTasksDatabaseId } from './notionService';
+import { fileAutoIssue } from './intakeService';
 import { getLearningStore, getLoopManifest, getRegisteredLoopIds } from '../loops/index';
 import {
   recordLoopApproval,
@@ -15,9 +15,6 @@ const LOOP_DISPATCH_FOOTER = 'React ✅ to dispatch all to cloud-dev';
 
 /** Back-compat marker for the AI Readiness parser while loop digests are text-only. */
 const AI_READINESS_DM_MARKER = 'AI Readiness Funnel — daily run';
-
-/** Sprint Tasks data source ID, matches notionDigestTool.ts. */
-const SPRINT_TASKS_DATA_SOURCE = '2bf09247-c951-812a-bd0a-000bd4c05bbf';
 
 interface ReactionItem {
   type?: string;
@@ -43,14 +40,16 @@ interface LoopDispatchTask {
   title: string;
   body: string;
   sourceLabel: string;
+  executionRoute: 'autofix' | 'human-triage';
 }
 
 interface DispatchResult {
-  /** Digest item id (analyst slug / Notion page id) — links back to the
-   * learning record's proposal for approval persistence. */
+  /** Digest item id (analyst slug) — links back to the learning record's
+   * proposal for approval persistence. */
   id: string;
   title: string;
   ok: boolean;
+  executionRoute: LoopDispatchTask['executionRoute'];
   url?: string;
   error?: string;
 }
@@ -73,26 +72,6 @@ export async function getEmmaBotUserId(): Promise<string | null> {
     console.warn('⚠️ Could not fetch Emma bot user ID:', err);
   }
   return emmaBotUserId;
-}
-
-/**
- * Extract Notion page IDs from a Slack DM body. Notion URLs render in Slack as
- * `<https://www.notion.so/<slug>-<32-hex-id>|<label>>`; the final 32-hex
- * segment before `|` is the page id, dashes stripped.
- */
-function extractNotionPageIds(text: string): string[] {
-  const ids: string[] = [];
-  const seen = new Set<string>();
-  const re = /notion\.so\/[^|>\s]*-([a-f0-9]{32})/gi;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(text)) !== null) {
-    const id = match[1].toLowerCase();
-    if (!seen.has(id)) {
-      seen.add(id);
-      ids.push(id);
-    }
-  }
-  return ids;
 }
 
 /**
@@ -155,16 +134,6 @@ function loopSlugFromTitle(title: string): string {
   return slugify(beforeDash);
 }
 
-function taskBlocksFromText(text: string): Array<Record<string, unknown>> {
-  return text.split('\n').map((line) => ({
-    object: 'block',
-    type: line.startsWith('- ') ? 'bulleted_list_item' : 'paragraph',
-    [line.startsWith('- ') ? 'bulleted_list_item' : 'paragraph']: {
-      rich_text: [{ type: 'text', text: { content: line.slice(0, 1900) } }],
-    },
-  }));
-}
-
 function extractAiReadinessDispatchTasks(text: string): LoopDispatchTask[] {
   const runId = extractRunId(text);
   const tasks: LoopDispatchTask[] = [];
@@ -184,6 +153,7 @@ function extractAiReadinessDispatchTasks(text: string): LoopDispatchTask[] {
       id,
       title: `fix(ai-readiness-funnel): ${id}`,
       sourceLabel: 'AI Readiness',
+      executionRoute: 'human-triage',
       body: [
         `Auto-generated from AI Readiness Funnel Slack approval.`,
         ``,
@@ -224,17 +194,23 @@ function extractGenericDigestTasks(text: string): LoopDispatchTask[] {
       .map((line) => line.trim())
       .filter(Boolean);
     const detailText = details.length ? `\n\nDetails:\n${details.map((line) => `- ${line}`).join('\n')}` : '';
+    const kind = details.find((line) => /^Kind:/i.test(line)) ?? '';
+    const explicitlyAdmitted = details.some((line) => /Autofix eligible:\s*yes/i.test(line));
     tasks.push({
       id: `${loopSlug}-${runId}-${index}`,
       title: `fix(${loopSlug}): ${item.slice(0, 90)}`,
       sourceLabel: title,
+      executionRoute:
+        explicitlyAdmitted && /Kind:\s*`?code_change`?/i.test(kind)
+          ? 'autofix'
+          : 'human-triage',
       body: [
         `Auto-generated from ${title} Slack approval.`,
         ``,
         `Run ID: ${runId}`,
         `Digest item: ${item}${detailText}`,
         ``,
-        `Requested change: Investigate and implement the smallest safe cloud-dev fix for this loop finding.`,
+        `Requested change: Investigate and implement the smallest safe Autofix change for this loop finding.`,
         ``,
         `Acceptance criteria:`,
         `- Preserve existing loop telemetry and dispatch behavior.`,
@@ -257,81 +233,39 @@ function itemSlugIsActionable(title: string): boolean {
   return slugify(title.replace(/^fix\([^)]+\):\s*/, '')).length > 0;
 }
 
-async function createLoopNotionTask(task: LoopDispatchTask): Promise<{ pageId: string; notionUrl: string }> {
-  const { apiToken } = await getNotionCredentials();
-  const dataSourceId = await getSprintTasksDatabaseId();
-  const tags = task.sourceLabel.includes('AI Readiness')
-    ? [{ name: 'Landing Site' }, { name: 'AI Readiness' }]
-    : [{ name: 'Auto Loop' }];
-
-  const resp = await fetch('https://api.notion.com/v1/pages', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiToken}`,
-      'Notion-Version': '2025-09-03',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      parent: { type: 'data_source_id', data_source_id: dataSourceId },
-      properties: {
-        Name: { title: [{ text: { content: task.title.slice(0, 200) } }] },
-        Status: { status: { name: 'To-do' } },
-        'Priority Level': { select: { name: 'Medium' } },
-        'Risk Level': { select: { name: 'Low' } },
-        Source: { select: { name: 'Human' } },
-        'Sprint Points': { number: 2 },
-        Tags: { multi_select: tags },
-      },
-      children: taskBlocksFromText(task.body),
-    }),
-  });
-  const data = await resp.json();
-  if (!resp.ok || data.object === 'error') {
-    throw new Error(data.message || `Notion API ${resp.status}`);
-  }
-  const pageId = data.id as string;
-  return {
-    pageId,
-    notionUrl: (data.url as string | undefined) || `https://notion.so/${pageId.replace(/-/g, '')}`,
-  };
-}
-
-async function dispatchExistingNotionPages(pageIds: string[]): Promise<DispatchResult[]> {
-  const { launchEnvironment, getNotionPage, getNotionPageContent } = await import('./devEnvService');
-  const results: DispatchResult[] = [];
-
-  for (const pageId of pageIds) {
-    let title = pageId;
-    try {
-      const page = await getNotionPage(pageId);
-      title = page.title || pageId;
-      const { text } = await getNotionPageContent(pageId);
-      await launchEnvironment(pageId, title, text, SPRINT_TASKS_DATA_SOURCE);
-      results.push({ id: pageId, title, ok: true });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`❌ loop approval reaction: launchEnvironment failed for ${pageId}:`, err);
-      results.push({ id: pageId, title, ok: false, error: message });
-    }
-  }
-
-  return results;
-}
-
 async function dispatchCreatedTasks(tasks: LoopDispatchTask[]): Promise<DispatchResult[]> {
-  const { launchEnvironment } = await import('./devEnvService');
   const results: DispatchResult[] = [];
-  const dataSourceId = await getSprintTasksDatabaseId();
 
   for (const task of tasks) {
     try {
-      const page = await createLoopNotionTask(task);
-      await launchEnvironment(page.pageId, task.title, task.body, dataSourceId);
-      results.push({ id: task.id, title: task.title, ok: true, url: page.notionUrl });
+      const issue = await fileAutoIssue({
+        title: task.title,
+        description: task.body,
+        source: `${task.sourceLabel} Slack approval`,
+        executionRoute: task.executionRoute,
+        notionContext: {
+          'Alert Class': `slack-approved-loop:${task.id}`,
+          'Alert Priority': 'medium',
+          'Loop Task ID': task.id,
+        },
+      });
+      results.push({
+        id: task.id,
+        title: task.title,
+        ok: true,
+        executionRoute: task.executionRoute,
+        url: issue.url,
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error(`❌ loop approval reaction: dispatch failed for ${task.id}:`, err);
-      results.push({ id: task.id, title: task.title, ok: false, error: message });
+      console.error(`❌ loop approval reaction: Linear intake failed for ${task.id}:`, err);
+      results.push({
+        id: task.id,
+        title: task.title,
+        ok: false,
+        executionRoute: task.executionRoute,
+        error: message,
+      });
     }
   }
 
@@ -403,9 +337,16 @@ async function persistApproval(
 
 function formatSummary(loopTitle: string, results: DispatchResult[]): string {
   const successCount = results.filter((r) => r.ok).length;
-  const lines = [`✅ Launched ${successCount}/${results.length} cloud-dev run${results.length === 1 ? '' : 's'} for ${loopTitle}:`];
+  const lines = [
+    `✅ Queued ${successCount}/${results.length} Linear task${results.length === 1 ? '' : 's'} from ${loopTitle}:`,
+  ];
   for (const r of results) {
-    lines.push(r.ok ? `  • ${r.title} — launching${r.url ? ` (${r.url})` : ''}` : `  • ${r.title} — ⚠️ Failed: ${r.error ?? 'unknown error'}`);
+    const routeLabel = r.executionRoute === 'autofix' ? 'Autofix' : 'Needs PM';
+    lines.push(
+      r.ok
+        ? `  • ${r.title} — ${routeLabel}${r.url ? ` (${r.url})` : ''}`
+        : `  • ${r.title} — ${routeLabel} — ⚠️ Failed: ${r.error ?? 'unknown error'}`,
+    );
   }
   return lines.join('\n');
 }
@@ -434,17 +375,6 @@ export async function handleLoopApprovalReaction(event: ReactionAddedEvent): Pro
   if (!message.text.includes(LOOP_DISPATCH_FOOTER)) return;
 
   const loopTitle = extractDigestTitle(message.text);
-  const pageIds = extractNotionPageIds(message.text);
-
-  if (pageIds.length > 0) {
-    await markDispatched(item.ts, pageIds);
-    await postThread(item.channel, item.ts, `🚀 Dispatching ${pageIds.length} cloud-dev run${pageIds.length === 1 ? '' : 's'} for ${loopTitle}...`);
-    const results = await dispatchExistingNotionPages(pageIds);
-    await postThread(item.channel, item.ts, formatSummary(loopTitle, results));
-    await persistApproval(item.channel, item.ts, message.text, event.user, results);
-    return;
-  }
-
   const tasks = parseDispatchableTasks(message.text);
   if (tasks.length === 0) {
     await postThread(
@@ -456,7 +386,11 @@ export async function handleLoopApprovalReaction(event: ReactionAddedEvent): Pro
   }
 
   await markDispatched(item.ts, tasks.map((t) => t.id));
-  await postThread(item.channel, item.ts, `🚀 Creating ${tasks.length} cloud-dev task${tasks.length === 1 ? '' : 's'} for ${loopTitle}...`);
+  await postThread(
+    item.channel,
+    item.ts,
+    `🚀 Queuing ${tasks.length} approved Linear task${tasks.length === 1 ? '' : 's'} from ${loopTitle}...`,
+  );
   const results = await dispatchCreatedTasks(tasks);
   await postThread(item.channel, item.ts, formatSummary(loopTitle, results));
   await persistApproval(item.channel, item.ts, message.text, event.user, results);
