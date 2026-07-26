@@ -2108,6 +2108,11 @@ export class MetaService {
        * verbatim per Meta's CAPI spec (unlike em/ph, these are NOT hashed). */
       fbp?: string;
       fbc?: string;
+      /** Real client-submission time (Unix seconds), threaded from the customer's own
+       *  capture route via forward-lead — NOT server CAPI-send time. Falls back to the
+       *  current time when absent/invalid (an older, not-yet-regenerated capture route
+       *  never sent one, or the caller's own validation rejected it as implausible). */
+      eventTimeSeconds?: number;
     },
   ): Promise<
     | { success: true; fbtraceId?: string; usage?: CapiUsage }
@@ -2132,6 +2137,16 @@ export class MetaService {
       if (event.fbp) userData.fbp = event.fbp;
       if (event.fbc) userData.fbc = event.fbc;
 
+      // Prefer the real client-submission time over server processing time — everything
+      // else about this function is about not UNDER-counting; a stale/skewed event_time
+      // is the opposite failure mode (risks Meta treating a delayed retry as a distinct
+      // event past its dedup window, i.e. OVER-counting). Only trust a valid, safe, positive
+      // integer; anything else (NaN, negative, non-integer) silently falls back to now.
+      const eventTime =
+        Number.isSafeInteger(event.eventTimeSeconds) && (event.eventTimeSeconds as number) > 0
+          ? (event.eventTimeSeconds as number)
+          : Math.floor(Date.now() / 1000);
+
       const apiVersion = process.env.META_API_VERSION || 'v25.0';
       const url = `https://graph.facebook.com/${apiVersion}/${pixelId}/events`;
       const body = {
@@ -2140,7 +2155,7 @@ export class MetaService {
           {
             event_name: 'Lead',
             event_id: event.eventId,
-            event_time: Math.floor(Date.now() / 1000),
+            event_time: eventTime,
             action_source: 'website',
             event_source_url: event.sourceUrl,
             user_data: userData,

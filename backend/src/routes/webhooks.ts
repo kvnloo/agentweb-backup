@@ -125,6 +125,24 @@ function isCapiAccountPaused(accountId: string): boolean {
   return !!pausedUntil && Date.now() < pausedUntil;
 }
 
+// ENG-449: real client-submission time for CAPI's event_time, instead of server
+// CAPI-send time. Never trust client-supplied input raw — defensively bounded before
+// ever threading it into a Meta API call. Anything implausible (absent, malformed,
+// notably stale, or in the future beyond normal clock skew) resolves to `undefined`,
+// letting sendCapiLeadEvent fall back to current server time exactly as it did before
+// this field existed — this can only make event_time MORE accurate, never break an
+// older/not-yet-regenerated capture route that simply never sends the field at all.
+const CAPTURED_AT_MAX_FUTURE_SKEW_MS = 5 * 60 * 1000;
+const CAPTURED_AT_MAX_PAST_STALENESS_MS = 60 * 60 * 1000;
+
+function validatedEventTimeSeconds(capturedAtMs: unknown): number | undefined {
+  if (typeof capturedAtMs !== 'number' || !Number.isFinite(capturedAtMs)) return undefined;
+  const now = Date.now();
+  if (capturedAtMs > now + CAPTURED_AT_MAX_FUTURE_SKEW_MS) return undefined;
+  if (capturedAtMs < now - CAPTURED_AT_MAX_PAST_STALENESS_MS) return undefined;
+  return Math.floor(capturedAtMs / 1000);
+}
+
 function recordCapiUsage(accountId: string, usage?: { callCountPct: number; totalTimePct: number; totalCpuTimePct: number; estimatedMinutesToRegainAccess?: number }): void {
   if (!usage || usage.estimatedMinutesToRegainAccess === undefined) return;
   const atLimit = usage.callCountPct >= 100 || usage.totalTimePct >= 100 || usage.totalCpuTimePct >= 100;
@@ -468,6 +486,10 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       // deterministic, no v0-authored client code involved.
       fbp,
       fbc,
+      // Real client-submission time (Unix ms), captured at the top of the platform-owned
+      // capture route (buildCaptureRoute) — NOT server CAPI-send time. Validated below
+      // before ever being trusted.
+      capturedAtMs,
     } = req.body;
 
     // Validate required field (email)
@@ -641,6 +663,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
             sourceUrl: req.headers['referer'],
             fbp: typeof fbp === 'string' ? fbp : undefined,
             fbc: typeof fbc === 'string' ? fbc : undefined,
+            eventTimeSeconds: validatedEventTimeSeconds(capturedAtMs),
           });
           if (!result.success) {
             console.error(`[CAPI] Lead event send failed for pixel ${pixelId}: ${result.error}`);

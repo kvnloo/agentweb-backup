@@ -4028,6 +4028,11 @@ async function resolvePagePath(): Promise<string | undefined> {
 }
 
 export async function POST(req: Request) {
+  // Captured as early as possible — this is effectively the real moment of submission
+  // (the browser posts directly to this site's own domain), not server CAPI-send time
+  // later in the pipeline. Forwarded through so Meta's event_time reflects reality
+  // instead of whatever processing delay happens downstream.
+  const capturedAtMs = Date.now();
   try {
     const body = await req.json().catch(() => ({}));
 
@@ -4059,6 +4064,7 @@ export async function POST(req: Request) {
         ...body,
         listId,
         source: "landing-page",
+        capturedAtMs,
         ...(attribution ? { attribution } : {}),
         ...(PIXEL_ID ? { pixelId: PIXEL_ID, metaAccountId: META_ACCOUNT_ID } : {}),
         ...(fbp ? { fbp } : {}),
