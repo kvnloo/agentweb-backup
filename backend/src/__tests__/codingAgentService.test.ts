@@ -663,6 +663,100 @@ describe('runCodingAgent', () => {
     expect(mockCreate).toHaveBeenCalledTimes(3);
   });
 
+  // --- edit_files (ENG-497): atomic multi-file commit ---
+
+  test('edit_files: commits 2 files (one edited, one deleted) in ONE atomic PUT to update-files', async () => {
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_files', input: {
+          files: [
+            { file_path: 'public/book-a-demo.html', edits: [{ search: '<h1>Old</h1>', replace: '<h1>New</h1>' }] },
+            { file_path: 'app/api/old-route/route.ts', deleted: true },
+          ],
+          commit_message: 'Fix email capture + remove stale route',
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    // edit_files: reads current content only for the non-deleted file, then ONE PUT
+    mockedMcpFetch
+      .mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 1000 }] }) // preflight list_files
+      .mockResolvedValueOnce({ path: 'public/book-a-demo.html', content: '<h1>Old</h1>' })
+      .mockResolvedValueOnce({
+        success: true,
+        commit_url: 'https://github.com/test/repo/commit/abc123',
+        deployed_url: 'https://test.vercel.app',
+      });
+
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Committed both files.', status: 'success' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    const result = await runCodingAgent('Fix the demo page and remove the old route', mockContext);
+
+    expect(result.success).toBe(true);
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(3); // preflight + one read + ONE atomic write, not two writes
+    const putCall = mockedMcpFetch.mock.calls[2][0] as any;
+    expect(putCall.method).toBe('PUT');
+    expect(putCall.path).toBe(`/api/landing-pages/v0/generated/${mockContext.pageId}/update-files`);
+    expect(putCall.body.files).toEqual([
+      { file_path: 'public/book-a-demo.html', content: '<h1>New</h1>' },
+      { file_path: 'app/api/old-route/route.ts', deleted: true },
+    ]);
+    expect(putCall.body.commit_message).toBe('Fix email capture + remove stale route');
+  });
+
+  test('edit_files: empty files array is rejected without calling update-files', async () => {
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 1000 }] }); // preflight list_files
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_files', input: { files: [], commit_message: 'msg' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Could not edit — no files given.', status: 'error' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    await runCodingAgent('do something', mockContext);
+
+    // Only the preflight call — the empty-array guard fires before any read/write.
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
+  });
+
+  test('edit_files: a path-traversal attempt in ANY one file blocks the whole batch, no update-files call', async () => {
+    mockedMcpFetch.mockResolvedValueOnce({ files: [{ path: 'app/page.tsx', size: 1000 }] }); // preflight list_files
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'edit_files', input: {
+          files: [
+            { file_path: 'app/page.tsx', edits: [{ search: 'a', replace: 'b' }] },
+            { file_path: '../../etc/passwd', edits: [{ search: 'a', replace: 'b' }] },
+          ],
+          commit_message: 'msg',
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Rejected unsafe path.', status: 'error' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+
+    await runCodingAgent('do something', mockContext);
+
+    // Only the preflight call — the safety guard fires before any read/write for this tool.
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
+  });
+
   test('returns text response when LLM responds without tool calls', async () => {
     mockCreate.mockResolvedValueOnce({
       content: [
