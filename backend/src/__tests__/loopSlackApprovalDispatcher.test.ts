@@ -8,7 +8,8 @@
  * - Footer check: messages without the dispatch footer are ignored
  * - legacy Notion links are not dispatched
  * - tasks path: files approved work through canonical fail-closed Linear intake
- * - markDispatched called BEFORE postThread (race-condition guard)
+ * - durable completion is recorded only AFTER Linear intake succeeds
+ * - interrupted completion tracking retries safely through canonical intake
  */
 
 import type { ReactionAddedEvent } from '../services/loopSlackApprovalDispatcher';
@@ -218,9 +219,20 @@ describe('handleLoopApprovalReaction — tasks path (no Notion URLs)', () => {
     mockBotMessage(taskText);
   });
 
-  it('calls markDispatched with task IDs before posting', async () => {
+  it('records durable completion only after Linear intake succeeds', async () => {
     const callOrder: string[] = [];
-    mockMarkDispatched.mockImplementation(() => callOrder.push('markDispatched'));
+    mockFileAutoIssue.mockImplementation(async () => {
+      callOrder.push('fileAutoIssue');
+      return {
+        pageId: 'ENG-600',
+        url: 'https://linear.app/emmabyaw/issue/ENG-600',
+        deduped: false,
+        tracker: 'Linear',
+      };
+    });
+    mockMarkDispatched.mockImplementation(async () => {
+      callOrder.push('markDispatched');
+    });
     mockPostMessage.mockImplementation(() => {
       callOrder.push('postMessage');
       return Promise.resolve({});
@@ -228,8 +240,12 @@ describe('handleLoopApprovalReaction — tasks path (no Notion URLs)', () => {
 
     await handleLoopApprovalReaction(makeEvent());
 
-    expect(callOrder[0]).toBe('markDispatched');
-    expect(callOrder[1]).toBe('postMessage');
+    expect(callOrder).toEqual([
+      'postMessage',
+      'fileAutoIssue',
+      'markDispatched',
+      'postMessage',
+    ]);
   });
 
   it('files each parsed task through canonical Linear intake', async () => {
@@ -276,6 +292,58 @@ describe('handleLoopApprovalReaction — tasks path (no Notion URLs)', () => {
 
     expect(mockFileAutoIssue).toHaveBeenCalledTimes(2);
     expect(dispatchEntry?.pageIds).toEqual(['comp-a']);
+  });
+
+  it('retries through canonical intake when interrupted after filing but before completion is recorded', async () => {
+    mockMarkDispatched
+      .mockRejectedValueOnce(new Error('process interrupted before completion record'))
+      .mockImplementationOnce(async (_ts: string, pageIds: string[]) => {
+        dispatchEntry = { dispatchedAt: new Date(), pageIds: [...pageIds] };
+      });
+
+    await expect(handleLoopApprovalReaction(makeEvent())).rejects.toThrow(
+      'process interrupted before completion record',
+    );
+    expect(mockFileAutoIssue).toHaveBeenCalledTimes(1);
+    expect(dispatchEntry).toBeNull();
+
+    mockBotMessage(taskText);
+    await handleLoopApprovalReaction(makeEvent());
+
+    expect(mockFileAutoIssue).toHaveBeenCalledTimes(2);
+    expect(dispatchEntry?.pageIds).toEqual(['comp-a']);
+  });
+
+  it('suppresses a concurrent duplicate reaction while the first dispatch is in flight', async () => {
+    mockHistoryFn.mockResolvedValue({
+      messages: [{ text: taskText, bot_id: 'BBOT123' }],
+    });
+    let finishLinear!: (value: {
+      pageId: string;
+      url: string;
+      deduped: boolean;
+      tracker: string;
+    }) => void;
+    mockFileAutoIssue.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishLinear = resolve;
+        }),
+    );
+
+    const firstReaction = handleLoopApprovalReaction(makeEvent());
+    await new Promise((resolve) => setImmediate(resolve));
+    await handleLoopApprovalReaction(makeEvent());
+
+    expect(mockFileAutoIssue).toHaveBeenCalledTimes(1);
+
+    finishLinear({
+      pageId: 'ENG-600',
+      url: 'https://linear.app/emmabyaw/issue/ENG-600',
+      deduped: false,
+      tracker: 'Linear',
+    });
+    await firstReaction;
   });
 });
 

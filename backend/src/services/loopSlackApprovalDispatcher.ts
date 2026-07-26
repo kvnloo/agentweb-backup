@@ -56,9 +56,14 @@ interface DispatchResult {
 
 // Cached Emma bot user ID (fetched lazily via auth.test on first use).
 let emmaBotUserId: string | null = null;
+// Prevent duplicate work from concurrent reactions in this process. Durable
+// completion is written only after Linear accepts the task, so a crash remains
+// retryable and the canonical intake path provides destination idempotency.
+const inFlightDispatches = new Set<string>();
 
 export function _resetLoopApprovalForTesting(): void {
   emmaBotUserId = null;
+  inFlightDispatches.clear();
 }
 
 export async function getEmmaBotUserId(): Promise<string | null> {
@@ -388,21 +393,26 @@ export async function handleLoopApprovalReaction(event: ReactionAddedEvent): Pro
     return;
   }
 
-  // Claim pending IDs before the first side effect so concurrent reactions cannot double-file.
-  // After filing, overwrite the claim with successful IDs only; a failed task is then eligible
-  // for a later reaction retry while successful siblings remain idempotent.
-  await markDispatched(item.ts, [
-    ...completedTaskIds,
-    ...pendingTasks.map((task) => task.id),
-  ]);
-  await postThread(
-    item.channel,
-    item.ts,
-    `🚀 Queuing ${pendingTasks.length} approved Linear task${pendingTasks.length === 1 ? '' : 's'} from ${loopTitle}...`,
-  );
-  const results = await dispatchCreatedTasks(pendingTasks);
-  const successfulTaskIds = results.filter((result) => result.ok).map((result) => result.id);
-  await markDispatched(item.ts, [...completedTaskIds, ...successfulTaskIds]);
-  await postThread(item.channel, item.ts, formatSummary(loopTitle, results));
-  await persistApproval(item.channel, item.ts, message.text, event.user, results);
+  if (inFlightDispatches.has(item.ts)) {
+    console.log(`🔁 loop approval reaction: ${item.ts} is already in flight — skipping`);
+    return;
+  }
+
+  inFlightDispatches.add(item.ts);
+  try {
+    await postThread(
+      item.channel,
+      item.ts,
+      `🚀 Queuing ${pendingTasks.length} approved Linear task${pendingTasks.length === 1 ? '' : 's'} from ${loopTitle}...`,
+    );
+    const results = await dispatchCreatedTasks(pendingTasks);
+    const successfulTaskIds = results.filter((result) => result.ok).map((result) => result.id);
+    // Record only accepted Linear tasks. If the process exits before this write,
+    // the next reaction retries canonical intake instead of suppressing work.
+    await markDispatched(item.ts, [...completedTaskIds, ...successfulTaskIds]);
+    await postThread(item.channel, item.ts, formatSummary(loopTitle, results));
+    await persistApproval(item.channel, item.ts, message.text, event.user, results);
+  } finally {
+    inFlightDispatches.delete(item.ts);
+  }
 }
