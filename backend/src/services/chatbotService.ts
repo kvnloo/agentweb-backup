@@ -5,8 +5,7 @@ import AWS from "aws-sdk";
 import dotenv from "dotenv";
 import path from "path";
 import { getReleases } from "../controllers/release";
-import { getUserGuideContent } from "../services/notionService";
-import { getApiDocs } from "../controllers/api";
+import { fetchMintlifyDocsContent, chunkDocsContent } from "./docsKnowledgeSource";
 import { getUserReleaseNotes } from "../controllers/docsController";
 import { Request, Response } from "express";
 import { EngineServiceClient } from '@google-cloud/discoveryengine';
@@ -3453,46 +3452,22 @@ function printKnowledgeBase(): void {
 }
 
 // Load and cache content from backend API controllers directly
-async function loadKnowledgeBase(): Promise<void> {
+export async function loadKnowledgeBase(): Promise<void> {
   const endpoints = [
     { controller: getReleases, source: "release" },
-    { controller: getApiDocs, source: "api" },
     { controller: getUserReleaseNotes, source: "user-release" },
   ];
 
   const chunks: ContextChunk[] = [];
   let chunkId = 0;
 
-  // Load Notion-based user guide content
+  // Load product docs from Mintlify (docs.agentweb.pro) — the canonical docs
+  // source. Replaces the retired Notion user-guide shadow copy (ENG-163).
   try {
-    const guideContent = await getUserGuideContent();
-    if (guideContent) {
-      const guideChunks = guideContent.match(/[^\.!\?]+[\.!\?]+/g) || [guideContent];
-      let currentChunk = "";
-      for (const sentence of guideChunks) {
-        if ((currentChunk + sentence).length > 2000) {
-          if (currentChunk) {
-            chunks.push({
-              id: `chunk-guide-${chunkId++}`,
-              content: currentChunk.trim(),
-              metadata: { source: "guide" },
-            });
-          }
-          currentChunk = sentence;
-        } else {
-          currentChunk += " " + sentence;
-        }
-      }
-      if (currentChunk.trim()) {
-        chunks.push({
-          id: `chunk-guide-${chunkId++}`,
-          content: currentChunk.trim(),
-          metadata: { source: "guide" },
-        });
-      }
-    }
+    const docsContent = await fetchMintlifyDocsContent();
+    chunks.push(...chunkDocsContent(docsContent, "guide"));
   } catch (error) {
-    console.error("Error loading Notion user guide for knowledge base:", error);
+    console.error("Error loading Mintlify docs for knowledge base:", error);
   }
 
   for (const endpoint of endpoints) {
@@ -3531,23 +3506,7 @@ async function loadKnowledgeBase(): Promise<void> {
       ) {
         let content = "";
 
-        if (endpoint.source === "api") {
-          for (const section of mockResponse.data.data) {
-            content += `${section.title}\n`;
-            for (const paragraph of section.content) {
-              content += `${paragraph}\n`;
-            }
-            if (section.subsections) {
-              for (const subsection of section.subsections) {
-                content += `${subsection.title}\n`;
-                for (const paragraph of subsection.content) {
-                  content += `${paragraph}\n`;
-                }
-              }
-            }
-            content += "\n";
-          }
-        } else if (endpoint.source === "user-release") {
+        if (endpoint.source === "user-release") {
           for (const release of mockResponse.data.data) {
             content += `Release Date: ${release.date}\n`;
             for (const change of release.changes) {

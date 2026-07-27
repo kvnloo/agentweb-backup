@@ -45,13 +45,7 @@ jest.mock('../../controllers/release', () => ({
   getReleases: jest.fn(),
 }));
 
-jest.mock('../../controllers/api', () => ({
-  getApiDocs: jest.fn(),
-}));
 
-jest.mock('../../controllers/user-guide', () => ({
-  getUserGuide: jest.fn(),
-}));
 
 jest.mock('../../controllers/docsController', () => ({
   getUserReleaseNotes: jest.fn(),
