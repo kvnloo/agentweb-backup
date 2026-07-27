@@ -191,6 +191,83 @@ describe('fileReportOnce', () => {
     expect(userBFiler).toHaveBeenCalledTimes(1);
   });
 
+  it('hard-bounds aggregate replay state and reclaims it only after entries expire', async () => {
+    const aggregateLimit = 2_000;
+    const filer = jest.fn().mockResolvedValue({ pageId: 'filed' });
+    for (let i = 0; i < aggregateLimit; i++) {
+      await (fileReportOnce as any)(`report-${i}`, filer, 1_000, 0, `user-${i}`);
+    }
+
+    const overflowFiler = jest.fn().mockResolvedValue({ pageId: 'overflow' });
+    await expect(
+      (fileReportOnce as any)('overflow', overflowFiler, 1_001, 0, 'overflow-user'),
+    ).rejects.toThrow('Report replay guard is busy');
+    expect(overflowFiler).not.toHaveBeenCalled();
+
+    await expect(
+      (fileReportOnce as any)(
+        'after-expiry',
+        overflowFiler,
+        1_000 + REPORT_REPLAY_WINDOW_MS,
+        0,
+        'overflow-user',
+      ),
+    ).resolves.toEqual({
+      result: { pageId: 'overflow' },
+      replayed: false,
+    });
+    expect(overflowFiler).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not start an untracked filing when pending reports occupy the aggregate ceiling', async () => {
+    const neverSettles = new Promise<{ pageId: string }>(() => {});
+    for (let i = 0; i < 2_000; i++) {
+      void (fileReportOnce as any)(
+        `pending-${i}`,
+        () => neverSettles,
+        1_000,
+        0,
+        `user-${i}`,
+      );
+    }
+
+    const overflowFiler = jest.fn().mockResolvedValue({ pageId: 'overflow' });
+    await expect(
+      (fileReportOnce as any)('overflow', overflowFiler, 1_001, 0, 'overflow-user'),
+    ).rejects.toThrow('Report replay guard is busy');
+    expect(overflowFiler).not.toHaveBeenCalled();
+  });
+
+  it('releases aggregate capacity when a tracked filing fails', async () => {
+    const filer = jest.fn().mockResolvedValue({ pageId: 'filed' });
+    for (let i = 0; i < 1_999; i++) {
+      await (fileReportOnce as any)(`report-${i}`, filer, 1_000, 0, `user-${i}`);
+    }
+
+    let rejectFiling: (error: Error) => void = () => {};
+    const doomed = (fileReportOnce as any)(
+      'doomed',
+      () => new Promise((_resolve, reject) => { rejectFiling = reject; }),
+      1_000,
+      0,
+      'doomed-user',
+    );
+    const replacementFiler = jest.fn().mockResolvedValue({ pageId: 'replacement' });
+    await expect(
+      (fileReportOnce as any)('replacement', replacementFiler, 1_001, 0, 'replacement-user'),
+    ).rejects.toThrow('Report replay guard is busy');
+    expect(replacementFiler).not.toHaveBeenCalled();
+
+    rejectFiling(new Error('filing failed'));
+    await expect(doomed).rejects.toThrow('filing failed');
+    await expect(
+      (fileReportOnce as any)('replacement', replacementFiler, 1_002, 0, 'replacement-user'),
+    ).resolves.toEqual({
+      result: { pageId: 'replacement' },
+      replayed: false,
+    });
+  });
+
   it('backpressures at all-pending capacity, then files once a tracked slot fails open', async () => {
     const rejecters: Array<(error: Error) => void> = [];
     const filer = jest.fn(

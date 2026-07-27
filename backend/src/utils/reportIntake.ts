@@ -92,6 +92,8 @@ export class ReportReplayCapacityError extends Error {
  * bucket; it cannot turn replay protection into a process-wide admission gate for other users.
  */
 const MAX_TRACKED_REPORTS_PER_SCOPE = 500;
+/** Process-wide hard bound; per-user isolation must not make aggregate memory unbounded. */
+const MAX_TRACKED_REPORTS_TOTAL = 2_000;
 const DEFAULT_REPLAY_SCOPE = 'default';
 
 interface TrackedReport {
@@ -107,16 +109,53 @@ interface TrackedReport {
  * becomes wrong, only less tight.
  */
 const trackedByScope = new Map<string, Map<string, TrackedReport>>();
+let trackedReportCount = 0;
+let earliestSettledExpiry = Number.POSITIVE_INFINITY;
 
-function pruneExpired(now: number): void {
+function deleteTrackedReport(
+  scope: string,
+  trackedByFingerprint: Map<string, TrackedReport>,
+  fingerprint: string,
+  expected?: TrackedReport,
+): boolean {
+  const current = trackedByFingerprint.get(fingerprint);
+  if (!current || (expected && current !== expected)) return false;
+
+  trackedByFingerprint.delete(fingerprint);
+  trackedReportCount -= 1;
+  if (trackedByFingerprint.size === 0) trackedByScope.delete(scope);
+  return true;
+}
+
+function pruneExpiredInScope(
+  scope: string,
+  trackedByFingerprint: Map<string, TrackedReport>,
+  now: number,
+): void {
+  for (const [fingerprint, entry] of trackedByFingerprint) {
+    if (entry.settled && now >= entry.at + REPORT_REPLAY_WINDOW_MS) {
+      deleteTrackedReport(scope, trackedByFingerprint, fingerprint, entry);
+    }
+  }
+}
+
+/**
+ * A full-registry sweep runs only when aggregate admission is blocked and the known earliest
+ * settled entry can have expired. Ordinary requests inspect only their bounded user scope.
+ */
+function pruneAllExpired(now: number): void {
+  let nextSettledExpiry = Number.POSITIVE_INFINITY;
   for (const [scope, trackedByFingerprint] of trackedByScope) {
-    for (const [key, entry] of trackedByFingerprint) {
-      if (entry.settled && now - entry.at >= REPORT_REPLAY_WINDOW_MS) {
-        trackedByFingerprint.delete(key);
+    for (const [fingerprint, entry] of trackedByFingerprint) {
+      const expiry = entry.at + REPORT_REPLAY_WINDOW_MS;
+      if (entry.settled && now >= expiry) {
+        deleteTrackedReport(scope, trackedByFingerprint, fingerprint, entry);
+      } else if (entry.settled) {
+        nextSettledExpiry = Math.min(nextSettledExpiry, expiry);
       }
     }
-    if (trackedByFingerprint.size === 0) trackedByScope.delete(scope);
   }
+  earliestSettledExpiry = nextSettledExpiry;
 }
 
 function reportsForScope(scope: string): Map<string, TrackedReport> {
@@ -162,6 +201,8 @@ async function waitForTrackedFilingToSettle(
 /** Test-only: clears the replay state so each test starts from a clean slate. */
 export function __resetReportIdempotencyForTests(): void {
   trackedByScope.clear();
+  trackedReportCount = 0;
+  earliestSettledExpiry = Number.POSITIVE_INFINITY;
 }
 
 export interface FileReportOnceResult<T> {
@@ -185,41 +226,56 @@ export async function fileReportOnce<T>(
   capacityWaitMs: number = REPORT_CAPACITY_WAIT_MS,
   scope: string = DEFAULT_REPLAY_SCOPE,
 ): Promise<FileReportOnceResult<T>> {
-  pruneExpired(now);
-  const trackedByFingerprint = reportsForScope(scope);
+  let trackedByFingerprint = trackedByScope.get(scope);
+  if (trackedByFingerprint) {
+    pruneExpiredInScope(scope, trackedByFingerprint, now);
+    if (trackedByFingerprint.size === 0) trackedByFingerprint = undefined;
+  }
 
-  const existing = trackedByFingerprint.get(fingerprint);
+  const existing = trackedByFingerprint?.get(fingerprint);
   if (existing) {
     // An active filing is always authoritative, even after the completed-result replay window.
     // Starting a replacement while it is pending makes duplicate durable tickets reachable.
     if (!existing.settled || now - existing.at < REPORT_REPLAY_WINDOW_MS) {
       return { result: (await existing.promise) as T, replayed: true };
     }
-    trackedByFingerprint.delete(fingerprint);
+    deleteTrackedReport(scope, trackedByFingerprint!, fingerprint, existing);
   }
 
   // Never evict a fresh replay: doing so would let that report's next retry create a duplicate
   // durable ticket. At capacity, wait briefly for an active filing to fail and release its slot;
   // all-settled capacity (or a bounded wait timeout) returns the explicit retryable overload
   // response. No filer runs without first claiming tracked state.
-  if (trackedByFingerprint.size >= MAX_TRACKED_REPORTS_PER_SCOPE) {
+  if (trackedByFingerprint && trackedByFingerprint.size >= MAX_TRACKED_REPORTS_PER_SCOPE) {
     await waitForTrackedFilingToSettle(trackedByFingerprint, capacityWaitMs);
     return fileReportOnce(fingerprint, file, now, capacityWaitMs, scope);
   }
+  if (
+    trackedReportCount >= MAX_TRACKED_REPORTS_TOTAL
+    && now >= earliestSettledExpiry
+  ) {
+    pruneAllExpired(now);
+  }
+  if (trackedReportCount >= MAX_TRACKED_REPORTS_TOTAL) {
+    throw new ReportReplayCapacityError();
+  }
 
+  trackedByFingerprint ??= reportsForScope(scope);
   const promise = file();
   const entry: TrackedReport = { promise, at: now, settled: false };
   trackedByFingerprint.set(fingerprint, entry);
+  trackedReportCount += 1;
   try {
     const result = await promise;
     entry.settled = true;
+    earliestSettledExpiry = Math.min(
+      earliestSettledExpiry,
+      entry.at + REPORT_REPLAY_WINDOW_MS,
+    );
     return { result, replayed: false };
   } catch (error) {
     // Never let an older rejection delete a replacement entry.
-    if (trackedByFingerprint.get(fingerprint) === entry) {
-      trackedByFingerprint.delete(fingerprint);
-      if (trackedByFingerprint.size === 0) trackedByScope.delete(scope);
-    }
+    deleteTrackedReport(scope, trackedByFingerprint, fingerprint, entry);
     throw error;
   }
 }
