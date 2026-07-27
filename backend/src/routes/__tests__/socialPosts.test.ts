@@ -221,6 +221,49 @@ describe('GET /api/social-posts', () => {
       expect(mockGetPosts).toHaveBeenCalledTimes(1);
     });
 
+    it('should still refresh the eligible pages on an all-account refresh when one page is cooling', async () => {
+      mockGetPosts.mockResolvedValue({ posts: [], total: 0 } as any);
+      mockGetSocialAccountIds.mockResolvedValue(['acc-1', 'acc-2']);
+
+      // acc-1 is refreshed and is now cooling down.
+      await request(app)
+        .get('/api/social-posts?force_reload=true&accountId=acc-1')
+        .expect(200);
+
+      // An all-account refresh must NOT be blocked by acc-1's cooldown — it
+      // should proceed and refresh the still-eligible acc-2.
+      await request(app).get('/api/social-posts?force_reload=true').expect(200);
+
+      // The all-account call force-reloads ONLY the eligible account (acc-2);
+      // the throttled acc-1 is served from cache, not re-fetched.
+      expect(mockGetPosts).toHaveBeenCalledTimes(2);
+      expect(mockGetPosts).toHaveBeenLastCalledWith(
+        'user-1',
+        expect.objectContaining({ forceReloadAccountIds: ['acc-2'] }),
+      );
+      // Both accounts now hold a cooldown reservation.
+      expect(_forceReloadCooldownSize()).toBe(2);
+    });
+
+    it('should 429 an all-account refresh only once every page is still cooling', async () => {
+      mockGetPosts.mockResolvedValue({ posts: [], total: 0 } as any);
+      mockGetSocialAccountIds.mockResolvedValue(['acc-1', 'acc-2']);
+
+      // First all-account refresh reserves both pages and force-reloads both.
+      await request(app).get('/api/social-posts?force_reload=true').expect(200);
+      expect(mockGetPosts).toHaveBeenLastCalledWith(
+        'user-1',
+        expect.objectContaining({ forceReloadAccountIds: ['acc-1', 'acc-2'] }),
+      );
+
+      // A second immediate all-account refresh — both pages cooling → throttled.
+      const res = await request(app).get('/api/social-posts?force_reload=true').expect(429);
+      expect(res.body).toHaveProperty('error');
+      expect(res.body.retry_after_seconds).toBeGreaterThan(0);
+      // The throttled request must not reach the quota-burning service again.
+      expect(mockGetPosts).toHaveBeenCalledTimes(1);
+    });
+
     it('should not throttle or persist cooldown state for an accountId the caller does not own', async () => {
       mockGetPosts.mockResolvedValue({ posts: [], total: 0 } as any);
       mockGetSocialAccountIds.mockResolvedValue(['acc-1']);
