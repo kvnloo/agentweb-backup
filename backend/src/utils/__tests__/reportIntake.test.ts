@@ -155,57 +155,31 @@ describe('fileReportOnce', () => {
     expect(filer).toHaveBeenCalledTimes(2);
   });
 
-  it('admits an unrelated report by evicting the oldest settled replay at capacity', async () => {
+  it('never evicts a fresh replay to admit an unrelated report at capacity', async () => {
     const filer = jest.fn().mockResolvedValue({ pageId: '169' });
     for (let i = 0; i < 500; i++) {
       await fileReportOnce(`fresh-${i}`, filer, 1_000);
     }
 
     const unrelatedFiler = jest.fn().mockResolvedValue({ pageId: '670' });
-    await expect(fileReportOnce('unrelated-user-report', unrelatedFiler, 1_001)).resolves.toEqual({
-      result: { pageId: '670' },
-      replayed: false,
-    });
-    expect(unrelatedFiler).toHaveBeenCalledTimes(1);
+    await expect(
+      fileReportOnce('unrelated-user-report', unrelatedFiler, 1_001, 0),
+    ).rejects.toThrow('Report replay guard is busy');
+    expect(unrelatedFiler).not.toHaveBeenCalled();
+
+    const evictedRetryFiler = jest.fn().mockResolvedValue({ pageId: 'duplicate' });
+    const oldestRetry = await fileReportOnce('fresh-0', evictedRetryFiler, 1_002);
+    expect(oldestRetry).toEqual({ result: { pageId: '169' }, replayed: true });
+    expect(evictedRetryFiler).not.toHaveBeenCalled();
   });
 
-  it('evicts a settled replay rather than any in-flight filing', async () => {
-    const settledFiler = jest.fn().mockResolvedValue({ pageId: 'old' });
-    await fileReportOnce('settled', settledFiler, 1_000);
-
-    const neverSettles = new Promise<{ pageId: string }>(() => {});
-    for (let i = 0; i < 499; i++) {
-      void fileReportOnce(`pending-${i}`, () => neverSettles, 1_000);
-    }
-
-    const unrelatedFiler = jest.fn().mockResolvedValue({ pageId: 'new' });
-    await expect(fileReportOnce('unrelated', unrelatedFiler, 1_001)).resolves.toEqual({
-      result: { pageId: 'new' },
-      replayed: false,
-    });
-    expect(unrelatedFiler).toHaveBeenCalledTimes(1);
-  });
-
-  it('keeps newer settled reports replayable when evicting the oldest settled entry', async () => {
-    const filer = jest.fn().mockImplementation(async (fingerprint: string) => ({ pageId: fingerprint }));
-    for (let i = 0; i < 500; i++) {
-      await fileReportOnce(`fresh-${i}`, () => filer(`fresh-${i}`), 1_000 + i);
-    }
-
-    await fileReportOnce('unrelated', () => filer('unrelated'), 1_501);
-    const recent = await fileReportOnce('fresh-499', () => filer('unexpected'), 1_502);
-
-    expect(recent).toEqual({ result: { pageId: 'fresh-499' }, replayed: true });
-    expect(filer).not.toHaveBeenCalledWith('unexpected');
-  });
-
-  it('backpressures at all-pending capacity, then files once a tracked slot settles', async () => {
-    const resolvers: Array<(result: { pageId: string }) => void> = [];
+  it('backpressures at all-pending capacity, then files once a tracked slot fails open', async () => {
+    const rejecters: Array<(error: Error) => void> = [];
     const filer = jest.fn(
-      () => new Promise<{ pageId: string }>((resolve) => { resolvers.push(resolve); }),
+      () => new Promise<{ pageId: string }>((_resolve, reject) => { rejecters.push(reject); }),
     );
     for (let i = 0; i < 500; i++) {
-      void fileReportOnce(`pending-${i}`, filer, 1_000);
+      void fileReportOnce(`pending-${i}`, filer, 1_000).catch(() => undefined);
     }
 
     const overflowFiler = jest.fn().mockResolvedValue({ pageId: 'overflow' });
@@ -215,7 +189,7 @@ describe('fileReportOnce', () => {
     expect(filer).toHaveBeenCalledTimes(500);
     expect(overflowFiler).not.toHaveBeenCalled();
 
-    resolvers[0]({ pageId: 'first' });
+    rejecters[0](new Error('first filing failed'));
     await expect(overflow).resolves.toEqual({
       result: { pageId: 'overflow' },
       replayed: false,

@@ -117,28 +117,6 @@ function pruneExpired(now: number): void {
 }
 
 /**
- * Free one slot without ever abandoning an active filing.
- *
- * Under pathological load, retaining every completed replay for the full window is less
- * important than allowing an unrelated user's new report to be filed. Evicting a settled result
- * can only shorten that result's replay window; evicting a pending result would make a concurrent
- * retry capable of creating a duplicate durable ticket, so pending entries are never removed.
- */
-function evictOldestSettledReplay(): boolean {
-  let oldestKey: string | undefined;
-  let oldestAt = Number.POSITIVE_INFINITY;
-  for (const [key, entry] of trackedByFingerprint) {
-    if (entry.settled && entry.at < oldestAt) {
-      oldestKey = key;
-      oldestAt = entry.at;
-    }
-  }
-  if (oldestKey === undefined) return false;
-  trackedByFingerprint.delete(oldestKey);
-  return true;
-}
-
-/**
  * Wait until one authoritative in-flight filing settles. This is backpressure, not another
  * tracking structure: the fixed-size map remains the only retained replay state, and a waiting
  * request never invokes its filer until it can first claim a tracked slot.
@@ -151,7 +129,7 @@ async function waitForTrackedFilingToSettle(waitMs: number): Promise<void> {
       () => undefined,
     ));
   if (active.length === 0) {
-    throw new Error('Report replay guard capacity invariant violated');
+    throw new ReportReplayCapacityError();
   }
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -202,14 +180,11 @@ export async function fileReportOnce<T>(
     trackedByFingerprint.delete(fingerprint);
   }
 
-  // Prefer dropping the oldest completed replay over causing a cross-user availability outage.
-  // If every slot is still filing, apply backpressure until one authoritative filing settles,
-  // then retry admission. Never call `file` without first claiming a tracked slot: concurrent
-  // retries still collapse onto one promise and the replay state remains hard-bounded.
-  if (
-    trackedByFingerprint.size >= MAX_TRACKED_REPORTS
-    && !evictOldestSettledReplay()
-  ) {
+  // Never evict a fresh replay: doing so would let that report's next retry create a duplicate
+  // durable ticket. At capacity, wait briefly for an active filing to fail and release its slot;
+  // all-settled capacity (or a bounded wait timeout) returns the explicit retryable overload
+  // response. No filer runs without first claiming tracked state.
+  if (trackedByFingerprint.size >= MAX_TRACKED_REPORTS) {
     await waitForTrackedFilingToSettle(capacityWaitMs);
     return fileReportOnce(fingerprint, file, now, capacityWaitMs);
   }
