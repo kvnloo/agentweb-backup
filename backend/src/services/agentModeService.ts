@@ -174,6 +174,10 @@ import { twitterService } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
+import {
+  NegativeCampaignCriteriaValidationError,
+  validateNegativeCampaignCriteria,
+} from './googleAdsCampaignCriteria';
 import { preflightTrackingGate } from './googleAdsTrackingPreflight';
 import { HubSpotService } from './hubspotService';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
@@ -29161,7 +29165,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
-    entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
+    entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
     action: string;
     [key: string]: any;
   }, opts?: { sessionId?: string }): Promise<any> {
@@ -29172,6 +29176,25 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (entity_type === 'BIDDING_STRATEGY' && action === 'LIST') {
         const biddingStrategies = await googleAdsService.listBiddingStrategies(userId, customer_id);
         return { success: true, biddingStrategies };
+      }
+
+      if (entity_type === 'CAMPAIGN_CRITERION' && action === 'ADD') {
+        const { placementUrls, mobileAppCategoryResourceNames } = validateNegativeCampaignCriteria(
+          customer_id,
+          args.campaign_resource_name,
+          args.placement_urls,
+          args.mobile_app_category_resource_names,
+        );
+        await googleAdsService.addNegativeCampaignCriteria(
+          userId,
+          customer_id,
+          args.campaign_resource_name,
+          { placementUrls, mobileAppCategoryResourceNames },
+        );
+        return {
+          success: true,
+          message: `Added ${placementUrls.length + mobileAppCategoryResourceNames.length} negative campaign criteria`,
+        };
       }
 
       if (entity_type === 'CAMPAIGN') {
@@ -29503,15 +29526,34 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       return { success: false, error: `Unsupported entity_type=${entity_type} action=${action}` };
     } catch (error: any) {
+      if (error instanceof NegativeCampaignCriteriaValidationError) {
+        return {
+          success: false,
+          errorType: error.errorType,
+          errorCode: error.errorCode,
+          error: error.message,
+        };
+      }
       if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true };
       console.error('[AgentMode] handleCallGoogleAdsApi error:', error);
       const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
+      const gadsErrorCodes = gadsErrors
+        .map((e: any) => Object.values(e.errorCode || {})[0])
+        .filter(Boolean);
       const gadsError = gadsErrors.length
         ? gadsErrors.map((e: any) => {
             const code = Object.values(e.errorCode || {})[0];
             return code ? `${code}: ${e.message}` : e.message;
           }).join('; ')
         : undefined;
+      if (args.entity_type === 'CAMPAIGN_CRITERION') {
+        return {
+          success: false,
+          errorType: gadsError ? 'GOOGLE_ADS_API_ERROR' : 'INTERNAL_ERROR',
+          errorCode: gadsErrorCodes[0] || 'UNKNOWN_GOOGLE_ADS_ERROR',
+          error: gadsError || error.message || 'Unknown error',
+        };
+      }
       return { success: false, error: gadsError || error.message || 'Unknown error' };
     }
   }

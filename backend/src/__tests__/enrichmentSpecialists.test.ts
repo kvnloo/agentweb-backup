@@ -103,15 +103,24 @@ describe('enrichmentSpecialists', () => {
 
   it('runs specialists in parallel for independent fields', async () => {
     let calls = 0;
-    const slow = async () => { calls++; await new Promise(r => setTimeout(r, 10)); return null; };
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const slow = async () => {
+      calls++;
+      await gate;
+      return null;
+    };
     registerSpecialist({ fieldName: 'a', label: 'spec-a', resolve: slow });
     registerSpecialist({ fieldName: 'b', label: 'spec-b', resolve: slow });
 
-    const t0 = Date.now();
-    await runSpecialists(['a', 'b'], {} as any, { userId: 'u1' });
-    const elapsed = Date.now() - t0;
-
+    const running = runSpecialists(['a', 'b'], {} as any, { userId: 'u1' });
+    // Both specialists must reach the shared gate before either is released.
+    // This proves parallel dispatch without a wall-clock threshold that flakes
+    // when a coverage runner is CPU-starved.
     expect(calls).toBe(2);
-    expect(elapsed).toBeLessThan(30); // parallel — both 10ms calls overlap
+    release();
+    await running;
   });
 });
