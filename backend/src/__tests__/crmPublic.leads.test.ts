@@ -34,6 +34,7 @@ jest.mock('../services/externalCrmSyncService', () => ({
 }));
 
 import express from 'express';
+import http from 'http';
 import request from 'supertest';
 import publicRouter from '../routes/crmPublic';
 import { crmDb } from '../services/db';
@@ -47,6 +48,7 @@ const flushAsyncWork = async () => {
 const app = express();
 app.use(express.json());
 app.use('/', publicRouter);
+let server: http.Server;
 
 const mockList = {
   listId: 'list_abc123',
@@ -63,6 +65,23 @@ const validBody = {
 };
 
 describe('POST /leads/:listId — public lead creation', () => {
+  beforeAll(async () => {
+    server = http.createServer(app);
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => {
+        server.off('error', reject);
+        resolve();
+      });
+    });
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+  });
+
   beforeEach(() => {
     jest.clearAllMocks();
     (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
@@ -71,35 +90,35 @@ describe('POST /leads/:listId — public lead creation', () => {
 
   test('returns 404 when list does not exist', async () => {
     (crmDb.getLeadListById as jest.Mock).mockResolvedValue(null);
-    const res = await request(app).post('/leads/list_notexist').send(validBody);
+    const res = await request(server).post('/leads/list_notexist').send(validBody);
     expect(res.status).toBe(404);
   });
 
   test('returns 403 when list does not have publicAccessEnabled', async () => {
     (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ ...mockList, publicAccessEnabled: false });
-    const res = await request(app).post('/leads/list_abc123').send(validBody);
+    const res = await request(server).post('/leads/list_abc123').send(validBody);
     expect(res.status).toBe(403);
   });
 
   test('returns 400 when email is missing', async () => {
-    const res = await request(app).post('/leads/list_abc123').send({ firstName: 'Jane' });
+    const res = await request(server).post('/leads/list_abc123').send({ firstName: 'Jane' });
     expect(res.status).toBe(400);
   });
 
   test('returns 400 when email is malformed', async () => {
-    const res = await request(app).post('/leads/list_abc123').send({ ...validBody, email: 'not-an-email' });
+    const res = await request(server).post('/leads/list_abc123').send({ ...validBody, email: 'not-an-email' });
     expect(res.status).toBe(400);
   });
 
   test('creates lead and returns 201 on valid request', async () => {
-    const res = await request(app).post('/leads/list_abc123').send(validBody);
+    const res = await request(server).post('/leads/list_abc123').send(validBody);
     expect(res.status).toBe(201);
     expect(crmDb.createLead).toHaveBeenCalledWith('list_abc123', expect.objectContaining({ email: 'test@example.com' }));
     expect(res.body).toHaveProperty('leadId');
   });
 
   test('strips unknown dangerous fields before creating lead', async () => {
-    const res = await request(app).post('/leads/list_abc123').send({
+    const res = await request(server).post('/leads/list_abc123').send({
       ...validBody,
       userId: 'hacker',
       listId: 'hacker',
@@ -115,7 +134,7 @@ describe('POST /leads/:listId — public lead creation', () => {
     const createdLead = { leadId: 'lead_new', ...validBody };
     (crmDb.createLead as jest.Mock).mockResolvedValue(createdLead);
 
-    const res = await request(app).post('/leads/list_abc123').send(validBody);
+    const res = await request(server).post('/leads/list_abc123').send(validBody);
     expect(res.status).toBe(201);
 
     await flushAsyncWork();
@@ -138,7 +157,7 @@ describe('POST /leads/:listId — public lead creation', () => {
 
   test('does not sync to any external CRM when the list rejects the request (403)', async () => {
     (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ ...mockList, publicAccessEnabled: false });
-    const res = await request(app).post('/leads/list_abc123').send(validBody);
+    const res = await request(server).post('/leads/list_abc123').send(validBody);
     expect(res.status).toBe(403);
 
     await flushAsyncWork();
@@ -147,7 +166,7 @@ describe('POST /leads/:listId — public lead creation', () => {
 
   test('still returns 201 when external CRM sync rejects (fire-and-forget)', async () => {
     (externalCrmSyncService.autoSyncLead as jest.Mock).mockRejectedValueOnce(new Error('hubspot down'));
-    const res = await request(app).post('/leads/list_abc123').send(validBody);
+    const res = await request(server).post('/leads/list_abc123').send(validBody);
     expect(res.status).toBe(201);
     await flushAsyncWork();
     expect(externalCrmSyncService.autoSyncLead).toHaveBeenCalled();

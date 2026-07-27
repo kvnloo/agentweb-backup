@@ -116,6 +116,28 @@ interface ExtractionOptions {
   includeExternalStylesheets?: boolean;
 }
 
+/**
+ * Fetch the current HTML for an already-validated URL.
+ *
+ * This transport boundary is exported so the real-network freshness contract
+ * can be tested against a portable loopback fixture without weakening or
+ * bypassing `validateURL`. Callers outside this module must validate untrusted
+ * URLs before invoking it.
+ */
+export async function fetchFreshHtmlFromValidatedUrl(validatedUrl: string): Promise<string> {
+  const response = await axios.get(validatedUrl, {
+    timeout: 30000,
+    headers: {
+      'User-Agent': 'AgentWeb-CSS-Extractor/1.0',
+      // Brand-build must scrape the CURRENT site — never a stale/CDN copy.
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache',
+    },
+    responseType: 'text',
+  });
+  return String(response.data);
+}
+
 // Security: URL validation
 function validateURL(urlString: string): URL {
   let url: URL;
@@ -801,17 +823,7 @@ async function extractWithJSDOM(
     htmlContent = html;
   } else {
     try {
-      const response = await axios.get(url.toString(), {
-        timeout: 30000,
-        headers: {
-          'User-Agent': 'AgentWeb-CSS-Extractor/1.0',
-          // Brand-build must scrape the CURRENT site — never a stale/CDN copy.
-          'Cache-Control': 'no-cache',
-          Pragma: 'no-cache',
-        },
-        responseType: 'text',
-      });
-      htmlContent = String(response.data);
+      htmlContent = await fetchFreshHtmlFromValidatedUrl(url.toString());
     } catch (error: any) {
       throw new Error(`Failed to fetch URL: ${error.message}`);
     }

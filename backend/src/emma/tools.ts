@@ -6815,6 +6815,85 @@ import { mcpToolRegistry } from '../mcp/server/registry';
 // for mcpToolRegistry to be available).
 mcpToolRegistry.register(visualContextTool);
 
+mcpToolRegistry.register({
+  name: 'manage_linear_governance_label',
+  definition: {
+    name: 'manage_linear_governance_label',
+    description:
+      'Admin-only: read, dry-run, or update an existing allowlisted Linear routing/intake label. ' +
+      'Returns verified before/after readback evidence. It cannot create, delete, or move labels and never exposes Linear credentials.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        label_name: {
+          type: 'string',
+          description: 'Existing allowlisted governance label, such as Route: Emma or Needs PM.',
+        },
+        name: {
+          type: 'string',
+          description: 'Optional replacement name. It must also be an allowlisted governance label and must not already exist.',
+        },
+        description: {
+          type: 'string',
+          maxLength: 1000,
+          description: 'Optional replacement description.',
+        },
+        color: {
+          type: 'string',
+          pattern: '^#[0-9A-Fa-f]{6}$',
+          description: 'Optional six-digit hex color.',
+        },
+        reason: {
+          type: 'string',
+          description: 'Required audit reason for the read, dry-run, or update.',
+        },
+        dry_run: {
+          type: 'boolean',
+          description: 'When true, return the exact proposed definition without mutating Linear.',
+        },
+      },
+      required: ['label_name', 'reason'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+    const user = await userDb.getUserById(userId);
+    const delegated = context?.isDelegatedAccess === true || context?.isDelegatedAdmin === true;
+    if (user?.isAdmin !== true && !delegated) {
+      throw new Error('Admin access required to manage Linear governance labels');
+    }
+    let actor: string | undefined;
+    if (delegated) {
+      actor = context?.adminEmail;
+      if (!actor && context?.sessionId) {
+        const session = await chatbotDb.getChatSession(context.sessionId);
+        if (session?.delegateInfo?.isDelegated) {
+          actor = session.delegateInfo.adminEmail;
+        }
+      }
+      if (!actor) {
+        throw new Error('Delegated administrator identity unavailable');
+      }
+    } else {
+      actor = user?.email || userId;
+    }
+    if (!actor) {
+      throw new Error('Administrator identity unavailable');
+    }
+    const { manageLinearGovernanceLabel } = await import('../services/linearGovernanceLabelService');
+    return manageLinearGovernanceLabel({
+      labelName: args.label_name,
+      name: args.name,
+      description: args.description,
+      color: args.color,
+      reason: args.reason,
+      actor,
+      dryRun: args.dry_run === true,
+    });
+  },
+});
+
 const bridgedToolNames = [
   // Scheduled Chat tools
   'list_scheduled_chats',
@@ -6851,6 +6930,7 @@ const bridgedToolNames = [
 
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
 const adminToolNames = [
+  'manage_linear_governance_label',
   'list_predefined_work_plans',
   'manage_predefined_work_plan',
   'list_skills',

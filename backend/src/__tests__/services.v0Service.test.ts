@@ -113,7 +113,7 @@ jest.mock("../services/settingsService", () => ({
 }));
 jest.mock("../services/autoHumanEvalService", () => ({
   enqueueAutoHumanEval: jest.fn().mockResolvedValue(null),
-}), { virtual: true });
+}));
 const mockRunGenerationSmokeTest = jest.fn().mockResolvedValue(undefined);
 jest.mock("../services/landingPageSmokeTest", () => ({
   runGenerationSmokeTest: (...args: any[]) => mockRunGenerationSmokeTest(...args),
