@@ -23,6 +23,7 @@ import {
 } from './services/liveVoiceService';
 import {
   getEffectiveLiveUserId,
+  registerLiveCloseHandler,
   registerLiveStartHandler,
 } from './services/liveVoiceSocket';
 import {
@@ -177,6 +178,7 @@ io.on('connection', (socket: Socket) => {
   // ---------------------------------------------------------------------------
 
   registerLiveStartHandler(socket);
+  registerLiveCloseHandler(socket);
 
   socket.on('live:audio', ({ sessionId, chunk }: { sessionId: string; chunk: string }) => {
     console.log(`[liveVoice] live:audio received for session ${sessionId}, hasSession=${hasLiveSession(sessionId)}`);
@@ -204,11 +206,6 @@ io.on('connection', (socket: Socket) => {
       console.error(`[liveVoice] live:text error for session ${sessionId}:`, err?.message);
       socket.emit('live:error', { sessionId, error: err?.message });
     }
-  });
-
-  socket.on('live:close', ({ sessionId }: { sessionId: string }) => {
-    closeLiveSession(sessionId, socket.id);
-    socket.data.liveSessions?.delete(sessionId);
   });
 
   socket.on('live:report-issue', async ({

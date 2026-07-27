@@ -489,6 +489,19 @@ export class LiveSessionAuthorizationError extends Error {
   }
 }
 
+export class LiveSessionStartCancelledError extends Error {
+  readonly code = 'LIVE_SESSION_START_CANCELLED';
+
+  constructor() {
+    super('Live session start cancelled');
+    this.name = 'LiveSessionStartCancelledError';
+  }
+}
+
+function throwIfLiveStartCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new LiveSessionStartCancelledError();
+}
+
 /**
  * ENG-521 — verify the caller owns the chat session before any live-session
  * work happens.
@@ -555,6 +568,7 @@ export async function startLiveSession(
   emitFn: EmitFn,
   userId: string,
   toolProfile: LiveToolProfile = 'default',
+  signal?: AbortSignal,
 ): Promise<void> {
   // Read + write of pendingStarts happen in the same synchronous block, so two
   // overlapping calls can never both observe "no start in flight".
@@ -562,7 +576,10 @@ export async function startLiveSession(
   const start = (prior ?? Promise.resolve())
     // A failed prior start only orders this one — it must not fail it.
     .catch(() => {})
-    .then(() => doStartLiveSession(sessionId, socketId, emitFn, userId, toolProfile));
+    .then(() => {
+      throwIfLiveStartCancelled(signal);
+      return doStartLiveSession(sessionId, socketId, emitFn, userId, toolProfile, signal);
+    });
   pendingStarts.set(sessionId, start);
   try {
     await start;
@@ -577,10 +594,12 @@ async function doStartLiveSession(
   emitFn: EmitFn,
   userId: string,
   toolProfile: LiveToolProfile,
+  signal?: AbortSignal,
 ): Promise<void> {
   // Ownership gate FIRST — before any telemetry, before the existing-session
   // close below, and before any history is loaded or registered.
   await assertLiveSessionOwnership(sessionId, userId);
+  throwIfLiveStartCancelled(signal);
 
   const startedAt = Date.now();
   void recordOnboardingEvent(
@@ -588,19 +607,22 @@ async function doStartLiveSession(
     ONBOARDING_TELEMETRY_EVENTS.voiceSessionStarted,
     { sessionId },
   );
-  // Close any existing session for this sessionId
-  if (activeSessions.has(sessionId)) {
-    closeLiveSession(sessionId);
-  }
-
   // Load tools and prior history in parallel
   const [functionDeclarations, historyContext] = await Promise.all([
     loadGeminiFunctionDeclarations(userId, toolProfile),
     loadHistoryForSystemPrompt(sessionId),
   ]);
+  throwIfLiveStartCancelled(signal);
 
   if (historyContext) {
     console.log(`[liveVoiceService] Injecting history into system prompt for ${sessionId}`);
+  }
+
+  // Keep the current caller's live session intact until the replacement has
+  // finished all cancellable preparation. A queued start abandoned by its
+  // socket must never terminate a healthy session.
+  if (activeSessions.has(sessionId)) {
+    closeLiveSession(sessionId);
   }
 
   // Placeholder entry — filled after session resolves
@@ -624,6 +646,15 @@ async function doStartLiveSession(
   // Pass history via system prompt on fresh starts. Code-1000 resumptions already
   // carry Gemini's own in-memory context, so historyContext is not passed there.
   await openGeminiSession(sessionId, entry, undefined, historyContext || undefined);
+  if (signal?.aborted) {
+    try {
+      entry.session.close();
+    } catch {
+      // Ignore close errors while cancelling an abandoned start.
+    }
+    if (activeSessions.get(sessionId) === entry) activeSessions.delete(sessionId);
+    throw new LiveSessionStartCancelledError();
+  }
   entry.readyAt = Date.now();
   void recordOnboardingEvent(
     userId,

@@ -1,6 +1,7 @@
 import type { Socket } from 'socket.io';
 import {
   closeLiveSession,
+  LiveSessionStartCancelledError,
   startLiveSession,
   type LiveToolProfile,
 } from './liveVoiceService';
@@ -10,6 +11,31 @@ interface LiveSocketPrincipal {
   delegateAccess?: {
     targetUserId?: string;
   };
+}
+
+function getPendingLiveStarts(socket: Socket): Map<string, AbortController> {
+  if (!socket.data.pendingLiveStarts) {
+    socket.data.pendingLiveStarts = new Map<string, AbortController>();
+  }
+  return socket.data.pendingLiveStarts;
+}
+
+export function cancelPendingLiveStart(socket: Socket, sessionId: string): void {
+  getPendingLiveStarts(socket).get(sessionId)?.abort();
+}
+
+export function registerLiveCloseHandler(socket: Socket): void {
+  socket.on('live:close', ({ sessionId }: { sessionId: string }) => {
+    cancelPendingLiveStart(socket, sessionId);
+    closeLiveSession(sessionId, socket.id);
+    socket.data.liveSessions?.delete(sessionId);
+  });
+}
+
+function cancelAllPendingLiveStarts(socket: Socket): void {
+  for (const controller of getPendingLiveStarts(socket).values()) {
+    controller.abort();
+  }
 }
 
 /**
@@ -35,6 +61,7 @@ export function getEffectiveLiveUserId(socket: Socket): string {
  */
 export function registerLiveStartHandler(socket: Socket): void {
   const liveEmit = (event: string, data: unknown) => socket.emit(event, data);
+  socket.once('disconnect', () => cancelAllPendingLiveStarts(socket));
 
   socket.on('live:start', async ({
     sessionId,
@@ -43,6 +70,11 @@ export function registerLiveStartHandler(socket: Socket): void {
     sessionId: string;
     toolProfile?: LiveToolProfile;
   }) => {
+    const pendingStarts = getPendingLiveStarts(socket);
+    pendingStarts.get(sessionId)?.abort();
+    const controller = new AbortController();
+    pendingStarts.set(sessionId, controller);
+
     try {
       if (socket.data.conversableSessionId && socket.data.conversableSessionId !== sessionId) {
         throw new Error('Session ID mismatch for conversable socket');
@@ -50,7 +82,14 @@ export function registerLiveStartHandler(socket: Socket): void {
 
       const userId = getEffectiveLiveUserId(socket);
       console.log(`[liveVoice] live:start received for session ${sessionId} on socket ${socket.id}`);
-      await startLiveSession(sessionId, socket.id, liveEmit, userId, toolProfile);
+      await startLiveSession(
+        sessionId,
+        socket.id,
+        liveEmit,
+        userId,
+        toolProfile,
+        controller.signal,
+      );
 
       // Authorization and Gemini start both completed. Only now grant the
       // socket-local capability used by stream-end/report handlers. If the
@@ -65,11 +104,14 @@ export function registerLiveStartHandler(socket: Socket): void {
       console.log(`[liveVoice] live:start completed for session ${sessionId}`);
     } catch (err: any) {
       socket.data.liveSessions?.delete(sessionId);
+      if (err instanceof LiveSessionStartCancelledError) return;
       console.error(`[liveVoice] live:start error for session ${sessionId}:`, err?.message);
       socket.emit('live:error', {
         sessionId,
         error: err?.message ?? 'Failed to start live session',
       });
+    } finally {
+      if (pendingStarts.get(sessionId) === controller) pendingStarts.delete(sessionId);
     }
   });
 }

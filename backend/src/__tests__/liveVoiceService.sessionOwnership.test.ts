@@ -470,4 +470,63 @@ describe('startLiveSession — overlapping authorized starts are serialized (ENG
       sendTextTurn(OWNER_SESSION, 'still mine', 'socket-owner'),
     ).resolves.toBeUndefined();
   });
+
+  it('a cancelled queued start never supersedes the active owner session', async () => {
+    const firstSession = {
+      sendClientContent: jest.fn(),
+      sendRealtimeInput: jest.fn(),
+      sendToolResponse: jest.fn(),
+      close: jest.fn(),
+    };
+    const secondSession = {
+      sendClientContent: jest.fn(),
+      sendRealtimeInput: jest.fn(),
+      sendToolResponse: jest.fn(),
+      close: jest.fn(),
+    };
+    let releaseFirstConnect: (() => void) | undefined;
+    let markFirstConnectStarted: (() => void) | undefined;
+    const firstConnectStarted = new Promise<void>((resolve) => {
+      markFirstConnectStarted = resolve;
+    });
+    mockLiveConnect
+      .mockImplementationOnce(() => {
+        markFirstConnectStarted?.();
+        return new Promise((resolve) => {
+          releaseFirstConnect = () => resolve(firstSession);
+        });
+      })
+      .mockResolvedValueOnce(secondSession);
+
+    const ownerStart = startLiveSession(
+      OWNER_SESSION,
+      'socket-owner',
+      jest.fn(),
+      VICTIM_USER,
+    );
+    await firstConnectStarted;
+
+    const controller = new AbortController();
+    const queuedStart = startLiveSession(
+      OWNER_SESSION,
+      'socket-queued',
+      jest.fn(),
+      VICTIM_USER,
+      'default',
+      controller.signal,
+    );
+    controller.abort();
+    releaseFirstConnect?.();
+
+    await ownerStart;
+    await expect(queuedStart).rejects.toMatchObject({
+      name: 'LiveSessionStartCancelledError',
+      code: 'LIVE_SESSION_START_CANCELLED',
+    });
+    expect(mockLiveConnect).toHaveBeenCalledTimes(1);
+    expect(firstSession.close).not.toHaveBeenCalled();
+    await expect(
+      sendTextTurn(OWNER_SESSION, 'still owned', 'socket-owner'),
+    ).resolves.toBeUndefined();
+  });
 });
