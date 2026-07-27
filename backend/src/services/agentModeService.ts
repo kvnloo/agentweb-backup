@@ -13930,7 +13930,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const droppedFields = fields.filter(
         (f) => !ALLOWED_INSIGHTS_FIELDS.includes(f)
       );
-      const validFields = fields.filter((f) =>
+      let validFields = fields.filter((f) =>
         ALLOWED_INSIGHTS_FIELDS.includes(f)
       );
 
@@ -14030,15 +14030,64 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ...(filtering?.length && { filtering }),
       };
 
-      const submitRes = await axios.post(submitUrl, {
-        ...filteredParams,
-        access_token: accessToken,
-      });
+      const submitReport = async (fieldsToSend: string[]): Promise<string> => {
+        const submitRes = await axios.post(submitUrl, {
+          ...filteredParams,
+          fields: fieldsToSend.join(","),
+          access_token: accessToken,
+        });
+        const rid = (submitRes.data as any)?.report_run_id;
+        if (!rid) {
+          throw new Error("Failed to get report_run_id from Meta");
+        }
+        return rid;
+      };
 
-      const reportRunId = (submitRes.data as any)?.report_run_id;
+      // ENG-511: A field can clear our whitelist yet still be rejected by Meta for
+      // this node/API version (HTTP 400). Previously that surfaced as a bare error,
+      // the model re-issued the identical call, and the anti-loop guard hard-blocked
+      // the whole insights channel. Instead, parse the offending field(s) out of
+      // Meta's error, drop them, and retry the submit exactly ONCE with the valid
+      // remainder. If we cannot isolate the offender (or nothing valid would remain),
+      // return a structured no-retry error so the model corrects rather than loops.
+      let reportRunId: string;
+      try {
+        reportRunId = await submitReport(validFields);
+      } catch (submitErr: any) {
+        const metaError = submitErr?.response?.data?.error;
+        const status = submitErr?.response?.status;
+        const haystack = `${metaError?.message || ""} ${metaError?.error_user_msg || ""} ${metaError?.error_user_title || ""}`;
+        const isFieldError = status === 400 && /field/i.test(haystack);
+        if (!isFieldError) {
+          throw submitErr;
+        }
 
-      if (!reportRunId) {
-        throw new Error("Failed to get report_run_id from Meta");
+        // Word-boundary match so a rejected field is not confused with a longer
+        // sibling that contains it (e.g. `ctr` inside `inline_link_click_ctr`).
+        const metaRejectedFields = validFields.filter((f) =>
+          new RegExp(`\\b${f}\\b`).test(haystack)
+        );
+        const retryFields = validFields.filter(
+          (f) => !metaRejectedFields.includes(f)
+        );
+
+        if (metaRejectedFields.length && retryFields.length) {
+          // Drop the Meta-rejected field(s) and retry once with the valid subset.
+          droppedFields.push(...metaRejectedFields);
+          validFields = retryFields;
+          filteredParams.fields = validFields.join(",");
+          reportRunId = await submitReport(validFields);
+        } else {
+          return {
+            success: false,
+            error: `Meta rejected the requested insights field(s)${metaRejectedFields.length ? `: ${metaRejectedFields.join(", ")}` : ""}. Do not retry the same request — remove or replace the offending field(s) and choose from allowed fields such as impressions, clicks, spend, cpc, ctr, reach, inline_link_clicks, cost_per_inline_link_click.`,
+            metadata: {
+              tool: "call_meta_ads_insights_api",
+              account_id,
+              meta_error: metaError?.message || submitErr?.message,
+            },
+          };
+        }
       }
 
       // Polling Engine
