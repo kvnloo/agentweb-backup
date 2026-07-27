@@ -492,7 +492,7 @@ function listPreviews() {
     .map(([id, e]) => {
       // Stale = the branch moved past the commit this stack was brought up from (see preview.mjs refresh).
       const head = e.commit && e.worktree ? gitHeadOf(e.worktree) : null;
-      return { id: id.toUpperCase(), urls: e.urls || null, at: e.at || null, busy: previewOps.has(id.toUpperCase()), owner: owners[id.toUpperCase()] || null, commit: e.commit ? e.commit.slice(0, 9) : null, stale: !!(head && e.commit && head !== e.commit) };
+      return { id: id.toUpperCase(), urls: e.urls || null, at: e.at || null, busy: previewOps.has(id.toUpperCase()), owner: owners[id.toUpperCase()] || null, commit: e.commit ? e.commit.slice(0, 9) : null, stale: !!(head && e.commit && head !== e.commit), refreshing: !!e.refreshing, manual: !!e.manual };
     })
     .sort((a, b) => String(a.at).localeCompare(String(b.at)));
 }
@@ -520,7 +520,9 @@ async function runPreviewOp(identifier, entry, action) {
       // an immediate "close one first" rejection; nothing to evict here.
       await ensureProxy();
       emit({ type: 'status', text: 'Starting preview — builds the portals once, can take a few minutes…' });
-      await spawnPreview(['up', identifier, loc.cwd]);
+      // '--manual' marks this preview as user-started, so the agent's idle/cap eviction never tears it
+      // down (only the OOM backstop may). The pipeline auto-keep brings previews up WITHOUT this flag.
+      await spawnPreview(['up', identifier, loc.cwd, '--manual']);
     } else if (action === 'refresh') {
       await ensureProxy();
       emit({ type: 'status', text: '🔄 Refreshing preview to the branch head…' });
@@ -554,8 +556,12 @@ async function refreshPreview(identifier, entry) {
     const loc = resolveCwd(identifier, entry, emit);
     if (loc.error || loc.cwd === agentRoot) return;
     await ensureProxy();
+    // Preserve user-started provenance across the down→up rebuild (the down clears the entry, so read it
+    // first and re-assert --manual on the way back up).
+    let wasManual = false;
+    try { wasManual = !!JSON.parse(readFileSync(previewStatePath, 'utf8'))[identifier.toLowerCase()]?.manual; } catch { /* none */ }
     await spawnPreview(['down', identifier]);
-    await spawnPreview(['up', identifier, loc.cwd]);
+    await spawnPreview(['up', identifier, loc.cwd, ...(wasManual ? ['--manual'] : [])]);
     emit({ type: 'status', text: '✅ Preview refreshed with your latest changes.' });
   } catch (e) {
     emit({ type: 'error', error: `preview refresh failed: ${String(e.message || e)}` });

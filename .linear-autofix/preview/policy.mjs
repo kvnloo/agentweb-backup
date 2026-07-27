@@ -68,13 +68,17 @@ export function evictToMakeRoom(identifier, cap, log = () => {}) {
   const others = Object.keys(state).filter((b) => b !== exc);
   const limit = Math.max(0, cap - 1);
   if (others.length <= limit) return [];
+  const need = others.length - limit;
   const access = readJson(ACCESS);
   const chat = readJson(CHAT_STATE);
-  const ranked = others
+  // Only agent-created previews are evictable to make room; a user-started (manual) preview is never
+  // torn down by the cap path (the OOM backstop is the only thing that may). If there aren't enough
+  // agent previews to reach the cap, we evict what we can and let the extra manual ones stand.
+  const ranked = others.filter((b) => !state[b]?.manual)
     .map((b) => ({ b, hit: lastHit(b, state, access, chat) }))
     .sort((a, z) => a.hit - z.hit);
   const evicted = [];
-  for (const { b, hit } of ranked.slice(0, others.length - limit)) {
+  for (const { b, hit } of ranked.slice(0, need)) {
     const ago = hit ? `${Math.round((Date.now() - hit) / 60000)}m ago` : 'never';
     log(`forced preview at cap ${cap}: evicting longest-idle ${b} (last hit ${ago}) to make room for ${identifier}`);
     spawnSync('node', [PREVIEW, 'down', b], { stdio: 'inherit' });
@@ -88,6 +92,7 @@ export function evictToMakeRoom(identifier, cap, log = () => {}) {
 // with a recent URL open or chat message has a recent lastHit and is never returned.
 export function idlePreviews(maxIdleMs, now = Date.now(), state = readJson(STATE), access = readJson(ACCESS), chat = readJson(CHAT_STATE)) {
   return Object.keys(state)
+    .filter((b) => !state[b]?.manual)  // never idle-reap a user-started preview (only the OOM backstop may)
     .map((b) => ({ b, hit: lastHit(b, state, access, chat) }))
     .filter(({ hit }) => now - hit >= maxIdleMs)
     .sort((a, z) => a.hit - z.hit);
@@ -162,13 +167,16 @@ export function evictPreviewsToFit(cap, log = () => {}) {
   const state = readJson(STATE);
   const bugs = Object.keys(state);
   if (bugs.length <= cap) return [];
+  const need = bugs.length - cap;
   const access = readJson(ACCESS);
   const chat = readJson(CHAT_STATE);
-  const ranked = bugs
+  // Only agent-created previews are evictable here; user-started (manual) ones are never dropped by the
+  // cap path (OOM backstop excepted). Evict as many agent previews as needed/available, oldest first.
+  const ranked = bugs.filter((b) => !state[b]?.manual)
     .map((b) => ({ b, hit: lastHit(b, state, access, chat) }))
     .sort((a, z) => a.hit - z.hit); // oldest (most idle) first
   const evicted = [];
-  for (const { b, hit } of ranked.slice(0, bugs.length - cap)) {
+  for (const { b, hit } of ranked.slice(0, need)) {
     const ago = hit ? `${Math.round((Date.now() - hit) / 60000)}m ago` : 'never';
     log(`preview cap ${cap}: evicting longest-idle preview ${b} (last hit ${ago})`);
     spawnSync('node', [PREVIEW, 'down', b], { stdio: 'inherit' });

@@ -142,6 +142,15 @@ async function up(bugRaw, worktreeRaw) {
   if (!existsSync(worktree)) { console.error(`worktree not found: ${worktree}`); process.exit(1); }
   mkdirSync(LOGS, { recursive: true });
 
+  // Provenance + refresh visibility: capture the prior entry BEFORE teardown. `manual` (the user
+  // explicitly started this preview) is carried across refreshes so eviction keeps respecting it; and a
+  // refresh of an already-up stack stays VISIBLE in the monitor during its ~30-60s rebuild (old urls +
+  // `refreshing`) instead of a bare `starting` placeholder that listPreviews hides (the "vanishes then
+  // reappears" flicker).
+  const prior = readJson(STATE)[bug];
+  const wasUp = !!(prior && prior.procs && prior.urls);
+  const manual = process.argv.includes('--manual') || !!prior?.manual;
+
   // Bug 2 leak fix: an existing live stack for this same bug is overwritten below (routes + state +
   // freshly-allocated ports), orphaning its old process groups forever (two full stacks resident for
   // one ticket → the OOM). Stop-and-await any prior stack FIRST so we never leak one.
@@ -151,7 +160,12 @@ async function up(bugRaw, worktreeRaw) {
   // bug counts this in-flight preview (otherwise two both read the same pre-write count and both slip
   // past the cap). Overwritten with the full entry at the end; torn down by down() / the cap-refuse
   // below on failure. The cap check excludes this bug, so its own placeholder never blocks it.
-  { const st0 = readJson(STATE); if (!st0[bug]) { st0[bug] = { worktree, at: new Date().toISOString(), starting: true }; writeJson(STATE, st0); } }
+  { const st0 = readJson(STATE); if (!st0[bug]) {
+      st0[bug] = wasUp
+        ? { worktree, urls: prior.urls, at: prior.at || new Date().toISOString(), refreshing: true, ...(manual ? { manual: true } : {}) }
+        : { worktree, at: new Date().toISOString(), starting: true, ...(manual ? { manual: true } : {}) };
+      writeJson(STATE, st0);
+  } }
 
   // Hard concurrent-preview cap (config.maxConcurrentPreviews): never run more than N full stacks at
   // once — the memory guard. REFUSE, don't evict: if N OTHER previews are already up, drop our
@@ -224,7 +238,7 @@ async function up(bugRaw, worktreeRaw) {
   // Record the commit this stack was brought up from, so gc / the chat dropdown can tell when the branch
   // has advanced past it (→ stale, needs a refresh). This is the main agentweb worktree HEAD (backend +
   // partner-portal live here; the customer-portal repo isn't tracked for staleness yet).
-  state[bug] = { worktree, ports, procs, urls, commit: currentHead(worktree), at: new Date().toISOString() };
+  state[bug] = { worktree, ports, procs, urls, commit: currentHead(worktree), at: new Date().toISOString(), ...(manual ? { manual: true } : {}) };
   writeJson(STATE, state);
 
   console.log('[preview] waiting for services to come up (first boot of backend can take ~30s)...');

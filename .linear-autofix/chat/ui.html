@@ -618,13 +618,18 @@ function buildPreviewsPop() {
   if (!S.previews.length) return head + '<div class="fmempty">No previews running.</div>';
   return head + S.previews.map((p) => {
     const owner = p.owner ? `<span class="pvowner" title="${esc(p.owner)}">${esc(p.owner.split(/\s+/)[0])}</span>` : '';
+    const mine = p.manual ? `<span class="pvmine" title="You started this preview — the agent won't auto-close it (only the OOM guard may)">📌</span>` : '';
     const stale = p.stale ? `<span class="pvstale" title="branch has advanced past this preview — stale">⚠</span>` : '';
     const chat = `<a class="pvopen" href="#${encodeURIComponent(p.id)}" title="Open this task's chat">chat ↗</a>`;
-    const refresh = (p.stale && !p.busy) ? `<button class="pvrefresh" data-refresh="${esc(p.id)}" title="Rebuild to the branch head">↻</button>` : '';
-    const btn = p.busy
-      ? '<button class="pvkill" disabled>working…</button>'
-      : `<button class="pvkill" data-id="${esc(p.id)}">■ Disable</button>`;
-    return `<div class="pvrow${p.stale ? ' stale' : ''}"><span class="pvid">${esc(p.id)}</span>${owner}${stale}${chat}${refresh}${btn}</div>`;
+    // A refreshing preview is rebuilding (portals build ~30-60s) — it STAYS listed with its old URLs so
+    // the count doesn't flicker; just show it's refreshing and don't offer refresh/disable mid-rebuild.
+    const refresh = (p.stale && !p.busy && !p.refreshing) ? `<button class="pvrefresh" data-refresh="${esc(p.id)}" title="Rebuild to the branch head">↻</button>` : '';
+    const btn = p.refreshing
+      ? '<button class="pvkill" disabled>↻ refreshing…</button>'
+      : p.busy
+        ? '<button class="pvkill" disabled>working…</button>'
+        : `<button class="pvkill" data-id="${esc(p.id)}">■ Disable</button>`;
+    return `<div class="pvrow${p.stale ? ' stale' : ''}${p.refreshing ? ' refreshing' : ''}"><span class="pvid">${esc(p.id)}</span>${mine}${owner}${stale}${chat}${refresh}${btn}</div>`;
   }).join('');
 }
 function openPreviews(anchorEl) {
