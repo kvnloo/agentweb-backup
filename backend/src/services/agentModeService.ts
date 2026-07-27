@@ -14102,37 +14102,56 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // corrects rather than loops.
       let reportRunId: string;
       let allData: any[];
-      try {
-        const first = await runReport(validFields);
-        reportRunId = first.reportRunId;
-        allData = first.data;
-      } catch (reportErr: any) {
-        const metaError = reportErr?.response?.data?.error;
-        const status = reportErr?.response?.status;
-        const haystack = `${metaError?.message || ""} ${metaError?.error_user_msg || ""} ${metaError?.error_user_title || ""}`;
-        const isFieldError = status === 400 && /field/i.test(haystack);
-        if (!isFieldError) {
-          throw reportErr;
-        }
+      // Meta names incompatible fields ONE AT A TIME, so a single retry only clears
+      // one bad field. Loop: drop the field(s) Meta names, retry with the remainder,
+      // and repeat until the report succeeds or nothing valid is left. Each pass
+      // removes >=1 field, so validFields strictly shrinks — the loop is bounded by
+      // the field count (maxHealAttempts is a belt-and-suspenders cap).
+      const maxHealAttempts = validFields.length + 1;
+      let healAttempts = 0;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        try {
+          const run = await runReport(validFields);
+          reportRunId = run.reportRunId;
+          allData = run.data;
+          break;
+        } catch (reportErr: any) {
+          const metaError = reportErr?.response?.data?.error;
+          const status = reportErr?.response?.status;
+          const haystack = `${metaError?.message || ""} ${metaError?.error_user_msg || ""} ${metaError?.error_user_title || ""}`;
+          const isFieldError = status === 400 && /field/i.test(haystack);
 
-        // Word-boundary match so a rejected field is not confused with a longer
-        // sibling that contains it (e.g. `ctr` inside `inline_link_click_ctr`).
-        const metaRejectedFields = validFields.filter((f) =>
-          new RegExp(`\\b${f}\\b`).test(haystack)
-        );
-        const retryFields = validFields.filter(
-          (f) => !metaRejectedFields.includes(f)
-        );
+          // Word-boundary match so a rejected field is not confused with a longer
+          // sibling that contains it (e.g. `ctr` inside `inline_link_click_ctr`).
+          const metaRejectedFields = isFieldError
+            ? validFields.filter((f) => new RegExp(`\\b${f}\\b`).test(haystack))
+            : [];
+          const retryFields = validFields.filter(
+            (f) => !metaRejectedFields.includes(f)
+          );
 
-        if (metaRejectedFields.length && retryFields.length) {
-          // Drop the Meta-rejected field(s) and retry once with the valid subset.
-          droppedFields.push(...metaRejectedFields);
-          validFields = retryFields;
-          filteredParams.fields = validFields.join(",");
-          const retry = await runReport(validFields);
-          reportRunId = retry.reportRunId;
-          allData = retry.data;
-        } else {
+          if (
+            isFieldError &&
+            metaRejectedFields.length &&
+            retryFields.length &&
+            healAttempts < maxHealAttempts
+          ) {
+            // Drop the Meta-rejected field(s) and retry with the valid subset.
+            healAttempts++;
+            droppedFields.push(...metaRejectedFields);
+            validFields = retryFields;
+            filteredParams.fields = validFields.join(",");
+            continue;
+          }
+
+          if (!isFieldError) {
+            throw reportErr;
+          }
+
+          // Field error we cannot recover from (offender unisolable, nothing valid
+          // remains, or cap hit): return a structured no-retry error so the model
+          // corrects rather than loops.
           const suggestions = suggestInsightsFields(metaRejectedFields);
           const suggestionHint = Object.keys(suggestions).length
             ? ` Did you mean: ${Object.entries(suggestions)
