@@ -8,48 +8,53 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import secrets_manager
 
 
+def _mock_secret_manager_client(payload: str):
+    client = MagicMock()
+    response = MagicMock()
+    response.payload.data = payload.encode('UTF-8')
+    client.access_secret_version.return_value = response
+    return client
+
+
 class TestSecretsManagerEnvFallback(unittest.TestCase):
-    """Env var must always win and Secrets Manager must never be called when it's set."""
+    """Env var must always win and GCP Secret Manager must never be called when it's set."""
 
     def setUp(self):
         secrets_manager._secret_cache.clear()
+        secrets_manager._client = None
 
-    @patch('secrets_manager.boto3.client')
-    def test_string_secret_uses_env_var_without_calling_aws(self, mock_boto_client):
+    @patch('secrets_manager.secretmanager.SecretManagerServiceClient')
+    def test_string_secret_uses_env_var_without_calling_gcp(self, mock_client_cls):
         with patch.dict(os.environ, {'RESEND_API_KEY': 'env-value'}, clear=False):
             result = secrets_manager.get_resend_api_key()
         self.assertEqual(result, 'env-value')
-        mock_boto_client.assert_not_called()
+        mock_client_cls.assert_not_called()
 
-    @patch('secrets_manager.boto3.client')
-    def test_json_secret_uses_env_var_without_calling_aws(self, mock_boto_client):
+    @patch('secrets_manager.secretmanager.SecretManagerServiceClient')
+    def test_json_secret_uses_env_var_without_calling_gcp(self, mock_client_cls):
         with patch.dict(os.environ, {'AZURE_OPENAI_API_KEY': 'env-azure-key'}, clear=False):
             result = secrets_manager.get_azure_openai_api_key()
         self.assertEqual(result, 'env-azure-key')
-        mock_boto_client.assert_not_called()
+        mock_client_cls.assert_not_called()
 
-    @patch('secrets_manager.boto3.client')
-    def test_string_secret_falls_back_to_secrets_manager_when_env_unset(self, mock_boto_client):
-        mock_client = MagicMock()
-        mock_client.get_secret_value.return_value = {'SecretString': 'sm-value'}
-        mock_boto_client.return_value = mock_client
+    @patch('secrets_manager.secretmanager.SecretManagerServiceClient')
+    def test_string_secret_falls_back_to_secret_manager_when_env_unset(self, mock_client_cls):
+        mock_client_cls.return_value = _mock_secret_manager_client('sm-value')
 
         with patch.dict(os.environ, {}, clear=True):
             os.environ.pop('RESEND_API_KEY', None)
             result = secrets_manager.get_resend_api_key()
 
         self.assertEqual(result, 'sm-value')
-        mock_client.get_secret_value.assert_called_once()
-        called_secret_id = mock_client.get_secret_value.call_args.kwargs['SecretId']
-        self.assertTrue(called_secret_id.endswith('/AgentWeb/AgentEngine/Resend'))
+        client = mock_client_cls.return_value
+        client.access_secret_version.assert_called_once()
+        called_name = client.access_secret_version.call_args.kwargs['request']['name']
+        self.assertIn('/secrets/agentengine-dev-resend/versions/latest', called_name)
 
-    @patch('secrets_manager.boto3.client')
-    def test_json_secret_falls_back_to_secrets_manager_when_env_unset(self, mock_boto_client):
-        mock_client = MagicMock()
-        mock_client.get_secret_value.return_value = {
-            'SecretString': '{"apiKey": "sm-azure-key", "endpoint": "https://example.azure.com", "apiVersion": "2024-08-01-preview"}'
-        }
-        mock_boto_client.return_value = mock_client
+    @patch('secrets_manager.secretmanager.SecretManagerServiceClient')
+    def test_json_secret_falls_back_to_secret_manager_when_env_unset(self, mock_client_cls):
+        payload = '{"apiKey": "sm-azure-key", "endpoint": "https://example.azure.com", "apiVersion": "2024-08-01-preview"}'
+        mock_client_cls.return_value = _mock_secret_manager_client(payload)
 
         with patch.dict(os.environ, {}, clear=True):
             os.environ.pop('AZURE_OPENAI_API_KEY', None)
@@ -59,34 +64,46 @@ class TestSecretsManagerEnvFallback(unittest.TestCase):
         self.assertEqual(api_key, 'sm-azure-key')
         self.assertEqual(endpoint, 'https://example.azure.com')
         # The underlying secret is fetched once and cached across getters.
-        mock_client.get_secret_value.assert_called_once()
+        mock_client_cls.return_value.access_secret_version.assert_called_once()
 
-    @patch('secrets_manager.boto3.client')
-    def test_secret_name_uses_dev_prefix_by_default(self, mock_boto_client):
-        mock_client = MagicMock()
-        mock_client.get_secret_value.return_value = {'SecretString': 'sm-value'}
-        mock_boto_client.return_value = mock_client
+    @patch('secrets_manager.secretmanager.SecretManagerServiceClient')
+    def test_secret_id_uses_dev_prefix_by_default(self, mock_client_cls):
+        mock_client_cls.return_value = _mock_secret_manager_client('sm-value')
 
         with patch.dict(os.environ, {}, clear=True):
             os.environ.pop('AGENT_ENGINE_ENV', None)
             os.environ.pop('RESEND_API_KEY', None)
             secrets_manager.get_resend_api_key()
 
-        called_secret_id = mock_client.get_secret_value.call_args.kwargs['SecretId']
-        self.assertTrue(called_secret_id.startswith('dev/'))
+        called_name = mock_client_cls.return_value.access_secret_version.call_args.kwargs['request']['name']
+        self.assertIn('/secrets/agentengine-dev-resend/', called_name)
 
-    @patch('secrets_manager.boto3.client')
-    def test_secret_name_uses_prod_prefix_when_configured(self, mock_boto_client):
-        mock_client = MagicMock()
-        mock_client.get_secret_value.return_value = {'SecretString': 'sm-value'}
-        mock_boto_client.return_value = mock_client
+    @patch('secrets_manager.secretmanager.SecretManagerServiceClient')
+    def test_secret_id_uses_prod_prefix_when_configured(self, mock_client_cls):
+        mock_client_cls.return_value = _mock_secret_manager_client('sm-value')
 
         with patch.dict(os.environ, {'AGENT_ENGINE_ENV': 'production'}, clear=False):
             os.environ.pop('RESEND_API_KEY', None)
             secrets_manager.get_resend_api_key()
 
-        called_secret_id = mock_client.get_secret_value.call_args.kwargs['SecretId']
-        self.assertTrue(called_secret_id.startswith('prod/'))
+        called_name = mock_client_cls.return_value.access_secret_version.call_args.kwargs['request']['name']
+        self.assertIn('/secrets/agentengine-prod-resend/', called_name)
+
+    @patch('secrets_manager.secretmanager.SecretManagerServiceClient')
+    def test_aws_credentials_fetched_from_json_secret(self, mock_client_cls):
+        payload = '{"accessKeyId": "AKIAFAKE", "secretAccessKey": "fakesecret"}'
+        mock_client_cls.return_value = _mock_secret_manager_client(payload)
+
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ.pop('AWS_ACCESS_KEY_ID', None)
+            os.environ.pop('AWS_SECRET_ACCESS_KEY', None)
+            access_key = secrets_manager.get_aws_access_key_id()
+            secret_key = secrets_manager.get_aws_secret_access_key()
+
+        self.assertEqual(access_key, 'AKIAFAKE')
+        self.assertEqual(secret_key, 'fakesecret')
+        # Both getters resolve from the same underlying secret, fetched once.
+        mock_client_cls.return_value.access_secret_version.assert_called_once()
 
 
 if __name__ == '__main__':

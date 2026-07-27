@@ -2,21 +2,23 @@ import os
 import boto3
 from botocore.config import Config
 import logging
+import secrets_manager
 
 logger = logging.getLogger(__name__)
 
 def get_aws_credentials():
     """
-    Get AWS credentials. If AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY are set
-    (local dev via .env), use them explicitly. Otherwise (prod), omit
-    explicit keys and let boto3's default credential chain use the
-    instance's attached/federated service account.
+    Get AWS credentials. Env vars (local dev via .env) take precedence;
+    otherwise fetch the (rotated, non-Rui) access key from GCP Secret
+    Manager. There is no GCP<->AWS workload identity federation for this
+    VM, so a stored access key — not an instance/federated identity — is
+    the actual credential source in prod.
     """
-    credentials = {'region_name': os.getenv('AWS_REGION', 'us-west-2')}
-    if os.getenv('AWS_ACCESS_KEY_ID'):
-        credentials['aws_access_key_id'] = os.getenv('AWS_ACCESS_KEY_ID')
-        credentials['aws_secret_access_key'] = os.getenv('AWS_SECRET_ACCESS_KEY')
-    return credentials
+    return {
+        'region_name': os.getenv('AWS_REGION', 'us-west-2'),
+        'aws_access_key_id': secrets_manager.get_aws_access_key_id(),
+        'aws_secret_access_key': secrets_manager.get_aws_secret_access_key(),
+    }
 
 def get_aws_client(service_name: str, config: Config = None) -> boto3.client:
     """
