@@ -472,6 +472,54 @@ async function loadHistoryForSystemPrompt(sessionId: string): Promise<string> {
 }
 
 /**
+ * Uniform rejection for an unauthorized live-session request. Deliberately does
+ * NOT distinguish "session does not exist" from "session belongs to someone
+ * else" — the message is relayed straight to the client over `live:error`, so a
+ * distinguishable message would turn `live:start` into a session-ID enumeration
+ * oracle.
+ */
+const LIVE_SESSION_FORBIDDEN = 'Not authorized for this chat session';
+
+/**
+ * ENG-521 — verify the caller owns the chat session before any live-session
+ * work happens.
+ *
+ * `live:start` takes a client-supplied `sessionId`. Without this check any
+ * authenticated user who learned another tenant's session ID got that tenant's
+ * message history injected into the Gemini Live system prompt (disclosure),
+ * had their own voice turns persisted onto that session (write), and closed
+ * and took over the victim's in-flight live session (hijack).
+ *
+ * `effectiveUserId` is already the resolved principal: the delegated
+ * `targetUserId` for a delegate token, and the share owner's `userId` for an
+ * iShare (conversable) socket — so those boundaries keep working unchanged.
+ *
+ * Uses `getChatSessionRecord` rather than `getChatSession` so an unauthorized
+ * caller never triggers a read (or legacy migration write) of the victim's
+ * message table.
+ */
+export async function assertLiveSessionOwnership(
+  sessionId: string,
+  effectiveUserId: string,
+): Promise<void> {
+  const session = await chatbotDb.getChatSessionRecord(sessionId);
+
+  if (!session) {
+    console.warn(
+      `[liveVoiceService] live session denied — session ${sessionId} not found (requested by ${effectiveUserId})`,
+    );
+    throw new Error(LIVE_SESSION_FORBIDDEN);
+  }
+
+  if (!session.userId || !effectiveUserId || session.userId !== effectiveUserId) {
+    console.warn(
+      `[liveVoiceService] live session denied — session ${sessionId} is owned by ${session.userId ?? '<none>'}, requested by ${effectiveUserId}`,
+    );
+    throw new Error(LIVE_SESSION_FORBIDDEN);
+  }
+}
+
+/**
  * Start a Gemini Live session for the given Agent Mode sessionId.
  * If a session already exists for this sessionId, it is closed first.
  *
@@ -486,6 +534,10 @@ export async function startLiveSession(
   userId: string,
   toolProfile: LiveToolProfile = 'default',
 ): Promise<void> {
+  // Ownership gate FIRST — before any telemetry, before the existing-session
+  // close below, and before any history is loaded or registered.
+  await assertLiveSessionOwnership(sessionId, userId);
+
   const startedAt = Date.now();
   void recordOnboardingEvent(
     userId,
