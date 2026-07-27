@@ -441,27 +441,31 @@ describe('executePreparedTools', () => {
       expect(input.toolCallsLedger[0].result).toEqual({ deferred: true, reason: 'media_generation_time_budget' });
     });
 
-    it('still produces one asset when over budget but nothing has been generated yet (forward progress)', async () => {
+    it('still makes forward progress (one batch) when over budget but nothing generated yet', async () => {
       const { ports, executed } = mediaPorts();
       const input = makeInput(
         [
           toolCall('a', 'generate_image', '{"prompt":"1"}'),
           toolCall('b', 'generate_image', '{"prompt":"2"}'),
           toolCall('c', 'generate_image', '{"prompt":"3"}'),
+          toolCall('d', 'generate_image', '{"prompt":"4"}'),
         ],
         ports,
         { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 0 },
       );
       const result = await executePreparedTools(input);
 
-      // First call runs (no asset existed yet); the remaining two defer.
-      expect(executed).toEqual(['generate_image']);
-      expect(result.mediaAssetsProduced).toBe(1);
+      // The first batch (bounded concurrency) runs as forward progress — a batch of 3
+      // concurrent images takes ~one image's wall-clock, so it is as cap-safe as the old
+      // single-image forward progress while delivering more. The 4th (next batch) defers.
+      expect(executed).toEqual(['generate_image', 'generate_image', 'generate_image']);
+      expect(result.mediaAssetsProduced).toBe(3);
       expect(result.mediaBudgetDeferred).toBe(true);
-      expect(result.pendingCounterUpdates).toEqual({ generate_image: 1 });
+      expect(result.pendingCounterUpdates).toEqual({ generate_image: 3 });
       expect(input.messages.map((m: any) => m.content)).toEqual([
         expect.stringContaining('https://s3/generate_image.png'),
-        expect.stringMatching(/paused|continue/i),
+        expect.stringContaining('https://s3/generate_image.png'),
+        expect.stringContaining('https://s3/generate_image.png'),
         expect.stringMatching(/paused|continue/i),
       ]);
     });
@@ -576,28 +580,26 @@ describe('executePreparedTools', () => {
       expect(result.mediaAssetsProduced).toBe(1);
     });
 
-    it("defers the second call once the first call's duration shows it will not fit before the hard cap", async () => {
+    it('defers a solo per-iteration media call when the run-wide longest duration will not fit before the hard cap', async () => {
+      // The real prod failure mode: variants emitted ONE PER ITERATION. Iteration 2's solo
+      // generate_image must be deferred because iteration 1's image (threaded in via
+      // longestMediaCallMsThisRun) was slow and there is < one image of time left.
       const { ports, executed } = mediaPortsWithDuration(5000);
       const input = makeInput(
-        [
-          toolCall('a', 'generate_image', '{"prompt":"1"}'),
-          toolCall('b', 'generate_image', '{"prompt":"2"}'),
-        ],
+        [toolCall('a', 'generate_image', '{"prompt":"x"}')],
         ports,
         {
-          mediaGenerationDeadlineMs: Date.now() + 60_000, // soft budget future
-          mediaAssetsProducedThisRun: 0,                  // forward-progress: first still runs
-          generationHardCapMs: Date.now() + 3000,         // < one 5s media call once the first has run
-          longestMediaCallMsThisRun: 0,
+          mediaGenerationDeadlineMs: Date.now() + 60_000, // soft budget NOT exceeded
+          mediaAssetsProducedThisRun: 1,                  // a prior iteration already produced one
+          generationHardCapMs: Date.now() + 3000,         // < the longest observed media call
+          longestMediaCallMsThisRun: 5000,                // prior iteration's image took ~5s
         } as any,
       );
       const result = await executePreparedTools(input);
 
-      // First runs (forward progress); its observed 5s duration then trips the reserve
-      // for the second, which is deferred instead of blowing the hard cap.
-      expect(executed).toEqual(['generate_image']);
-      expect(result.mediaAssetsProduced).toBe(1);
+      expect(executed).toEqual([]);
       expect(result.mediaBudgetDeferred).toBe(true);
+      expect(result.mediaAssetsProduced).toBe(0);
     });
 
     it('reports the longest media-call duration this iteration, carrying the prior-run floor', async () => {
@@ -630,6 +632,84 @@ describe('executePreparedTools', () => {
       const result = await executePreparedTools(input);
       expect(executed).toEqual(['generate_image']);
       expect(result.mediaBudgetDeferred).toBe(false);
+    });
+  });
+
+  describe('bounded-concurrency media batches (ENG-510)', () => {
+    // Gateway that tracks how many tool executions overlap in flight, so we can prove
+    // batched media-gen runs concurrently but capped — not strictly serial, not unbounded.
+    function concurrencyPorts() {
+      let inFlight = 0;
+      let maxInFlight = 0;
+      const executed: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          inFlight++;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await new Promise((r) => setImmediate(r)); // yield so batch siblings start before we finish
+          const result = await i.execute();
+          executed.push(i.toolName);
+          inFlight--;
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async (i: any) => ({ success: true, imageUrl: `https://s3/${i.toolName}.png` }),
+      });
+      return { ports, executed, maxInFlight: () => maxInFlight };
+    }
+
+    it('runs several batched image variants concurrently, capped at 3 in flight', async () => {
+      const { ports, executed, maxInFlight } = concurrencyPorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'generate_image', '{"prompt":"1"}'),
+          toolCall('b', 'generate_image', '{"prompt":"2"}'),
+          toolCall('c', 'generate_image', '{"prompt":"3"}'),
+          toolCall('d', 'generate_image', '{"prompt":"4"}'),
+        ],
+        ports,
+      );
+      const result = await executePreparedTools(input);
+
+      expect(executed).toHaveLength(4);
+      expect(maxInFlight()).toBe(3); // concurrent, but bounded to 3
+      expect(result.mediaAssetsProduced).toBe(4);
+      // Results preserve emission order regardless of completion order.
+      expect(input.toolCallsLedger.map((t: any) => t.id)).toEqual(['a', 'b', 'c', 'd']);
+    });
+
+    it('stays strictly sequential when wait_seconds is present', async () => {
+      const { ports, maxInFlight } = concurrencyPorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'generate_image', '{"prompt":"1"}'),
+          toolCall('w', 'wait_seconds', '{"seconds":0}'),
+          toolCall('b', 'generate_image', '{"prompt":"2"}'),
+        ],
+        ports,
+      );
+      await executePreparedTools(input);
+      expect(maxInFlight()).toBe(1);
+    });
+
+    it('defers the next BATCH as a unit once over budget with an asset produced', async () => {
+      const { ports, executed } = concurrencyPorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'generate_image', '{"prompt":"1"}'),
+          toolCall('b', 'generate_image', '{"prompt":"2"}'),
+          toolCall('c', 'generate_image', '{"prompt":"3"}'),
+          toolCall('d', 'generate_image', '{"prompt":"4"}'),
+          toolCall('e', 'generate_image', '{"prompt":"5"}'),
+          toolCall('f', 'generate_image', '{"prompt":"6"}'),
+        ],
+        ports,
+        { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 0 },
+      );
+      const result = await executePreparedTools(input);
+      // First batch of 3 runs (forward progress); the second batch is deferred as a unit.
+      expect(executed).toHaveLength(3);
+      expect(result.mediaAssetsProduced).toBe(3);
+      expect(result.mediaBudgetDeferred).toBe(true);
     });
   });
 
