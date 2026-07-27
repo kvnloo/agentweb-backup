@@ -6,7 +6,13 @@ import { settingsService } from "../services/settingsService";
 import { uploadScreenshotToS3, presignS3Url } from "../utils/s3Utils";
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from "../config";
 import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from "../utils/userFunnelStatus";
-import { buildReportTitle, toSingleLine, reportFingerprint, fileReportOnce } from "../utils/reportIntake";
+import {
+  buildReportTitle,
+  toSingleLine,
+  reportFingerprint,
+  fileReportOnce,
+  ReportReplayCapacityError,
+} from "../utils/reportIntake";
 import { reportUIError } from "../utils/errorReporter";
 import type { FiledUserResult } from "../services/intakeService";
 
@@ -473,6 +479,14 @@ router.post("/report-ui-bug", async (req, res) => {
       adminEmail: isDelegated && adminEmail ? adminEmail : undefined,
     };
   } catch (error) {
+    if (error instanceof ReportReplayCapacityError) {
+      // The bounded replay guard is fully occupied by authoritative filings. Ask the client to
+      // retry instead of misreporting this temporary admission condition as a filing failure.
+      return res
+        .status(503)
+        .set("Retry-After", "5")
+        .json({ message: "Report intake is busy; please retry shortly" });
+    }
     // Nothing durable happened — say so plainly and claim nothing was tracked.
     console.error("Error submitting product report:", error);
     return res.status(500).json({ message: "Failed to submit report" });

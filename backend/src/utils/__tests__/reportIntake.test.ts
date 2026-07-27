@@ -223,6 +223,26 @@ describe('fileReportOnce', () => {
     expect(overflowFiler).toHaveBeenCalledTimes(1);
   });
 
+  it('bounds all-pending backpressure without starting an untracked filing', async () => {
+    const neverSettles = new Promise<{ pageId: string }>(() => {});
+    for (let i = 0; i < 500; i++) {
+      void fileReportOnce(`pending-${i}`, () => neverSettles, 1_000);
+    }
+
+    const overflowFiler = jest.fn().mockResolvedValue({ pageId: 'overflow' });
+    const guarded = (fileReportOnce as any)('overflow', overflowFiler, 1_001, 1);
+    const observed = Promise.race([
+      guarded,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error('test observed unbounded backpressure')),
+        50,
+      )),
+    ]);
+
+    await expect(observed).rejects.toThrow('Report replay guard is busy');
+    expect(overflowFiler).not.toHaveBeenCalled();
+  });
+
   it('files again once the replay window has elapsed', async () => {
     const filer = jest.fn().mockResolvedValue({ pageId: '169' });
 

@@ -13,7 +13,9 @@
 import express from 'express';
 import request from 'supertest';
 import supportRouter from '../routes/support';
-import { __resetReportIdempotencyForTests } from '../utils/reportIntake';
+import * as reportIntake from '../utils/reportIntake';
+
+const { __resetReportIdempotencyForTests, ReportReplayCapacityError } = reportIntake;
 
 const FILED = {
   pageId: '169',
@@ -193,6 +195,22 @@ describe('POST /api/support/report-ui-bug — filing vs notification (ENG-529)',
     expect(retry.status).toBe(200);
     expect(retry.body.issueId).toBe('AGW-169');
     expect(fileUserIssue).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns an explicit retryable 503 when bounded replay admission times out', async () => {
+    const guard = jest
+      .spyOn(reportIntake, 'fileReportOnce')
+      .mockRejectedValueOnce(new ReportReplayCapacityError());
+    try {
+      const res = await submit({ description: MULTILINE, reportType: 'bug' });
+
+      expect(res.status).toBe(503);
+      expect(res.headers['retry-after']).toBe('5');
+      expect(res.body.message).toBe('Report intake is busy; please retry shortly');
+      expect(fileUserIssue).not.toHaveBeenCalled();
+    } finally {
+      guard.mockRestore();
+    }
   });
 
   // AC5 — retrying an ambiguous/timed-out request must not duplicate the reporter ticket.

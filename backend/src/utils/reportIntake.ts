@@ -77,6 +77,15 @@ export function reportFingerprint(id: ReportIdentity): string {
  * incident spanned 4.5 minutes), short enough that a genuine re-report later still files.
  */
 export const REPORT_REPLAY_WINDOW_MS = 10 * 60 * 1000;
+/** Maximum request-level backpressure before the caller gets an explicit retryable response. */
+export const REPORT_CAPACITY_WAIT_MS = 5_000;
+
+export class ReportReplayCapacityError extends Error {
+  constructor() {
+    super('Report replay guard is busy; retry later');
+    this.name = 'ReportReplayCapacityError';
+  }
+}
 
 /**
  * Prune threshold. Distinct reports inside a 10-minute window are few, so the map stays tiny;
@@ -134,7 +143,7 @@ function evictOldestSettledReplay(): boolean {
  * tracking structure: the fixed-size map remains the only retained replay state, and a waiting
  * request never invokes its filer until it can first claim a tracked slot.
  */
-async function waitForTrackedFilingToSettle(): Promise<void> {
+async function waitForTrackedFilingToSettle(waitMs: number): Promise<void> {
   const active = Array.from(trackedByFingerprint.values())
     .filter((entry) => !entry.settled)
     .map((entry) => entry.promise.then(
@@ -144,7 +153,17 @@ async function waitForTrackedFilingToSettle(): Promise<void> {
   if (active.length === 0) {
     throw new Error('Report replay guard capacity invariant violated');
   }
-  await Promise.race(active);
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      Promise.race(active),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new ReportReplayCapacityError()), waitMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 /** Test-only: clears the replay state so each test starts from a clean slate. */
@@ -169,6 +188,7 @@ export async function fileReportOnce<T>(
   fingerprint: string,
   file: () => Promise<T>,
   now: number = Date.now(),
+  capacityWaitMs: number = REPORT_CAPACITY_WAIT_MS,
 ): Promise<FileReportOnceResult<T>> {
   pruneExpired(now);
 
@@ -190,8 +210,8 @@ export async function fileReportOnce<T>(
     trackedByFingerprint.size >= MAX_TRACKED_REPORTS
     && !evictOldestSettledReplay()
   ) {
-    await waitForTrackedFilingToSettle();
-    return fileReportOnce(fingerprint, file, now);
+    await waitForTrackedFilingToSettle(capacityWaitMs);
+    return fileReportOnce(fingerprint, file, now, capacityWaitMs);
   }
 
   const promise = file();
