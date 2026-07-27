@@ -223,6 +223,7 @@ import {
   ALLOWED_NODE_TYPES,
   AllowedNodeType,
   ALLOWED_INSIGHTS_FIELDS,
+  suggestInsightsFields,
   ALLOWED_INSIGHTS_BREAKDOWNS,
   ALLOWED_ACTION_BREAKDOWNS,
   ALLOWED_DATE_PRESETS,
@@ -13935,8 +13936,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       );
 
       if (!validFields.length) {
+        // ENG-511: point the model at the closest valid field for each bad one so
+        // it can correct a typo/loose phrasing rather than guess.
+        const suggestions = suggestInsightsFields(droppedFields);
+        const suggestionHint = Object.keys(suggestions).length
+          ? ` Did you mean: ${Object.entries(suggestions)
+              .map(([bad, good]) => `${bad} -> ${good}`)
+              .join(", ")}?`
+          : "";
         throw new Error(
-          `Invalid insights fields requested: ${droppedFields.join(", ")}. None are supported, so no data could be fetched — do not retry with the same fields. Choose from allowed fields such as impressions, clicks, spend, cpc, ctr, reach, inline_link_clicks, cost_per_inline_link_click.`
+          `Invalid insights fields requested: ${droppedFields.join(", ")}. None are supported, so no data could be fetched — do not retry with the same fields.${suggestionHint} Choose from allowed fields such as impressions, clicks, spend, cpc, ctr, reach, inline_link_clicks, cost_per_inline_link_click.`
         );
       }
 
@@ -14124,13 +14133,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           reportRunId = retry.reportRunId;
           allData = retry.data;
         } else {
+          const suggestions = suggestInsightsFields(metaRejectedFields);
+          const suggestionHint = Object.keys(suggestions).length
+            ? ` Did you mean: ${Object.entries(suggestions)
+                .map(([bad, good]) => `${bad} -> ${good}`)
+                .join(", ")}?`
+            : "";
           return {
             success: false,
-            error: `Meta rejected the requested insights field(s)${metaRejectedFields.length ? `: ${metaRejectedFields.join(", ")}` : ""}. Do not retry the same request — remove or replace the offending field(s) and choose from allowed fields such as impressions, clicks, spend, cpc, ctr, reach, inline_link_clicks, cost_per_inline_link_click.`,
+            error: `Meta rejected the requested insights field(s)${metaRejectedFields.length ? `: ${metaRejectedFields.join(", ")}` : ""}. Do not retry the same request — remove or replace the offending field(s).${suggestionHint} Choose from allowed fields such as impressions, clicks, spend, cpc, ctr, reach, inline_link_clicks, cost_per_inline_link_click.`,
             metadata: {
               tool: "call_meta_ads_insights_api",
               account_id,
               meta_error: metaError?.message || reportErr?.message,
+              ...(Object.keys(suggestions).length && {
+                field_suggestions: suggestions,
+              }),
             },
           };
         }
@@ -14147,8 +14165,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           report_run_id: reportRunId,
           api_version: version,
           // ENG-511: surface any unsupported fields we dropped so the model knows
-          // why they are absent and does not re-request them on the next turn.
+          // why they are absent and does not re-request them on the next turn, plus
+          // a closest-valid-field suggestion for each so a typo/loose phrasing is
+          // actionable (e.g. `impression` -> `impressions`) rather than silently gone.
           ...(droppedFields.length && { dropped_fields: droppedFields }),
+          ...(droppedFields.length &&
+            Object.keys(suggestInsightsFields(droppedFields)).length && {
+              dropped_field_suggestions: suggestInsightsFields(droppedFields),
+            }),
         },
         data: allData,
       };

@@ -117,6 +117,70 @@ export const ALLOWED_INSIGHTS_FIELDS = [
   'cost_per_full_view'
 ];
 
+/** Levenshtein edit distance — small helper for typo/near-miss field suggestions. */
+function editDistance(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  let curr = new Array(n + 1).fill(0);
+  for (let i = 1; i <= m; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+    }
+    [prev, curr] = [curr, prev];
+  }
+  return prev[n];
+}
+
+/**
+ * ENG-511: Suggest the closest valid insights field for a dropped/unknown one, so
+ * the model can correct a typo or loose phrasing (e.g. `impression` -> `impressions`,
+ * `link_clicks` -> `inline_link_clicks`) instead of just seeing the field vanish.
+ * Returns null when nothing is plausibly the same intent (e.g. a made-up metric) —
+ * a wrong suggestion would be worse than none. This only produces a hint; it never
+ * substitutes the field, so the tool never returns a metric the caller did not ask for.
+ */
+export function suggestInsightsField(name: string): string | null {
+  const n = (name || '').toLowerCase().trim();
+  if (!n) return null;
+  let best: string | null = null;
+  let bestDist = Infinity;
+  for (const f of ALLOWED_INSIGHTS_FIELDS) {
+    let dist = editDistance(n, f);
+    // Reward containment (common when the model uses a looser phrasing like
+    // `link_clicks` for `inline_link_clicks`). Guard against tiny fragments so
+    // short field names don't match everything. Prefer a field that contains the
+    // whole query (a more specific field) over the reverse, so `link_clicks`
+    // resolves to `inline_link_clicks`, not the broader `clicks`.
+    if (n.length >= 4 && f.includes(n)) {
+      dist = Math.min(dist, 0.5);
+    } else if (n.length >= 4 && n.includes(f) && f.length >= 4) {
+      dist = Math.min(dist, 1);
+    }
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = f;
+    }
+  }
+  // Only suggest when the closest field is plausibly the same intent.
+  const threshold = Math.max(2, Math.floor(n.length / 3));
+  return best && bestDist <= threshold ? best : null;
+}
+
+/** Build a { droppedField: suggestion } map, omitting drops with no plausible match. */
+export function suggestInsightsFields(names: string[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const name of names) {
+    const s = suggestInsightsField(name);
+    if (s) out[name] = s;
+  }
+  return out;
+}
+
 export const ALLOWED_INSIGHTS_BREAKDOWNS = [
   'age',
   'gender',
