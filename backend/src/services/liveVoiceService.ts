@@ -480,6 +480,15 @@ async function loadHistoryForSystemPrompt(sessionId: string): Promise<string> {
  */
 const LIVE_SESSION_FORBIDDEN = 'Not authorized for this chat session';
 
+export class LiveSessionAuthorizationError extends Error {
+  readonly code = 'LIVE_SESSION_FORBIDDEN';
+
+  constructor() {
+    super(LIVE_SESSION_FORBIDDEN);
+    this.name = 'LiveSessionAuthorizationError';
+  }
+}
+
 /**
  * ENG-521 — verify the caller owns the chat session before any live-session
  * work happens.
@@ -508,14 +517,14 @@ export async function assertLiveSessionOwnership(
     console.warn(
       `[liveVoiceService] live session denied — session ${sessionId} not found (requested by ${effectiveUserId})`,
     );
-    throw new Error(LIVE_SESSION_FORBIDDEN);
+    throw new LiveSessionAuthorizationError();
   }
 
   if (!session.userId || !effectiveUserId || session.userId !== effectiveUserId) {
     console.warn(
       `[liveVoiceService] live session denied — session ${sessionId} is owned by ${session.userId ?? '<none>'}, requested by ${effectiveUserId}`,
     );
-    throw new Error(LIVE_SESSION_FORBIDDEN);
+    throw new LiveSessionAuthorizationError();
   }
 }
 

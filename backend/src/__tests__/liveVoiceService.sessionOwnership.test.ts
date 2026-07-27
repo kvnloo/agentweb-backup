@@ -158,6 +158,23 @@ describe('startLiveSession — cross-user session ownership (ENG-521)', () => {
     ).rejects.toThrow(/not authorized/i);
   });
 
+  it('rejects missing or mismatched sessions with a typed authorization error', async () => {
+    makeCallbacks();
+
+    const mismatch = await startLiveSession(
+      VICTIM_SESSION,
+      'socket-attacker',
+      jest.fn(),
+      ATTACKER_USER,
+    ).catch((error) => error);
+
+    expect(mismatch).toMatchObject({
+      name: 'LiveSessionAuthorizationError',
+      code: 'LIVE_SESSION_FORBIDDEN',
+      message: 'Not authorized for this chat session',
+    });
+  });
+
   it('loads NO history when a cross-user sessionId is supplied', async () => {
     makeCallbacks();
 
