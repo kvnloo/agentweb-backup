@@ -121,11 +121,11 @@ const secretsMatch = (a: string, b: string): boolean => {
   return crypto.timingSafeEqual(bufA, bufB);
 };
 
-export async function storeOAuthSession<T>(
+const storeSession = async (
   userId: string,
   provider: OAuthProvider,
-  data: T,
-): Promise<string> {
+  payload: Pick<StoredSession, 'data' | 'tokens' | 'profile'>,
+): Promise<string> => {
   const now = Date.now();
   const sessionId = crypto.randomBytes(32).toString('hex');
 
@@ -138,7 +138,7 @@ export async function storeOAuthSession<T>(
 
   row.sessions.push({
     sessionId,
-    data,
+    ...payload,
     expires: now + TOKEN_SESSION_TTL_MS,
   });
 
@@ -149,6 +149,14 @@ export async function storeOAuthSession<T>(
 
   await writeRow(row);
   return sessionId;
+};
+
+export async function storeOAuthSession<T>(
+  userId: string,
+  provider: OAuthProvider,
+  data: T,
+): Promise<string> {
+  return storeSession(userId, provider, { data });
 }
 
 /**
@@ -190,8 +198,10 @@ export async function retrieveOAuthSession<T>(
 
 /**
  * Gmail/Outlook flavour: the payload is the `{ tokens, profile }` pair these two routes
- * store. Kept as a thin wrapper over the generic primitive above so those routes (and this
- * store's test suite) are unchanged while other providers store their own payload shapes.
+ * store. Kept as a thin wrapper over the shared primitive so those routes remain unchanged
+ * while other providers store their own payload shapes. The wrapper deliberately writes
+ * `tokens` and `profile` at the session's top level so pre-deploy instances can read sessions
+ * created by a new instance during an Elastic Beanstalk rolling deployment.
  */
 export async function storeTokenSession(
   userId: string,
@@ -199,7 +209,7 @@ export async function storeTokenSession(
   tokens: OAuthTokens,
   profile: OAuthProfile,
 ): Promise<string> {
-  return storeOAuthSession(userId, provider, { tokens, profile });
+  return storeSession(userId, provider, { tokens, profile });
 }
 
 export async function retrieveTokenSession(
