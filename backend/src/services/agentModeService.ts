@@ -3055,6 +3055,16 @@ export class AgentModeService {
       const mediaBudgetMs = parseInt(process.env.AGENT_MODE_MEDIA_BUDGET_MS || '420000', 10);
       const mediaGenerationDeadlineMs = mediaBudgetMs > 0 ? Date.now() + mediaBudgetMs : undefined;
       let mediaAssetsProducedThisRun = 0;
+      // ENG-510: the fixed soft budget above assumed fast images and leaves only ~3 min
+      // of headroom below the controller's 10-min whole-turn hard cap. A single slow
+      // high-quality image can take ~6–7 min, so the next variant slips past the fixed
+      // deadline and runs past the cap — losing the already-generated variants. Give the
+      // dispatcher the hard-cap deadline + the longest media latency seen this run so it
+      // can also defer when there isn't time left for one more call. Mirror the soft
+      // budget's disable switch (off when AGENT_MODE_MEDIA_BUDGET_MS=0).
+      const generationTimeoutMs = parseInt(process.env.AGENT_MODE_GENERATION_TIMEOUT_MS || '600000', 10);
+      const generationHardCapMs = mediaBudgetMs > 0 ? Date.now() + generationTimeoutMs : undefined;
+      let longestMediaCallMsThisRun = 0;
 
       // Single loop for LLM calls and tool execution
       let maxIterations = 40; // Prevent infinite loops
@@ -3492,6 +3502,8 @@ export class AgentModeService {
           maxToolContentSize: MAX_TOOL_CONTENT_SIZE,
           mediaGenerationDeadlineMs,
           mediaAssetsProducedThisRun,
+          generationHardCapMs,
+          longestMediaCallMsThisRun,
           ports: {
             evaluateAgentToolPolicy,
             validateAndRepairToolArgs,
@@ -3531,6 +3543,9 @@ export class AgentModeService {
         // Carry the running per-run media-asset total forward so the next iteration's
         // budget decision knows whether this run has already produced ≥1 asset.
         mediaAssetsProducedThisRun += dispatchResult.mediaAssetsProduced;
+        // ENG-510: carry the run-wide longest media-call latency forward so the next
+        // iteration's adaptive hard-cap reserve uses real observed durations.
+        longestMediaCallMsThisRun = Math.max(longestMediaCallMsThisRun, dispatchResult.longestMediaCallMs ?? 0);
 
         // Send progress update after all tools complete.
         // Only send tool calls added in this iteration — the frontend accumulates

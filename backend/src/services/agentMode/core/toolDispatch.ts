@@ -262,6 +262,24 @@ export interface ExecutePreparedToolsInput {
    * image before stopping — guaranteeing forward progress every turn.
    */
   mediaAssetsProducedThisRun?: number;
+  /**
+   * ENG-510: wall-clock deadline (epoch ms) of the controller's whole-turn hard cap
+   * (GENERATION_TIMEOUT_MS, default 10 min). The fixed soft budget above leaves only a
+   * fixed headroom below this cap and assumes fast images; a single slow high-quality
+   * image can take ~6–7 min and nearly consume the budget, so the NEXT media call slips
+   * past the soft-deadline check and then runs past the hard cap — losing every already-
+   * generated image. When supplied, the dispatcher also defers a media call once the time
+   * left before this cap is less than the longest media call observed this run (see
+   * `longestMediaCallMsThisRun`), so the turn ends gracefully with its finished images
+   * persisted. Undefined disables the adaptive check (mirrors the soft-budget disable).
+   */
+  generationHardCapMs?: number;
+  /**
+   * Longest media-call wall-clock duration (ms) observed so far this run, across prior
+   * iterations. Seeds the adaptive hard-cap reserve so the decision uses real observed
+   * latency rather than a guess. The dispatcher returns an updated value each iteration.
+   */
+  longestMediaCallMsThisRun?: number;
   // ---- ports ----
   ports: ToolDispatchPorts;
 }
@@ -278,6 +296,12 @@ export interface ExecutePreparedToolsResult {
   mediaAssetsProduced: number;
   /** true if one or more media-gen calls were deferred this iteration due to the time budget */
   mediaBudgetDeferred: boolean;
+  /**
+   * ENG-510: longest media-call wall-clock duration (ms) observed this run, including
+   * this iteration's calls. The loop threads it back in as `longestMediaCallMsThisRun`
+   * so the adaptive hard-cap reserve tracks the run's actual media latency.
+   */
+  longestMediaCallMs: number;
 }
 
 /**
@@ -314,6 +338,8 @@ export async function executePreparedTools(
     maxToolContentSize,
     mediaGenerationDeadlineMs,
     mediaAssetsProducedThisRun = 0,
+    generationHardCapMs,
+    longestMediaCallMsThisRun = 0,
     ports,
   } = input;
 
@@ -581,12 +607,25 @@ export async function executePreparedTools(
   // is supplied (AGENT_MODE_MEDIA_BUDGET_MS=0, and the unit tests), which preserves
   // prior behavior. It is NOT opt-in — an unset env var still applies the 7-min default.
   let assetsThisBatch = 0;
+  // ENG-510: run-wide longest media-call duration, seeded from prior iterations and
+  // updated as calls settle below, so the adaptive reserve reflects real latency.
+  let longestMediaCallMs = longestMediaCallMsThisRun;
   const isMediaGenTool = (toolCall: any) => MEDIA_GEN_TOOLS.has(toolCall.function.name);
+  // Fixed soft-budget deadline passed (the original, fast-image assumption).
+  const softBudgetExceeded = (): boolean =>
+    mediaGenerationDeadlineMs != null && Date.now() > mediaGenerationDeadlineMs;
+  // ENG-510: not enough time before the whole-turn hard cap to finish another media
+  // call the size of the longest one seen this run. Catches the slow-single-image case
+  // the fixed soft headroom can't: after one ~6.5-min image there is < one image of
+  // time left, so the next call would run past the cap and lose the finished image(s).
+  const withinOneMediaCallOfHardCap = (): boolean =>
+    generationHardCapMs != null
+    && longestMediaCallMs > 0
+    && (generationHardCapMs - Date.now()) < longestMediaCallMs;
   const shouldDeferMedia = (toolCall: any): boolean =>
-    mediaGenerationDeadlineMs != null
-    && isMediaGenTool(toolCall)
-    && Date.now() > mediaGenerationDeadlineMs
-    && (mediaAssetsProducedThisRun + assetsThisBatch) >= 1;
+    isMediaGenTool(toolCall)
+    && (mediaAssetsProducedThisRun + assetsThisBatch) >= 1
+    && (softBudgetExceeded() || withinOneMediaCallOfHardCap());
   const makeDeferred = (toolCall: any, functionArgs: any, policyDecision: AgentToolPolicyDecision): DispatchToolResult => {
     mediaBudgetDeferred = true;
     return { status: 'deferred', toolCall, functionArgs, duration: 0, policyDecision };
@@ -600,6 +639,14 @@ export async function executePreparedTools(
     && isMediaGenTool(dr.toolCall)
     && !ports.toolResultError(dr.result)
     && mediaGenProducedAsset(dr.toolCall.function.name, dr.result);
+  // ENG-510: track how long a media call actually took so the adaptive reserve (and the
+  // value returned to the loop) reflects real latency. Updated as each call settles so a
+  // later call in the SAME batch already sees the earlier call's duration.
+  const recordMediaDuration = (dr: DispatchToolResult): void => {
+    if (isMediaGenTool(dr.toolCall) && dr.status !== 'deferred') {
+      longestMediaCallMs = Math.max(longestMediaCallMs, dr.duration || 0);
+    }
+  };
 
   if (hasWaitTool || hasMultipleMediaGenTools) {
     toolResults = [];
@@ -611,6 +658,7 @@ export async function executePreparedTools(
       const outcome = await runOne(toolCall, functionArgs, policyDecision);
       const dr = toDispatchResult(outcome, toolCall, functionArgs);
       if (countsAsAsset(dr)) assetsThisBatch++;
+      recordMediaDuration(dr);
       toolResults.push(dr);
     }
   } else {
@@ -624,6 +672,7 @@ export async function executePreparedTools(
       const outcome = await runOne(toolCall, functionArgs, policyDecision);
       const dr = toDispatchResult(outcome, toolCall, functionArgs);
       if (countsAsAsset(dr)) assetsThisBatch++;
+      recordMediaDuration(dr);
       return dr;
     });
     toolResults = await Promise.all(toolPromises);
@@ -866,5 +915,5 @@ export async function executePreparedTools(
     appendSuppressedDuplicate(suppressed);
   }
 
-  return { pendingCounterUpdates, failedCounterUpdates, skillsUpdated, mediaAssetsProduced, mediaBudgetDeferred };
+  return { pendingCounterUpdates, failedCounterUpdates, skillsUpdated, mediaAssetsProduced, mediaBudgetDeferred, longestMediaCallMs };
 }
