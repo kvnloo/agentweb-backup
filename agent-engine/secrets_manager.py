@@ -123,3 +123,8 @@ def get_azure_openai_endpoint3() -> str:
 
 def get_azure_openai_api_version3(default: str = '2025-01-01-preview') -> str:
     return _env_or_json_secret('AZURE_OPENAI_API_VERSION3', 'AzureOpenAI3', 'apiVersion', default)
+
+
+def get_alert_webhook_url() -> str:
+    """Slack incoming-webhook URL used by deploy/alert_oncall.sh on process failure."""
+    return _env_or_string_secret('AGENT_ENGINE_ALERT_WEBHOOK_URL', 'AlertWebhook')

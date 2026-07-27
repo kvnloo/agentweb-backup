@@ -1,0 +1,26 @@
+[Unit]
+Description=AgentWeb Agent Engine (task_monitor.py)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=agentengine
+Group=agentengine
+WorkingDirectory=/opt/agent-engine/agentweb/agent-engine
+Environment=AGENT_ENGINE_ENV=production
+Environment=AWS_REGION=us-west-2
+Environment=BACKEND_URL=https://api.agentweb.pro
+# ExecStart path is provisional — confirm the actual conda env interpreter
+# path on the VM during Phase 0/2 and update before installing this unit.
+ExecStart=/opt/miniconda3/envs/agent-engine/bin/python task_monitor.py
+Restart=on-failure
+RestartSec=10
+OnFailure=agent-engine-alert@%n.service
+TimeoutStopSec=30
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

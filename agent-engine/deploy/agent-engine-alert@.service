@@ -1,0 +1,9 @@
+[Unit]
+Description=Alert oncall that %i failed
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/agent-engine/agentweb/agent-engine
+Environment=AGENT_ENGINE_ENV=production
+Environment=AWS_REGION=us-west-2
+ExecStart=/opt/agent-engine/agentweb/agent-engine/deploy/alert_oncall.sh %i
