@@ -6841,6 +6841,12 @@ const bridgedToolNames = [
   'revert_landing_page_publish',
   'update_landing_page_context',
   'resolve_skill',
+  // CRM drip / nurture sequence tools (ENG-442). Bridged so Agent Mode and the
+  // in-app sidebar can answer "are email campaigns running?" and build a
+  // campaign, instead of only being able to scope the audience with
+  // get_leads_by_crm_criteria. Activation is gated in crmSequenceApproval.ts.
+  'list_crm_sequences',
+  'manage_crm_sequence',
   // Self account status (no-arg; wraps /api/auth/me for the CALLER's own account).
   // Bridged so the in-app loop can resolve the handler; also added to
   // DEFAULT_FOUNDATION_TOOLS so the loop actually offers it. Without this, Emma

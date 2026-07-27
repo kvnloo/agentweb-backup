@@ -2530,6 +2530,290 @@ Example:
   },
 });
 
+// ─── CRM drip / nurture sequences (ENG-442) ─────────────────────────────────
+//
+// `get_leads_by_crm_criteria` above scopes WHO a campaign targets; these two
+// tools build and inspect the campaign itself. Send safety lives in
+// services/crmSequenceApproval.ts — see the block comment there.
+
+async function resolveSequenceRunModeFromContext(context: any) {
+  const { resolveSequenceRunMode } = await import('../../services/crmSequenceApproval');
+  return resolveSequenceRunMode(context, async (sessionId: string) => {
+    const { chatbotDb } = await import('../../services/chatbotService');
+    const session = await chatbotDb.getChatSession(sessionId);
+    return session?.sessionType;
+  });
+}
+
+function sequenceToolError(message: string) {
+  return jsonResult({ success: false, error: message });
+}
+
+mcpToolRegistry.register({
+  name: 'list_crm_sequences',
+  definition: {
+    name: 'list_crm_sequences',
+    description: `List the CRM email drip / nurture sequences on the caller's account. Read-only — safe to call any time, including in a scheduled run.
+
+Use this to answer "are any email campaigns running for our CRM leads?". Each entry reports \`name\`, \`status\` (draft | active | paused | archived), \`target\` (the segment it enrolls), \`step_count\`, and \`is_sending\` — which is true ONLY for \`active\` sequences, because the drip worker mails nothing for a draft/paused/archived sequence.
+
+An account with no sequences returns \`{ total: 0, sequences: [] }\` with a summary line. That is a valid answer meaning "no campaigns exist", not an error — report it as such instead of retrying or guessing.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        status: {
+          type: 'string',
+          enum: ['draft', 'active', 'paused', 'archived'],
+          description: 'Only return sequences in this status. Omit to return all of them.',
+        },
+      },
+      required: [],
+      additionalProperties: false,
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const { summarizeSequence } = await import('../../services/crmSequenceApproval');
+    try {
+      const data = await mcpFetch({
+        method: 'GET',
+        path: '/api/crm/sequences',
+        context: ctx(context),
+      });
+
+      const all = Array.isArray(data?.sequences) ? data.sequences : [];
+      const filtered =
+        typeof args?.status === 'string' ? all.filter((s: any) => s?.status === args.status) : all;
+      const sequences = filtered.map(summarizeSequence);
+      const activeCount = sequences.filter((s: any) => s.is_sending).length;
+
+      return jsonResult({
+        total: sequences.length,
+        active_count: activeCount,
+        sequences,
+        summary:
+          sequences.length === 0
+            ? 'No CRM drip sequences exist on this account. No campaign email is being sent to CRM leads.'
+            : `${sequences.length} sequence(s); ${activeCount} actively sending.`,
+      });
+    } catch (err: any) {
+      return sequenceToolError(err?.message || String(err));
+    }
+  },
+});
+
+mcpToolRegistry.register({
+  name: 'manage_crm_sequence',
+  definition: {
+    name: 'manage_crm_sequence',
+    description: `Create, inspect, pause or activate a CRM email drip / nurture sequence. Use list_crm_sequences first to find a sequence_id, and get_leads_by_crm_criteria to confirm who a segment covers before building a campaign.
+
+Actions:
+- \`create\` — build a multi-step email sequence. Requires \`name\` and \`steps\`; \`target\` picks the audience. **Always created in \`draft\`, which sends nothing.** A status you pass is ignored.
+- \`get\` — show one sequence's status, target and step count.
+- \`pause\` — stop an active sequence from sending. Always allowed.
+- \`resume\` — activate a sequence so it STARTS SENDING REAL EMAIL TO REAL LEADS. Gated (see below).
+
+SEND SAFETY (\`resume\`): activation requires a human. In an interactive chat, the first call returns a preview and does NOT activate; show it to the user, get an explicit yes, then call again with \`confirm: true\`. In a scheduled or otherwise unattended run there is nobody to approve, so activation is refused outright and \`confirm: true\` does NOT override it. When that happens, leave the sequence in draft/paused and report that it is ready for a person to activate — do not look for another route to start it.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['create', 'get', 'pause', 'resume'],
+          description: 'What to do. create | get | pause | resume.',
+        },
+        sequence_id: {
+          type: 'string',
+          description: 'Sequence to act on. Required for get, pause and resume.',
+        },
+        name: { type: 'string', description: 'Sequence name. Required for create.' },
+        description: { type: 'string', description: 'Optional internal description of the campaign.' },
+        campaign_type: {
+          type: 'string',
+          enum: ['conversion', 'onboarding', 'reengagement', 'nurture', 'upsell', 'custom'],
+          description: 'Campaign type. Defaults to nurture.',
+        },
+        target: {
+          type: 'object',
+          description:
+            'Who the sequence enrolls. A sequence supports ONE extra condition, so a lead list plus BOTH lifecycle and min_heat_score is rejected — pick one.',
+          properties: {
+            lead_list_id: {
+              type: 'string',
+              description: 'Enroll leads from this lead list (new leads added later auto-enroll once active).',
+            },
+            lifecycle: {
+              type: 'string',
+              enum: ['unknown', 'inbox', 'signed_up', 'in_deal', 'trialing', 'paying', 'at_risk', 'churned'],
+              description:
+                'Lifecycle stage. Without lead_list_id it triggers enrollment when a lead reaches the stage; with one it filters the list.',
+            },
+            min_heat_score: {
+              type: 'number',
+              description: 'Only mail leads whose heatScore is at least this (0-100).',
+            },
+          },
+          additionalProperties: false,
+        },
+        steps: {
+          type: 'array',
+          description: 'Ordered email steps. Required for create; at least one.',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Step label. Defaults to "Step N".' },
+              subject: { type: 'string', description: 'Email subject line. Required.' },
+              body_html: {
+                type: 'string',
+                description:
+                  'Email body HTML. Required. Supports {{firstName}}, {{email}}, {{companyName}}, {{unsubscribeUrl}}.',
+              },
+              delay_days: {
+                type: 'integer',
+                minimum: 0,
+                description:
+                  'Whole days to wait after the previous step. Defaults to 0 for the first step and 3 for later ones.',
+              },
+            },
+            required: ['subject', 'body_html'],
+          },
+        },
+        confirm: {
+          type: 'boolean',
+          description:
+            'resume only. Set true ONLY after a human has seen the preview and explicitly approved sending. Ignored in unattended runs.',
+        },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const {
+      buildSequenceTargeting,
+      evaluateSequenceSendApproval,
+      normalizeSequenceSteps,
+      SequenceInputError,
+      summarizeSequence,
+    } = await import('../../services/crmSequenceApproval');
+
+    const action = args?.action;
+    const sequenceId = typeof args?.sequence_id === 'string' ? args.sequence_id.trim() : '';
+
+    if (action !== 'create' && !sequenceId) {
+      return sequenceToolError(`sequence_id is required for action "${action}".`);
+    }
+
+    try {
+      if (action === 'create') {
+        const name = typeof args?.name === 'string' ? args.name.trim() : '';
+        if (!name) return sequenceToolError('name is required to create a sequence.');
+
+        const targeting = buildSequenceTargeting(args?.target);
+        const steps = normalizeSequenceSteps(args?.steps);
+
+        const data = await mcpFetch({
+          method: 'POST',
+          path: '/api/crm/sequences',
+          context: ctx(context),
+          body: {
+            name,
+            ...(typeof args?.description === 'string' ? { description: args.description } : {}),
+            campaignType: typeof args?.campaign_type === 'string' ? args.campaign_type : 'nurture',
+            enrollmentTrigger: targeting.enrollmentTrigger,
+            ...(targeting.enrollmentCondition
+              ? { enrollmentCondition: targeting.enrollmentCondition }
+              : {}),
+            steps,
+            // Hard-coded: a sequence this tool creates can never send on its own.
+            // Any caller-supplied status is deliberately ignored.
+            status: 'draft',
+          },
+        });
+
+        return jsonResult({
+          success: true,
+          sequence: summarizeSequence(data?.sequence),
+          next_step:
+            'Created as a draft — it is sending nothing. A human must approve activation: show them the ' +
+            'sequence, then call manage_crm_sequence(action="resume", sequence_id, confirm=true) from an ' +
+            'interactive chat, or activate it in the CRM UI.',
+        });
+      }
+
+      if (action === 'get') {
+        const data = await mcpFetch({
+          method: 'GET',
+          path: `/api/crm/sequences/${encodeURIComponent(sequenceId)}`,
+          context: ctx(context),
+        });
+        return jsonResult({ success: true, sequence: summarizeSequence(data?.sequence) });
+      }
+
+      if (action === 'pause') {
+        // Pausing only ever stops sending, so it needs no approval gate.
+        const data = await mcpFetch({
+          method: 'PUT',
+          path: `/api/crm/sequences/${encodeURIComponent(sequenceId)}`,
+          context: ctx(context),
+          body: { status: 'paused' },
+        });
+        return jsonResult({ success: true, sequence: summarizeSequence(data?.sequence) });
+      }
+
+      if (action === 'resume') {
+        const runMode = await resolveSequenceRunModeFromContext(context);
+        const approval = evaluateSequenceSendApproval({
+          runMode,
+          confirmed: args?.confirm === true,
+        });
+
+        // Unattended: refuse before reading or writing anything.
+        if (!approval.approved && approval.reason === 'unattended_run') {
+          return jsonResult({
+            success: false,
+            approval: { approved: false, reason: approval.reason },
+            error: approval.message,
+          });
+        }
+
+        if (!approval.approved) {
+          const preview = await mcpFetch({
+            method: 'GET',
+            path: `/api/crm/sequences/${encodeURIComponent(sequenceId)}`,
+            context: ctx(context),
+          });
+          return jsonResult({
+            success: false,
+            approval: { approved: false, reason: approval.reason },
+            error: approval.message,
+            preview: summarizeSequence(preview?.sequence),
+          });
+        }
+
+        const data = await mcpFetch({
+          method: 'PUT',
+          path: `/api/crm/sequences/${encodeURIComponent(sequenceId)}`,
+          context: ctx(context),
+          body: { status: 'active' },
+        });
+        return jsonResult({
+          success: true,
+          approval: { approved: true },
+          sequence: summarizeSequence(data?.sequence),
+        });
+      }
+
+      return sequenceToolError(
+        `Unknown action "${action}". Supported: create, get, pause, resume.`,
+      );
+    } catch (err: any) {
+      if (err instanceof SequenceInputError) return sequenceToolError(err.message);
+      return sequenceToolError(err?.message || String(err));
+    }
+  },
+});
+
 mcpToolRegistry.register({
   name: 'get_registration_status',
   definition: {
