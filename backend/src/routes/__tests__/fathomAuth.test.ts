@@ -24,9 +24,26 @@ jest.mock('../../config/integrations', () => ({
 
 const mockCreateAccount = jest.fn();
 const mockUpdateAccountConfig = jest.fn();
+const mockOAuthSessions = new Map<string, any>();
 jest.mock('../../services/connectedAccountsDb', () => ({
   createAccount: (...args: any[]) => mockCreateAccount(...args),
   updateAccountConfig: (...args: any[]) => mockUpdateAccountConfig(...args),
+}));
+
+// /finalize and /connect may run on separate instances. Model their canonical
+// AW-OAuthSessions handoff while keeping this route test independent of DynamoDB.
+jest.mock('../../services/db', () => ({
+  oauthSessionDb: {
+    savePending: jest.fn(async (session: any) => {
+      mockOAuthSessions.set(session.sessionId, session);
+    }),
+    consumePending: jest.fn(async (sessionId: string, userId: string, provider: string) => {
+      const session = mockOAuthSessions.get(sessionId);
+      if (!session || session.userId !== userId || session.provider !== provider) return null;
+      mockOAuthSessions.delete(sessionId);
+      return session.data;
+    }),
+  },
 }));
 
 const mockRegisterWebhook = jest.fn();
@@ -76,6 +93,7 @@ describe('Fathom Auth Router - /connect webhook registration', () => {
   let app: express.Application;
 
   beforeEach(() => {
+    mockOAuthSessions.clear();
     jest.clearAllMocks();
     app = setupApp();
 
