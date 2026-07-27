@@ -6863,7 +6863,24 @@ mcpToolRegistry.register({
     if (user?.isAdmin !== true && !delegated) {
       throw new Error('Admin access required to manage Linear governance labels');
     }
-    const actor = context?.adminEmail || user?.email || userId;
+    let actor: string | undefined;
+    if (delegated) {
+      actor = context?.adminEmail;
+      if (!actor && context?.sessionId) {
+        const session = await chatbotDb.getChatSession(context.sessionId);
+        if (session?.delegateInfo?.isDelegated) {
+          actor = session.delegateInfo.adminEmail;
+        }
+      }
+      if (!actor) {
+        throw new Error('Delegated administrator identity unavailable');
+      }
+    } else {
+      actor = user?.email || userId;
+    }
+    if (!actor) {
+      throw new Error('Administrator identity unavailable');
+    }
     const { manageLinearGovernanceLabel } = await import('../services/linearGovernanceLabelService');
     return manageLinearGovernanceLabel({
       labelName: args.label_name,
