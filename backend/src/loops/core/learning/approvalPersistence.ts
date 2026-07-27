@@ -49,6 +49,21 @@ export interface RecordLoopApprovalOptions {
   now?: Date;
 }
 
+export interface DenialPersistenceResult {
+  /** Loop whose run matched the digest's runId; null when none did. */
+  loopId: LoopId | null;
+  /** Pending records resolved as denied. */
+  denied: number;
+}
+
+export interface RecordLoopDenialOptions {
+  runId: string;
+  /** Audit string for decision.decidedBy, e.g. 'slack:U08TM4QFQ1L'. */
+  denier: string;
+  stores: LoopApprovalStores[];
+  now?: Date;
+}
+
 function itemMatchesRecord(item: DispatchedItem, record: LearningRecord): boolean {
   const ruleId = record.proposal?.sourceRuleId;
   const proposalId = record.proposal?.proposalId as string | undefined;
@@ -79,9 +94,14 @@ export async function recordLoopApproval(
     if (runRecords.length === 0) continue;
 
     const pending = runRecords.filter((r) => r.decision?.status === 'pending');
-    const alreadyApproved = new Set(
+    const alreadyResolved = new Set(
       runRecords
-        .filter((r) => r.decision?.status === 'approved')
+        .filter((r) => (
+          r.decision?.status === 'approved'
+          || r.decision?.status === 'denied'
+          || r.decision?.status === 'held'
+          || r.decision?.status === 'auto_shipped'
+        ))
         .map((r) => r.proposal?.proposalId as string | undefined)
         .filter((id): id is string => id != null),
     );
@@ -90,8 +110,8 @@ export async function recordLoopApproval(
 
     for (const record of pending) {
       const proposalId = record.proposal?.proposalId as string | undefined;
-      if (proposalId && alreadyApproved.has(proposalId)) continue; // idempotent re-✅
-      if (proposalId) alreadyApproved.add(proposalId);
+      if (proposalId && alreadyResolved.has(proposalId)) continue;
+      if (proposalId) alreadyResolved.add(proposalId);
 
       const matched = options.items.find((item) => itemMatchesRecord(item, record));
       const shipped = matched ? matched.ok : allOk;
@@ -116,6 +136,54 @@ export async function recordLoopApproval(
     }
 
     // runIds are unique to one loop's run — no need to scan the rest.
+    break;
+  }
+
+  return result;
+}
+
+/**
+ * Persist a human ❌ against every still-pending proposal in a loop run.
+ *
+ * Learning stores are append-only, so terminal decisions are detected by
+ * proposal ID before writing. The first terminal decision wins: replays and a
+ * later conflicting reaction cannot create a second decision for a proposal.
+ */
+export async function recordLoopDenial(
+  options: RecordLoopDenialOptions,
+): Promise<DenialPersistenceResult> {
+  const now = options.now ?? new Date();
+  const result: DenialPersistenceResult = { loopId: null, denied: 0 };
+
+  for (const { loopId, store } of options.stores) {
+    const history = await store.queryHistory({ loopId });
+    const runRecords = history.filter((r) => (r.runId as unknown as string) === options.runId);
+    if (runRecords.length === 0) continue;
+
+    const resolvedProposalIds = new Set(
+      runRecords
+        .filter((r) => r.decision?.status !== 'pending' && r.decision != null)
+        .map((r) => r.proposal?.proposalId as string | undefined)
+        .filter((id): id is string => id != null),
+    );
+
+    result.loopId = loopId;
+    for (const record of runRecords.filter((r) => r.decision?.status === 'pending')) {
+      const proposalId = record.proposal?.proposalId as string | undefined;
+      if (proposalId && resolvedProposalIds.has(proposalId)) continue;
+      if (proposalId) resolvedProposalIds.add(proposalId);
+
+      await store.record({
+        loopId,
+        runId: record.runId,
+        ts: now,
+        proposal: record.proposal,
+        mutation: record.mutation,
+        decision: { status: 'denied', decidedAt: now, decidedBy: options.denier },
+      });
+      result.denied += 1;
+    }
+
     break;
   }
 

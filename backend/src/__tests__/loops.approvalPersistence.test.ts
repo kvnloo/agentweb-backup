@@ -16,7 +16,10 @@
  *      (status approved, shippedAt set, verdict null) so outcomes get graded.
  */
 
-import { recordLoopApproval } from '../loops/core/learning/approvalPersistence';
+import {
+  recordLoopApproval,
+  recordLoopDenial,
+} from '../loops/core/learning/approvalPersistence';
 import { InMemoryLearningStore } from '../loops/core/learning/inMemoryLearningStore';
 import { CooldownRuleSet } from '../loops/core/policy/cooldownRuleSet';
 import type {
@@ -258,5 +261,95 @@ describe('recordLoopApproval', () => {
 
     expect(candidates).toHaveLength(1);
     expect(candidates[0].proposal?.sourceRuleId).toBe('llm-analyst:fix-cta');
+  });
+});
+
+describe('recordLoopDenial', () => {
+  let store: InMemoryLearningStore;
+  const stores = () => [{ loopId: LOOP_ID, store }];
+
+  beforeEach(() => {
+    store = new InMemoryLearningStore();
+  });
+
+  it('records each pending proposal as denied without a shippedAt timestamp', async () => {
+    await seedPending(store, 'fix-cta', new Date('2026-06-12T07:00:00.000Z'));
+
+    const result = await recordLoopDenial({
+      runId: RUN_ID,
+      denier: 'slack:harsha',
+      stores: stores(),
+      now: NOW,
+    });
+
+    expect(result).toEqual({ loopId: LOOP_ID, denied: 1 });
+    const denied = await store.queryHistory({ loopId: LOOP_ID, status: ['denied'] });
+    expect(denied).toHaveLength(1);
+    expect(denied[0].proposal?.proposalId).toBe('prop-fix-cta');
+    expect(denied[0].decision).toEqual({
+      status: 'denied',
+      decidedAt: NOW,
+      decidedBy: 'slack:harsha',
+    });
+    expect(denied[0].shippedAt).toBeUndefined();
+  });
+
+  it('is idempotent when the same rejection is replayed', async () => {
+    await seedPending(store, 'fix-cta', new Date('2026-06-12T07:00:00.000Z'));
+    const options = {
+      runId: RUN_ID,
+      denier: 'slack:harsha',
+      stores: stores(),
+      now: NOW,
+    };
+
+    await recordLoopDenial(options);
+    const sizeAfterFirst = store.size;
+    const replay = await recordLoopDenial(options);
+
+    expect(replay.denied).toBe(0);
+    expect(store.size).toBe(sizeAfterFirst);
+  });
+
+  it('does not overwrite a proposal that was already approved', async () => {
+    await seedPending(store, 'fix-cta', new Date('2026-06-12T07:00:00.000Z'));
+    await recordLoopApproval({
+      runId: RUN_ID,
+      items: [{ id: 'fix-cta', ok: true }],
+      approver: 'slack:harsha',
+      stores: stores(),
+      now: NOW,
+    });
+
+    const result = await recordLoopDenial({
+      runId: RUN_ID,
+      denier: 'slack:harsha',
+      stores: stores(),
+      now: new Date('2026-06-12T09:00:00.000Z'),
+    });
+
+    expect(result.denied).toBe(0);
+    expect(await store.queryHistory({ loopId: LOOP_ID, status: ['denied'] })).toHaveLength(0);
+  });
+
+  it('prevents a later approval from overwriting a rejected proposal', async () => {
+    await seedPending(store, 'fix-cta', new Date('2026-06-12T07:00:00.000Z'));
+    await recordLoopDenial({
+      runId: RUN_ID,
+      denier: 'slack:harsha',
+      stores: stores(),
+      now: NOW,
+    });
+
+    const result = await recordLoopApproval({
+      runId: RUN_ID,
+      items: [{ id: 'fix-cta', ok: true }],
+      approver: 'slack:harsha',
+      stores: stores(),
+      now: new Date('2026-06-12T09:00:00.000Z'),
+    });
+
+    expect(result.approved).toBe(0);
+    expect(await store.queryHistory({ loopId: LOOP_ID, status: ['approved'] })).toHaveLength(0);
   });
 });

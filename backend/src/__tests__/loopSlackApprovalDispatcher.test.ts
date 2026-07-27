@@ -83,6 +83,7 @@ function mockBotMessage(text: string, bot_id = 'BBOT123'): void {
 beforeEach(() => {
   jest.clearAllMocks();
   _resetLoopApprovalForTesting();
+  delete process.env.LOOP_SLACK_DECISION_GATE_ENABLED;
   dispatchEntry = null;
   mockGetDispatched.mockImplementation(async () => dispatchEntry);
   mockMarkDispatched.mockImplementation(async (_ts: string, pageIds: string[]) => {
@@ -123,6 +124,27 @@ describe('handleLoopApprovalReaction — gate checks', () => {
       makeEvent({ item: { type: 'file', channel: DM_CHANNEL, ts: MSG_TS } }),
     );
     expect(mockHistoryFn).not.toHaveBeenCalled();
+  });
+
+  it('accepts a rejection reaction without dispatching work', async () => {
+    mockBotMessage(`*Daily digest*\nRun ID: run-001\n1. Fix the thing\n\n${FOOTER}`);
+
+    await handleLoopApprovalReaction(makeEvent({ reaction: 'x' }));
+    const historyCallCount = mockHistoryFn.mock.calls.length;
+    mockHistoryFn.mockReset();
+
+    expect(historyCallCount).toBeGreaterThan(0);
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
+    expect(mockMarkDispatched).not.toHaveBeenCalled();
+  });
+
+  it('restores the prior checkmark-only behavior when the decision gate is disabled', async () => {
+    process.env.LOOP_SLACK_DECISION_GATE_ENABLED = 'false';
+
+    await handleLoopApprovalReaction(makeEvent({ reaction: 'x' }));
+
+    expect(mockHistoryFn).not.toHaveBeenCalled();
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
   });
 });
 

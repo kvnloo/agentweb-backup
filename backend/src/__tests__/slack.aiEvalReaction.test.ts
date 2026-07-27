@@ -35,8 +35,10 @@ jest.mock('../services/intakeService', () => ({
 }));
 
 const mockRecordLoopApproval = jest.fn();
+const mockRecordLoopDenial = jest.fn();
 jest.mock('../loops/core/learning/approvalPersistence', () => ({
   recordLoopApproval: (...args: unknown[]) => mockRecordLoopApproval(...args),
+  recordLoopDenial: (...args: unknown[]) => mockRecordLoopDenial(...args),
 }));
 
 // Generic mocks so unrelated handlers in the same file don't blow up.
@@ -199,6 +201,7 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     mockAuthTest.mockResolvedValue({ ok: true, user_id: EMMA_BOT });
     mockChatPostMessage.mockResolvedValue({ ok: true, ts: 'reply-ts' });
     mockRecordLoopApproval.mockResolvedValue({ loopId: null, approved: 0, shipped: 0, dispatchFailures: 0 });
+    mockRecordLoopDenial.mockResolvedValue({ loopId: 'test-loop', denied: 1 });
     mockFileAutoIssue.mockResolvedValue({
       id: 'ENG-999',
       url: 'https://linear.app/agentweb/issue/ENG-999/test',
@@ -545,6 +548,40 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
 
     expect(res.status).toBe(200);
     await wait();
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
+  });
+
+  it('persists an authorized x reaction as a rejection without filing work', async () => {
+    mockConversationsHistory.mockResolvedValue({
+      ok: true,
+      messages: [
+        {
+          ts: MESSAGE_TS,
+          user: EMMA_BOT,
+          bot_id: 'B_EMMA',
+          text: buildLoopDmMessage(),
+        },
+      ],
+    });
+
+    const res = await request(buildApp())
+      .post('/api/slack/events')
+      .send({
+        type: 'event_callback',
+        event: {
+          type: 'reaction_added',
+          reaction: 'x',
+          user: HARSHA,
+          item: { type: 'message', channel: DM_CHANNEL, ts: MESSAGE_TS },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    await wait();
+    expect(mockRecordLoopDenial).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'abc-123',
+      denier: `slack:${HARSHA}`,
+    }));
     expect(mockFileAutoIssue).not.toHaveBeenCalled();
   });
 
