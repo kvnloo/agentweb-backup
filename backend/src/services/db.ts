@@ -679,6 +679,21 @@ export interface Organization {
     invitedAt: string;
     invitedBy: string;
   }>;
+  /**
+   * Owner opt-in: when true, new signups whose email domain matches
+   * autoJoinDomain create a pendingDomainJoinRequest and email the owner for
+   * approval, instead of requiring an explicit invite. autoJoinDomain is
+   * always derived server-side from the owner's own email domain — never
+   * client-supplied — so an owner can't claim a domain they don't belong to.
+   */
+  autoJoinEnabled?: boolean;
+  autoJoinDomain?: string;
+  pendingDomainJoinRequests?: Array<{
+    userId: string;
+    email: string;
+    requestedAt: string;
+    requestToken: string;
+  }>;
   maxMembers: number;
   createdAt: string;
   updatedAt: string;
@@ -8301,33 +8316,44 @@ export const orgDb = {
       return org;
     }
 
-    const updateExpressions: string[] = [];
+    const setExpressions: string[] = [];
+    const removeExpressions: string[] = [];
     const expressionAttributeNames: Record<string, string> = {};
     const expressionAttributeValues: Record<string, any> = {};
 
     Object.entries(updatableFields).forEach(([key, value]) => {
-      if (value !== undefined) {
-        updateExpressions.push(`#${key} = :${key}`);
-        expressionAttributeNames[`#${key}`] = key;
+      if (value === undefined) return;
+      expressionAttributeNames[`#${key}`] = key;
+      if (value === null) {
+        // Same REMOVE-on-null convention as userDb.updateUser — needed to
+        // actually clear a GSI-keyed attribute like autoJoinDomain, since
+        // DynamoDB rejects SET-ing a GSI key to NULL.
+        removeExpressions.push(`#${key}`);
+      } else {
+        setExpressions.push(`#${key} = :${key}`);
         expressionAttributeValues[`:${key}`] = value;
       }
     });
 
-    if (updateExpressions.length === 0) {
+    if (setExpressions.length === 0 && removeExpressions.length === 0) {
       const org = await this.getOrgById(orgId);
       if (!org) throw new Error(`Organization ${orgId} not found`);
       return org;
     }
 
     // Always update updatedAt
-    updateExpressions.push("#updatedAt = :updatedAt");
+    setExpressions.push("#updatedAt = :updatedAt");
     expressionAttributeNames["#updatedAt"] = "updatedAt";
     expressionAttributeValues[":updatedAt"] = new Date().toISOString();
+
+    const updateExpressionParts: string[] = [];
+    updateExpressionParts.push(`SET ${setExpressions.join(", ")}`);
+    if (removeExpressions.length > 0) updateExpressionParts.push(`REMOVE ${removeExpressions.join(", ")}`);
 
     const params = {
       TableName: ORGS_TABLE,
       Key: { orgId },
-      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      UpdateExpression: updateExpressionParts.join(" "),
       ExpressionAttributeNames: expressionAttributeNames,
       ExpressionAttributeValues: expressionAttributeValues,
       ReturnValues: "ALL_NEW" as const,
@@ -8399,6 +8425,27 @@ export const orgDb = {
       lastEvaluatedKey = result.LastEvaluatedKey;
     } while (lastEvaluatedKey);
     return null;
+  },
+
+  // Find all orgs with auto-join enabled for the given email domain (indexed
+  // query via AutoJoinDomainIndex, not a scan — this runs on every signup).
+  // Used at registration time to create pending domain-join requests.
+  async getOrgsWithAutoJoinDomain(domain: string): Promise<Organization[]> {
+    const allItems: Organization[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await dynamodb.query({
+        TableName: ORGS_TABLE,
+        IndexName: "AutoJoinDomainIndex",
+        KeyConditionExpression: "autoJoinDomain = :domain",
+        FilterExpression: "autoJoinEnabled = :enabled",
+        ExpressionAttributeValues: { ":domain": domain, ":enabled": true },
+        ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+      }).promise();
+      allItems.push(...((result.Items as Organization[]) || []));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return allItems;
   },
 
   async updateShareSettings(orgId: string, settings: OrgShareSettings): Promise<void> {
