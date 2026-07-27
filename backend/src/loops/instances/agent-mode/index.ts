@@ -172,7 +172,10 @@ const agentModeDigestTemplate: LoopDigestTemplate<number> = {
   ],
   findingsBody: (result, mutationCount) => [
     `*Failing tools (fix specs prepared: ${mutationCount})*`,
-    ...result.proposals.map((p, i) => `${i + 1}. ${p.hypothesis}`),
+    ...result.proposals.flatMap((p, i) => [
+      `${i + 1}. ${p.hypothesis}`,
+      `   Proposal ID: \`${p.proposalId}\``,
+    ]),
   ],
 };
 

@@ -44,8 +44,8 @@ interface LoopDispatchTask {
 }
 
 interface DispatchResult {
-  /** Digest item id (analyst slug) — links back to the learning record's
-   * proposal for approval persistence. */
+  /** Stable proposal/decision id — links back to the learning record for
+   * per-item approval persistence, including partial dispatch results. */
   id: string;
   title: string;
   ok: boolean;
@@ -199,10 +199,16 @@ function extractGenericDigestTasks(text: string): LoopDispatchTask[] {
       .map((line) => line.trim())
       .filter(Boolean);
     const detailText = details.length ? `\n\nDetails:\n${details.map((line) => `- ${line}`).join('\n')}` : '';
-    const kind = details.find((line) => /^Kind:/i.test(line)) ?? '';
+    const proposalId = details
+      .find((line) => /^Proposal ID:/i.test(line))
+      ?.match(/^Proposal ID:\s*`?([^`\s|]+)/i)?.[1];
+    const kind = details.find((line) => /(?:^|\|\s*)Kind:/i.test(line)) ?? '';
     const explicitlyAdmitted = details.some((line) => /Autofix eligible:\s*yes/i.test(line));
     tasks.push({
-      id: `${loopSlug}-${runId}-${index}`,
+      // Current loop digests carry the proposal ID so mixed success/failure
+      // dispatches can be reconciled one-for-one. Keep the synthetic fallback
+      // for already-posted legacy digests.
+      id: proposalId ?? `${loopSlug}-${runId}-${index}`,
       title: `fix(${loopSlug}): ${item.slice(0, 90)}`,
       sourceLabel: title,
       executionRoute:
