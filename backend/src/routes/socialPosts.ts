@@ -76,20 +76,36 @@ router.get('/social-posts', authenticateToken, async (req: Request, res: Respons
     //     one of those same accounts must share cooldown state, otherwise a
     //     caller can alternate between the two to bypass the cooldown and
     //     double up on LinkedIn calls for the same account.
+    // Force-reload only the accounts that aren't currently throttled. When
+    // undefined, getPostsForUser force-reloads everything (the non-force path
+    // leaves this undefined, which is harmless since forceReload is false).
+    let forceReloadAccountIds: string[] | undefined;
     if (forceReload) {
       const socialAccountIds = await getSocialAccountIds(userId);
       const targetAccountIds = accountId
         ? socialAccountIds.filter((id) => id === accountId)
         : socialAccountIds;
 
+      // Partition targets into those still cooling down and those eligible to
+      // refresh now. A single throttled page must NOT block an all-accounts
+      // refresh of the others — only refresh the eligible ones, and 429 solely
+      // when every targeted page is still cooling.
       const now = Date.now();
+      const eligibleAccountIds: string[] = [];
       let retryAfterMs = 0;
       for (const id of targetAccountIds) {
         const last = forceReloadCooldown.get(`${userId}::${id}`)?.at ?? 0;
-        retryAfterMs = Math.max(retryAfterMs, last + FORCE_RELOAD_COOLDOWN_MS - now);
+        const remainingMs = last + FORCE_RELOAD_COOLDOWN_MS - now;
+        if (remainingMs > 0) {
+          retryAfterMs = Math.max(retryAfterMs, remainingMs);
+        } else {
+          eligibleAccountIds.push(id);
+        }
       }
 
-      if (retryAfterMs > 0) {
+      // Only throttle when there's at least one target and nothing eligible —
+      // i.e. every targeted page is still within its cooldown window.
+      if (targetAccountIds.length > 0 && eligibleAccountIds.length === 0) {
         return res.status(429).json({
           success: false,
           error: 'Posts were just refreshed. Please wait a moment before refreshing again.',
@@ -103,13 +119,16 @@ router.get('/social-posts', authenticateToken, async (req: Request, res: Respons
       // with a unique token so rollback can tell this request's reservation
       // apart from one a later request may have written over the same key.
       reservedCooldownToken = ++forceReloadReservationSeq;
-      for (const id of targetAccountIds) {
+      for (const id of eligibleAccountIds) {
         forceReloadCooldown.set(`${userId}::${id}`, { at: now, token: reservedCooldownToken });
       }
-      reservedCooldownIds = targetAccountIds;
+      reservedCooldownIds = eligibleAccountIds;
+      // Force-reload exactly the accounts we just reserved; cooling pages are
+      // still returned, from cache. Passing [] scopes force-reload to nothing.
+      forceReloadAccountIds = eligibleAccountIds;
     }
 
-    const result = await getPostsForUser(userId, { accountId, limit, includeMetrics, forceReload });
+    const result = await getPostsForUser(userId, { accountId, limit, includeMetrics, forceReload, forceReloadAccountIds });
     return res.json(result);
   } catch (error) {
     if (userId) {

@@ -11,6 +11,12 @@ interface GetPostsOptions {
   limit?: number;
   includeMetrics?: boolean;
   forceReload?: boolean;
+  // Per-account force-reload allow-list. When provided, only accounts whose id
+  // is in this list bypass the cache; all others read from cache regardless of
+  // `forceReload`. Lets an "all accounts" refresh re-fetch only the pages that
+  // aren't currently throttled while still returning the throttled ones from
+  // cache. When omitted, `forceReload` applies to every account (legacy path).
+  forceReloadAccountIds?: string[];
 }
 
 interface NormalizedPost {
@@ -68,7 +74,10 @@ export async function getPostsForUser(
   userId: string,
   options: GetPostsOptions = {}
 ): Promise<GetPostsResult> {
-  const { accountId, limit = 20, includeMetrics = true, forceReload = false } = options;
+  const { accountId, limit = 20, includeMetrics = true, forceReload = false, forceReloadAccountIds } = options;
+  // When an explicit allow-list is given, force-reload is decided per account;
+  // otherwise the single `forceReload` flag applies to every account.
+  const forceReloadSet = forceReloadAccountIds ? new Set(forceReloadAccountIds) : null;
 
   const allAccounts = await getAccountsByUserId(userId);
 
@@ -86,7 +95,8 @@ export async function getPostsForUser(
   for (const account of accounts) {
     try {
       const adapter = socialPlatformService.getAdapter(account.platform);
-      let posts = await adapter.listPosts(account, { limit, force_reload: forceReload }, userId);
+      const shouldForceReload = forceReloadSet ? forceReloadSet.has(account.account_id) : forceReload;
+      let posts = await adapter.listPosts(account, { limit, force_reload: shouldForceReload }, userId);
 
       if (includeMetrics && posts.length > 0) {
         try {
