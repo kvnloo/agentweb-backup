@@ -114,12 +114,19 @@ export async function runLoop(
       try {
         const mutation = await tools.apply(proposal);
         mutations.push(mutation);
+        const recordedAt = ports.clock.now();
         await learning.record({
           loopId: manifest.loopId,
           runId,
-          ts: ports.clock.now(),
+          ts: recordedAt,
           proposal,
           mutation,
+          // `pending` is durable lifecycle metadata consumed by the existing
+          // dispatch/approval persistence path; it is not an in-process gate.
+          // Failed materializations are evidence only and cannot be shipped.
+          ...(mutation.error
+            ? {}
+            : { decision: { status: 'pending' as const, decidedAt: recordedAt } }),
         });
       } catch (err) {
         ports.logger.log('error', '[loops] tools.apply failed', {
