@@ -1,3 +1,63 @@
+## ENG-442: CRM drip-sequence agent tools + the pre-send approval gate (2026-07-27)
+
+**The gap.** The CRM drip engine has been fully built for a while — `routes/sequences.ts`
+(`/api/crm/sequences`, mounted in `app.ts`), `services/dripSequenceDb.ts`, and
+`services/dripSequenceWorker.ts`. What was missing was any *agent* surface for it. Emma had
+`get_leads_by_crm_criteria` (scope WHO a campaign targets) but nothing to list, build, inspect
+or pause the campaign itself, so answering "are email campaigns running for our CRM leads?"
+needed a delegated admin JWT and a raw backend call.
+
+**Registration pattern I followed (verified, not invented).** There are two registries and they
+are bridged, which is easy to get wrong:
+- `mcpToolRegistry` (`mcp/server/registry.ts`, populated by `mcp/server/apiTools.ts`) — tools
+  exposed to external MCP clients, plus the fallback lookup in `chatbotService`. Every tool here
+  goes through `mcpFetch` (HTTP self-call with a short-lived JWT) rather than calling services
+  directly — that is deliberate, it keeps `authenticateToken` in the path and closes the IDOR
+  surface. `get_leads_by_crm_criteria` lives here, so the new tools live next to it.
+- `emmaToolRegistry` (`emma/registry.ts`, populated by `emma/tools.ts`) — what Agent Mode
+  (`agentModeService.registerTools`) and the sidebar actually offer the model.
+- The link is the explicit `bridgedToolNames` array at the bottom of `emma/tools.ts`. **A tool
+  registered only in `mcpToolRegistry` is invisible to Agent Mode Emma.** `get_leads_by_crm_criteria`
+  is in fact not bridged today — MCP-only. The new tools ARE bridged, and
+  `emma.crmSequenceTools.bridge.test.ts` pins that so it cannot silently regress.
+
+**Send safety (the load-bearing part).** `dripSequenceWorker.processEnrollment` only mails an
+enrollment when `sequence.status === 'active'`; draft/paused return early, archived exits. So
+"activate" IS "start sending", and it is the single action worth gating. `services/crmSequenceApproval.ts`
+holds the decision as a pure function:
+- `create` hard-codes `status: 'draft'` and ignores any caller-supplied status, so a created
+  sequence can never send on its own. Drafting from a scheduled run is therefore safe and allowed.
+- `pause` is ungated — it only ever stops sending.
+- `resume` runs `resolveSequenceRunMode` → `evaluateSequenceSendApproval`. An unattended run is
+  refused unconditionally and `confirm: true` does NOT override it (in an unattended run the only
+  thing that could have set `confirm` is the model). The refusal happens before any HTTP call.
+- **Attended is proven, not assumed.** `ATTENDED_SESSION_TYPES` is an allowlist
+  (`regular`, `predefined-work-plan`, `interactive_share`). No session id, an unresolvable session
+  id (an external MCP transport id is *not* a chat session id — `getChatSession` returns null for
+  it), a lookup error, or any unlisted session type all resolve to `unattended`. New session types
+  therefore default to blocked, which is the direction a safety gate should drift.
+
+**Assumption worth writing down.** Fail-closed means activation is not reachable from an external
+MCP client (no chat session to prove a human). That is intentional: listing, drafting, inspecting
+and pausing all still work there, and activation stays available in an interactive Emma chat and
+in the CRM UI. If we later want MCP-client activation, the right fix is a real approval primitive
+(the AskUserQuestion card, or a Slack-reaction gate like `loops/core/gates`), not loosening this
+check.
+
+**One engine change was required.** Heat-score targeting emits
+`{ field: 'heatScore', operator: 'gte', value: N }`, and `StepConditionOperator` only had
+`eq | neq | exists | not_exists | contains`. `evaluateCondition`'s `default: return false` means an
+unsupported operator silently *exits every lead* — so emitting `gte` without the worker change
+would have produced a campaign that mails nobody. Added `gte`/`lte` with a shared numeric coercion
+helper (non-numeric or missing values never satisfy the condition, so the fail-safe direction is
+preserved) and covered it in `dripSequenceWorker.numericCondition.test.ts`. No schema, table, index
+or migration change — DynamoDB is schemaless and this is an additive optional value on an existing
+struct, only present on sequences created after this ships.
+
+**Known limit.** A sequence has exactly one `enrollmentCondition` slot, so "list + lifecycle +
+min_heat_score" needs two conditions and is rejected with an explicit error rather than silently
+dropping half the segment.
+
 ## ENG-114: durable MCP session store so sessions resolve across instances (2026-07-21)
 
 MCP Streamable-HTTP sessions lived only in a per-process `Map` in `mcp/server/mcpServer.ts`. On a
