@@ -443,7 +443,12 @@ async function main() {
     try { await addComment(issue.id, manualTestBody(marker, manualOpts)); } catch (e) { log('Warn: manual-test comment failed:', e.message); }
 
     if (verify) {
-      for (const p of prs) if (p.url) spawnSync('gh', ['pr', 'comment', p.url, '--body', verifyBody(verify)], { encoding: 'utf8' });
+      // Post the browser-verification comment AS THE ASSIGNEE (their GH token), same as openPrs opens the
+      // PR — otherwise it falls back to the box `gh` account (Harshit) and the comment is mis-attributed.
+      // No token configured → falls back to the box account (same as the PR-authorship fallback).
+      const ghToken = resolveAssigneeGhToken(issue.assignee);
+      const prEnv = ghToken ? { ...process.env, GH_TOKEN: ghToken } : process.env;
+      for (const p of prs) if (p.url) spawnSync('gh', ['pr', 'comment', p.url, '--body', verifyBody(verify)], { encoding: 'utf8', env: prEnv });
     }
 
     if (triage === 'green') {
