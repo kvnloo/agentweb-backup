@@ -6,6 +6,7 @@ import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
 import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey } from "../utils/leadSchema";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
+import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
@@ -7642,6 +7643,104 @@ export const browserCookieDb = {
       }).promise();
     } catch (error) {
       handleDynamoDbError(error, 'deleteAllBrowserCookies');
+      throw error;
+    }
+  },
+
+  /**
+   * Save a manually-imported (e.g. pasted from DevTools) cookie set for a specific
+   * domain, distinct from the auto-persisted '__all__' blob. Caller is responsible
+   * for normalizing `domain` (lowercase) before calling. Encrypted at rest — unlike
+   * the auto-persisted blob, this is a user-supplied, already-authenticated bearer
+   * credential.
+   */
+  async saveDomainCookies(userId: string, domain: string, cookies: any[]): Promise<void> {
+    const now = new Date().toISOString();
+    try {
+      await dynamodb.put({
+        TableName: BROWSER_COOKIES_TABLE,
+        Item: {
+          userId,
+          domain,
+          encryptedCookies: encryptPassword(JSON.stringify(cookies), userId),
+          cookieCount: cookies.length,
+          updatedAt: now,
+          createdAt: now,
+        },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'saveDomainBrowserCookies');
+      throw error;
+    }
+  },
+
+  /** List manually-imported cookie domains for a user — metadata only, never the encrypted values. */
+  async listDomainCookies(userId: string): Promise<Array<{ domain: string; cookieCount: number; createdAt: string }>> {
+    try {
+      const result = await dynamodb.query({
+        TableName: BROWSER_COOKIES_TABLE,
+        KeyConditionExpression: 'userId = :userId',
+        ExpressionAttributeValues: { ':userId': userId },
+      }).promise();
+
+      return (result.Items || [])
+        .filter((item) => item.domain !== '__all__')
+        .map((item) => ({
+          domain: item.domain,
+          cookieCount: item.cookieCount ?? 0,
+          createdAt: item.createdAt,
+        }));
+    } catch (error) {
+      handleDynamoDbError(error, 'listDomainBrowserCookies');
+      throw error;
+    }
+  },
+
+  async deleteDomainCookies(userId: string, domain: string): Promise<void> {
+    try {
+      await dynamodb.delete({
+        TableName: BROWSER_COOKIES_TABLE,
+        Key: { userId, domain },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'deleteDomainBrowserCookies');
+      throw error;
+    }
+  },
+
+  /**
+   * Combined cookie set for browser-automation injection: the auto-persisted
+   * '__all__' blob followed by every manually-imported per-domain entry. Order
+   * matters — per-domain (deliberately human-provided) cookies are appended AFTER
+   * '__all__' so they take precedence for the same site when Playwright's
+   * addCookies dedups by name/domain/path. A single corrupted/undecryptable
+   * per-domain entry is logged and skipped rather than failing the whole load.
+   */
+  async getAllCookiesForUser(userId: string): Promise<any[]> {
+    try {
+      const result = await dynamodb.query({
+        TableName: BROWSER_COOKIES_TABLE,
+        KeyConditionExpression: 'userId = :userId',
+        ExpressionAttributeValues: { ':userId': userId },
+      }).promise();
+
+      const items = result.Items || [];
+      const allItem = items.find((item) => item.domain === '__all__');
+      const combined: any[] = [...(allItem?.cookies || [])];
+
+      for (const item of items) {
+        if (item.domain === '__all__') continue;
+        try {
+          const { password: cookiesJson } = decryptPassword(item.encryptedCookies);
+          combined.push(...JSON.parse(cookiesJson));
+        } catch (error) {
+          console.error(`Failed to decrypt/parse browser cookies for domain "${item.domain}" (userId: ${userId}):`, error);
+        }
+      }
+
+      return combined;
+    } catch (error) {
+      handleDynamoDbError(error, 'getAllBrowserCookiesForUser');
       throw error;
     }
   },

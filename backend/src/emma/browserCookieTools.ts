@@ -119,7 +119,7 @@ emmaToolRegistry.register({
     const userId = context?.userId;
     if (!userId) throw new Error('Authentication required');
 
-    const cookies = await browserCookieDb.getCookies(userId);
+    const cookies = await browserCookieDb.getAllCookiesForUser(userId);
 
     if (!cookies || cookies.length === 0) {
       return { success: false, message: 'No saved cookies found. The user may need to log in manually.' };

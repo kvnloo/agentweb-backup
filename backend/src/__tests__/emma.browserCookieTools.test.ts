@@ -9,6 +9,7 @@ jest.mock('../services/db', () => ({
     saveCookies: jest.fn().mockResolvedValue(undefined),
     getCookies: jest.fn().mockResolvedValue(null),
     deleteAllCookies: jest.fn().mockResolvedValue(undefined),
+    getAllCookiesForUser: jest.fn().mockResolvedValue([]),
   },
 }));
 
@@ -140,8 +141,8 @@ describe('load_browser_cookies', () => {
       .rejects.toThrow('Authentication required');
   });
 
-  it('should return failure when no saved cookies exist', async () => {
-    mockedDb.getCookies.mockResolvedValue(null);
+  it('should return failure when no saved cookies exist (both "__all__" and per-domain empty)', async () => {
+    mockedDb.getAllCookiesForUser.mockResolvedValue([]);
     const ctx = createMockContext();
     const result = await executeTool('load_browser_cookies', {}, ctx);
 
@@ -150,14 +151,15 @@ describe('load_browser_cookies', () => {
     expect(ctx.service.executeTool).not.toHaveBeenCalled();
   });
 
-  it('should load all cookies from DB and inject into browser', async () => {
-    mockedDb.getCookies.mockResolvedValue(sampleCookies);
+  it('should load all cookies (via getAllCookiesForUser) and inject into browser', async () => {
+    mockedDb.getAllCookiesForUser.mockResolvedValue(sampleCookies);
     const ctx = createMockContext({ content: 'Loaded 3 cookies', raw: {} });
 
     const result = await executeTool('load_browser_cookies', {}, ctx);
 
     expect(result.success).toBe(true);
     expect(result.cookieCount).toBe(3);
+    expect(mockedDb.getAllCookiesForUser).toHaveBeenCalledWith('test-user-123');
 
     // Should have called browser_run_code to inject cookies
     expect(ctx.service.executeTool).toHaveBeenCalledWith(
@@ -169,8 +171,19 @@ describe('load_browser_cookies', () => {
     );
   });
 
+  it('should succeed when only manually-imported per-domain cookies exist (no "__all__" ever saved)', async () => {
+    const manualOnly = [sampleCookies[2]];
+    mockedDb.getAllCookiesForUser.mockResolvedValue(manualOnly);
+    const ctx = createMockContext({ content: 'Loaded 1 cookies', raw: {} });
+
+    const result = await executeTool('load_browser_cookies', {}, ctx);
+
+    expect(result.success).toBe(true);
+    expect(result.cookieCount).toBe(1);
+  });
+
   it('should reject when Playwright tools are not available', async () => {
-    mockedDb.getCookies.mockResolvedValue(sampleCookies);
+    mockedDb.getAllCookiesForUser.mockResolvedValue(sampleCookies);
     const ctx = createMockContext();
     ctx.service.toolRegistry.getAllTools = () => [];
     await expect(executeTool('load_browser_cookies', {}, ctx))
