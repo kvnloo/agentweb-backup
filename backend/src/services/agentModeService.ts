@@ -81,7 +81,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status'];
+const ADMIN_SKILL_TOOL_NAMES = ['manage_linear_governance_label', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -223,6 +223,7 @@ import {
   ALLOWED_NODE_TYPES,
   AllowedNodeType,
   ALLOWED_INSIGHTS_FIELDS,
+  suggestInsightsFields,
   ALLOWED_INSIGHTS_BREAKDOWNS,
   ALLOWED_ACTION_BREAKDOWNS,
   ALLOWED_DATE_PRESETS,
@@ -13918,13 +13919,33 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         throw new Error("fields array is required");
       }
 
-      const invalidFields = fields.filter(
+      // ENG-511: Do NOT hard-reject the whole call when some requested fields are
+      // unknown. Meta Insights has a large, evolving field vocabulary and the model
+      // occasionally requests a valid-but-unwhitelisted field (e.g.
+      // cost_per_inline_link_click) or a plausible-but-unsupported one. Previously
+      // any unknown field threw, the model re-issued the identical call, and the
+      // anti-loop/retry guard hard-blocked the entire insights channel before any
+      // metrics came back. Instead: drop the unknown fields, keep the valid subset,
+      // and proceed. Only fail when NOTHING valid remains — and even then, name the
+      // dropped fields so the model corrects rather than blindly retries.
+      const droppedFields = fields.filter(
         (f) => !ALLOWED_INSIGHTS_FIELDS.includes(f)
       );
+      let validFields = fields.filter((f) =>
+        ALLOWED_INSIGHTS_FIELDS.includes(f)
+      );
 
-      if (invalidFields.length) {
+      if (!validFields.length) {
+        // ENG-511: point the model at the closest valid field for each bad one so
+        // it can correct a typo/loose phrasing rather than guess.
+        const suggestions = suggestInsightsFields(droppedFields);
+        const suggestionHint = Object.keys(suggestions).length
+          ? ` Did you mean: ${Object.entries(suggestions)
+              .map(([bad, good]) => `${bad} -> ${good}`)
+              .join(", ")}?`
+          : "";
         throw new Error(
-          `Invalid insights fields requested: ${invalidFields.join(", ")}`
+          `Invalid insights fields requested: ${droppedFields.join(", ")}. None are supported, so no data could be fetched — do not retry with the same fields.${suggestionHint} Choose from allowed fields such as impressions, clicks, spend, cpc, ctr, reach, inline_link_clicks, cost_per_inline_link_click.`
         );
       }
 
@@ -14003,7 +14024,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const submitUrl = `${baseUrl}/${actualNodeId}/insights`;
 
       const filteredParams = {
-        fields: fields.join(","),
+        fields: validFields.join(","),
         limit: 5000,
 
         ...(date_preset && { date_preset }),
@@ -14018,57 +14039,138 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ...(filtering?.length && { filtering }),
       };
 
-      const submitRes = await axios.post(submitUrl, {
-        ...filteredParams,
-        access_token: accessToken,
-      });
-
-      const reportRunId = (submitRes.data as any)?.report_run_id;
-
-      if (!reportRunId) {
-        throw new Error("Failed to get report_run_id from Meta");
-      }
-
-      // Polling Engine
-      let attempts = 0;
-      const maxAttempts = 60;
-
-      while (attempts < maxAttempts) {
-        attempts++;
-
-        await new Promise((resolve) => setTimeout(resolve, 10000));
-
-        const statusRes = await axios.get(`${baseUrl}/${reportRunId}`, {
-          params: { access_token: accessToken },
+      // ENG-511: Run the full report (submit → poll → fetch) as one unit. Meta
+      // rejects some whitelisted fields at SUBMIT time (HTTP 400 on the POST) but
+      // others only LAZILY at result-read time (e.g. onsite_conversion_lead_grouped
+      // returns "(#100) Tried accessing nonexisting summary field ..." on the GET,
+      // after a report_run_id was already issued). Wrapping the whole run lets us
+      // self-heal a bad field regardless of which stage surfaces it.
+      const runReport = async (
+        fieldsToSend: string[]
+      ): Promise<{ reportRunId: string; data: any[] }> => {
+        const submitRes = await axios.post(submitUrl, {
+          ...filteredParams,
+          fields: fieldsToSend.join(","),
+          access_token: accessToken,
         });
-
-        const status = (statusRes.data as any)?.async_status;
-
-        if (status === "Job Completed") break;
-
-        if (status === "Job Failed" || status === "Job Skipped") {
-          throw new Error(`Meta Insights Job failed: ${status}`);
+        const rid = (submitRes.data as any)?.report_run_id;
+        if (!rid) {
+          throw new Error("Failed to get report_run_id from Meta");
         }
 
-        if (attempts === maxAttempts) {
-          throw new Error("Meta Insights Job timed out.");
+        // Polling Engine
+        let attempts = 0;
+        const maxAttempts = 60;
+        while (attempts < maxAttempts) {
+          attempts++;
+          await new Promise((resolve) => setTimeout(resolve, 10000));
+          const statusRes = await axios.get(`${baseUrl}/${rid}`, {
+            params: { access_token: accessToken },
+          });
+          const status = (statusRes.data as any)?.async_status;
+          if (status === "Job Completed") break;
+          if (status === "Job Failed" || status === "Job Skipped") {
+            throw new Error(`Meta Insights Job failed: ${status}`);
+          }
+          if (attempts === maxAttempts) {
+            throw new Error("Meta Insights Job timed out.");
+          }
         }
-      }
 
-      // Fetch Paginated Results
-      const resultsUrl = `${baseUrl}/${reportRunId}/insights`;
+        // Fetch Paginated Results
+        const resultsUrl = `${baseUrl}/${rid}/insights`;
+        const collected: any[] = [];
+        let nextUrl: string | null = resultsUrl;
+        let isFirstRequest = true;
+        while (nextUrl) {
+          const res: any = isFirstRequest
+            ? await axios.get(nextUrl, { params: { access_token: accessToken } })
+            : await axios.get(nextUrl); // paging.next already includes token
+          collected.push(...(res.data?.data || []));
+          nextUrl = res.data?.paging?.next || null;
+          isFirstRequest = false;
+        }
+        return { reportRunId: rid, data: collected };
+      };
 
-      let allData: any[] = [];
-      let nextUrl: string | null = resultsUrl;
-      let isFirstRequest = true;
+      // ENG-511: If Meta rejects a whitelisted field (400 at submit OR at read),
+      // don't surface a bare error the model will blindly re-issue until the
+      // anti-loop guard hard-blocks the whole insights channel. Parse the offending
+      // field(s) out of Meta's error, drop them, and retry the whole report exactly
+      // ONCE with the valid remainder. If we cannot isolate the offender (or nothing
+      // valid would remain), return a structured no-retry error so the model
+      // corrects rather than loops.
+      let reportRunId: string;
+      let allData: any[];
+      // Meta names incompatible fields ONE AT A TIME, so a single retry only clears
+      // one bad field. Loop: drop the field(s) Meta names, retry with the remainder,
+      // and repeat until the report succeeds or nothing valid is left. Each pass
+      // removes >=1 field, so validFields strictly shrinks — the loop is bounded by
+      // the field count (maxHealAttempts is a belt-and-suspenders cap).
+      const maxHealAttempts = validFields.length + 1;
+      let healAttempts = 0;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        try {
+          const run = await runReport(validFields);
+          reportRunId = run.reportRunId;
+          allData = run.data;
+          break;
+        } catch (reportErr: any) {
+          const metaError = reportErr?.response?.data?.error;
+          const status = reportErr?.response?.status;
+          const haystack = `${metaError?.message || ""} ${metaError?.error_user_msg || ""} ${metaError?.error_user_title || ""}`;
+          const isFieldError = status === 400 && /field/i.test(haystack);
 
-      while (nextUrl) {
-        const res: any = isFirstRequest
-          ? await axios.get(nextUrl, { params: { access_token: accessToken } })
-          : await axios.get(nextUrl); // paging.next already includes token
-        allData.push(...(res.data?.data || []));
-        nextUrl = res.data?.paging?.next || null;
-        isFirstRequest = false;
+          // Word-boundary match so a rejected field is not confused with a longer
+          // sibling that contains it (e.g. `ctr` inside `inline_link_click_ctr`).
+          const metaRejectedFields = isFieldError
+            ? validFields.filter((f) => new RegExp(`\\b${f}\\b`).test(haystack))
+            : [];
+          const retryFields = validFields.filter(
+            (f) => !metaRejectedFields.includes(f)
+          );
+
+          if (
+            isFieldError &&
+            metaRejectedFields.length &&
+            retryFields.length &&
+            healAttempts < maxHealAttempts
+          ) {
+            // Drop the Meta-rejected field(s) and retry with the valid subset.
+            healAttempts++;
+            droppedFields.push(...metaRejectedFields);
+            validFields = retryFields;
+            filteredParams.fields = validFields.join(",");
+            continue;
+          }
+
+          if (!isFieldError) {
+            throw reportErr;
+          }
+
+          // Field error we cannot recover from (offender unisolable, nothing valid
+          // remains, or cap hit): return a structured no-retry error so the model
+          // corrects rather than loops.
+          const suggestions = suggestInsightsFields(metaRejectedFields);
+          const suggestionHint = Object.keys(suggestions).length
+            ? ` Did you mean: ${Object.entries(suggestions)
+                .map(([bad, good]) => `${bad} -> ${good}`)
+                .join(", ")}?`
+            : "";
+          return {
+            success: false,
+            error: `Meta rejected the requested insights field(s)${metaRejectedFields.length ? `: ${metaRejectedFields.join(", ")}` : ""}. Do not retry the same request — remove or replace the offending field(s).${suggestionHint} Choose from allowed fields such as impressions, clicks, spend, cpc, ctr, reach, inline_link_clicks, cost_per_inline_link_click.`,
+            metadata: {
+              tool: "call_meta_ads_insights_api",
+              account_id,
+              meta_error: metaError?.message || reportErr?.message,
+              ...(Object.keys(suggestions).length && {
+                field_suggestions: suggestions,
+              }),
+            },
+          };
+        }
       }
 
       const envelope = {
@@ -14081,6 +14183,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           query: filteredParams,
           report_run_id: reportRunId,
           api_version: version,
+          // ENG-511: surface any unsupported fields we dropped so the model knows
+          // why they are absent and does not re-request them on the next turn, plus
+          // a closest-valid-field suggestion for each so a typo/loose phrasing is
+          // actionable (e.g. `impression` -> `impressions`) rather than silently gone.
+          ...(droppedFields.length && { dropped_fields: droppedFields }),
+          ...(droppedFields.length &&
+            Object.keys(suggestInsightsFields(droppedFields)).length && {
+              dropped_field_suggestions: suggestInsightsFields(droppedFields),
+            }),
         },
         data: allData,
       };
