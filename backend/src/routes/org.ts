@@ -209,12 +209,29 @@ router.put("/:orgId", async (req: Request, res: Response) => {
       "name", "brandGuidelines", "marketStrategy", "startupProfiles",
       "connected_accounts", "seoDomains", "cmsType", "emailDomain",
       "fromName", "slackChannel", "googleAnalyticsProperties", "googleDriveFolders",
+      "autoJoinEnabled",
     ];
 
     const updates: Partial<Organization> = {};
     for (const field of allowedFields) {
       if (req.body[field] !== undefined) {
         (updates as any)[field] = req.body[field];
+      }
+    }
+
+    // autoJoinDomain is always derived server-side from the owner's own email
+    // — never client-supplied — so an owner can't claim a domain they don't
+    // belong to. Disabling clears it so a later re-enable always re-derives.
+    if (updates.autoJoinEnabled !== undefined) {
+      if (updates.autoJoinEnabled) {
+        const ownerEmail = (req as AuthenticatedRequest).user?.email || "";
+        const domain = ownerEmail.split("@")[1]?.toLowerCase();
+        if (!domain) {
+          return res.status(400).json({ error: "Could not determine your email domain" });
+        }
+        updates.autoJoinDomain = domain;
+      } else {
+        (updates as any).autoJoinDomain = null;
       }
     }
 
@@ -382,6 +399,89 @@ router.post("/accept-invite", async (req: Request, res: Response) => {
     return res.json({ success: true, message: "Successfully joined the organization" });
   } catch (error) {
     console.error("Error accepting invite:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Approve a pending domain-join request (owner only)
+router.post("/:orgId/domain-requests/:requestToken/approve", async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Not authenticated" });
+
+    const { orgId, requestToken } = req.params;
+
+    const org = await orgDb.getOrgById(orgId);
+    if (!org) return res.status(404).json({ error: "Organization not found" });
+
+    if (org.ownerUserId !== userId) {
+      return res.status(403).json({ error: "Only the org owner can approve domain-join requests" });
+    }
+
+    const pendingRequests = org.pendingDomainJoinRequests || [];
+    const requestEntry = pendingRequests.find((r) => r.requestToken === requestToken);
+    if (!requestEntry) {
+      return res.status(400).json({ error: "Invalid or unknown domain-join request" });
+    }
+
+    // Re-check the requester hasn't already joined a different org in the
+    // meantime (can happen if the domain matched multiple orgs and another
+    // owner approved first — one-org-per-user is enforced here).
+    const targetUser = await userDb.getUserById(requestEntry.userId);
+    if (!targetUser) {
+      return res.status(404).json({ error: "The requesting user no longer exists" });
+    }
+    if (targetUser.orgId) {
+      return res.status(400).json({ error: "This user is already in an organization" });
+    }
+
+    // Check member count (race condition guard) — fail loud, never a silent drop.
+    const memberCount = await orgDb.getOrgMemberCount(orgId);
+    if (memberCount >= org.maxMembers) {
+      return res.status(400).json({
+        error: `Organization has reached the maximum of ${org.maxMembers} members. Upgrade to add more.`,
+      });
+    }
+
+    // Remove the request and add the user to the org. Same non-snapshotting
+    // join mechanics as accept-invite (see ENG-288) — no tier fields copied.
+    const updatedRequests = pendingRequests.filter((r) => r.requestToken !== requestToken);
+    await orgDb.updateOrg(orgId, { pendingDomainJoinRequests: updatedRequests });
+    await userDb.updateUser(requestEntry.userId, { orgId, orgRole: "member" });
+
+    return res.json({ success: true, message: "Domain-join request approved" });
+  } catch (error) {
+    console.error("Error approving domain-join request:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Reject a pending domain-join request (owner only)
+router.post("/:orgId/domain-requests/:requestToken/reject", async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Not authenticated" });
+
+    const { orgId, requestToken } = req.params;
+
+    const org = await orgDb.getOrgById(orgId);
+    if (!org) return res.status(404).json({ error: "Organization not found" });
+
+    if (org.ownerUserId !== userId) {
+      return res.status(403).json({ error: "Only the org owner can reject domain-join requests" });
+    }
+
+    const pendingRequests = org.pendingDomainJoinRequests || [];
+    const updatedRequests = pendingRequests.filter((r) => r.requestToken !== requestToken);
+    if (updatedRequests.length === pendingRequests.length) {
+      return res.status(404).json({ error: "No pending domain-join request found for this token" });
+    }
+
+    await orgDb.updateOrg(orgId, { pendingDomainJoinRequests: updatedRequests });
+
+    return res.json({ success: true, message: "Domain-join request rejected" });
+  } catch (error) {
+    console.error("Error rejecting domain-join request:", error);
     return res.status(500).json({ error: "Internal server error" });
   }
 });
