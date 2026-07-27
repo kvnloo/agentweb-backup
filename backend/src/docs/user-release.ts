@@ -1,5 +1,5 @@
 // Define the interface for release notes
-// Last updated: 2026-07-17
+// Last updated: 2026-07-22
 
 export interface UserReleaseNote {
   date: string;
@@ -18,6 +18,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fixed: Clearer, Honest Guidance When a Site Blocks Automated Login',
       '- Emma\'s automation browser runs in its own isolated session and does not share logins with the browser on your own computer. She used to sometimes suggest "log in on your own browser and I\'ll reuse it," which could never work — that suggestion has been removed',
       '- Some sites (for example, Luma) show a "Verifying Your Browser" bot-protection check that can block an automated sign-in. Instead of looping on it or offering a workaround that does not help, Emma now reports the block honestly and keeps your task moving — for instance by continuing from a guest or contact list you export and share',
+    ],
+  },
+  {
+    date: '2026-07-22',
+    changes: [
+      'Improved: Onboarding Outreach Invites Arrive Written For You',
+      '- The outreach step used to hand you empty message boxes and ask you to write each LinkedIn invite from scratch',
+      '- Every invite is now pre-filled the moment you arrive, personalized from your brand, your chosen audience, and each prospect\'s name and company — then quietly upgraded to a more tailored version a few seconds later',
+      '- Anything you type is yours: an edit is never overwritten by the personalization pass, and it survives a page reload',
+      '- Invites are now written to your LinkedIn account\'s real limit (200 characters on a free account, 300 on Premium) instead of always assuming 300, so the note you approve is the note that actually sends',
+      '- Skip wording on the outreach steps is plain and professional, and drafted invites no longer contain emojis',
     ],
   },
   {

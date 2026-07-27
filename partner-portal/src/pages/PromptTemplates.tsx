@@ -158,6 +158,8 @@ export default function PromptTemplates(): JSX.Element {
         </Button>
       </Stack>
 
+      <OutreachInviteCard token={token ?? ''} />
+
       {loadError && (
         <Alert severity="error" sx={{ mb: 2 }}>
           {loadError}
@@ -218,6 +220,208 @@ export default function PromptTemplates(): JSX.Element {
         </Stack>
       )}
     </Box>
+  );
+}
+
+interface OutreachInvitePrompt {
+  templateId: string;
+  version: string;
+  systemPrompt: string;
+  withCompanyVariants: string[];
+  withoutCompanyVariants: string[];
+  updatedAt: string;
+  updatedBy: string;
+}
+
+/**
+ * Editor for the onboarding "review your drafts" invite prompt. Each
+ * variant list is edited as one-per-line text; blank lines are dropped on
+ * save. Saving bumps the version and takes effect for new onboarding
+ * sessions within ~5 minutes (the backend read cache TTL) — no deploy.
+ */
+function OutreachInviteCard({ token }: { token: string }): JSX.Element {
+  const [row, setRow] = useState<OutreachInvitePrompt | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [systemPrompt, setSystemPrompt] = useState('');
+  const [withCompany, setWithCompany] = useState('');
+  const [withoutCompany, setWithoutCompany] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  const headers = useMemo(
+    () => ({ Authorization: `Bearer ${token}` }),
+    [token],
+  );
+
+  const hydrate = (r: OutreachInvitePrompt): void => {
+    setRow(r);
+    setSystemPrompt(r.systemPrompt);
+    setWithCompany(r.withCompanyVariants.join('\n'));
+    setWithoutCompany(r.withoutCompanyVariants.join('\n'));
+  };
+
+  const fetchOne = async (): Promise<void> => {
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const resp = await axios.get<{ template: OutreachInvitePrompt }>(
+        buildApiUrl('/api/admin/prompt-templates/outreach/invite'),
+        { headers },
+      );
+      hydrate(resp.data.template);
+    } catch (e: any) {
+      setLoadError(e?.response?.data?.message || e?.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    // Without a token there is nothing to fetch — clear the spinner rather
+    // than leaving it running forever.
+    if (token) void fetchOne();
+    else setLoading(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token]);
+
+  const splitLines = (s: string): string[] =>
+    s
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+
+  const dirty =
+    !!row &&
+    (systemPrompt !== row.systemPrompt ||
+      withCompany !== row.withCompanyVariants.join('\n') ||
+      withoutCompany !== row.withoutCompanyVariants.join('\n'));
+
+  const onSave = async (): Promise<void> => {
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const resp = await axios.put<{ template: OutreachInvitePrompt }>(
+        buildApiUrl('/api/admin/prompt-templates/outreach/invite'),
+        {
+          systemPrompt,
+          withCompanyVariants: splitLines(withCompany),
+          withoutCompanyVariants: splitLines(withoutCompany),
+        },
+        { headers },
+      );
+      hydrate(resp.data.template);
+    } catch (e: any) {
+      setSaveError(e?.response?.data?.message || e?.message || String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Card variant="outlined" sx={{ mb: 3, borderColor: 'primary.main' }}>
+      <CardContent>
+        <Stack
+          direction="row"
+          justifyContent="space-between"
+          alignItems="flex-start"
+          mb={1}
+        >
+          <Box>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Chip
+                label="OUTREACH"
+                color="secondary"
+                size="small"
+                sx={{ fontWeight: 700 }}
+              />
+              <Typography variant="h6">Onboarding outreach invite</Typography>
+            </Stack>
+            <Typography variant="body2" color="text.secondary">
+              Variant pool + system prompt the onboarding “review your
+              drafts” step pre-fills LinkedIn invites from (brand + ICP
+              context). One variant per line. Placeholders:{' '}
+              <code>{'{firstName} {company} {icp} {specs} {brand}'}</code> — a
+              variant whose placeholder can’t be filled is skipped. No emojis.
+            </Typography>
+            {row && (
+              <Typography variant="caption" color="text.secondary">
+                Version {row.version} · last edited{' '}
+                {new Date(row.updatedAt).toLocaleString()} by {row.updatedBy}
+              </Typography>
+            )}
+          </Box>
+          <Button
+            startIcon={<RefreshIcon />}
+            onClick={fetchOne}
+            disabled={loading || saving}
+            size="small"
+          >
+            Reload
+          </Button>
+        </Stack>
+
+        {loadError && (
+          <Alert severity="error" sx={{ mb: 2 }}>
+            {loadError}
+          </Alert>
+        )}
+        {loading && (
+          <Box display="flex" justifyContent="center" my={3}>
+            <CircularProgress size={24} />
+          </Box>
+        )}
+
+        {!loading && row && (
+          <Stack spacing={2}>
+            <TextField
+              label="System prompt (guidance / future LLM path)"
+              value={systemPrompt}
+              onChange={(e) => setSystemPrompt(e.target.value)}
+              multiline
+              minRows={3}
+              fullWidth
+              InputProps={{
+                sx: { fontFamily: 'monospace', fontSize: '0.85rem' },
+              }}
+            />
+            <TextField
+              label="Variants — prospect HAS a company (one per line)"
+              value={withCompany}
+              onChange={(e) => setWithCompany(e.target.value)}
+              multiline
+              minRows={5}
+              fullWidth
+              InputProps={{
+                sx: { fontFamily: 'monospace', fontSize: '0.85rem' },
+              }}
+            />
+            <TextField
+              label="Variants — prospect has NO company (one per line)"
+              value={withoutCompany}
+              onChange={(e) => setWithoutCompany(e.target.value)}
+              multiline
+              minRows={5}
+              fullWidth
+              InputProps={{
+                sx: { fontFamily: 'monospace', fontSize: '0.85rem' },
+              }}
+            />
+            {saveError && <Alert severity="error">{saveError}</Alert>}
+          </Stack>
+        )}
+      </CardContent>
+      <CardActions sx={{ px: 2, pb: 2, justifyContent: 'flex-end' }}>
+        <Button
+          variant="contained"
+          startIcon={saving ? <CircularProgress size={16} /> : <SaveIcon />}
+          onClick={onSave}
+          disabled={!dirty || saving}
+        >
+          {saving ? 'Saving…' : 'Save (bumps version)'}
+        </Button>
+      </CardActions>
+    </Card>
   );
 }
 
