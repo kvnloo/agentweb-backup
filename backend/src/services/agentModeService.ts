@@ -14030,7 +14030,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ...(filtering?.length && { filtering }),
       };
 
-      const submitReport = async (fieldsToSend: string[]): Promise<string> => {
+      // ENG-511: Run the full report (submit → poll → fetch) as one unit. Meta
+      // rejects some whitelisted fields at SUBMIT time (HTTP 400 on the POST) but
+      // others only LAZILY at result-read time (e.g. onsite_conversion_lead_grouped
+      // returns "(#100) Tried accessing nonexisting summary field ..." on the GET,
+      // after a report_run_id was already issued). Wrapping the whole run lets us
+      // self-heal a bad field regardless of which stage surfaces it.
+      const runReport = async (
+        fieldsToSend: string[]
+      ): Promise<{ reportRunId: string; data: any[] }> => {
         const submitRes = await axios.post(submitUrl, {
           ...filteredParams,
           fields: fieldsToSend.join(","),
@@ -14040,26 +14048,62 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         if (!rid) {
           throw new Error("Failed to get report_run_id from Meta");
         }
-        return rid;
+
+        // Polling Engine
+        let attempts = 0;
+        const maxAttempts = 60;
+        while (attempts < maxAttempts) {
+          attempts++;
+          await new Promise((resolve) => setTimeout(resolve, 10000));
+          const statusRes = await axios.get(`${baseUrl}/${rid}`, {
+            params: { access_token: accessToken },
+          });
+          const status = (statusRes.data as any)?.async_status;
+          if (status === "Job Completed") break;
+          if (status === "Job Failed" || status === "Job Skipped") {
+            throw new Error(`Meta Insights Job failed: ${status}`);
+          }
+          if (attempts === maxAttempts) {
+            throw new Error("Meta Insights Job timed out.");
+          }
+        }
+
+        // Fetch Paginated Results
+        const resultsUrl = `${baseUrl}/${rid}/insights`;
+        const collected: any[] = [];
+        let nextUrl: string | null = resultsUrl;
+        let isFirstRequest = true;
+        while (nextUrl) {
+          const res: any = isFirstRequest
+            ? await axios.get(nextUrl, { params: { access_token: accessToken } })
+            : await axios.get(nextUrl); // paging.next already includes token
+          collected.push(...(res.data?.data || []));
+          nextUrl = res.data?.paging?.next || null;
+          isFirstRequest = false;
+        }
+        return { reportRunId: rid, data: collected };
       };
 
-      // ENG-511: A field can clear our whitelist yet still be rejected by Meta for
-      // this node/API version (HTTP 400). Previously that surfaced as a bare error,
-      // the model re-issued the identical call, and the anti-loop guard hard-blocked
-      // the whole insights channel. Instead, parse the offending field(s) out of
-      // Meta's error, drop them, and retry the submit exactly ONCE with the valid
-      // remainder. If we cannot isolate the offender (or nothing valid would remain),
-      // return a structured no-retry error so the model corrects rather than loops.
+      // ENG-511: If Meta rejects a whitelisted field (400 at submit OR at read),
+      // don't surface a bare error the model will blindly re-issue until the
+      // anti-loop guard hard-blocks the whole insights channel. Parse the offending
+      // field(s) out of Meta's error, drop them, and retry the whole report exactly
+      // ONCE with the valid remainder. If we cannot isolate the offender (or nothing
+      // valid would remain), return a structured no-retry error so the model
+      // corrects rather than loops.
       let reportRunId: string;
+      let allData: any[];
       try {
-        reportRunId = await submitReport(validFields);
-      } catch (submitErr: any) {
-        const metaError = submitErr?.response?.data?.error;
-        const status = submitErr?.response?.status;
+        const first = await runReport(validFields);
+        reportRunId = first.reportRunId;
+        allData = first.data;
+      } catch (reportErr: any) {
+        const metaError = reportErr?.response?.data?.error;
+        const status = reportErr?.response?.status;
         const haystack = `${metaError?.message || ""} ${metaError?.error_user_msg || ""} ${metaError?.error_user_title || ""}`;
         const isFieldError = status === 400 && /field/i.test(haystack);
         if (!isFieldError) {
-          throw submitErr;
+          throw reportErr;
         }
 
         // Word-boundary match so a rejected field is not confused with a longer
@@ -14076,7 +14120,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           droppedFields.push(...metaRejectedFields);
           validFields = retryFields;
           filteredParams.fields = validFields.join(",");
-          reportRunId = await submitReport(validFields);
+          const retry = await runReport(validFields);
+          reportRunId = retry.reportRunId;
+          allData = retry.data;
         } else {
           return {
             success: false,
@@ -14084,52 +14130,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             metadata: {
               tool: "call_meta_ads_insights_api",
               account_id,
-              meta_error: metaError?.message || submitErr?.message,
+              meta_error: metaError?.message || reportErr?.message,
             },
           };
         }
-      }
-
-      // Polling Engine
-      let attempts = 0;
-      const maxAttempts = 60;
-
-      while (attempts < maxAttempts) {
-        attempts++;
-
-        await new Promise((resolve) => setTimeout(resolve, 10000));
-
-        const statusRes = await axios.get(`${baseUrl}/${reportRunId}`, {
-          params: { access_token: accessToken },
-        });
-
-        const status = (statusRes.data as any)?.async_status;
-
-        if (status === "Job Completed") break;
-
-        if (status === "Job Failed" || status === "Job Skipped") {
-          throw new Error(`Meta Insights Job failed: ${status}`);
-        }
-
-        if (attempts === maxAttempts) {
-          throw new Error("Meta Insights Job timed out.");
-        }
-      }
-
-      // Fetch Paginated Results
-      const resultsUrl = `${baseUrl}/${reportRunId}/insights`;
-
-      let allData: any[] = [];
-      let nextUrl: string | null = resultsUrl;
-      let isFirstRequest = true;
-
-      while (nextUrl) {
-        const res: any = isFirstRequest
-          ? await axios.get(nextUrl, { params: { access_token: accessToken } })
-          : await axios.get(nextUrl); // paging.next already includes token
-        allData.push(...(res.data?.data || []));
-        nextUrl = res.data?.paging?.next || null;
-        isFirstRequest = false;
       }
 
       const envelope = {
