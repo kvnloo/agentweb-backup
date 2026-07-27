@@ -30,8 +30,6 @@ jest.mock('@google-cloud/storage', () => ({
 }));
 jest.mock('../controllers/guide', () => ({ getGuide: jest.fn() }));
 jest.mock('../controllers/release', () => ({ getReleases: jest.fn() }));
-jest.mock('../controllers/api', () => ({ getApiDocs: jest.fn() }));
-jest.mock('../controllers/user-guide', () => ({ getUserGuide: jest.fn() }));
 jest.mock('../controllers/docsController', () => ({ getUserReleaseNotes: jest.fn() }));
 jest.mock('../services/db', () => ({ taskDb: {} }));
 jest.mock('../utils/secretsManager', () => ({ getGCSPPrivateKey: jest.fn() }));
