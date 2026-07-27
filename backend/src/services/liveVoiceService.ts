@@ -520,8 +520,21 @@ export async function assertLiveSessionOwnership(
 }
 
 /**
+ * In-flight start guard. `startLiveSession` awaits ownership (and later, tool/
+ * history loads and the Gemini connect), so two overlapping starts for the
+ * same sessionId could otherwise both pass the `activeSessions` duplicate
+ * check, both open Gemini connections, and the later map write would orphan
+ * the first (its `live:ready` caller left with an entry belonging to another
+ * socket, its Gemini WebSocket never closed). Serializing per sessionId makes
+ * overlap deterministic: the later start waits for the earlier to settle, then
+ * supersedes it through the normal existing-session close.
+ */
+const pendingStarts = new Map<string, Promise<void>>();
+
+/**
  * Start a Gemini Live session for the given Agent Mode sessionId.
  * If a session already exists for this sessionId, it is closed first.
+ * Overlapping calls for the same sessionId are serialized (last caller wins).
  *
  * @param sessionId  Agent Mode chat session ID
  * @param socketId   Socket.IO socket ID of the connected browser
@@ -533,6 +546,28 @@ export async function startLiveSession(
   emitFn: EmitFn,
   userId: string,
   toolProfile: LiveToolProfile = 'default',
+): Promise<void> {
+  // Read + write of pendingStarts happen in the same synchronous block, so two
+  // overlapping calls can never both observe "no start in flight".
+  const prior = pendingStarts.get(sessionId);
+  const start = (prior ?? Promise.resolve())
+    // A failed prior start only orders this one — it must not fail it.
+    .catch(() => {})
+    .then(() => doStartLiveSession(sessionId, socketId, emitFn, userId, toolProfile));
+  pendingStarts.set(sessionId, start);
+  try {
+    await start;
+  } finally {
+    if (pendingStarts.get(sessionId) === start) pendingStarts.delete(sessionId);
+  }
+}
+
+async function doStartLiveSession(
+  sessionId: string,
+  socketId: string,
+  emitFn: EmitFn,
+  userId: string,
+  toolProfile: LiveToolProfile,
 ): Promise<void> {
   // Ownership gate FIRST — before any telemetry, before the existing-session
   // close below, and before any history is loaded or registered.
