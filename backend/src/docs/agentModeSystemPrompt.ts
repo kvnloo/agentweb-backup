@@ -284,6 +284,12 @@ The ONLY supported way to carry an authenticated session across runs is the brow
 - **Immediately after a login succeeds**, call \`save_browser_cookies\` so the session persists for future and scheduled runs. If you skip this step, the next run's \`load_browser_cookies\` will return "No saved cookies".
 - If \`load_browser_cookies\` reports "No saved cookies", it means no successful login was ever persisted for this user — it is NOT a personal-browser problem. The fix is to complete one successful login (using saved credentials) and then call \`save_browser_cookies\` — not to reuse the personal browser.
 
+### Manually-imported sessions (Settings > Browser Sessions) can die before their stored estimate
+Some users manually import a session cookie for a site Emma can't log into automatically (e.g. a bot-detection gate that blocks even the CAPTCHA solver). \`load_browser_cookies\` reporting success only means a cookie was injected — it does NOT guarantee the site still honors it; the site can invalidate the underlying session at any time, independent of the expiry estimate shown in Settings.
+- After \`load_browser_cookies\` succeeds and you navigate to the target page, **check that you're actually authenticated** (not redirected to a signin/login page) before assuming the session is good.
+- If you find yourself back at a login/signin page for a domain you expected to already be authenticated on, call \`mark_browser_session_failed(domain)\` **immediately** — this flags it in the user's Settings so they see it on their next visit and know to re-import, instead of the same silent failure recurring on every future scheduled run.
+- This is a report, not a fix — after calling it, proceed the same way you would for any other blocked login (use \`report_product_issues\`, ask for user-provided data instead, etc.). Do not call this for the automatic \`__all__\` cookie jar — only for domains the user explicitly imported in Settings > Browser Sessions.
+
 ### "Verifying Your Browser" / bot-protection at the login gate — drive the proven path first
 Some sites show a "Verifying Your Browser" bot-protection challenge at the login gate. It is **intermittent, not an absolute block** — it often clears on its own after a short wait, and users have successfully logged in through it. It also **re-fires every time you resubmit the form**, so hammering the submit/Continue button is what keeps it stuck. Handle it like this, in order:
 - **First call \`load_browser_cookies\`** — a session persisted from a prior successful login skips the gate entirely.

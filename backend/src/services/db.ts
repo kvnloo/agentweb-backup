@@ -7687,7 +7687,7 @@ export const browserCookieDb = {
   },
 
   /** List manually-imported cookie domains for a user — metadata only, never the encrypted values. */
-  async listDomainCookies(userId: string): Promise<Array<{ domain: string; cookieCount: number; createdAt: string; expiresAt?: string }>> {
+  async listDomainCookies(userId: string): Promise<Array<{ domain: string; cookieCount: number; createdAt: string; expiresAt?: string; lastFailedAt?: string }>> {
     try {
       const result = await dynamodb.query({
         TableName: BROWSER_COOKIES_TABLE,
@@ -7702,10 +7702,39 @@ export const browserCookieDb = {
           cookieCount: item.cookieCount ?? 0,
           createdAt: item.createdAt,
           ...(item.expiresAt ? { expiresAt: item.expiresAt } : {}),
+          ...(item.lastFailedAt ? { lastFailedAt: item.lastFailedAt } : {}),
         }));
     } catch (error) {
       handleDynamoDbError(error, 'listDomainBrowserCookies');
       throw error;
+    }
+  },
+
+  /**
+   * Records that a manually-imported session for a domain failed to authenticate
+   * mid-task (e.g. the site still showed a signin page after load_browser_cookies
+   * injected it — the session died server-side before its synthetic expiresAt
+   * floor was reached). Called by Emma's mark_browser_session_failed tool so the
+   * failure is visible in Settings on the user's next visit instead of silently
+   * recurring on every future run. A fresh re-import (saveDomainCookies) fully
+   * overwrites the item, clearing this automatically.
+   *
+   * Best-effort: this is an observability signal, not a critical write. If the
+   * domain was deleted out from under it (condition fails) or the update
+   * otherwise errors, it's logged and swallowed rather than thrown — a failed
+   * "mark as failed" call must never break the automation task that reported it.
+   */
+  async markDomainCookiesFailed(userId: string, domain: string): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: BROWSER_COOKIES_TABLE,
+        Key: { userId, domain },
+        ConditionExpression: 'attribute_exists(userId)',
+        UpdateExpression: 'SET lastFailedAt = :now',
+        ExpressionAttributeValues: { ':now': new Date().toISOString() },
+      }).promise();
+    } catch (error) {
+      console.warn(`Failed to mark browser cookies as failed for domain "${domain}" (userId: ${userId}):`, error);
     }
   },
 

@@ -149,6 +149,47 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
+  name: 'mark_browser_session_failed',
+  definition: {
+    name: 'mark_browser_session_failed',
+    description:
+      'Report that a manually-imported browser session (Settings > Browser Sessions) for a domain did NOT actually authenticate, ' +
+      'even though load_browser_cookies reported loading it. Call this when, after load_browser_cookies succeeded, ' +
+      'the site still shows a signin/login page instead of the expected authenticated state — this means the ' +
+      "user's manually-imported session cookie has died server-side (it can happen before its stored expiry estimate). " +
+      "This does not fix the session — it flags it in the user's Settings so they know to re-import a fresh one. " +
+      'Only call this for a domain the user manually imported, not for the automatic __all__ cookie jar.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        domain: {
+          type: 'string',
+          description: 'The domain whose manually-imported session failed to authenticate (e.g. "rankai.ai").'
+        }
+      },
+      required: ['domain']
+    }
+  },
+  internal: true,
+  execute: async (args: any, context: any) => {
+    const userId = context?.userId;
+    if (!userId) throw new Error('Authentication required');
+
+    const domain = (args?.domain || '').toLowerCase().trim();
+    if (!domain) {
+      return { success: false, error: 'domain is required' };
+    }
+
+    await browserCookieDb.markDomainCookiesFailed(userId, domain);
+
+    return {
+      success: true,
+      message: `Flagged the manually-imported session for "${domain}" as failed. The user will see this in Settings > Browser Sessions and can re-import a fresh one.`
+    };
+  }
+});
+
+emmaToolRegistry.register({
   name: 'clear_browser_cookies',
   definition: {
     name: 'clear_browser_cookies',

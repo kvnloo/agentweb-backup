@@ -53,3 +53,29 @@ describe('AgentMode system prompt - browser session persistence & isolation guid
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('unattended/scheduled run cannot relay a one-time code');
   });
 });
+
+// ENG-494 follow-up: a manually-imported Browser Sessions cookie can die
+// server-side at any time, independent of the synthetic expiry estimate shown
+// in Settings. Without this guidance, load_browser_cookies reporting "success"
+// (a cookie was injected) would be mistaken for "still authenticated" — Emma
+// would proceed as if logged in, land back on a signin page, and the failure
+// would recur silently on every future run with no signal to the user.
+describe('AgentMode system prompt - manually-imported session failure reporting (mark_browser_session_failed)', () => {
+  it('warns that load_browser_cookies success does not guarantee the site still honors the session', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('does NOT guarantee the site still honors it');
+  });
+
+  it('directs Emma to verify authentication (not just cookie injection) before proceeding', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('check that you\'re actually authenticated');
+  });
+
+  it('directs Emma to call mark_browser_session_failed immediately upon finding a dead manually-imported session', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('mark_browser_session_failed(domain)');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('immediately');
+  });
+
+  it('clarifies this is a report, not a fix, and scopes it to manually-imported domains only (not the automatic __all__ jar)', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('This is a report, not a fix');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('only for domains the user explicitly imported');
+  });
+});

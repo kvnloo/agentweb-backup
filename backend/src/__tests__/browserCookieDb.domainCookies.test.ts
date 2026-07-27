@@ -6,6 +6,7 @@ jest.mock('aws-sdk', () => {
     put: jest.fn(),
     delete: jest.fn(),
     query: jest.fn(),
+    update: jest.fn(),
   };
   const mockS3 = {
     putObject: jest.fn().mockReturnThis(),
@@ -114,6 +115,34 @@ describe('browserCookieDb — manual per-domain cookie import', () => {
       const result = await browserCookieDb.listDomainCookies('user-1');
       expect(result).toEqual([]);
     });
+
+    it('surfaces lastFailedAt when present, so the UI can warn the user', async () => {
+      mockDynamoDB.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Items: [{
+            userId: 'user-1',
+            domain: 'rankai.ai',
+            cookieCount: 1,
+            createdAt: '2026-01-01T00:00:00.000Z',
+            lastFailedAt: '2026-02-01T00:00:00.000Z',
+          }],
+        }),
+      });
+
+      const result = await browserCookieDb.listDomainCookies('user-1');
+      expect(result[0].lastFailedAt).toBe('2026-02-01T00:00:00.000Z');
+    });
+
+    it('omits lastFailedAt when not present (never failed, or re-imported since)', async () => {
+      mockDynamoDB.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Items: [{ userId: 'user-1', domain: 'rankai.ai', cookieCount: 1, createdAt: '2026-01-01T00:00:00.000Z' }],
+        }),
+      });
+
+      const result = await browserCookieDb.listDomainCookies('user-1');
+      expect(result[0]).not.toHaveProperty('lastFailedAt');
+    });
   });
 
   describe('deleteDomainCookies', () => {
@@ -128,6 +157,30 @@ describe('browserCookieDb — manual per-domain cookie import', () => {
           Key: { userId: 'user-1', domain: 'rankai.ai' },
         })
       );
+    });
+  });
+
+  describe('markDomainCookiesFailed', () => {
+    it('sets lastFailedAt on the existing item without touching the stored cookies', async () => {
+      mockDynamoDB.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+
+      await browserCookieDb.markDomainCookiesFailed('user-1', 'rankai.ai');
+
+      expect(mockDynamoDB.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: expect.stringContaining('AW-BrowserCookies'),
+          Key: { userId: 'user-1', domain: 'rankai.ai' },
+          UpdateExpression: expect.stringContaining('lastFailedAt'),
+        })
+      );
+    });
+
+    it('is a no-op (does not throw) if the domain was already deleted out from under it', async () => {
+      mockDynamoDB.update.mockReturnValue({
+        promise: jest.fn().mockRejectedValue({ code: 'ConditionalCheckFailedException' }),
+      });
+
+      await expect(browserCookieDb.markDomainCookiesFailed('user-1', 'gone.com')).resolves.toBeUndefined();
     });
   });
 
