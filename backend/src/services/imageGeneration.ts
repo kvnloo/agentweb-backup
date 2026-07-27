@@ -68,10 +68,7 @@ interface ImageGenerationParams {
 export class ImageService {
   // Default timeout for a single image generation API call (10 minutes).
   // Prevents sessions from hanging indefinitely when a provider is unresponsive.
-  // Env-overridable (like the agent-turn timeout) so tests can force a fast provider
-  // timeout; falls back to 10 min on an unset/invalid value.
-  private readonly IMAGE_GENERATION_TIMEOUT_MS =
-    parseInt(process.env.IMAGE_GENERATION_TIMEOUT_MS || '', 10) || 10 * 60 * 1000;
+  private readonly IMAGE_GENERATION_TIMEOUT_MS = 10 * 60 * 1000;
 
   constructor() {
     // No initialization needed - clients will be created as needed
@@ -485,32 +482,6 @@ export class ImageService {
       // Normalize legacy/preview ids to their canonical (GA) equivalent so that
       // routing, generation behavior, and pricing all use a single id.
       params.imageModel = normalizeImageModel(params.imageModel);
-
-      // ── TEST-ONLY deterministic hooks (ENG-510) ──────────────────────────────
-      // NEVER active in production (hard-gated on NODE_ENV) and inert unless a hook
-      // env var is explicitly set. They exist to live-verify the media-gen DISPATCH
-      // paths whose real triggers are impractical to reproduce on demand: provider
-      // failover needs a transient 5xx/timeout, and the whole-turn deferral needs a
-      // predictable non-trivial image latency (real provider latency swings ~15x run
-      // to run). No real provider is called on either branch.
-      if (process.env.NODE_ENV !== 'production') {
-        const forceFail = process.env.AGENT_MODE_TEST_FORCE_IMAGE_FAILURE;
-        if (forceFail && (forceFail === '*' || forceFail === params.imageModel)) {
-          // "timed out" is classified retryable by isRetryableMediaToolError, so the
-          // caller's provider-failover path engages exactly as for a real transient.
-          throw new Error(`[test-hook] forced transient image generation timeout for model ${params.imageModel}`);
-        }
-        const delayMs = parseInt(process.env.AGENT_MODE_TEST_IMAGE_DELAY_MS || '0', 10);
-        if (delayMs > 0) {
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
-          return {
-            success: true,
-            filename: params.filename,
-            imageUrl: `https://agentweb-user-files.s3.us-west-2.amazonaws.com/test-hook/${encodeURIComponent(params.filename || 'image.png')}`,
-          };
-        }
-      }
-      // ─────────────────────────────────────────────────────────────────────────
 
       // Validate the provided model
       if (!SUPPORTED_MODELS.includes(params.imageModel as SupportedModel)) {
