@@ -647,3 +647,130 @@ describe('startLiveSession — replacement swap is cancellation-safe (ENG-521 P1
     ).resolves.toBeUndefined();
   });
 });
+
+describe('live session resumption — superseded reconnects are cleaned up (ENG-521)', () => {
+  const RECONNECT_SESSION = 'session-reconnect-replacement-race';
+
+  function makeSession() {
+    return {
+      sendClientContent: jest.fn(),
+      sendRealtimeInput: jest.fn(),
+      sendToolResponse: jest.fn(),
+      close: jest.fn(),
+    };
+  }
+
+  async function startWithPendingReconnect() {
+    const originalSession = makeSession();
+    const reconnectSession = makeSession();
+    const originalCallbacks: Record<string, Function> = {};
+    let releaseReconnect: (() => void) | undefined;
+    let markReconnectStarted: (() => void) | undefined;
+    const reconnectStarted = new Promise<void>((resolve) => {
+      markReconnectStarted = resolve;
+    });
+    mockLiveConnect
+      .mockImplementationOnce(({ callbacks }: { callbacks: Record<string, Function> }) => {
+        Object.assign(originalCallbacks, callbacks);
+        return Promise.resolve(originalSession);
+      })
+      .mockImplementationOnce(() => {
+        markReconnectStarted?.();
+        return new Promise((resolve) => {
+          releaseReconnect = () => resolve(reconnectSession);
+        });
+      });
+    mockGetChatSessionRecord.mockResolvedValue({
+      sessionId: RECONNECT_SESSION,
+      userId: VICTIM_USER,
+    });
+
+    await startLiveSession(
+      RECONNECT_SESSION,
+      'socket-original',
+      jest.fn(),
+      VICTIM_USER,
+    );
+    originalCallbacks.onmessage?.({
+      sessionResumptionUpdate: {
+        resumable: true,
+        newHandle: 'resume-handle',
+      },
+    });
+    originalCallbacks.onclose?.({ code: 1000, reason: 'normal rollover' });
+    await reconnectStarted;
+
+    return {
+      reconnectSession,
+      releaseReconnect: () => releaseReconnect?.(),
+    };
+  }
+
+  async function flushReconnect(): Promise<void> {
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  afterEach(() => {
+    closeLiveSession(RECONNECT_SESSION);
+  });
+
+  it('closes a reconnect that resolves after a replacement becomes active', async () => {
+    const scenario = await startWithPendingReconnect();
+    mockLiveConnect.mockResolvedValueOnce(makeSession());
+    await startLiveSession(
+      RECONNECT_SESSION,
+      'socket-replacement',
+      jest.fn(),
+      VICTIM_USER,
+    );
+
+    scenario.releaseReconnect();
+    await flushReconnect();
+    expect(scenario.reconnectSession.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes a reconnect that resolves after live:close removes its entry', async () => {
+    const scenario = await startWithPendingReconnect();
+    closeLiveSession(RECONNECT_SESSION, 'socket-original');
+
+    scenario.releaseReconnect();
+    await flushReconnect();
+    expect(scenario.reconnectSession.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes a reconnect that resolves after multiple replacements', async () => {
+    const scenario = await startWithPendingReconnect();
+    mockLiveConnect
+      .mockResolvedValueOnce(makeSession())
+      .mockResolvedValueOnce(makeSession());
+    await startLiveSession(
+      RECONNECT_SESSION,
+      'socket-replacement-1',
+      jest.fn(),
+      VICTIM_USER,
+    );
+    await startLiveSession(
+      RECONNECT_SESSION,
+      'socket-replacement-2',
+      jest.fn(),
+      VICTIM_USER,
+    );
+
+    scenario.releaseReconnect();
+    await flushReconnect();
+    expect(scenario.reconnectSession.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a reconnect open when its original entry is still active', async () => {
+    const scenario = await startWithPendingReconnect();
+    scenario.releaseReconnect();
+    await flushReconnect();
+
+    expect(scenario.reconnectSession.close).not.toHaveBeenCalled();
+    await expect(
+      sendTextTurn(RECONNECT_SESSION, 'resumed', 'socket-original'),
+    ).resolves.toBeUndefined();
+    expect(scenario.reconnectSession.sendClientContent).toHaveBeenCalledTimes(1);
+  });
+});

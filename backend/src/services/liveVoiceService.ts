@@ -390,6 +390,15 @@ async function openGeminiSession(
         if (e.code === 1000 && currentEntry.resumptionHandle) {
           console.log(`[liveVoiceService] Auto-reconnecting session ${sessionId} with handle ${currentEntry.resumptionHandle.slice(0, 8)}...`);
           openGeminiSession(sessionId, currentEntry, currentEntry.resumptionHandle)
+            .then(() => {
+              if (activeSessions.get(sessionId) !== currentEntry) {
+                try {
+                  currentEntry.session.close();
+                } catch {
+                  // Ignore close errors for a reconnect superseded in flight.
+                }
+              }
+            })
             .catch((err) => {
               console.error(`[liveVoiceService] Reconnect failed for ${sessionId}:`, err?.message);
               if (activeSessions.get(sessionId) === currentEntry) {
