@@ -1834,5 +1834,59 @@ describe('ImageService.getAzureImageConfig (ENG-410 endpoint migration)', () => 
     await (svc as any).getAzureImageConfig('gpt-image-1');
     expect(mockGetSecret).toHaveBeenCalledWith('dev/AgentWeb/Azure/Image');
   });
+
+  describe('test-only deterministic hooks (ENG-510)', () => {
+    const savedNodeEnv = process.env.NODE_ENV;
+    afterEach(() => {
+      delete process.env.AGENT_MODE_TEST_FORCE_IMAGE_FAILURE;
+      delete process.env.AGENT_MODE_TEST_IMAGE_DELAY_MS;
+      process.env.NODE_ENV = savedNodeEnv;
+    });
+
+    it('forces a RETRYABLE failure for the targeted (normalized) model outside production', async () => {
+      process.env.NODE_ENV = 'test';
+      process.env.AGENT_MODE_TEST_FORCE_IMAGE_FAILURE = 'gemini-3.1-flash-image';
+      // The admin-default preview id normalizes to the targeted GA id, so the hook fires.
+      // generateImage's own try/catch turns the throw into a {success:false, error} whose
+      // "timed out" message is classified RETRYABLE — exactly what the caller's failover
+      // path consumes to switch providers.
+      const svcHook = new ImageService();
+      const r = await svcHook.generateImage({ prompt: 'x', filename: 'x.png', userId: 'u', imageModel: 'gemini-3.1-flash-image-preview' });
+      expect(r.success).toBe(false);
+      expect(r.error).toMatch(/timed out|test-hook/i);
+    });
+
+    it('does NOT fail a non-targeted model, and returns a synthetic success (so failover can deliver)', async () => {
+      process.env.NODE_ENV = 'test';
+      process.env.AGENT_MODE_TEST_FORCE_IMAGE_FAILURE = 'gemini-3.1-flash-image';
+      process.env.AGENT_MODE_TEST_IMAGE_DELAY_MS = '1';
+      const svcHook = new ImageService();
+      const r = await svcHook.generateImage({ prompt: 'x', filename: 'fallback.png', userId: 'u', imageModel: 'gpt-image-2' });
+      expect(r.success).toBe(true);
+      expect(r.imageUrl).toContain('test-hook');
+    });
+
+    it('the delay hook returns a synthetic success without calling a provider', async () => {
+      process.env.NODE_ENV = 'test';
+      process.env.AGENT_MODE_TEST_IMAGE_DELAY_MS = '5';
+      const svcHook = new ImageService();
+      const r = await svcHook.generateImage({ prompt: 'x', filename: 'v.png', userId: 'u', imageModel: 'gemini-3.1-flash-image' });
+      expect(r.success).toBe(true);
+      expect(r.imageUrl).toContain('test-hook');
+    });
+
+    it('is INERT in production — neither hook fires (no forced throw, no synthetic short-circuit/hang)', async () => {
+      process.env.NODE_ENV = 'production';
+      process.env.AGENT_MODE_TEST_FORCE_IMAGE_FAILURE = '*';
+      process.env.AGENT_MODE_TEST_IMAGE_DELAY_MS = '999999'; // would hang the test if the hook fired
+      let result: any; let err: any;
+      try {
+        const svcHook = new ImageService();
+        result = await svcHook.generateImage({ prompt: 'x', filename: 'p.png', userId: 'u', imageModel: 'gpt-image-2' });
+      } catch (e) { err = e; }
+      if (err) expect(String(err.message)).not.toContain('test-hook');
+      if (result?.imageUrl) expect(result.imageUrl).not.toContain('test-hook');
+    });
+  });
 });
 
