@@ -70,12 +70,6 @@ const noopSlack: SlackPort = {
   async postMessage(_c, _m) {
     return { channel: 'smoke', ts: 'smoke' };
   },
-  async getReactions() {
-    return [];
-  },
-  async getReplies() {
-    return [];
-  },
 };
 const realClock: ClockPort = { now: () => new Date() };
 const consoleLogger: LoggerPort = {
@@ -286,7 +280,6 @@ interface SmokeReport {
     eventsScanned: number;
     proposalCount: number;
     mutationCount: number;
-    approvalCount: number;
     blocked: boolean;
     blockReason?: string;
     durationMs: number;
@@ -379,7 +372,6 @@ async function main(): Promise<void> {
       eventsScanned: result.eventsScanned,
       proposalCount: result.proposals.length,
       mutationCount: result.mutations.length,
-      approvalCount: result.approvals.length,
       blocked: result.blocked,
       blockReason: result.blockReason,
       durationMs: result.durationMs,

@@ -51,7 +51,6 @@ function runResult(proposals: MutationProposal<AiEvalProposalPayload>[]): LoopRu
     eventsScanned: 300,
     proposals,
     mutations: [],
-    approvals: [],
     blocked: false,
     durationMs: 1000,
     tokensSpentUsd: 0,

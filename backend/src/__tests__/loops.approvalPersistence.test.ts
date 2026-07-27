@@ -159,6 +159,32 @@ describe('recordLoopApproval', () => {
     expect(result.shipped).toBe(0);
   });
 
+  it('ships only the successful sibling when a multi-item dispatch partially fails', async () => {
+    await seedPending(store, 'tool-a', new Date('2026-06-12T07:00:00.000Z'));
+    await seedPending(store, 'tool-b', new Date('2026-06-12T07:00:01.000Z'));
+
+    const result = await recordLoopApproval({
+      runId: RUN_ID,
+      items: [
+        { id: 'prop-tool-a', ok: true },
+        { id: 'prop-tool-b', ok: false, error: 'Linear unavailable' },
+      ],
+      approver: 'slack:harsha',
+      stores: stores(),
+      now: NOW,
+    });
+
+    expect(result.approved).toBe(2);
+    expect(result.shipped).toBe(1);
+    expect(result.dispatchFailures).toBe(1);
+
+    const approved = await store.queryHistory({ loopId: LOOP_ID, status: ['approved'] });
+    expect(approved.find((record) => record.proposal?.proposalId === 'prop-tool-a')?.shippedAt)
+      .toEqual(NOW);
+    expect(approved.find((record) => record.proposal?.proposalId === 'prop-tool-b')?.shippedAt)
+      .toBeUndefined();
+  });
+
   it('writes nothing when no pending records exist for the run', async () => {
     const result = await recordLoopApproval({
       runId: 'run:unknown',

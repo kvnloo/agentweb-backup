@@ -261,6 +261,44 @@ describe('handleLoopApprovalReaction — tasks path (no Notion URLs)', () => {
     );
   });
 
+  it('preserves proposal IDs so partial dispatch results map to the right learning records', async () => {
+    mockHistoryFn.mockReset();
+    mockBotMessage([
+      '*Reliability Loop — daily run*',
+      'Run ID: `run-partial-001`',
+      '',
+      '1. Fix first tool',
+      '   Proposal ID: `proposal-first`  |  Kind: `code_change`',
+      '2. Fix second tool',
+      '   Proposal ID: `proposal-second`  |  Kind: `code_change`',
+      '',
+      FOOTER,
+    ].join('\n'));
+    mockFileAutoIssue
+      .mockResolvedValueOnce({
+        pageId: 'ENG-601',
+        url: 'https://linear.app/emmabyaw/issue/ENG-601',
+        deduped: false,
+        tracker: 'Linear',
+      })
+      .mockRejectedValueOnce(new Error('Linear unavailable'));
+
+    await handleLoopApprovalReaction(makeEvent());
+
+    expect(mockFileAutoIssue).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        notionContext: expect.objectContaining({ 'Loop Task ID': 'proposal-first' }),
+      }),
+    );
+    expect(mockFileAutoIssue).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        notionContext: expect.objectContaining({ 'Loop Task ID': 'proposal-second' }),
+      }),
+    );
+  });
+
   it('does not invoke the retired cloud-dev environment launcher', async () => {
     await handleLoopApprovalReaction(makeEvent());
     expect(mockFileAutoIssue).toHaveBeenCalledTimes(1);

@@ -5,9 +5,8 @@
  *  - `registerAiEvalFunnelForProduction` + `runAiEvalLoopOnce` — the daily
  *    production cron wiring (previously in cron.ts), built on the shared
  *    instance runner like the other loop instances: real DynamoPort + real
- *    SlackPort + LinearIntakeTool + CaptureGate + DynamoLearningStore.
- *    After each runLoop() the runner drains CaptureGate's collected mutations
- *    and posts a single Slack DM digest.
+ *    SlackPort + LinearIntakeTool + DynamoLearningStore.
+ *    After each runLoop() the runner posts a single Slack DM digest.
  *
  * Idempotent registration: safe to call at process startup multiple times
  * (e.g. across cluster instance hot-reloads). The cron itself is scheduled
@@ -19,14 +18,12 @@
 import {
   getLoopManifest,
   getRegisteredLoopIds,
-  registerGate,
   registerLearningStore,
   registerLoop,
   registerRuleSet,
   registerSensor,
   registerTools,
 } from '../../index';
-import { CaptureGate } from '../../core/gates/captureGate';
 import {
   postLoopDigest,
   type LoopDigestTemplate,
@@ -59,7 +56,6 @@ interface AiEvalRegistry {
   sensor: InMemoryEventSource;
   ruleSet: DslRuleSet<AiEvalProposalPayload>;
   tools: SpecOutputTool<AiEvalProposalPayload>;
-  gate: CaptureGate;
   learning: InMemoryLearningStore;
 }
 
@@ -73,7 +69,6 @@ export function registerAiEvalFunnel(events: readonly NormalizedEvent[] = []): A
   const sensor = new InMemoryEventSource(events);
   const ruleSet = new DslRuleSet<AiEvalProposalPayload>(AI_EVAL_LOOP_ID, aiEvalRules);
   const tools = new SpecOutputTool<AiEvalProposalPayload>(AI_EVAL_LOOP_ID);
-  const gate = new CaptureGate();
   const learning = new InMemoryLearningStore();
 
   registerSensor('aiEvalSensor', sensor);
@@ -81,11 +76,10 @@ export function registerAiEvalFunnel(events: readonly NormalizedEvent[] = []): A
   registerRuleSet('aiEvalRules', ruleSet as any);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   registerTools('aiEvalSpecTool', tools as any);
-  registerGate('aiEvalCaptureGate', gate);
   registerLearningStore('aiEvalLearning', learning);
   registerLoop(aiEvalManifest);
 
-  registered = { sensor, ruleSet, tools, gate, learning };
+  registered = { sensor, ruleSet, tools, learning };
   return registered;
 }
 
@@ -100,7 +94,6 @@ const runner = createInstanceRunner({
     sensor: 'aiEvalSensor:prod',
     ruleSet: 'aiEvalRules:prod',
     tools: 'aiEvalLinearIntake:prod',
-    gate: 'aiEvalCaptureGate:prod',
     learning: 'aiEvalLearning:prod',
   },
   // Already-registered only counts if it's the PRODUCTION wiring — the
@@ -151,7 +144,6 @@ const runner = createInstanceRunner({
       sensor,
       ruleSet: new CooldownRuleSet(baseRuleSet, learning, AI_EVAL_LOOP_ID),
       tools: new LinearIntakeTool(),
-      gate: new CaptureGate(),
       learning,
     };
   },
@@ -160,16 +152,13 @@ const runner = createInstanceRunner({
     sensorImpl: 'aiEvalSensor:prod',
     rulesetImpl: 'aiEvalRules:prod',
     toolsImpl: 'aiEvalLinearIntake:prod',
-    gateImpl: 'aiEvalCaptureGate:prod',
     learningImpl: 'aiEvalLearning:prod',
   }),
-  onRunComplete: async ({ result, drained, ports, manifest }) => {
-    // Drain the gate's captured mutations and post a single digest Slack DM.
-    if (drained === null) return;
-    if (drained.length > 0 || result.eventsScanned > 0) {
+  onRunComplete: async ({ result, mutations, ports, manifest }) => {
+    if (mutations.length > 0 || result.eventsScanned > 0) {
       await postDailyDigest(
         result,
-        drained,
+        mutations,
         ports.slack,
         manifest.approval.slackUserId,
         (digestDate, slackUserId, runId) =>
@@ -193,7 +182,7 @@ export async function runAiEvalLoopOnce(): Promise<LoopRunResult> {
   return (await runner.runOnce()) as LoopRunResult;
 }
 
-/** TExtra = the mutations drained from the gate this tick. */
+/** TExtra = the mutations produced this tick. */
 const aiEvalDigestTemplate: LoopDigestTemplate<readonly Mutation[]> = {
   logTag: '[ai-eval-funnel cron]',
   missingUserWarning: 'no approval.slackUserId configured — skipping daily DM',
@@ -271,9 +260,6 @@ export const _postDailyDigestForTesting = postDailyDigest;
 
 // Export internal so tests can assert on it without exposing it broadly.
 export const _internal = {
-  get aiEvalGate() {
-    return runner.gate;
-  },
   get aiEvalLearning() {
     return runner.layers?.learning ?? null;
   },

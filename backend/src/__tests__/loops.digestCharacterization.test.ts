@@ -48,7 +48,6 @@ function fakeResult(over: Partial<LoopRunResult>): LoopRunResult {
     eventsScanned: 0,
     proposals: [],
     mutations: [],
-    approvals: [],
     blocked: false,
     durationMs: 1,
     tokensSpentUsd: 0,
@@ -103,8 +102,8 @@ describe('loop digest characterization (exact rendered text)', () => {
     // default — it DM'd Harsha on EVERY daily run, including the empty/quiet
     // "healthy" windows, which was the only loop chirping in prod. The digest
     // wire format is still pinned below, but only when explicitly re-enabled
-    // via AGENT_MODE_LOOP_DIGEST=true (set once the Slack approval gate makes
-    // the DM actionable). See dev.md 2026-06-14.
+    // via AGENT_MODE_LOOP_DIGEST=true once the digest is operationally useful.
+    // See dev.md 2026-06-14.
     it('is silent by default — posts NO digest DM even when tools are failing', async () => {
       delete process.env.AGENT_MODE_LOOP_DIGEST;
       mockedRunLoop.mockResolvedValue(
@@ -151,7 +150,9 @@ describe('loop digest characterization (exact rendered text)', () => {
           '',
           '*Failing tools (fix specs prepared: 0)*',
           '1. Tool `publish_blog_article` failed 6/9 calls (67%) — top error: Webflow 502',
+          '   Proposal ID: `p1`',
           '2. Tool `search_leads` failed 3/7 calls (43%) — top error: timeout',
+          '   Proposal ID: `p1`',
           '',
           FOOTER,
         ].join('\n'),
@@ -221,9 +222,9 @@ describe('loop digest characterization (exact rendered text)', () => {
           '',
           '*What I found*',
           '1. Users loop back from brand review to goal selection',
-          '   Kind: `copy`  |  Fix: clarify the goal step CTA',
+          '   Proposal ID: `p1`  |  Kind: `copy`  |  Fix: clarify the goal step CTA',
           '2. ICP step abandonment at 40%',
-          '   Kind: `code_change`',
+          '   Proposal ID: `p1`  |  Kind: `code_change`',
           '',
           FOOTER,
         ].join('\n'),
@@ -292,7 +293,7 @@ describe('loop digest characterization (exact rendered text)', () => {
           '',
           '*What I found*',
           '1. Quiz step drops 40%',
-          '   Kind: `copy`  |  Fix: shorten the quiz to one question',
+          '   Proposal ID: `p1`  |  Kind: `copy`  |  Fix: shorten the quiz to one question',
           '',
           FOOTER,
         ].join('\n'),

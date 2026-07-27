@@ -16,8 +16,6 @@
  * gated separately by AGENT_MODE_LOOP_ENABLED.
  */
 
-import { CaptureGate } from '../../core/gates/captureGate';
-import { SlackReactionGate } from '../../core/gates/slackReactionGate';
 import { postLoopDigest, type LoopDigestTemplate } from '../../core/digest/loopDigest';
 import { claimLoopDailyDigestPost } from '../../core/digest/dailyDigestClaim';
 import { createInstanceRunner } from '../../core/instanceRunner';
@@ -41,7 +39,6 @@ const runner = createInstanceRunner({
     sensor: 'agentModeSensor',
     ruleSet: 'agentModeFailurePolicy',
     tools: 'agentModeSpecTool',
-    gate: 'agentModeGate',
     learning: 'agentModeLearning',
   },
   buildLayers: (ports) => {
@@ -50,24 +47,19 @@ const runner = createInstanceRunner({
       sensor: new EventTableEventSource(ports.dynamo, AGENT_MODE_LOOP_ID),
       ruleSet: new CooldownRuleSet(new AgentFailureRuleSet(), learning, AGENT_MODE_LOOP_ID),
       tools: new SpecOutputTool(AGENT_MODE_LOOP_ID, ['cloud-dev', 'auto-loop', 'agent-mode']),
-      gate: new CaptureGate(),
       learning,
     };
   },
   manifest: () => agentModeManifest,
-  onRunComplete: async ({ result, drained, ports, manifest }) => {
-    if (drained === null) return;
+  onRunComplete: async ({ result, mutations, ports, manifest }) => {
     // Chirp kill (2026-06-14): this loop was the only one scheduled+enabled in
     // prod (AGENT_MODE_LOOP_ENABLED), and unlike its siblings it DM'd Harsha a
     // digest on EVERY daily run — even empty/quiet windows. The recorder that
     // feeds it is gated separately (AGENT_RUNTIME_SPINE_ENABLED, off in prod),
     // so every run scanned 0 events and still fired the "healthy/empty" DM:
-    // pure daily noise. The approval gate is also still a no-op CaptureGate, so
-    // the DM can't dispatch a fix anyway. Default to silent. Re-enable with
-    // AGENT_MODE_LOOP_DIGEST=true once the Slack approval gate (C1) makes the
-    // digest actionable. See dev.md 2026-06-14.
+    // pure daily noise. Default to silent. See dev.md 2026-06-14.
     if (process.env.AGENT_MODE_LOOP_DIGEST !== 'true') return;
-    await postLoopDigest(result, ports.slack, manifest.approval.slackUserId, agentModeDigestTemplate, drained.length, {
+    await postLoopDigest(result, ports.slack, manifest.approval.slackUserId, agentModeDigestTemplate, mutations.length, {
       claimDailyDigest: (digestDate, slackUserId, runId) =>
         claimLoopDailyDigestPost(ports.dynamo, {
           loopId: AGENT_MODE_LOOP_ID,
@@ -157,40 +149,6 @@ export function checkFinalizeGuardMisconfiguration(): string | null {
 }
 
 /**
- * Opt-in flag for the real Slack-reaction approval gate (INCREMENT C1).
- *
- * Production still runs `CaptureGate` (pollDecision() always pending, so
- * shippedAt is never stamped). This flag gates the SlackReactionGate capability
- * WITHOUT auto-flipping the live runner: the runner's drain path is tied to
- * CaptureGate, so promoting this gate into the runner is a separate, larger
- * wiring change. This increment ships the capability + tests behind the flag;
- * Harsha enables + wires it explicitly. Default OFF.
- */
-export function isSlackReactionGateEnabled(): boolean {
-  return process.env.AGENT_MODE_SLACK_REACTION_GATE === 'true';
-}
-
-/**
- * Factory for the agent-mode Slack-reaction approval gate. Returns null when the
- * flag is off so callers stay on CaptureGate. The gate resolves ✅/❌ on the
- * proposal DM into a decision and stamps shippedAt on approval (Layer 4→5).
- *
- * Wiring is intentionally deferred: this builds the gate, it does not register
- * it as the loop's `gateImpl`. See isSlackReactionGateEnabled() for why.
- */
-export function buildAgentModeSlackReactionGate(): SlackReactionGate | null {
-  if (!isSlackReactionGateEnabled()) return null;
-  const ports = productionLoopPorts();
-  return new SlackReactionGate({
-    slack: ports.slack,
-    approver: agentModeManifest.approval.slackUserId ?? '',
-    clock: ports.clock,
-    channel: agentModeManifest.approval.slackChannel,
-    dmTitle: agentModeManifest.displayName,
-  });
-}
-
-/**
  * Run one analysis tick: register, run the orchestrator over the 7d window,
  * drain the gate, and DM the failing-tool fix specs. Never throws — errors are
  * logged. Scheduled from server.ts behind AGENT_MODE_LOOP_ENABLED.
@@ -200,7 +158,7 @@ export async function runAgentModeLoopOnce(): Promise<LoopRunResult> {
   return (await runner.runOnce()) as LoopRunResult;
 }
 
-/** TExtra = the count of fix specs drained from the gate this tick. */
+/** TExtra = the count of fix-spec mutations produced this tick. */
 const agentModeDigestTemplate: LoopDigestTemplate<number> = {
   logTag: '[agent-mode-loop]',
   header: (date) => `*🤖 Agent Mode — tool reliability ${date}*`,
@@ -212,17 +170,17 @@ const agentModeDigestTemplate: LoopDigestTemplate<number> = {
   quietBody: () => [
     `_No tool crossed the failure threshold this window. Keep watching the trend; this is not a dispatchable finding._`,
   ],
-  findingsBody: (result, drainedCount) => [
-    `*Failing tools (fix specs prepared: ${drainedCount})*`,
-    ...result.proposals.map((p, i) => `${i + 1}. ${p.hypothesis}`),
+  findingsBody: (result, mutationCount) => [
+    `*Failing tools (fix specs prepared: ${mutationCount})*`,
+    ...result.proposals.flatMap((p, i) => [
+      `${i + 1}. ${p.hypothesis}`,
+      `   Proposal ID: \`${p.proposalId}\``,
+    ]),
   ],
 };
 
 /** Test seam. */
 export const _internal = {
-  get agentModeGate() {
-    return runner.gate;
-  },
   resetForTesting() {
     runner.resetForTesting();
     recorderSingleton = null;

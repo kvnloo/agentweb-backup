@@ -2,9 +2,8 @@
  * instanceRunner — shared register/run plumbing for production loop instances.
  *
  * Every instance module repeated the same choreography: env-gated idempotent
- * registration of the 5 layers + manifest, a module-level CaptureGate
- * singleton, and a runOnce that registers, runs the orchestrator, drains the
- * gate, and posts the digest. `createInstanceRunner(config)` owns that; the
+ * registration of the 4 layers + manifest and a runOnce that registers, runs
+ * the orchestrator, and posts the digest. `createInstanceRunner(config)` owns that; the
  * instance keeps only layer construction, env gating, and its digest template.
  *
  * Boundary note: core/ normally only depends on ports, but the runner exists
@@ -15,14 +14,12 @@
 import {
   getLoopManifest,
   getRegisteredLoopIds,
-  registerOrReplaceGate,
   registerOrReplaceLearningStore,
   registerOrReplaceLoop,
   registerOrReplaceRuleSet,
   registerOrReplaceSensor,
   registerOrReplaceTools,
 } from '../index';
-import type { CaptureGate } from './gates/captureGate';
 import { runLoop } from './orchestrator';
 import type { LoopPorts } from './ports';
 import {
@@ -37,32 +34,28 @@ import {
   type RuleSet,
 } from './types';
 
-/** The five layer implementations one instance registers. `ruleSet` and
+/** The four layer implementations one instance registers. `ruleSet` and
  * `tools` are type-erased here (the registry stores them erased anyway), so
  * instances can return their concrete generics without per-call casts. */
 export interface InstanceLayers {
   sensor: EventSource<NormalizedEvent>;
   ruleSet: unknown;
   tools: unknown;
-  /** Must be a CaptureGate — the runner drains it after each tick. */
-  gate: CaptureGate;
   learning: LearningStore;
 }
 
-/** Registry names for the five layers (the manifest's *Impl values). */
+/** Registry names for the four layers (the manifest's *Impl values). */
 export interface InstanceImplNames {
   sensor: string;
   ruleSet: string;
   tools: string;
-  gate: string;
   learning: string;
 }
 
 export interface InstanceRunContext {
   result: LoopRunResult;
-  /** Mutations drained from the held gate, or null when no gate is held
-   * (i.e. this module instance never performed the registration). */
-  drained: readonly Mutation[] | null;
+  /** Mutations produced during this tick. */
+  mutations: readonly Mutation[];
   ports: LoopPorts;
   manifest: LoopManifest;
 }
@@ -90,8 +83,6 @@ export interface InstanceRunner {
   /** One tick: register (unless disabled by config), run, drain, digest.
    * Returns null only when the instance is env-gated off. */
   runOnce: () => Promise<LoopRunResult | null>;
-  /** The CaptureGate held since this module instance registered, if any. */
-  readonly gate: CaptureGate | null;
   /** The layers built at registration time (test seam). */
   readonly layers: InstanceLayers | null;
   /** Drop the held gate/layers so tests can simulate a fresh module. */
@@ -99,9 +90,6 @@ export interface InstanceRunner {
 }
 
 export function createInstanceRunner(config: InstanceRunnerConfig): InstanceRunner {
-  // Held so runOnce can drain the gate's captured mutations after the
-  // orchestrator returns and post a single digest DM.
-  let heldGate: CaptureGate | null = null;
   let heldLayers: InstanceLayers | null = null;
 
   function isAlreadyRegistered(): boolean {
@@ -119,11 +107,9 @@ export function createInstanceRunner(config: InstanceRunnerConfig): InstanceRunn
     registerOrReplaceSensor(config.implNames.sensor, layers.sensor);
     registerOrReplaceRuleSet(config.implNames.ruleSet, layers.ruleSet as RuleSet<NormalizedEvent, unknown>);
     registerOrReplaceTools(config.implNames.tools, layers.tools as MutationTools<unknown>);
-    registerOrReplaceGate(config.implNames.gate, layers.gate);
     registerOrReplaceLearningStore(config.implNames.learning, layers.learning);
     registerOrReplaceLoop(config.manifest());
 
-    heldGate = layers.gate;
     heldLayers = layers;
     return true;
   }
@@ -135,8 +121,7 @@ export function createInstanceRunner(config: InstanceRunnerConfig): InstanceRunn
     const manifest = getLoopManifest(asLoopId(config.loopId));
     const result = await runLoop(manifest, ports);
 
-    const drained = heldGate ? heldGate.drain() : null;
-    await config.onRunComplete({ result, drained, ports, manifest });
+    await config.onRunComplete({ result, mutations: result.mutations, ports, manifest });
 
     return result;
   }
@@ -144,14 +129,10 @@ export function createInstanceRunner(config: InstanceRunnerConfig): InstanceRunn
   return {
     register,
     runOnce,
-    get gate() {
-      return heldGate;
-    },
     get layers() {
       return heldLayers;
     },
     resetForTesting() {
-      heldGate = null;
       heldLayers = null;
     },
   };

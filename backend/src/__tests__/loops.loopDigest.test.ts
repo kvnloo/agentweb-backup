@@ -71,15 +71,15 @@ describe('buildLoopDigestLines', () => {
 describe('analystFindingsBody', () => {
   it('renders hypothesis + Kind lines, with Fix only when the payload has a directive', () => {
     const proposals = [
-      { hypothesis: 'h1', kind: 'copy', payload: { directive: 'do it' } },
-      { hypothesis: 'h2', kind: 'code_change', payload: {} },
+      { proposalId: 'proposal-1', hypothesis: 'h1', kind: 'copy', payload: { directive: 'do it' } },
+      { proposalId: 'proposal-2', hypothesis: 'h2', kind: 'code_change', payload: {} },
     ] as unknown as LoopRunResult['proposals'];
     expect(analystFindingsBody(fakeResult({ eventsScanned: 2, proposals }))).toEqual([
       '*What I found*',
       '1. h1',
-      '   Kind: `copy`  |  Fix: do it',
+      '   Proposal ID: `proposal-1`  |  Kind: `copy`  |  Fix: do it',
       '2. h2',
-      '   Kind: `code_change`',
+      '   Proposal ID: `proposal-2`  |  Kind: `code_change`',
     ]);
   });
 });

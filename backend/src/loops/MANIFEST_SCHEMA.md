@@ -18,12 +18,11 @@ This document is the authoritative reference for what a manifest contains. For r
 | `sensorImpl` | `string` | yes | Key into the sensor registry (e.g. `'userArrayEventSource'`, `'eventTableEventSource'`). |
 | `rulesetImpl` | `string` | yes | Key into the ruleset registry. Usually `'<loopId>-rules'`. |
 | `toolsImpl` | `string` | yes | Key into the tools registry. |
-| `gateImpl` | `string` | yes | Key into the gate registry (e.g. `'slackReactionGate'`). |
 | `learningImpl` | `string` | yes | Key into the learning registry. |
 | `thresholds` | `LoopThresholds` | yes | Promote/retire/watchdog cutoffs. |
 | `generator` | `GeneratorConfig` | yes | Bedrock model + system prompt for the Generator agent. |
 | `critic` | `CriticConfig` | yes | Bedrock model + rubric for the Critic agent. |
-| `approval` | `ApprovalConfig` | yes | Slack DM template + auto-ship parameters. |
+| `approval` | `ApprovalConfig` | yes | Legacy-named Slack digest destination/template. Execution authority lives in Linear routing and executor policy. |
 | `businessRules` | `readonly Record<string, unknown>[]` | yes | Free-form business-rule entries; the policy DSL parses these alongside the main rule list. |
 | `implParams` | `Record<string, unknown>` | optional | Free-form parameter bag passed to the chosen implementations. They cast and validate. |
 

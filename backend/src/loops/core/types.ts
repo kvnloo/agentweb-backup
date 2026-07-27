@@ -1,15 +1,14 @@
 /**
- * Closed-loop framework — type definitions for the 5 pluggable layers.
+ * Closed-loop framework — type definitions for the 4 pluggable layers.
  *
  * The architecture follows Tom Blomfield's recursive AI loop and Diana Hu's
  * AI-native-company thesis: every important process in a company is a self-
- * improving closed loop composed of five orthogonal layers:
+ * improving closed loop composed of four orthogonal layers:
  *
  *   1. Sensor       — captures events from the world (`EventSource`)
  *   2. Policy       — evaluates events against rules, proposes mutations (`RuleSet`)
  *   3. Tools        — turns proposals into concrete mutations (`MutationTools`)
- *   4. Quality gate — eval + human review for risky changes (`ApprovalGate`)
- *   5. Learning     — records outcomes, refeeds into the next cycle (`LearningStore`)
+ *   4. Learning     — records outcomes, refeeds into the next cycle (`LearningStore`)
  *
  * A loop instance is a `LoopManifest` that names one implementation per layer
  * plus the parameters those implementations need. The orchestrator (in
@@ -191,7 +190,7 @@ export interface MutationTools<TProposal> {
 }
 
 // ---------------------------------------------------------------------------
-// Layer 4 — Quality gate
+// Historical decision metadata
 // ---------------------------------------------------------------------------
 
 export type DecisionStatus = 'approved' | 'denied' | 'held' | 'pending' | 'auto_shipped';
@@ -203,31 +202,10 @@ export interface Decision {
   reason?: string;
 }
 
-/** Reference handle for an in-flight approval. Implementations store whatever
- * they need to poll later — e.g. Slack channel + ts for reaction-based gates,
- * PR number for PR-based gates. */
-export interface ApprovalRecord {
-  mutationId: MutationId;
-  /** Impl-specific handle. */
-  handle: Readonly<Record<string, string>>;
-  requestedAt: Date;
-}
-
-/** Layer 4. */
-export interface ApprovalGate {
-  /** Request approval for a mutation. Implementations post a Slack DM, open
-   * a PR, or auto-approve based on quality thresholds. */
-  requestApproval(mutation: Mutation): Promise<ApprovalRecord>;
-  /** Poll the approval system for the latest decision. Called by the
-   * watchdog cron. */
-  pollDecision(record: ApprovalRecord): Promise<Decision>;
-}
-
-// ---------------------------------------------------------------------------
-// Layer 5 — Learning store
+// Layer 4 — Learning store
 // ---------------------------------------------------------------------------
 
-/** Verdict from the attribution job (layer 5): did the shipped mutation move
+/** Verdict from the attribution job (layer 4): did the shipped mutation move
  * the loop's target metric over the settle window? This is what makes the loop
  * *self-improving* rather than only self-proposing. */
 export type OutcomeVerdict = 'improved' | 'no_change' | 'regressed' | 'inconclusive';
@@ -271,7 +249,7 @@ export interface LearningRecord extends LearningEvent {
   sortKey: string;
 }
 
-/** Layer 5. */
+/** Layer 4. */
 export interface LearningStore {
   record(event: LearningEvent): Promise<void>;
   queryHistory(filter: HistoryFilter): Promise<LearningRecord[]>;
@@ -286,9 +264,8 @@ export interface LearningStore {
 // Manifest — names one implementation per layer for a given loop instance
 // ---------------------------------------------------------------------------
 
-/** Approval-related parameters that apply to whatever ApprovalGate impl is
- * chosen. Keeping these on the manifest (not buried in the gate) lets the
- * Slack DM template be loop-specific. */
+/** Legacy-named Slack digest parameters. Execution/review authority is
+ * determined by Linear routing and the executor pipeline, not this config. */
 export interface ApprovalConfig {
   slackUserId?: string;
   slackChannel?: string;
@@ -352,7 +329,6 @@ export interface LoopManifest<TEvent extends NormalizedEvent = NormalizedEvent, 
   sensorImpl: string;
   rulesetImpl: string;
   toolsImpl: string;
-  gateImpl: string;
   learningImpl: string;
 
   /** Per-loop parameters. */
@@ -394,9 +370,6 @@ export interface LoopRunResult {
   /** Mutations the tools layer materialized. May be fewer than proposals if
    * business rules filtered some out. */
   mutations: readonly Mutation[];
-  /** Approval records opened this tick (decisions are checked later by the
-   * watchdog). */
-  approvals: readonly ApprovalRecord[];
   /** Set to true if anything was blocked by paused state, budget cap, or a
    * watchdog warning. Slack DM should surface why. */
   blocked: boolean;
