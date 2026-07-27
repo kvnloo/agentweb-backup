@@ -6,6 +6,7 @@ export type NegativeCampaignCriteriaValidationCode =
   | 'INVALID_CRITERIA_COLLECTION'
   | 'MISSING_CRITERIA'
   | 'INVALID_PLACEMENT_URL'
+  | 'UNSUPPORTED_PLACEMENT_CRITERION_TYPE'
   | 'INVALID_MOBILE_APP_CATEGORY_RESOURCE_NAME';
 
 export class NegativeCampaignCriteriaValidationError extends Error {
@@ -113,24 +114,64 @@ export function validateNegativeCampaignCriteria(
         `Invalid placement URL: ${placementUrl || '(empty)'}`,
       );
     }
+
+    const placementWithoutProtocol = placementUrl.replace(/^https?:\/\//i, '');
+    if (placementWithoutProtocol.length > 250) {
+      throw new NegativeCampaignCriteriaValidationError(
+        'INVALID_PLACEMENT_URL',
+        `Invalid placement URL: ${placementUrl} exceeds the 250-character Google Ads limit`,
+      );
+    }
+
+    let parsed: URL;
     try {
-      const parsed = new URL(
+      parsed = new URL(
         /^[a-z][a-z\d+.-]*:\/\//i.test(placementUrl)
           ? placementUrl
           : `https://${placementUrl}`,
       );
-      const hostnameLabels = parsed.hostname.split('.');
-      if (
-        !['http:', 'https:'].includes(parsed.protocol)
-        || hostnameLabels.length < 2
-        || hostnameLabels.some((label) => !label)
-      ) {
-        throw new Error('unsupported placement URL');
-      }
     } catch {
       throw new NegativeCampaignCriteriaValidationError(
         'INVALID_PLACEMENT_URL',
         `Invalid placement URL: ${placementUrl}`,
+      );
+    }
+
+    const hostname = parsed.hostname.toLowerCase();
+    const hostnameLabels = hostname.split('.');
+    const pathDepth = parsed.pathname.split('/').filter(Boolean).length;
+    if (
+      !['http:', 'https:'].includes(parsed.protocol)
+      || hostnameLabels.length < 2
+      || hostnameLabels.some((label) => !label)
+      || parsed.port
+      || parsed.username
+      || parsed.password
+      || pathDepth > 2
+    ) {
+      throw new NegativeCampaignCriteriaValidationError(
+        'INVALID_PLACEMENT_URL',
+        `Invalid placement URL: ${placementUrl}`,
+      );
+    }
+
+    const isHostOrSubdomain = (domain: string) => (
+      hostname === domain || hostname.endsWith(`.${domain}`)
+    );
+    if (
+      isHostOrSubdomain('youtube.com')
+      || isHostOrSubdomain('youtu.be')
+      || isHostOrSubdomain('youtube-nocookie.com')
+    ) {
+      throw new NegativeCampaignCriteriaValidationError(
+        'UNSUPPORTED_PLACEMENT_CRITERION_TYPE',
+        `YouTube placement ${placementUrl} requires a dedicated YouTube video or channel criterion`,
+      );
+    }
+    if (isHostOrSubdomain('adsenseformobileapps.com')) {
+      throw new NegativeCampaignCriteriaValidationError(
+        'UNSUPPORTED_PLACEMENT_CRITERION_TYPE',
+        'adsenseformobileapps.com is not an allowed Google Ads placement',
       );
     }
   }

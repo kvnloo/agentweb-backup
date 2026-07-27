@@ -790,6 +790,24 @@ describe('handleCallGoogleAdsApi — CAMPAIGN_CRITERION ADD', () => {
     expect(googleAdsService.addNegativeCampaignCriteria).not.toHaveBeenCalled();
   });
 
+  it('returns a typed criterion error for YouTube URLs without mutating', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN_CRITERION',
+      action: 'ADD',
+      campaign_resource_name: 'customers/1234567890/campaigns/24056663695',
+      placement_urls: ['https://www.youtube.com/watch?v=abc123'],
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      errorType: 'VALIDATION_ERROR',
+      errorCode: 'UNSUPPORTED_PLACEMENT_CRITERION_TYPE',
+      error: expect.stringMatching(/dedicated YouTube video or channel criterion/i),
+    });
+    expect(googleAdsService.addNegativeCampaignCriteria).not.toHaveBeenCalled();
+  });
+
   it('returns the typed Google Ads permission error from the single atomic mutation', async () => {
     (googleAdsService.addNegativeCampaignCriteria as jest.Mock).mockRejectedValueOnce({
       response: {

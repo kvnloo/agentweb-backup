@@ -925,6 +925,48 @@ describe('addNegativeCampaignCriteria', () => {
 
   it.each([
     {
+      name: 'a placement URL with an unsupported port',
+      placementUrl: 'https://example.com:8080/games',
+      errorCode: 'INVALID_PLACEMENT_URL',
+    },
+    {
+      name: 'a placement URL deeper than two path levels',
+      placementUrl: 'example.com/one/two/three',
+      errorCode: 'INVALID_PLACEMENT_URL',
+    },
+    {
+      name: 'a YouTube video URL that requires the dedicated criterion type',
+      placementUrl: 'https://www.youtube.com/watch?v=abc123',
+      errorCode: 'UNSUPPORTED_PLACEMENT_CRITERION_TYPE',
+    },
+    {
+      name: 'the retired mobile-app blanket placement',
+      placementUrl: 'adsenseformobileapps.com',
+      errorCode: 'UNSUPPORTED_PLACEMENT_CRITERION_TYPE',
+    },
+    {
+      name: 'a placement URL longer than the Google Ads limit',
+      placementUrl: `https://example.com/${'a'.repeat(240)}`,
+      errorCode: 'INVALID_PLACEMENT_URL',
+    },
+  ])('rejects $name before credentials or mutation', async ({ placementUrl, errorCode }) => {
+    await expect(service.addNegativeCampaignCriteria(
+      'user-123',
+      '1234567890',
+      'customers/1234567890/campaigns/24056663695',
+      {
+        placementUrls: [placementUrl],
+        mobileAppCategoryResourceNames: [],
+      },
+    )).rejects.toMatchObject({
+      errorType: 'VALIDATION_ERROR',
+      errorCode,
+    });
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
       name: 'invalid placement URL',
       params: {
         placementUrls: ['not a placement'],
