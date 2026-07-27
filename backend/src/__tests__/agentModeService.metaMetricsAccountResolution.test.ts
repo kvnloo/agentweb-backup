@@ -29,6 +29,7 @@ jest.mock('../utils/metaApiFetch', () => ({
 import { AgentModeService } from '../services/agentModeService';
 import { getAccountsWithOwnerIncludingOrgShared } from '../services/connectedAccountsDb';
 import { userDb } from '../services/db';
+import { ensureFreshMetaAdAccountToken } from '../services/metaTokenRefresh';
 import { fetchWithRetryAndPaging } from '../utils/metaApiFetch';
 import { getMetaAccessToken } from '../utils/secretsManager';
 
@@ -36,6 +37,7 @@ const connectedMetaAccount = {
   platform: 'meta',
   account_id: '922903076601160',
   account_name: 'AgentWeb',
+  userId: 'harsha-user',
   config: {
     account_type: 'ad_account',
     ad_account_id: '922903076601160',
@@ -137,6 +139,78 @@ describe('AgentModeService get_meta_ads_metrics account resolution', () => {
       success: false,
       errorType: 'permission',
       error: expect.stringMatching(/permission|ads_read/i),
+    }));
+  });
+
+  it('refreshes an org-shared account token against the account owner record', async () => {
+    const sharedAccount = {
+      ...connectedMetaAccount,
+      userId: 'account-owner',
+      sharedWithOrg: true,
+      config: {
+        ...connectedMetaAccount.config,
+        token_expires_at: Date.now() + 60_000,
+      },
+    };
+    (getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([sharedAccount]);
+
+    const result = await service.getMetaAdsMetrics(
+      '7d',
+      'org-member',
+      ['120248176191460585'],
+    );
+
+    expect(result.success).toBe(true);
+    expect(ensureFreshMetaAdAccountToken).toHaveBeenCalledWith(
+      sharedAccount,
+      'account-owner',
+    );
+  });
+
+  it('selects a requested account when multiple connected accounts are available', async () => {
+    const secondAccount = {
+      ...connectedMetaAccount,
+      account_id: '111222333444555',
+      account_name: 'Second Meta Account',
+      config: {
+        ...connectedMetaAccount.config,
+        ad_account_id: '111222333444555',
+        access_token: 'second-token',
+      },
+    };
+    (getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([
+      connectedMetaAccount,
+      secondAccount,
+    ]);
+
+    const result = await service.getMetaAdsMetrics(
+      '7d',
+      'harsha-user',
+      ['120248176191460585'],
+      '111222333444555',
+    );
+
+    expect(result.success).toBe(true);
+    for (const [url] of (fetchWithRetryAndPaging as jest.Mock).mock.calls) {
+      expect(url).toContain('/act_111222333444555/');
+      expect(url).toContain('access_token=second-token');
+    }
+  });
+
+  it('classifies Meta code 190 as a reconnectable connection failure', async () => {
+    (fetchWithRetryAndPaging as jest.Mock).mockResolvedValue({
+      error: {
+        code: 190,
+        message: 'Invalid OAuth access token: token has expired',
+      },
+    });
+
+    const result = await service.getMetaAdsMetrics('7d', 'harsha-user', ['campaign-1']);
+
+    expect(result).toEqual(expect.objectContaining({
+      success: false,
+      errorType: 'connection',
+      error: expect.stringMatching(/token|oauth/i),
     }));
   });
 

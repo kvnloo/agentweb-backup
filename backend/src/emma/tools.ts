@@ -839,12 +839,19 @@ emmaToolRegistry.register({
     description: 'List all Meta ad campaigns for the current user. Returns campaign names, IDs, statuses, and objectives. Works even without a Meta connected account (falls back to legacy adAccount config). Use this first to get campaign IDs, then call get_meta_ads_metrics.',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        account_id: {
+          type: 'string',
+          description: 'Optional Meta ad account ID from list_connected_accounts. Required only when multiple Meta ad accounts are available.'
+        }
+      },
       required: []
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.listMetaAdsCampaignsNew(context?.userId);
+    return args.account_id
+      ? await agentModeService.listMetaAdsCampaignsNew(context?.userId, args.account_id)
+      : await agentModeService.listMetaAdsCampaignsNew(context?.userId);
   }
 });
 
@@ -1305,6 +1312,10 @@ emmaToolRegistry.register({
           // Legacy single-id alias. execute() normalizes this into campaign_ids.
           type: 'string',
           description: 'Legacy alias for a single campaign id. Prefer campaign_ids. Provide at least one of campaign_ids or campaign_id.'
+        },
+        account_id: {
+          type: 'string',
+          description: 'Optional Meta ad account ID from list_connected_accounts. Required only when multiple Meta ad accounts are available.'
         }
       }
     }
@@ -1319,7 +1330,12 @@ emmaToolRegistry.register({
           ? [args.campaign_id.trim()]
           : [];
 
-    return await agentModeService.getMetaAdsMetrics(args.timeframe || '7d', context?.userId, normalizedCampaignIds);
+    return await agentModeService.getMetaAdsMetrics(
+      args.timeframe || '7d',
+      context?.userId,
+      normalizedCampaignIds,
+      args.account_id,
+    );
   }
 });
 

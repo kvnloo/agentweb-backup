@@ -13847,7 +13847,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         throw this.makeMetaAuthError(`Meta ad account with ID "${accountId}" not found in connected accounts. Ensure you have the correct ID from list_connected_accounts.`);
       }
 
-      await this.ensureUsableMetaToken(selected, userId);
+      await this.ensureUsableMetaToken(selected, selected.userId || userId);
 
       return {
         accountId: clean(selected.account_id || selected.config?.ad_account_id),
@@ -13869,7 +13869,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // 4. Default to the single available account
     const selected = fbAccounts[0];
 
-    await this.ensureUsableMetaToken(selected, userId);
+    await this.ensureUsableMetaToken(selected, selected.userId || userId);
 
     console.log(`[AgentMode] Using Meta credentials from connected_accounts for user ${userId} (Account: ${selected.account_name})`);
 
@@ -15693,7 +15693,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async getMetaAdsMetrics(timeframe: string, userId: string, campaign_ids: string[] | string): Promise<any> {
+  public async getMetaAdsMetrics(
+    timeframe: string,
+    userId: string,
+    campaign_ids: string[] | string,
+    requestedAccountId?: string,
+  ): Promise<any> {
     try {
       const rawCampaignIds = Array.isArray(campaign_ids)
         ? campaign_ids
@@ -15717,7 +15722,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       let accountId: string;
       let accessToken: string;
       try {
-        ({ accountId, accessToken } = await this.getMetaCredentials(userId));
+        ({ accountId, accessToken } = await this.getMetaCredentials(userId, requestedAccountId));
       } catch (error: any) {
         const credentialFailure =
           error?.isMetaAuthError ||
@@ -15792,11 +15797,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         console.error(`AgentMode: ${section} API Error:`, response.error);
         const message = response.error.message || 'Unknown Meta API error';
         const code = Number(response.error.code);
+        const connectionFailure =
+          code === 190 ||
+          /access token|oauth|token.*(?:expired|invalid|revoked)/i.test(message);
         const permissionFailure =
-          [10, 190, 200].includes(code) ||
-          /permission|not authorized|access token|oauth/i.test(message);
+          [10, 200].includes(code) ||
+          /permission|not authorized/i.test(message);
         const typedError = new Error(`${section} API Error: ${message}`) as any;
-        typedError.metaMetricsErrorType = permissionFailure ? 'permission' : 'api';
+        typedError.metaMetricsErrorType = connectionFailure
+          ? 'connection'
+          : (permissionFailure ? 'permission' : 'api');
         throw typedError;
       }
       // ENG-104: breakdown endpoints are NON-fatal (we proceed without them), but
