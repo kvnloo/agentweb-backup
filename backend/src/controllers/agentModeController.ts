@@ -35,6 +35,7 @@ import {
 import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { countMediaGeneratedSince, buildTimeoutContinuationMessage } from '../utils/timeoutContinuation';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
@@ -3483,6 +3484,10 @@ export const agentModeController = {
         }
       }
 
+      // ENG-510: stamp when this turn's generation began so that, if the whole-turn cap
+      // kills it mid-flight, we count only the media THIS turn saved (not prior turns').
+      const turnStartMs = Date.now();
+
       // Capture the generation promise so the durable path can reattach to it if the
       // run times out while the work is still going (it keeps running detached).
       const genPromise = generateSessionResponse(
@@ -3557,6 +3562,38 @@ export const agentModeController = {
           console.log(`AgentMode: generation timed out for session ${sessionId} — cancelling orphaned worker run`);
           requestCancel(sessionId);
           generateMarketingResponseWorkerService.cancelSession(sessionId);
+
+          // ENG-510: the cap can fire AFTER one or more image variants already finished
+          // and were saved (synchronous image-generated markers). A bare 504 there hides
+          // that finished work and leaves the user with no idea that "continue" will
+          // complete the rest. If this turn delivered >= 1 image, persist a clear
+          // partial-delivery message and return it (200) instead — Emma then resumes ONLY
+          // the still-missing assets on "continue" (it sees the saved markers in history).
+          // Non-media timeouts fall through to the existing 504 unchanged.
+          try {
+            const timedOutSession = await chatbotDb.getChatSession(sessionId);
+            const continuationMsg = buildTimeoutContinuationMessage(
+              countMediaGeneratedSince(timedOutSession?.messages, turnStartMs),
+            );
+            if (continuationMsg) {
+              markProgressComplete(sessionId);
+              await chatbotDb.addMessageToSession(sessionId, {
+                role: 'assistant',
+                content: continuationMsg,
+                timestamp: new Date().toISOString(),
+                metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation' },
+              }).catch((persistErr) =>
+                console.error('AgentMode: failed to persist timeout continuation message:', persistErr),
+              );
+              if (runSurvivalRunId) {
+                void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'timeout_partial_media' });
+              }
+              res.json({ content: continuationMsg, partialMediaDelivery: true });
+              return;
+            }
+          } catch (continuationErr) {
+            console.error('AgentMode: partial-media timeout continuation failed (falling through to 504):', continuationErr);
+          }
         }
         throw genErr; // preserve existing error handling (returns 504 GENERATION_TIMEOUT)
       }
