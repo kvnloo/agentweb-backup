@@ -61,13 +61,18 @@ function manifest(): LoopManifest {
     toolsImpl: 'reachability-tools',
     learningImpl: 'reachability-learning',
     thresholds: {
+      promoteLiftPct: 5,
+      promoteMinNPerArm: 1,
+      retireLiftPct: -5,
+      retireMinNPerArm: 1,
+      watchdogRollbackPct24h: -10,
+      watchdogPausePct7d: -5,
       maxActiveArmsPerKey: 1,
       maxTokensPerCycleUsd: 1,
-      promoteMinNPerArm: 1,
     },
     generator: {} as LoopManifest['generator'],
     critic: {} as LoopManifest['critic'],
-    approval: {},
+    approval: { dmTitleTemplate: 'Review {{loopId}}' },
     businessRules: [],
   };
 }
