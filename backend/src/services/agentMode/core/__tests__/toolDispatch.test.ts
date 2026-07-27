@@ -691,6 +691,42 @@ describe('executePreparedTools', () => {
       expect(maxInFlight()).toBe(1);
     });
 
+    it('delivers the succeeding variants when one in the batch fails (partial success under rate limits)', async () => {
+      // The bounded concurrency raises the chance of a provider 429; the image service
+      // already retries 429/503 with backoff, but if one variant still exhausts its
+      // retries the batch must NOT be all-or-nothing — the others still deliver and the
+      // failure is reported so the user can retry just that one (same as a deferral).
+      const executed: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          executed.push(i.toolName);
+          if (i.args && i.args.prompt === '2') {
+            return { status: 'error', error: new Error('429 Too Many Requests — rate limit exceeded'), durationMs: 1, policyDecision: i.policyDecision };
+          }
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async (i: any) => ({ success: true, imageUrl: `https://s3/${i.toolName}.png` }),
+      });
+      const input = makeInput(
+        [
+          toolCall('a', 'generate_image', '{"prompt":"1"}'),
+          toolCall('b', 'generate_image', '{"prompt":"2"}'), // exhausts retries → fails
+          toolCall('c', 'generate_image', '{"prompt":"3"}'),
+        ],
+        ports,
+      );
+      const result = await executePreparedTools(input);
+
+      // Two variants delivered, one failed — not all-or-nothing.
+      expect(result.mediaAssetsProduced).toBe(2);
+      expect(result.pendingCounterUpdates).toEqual({ generate_image: 2 });
+      expect(result.failedCounterUpdates).toEqual({ generate_image: 1 });
+      // Emission order preserved; the failing variant carries the (retryable) error.
+      expect(input.toolCallsLedger.map((t: any) => t.id)).toEqual(['a', 'b', 'c']);
+      expect(input.toolCallsLedger[1].error).toBeTruthy();
+    });
+
     it('defers the next BATCH as a unit once over budget with an asset produced', async () => {
       const { ports, executed } = concurrencyPorts();
       const input = makeInput(
