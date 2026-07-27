@@ -333,6 +333,65 @@ describe('GET /api/social-posts', () => {
           .expect(429);
         expect(res.body).toHaveProperty('error');
       });
+
+      it('should NOT roll back a NEWER request\'s reservation when a slow, expired request fails afterward', async () => {
+        // Repro of the diagrammed race: request A reserves acc-1 and runs
+        // longer than the cooldown window; request B then replaces A's expired
+        // reservation with its own; finally A fails. A's rollback must NOT
+        // delete B's active reservation — otherwise an immediate third refresh
+        // would bypass the cooldown and burn shared LinkedIn quota.
+        mockGetSocialAccountIds.mockResolvedValue(['acc-1']);
+
+        let clock = 1_000_000;
+        const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => clock);
+        try {
+          // Request A hangs inside getPostsForUser until we reject it.
+          let rejectA!: (e: Error) => void;
+          mockGetPosts.mockReturnValueOnce(
+            new Promise((_resolve, reject) => { rejectA = reject; }) as any,
+          );
+
+          // Kick A off (attaching .then triggers supertest to send) but keep
+          // its promise to assert on later.
+          let aError: unknown;
+          const aDone = request(app)
+            .get('/api/social-posts?force_reload=true&accountId=acc-1')
+            .expect(500)
+            .then(() => {}, (e) => { aError = e; });
+
+          // Let A place its reservation before the clock advances.
+          while (mockGetPosts.mock.calls.length < 1) {
+            await new Promise((r) => setImmediate(r));
+          }
+          expect(_forceReloadCooldownSize()).toBe(1);
+
+          // More than the cooldown window elapses → A's reservation is expired.
+          clock += 60_000 + 1;
+
+          // Request B refreshes the same account; the expired reservation lets
+          // it through and it records a fresh reservation with its own token.
+          mockGetPosts.mockResolvedValueOnce({ posts: [], total: 0 } as any);
+          await request(app)
+            .get('/api/social-posts?force_reload=true&accountId=acc-1')
+            .expect(200);
+          expect(_forceReloadCooldownSize()).toBe(1);
+
+          // A finally fails; its rollback must leave B's reservation intact.
+          rejectA(new Error('DynamoDB unavailable'));
+          await aDone;
+          expect(aError).toBeUndefined();
+
+          expect(_forceReloadCooldownSize()).toBe(1);
+
+          // A third immediate refresh is still throttled by B's live cooldown.
+          const res = await request(app)
+            .get('/api/social-posts?force_reload=true&accountId=acc-1')
+            .expect(429);
+          expect(res.body).toHaveProperty('error');
+        } finally {
+          nowSpy.mockRestore();
+        }
+      });
     });
   });
 });
