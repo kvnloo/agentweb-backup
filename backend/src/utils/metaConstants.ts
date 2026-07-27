@@ -150,6 +150,10 @@ export function suggestInsightsField(name: string): string | null {
   let best: string | null = null;
   let bestDist = Infinity;
   for (const f of ALLOWED_INSIGHTS_FIELDS) {
+    // Never suggest the field itself. A dropped field can still BE on the
+    // whitelist (e.g. a valid-but-account-unsupported field Meta rejects at
+    // runtime); suggesting it back verbatim is a degenerate, confusing hint.
+    if (f === n) continue;
     let dist = editDistance(n, f);
     // Reward containment (common when the model uses a looser phrasing like
     // `link_clicks` for `inline_link_clicks`). Guard against tiny fragments so
@@ -166,8 +170,10 @@ export function suggestInsightsField(name: string): string | null {
       best = f;
     }
   }
-  // Only suggest when the closest field is plausibly the same intent.
-  const threshold = Math.max(2, Math.floor(n.length / 3));
+  // Only suggest when the closest field is plausibly the same intent. Cap the
+  // threshold so a long field name can't match a far-off field on distance alone
+  // (containment matches, scored <= 1 above, are unaffected by the cap).
+  const threshold = Math.min(4, Math.max(2, Math.floor(n.length / 3)));
   return best && bestDist <= threshold ? best : null;
 }
 
