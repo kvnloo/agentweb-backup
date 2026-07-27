@@ -87,6 +87,7 @@ const MAX_TRACKED_REPORTS = 500;
 interface TrackedReport {
   promise: Promise<unknown>;
   at: number;
+  settled: boolean;
 }
 
 /**
@@ -100,7 +101,9 @@ const trackedByFingerprint = new Map<string, TrackedReport>();
 function pruneExpired(now: number): void {
   if (trackedByFingerprint.size < MAX_TRACKED_REPORTS) return;
   for (const [key, entry] of trackedByFingerprint) {
-    if (now - entry.at >= REPORT_REPLAY_WINDOW_MS) trackedByFingerprint.delete(key);
+    if (entry.settled && now - entry.at >= REPORT_REPLAY_WINDOW_MS) {
+      trackedByFingerprint.delete(key);
+    }
   }
 }
 
@@ -130,16 +133,33 @@ export async function fileReportOnce<T>(
   pruneExpired(now);
 
   const existing = trackedByFingerprint.get(fingerprint);
-  if (existing && now - existing.at < REPORT_REPLAY_WINDOW_MS) {
-    return { result: (await existing.promise) as T, replayed: true };
+  if (existing) {
+    // An active filing is always authoritative, even after the completed-result replay window.
+    // Starting a replacement while it is pending makes duplicate durable tickets reachable.
+    if (!existing.settled || now - existing.at < REPORT_REPLAY_WINDOW_MS) {
+      return { result: (await existing.promise) as T, replayed: true };
+    }
+    trackedByFingerprint.delete(fingerprint);
+  }
+
+  // Fail before calling `file`: an untracked filing could be duplicated by its first retry.
+  // This overload path is intentionally fail-closed and preserves the hard memory bound.
+  if (trackedByFingerprint.size >= MAX_TRACKED_REPORTS) {
+    throw new Error('Report replay guard is at capacity');
   }
 
   const promise = file();
-  trackedByFingerprint.set(fingerprint, { promise, at: now });
+  const entry: TrackedReport = { promise, at: now, settled: false };
+  trackedByFingerprint.set(fingerprint, entry);
   try {
-    return { result: await promise, replayed: false };
+    const result = await promise;
+    entry.settled = true;
+    return { result, replayed: false };
   } catch (error) {
-    trackedByFingerprint.delete(fingerprint);
+    // Never let an older rejection delete a replacement entry.
+    if (trackedByFingerprint.get(fingerprint) === entry) {
+      trackedByFingerprint.delete(fingerprint);
+    }
     throw error;
   }
 }

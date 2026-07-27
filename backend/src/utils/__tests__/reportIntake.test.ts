@@ -111,6 +111,62 @@ describe('fileReportOnce', () => {
     expect(filer).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps an active filing authoritative after the replay window elapses', async () => {
+    let resolveFiling: (value: { pageId: string }) => void = () => {};
+    const filer = jest.fn().mockImplementation(
+      () => new Promise<{ pageId: string }>((resolve) => { resolveFiling = resolve; }),
+    );
+
+    const first = fileReportOnce('slow', filer, 1_000);
+    const lateRetry = fileReportOnce('slow', filer, 1_000 + REPORT_REPLAY_WINDOW_MS + 1);
+    resolveFiling({ pageId: '169' });
+
+    await expect(first).resolves.toEqual({ result: { pageId: '169' }, replayed: false });
+    await expect(lateRetry).resolves.toEqual({ result: { pageId: '169' }, replayed: true });
+    expect(filer).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not let a late failure delete or overlap the authoritative filing', async () => {
+    let rejectFiling: (error: Error) => void = () => {};
+    const filer = jest
+      .fn()
+      .mockImplementationOnce(
+        () => new Promise((_resolve, reject) => { rejectFiling = reject; }),
+      )
+      .mockResolvedValueOnce({ pageId: '170' });
+
+    const first = fileReportOnce('slow-failure', filer, 1_000);
+    const lateRetry = fileReportOnce(
+      'slow-failure',
+      filer,
+      1_000 + REPORT_REPLAY_WINDOW_MS + 1,
+    );
+    rejectFiling(new Error('Linear timed out'));
+
+    await expect(first).rejects.toThrow('Linear timed out');
+    await expect(lateRetry).rejects.toThrow('Linear timed out');
+
+    const cleanRetry = await fileReportOnce(
+      'slow-failure',
+      filer,
+      1_000 + REPORT_REPLAY_WINDOW_MS + 2,
+    );
+    expect(cleanRetry).toEqual({ result: { pageId: '170' }, replayed: false });
+    expect(filer).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails closed at the hard capacity without starting an untracked filing', async () => {
+    const filer = jest.fn().mockResolvedValue({ pageId: '169' });
+    for (let i = 0; i < 500; i++) {
+      await fileReportOnce(`fresh-${i}`, filer, 1_000);
+    }
+
+    await expect(fileReportOnce('overflow', filer, 1_001)).rejects.toThrow(
+      'Report replay guard is at capacity',
+    );
+    expect(filer).toHaveBeenCalledTimes(500);
+  });
+
   it('files again once the replay window has elapsed', async () => {
     const filer = jest.fn().mockResolvedValue({ pageId: '169' });
 
@@ -145,8 +201,8 @@ describe('fileReportOnce', () => {
 
   it('prunes expired entries so the guard cannot grow without bound', async () => {
     const filer = jest.fn().mockResolvedValue({ pageId: '169' });
-    // Fill past the prune threshold while every entry is still fresh (nothing should be dropped).
-    for (let i = 0; i < 600; i++) {
+    // Fill the hard bound while every entry is fresh.
+    for (let i = 0; i < 500; i++) {
       await fileReportOnce(`old-${i}`, filer, 1_000);
     }
     // One call after the window elapses prunes the whole expired generation.
