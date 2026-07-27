@@ -17,6 +17,59 @@ import { isInitialPasswordExpired } from "../utils/secureRandom";
 import { AuthenticatedRequest } from "../middleware/auth";
 import { getJwtSecret } from "../config/jwt";
 
+// ENG-512: domain-based org auto-join. If the new signup's email domain
+// matches an org with autoJoinEnabled, create a pending domain-join request
+// on that org and email the owner an approve/reject link — never a silent
+// join. Shared between password register() and OAuth googleCallback().
+// Non-fatal on failure, same as the pending-invite check this runs alongside.
+async function createDomainJoinRequestsForNewUser(userId: string, email: string): Promise<void> {
+  if (!isCompanyEmail(email)) return;
+  const domain = email.toLowerCase().split("@")[1];
+  if (!domain) return;
+
+  try {
+    const matchingOrgs = await orgDb.getOrgsWithAutoJoinDomain(domain);
+    for (const org of matchingOrgs) {
+      const requestToken = crypto.randomBytes(32).toString("hex");
+      const pendingRequests = org.pendingDomainJoinRequests || [];
+      await orgDb.updateOrg(org.orgId, {
+        pendingDomainJoinRequests: [
+          ...pendingRequests,
+          { userId, email: email.toLowerCase(), requestedAt: new Date().toISOString(), requestToken },
+        ],
+      });
+
+      const ownerUser = await userDb.getUserById(org.ownerUserId);
+      if (!ownerUser?.email) continue;
+
+      const baseUrl = process.env.CUSTOMER_FRONTEND_URL || "http://localhost:5174";
+      const approveUrl = `${baseUrl}/org/domain-request?action=approve&token=${requestToken}&orgId=${org.orgId}`;
+      const rejectUrl = `${baseUrl}/org/domain-request?action=reject&token=${requestToken}&orgId=${org.orgId}`;
+
+      await emailService.sendEmail(
+        ownerUser.email,
+        `${email} wants to join ${org.name} on AgentWeb`,
+        `${email} signed up using your organization's email domain and would like to join "${org.name}". Approve: ${approveUrl} Reject: ${rejectUrl}`,
+        `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <h2 style="color: #1B2549;">${email} wants to join ${org.name}</h2>
+          <p>They signed up using your organization's email domain (<strong>@${domain}</strong>) and are requesting to join.</p>
+          <div style="text-align: center; margin: 30px 0;">
+            <a href="${approveUrl}" style="background-color: #1976d2; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin-right: 10px;">Approve</a>
+            <a href="${rejectUrl}" style="background-color: #999; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px;">Reject</a>
+          </div>
+          <p style="color: #666; font-size: 14px;">If approved, they'll join as a member and share your organization's plan.</p>
+          <p>Best regards,<br>The AgentWeb Team</p>
+        </div>
+        `
+      );
+    }
+  } catch (err) {
+    console.error("Failed to check domain-match orgs for new user:", err);
+    // Non-fatal — this is a best-effort convenience feature
+  }
+}
+
 export const register = async (req: Request, res: Response) => {
   try {
     let {
@@ -123,9 +176,13 @@ export const register = async (req: Request, res: Response) => {
 
     // If a pending org invite exists for this email, stamp it on the new user so
     // ProtectedRoute redirects them to accept-invite instead of onboarding.
+    // An explicit invite always wins over a domain match, so only fall through
+    // to the domain-match check below if no invite was found.
+    let hasPendingInvite = false;
     try {
       const pendingOrg = await orgDb.getOrgWithPendingInviteForEmail(email);
       if (pendingOrg) {
+        hasPendingInvite = true;
         const invite = pendingOrg.pendingInvites!.find((inv) => inv.email === email.toLowerCase())!;
         await userDb.updateUser(userId, {
           pendingOrgInvite: { orgId: pendingOrg.orgId, inviteToken: invite.inviteToken },
@@ -134,6 +191,10 @@ export const register = async (req: Request, res: Response) => {
     } catch (err) {
       console.error("Failed to check pending org invite for new user:", err);
       // Non-fatal — user can still accept invite via the link in the email
+    }
+
+    if (!hasPendingInvite) {
+      await createDomainJoinRequestsForNewUser(userId, email);
     }
 
     // Auto-sync new user to CRM lead list (fire-and-forget)
@@ -437,10 +498,13 @@ export const googleCallback = async (
 
     // For newly created users: check if a pending org invite exists for this email
     // and stamp it so ProtectedRoute redirects them to accept-invite instead of onboarding.
+    // An explicit invite always wins over a domain match.
     if (user && !user.orgId && !user.pendingOrgInvite) {
+      let hasPendingInvite = false;
       try {
         const pendingOrg = await orgDb.getOrgWithPendingInviteForEmail(email);
         if (pendingOrg) {
+          hasPendingInvite = true;
           const invite = pendingOrg.pendingInvites!.find((inv) => inv.email === email.toLowerCase())!;
           await userDb.updateUser(user.userId, {
             pendingOrgInvite: { orgId: pendingOrg.orgId, inviteToken: invite.inviteToken },
@@ -449,6 +513,10 @@ export const googleCallback = async (
         }
       } catch (err) {
         console.error("Failed to check pending org invite for new OAuth user:", err);
+      }
+
+      if (!hasPendingInvite) {
+        await createDomainJoinRequestsForNewUser(user.userId, email);
       }
     }
 
