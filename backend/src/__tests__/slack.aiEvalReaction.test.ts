@@ -36,7 +36,9 @@ jest.mock('../services/intakeService', () => ({
 
 const mockRecordLoopApproval = jest.fn();
 const mockRecordLoopDenial = jest.fn();
+const mockClaimLoopDecision = jest.fn();
 jest.mock('../loops/core/learning/approvalPersistence', () => ({
+  claimLoopDecision: (...args: unknown[]) => mockClaimLoopDecision(...args),
   recordLoopApproval: (...args: unknown[]) => mockRecordLoopApproval(...args),
   recordLoopDenial: (...args: unknown[]) => mockRecordLoopDenial(...args),
 }));
@@ -200,6 +202,13 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
 
     mockAuthTest.mockResolvedValue({ ok: true, user_id: EMMA_BOT });
     mockChatPostMessage.mockResolvedValue({ ok: true, ts: 'reply-ts' });
+    mockClaimLoopDecision.mockResolvedValue({
+      loopId: 'test-loop',
+      decision: 'approved',
+      accepted: true,
+      created: true,
+      proposalIds: ['proposal-1'],
+    });
     mockRecordLoopApproval.mockResolvedValue({ loopId: null, approved: 0, shipped: 0, dispatchFailures: 0 });
     mockRecordLoopDenial.mockResolvedValue({ loopId: 'test-loop', denied: 1 });
     mockFileAutoIssue.mockResolvedValue({

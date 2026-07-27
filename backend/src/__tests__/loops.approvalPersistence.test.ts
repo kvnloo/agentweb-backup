@@ -23,6 +23,8 @@ import {
 import { InMemoryLearningStore } from '../loops/core/learning/inMemoryLearningStore';
 import { CooldownRuleSet } from '../loops/core/policy/cooldownRuleSet';
 import type {
+  HistoryFilter,
+  LearningEvent,
   LoopId,
   MutationProposal,
   Mutation,
@@ -72,6 +74,31 @@ async function seedPending(store: InMemoryLearningStore, slug: string, ts: Date)
     mutation: mutation(slug),
     decision: { status: 'pending', decidedAt: ts },
   });
+}
+
+class ConcurrentQueryStore extends InMemoryLearningStore {
+  private queryCount = 0;
+  private release!: () => void;
+  private readonly bothRead = new Promise<void>((resolve) => {
+    this.release = resolve;
+  });
+
+  override async queryHistory(filter: HistoryFilter) {
+    const snapshot = await super.queryHistory(filter);
+    this.queryCount += 1;
+    if (this.queryCount === 2) this.release();
+    if (this.queryCount <= 2) await this.bothRead;
+    return snapshot;
+  }
+}
+
+class FailAtomicDenialWriteStore extends InMemoryLearningStore {
+  override async recordDecisionIfAbsent(
+    _event: LearningEvent,
+    _decisionKey: string,
+  ): Promise<boolean> {
+    throw new Error('injected atomic denial write failure');
+  }
 }
 
 describe('recordLoopApproval', () => {
@@ -285,11 +312,13 @@ describe('recordLoopDenial', () => {
     expect(result).toEqual({ loopId: LOOP_ID, denied: 1 });
     const denied = await store.queryHistory({ loopId: LOOP_ID, status: ['denied'] });
     expect(denied).toHaveLength(1);
-    expect(denied[0].proposal?.proposalId).toBe('prop-fix-cta');
+    expect(denied[0].decisionClaim).toBe('denied');
+    expect(denied[0].decisionProposalIds).toEqual(['prop-fix-cta']);
     expect(denied[0].decision).toEqual({
       status: 'denied',
       decidedAt: NOW,
       decidedBy: 'slack:harsha',
+      reason: 'atomic Slack denied decision',
     });
     expect(denied[0].shippedAt).toBeUndefined();
   });
@@ -351,5 +380,51 @@ describe('recordLoopDenial', () => {
 
     expect(result.approved).toBe(0);
     expect(await store.queryHistory({ loopId: LOOP_ID, status: ['approved'] })).toHaveLength(0);
+  });
+
+  it('allows exactly one terminal decision when approval and rejection race', async () => {
+    const concurrentStore = new ConcurrentQueryStore();
+    await seedPending(concurrentStore, 'fix-cta', new Date('2026-06-12T07:00:00.000Z'));
+    const sharedStores = [{ loopId: LOOP_ID, store: concurrentStore }];
+
+    await Promise.all([
+      recordLoopApproval({
+        runId: RUN_ID,
+        items: [{ id: 'fix-cta', ok: true }],
+        approver: 'slack:approver',
+        stores: sharedStores,
+        now: NOW,
+      }),
+      recordLoopDenial({
+        runId: RUN_ID,
+        denier: 'slack:denier',
+        stores: sharedStores,
+        now: NOW,
+      }),
+    ]);
+
+    const history = await concurrentStore.queryHistory({ loopId: LOOP_ID });
+    const terminal = history.filter((record) => (
+      record.decision?.status === 'approved' || record.decision?.status === 'denied'
+    ));
+    expect(new Set(terminal.map((record) => record.decision?.status)).size).toBe(1);
+  });
+
+  it('leaves a multi-proposal rejection wholly pending when its atomic write fails', async () => {
+    const failingStore = new FailAtomicDenialWriteStore();
+    await seedPending(failingStore, 'tool-a', new Date('2026-06-12T07:00:00.000Z'));
+    await seedPending(failingStore, 'tool-b', new Date('2026-06-12T07:00:01.000Z'));
+
+    await expect(recordLoopDenial({
+      runId: RUN_ID,
+      denier: 'slack:harsha',
+      stores: [{ loopId: LOOP_ID, store: failingStore }],
+      now: NOW,
+    })).rejects.toThrow('injected atomic denial write failure');
+
+    expect(await failingStore.queryHistory({
+      loopId: LOOP_ID,
+      status: ['denied'],
+    })).toHaveLength(0);
   });
 });

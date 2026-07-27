@@ -3,6 +3,7 @@ import { getDispatched, markDispatched } from './loopDispatchTracker';
 import { fileAutoIssue } from './intakeService';
 import { getLearningStore, getLoopManifest, getRegisteredLoopIds } from '../loops/index';
 import {
+  claimLoopDecision,
   recordLoopApproval,
   recordLoopDenial,
   type LoopApprovalStores,
@@ -391,6 +392,50 @@ async function persistDenial(
   }
 }
 
+async function claimApprovalDecision(
+  channel: string,
+  threadTs: string,
+  messageText: string,
+  approver: string,
+): Promise<boolean> {
+  const runId = extractRunId(messageText);
+  try {
+    const outcome = await claimLoopDecision({
+      runId,
+      decision: 'approved',
+      decidedBy: `slack:${approver}`,
+      stores: loopLearningStores(),
+    });
+    if (outcome.loopId == null) {
+      console.warn(`⚠️ loop approval: no pending learning records for run ${runId} — dispatch blocked`);
+      await postThread(
+        channel,
+        threadTs,
+        `⚠️ Approval could not be claimed in the learning store, so no work was dispatched.`,
+      );
+      return false;
+    }
+    if (!outcome.accepted) {
+      console.log(`🔁 loop approval: run ${runId} already has a terminal decision — skipping`);
+      await postThread(
+        channel,
+        threadTs,
+        `↩️ This run was already resolved${outcome.decision ? ` as ${outcome.decision}` : ''}; no work was dispatched.`,
+      );
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error(`❌ loop approval: failed to claim decision for run ${runId}:`, err);
+    await postThread(
+      channel,
+      threadTs,
+      `⚠️ Approval could not be persisted atomically, so no work was dispatched.`,
+    ).catch(() => undefined);
+    return false;
+  }
+}
+
 function formatSummary(loopTitle: string, results: DispatchResult[]): string {
   const successCount = results.filter((r) => r.ok).length;
   const lines = [
@@ -451,6 +496,8 @@ export async function handleLoopApprovalReaction(event: ReactionAddedEvent): Pro
     );
     return;
   }
+
+  if (!await claimApprovalDecision(item.channel, item.ts, message.text, event.user)) return;
 
   const priorDispatch = await getDispatched(item.ts);
   const completedTaskIds = new Set(priorDispatch?.pageIds ?? []);

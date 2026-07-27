@@ -45,20 +45,19 @@ export class DynamoLearningStore implements LearningStore {
   async record(event: LearningEvent): Promise<void> {
     counter++;
     const sortKey = `${event.ts.toISOString()}#${String(counter).padStart(6, '0')}`;
-    const item: Record<string, string> = {
-      loopId: event.loopId,
-      sortKey,
-      ts: event.ts.toISOString(),
-      data: JSON.stringify(serialize(event)),
-    };
-    const ruleId = event.proposal?.sourceRuleId;
-    if (ruleId) item.sourceRuleId = ruleId;
-    if (event.verdict != null) item.verdict = event.verdict;
-    if (event.shippedAt) {
-      item.shippedAt =
-        event.shippedAt instanceof Date ? event.shippedAt.toISOString() : String(event.shippedAt);
+    await this.dynamo.putItem(this.tableName, itemFor(event, sortKey));
+  }
+
+  async recordDecisionIfAbsent(event: LearningEvent, decisionKey: string): Promise<boolean> {
+    if (!this.dynamo.putItemIfAbsent) {
+      throw new Error('DynamoPort.putItemIfAbsent is required for atomic loop decisions');
     }
-    await this.dynamo.putItem(this.tableName, item as unknown as DynamoAttributeMap);
+    const sortKey = `decision#${decisionKey}`;
+    return this.dynamo.putItemIfAbsent(
+      this.tableName,
+      itemFor(event, sortKey),
+      ['loopId', 'sortKey'],
+    );
   }
 
   async queryHistory(filter: HistoryFilter): Promise<LearningRecord[]> {
@@ -90,6 +89,23 @@ export class DynamoLearningStore implements LearningStore {
       .sort((a, b) => b.sortKey.localeCompare(a.sortKey));
     return matches[0] ?? null;
   }
+}
+
+function itemFor(event: LearningEvent, sortKey: string): DynamoAttributeMap {
+  const item: Record<string, string> = {
+    loopId: event.loopId,
+    sortKey,
+    ts: event.ts.toISOString(),
+    data: JSON.stringify(serialize(event)),
+  };
+  const ruleId = event.proposal?.sourceRuleId;
+  if (ruleId) item.sourceRuleId = ruleId;
+  if (event.verdict != null) item.verdict = event.verdict;
+  if (event.shippedAt) {
+    item.shippedAt =
+      event.shippedAt instanceof Date ? event.shippedAt.toISOString() : String(event.shippedAt);
+  }
+  return item as unknown as DynamoAttributeMap;
 }
 
 /** Dates -> ISO strings for JSON storage. */

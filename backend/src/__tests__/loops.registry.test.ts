@@ -56,6 +56,7 @@ const stubTools: MutationTools<unknown> = {
 
 const stubLearning: LearningStore = {
   record: jest.fn().mockResolvedValue(undefined),
+  recordDecisionIfAbsent: jest.fn().mockResolvedValue(true),
   queryHistory: jest.fn().mockResolvedValue([]),
   lastOutcomeForRule: jest.fn().mockResolvedValue(null),
 };
@@ -211,6 +212,7 @@ describe('loops registry — happy paths', () => {
     const replacementTools: MutationTools<unknown> = { apply: jest.fn() };
     const replacementLearning: LearningStore = {
       record: jest.fn().mockResolvedValue(undefined),
+      recordDecisionIfAbsent: jest.fn().mockResolvedValue(true),
       queryHistory: jest.fn().mockResolvedValue([]),
       lastOutcomeForRule: jest.fn().mockResolvedValue(null),
     };
