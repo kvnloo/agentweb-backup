@@ -43,7 +43,6 @@ export const ALLOWED_INSIGHTS_FIELDS = [
   'cost_per_inline_link_click',
   'cost_per_unique_inline_link_click',
   'cost_per_unique_click',
-  'cost_per_inline_post_engagement',
 
   // VIDEO METRICS
   'video_views',
@@ -64,6 +63,7 @@ export const ALLOWED_INSIGHTS_FIELDS = [
   'action_values',
   'cost_per_action_type',
   'cost_per_unique_action_type',
+  'cost_per_inline_post_engagement',
   'engagement_rate_ranking',
   'quality_ranking',
   'conversion_rate_ranking',
