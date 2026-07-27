@@ -4172,12 +4172,8 @@ export class AgentModeService {
     // not the cause — the user was nudging a flow that kept looping. The real driver was
     // this regenerate-from-scratch-after-timeout loop; surfacing already-made assets is
     // what actually breaks it.
-    if (includeResumeGuidance && Array.isArray(generatedImageFilenames) && generatedImageFilenames.length > 0) {
-      workPlanContent += `⚠️ ALREADY-GENERATED ASSETS (${generatedImageFilenames.length}): these images already exist in this session and are saved — DO NOT regenerate them UNLESS the user explicitly asks to regenerate, restart, redo, or change them. Otherwise only generate the images that are still missing.\n`;
-      for (const filename of generatedImageFilenames) {
-        workPlanContent += `   - ${filename}\n`;
-      }
-      workPlanContent += `\n`;
+    if (includeResumeGuidance) {
+      workPlanContent += AgentModeService.buildGeneratedAssetsAwarenessText(generatedImageFilenames);
     }
 
     workPlan.steps.forEach((step: any) => {
@@ -4243,6 +4239,25 @@ export class AgentModeService {
       filenames.push(filename);
     }
     return filenames;
+  }
+
+  /**
+   * ENG-510: the shared "already-generated assets" awareness block. Lists images already
+   * saved this session so the model regenerates ONLY what is still missing after a
+   * mid-batch timeout — INCLUDING an image that completed in the orphaned worker AFTER the
+   * whole-turn cap fired (that image's marker lands in history but was never in any
+   * assistant toolCalls stamp). Returns '' when there is nothing to surface. Used both
+   * inside a work plan and standalone for plain multi-image requests, which have no work
+   * plan (the reported ENG-510 scenario — multiple ad-illustration variants).
+   */
+  public static buildGeneratedAssetsAwarenessText(generatedImageFilenames?: string[]): string {
+    if (!Array.isArray(generatedImageFilenames) || generatedImageFilenames.length === 0) return '';
+    let text = `⚠️ ALREADY-GENERATED ASSETS (${generatedImageFilenames.length}): these images already exist in this session and are saved — DO NOT regenerate them UNLESS the user explicitly asks to regenerate, restart, redo, or change them. Otherwise only generate the images that are still missing.\n`;
+    for (const filename of generatedImageFilenames) {
+      text += `   - ${filename}\n`;
+    }
+    text += `\n`;
+    return text;
   }
 
   private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string): any[] {
@@ -4404,6 +4419,18 @@ export class AgentModeService {
     if (workPlan) {
       const generatedImageFilenames = AgentModeService.extractGeneratedImageFilenames(sessionHistory);
       messages.push(...AgentModeService.buildWorkPlanContextMessages(workPlan, generatedImageFilenames));
+    } else {
+      // ENG-510: even WITHOUT a work plan (plain multi-image requests — the reported
+      // scenario), a run that timed out mid-batch leaves already-generated images in
+      // history. On the "continue" turn the model must be told which images already
+      // exist so it regenerates ONLY the missing ones — otherwise an image that
+      // completed in the orphaned worker AFTER the cap (its marker present, but no
+      // toolCalls stamp and not named in the continuation message) gets redone.
+      const generatedImageFilenames = AgentModeService.extractGeneratedImageFilenames(sessionHistory);
+      const assetAwarenessText = AgentModeService.buildGeneratedAssetsAwarenessText(generatedImageFilenames);
+      if (assetAwarenessText) {
+        messages.push({ role: 'assistant', content: assetAwarenessText });
+      }
     }
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)
