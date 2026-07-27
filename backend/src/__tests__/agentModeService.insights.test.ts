@@ -274,6 +274,41 @@ describe('AgentModeService - callMetaAdsInsightsApiWrapper', () => {
       expect(result.metadata.dropped_fields).toEqual(['made_up_metric']);
     });
 
+    it('should suggest the closest valid field for a dropped typo (ENG-511)', async () => {
+      mockUserDb.getUserById.mockResolvedValue({
+        id: userId,
+        adAccount: '922903076601160',
+      });
+      mockedAxios.post.mockResolvedValueOnce({
+        status: 200,
+        data: { report_run_id: 'report-typo' },
+      } as any);
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { async_status: 'Job Completed' },
+      } as any);
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { data: [{ impressions: '100' }], paging: {} },
+      } as any);
+
+      const insightsPromise = service.callMetaAdsInsightsApiWrapper(userId, {
+        account_id: '922903076601160',
+        object_type: 'account',
+        fields: ['impressions', 'impression'], // 'impression' is a typo of 'impressions'
+        date_preset: 'last_30d',
+      });
+      await jest.runAllTimersAsync();
+      const result = await insightsPromise;
+
+      expect(result.success).toBe(true);
+      expect(result.metadata.dropped_fields).toEqual(['impression']);
+      // The model is told the closest valid field so it can correct the typo.
+      expect(result.metadata.dropped_field_suggestions).toEqual({
+        impression: 'impressions',
+      });
+    });
+
     it('should drop a Meta-rejected field and retry the submit once (ENG-511 graceful 400 handling)', async () => {
       mockUserDb.getUserById.mockResolvedValue({
         id: userId,
