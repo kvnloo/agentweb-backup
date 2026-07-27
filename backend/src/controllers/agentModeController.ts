@@ -728,6 +728,31 @@ export function scheduledRunSignalsIncompleteWork(content: string): boolean {
   return INCOMPLETE_WORK_PATTERNS.some((re) => re.test(content));
 }
 
+// Deterministic, TOOL-CALL-based completion detector for scheduled runs (ENG-518).
+//
+// Some workflows split a mutation into a dry-run PREVIEW tool and a write-back
+// EXECUTE tool (the preview samples the result and its description tells the
+// model to confirm with the user before committing). In a scheduled, unattended
+// run the model can present the preview samples as if they were the deliverable
+// and end the turn — the enrichment is previewed but never committed. The
+// text/flag-based classifier above cannot see this: the closing text need not
+// admit anything or ask to confirm, so the gate lets the run finish mid-pipeline.
+//
+// This maps each preview tool to the execute tool that commits its result. If a
+// scheduled run called a preview tool but never its execute counterpart, the run
+// stopped before write-back and needs one more continuation to finish.
+const PREVIEW_EXECUTE_TOOL_PAIRS: Record<string, string> = {
+  enrich_leads_preview: 'enrich_leads_execute',
+};
+
+export function scheduledRunPreviewedWithoutExecute(toolCallNames: string[]): boolean {
+  if (!Array.isArray(toolCallNames) || toolCallNames.length === 0) return false;
+  const called = new Set(toolCallNames);
+  return Object.entries(PREVIEW_EXECUTE_TOOL_PAIRS).some(
+    ([previewTool, executeTool]) => called.has(previewTool) && !called.has(executeTool)
+  );
+}
+
 // Deterministic detector for the ENG-369 failure mode: a scheduled/unattended
 // run that halted to ask a HUMAN to confirm/approve before proceeding, when no
 // human is present to answer — so the task dead-ends with no deliverable.
@@ -805,7 +830,7 @@ export function scheduledRunAwaitsConfirmation(content: string): boolean {
 // The distinct reasons a scheduled run's latest turn needs one more
 // continuation before it can be considered finished. null = no continuation
 // needed. Ordered by precedence when more than one signal is present.
-export type ScheduledContinuationReason = 'budget' | 'confirmation' | 'unfinished';
+export type ScheduledContinuationReason = 'preview-only' | 'budget' | 'confirmation' | 'unfinished';
 
 // Classify why (if at all) a scheduled run's latest turn needs a continuation:
 //   (a) 'budget' — the run was truncated because it exhausted its step budget
@@ -819,13 +844,19 @@ export type ScheduledContinuationReason = 'budget' | 'confirmation' | 'unfinishe
 //       before proceeding, with no human present to answer (ENG-369); or
 //   (c) 'unfinished' — the final text explicitly admits it left work unfinished
 //       (scheduledRunSignalsIncompleteWork).
-// Budget truncation takes precedence (it is a hard state signal); a
-// confirmation halt takes precedence over a plain unfinished-work admission so
-// the continuation message can be tailored to "proceed best-effort".
+// A 'preview-only' write-back gap (ENG-518) takes precedence over everything: it
+// is a hard, tool-call-based fact (a preview tool ran, its execute counterpart
+// did not) that stays true whatever the closing text said, and its continuation
+// message is the most specific ("commit the write-back now"). Budget truncation
+// comes next (also a hard state signal); a confirmation halt takes precedence
+// over a plain unfinished-work admission so the continuation message can be
+// tailored to "proceed best-effort".
 export function classifyScheduledContinuation(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
+  toolCallNames?: string[];
 }): ScheduledContinuationReason | null {
+  if (scheduledRunPreviewedWithoutExecute(response?.toolCallNames || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
   if (scheduledRunAwaitsConfirmation(content)) return 'confirmation';
@@ -838,6 +869,7 @@ export function classifyScheduledContinuation(response: {
 export function scheduledRunSignalsIncompleteResponse(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
+  toolCallNames?: string[];
 }): boolean {
   return classifyScheduledContinuation(response) !== null;
 }
@@ -900,7 +932,9 @@ export async function scheduledTurnDefersToUser(content: string): Promise<boolea
 export async function classifyScheduledContinuationAsync(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
+  toolCallNames?: string[];
 }): Promise<ScheduledContinuationReason | null> {
+  if (scheduledRunPreviewedWithoutExecute(response?.toolCallNames || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
   if (await scheduledTurnDefersToUser(content)) return 'confirmation';
@@ -1177,7 +1211,17 @@ export async function runVerifiedChat(
         // to proceed best-effort rather than to "finish remaining entities" (ENG-369).
         completionGateContinue = false;
         userMessage =
-          completionGateReason === 'budget'
+          completionGateReason === 'preview-only'
+            ? 'Your previous run produced enrichment PREVIEWS (a dry-run sample) but ' +
+              'never committed them with the write-back step (enrich_leads_execute). ' +
+              'A preview is NOT the deliverable. This is an automated run with no human ' +
+              'present — do NOT wait for confirmation. Call enrich_leads_execute now for ' +
+              'every list whose preview succeeded (processedCount > 0), using the same ' +
+              'output_fields you previewed. Skip only a list whose preview explicitly ' +
+              'failed (processedCount === 0 with identityResolutionFailed > 0). Then ' +
+              'complete the rest of the requested workflow (recommendations, drafts) and ' +
+              'produce the final report.'
+          : completionGateReason === 'budget'
             ? 'The previous run was cut short because it exhausted its processing-step ' +
               'budget before it could produce the final deliverable. Using the data ' +
               'already gathered, produce the final consolidated report now. Surface any ' +
@@ -1223,8 +1267,13 @@ export async function runVerifiedChat(
         if (continuationQuestion?.action === 'park') {
           return continuationQuestion.result;
         }
-        // Re-evaluate the gate against the continuation's own output.
-        const continuationReason = await classifyScheduledContinuationAsync(continuationResponse);
+        // Re-evaluate the gate against the continuation's own output. Pass the
+        // accumulated tool calls so a still-uncommitted preview→execute gap
+        // (ENG-518) keeps the gate firing until the write-back actually runs.
+        const continuationReason = await classifyScheduledContinuationAsync({
+          ...continuationResponse,
+          toolCallNames: allActualFunctionCallsForReporting,
+        });
         if (
           completionGateContinuationsUsed < completionGateMaxContinuations &&
           attempt < maxAttempts &&
@@ -1393,7 +1442,12 @@ export async function runVerifiedChat(
         completionGateContinuationsUsed < completionGateMaxContinuations &&
         attempt < maxAttempts;
       const responseContinuationReason = gateEligible
-        ? await classifyScheduledContinuationAsync(response)
+        ? await classifyScheduledContinuationAsync({
+            ...response,
+            // Preview→execute detection needs the whole run's tool calls, not just
+            // this turn's — an earlier attempt may hold the unmatched preview.
+            toolCallNames: allActualFunctionCallsForReporting,
+          })
         : null;
       if (gateEligible && responseContinuationReason !== null) {
         completionGateContinuationsUsed++;
