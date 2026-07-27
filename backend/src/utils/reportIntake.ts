@@ -107,6 +107,28 @@ function pruneExpired(now: number): void {
   }
 }
 
+/**
+ * Free one slot without ever abandoning an active filing.
+ *
+ * Under pathological load, retaining every completed replay for the full window is less
+ * important than allowing an unrelated user's new report to be filed. Evicting a settled result
+ * can only shorten that result's replay window; evicting a pending result would make a concurrent
+ * retry capable of creating a duplicate durable ticket, so pending entries are never removed.
+ */
+function evictOldestSettledReplay(): boolean {
+  let oldestKey: string | undefined;
+  let oldestAt = Number.POSITIVE_INFINITY;
+  for (const [key, entry] of trackedByFingerprint) {
+    if (entry.settled && entry.at < oldestAt) {
+      oldestKey = key;
+      oldestAt = entry.at;
+    }
+  }
+  if (oldestKey === undefined) return false;
+  trackedByFingerprint.delete(oldestKey);
+  return true;
+}
+
 /** Test-only: clears the replay state so each test starts from a clean slate. */
 export function __resetReportIdempotencyForTests(): void {
   trackedByFingerprint.clear();
@@ -142,9 +164,14 @@ export async function fileReportOnce<T>(
     trackedByFingerprint.delete(fingerprint);
   }
 
-  // Fail before calling `file`: an untracked filing could be duplicated by its first retry.
-  // This overload path is intentionally fail-closed and preserves the hard memory bound.
-  if (trackedByFingerprint.size >= MAX_TRACKED_REPORTS) {
+  // Prefer dropping the oldest completed replay over causing a cross-user availability outage.
+  // If every slot is still filing, fail before calling `file`: an untracked filing could be
+  // duplicated by its first retry. This keeps the state bounded and the active-filing path
+  // fail-closed.
+  if (
+    trackedByFingerprint.size >= MAX_TRACKED_REPORTS
+    && !evictOldestSettledReplay()
+  ) {
     throw new Error('Report replay guard is at capacity');
   }
 
