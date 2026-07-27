@@ -37,7 +37,6 @@ function manifest(over: Partial<LoopManifest> = {}): LoopManifest {
     sensorImpl: 'test:sensor',
     rulesetImpl: 'test:rules',
     toolsImpl: 'test:tools',
-    gateImpl: 'test:gate',
     learningImpl: 'test:learning',
     thresholds: {
       promoteLiftPct: 10,

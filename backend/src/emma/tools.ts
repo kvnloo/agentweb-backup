@@ -16,6 +16,13 @@ import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
 import { enqueueAutoHumanEval } from '../services/autoHumanEvalService';
+import { v4 as uuidv4 } from 'uuid';
+import {
+  buildPendingUserQuestion,
+  renderQuestionPrompt,
+  AskUserQuestionError,
+  type AskUserQuestionOption,
+} from '../services/agentMode/core/askUserQuestion';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -86,6 +93,148 @@ emmaToolRegistry.register({
       slackMessageTs: candidate.slackMessageTs,
     };
   }
+});
+
+// ENG-396: AskUserQuestion — a structured, BLOCKING option-select prompt. Emma
+// emits it to force a human choice on an immutable/irreversible parameter
+// before building. It returns awaitingUserConfirmation:true so the agent loop
+// HALTS (see collectConfirmationPrompt); the answer is persisted structurally
+// on the session and only an inbound USER selection resolves it — the model
+// cannot self-answer.
+//
+// META-SCOPED, NOT OBJECTIVE-SCOPED (2026-07-25): originally restricted to
+// "Meta campaign objective only." That was narrower than intended — the
+// restriction is meant to bound the DOMAIN (Meta Ads), not the specific field
+// within it. Widened to any high-stakes/irreversible Meta Ads decision (e.g.
+// objective, special ad category), still explicitly NOT general-purpose across
+// other domains/platforms. Every part of the underlying mechanism (persistence,
+// the real UI card, the answer channel, headless park, full-autonomy
+// auto-take, delegation, archive, MCP wiring) is fully generic with zero
+// Meta-specific logic and was proven working end-to-end live before this was
+// widened — only the description below is what keeps this Meta-bounded, and
+// that's a prompt-level restriction, not code-enforced.
+//
+// The Meta objective write gate (agentModeService.ts,
+// resolveCampaignObjectiveGate) is UNCHANGED and independent of this — it
+// still enforces the objective deterministically at CAMPAIGN CREATE
+// regardless of whether Emma calls this tool voluntarily for anything else
+// within Meta. This only widens Emma's OWN judgment-based use of the card
+// within Meta; it does not add a new hard-enforced gate for other Meta
+// entities — that requires its own dedicated gate, built the same way
+// ENG-400 was, per irreversible action.
+emmaToolRegistry.register({
+  name: 'ask_user_question',
+  definition: {
+    name: 'ask_user_question',
+    description: `Ask the user a structured, blocking multiple-choice question and STOP until they pick. SCOPE: Meta Ads only — do NOT use this for Google Ads, LinkedIn, or any other platform/domain decision, no matter how high-stakes. Within Meta Ads, use this ONLY for a decision that is high-stakes or IRREVERSIBLE and that the user (not you) must own — e.g. the immutable campaign objective, a special ad category with legal/compliance implications, or a similarly consequential Meta-specific choice. Do NOT use it for routine confirmations or reversible Meta choices — those are yours to make with your own best judgment (the existing target-confirmation flow on writes still applies where it already does).
+
+Provide 2–4 options, each with a one-line \`consequence\`. EXACTLY ONE option must be marked recommended:true with a one-line \`why\` grounded in real signal from this session (e.g. "162 LEAD events fired on your pixel in the last 30d") — the recommendation is the point. Optionally set allow_emma_decide:true to offer a "Let Emma decide" delegation button (proceeds with the recommended option, logged).
+
+After you call this the run BLOCKS: you will NOT be able to answer it yourself and no further action executes until the user selects. Do not restate the options as prose asking for a "yes/confirm" — emit this tool instead.
+
+Ask only ONE question per turn. If several decisions are needed, ask the single most blocking/irreversible one now; the rest come up one at a time in later turns after each is answered. A second question emitted while one is still awaiting is rejected — never batch them.
+
+If the user replies with a TYPED message instead of clicking an option, that open card is abandoned (it freezes as unanswered) — do NOT infer their choice from the prose, even if it looks like they named an option. If you still need the answer, simply emit a FRESH card to ask again. Only an explicit click counts as the answer.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: 'The question to ask, e.g. "Which Meta campaign objective? It cannot be changed after launch."' },
+        intro: { type: 'string', description: 'Optional one- or two-sentence lead-in shown ABOVE the question on the card (e.g. context you just gathered). A card may come with text — use this instead of separate prose. Do NOT restate the options here.' },
+        options: {
+          type: 'array',
+          minItems: 2,
+          maxItems: 4,
+          description: '2–4 options; exactly one with recommended:true and a one-line why.',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Optional stable id; auto-generated from position if omitted.' },
+              label: { type: 'string', description: 'Short button label, e.g. "Leads".' },
+              consequence: { type: 'string', description: 'One-line consequence of choosing this option.' },
+              recommended: { type: 'boolean', description: 'Set true on EXACTLY ONE option.' },
+              why: { type: 'string', description: 'One-line justification. REQUIRED on the recommended option.' },
+              payload: { type: 'object', description: 'The concrete machine parameters this option implies (applied verbatim by the consumer — no re-inference).' },
+            },
+            required: ['label', 'consequence'],
+          },
+        },
+        immutable: { type: 'boolean', description: 'True if the parameter is irreversible (e.g. Meta objective). Immutable questions never auto-resolve in headless runs.' },
+        allow_emma_decide: { type: 'boolean', description: 'Offer a "Let Emma decide" delegation button that takes the recommended option.' },
+        kind: { type: 'string', description: 'Optional consumer tag (e.g. "meta_objective") identifying which class of decision this is, for a write gate to correlate against without inspecting question text.' },
+      },
+      required: ['question', 'options'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const sessionId = context?.sessionId;
+    if (!sessionId) {
+      return { success: false, message: 'ask_user_question requires an active session.' };
+    }
+    // Normalize incoming options: assign a stable id when the model omitted one.
+    const options: AskUserQuestionOption[] = Array.isArray(args.options)
+      ? args.options.map((o: any, i: number) => ({
+          id: typeof o?.id === 'string' && o.id.trim() !== '' ? o.id : `option-${i + 1}`,
+          label: o?.label,
+          consequence: o?.consequence,
+          recommended: o?.recommended === true,
+          why: o?.why,
+          payload: o?.payload,
+        }))
+      : [];
+
+    let question;
+    try {
+      question = buildPendingUserQuestion({
+        questionId: uuidv4(),
+        question: args.question,
+        intro: typeof args.intro === 'string' ? args.intro : undefined,
+        options,
+        immutable: args.immutable === true,
+        allowEmmaDecide: args.allow_emma_decide === true,
+        kind: typeof args.kind === 'string' ? args.kind : undefined,
+        createdAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      if (err instanceof AskUserQuestionError) {
+        // Surface the validation problem so the model can fix and re-emit.
+        return { success: false, message: `Invalid ask_user_question: ${err.message}` };
+      }
+      throw err;
+    }
+
+    // Persist as the single active question. The guard enforces one live question
+    // at a time: if a question is already awaiting, the write is refused (null) and
+    // we tell the model to ask this one later — questions are asked ONE AT A TIME,
+    // never batched, so a second call can't overwrite the pending one's slot.
+    const posted = await chatbotDb.updateSessionAskUserQuestion(sessionId, question, {
+      failIfAwaitingExists: true,
+    });
+    if (!posted) {
+      return {
+        success: false,
+        message:
+          'A question is already waiting for the user to answer. Only ONE question can be open at a time — do not ask another now. Wait until the current question is answered, then ask this one in a later turn (one question per turn).',
+      };
+    }
+
+    const prompt = renderQuestionPrompt(question);
+    // awaitingUserConfirmation halts the loop; type + options let the chat card
+    // render and the frontend post back a structured selection. No field tells
+    // the model how to answer — only a user selection can resolve it.
+    return {
+      success: true,
+      awaitingUserConfirmation: true,
+      type: 'ask_user_question',
+      questionId: question.questionId,
+      question: question.question,
+      ...(question.intro ? { intro: question.intro } : {}),
+      options: question.options,
+      recommendedOptionId: question.recommendedOptionId,
+      allowEmmaDecide: question.allowEmmaDecide,
+      confirmationPrompt: prompt,
+      summary: prompt,
+    };
+  },
 });
 
 function outputFieldNames(outputFields: unknown): string[] {
@@ -720,6 +869,21 @@ emmaToolRegistry.register({
   user did not explicitly name, and never regenerate/edit an asset set without confirming which assets.
   (LIST/SEARCH/UPLOAD_IMAGE/UPLOAD_VIDEO are read/upload-only and need no confirmation.)
 
+⚠️ CAMPAIGN OBJECTIVE IS IMMUTABLE — cannot be changed after creation. There is NO "start with Traffic/LPV
+  and switch to conversions later" on Meta; that is not a valid plan. Because of this, a CAMPAIGN CREATE
+  with no objective the user explicitly chose is BLOCKED SERVER-SIDE before it reaches Meta: if you omit
+  objective_quote (see below) and the objective hasn't already been confirmed by the user in this session,
+  the call returns a blocking question instead of creating the campaign — do not try to work around this
+  by guessing an objective or retrying.
+
+  If the user asks you to confirm the objective (or any other setting) via a structured card BEFORE you
+  build anything: you have NO way to render an interactive card yourself — do not fabricate one out of HTML,
+  markdown tables, or styled text in your reply; a hand-written "card" you write is not real and answering
+  it does nothing. Just attempt the CAMPAIGN CREATE call directly (with your real name/budget/targeting
+  params, omitting objective if it isn't explicitly confirmed) — if the objective truly isn't settled, the
+  call itself returns the real blocking question, which the platform renders as an actual clickable card.
+  Do not stall in prose waiting to "ask first"; attempting the call is how the real card appears.
+
 ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
   AD_SET        → LIST, CREATE, UPDATE, DELETE
@@ -893,6 +1057,11 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
 
             // --- Campaign ---
             objective: { type: "string", description: "Campaign objective (e.g., OUTCOME_TRAFFIC, OUTCOME_SALES)." },
+            objective_quote: {
+              type: "string",
+              description:
+                "CAMPAIGN CREATE ONLY: the exact, literal substring from the user's own message that names this objective (e.g. the user typed \"set up a leads campaign\" → objective_quote: \"leads campaign\"). Provide this ONLY when the user explicitly named the objective themselves — it is checked against their actual message, and a quote that doesn't genuinely appear there is rejected. Do NOT invent or paraphrase a quote, and do NOT provide this if the user did not actually name an objective — just omit it and the objective will be confirmed automatically before the campaign is created.",
+            },
             special_ad_categories: { type: "array", items: { type: "string" }, description: 'Special ad categories. Use ["NONE"] if not applicable.' },
             advantage_campaign_budget: { type: "boolean", description: "Enable Advantage Campaign Budget." },
             budget_amount: { type: "number", description: "Campaign-level daily budget in dollars (when advantage_campaign_budget is true)." },
@@ -986,6 +1155,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
       args.ad_set_id,
       args.ad_id,
       args.params,
+      context?.sessionId,
     );
   }
 });
@@ -6688,7 +6858,6 @@ const adminToolNames = [
   'get_chat_history',
   'list_all_clients',
   'assess_client_health',
-  'manage_user_guide',
   'get_pr_digest',
   'freeze_user_account',
   'manage_scoring_judges',
@@ -8133,6 +8302,9 @@ ACTION MATRIX:
               For PERFORMANCE_MAX: pass brand_business_name and brand_logo_asset_resource_name — backend batches campaign creation + brand asset attachment atomically
               Bidding: pass bidding_strategy for a standard (embedded) strategy, OR bidding_strategy_resource_name to attach a portfolio/shared strategy (from BIDDING_STRATEGY LIST) — never both. Switching to a standard strategy detaches any portfolio strategy.
               LAUNCH GATE: RESUME (or UPDATE with status=ENABLED) enables a campaign — this runs a pre-flight tracking check on the campaign's final URLs. If any URL lacks a detectable GA4/GTM/Google Ads conversion snippet the launch is BLOCKED (result has blocked=true and names the unmeasured URLs). Relay that to the user and help them fix tracking; only pass override_tracking_check=true if they explicitly choose to launch anyway.
+              ADD_PROXIMITY (campaign_resource_name, radius, address{street_address?, city_name?, postal_code?, province_code?, province_name?, country_code?}; radius_units defaults MILES) — mile/km-radius targeting centered on a real address (Google geocodes it server-side). This is native API support for "within N miles of our store/showroom" requests — do NOT tell the user proximity/radius targeting requires the UI; it does not. Additive to any existing LOCATION (city) criteria — REMOVE_PROXIMITY the old one first if only the radius should apply.
+              REMOVE_PROXIMITY (criterion_resource_name) — removes a campaign-level LOCATION or PROXIMITY criterion. Obtain resource names via a raw GAQL query on campaign_criterion (call_google_ads_reporting_api mode="raw").
+              TRANSPARENCY GUARDRAIL: if any Google Ads request cannot be fully satisfied via this API — including cases where you genuinely must fall back to a UI-only step (e.g. linking Google Business Profile) — you MUST say so explicitly to the user at deployment: name the gap, what you did instead, and the exact manual step left for them. Never silently substitute a workaround or imply a request is fully done when a manual step remains outstanding.
   BIDDING_STRATEGY → LIST (portfolio/shared bidding strategies; returns resource_name for use as bidding_strategy_resource_name)
   AD_GROUP    → LIST (campaign_resource_name)
                CREATE (name, campaign_resource_name, type [SEARCH_STANDARD|DISPLAY_STANDARD], cpc_bid_micros?)
@@ -8176,14 +8348,28 @@ ACTION MATRIX:
         bidding_strategy_target: { type: 'number' },
         cpc_bid_ceiling_micros: { type: 'number', description: 'Max CPC bid ceiling in micros for TARGET_IMPRESSION_SHARE (default 100000000 ≈100 currency units) or TARGET_SPEND/Maximize Clicks campaigns. Pass a lower value to cap spend per click.' },
         location_target_ids: { type: 'array', items: { type: 'number' }, description: 'From LOCATION SEARCH.' },
-        campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE and AD_GROUP LIST.' },
+        campaign_resource_name: { type: 'string', description: 'Required for CAMPAIGN PAUSE/RESUME/UPDATE/REMOVE/ADD_PROXIMITY and AD_GROUP LIST.' },
+        radius: { type: 'number', description: 'Proximity radius for CAMPAIGN ADD_PROXIMITY, in radius_units (default MILES).' },
+        radius_units: { type: 'string', enum: ['MILES', 'KILOMETERS'], description: 'Unit for radius on CAMPAIGN ADD_PROXIMITY. Defaults to MILES.' },
+        address: {
+          type: 'object',
+          description: 'Address to center the radius on for CAMPAIGN ADD_PROXIMITY (Google geocodes it server-side). At least one field required.',
+          properties: {
+            street_address: { type: 'string' },
+            city_name: { type: 'string' },
+            postal_code: { type: 'string' },
+            province_code: { type: 'string' },
+            province_name: { type: 'string' },
+            country_code: { type: 'string' },
+          },
+        },
         final_url_suffix: { type: 'string', description: 'Campaign-level Final URL suffix (query params appended to all final URLs, e.g. "utm_source=google&utm_medium=cpc"). For CAMPAIGN UPDATE only.' },
         ad_group_resource_name: { type: 'string', description: 'Required for KEYWORD LIST/ADD/ADD_NEGATIVE/REMOVE, AD LIST/CREATE, AD_GROUP UPDATE.' },
         ad_resource_name: { type: 'string', description: 'AdGroupAd resource name. Required for AD UPDATE/REMOVE/RETAG_UTM. Obtain from AD LIST.' },
         asset_group_resource_name: { type: 'string', description: 'Asset group resource name. Required for ASSET_GROUP RETAG_UTM. Obtain from audit_ad_utm_coverage or a GAQL read on asset_group.' },
         brand_business_name: { type: 'string', description: 'Business name for PMax brand guidelines. Required for PERFORMANCE_MAX CAMPAIGN CREATE when brand guidelines are enforced.' },
         brand_logo_asset_resource_name: { type: 'string', description: 'Logo image asset resource name for PMax brand guidelines. Upload via ASSET UPLOAD first.' },
-        criterion_resource_name: { type: 'string', description: 'Ad group criterion resource name. Required for KEYWORD REMOVE. Obtain from KEYWORD LIST.' },
+        criterion_resource_name: { type: 'string', description: 'Criterion resource name. Required for KEYWORD REMOVE (ad group criterion, from KEYWORD LIST) and CAMPAIGN REMOVE_PROXIMITY (campaign criterion, from a raw GAQL query on campaign_criterion).' },
         assets: { type: 'array', items: { type: 'object', properties: { fieldType: { type: 'string', enum: ['BUSINESS_NAME', 'LOGO', 'SQUARE_MARKETING_IMAGE', 'MARKETING_IMAGE', 'HEADLINE', 'DESCRIPTION'] }, assetResourceName: { type: 'string' }, text: { type: 'string' } }, required: ['fieldType'] }, description: 'Assets to attach for CAMPAIGN_ASSET ATTACH. Use text for BUSINESS_NAME, assetResourceName for image/logo types.' },
         keywords: { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, matchType: { type: 'string', enum: ['BROAD', 'PHRASE', 'EXACT'] } }, required: ['text', 'matchType'] }, description: 'Keywords for ADD or ADD_NEGATIVE action.' },
         query: { type: 'string', description: 'Location search query.' },

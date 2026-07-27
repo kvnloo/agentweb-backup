@@ -38,11 +38,17 @@ import {
   resolveLandingPageLiveUrl,
   canUserEditLandingPage,
   updateLandingPageTrackingInstalled,
+  updateLandingPageMetaPixel,
+  updateLandingPageMetaTrackingInstalled,
+  buildCaptureRoute,
+  commitFilesToRepoMain,
 } from "../services/v0Service";
 import { injectGtmIntoLayout, verifyGtmInjection } from "../utils/gtmInjection";
+import { injectPixelIntoLayout, verifyPixelInjection } from "../utils/pixelInjection";
 import { canEditItem, canViewItem, canManageOrgFeature, isFeatureEffectivelyEnabled } from "../services/orgShareService";
 import { MISSING_BRAND_LOGO_ERROR } from "../services/agentMode/brandLogo";
 import { listDomains, CustomDomainRecord, SUBDOMAIN_BASE } from "../services/customDomainService";
+import { verifyLanderLiveMapping } from "../services/landerLiveMappingCheck";
 
 const router = Router();
 
@@ -60,6 +66,85 @@ const EDIT_RATE_LIMIT_MAX = 60;
 const EDIT_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 
 const REUSABLE_PREVIEW_BRANCH = "draft/agentweb-preview";
+
+const DEFAULT_LANDING_PAGE_LEAD_LIST_NAME = "Landing Page Leads";
+
+// Singleflight for default-list resolution, keyed by orgId-or-userId (the same
+// identity boundary the org-shared list lookup uses). Prod runs a single backend
+// instance today (verified 2026-07-24), so this fully closes the double-click /
+// two-tabs / two-org-members-simultaneously-generating race — two concurrent
+// callers sharing a key join the SAME resolve-or-create call instead of each
+// racing to create their own default list. Same scope caveat as the analogous
+// fix in metaTokenRefresh.ts: per-process only, revisit if ever scaled to 2+ instances.
+const inFlightDefaultListResolutions = new Map<string, Promise<{ id: string; publicAccessEnabled: boolean }>>();
+
+async function resolveDefaultListOnce(userId: string): Promise<{ id: string; publicAccessEnabled: boolean }> {
+  // Only match a list WE created (isSystemManaged), never an unrelated pre-existing
+  // list a user happens to have named the same thing — a name-only match could
+  // silently start routing landing-page leads into a list the user made for some
+  // other purpose. isSystemManaged is only ever set by this function's own create call.
+  const existing = await crmDb.getLeadListsForUser(userId);
+  const match = (existing || []).find(
+    (l: any) => l && l.isSystemManaged === true && l.name === DEFAULT_LANDING_PAGE_LEAD_LIST_NAME
+  );
+  if (match) {
+    return { id: match.listId, publicAccessEnabled: !!match.publicAccessEnabled };
+  }
+  console.log(`[LP GENERATION] No default lead list found for user ${userId} — creating "${DEFAULT_LANDING_PAGE_LEAD_LIST_NAME}"`);
+  const created = await crmDb.createLeadList(
+    userId,
+    DEFAULT_LANDING_PAGE_LEAD_LIST_NAME,
+    "Auto-created default list for landing pages generated without an explicit lead list. System-managed.",
+    undefined, // alertEvents
+    null, // listSenderId
+    undefined, // autoDraftEnabled
+    undefined, // autoDraftInstruction
+    undefined, // autoSendEnabled
+    undefined, // statusConfig — defaults to sales-style
+    "sales", // listType
+    true // isSystemManaged
+  );
+  return { id: (created as any).listId, publicAccessEnabled: !!(created as any).publicAccessEnabled };
+}
+
+/**
+ * ENG-449 capture-or-fail: resolve (or create) the default lead list a landing
+ * page generated with no explicit lead_list_id gets bound to, so no page is ever
+ * generated unbound. Idempotent by name+isSystemManaged, org-aware (mirrors
+ * signupAutoEnrollService's ensureFoundersSignupsList pattern) — org members
+ * share ONE default list rather than one each, consistent with how brand
+ * guidelines are already org-shared in this same route.
+ *
+ * Retries once on failure (transient DynamoDB blips happen) before giving up —
+ * but deliberately does NOT swallow a persistent failure and fall back to
+ * "proceed unbound": that would silently reintroduce the exact bug this fix
+ * exists to close. A persistent failure here is meant to fail the generation
+ * request loudly, not slip an unbound page through.
+ */
+async function resolveOrCreateDefaultLeadList(
+  userId: string,
+  orgId?: string
+): Promise<{ id: string; publicAccessEnabled: boolean }> {
+  const key = orgId || userId;
+  let inFlight = inFlightDefaultListResolutions.get(key);
+  if (!inFlight) {
+    inFlight = (async () => {
+      try {
+        return await resolveDefaultListOnce(userId);
+      } catch (firstError) {
+        console.warn(`[LP GENERATION] Default lead list resolution failed once, retrying:`, firstError);
+        return await resolveDefaultListOnce(userId);
+      }
+    })();
+    inFlightDefaultListResolutions.set(key, inFlight);
+    // .finally()'s returned promise re-throws on rejection — if left unhandled (and
+    // uncaught, since the ORIGINAL inFlight's rejection is separately handled by
+    // whoever awaits resolveOrCreateDefaultLeadList), it surfaces as an unhandled
+    // promise rejection. The cleanup itself can't fail (a synchronous Map.delete).
+    inFlight.finally(() => inFlightDefaultListResolutions.delete(key)).catch(() => {});
+  }
+  return inFlight;
+}
 
 function validateBranchName(branch: string): boolean {
   return branch === "main" || branch === REUSABLE_PREVIEW_BRANCH;
@@ -298,11 +383,29 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       }
     }
 
-    const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_id, site_id, originating_session_id, mode: requestedMode } = req.body;
+    const { prompt, name, lead_list_id, template_html: rawTemplateHtml, template_id, site_id, originating_session_id, mode: requestedMode, bridge_out_url } = req.body;
     // Condense uploaded HTML to avoid exceeding v0 prompt size limits
     let template_html: string | undefined = rawTemplateHtml
       ? extractTemplateOutline(rawTemplateHtml)
       : undefined;
+
+    // ENG-449 (Harsha, 2026-07-24): a bridge-out destination is a THIRD-PARTY URL the
+    // generated form redirects to after capturing the lead (e.g. an external booking
+    // page) — a malformed destination would silently break that customer's funnel, so
+    // fail loud here rather than generate a page whose redirect goes nowhere useful.
+    if (bridge_out_url !== undefined && bridge_out_url !== null) {
+      if (typeof bridge_out_url !== "string") {
+        return res.status(400).json({ error: "bridge_out_url must be a string" });
+      }
+      try {
+        const parsed = new URL(bridge_out_url);
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+          throw new Error("not http(s)");
+        }
+      } catch {
+        return res.status(400).json({ error: "bridge_out_url must be a well-formed http(s) URL" });
+      }
+    }
 
     // If template_id provided (user picked a template), look it up from DynamoDB
     if (template_id && !template_html) {
@@ -340,6 +443,24 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       return res.status(400).json({ error: `prompt must not exceed ${MAX_INPUT_LENGTH} characters` });
     }
 
+    // ENG-449 (Harsha, 2026-07-24) capture-or-fail, explicit lead_list_id case: if the
+    // caller names a specific list, it must actually exist — that's a genuine bad-input
+    // error, fail loud. (The no-list-given case is handled AFTER the brand-logo gate
+    // below, since it may provision a list — a real side effect that must not happen
+    // on a request that's about to be rejected for an unrelated reason.)
+    if (lead_list_id !== undefined && lead_list_id !== null && lead_list_id !== "") {
+      if (typeof lead_list_id !== "string") {
+        return res.status(400).json({ error: "lead_list_id must be a string" });
+      }
+      const explicitList = await crmDb.getLeadListById(lead_list_id);
+      if (!explicitList) {
+        return res.status(400).json({ error: `lead_list_id "${lead_list_id}" does not exist` });
+      }
+      if (!(await crmDb.canOrgMemberAccessList(userId, explicitList))) {
+        return res.status(403).json({ error: `lead_list_id "${lead_list_id}" is not accessible to you` });
+      }
+    }
+
     const pageName = name || prompt.slice(0, 60);
 
     // Brand guidelines + market strategy for maximum context. The shared
@@ -366,17 +487,27 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       });
     }
 
-    // Auto-enable public access on the lead list so the landing page form works
-    if (lead_list_id) {
-      try {
-        const list = await crmDb.getLeadListById(lead_list_id);
-        if (list && !list.publicAccessEnabled) {
-          await crmDb.updateLeadList(lead_list_id, { publicAccessEnabled: true });
-          console.log(`[LP GENERATION] Auto-enabled public access on lead list ${lead_list_id}`);
-        }
-      } catch (err) {
-        console.warn(`[LP GENERATION] Could not auto-enable public access on lead list:`, err);
+    // ENG-449 capture-or-fail: every generated page ships bound to a REAL lead list —
+    // either the caller's explicit one (already validated to exist above) or, if none
+    // was given, an auto-resolved/created default. No page is ever generated unbound.
+    // Placed AFTER the brand-logo gate so a request that's about to be rejected for an
+    // unrelated reason never triggers the (write) side effect of provisioning a list.
+    const effectiveLeadListId: string =
+      typeof lead_list_id === "string" && lead_list_id !== ""
+        ? lead_list_id
+        : (await resolveOrCreateDefaultLeadList(userId, caller?.orgId)).id;
+
+    // Auto-enable public access on the lead list so the landing page form works.
+    // Only the enabling WRITE is best-effort here: a transient DB hiccup on this side
+    // effect shouldn't block generation (unlike a genuinely missing explicit list).
+    try {
+      const boundLeadList = await crmDb.getLeadListById(effectiveLeadListId);
+      if (boundLeadList && !boundLeadList.publicAccessEnabled) {
+        await crmDb.updateLeadList(effectiveLeadListId, { publicAccessEnabled: true });
+        console.log(`[LP GENERATION] Auto-enabled public access on lead list ${effectiveLeadListId}`);
       }
+    } catch (err) {
+      console.warn(`[LP GENERATION] Could not auto-enable public access on lead list:`, err);
     }
 
     // Effective site mode, WRITE-ONCE locked. A saved mode is immutable (switching
@@ -389,10 +520,11 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
         .catch((e) => console.warn(`[LP GENERATION] could not lock site mode: ${e?.message}`));
     }
 
-    const result = await generateLandingPage(userId, prompt, pageName, brandContext, lead_list_id, template_html, {
+    const result = await generateLandingPage(userId, prompt, pageName, brandContext, effectiveLeadListId, template_html, {
       siteId: typeof site_id === "string" ? site_id : undefined,
       originatingSessionId: typeof originating_session_id === "string" ? originating_session_id : undefined,
       mode: effectiveMode,
+      bridgeOutUrl: typeof bridge_out_url === "string" ? bridge_out_url : undefined,
     });
     void emitLanderLifecycle("created", { pageId: (result as any)?.id || "unknown", userId, channel: landerChannelFromRequest(req), mode: "cold_start", outcome: (result as any)?.status === "failed" ? "failed" : "ok" });
     res.status(201).json(result);
@@ -720,7 +852,13 @@ router.post("/generated/:id/duplicate", async (req, res: Response) => {
       });
     }
 
-    const result = await generateLandingPage(userId, original.prompt, newName, brandContext);
+    // ENG-449 capture-or-fail: carry over the original page's own list if it had one;
+    // otherwise resolve/create the same default list /generate uses. A duplicated page
+    // used to start completely unbound — this closes that gap without needing a new
+    // request field, consistent with the "no page is ever generated unbound" intent.
+    const leadListId = original.leadListId || (await resolveOrCreateDefaultLeadList(userId, user?.orgId)).id;
+
+    const result = await generateLandingPage(userId, original.prompt, newName, brandContext, leadListId);
     res.status(201).json(result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error duplicating:", error);
@@ -759,7 +897,10 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
     const { file_path, content, commit_message, branch: rawBranch } = req.body;
     const branch: string = rawBranch || "main";
 
-    if (!file_path || !content) {
+    // content === "" is a legitimate empty file, not a missing one (Greptile) —
+    // only an actually-absent value should be rejected. Mirrors update-files'
+    // already-correct check for the same reason.
+    if (!file_path || content === undefined || content === null) {
       return res.status(400).json({ error: "file_path and content are required" });
     }
 
@@ -942,6 +1083,151 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
     } else {
       res.status(500).json({ error: `GitHub API error (${ghStatus || 'unknown'}): ${ghMessage}` });
     }
+  }
+});
+
+const MAX_UPDATE_FILES_PER_COMMIT = 20;
+
+/**
+ * PUT /api/landing-pages/v0/generated/:id/update-files
+ * ENG-497: commit several files to an existing lander's repo in ONE atomic
+ * commit — the multi-file cousin of github-edit (which commits exactly one
+ * file per call). Reuses commitFilesToRepoMain, the same retry/rebase-safe
+ * commit path generation itself trusts, authored via the org's GitHub App
+ * token (not a personal git identity) — this is why it doesn't hit Vercel's
+ * "commit must be authored by agentwebdeployer" deploy-guard block that
+ * forced a manual re-authored git push during the ENG-443 incident.
+ *
+ * Supports the reusable staging branch (draft/agentweb-preview) the same
+ * way github-edit does — creating it from main first via ensureBranchExists
+ * if it doesn't exist yet — since commitFilesToRepoMain now accepts a
+ * branch parameter (defaults to "main").
+ */
+router.put("/generated/:id/update-files", editRateLimiter, async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const page = auth.page;
+
+    if (!page.githubRepoUrl) {
+      return res.status(400).json({ error: "Landing page has no GitHub repository" });
+    }
+
+    const match = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+    if (!match) {
+      return res.status(400).json({ error: "Invalid GitHub repo URL" });
+    }
+    const [, owner, repo] = match;
+    const repoName = repo.replace(".git", "");
+    const repoFullName = `${owner}/${repoName}`;
+
+    const { files, commit_message, branch: rawBranch } = req.body;
+    const branch: string = rawBranch || "main";
+    if (!validateBranchName(branch)) {
+      return res.status(400).json({ error: "Invalid branch name. Must be 'main' or 'draft/agentweb-preview'." });
+    }
+    if (!commit_message || typeof commit_message !== "string") {
+      return res.status(400).json({ error: "commit_message is required" });
+    }
+    if (!Array.isArray(files) || files.length === 0) {
+      return res.status(400).json({ error: "files must be a non-empty array" });
+    }
+    if (files.length > MAX_UPDATE_FILES_PER_COMMIT) {
+      return res.status(400).json({ error: `files must not exceed ${MAX_UPDATE_FILES_PER_COMMIT} entries per commit` });
+    }
+
+    const filesToCommit: Array<{ path: string; content?: Buffer; deleted?: boolean }> = [];
+    for (const f of files) {
+      const filePath = f?.file_path;
+      if (!filePath || typeof filePath !== "string") {
+        return res.status(400).json({ error: "Each file requires a file_path" });
+      }
+      if (filePath.includes("..") || filePath.startsWith(".github/") || filePath.startsWith(".github\\")) {
+        return res.status(400).json({ error: `Invalid file path: ${filePath}` });
+      }
+      if (!f.deleted && (f.content === undefined || f.content === null)) {
+        return res.status(400).json({ error: `File ${filePath} requires content (or deleted: true)` });
+      }
+      filesToCommit.push({
+        path: filePath,
+        ...(f.deleted ? { deleted: true } : { content: Buffer.from(String(f.content), "utf-8") }),
+      });
+    }
+
+    const { getGitHubOrgToken } = await import("../utils/secretsManager");
+    const { token } = await getGitHubOrgToken();
+    const ghHeaders = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" };
+
+    if (branch !== "main") {
+      await ensureBranchExists(`https://api.github.com/repos/${owner}/${repoName}`, branch, ghHeaders, 30_000);
+    }
+
+    const { pushedCommitSha } = await commitFilesToRepoMain(
+      repoFullName,
+      ghHeaders,
+      filesToCommit as any,
+      commit_message,
+      4,
+      branch
+    );
+
+    const isStaging = branch !== "main";
+    const liveUrl = await resolveLandingPageLiveUrl(page);
+    void emitLanderLifecycle("edited", { pageId: page.id, userId, channel: landerChannelFromRequest(req), mode: "incremental" });
+    res.json({
+      success: true,
+      commit_url: `https://github.com/${repoFullName}/commit/${pushedCommitSha}`,
+      files: filesToCommit.map((f) => f.path),
+      page_id: page.id,
+      live_url: liveUrl,
+      deployed_url: page.deployedUrl,
+      branch,
+      is_staging: isStaging,
+      message: isStaging
+        ? `${filesToCommit.length} file(s) updated on branch ${branch}. A Vercel preview deployment will be created.`
+        : `${filesToCommit.length} file(s) updated in one commit. Changes will auto-deploy to ${liveUrl} within ~30 seconds.`,
+    });
+  } catch (error: any) {
+    const ghStatus = error.response?.status;
+    const ghMessage = error.response?.data?.message || error.message;
+    console.error(`[LP GENERATION] Error with update-files (HTTP ${ghStatus}):`, ghMessage);
+    if (ghStatus === 401 || ghStatus === 403) {
+      res.status(ghStatus).json({ error: `GitHub auth error: ${ghMessage}` });
+    } else if (ghStatus === 422) {
+      res.status(422).json({ error: `GitHub rejected the request: ${ghMessage}` });
+    } else if (error.code === "ECONNABORTED" || error.code === "ETIMEDOUT") {
+      res.status(504).json({ error: `GitHub API timed out. Files may be too large or GitHub is slow.` });
+    } else {
+      res.status(500).json({ error: `GitHub API error (${ghStatus || "unknown"}): ${ghMessage}` });
+    }
+  }
+});
+
+/**
+ * GET /api/landing-pages/v0/generated/:id/verify-live-mapping
+ * ENG-496: verify this page's stored githubRepoUrl/vercelProjectId against
+ * what Vercel is ACTUALLY serving at its live URL. Surfaces a sibling record
+ * whose own githubRepoUrl matches reality when this one has drifted — the
+ * same manual GitHub-search step Harsha had to do by hand during ENG-443.
+ */
+router.get("/generated/:id/verify-live-mapping", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "view");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+
+    const result = await verifyLanderLiveMapping(auth.page);
+    res.json(result);
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error verifying live mapping:", error);
+    res.status(500).json({ error: error.message || "Failed to verify live mapping" });
   }
 });
 
@@ -1855,6 +2141,177 @@ async function saveGtmForPage(
 }
 
 // ---------------------------------------------------------------------------
+// Helper: inject a Meta pixel into a page's layout.tsx + regenerate its capture
+// route with the pixel/account id baked in, and persist the pixel id.
+// Manual override path (API-only — no portal UI, per confirmed scope) for when
+// auto-resolution (metaService.resolveMetaPixelForUser) can't determine a pixel,
+// or a customer needs a different one than the one auto-resolved.
+// Does NOT do auth checks — callers must authorize before calling.
+// ---------------------------------------------------------------------------
+async function saveMetaPixelForPage(
+  page: GeneratedLandingPage,
+  pixelId: string,
+  accountId?: string,
+): Promise<void> {
+  if (!page.githubRepoUrl) throw new Error("Landing page has no GitHub repository");
+
+  const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+  if (!repoMatch) throw new Error("Invalid GitHub repo URL");
+  const [, owner, repoRaw] = repoMatch;
+  const repo = repoRaw.replace(".git", "");
+  const repoFullName = `${owner}/${repo}`;
+
+  const { getGitHubOrgToken } = await import("../utils/secretsManager");
+  const { token } = await getGitHubOrgToken();
+  const ghHeaders = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" };
+  const GITHUB_TIMEOUT_MS = 30_000;
+  const repoBase = `https://api.github.com/repos/${owner}/${repo}`;
+
+  // 1. Inject/strip the pixel base snippet in app/layout.tsx — same retry-on-409 pattern
+  //    as saveGtmForPage, and the SAME shared util the auto-inject-at-generation path uses.
+  const layoutPath = "app/layout.tsx";
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const fileRes = await axios.get<any>(`${repoBase}/contents/${layoutPath}`, {
+        headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS,
+      });
+      const currentContent = Buffer.from(fileRes.data.content, "base64").toString("utf-8");
+      const fileSha = fileRes.data.sha;
+
+      const updatedContent = injectPixelIntoLayout(currentContent, pixelId);
+
+      if (!verifyPixelInjection(updatedContent, pixelId)) {
+        console.error(
+          `[LP GENERATION] Meta Pixel ${pixelId ? "injection" : "removal"} verification failed ` +
+          `for page ${page.id}: layout.tsx has no <head> or <body> tag to anchor on.`,
+        );
+        throw Object.assign(
+          new Error(
+            pixelId
+              ? "We couldn't add Meta Pixel tracking to this page automatically. Try regenerating the page, or contact support if this keeps happening."
+              : "We couldn't remove Meta Pixel tracking from this page automatically. Try regenerating the page, or contact support if this keeps happening.",
+          ),
+          { httpStatus: 422 },
+        );
+      }
+
+      const base64New = Buffer.from(updatedContent, "utf-8").toString("base64");
+      await axios.put<any>(
+        `${repoBase}/contents/${layoutPath}`,
+        {
+          message: pixelId ? `chore: inject Meta Pixel ${pixelId}` : "chore: remove Meta Pixel",
+          content: base64New,
+          sha: fileSha,
+        },
+        { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+      );
+      break;
+    } catch (err: any) {
+      const status = err?.response?.status;
+      if (status === 404) {
+        throw Object.assign(new Error("app/layout.tsx not found in the repository"), { httpStatus: 400 });
+      }
+      if (status === 409 && attempt < MAX_ATTEMPTS) continue;
+      throw err;
+    }
+  }
+
+  // 2. Regenerate the repo's capture route with the new PIXEL_ID/META_ACCOUNT_ID baked in —
+  //    unlike GTM, the pixel id must also reach app/api/capture/route.ts so forward-lead can
+  //    fire the matching server-side CAPI event. Build the whole-site path->list map the same
+  //    way syncLeadCaptureForPage does (the capture route is repo-level, the list is per-page).
+  //
+  //    ENG-485: re-derived FRESH by syncLeadCaptureFilesToRepo on every retry attempt, not
+  //    just once here — see that function's own doc comment on why a static snapshot isn't
+  //    safe to reuse across a rebase retry.
+  const buildListByPath = async (): Promise<Record<string, string>> => {
+    const siblings = await listLandingPages(page.userId);
+    const listByPath: Record<string, string> = {};
+    for (const p of siblings) {
+      if (p.githubRepoUrl !== page.githubRepoUrl) continue;
+      if (!p.leadListId) continue;
+      listByPath[p.slug ? `/${p.slug}` : "/"] = p.leadListId;
+    }
+    return listByPath;
+  };
+  await syncLeadCaptureFilesToRepo(repoFullName, buildListByPath, pixelId || undefined, pixelId ? accountId : undefined);
+
+  // 3. Persist metaPixelId/metaAdAccountId on this record.
+  await updateLandingPageMetaPixel(page.id, page.userId, pixelId, accountId);
+
+  // 4. Sync metaTrackingInstalled across every sibling sharing this site's root layout —
+  //    same rationale as saveGtmForPage's trackingInstalled sync. Best-effort; a sync
+  //    failure must never undo the GitHub commit that already succeeded. Its own fresh
+  //    query (ENG-485 moved the capture-route map's own siblings lookup into a re-callable
+  //    closure above) — this one is unrelated to the race that closure exists to fix.
+  const siteId = page.siteId ?? page.id;
+  try {
+    const siblingsForTrackingSync = await listLandingPages(page.userId);
+    await Promise.all(
+      siblingsForTrackingSync
+        .filter((p) => (p.siteId ?? p.id) === siteId)
+        .map((p) =>
+          updateLandingPageMetaTrackingInstalled(p.id, !!pixelId).catch((err: any) => {
+            console.error(`[LP GENERATION] Failed to sync metaTrackingInstalled for page ${p.id}: ${err.message}`);
+          }),
+        ),
+    );
+  } catch (err: any) {
+    console.error(`[LP GENERATION] Failed to sync metaTrackingInstalled across sibling pages: ${err.message}`);
+  }
+
+  // 5. Trigger Vercel re-deploy if we have a project ID
+  const vercelProjectId = await resolveVercelProjectId(page);
+  if (vercelProjectId) {
+    try {
+      await triggerVercelDeployment(vercelProjectId, `${owner}/${repo}`);
+    } catch (deployErr: any) {
+      console.warn(`[LP GENERATION] Could not trigger Vercel re-deploy after Meta Pixel inject: ${deployErr.message}`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /generated/:id/meta-pixel
+// Manual override for the Meta pixel/account id (API-only — no portal UI in v1).
+// ---------------------------------------------------------------------------
+router.post("/generated/:id/meta-pixel", editRateLimiter, async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+    const page = auth.page;
+    if (!page.githubRepoUrl) return res.status(400).json({ error: "Landing page has no GitHub repository" });
+
+    const { pixelId, accountId } = req.body as { pixelId?: string; accountId?: string };
+    if (typeof pixelId !== "string") {
+      return res.status(400).json({ error: "pixelId is required" });
+    }
+    const trimmed = pixelId.trim();
+    if (trimmed && !/^\d+$/.test(trimmed)) {
+      return res.status(400).json({ error: "Invalid Meta pixel id. Expected a numeric id." });
+    }
+
+    await saveMetaPixelForPage(page, trimmed, accountId);
+
+    res.json({
+      success: true,
+      pixelId: trimmed,
+      message: trimmed
+        ? `Meta Pixel ${trimmed} injected. Your site will redeploy shortly.`
+        : "Meta Pixel removed. Your site will redeploy shortly.",
+    });
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error injecting Meta Pixel:", error);
+    const httpStatus = error?.httpStatus ?? 500;
+    res.status(httpStatus).json({ error: error.response?.data?.message || error.message || "Failed to inject Meta Pixel" });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // POST /site/gtm
 // Injects GTM into the caller's root landing site.
 // ---------------------------------------------------------------------------
@@ -2059,26 +2516,50 @@ async function syncLeadCaptureForPage(
   const repoFullName = repoMatch[1];
 
   try {
-    // Every page of this site — i.e. every page deployed into this same repo. Sibling
-    // pages are the page owner's (UserIdIndex query, same pattern routes/domains.ts uses).
-    const siblings = await getLandingPagesByOwner(page.userId);
-    const listByPath: Record<string, string> = {};
-    for (const p of siblings) {
-      if (p.id === page.id) continue; // this page's entry comes from the write below
-      if (p.githubRepoUrl !== page.githubRepoUrl) continue; // different site, different repo
-      if (!p.leadListId) continue;
-      // Same path convention routes/domains.ts uses for its domain map.
-      listByPath[p.slug ? `/${p.slug}` : "/"] = p.leadListId;
-    }
-    // The page we just wrote, from the value we wrote — the GSI read above is eventually
-    // consistent and may still be showing the old value. A detach (null) simply leaves the
-    // page OUT of the map, so its form starts failing loudly (422) rather than quietly
-    // filing leads into a list it is no longer wired to.
-    if (leadListId) {
-      listByPath[page.slug ? `/${page.slug}` : "/"] = leadListId;
-    }
+    // ENG-485: re-derived FRESH by syncLeadCaptureFilesToRepo on every retry attempt, not
+    // just once here — see that function's own doc comment on why a static snapshot isn't
+    // safe to reuse across a rebase retry.
+    const buildListByPath = async (): Promise<Record<string, string>> => {
+      // Every page of this site — i.e. every page deployed into this same repo. Sibling
+      // pages are the page owner's (UserIdIndex query, same pattern routes/domains.ts uses).
+      const siblings = await getLandingPagesByOwner(page.userId);
+      const listByPath: Record<string, string> = {};
+      for (const p of siblings) {
+        if (p.id === page.id) continue; // this page's entry comes from the write below
+        if (p.githubRepoUrl !== page.githubRepoUrl) continue; // different site, different repo
+        if (!p.leadListId) continue;
+        // Same path convention routes/domains.ts uses for its domain map.
+        listByPath[p.slug ? `/${p.slug}` : "/"] = p.leadListId;
+      }
+      // The page we just wrote, from the value we wrote — the GSI read above is eventually
+      // consistent and may still be showing the old value. A detach (null) simply leaves the
+      // page OUT of the map, so its form starts failing loudly (422) rather than quietly
+      // filing leads into a list it is no longer wired to.
+      if (leadListId) {
+        listByPath[page.slug ? `/${page.slug}` : "/"] = leadListId;
+      }
+      return listByPath;
+    };
 
-    const result = await syncLeadCaptureFilesToRepo(repoFullName, listByPath);
+    // ENG-489: syncLeadCaptureFilesToRepo fully regenerates app/api/capture/route.ts,
+    // so omitting the site's pixelId/metaAdAccountId here would silently strip an
+    // already-configured Meta pixel back out of the route on every lead-list attach.
+    // metaPixelId/metaAdAccountId live on the SITE ROOT record, which may not be `page`
+    // itself (a lead list can be attached to any sub-page) — resolve it once (not part of
+    // the race being fixed above — site-level config, not the fast-changing sibling list).
+    // The root's own id equals the site's siteId by construction — more reliable than
+    // the isRootPage flag, which isn't guaranteed set on every record.
+    const siteId = page.siteId ?? page.id;
+    const rootRecord = page.id === siteId
+      ? page
+      : (await getLandingPagesByOwner(page.userId)).find((p) => p.id === siteId);
+
+    const result = await syncLeadCaptureFilesToRepo(
+      repoFullName,
+      buildListByPath,
+      rootRecord?.metaPixelId,
+      rootRecord?.metaAdAccountId,
+    );
     if (result.committed || result.reason === "up-to-date") return undefined;
     return `Lead list saved, but the live site was not updated (${result.reason}). It will be applied on the next deploy or retry.`;
   } catch (err: any) {

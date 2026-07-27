@@ -20,6 +20,8 @@ import { isDoNotContact } from '../utils/leadContactStatus';
 import { normalizeAttribution } from '../types/attribution';
 import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
+import { metaService } from '../services/metaService';
+import { isSmokeTestEmail } from '../utils/smokeTestLead';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -72,6 +74,87 @@ async function resolveContactEmail(
 }
 
 const router = express.Router();
+
+// ENG-492: bounds how often the Meta CAPI send (below, in the forward-lead handler) is
+// actually ATTEMPTED per lead list, so a scripted flood against one customer's list can't
+// pollute their live ad account with unlimited fake "Lead" conversions. Deliberately NOT an
+// HTTP-level rate limiter (like express-rate-limit) — this only ever gates the optional,
+// fire-and-forget CAPI call, never the lead save/response itself, so hitting the cap has
+// zero customer-visible effect: the lead still saves normally, the response is still 201,
+// the only consequence is that this one submission doesn't get forwarded to Meta.
+const capiSendTimestampsByListId = new Map<string, number[]>();
+const CAPI_SEND_BUDGET_MAX = 100;
+const CAPI_SEND_BUDGET_WINDOW_MS = 15 * 60 * 1000;
+
+function shouldAttemptCapiSend(listId: string): boolean {
+  const now = Date.now();
+  const recent = (capiSendTimestampsByListId.get(listId) || []).filter(
+    (t) => now - t < CAPI_SEND_BUDGET_WINDOW_MS,
+  );
+  if (recent.length >= CAPI_SEND_BUDGET_MAX) {
+    capiSendTimestampsByListId.set(listId, recent);
+    // Logged every time (not just on the first overflow) so the actual overflow VOLUME is
+    // visible in logs, not just that it happened once — that's what tells us whether
+    // CAPI_SEND_BUDGET_MAX is too low for a real customer's real traffic (tune it up) vs.
+    // a genuine flood (leave it, or investigate the source).
+    console.warn(
+      `[CAPI] Send budget exhausted for list ${listId} (${recent.length}/${CAPI_SEND_BUDGET_MAX} ` +
+      `in the last ${CAPI_SEND_BUDGET_WINDOW_MS / 60000}min) — this submission's Lead event will NOT be forwarded to Meta. Lead itself still saved normally.`
+    );
+    return false;
+  }
+  recent.push(now);
+  capiSendTimestampsByListId.set(listId, recent);
+  return true;
+}
+
+// Second, independent layer on top of the per-listId budget above: that budget is an
+// invented internal number, not Meta's actual rate limit. Meta documents NO fixed CAPI
+// rate limit of its own — CAPI calls count against the ad account's dynamic Business Use
+// Case (BUC) allowance, reported on every response via the X-Business-Use-Case-Usage
+// header (see metaService.sendCapiLeadEvent's CapiUsage return). A customer with many
+// lists, each individually within its own per-list budget, could still collectively
+// exceed what THEIR OWN Meta access token is actually allowed. This tracks that real
+// signal per ad account and pauses sends for that account using Meta's own reported
+// cooldown — Meta's own documented advice is to stop calling once throttled, since
+// calling through it only extends the throttle.
+const capiAccountPausedUntil = new Map<string, number>();
+
+function isCapiAccountPaused(accountId: string): boolean {
+  const pausedUntil = capiAccountPausedUntil.get(accountId);
+  return !!pausedUntil && Date.now() < pausedUntil;
+}
+
+// ENG-449: real client-submission time for CAPI's event_time, instead of server
+// CAPI-send time. Never trust client-supplied input raw — defensively bounded before
+// ever threading it into a Meta API call. Anything implausible (absent, malformed,
+// notably stale, or in the future beyond normal clock skew) resolves to `undefined`,
+// letting sendCapiLeadEvent fall back to current server time exactly as it did before
+// this field existed — this can only make event_time MORE accurate, never break an
+// older/not-yet-regenerated capture route that simply never sends the field at all.
+const CAPTURED_AT_MAX_FUTURE_SKEW_MS = 5 * 60 * 1000;
+const CAPTURED_AT_MAX_PAST_STALENESS_MS = 60 * 60 * 1000;
+
+function validatedEventTimeSeconds(capturedAtMs: unknown): number | undefined {
+  if (typeof capturedAtMs !== 'number' || !Number.isFinite(capturedAtMs)) return undefined;
+  const now = Date.now();
+  if (capturedAtMs > now + CAPTURED_AT_MAX_FUTURE_SKEW_MS) return undefined;
+  if (capturedAtMs < now - CAPTURED_AT_MAX_PAST_STALENESS_MS) return undefined;
+  return Math.floor(capturedAtMs / 1000);
+}
+
+function recordCapiUsage(accountId: string, usage?: { callCountPct: number; totalTimePct: number; totalCpuTimePct: number; estimatedMinutesToRegainAccess?: number }): void {
+  if (!usage || usage.estimatedMinutesToRegainAccess === undefined) return;
+  const atLimit = usage.callCountPct >= 100 || usage.totalTimePct >= 100 || usage.totalCpuTimePct >= 100;
+  if (!atLimit) return;
+  const pausedUntil = Date.now() + usage.estimatedMinutesToRegainAccess * 60_000;
+  capiAccountPausedUntil.set(accountId, pausedUntil);
+  console.warn(
+    `[CAPI] Meta ad account ${accountId} at its Business Use Case rate limit ` +
+    `(call_count=${usage.callCountPct}%, total_time=${usage.totalTimePct}%, total_cputime=${usage.totalCpuTimePct}%) — ` +
+    `pausing CAPI sends for this account for ~${usage.estimatedMinutesToRegainAccess}min. Leads still save normally.`
+  );
+}
 
 /**
  * Fire-and-forget: enroll a single lead into any sequences that have
@@ -308,6 +391,17 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
   }
 });
 
+// ENG-492: the lead-SAVE path below is never rate-limited — a real customer's real lead must
+// never be rejected, no matter how large a traffic spike (viral post, big ad spend, a featured
+// TV segment can all legitimately blow past any fixed number we'd pick). Rate limiting here
+// used to gate the whole request, including the save; that was reverted in favor of gating
+// ONLY the optional, best-effort Meta CAPI send below (capiSendBudget), so the worst case of
+// hitting a limit is "this one submission doesn't get forwarded to Meta" — never a lost lead.
+//
+// (Keying any future request-level limiter here by IP would also be unsound: this app never
+// configures Express's `trust proxy`, so `req.ip` collapses to the same value for every
+// caller — confirmed live in both prod and the test env. See ENG-493.)
+
 // Public endpoint for forwarding leads to CRM
 router.post('/forward-lead', async (req: express.Request, res: express.Response) => {
   // Set CORS headers to allow all origins for this endpoint
@@ -381,6 +475,21 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       customFields,
       attribution,
       utm,
+      // Baked into the generated app/api/capture/route.ts (see buildCaptureRoute) — not
+      // spread through automatically, this handler destructures a fixed field list rather
+      // than `...req.body`, so these must be listed explicitly or they're silently dropped.
+      pixelId,
+      metaAccountId,
+      eventId,
+      // Meta's own first-party click-id cookies, read server-side from the Cookie header by
+      // the platform-owned app/api/capture/route.ts (buildCaptureRoute) and forwarded here —
+      // deterministic, no v0-authored client code involved.
+      fbp,
+      fbc,
+      // Real client-submission time (Unix ms), captured at the top of the platform-owned
+      // capture route (buildCaptureRoute) — NOT server CAPI-send time. Validated below
+      // before ever being trusted.
+      capturedAtMs,
     } = req.body;
 
     // Validate required field (email)
@@ -525,6 +634,47 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       });
     }
 
+    // Server-side Meta Conversions API send. Fire-and-forget (same pattern as the
+    // roadmap-delivery email below) — this must never delay or affect the lead-save response
+    // already sent above, and a Meta-side failure must never be surfaced as a lead-capture
+    // failure (the lead itself already saved successfully).
+    // ENG-449 gap #3: never send a real CAPI conversion event for the automated smoke test's
+    // synthetic lead — CAPI's correctness is already covered by unit tests (metaService.capi
+    // .test.ts) and doesn't depend on v0-authored code, so there's nothing extra to verify
+    // live here, only real-ad-account conversion data to needlessly pollute.
+    if (pixelId && metaAccountId && eventId && !isSmokeTestEmail(leadData.email) && shouldAttemptCapiSend(leadList.listId) && !isCapiAccountPaused(metaAccountId)) {
+      void (async () => {
+        try {
+          const owner = await userDb.getUserById(leadList.userId);
+          const { getMetaAccountCredentials } = await import('../services/metaAccountCredentials');
+          const { accessToken } = await getMetaAccountCredentials(owner, leadList.userId, metaAccountId);
+          // ENG-493 is deferred (flipping Express's global `trust proxy` also changes
+          // auth.ts's IP-keyed rate limiters — a separate, riskier change). Scope the fix to
+          // just this CAPI call site instead, same pattern as loopEvents.ts/assetController.ts.
+          const clientIp = (req.headers['x-forwarded-for']?.toString().split(',')[0] ?? req.ip ?? 'unknown').trim();
+          const result = await metaService.sendCapiLeadEvent(pixelId, accessToken, {
+            eventId,
+            email: leadData.email,
+            firstName: leadData.firstName,
+            lastName: leadData.lastName,
+            phone: leadData.phone,
+            clientIp,
+            userAgent: req.headers['user-agent'],
+            sourceUrl: req.headers['referer'],
+            fbp: typeof fbp === 'string' ? fbp : undefined,
+            fbc: typeof fbc === 'string' ? fbc : undefined,
+            eventTimeSeconds: validatedEventTimeSeconds(capturedAtMs),
+          });
+          if (!result.success) {
+            console.error(`[CAPI] Lead event send failed for pixel ${pixelId}: ${result.error}`);
+          }
+          recordCapiUsage(metaAccountId, result.usage);
+        } catch (err: any) {
+          console.error(`[CAPI] Unexpected error sending Lead event for pixel ${pixelId}: ${err?.message}`);
+        }
+      })();
+    }
+
     // WORKAROUND (2026-06-04): deliver the AI Readiness roadmap PDF directly.
     // The proper path (list-bound drip sequence) is not usable yet — the
     // sequence feature is not production ready and this webhook does not
@@ -558,7 +708,17 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     }
 
     // After response is sent: auto-draft, auto-send, and alert (fire-and-forget, fully awaited internally)
-    if (isNew || isUpdated) {
+    if (isNew && isSmokeTestEmail(lead.email)) {
+      // ENG-449 gap #3: the automated post-deploy smoke test submits a REAL lead through a
+      // customer's real form to verify the pipeline works, then deletes the row. But deleting
+      // the row doesn't undo an already-fired side effect — HubSpot/Attio sync, drip-sequence
+      // enrollment, and (worse) a real auto-sent email to a fake address would all have
+      // already fired by the time the row is deleted, since they're dispatched fire-and-forget
+      // the instant the lead is created. Skip the whole cascade for a recognized synthetic
+      // lead; the lead row itself is still created/returned normally above so the smoke
+      // test's CRM-landing check still works.
+      console.log(`[webhooks] Synthetic smoke-test lead (${lead.email}) — skipping CRM sync/sequence enrollment/auto-draft/auto-send/owner-notify side effects`);
+    } else if (isNew || isUpdated) {
       // Real-time push to any connected external CRM (HubSpot / Attio). The
       // authenticated UI create/update routes do this inline; inbound capture
       // (landing pages, lead-forward webhooks) did not, so form leads only ever

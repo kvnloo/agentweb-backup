@@ -1,4 +1,5 @@
 import { getSecret } from '../utils/secretsManager';
+import type { AttributionIssueOutcome } from '../loops/core/learning/attribution';
 
 /**
  * Linear intake service.
@@ -282,9 +283,9 @@ export async function createInternalLinearIssue(params: {
 
 /**
  * Raise-only triage update on an existing issue (ENG-187 dedup upgrade): UNION the given labels in,
- * and RAISE the priority to `priority` when it is more urgent than the current one. Never lowers
- * priority and never removes labels — a later lower-tier reporter must not downgrade a canonical
- * that a higher-tier reporter already escalated. Linear priority enum: 0=None, 1=Urgent … 4=Low,
+ * and RAISE the priority to `priority` when it is more urgent than the current one. Route callers
+ * may also atomically remove mutually exclusive labels and set the canonical owner; ordinary
+ * callers retain the original union-only behavior. Linear priority enum: 0=None, 1=Urgent … 4=Low,
  * so "more urgent" = smaller non-zero number (and anything beats 0/None).
  *
  * `settleStateName` (ENG-187 contract #4): ensure a freshly synced issue SITS in the named state
@@ -297,21 +298,38 @@ export async function createInternalLinearIssue(params: {
  */
 export async function raiseIssueTriage(
   issueId: string,
-  params: { addLabelNames: string[]; priority?: number; settleStateName?: string },
+  params: {
+    addLabelNames: string[];
+    removeLabelNames?: string[];
+    priority?: number;
+    settleStateName?: string;
+    assigneeId?: string;
+  },
 ): Promise<void> {
   const meta = await getTeamMeta();
   const data = await linearGraphQL(
-    `query($id: String!) { issue(id: $id) { priority state { id type } labels { nodes { id } } } }`,
+    `query($id: String!) { issue(id: $id) { priority assignee { id } state { id type } labels { nodes { id } } } }`,
     { id: issueId },
   );
   const issue = data?.issue;
   if (!issue) throw new Error('Linear issue not found for triage raise');
 
   const currentLabelIds: string[] = (issue.labels?.nodes || []).map((n: any) => n.id);
-  const addIds = resolveLabelIdsLoud(meta, params.addLabelNames).filter((id) => !currentLabelIds.includes(id));
+  const removeIds = new Set(resolveLabelIdsLoud(meta, params.removeLabelNames ?? []));
+  const retainedLabelIds = currentLabelIds.filter((id) => !removeIds.has(id));
+  const addIds = resolveLabelIdsLoud(meta, params.addLabelNames).filter((id) => !retainedLabelIds.includes(id));
+  const nextLabelIds = [...retainedLabelIds, ...addIds];
 
   const input: Record<string, any> = {};
-  if (addIds.length > 0) input.labelIds = [...currentLabelIds, ...addIds];
+  if (
+    nextLabelIds.length !== currentLabelIds.length ||
+    nextLabelIds.some((id) => !currentLabelIds.includes(id))
+  ) {
+    input.labelIds = nextLabelIds;
+  }
+  if (params.assigneeId && issue.assignee?.id !== params.assigneeId) {
+    input.assigneeId = params.assigneeId;
+  }
   const current: number = typeof issue.priority === 'number' ? issue.priority : 0;
   if (typeof params.priority === 'number' && params.priority > 0 && (current === 0 || params.priority < current)) {
     input.priority = params.priority;
@@ -460,6 +478,121 @@ export async function reopenIssue(issueId: string, stateName = 'Todo'): Promise<
   if (!res?.issueUpdate?.success) {
     throw new Error('Linear reopen (issueUpdate) failed');
   }
+}
+
+export type LoopAttributionWriteResult =
+  | { status: 'applied' }
+  | { status: 'already_applied' }
+  | { status: 'missing_issue' };
+
+function attributionMarker(outcome: AttributionIssueOutcome): string {
+  return `<!-- loop-attribution:${outcome.loopId}:${outcome.mutationId}:${outcome.verdict} -->`;
+}
+
+function metricValue(value: number | null): string {
+  return value == null ? 'n/a' : value.toFixed(4);
+}
+
+function attributionEvidence(outcome: AttributionIssueOutcome, marker: string): string {
+  const lift = outcome.observedLiftPct == null
+    ? 'n/a'
+    : `${outcome.observedLiftPct >= 0 ? '+' : ''}${outcome.observedLiftPct.toFixed(1)}%`;
+  const state = outcome.transition === 'verifying'
+    ? 'Moved to **Verifying** and assigned to the verifier.'
+    : outcome.transition === 'reopen'
+      ? 'Regression detected; reopened to **Todo** and assigned to the verifier.'
+      : 'Evidence recorded; workflow state left unchanged.';
+  return [
+    `## Loop attribution: ${outcome.verdict}`,
+    '',
+    `- Loop: \`${outcome.loopId}\``,
+    `- Rule: \`${outcome.ruleId}\``,
+    `- Run: \`${outcome.runId}\``,
+    `- Mutation: \`${outcome.mutationId}\``,
+    `- ${outcome.metricName}: ${metricValue(outcome.metricBefore)} → ${metricValue(outcome.metricAfter)} (${lift}; n=${outcome.sampleN})`,
+    `- Result: ${state}`,
+    '',
+    marker,
+  ].join('\n');
+}
+
+/**
+ * Close the loop's Linear lifecycle after metric attribution.
+ *
+ * Ordering is deliberate: state/assignee update first, evidence marker last.
+ * If the comment fails, the next cron safely repeats the idempotent state
+ * update and retries the comment. Once the marker exists, all later retries
+ * are no-ops. The only writable states are Verifying and Todo; this path can
+ * never set Done.
+ */
+export async function recordLoopAttributionOutcome(
+  outcome: AttributionIssueOutcome,
+): Promise<LoopAttributionWriteResult> {
+  const marker = attributionMarker(outcome);
+  const data = await linearGraphQL(
+    `query($id: String!) {
+      issue(id: $id) {
+        id
+        comments(first: 250, orderBy: createdAt) {
+          nodes { body }
+          pageInfo { hasNextPage }
+        }
+      }
+    }`,
+    { id: outcome.issueId },
+  );
+  const issue = data?.issue;
+  if (!issue) return { status: 'missing_issue' };
+
+  if (issue.comments?.pageInfo?.hasNextPage) {
+    console.error(
+      `[linear] issue ${outcome.issueId} has >250 comments — loop-attribution idempotency scan is truncated`,
+    );
+  }
+  const alreadyApplied = (issue.comments?.nodes ?? []).some(
+    (comment: { body?: string } | null) => comment?.body?.includes(marker),
+  );
+  if (alreadyApplied) return { status: 'already_applied' };
+
+  if (outcome.transition !== 'evidence_only') {
+    const meta = await getTeamMeta();
+    const stateName = outcome.transition === 'verifying' ? 'Verifying' : 'Todo';
+    const stateId = meta.stateIds[stateName.toLowerCase()];
+    if (!stateId) {
+      throw new Error(`Linear loop attribution: state "${stateName}" not found in team ${TEAM_KEY}`);
+    }
+    const updated = await linearGraphQL(
+      `mutation($id: String!, $input: IssueUpdateInput!) {
+        issueUpdate(id: $id, input: $input) { success }
+      }`,
+      {
+        id: issue.id,
+        input: {
+          stateId,
+          assigneeId: outcome.verifierId,
+        },
+      },
+    );
+    if (!updated?.issueUpdate?.success) {
+      throw new Error('Linear loop attribution issueUpdate failed');
+    }
+  }
+
+  const commented = await linearGraphQL(
+    `mutation($input: CommentCreateInput!) {
+      commentCreate(input: $input) { success }
+    }`,
+    {
+      input: {
+        issueId: issue.id,
+        body: attributionEvidence(outcome, marker),
+      },
+    },
+  );
+  if (!commented?.commentCreate?.success) {
+    throw new Error('Linear loop attribution commentCreate failed');
+  }
+  return { status: 'applied' };
 }
 
 export interface EngineeringBugStats {

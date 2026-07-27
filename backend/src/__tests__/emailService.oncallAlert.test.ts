@@ -9,10 +9,9 @@ jest.mock('../services/resendService', () => ({
   },
 }));
 
-// Mock notionService
-const mockCreateOncallItem = jest.fn();
-jest.mock('../services/notionService', () => ({
-  createOncallItem: (...args: any[]) => mockCreateOncallItem(...args),
+const mockFileAutoIssue = jest.fn();
+jest.mock('../services/intakeService', () => ({
+  fileAutoIssue: (...args: any[]) => mockFileAutoIssue(...args),
 }));
 
 import { emailService } from '../services/emailService';
@@ -23,7 +22,7 @@ describe('EmailService - sendOncallAlert', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockSendMail.mockClear();
-    mockCreateOncallItem.mockClear();
+    mockFileAutoIssue.mockClear();
     // Set default oncall email
     process.env.ONCALL_EMAIL_LIST = 'test@example.com,test2@example.com';
     process.env.NODE_ENV = 'production';
@@ -37,14 +36,16 @@ describe('EmailService - sendOncallAlert', () => {
   it('should suppress alert in non-production environments', async () => {
     process.env.NODE_ENV = 'development';
     await emailService.sendOncallAlert('Test Alert', 'Test message');
-    expect(mockCreateOncallItem).not.toHaveBeenCalled();
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
     expect(mockSendMail).not.toHaveBeenCalled();
   });
 
-  it('should send slim email when Notion item is created successfully', async () => {
-    mockCreateOncallItem.mockResolvedValueOnce({
-      pageId: 'page-123',
-      notionUrl: 'https://notion.so/page123',
+  it('should send slim email when a Linear issue is filed successfully', async () => {
+    mockFileAutoIssue.mockResolvedValueOnce({
+      pageId: 'ENG-123',
+      url: 'https://linear.app/emmabyaw/issue/ENG-123',
+      deduped: false,
+      tracker: 'Linear',
     });
 
     await emailService.sendOncallAlert(
@@ -53,25 +54,24 @@ describe('EmailService - sendOncallAlert', () => {
       { 'Context Key': 'Context Value' }
     );
 
-    // Oncall alerts now route through intakeService.fileAutoIssue, which (flag off) calls
-    // createOncallItem with notionTags [] (createOncallItem still adds its internal Oncall tag).
-    expect(mockCreateOncallItem).toHaveBeenCalledWith(expect.objectContaining({
+    expect(mockFileAutoIssue).toHaveBeenCalledWith(expect.objectContaining({
       title: 'Test Alert',
       description: 'This is a test alert message',
-      context: { 'Context Key': 'Context Value' },
+      notionContext: { 'Context Key': 'Context Value' },
+      executionRoute: 'human-triage',
     }));
 
     expect(mockSendMail).toHaveBeenCalled();
     const callArgs = mockSendMail.mock.calls[0][0];
-    expect(callArgs.html).toContain('View in Notion');
-    expect(callArgs.html).toContain('https://notion.so/page123');
+    expect(callArgs.html).toContain('View tracked issue');
+    expect(callArgs.html).toContain('https://linear.app/emmabyaw/issue/ENG-123');
     // Slim email should NOT contain the full context table
     expect(callArgs.html).not.toContain('Additional Context');
-    expect(callArgs.text).toContain('Notion: https://notion.so/page123');
+    expect(callArgs.text).toContain('Issue: https://linear.app/emmabyaw/issue/ENG-123');
   });
 
-  it('should send full detail email when Notion creation fails', async () => {
-    mockCreateOncallItem.mockRejectedValueOnce(new Error('Notion API error'));
+  it('should send full detail email when Linear filing fails', async () => {
+    mockFileAutoIssue.mockRejectedValueOnce(new Error('Linear API error'));
 
     await emailService.sendOncallAlert(
       'Test Alert',
@@ -88,7 +88,7 @@ describe('EmailService - sendOncallAlert', () => {
     expect(callArgs.text).toContain('Test message');
   });
 
-  it('should skip Notion creation when notionUrl is provided', async () => {
+  it('should skip issue filing when a tracker URL is provided', async () => {
     await emailService.sendOncallAlert(
       'Test Alert',
       'Test message',
@@ -96,16 +96,16 @@ describe('EmailService - sendOncallAlert', () => {
       'https://notion.so/existing-page'
     );
 
-    expect(mockCreateOncallItem).not.toHaveBeenCalled();
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
     expect(mockSendMail).toHaveBeenCalled();
     const callArgs = mockSendMail.mock.calls[0][0];
-    expect(callArgs.html).toContain('View in Notion');
+    expect(callArgs.html).toContain('View tracked issue');
     expect(callArgs.html).toContain('https://notion.so/existing-page');
   });
 
   it('should send oncall alert with default email when ONCALL_EMAIL_LIST is not set', async () => {
     delete process.env.ONCALL_EMAIL_LIST;
-    mockCreateOncallItem.mockRejectedValueOnce(new Error('skip'));
+    mockFileAutoIssue.mockRejectedValueOnce(new Error('skip'));
 
     await emailService.sendOncallAlert(
       'Test Alert',
@@ -127,9 +127,11 @@ describe('EmailService - sendOncallAlert', () => {
 
   it('should send oncall alert to configured emails', async () => {
     process.env.ONCALL_EMAIL_LIST = 'oncall1@example.com,oncall2@example.com';
-    mockCreateOncallItem.mockResolvedValueOnce({
-      pageId: 'p1',
-      notionUrl: 'https://notion.so/p1',
+    mockFileAutoIssue.mockResolvedValueOnce({
+      pageId: 'ENG-1',
+      url: 'https://linear.app/emmabyaw/issue/ENG-1',
+      deduped: false,
+      tracker: 'Linear',
     });
 
     await emailService.sendOncallAlert(
@@ -149,7 +151,7 @@ describe('EmailService - sendOncallAlert', () => {
 
   it('should handle errors gracefully without throwing', async () => {
     mockSendMail.mockRejectedValueOnce(new Error('Resend API error: down'));
-    mockCreateOncallItem.mockRejectedValueOnce(new Error('Notion error'));
+    mockFileAutoIssue.mockRejectedValueOnce(new Error('Linear error'));
 
     // Should not throw
     await expect(emailService.sendOncallAlert(

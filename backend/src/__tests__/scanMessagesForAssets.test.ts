@@ -18,8 +18,6 @@ jest.mock('@google-cloud/discoveryengine', () => ({ EngineServiceClient: jest.fn
 jest.mock('@google-cloud/storage', () => ({ Storage: jest.fn() }));
 jest.mock('../controllers/guide', () => ({ getGuide: jest.fn() }));
 jest.mock('../controllers/release', () => ({ getReleases: jest.fn() }));
-jest.mock('../controllers/api', () => ({ getApiDocs: jest.fn() }));
-jest.mock('../controllers/user-guide', () => ({ getUserGuide: jest.fn() }));
 jest.mock('../controllers/docsController', () => ({ getUserReleaseNotes: jest.fn() }));
 jest.mock('../services/db', () => ({ taskDb: {
   getAllTaskExecutionsByUserId: jest.fn(),

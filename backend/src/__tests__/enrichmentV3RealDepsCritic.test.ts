@@ -116,3 +116,59 @@ describe('runCriticReal — entity identity guard (Slashy bug)', () => {
     expect(result.verdicts.funding_stage).toBe('supported');
   });
 });
+
+describe('runCriticReal — person identity guard (namesake LinkedIn bug, ENG-151)', () => {
+  // A wrong-person LinkedIn URL: the lead is a "Founder in residence at The
+  // Bridge", but the web-extracted /in/ URL's source snippet describes a
+  // different Luke Molony ("Senior System Administrator at a University"). The
+  // critic must be able to judge PERSON identity — not just company — to drop it.
+  const linkedinFill = [{
+    field: 'linkedin',
+    value: 'https://www.linkedin.com/in/luke-molony-590a1b9',
+    meta: {
+      source: 'web_search' as const,
+      provider: 'llm_web_search',
+      enrichedAt: '2026-01-01T00:00:00Z',
+      sourceUrl: 'https://www.linkedin.com/in/luke-molony-590a1b9',
+      sourceQuote: 'Luke Molony - Senior System Administrator at University',
+    },
+  }];
+
+  function makePersonLead(): LeadRecord {
+    return makeLead({
+      email: 'molonyluke@gmail.com',
+      firstName: 'Luke',
+      lastName: 'Molony',
+      company: 'The Bridge',
+      website: '',
+      title: 'Founder in residence at The Bridge',
+    });
+  }
+
+  it('the system prompt instructs the model to verify PERSON identity (namesake guard)', async () => {
+    mockGenerateJSONContent.mockResolvedValue({ linkedin: 'contradicted' });
+    const runCritic = getRunCritic();
+    await runCritic({ lead: makePersonLead(), fills: linkedinFill });
+    const { system } = lastCallPrompts();
+    const lower = system.toLowerCase();
+    expect(lower).toContain('person');
+    expect(lower).toContain('namesake');
+  });
+
+  it('the user prompt includes the lead name and title so the model can judge person identity', async () => {
+    mockGenerateJSONContent.mockResolvedValue({ linkedin: 'supported' });
+    const runCritic = getRunCritic();
+    await runCritic({ lead: makePersonLead(), fills: linkedinFill });
+    const { user } = lastCallPrompts();
+    expect(user).toContain('Luke');
+    expect(user).toContain('Molony');
+    expect(user).toContain('Founder in residence at The Bridge');
+  });
+
+  it('FAIL CASE: a "contradicted" verdict on a namesake LinkedIn URL is surfaced', async () => {
+    mockGenerateJSONContent.mockResolvedValue({ linkedin: 'contradicted' });
+    const runCritic = getRunCritic();
+    const result = await runCritic({ lead: makePersonLead(), fills: linkedinFill });
+    expect(result.verdicts.linkedin).toBe('contradicted');
+  });
+});

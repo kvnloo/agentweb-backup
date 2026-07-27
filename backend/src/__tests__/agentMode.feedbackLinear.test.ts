@@ -1,7 +1,7 @@
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb, ChatMessage } from '../services/chatbotService';
 import { AuthenticatedRequest } from '../middleware/auth';
-import * as notionService from '../services/notionService';
+import { fileAutoIssue } from '../services/intakeService';
 
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
@@ -13,8 +13,13 @@ jest.mock('../services/chatbotService', () => ({
   },
 }));
 
-jest.mock('../services/notionService', () => ({
-  createOncallItem: jest.fn().mockResolvedValue({ pageId: 'notion-page-1', notionUrl: 'https://notion.so/notion-page-1' }),
+jest.mock('../services/intakeService', () => ({
+  fileAutoIssue: jest.fn().mockResolvedValue({
+    pageId: 'ENG-1',
+    url: 'https://linear.app/emmabyaw/issue/ENG-1',
+    deduped: false,
+    tracker: 'Linear',
+  }),
 }));
 
 const mockUser: AuthenticatedRequest['user'] = {
@@ -59,9 +64,9 @@ beforeEach(() => {
   (chatbotDb.addMessageToSession as jest.Mock).mockResolvedValue(undefined);
 });
 
-describe('Agent Mode feedback → Notion item creation', () => {
+describe('Agent Mode feedback → Linear intake', () => {
   describe('submitMessageFeedback (authenticated)', () => {
-    it('should create a Notion item when user dislikes a message', async () => {
+    it('should file human-triage intake when user dislikes a message', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
       (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(mockMessages);
 
@@ -73,16 +78,17 @@ describe('Agent Mode feedback → Notion item creation', () => {
       // Allow async fire-and-forget to settle
       await Promise.resolve();
 
-      expect(notionService.createOncallItem).toHaveBeenCalledWith(
+      expect(fileAutoIssue).toHaveBeenCalledWith(
         expect.objectContaining({
           title: expect.stringContaining('Dislike'),
           description: expect.stringContaining('Not helpful'),
+          executionRoute: 'human-triage',
         }),
       );
       expect(res.json).toHaveBeenCalledWith({ success: true, message: expect.any(Object) });
     });
 
-    it('should create a Notion item when user likes a message', async () => {
+    it('should file human-triage intake when user likes a message', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
       (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(mockMessages);
 
@@ -93,7 +99,7 @@ describe('Agent Mode feedback → Notion item creation', () => {
 
       await Promise.resolve();
 
-      expect(notionService.createOncallItem).toHaveBeenCalledWith(
+      expect(fileAutoIssue).toHaveBeenCalledWith(
         expect.objectContaining({
           title: expect.stringContaining('Like'),
           description: expect.stringContaining('Excellent!'),
@@ -101,7 +107,7 @@ describe('Agent Mode feedback → Notion item creation', () => {
       );
     });
 
-    it('should create a Notion item without comment when no comment provided', async () => {
+    it('should file intake without comment when no comment provided', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
       (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(mockMessages);
 
@@ -112,10 +118,10 @@ describe('Agent Mode feedback → Notion item creation', () => {
 
       await Promise.resolve();
 
-      expect(notionService.createOncallItem).toHaveBeenCalled();
+      expect(fileAutoIssue).toHaveBeenCalled();
     });
 
-    it('should include session title and session link in the Notion item', async () => {
+    it('should include session context in the Linear issue', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
       (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(mockMessages);
 
@@ -126,19 +132,19 @@ describe('Agent Mode feedback → Notion item creation', () => {
 
       await Promise.resolve();
 
-      expect(notionService.createOncallItem).toHaveBeenCalledWith(
+      expect(fileAutoIssue).toHaveBeenCalledWith(
         expect.objectContaining({
-          context: expect.objectContaining({
+          notionContext: expect.objectContaining({
             sessionId: 'session-abc',
           }),
         }),
       );
     });
 
-    it('should still return success even when Notion item creation fails', async () => {
+    it('should still return success even when Linear intake fails', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
       (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(mockMessages);
-      (notionService.createOncallItem as jest.Mock).mockRejectedValue(new Error('Notion API down'));
+      (fileAutoIssue as jest.Mock).mockRejectedValue(new Error('Linear API down'));
 
       const req = mockRequest(mockUser, 'session-abc', '1', { type: 'dislike', comment: 'Bad' });
       const res = mockResponse();
@@ -148,7 +154,7 @@ describe('Agent Mode feedback → Notion item creation', () => {
       expect(res.json).toHaveBeenCalledWith({ success: true, message: expect.any(Object) });
     });
 
-    it('should not create Notion item when session is not found', async () => {
+    it('should not file intake when session is not found', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(null);
 
       const req = mockRequest(mockUser, 'session-abc', '1', { type: 'dislike' });
@@ -156,17 +162,17 @@ describe('Agent Mode feedback → Notion item creation', () => {
 
       await agentModeController.submitMessageFeedback(req, res);
 
-      expect(notionService.createOncallItem).not.toHaveBeenCalled();
+      expect(fileAutoIssue).not.toHaveBeenCalled();
       expect(res.status).toHaveBeenCalledWith(404);
     });
 
-    it('should not create Notion item when user is unauthorized', async () => {
+    it('should not file intake when user is unauthorized', async () => {
       const req = mockRequest(undefined, 'session-abc', '1', { type: 'dislike' });
       const res = mockResponse();
 
       await agentModeController.submitMessageFeedback(req, res);
 
-      expect(notionService.createOncallItem).not.toHaveBeenCalled();
+      expect(fileAutoIssue).not.toHaveBeenCalled();
       expect(res.status).toHaveBeenCalledWith(401);
     });
   });

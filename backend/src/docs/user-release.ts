@@ -9,6 +9,18 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-07-23',
+    changes: [
+      'Improved: Emma Now Remembers a Website Login Between Runs',
+      '- When Emma logs into a website for you (using credentials saved in Settings → Login Credentials), she now saves that session automatically and restores it at the start of later runs — including scheduled ones — so she does not have to fight through the login every time',
+      '- This matters most for sites that only let an automated browser in occasionally: once a login succeeds, it now sticks, instead of being lost because the session was not saved',
+      '',
+      'Fixed: Clearer, Honest Guidance When a Site Blocks Automated Login',
+      '- Emma\'s automation browser runs in its own isolated session and does not share logins with the browser on your own computer. She used to sometimes suggest "log in on your own browser and I\'ll reuse it," which could never work — that suggestion has been removed',
+      '- Some sites (for example, Luma) show a "Verifying Your Browser" bot-protection check that can block an automated sign-in. Instead of looping on it or offering a workaround that does not help, Emma now reports the block honestly and keeps your task moving — for instance by continuing from a guest or contact list you export and share',
+    ],
+  },
+  {
     date: '2026-07-22',
     changes: [
       'Improved: Onboarding Outreach Invites Arrive Written For You',

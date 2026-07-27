@@ -114,6 +114,10 @@ jest.mock("../services/settingsService", () => ({
 jest.mock("../services/autoHumanEvalService", () => ({
   enqueueAutoHumanEval: jest.fn().mockResolvedValue(null),
 }), { virtual: true });
+const mockRunGenerationSmokeTest = jest.fn().mockResolvedValue(undefined);
+jest.mock("../services/landingPageSmokeTest", () => ({
+  runGenerationSmokeTest: (...args: any[]) => mockRunGenerationSmokeTest(...args),
+}));
 
 // Mock fs for filesystem fallback tests
 const mockFsExistsSync = jest.fn().mockReturnValue(false);
@@ -151,6 +155,9 @@ import {
   listLandingPages,
   deleteLandingPage,
   validateV0Output,
+  collectMissingInternalImports,
+  detectIncompleteSyntheticPage,
+  repairMisrootedImports,
   V0OutputValidationError,
   BrandContext,
   remapFilesForSubPage,
@@ -173,9 +180,11 @@ import {
   triggerVercelDeployment,
   injectLeadCaptureAttribution,
   assertNoDuplicateInjectedRoutes,
+  buildTrackingHelper,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord, getVercelBuildErrors, isNonErrorBuildLine } from "../services/v0Service";
+import { metaService } from "../services/metaService";
 import { _resetV0UsageGuardForTest, guardedV0ChatCreate, hashV0Prompt } from "../services/v0UsageGuard";
 const { enqueueAutoHumanEval } = jest.requireMock("../services/autoHumanEvalService");
 
@@ -444,6 +453,12 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
     expect(routeSrc).toContain("/api/webhooks/forward-lead");
     expect(routeSrc).toContain('from "next/headers"');
     expect(routeSrc).toContain("aw_first_touch");
+
+    // ENG-449 match-quality gap: _fbp/_fbc are Meta's own first-party click-id cookies (set
+    // by the already-platform-injected base Pixel snippet) — read server-side here and
+    // forwarded to /forward-lead, fully deterministic, no v0-authored client code involved.
+    expect(routeSrc).toContain('"_fbp"');
+    expect(routeSrc).toContain('"_fbc"');
   });
 
   it("FAIL: v0-generated app/api/capture/route.ts is replaced, not duplicated", () => {
@@ -537,6 +552,126 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("SUCCESS: injectLeadCaptureAttribution never trips the duplicate guard on the normal path", () => {
     const files = [file("app/page.tsx"), file("app/api/capture/route.ts", "// v0's own"), file("middleware.ts", "// v0's own")];
     expect(() => injectLeadCaptureAttribution(files, { "/": "list_xyz" })).not.toThrow();
+  });
+
+  // ---------------------------------------------------------------------------
+  // pixelId/metaAccountId threaded through to the generated capture route,
+  // forwarded to the backend's forward-lead webhook alongside the client's own eventId.
+  // ---------------------------------------------------------------------------
+  it("SUCCESS: pixelId + metaAccountId are baked into the capture route and forwarded", () => {
+    const result = injectLeadCaptureAttribution([file("app/page.tsx")], { "/": "list_xyz" }, "1430870751246428", "acc1");
+
+    const route = result.find((f) => f.path === "app/api/capture/route.ts")!;
+    const routeSrc = route.content.toString();
+    expect(routeSrc).toContain('const PIXEL_ID = "1430870751246428"');
+    expect(routeSrc).toContain('const META_ACCOUNT_ID = "acc1"');
+    expect(routeSrc).toContain("pixelId: PIXEL_ID");
+    expect(routeSrc).toContain("metaAccountId: META_ACCOUNT_ID");
+    // The client's own eventId already passes through via the existing `...body` spread —
+    // no separate handling needed, but pin that the spread still comes first.
+    expect(routeSrc.indexOf("...body")).toBeLessThan(routeSrc.indexOf("pixelId: PIXEL_ID"));
+  });
+
+  it("SUCCESS: no pixelId => no PIXEL_ID/META_ACCOUNT_ID fields forwarded at all", () => {
+    const result = injectLeadCaptureAttribution([file("app/page.tsx")], { "/": "list_xyz" });
+
+    const route = result.find((f) => f.path === "app/api/capture/route.ts")!;
+    const routeSrc = route.content.toString();
+    // PIXEL_ID/META_ACCOUNT_ID are declared undefined, so the runtime `PIXEL_ID ? {...} : {}`
+    // ternary in the forwarded body naturally omits pixelId/metaAccountId — no separate
+    // conditional needed in the generated source itself.
+    expect(routeSrc).toContain("const PIXEL_ID = undefined");
+    expect(routeSrc).toContain("const META_ACCOUNT_ID = undefined");
+  });
+});
+
+// =============================================================================
+// buildTrackingHelper + its injection (ENG-449 follow-up: deterministic tracking,
+// shrinks the v0-compliance surface for fbq()/bridge-out — see plan
+// "ENG-449 follow-up: close CAPI/Pixel reliability gaps")
+// =============================================================================
+describe("v0Service - buildTrackingHelper", () => {
+  it("SUCCESS: generated module exports fireLeadTracking with fbq + 800ms flush + bridge-out redirect logic", () => {
+    const src = buildTrackingHelper();
+    expect(src).toContain("export async function fireLeadTracking");
+    expect(src).toContain("window.fbq");
+    expect(src).toContain("'track'");
+    expect(src).toContain("'Lead'");
+    expect(src).toContain("800");
+    expect(src).toContain("window.location.href");
+    // Query building uses the URL API now (searchParams.set), not manual
+    // encodeURIComponent string concatenation — see the dedicated UTM test below
+    // for why (respecting an explicit override already on the destination URL).
+    expect(src).toContain("URLSearchParams");
+    // pixelId/bridgeOutUrl are CALL-TIME arguments (per-page data), not baked into this
+    // repo-level shared file — a page's own values are literal args v0 is instructed to pass.
+    expect(src).toContain("pixelId");
+    expect(src).toContain("bridgeOutUrl");
+    // eventId must be a caller-supplied argument, NOT generated inside this helper — the
+    // SAME id has to also reach the server (in the /api/capture POST body) for Meta's CAPI
+    // dedup to work. Generating it here would desync the client fbq call from the
+    // server-side CAPI event_id, silently breaking dedup.
+    expect(src).toContain("eventId");
+    expect(src).not.toContain("crypto.randomUUID");
+  });
+
+  it("SUCCESS (ENG-449): bridge-out forwards UTMs alongside email, read from the current page's own URL", () => {
+    const src = buildTrackingHelper();
+    expect(src).toContain("window.location.search");
+    expect(src).toContain("URLSearchParams");
+    for (const key of ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"]) {
+      expect(src).toContain(key);
+    }
+  });
+
+  it("SUCCESS (ENG-449): an explicit utm_* param already on the bridge-out URL is never overridden — source asserts the override-respecting guard", () => {
+    const src = buildTrackingHelper();
+    // A same-named-key match alone wouldn't prove the guard is real (a same-looking
+    // string could still omit the check). Assert the specific defensive line directly:
+    // the destination URL's OWN params are checked first, before ever copying one over.
+    expect(src).toContain("url.searchParams.has(key)");
+    expect(src).toContain("continue");
+  });
+
+  it("SUCCESS (gap follow-up): a malformed bridgeOutUrl degrades gracefully instead of throwing", () => {
+    const src = buildTrackingHelper();
+    // new URL(opts.bridgeOutUrl) throws on a malformed value — a persisted-record edge
+    // case that shouldn't crash the whole submit flow (the lead is already captured via
+    // /api/capture by the time this runs). Assert the guard exists around it.
+    expect(src).toContain("try {");
+    expect(src).toContain("catch (err)");
+    expect(src).toMatch(/catch \(err\) \{[\s\S]*console\.error/);
+  });
+});
+
+describe("v0Service - injectLeadCaptureAttribution also injects lib/agentweb-track.ts", () => {
+  const file = (path: string, content = "// v0 generated") => ({ path, content: Buffer.from(content) });
+
+  it("SUCCESS: injects lib/agentweb-track.ts alongside the existing capture files", () => {
+    const result = injectLeadCaptureAttribution([file("app/page.tsx")], { "/": "list_xyz" });
+    const helper = result.find((f) => f.path === "lib/agentweb-track.ts");
+    expect(helper).toBeDefined();
+    expect(helper!.content.toString()).toContain("fireLeadTracking");
+  });
+
+  it("FAIL: v0-generated lib/agentweb-track.ts is replaced, not duplicated", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("lib/agentweb-track.ts", "// v0's own fake tracking helper"), file("app/page.tsx")],
+      { "/": "list_xyz" }
+    );
+    const helpers = result.filter((f) => f.path === "lib/agentweb-track.ts");
+    expect(helpers).toHaveLength(1);
+    expect(helpers[0].content.toString()).not.toContain("v0's own fake tracking helper");
+  });
+
+  it("FAIL: route-group/src-prefixed variant of v0's tracking helper is also dropped", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("src/lib/agentweb-track.ts", "// v0 variant"), file("app/page.tsx")],
+      { "/": "list_xyz" }
+    );
+    const helpers = result.filter((f) => f.path === "lib/agentweb-track.ts");
+    expect(helpers).toHaveLength(1);
+    expect(helpers[0].content.toString()).not.toContain("v0 variant");
   });
 });
 
@@ -888,6 +1023,24 @@ describe("v0Service - commitFilesToRepoMain (retry + rebase)", () => {
     expect(mockAxiosGet).toHaveBeenCalledTimes(1); // no rebase needed
   });
 
+  it("ENG-497: commits to a non-default branch when one is passed, never touching heads/main", async () => {
+    mockAxiosGet.mockResolvedValue(ref);
+    mockAxiosPost.mockResolvedValue(post);
+    mockAxiosPatch.mockResolvedValue({ data: {} });
+
+    const res = await commitFilesToRepoMain("o/r", {}, files, "msg", 4, "draft/agentweb-preview");
+    expect(res.pushedCommitSha).toBe("new-sha");
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      "https://api.github.com/repos/o/r/git/ref/heads/draft/agentweb-preview",
+      expect.anything()
+    );
+    expect(mockAxiosPatch).toHaveBeenCalledWith(
+      "https://api.github.com/repos/o/r/git/refs/heads/draft/agentweb-preview",
+      expect.anything(),
+      expect.anything()
+    );
+  });
+
   it("rebases and retries on a non-fast-forward 422 (concurrent commit landed)", async () => {
     mockAxiosGet.mockResolvedValue(ref);
     mockAxiosPost.mockResolvedValue(post);
@@ -948,22 +1101,23 @@ describe("v0Service - multi-site routing (DURABLE_LANDING_GENERATION=on)", () =>
     else process.env.DURABLE_LANDING_GENERATION = ORIG;
   });
 
-  const siteRow = (over: Record<string, any> = {}) => ({
-    promise: () =>
-      Promise.resolve({
-        Items: [
-          {
-            id: "site-1",
-            userId: "user-1",
-            githubRepoUrl: "https://github.com/o/r",
-            vercelProjectId: "vp1",
-            isRootPage: true,
-            siteId: "site-1",
-            ...over,
-          },
-        ],
-      }),
-  });
+  const siteRow = (over: Record<string, any> = {}) => {
+    const item = {
+      id: "site-1",
+      userId: "user-1",
+      githubRepoUrl: "https://github.com/o/r",
+      vercelProjectId: "vp1",
+      isRootPage: true,
+      siteId: "site-1",
+      ...over,
+    };
+    // ENG-478: findUserSiteRecord verifies its GSI-selected candidate with a
+    // strongly-consistent GetItem by id — this file's shared mockGet defaults to
+    // `{Item: null}`, so every caller of siteRow() needs a matching get() response
+    // too, or the candidate above would look archived/deleted and return null.
+    mockGet.mockReturnValue({ promise: () => Promise.resolve({ Item: item }) });
+    return { promise: () => Promise.resolve({ Items: [item] }) };
+  };
   const noSites = () => ({ promise: () => Promise.resolve({ Items: [] }) });
 
   it("unified default + no existing site → creates the first site root", async () => {
@@ -1692,6 +1846,15 @@ describe("v0Service - deployLandingPage", () => {
         userId: "user-1",
       },
     }));
+
+    // ENG-449 gap #3: dispatched via a dynamic import (avoids a circular import with
+    // landingPageSmokeTest.ts, which imports FROM this module) — flush microtasks so
+    // that import()'s .then() chain has a chance to run before asserting.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mockRunGenerationSmokeTest).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "page-1", status: "deployed" })
+    );
   });
 
   it("FAIL: chats.downloadVersion throws → throws deployment error", async () => {
@@ -1881,6 +2044,131 @@ describe("v0Service - deployLandingPage", () => {
       .some((c) => Buffer.from(c[1].content, "base64").toString("utf8").includes("googletagmanager.com"));
     expect(anyTagPushed).toBe(false);
     expect(pushedTrackingSignal()).toBe(false);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Meta Pixel auto-injection wiring — the resolved metaPixelId flows through
+  // the push path into the files array pushed to GitHub, and metaTrackingInstalled is
+  // persisted. Mirrors the GTM wiring section above. resolveMetaPixelForUser
+  // itself is unit-tested elsewhere (metaService.pixelResolution.test.ts) — these pin
+  // the WIRING between resolution and injection.
+  // ---------------------------------------------------------------------------
+
+  function pushedMetaTrackingSignal(): boolean | undefined {
+    const call = mockUpdate.mock.calls.find(
+      (c) => c[0]?.ExpressionAttributeValues && ":metaTrackingInstalled" in c[0].ExpressionAttributeValues,
+    );
+    return call?.[0].ExpressionAttributeValues[":metaTrackingInstalled"];
+  }
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it("SUCCESS (criterion 1): a resolvable pixel pushes an app/layout.tsx carrying the Meta Pixel snippet and records metaTrackingInstalled=true", async () => {
+    jest.spyOn(metaService, "resolveMetaPixelForUser").mockResolvedValue({
+      pixelId: "1430870751246428",
+      accountId: "acc1",
+    });
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page-1",
+            userId: "user-1",
+            name: "Compare Landing Page",
+            prompt: "Build a compare landing page",
+            status: "draft",
+            v0ChatId: "chat_1",
+            iterations: 0,
+          },
+        }),
+    });
+    mockChatsGetById.mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+    mockChatsDownloadVersion.mockResolvedValueOnce(await createV0ZipWithLayout());
+    wireHappyPathDeploy();
+
+    const result = await deployLandingPage("page-1", "user-1");
+
+    expect(result.status).toBe("deployed");
+    const layout = pushedLayoutBlob();
+    expect(layout).toBeDefined();
+    expect(layout).toContain("fbq('init', '1430870751246428')");
+    expect(layout).toContain('rel="icon"'); // v0's original layout content preserved
+    expect(pushedMetaTrackingSignal()).toBe(true);
+  });
+
+  it("SUCCESS (criterion 3): an unresolvable pixel (0 connected accounts) still deploys, pushes NO pixel tag, and records metaTrackingInstalled=false", async () => {
+    jest.spyOn(metaService, "resolveMetaPixelForUser").mockResolvedValue({
+      unresolved: true,
+      reason: "No Meta ad account connected",
+    });
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page-1",
+            userId: "user-1",
+            name: "Untracked Landing Page",
+            prompt: "Build an untracked landing page",
+            status: "draft",
+            v0ChatId: "chat_1",
+            iterations: 0,
+            // metaPixelId intentionally absent
+          },
+        }),
+    });
+    mockChatsGetById.mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+    mockChatsDownloadVersion.mockResolvedValueOnce(await createV0ZipWithLayout());
+    wireHappyPathDeploy();
+
+    const result = await deployLandingPage("page-1", "user-1");
+
+    expect(result.status).toBe("deployed");
+    const layout = pushedLayoutBlob();
+    expect(layout).toBeDefined();
+    expect(layout).not.toContain("fbq(");
+    expect(layout).not.toContain("facebook.com");
+    expect(pushedMetaTrackingSignal()).toBe(false);
+  });
+
+  it("SUCCESS (criterion 4): both GTM and Meta Pixel configured — both snippets present in the same pushed layout, neither corrupts the other", async () => {
+    jest.spyOn(metaService, "resolveMetaPixelForUser").mockResolvedValue({
+      pixelId: "1430870751246428",
+      accountId: "acc1",
+    });
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page-1",
+            userId: "user-1",
+            name: "Fully Tracked Landing Page",
+            prompt: "Build a fully tracked landing page",
+            status: "draft",
+            v0ChatId: "chat_1",
+            iterations: 0,
+            gtmContainerId: "GTM-TEST99",
+          },
+        }),
+    });
+    mockChatsGetById.mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+    mockChatsDownloadVersion.mockResolvedValueOnce(await createV0ZipWithLayout());
+    wireHappyPathDeploy();
+
+    const result = await deployLandingPage("page-1", "user-1");
+
+    expect(result.status).toBe("deployed");
+    const layout = pushedLayoutBlob();
+    expect(layout).toBeDefined();
+    // Both present
+    expect(layout).toContain("'GTM-TEST99'");
+    expect(layout).toContain("fbq('init', '1430870751246428')");
+    // Neither duplicated / corrupted by the other's injection running second
+    expect(layout!.match(/gtm\.js\?id=/g)).toHaveLength(1);
+    expect(layout!.match(/fbq\('init',/g)).toHaveLength(1);
+    expect(pushedTrackingSignal()).toBe(true);
+    expect(pushedMetaTrackingSignal()).toBe(true);
   });
 });
 
@@ -2791,6 +3079,9 @@ export default function Page() {
           "app/page.tsx",
           VALID_TSX + `\nasync function load() { const m = await import("./heavy-component"); return m; }`
         ),
+        // ENG-384: the target file must exist, else the missing-file check (check 7) rightly
+        // flags it — this test's point is only that a RELATIVE specifier isn't a denylisted bare word.
+        makeFile("app/heavy-component.tsx", `export default function H() { return null; }`),
       ];
       expect(() => validateV0Output(files)).not.toThrow();
     });
@@ -2899,6 +3190,217 @@ export default function Page() {
       });
     });
   });
+
+  // ENG-384: v0 sometimes references an intra-project file it never generated — a
+  // syntactically legitimate relative or `@/` import pointing at a component missing from the
+  // zip (e.g. `@/components/compare-table` with no compare-table.tsx). The alias resolves
+  // correctly; the file simply is not there, so `next build` fails "Module not found". This is
+  // the OPPOSITE shape from ENG-374's bare-import denylist, which structurally cannot see it.
+  describe("missing-file import check (ENG-384)", () => {
+    it("FAIL: flags an @/ import of a component that was never generated", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX),
+        makeFile(
+          "components/compare-page.tsx",
+          `import CompareTable from "@/components/compare-table"\nexport default function Compare() { return <CompareTable />; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(files)).toThrow(/not generated/i);
+      expect(() => validateV0Output(files)).toThrow(/@\/components\/compare-table/);
+    });
+
+    it("FAIL: flags a relative import of a sibling file that was never generated", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX),
+        makeFile(
+          "components/compare-page.tsx",
+          `import CompareTable from "./compare-table"\nexport default function Compare() { return <CompareTable />; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).toThrow(/compare-table/);
+    });
+
+    it("passes when the @/ import DOES resolve to a generated file (any tried extension)", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX),
+        makeFile(
+          "components/compare-page.tsx",
+          `import CompareTable from "@/components/compare-table"\nimport CompareHero from "@/components/compare-hero"\nexport default function Compare() { return <><CompareHero /><CompareTable /></>; }`
+        ),
+        makeFile("components/compare-table.tsx", `export default function T() { return <table />; }`),
+        makeFile("components/compare-hero.tsx", `export default function H() { return <div />; }`),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("passes an @/ import resolved via an index file inside a directory", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX),
+        makeFile(
+          "components/widget.tsx",
+          `import { thing } from "@/lib/helpers"\nexport default function W() { return <div>{thing}</div>; }`
+        ),
+        makeFile("lib/helpers/index.ts", `export const thing = 1;`),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("passes an @/ import of a scaffold-provided file even when v0 omits it from the zip", () => {
+      // lib/utils, app/layout, middleware, domainMap are injected by the deploy pipeline later,
+      // so a legitimate import of one must never be flagged just because this zip lacks it.
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import { cn } from "@/lib/utils"\nimport "@/middleware"\nexport default function Page() { return <div className={cn("a")} />; }`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("passes a component importing a shadcn ui primitive present via includeDefaultFiles", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import { Button } from "@/components/ui/button"\nexport default function Page() { return <Button />; }`
+        ),
+        makeFile("components/ui/button.tsx", `export function Button() { return <button />; }`),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("does NOT flag non-JS asset imports (css/json/images)", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import "./styles.css"\nimport data from "@/data/config.json"\nimport logo from "@/assets/logo.svg"\n${VALID_TSX}`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("does NOT flag bare package imports (left to ENG-374 / real dependency resolution)", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import React from "react"\nimport { motion } from "framer-motion"\nimport { Icon } from "@radix-ui/react-icons"\n${VALID_TSX}`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("does NOT flag an import that escapes the repo root (unknowable)", () => {
+      const files = [
+        makeFile(
+          "app/page.tsx",
+          `import shared from "../../shared/thing"\n${VALID_TSX}`
+        ),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+
+    it("reports ALL missing files across all components in a single aggregated error", () => {
+      const files = [
+        makeFile("app/page.tsx", VALID_TSX),
+        makeFile(
+          "components/a.tsx",
+          `import X from "@/components/missing-x"\nexport default function A() { return <X />; }`
+        ),
+        makeFile(
+          "components/b.tsx",
+          `import Y from "./missing-y"\nexport default function B() { return <Y />; }`
+        ),
+      ];
+      let error: V0OutputValidationError | undefined;
+      try {
+        validateV0Output(files);
+      } catch (e) {
+        error = e as V0OutputValidationError;
+      }
+      expect(error).toBeInstanceOf(V0OutputValidationError);
+      expect(error!.message).toContain("components/a.tsx");
+      expect(error!.message).toContain('"@/components/missing-x"');
+      expect(error!.message).toContain("components/b.tsx");
+      expect(error!.message).toContain('"./missing-y"');
+    });
+
+    // Direct unit tests of the pure resolution helper — the resolution logic is the
+    // false-positive-prone part, so it is verified in isolation from the throw trigger.
+    describe("collectMissingInternalImports (resolution logic)", () => {
+      const mk = (path: string, content: string) => ({ path, content: Buffer.from(content) });
+
+      it("returns the exact missing (path, specifier) for a dangling @/ import", () => {
+        const result = collectMissingInternalImports([
+          mk("components/compare-page.tsx", `import T from "@/components/compare-table"`),
+        ]);
+        expect(result).toEqual([
+          { path: "components/compare-page.tsx", specifier: "@/components/compare-table" },
+        ]);
+      });
+
+      it("returns empty when every relative/@ import resolves", () => {
+        const result = collectMissingInternalImports([
+          mk("app/page.tsx", `import H from "@/components/hero"\nimport B from "./page-bits"`),
+          mk("components/hero.tsx", `export default function H() { return null; }`),
+          mk("app/page-bits.ts", `export default 1;`),
+        ]);
+        expect(result).toEqual([]);
+      });
+
+      it("ignores content inside comments and template literals", () => {
+        const result = collectMissingInternalImports([
+          mk(
+            "app/page.tsx",
+            `// import Ghost from "@/components/ghost"\nconst s = \`import Ghost from "@/components/ghost"\`;\nexport default function P() { return null; }`
+          ),
+        ]);
+        expect(result).toEqual([]);
+      });
+
+      it("resolves a relative import against the importing file's own directory", () => {
+        // "./bar" from components/foo.tsx means components/bar — present, so NOT missing.
+        expect(
+          collectMissingInternalImports([
+            mk("components/foo.tsx", `import Bar from "./bar"`),
+            mk("components/bar.tsx", `export default function Bar() { return null; }`),
+          ])
+        ).toEqual([]);
+        // ...but the same specifier from app/foo.tsx means app/bar — absent, so missing.
+        expect(
+          collectMissingInternalImports([mk("app/foo.tsx", `import Bar from "./bar"`)])
+        ).toEqual([{ path: "app/foo.tsx", specifier: "./bar" }]);
+      });
+
+      it("flags a MISSING dynamic import (await import(...))", () => {
+        // DYNAMIC_IMPORT_PATTERN is scanned too — a dangling `await import("@/...")` is just
+        // as unresolvable at build time as a static one.
+        const result = collectMissingInternalImports([
+          mk(
+            "app/page.tsx",
+            `export default async function P() { const m = await import("@/components/missing-dynamic"); return m; }`
+          ),
+        ]);
+        expect(result).toEqual([
+          { path: "app/page.tsx", specifier: "@/components/missing-dynamic" },
+        ]);
+      });
+
+      it("scans a .ts (non-.tsx) importer for dangling imports", () => {
+        // Both extensions are scanned — a plain .ts module with a dangling relative/@ import
+        // fails the build the same way a .tsx one does.
+        const result = collectMissingInternalImports([
+          mk(
+            "lib/data.ts",
+            `import { helper } from "./helpers"\nimport C from "@/components/gone"\nexport const x = helper;`
+          ),
+        ]);
+        expect(result).toEqual([
+          { path: "lib/data.ts", specifier: "./helpers" },
+          { path: "lib/data.ts", specifier: "@/components/gone" },
+        ]);
+      });
+    });
+  });
 });
 
 describe("V0OutputValidationError", () => {
@@ -2907,6 +3409,305 @@ describe("V0OutputValidationError", () => {
     expect(err.name).toBe("V0OutputValidationError");
     expect(err.reason).toBe("test reason");
     expect(err.message).toContain("test reason");
+  });
+});
+
+// =============================================================================
+// ENG-467: incomplete "synthetic stub" page (deploys blank but for the top bar)
+// =============================================================================
+describe("v0Service - incomplete synthetic page check (ENG-467)", () => {
+  const f = (path: string, content: string) => ({ path, content: Buffer.from(content) });
+
+  const NAVBAR = `export default function NavBar() {
+    return <header><nav><a href="#">FocusFlow</a></nav></header>;
+  }`;
+  const HERO = `import ProductMockup from "./ProductMockup";
+  export default function Hero() {
+    return <section><h1>Do your best work</h1><ProductMockup /></section>;
+  }`;
+  const PRODUCT_MOCKUP = `export default function ProductMockup() {
+    return <div className="mockup">screenshot</div>;
+  }`;
+  const THEME_PROVIDER = `export default function ThemeProvider({ children }: { children: React.ReactNode }) {
+    return <>{children}</>;
+  }`;
+
+  // The exact live repro (ENG-467): app/page.tsx is a SyntheticV0PageForDeployment stub that
+  // renders only <NavBar/>, orphaning the Hero + ProductMockup it generated.
+  const reproFiles = () => [
+    f("app/page.tsx", `"use client"\nimport NavBar from "@/components/focusflow/NavBar";\nexport default function SyntheticV0PageForDeployment() {\n  return <NavBar />;\n}`),
+    f("components/focusflow/NavBar.tsx", NAVBAR),
+    f("components/focusflow/Hero.tsx", HERO),
+    f("components/focusflow/ProductMockup.tsx", PRODUCT_MOCKUP),
+    f("components/theme-provider.tsx", THEME_PROVIDER),
+  ];
+
+  describe("detectIncompleteSyntheticPage (detection logic)", () => {
+    it("FAIL: flags the synthetic stub and lists orphaned SECTION components", () => {
+      const result = detectIncompleteSyntheticPage(reproFiles());
+      expect(result).not.toBeNull();
+      expect(result!.entryPath).toBe("app/page.tsx");
+      // Hero + ProductMockup are orphaned sections; theme-provider is excluded (provider).
+      expect(result!.orphaned.sort()).toEqual([
+        "components/focusflow/Hero.tsx",
+        "components/focusflow/ProductMockup.tsx",
+      ]);
+    });
+
+    it("FAIL: resolves a RELATIVE nav import too (not just the @/ alias)", () => {
+      const files = [
+        f("app/page.tsx", `import NavBar from "./_nav/NavBar";\nexport default function SyntheticV0PageForDeployment() { return <NavBar />; }`),
+        f("app/_nav/NavBar.tsx", NAVBAR),
+        f("components/hero.tsx", `export default function Hero() { return <section><h1>Hi there friend</h1></section>; }`),
+      ];
+      const result = detectIncompleteSyntheticPage(files);
+      expect(result).not.toBeNull();
+      expect(result!.orphaned).toEqual(["components/hero.tsx"]);
+    });
+
+    it("FAIL: lists EVERY orphaned section so one correction can name them all", () => {
+      const files = [
+        f("app/page.tsx", `import NavBar from "@/components/navbar";\nexport default function SyntheticV0PageForDeployment() { return <NavBar />; }`),
+        f("components/navbar.tsx", NAVBAR),
+        f("components/hero.tsx", `export default function Hero() { return <section><h1>Focus deeply</h1></section>; }`),
+        f("components/features.tsx", `export default function Features() { return <section><h2>Features here</h2></section>; }`),
+        f("components/pricing.tsx", `export default function Pricing() { return <section><h2>Pricing here</h2></section>; }`),
+      ];
+      const result = detectIncompleteSyntheticPage(files);
+      expect(result!.orphaned.sort()).toEqual([
+        "components/features.tsx",
+        "components/hero.tsx",
+        "components/pricing.tsx",
+      ]);
+    });
+
+    it("PASS (control): a real composed page (not a synthetic stub) is never examined", () => {
+      const files = [
+        f("app/page.tsx", `import NavBar from "@/components/navbar";\nimport Hero from "@/components/hero";\nexport default function Home() { return <main><NavBar /><Hero /></main>; }`),
+        f("components/navbar.tsx", NAVBAR),
+        f("components/hero.tsx", `export default function Hero() { return <section><h1>Hello world here</h1></section>; }`),
+        // A stray unused component must NOT trip the check when the page is legitimately named.
+        f("components/unused-banner.tsx", `export default function Banner() { return <div>promo banner</div>; }`),
+      ];
+      expect(detectIncompleteSyntheticPage(files)).toBeNull();
+    });
+
+    it("PASS (control): synthetic stub that renders ONE component composing the whole page — no orphans", () => {
+      const files = [
+        f("app/page.tsx", `import LandingPage from "@/components/landing-page";\nexport default function SyntheticV0PageForDeployment() { return <LandingPage />; }`),
+        f("components/landing-page.tsx", `import Hero from "./hero";\nimport Features from "./features";\nexport default function LandingPage() { return <main><Hero /><Features /></main>; }`),
+        f("components/hero.tsx", `export default function Hero() { return <section><h1>Deep work daily</h1></section>; }`),
+        f("components/features.tsx", `export default function Features() { return <section><h2>Great features</h2></section>; }`),
+      ];
+      expect(detectIncompleteSyntheticPage(files)).toBeNull();
+    });
+
+    it("PASS (control): synthetic stub with only a provider/util orphaned is not flagged", () => {
+      const files = [
+        f("app/page.tsx", `import NavBar from "@/components/navbar";\nexport default function SyntheticV0PageForDeployment() { return <NavBar />; }`),
+        f("components/navbar.tsx", NAVBAR),
+        f("components/theme-provider.tsx", THEME_PROVIDER),
+        f("lib/utils.ts", `export function cn(...a: string[]) { return a.join(" "); }`),
+      ];
+      expect(detectIncompleteSyntheticPage(files)).toBeNull();
+    });
+
+    it("PASS (control): no app/page.tsx entry → cannot judge, returns null", () => {
+      const files = [
+        f("components/hero.tsx", `export default function Hero() { return <section><h1>Orphan hero here</h1></section>; }`),
+      ];
+      expect(detectIncompleteSyntheticPage(files)).toBeNull();
+    });
+  });
+
+  describe("validateV0Output wiring (check 8)", () => {
+    it("FAIL: throws V0OutputValidationError naming the orphaned sections", () => {
+      expect(() => validateV0Output(reproFiles())).toThrow(V0OutputValidationError);
+      expect(() => validateV0Output(reproFiles())).toThrow(/SyntheticV0PageForDeployment/);
+      expect(() => validateV0Output(reproFiles())).toThrow(/Hero\.tsx/);
+    });
+
+    it("PASS: a fully-composed page deploys without a correction round", () => {
+      const files = [
+        f("app/page.tsx", `import NavBar from "@/components/navbar";\nimport Hero from "@/components/hero";\nexport default function Home() { return <main><NavBar /><Hero /></main>; }`),
+        f("components/navbar.tsx", NAVBAR),
+        f("components/hero.tsx", `export default function Hero() { return <section><h1>Hello world here</h1></section>; }`),
+      ];
+      expect(() => validateV0Output(files)).not.toThrow();
+    });
+  });
+});
+
+// =============================================================================
+// ENG-384/467 follow-up: deterministic repair of v0's mis-rooted relative imports
+// =============================================================================
+describe("v0Service - repairMisrootedImports", () => {
+  const f = (path: string, content: string) => ({ path, content: Buffer.from(content) });
+  const imp = (files: Array<{ path: string; content: Buffer }>, path: string) =>
+    files.find((x) => x.path === path)!.content.toString().split("\n").filter((l) => l.includes("import") || l.includes("from")).join(" | ");
+
+  it("REPAIR: sub-page nested sibling — ./landing/LeadCaptureForm -> ./LeadCaptureForm", () => {
+    const files = [
+      f("app/x/_components/landing/FinalCTA.tsx", `import LeadCaptureForm from "./landing/LeadCaptureForm";\nexport default function FinalCTA(){return <LeadCaptureForm/>;}`),
+      f("app/x/_components/landing/LeadCaptureForm.tsx", `export default function LeadCaptureForm(){return <form/>;}`),
+    ];
+    const n = repairMisrootedImports(files);
+    expect(n).toBe(1);
+    expect(imp(files, "app/x/_components/landing/FinalCTA.tsx")).toContain('"./LeadCaptureForm"');
+    // and it now actually resolves
+    expect(collectMissingInternalImports(files)).toEqual([]);
+  });
+
+  it("REPAIR: sub-page nested sibling — ./landing/Mockup -> ./Mockup", () => {
+    const files = [
+      f("app/x/_components/landing/Hero.tsx", `import Mockup from "./landing/Mockup";\nexport default function Hero(){return <Mockup/>;}`),
+      f("app/x/_components/landing/Mockup.tsx", `export default function Mockup(){return <div/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(1);
+    expect(imp(files, "app/x/_components/landing/Hero.tsx")).toContain('"./Mockup"');
+  });
+
+  it("REPAIR: first-page shape (components/landing/*) too", () => {
+    const files = [
+      f("components/landing/FinalCTA.tsx", `import LeadCaptureForm from "./landing/LeadCaptureForm";\nexport default function FinalCTA(){return <LeadCaptureForm/>;}`),
+      f("components/landing/LeadCaptureForm.tsx", `export default function LeadCaptureForm(){return <form/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(1);
+    expect(imp(files, "components/landing/FinalCTA.tsx")).toContain('"./LeadCaptureForm"');
+  });
+
+  it("REPAIR: re-export form (export ... from) in an index barrel", () => {
+    const files = [
+      f("app/x/_components/landing/index.ts", `export { default as Nav } from "./landing/Nav";\nexport { default as Hero } from "./landing/Hero";`),
+      f("app/x/_components/landing/Nav.tsx", `export default function Nav(){return <nav/>;}`),
+      f("app/x/_components/landing/Hero.tsx", `export default function Hero(){return <section/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(2);
+    expect(imp(files, "app/x/_components/landing/index.ts")).toContain('"./Nav"');
+    expect(imp(files, "app/x/_components/landing/index.ts")).toContain('"./Hero"');
+  });
+
+  it("NO-OP: a correct sibling import is left untouched", () => {
+    const files = [
+      f("app/x/_components/landing/FinalCTA.tsx", `import LeadCaptureForm from "./LeadCaptureForm";\nexport default function FinalCTA(){return <LeadCaptureForm/>;}`),
+      f("app/x/_components/landing/LeadCaptureForm.tsx", `export default function LeadCaptureForm(){return <form/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0);
+    expect(imp(files, "app/x/_components/landing/FinalCTA.tsx")).toContain('"./LeadCaptureForm"');
+  });
+
+  it("NO-OP: a genuinely missing file is NOT invented (stays for check 7)", () => {
+    const files = [
+      f("app/x/_components/landing/Hero.tsx", `import Ghost from "./landing/Ghost";\nexport default function Hero(){return <Ghost/>;}`),
+      f("app/x/_components/landing/Nav.tsx", `export default function Nav(){return <nav/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0);
+    expect(imp(files, "app/x/_components/landing/Hero.tsx")).toContain('"./landing/Ghost"');
+    // and check 7 still flags it
+    expect(collectMissingInternalImports(files).some((m) => m.specifier === "./landing/Ghost")).toBe(true);
+  });
+
+  it("NO-OP: ambiguous basename (two matches in scope) is left untouched", () => {
+    const files = [
+      f("app/x/_components/landing/A.tsx", `import Card from "./landing/Card";\nexport default function A(){return <Card/>;}`),
+      f("app/x/_components/landing/Card.tsx", `export default function Card(){return <div/>;}`),
+      f("app/x/_components/landing/sub/Card.tsx", `export default function Card(){return <div/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0);
+    expect(imp(files, "app/x/_components/landing/A.tsx")).toContain('"./landing/Card"');
+  });
+
+  it("NO-OP: legit root-repo @/ refs (ui, lib/utils) are preserved", () => {
+    const files = [
+      f("app/x/_components/landing/Hero.tsx", `import { Button } from "@/components/ui/button";\nimport { cn } from "@/lib/utils";\nexport default function Hero(){return <Button className={cn()}/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0);
+    expect(imp(files, "app/x/_components/landing/Hero.tsx")).toContain('"@/components/ui/button"');
+    expect(imp(files, "app/x/_components/landing/Hero.tsx")).toContain('"@/lib/utils"');
+  });
+
+  it("REPAIR: mangled @/ from remap step-0 (@/components/landing/landing/Mockup -> ./Mockup)", () => {
+    // The sub-page remap's step-0 turns v0's bad `./landing/Mockup` into this @/ form; it points
+    // at a repo-root path that doesn't exist, so it must be repaired to the real sibling.
+    const files = [
+      f("app/x/_components/landing/Hero.tsx", `import Mockup from "@/components/landing/landing/Mockup";\nexport default function Hero(){return <Mockup/>;}`),
+      f("app/x/_components/landing/Mockup.tsx", `export default function Mockup(){return <div/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(1);
+    expect(imp(files, "app/x/_components/landing/Hero.tsx")).toContain('"./Mockup"');
+    expect(collectMissingInternalImports(files)).toEqual([]);
+  });
+
+  it("NO-OP: does not repair across component subtrees (won't grab a lib/ file)", () => {
+    const files = [
+      f("app/x/_components/landing/Hero.tsx", `import { cn } from "./utils";\nexport default function Hero(){return <div className={cn()}/>;}`),
+      f("lib/utils.ts", `export function cn(){return "";}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0);
+    expect(imp(files, "app/x/_components/landing/Hero.tsx")).toContain('"./utils"');
+  });
+
+  it("INTEGRATION: remap output with v0's mis-rooted imports fully resolves after repair", () => {
+    // Raw v0 layout: page composes nested landing/ components; Hero & FinalCTA use v0's bad
+    // `./landing/X` sibling imports. After remap + repair, nothing should be unresolved.
+    const raw = [
+      f("app/page.tsx", `import { Hero } from "@/components/landing/Hero";\nimport { FinalCTA } from "@/components/landing/FinalCTA";\nexport default function Page(){return <main><Hero/><FinalCTA/></main>;}`),
+      f("components/landing/Hero.tsx", `import Mockup from "./landing/Mockup";\nexport function Hero(){return <Mockup/>;}`),
+      f("components/landing/Mockup.tsx", `export default function Mockup(){return <div/>;}`),
+      f("components/landing/FinalCTA.tsx", `import LeadCaptureForm from "./landing/LeadCaptureForm";\nexport function FinalCTA(){return <LeadCaptureForm/>;}`),
+      f("components/landing/LeadCaptureForm.tsx", `export default function LeadCaptureForm(){return <form/>;}`),
+    ];
+    const committed = remapFilesForSubPage(raw, "quiet", "Quiet");
+    repairMisrootedImports(committed);
+    // Every internal import in the committed set now resolves (no Module-not-found at build).
+    expect(collectMissingInternalImports(committed)).toEqual([]);
+  });
+
+  it("ORDERING: repair before validate lets check 7 pass on a mis-rooted import", () => {
+    // The caller runs repair BEFORE validateV0Output; otherwise check 7 rejects the mis-rooted
+    // import and the flaky v0 self-heal runs instead of this deterministic fix.
+    const raw = () => [
+      f("app/page.tsx", `import { Hero } from "@/components/landing/Hero";\nexport default function Page(){return <Hero/>;}`),
+      f("components/landing/Hero.tsx", `import Mockup from "./landing/Mockup";\nexport function Hero(){return <Mockup/>;}`),
+      f("components/landing/Mockup.tsx", `export default function Mockup(){return <div/>;}`),
+    ];
+    // Without repair, check 7 rejects it.
+    expect(() => validateV0Output(raw())).toThrow(V0OutputValidationError);
+    // With repair first, validation passes.
+    const repaired = raw();
+    expect(repairMisrootedImports(repaired)).toBe(1);
+    expect(() => validateV0Output(repaired)).not.toThrow();
+  });
+
+  it("REPAIR (bare): v0's prefix-less `landing/Nav` -> @/components/landing/Nav", () => {
+    // v0 sometimes drops the prefix entirely; the spec looks like a package but isn't.
+    const files = [
+      f("app/page.tsx", `"use client"\nimport { Nav } from "landing/Nav";\nexport default function Page(){return <Nav/>;}`),
+      f("components/landing/Nav.tsx", `export function Nav(){return <nav/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(1);
+    expect(imp(files, "app/page.tsx")).toContain('"@/components/landing/Nav"');
+    expect(collectMissingInternalImports(files)).toEqual([]);
+  });
+
+  it("NO-OP (bare): real npm packages are never touched", () => {
+    const files = [
+      f("app/page.tsx", `import Image from "next/image";\nimport { Star } from "lucide-react";\nimport * as React from "react";\nimport { Slot } from "@radix-ui/react-slot";\nexport default function Page(){return <Image/>;}`),
+      f("components/landing/Nav.tsx", `export function Nav(){return <nav/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0);
+    const line = imp(files, "app/page.tsx");
+    expect(line).toContain('"next/image"');
+    expect(line).toContain('"lucide-react"');
+    expect(line).toContain('"@radix-ui/react-slot"');
+  });
+
+  it("ORDERING: a genuinely-missing file still trips check 7 even after repair", () => {
+    const files = [
+      f("app/page.tsx", `import Compare from "@/components/compare-table";\nexport default function Page(){return <Compare/>;}`),
+    ];
+    expect(repairMisrootedImports(files)).toBe(0); // nothing to repair to
+    expect(() => validateV0Output(files)).toThrow(/not generated/);
   });
 });
 
@@ -3370,6 +4171,20 @@ describe("v0Service - remapFilesForSubPage", () => {
     expect(result[0].path).toBe("app/test/page.tsx");
   });
 
+  // ENG-449 follow-up: if v0 ever authors its own copy of the platform-owned tracking
+  // helper for a sub-page (rather than just importing it, per the updated prompt
+  // instruction), it must be dropped here — same defense as lib/utils.ts above — so the
+  // platform's own version (injected/synced separately) stays authoritative.
+  it("skips a v0-authored lib/agentweb-track.ts", () => {
+    const files = [
+      { path: "lib/agentweb-track.ts", content: buf('// v0-authored fake tracking helper') },
+      { path: "app/page.tsx", content: buf('export default function Page() { return <div/>; }') },
+    ];
+    const result = remapFilesForSubPage(files, "test");
+    expect(result).toHaveLength(1);
+    expect(result[0].path).toBe("app/test/page.tsx");
+  });
+
   it("moves custom components to app/<slug>/_components/ and rewrites imports", () => {
     const pageContent = `import { Hero } from "@/components/hero";\nimport { Footer } from "@/components/footer";\nexport default function Page() { return <><Hero/><Footer/></>; }`;
     const files = [
@@ -3647,6 +4462,13 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     mockQuery.mockReturnValueOnce({
       promise: () => Promise.resolve({ Items: [existingSiteRecord] }),
     });
+    // ENG-478: findUserSiteRecord now verifies its GSI-selected candidate with a
+    // strongly-consistent GetItem by primary key. This file's shared mockGet
+    // defaults to `{Item: null}` (used elsewhere for unrelated lookups), which would
+    // make every test here see "no site found" unless paired explicitly.
+    mockGet.mockReturnValueOnce({
+      promise: () => Promise.resolve({ Item: existingSiteRecord }),
+    });
   };
 
   // Setup: mock v0 chat creation, polling, and zip download
@@ -3661,7 +4483,13 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
   };
 
   // Setup: mock GitHub API (repair scan, ref, blob, tree, commit, patch)
-  const setupGitHubMocks = () => {
+  // `extraBlobs`: mockAxiosPost is a plain sequential mockResolvedValueOnce queue (not
+  // URL-matched), so every POST call — blob, tree, or commit — consumes the next queued
+  // entry regardless of which one it "means" to be. When lib/agentweb-track.ts also rides in
+  // the page's own commit (ENG-449 follow-up: only when leadListId && (metaPixelId ||
+  // bridgeOutUrl)), that's a 2nd blob upload that MUST be queued between the page's own blob
+  // and the tree/commit mocks, or the tree call would wrongly consume a blob-shaped response.
+  const setupGitHubMocks = (extraBlobs: number = 0) => {
     // GET git/trees/main?recursive=1 — the poisoned-import repair scan runs first.
     // An empty tree means a healthy repo: nothing to scan, nothing to repair, no extra reads.
     mockAxiosGet.mockResolvedValueOnce({ data: { tree: [] } });
@@ -3673,6 +4501,9 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     mockAxiosPost.mockResolvedValueOnce({
       data: { sha: "blob_sha" },
     });
+    for (let i = 0; i < extraBlobs; i++) {
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: `blob_sha_extra_${i}` } });
+    }
     // POST tree
     mockAxiosPost.mockResolvedValueOnce({
       data: { sha: "tree_sha" },
@@ -3995,7 +4826,12 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     // 1 repair-scan tree listing + 1 GitHub ref + 2 Vercel polls.
     // The tree listing is the whole cost of the poisoned-import scan on a healthy repo:
     // an empty/clean tree yields no candidates, so no file contents are ever read.
-    expect(mockAxiosGet).toHaveBeenCalledTimes(4);
+    // Plus 4 more (ENG-483 + ENG-449 follow-up): the post-deploy capture-route sync reads
+    // middleware.ts, app/api/capture/route.ts, domainMap.ts, and lib/agentweb-track.ts to
+    // decide whether anything needs updating/backfilling. No mock is queued for them here,
+    // so all 4 reject and the sync gives up silently (never blocking the deploy) — still 4
+    // real GET attempts.
+    expect(mockAxiosGet).toHaveBeenCalledTimes(8);
   });
 
   it("SUCCESS: sub-page deployedUrl uses customDomainUrl as base when existingPage has one", async () => {
@@ -4006,6 +4842,9 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     };
     mockQuery.mockReturnValueOnce({
       promise: () => Promise.resolve({ Items: [siteWithCustomDomain] }),
+    });
+    mockGet.mockReturnValueOnce({
+      promise: () => Promise.resolve({ Item: siteWithCustomDomain }),
     });
     await setupV0Mocks();
     setupGitHubMocks();
@@ -4021,6 +4860,474 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     expect(result.status).toBe("deployed");
     expect(result.deployedUrl).toContain("https://my-brand.agentwebforms.com/");
     expect(result.deployedUrl).not.toContain("vercel.app");
+  });
+
+  // ENG-483: addPageToExistingRepo used to push only the new page's own files, never
+  // updating the shared app/api/capture/route.ts LIST_BY_PATH map — so a new sub-page's
+  // lead form 422'd forever until an unrelated GTM/Pixel override happened to resync it.
+  describe("ENG-483: sub-page registered in shared capture route", () => {
+    // Sync's own GitHub calls, run AFTER the page's own commit + Vercel poll succeed:
+    // Promise.all([middleware.ts, capture route, domainMap.ts, lib/agentweb-track.ts]) reads,
+    // then (if different) a ref read, a blob per changed file, a tree, a commit, and a ref patch.
+    const setupCaptureRouteSyncMocks = (existingCaptureRouteContent: string) => {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from("stale middleware").toString("base64") },
+      }); // middleware.ts (deliberately stale so the sync always proceeds to commit)
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from(existingCaptureRouteContent).toString("base64") },
+      }); // app/api/capture/route.ts
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from("{}").toString("base64") },
+      }); // domainMap.ts (already exists)
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from(buildTrackingHelper()).toString("base64") },
+      }); // lib/agentweb-track.ts (already up to date — only the capture-route staleness above forces the commit)
+      mockAxiosGet.mockResolvedValueOnce({ data: { object: { sha: "sync_base_sha" } } }); // ref/heads/main
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_middleware" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_capture_route" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_tracking_helper" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "sync_tree_sha" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "sync_commit_sha" } });
+      mockAxiosPatch.mockResolvedValueOnce({ data: {} }); // ref update
+    };
+
+    const committedCaptureRouteContent = (): string | undefined =>
+      mockAxiosPost.mock.calls
+        .filter((c) => typeof c[0] === "string" && c[0].includes("/git/blobs"))
+        .map((c) => Buffer.from(c[1].content, "base64").toString("utf8"))
+        .find((content) => content.includes("LIST_BY_PATH"));
+
+    it("SUCCESS: new sub-page's path + an existing sibling's path both land in the committed LIST_BY_PATH", async () => {
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      // findReusablePageForRoute's own listLandingPages query runs BEFORE
+      // addPageToExistingRepo — must be satisfied first so it doesn't consume the
+      // siblings mock meant for this fix's own getLandingPagesByOwner call.
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Items: [
+              existingSiteRecord,
+              {
+                id: "sibling-1",
+                userId: "user-1",
+                githubRepoUrl: existingSiteRecord.githubRepoUrl,
+                slug: "features",
+                leadListId: "list_features",
+              },
+            ],
+          }),
+      });
+      setupCaptureRouteSyncMocks('const LIST_BY_PATH: Record<string, string> = {"/features":"list_features"};');
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create pricing page with a lead form",
+        "Pricing",
+        {},
+        "list_pricing"
+      );
+
+      expect(result.status).toBe("deployed");
+      const capturedContent = committedCaptureRouteContent();
+      expect(capturedContent).toBeDefined();
+      expect(capturedContent).toContain('"/pricing": "list_pricing"');
+      expect(capturedContent).toContain('"/features": "list_features"');
+    });
+
+    it("SUCCESS: new sub-page has no leadListId → sync still commits siblings, new page's own path stays absent", async () => {
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () =>
+          Promise.resolve({
+            Items: [
+              existingSiteRecord,
+              {
+                id: "sibling-1",
+                userId: "user-1",
+                githubRepoUrl: existingSiteRecord.githubRepoUrl,
+                slug: "features",
+                leadListId: "list_features",
+              },
+            ],
+          }),
+      });
+      setupCaptureRouteSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create an about page",
+        "About Page",
+        {}
+        // no leadListId
+      );
+
+      expect(result.status).toBe("deployed");
+      const capturedContent = committedCaptureRouteContent();
+      expect(capturedContent).toBeDefined();
+      expect(capturedContent).toContain('"/features": "list_features"');
+      expect(capturedContent).not.toContain("/about-page");
+    });
+
+    it("FAIL: sibling lookup (getLandingPagesByOwner) throws → page still deploys, error only logged", async () => {
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.reject(new Error("DynamoDB unavailable")),
+      });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a newsletter signup page",
+        "Newsletter",
+        {},
+        "list_newsletter"
+      );
+
+      expect(result.status).toBe("deployed");
+    });
+
+    it("FAIL: capture-route sync's own GitHub read fails → page still deploys, error only logged", async () => {
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Items: [existingSiteRecord] }),
+      });
+      // middleware.ts read fails with a non-404 error inside the Promise.all —
+      // syncLeadCaptureFilesToRepo must swallow this, not let it escape.
+      mockAxiosGet.mockRejectedValueOnce(new Error("GitHub 500"));
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from("const LIST_BY_PATH = {};").toString("base64") },
+      });
+      mockAxiosGet.mockResolvedValueOnce({ data: { content: Buffer.from("{}").toString("base64") } });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a contact page",
+        "Contact",
+        {},
+        "list_contact"
+      );
+
+      expect(result.status).toBe("deployed");
+    });
+
+    // The sync build's Vercel poll is fire-and-forget (never awaited by
+    // addPageToExistingRepo — see the "bulk sub-page add" latency note at its call
+    // site), so these two tests must drain it explicitly before asserting, or its
+    // queued mocks would leak into whichever test runs next.
+    const flushFireAndForgetPoll = () => new Promise((r) => setTimeout(r, 20));
+
+    it("SUCCESS: capture-route sync commit's own Vercel build is polled (fire-and-forget) and confirmed READY", async () => {
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [existingSiteRecord] }) });
+      setupCaptureRouteSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+      // The sync's own Vercel poll — matches sync_commit_sha, the sha
+      // setupCaptureRouteSyncMocks' commit POST returns.
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          deployments: [
+            { uid: "dpl_sync", readyState: "READY", meta: { githubCommitSha: "sync_commit_sha" } },
+          ],
+        },
+      });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a careers page",
+        "Careers",
+        {},
+        "list_careers"
+      );
+
+      // generateLandingPage resolves WITHOUT waiting for the sync poll — proves it's
+      // genuinely non-blocking, not just fast in this test's 0ms-interval config.
+      expect(result.status).toBe("deployed");
+
+      await flushFireAndForgetPoll();
+      const loggedSyncBuildIssue = [...warnSpy.mock.calls, ...errorSpy.mock.calls].some((call) =>
+        String(call[0]).includes("ENG-483: capture-route sync build")
+      );
+      expect(loggedSyncBuildIssue).toBe(false);
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it("FAIL: capture-route sync commit's own Vercel build errors (fire-and-forget) → page already deployed, error only logged", async () => {
+      const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      setupSiteRecordMock();
+      await setupV0Mocks();
+      setupGitHubMocks();
+      setupVercelDeploySuccessMock();
+
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [] }) });
+      mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [existingSiteRecord] }) });
+      setupCaptureRouteSyncMocks('const LIST_BY_PATH: Record<string, string> = {};');
+      // Sync's own Vercel poll: build for sync_commit_sha errored.
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { deployments: [{ uid: "dpl_sync_fail", readyState: "ERROR", meta: { githubCommitSha: "sync_commit_sha" } }] },
+      });
+      // getVercelBuildErrors' own log-fetch call
+      mockAxiosGet.mockResolvedValueOnce({
+        data: [{ type: "stderr", payload: { text: "Module not found: @/lib/stale" } }],
+      });
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a team page",
+        "Team",
+        {},
+        "list_team"
+      );
+
+      // The page's OWN content already deployed successfully, and the poll hasn't
+      // even run yet at this point — the sync's build failing must never flip this
+      // page to "failed".
+      expect(result.status).toBe("deployed");
+
+      await flushFireAndForgetPoll();
+      const loggedBuildFailure = errorSpy.mock.calls.some(
+        (call) =>
+          String(call[0]).includes("ENG-483: capture-route sync build FAILED") &&
+          String(call[0]).includes("Module not found: @/lib/stale")
+      );
+      expect(loggedBuildFailure).toBe(true);
+      errorSpy.mockRestore();
+    });
+  });
+
+  // ENG-482: validatePixelLeadEvent used to run on `previewFiles` — v0's raw,
+  // unfiltered zip — while the files actually committed are `filesToCommit`, produced
+  // by a LATER, separate remapFilesForSubPage() call with its own skip-list (drops
+  // app/layout.tsx, lib/utils.ts, etc.). A file that satisfies the fbq('track','Lead')
+  // regex in the raw zip but gets dropped by that skip-list made pixelLeadEventVerified
+  // a false positive: the platform believed Lead tracking worked on a page whose
+  // deployed code could never fire it. Live-repro'd against a real generated sub-page
+  // whose only "hit" was v0's own scaffold app/layout.tsx, which remapFilesForSubPage
+  // always drops (the real, already-injected layout already lives in the target repo).
+  describe("ENG-482: pixel Lead-event validation must check the file set that actually ships", () => {
+    const existingSiteWithPixel = {
+      ...existingSiteRecord,
+      metaPixelId: "1012387921717047",
+    };
+
+    const setupSiteRecordWithPixelMock = () => {
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Items: [existingSiteWithPixel] }),
+      });
+      mockGet.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Item: existingSiteWithPixel }),
+      });
+    };
+
+    /** v0's raw zip: the real form component has NO fbq call, but v0's own scaffold
+     *  app/layout.tsx (always dropped by remapFilesForSubPage) happens to contain one —
+     *  exactly the false-positive mechanism the live repro found. */
+    const createZipWithFbqOnlyInLayout = async () => {
+      const AdmZip = (await import("adm-zip")).default;
+      const zip = new AdmZip();
+      zip.addFile(
+        "app/page.tsx",
+        Buffer.from('export default function Page() { return <div>No form here</div>; }')
+      );
+      zip.addFile(
+        "app/layout.tsx",
+        Buffer.from(
+          `export default function RootLayout({ children }: { children: React.ReactNode }) {
+             return <html><body>{children}<script>fbq('track', 'Lead');</script></body></html>;
+           }`
+        )
+      );
+      return zip.toBuffer();
+    };
+
+    it("SUCCESS: exhausts retries and correctly reports pixelLeadEventVerified:false when the only fbq match is in a file remapFilesForSubPage drops", async () => {
+      setupSiteRecordWithPixelMock();
+
+      const buggyZip = await createZipWithFbqOnlyInLayout();
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      // Initial version + 2 correction-round versions — all download the SAME
+      // buggy zip, so validation fails identically on every attempt.
+      mockChatsGetById
+        .mockResolvedValueOnce({ latestVersion: { id: "v1" } })
+        .mockResolvedValueOnce({ latestVersion: { id: "v2" } })
+        .mockResolvedValueOnce({ latestVersion: { id: "v3" } });
+      mockChatsDownloadVersion
+        .mockResolvedValueOnce(buggyZip)
+        .mockResolvedValueOnce(buggyZip)
+        .mockResolvedValueOnce(buggyZip);
+      mockChatsSendMessage.mockResolvedValue({});
+
+      setupGitHubMocks(1);
+      setupVercelDeploySuccessMock();
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a signup page",
+        "Signup Page",
+        {},
+        "list_signup"
+      );
+
+      // Never fails generation over a missing client-side event (AC3) — the page
+      // itself is fine, this is purely a tracking-completeness signal.
+      expect(result.status).toBe("deployed");
+      // 2 correction messages sent (both retry attempts exhausted, not just detected once).
+      expect(mockChatsSendMessage).toHaveBeenCalledTimes(2);
+      expect(result.pixelLeadEventVerified).toBe(false);
+    });
+
+    it("SUCCESS: reports pixelLeadEventVerified:true when the fbq call is in the file that actually ships (app/page.tsx)", async () => {
+      setupSiteRecordWithPixelMock();
+      const AdmZip = (await import("adm-zip")).default;
+      const zip = new AdmZip();
+      zip.addFile(
+        "app/page.tsx",
+        Buffer.from(
+          `export default function Page() { return <button onClick={() => window.fbq && window.fbq('track', 'Lead')}>Submit</button>; }`
+        )
+      );
+      const goodZip = zip.toBuffer();
+
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "v1" } });
+      mockChatsDownloadVersion.mockResolvedValueOnce(goodZip);
+
+      setupGitHubMocks(1);
+      setupVercelDeploySuccessMock();
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a signup page",
+        "Signup Page 2",
+        {},
+        "list_signup2"
+      );
+
+      expect(result.status).toBe("deployed");
+      expect(mockChatsSendMessage).not.toHaveBeenCalled();
+      expect(result.pixelLeadEventVerified).toBe(true);
+    });
+  });
+
+  // ENG-449 (Harsha's bridge-out requirement): validateBridgeOutRedirect mirrors
+  // validatePixelLeadEvent's "verify not guarantee" contract — exhausted retries never
+  // fail generation, they just record bridgeOutVerified:false on the record.
+  describe("bridge-out redirect validation (ENG-449, mirrors ENG-482's pixel Lead-event checks)", () => {
+    const BRIDGE_URL = "https://rankai.ai/book-a-call";
+
+    const existingSiteWithBridgeOut = {
+      ...existingSiteRecord,
+      bridgeOutUrl: BRIDGE_URL,
+    };
+
+    const setupSiteRecordWithBridgeOutMock = () => {
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Items: [existingSiteWithBridgeOut] }),
+      });
+      mockGet.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Item: existingSiteWithBridgeOut }),
+      });
+    };
+
+    it("SUCCESS: exhausts retries and correctly reports bridgeOutVerified:false when the redirect is missing", async () => {
+      setupSiteRecordWithBridgeOutMock();
+
+      const AdmZip = (await import("adm-zip")).default;
+      const zip = new AdmZip();
+      zip.addFile(
+        "app/page.tsx",
+        Buffer.from('export default function Page() { return <div>No redirect here</div>; }')
+      );
+      const buggyZip = zip.toBuffer();
+
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      mockChatsGetById
+        .mockResolvedValueOnce({ latestVersion: { id: "v1" } })
+        .mockResolvedValueOnce({ latestVersion: { id: "v2" } })
+        .mockResolvedValueOnce({ latestVersion: { id: "v3" } });
+      mockChatsDownloadVersion
+        .mockResolvedValueOnce(buggyZip)
+        .mockResolvedValueOnce(buggyZip)
+        .mockResolvedValueOnce(buggyZip);
+      mockChatsSendMessage.mockResolvedValue({});
+
+      setupGitHubMocks(1);
+      setupVercelDeploySuccessMock();
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a booking page",
+        "Booking Page",
+        {},
+        "list_booking",
+        undefined,
+        { bridgeOutUrl: BRIDGE_URL }
+      );
+
+      // Never fails generation over a missing client-side redirect (same AC3 contract).
+      expect(result.status).toBe("deployed");
+      expect(mockChatsSendMessage).toHaveBeenCalledTimes(2);
+      expect(result.bridgeOutVerified).toBe(false);
+    });
+
+    it("SUCCESS: reports bridgeOutVerified:true when the redirect + email= param are in the file that actually ships", async () => {
+      setupSiteRecordWithBridgeOutMock();
+      const AdmZip = (await import("adm-zip")).default;
+      const zip = new AdmZip();
+      zip.addFile(
+        "app/page.tsx",
+        Buffer.from(
+          `export default function Page() { return <button onClick={() => { window.location.href = \`${BRIDGE_URL}?email=\${encodeURIComponent(email)}\`; }}>Submit</button>; }`
+        )
+      );
+      const goodZip = zip.toBuffer();
+
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "v1" } });
+      mockChatsDownloadVersion.mockResolvedValueOnce(goodZip);
+
+      setupGitHubMocks(1);
+      setupVercelDeploySuccessMock();
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a booking page",
+        "Booking Page 2",
+        {},
+        "list_booking2",
+        undefined,
+        { bridgeOutUrl: BRIDGE_URL }
+      );
+
+      expect(result.status).toBe("deployed");
+      expect(mockChatsSendMessage).not.toHaveBeenCalled();
+      expect(result.bridgeOutVerified).toBe(true);
+    });
   });
 });
 
@@ -4053,6 +5360,9 @@ describe("v0Service - loadDefaultTemplateOutline fallback", () => {
   const setupFullSuccess = async () => {
     const zipBuffer = await createTestZip();
     mockQuery.mockReturnValueOnce({ promise: () => Promise.resolve({ Items: [existingSiteRecord] }) });
+    // ENG-478: findUserSiteRecord verifies its GSI candidate with a strongly-
+    // consistent GetItem — this file's shared mockGet defaults to `{Item: null}`.
+    mockGet.mockReturnValueOnce({ promise: () => Promise.resolve({ Item: existingSiteRecord }) });
     mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
     mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "version_new" } });
     mockChatsDownloadVersion.mockResolvedValueOnce(zipBuffer);

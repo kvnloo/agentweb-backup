@@ -87,7 +87,6 @@ export const onboardingManifest: LoopManifest<NormalizedEvent, LlmAnalystProposa
   sensorImpl: 'onboardingUserSensor',
   rulesetImpl: 'onboardingAnalyst',
   toolsImpl: 'onboardingSpecTool',
-  gateImpl: 'onboardingGate',
   learningImpl: 'onboardingLearning',
   thresholds: {
     promoteLiftPct: 15,

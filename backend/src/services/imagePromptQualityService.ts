@@ -9,8 +9,7 @@
  * meaningful — as "underperformers" the taste team should edit.
  *
  * It does NOT auto-edit prompts. Auto-application of a proposed edit depends
- * on the Slack-reaction approval gate (the loops framework's ApprovalGate is
- * still a no-op CaptureGate today), so this stage surfaces recommendations;
+ * on the Linear/executor review policy, so this stage surfaces recommendations;
  * a human applies them via PUT /api/admin/prompt-templates/:id (or the global
  * directives route). When the approval gate lands, this analyzer is the
  * natural source of the `prompt_edit` proposals.

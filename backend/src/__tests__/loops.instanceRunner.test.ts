@@ -3,11 +3,10 @@
  * register/run choreography extracted from the four loop instance modules.
  * Pins the branches the instance-level tests reach only indirectly:
  * env gating, idempotent registration, custom already-registered checks,
- * registerOnRun:false, and gate draining.
+ * registerOnRun:false, and mutation handoff.
  */
 
 import { _resetRegistryForTesting, getRegisteredLoopIds, getSensor } from '../loops';
-import { CaptureGate } from '../loops/core/gates/captureGate';
 import {
   createInstanceRunner,
   type InstanceLayers,
@@ -15,8 +14,7 @@ import {
 } from '../loops/core/instanceRunner';
 import { runLoop } from '../loops/core/orchestrator';
 import type { LoopPorts } from '../loops/core/ports';
-import type { LoopManifest, LoopRunResult, Mutation } from '../loops/core/types';
-import { asMutationId } from '../loops/core/types';
+import type { LoopManifest, LoopRunResult } from '../loops/core/types';
 
 jest.mock('../loops/core/orchestrator', () => ({
   runLoop: jest.fn(),
@@ -32,7 +30,6 @@ function manifest(over: Partial<LoopManifest> = {}): LoopManifest {
     sensorImpl: 'runnerTestSensor',
     rulesetImpl: 'runnerTestRules',
     toolsImpl: 'runnerTestTools',
-    gateImpl: 'runnerTestGate',
     learningImpl: 'runnerTestLearning',
     approval: { slackUserId: 'U_TEST' },
     ...over,
@@ -40,7 +37,7 @@ function manifest(over: Partial<LoopManifest> = {}): LoopManifest {
 }
 
 function fakeResult(over: Partial<LoopRunResult> = {}): LoopRunResult {
-  return { runId: 'run_runner', eventsScanned: 3, proposals: [], ...over } as unknown as LoopRunResult;
+  return { runId: 'run_runner', eventsScanned: 3, proposals: [], mutations: [], ...over } as unknown as LoopRunResult;
 }
 
 function fakePorts(): LoopPorts {
@@ -62,14 +59,12 @@ function config(over: Partial<InstanceRunnerConfig> = {}): InstanceRunnerConfig 
       sensor: 'runnerTestSensor',
       ruleSet: 'runnerTestRules',
       tools: 'runnerTestTools',
-      gate: 'runnerTestGate',
       learning: 'runnerTestLearning',
     },
     buildLayers: () => ({
       sensor: { fetchEvents: jest.fn().mockResolvedValue([]) },
       ruleSet: { evaluate: jest.fn().mockResolvedValue([]) },
       tools: { apply: jest.fn() },
-      gate: new CaptureGate(),
       learning: {
         recordDecision: jest.fn(),
         recordOutcome: jest.fn(),
@@ -92,17 +87,15 @@ describe('createInstanceRunner', () => {
     _resetRegistryForTesting();
   });
 
-  it('register() wires all five layers + the manifest and holds the gate', () => {
+  it('register() wires all four layers + the manifest', () => {
     const runner = createInstanceRunner(config());
 
-    expect(runner.gate).toBeNull();
     expect(runner.layers).toBeNull();
     expect(runner.register()).toBe(true);
 
     expect(getRegisteredLoopIds() as readonly string[]).toContain(LOOP_ID);
     expect(getSensor('runnerTestSensor')).toBeDefined();
-    expect(runner.gate).toBeInstanceOf(CaptureGate);
-    expect(runner.layers?.gate).toBe(runner.gate);
+    expect(runner.layers?.learning).toBeDefined();
   });
 
   it('register() is idempotent — second call does not rebuild the layers', () => {
@@ -130,7 +123,7 @@ describe('createInstanceRunner', () => {
     expect(onRunComplete).not.toHaveBeenCalled();
   });
 
-  it('runOnce() registers, runs, drains the gate, and hands everything to onRunComplete', async () => {
+  it('runOnce() registers, runs, and hands mutations to onRunComplete', async () => {
     const onRunComplete = jest.fn().mockResolvedValue(undefined);
     const runner = createInstanceRunner(config({ onRunComplete }));
 
@@ -139,39 +132,19 @@ describe('createInstanceRunner', () => {
     expect(result).toEqual(fakeResult());
     expect(mockedRunLoop).toHaveBeenCalledTimes(1);
     expect(onRunComplete).toHaveBeenCalledWith(
-      expect.objectContaining({ result: fakeResult(), drained: [], manifest: expect.objectContaining({ loopId: LOOP_ID }) }),
+      expect.objectContaining({ result: fakeResult(), mutations: [], manifest: expect.objectContaining({ loopId: LOOP_ID }) }),
     );
   });
 
-  it('runOnce() drains the mutations the gate captured during the run', async () => {
+  it('runOnce() passes the orchestrator mutations without a second collector', async () => {
     const onRunComplete = jest.fn().mockResolvedValue(undefined);
     const runner = createInstanceRunner(config({ onRunComplete }));
-    runner.register();
-    const captured = {
-      mutationId: asMutationId('m1'),
-      proposalId: asMutationId('p1'),
-      kind: 'copy',
-      artifact: {},
-    } as unknown as Mutation;
-    await runner.gate!.requestApproval(captured);
+    const produced = [{ mutationId: 'm1', proposalId: 'p1', kind: 'copy', artifact: {} }];
+    mockedRunLoop.mockResolvedValue(fakeResult({ mutations: produced as never }));
 
     await runner.runOnce();
 
-    expect(onRunComplete.mock.calls[0][0].drained).toEqual([captured]);
-    expect(runner.gate!.captured).toHaveLength(0); // drained, not copied
-  });
-
-  it('runOnce() passes drained:null when no gate is held (registerOnRun:false, app-boot wiring missing)', async () => {
-    // Another module registered the manifest, but THIS runner never did — so
-    // it holds no gate, mirroring the pre-refactor module-singleton behavior.
-    const other = createInstanceRunner(config());
-    other.register();
-    const onRunComplete = jest.fn().mockResolvedValue(undefined);
-    const runner = createInstanceRunner(config({ registerOnRun: false, onRunComplete }));
-
-    await runner.runOnce();
-
-    expect(onRunComplete.mock.calls[0][0].drained).toBeNull();
+    expect(onRunComplete.mock.calls[0][0].mutations).toEqual(produced);
   });
 
   it('runOnce() with registerOnRun:false skips registration entirely', async () => {
@@ -199,14 +172,13 @@ describe('createInstanceRunner', () => {
     expect(buildLayers).toHaveBeenCalledTimes(2);
   });
 
-  it('resetForTesting() drops the held gate and layers', () => {
+  it('resetForTesting() drops the held layers', () => {
     const runner = createInstanceRunner(config());
     runner.register();
-    expect(runner.gate).not.toBeNull();
+    expect(runner.layers).not.toBeNull();
 
     runner.resetForTesting();
 
-    expect(runner.gate).toBeNull();
     expect(runner.layers).toBeNull();
   });
 });

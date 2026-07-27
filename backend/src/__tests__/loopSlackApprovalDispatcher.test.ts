@@ -6,9 +6,10 @@
  * - Idempotency: second ✅ on same ts is a no-op
  * - Bot-authorship check: non-bot messages are ignored
  * - Footer check: messages without the dispatch footer are ignored
- * - pageIds path: dispatches existing Notion pages found in message
- * - tasks path: creates + dispatches new Notion tasks parsed from message
- * - markDispatched called BEFORE postThread (race-condition guard)
+ * - legacy Notion links are not dispatched
+ * - tasks path: files approved work through canonical fail-closed Linear intake
+ * - durable completion is recorded only AFTER Linear intake succeeds
+ * - interrupted completion tracking retries safely through canonical intake
  */
 
 import type { ReactionAddedEvent } from '../services/loopSlackApprovalDispatcher';
@@ -29,44 +30,27 @@ jest.mock('@slack/web-api', () => ({
 
 // --- loopDispatchTracker mock ---------------------------------------------------
 
-const mockIsDispatched = jest.fn().mockReturnValue(false);
+const mockGetDispatched = jest.fn();
 const mockMarkDispatched = jest.fn();
+let dispatchEntry: { dispatchedAt: Date; pageIds: string[] } | null = null;
 
 jest.mock('../services/loopDispatchTracker', () => ({
-  isDispatched: (...args: unknown[]) => mockIsDispatched(...args),
+  getDispatched: (...args: unknown[]) => mockGetDispatched(...args),
   markDispatched: (...args: unknown[]) => mockMarkDispatched(...args),
 }));
 
-// --- notionService mock ---------------------------------------------------------
+// --- canonical Linear intake mock ----------------------------------------------
 
-jest.mock('../services/notionService', () => ({
-  getNotionCredentials: jest.fn().mockResolvedValue({ apiToken: 'ntn_fake' }),
-  getSprintTasksDatabaseId: jest.fn().mockResolvedValue('db-fake-id'),
+const mockFileAutoIssue = jest.fn().mockResolvedValue({
+  pageId: 'ENG-600',
+  url: 'https://linear.app/emmabyaw/issue/ENG-600',
+  deduped: false,
+  tracker: 'Linear',
+});
+
+jest.mock('../services/intakeService', () => ({
+  fileAutoIssue: (...args: unknown[]) => mockFileAutoIssue(...args),
 }));
-
-// --- devEnvService mock (dynamic import) ----------------------------------------
-
-const mockLaunchEnvironment = jest.fn().mockResolvedValue(undefined);
-const mockGetNotionPage = jest.fn().mockResolvedValue({ title: 'Test Page' });
-const mockGetNotionPageContent = jest.fn().mockResolvedValue({ text: 'page body' });
-
-jest.mock('../services/devEnvService', () => ({
-  launchEnvironment: (...args: unknown[]) => mockLaunchEnvironment(...args),
-  getNotionPage: (...args: unknown[]) => mockGetNotionPage(...args),
-  getNotionPageContent: (...args: unknown[]) => mockGetNotionPageContent(...args),
-}));
-
-// --- global fetch mock (for Notion API calls) -----------------------------------
-
-global.fetch = jest.fn().mockResolvedValue({
-  ok: true,
-  status: 200,
-  json: async () => ({
-    object: 'page',
-    id: 'notion-page-id-abc123',
-    url: 'https://notion.so/notion-page-id-abc123',
-  }),
-}) as jest.Mock;
 
 // -------------------------------------------------------------------------------
 
@@ -99,7 +83,11 @@ function mockBotMessage(text: string, bot_id = 'BBOT123'): void {
 beforeEach(() => {
   jest.clearAllMocks();
   _resetLoopApprovalForTesting();
-  mockIsDispatched.mockReturnValue(false);
+  dispatchEntry = null;
+  mockGetDispatched.mockImplementation(async () => dispatchEntry);
+  mockMarkDispatched.mockImplementation(async (_ts: string, pageIds: string[]) => {
+    dispatchEntry = { dispatchedAt: new Date(), pageIds: [...pageIds] };
+  });
   mockAuthTest.mockResolvedValue({ user_id: 'UBOT123' });
 });
 
@@ -141,10 +129,14 @@ describe('handleLoopApprovalReaction — gate checks', () => {
 // -------------------------------------------------------------------------------
 
 describe('handleLoopApprovalReaction — idempotency', () => {
-  it('skips dispatch when ts is already marked dispatched', async () => {
-    mockIsDispatched.mockReturnValue(true);
+  it('skips tasks whose IDs are already marked dispatched', async () => {
+    mockBotMessage(`*Daily digest*\nRun ID: run-001\n1. Fix the thing\n\n${FOOTER}`);
+    dispatchEntry = {
+      dispatchedAt: new Date(),
+      pageIds: ['daily-digest-run-001-1'],
+    };
     await handleLoopApprovalReaction(makeEvent());
-    expect(mockHistoryFn).not.toHaveBeenCalled();
+    expect(mockHistoryFn).toHaveBeenCalled();
     expect(mockMarkDispatched).not.toHaveBeenCalled();
     expect(mockPostMessage).not.toHaveBeenCalled();
   });
@@ -190,7 +182,7 @@ describe('handleLoopApprovalReaction — footer gate', () => {
 
 // -------------------------------------------------------------------------------
 
-describe('handleLoopApprovalReaction — pageIds path', () => {
+describe('handleLoopApprovalReaction — legacy Notion path removed', () => {
   // 32 lowercase hex chars required by extractNotionPageIds regex
   const PAGE_ID = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6';
   const NOTION_URL = `https://www.notion.so/my-workspace/Page-Title-${PAGE_ID}`;
@@ -201,41 +193,12 @@ describe('handleLoopApprovalReaction — pageIds path', () => {
     );
   });
 
-  it('calls markDispatched with the extracted page IDs', async () => {
+  it('does not launch or mark legacy Notion pages as dispatched', async () => {
     await handleLoopApprovalReaction(makeEvent());
-    expect(mockMarkDispatched).toHaveBeenCalledWith(MSG_TS, [PAGE_ID]);
-  });
-
-  it('calls markDispatched BEFORE postThread (race-condition guard)', async () => {
-    const callOrder: string[] = [];
-    mockMarkDispatched.mockImplementation(() => callOrder.push('markDispatched'));
-    mockPostMessage.mockImplementation(() => {
-      callOrder.push('postMessage');
-      return Promise.resolve({});
-    });
-
-    await handleLoopApprovalReaction(makeEvent());
-
-    expect(callOrder[0]).toBe('markDispatched');
-    expect(callOrder[1]).toBe('postMessage');
-  });
-
-  it('calls launchEnvironment for each page ID', async () => {
-    await handleLoopApprovalReaction(makeEvent());
-    expect(mockLaunchEnvironment).toHaveBeenCalledWith(
-      PAGE_ID,
-      expect.any(String),
-      expect.any(String),
-      expect.any(String),
-    );
-  });
-
-  it('posts a summary thread message after dispatch', async () => {
-    await handleLoopApprovalReaction(makeEvent());
-    // Two postMessage calls: "Dispatching..." and the summary
-    expect(mockPostMessage).toHaveBeenCalledTimes(2);
-    const summaryCall = mockPostMessage.mock.calls[1][0];
-    expect(summaryCall.text).toMatch(/✅ Launched/);
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
+    expect(mockMarkDispatched).not.toHaveBeenCalled();
+    expect(mockPostMessage).toHaveBeenCalledTimes(1);
+    expect(mockPostMessage.mock.calls[0][0].text).toMatch(/could not parse/i);
   });
 });
 
@@ -256,9 +219,20 @@ describe('handleLoopApprovalReaction — tasks path (no Notion URLs)', () => {
     mockBotMessage(taskText);
   });
 
-  it('calls markDispatched with task IDs before posting', async () => {
+  it('records durable completion only after Linear intake succeeds', async () => {
     const callOrder: string[] = [];
-    mockMarkDispatched.mockImplementation(() => callOrder.push('markDispatched'));
+    mockFileAutoIssue.mockImplementation(async () => {
+      callOrder.push('fileAutoIssue');
+      return {
+        pageId: 'ENG-600',
+        url: 'https://linear.app/emmabyaw/issue/ENG-600',
+        deduped: false,
+        tracker: 'Linear',
+      };
+    });
+    mockMarkDispatched.mockImplementation(async () => {
+      callOrder.push('markDispatched');
+    });
     mockPostMessage.mockImplementation(() => {
       callOrder.push('postMessage');
       return Promise.resolve({});
@@ -266,34 +240,171 @@ describe('handleLoopApprovalReaction — tasks path (no Notion URLs)', () => {
 
     await handleLoopApprovalReaction(makeEvent());
 
-    expect(callOrder[0]).toBe('markDispatched');
-    expect(callOrder[1]).toBe('postMessage');
+    expect(callOrder).toEqual([
+      'postMessage',
+      'fileAutoIssue',
+      'markDispatched',
+      'postMessage',
+    ]);
   });
 
-  it('creates a Notion page for each parsed task', async () => {
+  it('files each parsed task through canonical Linear intake', async () => {
     await handleLoopApprovalReaction(makeEvent());
-    expect(global.fetch).toHaveBeenCalledWith(
-      'https://api.notion.com/v1/pages',
-      expect.objectContaining({ method: 'POST' }),
+    expect(mockFileAutoIssue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        executionRoute: 'human-triage',
+        source: expect.stringContaining('Slack approval'),
+        notionContext: expect.objectContaining({
+          'Alert Class': expect.stringContaining('slack-approved-loop:'),
+        }),
+      }),
     );
   });
 
-  it('calls launchEnvironment for each created task', async () => {
+  it('preserves proposal IDs so partial dispatch results map to the right learning records', async () => {
+    mockHistoryFn.mockReset();
+    mockBotMessage([
+      '*Reliability Loop — daily run*',
+      'Run ID: `run-partial-001`',
+      '',
+      '1. Fix first tool',
+      '   Proposal ID: `proposal-first`  |  Kind: `code_change`',
+      '2. Fix second tool',
+      '   Proposal ID: `proposal-second`  |  Kind: `code_change`',
+      '',
+      FOOTER,
+    ].join('\n'));
+    mockFileAutoIssue
+      .mockResolvedValueOnce({
+        pageId: 'ENG-601',
+        url: 'https://linear.app/emmabyaw/issue/ENG-601',
+        deduped: false,
+        tracker: 'Linear',
+      })
+      .mockRejectedValueOnce(new Error('Linear unavailable'));
+
     await handleLoopApprovalReaction(makeEvent());
-    expect(mockLaunchEnvironment).toHaveBeenCalledTimes(1);
-    expect(mockLaunchEnvironment).toHaveBeenCalledWith(
-      'notion-page-id-abc123',
-      expect.stringContaining('comp-a'),
-      expect.any(String),
-      expect.any(String),
+
+    expect(mockFileAutoIssue).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        notionContext: expect.objectContaining({ 'Loop Task ID': 'proposal-first' }),
+      }),
     );
+    expect(mockFileAutoIssue).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        notionContext: expect.objectContaining({ 'Loop Task ID': 'proposal-second' }),
+      }),
+    );
+  });
+
+  it('does not invoke the retired cloud-dev environment launcher', async () => {
+    await handleLoopApprovalReaction(makeEvent());
+    expect(mockFileAutoIssue).toHaveBeenCalledTimes(1);
+    expect(mockFileAutoIssue.mock.calls[0][0].title).toContain('comp-a');
   });
 
   it('posts a summary thread after dispatch', async () => {
     await handleLoopApprovalReaction(makeEvent());
     expect(mockPostMessage).toHaveBeenCalledTimes(2);
     const summary = mockPostMessage.mock.calls[1][0].text as string;
-    expect(summary).toMatch(/✅ Launched/);
+    expect(summary).toMatch(/✅ Queued/);
+  });
+
+  it('removes failed task claims so a later reaction retries them', async () => {
+    mockFileAutoIssue
+      .mockRejectedValueOnce(new Error('Linear unavailable'))
+      .mockResolvedValueOnce({
+        pageId: 'ENG-601',
+        url: 'https://linear.app/emmabyaw/issue/ENG-601',
+        deduped: false,
+        tracker: 'Linear',
+      });
+
+    await handleLoopApprovalReaction(makeEvent());
+    expect(dispatchEntry?.pageIds).toEqual([]);
+
+    mockBotMessage(taskText);
+    await handleLoopApprovalReaction(makeEvent());
+
+    expect(mockFileAutoIssue).toHaveBeenCalledTimes(2);
+    expect(dispatchEntry?.pageIds).toEqual(['comp-a']);
+  });
+
+  it('retries through canonical intake when interrupted after filing but before completion is recorded', async () => {
+    mockMarkDispatched
+      .mockRejectedValueOnce(new Error('process interrupted before completion record'))
+      .mockImplementationOnce(async (_ts: string, pageIds: string[]) => {
+        dispatchEntry = { dispatchedAt: new Date(), pageIds: [...pageIds] };
+      });
+
+    await expect(handleLoopApprovalReaction(makeEvent())).rejects.toThrow(
+      'process interrupted before completion record',
+    );
+    expect(mockFileAutoIssue).toHaveBeenCalledTimes(1);
+    expect(dispatchEntry).toBeNull();
+
+    mockBotMessage(taskText);
+    await handleLoopApprovalReaction(makeEvent());
+
+    expect(mockFileAutoIssue).toHaveBeenCalledTimes(2);
+    expect(dispatchEntry?.pageIds).toEqual(['comp-a']);
+  });
+
+  it('suppresses a concurrent duplicate reaction while the first dispatch is in flight', async () => {
+    mockHistoryFn.mockResolvedValue({
+      messages: [{ text: taskText, bot_id: 'BBOT123' }],
+    });
+    let finishLinear!: (value: {
+      pageId: string;
+      url: string;
+      deduped: boolean;
+      tracker: string;
+    }) => void;
+    mockFileAutoIssue.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishLinear = resolve;
+        }),
+    );
+
+    const firstReaction = handleLoopApprovalReaction(makeEvent());
+    await new Promise((resolve) => setImmediate(resolve));
+    await handleLoopApprovalReaction(makeEvent());
+
+    expect(mockFileAutoIssue).toHaveBeenCalledTimes(1);
+
+    finishLinear({
+      pageId: 'ENG-600',
+      url: 'https://linear.app/emmabyaw/issue/ENG-600',
+      deduped: false,
+      tracker: 'Linear',
+    });
+    await firstReaction;
+  });
+});
+
+// -------------------------------------------------------------------------------
+
+describe('handleLoopApprovalReaction — explicit legacy Autofix admission', () => {
+  it('routes only an explicitly admitted code change to Autofix', async () => {
+    mockBotMessage([
+      '*Reliability Loop — daily run*',
+      'Run ID: `run-safe-code-001`',
+      '',
+      '1. Typed tool schema no longer matches the handler',
+      '   Kind: `code_change`',
+      '   Autofix eligible: yes',
+      '',
+      FOOTER,
+    ].join('\n'));
+
+    await handleLoopApprovalReaction(makeEvent());
+
+    expect(mockFileAutoIssue).toHaveBeenCalledWith(
+      expect.objectContaining({ executionRoute: 'autofix' }),
+    );
   });
 });
 

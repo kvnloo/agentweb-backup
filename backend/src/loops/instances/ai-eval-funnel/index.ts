@@ -5,9 +5,8 @@
  *  - `registerAiEvalFunnelForProduction` + `runAiEvalLoopOnce` — the daily
  *    production cron wiring (previously in cron.ts), built on the shared
  *    instance runner like the other loop instances: real DynamoPort + real
- *    SlackPort + NotionDigestTool + CaptureGate + DynamoLearningStore.
- *    After each runLoop() the runner drains CaptureGate's collected mutations
- *    and posts a single Slack DM digest.
+ *    SlackPort + LinearIntakeTool + DynamoLearningStore.
+ *    After each runLoop() the runner posts a single Slack DM digest.
  *
  * Idempotent registration: safe to call at process startup multiple times
  * (e.g. across cluster instance hot-reloads). The cron itself is scheduled
@@ -19,14 +18,12 @@
 import {
   getLoopManifest,
   getRegisteredLoopIds,
-  registerGate,
   registerLearningStore,
   registerLoop,
   registerRuleSet,
   registerSensor,
   registerTools,
 } from '../../index';
-import { CaptureGate } from '../../core/gates/captureGate';
 import {
   postLoopDigest,
   type LoopDigestTemplate,
@@ -46,7 +43,7 @@ import { productionLoopPorts } from '../../adapters/awsAdapters';
 import type { LoopRunResult, Mutation, NormalizedEvent, RuleSet } from '../../core/types';
 import { asLoopId } from '../../core/types';
 import { AI_EVAL_LOOP_ID, aiEvalManifest } from './manifest';
-import { NotionDigestTool } from './notionDigestTool';
+import { LinearIntakeTool } from './linearIntakeTool';
 import type { RcaEnrichment } from './rcaEnricher';
 import type { AiEvalProposalPayload } from './rules';
 import { aiEvalRules } from './rules';
@@ -59,7 +56,6 @@ interface AiEvalRegistry {
   sensor: InMemoryEventSource;
   ruleSet: DslRuleSet<AiEvalProposalPayload>;
   tools: SpecOutputTool<AiEvalProposalPayload>;
-  gate: CaptureGate;
   learning: InMemoryLearningStore;
 }
 
@@ -73,7 +69,6 @@ export function registerAiEvalFunnel(events: readonly NormalizedEvent[] = []): A
   const sensor = new InMemoryEventSource(events);
   const ruleSet = new DslRuleSet<AiEvalProposalPayload>(AI_EVAL_LOOP_ID, aiEvalRules);
   const tools = new SpecOutputTool<AiEvalProposalPayload>(AI_EVAL_LOOP_ID);
-  const gate = new CaptureGate();
   const learning = new InMemoryLearningStore();
 
   registerSensor('aiEvalSensor', sensor);
@@ -81,11 +76,10 @@ export function registerAiEvalFunnel(events: readonly NormalizedEvent[] = []): A
   registerRuleSet('aiEvalRules', ruleSet as any);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   registerTools('aiEvalSpecTool', tools as any);
-  registerGate('aiEvalCaptureGate', gate);
   registerLearningStore('aiEvalLearning', learning);
   registerLoop(aiEvalManifest);
 
-  registered = { sensor, ruleSet, tools, gate, learning };
+  registered = { sensor, ruleSet, tools, learning };
   return registered;
 }
 
@@ -99,8 +93,7 @@ const runner = createInstanceRunner({
   implNames: {
     sensor: 'aiEvalSensor:prod',
     ruleSet: 'aiEvalRules:prod',
-    tools: 'aiEvalSpecTool:prod',
-    gate: 'aiEvalCaptureGate:prod',
+    tools: 'aiEvalLinearIntake:prod',
     learning: 'aiEvalLearning:prod',
   },
   // Already-registered only counts if it's the PRODUCTION wiring — the
@@ -150,8 +143,7 @@ const runner = createInstanceRunner({
     return {
       sensor,
       ruleSet: new CooldownRuleSet(baseRuleSet, learning, AI_EVAL_LOOP_ID),
-      tools: new NotionDigestTool(),
-      gate: new CaptureGate(),
+      tools: new LinearIntakeTool(),
       learning,
     };
   },
@@ -159,17 +151,14 @@ const runner = createInstanceRunner({
     ...aiEvalManifest,
     sensorImpl: 'aiEvalSensor:prod',
     rulesetImpl: 'aiEvalRules:prod',
-    toolsImpl: 'aiEvalSpecTool:prod',
-    gateImpl: 'aiEvalCaptureGate:prod',
+    toolsImpl: 'aiEvalLinearIntake:prod',
     learningImpl: 'aiEvalLearning:prod',
   }),
-  onRunComplete: async ({ result, drained, ports, manifest }) => {
-    // Drain the gate's captured mutations and post a single digest Slack DM.
-    if (drained === null) return;
-    if (drained.length > 0 || result.eventsScanned > 0) {
+  onRunComplete: async ({ result, mutations, ports, manifest }) => {
+    if (mutations.length > 0 || result.eventsScanned > 0) {
       await postDailyDigest(
         result,
-        drained,
+        mutations,
         ports.slack,
         manifest.approval.slackUserId,
         (digestDate, slackUserId, runId) =>
@@ -193,7 +182,7 @@ export async function runAiEvalLoopOnce(): Promise<LoopRunResult> {
   return (await runner.runOnce()) as LoopRunResult;
 }
 
-/** TExtra = the mutations drained from the gate this tick. */
+/** TExtra = the mutations produced this tick. */
 const aiEvalDigestTemplate: LoopDigestTemplate<readonly Mutation[]> = {
   logTag: '[ai-eval-funnel cron]',
   missingUserWarning: 'no approval.slackUserId configured — skipping daily DM',
@@ -212,16 +201,19 @@ const aiEvalDigestTemplate: LoopDigestTemplate<readonly Mutation[]> = {
       const m = mutations[i];
       const p = result.proposals[i];
       const artifact = m.artifact as {
-        notionUrl?: string;
+        linearUrl?: string;
         title?: string;
+        executionRoute?: 'autofix' | 'human-triage';
         rcaEnrichment?: RcaEnrichment;
       };
       const ruleId = p?.sourceRuleId ?? 'unknown';
-      const titleLine = artifact.notionUrl
-        ? `${i + 1}. <${artifact.notionUrl}|${artifact.title ?? ruleId}>`
+      const titleLine = artifact.linearUrl
+        ? `${i + 1}. <${artifact.linearUrl}|${artifact.title ?? ruleId}>`
         : `${i + 1}. ${artifact.title ?? ruleId}`;
       lines.push(titleLine);
-      lines.push(`   Rule: \`${ruleId}\`  |  Kind: \`${p?.kind ?? 'n/a'}\``);
+      lines.push(
+        `   Rule: \`${ruleId}\`  |  Kind: \`${p?.kind ?? 'n/a'}\`  |  Route: \`${artifact.executionRoute ?? 'unknown'}\``,
+      );
       // RCA top-fix line: one indented bullet under each rule. Acceptance #3.
       const rca = artifact.rcaEnrichment;
       if (rca?.error) {
@@ -233,7 +225,10 @@ const aiEvalDigestTemplate: LoopDigestTemplate<readonly Mutation[]> = {
     }
     return lines;
   },
-  footerExtra: [`Reply in thread to skip a specific item (e.g. "skip 2").`],
+  footer: (result) =>
+    result.proposals.length > 0
+      ? 'Filed in Linear automatically. Autofix-eligible work is queued; restricted work is labeled Needs PM.'
+      : null,
 };
 
 async function postDailyDigest(
@@ -265,9 +260,6 @@ export const _postDailyDigestForTesting = postDailyDigest;
 
 // Export internal so tests can assert on it without exposing it broadly.
 export const _internal = {
-  get aiEvalGate() {
-    return runner.gate;
-  },
   get aiEvalLearning() {
     return runner.layers?.learning ?? null;
   },
