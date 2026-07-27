@@ -62,6 +62,20 @@ describe('browserCookieDb — manual per-domain cookie import', () => {
         })
       );
     });
+
+    it('derives expiresAt from the earliest cookie expiry in the set', async () => {
+      mockDynamoDB.put.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const twoCookies = [
+        { name: 'a', value: '1', domain: '.rankai.ai', path: '/', secure: true, expires: nowSeconds + 1000 },
+        { name: 'b', value: '2', domain: '.rankai.ai', path: '/', secure: true, expires: nowSeconds + 500 },
+      ];
+
+      await browserCookieDb.saveDomainCookies('user-1', 'rankai.ai', twoCookies);
+
+      const item = mockDynamoDB.put.mock.calls[0][0].Item;
+      expect(item.expiresAt).toBe(new Date((nowSeconds + 500) * 1000).toISOString());
+    });
   });
 
   describe('listDomainCookies', () => {
@@ -70,7 +84,14 @@ describe('browserCookieDb — manual per-domain cookie import', () => {
         promise: jest.fn().mockResolvedValue({
           Items: [
             { userId: 'user-1', domain: '__all__', cookies: [{ name: 'x', value: 'y' }] },
-            { userId: 'user-1', domain: 'rankai.ai', cookieCount: 1, encryptedCookies: 'secret', createdAt: '2026-01-01T00:00:00.000Z' },
+            {
+              userId: 'user-1',
+              domain: 'rankai.ai',
+              cookieCount: 1,
+              encryptedCookies: 'secret',
+              createdAt: '2026-01-01T00:00:00.000Z',
+              expiresAt: '2026-04-01T00:00:00.000Z',
+            },
           ],
         }),
       });
@@ -78,7 +99,7 @@ describe('browserCookieDb — manual per-domain cookie import', () => {
       const result = await browserCookieDb.listDomainCookies('user-1');
 
       expect(result).toEqual([
-        { domain: 'rankai.ai', cookieCount: 1, createdAt: '2026-01-01T00:00:00.000Z' },
+        { domain: 'rankai.ai', cookieCount: 1, createdAt: '2026-01-01T00:00:00.000Z', expiresAt: '2026-04-01T00:00:00.000Z' },
       ]);
       expect(result[0]).not.toHaveProperty('encryptedCookies');
     });
@@ -145,6 +166,46 @@ describe('browserCookieDb — manual per-domain cookie import', () => {
 
       const result = await browserCookieDb.getAllCookiesForUser('user-1');
       expect(result).toEqual([]);
+    });
+
+    it('skips a per-domain entry whose expiresAt is in the past, without dropping valid entries', async () => {
+      const expiredCookies = [{ name: 'session', value: 'dead-val' }];
+      const validCookies = [{ name: 'session', value: 'live-val' }];
+      mockDynamoDB.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Items: [
+            {
+              userId: 'user-1',
+              domain: 'expired.com',
+              encryptedCookies: `ENC(user-1:${JSON.stringify(expiredCookies)})`,
+              expiresAt: '2020-01-01T00:00:00.000Z',
+            },
+            {
+              userId: 'user-1',
+              domain: 'rankai.ai',
+              encryptedCookies: `ENC(user-1:${JSON.stringify(validCookies)})`,
+              expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 24 * 30).toISOString(),
+            },
+          ],
+        }),
+      });
+
+      const result = await browserCookieDb.getAllCookiesForUser('user-1');
+      expect(result).toEqual(validCookies);
+    });
+
+    it('does not skip a per-domain entry with no expiresAt field (backward compatibility)', async () => {
+      const cookiesNoExpiry = [{ name: 'session', value: 'still-valid' }];
+      mockDynamoDB.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Items: [
+            { userId: 'user-1', domain: 'rankai.ai', encryptedCookies: `ENC(user-1:${JSON.stringify(cookiesNoExpiry)})` },
+          ],
+        }),
+      });
+
+      const result = await browserCookieDb.getAllCookiesForUser('user-1');
+      expect(result).toEqual(cookiesNoExpiry);
     });
 
     it('skips a single corrupted per-domain entry without dropping other valid entries', async () => {

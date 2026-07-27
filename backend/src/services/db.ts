@@ -7656,6 +7656,17 @@ export const browserCookieDb = {
    */
   async saveDomainCookies(userId: string, domain: string, cookies: any[]): Promise<void> {
     const now = new Date().toISOString();
+    // Cookies from one parseCookieHeader() call all share the same synthetic expiry,
+    // but take the earliest present (defensive, e.g. if callers ever mix sources) as
+    // the honest floor: once ANY cookie in the set is past this, injection is a no-op
+    // anyway, so surface/exclude the whole entry rather than silently keep using it.
+    const expirySeconds = cookies
+      .map((c) => c.expires)
+      .filter((e): e is number => typeof e === 'number');
+    const expiresAt = expirySeconds.length > 0
+      ? new Date(Math.min(...expirySeconds) * 1000).toISOString()
+      : undefined;
+
     try {
       await dynamodb.put({
         TableName: BROWSER_COOKIES_TABLE,
@@ -7664,6 +7675,7 @@ export const browserCookieDb = {
           domain,
           encryptedCookies: encryptPassword(JSON.stringify(cookies), userId),
           cookieCount: cookies.length,
+          ...(expiresAt ? { expiresAt } : {}),
           updatedAt: now,
           createdAt: now,
         },
@@ -7675,7 +7687,7 @@ export const browserCookieDb = {
   },
 
   /** List manually-imported cookie domains for a user — metadata only, never the encrypted values. */
-  async listDomainCookies(userId: string): Promise<Array<{ domain: string; cookieCount: number; createdAt: string }>> {
+  async listDomainCookies(userId: string): Promise<Array<{ domain: string; cookieCount: number; createdAt: string; expiresAt?: string }>> {
     try {
       const result = await dynamodb.query({
         TableName: BROWSER_COOKIES_TABLE,
@@ -7689,6 +7701,7 @@ export const browserCookieDb = {
           domain: item.domain,
           cookieCount: item.cookieCount ?? 0,
           createdAt: item.createdAt,
+          ...(item.expiresAt ? { expiresAt: item.expiresAt } : {}),
         }));
     } catch (error) {
       handleDynamoDbError(error, 'listDomainBrowserCookies');
@@ -7713,8 +7726,11 @@ export const browserCookieDb = {
    * '__all__' blob followed by every manually-imported per-domain entry. Order
    * matters — per-domain (deliberately human-provided) cookies are appended AFTER
    * '__all__' so they take precedence for the same site when Playwright's
-   * addCookies dedups by name/domain/path. A single corrupted/undecryptable
-   * per-domain entry is logged and skipped rather than failing the whole load.
+   * addCookies dedups by name/domain/path (empirically verified: last entry in
+   * the array wins). A per-domain entry past its `expiresAt` floor is skipped —
+   * injecting it would be a guaranteed no-op, so don't waste the attempt. A
+   * corrupted/undecryptable entry is likewise logged and skipped rather than
+   * failing the whole load.
    */
   async getAllCookiesForUser(userId: string): Promise<any[]> {
     try {
@@ -7727,9 +7743,16 @@ export const browserCookieDb = {
       const items = result.Items || [];
       const allItem = items.find((item) => item.domain === '__all__');
       const combined: any[] = [...(allItem?.cookies || [])];
+      const now = Date.now();
 
       for (const item of items) {
         if (item.domain === '__all__') continue;
+
+        if (item.expiresAt && new Date(item.expiresAt).getTime() <= now) {
+          console.warn(`Skipping expired manually-imported browser cookies for domain "${item.domain}" (userId: ${userId}, expiresAt: ${item.expiresAt})`);
+          continue;
+        }
+
         try {
           const { password: cookiesJson } = decryptPassword(item.encryptedCookies);
           combined.push(...JSON.parse(cookiesJson));
