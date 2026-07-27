@@ -876,6 +876,53 @@ describe('addNegativeCampaignCriteria', () => {
     ]);
   });
 
+  it('rejects a campaign from another customer before credentials or mutation', async () => {
+    await expect(service.addNegativeCampaignCriteria(
+      'user-123',
+      '1234567890',
+      'customers/9999999999/campaigns/24056663695',
+      {
+        placementUrls: ['coeurdazur.com'],
+        mobileAppCategoryResourceNames: [],
+      },
+    )).rejects.toMatchObject({
+      errorType: 'VALIDATION_ERROR',
+      errorCode: 'CAMPAIGN_CUSTOMER_MISMATCH',
+    });
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
+  it('surfaces an API permission failure after one atomic mutation request', async () => {
+    const permissionError = {
+      response: {
+        data: {
+          error: {
+            details: [{
+              errors: [{
+                errorCode: { authorizationError: 'USER_PERMISSION_DENIED' },
+                message: 'User does not have permission to access customer.',
+              }],
+            }],
+          },
+        },
+      },
+    };
+    mockAxiosPost.mockRejectedValueOnce(permissionError);
+
+    await expect(service.addNegativeCampaignCriteria(
+      'user-123',
+      '1234567890',
+      'customers/1234567890/campaigns/24056663695',
+      {
+        placementUrls: ['coeurdazur.com'],
+        mobileAppCategoryResourceNames: ['mobileAppCategoryConstants/60000'],
+      },
+    )).rejects.toBe(permissionError);
+
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+    expect(mockAxiosPost.mock.calls[0][1].operations).toHaveLength(2);
+  });
+
   it.each([
     {
       name: 'invalid placement URL',

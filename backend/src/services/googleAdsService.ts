@@ -3,6 +3,7 @@ import { getGoogleAdsCredentials } from '../utils/secretsManager';
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
 import { buildUtmSpec, mergeUtmIntoQueryString, mergeUtmIntoUrl, readUtmKeys, utmKeysInQueryString, utmQueryString } from '../utils/adUtm';
+import { validateNegativeCampaignCriteria } from './googleAdsCampaignCriteria';
 
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
 const TOKEN_REFRESH_URL = 'https://oauth2.googleapis.com/token';
@@ -848,46 +849,12 @@ export class GoogleAdsService {
       mobileAppCategoryResourceNames: string[];
     },
   ): Promise<void> {
-    this.assertResourceName(campaignResourceName, 'campaigns');
-
-    if (params.placementUrls.some((value) => typeof value !== 'string')) {
-      throw new Error('Invalid placement URL: every placement must be a string');
-    }
-    if (params.mobileAppCategoryResourceNames.some((value) => typeof value !== 'string')) {
-      throw new Error('Invalid mobile app category resource name: every category must be a string');
-    }
-
-    const placementUrls = [...new Set(params.placementUrls.map((value) => value.trim()))];
-    const mobileAppCategoryResourceNames = [
-      ...new Set(params.mobileAppCategoryResourceNames.map((value) => value.trim())),
-    ];
-    if (placementUrls.length === 0 && mobileAppCategoryResourceNames.length === 0) {
-      throw new Error('At least one placement URL or mobile app category resource name is required');
-    }
-
-    for (const placementUrl of placementUrls) {
-      if (!placementUrl || /\s/.test(placementUrl)) {
-        throw new Error(`Invalid placement URL: ${placementUrl || '(empty)'}`);
-      }
-      try {
-        const parsed = new URL(
-          /^[a-z][a-z\d+.-]*:\/\//i.test(placementUrl)
-            ? placementUrl
-            : `https://${placementUrl}`,
-        );
-        if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname.includes('.')) {
-          throw new Error('unsupported placement URL');
-        }
-      } catch {
-        throw new Error(`Invalid placement URL: ${placementUrl}`);
-      }
-    }
-
-    for (const resourceName of mobileAppCategoryResourceNames) {
-      if (!/^mobileAppCategoryConstants\/\d+$/.test(resourceName)) {
-        throw new Error(`Invalid mobile app category resource name: ${resourceName || '(empty)'}`);
-      }
-    }
+    const { placementUrls, mobileAppCategoryResourceNames } = validateNegativeCampaignCriteria(
+      customerId,
+      campaignResourceName,
+      params.placementUrls,
+      params.mobileAppCategoryResourceNames,
+    );
 
     const operations = [
       ...placementUrls.map((url) => ({

@@ -756,6 +756,73 @@ describe('handleCallGoogleAdsApi — CAMPAIGN_CRITERION ADD', () => {
     expect(googleAdsService.addNegativeCampaignCriteria).not.toHaveBeenCalled();
   });
 
+  it('returns a typed validation error for a malformed campaign resource without mutating', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN_CRITERION',
+      action: 'ADD',
+      campaign_resource_name: 'campaigns/not-canonical',
+      placement_urls: ['coeurdazur.com'],
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      errorType: 'VALIDATION_ERROR',
+      errorCode: 'INVALID_CAMPAIGN_RESOURCE_NAME',
+    });
+    expect(googleAdsService.addNegativeCampaignCriteria).not.toHaveBeenCalled();
+  });
+
+  it('returns a typed validation error when the campaign belongs to another customer', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN_CRITERION',
+      action: 'ADD',
+      campaign_resource_name: 'customers/9999999999/campaigns/24056663695',
+      placement_urls: ['coeurdazur.com'],
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      errorType: 'VALIDATION_ERROR',
+      errorCode: 'CAMPAIGN_CUSTOMER_MISMATCH',
+    });
+    expect(googleAdsService.addNegativeCampaignCriteria).not.toHaveBeenCalled();
+  });
+
+  it('returns the typed Google Ads permission error from the single atomic mutation', async () => {
+    (googleAdsService.addNegativeCampaignCriteria as jest.Mock).mockRejectedValueOnce({
+      response: {
+        data: {
+          error: {
+            details: [{
+              errors: [{
+                errorCode: { authorizationError: 'USER_PERMISSION_DENIED' },
+                message: 'User does not have permission to access customer.',
+              }],
+            }],
+          },
+        },
+      },
+    });
+
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN_CRITERION',
+      action: 'ADD',
+      campaign_resource_name: 'customers/1234567890/campaigns/24056663695',
+      placement_urls: ['coeurdazur.com'],
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      errorType: 'GOOGLE_ADS_API_ERROR',
+      errorCode: 'USER_PERMISSION_DENIED',
+      error: expect.stringMatching(/USER_PERMISSION_DENIED.*permission/i),
+    });
+    expect(googleAdsService.addNegativeCampaignCriteria).toHaveBeenCalledTimes(1);
+  });
+
   it('preserves the existing negative-keyword path', async () => {
     const result = await service.handleCallGoogleAdsApi('user-123', {
       customer_id: '1234567890',
