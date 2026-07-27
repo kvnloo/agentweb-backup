@@ -28,6 +28,16 @@ export function scanMessagesForAssets(
 
     const timestamp = ownTimestamp || lastAssistantTimestamp || session.updatedAt || session.createdAt;
 
+    // ENG-510: a per-image marker persisted the moment each image completes (before the
+    // end-of-turn toolCalls stamp). It is the only surviving record if the whole-turn cap
+    // kills the turn mid-flight, so completed images are still delivered. De-duped by URL
+    // against the toolCalls stamp below, so a normally-completed image is listed once.
+    const marker = message.metadata;
+    if (marker?.kind === 'image-generated' && marker?.imageUrl && !seenUrls.has(marker.imageUrl)) {
+      seenUrls.add(marker.imageUrl);
+      images.push({ url: marker.imageUrl, filename: marker.imageFilename || 'generated-image.png', generatedAt: timestamp });
+    }
+
     if (!message.metadata?.toolCalls) {
       if (typeof message.content === 'string') {
         htmlUrlRegex.lastIndex = 0;

@@ -138,6 +138,7 @@ export interface ChatMessage {
     };
     kind?: string;                      // Stable marker for system messages (e.g. 'image-generated')
     imageFilename?: string;             // Filename when kind === 'image-generated'
+    imageUrl?: string;                  // ENG-510: image URL on the immediate marker so a completed image survives a whole-turn-cap kill
     citations?: Citation[];             // ENG-351: de-duplicated web sources this message consulted (ChatGPT-style Sources UI)
   };
 }

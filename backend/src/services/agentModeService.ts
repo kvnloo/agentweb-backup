@@ -21544,7 +21544,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // Stable marker so extractGeneratedImageFilenames can detect generated
               // images without relying solely on the content-string format.
               kind: 'image-generated',
-              imageFilename: result.filename
+              imageFilename: result.filename,
+              // ENG-510: carry the URL on this immediately-persisted marker so a completed
+              // image is discoverable (scanMessagesForAssets) even if the whole-turn cap
+              // kills the turn before the end-of-turn toolCalls stamp runs — graceful
+              // partial delivery instead of losing finished work. De-duped by URL.
+              imageUrl: result.imageUrl
             }
           });
         } catch (error) {
