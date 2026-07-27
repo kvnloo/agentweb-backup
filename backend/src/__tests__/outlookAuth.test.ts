@@ -52,6 +52,8 @@ jest.mock('../services/settingsService', () => {
   };
 });
 
+jest.mock('../services/db', () => ({ oauthSessionDb: {} }));
+
 jest.mock('axios');
 const axios = require('axios');
 

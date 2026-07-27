@@ -14,6 +14,7 @@ const MARKETING_SCOPES = [
   'marketing.campaigns.write',
   'content',
 ];
+const mockOAuthSessions = new Map<string, any>();
 
 jest.mock('../config/integrations', () => ({
   getHubSpotConfig: jest.fn().mockResolvedValue({
@@ -67,6 +68,20 @@ jest.mock('../services/settingsService', () => {
   };
 });
 
+jest.mock('../services/db', () => ({
+  oauthSessionDb: {
+    savePending: jest.fn(async (session: any) => {
+      mockOAuthSessions.set(session.sessionId, session);
+    }),
+    consumePending: jest.fn(async (sessionId: string, userId: string, provider: string) => {
+      const session = mockOAuthSessions.get(sessionId);
+      if (!session || session.userId !== userId || session.provider !== provider) return null;
+      mockOAuthSessions.delete(sessionId);
+      return session.data;
+    }),
+  },
+}));
+
 jest.mock('axios');
 const axios = require('axios');
 
@@ -76,7 +91,7 @@ process.env.CUSTOMER_FRONTEND_URL = 'http://localhost:5174';
 
 import hubspotAuthRouter from '../routes/hubspotAuth';
 import { createAccount } from '../services/connectedAccountsDb';
-import { settingsService } from '../services/settingsService';
+import { oauthSessionDb } from '../services/db';
 
 const app = express();
 app.use(express.json());
@@ -250,7 +265,7 @@ describe('HubSpot OAuth Routes', () => {
           scopes: CRM_SCOPES,
         },
       });
-      (settingsService.setSetting as jest.Mock).mockRejectedValueOnce(
+      (oauthSessionDb.savePending as jest.Mock).mockRejectedValueOnce(
         new Error('Dynamo write failed'),
       );
 
@@ -342,7 +357,7 @@ describe('HubSpot OAuth Routes', () => {
     });
 
     it('returns an explicit 500 when the shared session store cannot be read', async () => {
-      (settingsService.getSetting as jest.Mock).mockRejectedValueOnce(
+      (oauthSessionDb.consumePending as jest.Mock).mockRejectedValueOnce(
         new Error('Dynamo read failed'),
       );
 

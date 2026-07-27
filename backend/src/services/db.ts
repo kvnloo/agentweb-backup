@@ -8704,6 +8704,50 @@ export const scheduleTemplateDb = {
 const OAUTH_SESSIONS_TABLE = `${TABLE_PREFIX}AW-OAuthSessions`;
 
 export const oauthSessionDb = {
+  async savePending<T>(session: {
+    sessionId: string;
+    userId: string;
+    provider: string;
+    data: T;
+  }): Promise<void> {
+    const ttl = Math.floor(Date.now() / 1000) + 10 * 60;
+    try {
+      await dynamodb.put({
+        TableName: OAUTH_SESSIONS_TABLE,
+        Item: { ...session, ttl },
+        ConditionExpression: 'attribute_not_exists(sessionId)',
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'oauthSessionDb.savePending');
+    }
+  },
+
+  async consumePending<T>(
+    sessionId: string,
+    userId: string,
+    provider: string,
+  ): Promise<T | null> {
+    try {
+      const result = await dynamodb.delete({
+        TableName: OAUTH_SESSIONS_TABLE,
+        Key: { sessionId },
+        ConditionExpression: 'userId = :userId AND provider = :provider AND #ttl > :now',
+        ExpressionAttributeNames: { '#ttl': 'ttl' },
+        ExpressionAttributeValues: {
+          ':userId': userId,
+          ':provider': provider,
+          ':now': Math.floor(Date.now() / 1000),
+        },
+        ReturnValues: 'ALL_OLD',
+      }).promise();
+      return result.Attributes ? result.Attributes.data as T : null;
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return null;
+      handleDynamoDbError(error, 'oauthSessionDb.consumePending');
+      return null;
+    }
+  },
+
   async save(session: {
     sessionId: string;
     userId: string;

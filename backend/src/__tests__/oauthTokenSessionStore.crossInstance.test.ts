@@ -5,30 +5,44 @@
  * This is the bug the migration fixes: the old per-route in-memory `Map` lived in a single
  * process, so /finalize on EB instance A and /connect on instance B saw different maps and the
  * user got "Please reconnect" (masked only by ALB stickiness). The shared store keeps NO
- * module-level session state — the ONLY carrier is the settings table (DynamoDB in prod).
+ * module-level session state — the ONLY carrier is AW-OAuthSessions (DynamoDB in prod).
  *
  * We simulate two instances with two independent module loads of the store
- * (`jest.isolateModulesAsync`), both wired to ONE shared mocked settings table. Instance A
+ * (`jest.isolateModulesAsync`), both wired to ONE shared mocked Dynamo table. Instance A
  * stores; instance B — a genuinely separate module instance — retrieves. If anything were held
  * in process memory, B would come up empty.
  */
 
 // Single backing table shared across BOTH isolated module loads (the DynamoDB stand-in). Named
 // `mock*` so Jest's hoisted `jest.mock` factory may reference it.
-const mockSettingsTable = new Map<string, string>();
+const mockOAuthTable = new Map<string, {
+  sessionId: string;
+  userId: string;
+  provider: string;
+  data: unknown;
+}>();
+
+jest.mock('../services/db', () => ({
+  oauthSessionDb: {
+    savePending: jest.fn(async (session: any) => {
+      if (mockOAuthTable.has(session.sessionId)) throw new Error('session id collision');
+      mockOAuthTable.set(session.sessionId, session);
+    }),
+    consumePending: jest.fn(async (sessionId: string, userId: string, provider: string) => {
+      const session = mockOAuthTable.get(sessionId);
+      if (!session || session.userId !== userId || session.provider !== provider) return null;
+      // Delete and return happen as one mocked Dynamo operation.
+      mockOAuthTable.delete(sessionId);
+      return session.data;
+    }),
+  },
+}));
 
 jest.mock('../services/settingsService', () => ({
   settingsService: {
-    setSetting: jest.fn(async (name: string, value: string) => {
-      mockSettingsTable.set(name, value);
-    }),
-    getSetting: jest.fn(async (name: string) => {
-      const value = mockSettingsTable.get(name);
-      return value ? { settingName: name, settingValue: value } : null;
-    }),
-    deleteSetting: jest.fn(async (name: string) => {
-      mockSettingsTable.delete(name);
-    }),
+    getSetting: jest.fn(),
+    setSetting: jest.fn(),
+    deleteSetting: jest.fn(),
   },
 }));
 
@@ -46,7 +60,7 @@ const onFreshInstance = async <R>(fn: (store: Store) => Promise<R>): Promise<R> 
 
 describe('oauthTokenSessionStore — cross-instance handoff (ENG-162)', () => {
   beforeEach(() => {
-    mockSettingsTable.clear();
+    mockOAuthTable.clear();
     jest.clearAllMocks();
   });
 
@@ -113,6 +127,37 @@ describe('oauthTokenSessionStore — cross-instance handoff (ENG-162)', () => {
 
     expect(first).not.toBeNull();
     expect(second).toBeNull();
+  });
+
+  it('allows exactly one of two concurrent instances to consume a session', async () => {
+    const sessionId = await onFreshInstance((store) =>
+      store.storeOAuthSession('user-C', 'fathom', {
+        tokens: { access_token: 'x', expires_in: 3600 },
+      }),
+    );
+    const consumeA = await onFreshInstance(async (store) => store.retrieveOAuthSession);
+    const consumeB = await onFreshInstance(async (store) => store.retrieveOAuthSession);
+
+    const results = await Promise.all([
+      consumeA(sessionId, 'user-C', 'fathom'),
+      consumeB(sessionId, 'user-C', 'fathom'),
+    ]);
+
+    expect(results.filter(Boolean)).toHaveLength(1);
+  });
+
+  it('stores same-user sibling sessions independently so neither can overwrite the other', async () => {
+    const [first, second] = await onFreshInstance(async (store) => Promise.all([
+      store.storeOAuthSession('user-D', 'hubspot', { marker: 'first' }),
+      store.storeOAuthSession('user-D', 'hubspot', { marker: 'second' }),
+    ]));
+
+    await expect(onFreshInstance((store) =>
+      store.retrieveOAuthSession(first, 'user-D', 'hubspot'),
+    )).resolves.toEqual({ marker: 'first' });
+    await expect(onFreshInstance((store) =>
+      store.retrieveOAuthSession(second, 'user-D', 'hubspot'),
+    )).resolves.toEqual({ marker: 'second' });
   });
 
   it('instance B refuses another user presenting the session id', async () => {

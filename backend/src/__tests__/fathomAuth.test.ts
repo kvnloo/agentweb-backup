@@ -30,6 +30,7 @@ jest.mock('../services/connectedAccountsDb', () => ({
 // live HTTP call. The default resolves; individual tests can override to prove /connect
 // still succeeds when webhook registration fails (it is wrapped in a try/catch that only warns).
 const mockRegisterWebhook = jest.fn(async () => ({ id: 'webhook-123' }));
+const mockOAuthSessions = new Map<string, any>();
 jest.mock('../services/fathomApiService', () => ({
   FathomApiService: jest.fn().mockImplementation(() => ({
     registerWebhook: mockRegisterWebhook,
@@ -64,6 +65,20 @@ jest.mock('../services/settingsService', () => {
   };
 });
 
+jest.mock('../services/db', () => ({
+  oauthSessionDb: {
+    savePending: jest.fn(async (session: any) => {
+      mockOAuthSessions.set(session.sessionId, session);
+    }),
+    consumePending: jest.fn(async (sessionId: string, userId: string, provider: string) => {
+      const session = mockOAuthSessions.get(sessionId);
+      if (!session || session.userId !== userId || session.provider !== provider) return null;
+      mockOAuthSessions.delete(sessionId);
+      return session.data;
+    }),
+  },
+}));
+
 jest.mock('axios');
 const axios = require('axios');
 
@@ -73,7 +88,7 @@ process.env.CUSTOMER_FRONTEND_URL = 'http://localhost:5174';
 
 import fathomAuthRouter from '../routes/fathomAuth';
 import { createAccount } from '../services/connectedAccountsDb';
-import { settingsService } from '../services/settingsService';
+import { oauthSessionDb } from '../services/db';
 
 const app = express();
 app.use(express.json());
@@ -198,7 +213,7 @@ describe('Fathom OAuth Routes', () => {
 
     it('returns an explicit 500 when the shared session store cannot persist tokens', async () => {
       axios.post.mockResolvedValueOnce(tokenExchangeResponse);
-      (settingsService.setSetting as jest.Mock).mockRejectedValueOnce(
+      (oauthSessionDb.savePending as jest.Mock).mockRejectedValueOnce(
         new Error('Dynamo write failed'),
       );
       const state = generateValidState('user-123');
@@ -241,7 +256,7 @@ describe('Fathom OAuth Routes', () => {
     });
 
     it('returns an explicit 500 when the shared session store cannot be read', async () => {
-      (settingsService.getSetting as jest.Mock).mockRejectedValueOnce(
+      (oauthSessionDb.consumePending as jest.Mock).mockRejectedValueOnce(
         new Error('Dynamo read failed'),
       );
 

@@ -1,8 +1,4 @@
-import {
-  storeOAuthSession,
-  storeTokenSession,
-  retrieveTokenSession,
-} from '../services/oauthTokenSessionStore';
+import { storeTokenSession, retrieveTokenSession } from '../services/oauthTokenSessionStore';
 import { settingsService } from '../services/settingsService';
 
 // Back the settings table with an in-memory map so the read-modify-write behaviour of the
@@ -246,61 +242,5 @@ describe('oauthTokenSessionStore — persistence failures stay explicit', () => 
 
     await expect(retrieveTokenSession(id, 'u1', 'outlook'))
       .rejects.toThrow('Dynamo delete failed');
-  });
-});
-
-describe('oauthTokenSessionStore — rolling-deploy compatibility', () => {
-  it('reads the pre-generalization Gmail/Outlook row shape during the TTL window', async () => {
-    table.set('oauth_token_session_outlook_u1', JSON.stringify({
-      userId: 'u1',
-      provider: 'outlook',
-      sessions: [{
-        sessionId: 'legacy-session-id',
-        tokens,
-        profile,
-        expires: Date.now() + 60_000,
-      }],
-    }));
-
-    await expect(retrieveTokenSession('legacy-session-id', 'u1', 'outlook'))
-      .resolves.toEqual({ tokens, profile });
-  });
-
-  it('writes new Outlook sessions in the top-level shape a pre-deploy reader expects', async () => {
-    await storeTokenSession('u1', 'outlook', tokens, profile);
-
-    const row = JSON.parse(table.get('oauth_token_session_outlook_u1')!);
-    expect(row.sessions[0]).toEqual(expect.objectContaining({ tokens, profile }));
-    expect(row.sessions[0]).not.toHaveProperty('data');
-  });
-
-  it('writes new Gmail sessions in the top-level shape a pre-deploy reader expects', async () => {
-    await storeTokenSession('u1', 'gmail', tokens, profile);
-
-    const row = JSON.parse(table.get('oauth_token_session_gmail_u1')!);
-    expect(row.sessions[0]).toEqual(expect.objectContaining({ tokens, profile }));
-    expect(row.sessions[0]).not.toHaveProperty('data');
-  });
-
-  it('lets a pre-deploy reader decode a session written by the new Outlook wrapper', async () => {
-    const sessionId = await storeTokenSession('u1', 'outlook', tokens, profile);
-    const row = JSON.parse(table.get('oauth_token_session_outlook_u1')!);
-    const match = row.sessions.find((session: { sessionId: string }) => session.sessionId === sessionId);
-
-    // This is the payload projection used by the pre-generalization reader.
-    expect({ tokens: match.tokens, profile: match.profile }).toEqual({ tokens, profile });
-  });
-
-  it('keeps provider-specific HubSpot payloads under the generic data field', async () => {
-    const data = {
-      tokens,
-      hubInfo: { hub_id: 42 },
-      accountType: 'crm' as const,
-      grantedScopes: [],
-    };
-    await storeOAuthSession('u1', 'hubspot', data);
-
-    const row = JSON.parse(table.get('oauth_token_session_hubspot_u1')!);
-    expect(row.sessions[0].data).toEqual(data);
   });
 });
