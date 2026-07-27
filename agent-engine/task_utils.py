@@ -11,6 +11,7 @@ from urllib.parse import quote
 import aiohttp
 from browser_use.agent.views import ActionResult
 from aws_utils import get_dynamodb_resource, get_s3_client, get_bedrock_client
+import secrets_manager
 from pydantic import SecretStr
 from langchain_aws import ChatBedrock
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
@@ -263,10 +264,10 @@ def get_azure_openai_llm(model_name: str):
         
         return AzureChatOpenAI(
             model_name=model_name,
-            azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
+            azure_endpoint=secrets_manager.get_azure_openai_endpoint(),
             azure_deployment=deployment_name,
-            api_key=os.getenv('AZURE_OPENAI_API_KEY'),
-            api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-08-01-preview'),
+            api_key=secrets_manager.get_azure_openai_api_key(),
+            api_version=secrets_manager.get_azure_openai_api_version(),
             temperature=0.0
         )
     except Exception as e:
@@ -278,13 +279,13 @@ def get_azure_openai_llm2(model_name: str):
     """Initialize Azure OpenAI language model"""
     try:
         deployment_name = model_name # use model name as deployment name in Azure portal
-        
+
         return AzureChatOpenAI(
             model_name=model_name,
-            azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT2'),
+            azure_endpoint=secrets_manager.get_azure_openai_endpoint2(),
             azure_deployment=deployment_name,
-            api_key=os.getenv('AZURE_OPENAI_API_KEY2'),
-            api_version=os.getenv('AZURE_OPENAI_API_VERSION2', '2024-12-01-preview'),
+            api_key=secrets_manager.get_azure_openai_api_key2(),
+            api_version=secrets_manager.get_azure_openai_api_version2(),
             temperature=0.0
         )
     except Exception as e:
@@ -296,13 +297,13 @@ def get_azure_openai_llm3(model_name: str):
     """Initialize Azure OpenAI language model"""
     try:
         deployment_name = model_name # use model name as deployment name in Azure portal
-        
+
         return AzureChatOpenAI(
             model_name=model_name,
-            azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT3'),
+            azure_endpoint=secrets_manager.get_azure_openai_endpoint3(),
             azure_deployment=deployment_name,
-            api_key=os.getenv('AZURE_OPENAI_API_KEY3'),
-            api_version=os.getenv('AZURE_OPENAI_API_VERSION3', '2025-01-01-preview'),
+            api_key=secrets_manager.get_azure_openai_api_key3(),
+            api_version=secrets_manager.get_azure_openai_api_version3(),
         )
     except Exception as e:
         logger.error(f"Error initializing Azure OpenAI: {e}")
@@ -313,14 +314,14 @@ def get_azure_openai_llm_o1(model_name: str):
     """Initialize Azure OpenAI language model"""
     try:
         deployment_name = model_name # use model name as deployment name in Azure portal
-        
+
         # O1 series model does not support temperature
         return AzureChatOpenAI(
             model_name=model_name,
-            azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
+            azure_endpoint=secrets_manager.get_azure_openai_endpoint(),
             azure_deployment=deployment_name,
-            api_key=os.getenv('AZURE_OPENAI_API_KEY'),
-            api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-09-12')
+            api_key=secrets_manager.get_azure_openai_api_key(),
+            api_version=secrets_manager.get_azure_openai_api_version(default='2024-09-12')
         )
     except Exception as e:
         logger.error(f"Error initializing Azure OpenAI: {e}")
@@ -332,7 +333,7 @@ def get_deepseek_llm(model_name: str):
     global global_use_vision
     try:
         global_use_vision = False
-        api_key = os.getenv('DEEPSEEK_API_KEY')
+        api_key = secrets_manager.get_deepseek_api_key()
         if not api_key:
             raise ValueError('DEEPSEEK_API_KEY is not set')
             
@@ -352,7 +353,7 @@ def get_pld_deepseek_llm(model_name: str):
     global global_use_vision
     try:
         global_use_vision = False
-        api_key = os.getenv('PLD_DEEPSEEK_API_KEY')
+        api_key = secrets_manager.get_pld_deepseek_api_key()
         if not api_key:
             raise ValueError('PLD_DEEPSEEK_API_KEY is not set')
             
@@ -374,10 +375,10 @@ def get_openai_llm(model_name: str):
     
     """Initialize OpenAI language model"""
     try:
-        api_key = os.getenv('OPENAI_API_KEY')
+        api_key = secrets_manager.get_openai_api_key()
         if not api_key:
             raise ValueError('OPENAI_API_KEY is not set')
-            
+
         return ChatOpenAI(
             model=model_name,
             api_key=SecretStr(api_key),
@@ -392,7 +393,7 @@ def get_openai_llm_think(model_name: str):
     """Initialize OpenAI language model"""
     global global_use_vision
     try:
-        api_key = os.getenv('OPENAI_API_KEY')
+        api_key = secrets_manager.get_openai_api_key()
         if not api_key:
             raise ValueError('OPENAI_API_KEY is not set')
             
@@ -412,7 +413,7 @@ def get_openai_llm_think(model_name: str):
 def get_gemini_llm(model_name: str, code_execution: bool = False):
     """Initialize Google Gemini language model"""
     try:
-        api_key = os.getenv('GEMINI_API_KEY')
+        api_key = secrets_manager.get_gemini_api_key()
         if not api_key:
             raise ValueError('GEMINI_API_KEY is not set')
             

@@ -18,6 +18,7 @@ from pydantic import SecretStr, BaseModel
 from botocore.config import Config
 from dotenv import load_dotenv
 import logging
+import secrets_manager
 from pathlib import Path
 from browser_use.agent.views import ActionResult
 from cookie_sync import CookieSync
@@ -922,7 +923,7 @@ class WebAgent:
                         return ActionResult(error="OpenAI package not installed. Install with: pip install openai")
 
                     # Get API key
-                    api_key = os.getenv('OPENAI_API_KEY')
+                    api_key = secrets_manager.get_openai_api_key()
                     if not api_key:
                         return ActionResult(error="OPENAI_API_KEY environment variable is not set")
 
@@ -2463,7 +2464,7 @@ class WebAgent:
                     return ActionResult(error="Google Gemini SDK not installed. Install with: pip install google-genai")
 
                 # Get API key
-                api_key = os.getenv('GEMINI_API_KEY')
+                api_key = secrets_manager.get_gemini_api_key()
                 if not api_key:
                     return ActionResult(error="GEMINI_API_KEY environment variable is not set")
 
@@ -2677,7 +2678,7 @@ class WebAgent:
                     return ActionResult(error="Google Generative AI package not installed. Install with: pip install google-genai")
 
                 # Get API key
-                api_key = os.getenv('GEMINI_API_KEY')
+                api_key = secrets_manager.get_gemini_api_key()
                 if not api_key:
                     return ActionResult(error="GEMINI_API_KEY environment variable is not set")
 
@@ -3177,7 +3178,7 @@ class WebAgent:
                 
                 if model_to_use == "FLUX.1-Kontext-pro":
                     # Use Azure AI Services for FLUX model with direct HTTP requests
-                    api_key = os.getenv('AZURE_OPENAI_API_KEY2')
+                    api_key = secrets_manager.get_azure_openai_api_key2()
                     if not api_key:
                         return ActionResult(error="AZURE_OPENAI_API_KEY2 environment variable is not set for FLUX.1-Kontext-pro model")
                     
@@ -3193,7 +3194,7 @@ class WebAgent:
                     logger.info(f"Azure AI Services FLUX model configured: {azure_model_name}")
                 elif model_to_use == "gemini-2.5-flash-image":
                     # Use Google Gemini Nano Banana image model
-                    api_key = os.getenv('GOOGLE_IMAGE_API_KEY')
+                    api_key = secrets_manager.get_google_image_api_key()
                     if not api_key:
                         return ActionResult(error="GOOGLE_IMAGE_API_KEY environment variable is not set for Google Nano Banana model")
                     try:
@@ -3207,7 +3208,7 @@ class WebAgent:
                     google_model_name = "gemini-2.5-flash-image"
                 elif model_to_use == "gpt-image-1":
                     # Use Azure AI Services for gpt-image-1 model (same as FLUX)
-                    api_key = os.getenv('AZURE_OPENAI_API_KEY2')
+                    api_key = secrets_manager.get_azure_openai_api_key2()
                     if not api_key:
                         return ActionResult(error="AZURE_OPENAI_API_KEY2 environment variable is not set for gpt-image-1 model")
                     

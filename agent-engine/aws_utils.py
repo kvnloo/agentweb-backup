@@ -6,12 +6,17 @@ import logging
 logger = logging.getLogger(__name__)
 
 def get_aws_credentials():
-    """Get AWS credentials from environment variables"""
-    return {
-        'region_name': os.getenv('AWS_REGION', 'us-west-2'),
-        'aws_access_key_id': os.getenv('AWS_ACCESS_KEY_ID'),
-        'aws_secret_access_key': os.getenv('AWS_SECRET_ACCESS_KEY')
-    }
+    """
+    Get AWS credentials. If AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY are set
+    (local dev via .env), use them explicitly. Otherwise (prod), omit
+    explicit keys and let boto3's default credential chain use the
+    instance's attached/federated service account.
+    """
+    credentials = {'region_name': os.getenv('AWS_REGION', 'us-west-2')}
+    if os.getenv('AWS_ACCESS_KEY_ID'):
+        credentials['aws_access_key_id'] = os.getenv('AWS_ACCESS_KEY_ID')
+        credentials['aws_secret_access_key'] = os.getenv('AWS_SECRET_ACCESS_KEY')
+    return credentials
 
 def get_aws_client(service_name: str, config: Config = None) -> boto3.client:
     """
