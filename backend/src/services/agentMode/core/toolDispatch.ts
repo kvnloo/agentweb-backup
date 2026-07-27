@@ -56,6 +56,19 @@ export const MEDIA_GEN_TOOLS = new Set<string>([
 ]);
 
 /**
+ * ENG-510: how many media-gen calls batched in ONE assistant turn may run at once.
+ * Multi-variant requests were previously forced strictly serial (concurrency 1) to
+ * respect provider rate limits, but that makes N independent variants take N× a single
+ * image's wall-clock and blow the whole-turn cap. Run them with BOUNDED concurrency
+ * instead — big enough to finish a batch in ~one image's time, small enough to stay
+ * under provider rate limits. Override with AGENT_MODE_MEDIA_GEN_CONCURRENCY (min 1).
+ */
+export const MEDIA_GEN_MAX_CONCURRENCY = Math.max(
+  1,
+  parseInt(process.env.AGENT_MODE_MEDIA_GEN_CONCURRENCY || '3', 10) || 3,
+);
+
+/**
  * Tools exempt from same-turn dedupe (ENG-108) — they have legitimate repeat
  * semantics within a single assistant turn, so two identical calls are NOT a
  * double-execution bug. `wait_seconds` is the canonical case (sleeping twice is
@@ -648,7 +661,9 @@ export async function executePreparedTools(
     }
   };
 
-  if (hasWaitTool || hasMultipleMediaGenTools) {
+  if (hasWaitTool) {
+    // Strict sequential: wait_seconds must take effect in emission order, so nothing
+    // batched with it may overlap it.
     toolResults = [];
     for (const { toolCall, functionArgs, policyDecision } of preparedCalls) {
       if (shouldDeferMedia(toolCall)) {
@@ -660,6 +675,31 @@ export async function executePreparedTools(
       if (countsAsAsset(dr)) assetsThisBatch++;
       recordMediaDuration(dr);
       toolResults.push(dr);
+    }
+  } else if (hasMultipleMediaGenTools) {
+    // ENG-510: run batched media-gen with BOUNDED concurrency (MEDIA_GEN_MAX_CONCURRENCY
+    // at a time) instead of strictly serial, so N independent variants finish in ~one
+    // image's wall-clock and fit under the whole-turn cap — while staying under provider
+    // rate limits. Budget/duration state settles BETWEEN batches, so the deferral decision
+    // (and the >=1-asset forward-progress gate) is made per batch, race-free. Results are
+    // written by index so emission order is preserved regardless of completion order.
+    toolResults = new Array(preparedCalls.length);
+    for (let start = 0; start < preparedCalls.length; start += MEDIA_GEN_MAX_CONCURRENCY) {
+      const batch = preparedCalls.slice(start, start + MEDIA_GEN_MAX_CONCURRENCY);
+      const batchResults = await Promise.all(
+        batch.map(async ({ toolCall, functionArgs, policyDecision }) => {
+          if (shouldDeferMedia(toolCall)) {
+            return makeDeferred(toolCall, functionArgs, policyDecision);
+          }
+          const outcome = await runOne(toolCall, functionArgs, policyDecision);
+          return toDispatchResult(outcome, toolCall, functionArgs);
+        }),
+      );
+      batchResults.forEach((dr, i) => {
+        if (countsAsAsset(dr)) assetsThisBatch++;
+        recordMediaDuration(dr);
+        toolResults[start + i] = dr;
+      });
     }
   } else {
     // Parallel path carries at most one media-gen call (a solo call; any media call
