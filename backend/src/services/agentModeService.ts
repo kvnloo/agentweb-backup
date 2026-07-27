@@ -13847,7 +13847,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         throw this.makeMetaAuthError(`Meta ad account with ID "${accountId}" not found in connected accounts. Ensure you have the correct ID from list_connected_accounts.`);
       }
 
-      await this.ensureUsableMetaToken(selected, userId);
+      await this.ensureUsableMetaToken(selected, selected.userId || userId);
 
       return {
         accountId: clean(selected.account_id || selected.config?.ad_account_id),
@@ -13869,7 +13869,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // 4. Default to the single available account
     const selected = fbAccounts[0];
 
-    await this.ensureUsableMetaToken(selected, userId);
+    await this.ensureUsableMetaToken(selected, selected.userId || userId);
 
     console.log(`[AgentMode] Using Meta credentials from connected_accounts for user ${userId} (Account: ${selected.account_name})`);
 
@@ -15693,43 +15693,46 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async getMetaAdsMetrics(timeframe: string, userId: string, campaign_ids: string[] | string): Promise<any> {
+  public async getMetaAdsMetrics(
+    timeframe: string,
+    userId: string,
+    campaign_ids: string[] | string,
+    requestedAccountId?: string,
+  ): Promise<any> {
     try {
+      const rawCampaignIds = Array.isArray(campaign_ids)
+        ? campaign_ids
+        : (typeof campaign_ids === 'string' ? [campaign_ids] : []);
+      const campaignFilterIds = [
+        ...new Set(rawCampaignIds.map((id) => String(id).trim()).filter(Boolean))
+      ];
+      console.log('AgentMode: Filtering metrics by campaign IDs:', campaignFilterIds);
+      if (campaignFilterIds.length === 0) {
+        return {
+          success: false,
+          message: 'campaign_ids is required and must contain at least one campaign ID.',
+          error: 'Invalid campaign_ids'
+        };
+      }
 
-      // Import the Meta API functions directly to reuse the same logic
-      const { getMetaAccessToken } = await import('../utils/secretsManager');
-      const { userDb } = await import('./db');
       const { fetchWithRetryAndPaging } = await import('../utils/metaApiFetch');
 
-      // Get user from database
-      const user = await userDb.getUserById(userId);
-      if (!user) {
-        return {
-          success: false,
-          message: 'User not found',
-          error: 'User not found'
-        };
-      }
-
-      // Check if user has ad account configured
-      if (!user.adAccount || user.adAccount.trim() === "") {
-        return {
-          success: false,
-          message: 'Ad account not configured. Please configure your Meta ad account first.',
-          error: 'Ad account not configured'
-        };
-      }
-
-      // Get Meta API access token from Secrets Manager
+      // Use the same account resolver as the raw Insights tool. This keeps
+      // connected-account, org-shared, and legacy account selection consistent.
+      let accountId: string;
       let accessToken: string;
       try {
-        accessToken = await getMetaAccessToken();
+        ({ accountId, accessToken } = await this.getMetaCredentials(userId, requestedAccountId));
       } catch (error: any) {
-        console.error('AgentMode: Error fetching Meta access token:', error);
+        const credentialFailure =
+          error?.isMetaAuthError ||
+          /meta.*(?:access token|secret)|(?:access token|secret).*meta/i.test(error?.message || '');
+        if (!credentialFailure) throw error;
         return {
           success: false,
-          message: 'Meta access token not configured. Please contact your administrator.',
-          error: error.message || 'Failed to fetch access token from Secrets Manager'
+          message: error.message,
+          error: error.message,
+          errorType: 'connection'
         };
       }
 
@@ -15753,21 +15756,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const untilStr = endDate.toISOString().split('T')[0];
       const attributionDays = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24))) + 1; // +1 to include both start and end dates
 
-      // Build filtering parameter for API calls from campaign_ids
-      let campaignFilterIds: string[] = [];
-      const rawCampaignIds = Array.isArray(campaign_ids)
-        ? campaign_ids
-        : (typeof campaign_ids === 'string' ? [campaign_ids] : []);
-      campaignFilterIds = [...new Set(rawCampaignIds.map((id) => String(id).trim()).filter(Boolean))];
-      console.log('AgentMode: Filtering metrics by campaign IDs:', campaignFilterIds);
-      if (campaignFilterIds.length === 0) {
-        return {
-          success: false,
-          message: 'campaign_ids is required and must contain at least one campaign ID.',
-          error: 'Invalid campaign_ids'
-        };
-      }
-
       // Build filtering parameter for API calls
       const filteringParam = campaignFilterIds.length > 0
         ? `&filtering=[{"field":"campaign.id","operator":"IN","value":["${campaignFilterIds.join('","')}"]}]`
@@ -15777,48 +15765,49 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Get campaigns, ad sets, ads, and insights using Graph API - fetch at multiple levels
       // Using fetchWithRetryAndPaging to automatically handle pagination if there are multiple pages
       const [campaignsData, adSetsData, adsData, adInsightsData, adSetInsightsData, campaignInsightsData, insightsDemographicsData, insightsPlacementData, insightsDeviceData] = await Promise.all([
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
         // Ad-level insights for ads processing
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
         // Adset-level insights for ad sets processing
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset${filteringParam}&access_token=${accessToken}`),
         // Campaign-level insights for campaigns processing
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Demographics breakdown (age/gender)
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Placement breakdown (publisher platform and position)
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Device breakdown (mobile/desktop, etc.)
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`)
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`)
       ]);
 
 
-      // Check for errors in any of the responses
-      if (campaignsData.error) {
-        console.error('AgentMode: Campaigns API Error:', campaignsData.error);
-        throw new Error(`Campaigns API Error: ${campaignsData.error.message}`);
-      }
-      if (adSetsData.error) {
-        console.error('AgentMode: Ad Sets API Error:', adSetsData.error);
-        throw new Error(`Ad Sets API Error: ${adSetsData.error.message}`);
-      }
-      if (adsData.error) {
-        console.error('AgentMode: Ads API Error:', adsData.error);
-        throw new Error(`Ads API Error: ${adsData.error.message}`);
-      }
-      if (adInsightsData.error) {
-        console.error('AgentMode: Ad-level Insights API Error:', adInsightsData.error);
-        throw new Error(`Ad-level Insights API Error: ${adInsightsData.error.message}`);
-      }
-      if (adSetInsightsData.error) {
-        console.error('AgentMode: Adset-level Insights API Error:', adSetInsightsData.error);
-        throw new Error(`Adset-level Insights API Error: ${adSetInsightsData.error.message}`);
-      }
-      if (campaignInsightsData.error) {
-        console.error('AgentMode: Campaign-level Insights API Error:', campaignInsightsData.error);
-        throw new Error(`Campaign-level Insights API Error: ${campaignInsightsData.error.message}`);
+      // Keep connection lookup, permission, and query failures distinct so Emma
+      // can prompt for the right remedy instead of always asking for reconnect.
+      for (const [section, response] of [
+        ['Campaigns', campaignsData],
+        ['Ad Sets', adSetsData],
+        ['Ads', adsData],
+        ['Ad-level Insights', adInsightsData],
+        ['Adset-level Insights', adSetInsightsData],
+        ['Campaign-level Insights', campaignInsightsData],
+      ] as const) {
+        if (!response?.error) continue;
+        console.error(`AgentMode: ${section} API Error:`, response.error);
+        const message = response.error.message || 'Unknown Meta API error';
+        const code = Number(response.error.code);
+        const connectionFailure =
+          code === 190 ||
+          /access token|oauth|token.*(?:expired|invalid|revoked)/i.test(message);
+        const permissionFailure =
+          [10, 200].includes(code) ||
+          /permission|not authorized/i.test(message);
+        const typedError = new Error(`${section} API Error: ${message}`) as any;
+        typedError.metaMetricsErrorType = connectionFailure
+          ? 'connection'
+          : (permissionFailure ? 'permission' : 'api');
+        throw typedError;
       }
       // ENG-104: breakdown endpoints are NON-fatal (we proceed without them), but
       // a missing/errored breakdown must be distinguishable from an empty-but-OK
@@ -15895,13 +15884,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
 
       return result;
-    } catch (error) {
+    } catch (error: any) {
       console.error('AgentMode: Error fetching Meta ads metrics:', error);
       console.error('AgentMode: Error stack:', error instanceof Error ? error.stack : 'No stack trace');
+      const errorType = error?.isMetaAuthError
+        ? 'connection'
+        : (error?.metaMetricsErrorType || 'api');
+      const message = error instanceof Error ? error.message : 'Unknown error';
       return {
         success: false,
-        message: 'Failed to fetch Meta ads metrics. Please ensure your Meta ad account is properly configured.',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        message,
+        error: message,
+        errorType
       };
     }
   }
