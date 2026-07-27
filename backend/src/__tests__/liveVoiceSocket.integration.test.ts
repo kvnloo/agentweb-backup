@@ -69,6 +69,7 @@ jest.mock('../services/agentModeService', () => ({
 import {
   closeLiveSession,
   hasLiveSession,
+  sendTextTurn,
 } from '../services/liveVoiceService';
 import {
   registerLiveCloseHandler,
@@ -437,4 +438,62 @@ it('does not run a queued replacement after live:close cancels it', async () => 
   expect(blocked.firstSession.close).not.toHaveBeenCalled();
   expect(hasLiveSession(OWNED_SESSION)).toBe(true);
   abortSpy.mockRestore();
+});
+
+it('keeps the active owner when a replacement socket disconnects during Gemini connect', async () => {
+  const originalSession = {
+    sendClientContent: jest.fn(),
+    sendRealtimeInput: jest.fn(),
+    sendToolResponse: jest.fn(),
+    close: jest.fn(),
+  };
+  const replacementSession = {
+    sendClientContent: jest.fn(),
+    sendRealtimeInput: jest.fn(),
+    sendToolResponse: jest.fn(),
+    close: jest.fn(),
+  };
+  let releaseReplacement: (() => void) | undefined;
+  let markReplacementStarted: (() => void) | undefined;
+  const replacementStarted = new Promise<void>((resolve) => {
+    markReplacementStarted = resolve;
+  });
+  mockLiveConnect
+    .mockResolvedValueOnce(originalSession)
+    .mockImplementationOnce(() => {
+      markReplacementStarted?.();
+      return new Promise((resolve) => {
+        releaseReplacement = () => resolve(replacementSession);
+      });
+    });
+
+  const owner = await connect({ kind: 'normal', userId: OWNER });
+  const ownerReady = waitForEvent<{ sessionId: string }>(owner, 'live:ready');
+  owner.emit('live:start', { sessionId: OWNED_SESSION });
+  await expect(ownerReady).resolves.toEqual({ sessionId: OWNED_SESSION });
+
+  const replacement = await connect({ kind: 'normal', userId: OWNER });
+  const replacementServerSocket = serverSockets.get(replacement.id!);
+  replacement.emit('live:start', { sessionId: OWNED_SESSION });
+  await within(replacementStarted, 'replacement Gemini connect');
+
+  const serverDisconnected = new Promise<void>((resolve) => {
+    replacementServerSocket?.once('disconnect', () => resolve());
+  });
+  replacement.disconnect();
+  await serverDisconnected;
+  releaseReplacement?.();
+  await within(
+    waitForCondition(
+      () => replacementServerSocket?.data.pendingLiveStarts?.has(OWNED_SESSION) !== true,
+    ),
+    'cancelled replacement cleanup',
+  );
+
+  expect(originalSession.close).not.toHaveBeenCalled();
+  expect(replacementSession.close).toHaveBeenCalledTimes(1);
+  expect(hasLiveSession(OWNED_SESSION)).toBe(true);
+  await expect(
+    sendTextTurn(OWNED_SESSION, 'still active', owner.id!),
+  ).resolves.toBeUndefined();
 });

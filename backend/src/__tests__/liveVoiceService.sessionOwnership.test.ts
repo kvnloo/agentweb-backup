@@ -136,6 +136,7 @@ afterAll(() => {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockLiveConnect.mockReset();
   closeLiveSession(VICTIM_SESSION);
   mockGetChatSessionRecord.mockResolvedValue({
     sessionId: VICTIM_SESSION,
@@ -527,6 +528,122 @@ describe('startLiveSession — overlapping authorized starts are serialized (ENG
     expect(firstSession.close).not.toHaveBeenCalled();
     await expect(
       sendTextTurn(OWNER_SESSION, 'still owned', 'socket-owner'),
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe('startLiveSession — replacement swap is cancellation-safe (ENG-521 P1)', () => {
+  const SWAP_SESSION = 'session-cancellation-safe-swap';
+
+  async function beginBlockedReplacement() {
+    const originalSession = {
+      sendClientContent: jest.fn(),
+      sendRealtimeInput: jest.fn(),
+      sendToolResponse: jest.fn(),
+      close: jest.fn(),
+    };
+    const replacementSession = {
+      sendClientContent: jest.fn(),
+      sendRealtimeInput: jest.fn(),
+      sendToolResponse: jest.fn(),
+      close: jest.fn(),
+    };
+    let releaseReplacement: (() => void) | undefined;
+    let markReplacementStarted: (() => void) | undefined;
+    const replacementStarted = new Promise<void>((resolve) => {
+      markReplacementStarted = resolve;
+    });
+    mockLiveConnect
+      .mockResolvedValueOnce(originalSession)
+      .mockImplementationOnce(() => {
+        markReplacementStarted?.();
+        return new Promise((resolve) => {
+          releaseReplacement = () => resolve(replacementSession);
+        });
+      });
+    mockGetChatSessionRecord.mockResolvedValue({
+      sessionId: SWAP_SESSION,
+      userId: VICTIM_USER,
+    });
+
+    await startLiveSession(
+      SWAP_SESSION,
+      'socket-original',
+      jest.fn(),
+      VICTIM_USER,
+    );
+    const controller = new AbortController();
+    const replacementStart = startLiveSession(
+      SWAP_SESSION,
+      'socket-replacement',
+      jest.fn(),
+      VICTIM_USER,
+      'default',
+      controller.signal,
+    );
+    await replacementStarted;
+
+    return {
+      controller,
+      originalSession,
+      replacementSession,
+      replacementStart,
+      releaseReplacement: () => releaseReplacement?.(),
+    };
+  }
+
+  afterEach(() => {
+    closeLiveSession(SWAP_SESSION);
+  });
+
+  it('does not close the original Gemini connection when replacement connect is cancelled', async () => {
+    const scenario = await beginBlockedReplacement();
+    scenario.controller.abort();
+    scenario.releaseReplacement();
+
+    await expect(scenario.replacementStart).rejects.toMatchObject({
+      code: 'LIVE_SESSION_START_CANCELLED',
+    });
+    expect(scenario.originalSession.close).not.toHaveBeenCalled();
+  });
+
+  it('keeps the original socket routable when replacement connect is cancelled', async () => {
+    const scenario = await beginBlockedReplacement();
+    scenario.controller.abort();
+    scenario.releaseReplacement();
+    await expect(scenario.replacementStart).rejects.toMatchObject({
+      code: 'LIVE_SESSION_START_CANCELLED',
+    });
+
+    await expect(
+      sendTextTurn(SWAP_SESSION, 'still here', 'socket-original'),
+    ).resolves.toBeUndefined();
+    expect(scenario.originalSession.sendClientContent).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the original registry entry active when replacement connect is cancelled', async () => {
+    const scenario = await beginBlockedReplacement();
+    scenario.controller.abort();
+    scenario.releaseReplacement();
+    await expect(scenario.replacementStart).rejects.toMatchObject({
+      code: 'LIVE_SESSION_START_CANCELLED',
+    });
+
+    expect(hasLiveSession(SWAP_SESSION)).toBe(true);
+    await expect(
+      sendTextTurn(SWAP_SESSION, 'wrong socket', 'socket-replacement'),
+    ).rejects.toThrow();
+  });
+
+  it('still swaps successfully after a replacement connection is fully ready', async () => {
+    const scenario = await beginBlockedReplacement();
+    scenario.releaseReplacement();
+    await scenario.replacementStart;
+
+    expect(scenario.originalSession.close).toHaveBeenCalledTimes(1);
+    expect(scenario.replacementSession.close).not.toHaveBeenCalled();
+    await expect(
+      sendTextTurn(SWAP_SESSION, 'new owner', 'socket-replacement'),
     ).resolves.toBeUndefined();
   });
 });

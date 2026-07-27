@@ -361,6 +361,7 @@ async function openGeminiSession(
         console.log(`[liveVoiceService] Gemini session OPEN for ${sessionId}${resumptionHandle ? ' (resumed)' : ''}`);
       },
       onmessage: (message: LiveServerMessage) => {
+        if (activeSessions.get(sessionId) !== entry) return;
         console.log(`[liveVoiceService] Gemini message for ${sessionId}:`, JSON.stringify(message).slice(0, 200));
         handleIncomingMessage(sessionId, message).catch((err) => {
           console.error(`[liveVoiceService] handleIncomingMessage error for ${sessionId}:`, err?.message, err?.stack?.split('\n').slice(0, 5).join(' | '));
@@ -369,7 +370,7 @@ async function openGeminiSession(
       onerror: (e: ErrorEvent) => {
         console.error(`[liveVoiceService] Gemini ERROR on session ${sessionId}:`, e.message, e);
         const currentEntry = activeSessions.get(sessionId);
-        if (currentEntry) {
+        if (currentEntry === entry) {
           void recordOnboardingFailure(
             currentEntry.userId,
             ONBOARDING_TELEMETRY_EVENTS.voiceSessionFailed,
@@ -382,18 +383,19 @@ async function openGeminiSession(
       onclose: (e: CloseEvent) => {
         console.log(`[liveVoiceService] Gemini CLOSED session ${sessionId}, code=${e.code}, reason=${e.reason}`);
         const currentEntry = activeSessions.get(sessionId);
-        if (!currentEntry) return;
+        if (currentEntry !== entry) return;
 
         // Code 1000 = normal closure by Gemini after a turn. Reconnect transparently
         // using the latest resumption handle so the conversation continues.
         if (e.code === 1000 && currentEntry.resumptionHandle) {
           console.log(`[liveVoiceService] Auto-reconnecting session ${sessionId} with handle ${currentEntry.resumptionHandle.slice(0, 8)}...`);
           openGeminiSession(sessionId, currentEntry, currentEntry.resumptionHandle)
-            .then(() => { currentEntry.session = activeSessions.get(sessionId)!.session; })
             .catch((err) => {
               console.error(`[liveVoiceService] Reconnect failed for ${sessionId}:`, err?.message);
-              activeSessions.delete(sessionId);
-              currentEntry.emitFn('live:closed', { sessionId });
+              if (activeSessions.get(sessionId) === currentEntry) {
+                activeSessions.delete(sessionId);
+                currentEntry.emitFn('live:closed', { sessionId });
+              }
             });
           return;
         }
@@ -618,13 +620,6 @@ async function doStartLiveSession(
     console.log(`[liveVoiceService] Injecting history into system prompt for ${sessionId}`);
   }
 
-  // Keep the current caller's live session intact until the replacement has
-  // finished all cancellable preparation. A queued start abandoned by its
-  // socket must never terminate a healthy session.
-  if (activeSessions.has(sessionId)) {
-    closeLiveSession(sessionId);
-  }
-
   // Placeholder entry — filled after session resolves
   const entry: LiveEntry = {
     session: null as unknown as Session,
@@ -641,10 +636,12 @@ async function doStartLiveSession(
     startedAt,
     turnCount: 0,
   };
-  activeSessions.set(sessionId, entry);
 
   // Pass history via system prompt on fresh starts. Code-1000 resumptions already
   // carry Gemini's own in-memory context, so historyContext is not passed there.
+  // The replacement is staged outside the registry: the healthy prior session
+  // remains routable until Gemini accepts the new connection and cancellation
+  // can no longer strand both callers.
   await openGeminiSession(sessionId, entry, undefined, historyContext || undefined);
   if (signal?.aborted) {
     try {
@@ -652,9 +649,22 @@ async function doStartLiveSession(
     } catch {
       // Ignore close errors while cancelling an abandoned start.
     }
-    if (activeSessions.get(sessionId) === entry) activeSessions.delete(sessionId);
     throw new LiveSessionStartCancelledError();
   }
+
+  // Atomically publish the ready replacement, then retire the prior connection.
+  // Old-session callbacks are identity-guarded above, so a synchronous close
+  // cannot delete or emit against the newly published entry.
+  const previousEntry = activeSessions.get(sessionId);
+  activeSessions.set(sessionId, entry);
+  if (previousEntry) {
+    try {
+      previousEntry.session.close();
+    } catch {
+      // Ignore close errors after the replacement is safely active.
+    }
+  }
+
   entry.readyAt = Date.now();
   void recordOnboardingEvent(
     userId,
