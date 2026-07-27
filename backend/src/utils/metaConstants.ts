@@ -36,6 +36,13 @@ export const ALLOWED_INSIGHTS_FIELDS = [
   'cpc',
   'cpm',
   'cpp',
+  // COST-PER-CLICK DERIVED METRICS
+  // Genuinely valid Meta Insights fields that were missing from the whitelist.
+  // Their absence caused scheduled campaign check-ins to be hard-rejected and
+  // retried until the loop guard blocked the whole insights channel (ENG-511).
+  'cost_per_inline_link_click',
+  'cost_per_unique_inline_link_click',
+  'cost_per_unique_click',
 
   // VIDEO METRICS
   'video_views',
@@ -56,6 +63,7 @@ export const ALLOWED_INSIGHTS_FIELDS = [
   'action_values',
   'cost_per_action_type',
   'cost_per_unique_action_type',
+  'cost_per_inline_post_engagement',
   'engagement_rate_ranking',
   'quality_ranking',
   'conversion_rate_ranking',
@@ -108,6 +116,76 @@ export const ALLOWED_INSIGHTS_FIELDS = [
   'full_view_impressions',
   'cost_per_full_view'
 ];
+
+/** Levenshtein edit distance — small helper for typo/near-miss field suggestions. */
+function editDistance(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  let curr = new Array(n + 1).fill(0);
+  for (let i = 1; i <= m; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+    }
+    [prev, curr] = [curr, prev];
+  }
+  return prev[n];
+}
+
+/**
+ * ENG-511: Suggest the closest valid insights field for a dropped/unknown one, so
+ * the model can correct a typo or loose phrasing (e.g. `impression` -> `impressions`,
+ * `link_clicks` -> `inline_link_clicks`) instead of just seeing the field vanish.
+ * Returns null when nothing is plausibly the same intent (e.g. a made-up metric) —
+ * a wrong suggestion would be worse than none. This only produces a hint; it never
+ * substitutes the field, so the tool never returns a metric the caller did not ask for.
+ */
+export function suggestInsightsField(name: string): string | null {
+  const n = (name || '').toLowerCase().trim();
+  if (!n) return null;
+  let best: string | null = null;
+  let bestDist = Infinity;
+  for (const f of ALLOWED_INSIGHTS_FIELDS) {
+    // Never suggest the field itself. A dropped field can still BE on the
+    // whitelist (e.g. a valid-but-account-unsupported field Meta rejects at
+    // runtime); suggesting it back verbatim is a degenerate, confusing hint.
+    if (f === n) continue;
+    let dist = editDistance(n, f);
+    // Reward containment (common when the model uses a looser phrasing like
+    // `link_clicks` for `inline_link_clicks`). Guard against tiny fragments so
+    // short field names don't match everything. Prefer a field that contains the
+    // whole query (a more specific field) over the reverse, so `link_clicks`
+    // resolves to `inline_link_clicks`, not the broader `clicks`.
+    if (n.length >= 4 && f.includes(n)) {
+      dist = Math.min(dist, 0.5);
+    } else if (n.length >= 4 && n.includes(f) && f.length >= 4) {
+      dist = Math.min(dist, 1);
+    }
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = f;
+    }
+  }
+  // Only suggest when the closest field is plausibly the same intent. Cap the
+  // threshold so a long field name can't match a far-off field on distance alone
+  // (containment matches, scored <= 1 above, are unaffected by the cap).
+  const threshold = Math.min(4, Math.max(2, Math.floor(n.length / 3)));
+  return best && bestDist <= threshold ? best : null;
+}
+
+/** Build a { droppedField: suggestion } map, omitting drops with no plausible match. */
+export function suggestInsightsFields(names: string[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const name of names) {
+    const s = suggestInsightsField(name);
+    if (s) out[name] = s;
+  }
+  return out;
+}
 
 export const ALLOWED_INSIGHTS_BREAKDOWNS = [
   'age',

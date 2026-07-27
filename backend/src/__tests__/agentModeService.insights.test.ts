@@ -149,6 +149,11 @@ describe('AgentModeService - callMetaAdsInsightsApiWrapper', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    // clearAllMocks does not drain queued `...Once` implementations; reset the
+    // axios mocks explicitly so per-test mockResolvedValueOnce/mockRejectedValueOnce
+    // chains never bleed across tests (order-independent).
+    mockedAxios.post.mockReset();
+    mockedAxios.get.mockReset();
     service = new AgentModeService();
     // Speed up polling
     jest.useFakeTimers();
@@ -187,7 +192,7 @@ describe('AgentModeService - callMetaAdsInsightsApiWrapper', () => {
       expect(result.error).toContain('fields array is required');
     });
 
-    it('should return error for invalid fields', async () => {
+    it('should return error when ALL requested fields are invalid', async () => {
       const result = await service.callMetaAdsInsightsApiWrapper(userId, {
         account_id: '123',
         object_type: 'account',
@@ -195,6 +200,319 @@ describe('AgentModeService - callMetaAdsInsightsApiWrapper', () => {
       });
       expect(result.success).toBe(false);
       expect(result.error).toContain('Invalid insights fields requested: invalid_field');
+      // ENG-511: the error must steer the model away from a blind retry.
+      expect(result.error).toContain('do not retry');
+    });
+
+    it('should accept cost_per_inline_link_click (ENG-511 whitelist gap)', async () => {
+      mockUserDb.getUserById.mockResolvedValue({
+        id: userId,
+        adAccount: '922903076601160',
+      });
+      mockedAxios.post.mockResolvedValueOnce({
+        status: 200,
+        data: { report_run_id: 'report-cplc' }
+      } as any);
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { async_status: 'Job Completed' }
+      } as any);
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { data: [{ cost_per_inline_link_click: '1.23' }], paging: {} }
+      } as any);
+
+      const insightsPromise = service.callMetaAdsInsightsApiWrapper(userId, {
+        account_id: '922903076601160',
+        object_type: 'account',
+        fields: ['spend', 'cost_per_inline_link_click'],
+        date_preset: 'last_30d'
+      });
+      await jest.runAllTimersAsync();
+      const result = await insightsPromise;
+
+      expect(result.success).toBe(true);
+      // The field reached Meta rather than being rejected as "invalid".
+      const postArgs = mockedAxios.post.mock.calls[0][1] as any;
+      expect(postArgs.fields).toContain('cost_per_inline_link_click');
+      expect(result.metadata.dropped_fields).toBeUndefined();
+    });
+
+    it('should drop unknown fields, proceed with the valid subset, and report the dropped ones (ENG-511)', async () => {
+      mockUserDb.getUserById.mockResolvedValue({
+        id: userId,
+        adAccount: '922903076601160',
+      });
+      mockedAxios.post.mockResolvedValueOnce({
+        status: 200,
+        data: { report_run_id: 'report-mixed' }
+      } as any);
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { async_status: 'Job Completed' }
+      } as any);
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { data: [{ impressions: '100' }], paging: {} }
+      } as any);
+
+      const insightsPromise = service.callMetaAdsInsightsApiWrapper(userId, {
+        account_id: '922903076601160',
+        object_type: 'account',
+        fields: ['impressions', 'made_up_metric'],
+        date_preset: 'last_30d'
+      });
+      await jest.runAllTimersAsync();
+      const result = await insightsPromise;
+
+      expect(result.success).toBe(true);
+      // Only the valid field is sent to Meta; the unknown one is stripped.
+      const postArgs = mockedAxios.post.mock.calls[0][1] as any;
+      expect(postArgs.fields).toBe('impressions');
+      expect(postArgs.fields).not.toContain('made_up_metric');
+      // The dropped field is surfaced so the model does not re-request it.
+      expect(result.metadata.dropped_fields).toEqual(['made_up_metric']);
+    });
+
+    it('should suggest the closest valid field for a dropped typo (ENG-511)', async () => {
+      mockUserDb.getUserById.mockResolvedValue({
+        id: userId,
+        adAccount: '922903076601160',
+      });
+      mockedAxios.post.mockResolvedValueOnce({
+        status: 200,
+        data: { report_run_id: 'report-typo' },
+      } as any);
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { async_status: 'Job Completed' },
+      } as any);
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { data: [{ impressions: '100' }], paging: {} },
+      } as any);
+
+      const insightsPromise = service.callMetaAdsInsightsApiWrapper(userId, {
+        account_id: '922903076601160',
+        object_type: 'account',
+        fields: ['impressions', 'impression'], // 'impression' is a typo of 'impressions'
+        date_preset: 'last_30d',
+      });
+      await jest.runAllTimersAsync();
+      const result = await insightsPromise;
+
+      expect(result.success).toBe(true);
+      expect(result.metadata.dropped_fields).toEqual(['impression']);
+      // The model is told the closest valid field so it can correct the typo.
+      expect(result.metadata.dropped_field_suggestions).toEqual({
+        impression: 'impressions',
+      });
+    });
+
+    it('should drop a Meta-rejected field and retry the submit once (ENG-511 graceful 400 handling)', async () => {
+      mockUserDb.getUserById.mockResolvedValue({
+        id: userId,
+        adAccount: '922903076601160',
+      });
+      // First submit: Meta rejects a field that passed our whitelist.
+      mockedAxios.post.mockRejectedValueOnce({
+        response: {
+          status: 400,
+          data: {
+            error: {
+              code: 100,
+              message:
+                '(#100) cost_per_unique_click is not valid for fields param',
+            },
+          },
+        },
+      } as any);
+      // Retry submit (offending field dropped): succeeds.
+      mockedAxios.post.mockResolvedValueOnce({
+        status: 200,
+        data: { report_run_id: 'report-retry' },
+      } as any);
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { async_status: 'Job Completed' },
+      } as any);
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { data: [{ spend: '10' }], paging: {} },
+      } as any);
+
+      const insightsPromise = service.callMetaAdsInsightsApiWrapper(userId, {
+        account_id: '922903076601160',
+        object_type: 'account',
+        fields: ['spend', 'cost_per_unique_click'],
+        date_preset: 'last_30d',
+      });
+      await jest.runAllTimersAsync();
+      const result = await insightsPromise;
+
+      expect(result.success).toBe(true);
+      // Submitted exactly twice: original + one corrected retry (no loop).
+      expect(mockedAxios.post).toHaveBeenCalledTimes(2);
+      // The retry dropped only the Meta-rejected field.
+      const retryArgs = mockedAxios.post.mock.calls[1][1] as any;
+      expect(retryArgs.fields).toBe('spend');
+      expect(result.metadata.dropped_fields).toContain('cost_per_unique_click');
+    });
+
+    it('should self-heal when Meta rejects a field lazily at result-read time, not at submit (ENG-511)', async () => {
+      mockUserDb.getUserById.mockResolvedValue({
+        id: userId,
+        adAccount: '922903076601160',
+      });
+      // Submit succeeds (report_run_id issued) ...
+      mockedAxios.post.mockResolvedValueOnce({
+        status: 200,
+        data: { report_run_id: 'report-lazy-1' },
+      } as any);
+      // ... job completes ...
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { async_status: 'Job Completed' },
+      } as any);
+      // ... but the RESULTS fetch 400s on the field (Meta validates it lazily).
+      mockedAxios.get.mockRejectedValueOnce({
+        response: {
+          status: 400,
+          data: {
+            error: {
+              code: 100,
+              message:
+                '(#100) Tried accessing nonexisting summary field (onsite_conversion_lead_grouped)',
+            },
+          },
+        },
+      } as any);
+      // Retry: whole report re-runs with the field dropped, and succeeds.
+      mockedAxios.post.mockResolvedValueOnce({
+        status: 200,
+        data: { report_run_id: 'report-lazy-2' },
+      } as any);
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { async_status: 'Job Completed' },
+      } as any);
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { data: [{ spend: '5' }], paging: {} },
+      } as any);
+
+      const insightsPromise = service.callMetaAdsInsightsApiWrapper(userId, {
+        account_id: '922903076601160',
+        object_type: 'account',
+        fields: ['spend', 'onsite_conversion_lead_grouped'],
+        date_preset: 'last_30d',
+      });
+      await jest.runAllTimersAsync();
+      const result = await insightsPromise;
+
+      expect(result.success).toBe(true);
+      // The whole report was re-run once (two submits), not left as a bare error.
+      expect(mockedAxios.post).toHaveBeenCalledTimes(2);
+      const retryArgs = mockedAxios.post.mock.calls[1][1] as any;
+      expect(retryArgs.fields).toBe('spend');
+      expect(result.metadata.dropped_fields).toContain(
+        'onsite_conversion_lead_grouped'
+      );
+    });
+
+    it('should recover valid metrics when Meta rejects multiple fields one at a time (ENG-511)', async () => {
+      mockUserDb.getUserById.mockResolvedValue({
+        id: userId,
+        adAccount: '922903076601160',
+      });
+      // Submit #1: Meta names only the FIRST incompatible field.
+      mockedAxios.post.mockRejectedValueOnce({
+        response: {
+          status: 400,
+          data: {
+            error: {
+              code: 100,
+              message: '(#100) store_visit_actions is not valid for fields param',
+            },
+          },
+        },
+      } as any);
+      // Submit #2 (store_visit_actions dropped): Meta now names the SECOND one.
+      mockedAxios.post.mockRejectedValueOnce({
+        response: {
+          status: 400,
+          data: {
+            error: {
+              code: 100,
+              message:
+                '(#100) Tried accessing nonexisting summary field (onsite_conversion_lead_grouped)',
+            },
+          },
+        },
+      } as any);
+      // Submit #3 (both dropped): succeeds.
+      mockedAxios.post.mockResolvedValueOnce({
+        status: 200,
+        data: { report_run_id: 'report-multi' },
+      } as any);
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { async_status: 'Job Completed' },
+      } as any);
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { data: [{ spend: '12' }], paging: {} },
+      } as any);
+
+      const insightsPromise = service.callMetaAdsInsightsApiWrapper(userId, {
+        account_id: '922903076601160',
+        object_type: 'account',
+        fields: ['spend', 'store_visit_actions', 'onsite_conversion_lead_grouped'],
+        date_preset: 'last_30d',
+      });
+      await jest.runAllTimersAsync();
+      const result = await insightsPromise;
+
+      // The otherwise-valid metric survives; it is NOT lost to the second rejection.
+      expect(result.success).toBe(true);
+      expect(mockedAxios.post).toHaveBeenCalledTimes(3);
+      const finalArgs = mockedAxios.post.mock.calls[2][1] as any;
+      expect(finalArgs.fields).toBe('spend');
+      expect(result.metadata.dropped_fields).toEqual(
+        expect.arrayContaining([
+          'store_visit_actions',
+          'onsite_conversion_lead_grouped',
+        ])
+      );
+    });
+
+    it('should return a no-retry error when Meta rejects fields but the offender cannot be isolated (ENG-511)', async () => {
+      mockUserDb.getUserById.mockResolvedValue({
+        id: userId,
+        adAccount: '922903076601160',
+      });
+      mockedAxios.post.mockRejectedValueOnce({
+        response: {
+          status: 400,
+          data: {
+            error: { code: 100, message: '(#100) The fields parameter is malformed' },
+          },
+        },
+      } as any);
+
+      const insightsPromise = service.callMetaAdsInsightsApiWrapper(userId, {
+        account_id: '922903076601160',
+        object_type: 'account',
+        fields: ['spend', 'impressions'],
+        date_preset: 'last_30d',
+      });
+      await jest.runAllTimersAsync();
+      const result = await insightsPromise;
+
+      expect(result.success).toBe(false);
+      // No blind retry into the anti-loop guard.
+      expect(mockedAxios.post).toHaveBeenCalledTimes(1);
+      expect(result.error).toMatch(/do not retry/i);
     });
 
     it('should return error for invalid breakdowns', async () => {
