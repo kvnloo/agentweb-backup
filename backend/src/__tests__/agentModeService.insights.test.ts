@@ -420,6 +420,72 @@ describe('AgentModeService - callMetaAdsInsightsApiWrapper', () => {
       );
     });
 
+    it('should recover valid metrics when Meta rejects multiple fields one at a time (ENG-511)', async () => {
+      mockUserDb.getUserById.mockResolvedValue({
+        id: userId,
+        adAccount: '922903076601160',
+      });
+      // Submit #1: Meta names only the FIRST incompatible field.
+      mockedAxios.post.mockRejectedValueOnce({
+        response: {
+          status: 400,
+          data: {
+            error: {
+              code: 100,
+              message: '(#100) store_visit_actions is not valid for fields param',
+            },
+          },
+        },
+      } as any);
+      // Submit #2 (store_visit_actions dropped): Meta now names the SECOND one.
+      mockedAxios.post.mockRejectedValueOnce({
+        response: {
+          status: 400,
+          data: {
+            error: {
+              code: 100,
+              message:
+                '(#100) Tried accessing nonexisting summary field (onsite_conversion_lead_grouped)',
+            },
+          },
+        },
+      } as any);
+      // Submit #3 (both dropped): succeeds.
+      mockedAxios.post.mockResolvedValueOnce({
+        status: 200,
+        data: { report_run_id: 'report-multi' },
+      } as any);
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { async_status: 'Job Completed' },
+      } as any);
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { data: [{ spend: '12' }], paging: {} },
+      } as any);
+
+      const insightsPromise = service.callMetaAdsInsightsApiWrapper(userId, {
+        account_id: '922903076601160',
+        object_type: 'account',
+        fields: ['spend', 'store_visit_actions', 'onsite_conversion_lead_grouped'],
+        date_preset: 'last_30d',
+      });
+      await jest.runAllTimersAsync();
+      const result = await insightsPromise;
+
+      // The otherwise-valid metric survives; it is NOT lost to the second rejection.
+      expect(result.success).toBe(true);
+      expect(mockedAxios.post).toHaveBeenCalledTimes(3);
+      const finalArgs = mockedAxios.post.mock.calls[2][1] as any;
+      expect(finalArgs.fields).toBe('spend');
+      expect(result.metadata.dropped_fields).toEqual(
+        expect.arrayContaining([
+          'store_visit_actions',
+          'onsite_conversion_lead_grouped',
+        ])
+      );
+    });
+
     it('should return a no-retry error when Meta rejects fields but the offender cannot be isolated (ENG-511)', async () => {
       mockUserDb.getUserById.mockResolvedValue({
         id: userId,
