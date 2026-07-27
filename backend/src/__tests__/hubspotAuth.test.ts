@@ -46,6 +46,27 @@ jest.mock('../middleware/auth', () => ({
   },
 }));
 
+// OAuth token sessions are no longer held in process memory — they round-trip through the
+// settings table (shared DynamoDB-backed store) so /finalize and /connect can land on
+// different instances (ENG-162). Back it with an in-memory map for this route test.
+jest.mock('../services/settingsService', () => {
+  const store = new Map<string, string>();
+  return {
+    settingsService: {
+      setSetting: jest.fn(async (settingName: string, settingValue: string) => {
+        store.set(settingName, settingValue);
+      }),
+      getSetting: jest.fn(async (settingName: string) => {
+        const settingValue = store.get(settingName);
+        return settingValue ? { settingName, settingValue } : null;
+      }),
+      deleteSetting: jest.fn(async (settingName: string) => {
+        store.delete(settingName);
+      }),
+    },
+  };
+});
+
 jest.mock('axios');
 const axios = require('axios');
 
@@ -55,6 +76,7 @@ process.env.CUSTOMER_FRONTEND_URL = 'http://localhost:5174';
 
 import hubspotAuthRouter from '../routes/hubspotAuth';
 import { createAccount } from '../services/connectedAccountsDb';
+import { settingsService } from '../services/settingsService';
 
 const app = express();
 app.use(express.json());
@@ -216,6 +238,30 @@ describe('HubSpot OAuth Routes', () => {
 
       expect(res.status).toBe(403);
     });
+
+    it('returns an explicit 500 when the shared session store cannot persist tokens', async () => {
+      const state = generateValidState('user-123', 'crm');
+      axios.post.mockResolvedValueOnce(tokenExchangeResponse);
+      axios.get.mockResolvedValueOnce({
+        data: {
+          hub_id: 1234,
+          hub_domain: 'test.hubspot.com',
+          user: 'user@test.com',
+          scopes: CRM_SCOPES,
+        },
+      });
+      (settingsService.setSetting as jest.Mock).mockRejectedValueOnce(
+        new Error('Dynamo write failed'),
+      );
+
+      const res = await request(app)
+        .post('/api/oauth/hubspot/finalize')
+        .send({ code: 'auth-code', state });
+
+      expect(res.status).toBe(500);
+      expect(res.body.error).toBe('Failed to finalize HubSpot connection');
+      expect(res.body.tokenSessionId).toBeUndefined();
+    });
   });
 
   // ── /connect ─────────────────────────────────────────────────────────
@@ -293,6 +339,19 @@ describe('HubSpot OAuth Routes', () => {
         .send({ tokenSessionId: 'nonexistent-session' });
 
       expect(res.status).toBe(401);
+    });
+
+    it('returns an explicit 500 when the shared session store cannot be read', async () => {
+      (settingsService.getSetting as jest.Mock).mockRejectedValueOnce(
+        new Error('Dynamo read failed'),
+      );
+
+      const res = await request(app)
+        .post('/api/oauth/hubspot/connect')
+        .send({ tokenSessionId: 'session-id' });
+
+      expect(res.status).toBe(500);
+      expect(res.body.error).toBe('Failed to connect HubSpot account');
     });
   });
 });

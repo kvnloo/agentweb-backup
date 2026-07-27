@@ -28,7 +28,7 @@ import { settingsService } from './settingsService';
 
 const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
-export type OAuthProvider = 'gmail' | 'outlook';
+export type OAuthProvider = 'gmail' | 'outlook' | 'hubspot' | 'fathom';
 
 export interface OAuthTokens {
   access_token: string;
@@ -44,10 +44,13 @@ export interface OAuthProfile {
   tenant_id?: string;
 }
 
-interface StoredSession {
+interface StoredSession<T = unknown> {
   sessionId: string; // the bearer secret /connect must present
-  tokens: OAuthTokens;
-  profile: OAuthProfile;
+  data?: T; // opaque per-provider payload — the tokens plus whatever else /connect needs
+  // Rolling-deploy compatibility for Gmail/Outlook rows written before ENG-162 generalized
+  // the payload shape. These disappear naturally after the ten-minute session TTL.
+  tokens?: OAuthTokens;
+  profile?: OAuthProfile;
   expires: number;
 }
 
@@ -88,7 +91,9 @@ const readRow = async (userId: string, provider: OAuthProvider): Promise<Session
 
 const writeRow = async (row: SessionRow): Promise<void> => {
   if (row.sessions.length === 0) {
-    await settingsService.deleteSetting(settingName(row.userId, row.provider)).catch(() => undefined);
+    // One-time use is only proven after the shared row is deleted. Returning token material
+    // after a failed delete would silently leave a replayable session behind.
+    await settingsService.deleteSetting(settingName(row.userId, row.provider));
     return;
   }
   // DynamoDB TTL attribute (Greptile, ENG-266 review): without this, an abandoned popup's
@@ -116,11 +121,10 @@ const secretsMatch = (a: string, b: string): boolean => {
   return crypto.timingSafeEqual(bufA, bufB);
 };
 
-export async function storeTokenSession(
+export async function storeOAuthSession<T>(
   userId: string,
   provider: OAuthProvider,
-  tokens: OAuthTokens,
-  profile: OAuthProfile,
+  data: T,
 ): Promise<string> {
   const now = Date.now();
   const sessionId = crypto.randomBytes(32).toString('hex');
@@ -134,8 +138,7 @@ export async function storeTokenSession(
 
   row.sessions.push({
     sessionId,
-    tokens,
-    profile,
+    data,
     expires: now + TOKEN_SESSION_TTL_MS,
   });
 
@@ -155,11 +158,11 @@ export async function storeTokenSession(
  * Only the matching session is consumed — concurrent popups for the same provider do not
  * invalidate each other. Expired siblings are pruned on the way through.
  */
-export async function retrieveTokenSession(
+export async function retrieveOAuthSession<T>(
   sessionId: string,
   userId: string,
   provider: OAuthProvider,
-): Promise<{ tokens: OAuthTokens; profile: OAuthProfile } | null> {
+): Promise<T | null> {
   if (!sessionId) return null;
 
   const now = Date.now();
@@ -178,5 +181,35 @@ export async function retrieveTokenSession(
     return null;
   }
 
-  return { tokens: match.tokens, profile: match.profile };
+  if (Object.prototype.hasOwnProperty.call(match, 'data')) {
+    return match.data as T;
+  }
+
+  return { tokens: match.tokens, profile: match.profile } as T;
+}
+
+/**
+ * Gmail/Outlook flavour: the payload is the `{ tokens, profile }` pair these two routes
+ * store. Kept as a thin wrapper over the generic primitive above so those routes (and this
+ * store's test suite) are unchanged while other providers store their own payload shapes.
+ */
+export async function storeTokenSession(
+  userId: string,
+  provider: OAuthProvider,
+  tokens: OAuthTokens,
+  profile: OAuthProfile,
+): Promise<string> {
+  return storeOAuthSession(userId, provider, { tokens, profile });
+}
+
+export async function retrieveTokenSession(
+  sessionId: string,
+  userId: string,
+  provider: OAuthProvider,
+): Promise<{ tokens: OAuthTokens; profile: OAuthProfile } | null> {
+  return retrieveOAuthSession<{ tokens: OAuthTokens; profile: OAuthProfile }>(
+    sessionId,
+    userId,
+    provider,
+  );
 }

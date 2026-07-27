@@ -222,3 +222,43 @@ describe('oauthTokenSessionStore — security properties', () => {
     expect(a.length).toBeGreaterThanOrEqual(32);
   });
 });
+
+describe('oauthTokenSessionStore — persistence failures stay explicit', () => {
+  it('fails closed when the shared store cannot be read', async () => {
+    mockGet.mockRejectedValueOnce(new Error('Dynamo read failed'));
+    await expect(retrieveTokenSession('session-id', 'u1', 'outlook'))
+      .rejects.toThrow('Dynamo read failed');
+  });
+
+  it('fails closed when a pending session cannot be written', async () => {
+    mockSet.mockRejectedValueOnce(new Error('Dynamo write failed'));
+    await expect(storeTokenSession('u1', 'outlook', tokens, profile))
+      .rejects.toThrow('Dynamo write failed');
+  });
+
+  it('does not return token material when one-time-use deletion fails', async () => {
+    const id = await storeTokenSession('u1', 'outlook', tokens, profile);
+    mockDelete.mockRejectedValueOnce(new Error('Dynamo delete failed'));
+
+    await expect(retrieveTokenSession(id, 'u1', 'outlook'))
+      .rejects.toThrow('Dynamo delete failed');
+  });
+});
+
+describe('oauthTokenSessionStore — rolling-deploy compatibility', () => {
+  it('reads the pre-generalization Gmail/Outlook row shape during the TTL window', async () => {
+    table.set('oauth_token_session_outlook_u1', JSON.stringify({
+      userId: 'u1',
+      provider: 'outlook',
+      sessions: [{
+        sessionId: 'legacy-session-id',
+        tokens,
+        profile,
+        expires: Date.now() + 60_000,
+      }],
+    }));
+
+    await expect(retrieveTokenSession('legacy-session-id', 'u1', 'outlook'))
+      .resolves.toEqual({ tokens, profile });
+  });
+});

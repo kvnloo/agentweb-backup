@@ -6,12 +6,11 @@ import { getHubSpotConfig } from '../config/integrations';
 import { createAccount } from '../services/connectedAccountsDb';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
+import { storeOAuthSession, retrieveOAuthSession } from '../services/oauthTokenSessionStore';
 
 const router = express.Router();
 
 const STATE_EXPIRATION = '15m';
-const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000;
-const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 type HubSpotAccountType = 'crm' | 'marketing';
@@ -37,7 +36,11 @@ const verifyState = (state: string, userId: string): StatePayload | null => {
   }
 };
 
-interface TokenSession {
+// The pending session held between /finalize and /connect. It lives in the shared,
+// DynamoDB-backed store (AW-Settings via oauthTokenSessionStore) — NOT a process-local Map —
+// so /connect can land on a different Elastic Beanstalk instance than /finalize without the
+// user seeing "Please reconnect" (the cross-instance bug ALB stickiness was masking). ENG-162.
+interface HubSpotSessionData {
   tokens: {
     access_token: string;
     refresh_token: string;
@@ -50,42 +53,7 @@ interface TokenSession {
   };
   accountType: HubSpotAccountType;
   grantedScopes: string[];
-  missingScopes: string[];
-  userId: string;
-  expires: number;
 }
-
-const tokenSessions = new Map<string, TokenSession>();
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of tokenSessions.entries()) {
-    if (now > session.expires) tokenSessions.delete(id);
-  }
-}, SESSION_CLEANUP_INTERVAL_MS).unref();
-
-const storeTokenSession = (
-  userId: string,
-  tokens: TokenSession['tokens'],
-  hubInfo: TokenSession['hubInfo'],
-  accountType: HubSpotAccountType,
-  grantedScopes: string[],
-  missingScopes: string[],
-): string => {
-  const sessionId = crypto.randomBytes(32).toString('hex');
-  tokenSessions.set(sessionId, { tokens, hubInfo, accountType, grantedScopes, missingScopes, userId, expires: Date.now() + TOKEN_SESSION_TTL_MS });
-  return sessionId;
-};
-
-const retrieveTokenSession = (sessionId: string, userId: string): Pick<TokenSession, 'tokens' | 'hubInfo' | 'accountType' | 'grantedScopes' | 'missingScopes'> | null => {
-  const session = tokenSessions.get(sessionId);
-  if (!session || session.userId !== userId || Date.now() > session.expires) {
-    tokenSessions.delete(sessionId);
-    return null;
-  }
-  tokenSessions.delete(sessionId);
-  return { tokens: session.tokens, hubInfo: session.hubInfo, accountType: session.accountType, grantedScopes: session.grantedScopes, missingScopes: session.missingScopes };
-};
 
 // GET /init
 router.get('/init', authenticateToken, async (req: any, res) => {
@@ -180,14 +148,12 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
         : [];
     const missingScopes = requestedScopes.filter(s => !grantedScopes.includes(s));
 
-    const tokenSessionId = storeTokenSession(
-      userId,
-      { access_token, refresh_token, expires_in },
-      { hub_id, hub_domain, user },
+    const tokenSessionId = await storeOAuthSession<HubSpotSessionData>(userId, 'hubspot', {
+      tokens: { access_token, refresh_token, expires_in },
+      hubInfo: { hub_id, hub_domain, user },
       accountType,
       grantedScopes,
-      missingScopes,
-    );
+    });
 
     res.json({ success: true, tokenSessionId, missingScopes });
   } catch (error: any) {
@@ -206,12 +172,12 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     return res.status(400).json({ error: 'Missing tokenSessionId' });
   }
 
-  const session = retrieveTokenSession(tokenSessionId, userId);
-  if (!session) {
-    return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
-  }
-
   try {
+    const session = await retrieveOAuthSession<HubSpotSessionData>(tokenSessionId, userId, 'hubspot');
+    if (!session) {
+      return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
+    }
+
     const { tokens, hubInfo, accountType, grantedScopes } = session;
 
     const account = await createAccount(userId, 'hubspot', {
