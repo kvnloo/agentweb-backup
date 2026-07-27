@@ -74,6 +74,56 @@ describe('scanMessagesForAssets', () => {
     expect(result.htmlReports).toHaveLength(0);
   });
 
+  it('ENG-510: extracts images from the per-image "image-generated" marker (survives a hard-cap kill)', () => {
+    // This marker message is persisted immediately when each image completes — BEFORE the
+    // end-of-turn toolCalls stamp — so it is the only record left if the whole-turn cap
+    // kills the turn mid-flight. It must surface the completed image.
+    const messages = [
+      {
+        role: 'system',
+        content: 'Image generated: variant-1.png',
+        timestamp: '2026-01-01T12:00:00Z',
+        metadata: {
+          kind: 'image-generated',
+          imageFilename: 'variant-1.png',
+          imageUrl: 'https://s3.amazonaws.com/variant-1.png',
+        },
+      },
+    ];
+
+    const result = scanMessagesForAssets(messages, makeSession());
+
+    expect(result.images).toHaveLength(1);
+    expect(result.images[0]).toEqual({
+      url: 'https://s3.amazonaws.com/variant-1.png',
+      filename: 'variant-1.png',
+      generatedAt: '2026-01-01T12:00:00Z',
+    });
+  });
+
+  it('ENG-510: de-duplicates the marker against the end-of-turn toolCalls stamp (normal completion)', () => {
+    const url = 'https://s3.amazonaws.com/variant-1.png';
+    const messages = [
+      { role: 'system', content: 'Image generated: v1.png', timestamp: '2026-01-01T12:00:00Z',
+        metadata: { kind: 'image-generated', imageFilename: 'v1.png', imageUrl: url } },
+      { role: 'assistant', content: 'done', timestamp: '2026-01-01T12:00:05Z',
+        metadata: { toolCalls: [{ name: 'generate_image', result: { success: true, imageUrl: url, filename: 'v1.png' } }] } },
+    ];
+
+    const result = scanMessagesForAssets(messages, makeSession());
+
+    expect(result.images).toHaveLength(1); // listed once, not twice
+    expect(result.images[0].url).toBe(url);
+  });
+
+  it('ENG-510: ignores a legacy marker that has no imageUrl (backward compatible)', () => {
+    const messages = [
+      { role: 'system', content: 'Image generated: old.png', timestamp: '2026-01-01T12:00:00Z',
+        metadata: { kind: 'image-generated', imageFilename: 'old.png' } },
+    ];
+    expect(scanMessagesForAssets(messages, makeSession()).images).toHaveLength(0);
+  });
+
   it('should extract videos from generate_video tool calls', () => {
     const messages = [
       {
