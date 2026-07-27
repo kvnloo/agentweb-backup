@@ -1,5 +1,6 @@
 import request from 'supertest';
 import express from 'express';
+import http from 'http';
 import crmSyncRoutes from '../routes/crmSync';
 
 jest.mock('../utils/hubspotWebhookSubscriptions', () => ({
@@ -77,9 +78,26 @@ jest.mock('../services/externalCrmSyncService', () => ({
   },
 }));
 
-const app = express();
-app.use(express.json());
-app.use('/api/crm-sync', crmSyncRoutes);
+const expressApp = express();
+expressApp.use(express.json());
+expressApp.use('/api/crm-sync', crmSyncRoutes);
+const app = http.createServer(expressApp);
+
+beforeAll(async () => {
+  await new Promise<void>((resolve, reject) => {
+    app.once('error', reject);
+    app.listen(0, '127.0.0.1', () => {
+      app.off('error', reject);
+      resolve();
+    });
+  });
+});
+
+afterAll(async () => {
+  await new Promise<void>((resolve, reject) => {
+    app.close((error) => (error ? reject(error) : resolve()));
+  });
+});
 
 describe('PUT /api/crm-sync/config/:listId/:provider/pipeline — change pipeline', () => {
   const { externalCrmSyncService } = require('../services/externalCrmSyncService');

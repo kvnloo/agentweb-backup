@@ -5,16 +5,15 @@
  * The onboarding stale-scrape reports (Vivian's agent scraped an old version
  * of her site) motivated the no-cache scrape work. The sibling
  * `cssExtractor.test.ts` asserts the request opts out of caches with a MOCKED
- * axios; this test closes the acceptance criterion literally: it stands up a
- * real HTTP server, scrapes it with the REAL http client, MUTATES the served
- * content, scrapes again, and asserts the second scrape reflects the new
- * content — a stale cache would return the first version twice.
+ * axios; this test closes the fetch-layer acceptance criterion literally: it
+ * stands up a real HTTP server, fetches it with the REAL http client, MUTATES
+ * the served content, fetches again, and asserts the second response reflects
+ * the new content — a stale cache would return the first version twice.
  *
  * The stale-cache risk lives entirely at the fetch layer, so axios is REAL
- * here (unlike the sibling suite). Chrome is forced absent so extraction
- * takes the JSDOM fetch path; jsdom / color / css-analyzer are mocked only to
- * keep the module loadable under ts-jest (their real ESM/TS deps don't
- * transform) — none of them touch the network being exercised.
+ * here (unlike the sibling suite). The test calls that same production fetch
+ * boundary directly so its loopback fixture does not need to bypass the
+ * extractor's SSRF validation.
  */
 import http from "http";
 import type { AddressInfo } from "net";
@@ -58,14 +57,7 @@ jest.mock("jsdom", () => ({
 
 jest.mock("@projectwallace/css-analyzer", () => ({ analyze: jest.fn() }));
 
-// Force the JSDOM fetch path — no real Chrome in CI. The fetch itself (axios)
-// stays REAL so this is a genuine end-to-end scrape of the fixture server.
-jest.mock("../utils/browserUtils", () => ({
-  findChromeExecutable: () => null,
-  PUPPETEER_LAUNCH_ARGS: [],
-}));
-
-import { extractCSSFromURL } from "../services/cssExtractor";
+import { fetchFreshHtmlFromValidatedUrl } from "../services/cssExtractor";
 
 function page(version: string, color: string): string {
   return `<!DOCTYPE html>
@@ -83,55 +75,51 @@ describe("cssExtractor — fresh changing-fixture scrape (AC#3)", () => {
   let baseUrl: string;
   let currentHtml = page("V1", "#112233");
   const requestHeaders: Array<http.IncomingHttpHeaders> = [];
-  // Expected: forcing Chrome absent makes the extractor log the puppeteer→
-  // JSDOM fallback. Silence it so the suite output stays clean.
-  let warnSpy: jest.SpyInstance;
-
-  beforeAll((done) => {
-    warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+  beforeAll(async () => {
     server = http.createServer((req, res) => {
       requestHeaders.push(req.headers);
       res.writeHead(200, { "Content-Type": "text/html" });
       res.end(currentHtml);
     });
-    // 127.0.0.2 is still loopback on Linux but is not the literal 127.0.0.1
-    // that the extractor's SSRF guard blocks — so the fixture is reachable by
-    // the REAL http client without weakening or bypassing that guard's intent
-    // (we're testing cache freshness, not the SSRF check).
-    server.listen(0, "127.0.0.2", () => {
-      const { port } = server.address() as AddressInfo;
-      baseUrl = `http://127.0.0.2:${port}/`;
-      done();
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        server.off("error", reject);
+        const { port } = server.address() as AddressInfo;
+        baseUrl = `http://127.0.0.1:${port}/`;
+        resolve();
+      });
     });
   });
 
-  afterAll((done) => {
-    warnSpy.mockRestore();
-    server.close(() => done());
+  afterAll(async () => {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
   });
 
   it("scrapes the CURRENT content on every call — a changed fixture yields the new version, not a stale copy", async () => {
     // First scrape sees V1.
     currentHtml = page("V1", "#112233");
-    const first = await extractCSSFromURL(baseUrl);
-    expect(first.html).toContain("marker-V1");
-    expect(first.html).toContain("#112233");
-    expect(first.html).not.toContain("marker-V2");
+    const first = await fetchFreshHtmlFromValidatedUrl(baseUrl);
+    expect(first).toContain("marker-V1");
+    expect(first).toContain("#112233");
+    expect(first).not.toContain("marker-V2");
 
     // Site changes underneath us.
     currentHtml = page("V2", "#ff8800");
 
     // Second scrape must reflect V2 — proving no stale-cache reuse.
-    const second = await extractCSSFromURL(baseUrl);
-    expect(second.html).toContain("marker-V2");
-    expect(second.html).toContain("#ff8800");
-    expect(second.html).not.toContain("marker-V1");
+    const second = await fetchFreshHtmlFromValidatedUrl(baseUrl);
+    expect(second).toContain("marker-V2");
+    expect(second).toContain("#ff8800");
+    expect(second).not.toContain("marker-V1");
   });
 
   it("opts every scrape request out of intermediary caches (no-cache headers on the wire)", async () => {
     requestHeaders.length = 0;
     currentHtml = page("V3", "#00aa55");
-    await extractCSSFromURL(baseUrl);
+    await fetchFreshHtmlFromValidatedUrl(baseUrl);
 
     const scrapeReq = requestHeaders.find(
       (h) => h["cache-control"] !== undefined
