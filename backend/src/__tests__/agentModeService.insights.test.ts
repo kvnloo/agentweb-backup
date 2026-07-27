@@ -324,6 +324,67 @@ describe('AgentModeService - callMetaAdsInsightsApiWrapper', () => {
       expect(result.metadata.dropped_fields).toContain('cost_per_unique_click');
     });
 
+    it('should self-heal when Meta rejects a field lazily at result-read time, not at submit (ENG-511)', async () => {
+      mockUserDb.getUserById.mockResolvedValue({
+        id: userId,
+        adAccount: '922903076601160',
+      });
+      // Submit succeeds (report_run_id issued) ...
+      mockedAxios.post.mockResolvedValueOnce({
+        status: 200,
+        data: { report_run_id: 'report-lazy-1' },
+      } as any);
+      // ... job completes ...
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { async_status: 'Job Completed' },
+      } as any);
+      // ... but the RESULTS fetch 400s on the field (Meta validates it lazily).
+      mockedAxios.get.mockRejectedValueOnce({
+        response: {
+          status: 400,
+          data: {
+            error: {
+              code: 100,
+              message:
+                '(#100) Tried accessing nonexisting summary field (onsite_conversion_lead_grouped)',
+            },
+          },
+        },
+      } as any);
+      // Retry: whole report re-runs with the field dropped, and succeeds.
+      mockedAxios.post.mockResolvedValueOnce({
+        status: 200,
+        data: { report_run_id: 'report-lazy-2' },
+      } as any);
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { async_status: 'Job Completed' },
+      } as any);
+      mockedAxios.get.mockResolvedValueOnce({
+        status: 200,
+        data: { data: [{ spend: '5' }], paging: {} },
+      } as any);
+
+      const insightsPromise = service.callMetaAdsInsightsApiWrapper(userId, {
+        account_id: '922903076601160',
+        object_type: 'account',
+        fields: ['spend', 'onsite_conversion_lead_grouped'],
+        date_preset: 'last_30d',
+      });
+      await jest.runAllTimersAsync();
+      const result = await insightsPromise;
+
+      expect(result.success).toBe(true);
+      // The whole report was re-run once (two submits), not left as a bare error.
+      expect(mockedAxios.post).toHaveBeenCalledTimes(2);
+      const retryArgs = mockedAxios.post.mock.calls[1][1] as any;
+      expect(retryArgs.fields).toBe('spend');
+      expect(result.metadata.dropped_fields).toContain(
+        'onsite_conversion_lead_grouped'
+      );
+    });
+
     it('should return a no-retry error when Meta rejects fields but the offender cannot be isolated (ENG-511)', async () => {
       mockUserDb.getUserById.mockResolvedValue({
         id: userId,
