@@ -4721,8 +4721,12 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    // If the LLM didn't specify a model, fall back to the admin-configured image API default
-    const imageModel = args.imageModel || await agentModeService.getImageApiDefaultModel();
+    // ENG-510: pass the LLM's model choice through AS-IS (undefined when it didn't
+    // pick one). Resolving the admin-configured default here made every request look
+    // like an explicit model choice, which disabled the transient-timeout fallback in
+    // generateImage — so a provider timeout produced zero deliverables. generateImage
+    // now resolves the admin default itself and only suppresses the fallback for a
+    // genuinely LLM-specified model.
     return await agentModeService.generateImage(
       args.prompt,
       args.filename,
@@ -4731,7 +4735,7 @@ emmaToolRegistry.register({
       args.inputImages || [],
       context?.userId,
       context?.sessionId,
-      imageModel,
+      args.imageModel,
       args.logo_image,
       args.confirm
     );

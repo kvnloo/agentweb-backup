@@ -56,6 +56,7 @@ import {
   imageGenerationCostUsd,
   videoGenerationCostUsd,
 } from '../utils/llmPricing';
+import { normalizeImageModel } from './imageGeneration';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
 import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmMutationEvents';
 import {
@@ -2688,15 +2689,21 @@ export class AgentModeService {
   }
 
   private getImageGenerationFallbackModel(
-    primaryModel: string | undefined,
+    currentModel: string | undefined,
     inputImages: string[] | undefined,
-    logoImage: string | undefined
+    logoImage: string | undefined,
+    modelExplicitlyChosen: boolean = false
   ): string | undefined {
     // Keep generation fallback narrow. Telemetry showed the painful cases were
     // product-fidelity workflows and explicit model choices; silently switching
     // providers there changes output semantics. Only recover when the caller left
     // model selection to us and the request is fresh text-to-image.
-    if (primaryModel) {
+    //
+    // ENG-510: gate on whether the model was an explicit per-request choice — NOT
+    // merely on a model string being present. The admin-configured default is
+    // resolved to a concrete id before generation, but that is a system default,
+    // not a user choice, so a transient timeout on it must still fail over.
+    if (modelExplicitlyChosen) {
       return undefined;
     }
 
@@ -2705,8 +2712,13 @@ export class AgentModeService {
       return undefined;
     }
 
+    // Pick the first alternate that isn't the model we just failed on (compare on
+    // the normalized id so e.g. the legacy "...-preview" alias matches its GA id).
+    const normalizedCurrent = normalizeImageModel(currentModel);
     const fallbackOrder = ['gpt-image-2', 'gemini-3.1-flash-image', 'gemini-2.5-flash-image'];
-    return fallbackOrder[0];
+    return fallbackOrder.find(
+      (model) => model !== currentModel && model !== normalizedCurrent
+    );
   }
 
   private getVisionFallbackModel(primaryModel: string): string | undefined {
@@ -21390,6 +21402,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
+      // ENG-510: distinguish an LLM-specified model from a system-resolved default.
+      // Only a genuine per-request choice should suppress the transient-timeout
+      // fallback; the admin-configured default is a system preference, not a
+      // semantic lock, so a timeout on it must still fail over to another provider
+      // instead of delivering zero images. Resolving the default here (rather than
+      // in the tool handler) preserves that distinction end-to-end.
+      const modelExplicitlyChosen = typeof imageModel === 'string' && imageModel.trim().length > 0;
+      const resolvedImageModel = modelExplicitlyChosen
+        ? imageModel
+        : await this.getImageApiDefaultModel();
+
       const inputImagesForRequest = inputImages || [];
       const primaryRequest = {
         prompt,
@@ -21399,11 +21422,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         inputImages: inputImagesForRequest,
         logoImage,
         userId,
-        imageModel
+        imageModel: resolvedImageModel
       };
 
       let result: any;
-      let imageModelUsed = imageModel || 'gemini-3-pro-image-preview';
+      let imageModelUsed = resolvedImageModel || 'gemini-3-pro-image-preview';
       let fallbackUsed = false;
       let primaryError: string | undefined;
 
@@ -21411,7 +21434,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         result = await imageService.generateImage(primaryRequest);
       } catch (primaryFailure: any) {
         primaryError = primaryFailure instanceof Error ? primaryFailure.message : String(primaryFailure);
-        const fallbackModel = this.getImageGenerationFallbackModel(imageModel, inputImagesForRequest, logoImage);
+        const fallbackModel = this.getImageGenerationFallbackModel(resolvedImageModel, inputImagesForRequest, logoImage, modelExplicitlyChosen);
         if (!fallbackModel || !this.isRetryableMediaToolError(primaryError)) {
           throw primaryFailure;
         }
@@ -21446,7 +21469,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       if (!(result.success && result.imageUrl) && !fallbackUsed) {
         primaryError = result.error || 'Failed to generate image';
-        const fallbackModel = this.getImageGenerationFallbackModel(imageModel, inputImagesForRequest, logoImage);
+        const fallbackModel = this.getImageGenerationFallbackModel(resolvedImageModel, inputImagesForRequest, logoImage, modelExplicitlyChosen);
         if (fallbackModel && this.isRetryableMediaToolError(primaryError)) {
           console.warn(
             `AgentMode: Image generation with "${imageModelUsed}" failed with a retryable error; trying fallback "${fallbackModel}":`,
