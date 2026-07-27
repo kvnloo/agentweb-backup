@@ -13918,13 +13918,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         throw new Error("fields array is required");
       }
 
-      const invalidFields = fields.filter(
+      // ENG-511: Do NOT hard-reject the whole call when some requested fields are
+      // unknown. Meta Insights has a large, evolving field vocabulary and the model
+      // occasionally requests a valid-but-unwhitelisted field (e.g.
+      // cost_per_inline_link_click) or a plausible-but-unsupported one. Previously
+      // any unknown field threw, the model re-issued the identical call, and the
+      // anti-loop/retry guard hard-blocked the entire insights channel before any
+      // metrics came back. Instead: drop the unknown fields, keep the valid subset,
+      // and proceed. Only fail when NOTHING valid remains — and even then, name the
+      // dropped fields so the model corrects rather than blindly retries.
+      const droppedFields = fields.filter(
         (f) => !ALLOWED_INSIGHTS_FIELDS.includes(f)
       );
+      const validFields = fields.filter((f) =>
+        ALLOWED_INSIGHTS_FIELDS.includes(f)
+      );
 
-      if (invalidFields.length) {
+      if (!validFields.length) {
         throw new Error(
-          `Invalid insights fields requested: ${invalidFields.join(", ")}`
+          `Invalid insights fields requested: ${droppedFields.join(", ")}. None are supported, so no data could be fetched — do not retry with the same fields. Choose from allowed fields such as impressions, clicks, spend, cpc, ctr, reach, inline_link_clicks, cost_per_inline_link_click.`
         );
       }
 
@@ -14003,7 +14015,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const submitUrl = `${baseUrl}/${actualNodeId}/insights`;
 
       const filteredParams = {
-        fields: fields.join(","),
+        fields: validFields.join(","),
         limit: 5000,
 
         ...(date_preset && { date_preset }),
@@ -14081,6 +14093,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           query: filteredParams,
           report_run_id: reportRunId,
           api_version: version,
+          // ENG-511: surface any unsupported fields we dropped so the model knows
+          // why they are absent and does not re-request them on the next turn.
+          ...(droppedFields.length && { dropped_fields: droppedFields }),
         },
         data: allData,
       };

@@ -36,6 +36,14 @@ export const ALLOWED_INSIGHTS_FIELDS = [
   'cpc',
   'cpm',
   'cpp',
+  // COST-PER-CLICK DERIVED METRICS
+  // Genuinely valid Meta Insights fields that were missing from the whitelist.
+  // Their absence caused scheduled campaign check-ins to be hard-rejected and
+  // retried until the loop guard blocked the whole insights channel (ENG-511).
+  'cost_per_inline_link_click',
+  'cost_per_unique_inline_link_click',
+  'cost_per_unique_click',
+  'cost_per_inline_post_engagement',
 
   // VIDEO METRICS
   'video_views',
