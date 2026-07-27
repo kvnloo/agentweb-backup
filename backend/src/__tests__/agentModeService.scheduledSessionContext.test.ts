@@ -233,6 +233,46 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
     expect(directive.toLowerCase()).toContain('reversible');
     expect(directive).toContain('best-effort');
   });
+
+  // ── (6) Prescribed per-item call patterns are intent, not literal law ────────
+  // Regression coverage for ENG-480 (sessions 54325528 / fa552592, "Daily User
+  // Activity Report"): the scheduled prompt prescribed impossible per-session and
+  // per-userId tool calls. One run proceeded via the efficient supported path
+  // (get_chat_history already returns per-session data) but was scored as having
+  // "refused/bypassed explicit constraints"; the other stopped to explain instead
+  // of delivering. The directive must reframe using the supported path as CORRECT
+  // and compliant — not a refusal — and still require producing the deliverable.
+  it('treats a prescribed per-item call pattern as intent, not a literal tool requirement', () => {
+    expect(directive.toLowerCase()).toContain('not a literal requirement');
+    expect(directive.toLowerCase()).toContain('one call per item');
+  });
+
+  it('names the efficient supported path (get_chat_history) as the correct, complete execution', () => {
+    expect(directive).toContain('get_chat_history');
+  });
+
+  it('states that using the supported path is NOT skipping/refusing/violating the instruction', () => {
+    expect(directive.toLowerCase()).toContain('not skipping, refusing');
+  });
+
+  it('still requires producing the deliverable in full rather than stopping', () => {
+    expect(directive.toLowerCase()).toContain('always produce the requested deliverable');
+  });
+
+  // The reframing must NOT bleed into per-entity ACTIONS (send/post/draft). It is
+  // scoped to fetching per-item DATA for a report; a batched call must never be
+  // treated as satisfying a per-entity side effect (guards the tension with the
+  // PER-ENTITY COMPLETION LOOP directive that immediately follows it).
+  it('scopes the reframing to reading/gathering data, not per-entity actions', () => {
+    expect(directive.toLowerCase()).toContain('reading/gathering data');
+  });
+
+  it('carves out per-entity actions so a batched call never collapses per-item side effects', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toContain('carve-out');
+    expect(lower).toContain('does not loosen per-entity actions');
+    expect(lower).toContain('per-entity completion loop');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
