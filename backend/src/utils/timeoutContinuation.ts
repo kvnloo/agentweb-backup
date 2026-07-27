@@ -3,50 +3,69 @@
  * turn mid-flight, the images that already finished ARE persisted (the synchronous
  * `image-generated` markers written the instant each image completes), but the caller
  * otherwise sees a bare 504 with no hint that work was saved or that "continue" will
- * finish the rest. These pure helpers let the controller count exactly what THIS turn
- * delivered and craft a user-facing continuation message instead of a silent failure.
+ * finish the rest. Worse, the chat renders generated images inline only from the
+ * end-of-turn `toolCalls` stamp (lost on a cap-kill) — so those finished images would
+ * never actually reach the user in the thread. If the 3rd variant then fails forever,
+ * the 2 that DID complete are unrecoverable in-chat.
+ *
+ * These pure helpers let the controller (a) collect exactly the images THIS turn saved
+ * and (b) build a user-facing continuation message that embeds them as markdown so they
+ * render inline (MarkdownMessage's img component) — delivering the finished work
+ * immediately, independent of the lost toolCalls stamp — and invites "continue".
  */
 
 export interface TimeoutContinuationMessage {
-  metadata?: { kind?: string; imageUrl?: string; timestamp?: string } | null;
+  metadata?: { kind?: string; imageUrl?: string; imageFilename?: string; timestamp?: string } | null;
   timestamp?: string;
 }
 
+export interface GeneratedImageRef {
+  imageUrl: string;
+  filename: string;
+}
+
 /**
- * Count image-generated markers (carrying a saved URL) persisted at or after `sinceMs`.
- * Mirrors scanMessagesForAssets' marker shape and timestamp precedence
- * (`message.timestamp || metadata.timestamp`) so the count matches exactly what the
- * asset panel will render for this turn — and never double-counts an earlier turn's
- * images.
+ * Collect image-generated markers (carrying a saved URL) persisted at or after `sinceMs`,
+ * URL-deduped. Mirrors scanMessagesForAssets' marker shape and timestamp precedence
+ * (`message.timestamp || metadata.timestamp`) so the set matches exactly what the asset
+ * panel will render for this turn — and never includes an earlier turn's images.
  */
-export function countMediaGeneratedSince(
+export function collectMediaGeneratedSince(
   messages: TimeoutContinuationMessage[] | undefined | null,
   sinceMs: number,
-): number {
-  if (!Array.isArray(messages)) return 0;
-  let count = 0;
+): GeneratedImageRef[] {
+  if (!Array.isArray(messages)) return [];
+  const out: GeneratedImageRef[] = [];
+  const seen = new Set<string>();
   for (const message of messages) {
     const marker = message?.metadata;
     if (marker?.kind !== 'image-generated' || !marker?.imageUrl) continue;
     const rawTs = message?.timestamp || marker?.timestamp;
     const ts = rawTs ? Date.parse(rawTs) : NaN;
-    if (Number.isFinite(ts) && ts >= sinceMs) count++;
+    if (!Number.isFinite(ts) || ts < sinceMs) continue;
+    if (seen.has(marker.imageUrl)) continue;
+    seen.add(marker.imageUrl);
+    out.push({ imageUrl: marker.imageUrl, filename: marker.imageFilename || 'generated-image.png' });
   }
-  return count;
+  return out;
 }
 
 /**
- * User-facing message shown when the turn timed out AFTER delivering >= 1 media asset.
- * Returns null when nothing was delivered this turn, so the caller keeps the existing
- * 504 — a genuinely empty timeout must not be dressed up as a partial success.
+ * User-facing message shown when the turn timed out AFTER delivering >= 1 image. Embeds
+ * each completed image as a markdown image so it renders inline in the chat (and persists
+ * for reload), then invites "continue". Returns null when nothing was delivered this turn,
+ * so the caller keeps the existing 504 — a genuinely empty timeout must not be dressed up
+ * as a partial success.
  */
-export function buildTimeoutContinuationMessage(mediaGeneratedThisTurn: number): string | null {
-  if (!Number.isFinite(mediaGeneratedThisTurn) || mediaGeneratedThisTurn < 1) return null;
-  const n = Math.floor(mediaGeneratedThisTurn);
+export function buildTimeoutContinuationMessage(images: GeneratedImageRef[] | undefined | null): string | null {
+  if (!Array.isArray(images) || images.length < 1) return null;
+  const n = images.length;
   const noun = n === 1 ? 'image' : 'images';
+  const gallery = images.map((img) => `![${img.filename}](${img.imageUrl})`).join('\n\n');
   return (
     `⚠️ This request went over the time limit before I could finish everything. ` +
-    `I generated and saved ${n} ${noun} so far (shown above). ` +
+    `I generated and saved ${n} ${noun} so far — here ${n === 1 ? 'it is' : 'they are'}:\n\n` +
+    `${gallery}\n\n` +
     `Reply "continue" and I'll pick up where I left off and create anything still missing — ` +
     `I won't redo what's already done.`
   );
