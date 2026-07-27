@@ -351,3 +351,106 @@ describe('startLiveSession — authorized callers are unaffected (ENG-521)', () 
     expect(hasLiveSession(VICTIM_SESSION)).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// OVERLAP — concurrent authorized starts must not orphan a Gemini session
+// (Greptile P1 on PR #2183: the ownership await runs before the
+// activeSessions duplicate-check, so two overlapping starts could both open
+// Gemini connections and the later map write silently replaced the first)
+// ---------------------------------------------------------------------------
+
+describe('startLiveSession — overlapping authorized starts are serialized (ENG-521 P1)', () => {
+  const OWNER_SESSION = 'session-overlap-owner';
+
+  /**
+   * Unlike makeCallbacks(), returns a FRESH session object per live.connect
+   * call, each with its own close mock — so the test can tell exactly which
+   * Gemini connection was closed and which one survived.
+   */
+  function makePerConnectionSessions() {
+    const sessions: Array<{
+      sendClientContent: jest.Mock;
+      sendRealtimeInput: jest.Mock;
+      sendToolResponse: jest.Mock;
+      close: jest.Mock;
+    }> = [];
+    mockLiveConnect.mockImplementation(() => {
+      const session = {
+        sendClientContent: jest.fn(),
+        sendRealtimeInput: jest.fn(),
+        sendToolResponse: jest.fn(),
+        close: jest.fn(),
+      };
+      sessions.push(session);
+      return Promise.resolve(session);
+    });
+    return sessions;
+  }
+
+  beforeEach(() => {
+    mockGetChatSessionRecord.mockResolvedValue({
+      sessionId: OWNER_SESSION,
+      userId: VICTIM_USER,
+    });
+  });
+
+  afterEach(() => {
+    closeLiveSession(OWNER_SESSION);
+  });
+
+  it('two concurrent starts leave exactly one entry and close every superseded Gemini connection', async () => {
+    const sessions = makePerConnectionSessions();
+
+    await Promise.all([
+      startLiveSession(OWNER_SESSION, 'socket-first', jest.fn(), VICTIM_USER),
+      startLiveSession(OWNER_SESSION, 'socket-second', jest.fn(), VICTIM_USER),
+    ]);
+
+    // Exactly one live entry survives.
+    expect(hasLiveSession(OWNER_SESSION)).toBe(true);
+
+    // Every opened Gemini connection except the single survivor was closed —
+    // no orphan. (Pre-fix: two connections opened, zero closed.)
+    expect(sessions.length).toBeGreaterThanOrEqual(1);
+    const closedCount = sessions.filter((s) => s.close.mock.calls.length > 0).length;
+    expect(closedCount).toBe(sessions.length - 1);
+
+    // Deterministic supersession: the LATER caller owns the surviving entry...
+    await expect(
+      sendTextTurn(OWNER_SESSION, 'ping', 'socket-second'),
+    ).resolves.toBeUndefined();
+    // ...and the superseded caller's socket no longer routes turns anywhere.
+    await expect(
+      sendTextTurn(OWNER_SESSION, 'ping', 'socket-first'),
+    ).rejects.toThrow();
+
+    // The surviving socket's turn reached the one un-closed Gemini connection.
+    const survivor = sessions.find((s) => s.close.mock.calls.length === 0)!;
+    expect(survivor).toBeDefined();
+    expect(survivor.sendClientContent).toHaveBeenCalledTimes(1);
+  });
+
+  it('an unauthorized start overlapping the owner\'s in-flight start is rejected and does not disturb the owner', async () => {
+    const sessions = makePerConnectionSessions();
+    const ownerEmit = jest.fn();
+    const attackerEmit = jest.fn();
+
+    // Fire both before either resolves — the attacker overlaps the owner's start.
+    const ownerStart = startLiveSession(OWNER_SESSION, 'socket-owner', ownerEmit, VICTIM_USER);
+    const attackerStart = startLiveSession(OWNER_SESSION, 'socket-attacker', attackerEmit, ATTACKER_USER);
+
+    await expect(attackerStart).rejects.toThrow(/not authorized/i);
+    await ownerStart;
+
+    // The owner's session survives, bound to the owner's socket, with the
+    // uniform error and zero side effects for the attacker.
+    expect(hasLiveSession(OWNER_SESSION)).toBe(true);
+    expect(attackerEmit).not.toHaveBeenCalled();
+    expect(ownerEmit).toHaveBeenCalledWith('live:ready', { sessionId: OWNER_SESSION });
+    const closedCount = sessions.filter((s) => s.close.mock.calls.length > 0).length;
+    expect(closedCount).toBe(sessions.length - 1);
+    await expect(
+      sendTextTurn(OWNER_SESSION, 'still mine', 'socket-owner'),
+    ).resolves.toBeUndefined();
+  });
+});
