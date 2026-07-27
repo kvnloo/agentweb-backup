@@ -13,6 +13,7 @@ import { settingsService } from '../services/settingsService';
 import { workPlanService } from '../services/workPlanService';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
+import { resolveInboundAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
@@ -210,10 +211,10 @@ function getInteractiveShareExpiresAt(share: { expiresAt?: string; sharedAt?: st
 }
 
 /**
- * Auto-files a Notion "Customer Reported" issue for context-limit errors.
+ * Auto-files a Linear "Customer Reported" issue for context-limit errors.
  * Skips if the session already has contextLimitReported set (dedup).
  */
-async function autoReportContextLimitToNotion(
+async function autoReportContextLimitToLinear(
   sessionId: string | undefined,
   userEmail: string | undefined,
   userId: string | undefined,
@@ -226,7 +227,8 @@ async function autoReportContextLimitToNotion(
       title: `Context limit reached - session ${sessionId}`,
       description: `User hit the context window limit in agent mode.\n\nUser: ${userEmail || 'Unknown'}\nModel: ${llmModel || 'Not specified'}\nSession messages: ${session?.messages?.length ?? 'N/A'}\nSession title: ${session?.title || 'N/A'}`,
       source: 'Context limit',
-      notionTags: ['Customer Reported', 'Context Limit'],
+      executionRoute: 'human-triage',
+      extraLabels: ['Customer Reported', 'Context Limit'],
       notionContext: {
         'User ID': userId || 'N/A',
         'User Email': userEmail || 'N/A',
@@ -240,7 +242,7 @@ async function autoReportContextLimitToNotion(
       console.error('Failed to set contextLimitReported flag:', err)
     );
   } catch (err) {
-    console.error('Failed to create context-limit Notion item:', err);
+    console.error('Failed to create context-limit Linear issue:', err);
   }
 }
 
@@ -784,6 +786,20 @@ const AWAITING_CONFIRMATION_PATTERNS: RegExp[] = [
   /\bwhich\s+(?:option|one|approach|route|path|of\s+(?:these|the))\b[^\n?!]*\byou\b/i,
   // "would you prefer / would you rather …"
   /\bwould\s+you\s+(?:prefer|rather)\b/i,
+  // Deterministic backstop for ENG-480: the run reframes an impossible per-item
+  // pattern correctly but STILL dead-ends by asking the human to supply a scope
+  // parameter (a date range / time window) before it will deliver — a novel
+  // phrasing the LLM judge is the only other line of defense against, and that
+  // judge fails safe when its provider is unavailable. Two scoped catches:
+  //   "Reply 'last 24h' (or give me an exact date range) and I'll generate…" —
+  //   the turn tells the user to REPLY WITH A VALUE and dangles the deliverable
+  //   behind it. Anchored on reply + a quoted value + a following "(", "," or
+  //   "or" so a report that merely quotes text ("reply to my email") can't match.
+  /\breply\s+["'“”][^"'“”\n]{1,40}["'“”]\s*(?:\(|,|\bor\b)/i,
+  //   "what time window / date range / period … do you want?" — asks the human to
+  //   specify the scope before proceeding. Scoped to scope-nouns so a delivered
+  //   report asking a rhetorical "what does this mean" cannot trip it.
+  /\bwhat\s+(?:time\s*window|date\s*range|range|time\s*frame|period|scope|window|day|month|week)\b[^\n?]{0,50}\bdo\s+you\b/i,
 ];
 
 // Markdown emphasis and inline code fences (**bold**, _italic_, `code`) split
@@ -906,6 +922,31 @@ export async function classifyScheduledContinuationAsync(response: {
   return null;
 }
 
+// Result shape of a verified/scheduled chat run. Named so the ENG-396
+// park/auto-take helper can return the same type the function returns.
+type RunVerifiedChatResult = {
+  success: boolean;
+  content: string;
+  toolCalls: any[];
+  keywordMatches: string[];
+  keywordMisses: string[];
+  functionCallMatches: string[];
+  functionCallMisses: string[];
+  functionStatus: Array<{
+    functionName: string;
+    requiredCount: number;
+    actualCount: number;
+    met: boolean;
+  }>;
+  attempts: number;
+  workPlanCompleted: boolean;
+  // ENG-396: set when a headless turn left an unanswered blocking AskUserQuestion.
+  // The run stopped without proceeding on a guess; a human must answer it. The
+  // scheduled caller maps this to a `pending_user_input` outcome and notifies.
+  parked?: boolean;
+  pendingUserQuestion?: PendingUserQuestion;
+};
+
 // Common function to run verified chat with work plan, keywords, and function call verification
 // Used by both scheduled chat and verified-generate
 export async function runVerifiedChat(
@@ -924,24 +965,14 @@ export async function runVerifiedChat(
     // before returning success. Default off so other callers are unaffected.
     completionGate?: boolean;
     completionGateMaxContinuations?: number;
+    // ENG-396: opt-in "full autonomy" (from the schedule). When true, a headless
+    // turn that hits a blocking AskUserQuestion AUTO-TAKES Emma's recommended
+    // option (logged as delegation) and continues, instead of parking — including
+    // for IMMUTABLE questions. This is a deliberate, default-off WAIVER of the
+    // human protection on irreversible decisions (owner opted in per-schedule).
+    fullAutonomy?: boolean;
   }
-): Promise<{
-  success: boolean;
-  content: string;
-  toolCalls: any[];
-  keywordMatches: string[];
-  keywordMisses: string[];
-  functionCallMatches: string[];
-  functionCallMisses: string[];
-  functionStatus: Array<{
-    functionName: string;
-    requiredCount: number;
-    actualCount: number;
-    met: boolean;
-  }>;
-  attempts: number;
-  workPlanCompleted: boolean;
-}> {
+): Promise<RunVerifiedChatResult> {
   const {
     sessionId,
     userId,
@@ -951,8 +982,15 @@ export async function runVerifiedChat(
     maxAttempts = 20,
     attachments = [],
     completionGate = false,
-    completionGateMaxContinuations = 2
+    completionGateMaxContinuations = 2,
+    fullAutonomy = false
   } = params;
+
+  // ENG-396: bound how many times a single full-autonomy run may auto-take a
+  // question, so a model that keeps re-asking cannot loop until maxAttempts. Once
+  // exhausted, the run parks (falls back to the safe default).
+  let autoTakesUsed = 0;
+  const MAX_AUTO_TAKES = 3;
 
   // Tracks how many completion-gate continuation turns we've already spent, so a
   // model that keeps admitting "not finished" can't loop indefinitely.
@@ -1071,6 +1109,74 @@ export async function runVerifiedChat(
   // or 'unfinished' (admitted it left per-entity work undone).
   let completionGateReason: ScheduledContinuationReason = 'unfinished';
 
+  // ENG-396: A turn — the MAIN turn OR a completion-gate continuation turn — may
+  // have left an unanswered blocking AskUserQuestion (the tool handler persisted
+  // it via updateSessionAskUserQuestion). Handle it identically at BOTH LLM call
+  // sites so the park guarantee can never be bypassed: re-read from the DB (never
+  // trust a stale in-memory blank), then AUTO-TAKE Emma's recommended option under
+  // full autonomy (bounded, logged as a delegation — a deliberate per-schedule
+  // WAIVER of the human protection on irreversible decisions), otherwise PARK and
+  // stop rather than proceed on a guess. Returns 'autoTake' (caller retries), a
+  // 'park' result to return, or null when no question is awaiting.
+  const resolveAwaitingUserQuestion = async (): Promise<
+    { action: 'autoTake' } | { action: 'park'; result: RunVerifiedChatResult } | null
+  > => {
+    const postTurnSession = await chatbotDb.getChatSession(sessionId);
+    if (postTurnSession?.pendingUserQuestion?.status !== 'awaiting') return null;
+    const pending = postTurnSession.pendingUserQuestion;
+
+    if (fullAutonomy && autoTakesUsed < MAX_AUTO_TAKES) {
+      autoTakesUsed++;
+      const answered = resolveInboundAnswer(pending, { delegated: true }, new Date().toISOString());
+      await chatbotDb.updateSessionAskUserQuestion(sessionId, answered, {
+        requireStillAwaiting: pending.questionId,
+      });
+      const chosen = answered.options.find(o => o.id === answered.answer!.optionId);
+      console.log(
+        `AgentMode runVerifiedChat: full-autonomy auto-take on session ${sessionId} — question ${pending.questionId} → "${chosen?.label}" (delegation); continuing`
+      );
+      // Breadcrumb in history so Emma sees the decision and resumes without
+      // re-asking (best-effort; the persisted answer is the source of truth).
+      try {
+        await chatbotDb.addMessageToSession(sessionId, {
+          role: 'user',
+          content: `[Full autonomy] Proceed with "${chosen?.label}"${answered.answer?.rationale ? ` — ${answered.answer.rationale}` : ''}.`,
+          timestamp: new Date().toISOString(),
+          metadata: { timestamp: new Date().toISOString(), autoDelegatedAnswer: true, questionId: pending.questionId } as any,
+        });
+      } catch (breadcrumbError) {
+        console.error('Failed to persist full-autonomy auto-take breadcrumb:', breadcrumbError);
+      }
+      return { action: 'autoTake' };
+    }
+
+    console.log(
+      `AgentMode runVerifiedChat: parking session ${sessionId} — blocking user question (${pending.questionId}) awaiting a selection; run will not proceed on a guess`
+    );
+    return {
+      action: 'park',
+      result: {
+        success: false,
+        parked: true,
+        pendingUserQuestion: postTurnSession.pendingUserQuestion,
+        content: allContent,
+        toolCalls: allToolCalls,
+        keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
+        keywordMisses: remainingKeywords,
+        functionCallMatches: [],
+        functionCallMisses: requiredFunctions.map(f => f.functionName),
+        functionStatus: requiredFunctions.map(reqFunc => ({
+          functionName: reqFunc.functionName,
+          requiredCount: reqFunc.minCount,
+          actualCount: countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting),
+          met: false,
+        })),
+        attempts: attempt,
+        workPlanCompleted: false,
+      },
+    };
+  };
+
   while (attempt < maxAttempts) {
     attempt++;
 
@@ -1119,6 +1225,18 @@ export async function runVerifiedChat(
         allActualFunctionCallsForReporting.push(
           ...continuationToolCalls.map((call: any) => call.name).filter(Boolean)
         );
+        // ENG-396: a completion-gate continuation turn can ALSO emit a blocking
+        // AskUserQuestion. Route it through the same park/auto-take handler as the
+        // main turn instead of falling through and returning success on an
+        // unanswered question (the second LLM call site the original park missed).
+        const continuationQuestion = await resolveAwaitingUserQuestion();
+        if (continuationQuestion?.action === 'autoTake') {
+          await waitForVerifiedChatRetry(attempt);
+          continue;
+        }
+        if (continuationQuestion?.action === 'park') {
+          return continuationQuestion.result;
+        }
         // Re-evaluate the gate against the continuation's own output.
         const continuationReason = await classifyScheduledContinuationAsync(continuationResponse);
         if (
@@ -1220,6 +1338,18 @@ export async function runVerifiedChat(
       const actualFunctionCalls = toolCalls.map((call: any) => call.name).filter(Boolean);
 
       allActualFunctionCallsForReporting.push(...actualFunctionCalls);
+
+      // ENG-396: this MAIN turn may have left an unanswered blocking
+      // AskUserQuestion — auto-take (full autonomy) or park before doing anything
+      // else. Same handler covers the completion-gate continuation turn below.
+      const mainTurnQuestion = await resolveAwaitingUserQuestion();
+      if (mainTurnQuestion?.action === 'autoTake') {
+        await waitForVerifiedChatRetry(attempt);
+        continue;
+      }
+      if (mainTurnQuestion?.action === 'park') {
+        return mainTurnQuestion.result;
+      }
 
       // Check work plan status
       const workPlan = response.workPlan;
@@ -1436,7 +1566,8 @@ export async function runScheduledChat(
 ): Promise<{
   scheduleId: string;
   runId: string;
-  status: 'success' | 'failure';
+  // ENG-396: 'pending_user_input' when the run parked on a blocking AskUserQuestion.
+  status: 'success' | 'failure' | 'pending_user_input';
   passed: boolean;
   actualResponse: string;
   actualFunctionCalls: string[];
@@ -1449,6 +1580,8 @@ export async function runScheduledChat(
   attempt: number;
   createdAt: string;
   summary?: string;
+  // Present only on a parked run — links the pending question for the UI.
+  pendingQuestionId?: string;
 }> {
   const now = new Date();
   let sessionId: string = '';
@@ -1756,8 +1889,67 @@ export async function runScheduledChat(
       llmModel: schedule.llmModel || defaultModel,
       // Deterministic backstop for multi-entity scheduled runs (PR #1941 follow-up):
       // if the run admits it left work unfinished, auto-continue before finishing.
-      completionGate: true
+      completionGate: true,
+      // ENG-396: opt-in per-schedule full autonomy — auto-take Emma's recommended
+      // option on a blocking question instead of parking (waives the human gate on
+      // irreversible decisions; default off).
+      fullAutonomy: schedule.fullAutonomy === true
     });
+
+    // ENG-396: the run parked on a blocking AskUserQuestion with no human present.
+    // It did NOT proceed on a guess. Record a `pending_user_input` outcome and
+    // notify the owner so they can make the choice; this is NOT a failure, so we
+    // early-return BEFORE the oncall/auto-issue path. `sessionId: ''` reuses the
+    // established convention (see error/token paths) so the orchestrator/callers
+    // skip their normal result email — the paused email below carries the link.
+    if (result.parked && result.pendingUserQuestion) {
+      const scheduleUser = await userDb.getUserById(userId);
+      const notifyEmails = (schedule.emailNotifications && schedule.emailNotifications.length > 0)
+        ? schedule.emailNotifications
+        : (scheduleUser?.email ? [scheduleUser.email] : []);
+      if (notifyEmails.length > 0) {
+        await emailService.sendScheduledChatPausedForInputEmail(
+          notifyEmails,
+          schedule.scheduleName,
+          schedule.scheduleId,
+          result.pendingUserQuestion.question,
+          sessionId
+        );
+      } else {
+        // Parked but no recipient (no emailNotifications and no account email) — the
+        // owner won't be notified. Surface it loudly rather than parking silently.
+        console.warn(
+          `AgentMode runScheduledChat: schedule ${schedule.scheduleId} parked on a user question but has NO notification recipient — owner will not be told. Session ${sessionId}, question ${result.pendingUserQuestion.questionId}`
+        );
+      }
+
+      const parkedResult = {
+        scheduleId: schedule.scheduleId,
+        runId: preGeneratedRunId || require('uuid').v4(),
+        status: 'pending_user_input' as const,
+        passed: false,
+        actualResponse: result.content,
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: [],
+        functionCallMatches: [],
+        functionCallMisses: [],
+        functionCallDetails: {},
+        executionTime: Date.now() - now.getTime(),
+        // Empty on purpose — suppresses the callers' result email (the paused
+        // email already notified). The pending question id links back for the UI.
+        sessionId: '',
+        pendingQuestionId: result.pendingUserQuestion.questionId,
+        attempt: result.attempts,
+        createdAt: new Date().toISOString(),
+      };
+      try {
+        await scheduleDb.addRunResult(schedule.scheduleId, parkedResult);
+      } catch (error) {
+        console.error('Error saving parked run result:', error);
+      }
+      return parkedResult;
+    }
 
     if (!isTest && process.env.NODE_ENV !== 'test') {
       const hasAssistantMessage = await sessionHasAssistantMessage(sessionId);
@@ -2416,7 +2608,14 @@ export async function generateSessionResponse(
   isInteractiveShare?: boolean,
   pageContext?: { currentUrl?: string; structuredContext?: string; screenshot?: string },
   isDelegatedAccess?: boolean,
-  ishareSenderInfo?: { ip?: string; userAgent?: string }
+  ishareSenderInfo?: { ip?: string; userAgent?: string },
+  // ENG-396: a model-visible directive (from buildAnswerAcknowledgement) appended to
+  // THIS turn's LLM content so Emma opens her reply by naming the chosen option.
+  // Never stored on the displayed user bubble.
+  answerAck?: string,
+  // ENG-396: the structured selection stamped on this reply's metadata, so a card can
+  // show which option was CLICKED (never inferred from the message text).
+  answeredQuestionMeta?: { questionId: string; optionId: string; delegated: boolean }
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -2463,6 +2662,12 @@ export async function generateSessionResponse(
     messageContent += `\n\n[Current page: ${pageContext.currentUrl}]`;
   }
 
+  // ENG-396: when this turn answers an AskUserQuestion, append a directive (LLM-only)
+  // so Emma explicitly names the chosen option in her reply — not just the card footer.
+  if (answerAck) {
+    messageContent += `\n\n${answerAck}`;
+  }
+
   // Create user message object - store processed content with attachments
   const userMessageObj = {
     role: 'user' as const,
@@ -2479,7 +2684,10 @@ export async function generateSessionResponse(
           ...(ishareSenderInfo?.ip ? { ip: ishareSenderInfo.ip } : {}),
           ...(ishareSenderInfo?.userAgent ? { userAgent: ishareSenderInfo.userAgent } : {}),
         }
-      } : {})
+      } : {}),
+      // ENG-396: structured record of the card selection this reply answered (from a
+      // click, not the text). The card reads this to show which option was chosen.
+      ...(answeredQuestionMeta ? { askUserQuestionAnswer: answeredQuestionMeta } : {})
     }
   };
 
@@ -3026,7 +3234,7 @@ export const agentModeController = {
     let idemKeyHeld: string | undefined;
     try {
       const user = req.user as User;
-      const { sessionId, llmModel, attachments, currentUrl, structuredContext, screenshot, audioInput } = req.body;
+      const { sessionId, llmModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer } = req.body;
       let { userMessage } = req.body;
 
       // If the request contains audio, transcribe it to text first
@@ -3063,6 +3271,97 @@ export const agentModeController = {
       }
       if (session.userId !== user.userId && !user.isAdmin) {
         return res.status(403).json({ error: 'Unauthorized access to session' });
+      }
+
+      // ENG-396: structured AskUserQuestion answer channel. When the chat card
+      // posts a selection, resolve it against the session's pending question and
+      // persist the ANSWERED state BEFORE the run starts, so the consumer gate
+      // (checkQuestionGate — e.g. the Meta objective write, ENG-400) reads a
+      // human-attributed answer from the DB rather than parsing it from prose.
+      // Placed before the idempotency/session locks so a bad selection returns
+      // cleanly with no lock to release. answeredBy is derived server-side inside
+      // resolveInboundAnswer — the client cannot forge who answered.
+      let answerAck: string | undefined;
+      let answeredQuestionMeta: { questionId: string; optionId: string; delegated: boolean } | undefined;
+      if (questionAnswer) {
+        try {
+          const answered = resolveInboundAnswer(
+            session.pendingUserQuestion,
+            {
+              questionId: questionAnswer.questionId,
+              optionId: questionAnswer.optionId,
+              delegated: questionAnswer.delegated === true,
+            },
+            new Date().toISOString(),
+          );
+          // Optimistic-locked: only persists if the question is STILL exactly
+          // this one and STILL 'awaiting' at write time. Without this, two
+          // concurrent submissions (e.g. a double-click) could both validate
+          // against the same in-memory snapshot and the later write would
+          // silently clobber the earlier answer.
+          const persisted = await chatbotDb.updateSessionAskUserQuestion(sessionId, answered, {
+            requireStillAwaiting: session.pendingUserQuestion!.questionId,
+          });
+          if (!persisted) {
+            // Lost the race to a concurrent submission that already answered
+            // this same question — refresh and re-render rather than silently
+            // overwriting whichever answer actually won.
+            return res.status(409).json({
+              error: 'This question was already answered by a concurrent request.',
+              code: 'ASK_USER_QUESTION_INVALID',
+            });
+          }
+          // ENG-396: make Emma name the chosen option in her reply (esp. for delegation,
+          // where the user's "Let Emma decide" bubble doesn't say which option won).
+          answerAck = buildAnswerAcknowledgement(answered) ?? undefined;
+          // ENG-396: stamp the STRUCTURED selection on this reply so the card reads which
+          // option was chosen from the click record — never inferred from prose. Superseded
+          // cards read this instead of matching chat text.
+          if (answered.answer) {
+            answeredQuestionMeta = {
+              questionId: answered.questionId,
+              optionId: answered.answer.optionId,
+              delegated: answered.answer.delegated === true,
+            };
+          }
+        } catch (err) {
+          if (err instanceof AskUserQuestionError) {
+            // Stale/duplicate/invalid selection (e.g. the card was already
+            // answered, or the questionId no longer matches). 409 so the client
+            // can refresh the session and re-render the current question state.
+            return res.status(409).json({ error: err.message, code: 'ASK_USER_QUESTION_INVALID' });
+          }
+          throw err;
+        }
+      } else if (session.pendingUserQuestion?.status === 'awaiting') {
+        // ENG-396: the user typed a message instead of clicking the open card. Per the
+        // primitive's model, a selection is ONLY an explicit click — never inferred from
+        // prose. So the open question is abandoned: clear it (the old card freezes as
+        // "not answered" history) so the one-live-question guard lets Emma re-ask with a
+        // FRESH card. The irreversible-write gate still blocks until a real structured
+        // answer lands, so this can't rubber-stamp. Inject a directive so Emma re-asks
+        // THAT SAME question instead of inferring a choice from the prose and advancing.
+        // Optimistic-locked (Greptile P1, "Typed messages bypass answer lock"):
+        // a card-answer submission racing this typed message could already have
+        // persisted a real answer between our read and this write. An
+        // unconditional clear would then erase that just-landed answer (or,
+        // the other way round, this clear could land first and make the valid
+        // answer submission fail with a false "already answered"). Guard the
+        // clear on the question still being exactly this one, still awaiting.
+        const abandoned = session.pendingUserQuestion;
+        const cleared = await chatbotDb.updateSessionAskUserQuestion(sessionId, null, {
+          requireStillAwaiting: abandoned.questionId,
+        });
+        if (cleared) {
+          session.pendingUserQuestion = undefined;
+          answerAck = buildReaskDirective(abandoned);
+        } else {
+          // Lost the race — a concurrent structured answer already resolved
+          // this question. Re-read the fresh state so the run proceeds against
+          // the REAL answer rather than silently discarding it.
+          const fresh = await chatbotDb.getChatSession(sessionId);
+          session.pendingUserQuestion = fresh?.pendingUserQuestion;
+        }
       }
 
       // Cross-restart duplicate-submit lock (ENG-147: one question spawned ~30
@@ -3194,7 +3493,10 @@ export const agentModeController = {
         attachments,
         undefined, // isInteractiveShare
         pageContext,
-        isDelegatedAccessForMessage
+        isDelegatedAccessForMessage,
+        undefined, // ishareSenderInfo
+        answerAck, // ENG-396: make Emma name the chosen option in her reply
+        answeredQuestionMeta // ENG-396: structured click record stamped on the reply
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
@@ -3474,8 +3776,8 @@ export const agentModeController = {
             }
           }).catch(err => console.error('Failed to send oncall alert:', err));
 
-          autoReportContextLimitToNotion(sessionId, user?.email, user?.userId, llmModel, session)
-            .catch(err => console.error('autoReportContextLimitToNotion failed:', err));
+          autoReportContextLimitToLinear(sessionId, user?.email, user?.userId, llmModel, session)
+            .catch(err => console.error('autoReportContextLimitToLinear failed:', err));
 
           res.status(413).json({
             error: 'Context limit exceeded',
@@ -3913,7 +4215,12 @@ export const agentModeController = {
           hasActiveProgress: hasActiveProgress(session.sessionId),
           supportNote: supportNote,
           skills: sharedSkills,
-          slackThread: session.slackThread
+          slackThread: session.slackThread,
+          // ENG-396: expose the AskUserQuestion state so a shared/read-only card can
+          // reflect the real answered option (highlight + "Answered") instead of a bare
+          // "View only". Everything here is already visible in the transcript's card, so
+          // it leaks nothing new; the share stays read-only via the card's readOnly path.
+          pendingUserQuestion: session.pendingUserQuestion
         }
       });
 
@@ -4153,8 +4460,8 @@ export const agentModeController = {
             }
           }).catch(err => console.error('Failed to send oncall alert:', err));
 
-          autoReportContextLimitToNotion(shareId, session?.userId, session?.userId, llmModel || session?.llmModel, session)
-            .catch(err => console.error('autoReportContextLimitToNotion failed (shared):', err));
+          autoReportContextLimitToLinear(shareId, session?.userId, session?.userId, llmModel || session?.llmModel, session)
+            .catch(err => console.error('autoReportContextLimitToLinear failed (shared):', err));
 
           res.status(413).json({
             error: 'Context limit exceeded',
@@ -4502,6 +4809,7 @@ export const agentModeController = {
           `Message preview: ${String(message.content || '').slice(0, 300)}`,
         ].filter(Boolean).join('\n'),
         source: `Feedback (${type})`,
+        executionRoute: 'human-triage',
         notionTags: [type === 'like' ? 'Feedback-Like' : 'Feedback-Dislike'],
         notionContext: {
           sessionId,
@@ -5039,7 +5347,8 @@ export const agentModeController = {
         variables,
         variableValues,
         frequencyIntervalDays,
-        selfImprove
+        selfImprove,
+        fullAutonomy
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -5107,6 +5416,10 @@ export const agentModeController = {
         emailNotifications: [] as string[],
         dailyDigest: scheduleFrequency === 'hourly' ? (req.body.dailyDigest || false) : false, // Only allow daily digest for hourly schedules
         selfImprove: selfImprove === true, // When on, a reflection turn after each run may improve the prompt
+        // ENG-396: when on, a headless run auto-takes Emma's recommended option on a
+        // blocking question (incl. immutable) instead of parking — an opt-in waiver
+        // of the human gate on irreversible decisions. Default off.
+        fullAutonomy: fullAutonomy === true,
         status: 'active',
         nextRunTime: scheduledNextRunTime,
         createdAt: now.toISOString(),
@@ -5222,7 +5535,8 @@ export const agentModeController = {
         variables,
         variableValues,
         frequencyIntervalDays,
-        selfImprove
+        selfImprove,
+        fullAutonomy
       } = req.body;
 
       // Verify schedule exists and belongs to user (before validation so we can merge)
@@ -5287,6 +5601,8 @@ export const agentModeController = {
         emailNotifications: normalizeEmailList(emailNotifications !== undefined ? emailNotifications : (existingSchedule.emailNotifications || [])),
         dailyDigest: effectiveScheduleFrequency === 'hourly' ? (dailyDigest !== undefined ? dailyDigest : (existingSchedule.dailyDigest || false)) : false,
         selfImprove: selfImprove !== undefined ? (selfImprove === true) : ((existingSchedule as any).selfImprove || false),
+        // ENG-396: opt-in full autonomy (auto-take on blocking questions). Partial-update safe.
+        fullAutonomy: fullAutonomy !== undefined ? (fullAutonomy === true) : ((existingSchedule as any).fullAutonomy || false),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),

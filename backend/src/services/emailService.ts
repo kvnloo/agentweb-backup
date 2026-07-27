@@ -1173,6 +1173,83 @@ Schedule ID: ${scheduleId}
     }
   },
 
+  // ENG-396: a scheduled/headless run paused because Emma emitted a blocking
+  // AskUserQuestion (e.g. an immutable Meta campaign objective) and there was no
+  // human present to answer it. The run did NOT proceed on a guess — it is waiting
+  // for the owner to make a choice. Deliberately decision-agnostic: the specific
+  // options live in the chat, so this wording is stable regardless of the question.
+  async sendScheduledChatPausedForInputEmail(
+    toEmails: string | string[],
+    scheduleName: string,
+    scheduleId: string,
+    question: string,
+    sessionId?: string
+  ) {
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      // Deep-link must use the PATH form `/agent-mode/<sessionId>` — the customer
+      // portal reads the session id from the route param (useParams), NOT from a
+      // `?sessionId=` query, so the query form would open a blank chat and the
+      // "Open chat to decide" button would dead-end away from the parked question.
+      const openUrl = `${customerFrontendUrl}/agent-mode${sessionId ? `/${encodeURIComponent(sessionId)}` : ''}`;
+      const currentDate = new Date().toLocaleDateString('en-US', {
+        year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+      });
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 760px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); }
+            .header { background-color: #f9a825; color: white; padding: 20px; border-radius: 8px 8px 0 0; }
+            .content { padding: 20px; }
+            .question { margin: 12px 0; padding: 14px 16px; background-color: #fff8e1; border-left: 4px solid #f9a825; border-radius: 4px; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #f9a825; color: white !important; padding: 10px 18px; text-decoration: none; border-radius: 4px; margin-top: 10px; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h2 style="margin: 0;">Emma needs your input to continue</h2>
+              <p style="margin: 6px 0 0 0; opacity: 0.92;">${this.escapeHtml(scheduleName)}</p>
+            </div>
+            <div class="content">
+              <p>Your scheduled run on ${currentDate} paused because Emma needs you to make a choice before continuing. She did not proceed on a guess.</p>
+              <div class="question">${this.escapeHtml(question)}</div>
+              <p>Open the chat to see the options and choose, and the run will pick up from there.</p>
+              <a class="button" href="${openUrl}">Open chat to decide</a>
+            </div>
+            <div class="footer" style="color: #6c757d; font-size: 13px;">Schedule ID: ${scheduleId}</div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `
+Emma needs your input to continue: ${scheduleName}
+
+Your scheduled run on ${currentDate} paused because Emma needs you to make a choice before continuing. She did not proceed on a guess.
+
+${question}
+
+Open the chat to see the options and choose, and the run will pick up from there:
+${openUrl}
+
+Schedule ID: ${scheduleId}
+      `;
+
+      const subject = `🟡 Emma needs your input: ${scheduleName}`;
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      await this.sendEmail(emailList, subject, text, html);
+      console.log(`Scheduled chat paused-for-input email sent to recipients: ${emailList.join(', ')}`);
+    } catch (error) {
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      console.error(`Error sending scheduled chat paused-for-input emails to ${emailList.join(', ')}:`, error);
+    }
+  },
+
   async sendScheduledChatResultEmail(
     toEmails: string | string[],
     scheduleName: string,
@@ -1798,7 +1875,7 @@ View Session: ${sessionUrl}`;
     subject: string,
     message: string,
     context?: Record<string, any>,
-    notionUrl?: string
+    trackerUrl?: string
   ) {
     if (process.env.NODE_ENV !== 'production') {
       console.log(`[DEV] Suppressed oncall alert: ${subject}`);
@@ -1809,26 +1886,24 @@ View Session: ${sessionUrl}`;
       const env: string = process.env.NODE_ENV || 'unknown';
       const envLabel = env === 'production' ? 'PROD' : env.toUpperCase();
 
-      // File a tracked oncall item if no URL was provided. Routes via the shared intake
-      // service: behind FEATUREBASE_INTAKE this creates a PRIVATE Linear issue (Auto label,
-      // deduped by title) instead of Notion. Best-effort — a filing failure just means the
-      // alert email carries full details instead of a link.
-      let resolvedNotionUrl = notionUrl || null;
-      if (!resolvedNotionUrl) {
+      // File a tracked oncall item if no URL was provided. System-generated work always goes
+      // through Linear; generic alerts fail closed to PM triage because this layer cannot prove
+      // that a code-only fix is safe. A filing failure leaves the full detail in email.
+      let resolvedTrackerUrl = trackerUrl || null;
+      if (!resolvedTrackerUrl) {
         try {
           const { fileAutoIssue } = await import('./intakeService');
           const result = await fileAutoIssue({
             title: subject,
             description: message,
             source: 'Oncall alert',
+            executionRoute: 'human-triage',
             extraLabels: ['Oncall'],
-            // notionTags [] -> createOncallItem still adds its internal "Oncall" tag, so the
-            // Notion-path behaviour is unchanged (no duplicate Oncall tag).
             notionTags: [],
             notionContext: context,
           });
-          resolvedNotionUrl = result.url || null;
-          console.log(`Oncall item filed (${result.tracker}): ${resolvedNotionUrl}`);
+          resolvedTrackerUrl = result.url || null;
+          console.log(`Oncall item filed (${result.tracker}): ${resolvedTrackerUrl}`);
         } catch (fileError) {
           console.error('Failed to file oncall item, falling back to full email:', fileError);
         }
@@ -1837,8 +1912,8 @@ View Session: ${sessionUrl}`;
       let html: string;
       let text: string;
 
-      if (resolvedNotionUrl) {
-        // Slim email with Notion link
+      if (resolvedTrackerUrl) {
+        // Slim email with a link to the canonical tracked issue.
         html = `
         <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f8f9fa;">
           <div style="background-color: #dc3545; color: white; padding: 20px; border-radius: 8px 8px 0 0;">
@@ -1847,18 +1922,18 @@ View Session: ${sessionUrl}`;
           <div style="background-color: white; padding: 20px; border-radius: 0 0 8px 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
             <h2 style="color: #dc3545; margin-top: 0;">${this.escapeHtml(subject)}</h2>
             <div style="margin: 20px 0;">
-              <a href="${this.escapeHtml(resolvedNotionUrl)}" style="display: inline-block; padding: 12px 24px; background-color: #dc3545; color: white; text-decoration: none; border-radius: 6px; font-weight: bold;">View in Notion</a>
+              <a href="${this.escapeHtml(resolvedTrackerUrl)}" style="display: inline-block; padding: 12px 24px; background-color: #dc3545; color: white; text-decoration: none; border-radius: 6px; font-weight: bold;">View tracked issue</a>
             </div>
             <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #e9ecef; color: #6c757d; font-size: 12px;">
-              <p>Full details available in the Notion item above.</p>
+              <p>Full details are available in the tracked issue above.</p>
             </div>
           </div>
         </div>
         `;
 
-        text = `⚠️ [${envLabel}] Oncall Alert\n\n${subject}\n\nNotion: ${resolvedNotionUrl}`;
+        text = `⚠️ [${envLabel}] Oncall Alert\n\n${subject}\n\nIssue: ${resolvedTrackerUrl}`;
       } else {
-        // Full detail email (fallback when Notion creation failed)
+        // Full detail email (fallback when issue filing failed)
         const contextHtml = context
           ? Object.entries(context)
             .map(([key, value]) => {

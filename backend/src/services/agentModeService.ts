@@ -24,7 +24,16 @@ import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
-import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
+import { taskDb, taskTemplateDb, accountMemoryDb, userDb } from './db';
+import {
+  applyAnswer,
+  buildPendingUserQuestion,
+  checkQuestionGate,
+  findQuestionByKind,
+  renderQuestionPrompt,
+  verifyExplicitStatement,
+  type AskUserQuestionOption,
+} from './agentMode/core/askUserQuestion';
 import { buildReadyPatch, logCompletionMetric } from './brandBuildStatusService';
 import { settingsService } from './settingsService';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
@@ -72,7 +81,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'manage_user_guide', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status'];
+const ADMIN_SKILL_TOOL_NAMES = ['manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -4629,6 +4638,17 @@ export class AgentModeService {
     'fathom_get_meetings',
     'fathom_get_transcript',
     'fathom_get_onboarding_context',
+    // ENG-396/400: re-exposed after being found dormant-only in practice (a
+    // user asking Emma to "confirm settings via a card before building"
+    // couldn't get one at all — she has no way to render a real card and was
+    // fabricating fake HTML in prose instead, since the deterministic Meta
+    // objective gate only auto-fires at an actual CAMPAIGN CREATE attempt, not
+    // proactively). The gate itself (resolveCampaignObjectiveGate) is
+    // UNCHANGED and fully independent of this exposure — it enforces the
+    // objective at create time regardless of whether Emma also calls this
+    // voluntarily. Restriction to Meta-only is prompt-level (tool description),
+    // not code-enforced — see emma/tools.ts for the explicit scope language.
+    'ask_user_question',
   ];
 
   private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
@@ -5063,7 +5083,7 @@ export class AgentModeService {
     // per-tool minimizers below drop unknown fields — without this, the frontend
     // (tool card "Awaiting your confirmation", panel teardown) never sees the flag.
     if (result && result.awaitingUserConfirmation === true) {
-      return {
+      const base = {
         success: true,
         requiresConfirmation: true,
         awaitingUserConfirmation: true,
@@ -5071,6 +5091,22 @@ export class AgentModeService {
         confirmationDetail: result.confirmationDetail,
         summary: result.summary,
       };
+      // ENG-396: also preserve the structured AskUserQuestion payload so the chat
+      // card can render its options and the frontend can post back a structured
+      // selection. Without this the per-tool minimizers drop these unknown fields.
+      if (result.type === 'ask_user_question') {
+        return {
+          ...base,
+          type: 'ask_user_question',
+          questionId: result.questionId,
+          question: result.question,
+          ...(result.intro ? { intro: result.intro } : {}),
+          options: result.options,
+          recommendedOptionId: result.recommendedOptionId,
+          allowEmmaDecide: result.allowEmmaDecide,
+        };
+      }
+      return base;
     }
 
     // For playwright screenshots, result has already been processed (base64 → S3 URL)
@@ -16055,6 +16091,289 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return { summary: lines.join(' '), target };
   }
 
+  private static readonly META_OBJECTIVE_VALUES = [
+    'OUTCOME_TRAFFIC',
+    'OUTCOME_AWARENESS',
+    'OUTCOME_ENGAGEMENT',
+    'OUTCOME_SALES',
+    'OUTCOME_LEADS',
+    'OUTCOME_APP_PROMOTION',
+  ];
+
+  // Greptile P1 ("Quote does not bind objective"): verifyExplicitStatement only
+  // proves the quote is real transcript text — it says nothing about WHICH
+  // objective that text describes. Without this, a genuine quote for one
+  // objective (e.g. "traffic campaign") could be paired with a completely
+  // different claimed objective (OUTCOME_LEADS) and both would check out,
+  // letting a model-supplied objective bypass the human-attribution gate on
+  // its own say-so — the exact class of bug this gate exists to prevent. Each
+  // claimed objective must have its OWN keyword actually present in the quote.
+  private static readonly META_OBJECTIVE_KEYWORDS: Record<string, RegExp> = {
+    OUTCOME_LEADS: /\blead(s|-?gen(eration)?)?\b/i,
+    OUTCOME_SALES: /\bsales?\b|\bpurchase(s)?\b|\be-?commerce\b|\bcheckout\b|\bconversion(s)?\b/i,
+    OUTCOME_TRAFFIC: /\btraffic\b|\bclicks?\b|\blanding[- ]page\b|\blpv\b/i,
+    OUTCOME_AWARENESS: /\bawareness\b|\breach\b|\bimpressions?\b/i,
+    OUTCOME_ENGAGEMENT: /\bengagement\b/i,
+    OUTCOME_APP_PROMOTION: /\bapp[- ]?(promotion|install(s)?)\b/i,
+  };
+
+  /**
+   * The last message with role 'user' in the session, or undefined. Used ONLY
+   * to verify an "explicitly stated by the user" claim against real transcript
+   * text (verifyExplicitStatement) — never to infer or parse an answer.
+   */
+  private async getLastUserMessageText(sessionId: string): Promise<string | undefined> {
+    const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') return messages[i].content;
+    }
+    return undefined;
+  }
+
+  /**
+   * Greptile P1 ("Confirmation retry reopens objective gate"): makes a Path 1
+   * (verified explicit-statement) success durable for the rest of the session,
+   * the same way a card answer is — so a target-confirmation retry (or any
+   * later CAMPAIGN CREATE in this session) finds it via Path 2 instead of
+   * re-deriving it against a possibly different later message. Synthesizes a
+   * single-option "question" that's already answered — never shown to the
+   * user (no card was needed; the user already stated it themselves), just a
+   * structural record for the gate to find.
+   */
+  private async persistExplicitObjectiveConfirmation(
+    sessionId: string,
+    objective: string,
+    quote: string,
+    objectiveKind: string,
+  ): Promise<void> {
+    const question = buildPendingUserQuestion({
+      questionId: uuidv4(),
+      question: 'Meta campaign objective (confirmed from the user\'s own explicit statement).',
+      options: [
+        {
+          id: 'confirmed',
+          label: objective,
+          consequence: 'Confirmed by the user\'s own words — not shown as a card.',
+          recommended: true,
+          why: `The user explicitly stated this: "${quote}"`,
+          payload: { objective },
+        },
+        {
+          // Structural placeholder only — the primitive requires 2–4 options
+          // and exactly one recommended. This one was never actually offered;
+          // it can never be selected since this record is built pre-answered.
+          id: 'not-applicable',
+          label: 'N/A',
+          consequence: 'Not a real choice — this record reflects an explicit user statement, not a live card.',
+          payload: {},
+        },
+      ],
+      immutable: true,
+      allowEmmaDecide: false,
+      kind: objectiveKind,
+      createdAt: new Date().toISOString(),
+    });
+    const answered = applyAnswer(question, {
+      optionId: 'confirmed',
+      delegated: false,
+      answeredBy: 'user',
+      rationale: `Explicitly stated by the user: "${quote}"`,
+      at: new Date().toISOString(),
+    });
+    await chatbotDb.updateSessionAskUserQuestion(sessionId, answered);
+  }
+
+  /**
+   * ENG-400: the Meta campaign-objective write gate — the one hard rule this
+   * whole chain exists to enforce. A CAMPAIGN CREATE's objective must come from
+   * one of three human-attributed sources; there is no fourth path. See the
+   * ticket + askUserQuestion.ts file header for the RankAI incident this
+   * prevents (Emma defaulted the objective, then self-approved via a
+   * model-controlled `confirm:true` flag — the same shape of bug this method
+   * refuses to reintroduce).
+   *
+   * 1. Explicitly stated by the user THIS turn — verified against the actual
+   *    message text (verifyExplicitStatement), never trusted on a model flag.
+   * 2. A prior ask_user_question (kind 'meta_objective') answered by the user
+   *    or delegation — live or archived in this session (checkQuestionGate).
+   * 3. Neither: this method emits the blocking question itself (grounded,
+   *    static per the 80/20 design) and refuses the create.
+   */
+  private async resolveCampaignObjectiveGate(
+    userId: string,
+    sessionId: string | undefined,
+    account_id: string,
+    params: any,
+  ): Promise<{ allowed: true; objective: string } | { allowed: false; response: MetaApiResult }> {
+    const claimedObjective = typeof params.objective === 'string' ? params.objective : undefined;
+    const quote = typeof params.objective_quote === 'string' ? params.objective_quote : undefined;
+    // Greptile P1 ("Objective persists across campaigns" / "Campaign name
+    // conflates objective state"): a bare 'meta_objective' kind matches ANY
+    // campaign's objective question in this session — a second, different
+    // campaign created later would silently inherit the first one's answered
+    // objective via Path 2. Scoped to a composite correlator (account + name,
+    // normalized + budget + special_ad_categories, all objective-independent
+    // fields already validated present/shaped before this runs) rather than
+    // name alone — collapses the two failure modes together: a confirmation
+    // retry (tool description guarantees "the SAME arguments plus
+    // params.confirm=true") reproduces the identical key regardless of
+    // name whitespace/casing, while two genuinely DIFFERENT campaigns need to
+    // differ in at least one of these fields to get a real create through
+    // (matching name is common; matching name AND budget AND categories too is
+    // not). Not a perfect unique ID — no caller supplies one — but meaningfully
+    // stronger than name alone against both bugs Greptile found.
+    const objectiveCorrelator = [
+      account_id,
+      typeof params.name === 'string' ? params.name.trim().toLowerCase() : '',
+      params.daily_budget ?? '',
+      params.lifetime_budget ?? '',
+      Array.isArray(params.special_ad_categories) ? [...params.special_ad_categories].sort().join(',') : '',
+    ].join('|');
+    const objectiveKind = `meta_objective:${objectiveCorrelator}`;
+
+    // No session was given — this shouldn't happen for either known caller
+    // (emma/tools.ts and routes/emmaApi.ts both pass one), so this is an
+    // anomaly worth surfacing loudly rather than a routine path. Rather than a
+    // dead-end failure with nothing the caller can do about it, auto-provision
+    // a session so the SAME park/answer machinery still applies: the create
+    // still refuses to proceed on a guess, but the resulting question is
+    // recoverable (answerable later via chat/MCP) instead of a hard stop.
+    if (!sessionId) {
+      console.warn(
+        `AgentMode: callMetaMarketingApi CAMPAIGN CREATE called with NO sessionId for user ${userId} — ` +
+        `this should be unreachable from any known caller (emma/tools.ts, routes/emmaApi.ts both pass one). ` +
+        `Auto-provisioning a session so the objective gate can still park safely instead of dead-ending. ` +
+        `Investigate the caller — this may indicate an untracked integration hitting the Meta write path.`,
+      );
+      const created = await chatbotDb.createChatSession(
+        userId,
+        undefined,
+        'agent',
+        'meta-objective-gate-auto-session',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        'result-endpoint',
+      );
+      sessionId = created.sessionId;
+    }
+
+    // Path 1: explicitly stated by the user in their own words this turn. Two
+    // independent checks, BOTH required: the quote must be real transcript
+    // text (verifyExplicitStatement), AND it must actually describe the
+    // claimed objective (its own keyword present in the quote) — otherwise a
+    // genuine-but-unrelated quote could rubber-stamp any objective the model
+    // names alongside it.
+    if (claimedObjective && AgentModeService.META_OBJECTIVE_VALUES.includes(claimedObjective) && quote) {
+      const lastUserText = await this.getLastUserMessageText(sessionId);
+      const keywordPattern = AgentModeService.META_OBJECTIVE_KEYWORDS[claimedObjective];
+      if (verifyExplicitStatement(lastUserText, quote) && keywordPattern?.test(quote)) {
+        // Greptile P1 ("Confirmation retry reopens objective gate"): CAMPAIGN
+        // CREATE is also a write action, so the target-confirmation guardrail
+        // below still fires after this and asks the user to confirm the
+        // target. That reply ("yes") becomes the new last user message on the
+        // retry — the ORIGINAL quote no longer appears there, so re-evaluating
+        // Path 1 from scratch would fail and wrongly fall through to a fresh
+        // Path 3 ask, even though the objective was already legitimately
+        // confirmed. Persist this success as a real answered record (same
+        // shape Path 2 looks for) so the retry finds it settled instead of
+        // re-deriving it against a message that no longer contains the quote.
+        await this.persistExplicitObjectiveConfirmation(sessionId, claimedObjective, quote, objectiveKind);
+        return { allowed: true, objective: claimedObjective };
+      }
+      // The quote didn't check out against the real transcript, or doesn't
+      // describe the claimed objective — do NOT trust
+      // the claim; fall through to the deterministic ask gate below.
+    }
+
+    // Path 2: already settled via a prior ask_user_question in this session,
+    // scoped to THIS campaign (see objectiveKind above).
+    const session = await chatbotDb.getChatSession(sessionId);
+    const candidate = findQuestionByKind(session?.pendingUserQuestion, session?.answeredQuestions, objectiveKind);
+    const outcome = checkQuestionGate(candidate);
+    if (outcome.allowed) {
+      const objective = (outcome.payload as any)?.objective;
+      if (typeof objective === 'string' && AgentModeService.META_OBJECTIVE_VALUES.includes(objective)) {
+        return { allowed: true, objective };
+      }
+    }
+
+    // Path 3: nothing settled — surface the blocking ask ourselves. Never
+    // proceed on a guess (this is the load-bearing refusal). Recommendation is
+    // STATIC per the 80/20 design (Harsha, 2026-07-20) — OUTCOME_LEADS is the
+    // fixed default for AgentWeb's demo-booking client base; Sales/Traffic stay
+    // selectable but never computed/inferred per-account.
+    const recommendedWhy =
+      'Most advertisers want conversions, not just landing-page views — recommended unless you specifically want reach/exposure.';
+
+    const options: AskUserQuestionOption[] = [
+      {
+        id: 'leads',
+        label: 'Leads',
+        consequence: 'Optimizes delivery for lead/conversion events on your pixel.',
+        recommended: true,
+        why: recommendedWhy,
+        payload: { objective: 'OUTCOME_LEADS' },
+      },
+      {
+        id: 'sales',
+        label: 'Sales',
+        consequence: 'Optimizes for Purchase events — for a true e-commerce/checkout funnel.',
+        payload: { objective: 'OUTCOME_SALES' },
+      },
+      {
+        id: 'traffic',
+        label: 'Traffic / Awareness',
+        consequence: 'Optimizes for clicks/reach, not conversions — exposure only, not the default.',
+        payload: { objective: 'OUTCOME_TRAFFIC' },
+      },
+    ];
+
+    const question = buildPendingUserQuestion({
+      questionId: uuidv4(),
+      question: 'Which Meta campaign objective should this campaign use? It cannot be changed after creation.',
+      options,
+      immutable: true,
+      allowEmmaDecide: true,
+      kind: objectiveKind,
+      createdAt: new Date().toISOString(),
+    });
+
+    const posted = await chatbotDb.updateSessionAskUserQuestion(sessionId, question, { failIfAwaitingExists: true });
+    if (!posted) {
+      return {
+        allowed: false,
+        response: {
+          success: false,
+          error: 'ASK_USER_QUESTION_ALREADY_PENDING',
+          message:
+            'A question is already waiting for the user to answer. Wait until it is answered before creating this campaign.',
+        } as any,
+      };
+    }
+
+    const prompt = renderQuestionPrompt(question);
+    return {
+      allowed: false,
+      response: {
+        success: true,
+        awaitingUserConfirmation: true,
+        type: 'ask_user_question',
+        sessionId,
+        questionId: question.questionId,
+        question: question.question,
+        options: question.options,
+        recommendedOptionId: question.recommendedOptionId,
+        allowEmmaDecide: question.allowEmmaDecide,
+        confirmationPrompt: prompt,
+        summary: prompt,
+        message:
+          'The campaign objective is immutable and has not been confirmed by the user yet. Do NOT retry the create yourself — the run halts here until they pick an option or delegate.',
+      } as any,
+    };
+  }
+
   /**
    * Master method for calling Meta Marketing API.
    * Routes the request to the appropriate entity manager based on entity_type.
@@ -16067,12 +16386,55 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     campaign_id?: string,
     ad_set_id?: string,
     ad_id?: string,
-    params: any = {}
+    params: any = {},
+    sessionId?: string
   ): Promise<MetaApiResult> {
     console.log(`AgentMode: callMetaMarketingApi -> ${entity_type} / ${action}`);
 
     // Ensure params is an object
     params = params || {};
+
+    // ENG-400: a Meta campaign objective is IMMUTABLE — the one hard rule this
+    // gate exists to enforce is that a CAMPAIGN CREATE never executes with an
+    // objective no human chose. The gate itself MUST run BEFORE objective
+    // validation: the safest thing a model can do when it doesn't know the
+    // objective is omit it entirely, and validateMetaActionParams used to
+    // require objective to be PRESENT for CAMPAIGN CREATE — if that ran first,
+    // omitting it produced a generic PARAM_VALIDATION_ERROR instead of the real
+    // blocking card, defeating the whole point of the gate for exactly the
+    // callers who behave correctly.
+    //
+    // Greptile P1 ("Invalid requests now require session storage"): the gate
+    // can touch the DB (auto-provisioning a session, reading pending
+    // questions), so a request that's malformed independent of objective
+    // (e.g. missing "name") must be rejected BEFORE the gate runs, not after —
+    // otherwise a basic, previously DB-free validation failure now depends on
+    // session storage being reachable at all. Validate those fields first.
+    if (entity_type === 'CAMPAIGN' && action === 'CREATE') {
+      try {
+        MetaService.validateCampaignParamsExceptObjective(action, params);
+      } catch (validationError: any) {
+        return {
+          success: false,
+          message: validationError.message,
+          error: 'PARAM_VALIDATION_ERROR',
+          hint: 'Fix the listed parameters and retry.'
+        } as any;
+      }
+    }
+
+    // Scope is deliberately narrow: only CAMPAIGN CREATE calls this — no other
+    // Meta write is gated.
+    if (entity_type === 'CAMPAIGN' && action === 'CREATE') {
+      const gate = await this.resolveCampaignObjectiveGate(userId, sessionId, account_id, params);
+      if (!gate.allowed) {
+        return gate.response;
+      }
+      // Apply the deterministically-resolved objective verbatim — never
+      // re-derived from params after this point, so nothing downstream can
+      // silently drift it (the idx=202→205 LEADS→TRAFFIC flip in the incident).
+      params = { ...params, objective: gate.objective };
+    }
 
     // Pre-validate params before any API round-trip
     try {
@@ -28776,6 +29138,29 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           });
           if (!didUpdate) return { success: false, error: 'This tool does not support updating the field(s) requested for CAMPAIGN — nothing was sent to Google Ads, no changes were made.' };
           return { success: true, message: 'Campaign updated' };
+        }
+        if (action === 'ADD_PROXIMITY') {
+          if (!args.campaign_resource_name || args.radius === undefined || !args.address) {
+            return { success: false, error: 'campaign_resource_name, radius, and address are required for ADD_PROXIMITY' };
+          }
+          const criterion = await googleAdsService.addProximityCriterion(userId, customer_id, args.campaign_resource_name, {
+            radius: args.radius,
+            radiusUnits: args.radius_units,
+            address: {
+              streetAddress: args.address.street_address,
+              cityName: args.address.city_name,
+              postalCode: args.address.postal_code,
+              provinceCode: args.address.province_code,
+              provinceName: args.address.province_name,
+              countryCode: args.address.country_code,
+            },
+          });
+          return { success: true, criterionResourceName: criterion.resourceName };
+        }
+        if (action === 'REMOVE_PROXIMITY') {
+          if (!args.criterion_resource_name) return { success: false, error: 'criterion_resource_name is required for REMOVE_PROXIMITY' };
+          await googleAdsService.removeCampaignCriterion(userId, customer_id, args.criterion_resource_name, ['PROXIMITY']);
+          return { success: true, message: 'Campaign criterion removed' };
         }
       }
 

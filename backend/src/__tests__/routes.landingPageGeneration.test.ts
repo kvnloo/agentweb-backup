@@ -48,6 +48,9 @@ const mockGetUserById = jest.fn();
 const mockGetOrgById = jest.fn();
 const mockGetLeadListById = jest.fn();
 const mockUpdateLeadList = jest.fn();
+const mockGetLeadListsForUser = jest.fn();
+const mockCreateLeadList = jest.fn();
+const mockCanOrgMemberAccessList = jest.fn();
 
 jest.mock("../services/db", () => ({
   userDb: {
@@ -60,6 +63,9 @@ jest.mock("../services/db", () => ({
   crmDb: {
     getLeadListById: (...args: any[]) => mockGetLeadListById(...args),
     updateLeadList: (...args: any[]) => mockUpdateLeadList(...args),
+    getLeadListsForUser: (...args: any[]) => mockGetLeadListsForUser(...args),
+    createLeadList: (...args: any[]) => mockCreateLeadList(...args),
+    canOrgMemberAccessList: (...args: any[]) => mockCanOrgMemberAccessList(...args),
   },
 }));
 
@@ -84,6 +90,9 @@ const mockDeleteLandingPage = jest.fn();
 const mockDeleteLandingPageByRecord = jest.fn();
 const mockUpdateLandingPageGtm = jest.fn();
 const mockUpdateLandingPageTrackingInstalled = jest.fn();
+const mockUpdateLandingPageMetaPixel = jest.fn();
+const mockUpdateLandingPageMetaTrackingInstalled = jest.fn();
+const mockSyncLeadCaptureFilesToRepo = jest.fn();
 const mockUpdateLandingPageContext = jest.fn();
 const mockResolveVercelProjectId = jest.fn();
 const mockTriggerVercelDeployment = jest.fn();
@@ -92,6 +101,7 @@ const mockUpsertEnvVar = jest.fn();
 const mockDeleteEnvVar = jest.fn();
 const mockResolveLandingPageLiveUrl = jest.fn();
 const mockRecordLandingPagePublish = jest.fn();
+const mockCommitFilesToRepoMain = jest.fn();
 
 jest.mock("../services/v0Service", () => ({
   // Real lock logic (pure) so the route resolves the mode correctly under test.
@@ -114,6 +124,9 @@ jest.mock("../services/v0Service", () => ({
   deleteLandingPageByRecord: (...args: any[]) => mockDeleteLandingPageByRecord(...args),
   updateLandingPageGtm: (...args: any[]) => mockUpdateLandingPageGtm(...args),
   updateLandingPageTrackingInstalled: (...args: any[]) => mockUpdateLandingPageTrackingInstalled(...args),
+  updateLandingPageMetaPixel: (...args: any[]) => mockUpdateLandingPageMetaPixel(...args),
+  updateLandingPageMetaTrackingInstalled: (...args: any[]) => mockUpdateLandingPageMetaTrackingInstalled(...args),
+  syncLeadCaptureFilesToRepo: (...args: any[]) => mockSyncLeadCaptureFilesToRepo(...args),
   updateLandingPageContext: (...args: any[]) => mockUpdateLandingPageContext(...args),
   resolveVercelProjectId: (...args: any[]) => mockResolveVercelProjectId(...args),
   triggerVercelDeployment: (...args: any[]) => mockTriggerVercelDeployment(...args),
@@ -126,6 +139,7 @@ jest.mock("../services/v0Service", () => ({
   getPreviewDeploymentUrl: jest.fn(),
   resolveLandingPageLiveUrl: (...args: any[]) => mockResolveLandingPageLiveUrl(...args),
   recordLandingPagePublish: (...args: any[]) => mockRecordLandingPagePublish(...args),
+  commitFilesToRepoMain: (...args: any[]) => mockCommitFilesToRepoMain(...args),
   markLandingPagePublishReverted: jest.fn(),
   // Owner fast-path returns true; non-owner cases aren't exercised by this suite.
   canUserEditLandingPage: jest.fn().mockResolvedValue(true),
@@ -155,6 +169,11 @@ jest.mock("../services/settingsService", () => ({
   settingsService: {
     getSetting: (...args: any[]) => mockGetSetting(...args),
   },
+}));
+
+const mockVerifyLanderLiveMapping = jest.fn();
+jest.mock("../services/landerLiveMappingCheck", () => ({
+  verifyLanderLiveMapping: (...args: any[]) => mockVerifyLanderLiveMapping(...args),
 }));
 
 import landingPageGenerationRouter, { _resetRateLimitState } from "../routes/landingPageGeneration";
@@ -194,6 +213,8 @@ beforeEach(() => {
   mockListDomainsForPages.mockResolvedValue([]);
   mockGetSetting.mockResolvedValue(null);
   mockUpdateLandingPageGtm.mockResolvedValue(undefined);
+  mockUpdateLandingPageMetaPixel.mockResolvedValue(undefined);
+  mockSyncLeadCaptureFilesToRepo.mockResolvedValue({ committed: true });
   // main's tests rely on a non-null project id by default; HEAD's GTM tests
   // override per-call with `.mockResolvedValueOnce(null)` where needed.
   mockResolveVercelProjectId.mockResolvedValue("vercel-proj-123");
@@ -203,6 +224,7 @@ beforeEach(() => {
   mockDeleteEnvVar.mockResolvedValue(undefined);
   mockResolveLandingPageLiveUrl.mockResolvedValue("https://everyio.agentwebforms.com");
   mockRecordLandingPagePublish.mockResolvedValue(undefined);
+  mockCommitFilesToRepoMain.mockResolvedValue({ pushedCommitSha: "abc1234", pushTimestampMs: Date.now() });
   // ENG-326 AC-3 gate: generation requires a persisted brand logo. Default
   // the projection to a logo-carrying context so unrelated tests pass the
   // gate; the missing-logo tests override per-call.
@@ -210,6 +232,20 @@ beforeEach(() => {
     brandName: "TestBrand",
     logoUrl: "https://s3/brand/logo.png",
   });
+  // ENG-449 capture-or-fail gate: generation requires an existing, bound lead
+  // list. Default to a resolvable one so unrelated tests pass the gate; the
+  // dedicated capture-or-fail tests override per-call.
+  mockGetLeadListById.mockResolvedValue({ id: "list-1", publicAccessEnabled: true });
+  // ENG-449 security fix: explicit lead_list_id must belong to the caller's own
+  // account/org. Default to allowed so unrelated tests pass the gate; the
+  // dedicated cross-tenant test overrides per-call.
+  mockCanOrgMemberAccessList.mockResolvedValue(true);
+  // Default-list auto-resolve path: default to "already exists" so tests that omit
+  // lead_list_id don't accidentally exercise list creation unless they mean to.
+  mockGetLeadListsForUser.mockResolvedValue([
+    { listId: "default-list-1", name: "Landing Page Leads", publicAccessEnabled: true, isSystemManaged: true },
+  ]);
+  mockCreateLeadList.mockResolvedValue({ listId: "default-list-1", publicAccessEnabled: false });
   _resetRateLimitState();
 });
 
@@ -259,7 +295,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
     const exactPrompt = "a".repeat(10_000);
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: exactPrompt });
+      .send({ prompt: exactPrompt, lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
   });
@@ -269,7 +305,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a page" });
+      .send({ prompt: "Create a page", lead_list_id: "list-1" });
 
     expect(res.status).toBe(500);
   });
@@ -304,7 +340,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a pricing page", name: "Test Page" });
+      .send({ prompt: "Create a pricing page", name: "Test Page", lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
     expect(res.body.status).toBe("draft");
@@ -335,6 +371,24 @@ describe("POST /api/landing-pages/v0/generate", () => {
     expect(mockUpdateLeadList).not.toHaveBeenCalled();
   });
 
+  it("FAIL: no persisted brand logo AND lead_list_id omitted → 422, and NO default list is provisioned (side effect must not fire on a rejected request)", async () => {
+    mockGetUserById.mockResolvedValue({ userId: "test-user-id" });
+    mockBuildBrandContextFromUser.mockReturnValue({ brandName: "TestBrand" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a pricing page" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toBe("missing_brand_logo");
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+    // The bug this test locks in: the default-list auto-resolve/create step must run
+    // AFTER the brand-logo gate, never before — otherwise every failed generation
+    // attempt from a user with no saved logo would silently spawn an orphan lead list.
+    expect(mockGetLeadListsForUser).not.toHaveBeenCalled();
+    expect(mockCreateLeadList).not.toHaveBeenCalled();
+  });
+
   it("SUCCESS: org member → the projection receives the ORG brandGuidelines (logo lives on the org record)", async () => {
     const orgBrand = {
       brandData: { brandName: "OrgBrand" },
@@ -351,7 +405,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a page" });
+      .send({ prompt: "Create a page", lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
     expect(mockBuildBrandContextFromUser).toHaveBeenCalledWith(userRecord, orgBrand);
@@ -375,7 +429,8 @@ describe("POST /api/landing-pages/v0/generate", () => {
       .post("/api/landing-pages/v0/generate")
       .send({
         prompt: "Create a B2B page",
-        template_id: "event-marketing-id"
+        template_id: "event-marketing-id",
+        lead_list_id: "list-1"
       });
 
     expect(res.status).toBe(201);
@@ -393,7 +448,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a page", template_id: "event-marketing-id" });
+      .send({ prompt: "Create a page", template_id: "event-marketing-id", lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
     expect(mockGetSetting).toHaveBeenCalled();
@@ -406,7 +461,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a page", template_id: "unknown-xyz" });
+      .send({ prompt: "Create a page", template_id: "unknown-xyz", lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
     expect(mockGetSetting).toHaveBeenCalled();
@@ -420,7 +475,9 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
   it("SUCCESS: auto-enables public access on lead list if disabled", async () => {
     mockGetUserById.mockResolvedValueOnce({ userId: "test-user-id" });
-    mockGetLeadListById.mockResolvedValueOnce({ id: "list-123", publicAccessEnabled: false });
+    // Fetched twice (existence-validation gate, then the auto-enable-public-access
+    // step) — mockResolvedValue (not Once) so both calls see the disabled state.
+    mockGetLeadListById.mockResolvedValue({ id: "list-123", publicAccessEnabled: false });
     mockUpdateLeadList.mockResolvedValueOnce({});
     mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
 
@@ -435,13 +492,244 @@ describe("POST /api/landing-pages/v0/generate", () => {
     expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("list-123");
   });
 
+  it("SUCCESS (ENG-449 capture-or-fail): lead_list_id omitted → auto-resolves the existing default list, generation proceeds bound to it", async () => {
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page" });
+
+    expect(res.status).toBe(201);
+    expect(mockGetLeadListsForUser).toHaveBeenCalledWith("test-user-id");
+    expect(mockCreateLeadList).not.toHaveBeenCalled();
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("default-list-1");
+  });
+
+  it("SUCCESS (ENG-449 capture-or-fail): no default list exists yet → creates one, generation proceeds bound to it", async () => {
+    mockGetLeadListsForUser.mockResolvedValueOnce([]);
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page" });
+
+    expect(res.status).toBe(201);
+    expect(mockCreateLeadList).toHaveBeenCalledWith(
+      "test-user-id",
+      "Landing Page Leads",
+      expect.any(String),
+      undefined,
+      null,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "sales",
+      true
+    );
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("default-list-1");
+  });
+
+  it("SUCCESS (ENG-449 capture-or-fail): a same-named list the user made themselves is ignored (not isSystemManaged) — a fresh default is created instead", async () => {
+    mockGetLeadListsForUser.mockResolvedValueOnce([
+      { listId: "user-owned-list", name: "Landing Page Leads", publicAccessEnabled: false }, // no isSystemManaged
+    ]);
+    mockCreateLeadList.mockResolvedValueOnce({ listId: "new-default-list", publicAccessEnabled: false });
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page" });
+
+    expect(res.status).toBe(201);
+    expect(mockCreateLeadList).toHaveBeenCalled();
+    // Never bound to the unrelated user-owned list that happened to share the name.
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("new-default-list");
+  });
+
+  it("SUCCESS (ENG-449 capture-or-fail): concurrent omitted-lead_list_id requests singleflight — only ONE list gets created", async () => {
+    mockGetLeadListsForUser.mockResolvedValue([]); // no default exists yet, for either call
+    // A real (short) delay, not a manually-held-open promise — a promise resolved
+    // synchronously right after firing both requests can settle before either
+    // request's actual async I/O reaches the mock, closing the race window before
+    // it opens. A real setTimeout guarantees both requests have time to arrive.
+    mockCreateLeadList.mockImplementationOnce(
+      () => new Promise((resolve) => setTimeout(() => resolve({ listId: "new-default-list", publicAccessEnabled: false }), 20))
+    );
+    mockGenerateLandingPage.mockResolvedValue({ id: "page-1", status: "draft" });
+
+    const [res1, res2] = await Promise.all([
+      request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page A" }),
+      request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page B" }),
+    ]);
+
+    expect(res1.status).toBe(201);
+    expect(res2.status).toBe(201);
+    expect(mockCreateLeadList).toHaveBeenCalledTimes(1);
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("new-default-list");
+    expect(mockGenerateLandingPage.mock.calls[1][4]).toBe("new-default-list");
+  });
+
+  it("SUCCESS (ENG-449 capture-or-fail): default-list resolution retries once on a transient failure", async () => {
+    mockGetLeadListsForUser
+      .mockRejectedValueOnce(new Error("transient DynamoDB blip"))
+      .mockResolvedValueOnce([{ listId: "default-list-1", name: "Landing Page Leads", isSystemManaged: true, publicAccessEnabled: true }]);
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page" });
+
+    expect(res.status).toBe(201);
+    expect(mockGetLeadListsForUser).toHaveBeenCalledTimes(2);
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("default-list-1");
+  });
+
+  it("FAIL (ENG-449 capture-or-fail): default-list resolution fails twice → 500, never generates unbound", async () => {
+    mockGetLeadListsForUser.mockRejectedValue(new Error("DynamoDB is down"));
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page" });
+
+    expect(res.status).toBe(500);
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS (ENG-449 capture-or-fail): lead_list_id is an empty string → treated as omitted, auto-resolves default", async () => {
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "" });
+
+    expect(res.status).toBe(201);
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("default-list-1");
+  });
+
+  it("FAIL (ENG-449 capture-or-fail): lead_list_id is not a string → 400", async () => {
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: 12345 });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("lead_list_id must be a string");
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+  });
+
+  it("FAIL (ENG-449 capture-or-fail): lead_list_id does not resolve to a real list → 400, never generates", async () => {
+    mockGetLeadListById.mockResolvedValueOnce(null);
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "nonexistent-list" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/does not exist/);
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS (ENG-449 capture-or-fail): valid, existing lead_list_id → generation proceeds", async () => {
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1" });
+
+    expect(res.status).toBe(201);
+    expect(mockGetLeadListById).toHaveBeenCalledWith("list-1");
+  });
+
+  it("FAIL (security): explicit lead_list_id belongs to another tenant → 403, never generates", async () => {
+    mockGetLeadListById.mockResolvedValueOnce({ id: "list-1", userId: "other-user-id", publicAccessEnabled: true });
+    mockCanOrgMemberAccessList.mockResolvedValueOnce(false);
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1" });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toMatch(/not accessible to you/);
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+    expect(mockCanOrgMemberAccessList).toHaveBeenCalledWith(
+      "test-user-id",
+      expect.objectContaining({ id: "list-1", userId: "other-user-id" }),
+    );
+  });
+
+  it("SUCCESS (security): explicit lead_list_id owned by the caller's own org → generation proceeds", async () => {
+    mockGetLeadListById.mockResolvedValueOnce({ id: "list-1", userId: "org-mate-id", publicAccessEnabled: true });
+    mockCanOrgMemberAccessList.mockResolvedValueOnce(true);
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1" });
+
+    expect(res.status).toBe(201);
+  });
+
+  it("FAIL: bridge_out_url is not a well-formed http(s) URL → 400", async () => {
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", bridge_out_url: "not-a-url" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/bridge_out_url must be a well-formed http\(s\) URL/);
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: bridge_out_url is a non-http(s) URL (e.g. javascript:) → 400", async () => {
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", bridge_out_url: "javascript:alert(1)" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/bridge_out_url must be a well-formed http\(s\) URL/);
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: bridge_out_url is not a string (e.g. a number) → 400", async () => {
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", bridge_out_url: 12345 });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("bridge_out_url must be a string");
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: well-formed bridge_out_url is threaded through to generateLandingPage's opts", async () => {
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1", bridge_out_url: "https://rankai.ai/book-a-call" });
+
+    expect(res.status).toBe(201);
+    expect(mockGenerateLandingPage.mock.calls[0][6]).toMatchObject({
+      bridgeOutUrl: "https://rankai.ai/book-a-call",
+    });
+  });
+
+  it("SUCCESS: bridge_out_url omitted → generateLandingPage's opts.bridgeOutUrl is undefined", async () => {
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page", lead_list_id: "list-1" });
+
+    expect(res.status).toBe(201);
+    expect(mockGenerateLandingPage.mock.calls[0][6].bridgeOutUrl).toBeUndefined();
+  });
+
   it("FAIL: template_html provided but extractTemplateOutline returns empty string → generation proceeds with empty template", async () => {
     mockedExtractOutline.mockReturnValue("");
     mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a page", template_html: "<html></html>" });
+      .send({ prompt: "Create a page", template_html: "<html></html>", lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
     expect(mockedExtractOutline).toHaveBeenCalledWith("<html></html>");
@@ -456,7 +744,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
     const largeHtml = "<html><body><section id='hero'>Hello</section></body></html>";
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Deploy this page", template_html: largeHtml });
+      .send({ prompt: "Deploy this page", template_html: largeHtml, lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
     // extractTemplateOutline must be called on the raw uploaded HTML
@@ -471,7 +759,7 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a page", template_html: "<html>uploaded</html>", template_id: "some-template-id" });
+      .send({ prompt: "Create a page", template_html: "<html>uploaded</html>", template_id: "some-template-id", lead_list_id: "list-1" });
 
     expect(res.status).toBe(201);
     // template_html was condensed from uploaded content
@@ -937,6 +1225,48 @@ describe("POST /api/landing-pages/v0/generated/:id/duplicate", () => {
     expect(res.body.error).toBe("missing_brand_logo");
     expect(mockGenerateLandingPage).not.toHaveBeenCalled();
   });
+
+  it("SUCCESS (ENG-449 capture-or-fail): the original page's own leadListId is carried over to the duplicate, no default-list resolution", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Original",
+      prompt: "Build a page",
+      status: "deployed",
+      iterations: 0,
+      leadListId: "list-original",
+    });
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(201);
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("list-original");
+    expect(mockGetLeadListsForUser).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS (ENG-449 capture-or-fail): the original page has no leadListId → duplicate resolves the default list, never generates unbound", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Original",
+      prompt: "Build a page",
+      status: "deployed",
+      iterations: 0,
+      // no leadListId
+    });
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(201);
+    expect(mockGetLeadListsForUser).toHaveBeenCalledWith("test-user-id");
+    expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("default-list-1");
+  });
 });
 
 describe("Rate limiting on expensive endpoints", () => {
@@ -947,14 +1277,14 @@ describe("Rate limiting on expensive endpoints", () => {
     for (let i = 0; i < 10; i++) {
       const res = await request(app)
         .post("/api/landing-pages/v0/generate")
-        .send({ prompt: "Create a page" });
+        .send({ prompt: "Create a page", lead_list_id: "list-1" });
       expect(res.status).toBe(201);
     }
 
     // 11th request should be rate limited
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Create a page" });
+      .send({ prompt: "Create a page", lead_list_id: "list-1" });
 
     expect(res.status).toBe(429);
     expect(res.body.error).toMatch(/Rate limit exceeded/);
@@ -967,7 +1297,7 @@ describe("Rate limiting on expensive endpoints", () => {
 
     // 4 generate
     for (let i = 0; i < 4; i++) {
-      await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page" });
+      await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page", lead_list_id: "list-1" });
     }
     // 3 deploy
     for (let i = 0; i < 3; i++) {
@@ -989,17 +1319,17 @@ describe("Rate limiting on expensive endpoints", () => {
     mockGenerateLandingPage.mockResolvedValue({ id: "page-1", status: "draft" });
 
     for (let i = 0; i < 10; i++) {
-      await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page" });
+      await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page", lead_list_id: "list-1" });
     }
 
     // Rate limited
-    let res = await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page" });
+    let res = await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page", lead_list_id: "list-1" });
     expect(res.status).toBe(429);
 
     // Reset (simulates window expiration)
     _resetRateLimitState();
 
-    res = await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page" });
+    res = await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page", lead_list_id: "list-1" });
     expect(res.status).toBe(201);
   });
 
@@ -1009,7 +1339,7 @@ describe("Rate limiting on expensive endpoints", () => {
     for (let i = 0; i < 8; i++) {
       const r = await request(app)
         .post("/api/landing-pages/v0/generate")
-        .send({ prompt: "Page" });
+        .send({ prompt: "Page", lead_list_id: "list-1" });
       expect(r.status).toBe(201);
     }
 
@@ -1018,7 +1348,7 @@ describe("Rate limiting on expensive endpoints", () => {
     for (let i = 0; i < 5; i++) {
       const r = await request(app)
         .post("/api/landing-pages/v0/generate")
-        .send({ prompt: "Page" });
+        .send({ prompt: "Page", lead_list_id: "list-1" });
       expect(r.status).toBe(500);
     }
 
@@ -1026,7 +1356,7 @@ describe("Rate limiting on expensive endpoints", () => {
     mockGenerateLandingPage.mockResolvedValue({ id: "page-2", status: "draft" });
     const res = await request(app)
       .post("/api/landing-pages/v0/generate")
-      .send({ prompt: "Page" });
+      .send({ prompt: "Page", lead_list_id: "list-1" });
     expect(res.status).toBe(201);
   });
 
@@ -1246,6 +1576,218 @@ describe("POST /api/landing-pages/v0/generated/:id/gtm", () => {
 });
 
 // =============================================================================
+// POST /generated/:id/meta-pixel (manual override, API-only)
+// =============================================================================
+describe("POST /api/landing-pages/v0/generated/:id/meta-pixel", () => {
+  const PAGE_WITH_REPO = {
+    id: "page-1",
+    userId: "test-user-id",
+    githubRepoUrl: "https://github.com/testorg/testrepo",
+  };
+  const FAKE_LAYOUT = `<head>\n<title>Test</title>\n</head>\n<body>\nHello\n</body>`;
+  const ENCODED_LAYOUT = Buffer.from(FAKE_LAYOUT).toString("base64");
+
+  it("FAIL: missing pixelId → 400", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE_WITH_REPO);
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({});
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/pixelId is required/);
+  });
+
+  it("FAIL: non-numeric pixelId → 400", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE_WITH_REPO);
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "not-a-number" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/Invalid Meta pixel id/);
+  });
+
+  it("FAIL: page not found → 404", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(null);
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/missing/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+    expect(res.status).toBe(404);
+  });
+
+  it("FAIL: page has no githubRepoUrl → 400", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({ id: "page-1", userId: "test-user-id" });
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/no GitHub repository/);
+  });
+
+  it("SUCCESS: injects Meta Pixel and returns 200", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE_WITH_REPO);
+    mockAxios.get.mockResolvedValueOnce({
+      data: { content: ENCODED_LAYOUT, sha: "abc123sha" },
+    });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([PAGE_WITH_REPO]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValueOnce(undefined);
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428", accountId: "acc1" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.pixelId).toBe("1430870751246428");
+    expect(mockUpdateLandingPageMetaPixel).toHaveBeenCalledWith("page-1", "test-user-id", "1430870751246428", "acc1");
+    // ENG-485: 2nd arg is now a callback (re-derived fresh on every retry attempt inside
+    // syncLeadCaptureFilesToRepo, which is mocked here so the callback is never actually
+    // invoked) — assert it's a function with the right shape, and that calling it directly
+    // still produces the expected map.
+    const [repoArg, buildListByPath, pixelArg, accountArg] = mockSyncLeadCaptureFilesToRepo.mock.calls[0];
+    expect(repoArg).toBe("testorg/testrepo");
+    expect(typeof buildListByPath).toBe("function");
+    expect(pixelArg).toBe("1430870751246428");
+    expect(accountArg).toBe("acc1");
+    // PAGE_WITH_REPO carries no leadListId, so the map it produces is empty — the point of
+    // this assertion is just that calling the callback works and re-queries, not the value.
+    mockListLandingPages.mockResolvedValueOnce([PAGE_WITH_REPO]);
+    await expect(buildListByPath()).resolves.toEqual({});
+    const putCall = mockAxios.put.mock.calls[0][1] as any;
+    expect(putCall.message).toContain("1430870751246428");
+  });
+
+  it("SUCCESS: syncs metaTrackingInstalled across every sibling page on the same site", async () => {
+    const root = { ...PAGE_WITH_REPO, id: "page-1", siteId: "page-1" };
+    const subpageA = { id: "sub-a", userId: "test-user-id", siteId: "page-1", githubRepoUrl: PAGE_WITH_REPO.githubRepoUrl };
+    const otherSite = { id: "other-1", userId: "test-user-id", siteId: "other-1" };
+
+    mockGetLandingPageById.mockResolvedValueOnce(root);
+    mockAxios.get.mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "sha-x" } });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([root, subpageA, otherSite]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValue(undefined);
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateLandingPageMetaTrackingInstalled).toHaveBeenCalledWith("page-1", true);
+    expect(mockUpdateLandingPageMetaTrackingInstalled).toHaveBeenCalledWith("sub-a", true);
+    expect(mockUpdateLandingPageMetaTrackingInstalled).not.toHaveBeenCalledWith("other-1", expect.anything());
+    expect(mockUpdateLandingPageMetaTrackingInstalled).toHaveBeenCalledTimes(2);
+  });
+
+  it("FAIL: verification failure on malformed layout → 422, no partial write", async () => {
+    const malformedLayout = `export default function RootLayout({ children }) { return <>{children}</>; }`;
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE_WITH_REPO);
+    mockAxios.get.mockResolvedValueOnce({
+      data: { content: Buffer.from(malformedLayout).toString("base64"), sha: "sha-y" },
+    });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toBe(
+      "We couldn't add Meta Pixel tracking to this page automatically. Try regenerating the page, or contact support if this keeps happening.",
+    );
+    expect(res.body.error).not.toMatch(/layout\.tsx|<head>|<body>/);
+    expect(mockAxios.put).not.toHaveBeenCalled();
+    expect(mockUpdateLandingPageMetaPixel).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: retries on a GitHub 409 (stale sha) and succeeds on the second attempt", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE_WITH_REPO);
+    // First GET+PUT: sha is stale by the time we PUT, GitHub returns 409.
+    mockAxios.get
+      .mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "stale-sha" } })
+      .mockResolvedValueOnce({ data: { content: ENCODED_LAYOUT, sha: "fresh-sha" } });
+    mockAxios.put
+      .mockRejectedValueOnce({ response: { status: 409 } })
+      .mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([PAGE_WITH_REPO]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValueOnce(undefined);
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428", accountId: "acc1" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(mockAxios.get).toHaveBeenCalledTimes(2);
+    expect(mockAxios.put).toHaveBeenCalledTimes(2);
+    // The successful PUT used the sha fetched on the retry, not the stale one.
+    expect(mockAxios.put.mock.calls[1][1].sha).toBe("fresh-sha");
+    expect(mockUpdateLandingPageMetaPixel).toHaveBeenCalledWith("page-1", "test-user-id", "1430870751246428", "acc1");
+  });
+
+  it("FAIL: exhausts all 3 attempts on repeated 409s and surfaces the error", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE_WITH_REPO);
+    mockAxios.get.mockResolvedValue({ data: { content: ENCODED_LAYOUT, sha: "sha-x" } });
+    mockAxios.put.mockRejectedValue({ response: { status: 409 } });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+
+    expect(res.status).toBe(500);
+    expect(mockAxios.get).toHaveBeenCalledTimes(3);
+    expect(mockAxios.put).toHaveBeenCalledTimes(3);
+    expect(mockUpdateLandingPageMetaPixel).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: empty pixelId removes the block and persists an empty pixelId", async () => {
+    const injectedLayout =
+      `<head>\n{/* Meta Pixel Code */}\n<script>fbq('init','1430870751246428');</script>\n{/* End Meta Pixel Code */}\n</head>\n<body></body>`;
+    mockGetLandingPageById.mockResolvedValueOnce(PAGE_WITH_REPO);
+    mockAxios.get.mockResolvedValueOnce({
+      data: { content: Buffer.from(injectedLayout).toString("base64"), sha: "sha-remove" },
+    });
+    mockAxios.put.mockResolvedValueOnce({ data: {} });
+    mockListLandingPages.mockResolvedValueOnce([PAGE_WITH_REPO]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValueOnce(undefined);
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.pixelId).toBe("");
+    expect(res.body.message).toMatch(/removed/i);
+    const putBody = mockAxios.put.mock.calls[0][1] as any;
+    expect(putBody.content).not.toContain(
+      Buffer.from("fbq('init','1430870751246428')").toString("base64").slice(0, 10),
+    );
+    expect(mockUpdateLandingPageMetaPixel).toHaveBeenCalledWith("page-1", "test-user-id", "", undefined);
+    expect(mockUpdateLandingPageMetaTrackingInstalled).toHaveBeenCalledWith("page-1", false);
+  });
+
+  it("FAIL: 61st request in the same hour → 429 (shared editRateLimiter, 60/hr)", async () => {
+    mockGetLandingPageById.mockResolvedValue(PAGE_WITH_REPO);
+    mockAxios.get.mockResolvedValue({ data: { content: ENCODED_LAYOUT, sha: "sha-rl" } });
+    mockAxios.put.mockResolvedValue({ data: {} });
+    mockListLandingPages.mockResolvedValue([PAGE_WITH_REPO]);
+    mockUpdateLandingPageMetaTrackingInstalled.mockResolvedValue(undefined);
+
+    for (let i = 0; i < 60; i++) {
+      await request(app)
+        .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+        .send({ pixelId: "1430870751246428" });
+    }
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/meta-pixel")
+      .send({ pixelId: "1430870751246428" });
+
+    expect(res.status).toBe(429);
+    expect(res.body.error).toMatch(/Rate limit exceeded/);
+  });
+});
+
+// =============================================================================
 // GET /generated/:id/integrations
 // =============================================================================
 describe("GET /api/landing-pages/v0/generated/:id/integrations", () => {
@@ -1453,5 +1995,227 @@ describe("PUT /api/landing-pages/v0/generated/:id/integrations", () => {
       "proj-1", "MY_API_URL", "https://api.example.com",
       ["production", "preview", "development"], undefined, "plain"
     );
+  });
+});
+
+describe("GET /generated/:id/verify-live-mapping (ENG-496)", () => {
+  it("SUCCESS: owner gets the mapping report", async () => {
+    mockVerifyLanderLiveMapping.mockResolvedValueOnce({
+      liveUrl: "https://test-page.vercel.app",
+      liveTrafficFound: true,
+      actualProjectId: "vercel-proj-123",
+      storedProjectId: "vercel-proj-123",
+      projectIdMismatch: false,
+      repoMismatch: false,
+      checkedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const res = await request(app).get("/api/landing-pages/v0/generated/page-1/verify-live-mapping");
+
+    expect(res.status).toBe(200);
+    expect(res.body.projectIdMismatch).toBe(false);
+    expect(mockVerifyLanderLiveMapping).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "page-1" })
+    );
+  });
+
+  it("FAIL: non-owner, non-org caller -> 404 (view-mode denial is masked as not-found), verifyLanderLiveMapping never called", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "someone-else",
+      status: "deployed",
+    });
+
+    const res = await request(app).get("/api/landing-pages/v0/generated/page-1/verify-live-mapping");
+
+    expect(res.status).toBe(404);
+    expect(mockVerifyLanderLiveMapping).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: page not found -> 404", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce(null);
+
+    const res = await request(app).get("/api/landing-pages/v0/generated/page-1/verify-live-mapping");
+
+    expect(res.status).toBe(404);
+    expect(mockVerifyLanderLiveMapping).not.toHaveBeenCalled();
+  });
+});
+
+describe("PUT /generated/:id/github-edit (Greptile: empty content must not be rejected)", () => {
+  it("FAIL: content genuinely missing (undefined) -> 400", async () => {
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/github-edit")
+      .send({ file_path: "app/page.tsx", commit_message: "msg" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("file_path and content are required");
+  });
+
+  it("SUCCESS: content is an empty string (a legitimately empty file) -> accepted, not rejected as missing", async () => {
+    mockAxios.get.mockResolvedValueOnce({ data: { sha: "existing-file-sha" } }); // getFileSha
+    mockAxios.put.mockResolvedValueOnce({ data: { content: { html_url: "https://github.com/agentweb/test-repo/blob/main/app/empty.css" }, commit: { html_url: "https://github.com/agentweb/test-repo/commit/abc" } } });
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/github-edit")
+      .send({ file_path: "app/empty.css", content: "", commit_message: "Restore to empty" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    const putBody = mockAxios.put.mock.calls[0][1] as any;
+    expect(putBody.content).toBe(""); // empty base64 of "" is still ""
+  });
+});
+
+describe("PUT /generated/:id/update-files (ENG-497)", () => {
+  it("SUCCESS: commits 2 files (one edit, one delete) in ONE atomic commit", async () => {
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({
+        commit_message: "Fix email capture + add API route",
+        files: [
+          { file_path: "public/book-a-demo.html", content: "<html>updated</html>" },
+          { file_path: "app/api/old-route/route.ts", deleted: true },
+        ],
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.files).toEqual(["public/book-a-demo.html", "app/api/old-route/route.ts"]);
+    expect(mockCommitFilesToRepoMain).toHaveBeenCalledTimes(1); // ONE atomic commit, not two
+    const [repoFullNameArg, , filesArg, messageArg] = mockCommitFilesToRepoMain.mock.calls[0];
+    expect(repoFullNameArg).toBe("agentweb/test-repo");
+    expect(messageArg).toBe("Fix email capture + add API route");
+    expect(filesArg).toEqual([
+      { path: "public/book-a-demo.html", content: Buffer.from("<html>updated</html>", "utf-8") },
+      { path: "app/api/old-route/route.ts", deleted: true },
+    ]);
+  });
+
+  it("FAIL: empty files array -> 400, commit never attempted", async () => {
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({ commit_message: "msg", files: [] });
+
+    expect(res.status).toBe(400);
+    expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: more than 20 files -> 400, commit never attempted", async () => {
+    const files = Array.from({ length: 21 }, (_, i) => ({ file_path: `f${i}.txt`, content: "x" }));
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({ commit_message: "msg", files });
+
+    expect(res.status).toBe(400);
+    expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: a file missing both content and deleted -> 400, whole call rejected", async () => {
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({
+        commit_message: "msg",
+        files: [
+          { file_path: "ok.txt", content: "fine" },
+          { file_path: "bad.txt" },
+        ],
+      });
+
+    expect(res.status).toBe(400);
+    expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: path traversal in one file rejects the whole call, even with other valid files", async () => {
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({
+        commit_message: "msg",
+        files: [
+          { file_path: "ok.txt", content: "fine" },
+          { file_path: "../../etc/passwd", content: "nope" },
+        ],
+      });
+
+    expect(res.status).toBe(400);
+    expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: an invalid (unsupported) branch name is rejected", async () => {
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({ commit_message: "msg", branch: "some-random-branch", files: [{ file_path: "ok.txt", content: "x" }] });
+
+    expect(res.status).toBe(400);
+    expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
+  });
+
+  it("SUCCESS: staging branch (draft/agentweb-preview) commits with is_staging: true, ensureBranchExists invoked", async () => {
+    // ensureBranchExists: GET the branch ref — resolves (already exists), no POST needed.
+    mockAxios.get.mockResolvedValueOnce({ data: { object: { sha: "existing-branch-sha" } } });
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({
+        commit_message: "Preview a 2-file change",
+        branch: "draft/agentweb-preview",
+        files: [{ file_path: "ok.txt", content: "x" }],
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.is_staging).toBe(true);
+    expect(res.body.branch).toBe("draft/agentweb-preview");
+    expect(mockAxios.get).toHaveBeenCalledWith(
+      expect.stringContaining("/git/ref/heads/draft/agentweb-preview"),
+      expect.anything()
+    );
+    expect(mockCommitFilesToRepoMain).toHaveBeenCalledWith(
+      "agentweb/test-repo",
+      expect.anything(),
+      expect.anything(),
+      "Preview a 2-file change",
+      4,
+      "draft/agentweb-preview"
+    );
+  });
+
+  it("FAIL: no commit_message -> 400", async () => {
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({ files: [{ file_path: "ok.txt", content: "x" }] });
+
+    expect(res.status).toBe(400);
+    expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: non-owner, non-org caller -> 403 (edit-mode denial), commit never attempted", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "someone-else",
+      status: "deployed",
+      githubRepoUrl: "https://github.com/agentweb/test-repo",
+    });
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({ commit_message: "msg", files: [{ file_path: "ok.txt", content: "x" }] });
+
+    expect(res.status).toBe(403);
+    expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
+  });
+
+  it("FAIL: page has no GitHub repo -> 400", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      status: "generating",
+    });
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-1/update-files")
+      .send({ commit_message: "msg", files: [{ file_path: "ok.txt", content: "x" }] });
+
+    expect(res.status).toBe(400);
+    expect(mockCommitFilesToRepoMain).not.toHaveBeenCalled();
   });
 });

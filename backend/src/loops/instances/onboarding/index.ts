@@ -12,11 +12,9 @@
  *   policy   = LlmAnalystRuleSet (reasons over journeys, not threshold rules)
  *   tools    = SpecOutputTool (records the proposal spec; the DM is the value
  *              during verification — swap to a cloud-dev dispatch tool at cutover)
- *   gate     = CaptureGate (Slack DM + reactions)
  *   learning = DynamoLearningStore + CooldownRuleSet read-back
  */
 
-import { CaptureGate } from '../../core/gates/captureGate';
 import {
   analystFindingsBody,
   postLoopDigest,
@@ -45,7 +43,6 @@ const runner = createInstanceRunner({
     sensor: 'onboardingUserSensor',
     ruleSet: 'onboardingAnalyst',
     tools: 'onboardingSpecTool',
-    gate: 'onboardingGate',
     learning: 'onboardingLearning',
   },
   buildLayers: (ports) => {
@@ -62,13 +59,11 @@ const runner = createInstanceRunner({
       ),
       ruleSet: new CooldownRuleSet(analyst, learning, ONBOARDING_LOOP_ID),
       tools: new SpecOutputTool(ONBOARDING_LOOP_ID),
-      gate: new CaptureGate(),
       learning,
     };
   },
   manifest: () => onboardingManifest,
-  onRunComplete: async ({ result, drained, ports, manifest }) => {
-    if (drained === null) return;
+  onRunComplete: async ({ result, ports, manifest }) => {
     await postLoopDigest(result, ports.slack, manifest.approval.slackUserId, onboardingDigestTemplate, undefined, {
       claimDailyDigest: (digestDate, slackUserId, runId) =>
         claimLoopDailyDigestPost(ports.dynamo, {

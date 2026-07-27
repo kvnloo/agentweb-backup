@@ -71,7 +71,6 @@ export const aiReadinessManifest: LoopManifest<NormalizedEvent, LlmAnalystPropos
   sensorImpl: 'aiReadinessSensor',
   rulesetImpl: 'aiReadinessAnalyst',
   toolsImpl: 'aiReadinessSpecTool',
-  gateImpl: 'aiReadinessGate',
   learningImpl: 'aiReadinessLearning',
   thresholds: {
     promoteLiftPct: 15,

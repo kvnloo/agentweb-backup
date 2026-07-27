@@ -2,7 +2,7 @@
  * Generic attribution cron for every registered loop.
  *
  * A loop is not self-learning until shipped mutations are measured after their
- * settle window and the result is written back into Layer 5. This runner is
+ * settle window and the result is written back into Layer 4. This runner is
  * deliberately loop-agnostic: any product surface that registers a manifest,
  * sensor, and durable learning store gets the same attribution pass.
  */
@@ -16,6 +16,12 @@ import { productionLoopPorts } from '../adapters/awsAdapters';
 import { runAttribution, type AttributionSummary } from '../core/learning/attribution';
 import type { LoopId } from '../core/types';
 import type { LoopPorts } from '../core/ports';
+import { recordLoopAttributionOutcome } from '../../services/linearService';
+
+/** Harsha is the accountable verifier for loop-generated ENG work. Override
+ * only when the board's accountable owner changes explicitly. */
+const LOOP_ATTRIBUTION_VERIFIER_ID =
+  process.env.LOOP_ATTRIBUTION_VERIFIER_ID ?? '142fef82-4d45-4070-99be-c5debe565ac6';
 
 export interface LoopAttributionResult {
   loopId: LoopId;
@@ -58,6 +64,8 @@ export async function runLoopAttributionOnce(
         logger: ports.logger,
         slack: ports.slack,
         slackChannelOrUserId: manifest.approval.slackChannel ?? manifest.approval.slackUserId,
+        issueLifecycle: { recordOutcome: recordLoopAttributionOutcome },
+        verifierId: LOOP_ATTRIBUTION_VERIFIER_ID,
       });
       results.push({ loopId: manifest.loopId, skipped: false, summary });
     } catch (err) {

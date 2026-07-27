@@ -18,13 +18,12 @@
 import AWS from 'aws-sdk';
 import { runLoop } from '../core/orchestrator';
 import type { LoopPorts, S3Port, DynamoPort, BedrockPort, SlackPort, ClockPort, LoggerPort, DynamoAttributeMap, DynamoQueryParams, DynamoQueryResult } from '../core/ports';
-import { _resetRegistryForTesting, registerLoop, registerSensor, registerRuleSet, registerTools, registerGate, registerLearningStore } from '../index';
+import { _resetRegistryForTesting, registerLoop, registerSensor, registerRuleSet, registerTools, registerLearningStore } from '../index';
 import { aiEvalManifest } from '../instances/ai-eval-funnel/manifest';
 import { aiEvalRules } from '../instances/ai-eval-funnel/rules';
 import { EventTableEventSource, LOOP_EVENTS_TABLE, eventToItem } from '../core/sensors/eventTableEventSource';
 import { DslRuleSet } from '../core/policy/dslRuleSet';
 import { SpecOutputTool } from '../core/tools/specOutputTool';
-import { CaptureGate } from '../core/gates/captureGate';
 import { InMemoryLearningStore } from '../core/learning/inMemoryLearningStore';
 import { asLoopId, asSubjectId } from '../core/types';
 import type { NormalizedEvent } from '../core/types';
@@ -74,8 +73,6 @@ const noopBedrock: BedrockPort = {
 };
 const noopSlack: SlackPort = {
   async postMessage() { return { channel: 'smoke', ts: 'smoke' }; },
-  async getReactions() { return []; },
-  async getReplies() { return []; },
 };
 const realClock: ClockPort = { now: () => new Date() };
 const stderrLogger: LoggerPort = {
@@ -205,7 +202,6 @@ async function main(): Promise<void> {
   registerSensor('aiEvalSensor', sensor);
   registerRuleSet('aiEvalRules', new DslRuleSet(aiEvalManifest.loopId, aiEvalRules) as never);
   registerTools('aiEvalSpecTool', new SpecOutputTool(aiEvalManifest.loopId) as never);
-  registerGate('aiEvalCaptureGate', new CaptureGate());
   registerLearningStore('aiEvalLearning', new InMemoryLearningStore());
   registerLoop(aiEvalManifest);
 

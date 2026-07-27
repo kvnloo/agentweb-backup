@@ -35,7 +35,6 @@ describe('onboarding manifest (revamp contract)', () => {
   it('impl names in the manifest match what the instance registers', () => {
     expect(onboardingManifest.sensorImpl).toBe('onboardingUserSensor');
     expect(onboardingManifest.toolsImpl).toBe('onboardingSpecTool');
-    expect(onboardingManifest.gateImpl).toBe('onboardingGate');
     expect(onboardingManifest.learningImpl).toBe('onboardingLearning');
   });
 });

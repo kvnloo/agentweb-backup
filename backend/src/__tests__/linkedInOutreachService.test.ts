@@ -1771,6 +1771,42 @@ describe('LinkedInOutreachService', () => {
     });
   });
 
+  describe('listUserOwnedUnipileAccountIds', () => {
+    const mockGetAccountsByUserId = jest.fn();
+
+    beforeEach(() => {
+      jest.resetModules();
+      jest.doMock('../services/connectedAccountsDb', () => ({
+        getAccountsByUserId: mockGetAccountsByUserId,
+      }));
+    });
+
+    it('returns every owned unipile account_id', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'a-1' },
+        { platform: 'linkedin', account_id: 'li-ads' }, // non-unipile: excluded
+        { platform: 'unipile', account_id: 'a-2' },
+        { platform: 'unipile' }, // no id: excluded
+      ]);
+      const ids = await linkedInOutreachService.listUserOwnedUnipileAccountIds('user-1');
+      expect(ids).toEqual(['a-1', 'a-2']);
+    });
+
+    it('returns [] when the user owns no unipile accounts', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'google', account_id: 'g-1' },
+      ]);
+      const ids = await linkedInOutreachService.listUserOwnedUnipileAccountIds('user-2');
+      expect(ids).toEqual([]);
+    });
+
+    it('returns [] when the lookup throws', async () => {
+      mockGetAccountsByUserId.mockRejectedValue(new Error('db down'));
+      const ids = await linkedInOutreachService.listUserOwnedUnipileAccountIds('user-3');
+      expect(ids).toEqual([]);
+    });
+  });
+
   describe('getInviteCharLimitForAccount', () => {
     const mockGetAccountsByUserIdIncludingOrgShared = jest.fn();
 

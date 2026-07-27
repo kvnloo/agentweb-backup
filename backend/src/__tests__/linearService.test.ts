@@ -7,10 +7,12 @@ import {
   listOpenBugCanonicals,
   listOpenIssuesByLabel,
   listRecentlyResolvedBugCanonicals,
+  recordLoopAttributionOutcome,
   reopenIssue,
   raiseIssueTriage,
   _resetLinearTeamCache,
 } from '../services/linearService';
+import { asLoopId } from '../loops/core/types';
 
 jest.mock('../utils/secretsManager', () => ({
   getSecret: jest.fn().mockResolvedValue(JSON.stringify({ apiKey: 'lin_api_test' })),
@@ -83,6 +85,8 @@ describe('linearService.createInternalLinearIssue — triage fields + loud label
               { id: 'lab_crep', name: 'Customer Reported' },
               { id: 'lab_ret', name: 'Retention' },
               { id: 'lab_st_paid', name: 'Status: Paid / Retention Handoff' },
+              { id: 'lab_autofix', name: 'autofix' },
+              { id: 'lab_needs_pm', name: 'Needs PM' },
             ],
           },
         }],
@@ -182,6 +186,22 @@ describe('linearService.createInternalLinearIssue — triage fields + loud label
       const input = lastUpdateInput();
       expect(input.labelIds.sort()).toEqual(['lab_bug', 'lab_ret'].sort());
       expect(input.priority).toBeUndefined();
+    });
+
+    it('atomically replaces an exclusive route label and updates the assignee', async () => {
+      mockFetchSequence(
+        TEAM_TRIAGE,
+        issueResponse(3, ['lab_bug', 'lab_needs_pm']),
+        UPDATE_OK,
+      );
+      await raiseIssueTriage('uuid-5', {
+        addLabelNames: ['autofix'],
+        removeLabelNames: ['Needs PM'],
+        assigneeId: 'user-manan',
+      });
+      const input = lastUpdateInput();
+      expect(input.labelIds.sort()).toEqual(['lab_bug', 'lab_autofix'].sort());
+      expect(input.assigneeId).toBe('user-manan');
     });
 
     // ENG-187 contract #4 — settleStateName: an FB-synced feature request must END UP in Backlog,
@@ -376,6 +396,106 @@ describe('linearService.reopenIssue (ENG-240)', () => {
   it('throws (never silently no-ops) when the state name is unknown', async () => {
     (global.fetch as any) = jest.fn(() => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(TEAM_WITH_TODO) } as any));
     await expect(reopenIssue('uuid-179', 'Nonexistent')).rejects.toThrow(/state "Nonexistent" not found/);
+  });
+});
+
+describe('linearService.recordLoopAttributionOutcome (ENG-535)', () => {
+  const TEAM_WITH_LIFECYCLE = { data: { teams: { nodes: [{
+    id: 'team_eng',
+    states: { nodes: [
+      { id: 'st_backlog', name: 'Backlog', type: 'backlog' },
+      { id: 'st_todo', name: 'Todo', type: 'unstarted' },
+      { id: 'st_verifying', name: 'Verifying', type: 'started' },
+      { id: 'st_done', name: 'Done', type: 'completed' },
+    ], pageInfo: { hasNextPage: false } },
+    labels: { nodes: [], pageInfo: { hasNextPage: false } },
+  }] } } };
+  const outcome = {
+    issueId: 'ENG-600',
+    loopId: asLoopId('ai-eval-funnel'),
+    runId: 'run-1',
+    mutationId: 'mutation-1',
+    ruleId: 'capture-broken',
+    verdict: 'improved' as const,
+    transition: 'verifying' as const,
+    metricName: 'eval_to_signup_rate',
+    metricBefore: 0.1,
+    metricAfter: 0.4,
+    observedLiftPct: 300,
+    sampleN: 20,
+    verifierId: 'user-harsha',
+  };
+
+  function sequence(...bodies: any[]) {
+    let n = 0;
+    (global.fetch as any) = jest.fn(() => {
+      const body = bodies[Math.min(n, bodies.length - 1)];
+      n += 1;
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) } as any);
+    });
+  }
+
+  beforeEach(() => { _resetLinearTeamCache(); });
+  afterEach(() => { jest.clearAllMocks(); });
+
+  it('moves improved work to Verifying, assigns the verifier, and comments before/after evidence', async () => {
+    sequence(
+      { data: { issue: { id: 'uuid-600', comments: { nodes: [], pageInfo: { hasNextPage: false } } } } },
+      TEAM_WITH_LIFECYCLE,
+      { data: { issueUpdate: { success: true } } },
+      { data: { commentCreate: { success: true } } },
+    );
+
+    await expect(recordLoopAttributionOutcome(outcome)).resolves.toEqual({ status: 'applied' });
+
+    const calls = (global.fetch as jest.Mock).mock.calls.map((c) => JSON.parse(c[1].body));
+    const update = calls.find((c) => c.query.includes('issueUpdate'));
+    expect(update.variables).toEqual({
+      id: 'uuid-600',
+      input: { stateId: 'st_verifying', assigneeId: 'user-harsha' },
+    });
+    const comment = calls.find((c) => c.query.includes('commentCreate'));
+    expect(comment.variables.input.body).toContain('0.1000 → 0.4000');
+    expect(comment.variables.input.body).toContain('loop-attribution:ai-eval-funnel:mutation-1:improved');
+  });
+
+  it('reopens regressed work to Todo and never targets Done', async () => {
+    sequence(
+      { data: { issue: { id: 'uuid-600', comments: { nodes: [], pageInfo: { hasNextPage: false } } } } },
+      TEAM_WITH_LIFECYCLE,
+      { data: { issueUpdate: { success: true } } },
+      { data: { commentCreate: { success: true } } },
+    );
+
+    await recordLoopAttributionOutcome({
+      ...outcome,
+      verdict: 'regressed',
+      transition: 'reopen',
+      metricBefore: 0.4,
+      metricAfter: 0.1,
+      observedLiftPct: -75,
+    });
+
+    const calls = (global.fetch as jest.Mock).mock.calls.map((c) => JSON.parse(c[1].body));
+    const update = calls.find((c) => c.query.includes('issueUpdate'));
+    expect(update.variables.input.stateId).toBe('st_todo');
+    expect(update.variables.input.stateId).not.toBe('st_done');
+  });
+
+  it('is idempotent when the deterministic evidence marker already exists', async () => {
+    sequence({ data: { issue: { id: 'uuid-600', comments: {
+      nodes: [{ body: '<!-- loop-attribution:ai-eval-funnel:mutation-1:improved -->' }],
+      pageInfo: { hasNextPage: false },
+    } } } });
+
+    await expect(recordLoopAttributionOutcome(outcome)).resolves.toEqual({ status: 'already_applied' });
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns missing_issue without issuing a mutation', async () => {
+    sequence({ data: { issue: null } });
+    await expect(recordLoopAttributionOutcome(outcome)).resolves.toEqual({ status: 'missing_issue' });
+    expect(global.fetch).toHaveBeenCalledTimes(1);
   });
 });
 

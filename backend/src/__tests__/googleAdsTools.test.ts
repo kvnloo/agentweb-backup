@@ -10,6 +10,8 @@ jest.mock('../services/googleAdsService', () => ({
     pauseCampaign: jest.fn().mockResolvedValue(undefined),
     resumeCampaign: jest.fn().mockResolvedValue(undefined),
     updateCampaign: jest.fn().mockResolvedValue(true),
+    addProximityCriterion: jest.fn().mockResolvedValue({ resourceName: 'customers/123/campaignCriteria/1~1' }),
+    removeCampaignCriterion: jest.fn().mockResolvedValue(undefined),
     // ENG-335 launch gate: default to no serving URLs and a PAUSED parent so the
     // gate (and the ad/asset-group creative-addition gate) are no-ops here — these
     // tests cover the underlying create paths, not the launch gate itself.
@@ -197,6 +199,62 @@ describe('handleCallGoogleAdsApi', () => {
       'customers/123/campaigns/1',
       expect.objectContaining({ finalUrlSuffix: 'utm_source=google&utm_medium=cpc' })
     );
+  });
+
+  it('handles CAMPAIGN ADD_PROXIMITY action (ENG-487)', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'ADD_PROXIMITY',
+      campaign_resource_name: 'customers/123/campaigns/1',
+      radius: 25,
+      radius_units: 'MILES',
+      address: { street_address: '123 Main St', city_name: 'Tacoma', province_code: 'WA', country_code: 'US' },
+    });
+    expect(result.success).toBe(true);
+    expect(result.criterionResourceName).toBe('customers/123/campaignCriteria/1~1');
+    expect(googleAdsService.addProximityCriterion).toHaveBeenCalledWith(
+      'user-123',
+      '1234567890',
+      'customers/123/campaigns/1',
+      expect.objectContaining({
+        radius: 25,
+        radiusUnits: 'MILES',
+        address: expect.objectContaining({ streetAddress: '123 Main St', cityName: 'Tacoma', provinceCode: 'WA', countryCode: 'US' }),
+      })
+    );
+  });
+
+  it('returns error for ADD_PROXIMITY without required fields', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'ADD_PROXIMITY',
+      campaign_resource_name: 'customers/123/campaigns/1',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/radius|address/i);
+  });
+
+  it('handles CAMPAIGN REMOVE_PROXIMITY action (ENG-487)', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'REMOVE_PROXIMITY',
+      criterion_resource_name: 'customers/123/campaignCriteria/1~1',
+    });
+    expect(result.success).toBe(true);
+    expect(googleAdsService.removeCampaignCriterion).toHaveBeenCalledWith('user-123', '1234567890', 'customers/123/campaignCriteria/1~1', ['PROXIMITY']);
+  });
+
+  it('returns error for REMOVE_PROXIMITY without criterion_resource_name', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'REMOVE_PROXIMITY',
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/criterion_resource_name/i);
   });
 
   it('handles BIDDING_STRATEGY LIST via listBiddingStrategies service method', async () => {
@@ -767,6 +825,45 @@ describe('handleCallGoogleAdsApi — error handling', () => {
       action: 'LIST',
     });
     expect(result).toEqual({ success: false, error: 'Unknown error' });
+  });
+
+  // ENG-487 — adversarial inputs, confirmed against the live Google Ads API (v24):
+  // an ungeocodable address and an invalid radius (0/negative/huge) all come back
+  // as INVALID_PROXIMITY_ADDRESS / INVALID_PROXIMITY_RADIUS criterionErrors, which
+  // the existing "CODE: message" formatter above already renders cleanly — no new
+  // formatting code needed, just locking the behavior in with a mock.
+  it('formats an ungeocodable-address error from ADD_PROXIMITY as "CODE: message"', async () => {
+    (googleAdsService.addProximityCriterion as jest.Mock).mockRejectedValueOnce({
+      response: { data: { error: { details: [{ errors: [
+        { errorCode: { criterionError: 'INVALID_PROXIMITY_ADDRESS' }, message: 'The Proximity address cannot be geocoded to a valid lat/long.' },
+      ] }] } } },
+    });
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'ADD_PROXIMITY',
+      campaign_resource_name: 'customers/123/campaigns/1',
+      radius: 10,
+      address: { street_address: 'near the mall lol' },
+    });
+    expect(result).toEqual({ success: false, error: 'INVALID_PROXIMITY_ADDRESS: The Proximity address cannot be geocoded to a valid lat/long.' });
+  });
+
+  it('formats an invalid-radius error from ADD_PROXIMITY as "CODE: message"', async () => {
+    (googleAdsService.addProximityCriterion as jest.Mock).mockRejectedValueOnce({
+      response: { data: { error: { details: [{ errors: [
+        { errorCode: { criterionError: 'INVALID_PROXIMITY_RADIUS' }, message: 'Distance for the radius for the proximity criterion is invalid.' },
+      ] }] } } },
+    });
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN',
+      action: 'ADD_PROXIMITY',
+      campaign_resource_name: 'customers/123/campaigns/1',
+      radius: 0,
+      address: { city_name: 'Austin', country_code: 'US' },
+    });
+    expect(result).toEqual({ success: false, error: 'INVALID_PROXIMITY_RADIUS: Distance for the radius for the proximity criterion is invalid.' });
   });
 
   it('returns a structured error for an unsupported entity_type/action', async () => {

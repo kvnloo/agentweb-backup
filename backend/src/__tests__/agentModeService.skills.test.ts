@@ -902,6 +902,20 @@ describe('AgentModeService - Skills', () => {
     });
   });
 
+  describe('getAdminToolNames', () => {
+    it('does not expose manage_user_guide (ENG-163: legacy Notion write tool removed)', () => {
+      // The admin tool registry (ADMIN_SKILL_TOOL_NAMES) must no longer carry the
+      // retired manage_user_guide Notion write tool.
+      expect(agentModeService.getAdminToolNames()).not.toContain('manage_user_guide');
+    });
+
+    it('still exposes other admin tools', () => {
+      const adminTools = agentModeService.getAdminToolNames();
+      expect(adminTools).toContain('manage_user_notes');
+      expect(adminTools).toContain('get_registration_status');
+    });
+  });
+
   describe('loadFoundationTools', () => {
     beforeEach(() => {
       (AgentModeService as any).FOUNDATION_TOOLS = new Set(AgentModeService.DEFAULT_FOUNDATION_TOOLS);

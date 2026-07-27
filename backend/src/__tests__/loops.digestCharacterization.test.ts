@@ -48,7 +48,6 @@ function fakeResult(over: Partial<LoopRunResult>): LoopRunResult {
     eventsScanned: 0,
     proposals: [],
     mutations: [],
-    approvals: [],
     blocked: false,
     durationMs: 1,
     tokensSpentUsd: 0,
@@ -103,8 +102,8 @@ describe('loop digest characterization (exact rendered text)', () => {
     // default — it DM'd Harsha on EVERY daily run, including the empty/quiet
     // "healthy" windows, which was the only loop chirping in prod. The digest
     // wire format is still pinned below, but only when explicitly re-enabled
-    // via AGENT_MODE_LOOP_DIGEST=true (set once the Slack approval gate makes
-    // the DM actionable). See dev.md 2026-06-14.
+    // via AGENT_MODE_LOOP_DIGEST=true once the digest is operationally useful.
+    // See dev.md 2026-06-14.
     it('is silent by default — posts NO digest DM even when tools are failing', async () => {
       delete process.env.AGENT_MODE_LOOP_DIGEST;
       mockedRunLoop.mockResolvedValue(
@@ -151,7 +150,9 @@ describe('loop digest characterization (exact rendered text)', () => {
           '',
           '*Failing tools (fix specs prepared: 0)*',
           '1. Tool `publish_blog_article` failed 6/9 calls (67%) — top error: Webflow 502',
+          '   Proposal ID: `p1`',
           '2. Tool `search_leads` failed 3/7 calls (43%) — top error: timeout',
+          '   Proposal ID: `p1`',
           '',
           FOOTER,
         ].join('\n'),
@@ -221,9 +222,9 @@ describe('loop digest characterization (exact rendered text)', () => {
           '',
           '*What I found*',
           '1. Users loop back from brand review to goal selection',
-          '   Kind: `copy`  |  Fix: clarify the goal step CTA',
+          '   Proposal ID: `p1`  |  Kind: `copy`  |  Fix: clarify the goal step CTA',
           '2. ICP step abandonment at 40%',
-          '   Kind: `code_change`',
+          '   Proposal ID: `p1`  |  Kind: `code_change`',
           '',
           FOOTER,
         ].join('\n'),
@@ -292,7 +293,7 @@ describe('loop digest characterization (exact rendered text)', () => {
           '',
           '*What I found*',
           '1. Quiz step drops 40%',
-          '   Kind: `copy`  |  Fix: shorten the quiz to one question',
+          '   Proposal ID: `p1`  |  Kind: `copy`  |  Fix: shorten the quiz to one question',
           '',
           FOOTER,
         ].join('\n'),
@@ -369,7 +370,7 @@ describe('loop digest characterization (exact rendered text)', () => {
       return m;
     }
 
-    it('renders the findings digest (Notion link + RCA top fix + Notion error) verbatim', async () => {
+    it('renders the findings digest (Linear link + route + RCA + intake error) verbatim', async () => {
       const result = fakeResult({
         runId: 'run-eval-1' as LoopRunResult['runId'],
         eventsScanned: 300,
@@ -380,8 +381,9 @@ describe('loop digest characterization (exact rendered text)', () => {
       });
       const muts: Mutation[] = [
         evalMutation({
-          notionUrl: 'https://www.notion.so/p1',
+          linearUrl: 'https://linear.app/emmabyaw/issue/ENG-601',
           title: 'fix(ai-eval-funnel): capture-broken',
+          executionRoute: 'human-triage',
           rcaEnrichment: {
             topHypotheses: ['x'],
             rankedFixes: [
@@ -389,7 +391,11 @@ describe('loop digest characterization (exact rendered text)', () => {
             ],
           },
         }),
-        evalMutation({ title: 'fix(ai-eval-funnel): no-signup', rcaEnrichment: { topHypotheses: [], rankedFixes: [], error: 'Bedrock 500' } }, 'Notion API 502'),
+        evalMutation({
+          title: 'fix(ai-eval-funnel): no-signup',
+          executionRoute: 'human-triage',
+          rcaEnrichment: { topHypotheses: [], rankedFixes: [], error: 'Bedrock 500' },
+        }, 'Linear API 502'),
       ];
       const slack = { postMessage: jest.fn().mockResolvedValue({ ok: true }) };
 
@@ -404,16 +410,15 @@ describe('loop digest characterization (exact rendered text)', () => {
           'Events scanned: 300  |  Rules fired: 2  |  Mutations: 2',
           '',
           '*Proposed fixes*',
-          '1. <https://www.notion.so/p1|fix(ai-eval-funnel): capture-broken>',
-          '   Rule: `capture-broken`  |  Kind: `copy`',
+          '1. <https://linear.app/emmabyaw/issue/ENG-601|fix(ai-eval-funnel): capture-broken>',
+          '   Rule: `capture-broken`  |  Kind: `copy`  |  Route: `human-triage`',
           '   ↳ Top fix: Scope rule denominator by landerPath = /ai-eval',
           '2. fix(ai-eval-funnel): no-signup',
-          '   Rule: `no-signup`  |  Kind: `copy`',
+          '   Rule: `no-signup`  |  Kind: `copy`  |  Route: `human-triage`',
           '   ⚠️ RCA unavailable',
-          '   ⚠️ Notion API 502',
+          '   ⚠️ Linear API 502',
           '',
-          FOOTER,
-          'Reply in thread to skip a specific item (e.g. "skip 2").',
+          'Filed in Linear automatically. Autofix-eligible work is queued; restricted work is labeled Needs PM.',
         ].join('\n'),
       );
     });

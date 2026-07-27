@@ -40,6 +40,7 @@ if (process.env.SLACK_BOT_TOKEN) {
 }
 
 export const APPROVAL_CHANNEL = process.env.SLACK_APPROVAL_CHANNEL || "#approvals";
+export const LANDING_PAGE_ALERTS_CHANNEL = process.env.SLACK_LANDING_PAGE_ALERTS_CHANNEL || APPROVAL_CHANNEL;
 
 export interface SlackChannel {
   id: string;
@@ -1486,4 +1487,32 @@ export async function getEffectiveAllowedChannels(
     }
   }
   return [];
+}
+
+/**
+ * ENG-449 gap #3: alert when the automated post-deploy smoke test finds a landing
+ * page's tracking pipeline actually broken (pixel not firing, or lead not landing in
+ * the CRM). Success is quiet by design (see runGenerationSmokeTest); only failure gets
+ * pushed in front of a human — the whole point is to never repeat the original RankAI
+ * incident (a broken pipeline sat unnoticed for months). Never throws — this runs from
+ * inside a fire-and-forget background task; a failed ALERT must not become a second
+ * unhandled failure on top of the one it's reporting.
+ */
+export async function sendLandingPageSmokeTestAlert(
+  pageId: string,
+  deployedUrl: string,
+  reason: string,
+): Promise<void> {
+  if (!slackClient) {
+    console.warn(`[slackService] Smoke test alert not sent (no Slack client): page ${pageId} — ${reason}`);
+    return;
+  }
+  try {
+    await slackClient.chat.postMessage({
+      channel: LANDING_PAGE_ALERTS_CHANNEL,
+      text: `⚠️ Landing page smoke test failed for ${pageId} (${deployedUrl}): ${reason}`,
+    });
+  } catch (error: any) {
+    console.warn(`[slackService] Failed to send smoke test alert for page ${pageId}: ${error?.message}`);
+  }
 }
