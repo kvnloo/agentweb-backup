@@ -11,6 +11,7 @@ import {
   toSingleLine,
   reportFingerprint,
   fileReportOnce,
+  REPORT_CAPACITY_WAIT_MS,
   ReportReplayCapacityError,
 } from "../utils/reportIntake";
 import { reportUIError } from "../utils/errorReporter";
@@ -460,6 +461,9 @@ router.post("/report-ui-bug", async (req, res) => {
         notionTags: ["Customer Reported", config.tag, ...funnelStatusTags],
         notionContext: issueContext,
       }),
+      Date.now(),
+      REPORT_CAPACITY_WAIT_MS,
+      userId,
     );
     filed = outcome.result;
     replayed = outcome.replayed;

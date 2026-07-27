@@ -88,10 +88,11 @@ export class ReportReplayCapacityError extends Error {
 }
 
 /**
- * Prune threshold. Distinct reports inside a 10-minute window are few, so the map stays tiny;
- * this only exists so a pathological burst can't grow it without bound.
+ * Per-authenticated-user bound. One abusive or broken client can exhaust only its own replay
+ * bucket; it cannot turn replay protection into a process-wide admission gate for other users.
  */
-const MAX_TRACKED_REPORTS = 500;
+const MAX_TRACKED_REPORTS_PER_SCOPE = 500;
+const DEFAULT_REPLAY_SCOPE = 'default';
 
 interface TrackedReport {
   promise: Promise<unknown>;
@@ -105,23 +106,37 @@ interface TrackedReport {
  * degrades to per-instance and intake's own canonical dedup still groups the reports — it never
  * becomes wrong, only less tight.
  */
-const trackedByFingerprint = new Map<string, TrackedReport>();
+const trackedByScope = new Map<string, Map<string, TrackedReport>>();
 
 function pruneExpired(now: number): void {
-  if (trackedByFingerprint.size < MAX_TRACKED_REPORTS) return;
-  for (const [key, entry] of trackedByFingerprint) {
-    if (entry.settled && now - entry.at >= REPORT_REPLAY_WINDOW_MS) {
-      trackedByFingerprint.delete(key);
+  for (const [scope, trackedByFingerprint] of trackedByScope) {
+    for (const [key, entry] of trackedByFingerprint) {
+      if (entry.settled && now - entry.at >= REPORT_REPLAY_WINDOW_MS) {
+        trackedByFingerprint.delete(key);
+      }
     }
+    if (trackedByFingerprint.size === 0) trackedByScope.delete(scope);
   }
+}
+
+function reportsForScope(scope: string): Map<string, TrackedReport> {
+  let reports = trackedByScope.get(scope);
+  if (!reports) {
+    reports = new Map<string, TrackedReport>();
+    trackedByScope.set(scope, reports);
+  }
+  return reports;
 }
 
 /**
  * Wait until one authoritative in-flight filing settles. This is backpressure, not another
- * tracking structure: the fixed-size map remains the only retained replay state, and a waiting
- * request never invokes its filer until it can first claim a tracked slot.
+ * tracking structure: the fixed-size per-user map remains the only retained replay state, and a
+ * waiting request never invokes its filer until it can first claim a tracked slot.
  */
-async function waitForTrackedFilingToSettle(waitMs: number): Promise<void> {
+async function waitForTrackedFilingToSettle(
+  trackedByFingerprint: Map<string, TrackedReport>,
+  waitMs: number,
+): Promise<void> {
   const active = Array.from(trackedByFingerprint.values())
     .filter((entry) => !entry.settled)
     .map((entry) => entry.promise.then(
@@ -146,7 +161,7 @@ async function waitForTrackedFilingToSettle(waitMs: number): Promise<void> {
 
 /** Test-only: clears the replay state so each test starts from a clean slate. */
 export function __resetReportIdempotencyForTests(): void {
-  trackedByFingerprint.clear();
+  trackedByScope.clear();
 }
 
 export interface FileReportOnceResult<T> {
@@ -160,15 +175,18 @@ export interface FileReportOnceResult<T> {
  *
  * A repeat submission that arrives while the first filing is still in flight awaits that same
  * promise; one that arrives after it completed replays the stored result. A FAILED filing is
- * never retained — nothing was tracked, so the user's retry must genuinely re-file.
+ * never retained — nothing was tracked, so the user's retry must genuinely re-file. `scope` must
+ * be the authenticated user id in production so capacity pressure cannot cross tenant boundaries.
  */
 export async function fileReportOnce<T>(
   fingerprint: string,
   file: () => Promise<T>,
   now: number = Date.now(),
   capacityWaitMs: number = REPORT_CAPACITY_WAIT_MS,
+  scope: string = DEFAULT_REPLAY_SCOPE,
 ): Promise<FileReportOnceResult<T>> {
   pruneExpired(now);
+  const trackedByFingerprint = reportsForScope(scope);
 
   const existing = trackedByFingerprint.get(fingerprint);
   if (existing) {
@@ -184,9 +202,9 @@ export async function fileReportOnce<T>(
   // durable ticket. At capacity, wait briefly for an active filing to fail and release its slot;
   // all-settled capacity (or a bounded wait timeout) returns the explicit retryable overload
   // response. No filer runs without first claiming tracked state.
-  if (trackedByFingerprint.size >= MAX_TRACKED_REPORTS) {
-    await waitForTrackedFilingToSettle(capacityWaitMs);
-    return fileReportOnce(fingerprint, file, now, capacityWaitMs);
+  if (trackedByFingerprint.size >= MAX_TRACKED_REPORTS_PER_SCOPE) {
+    await waitForTrackedFilingToSettle(trackedByFingerprint, capacityWaitMs);
+    return fileReportOnce(fingerprint, file, now, capacityWaitMs, scope);
   }
 
   const promise = file();
@@ -200,6 +218,7 @@ export async function fileReportOnce<T>(
     // Never let an older rejection delete a replacement entry.
     if (trackedByFingerprint.get(fingerprint) === entry) {
       trackedByFingerprint.delete(fingerprint);
+      if (trackedByFingerprint.size === 0) trackedByScope.delete(scope);
     }
     throw error;
   }

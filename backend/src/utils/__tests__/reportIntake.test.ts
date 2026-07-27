@@ -173,6 +173,24 @@ describe('fileReportOnce', () => {
     expect(evictedRetryFiler).not.toHaveBeenCalled();
   });
 
+  it('isolates capacity by authenticated user so one full bucket cannot block another', async () => {
+    const userAFiler = jest.fn().mockResolvedValue({ pageId: 'user-a-report' });
+    for (let i = 0; i < 500; i++) {
+      await (fileReportOnce as any)(`user-a-${i}`, userAFiler, 1_000, 0, 'user-a');
+    }
+
+    const userBFiler = jest.fn().mockResolvedValue({ pageId: 'user-b-report' });
+    await expect(
+      (fileReportOnce as any)('user-b-0', userBFiler, 1_001, 0, 'user-b'),
+    ).resolves.toEqual({
+      result: { pageId: 'user-b-report' },
+      replayed: false,
+    });
+
+    expect(userAFiler).toHaveBeenCalledTimes(500);
+    expect(userBFiler).toHaveBeenCalledTimes(1);
+  });
+
   it('backpressures at all-pending capacity, then files once a tracked slot fails open', async () => {
     const rejecters: Array<(error: Error) => void> = [];
     const filer = jest.fn(
