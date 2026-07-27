@@ -516,6 +516,123 @@ describe('executePreparedTools', () => {
     });
   });
 
+  describe('adaptive hard-cap deferral (ENG-510)', () => {
+    // Gateway fake whose media-gen calls report a configurable wall-clock duration,
+    // so we can prove the deferral reserves enough time for one more call below the
+    // whole-turn hard cap (which a fixed soft-budget deadline cannot when a single
+    // image is slow enough to nearly consume the whole budget).
+    function mediaPortsWithDuration(durationMs: number) {
+      const executed: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          executed.push(i.toolName);
+          const result = await i.execute();
+          const isMedia = i.toolName === 'generate_image' || i.toolName === 'generate_video';
+          return { status: 'success', result, durationMs: isMedia ? durationMs : 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async (i: any) => ({ success: true, imageUrl: `https://s3/${i.toolName}.png` }),
+      });
+      return { ports, executed };
+    }
+
+    it('defers the next media call when within one media-call duration of the hard cap, even before the soft deadline', async () => {
+      const { ports, executed } = mediaPortsWithDuration(5000);
+      const input = makeInput(
+        [toolCall('a', 'generate_image', '{"prompt":"x"}')],
+        ports,
+        {
+          // Soft budget NOT exceeded — the old fixed-deadline check alone would run it.
+          mediaGenerationDeadlineMs: Date.now() + 60_000,
+          mediaAssetsProducedThisRun: 1,
+          // Only ~100ms left before the whole-turn hard cap, but a media call takes ~5s.
+          generationHardCapMs: Date.now() + 100,
+          longestMediaCallMsThisRun: 5000,
+        } as any,
+      );
+      const result = await executePreparedTools(input);
+
+      expect(executed).toEqual([]);
+      expect(result.mediaBudgetDeferred).toBe(true);
+      expect(result.mediaAssetsProduced).toBe(0);
+      expect(input.toolCallsLedger[0].result).toEqual({ deferred: true, reason: 'media_generation_time_budget' });
+    });
+
+    it('does NOT defer when there is ample time before the hard cap', async () => {
+      const { ports, executed } = mediaPortsWithDuration(5000);
+      const input = makeInput(
+        [toolCall('a', 'generate_image', '{"prompt":"x"}')],
+        ports,
+        {
+          mediaGenerationDeadlineMs: Date.now() + 60_000,
+          mediaAssetsProducedThisRun: 1,
+          generationHardCapMs: Date.now() + 600_000, // plenty of headroom for another call
+          longestMediaCallMsThisRun: 5000,
+        } as any,
+      );
+      const result = await executePreparedTools(input);
+
+      expect(executed).toEqual(['generate_image']);
+      expect(result.mediaBudgetDeferred).toBe(false);
+      expect(result.mediaAssetsProduced).toBe(1);
+    });
+
+    it("defers the second call once the first call's duration shows it will not fit before the hard cap", async () => {
+      const { ports, executed } = mediaPortsWithDuration(5000);
+      const input = makeInput(
+        [
+          toolCall('a', 'generate_image', '{"prompt":"1"}'),
+          toolCall('b', 'generate_image', '{"prompt":"2"}'),
+        ],
+        ports,
+        {
+          mediaGenerationDeadlineMs: Date.now() + 60_000, // soft budget future
+          mediaAssetsProducedThisRun: 0,                  // forward-progress: first still runs
+          generationHardCapMs: Date.now() + 3000,         // < one 5s media call once the first has run
+          longestMediaCallMsThisRun: 0,
+        } as any,
+      );
+      const result = await executePreparedTools(input);
+
+      // First runs (forward progress); its observed 5s duration then trips the reserve
+      // for the second, which is deferred instead of blowing the hard cap.
+      expect(executed).toEqual(['generate_image']);
+      expect(result.mediaAssetsProduced).toBe(1);
+      expect(result.mediaBudgetDeferred).toBe(true);
+    });
+
+    it('reports the longest media-call duration this iteration, carrying the prior-run floor', async () => {
+      const { ports } = mediaPortsWithDuration(5000);
+      const input = makeInput(
+        [toolCall('a', 'generate_image', '{"prompt":"x"}')],
+        ports,
+        {
+          generationHardCapMs: Date.now() + 600_000,
+          longestMediaCallMsThisRun: 8000, // a slower earlier call this run
+        } as any,
+      );
+      const result = await executePreparedTools(input);
+      // Max of this batch's 5s call and the 8s prior-run floor.
+      expect(result.longestMediaCallMs).toBe(8000);
+    });
+
+    it('is inert when no hard cap is supplied (budget disabled / unit tests)', async () => {
+      const { ports, executed } = mediaPortsWithDuration(5000);
+      const input = makeInput(
+        [toolCall('a', 'generate_image', '{"prompt":"x"}')],
+        ports,
+        {
+          mediaGenerationDeadlineMs: undefined,
+          generationHardCapMs: undefined,
+          longestMediaCallMsThisRun: 5000,
+          mediaAssetsProducedThisRun: 3,
+        } as any,
+      );
+      const result = await executePreparedTools(input);
+      expect(executed).toEqual(['generate_image']);
+      expect(result.mediaBudgetDeferred).toBe(false);
+    });
+  });
+
   describe('same-turn duplicate dedupe (ENG-108)', () => {
     it('collapses two identical calls: executes once, answers BOTH tool_call_ids, no failure', async () => {
       const ports = makePorts();
