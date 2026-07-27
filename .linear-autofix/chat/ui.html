@@ -2228,9 +2228,16 @@ const sideState = () => document.body.classList.contains('side-hidden') ? 'hidde
 function setSide(state) {
   document.body.classList.toggle('side-rail', state === 'rail');
   document.body.classList.toggle('side-hidden', state === 'hidden');
-  $('sideToggle').textContent = state === 'rail' ? '›' : '‹';
-  $('sideToggle').title = state === 'rail' ? 'Expand sidebar (Ctrl+B)' : 'Collapse to rail (Ctrl+B)';
+  updateRailArrow();
   try { localStorage.setItem('sideState', state); } catch { /* private mode */ }
+}
+// The collapse/expand chevron points TOWARD the edge the sidebar tucks into, so it flips when the
+// sidebar is on the right: full+left = ‹, full+right = ›, rail+left = ›, rail+right = ‹  (right XOR rail).
+function updateRailArrow() {
+  const rail = document.body.classList.contains('side-rail');
+  const right = document.body.classList.contains('side-right');
+  $('sideToggle').textContent = (right !== rail) ? '›' : '‹';
+  $('sideToggle').title = rail ? 'Expand sidebar (Ctrl+B)' : 'Collapse to rail (Ctrl+B)';
 }
 const toggleRail = () => setSide(sideState() === 'rail' ? 'full' : 'rail'); // ‹ button + Ctrl+B: full <-> rail
 const toggleHidden = () => setSide(sideState() === 'hidden' ? 'full' : 'hidden'); // Alt+Enter: hide/show whole thing
@@ -2243,6 +2250,7 @@ function setSidePos(pos) {
   const right = pos === 'right';
   document.body.classList.toggle('side-right', right);
   $('sidePosToggle').title = right ? 'Move sidebar to the left' : 'Move sidebar to the right';
+  updateRailArrow(); // the collapse chevron flips with the side
   try { localStorage.setItem('sidePos', right ? 'right' : 'left'); } catch { /* private mode */ }
 }
 $('sidePosToggle').onclick = () => setSidePos(document.body.classList.contains('side-right') ? 'left' : 'right');
