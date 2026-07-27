@@ -29161,7 +29161,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
-    entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
+    entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
     action: string;
     [key: string]: any;
   }, opts?: { sessionId?: string }): Promise<any> {
@@ -29172,6 +29172,35 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (entity_type === 'BIDDING_STRATEGY' && action === 'LIST') {
         const biddingStrategies = await googleAdsService.listBiddingStrategies(userId, customer_id);
         return { success: true, biddingStrategies };
+      }
+
+      if (entity_type === 'CAMPAIGN_CRITERION' && action === 'ADD') {
+        if (!customer_id || !args.campaign_resource_name) {
+          return {
+            success: false,
+            error: 'customer_id and campaign_resource_name are required for CAMPAIGN_CRITERION ADD',
+          };
+        }
+        if (!/^\d+$/.test(customer_id)) {
+          return {
+            success: false,
+            error: 'customer_id must be numeric with no dashes for CAMPAIGN_CRITERION ADD',
+          };
+        }
+        const placementUrls = Array.isArray(args.placement_urls) ? args.placement_urls : [];
+        const mobileAppCategoryResourceNames = Array.isArray(args.mobile_app_category_resource_names)
+          ? args.mobile_app_category_resource_names
+          : [];
+        await googleAdsService.addNegativeCampaignCriteria(
+          userId,
+          customer_id,
+          args.campaign_resource_name,
+          { placementUrls, mobileAppCategoryResourceNames },
+        );
+        return {
+          success: true,
+          message: `Added ${placementUrls.length + mobileAppCategoryResourceNames.length} negative campaign criteria`,
+        };
       }
 
       if (entity_type === 'CAMPAIGN') {

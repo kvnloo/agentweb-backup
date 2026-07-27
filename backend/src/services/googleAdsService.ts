@@ -839,6 +839,77 @@ export class GoogleAdsService {
     }
   }
 
+  async addNegativeCampaignCriteria(
+    userId: string,
+    customerId: string,
+    campaignResourceName: string,
+    params: {
+      placementUrls: string[];
+      mobileAppCategoryResourceNames: string[];
+    },
+  ): Promise<void> {
+    this.assertResourceName(campaignResourceName, 'campaigns');
+
+    if (params.placementUrls.some((value) => typeof value !== 'string')) {
+      throw new Error('Invalid placement URL: every placement must be a string');
+    }
+    if (params.mobileAppCategoryResourceNames.some((value) => typeof value !== 'string')) {
+      throw new Error('Invalid mobile app category resource name: every category must be a string');
+    }
+
+    const placementUrls = [...new Set(params.placementUrls.map((value) => value.trim()))];
+    const mobileAppCategoryResourceNames = [
+      ...new Set(params.mobileAppCategoryResourceNames.map((value) => value.trim())),
+    ];
+    if (placementUrls.length === 0 && mobileAppCategoryResourceNames.length === 0) {
+      throw new Error('At least one placement URL or mobile app category resource name is required');
+    }
+
+    for (const placementUrl of placementUrls) {
+      if (!placementUrl || /\s/.test(placementUrl)) {
+        throw new Error(`Invalid placement URL: ${placementUrl || '(empty)'}`);
+      }
+      try {
+        const parsed = new URL(
+          /^[a-z][a-z\d+.-]*:\/\//i.test(placementUrl)
+            ? placementUrl
+            : `https://${placementUrl}`,
+        );
+        if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname.includes('.')) {
+          throw new Error('unsupported placement URL');
+        }
+      } catch {
+        throw new Error(`Invalid placement URL: ${placementUrl}`);
+      }
+    }
+
+    for (const resourceName of mobileAppCategoryResourceNames) {
+      if (!/^mobileAppCategoryConstants\/\d+$/.test(resourceName)) {
+        throw new Error(`Invalid mobile app category resource name: ${resourceName || '(empty)'}`);
+      }
+    }
+
+    const operations = [
+      ...placementUrls.map((url) => ({
+        create: {
+          campaign: campaignResourceName,
+          negative: true,
+          placement: { url },
+        },
+      })),
+      ...mobileAppCategoryResourceNames.map((mobileAppCategoryConstant) => ({
+        create: {
+          campaign: campaignResourceName,
+          negative: true,
+          mobileAppCategory: { mobileAppCategoryConstant },
+        },
+      })),
+    ];
+
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'campaignCriteria', operations, loginCustomerId);
+  }
+
   async listKeywords(userId: string, customerId: string, adGroupResourceName: string): Promise<any[]> {
     const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
     const query = `SELECT ad_group_criterion.resource_name, ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, ad_group_criterion.status, ad_group_criterion.negative FROM ad_group_criterion WHERE ad_group_criterion.ad_group = '${adGroupResourceName}' AND ad_group_criterion.type = 'KEYWORD'`;

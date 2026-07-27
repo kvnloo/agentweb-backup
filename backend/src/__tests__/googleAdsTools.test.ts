@@ -20,6 +20,7 @@ jest.mock('../services/googleAdsService', () => ({
     getAdGroupCampaign: jest.fn().mockResolvedValue({ campaignResourceName: 'customers/123/campaigns/1', campaignStatus: 'PAUSED' }),
     addKeywords: jest.fn().mockResolvedValue(undefined),
     addNegativeKeywords: jest.fn().mockResolvedValue(undefined),
+    addNegativeCampaignCriteria: jest.fn().mockResolvedValue(undefined),
     searchLocations: jest.fn().mockResolvedValue([
       { id: '2840', name: 'United States', countryCode: 'US', targetType: 'Country' },
     ]),
@@ -687,6 +688,86 @@ describe('handleCallGoogleAdsApi — KEYWORD actions', () => {
       action: 'REMOVE',
     });
     expect(result.success).toBe(false);
+  });
+});
+
+describe('handleCallGoogleAdsApi — CAMPAIGN_CRITERION ADD', () => {
+  it('adds negative placement URLs at campaign scope', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN_CRITERION',
+      action: 'ADD',
+      campaign_resource_name: 'customers/1234567890/campaigns/24056663695',
+      placement_urls: ['coeurdazur.com', 'https://viraltemy.com/games'],
+    });
+
+    expect(result).toEqual({
+      success: true,
+      message: 'Added 2 negative campaign criteria',
+    });
+    expect(googleAdsService.addNegativeCampaignCriteria).toHaveBeenCalledWith(
+      'user-123',
+      '1234567890',
+      'customers/1234567890/campaigns/24056663695',
+      {
+        placementUrls: ['coeurdazur.com', 'https://viraltemy.com/games'],
+        mobileAppCategoryResourceNames: [],
+      },
+    );
+  });
+
+  it('adds negative mobile-app-category constants at campaign scope', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'CAMPAIGN_CRITERION',
+      action: 'ADD',
+      campaign_resource_name: 'customers/1234567890/campaigns/24056663695',
+      mobile_app_category_resource_names: [
+        'mobileAppCategoryConstants/60000',
+        'mobileAppCategoryConstants/60001',
+      ],
+    });
+
+    expect(result.success).toBe(true);
+    expect(googleAdsService.addNegativeCampaignCriteria).toHaveBeenCalledWith(
+      'user-123',
+      '1234567890',
+      'customers/1234567890/campaigns/24056663695',
+      {
+        placementUrls: [],
+        mobileAppCategoryResourceNames: [
+          'mobileAppCategoryConstants/60000',
+          'mobileAppCategoryConstants/60001',
+        ],
+      },
+    );
+  });
+
+  it('rejects missing campaign/customer identifiers before any mutation', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '',
+      entity_type: 'CAMPAIGN_CRITERION',
+      action: 'ADD',
+      placement_urls: ['coeurdazur.com'],
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/customer_id.*campaign_resource_name/i);
+    expect(googleAdsService.addNegativeCampaignCriteria).not.toHaveBeenCalled();
+  });
+
+  it('preserves the existing negative-keyword path', async () => {
+    const result = await service.handleCallGoogleAdsApi('user-123', {
+      customer_id: '1234567890',
+      entity_type: 'KEYWORD',
+      action: 'ADD_NEGATIVE',
+      campaign_resource_name: 'customers/1234567890/campaigns/24056663695',
+      keywords: [{ text: 'free', matchType: 'BROAD' }],
+    });
+
+    expect(result.success).toBe(true);
+    expect(googleAdsService.addNegativeKeywords).toHaveBeenCalled();
+    expect(googleAdsService.addNegativeCampaignCriteria).not.toHaveBeenCalled();
   });
 });
 
