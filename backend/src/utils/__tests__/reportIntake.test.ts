@@ -199,19 +199,28 @@ describe('fileReportOnce', () => {
     expect(filer).not.toHaveBeenCalledWith('unexpected');
   });
 
-  it('fails closed when every capacity slot is in flight', async () => {
-    const neverSettles = new Promise<{ pageId: string }>(() => {});
-    const filer = jest.fn(() => neverSettles);
+  it('backpressures at all-pending capacity, then files once a tracked slot settles', async () => {
+    const resolvers: Array<(result: { pageId: string }) => void> = [];
+    const filer = jest.fn(
+      () => new Promise<{ pageId: string }>((resolve) => { resolvers.push(resolve); }),
+    );
     for (let i = 0; i < 500; i++) {
       void fileReportOnce(`pending-${i}`, filer, 1_000);
     }
 
     const overflowFiler = jest.fn().mockResolvedValue({ pageId: 'overflow' });
-    await expect(fileReportOnce('overflow', overflowFiler, 1_001)).rejects.toThrow(
-      'Report replay guard is at capacity',
-    );
+    const overflow = fileReportOnce('overflow', overflowFiler, 1_001);
+    await Promise.resolve();
+
     expect(filer).toHaveBeenCalledTimes(500);
     expect(overflowFiler).not.toHaveBeenCalled();
+
+    resolvers[0]({ pageId: 'first' });
+    await expect(overflow).resolves.toEqual({
+      result: { pageId: 'overflow' },
+      replayed: false,
+    });
+    expect(overflowFiler).toHaveBeenCalledTimes(1);
   });
 
   it('files again once the replay window has elapsed', async () => {

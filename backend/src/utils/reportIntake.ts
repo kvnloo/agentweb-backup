@@ -129,6 +129,24 @@ function evictOldestSettledReplay(): boolean {
   return true;
 }
 
+/**
+ * Wait until one authoritative in-flight filing settles. This is backpressure, not another
+ * tracking structure: the fixed-size map remains the only retained replay state, and a waiting
+ * request never invokes its filer until it can first claim a tracked slot.
+ */
+async function waitForTrackedFilingToSettle(): Promise<void> {
+  const active = Array.from(trackedByFingerprint.values())
+    .filter((entry) => !entry.settled)
+    .map((entry) => entry.promise.then(
+      () => undefined,
+      () => undefined,
+    ));
+  if (active.length === 0) {
+    throw new Error('Report replay guard capacity invariant violated');
+  }
+  await Promise.race(active);
+}
+
 /** Test-only: clears the replay state so each test starts from a clean slate. */
 export function __resetReportIdempotencyForTests(): void {
   trackedByFingerprint.clear();
@@ -165,14 +183,15 @@ export async function fileReportOnce<T>(
   }
 
   // Prefer dropping the oldest completed replay over causing a cross-user availability outage.
-  // If every slot is still filing, fail before calling `file`: an untracked filing could be
-  // duplicated by its first retry. This keeps the state bounded and the active-filing path
-  // fail-closed.
+  // If every slot is still filing, apply backpressure until one authoritative filing settles,
+  // then retry admission. Never call `file` without first claiming a tracked slot: concurrent
+  // retries still collapse onto one promise and the replay state remains hard-bounded.
   if (
     trackedByFingerprint.size >= MAX_TRACKED_REPORTS
     && !evictOldestSettledReplay()
   ) {
-    throw new Error('Report replay guard is at capacity');
+    await waitForTrackedFilingToSettle();
+    return fileReportOnce(fingerprint, file, now);
   }
 
   const promise = file();
