@@ -1,3 +1,39 @@
+## ENG-529: report-ui-bug returned 500 on reports it had already filed (2026-07-27)
+
+Production `POST /api/support/report-ui-bug` 500'd three times on 2026-07-26 (17:15:04, 17:15:11,
+17:19:38 UTC) while **successfully filing every attempt**. Root cause chain, verified in
+`routes/support.ts`:
+
+1. The title was `` `${config.titlePrefix}: ${description.trim().slice(0, 80)}` `` — a RAW slice, so
+   a multiline description carried real newlines.
+2. That same string was reused verbatim as the Resend subject
+   (`[${subjectLabel}] ${title} — reported by ${email}`). Resend answers
+   `422 validation_error: "The \n is not allowed in the subject field."` and rejects the send.
+3. The `await resendService.sendEmail(...)` sat inside the route's ONE success-critical try/catch,
+   whose catch returns `500 "Failed to submit report"`. So a durable, already-filed report was
+   reported to the user as a total failure.
+4. The client's generic failure toast invited retries; each retry re-ran `fileUserIssue` →
+   `createTicket`, producing reporter tickets #169, #170, #171 for one report.
+
+**Assumption checked, not assumed:** prod backend is a SINGLE EC2 instance
+(`describe-environment-resources` on `Agentweb-backend-env-prod-3` returns one instance) and
+`server.ts` does not `cluster.fork()`. So an in-process replay guard covers every retry that reaches
+the API today. If the env is ever scaled out the guard degrades to per-instance and intake's own
+canonical dedup still groups the reports — it gets looser, never wrong. A durable cross-instance
+store would need a new DynamoDB table (database/data-plane gate), which this fix deliberately avoids.
+
+**Fix shape:** `utils/reportIntake.ts` owns (a) the ONE normalization of the shared title —
+whitespace/control collapse BEFORE truncation, so the summary is 80 characters of readable text —
+and (b) `fileReportOnce`, a 10-minute replay guard keyed on
+`sha256(userId, reportType, pageUrl, normalizedDescription)`. In-flight duplicates share the same
+promise; completed filings replay; a FAILED filing is never cached, so a genuine retry really
+re-files. The route now has two failure boundaries instead of one: filing failure → 500 claiming
+nothing tracked; notification failure → the user still gets success + tracking link, and the failure
+is recorded via `reportUIError('support:report-ui-bug:notification')`.
+
+**Pattern to remember:** any user text that reaches an email subject must be single-lined at the
+source, and a best-effort side effect must never share a try/catch with the durable one.
+
 ## ENG-114: durable MCP session store so sessions resolve across instances (2026-07-21)
 
 MCP Streamable-HTTP sessions lived only in a per-process `Map` in `mcp/server/mcpServer.ts`. On a
