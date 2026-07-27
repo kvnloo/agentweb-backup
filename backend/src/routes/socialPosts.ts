@@ -1,15 +1,59 @@
 import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { AuthenticatedRequest } from '../middleware/auth';
-import { getPostsForUser, generateEngagementMemory } from '../services/socialPostsService';
+import { getPostsForUser, getSocialAccountIds, generateEngagementMemory } from '../services/socialPostsService';
 import { userDb, scheduleDb, socialEngagementTrackingDb } from '../services/db';
 import { getEngagementMemory, saveEngagementMemory, EngagementMemory } from '../services/connectedAccountsDb';
 
 const router = Router();
 
+// In-memory per-user/per-account cooldown for on-demand force_reload refreshes.
+// force_reload bypasses the 24h cache and hits the shared LinkedIn API quota, so a
+// caller who spams it could exhaust app-wide quota or trip LinkedIn abuse detection
+// for every tenant. Throttle how often a single user can trigger it, returning 429
+// when called too soon. Mirrors the SEO GA-probe per-user cooldown convention.
+//
+// Process-local by design, same trade-off as the loop-events rate limiter
+// (routes/loopEvents.ts): sufficient as long as the backend runs a single
+// instance (currently pinned at MinSize=MaxSize=1 in production). If backend
+// auto-scaling is ever turned on in production, replace this with a shared
+// store (e.g. a DynamoDB item with a conditional write + TTL) so the cooldown
+// is enforced across instances instead of per-process.
+const FORCE_RELOAD_COOLDOWN_MS = 60_000;
+// Value carries the reservation timestamp (`at`, for expiry) plus a unique
+// `token` identifying the request that made it. Rollback deletes a key only
+// when its token still matches — so a late-failing request never erases a
+// newer request's reservation for the same account (which would let a third
+// request bypass the cooldown and burn shared LinkedIn quota).
+const forceReloadCooldown = new Map<string, { at: number; token: number }>();
+let forceReloadReservationSeq = 0;
+
+/** Exported for testing — clears force_reload cooldown state between runs. */
+export function _resetForceReloadCooldown(): void {
+  forceReloadCooldown.clear();
+}
+
+/** Exported for testing — asserts the cooldown map stays bounded to real accounts. */
+export function _forceReloadCooldownSize(): number {
+  return forceReloadCooldown.size;
+}
+
 router.get('/social-posts', authenticateToken, async (req: Request, res: Response) => {
+  let userId: string | undefined;
+  // Account ids whose cooldown was reserved by THIS request — rolled back in
+  // the catch block if getPostsForUser throws outright, so a hard failure
+  // (e.g. a DB read error) doesn't consume the user's retry window for a
+  // refresh that never actually reached LinkedIn. Per-account LinkedIn
+  // failures don't hit this path — getPostsForUser catches those internally
+  // and returns them as a per-account `error` field, not a thrown error —
+  // so an attempt that did reach (and fail against) LinkedIn still correctly
+  // keeps its cooldown.
+  let reservedCooldownIds: string[] = [];
+  // Token of the reservation THIS request made; rollback only clears keys that
+  // still hold this token, so it can't delete a newer request's reservation.
+  let reservedCooldownToken = 0;
   try {
-    const userId = (req as any).user?.userId;
+    userId = (req as any).user?.userId;
     if (!userId) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
@@ -17,10 +61,87 @@ router.get('/social-posts', authenticateToken, async (req: Request, res: Respons
     const accountId = req.query.accountId as string | undefined;
     const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 20;
     const includeMetrics = req.query.include_metrics !== 'false';
+    // On-demand refresh: bypass the 24h cache and re-fetch from LinkedIn.
+    // Only affects company/organization pages — personal profiles always read from the DB.
+    const forceReload = req.query.force_reload === 'true';
 
-    const result = await getPostsForUser(userId, { accountId, limit, includeMetrics });
+    // Throttle force_reload — it's the only path that bypasses the 24h cache and
+    // burns the shared LinkedIn quota, so cap how frequently one user can call it.
+    //
+    // The cooldown is keyed per real, owned social account (not the raw
+    // accountId query param) for two reasons:
+    //  1. Bounded memory — an unvalidated accountId would let a caller grow
+    //     the process-global map without limit; real accounts are finite.
+    //  2. Consistent throttling — an "all accounts" refresh and a refresh of
+    //     one of those same accounts must share cooldown state, otherwise a
+    //     caller can alternate between the two to bypass the cooldown and
+    //     double up on LinkedIn calls for the same account.
+    // Force-reload only the accounts that aren't currently throttled. When
+    // undefined, getPostsForUser force-reloads everything (the non-force path
+    // leaves this undefined, which is harmless since forceReload is false).
+    let forceReloadAccountIds: string[] | undefined;
+    if (forceReload) {
+      const socialAccountIds = await getSocialAccountIds(userId);
+      const targetAccountIds = accountId
+        ? socialAccountIds.filter((id) => id === accountId)
+        : socialAccountIds;
+
+      // Partition targets into those still cooling down and those eligible to
+      // refresh now. A single throttled page must NOT block an all-accounts
+      // refresh of the others — only refresh the eligible ones, and 429 solely
+      // when every targeted page is still cooling.
+      const now = Date.now();
+      const eligibleAccountIds: string[] = [];
+      let retryAfterMs = 0;
+      for (const id of targetAccountIds) {
+        const last = forceReloadCooldown.get(`${userId}::${id}`)?.at ?? 0;
+        const remainingMs = last + FORCE_RELOAD_COOLDOWN_MS - now;
+        if (remainingMs > 0) {
+          retryAfterMs = Math.max(retryAfterMs, remainingMs);
+        } else {
+          eligibleAccountIds.push(id);
+        }
+      }
+
+      // Only throttle when there's at least one target and nothing eligible —
+      // i.e. every targeted page is still within its cooldown window.
+      if (targetAccountIds.length > 0 && eligibleAccountIds.length === 0) {
+        return res.status(429).json({
+          success: false,
+          error: 'Posts were just refreshed. Please wait a moment before refreshing again.',
+          retry_after_seconds: Math.ceil(retryAfterMs / 1000),
+        });
+      }
+
+      // Reserve synchronously — before the async getPostsForUser call below —
+      // so a concurrent request for the same account can't slip past the
+      // check above while this one is still in flight. Tag each reservation
+      // with a unique token so rollback can tell this request's reservation
+      // apart from one a later request may have written over the same key.
+      reservedCooldownToken = ++forceReloadReservationSeq;
+      for (const id of eligibleAccountIds) {
+        forceReloadCooldown.set(`${userId}::${id}`, { at: now, token: reservedCooldownToken });
+      }
+      reservedCooldownIds = eligibleAccountIds;
+      // Force-reload exactly the accounts we just reserved; cooling pages are
+      // still returned, from cache. Passing [] scopes force-reload to nothing.
+      forceReloadAccountIds = eligibleAccountIds;
+    }
+
+    const result = await getPostsForUser(userId, { accountId, limit, includeMetrics, forceReload, forceReloadAccountIds });
     return res.json(result);
   } catch (error) {
+    if (userId) {
+      for (const id of reservedCooldownIds) {
+        const key = `${userId}::${id}`;
+        // Only clear the reservation if it's still the one this request made.
+        // If a later request replaced it (its expired predecessor), leave that
+        // newer reservation intact so the cooldown keeps protecting quota.
+        if (forceReloadCooldown.get(key)?.token === reservedCooldownToken) {
+          forceReloadCooldown.delete(key);
+        }
+      }
+    }
     console.error('[SocialPosts] Error:', error);
     return res.status(500).json({
       success: false,
