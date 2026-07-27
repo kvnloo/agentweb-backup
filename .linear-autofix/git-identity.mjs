@@ -117,6 +117,13 @@ export function applyWorktreeIdentity(WT, identity, log = () => {}) {
 // process.env so EVERY commit-making stage they spawn inherits it. Returns the resolved
 // identity (or null) so the caller can log who commits will be attributed to.
 export function applyAssigneeIdentity(issue, log = () => {}) {
+  // Route pushes (and every `gh` call) through the assignee's token so the PUSH — not just the commits —
+  // is attributed to them on GitHub, instead of the box account. The box's git uses `gh` as its
+  // credential helper and `gh` honors GH_TOKEN, so setting it here makes `git push` authenticate as the
+  // assignee. Independent of commit identity: set it whenever a token exists (no token → box default).
+  const ghToken = resolveAssigneeGhToken(issue?.assignee);
+  if (ghToken) { process.env.GH_TOKEN = ghToken; log('Push/PR attribution: git push + gh will run as the assignee (their GitHub token).'); }
+
   const identity = resolveAssigneeIdentity(issue?.assignee);
   if (!identity) {
     if (issue?.assignee) log(`Commit attribution: could not resolve a git identity for assignee ${issue.assignee.name || issue.assignee.email || '(unknown)'} — using the box default.`);
