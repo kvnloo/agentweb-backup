@@ -1834,5 +1834,37 @@ describe('ImageService.getAzureImageConfig (ENG-410 endpoint migration)', () => 
     await (svc as any).getAzureImageConfig('gpt-image-1');
     expect(mockGetSecret).toHaveBeenCalledWith('dev/AgentWeb/Azure/Image');
   });
+
+  describe('per-image timeout is decoupled from the whole-turn cap (ENG-510 mode 2)', () => {
+    const saved = process.env.IMAGE_GENERATION_TIMEOUT_MS;
+    afterEach(() => {
+      if (saved === undefined) delete process.env.IMAGE_GENERATION_TIMEOUT_MS;
+      else process.env.IMAGE_GENERATION_TIMEOUT_MS = saved;
+    });
+
+    // The whole-turn cap default (agentModeController GENERATION_TIMEOUT_MS) is 600_000ms.
+    const WHOLE_TURN_CAP_DEFAULT_MS = 600_000;
+
+    it('defaults BELOW the whole-turn cap so one hung image cannot consume the entire turn', () => {
+      delete process.env.IMAGE_GENERATION_TIMEOUT_MS;
+      const t = (new ImageService() as any).IMAGE_GENERATION_TIMEOUT_MS;
+      expect(t).toBeLessThan(WHOLE_TURN_CAP_DEFAULT_MS);
+      // …but still above observed legitimate slow (high-quality Pro) generations (~6.5 min)
+      // so it does not regress successful-but-slow renders.
+      expect(t).toBeGreaterThanOrEqual(7 * 60 * 1000);
+    });
+
+    it('is env-overridable for per-environment tuning', () => {
+      process.env.IMAGE_GENERATION_TIMEOUT_MS = '123456';
+      expect((new ImageService() as any).IMAGE_GENERATION_TIMEOUT_MS).toBe(123456);
+    });
+
+    it('falls back to the safe default on an invalid/empty override', () => {
+      process.env.IMAGE_GENERATION_TIMEOUT_MS = 'not-a-number';
+      const t = (new ImageService() as any).IMAGE_GENERATION_TIMEOUT_MS;
+      expect(t).toBeLessThan(WHOLE_TURN_CAP_DEFAULT_MS);
+      expect(t).toBeGreaterThan(0);
+    });
+  });
 });
 
