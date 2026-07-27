@@ -385,6 +385,17 @@ function getNestedValue(obj: any, path: string): any {
   return path.split('.').reduce((cur, key) => (cur != null ? cur[key] : undefined), obj);
 }
 
+function compareNumeric(
+  actual: unknown,
+  expected: unknown,
+  compare: (a: number, b: number) => boolean,
+): boolean {
+  const a = typeof actual === 'number' ? actual : Number(actual);
+  const b = typeof expected === 'number' ? expected : Number(expected);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+  return compare(a, b);
+}
+
 function evaluateCondition(condition: StepCondition, lead: any): boolean {
   const actual = getNestedValue(lead, condition.field);
   switch (condition.operator) {
@@ -393,6 +404,11 @@ function evaluateCondition(condition: StepCondition, lead: any): boolean {
     case 'eq':         return String(actual) === String(condition.value);
     case 'neq':        return String(actual) !== String(condition.value);
     case 'contains':   return typeof actual === 'string' && actual.includes(String(condition.value));
+    // Numeric comparisons (e.g. heatScore >= 60). A missing or non-numeric
+    // value never satisfies the condition, so the lead exits rather than being
+    // mailed on an unverified segment.
+    case 'gte':        return compareNumeric(actual, condition.value, (a, b) => a >= b);
+    case 'lte':        return compareNumeric(actual, condition.value, (a, b) => a <= b);
     default:           return false;
   }
 }

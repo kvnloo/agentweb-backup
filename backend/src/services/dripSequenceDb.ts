@@ -86,7 +86,7 @@ export type ExitReason =
 
 export type SequenceChannel = 'email' | 'linkedin';
 
-export type StepConditionOperator = 'eq' | 'neq' | 'exists' | 'not_exists' | 'contains';
+export type StepConditionOperator = 'eq' | 'neq' | 'exists' | 'not_exists' | 'contains' | 'gte' | 'lte';
 
 export interface StepCondition {
   field: string;              // dot-notation path on lead record, e.g. "lifecycle" or "customFields.interested_in_outreach"
