@@ -232,4 +232,76 @@ describe('runScheduledChat — deterministic completion gate', () => {
     expect(calls).toBeGreaterThanOrEqual(2);
     expect(calls).toBeLessThanOrEqual(3);
   });
+
+  // ENG-518: the preview→execute write-back gate, driven end-to-end through the
+  // real runScheduledChat → runVerifiedChat loop (not just the classifier). These
+  // prove the wiring: the loop accumulates the worker's tool-call names into
+  // allActualFunctionCallsForReporting, feeds them to the gate, and the gate
+  // drives a continuation that actually commits the write-back.
+  const workerResultWithTools = (content: string, toolNames: string[]) => ({
+    ...workerResult(content),
+    toolCalls: toolNames.map((name) => ({ name })),
+  });
+
+  it('ENG-518: a run that previewed but never executed is driven to commit the write-back', async () => {
+    let call = 0;
+    mockWorker.runInWorker.mockImplementation(() => {
+      call++;
+      // Turn 1: ran enrich_leads_preview and presented the dry-run samples as if
+      // delivered — NO admission phrasing, NO confirmation question, not truncated.
+      // The old text/flag-based gate saw nothing to continue on. Turn 2
+      // (continuation): the model calls the execute write-back and finishes.
+      return Promise.resolve(
+        call === 1
+          ? workerResultWithTools(
+              'Here are the enriched leads from the preview. Top prospects look strong.',
+              ['enrich_leads_preview']
+            )
+          : workerResultWithTools(
+              'Enrichment committed. Top 10 leads recommended and connection drafts below.',
+              ['enrich_leads_execute']
+            )
+      );
+    });
+
+    const result = await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    // Gate fired on the tool-call fact (preview without execute) → a second turn ran.
+    expect(mockWorker.runInWorker.mock.calls.length).toBeGreaterThanOrEqual(2);
+    // The continuation message specifically instructs committing the write-back.
+    const secondMsg = mockWorker.runInWorker.mock.calls[1][0].messageContent as string;
+    expect(secondMsg).toMatch(/enrich_leads_execute/);
+    expect(secondMsg).toMatch(/never committed|write-back/i);
+    // Once execute ran, the gap is closed and the run succeeds.
+    expect(result).toEqual(expect.objectContaining({ status: 'success' }));
+  });
+
+  it('ENG-518: a run that previewed AND executed in one turn does NOT fire the gate', async () => {
+    mockWorker.runInWorker.mockResolvedValue(
+      workerResultWithTools(
+        'Enrichment previewed and committed. Recommendations and drafts below.',
+        ['enrich_leads_preview', 'enrich_leads_execute']
+      )
+    );
+
+    await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    // Preview's execute counterpart already ran → no continuation.
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('ENG-518: keeps chasing the write-back but stays bounded if execute never runs', async () => {
+    // Every turn previews without executing → the gate must keep firing (the gap
+    // is still open) yet remain capped by completionGateMaxContinuations, not loop.
+    mockWorker.runInWorker.mockResolvedValue(
+      workerResultWithTools('Preview samples shown above.', ['enrich_leads_preview'])
+    );
+
+    await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    // 1 initial + up to 2 continuations = 3. Bounded well under maxAttempts(20).
+    const calls = mockWorker.runInWorker.mock.calls.length;
+    expect(calls).toBeGreaterThanOrEqual(2);
+    expect(calls).toBeLessThanOrEqual(3);
+  });
 });
