@@ -9,6 +9,21 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-07-27',
+    changes: [
+      'New: Ask Emma About Your CRM Email Campaigns — and Have Her Build One',
+      '- You can now ask Emma "are any email campaigns running for our CRM leads?" and get a straight answer: every drip sequence with its name, status, who it targets, how many steps it has, and whether it is actually sending right now',
+      '- An account with no campaigns gets a clear "nothing is running" answer instead of a confusing error',
+      '- Emma can build a multi-step nurture sequence for you — subject lines, email copy and the wait between each step — targeted at a lead list, a lifecycle stage, or leads above a heat score',
+      '- Emma can also show a single campaign\'s status and pause one that is running',
+      '',
+      'Safety: Emma Can Never Start Sending a Campaign Without You',
+      '- Any sequence Emma creates is saved as a draft, which sends nothing. Turning it on is a separate, deliberate step',
+      '- In a chat, Emma shows you the campaign and waits for an explicit yes before activating it',
+      '- In a scheduled/automated run there is nobody to approve, so activation is refused outright — an unattended run can never start emailing your leads. Emma leaves the campaign ready and tells you it is waiting for your approval',
+    ],
+  },
+  {
     date: '2026-07-23',
     changes: [
       'Improved: Emma Now Remembers a Website Login Between Runs',
