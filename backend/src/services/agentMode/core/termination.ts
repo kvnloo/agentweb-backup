@@ -37,6 +37,18 @@ export interface TerminationInput {
   /** empty-synthesis nudges already used */
   emptySynthesisRetries: number;
   maxEmptySynthesisRetries: number;
+  /**
+   * ENG-657: the text THIS terminating turn produced (the loop's per-iteration
+   * `responseContent`). The loop's accumulated `content` is replace-on-nonempty,
+   * so a run that narrates mid-tool ("Now enriching list 5…") and then ends its
+   * FINAL turn with no text leaves that stale narration in `content` — masking
+   * the missing final synthesis from the `!content` empty-synthesis check, so the
+   * run finishes on a tool result with no assistant summary. When provided, the
+   * empty-synthesis retry keys off THIS turn's text instead of the accumulated
+   * content, so a tools-ran-but-no-final-summary turn still gets its synthesis
+   * nudge. Undefined → pre-ENG-657 behavior (keys off `content`).
+   */
+  currentTurnText?: string;
 }
 
 export interface TerminationDecision {
@@ -105,8 +117,16 @@ export function decideTermination(input: TerminationInput): TerminationDecision 
   //    Uses effectiveContent so a content-filter canned message counts as "has content"
   //    and does NOT trigger a synthesis retry — matching the monolith's `if (!content ...)`
   //    which runs AFTER the content-filter block has already set `content`.
+  //    ENG-657: when the caller passes `currentTurnText`, base the "did the model
+  //    actually synthesize?" decision on THIS turn's text rather than the
+  //    accumulated `content` (which can hold stale mid-tool narration). A
+  //    content filter still suppresses the retry (safety stop wins).
+  const turnContent =
+    input.currentTurnText !== undefined ? input.currentTurnText : input.content;
+  const turnEffective =
+    isContentFiltered && !turnContent ? CONTENT_FILTER_MESSAGE : turnContent;
   if (
-    !effectiveContent &&
+    !turnEffective &&
     input.toolCallsSoFar > 0 &&
     input.emptySynthesisRetries < input.maxEmptySynthesisRetries
   ) {

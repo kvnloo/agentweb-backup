@@ -3390,6 +3390,12 @@ export class AgentModeService {
             finishReason,
             stopReason,
             content,
+            // ENG-657: `content` is replace-on-nonempty, so if this final turn
+            // emitted no text it still holds stale mid-tool narration and the
+            // `!content` synthesis check would miss the missing summary. Pass THIS
+            // turn's own text so the synthesis nudge fires when the run ends on a
+            // tool result without a final assistant summary.
+            currentTurnText: responseContent,
             toolCallsSoFar: toolCalls.length,
             maxTokensContinuations,
             maxTokenContinuationsLimit: MAX_TOKEN_CONTINUATIONS,
