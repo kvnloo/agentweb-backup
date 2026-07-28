@@ -89,6 +89,15 @@ jest.mock('../services/db', () => ({
     getOrgMemberCount: jest.fn((orgId: string) => {
       return Promise.resolve(Object.values(mockUsers).filter((u: any) => u.orgId === orgId).length);
     }),
+    removeDomainJoinRequest: jest.fn((orgId: string, requestToken: string) => {
+      const org = mockOrgs[orgId];
+      if (!org) return Promise.resolve(false);
+      const pending = org.pendingDomainJoinRequests || [];
+      const updated = pending.filter((r: any) => r.requestToken !== requestToken);
+      if (updated.length === pending.length) return Promise.resolve(false);
+      org.pendingDomainJoinRequests = updated;
+      return Promise.resolve(true);
+    }),
     ORG_MAX_MEMBERS: 5,
   },
 }));

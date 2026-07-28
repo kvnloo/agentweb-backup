@@ -8833,6 +8833,53 @@ export const orgDb = {
       .promise();
   },
 
+  // Atomically removes a domain-join request by token (approve/reject),
+  // via optimistic-concurrency retry rather than the read-filter-then-SET-
+  // whole-array pattern this replaced — that pattern silently dropped a
+  // concurrently-appended request (a new signup landing via
+  // addPendingDomainJoinRequest while an owner was mid-approve on this same
+  // org) or let two concurrent owner actions overwrite each other and
+  // resurrect an already-processed request (flagged in review). Each retry
+  // re-reads the org fresh and re-filters, conditioned on updatedAt not
+  // having changed since that read; on a conflict it just retries against
+  // the new state. Returns false if the token isn't found (already removed,
+  // or never existed) — never throws for that case.
+  async removeDomainJoinRequest(orgId: string, requestToken: string): Promise<boolean> {
+    const MAX_ATTEMPTS = 5;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const result = await dynamodb.get({ TableName: ORGS_TABLE, Key: { orgId } }).promise();
+      const org = result.Item as Organization | undefined;
+      if (!org) return false;
+
+      const pending = org.pendingDomainJoinRequests || [];
+      const updated = pending.filter((r) => r.requestToken !== requestToken);
+      if (updated.length === pending.length) return false; // Not found.
+
+      try {
+        await dynamodb
+          .update({
+            TableName: ORGS_TABLE,
+            Key: { orgId },
+            UpdateExpression: "SET pendingDomainJoinRequests = :updated, updatedAt = :now",
+            ConditionExpression: "updatedAt = :expectedUpdatedAt",
+            ExpressionAttributeValues: {
+              ":updated": updated,
+              ":now": new Date().toISOString(),
+              ":expectedUpdatedAt": org.updatedAt,
+            },
+          })
+          .promise();
+        return true;
+      } catch (error: any) {
+        if (error.code === "ConditionalCheckFailedException") {
+          continue; // Org changed concurrently — re-read and retry.
+        }
+        throw error;
+      }
+    }
+    throw new Error(`removeDomainJoinRequest: exceeded ${MAX_ATTEMPTS} retry attempts for org ${orgId}`);
+  },
+
   async updateShareSettings(orgId: string, settings: OrgShareSettings): Promise<void> {
     await dynamodb.update({
       TableName: ORGS_TABLE,

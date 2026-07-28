@@ -475,9 +475,10 @@ router.post("/:orgId/domain-requests/:requestToken/approve", async (req: Request
     }
 
     // Same non-snapshotting join mechanics as accept-invite (see ENG-288) —
-    // no tier fields copied.
-    const updatedRequests = pendingRequests.filter((r) => r.requestToken !== requestToken);
-    await orgDb.updateOrg(orgId, { pendingDomainJoinRequests: updatedRequests });
+    // no tier fields copied. If this is already gone (e.g. a concurrent
+    // reject beat us to it, extremely unlikely given the join already
+    // succeeded above), that's fine — nothing left to clean up.
+    await orgDb.removeDomainJoinRequest(orgId, requestToken);
 
     return res.json({ success: true, message: "Domain-join request approved" });
   } catch (error) {
@@ -501,13 +502,10 @@ router.post("/:orgId/domain-requests/:requestToken/reject", async (req: Request,
       return res.status(403).json({ error: "Only the org owner can reject domain-join requests" });
     }
 
-    const pendingRequests = org.pendingDomainJoinRequests || [];
-    const updatedRequests = pendingRequests.filter((r) => r.requestToken !== requestToken);
-    if (updatedRequests.length === pendingRequests.length) {
+    const removed = await orgDb.removeDomainJoinRequest(orgId, requestToken);
+    if (!removed) {
       return res.status(404).json({ error: "No pending domain-join request found for this token" });
     }
-
-    await orgDb.updateOrg(orgId, { pendingDomainJoinRequests: updatedRequests });
 
     return res.json({ success: true, message: "Domain-join request rejected" });
   } catch (error) {
