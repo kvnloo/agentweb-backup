@@ -191,32 +191,44 @@ describe('fileReportOnce', () => {
     expect(userBFiler).toHaveBeenCalledTimes(1);
   });
 
-  it('hard-bounds aggregate replay state and reclaims it only after entries expire', async () => {
+  it('admits a new user at settled aggregate capacity by evicting the oldest settled replay', async () => {
     const aggregateLimit = 2_000;
     const filer = jest.fn().mockResolvedValue({ pageId: 'filed' });
     for (let i = 0; i < aggregateLimit; i++) {
       await (fileReportOnce as any)(`report-${i}`, filer, 1_000, 0, `user-${i}`);
     }
 
+    // A new authenticated user must never be denied filing by OTHER users' settled
+    // replay entries: the oldest settled entry is evicted to admit the new report.
     const overflowFiler = jest.fn().mockResolvedValue({ pageId: 'overflow' });
     await expect(
       (fileReportOnce as any)('overflow', overflowFiler, 1_001, 0, 'overflow-user'),
-    ).rejects.toThrow('Report replay guard is busy');
-    expect(overflowFiler).not.toHaveBeenCalled();
-
-    await expect(
-      (fileReportOnce as any)(
-        'after-expiry',
-        overflowFiler,
-        1_000 + REPORT_REPLAY_WINDOW_MS,
-        0,
-        'overflow-user',
-      ),
     ).resolves.toEqual({
       result: { pageId: 'overflow' },
       replayed: false,
     });
     expect(overflowFiler).toHaveBeenCalledTimes(1);
+
+    // The evicted entry (report-0, the oldest settled) no longer replays: its retry
+    // genuinely re-files. Bounded degradation of replay suppression, never denial.
+    const retryEvictedFiler = jest.fn().mockResolvedValue({ pageId: 'refiled' });
+    await expect(
+      (fileReportOnce as any)('report-0', retryEvictedFiler, 1_002, 0, 'user-0'),
+    ).resolves.toEqual({
+      result: { pageId: 'refiled' },
+      replayed: false,
+    });
+    expect(retryEvictedFiler).toHaveBeenCalledTimes(1);
+
+    // A non-evicted tracked report still replays without re-filing.
+    const retryTrackedFiler = jest.fn().mockResolvedValue({ pageId: 'should-not-file' });
+    await expect(
+      (fileReportOnce as any)('report-2', retryTrackedFiler, 1_003, 0, 'user-2'),
+    ).resolves.toEqual({
+      result: { pageId: 'filed' },
+      replayed: true,
+    });
+    expect(retryTrackedFiler).not.toHaveBeenCalled();
   });
 
   it('does not start an untracked filing when pending reports occupy the aggregate ceiling', async () => {
@@ -239,9 +251,17 @@ describe('fileReportOnce', () => {
   });
 
   it('releases aggregate capacity when a tracked filing fails', async () => {
-    const filer = jest.fn().mockResolvedValue({ pageId: 'filed' });
+    // Pending entries are never evicted, so an all-pending registry proves the
+    // capacity release without settled-entry eviction masking it.
+    const neverSettles = new Promise<{ pageId: string }>(() => {});
     for (let i = 0; i < 1_999; i++) {
-      await (fileReportOnce as any)(`report-${i}`, filer, 1_000, 0, `user-${i}`);
+      void (fileReportOnce as any)(
+        `report-${i}`,
+        () => neverSettles,
+        1_000,
+        0,
+        `user-${i}`,
+      );
     }
 
     let rejectFiling: (error: Error) => void = () => {};
