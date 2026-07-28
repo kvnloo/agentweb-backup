@@ -21,10 +21,18 @@
  *
  * Every routed webhook logs its full run report (one JSON line, prefix
  * `[FathomLinearRouter]`) so shadow output is observable in EB/CloudWatch logs.
+ * HTTP responses carry aggregate summary counts only — never issue identifiers.
+ *
+ * Security: when FATHOM_WEBHOOK_SECRET is set, every request must present it
+ * (`x-fathom-webhook-token` header or `?token=` on the registered destination
+ * URL; constant-time compare). The router leg refuses to run at all while a
+ * LinearPort is registered without a secret — Linear reads/writes never happen
+ * on an unauthenticated surface.
  *
  * Mounted at /api/webhooks/fathom in app.ts.
  */
 
+import crypto from 'crypto';
 import express from 'express';
 import { extractMeetingActionItems } from '../services/fathomExtraction';
 import { routeMeetingToLinear, RunReport } from '../services/fathomLinearRouter';
@@ -32,6 +40,36 @@ import { getFathomLinearPort } from '../services/fathomLinearPortRegistry';
 import { ingestFathomOnboardingRecording } from '../services/fathomOnboardingIngestionService';
 
 const router = express.Router();
+
+/** Constant-time string comparison (hash first so lengths never leak). */
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const ha = crypto.createHash('sha256').update(a).digest();
+  const hb = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+/** The shared webhook token, from header or the registered destination URL's query. */
+function presentedToken(req: express.Request): string | undefined {
+  const header = req.get('x-fathom-webhook-token');
+  if (typeof header === 'string' && header.length > 0) return header;
+  const q = req.query?.token;
+  return typeof q === 'string' && q.length > 0 ? q : undefined;
+}
+
+/** Aggregate counts only — the full report (issue identifiers) stays in server logs. */
+function reportSummary(report: RunReport) {
+  return {
+    meetingsScanned: report.meetingsScanned,
+    itemsScanned: report.itemsScanned,
+    created: report.created.length,
+    enriched: report.enriched.length,
+    related: report.related.length,
+    duplicatesAvoided: report.duplicatesAvoided.length,
+    notFiled: report.notFiled.length,
+    needsPm: report.needsPm.length,
+    errors: report.errors.length,
+  };
+}
 
 export type FathomRouterMode = 'off' | 'shadow' | 'live';
 
@@ -46,7 +84,7 @@ export function getFathomRouterMode(): FathomRouterMode {
 
 type RouterLegResult =
   | { routed: false; reason: string; itemsExtracted?: number }
-  | { routed: true; mode: RunReport['mode']; report: RunReport };
+  | { routed: true; mode: RunReport['mode']; summary: ReturnType<typeof reportSummary> };
 
 interface OnboardingLegResult {
   status: string;
@@ -112,6 +150,17 @@ async function runOnboardingLeg(
 router.post('/', async (req: express.Request, res: express.Response) => {
   const { event, data } = req.body;
 
+  // Webhook authentication: when a secret is configured, every request must
+  // present it (header or ?token= from the registered destination URL).
+  const webhookSecret = process.env.FATHOM_WEBHOOK_SECRET;
+  if (webhookSecret) {
+    const token = presentedToken(req);
+    if (!token || !timingSafeEqualStr(token, webhookSecret)) {
+      console.warn('[Fathom Webhook] Rejected request with missing or invalid webhook token.');
+      return res.status(401).json({ error: 'Missing or invalid webhook token.' });
+    }
+  }
+
   // Validate event field
   if (!event || typeof event !== 'string') {
     return res.status(400).json({ error: 'Missing or invalid event field.' });
@@ -143,6 +192,15 @@ router.post('/', async (req: express.Request, res: express.Response) => {
       };
     } else {
       const port = getFathomLinearPort();
+      // Security invariant (Greptile P1): the router leg never touches Linear —
+      // reads OR writes — on an unauthenticated surface. A registered port with
+      // no webhook secret is a misconfiguration, not a degraded mode.
+      if (port && !webhookSecret) {
+        throw new Error(
+          'FATHOM_WEBHOOK_SECRET must be configured before the Fathom→Linear router can run — ' +
+            'set the secret and include it in the registered Fathom webhook destination URL (?token=…).',
+        );
+      }
       if (!port) {
         console.warn(
           `[FathomLinearRouter] LinearPort not configured — router inactive until the production adapter (ENG-536) registers. ` +
@@ -159,7 +217,7 @@ router.post('/', async (req: express.Request, res: express.Response) => {
           `[FathomLinearRouter] ${report.mode} run report for "${meetingRef.title}" ` +
             `(recording ${meetingRef.recordingId}): ${JSON.stringify(report)}`,
         );
-        routerLeg = { routed: true, mode: report.mode, report };
+        routerLeg = { routed: true, mode: report.mode, summary: reportSummary(report) };
       }
     }
 
